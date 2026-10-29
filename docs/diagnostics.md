@@ -163,13 +163,21 @@ Claude's supported old-binding migration reports `counts.migration` as four
 reservation save, claimed A5, durably replaced. These are events, not unique
 file gauges. `upgrade_state_missing` counts actual first native read attempts
 under A5; claiming or saving a reservation alone does not increment it. The
-saved release/key spend survives restart. An interrupted or exhausted migration
-uses the existing paced `retail_exhausted` recovery Full and never refunds A5.
-Successful native completion and the exact saved selection authorize replacement;
-only the successful current-target directory-sync receipt counts as replaced.
-The retired `old_binding_no_match` alarm field remains present with zero counts.
-Idle files take no migration body or sample read. Ordinary restored records may
-still perform the existing bounded certificate samples, separately from body I/O.
+saved release/key spend survives restart. A witness's captured floor remains
+immutable for that permission. Completed native output, exact saved selection
+and the current-target directory-sync receipt are required to count replacement.
+
+O3 adds a termination path to the existing option (i). Other migration refusals
+on real growth use the counted, shared paced `old_binding_no_match` Full, with
+no migration/replacement authority and no A5 refund. This includes spent grants,
+a shorter current extent, obsolete certificate length, generation-ahead records,
+object changes and resource failures. Genuine idle and correctness barriers
+(future revision, owed replay, context/namespace or downgrade) stay held.
+Fallback counts and pacing are separate from A5 reads and durable replacements.
+Indexed Claude growth stays eligible past the activity window until its committed
+end catches up, using already-observed length; secure opens and file-size caps
+still apply. Idle migration files take no body/sample read. Restored records may
+perform existing bounded certificate samples, separately from body I/O.
 
 ## Line Delivery Counters
 

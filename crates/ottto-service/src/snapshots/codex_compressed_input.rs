@@ -4,7 +4,7 @@
 //! open site before it constructs `OpenedInput::compressed`.
 #![cfg_attr(not(test), allow(dead_code))]
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Seek};
+use std::io::{self, BufRead, BufReader, Read};
 use std::mem::size_of;
 use zstd::zstd_safe::{DCtx, DParameter, InBuffer, OutBuffer};
 

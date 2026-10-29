@@ -324,7 +324,7 @@ impl State {
             && self
                 .reservations
                 .get(&id)
-                .is_none_or(|r| r.growth != growth);
+                .map_or(true, |r| r.growth != growth);
         let spent = self.replayed.entry(release).or_default();
         if new_growth {
             spent.remove(&id);

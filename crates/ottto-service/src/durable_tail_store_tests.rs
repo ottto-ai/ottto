@@ -124,7 +124,7 @@ pub(super) fn pending(
     }
 }
 
-pub(super) fn found(outcome: ReadOutcome) -> DurableRecord {
+pub(crate) fn found(outcome: ReadOutcome) -> DurableRecord {
     match outcome {
         ReadOutcome::Found(record) => *record,
         other => panic!("expected a record, got {other:?}"),
@@ -2090,7 +2090,7 @@ fn batch_ack_has_a_fixed_allocation_at_the_dirty_batch_limit() {
     let acks = receipt.committed.as_ref().expect("real durable writes");
     assert_eq!(acks.iter().flatten().count(), MAX_BATCH);
     assert_eq!(std::mem::size_of_val(acks.as_ref()), BATCH_ACK_BYTES);
-    assert!(BATCH_ACK_BYTES <= MAX_BATCH * 80);
+    const _: () = assert!(BATCH_ACK_BYTES <= MAX_BATCH * 80);
     assert!(store.counters().peak_codec_bytes >= BATCH_ACK_BYTES as u64);
     assert!(acks
         .iter()
@@ -2172,10 +2172,14 @@ fn o3_conditional_replacement_binds_original_current_object_and_real_floor() {
             "ordinary strict mutation remains refused"
         );
         fs::write(&path, b"{}\n{}\n").unwrap();
-        let mut proof = store
+        let proof = store
             .migration_witness(&record, &current, 6)
             .expect("exact old envelope/current context");
-        assert_eq!(proof.migration_floor(3), Some(6), "floor never lowers");
+        assert_eq!(
+            proof.migration_floor(),
+            Some(6),
+            "original permission floor is immutable"
+        );
         let mut candidate = record.clone();
         let mut now = current.clone();
         let mut replacement = certificate(&path);

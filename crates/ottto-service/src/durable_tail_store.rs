@@ -1240,10 +1240,8 @@ impl DurableTailStore {
 }
 
 impl MutationWitness {
-    pub(crate) fn migration_floor(&mut self, end: u64) -> Option<u64> {
-        let m = self.migration.as_mut()?;
-        m.floor = std::num::NonZeroU64::new(m.floor.get().max(end))?;
-        Some(m.floor.get())
+    pub(crate) fn migration_floor(&self) -> Option<u64> {
+        self.migration.as_ref().map(|m| m.floor.get())
     }
     pub(crate) fn is_migration(&self) -> bool {
         self.migration.is_some()

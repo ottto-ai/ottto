@@ -31928,6 +31928,10 @@ impl OwnedSourceScan {
                                                 migration_floor = Some(end);
                                                 (None, taken_admission)
                                             }
+                                            Some(Ok(MigrationStart::Fallback)) => {
+                                                migration_floor = durable_accepted.map(|a| a.end);
+                                                (None, taken_admission)
+                                            }
                                             Some(Ok(MigrationStart::AwaitSave)) => {
                                                 identified_candidates.push_front(candidate);
                                                 pending!();
@@ -31994,14 +31998,28 @@ impl OwnedSourceScan {
                                 })
                             })
                         {
-                            context.cache.durable_hold_exit(
-                                source,
-                                crate::durable_tail_store::Refusal::BehindAccepted,
-                                index,
-                                &candidate,
-                                &mut census,
-                            );
-                            pending!();
+                            let fallback = migration_floor.is_some()
+                                && parser.reader.acquisition.as_ref().is_some_and(|p| {
+                                    durable_accepted.is_some_and(|a| p.frozen_length() > a.end)
+                                })
+                                && context
+                                    .cache
+                                    .no_match_full(
+                                        &key,
+                                        parser.reader.reader.get_ref(),
+                                        durable_accepted,
+                                    )
+                                    .is_some();
+                            if !fallback {
+                                context.cache.durable_hold_exit(
+                                    source,
+                                    crate::durable_tail_store::Refusal::BehindAccepted,
+                                    index,
+                                    &candidate,
+                                    &mut census,
+                                );
+                                pending!();
+                            }
                         }
                         #[cfg(unix)]
                         if let Some(attempt) = retail_attempt {
@@ -41456,6 +41474,7 @@ fn refresh_retained_codex_roster(
                 .and_then(unix_seconds)
                 .unwrap_or_default();
             if !sampled_audit::path_requires_verification(files, &path)
+                && !path_has_unread_claude_growth(source, files, &path, metadata.len())
                 && census_unix_seconds.is_some_and(|now| {
                     !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
                 })
@@ -41791,6 +41810,7 @@ fn advance_bounded_directory_traversal_with_budget(
                 .and_then(unix_seconds)
                 .unwrap_or_default();
             if !sampled_audit::path_requires_verification(files, &path)
+                && !path_has_unread_claude_growth(source, files, &path, metadata.len())
                 && census_unix_seconds.is_some_and(|now| {
                     !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
                 })
@@ -41946,6 +41966,7 @@ fn candidate_from_traversal_path_at(
         .and_then(unix_seconds)
         .unwrap_or_default();
     if !sampled_audit::path_requires_verification(files, &pending.path)
+        && !path_has_unread_claude_growth(source, files, &pending.path, metadata.len())
         && census_unix_seconds.is_some_and(|now| {
             !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
         })
@@ -42189,6 +42210,20 @@ fn is_recent_enough(modified_unix_seconds: u64, backfill_window_days: u64) -> bo
     is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
 }
 
+/// Age is not completion: indexed Claude growth stays observable until its
+/// committed end catches up. Uses metadata already read by discovery/open.
+fn path_has_unread_claude_growth(
+    source: SnapshotSource,
+    files: &BTreeMap<String, ScanIndexEntry>,
+    path: &Path,
+    length: u64,
+) -> bool {
+    source == SnapshotSource::ClaudeCode
+        && files
+            .get(&local_index_key(path))
+            .is_some_and(|e| length > e.size_bytes)
+}
+
 fn is_recent_enough_at(
     modified_unix_seconds: u64,
     now_unix_seconds: u64,
@@ -42426,6 +42461,7 @@ fn open_and_identify_scan_candidate_with_rescue(
         };
     if !verification_rescue
         && !sampled_audit::path_requires_verification(files, &candidate.path)
+        && !path_has_unread_claude_growth(source, files, &candidate.path, candidate.size_bytes)
         && !opened_candidate_is_within_frozen_window(
             &candidate,
             census_unix_seconds,
