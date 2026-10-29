@@ -382,6 +382,19 @@ impl Holds {
     }
 }
 
+/// A fresh projection; an unscopable or unaffordable one holds globally.
+pub(super) fn projection(index: &ScanIndex, current: Option<&str>) -> Holds {
+    #[cfg(test)]
+    if REPLAY_OLD.with(std::cell::Cell::get) {
+        return Holds::default();
+    }
+    Holds::build(index, current).unwrap_or(Holds {
+        global: true,
+        built: true,
+        ..Holds::default()
+    })
+}
+
 impl ScanIndex {
     fn current_census_window(&self) -> Option<String> {
         self.traversal
@@ -394,19 +407,7 @@ impl ScanIndex {
     }
     /// A traversal start passes its new window before the checkpoint exists.
     pub(super) fn refresh_usage_guard_holds_at(&mut self, current: Option<&str>) {
-        #[cfg(test)]
-        if REPLAY_OLD.with(std::cell::Cell::get) {
-            self.usage_guard_holds = Holds::default();
-            return;
-        }
-        match Holds::build(self, current) {
-            Some(holds) => self.usage_guard_holds = holds,
-            None => {
-                self.usage_guard_holds.global = true;
-                self.usage_guard_holds.built = true;
-                self.usage_guard_holds.dirty = false;
-            }
-        }
+        self.usage_guard_holds = projection(self, current);
     }
     pub(super) fn refresh_usage_guard_after_native_completion(&mut self) {
         if self.usage_guard_holds.dirty {

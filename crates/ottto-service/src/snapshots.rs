@@ -10188,6 +10188,9 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             ..Default::default()
         };
         let mut preserved = 0;
+        // B3 phase 1: Unknown-held stale proof keeps its fingerprints here as
+        // at retry start; clearing them would refuse its durable Tail restore.
+        let usage_holds = usage_pending_guard::projection(index, Some(census_window_end));
         for (index_key, entry) in &mut index.files {
             let Some((root_session_id, source_session_id)) =
                 claude_index_path_family_member(Path::new(index_key))
@@ -10237,27 +10240,28 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             rearm.other_rearm_matches = rearm
                 .other_rearm_matches
                 .saturating_add(usize::from(other_rearm));
-            let rearmed = full_rearm
-                || identity_contract_rearm
-                || fence_recovery_rearm
-                || {
-                    let proof_rearm = proof_candidate && !negative && !settled_unchanged_proof;
-                    #[cfg(test)]
-                    {
-                        proof_rearm
-                            && !envelope_selection_experiment::suppress_certified_negative_rearm(
-                                &root_session_id,
-                                index_key,
-                            )
+            let rearmed = !usage_holds.holds(&root_session_id)
+                && (full_rearm
+                    || identity_contract_rearm
+                    || fence_recovery_rearm
+                    || {
+                        let proof_rearm = proof_candidate && !negative && !settled_unchanged_proof;
+                        #[cfg(test)]
+                        {
+                            proof_rearm
+                                && !envelope_selection_experiment::suppress_certified_negative_rearm(
+                                    &root_session_id,
+                                    index_key,
+                                )
+                        }
+                        #[cfg(not(test))]
+                        {
+                            proof_rearm
+                        }
                     }
-                    #[cfg(not(test))]
-                    {
-                        proof_rearm
-                    }
-                }
-                || invalidated_witness_roots.contains(&root_session_id)
-                || changed_duplicate_owner
-                || current_member_owns_changed_request;
+                    || invalidated_witness_roots.contains(&root_session_id)
+                    || changed_duplicate_owner
+                    || current_member_owns_changed_request);
             if rearmed {
                 // Reparse earlier-page members of every proven family unless
                 // its proof is unchanged and settled behind a fence that was
@@ -10304,16 +10308,23 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         }
 
         // B3 phase 1: Unknown-held stale proof is neither carried nor re-read,
-        // so a complete census cannot retire it; it stays the reconstructible hold.
-        index.refresh_usage_guard_holds_at(Some(census_window_end));
+        // so a complete census cannot retire it; it stays the reconstructible
+        // hold. The complete-census disappearance rule still retires it.
         index
             .claude_usage_family_pending
-            .retain(|root_session_id, _| {
+            .retain(|root_session_id, pending| {
                 index
                     .claude_usage_authority_quarantine
                     .contains_key(root_session_id)
-                    || index.usage_guard_holds.holds(root_session_id)
+                    || (usage_holds.holds(root_session_id)
+                        && (indexed_claude_family_ids.contains(root_session_id)
+                            || pending
+                                .membership()
+                                .keys()
+                                .chain(pending.member_occurrences.keys())
+                                .any(|member| indexed_claude_family_ids.contains(member))))
             });
+        index.usage_guard_holds = usage_holds;
         let progress = &mut index.claude_full_rearm_progress;
         progress.observed_window = None;
         progress.ignored_vetoes = 0;
