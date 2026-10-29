@@ -513,18 +513,29 @@ fn verify_codex_zst_downgrade_roundtrip() {
 }
 
 #[test]
-fn foundation_unknown_owner_coverage_defers_sibling_without_red_or_smaller_body() {
-    let root = crate::test_scratch::private_dir("custody-foundation-sibling");
-    let held = member(&root, "sessions", OWNER, false);
-    let mut index = accepted(&root, &held);
-    latch(&mut index, &held);
-    member(&root, "archived_sessions", OWNER, false);
-    let ((index, scan), rows) = capture(|| normal(&root, index, &[]));
-    assert_no_red(&scan, &rows);
-    assert!(index.files[&local_index_key(&held)]
-        .last_upload_body_witness
-        .is_some());
-    fs::remove_dir_all(root).unwrap();
+fn foundation_unknown_owner_coverage_defers_present_or_absent_held_siblings() {
+    for absent in [false, true] {
+        let root = crate::test_scratch::private_dir("custody-foundation-sibling");
+        let held = member(&root, "sessions", OWNER, false);
+        let mut index = accepted(&root, &held);
+        latch(&mut index, &held);
+        let smaller = held.with_file_name(format!("rollout-2026-10-01T11-00-00-{OWNER}.jsonl"));
+        let bytes = codex_file_join::tests::member(OWNER, "shorter", 1, 1)
+            .iter()
+            .map(|v| v.to_string() + "\n")
+            .collect::<String>();
+        fs::write(&smaller, bytes).unwrap();
+        assert!(smaller.exists());
+        if absent {
+            fs::remove_file(&held).unwrap();
+        }
+        let ((index, scan), rows) = capture(|| normal(&root, index, &[]));
+        assert_no_red(&scan, &rows);
+        assert!(index.files[&local_index_key(&held)]
+            .last_upload_body_witness
+            .is_some());
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[test]

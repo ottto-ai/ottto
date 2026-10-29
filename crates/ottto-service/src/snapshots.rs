@@ -26851,7 +26851,13 @@ impl OwnedSourceScan {
                     if !done {
                         pending!();
                     }
-                    if inventory.custody_incomplete {
+                    if inventory.custody_incomplete
+                        || index
+                            .files
+                            .values()
+                            .any(|entry| entry.codex_compressed_hold.is_some())
+                    {
+                        inventory.complete = false;
                         if let Some(traversal) = index.traversal.as_mut() {
                             for candidate in identified_candidates.drain(..) {
                                 traversal.pending_candidates.push_back(ScanTraversalPath {
