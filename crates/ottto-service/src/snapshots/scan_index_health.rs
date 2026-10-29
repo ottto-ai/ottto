@@ -60,7 +60,7 @@ pub(crate) fn is_version_refusal(error: &anyhow::Error) -> bool {
 
 pub(super) fn observe(source: SnapshotSource, loaded: &anyhow::Result<(ScanIndex, LoadOrigin)>) {
     let refused = match loaded {
-        Ok((_, LoadOrigin::Loaded(_))) => false,
+        Ok((index, LoadOrigin::Loaded(_))) if index.persistence_available() => false,
         Err(error) if is_version_refusal(error) => true,
         // Missing/quarantined state and other errors are not a good root load.
         // In particular, a failed read must not hide an existing update blocker.

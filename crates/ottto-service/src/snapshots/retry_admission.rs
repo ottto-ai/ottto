@@ -18,6 +18,10 @@ fn claude_retry_record_due(
 }
 
 fn claude_retry_due_family_exists(index: &ScanIndex, collected_at: &str) -> bool {
+    if !index.persistence_available() {
+        return false;
+    }
+
     let now = rfc3339_unix_seconds(collected_at).unwrap_or_default();
     let served = index
         .traversal
@@ -323,6 +327,10 @@ fn claude_retry_path_owed(
 }
 
 fn claude_retry_queue_due_families(index: &mut ScanIndex, collected_at: &str) {
+    if !index.persistence_available() {
+        return;
+    }
+
     let now = rfc3339_unix_seconds(collected_at).unwrap_or_default();
     let became_storage_only = index
         .claude_stale_family_carry
