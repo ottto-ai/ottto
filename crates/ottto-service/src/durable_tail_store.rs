@@ -291,6 +291,60 @@ pub(crate) struct DurableRecord {
     pub(crate) format: u16,
 }
 
+/// Exact encoded candidate, including the original trailer (not a re-encoding
+/// of decoded fields, which may discard retired positional values).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RecordIdentity {
+    key: Digest32,
+    allowlist: Digest32,
+    format: u16,
+    generation: u64,
+    encoded_len: u64,
+    trailer: Digest32,
+}
+impl RecordIdentity {
+    /// Only called with our encoded bytes or a fully verified decoded record.
+    fn verified(record: &DurableRecord, bytes: &[u8]) -> Self {
+        Self {
+            key: record.record.binding.key,
+            allowlist: record.record.allowlist,
+            format: record.format,
+            generation: record.index_generation,
+            encoded_len: bytes.len() as u64,
+            trailer: bytes[bytes.len() - TRAILER_BYTES..]
+                .try_into()
+                .expect("verified trailer"),
+        }
+    }
+}
+
+struct VerifiedRecord {
+    record: Box<DurableRecord>,
+    identity: RecordIdentity,
+}
+#[derive(Clone, Copy)]
+struct PendingWrite {
+    prior: Option<Stamp>,
+    candidate: RecordIdentity,
+}
+// Existing per-source pending reservation allows 4096 bytes per tree node.
+const _: () = assert!(std::mem::size_of::<(Digest32, PendingWrite)>() <= 256);
+
+/// Acquisition durability only; never accepted-money or replacement ACK credit.
+pub(crate) struct ReceiptProof {
+    identity: RecordIdentity,
+    stamp: Stamp,
+}
+/// Verified absence (including ordinary retirement), after directory sync.
+pub(crate) struct RetirementProof {
+    candidate: RecordIdentity,
+}
+pub(crate) enum ReconcileOutcome {
+    NoPending,
+    Receipted(ReceiptProof),
+    Retired(RetirementProof),
+}
+
 /// Preservation classes: unknown representations (U) precede known corruption (T14).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Refusal {
@@ -448,7 +502,7 @@ pub(crate) struct DurableTailStore {
     pass: [u64; 2],
     rebuilt: BTreeSet<Digest32>,
     startup_synced: bool,
-    pending: BTreeMap<Digest32, (Option<Stamp>, u64, Digest32, Digest32)>,
+    pending: BTreeMap<Digest32, PendingWrite>,
 }
 
 /// The most record files one GC or inventory pass looks at. Twice the
@@ -721,25 +775,29 @@ impl DurableTailStore {
         if self.pending.contains_key(key) {
             return ReadOutcome::Refused(Refusal::ReceiptPending);
         }
-        self.read_known(key, allowlist, None)
+        match self.read_known(key, allowlist, None) {
+            Ok(Some(verified)) => ReadOutcome::Found(verified.record),
+            Ok(None) => ReadOutcome::Missing,
+            Err(reason) => ReadOutcome::Refused(reason),
+        }
     }
     fn read_known(
         &mut self,
         key: &Digest32,
         allowlist: &Digest32,
         writer: Option<&dyn SingleWriter>,
-    ) -> ReadOutcome {
+    ) -> Result<Option<VerifiedRecord>, Refusal> {
         match self.classify(key, "guard", writer) {
-            Err(reason) => return ReadOutcome::Refused(reason),
+            Err(reason) => return Err(reason),
             Ok(None) => {
                 self.counters.missing += 1;
-                return ReadOutcome::Missing;
+                return Ok(None);
             }
             Ok(Some(_)) => {}
         }
         let bytes = match read_private(&self.record_path(key)) {
             Ok(Some(bytes)) => bytes,
-            _ => return ReadOutcome::Refused(Refusal::Corrupt),
+            _ => return Err(Refusal::Corrupt),
         };
         self.counters.records_read += 1;
         self.counters.bytes_read += bytes.len() as u64;
@@ -750,9 +808,13 @@ impl DurableTailStore {
                 if let Some((content, _, _)) = self.durable.get_mut(key) {
                     *content = Some(content_digest(&record.record));
                 }
-                ReadOutcome::Found(Box::new(record))
+                let identity = RecordIdentity::verified(&record, &bytes);
+                Ok(Some(VerifiedRecord {
+                    record: Box::new(record),
+                    identity,
+                }))
             }
-            Err(reason) => ReadOutcome::Refused(reason),
+            Err(reason) => Err(reason),
         }
     }
 
@@ -767,23 +829,20 @@ impl DurableTailStore {
         &mut self,
         writer: &dyn SingleWriter,
         key: &Digest32,
-    ) -> io::Result<bool> {
+    ) -> io::Result<ReconcileOutcome> {
         self.check_writer(writer)?;
         if !self.usable(Some(writer)) {
             return Err(io::Error::other("store disabled"));
         }
-        let Some((prior, generation, content, allowlist)) = self.pending.get(key).copied() else {
-            return Ok(true);
+        let Some(PendingWrite { prior, candidate }) = self.pending.get(key).copied() else {
+            return Ok(ReconcileOutcome::NoPending);
         };
         let path = self.record_path(key);
-        let stamp = || fs::symlink_metadata(&path).ok().map(|m| Stamp::of(&m));
-        let before = stamp();
-        self.durable.remove(key); // Reconcile must fully verify, even a memo hit.
-        let receipted = match self.read_known(key, &allowlist, Some(writer)) {
-            ReadOutcome::Found(record) if before == stamp() => {
-                if record.index_generation == generation
-                    && content_digest(&record.record) == content
-                {
+        let before = stamp_at(&path)?;
+        self.durable.remove(key); // Reconcile fully verifies, even a memo hit.
+        let receipted = match self.read_known(key, &candidate.allowlist, Some(writer)) {
+            Ok(Some(verified)) if before == stamp_at(&path)? => {
+                if verified.identity == candidate {
                     let file = OpenOptions::new()
                         .read(true)
                         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -793,8 +852,11 @@ impl DurableTailStore {
                     }
                     file.sync_all()?;
                     true
-                } else if prior.is_some() && before == prior && record.format == FORMAT_VERSION {
-                    if stamp() != before {
+                } else if prior.is_some()
+                    && before == prior
+                    && verified.record.format == FORMAT_VERSION
+                {
+                    if stamp_at(&path)? != before {
                         return Err(io::Error::other("predecessor changed"));
                     }
                     remove_if_present(&path)?;
@@ -803,23 +865,26 @@ impl DurableTailStore {
                     return Err(io::Error::other("unadjudicated survivor"));
                 }
             }
-            ReadOutcome::Missing if before.is_none() && self.disabled.is_none() => false,
+            Ok(None) if before.is_none() && self.disabled.is_none() => false,
             _ => return Err(io::Error::other("unverified survivor")),
         };
         self.sync_store()?;
-        if (receipted && stamp() != before)
-            || (!receipted
-                && !fs::symlink_metadata(&path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound))
-        {
+        let after = stamp_at(&path)?;
+        if (receipted && after != before) || (!receipted && after.is_some()) {
             return Err(io::Error::other("survivor changed"));
         }
         self.pending.remove(key);
         if receipted {
             self.counters.receipt_reconciled += 1;
+            Ok(ReconcileOutcome::Receipted(ReceiptProof {
+                identity: candidate,
+                stamp: after.expect("verified survivor"),
+            }))
         } else {
+            self.durable.remove(key);
             self.counters.durable_write_failed_published += 1;
+            Ok(ReconcileOutcome::Retired(RetirementProof { candidate }))
         }
-        Ok(receipted)
     }
 
     /// Only a fully verified original binding may authorize a Claude mutation.
@@ -878,7 +943,7 @@ impl DurableTailStore {
                 let same = self
                     .pending
                     .get(&record.binding.key)
-                    .is_some_and(|(prior, ..)| prior.is_some() && *prior == stamp);
+                    .is_some_and(|pending| pending.prior.is_some() && pending.prior == stamp);
                 if !(same
                     && matches!(
                         self.classify(&record.binding.key, "overwrite", Some(writer)),
@@ -982,36 +1047,35 @@ impl DurableTailStore {
                 break;
             }
             attempted += 1;
-            self.pending.insert(
-                key,
-                (
-                    prior,
-                    committed_generation,
-                    content,
-                    stored.record.allowlist,
-                ),
-            );
-            if write_atomic(&self.dir, &path, &bytes, prior, &mut self.counters)
-                .and_then(|_| self.sync_store())
-                .is_err()
-            {
-                match self.reconcile_pending(writer, &key) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        on_disk.remove(&key);
-                        continue;
+            let candidate = RecordIdentity::verified(&stored, &bytes);
+            self.pending.insert(key, PendingWrite { prior, candidate });
+            let attempt = write_atomic(&self.dir, &path, &bytes, prior, &mut self.counters)
+                .and_then(|stamp| {
+                    self.sync_store()?;
+                    if stamp_at(&path)? != Some(stamp) {
+                        return Err(io::Error::other("committed survivor changed"));
                     }
-                    Err(_) => {
-                        self.counters.receipt_pending_held += 1;
-                        receipt.deferred_keys.push(key);
-                        continue;
-                    }
+                    Ok(ReconcileOutcome::Receipted(ReceiptProof {
+                        identity: candidate,
+                        stamp,
+                    }))
+                });
+            let outcome = attempt.or_else(|_| self.reconcile_pending(writer, &key));
+            let proof = match outcome {
+                Ok(ReconcileOutcome::Receipted(proof)) if proof.identity == candidate => proof,
+                Ok(ReconcileOutcome::Retired(proof)) if proof.candidate == candidate => {
+                    on_disk.remove(&key);
+                    continue;
                 }
-            } else {
-                self.pending.remove(&key);
-            }
-            on_disk.insert(key, bytes.len() as u64);
-            let stamp = Stamp::of(&fs::symlink_metadata(&path)?);
+                _ => {
+                    self.counters.receipt_pending_held += 1;
+                    receipt.deferred_keys.push(key);
+                    continue;
+                }
+            };
+            self.pending.remove(&key);
+            on_disk.insert(key, proof.identity.encoded_len);
+            let stamp = proof.stamp;
             if self.durable.len() < MAX_RECORDS || self.durable.contains_key(&key) {
                 self.durable.insert(key, (Some(content), stamp, true));
             }
@@ -1361,6 +1425,14 @@ impl Stamp {
     }
 }
 
+fn stamp_at(path: &Path) -> io::Result<Option<Stamp>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(Stamp::of(&metadata))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 fn our_uid() -> u32 {
     #[cfg(test)]
     if let Some(uid) = test_hooks::uid() {
@@ -1544,7 +1616,7 @@ impl<'a> TempRecord<'a> {
         Ok(())
     }
 
-    fn commit(&mut self, path: &Path, prior: Option<Stamp>) -> io::Result<()> {
+    fn commit(&mut self, path: &Path, prior: Option<Stamp>) -> io::Result<Stamp> {
         #[cfg(test)]
         test_hooks::before_rename(&self.path, path)?;
         self.verify()?;
@@ -1557,8 +1629,9 @@ impl<'a> TempRecord<'a> {
             return Err(io::Error::other("predecessor changed"));
         }
         fs::rename(&self.path, path)?;
+        let stamp = Stamp::of(&self.file.as_ref().expect("owned temp").metadata()?);
         self.file.take(); // The caller still owes store/parent sync for a receipt.
-        Ok(())
+        Ok(stamp)
     }
 
     fn discard(&mut self) -> io::Result<()> {
@@ -1603,7 +1676,7 @@ fn write_atomic(
     bytes: &[u8],
     prior: Option<Stamp>,
     counters: &mut StoreCounters,
-) -> io::Result<()> {
+) -> io::Result<Stamp> {
     let mut temp = TempRecord::prepare(dir, path, counters)?;
     let result = (|| {
         temp.file.as_mut().expect("owned temp").write_all(bytes)?;

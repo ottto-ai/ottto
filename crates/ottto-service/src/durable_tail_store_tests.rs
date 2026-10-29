@@ -73,7 +73,7 @@ impl Drop for Scratch {
 /// Exact in-memory custody oracle; no new production representation/hash.
 pub(crate) fn pending_snapshot(store: &DurableTailStore) -> Vec<u8> {
     let mut out = Vec::new();
-    for (key, (prior, generation, content, allowlist)) in &store.pending {
+    for (key, PendingWrite { prior, candidate }) in &store.pending {
         out.extend_from_slice(key);
         out.push(u8::from(prior.is_some()));
         if let Some(stamp) = prior {
@@ -84,9 +84,12 @@ pub(crate) fn pending_snapshot(store: &DurableTailStore) -> Vec<u8> {
                 out.extend_from_slice(&word.to_le_bytes());
             }
         }
-        out.extend_from_slice(&generation.to_le_bytes());
-        out.extend_from_slice(content);
-        out.extend_from_slice(allowlist);
+        out.extend_from_slice(&candidate.generation.to_le_bytes());
+        out.extend_from_slice(&candidate.format.to_le_bytes());
+        out.extend_from_slice(&candidate.encoded_len.to_le_bytes());
+        out.extend_from_slice(&candidate.key);
+        out.extend_from_slice(&candidate.trailer);
+        out.extend_from_slice(&candidate.allowlist);
     }
     out
 }
@@ -201,7 +204,13 @@ fn failed_unlink_holds_across_memo_clear_then_reconciles_no_record() {
                 0
             );
             assert_eq!(fs::read(record_file(&store, &b.key)).unwrap(), original);
-            assert!(!store.reconcile_pending(&lock, &b.key).unwrap());
+            let candidate = store.pending[&b.key].candidate;
+            let ReconcileOutcome::Retired(proof) = store.reconcile_pending(&lock, &b.key).unwrap()
+            else {
+                panic!("verified retirement must return its exact candidate");
+            };
+            assert_eq!(proof.candidate, candidate);
+            assert!(stamp_at(&record_file(&store, &b.key)).unwrap().is_none());
         }
         assert!(!record_file(&store, &b.key).exists());
         assert!(!store.receipt_pending(&b.key));
@@ -253,10 +262,104 @@ fn equal_generation_impostor_never_elects_receipt_and_unknown_swap_is_protected(
                 format: FORMAT_VERSION,
             }),
         );
-        assert!(store.reconcile_pending(&lock, &b.key).unwrap());
+        assert!(matches!(
+            store.reconcile_pending(&lock, &b.key).unwrap(),
+            ReconcileOutcome::Receipted(_)
+        ));
         assert_eq!(store.counters().receipt_reconciled, 1);
         assert_eq!(store.counters().durable_write_failed_published, 0);
     }
+}
+
+#[test]
+fn exact_survivor_uses_original_trailer_not_canonicalized_retired_fields() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let path = scratch.transcript("source.jsonl", b"{}\n");
+    let b = binding("account", "scope", ("fp-a", None));
+    let mut store = scratch.store();
+    store
+        .write_after_save(&lock, 1, 0, vec![pending(b.clone(), certificate(&path), 1)])
+        .unwrap();
+    test_hooks::set_before_dir_sync(Some(Box::new(|_| Err(io::Error::other("sync EIO")))));
+    let receipt = store
+        .write_after_save(&lock, 2, 0, vec![pending(b.clone(), certificate(&path), 2)])
+        .unwrap();
+    test_hooks::set_before_dir_sync(None);
+    assert_eq!(receipt.written, 0);
+    assert!(store.receipt_pending(&b.key));
+    let disk = record_file(&store, &b.key);
+    let original = fs::read(&disk).unwrap();
+    let mut altered = original.clone();
+    // The typed decoder deliberately drops these retired bytes. A reconstructed
+    // header/content digest would therefore call these two records identical.
+    altered[HEADER_BYTES - 13] = 1;
+    altered[HEADER_BYTES - 12..HEADER_BYTES - 4].copy_from_slice(&123_u64.to_le_bytes());
+    set_version(&mut altered, FORMAT_VERSION); // Refresh the existing trailer.
+    assert_eq!(
+        decode(&altered, &placeholder_allowlist()).unwrap(),
+        decode(&original, &placeholder_allowlist()).unwrap()
+    );
+    assert_ne!(altered, original);
+    put_record(&disk, &altered);
+    let debt = pending_snapshot(&store);
+    assert!(store.reconcile_pending(&lock, &b.key).is_err());
+    assert_eq!(pending_snapshot(&store), debt);
+    assert_eq!(fs::read(&disk).unwrap(), altered);
+    assert_eq!(store.counters().receipt_reconciled, 0);
+    put_record(&disk, &original);
+    let ReconcileOutcome::Receipted(proof) = store.reconcile_pending(&lock, &b.key).unwrap() else {
+        panic!("original bytes alone discharge this candidate");
+    };
+    assert_eq!(
+        proof.identity.trailer.as_slice(),
+        &original[original.len() - TRAILER_BYTES..]
+    );
+    assert_eq!(proof.identity.encoded_len, original.len() as u64);
+    assert!(Some(proof.stamp) == stamp_at(&disk).unwrap());
+}
+
+#[test]
+fn replacement_during_successful_directory_sync_cannot_receipt_an_impostor() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let path = scratch.transcript("source.jsonl", b"{}\n");
+    let b = binding("account", "scope", ("fp-a", None));
+    let mut store = scratch.store();
+    store
+        .write_after_save(&lock, 1, 0, vec![pending(b.clone(), certificate(&path), 1)])
+        .unwrap();
+    let disk = record_file(&store, &b.key);
+    let impostor = encode(&DurableRecord {
+        record: pending(b.clone(), certificate(&path), 3),
+        index_generation: 2,
+        format: FORMAT_VERSION,
+    });
+    let target = disk.clone();
+    let swapped = impostor.clone();
+    let reached = std::rc::Rc::new(std::cell::Cell::new(false));
+    let hit = reached.clone();
+    test_hooks::set_before_dir_sync(Some(Box::new(move |_| {
+        if !hit.replace(true) {
+            put_record(&target, &swapped);
+        }
+        Ok(())
+    })));
+    let receipt = store
+        .write_after_save(&lock, 2, 0, vec![pending(b.clone(), certificate(&path), 2)])
+        .unwrap();
+    test_hooks::set_before_dir_sync(None);
+    assert!(reached.get());
+    assert_eq!(receipt.written, 0);
+    assert_eq!(receipt.deferred_keys, vec![b.key]);
+    assert!(store.receipt_pending(&b.key));
+    assert_eq!(fs::read(&disk).unwrap(), impostor);
+    assert_eq!(store.hold(&b.key), Some(Refusal::ReceiptPending));
+}
+
+#[test]
+fn exact_pending_identity_fits_existing_node_reservation() {
+    assert!(crate::heap_layout_bound::tree_node_bytes::<Digest32, PendingWrite>().unwrap() <= 4096);
 }
 
 #[test]
@@ -471,7 +574,19 @@ fn post_rename_sync_failure_keeps_b_pending_until_its_exact_receipt() {
             })
         );
         assert_eq!(store.counters().t14_rebuild, 0);
-        assert!(store.reconcile_pending(&lock, &b.key).unwrap());
+        let candidate = store.pending[&b.key].candidate;
+        let expected_stamp = stamp_at(&record_file(&store, &b.key)).unwrap();
+        let ReconcileOutcome::Receipted(proof) = store.reconcile_pending(&lock, &b.key).unwrap()
+        else {
+            panic!("exact survivor must yield an acquisition proof");
+        };
+        assert_eq!(proof.identity, candidate);
+        assert!(Some(proof.stamp) == expected_stamp);
+        assert!(matches!(
+            store.reconcile_pending(&lock, &b.key).unwrap(),
+            ReconcileOutcome::NoPending
+        ));
+
         assert_eq!(store.counters().receipt_reconciled, 1);
         assert_eq!(store.counters().durable_write_failed_published, 0);
         assert_eq!(
