@@ -754,8 +754,8 @@ mod tests {
         let fixture = ForcedFamilyFixture::new("absence-forced-family");
         let member_key = local_index_key(&fixture.member_path);
         let mut index = fixture.index();
-        // N3: the member's own snapshot fingerprints and account hold are not
-        // released with its marker; their own rules settle them.
+        // N3 keeps snapshot incidence; proven absence now releases the
+        // unfulfillable account hold without granting body/ACK credit.
         let held = std::collections::BTreeSet::from(["held-member-body".to_string()]);
         index
             .file_snapshot_fingerprints
@@ -764,12 +764,23 @@ mod tests {
             .claude_account_deferred_holds
             .insert(member_key.clone(), "held-member-revision".to_string());
         for at in [NOW, RETRY] {
-            let (((pages, events), sites), vanished) = observe_vanished(|| {
-                observe_sites(|| {
-                    observe(|| claude_generation(&mut index, &fixture.dir, at, 10, &[]))
+            let (result, rows) = crate::local_resource_diagnostics::capture(|| {
+                observe_vanished(|| {
+                    observe_sites(|| {
+                        observe(|| claude_generation(&mut index, &fixture.dir, at, 10, &[]))
+                    })
                 })
             });
+            let (((pages, events), sites), vanished) = result;
             let retired = u64::from(at == NOW);
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row["stage"] == "withheld_hold_released"
+                        && row["counts"]["withheld_hold_released"]["deleted"] == 1)
+                    .count(),
+                retired as usize,
+                "proven account-hold release is counted exactly once"
+            );
             let mut expected_sites = [[[0; OUTCOMES]; SITES]; 3];
             expected_sites[1][Site::CandidateForcedIndex.index()] = [0, retired];
             assert_eq!(sites, expected_sites, "{at}: retired once");
@@ -804,7 +815,8 @@ mod tests {
                     .claude_account_deferred_holds
                     .get(&member_key)
                     .map(String::as_str),
-                Some("held-member-revision")
+                None,
+                "positively absent account hold is released"
             );
         }
     }
@@ -1494,11 +1506,12 @@ mod tests {
             3
         );
         let vanished = calls("vanished");
-        assert_eq!(vanished.len(), 3);
+        assert_eq!(vanished.len(), 4);
         for (call, kind) in vanished.into_iter().zip([
             "AuditDebtDropped",
             "RequestCensusRemoved",
             "AuditDebtDropped",
+            "RequestCensusRemoved",
         ]) {
             assert!(call.contains(&format!("Vanished::{kind}")));
         }

@@ -98,9 +98,12 @@ Their sum equals `full_selections`. It also records `priority_full_replays`,
 `max_completion_overdue_seconds`. Separate `index_state_at_page_end` gauges
 record `pending_audits`, `overdue_audits` and `oldest_due_age_seconds` using the
 existing index calculations. These three fields are state gauges. The same
-object adds page-event counts `audit_quiet_retired`, `audit_cap_full`,
-`audit_cap_delay` and `pace_evicted`. Full counts actual per-file cap fallbacks;
-refused prefix/lossy completions and paced candidates count as delays. The RAM
+object adds page-event counts `audit_quiet_retired` and `audit_cap_full`.
+To keep the existing native page under its 4 KiB budget, `audit_cap_delay`
+emits a separate nonzero-only `sampled_audit_cap_delay` record on this carrier;
+`pace_evicted` is emitted by `sampled_audit_pace_alarm`. Values remain exact.
+Full counts actual per-file cap fallbacks; refused prefix/lossy completions and
+paced candidates count as delays. The RAM
 pace is six hours per key, 256 fixed slots, oldest-evicted on overflow. Its
 SystemTime clock expires on backwards time or jumps beyond 30 days. A restart
 allows at most one extra cap Full per key. Existing marked Tails stay enabled.
@@ -121,8 +124,10 @@ Quiet retirement keeps the old Full verification time and grants no
 `audits_completed`, source, census or ACK credit.
 
 `audit_retired_absent` counts an obligation retired on positively proven absence:
-NotFound beneath a readable parent and configured readable root. Missing parent,
-unreadable root and permission errors keep it owed. Codex-protected history
+ENOENT on a no-follow descriptor chain from a readable configured root.
+A missing intermediate directory counts only beneath the nearest securely
+opened readable ancestor; all pinned directories are revalidated. Symlinks,
+dangling links, unreadable/missing roots and other errors keep it owed. Codex-protected history
 remains retained; this counter grants no Full or source/census credit. Account
 removal also emits `withheld_hold_released{deleted}`. Ordinary unavailable audit
 markers are never evicted.

@@ -1179,8 +1179,6 @@ pub(crate) struct PageEvents {
 pub(crate) struct IndexState {
     pub(crate) audit_quiet_retired: usize,
     pub(crate) audit_cap_full: usize,
-    pub(crate) audit_cap_delay: usize,
-    pub(crate) pace_evicted: usize,
     pub(crate) pending_audits: usize,
     pub(crate) overdue_audits: usize,
     pub(crate) oldest_due_age_seconds: u64,
@@ -1598,8 +1596,6 @@ mod tests {
             index_state_at_page_end: IndexState {
                 audit_quiet_retired: usize::MAX,
                 audit_cap_full: usize::MAX,
-                audit_cap_delay: usize::MAX,
-                pace_evicted: usize::MAX,
                 pending_audits: usize::MAX,
                 overdue_audits: usize::MAX,
                 oldest_due_age_seconds: u64::MAX,

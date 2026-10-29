@@ -205,7 +205,8 @@ charges their complete inline layouts, including empty slots.
 Absence uses E3/#876's exact proven_absent(Path, &[PathBuf]) seam: NotFound with
 both immediate parent and configured root readable. The bounded reconciliation
 path retires marked obligations and counts audit_retired_absent without Full,
-source or census credit. Missing parents/permission uncertainty keep debt.
+source or census credit. Unsafe ancestors/root permission uncertainty keep debt;
+round18 below strengthens the proof for a missing intermediate directory.
 Codex-protected entries keep their history; only audit scheduling ends. The
 account-hold carve-out has the same helper name and two call sites as #876;
 whichever lands second must retain both paths and the three-producer vanished
@@ -219,3 +220,36 @@ Synthetic acquisition clocks precede wall time so #865's deadline clamp cannot
 turn fixture timing into a carrier mismatch. Fixtures remain unexecuted until
 E1's exact-head Linux and one native macOS contracts run; only serialized local
 package Clippy is authorized here. Existing raw/finalized money equality stays.
+
+
+Round12 repairs the five Linux contract failures from round11. The dense native
+resource record keeps its existing 4 KiB limit: cap delays emit their exact count
+as sampled_audit_cap_delay on the existing carrier, while pace_evicted stays on
+its existing immediate alarm. The origin-unknown acquisition test checks its
+admission block rather than treating an unrelated pacing field as cache history.
+The deleted forced-member test now requires its proven-absent account hold to
+be released while retaining SOURCE N3 fingerprint incidence. #865's discarded
+envelope debt is explicitly absent from decoded checkpoints; live index debt
+still wins, remains due across Unchanged sampling and is never Full permission.
+The standalone acquisition fixture supplies that live debt at the prepare seam.
+Missing-entry and foreign-context write-only descriptor controls mirror P3;
+this branch already classified the same-context carrier before membership.
+
+The hardened absence predicate and helper are an exact round18 copy from E3's
+#876 while it is unmerged, to be replaced by #876's implementation at merge.
+Every parent below the configured root opens by no-follow openat; final
+fstatat(AT_SYMLINK_NOFOLLOW) must report precisely ENOENT; the pinned chain is
+revalidated. A missing intermediate component beneath a securely opened readable
+ancestor is positive absence. Intermediate/dangling links, non-directory or
+unreadable ancestors and missing/unreadable roots keep debt; non-Unix always
+returns false. This supersedes round11's immediate-parent-only predicate.
+The existing 4096-hold bound also limits the held-new absence inventory; omission
+from the index or observed set alone cannot release a hold. The account item
+stops reconciliation after retirement, preserving SOURCE N3 incidence. Request-
+census removal now counts through the same shared seam. Native cohort controls
+use non-directory unavailable ancestors, so no valid absence proof frees them.
+
+The new platform/held-new/missing-intermediate controls remain unexecuted until
+E1's exact-head Linux and supported-layout macOS contracts. Local Clippy compiles
+all targets but does not execute them. No version/field, money, proof, codec,
+allowlist, audit-cap value or Full admission rule changes in this round.

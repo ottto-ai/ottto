@@ -3895,8 +3895,12 @@ fn resource_diagnostics_acquisition_absence_preserves_unknown_and_short_circuit(
         );
         let encoded = serde_json::to_string(pages[0]).unwrap();
         assert!(!encoded.contains(f.dir.to_str().unwrap()));
-        assert!(!encoded.contains("expired"));
-        assert!(!encoded.contains("evicted"));
+        let admission = serde_json::to_string(counts).unwrap();
+        assert!(!admission.contains("expired"));
+        assert!(!admission.contains("evicted"));
+        assert!(rows
+            .iter()
+            .all(|row| row["stage"] != "sampled_audit_pace_alarm"));
     }
 }
 
