@@ -2235,3 +2235,77 @@ fn replaced_held_path_cannot_retire_its_hidden_current_legacy_owner() {
     }
     fs::remove_dir_all(root).unwrap();
 }
+
+/// Historical money survives custody/replay; current archive credit still
+/// requires the current attempt's exact body witness, never its old fingerprint.
+#[test]
+fn held_archive_replay_does_not_settle_from_historical_fingerprint_alone() {
+    for current_body in [false, true] {
+        let root = crate::test_scratch::private_dir("custody-current-archive-body");
+        let path = member(&root, "sessions", OWNER, true);
+        let key = local_index_key(&path);
+        let mut index = accepted(&root, &path);
+        let before = index.files[&key].clone();
+        let fp = before.last_snapshot_fingerprint.as_ref().unwrap().clone();
+        let witness = before.last_upload_body_witness.as_ref().unwrap().clone();
+        let historical_ack = BTreeMap::from([(fp.clone(), witness.clone())]);
+        seed_archive(&mut index, &path, OWNER);
+        let archive = index.files.get_mut(&key).unwrap().archive.as_mut().unwrap();
+        archive.disposition = ArchiveDisposition::Pending {
+            attempts: 1,
+            retry_after: u64::MAX,
+        };
+        archive.body_witness =
+            current_body.then(|| snapshot_file_upload_body_set_hex(BTreeSet::from([&witness])));
+        index.hold_compressed(
+            &path,
+            BTreeSet::from([OWNER.into()]),
+            CodexZstCause::FamilyUnproven,
+        );
+        assert!(index.prepare_historical_replay("held-archive-current-body".into()));
+        let saved = root.join("index.json");
+        for _ in 0..3 {
+            index.save(&saved).unwrap();
+            let ((mut next, result), rows) = capture(|| {
+                no_open(&path, || {
+                    normal(&root, ScanIndex::load(&saved).unwrap(), &[])
+                })
+            });
+            assert_no_red(&result, &rows);
+            assert!(
+                next.accepted_snapshot_fingerprints.contains(&fp),
+                "retain historical money"
+            );
+            assert_eq!(
+                next.files[&key].last_snapshot_fingerprint,
+                before.last_snapshot_fingerprint
+            );
+            assert_eq!(
+                next.files[&key].last_upload_body_witness,
+                before.last_upload_body_witness
+            );
+            // Exercise the real settlement consumer with every historical ACK
+            // present. Only its exact CURRENT body witness may accept the attempt.
+            next.settle_archive_outcome(&historical_ack, true, Some(&historical_ack));
+            let entry = &next.files[&key];
+            assert_eq!(
+                entry.codex_compressed_hold,
+                Some(CodexZstCause::FamilyUnproven)
+            );
+            let archive = entry.archive.as_ref().unwrap();
+            assert_eq!(
+                matches!(archive.disposition, ArchiveDisposition::Acquired),
+                current_body
+            );
+            if !current_body {
+                assert!(matches!(
+                    archive.disposition,
+                    ArchiveDisposition::Pending { .. }
+                ));
+                assert!(archive.body_witness.is_none());
+            }
+            index = next;
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+}
