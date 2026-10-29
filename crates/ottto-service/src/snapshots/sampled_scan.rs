@@ -2161,3 +2161,6 @@ impl HeapLayoutBound for std::sync::Weak<SharedCache> {
         Some(())
     }
 }
+
+#[cfg(test)]
+pub(crate) mod transition_fixture;
