@@ -291,9 +291,6 @@ fn fits(
     base_bytes: usize,
     prior_refusals: u64,
 ) -> Option<usize> {
-    if selection.metrics.parts > MAX_PARTS_PER_ITEM {
-        return None;
-    }
     for (row, groups) in item.model_usage.iter().zip(&selection.top) {
         if groups
             .values()
@@ -307,6 +304,13 @@ fn fits(
         {
             return None;
         }
+    }
+    fits_caps(selection, base_bytes, prior_refusals)
+}
+
+fn fits_caps(selection: &Selection, base_bytes: usize, prior_refusals: u64) -> Option<usize> {
+    if selection.metrics.parts > MAX_PARTS_PER_ITEM {
+        return None;
     }
     let evidence = selection
         .keys
@@ -441,29 +445,39 @@ pub(super) fn select(
     // Try the complete accepted set before considering overflow. Derived top
     // rows can collapse, and missing money can reconcile only when all of an
     // authority's accepted buckets are present. Intermediate fit is not a
-    // prerequisite for the final accepted set to fit.
-    let mut all_accepted = Some(selection.clone());
-    let mut accepted_rows = Vec::new();
-    for index in order.iter().copied().filter(|&index| is_accepted[index]) {
-        let Some((next, rows)) = all_accepted
-            .as_ref()
-            .and_then(|state| add_bucket(item, grouping, state, &row_index, index))
-        else {
-            all_accepted = None;
-            break;
-        };
-        all_accepted = Some(next);
-        accepted_rows.push((index, rows));
-    }
-    if let Some(state) =
-        all_accepted.filter(|state| fits(item, state, base_bytes, prior_refusals).is_some())
-    {
-        selection = state;
-        for (index, rows) in accepted_rows {
-            kept[index] = true;
-            bucket_identities[index] = rows;
+    // prerequisite for the final accepted set to fit. An individually
+    // unencodable bucket is excluded without aborting the collective trial.
+    for check_individual_caps in [false, true] {
+        let mut all_accepted = selection.clone();
+        let mut accepted_rows = Vec::new();
+        for index in order.iter().copied().filter(|&index| is_accepted[index]) {
+            if check_individual_caps {
+                let Some((single, _)) = add_bucket(item, grouping, &selection, &row_index, index)
+                else {
+                    continue;
+                };
+                // Ignore intermediate money reconciliation here: independent
+                // accepted buckets may need each other to reconcile. Exclude
+                // only buckets that cannot fit even the representation caps.
+                if fits_caps(&single, base_bytes, prior_refusals).is_none() {
+                    continue;
+                }
+            }
+            let Some((next, rows)) = add_bucket(item, grouping, &all_accepted, &row_index, index)
+            else {
+                continue;
+            };
+            all_accepted = next;
+            accepted_rows.push((index, rows));
         }
-    } else {
+        if fits(item, &all_accepted, base_bytes, prior_refusals).is_some() {
+            selection = all_accepted;
+            for (index, rows) in accepted_rows {
+                kept[index] = true;
+                bucket_identities[index] = rows;
+            }
+            break;
+        }
         drop(accepted_rows);
     }
     // One unencodable candidate cannot discard independent accepted proof.

@@ -1141,6 +1141,53 @@ pub(crate) fn measure_identity_cap(
     Some(measured)
 }
 
+fn wire_usage(row: &SnapshotModelUsage) -> Option<UsageTotals> {
+    let mut amounts = [None; 5];
+    for (slot, text) in amounts.iter_mut().zip(row_costs(row)) {
+        if let Some(text) = text {
+            let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
+            if whole.is_empty()
+                || fraction.len() > 12
+                || !whole
+                    .bytes()
+                    .chain(fraction.bytes())
+                    .all(|byte| byte.is_ascii_digit())
+            {
+                return None;
+            }
+            let picos = whole
+                .parse::<u128>()
+                .ok()?
+                .checked_mul(USD_PICO_SCALE)?
+                .checked_add(if fraction.is_empty() {
+                    0
+                } else {
+                    fraction
+                        .parse::<u128>()
+                        .ok()?
+                        .checked_mul(10u128.pow((12 - fraction.len()) as u32))?
+                })?;
+            if !micro_exact(picos) || usd_picos_string(picos) != *text {
+                return None;
+            }
+            *slot = Some(picos);
+        }
+    }
+    let reported = amounts.iter().any(Option::is_some);
+    let [total, input, output, cache_read, cache_creation] = amounts;
+    let mut usage = super::usage_totals_from_model_usage(row);
+    usage.costs = super::UsageCosts {
+        observed: true,
+        reported,
+        total,
+        input,
+        output,
+        cache_read,
+        cache_creation,
+    };
+    Some(usage)
+}
+
 // A side-run may have a tagged item without the native fold. Use only its
 // explicit current shares, never reconstruct lost proof from an account hint.
 fn wire_grouping(item: &SnapshotItem) -> Option<Grouping> {
@@ -1195,14 +1242,14 @@ fn wire_grouping(item: &SnapshotItem) -> Option<Grouping> {
                     add(
                         part.account_identifier_hash.as_deref(),
                         part.evidence_ref,
-                        super::usage_totals_from_model_usage(&share),
+                        wire_usage(&share)?,
                     )?;
                 }
             } else {
                 add(
                     row.account_identifier_hash.as_deref(),
                     row.evidence_ref,
-                    super::usage_totals_from_model_usage(row),
+                    wire_usage(row)?,
                 )?;
             }
         }

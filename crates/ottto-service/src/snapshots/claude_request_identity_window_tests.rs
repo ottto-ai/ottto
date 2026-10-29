@@ -525,3 +525,98 @@ fn sticky_complete_accepted_set_is_checked_before_intermediate_money_fit() {
     assert_eq!(measured.accepted_overflow.differs, 0);
     assert_eq!(measured.item_bytes, identity::item_bytes(&item));
 }
+
+fn sticky_assert_joint_pair_survives(large_parts: bool) {
+    let requests = [
+        display_request(Some("max"), HOUR_10, 1, login_key(OWNER_A), Some(HOUR_10)),
+        display_request(Some("max"), HOUR_11, 1, login_key(OWNER_A), Some(HOUR_11)),
+        display_request(
+            Some("pro"),
+            "2026-09-01T12:00:00Z",
+            1,
+            login_key(OWNER_A),
+            Some("2026-09-01T12:00:00Z"),
+        ),
+    ];
+    let (mut item, timed) = display_item(&requests);
+    item.collected_at = "2026-09-01T12:05:00Z".into();
+    let mut proof = timed
+        .into_iter()
+        .map(|(proof, _)| proof)
+        .collect::<Vec<_>>();
+    if large_parts {
+        let prototype = proof.pop().unwrap();
+        let row = item.usage_buckets[2].model_usage.pop().unwrap();
+        item.model_usage
+            .retain(|row| row.subscription_product.as_deref() != Some("pro"));
+        for n in 0..99 {
+            let mut row = row.clone();
+            row.model = format!("claude-large-{n:02}");
+            item.model_usage.push(row.clone());
+            item.usage_buckets[2].model_usage.push(row.clone());
+            let mut c = prototype.clone();
+            c.row_key = row_key_from_model_usage(&row);
+            proof.push(c);
+        }
+    }
+    item.usage_buckets[0].model_usage[0].cost_usd = Some("0.000001".into());
+    proof[0].usage.costs = UsageCosts {
+        observed: true,
+        reported: true,
+        total: Some(1_000_000),
+        ..Default::default()
+    };
+    proof[1].usage.costs = UsageCosts {
+        observed: true,
+        reported: false,
+        ..Default::default()
+    };
+    let mut accepted = identity::AcceptedBuckets::default();
+    identity::apply_with_accepted_for_test(&mut item, &proof, &accepted).unwrap();
+    accepted.record(&serde_json::to_value(&item).unwrap());
+    let extras = if large_parts { 15 } else { 16 };
+    for prototype in proof[2..].to_vec() {
+        for n in 0..extras {
+            let mut extra = prototype.clone();
+            extra.identity = RequestIdentity::Tagged(AuthorityKey {
+                login: Some(format!("{n:064x}")),
+                org: None,
+                basis: identity::TELEMETRY_LOGIN,
+            });
+            proof.push(extra);
+        }
+    }
+    for row in item
+        .model_usage
+        .iter_mut()
+        .filter(|row| row.subscription_product.as_deref() == Some("pro"))
+    {
+        row.input_tokens += extras;
+        row.request_count += extras;
+    }
+    for row in &mut item.usage_buckets[2].model_usage {
+        row.input_tokens += extras;
+        row.request_count += extras;
+    }
+    identity::apply_with_accepted_for_test(&mut item, &proof, &accepted).unwrap();
+    assert!(sticky_tagged(&item.usage_buckets[0].model_usage[0]));
+    assert!(sticky_tagged(&item.usage_buckets[1].model_usage[0]));
+    assert!(item.usage_buckets[2]
+        .model_usage
+        .iter()
+        .all(|row| !sticky_tagged(row)));
+    assert_eq!(
+        item.request_identity_refusals,
+        if large_parts { 99 } else { 1 }
+    );
+    sticky_assert_reconciled(&item);
+}
+
+#[test]
+fn sticky_unencodable_bucket_preserves_a_jointly_reconcilable_accepted_pair() {
+    sticky_assert_joint_pair_survives(false);
+}
+#[test]
+fn sticky_individually_over_parts_bucket_preserves_joint_accepted_money_proof() {
+    sticky_assert_joint_pair_survives(true);
+}

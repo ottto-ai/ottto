@@ -1816,7 +1816,14 @@ fn switch_context() -> Value {
 fn org_hash(org: &str) -> String {
     ottto_core::billing_identity_hash("anthropic", "organization", org).unwrap()
 }
-fn tag_owned(mut items: Vec<SnapshotItem>, index: &ScanIndex) -> Vec<SnapshotItem> {
+fn tag_owned(items: Vec<SnapshotItem>, index: &ScanIndex) -> Vec<SnapshotItem> {
+    tag_owned_with_fallbacks(items, index, 0)
+}
+fn tag_owned_with_fallbacks(
+    mut items: Vec<SnapshotItem>,
+    index: &ScanIndex,
+    expected_fallbacks: usize,
+) -> Vec<SnapshotItem> {
     decide_page_copies(&mut items, index);
     let api = ClaudeLocalOtelLoadReport::default();
     let trace = ClaudeTraceOwnershipLoadReport::default();
@@ -1853,7 +1860,9 @@ fn tag_owned(mut items: Vec<SnapshotItem>, index: &ScanIndex) -> Vec<SnapshotIte
         &ownership,
     );
     claude_request_identity::publish_request_owned_activity(&items, activity);
-    assert_eq!(outcome.sent, items.len());
+    assert!(expected_fallbacks <= items.len());
+    assert_eq!(outcome.sent, items.len() - expected_fallbacks);
+    assert_eq!(outcome.fallback, expected_fallbacks);
     assert_eq!(outcome.ineligible, 0);
     items
 }
@@ -2635,7 +2644,7 @@ fn e2_identity_final_twin_union_over_authority_cap_withholds_unproved_identity()
         assert!(items
             .iter()
             .all(|item| !fold(item).accounts.as_ref().unwrap().conflict));
-        let item = tag_owned(items, &index).remove(0);
+        let item = tag_owned_with_fallbacks(items, &index, 1).remove(0);
         assert_eq!((item.request_count, item.input_tokens), (20, 20));
         // SOURCE: overflowing proof cannot be replaced by the starting org.
         // The old uniform-retry expectation would manufacture that identity.
