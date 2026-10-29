@@ -100,7 +100,7 @@ pub(crate) trait SingleWriter {
     fn state_dir(&self) -> &Path;
 }
 
-/// The sources M1 keeps. Pi is never stored.
+/// Sources admitted by the durable property table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum DurableSource {
     ClaudeCode,
@@ -108,17 +108,13 @@ pub(crate) enum DurableSource {
 }
 impl DurableSource {
     fn tag(self) -> u8 {
-        match self {
-            Self::ClaudeCode => 1,
-            Self::Codex => 2,
-        }
+        self.properties().tag
     }
     fn from_tag(tag: u8) -> Option<Self> {
-        match tag {
-            1 => Some(Self::ClaudeCode),
-            2 => Some(Self::Codex),
-            _ => None,
-        }
+        crate::snapshots::durable_sources::SOURCES
+            .iter()
+            .find(|row| row.tag == tag)
+            .map(|row| row.source)
     }
 }
 
@@ -294,6 +290,15 @@ pub(crate) struct DurableRecord {
     pub(crate) envelope_audit_debt: Option<u64>,
 }
 
+/// Exact verified predecessor; no caller can manufacture or clone its authority.
+pub(crate) struct MutationWitness {
+    key: Digest32,
+    content: Digest32,
+    stamp: Stamp,
+    format: u16,
+    generation: u64,
+}
+
 /// Preservation classes: unknown representations (U) precede known corruption (T14).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Refusal {
@@ -302,6 +307,7 @@ pub(crate) enum Refusal {
     Undecodable,
     Unbindable,
     Corrupt,
+    BehindAccepted,
 }
 
 /// The outcome of reading one key.
@@ -352,9 +358,11 @@ impl DurableRecord {
             Err(Ineligible::Context)
         } else if have.scope != want.scope {
             Err(Ineligible::Scope)
-        } else if self.index_generation > expected.committed_generation {
+        } else if have.source == DurableSource::Codex
+            && self.index_generation > expected.committed_generation
+        {
             Err(Ineligible::GenerationAhead)
-        } else if have.entry != want.entry {
+        } else if have.source == DurableSource::Codex && have.entry != want.entry {
             Err(Ineligible::EntryChanged)
         } else {
             Ok(())
@@ -385,8 +393,9 @@ pub(crate) struct StoreCounters {
     /// Per-pass read I/O.
     pub(crate) bytes_read: u64,
     pub(crate) records_read: u64,
+    pub(crate) mutation_unproved: u64,
     pub(crate) missing: u64,
-    pub(crate) format_hold: [u64; 5],
+    pub(crate) format_hold: [u64; 6],
     /// Writes skipped: predecessor unknown, or a new key while record files
     /// exceed `INVENTORY_BOUND` (offered again after the next save).
     pub(crate) store_write_skipped: [u64; 2],
@@ -412,6 +421,10 @@ pub(crate) struct StoreCounters {
     pub(crate) peak_codec_bytes: u64,
 }
 
+/// Fixed-size key/content/target identities for the strict Claude caller.
+type BatchAcks = [Option<(Digest32, Digest32, Stamp)>; MAX_BATCH];
+const BATCH_ACK_BYTES: usize = std::mem::size_of::<BatchAcks>();
+
 /// What one post-save batch did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct BatchReceipt {
@@ -423,6 +436,8 @@ pub(crate) struct BatchReceipt {
     pub(crate) deferred_keys: Vec<Digest32>,
     pub(crate) budget_refused: usize,
     pub(crate) bytes_written: u64,
+    /// Fixed allocation; no acknowledgement escapes a failed directory sync.
+    committed: Option<Box<BatchAcks>>,
 }
 
 /// One store directory. The in-RAM map of last durable content digests
@@ -430,7 +445,7 @@ pub(crate) struct BatchReceipt {
 pub(crate) struct DurableTailStore {
     dir: PathBuf,
     source: DurableSource,
-    durable: BTreeMap<Digest32, (Option<Digest32>, Stamp)>,
+    durable: BTreeMap<Digest32, (Option<Digest32>, Stamp, bool)>,
     counters: StoreCounters,
     /// The store-level fault that made this store memory-only for the process.
     disabled: Option<&'static str>,
@@ -458,7 +473,7 @@ pub(crate) const INVENTORY_BOUND: usize = 2 * MAX_RECORDS;
 pub(crate) const T14_BREAKER: u64 = 20;
 const REBUILT_BOUND: usize = 64;
 // A memo entry stays within the 128 bytes per record `STORES_RESIDENT_BOUND` charges.
-const _: () = assert!(std::mem::size_of::<(Digest32, (Option<Digest32>, Stamp))>() <= 128);
+const _: () = assert!(std::mem::size_of::<(Digest32, (Option<Digest32>, Stamp, bool))>() <= 128);
 
 impl DurableTailStore {
     pub(crate) fn new(dir: PathBuf, source: DurableSource) -> Self {
@@ -477,6 +492,7 @@ impl DurableTailStore {
     /// A new pass: the directory is checked again and the T14 breaker resets.
     pub(crate) fn begin_pass(&mut self) {
         self.checked = false;
+        self.revoke_all();
         self.pass = [0; 2];
     }
 
@@ -532,6 +548,13 @@ impl DurableTailStore {
             .ok()
             .flatten()
             .map(|h| (h.format, h.record.allowlist))
+    }
+
+    /// Metadata-only: Claude observes the native read of a key with no record.
+    pub(crate) fn absent(&self, key: &Digest32) -> bool {
+        self.disabled.is_none()
+            && inspect_path(&self.record_path(key))
+                .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
     }
 
     pub(crate) fn counters(&self) -> StoreCounters {
@@ -630,7 +653,11 @@ impl DurableTailStore {
             {
                 return Err(Refusal::Corrupt);
             }
-            if self.durable.get(key).is_some_and(|(_, old)| *old == stamp) {
+            if self
+                .durable
+                .get(key)
+                .is_some_and(|(_, old, _)| *old == stamp)
+            {
                 return Ok(Some(binding));
             }
             #[cfg(test)]
@@ -649,7 +676,7 @@ impl DurableTailStore {
             self.note_codec(bytes.capacity());
             verify(&bytes, self.source)?;
             if self.durable.len() < MAX_RECORDS || self.durable.contains_key(key) {
-                self.durable.insert(*key, (None, stamp));
+                self.durable.insert(*key, (None, stamp, false));
             }
             Ok(Some(binding))
         })();
@@ -778,7 +805,7 @@ impl DurableTailStore {
         self.note_codec(bytes.capacity() + bytes.len().saturating_sub(HEADER_BYTES));
         match decode(&bytes) {
             Ok(record) => {
-                if let Some((content, _)) = self.durable.get_mut(key) {
+                if let Some((content, _, _)) = self.durable.get_mut(key) {
                     // Memo the verified STORED representation, not the decoded
                     // certificate whose compatibility debt was dropped.
                     let mut header = [0; HEADER_BYTES];
@@ -793,6 +820,113 @@ impl DurableTailStore {
             }
             Err(reason) => ReadOutcome::Refused(reason),
         }
+    }
+
+    pub(crate) fn revoke(&mut self, key: &Digest32) {
+        if let Some((_, _, allowed)) = self.durable.get_mut(key) {
+            *allowed = false;
+        }
+    }
+    pub(crate) fn revoke_all(&mut self) {
+        for (_, _, allowed) in self.durable.values_mut() {
+            *allowed = false;
+        }
+    }
+
+    /// Only a fully verified original binding may authorize a Claude mutation.
+    pub(crate) fn authorize(&mut self, record: &DurableRecord, expected: &Expected) {
+        self.revoke(&record.record.binding.key);
+        if let Some(proof) = self.mutation_witness(record, expected) {
+            self.authorize_witness(record, expected, &proof);
+        }
+    }
+    pub(crate) fn mutation_witness(
+        &self,
+        record: &DurableRecord,
+        expected: &Expected,
+    ) -> Option<MutationWitness> {
+        if record.eligible(expected).is_err()
+            || record.record.binding.entry != expected.binding.entry
+            || record.index_generation > expected.committed_generation
+        {
+            return None;
+        }
+        let key = record.record.binding.key;
+        let digest = stored_digest(record);
+        let (Some(content), stamp, _) = self.durable.get(&key)? else {
+            return None;
+        };
+        let proof = MutationWitness {
+            key,
+            content: digest,
+            stamp: *stamp,
+            format: record.format,
+            generation: record.index_generation,
+        };
+        (*content == digest && self.witness_current(&proof)).then_some(proof)
+    }
+    pub(crate) fn witness_current(&self, proof: &MutationWitness) -> bool {
+        fs::symlink_metadata(self.record_path(&proof.key))
+            .is_ok_and(|m| Stamp::of(&m) == proof.stamp)
+    }
+    /// Key-specific durable write, still the exact target observed by that write.
+    /// A clean retry, stale receipt or another key cannot retire custody.
+    pub(crate) fn replacement_committed(
+        &self,
+        proof: &MutationWitness,
+        receipt: &BatchReceipt,
+    ) -> bool {
+        receipt.committed.as_ref().is_some_and(|acks| {
+            acks.iter().flatten().any(|(key, content, stamp)| {
+                *key == proof.key
+                    && *content != proof.content
+                    && self.durable.get(key).is_some_and(|(have, current, _)| {
+                        *have == Some(*content) && current == stamp
+                    })
+                    && fs::symlink_metadata(self.record_path(key))
+                        .is_ok_and(|m| Stamp::of(&m) == *stamp)
+            })
+        })
+    }
+    pub(crate) fn authorize_witness(
+        &mut self,
+        record: &DurableRecord,
+        expected: &Expected,
+        proof: &MutationWitness,
+    ) {
+        self.revoke(&record.record.binding.key);
+        if record.eligible(expected).is_err()
+            || record.record.binding.entry != expected.binding.entry
+            || record.index_generation > expected.committed_generation
+            || proof.key != record.record.binding.key
+            || proof.format != record.format
+            || proof.generation != record.index_generation
+            || proof.content != stored_digest(record)
+            || !self.witness_current(proof)
+        {
+            return;
+        }
+        if self.durable.len() >= MAX_RECORDS && !self.durable.contains_key(&proof.key) {
+            let Some(key) = self
+                .durable
+                .iter()
+                .find_map(|(k, (_, _, allowed))| (!allowed).then_some(*k))
+            else {
+                return;
+            };
+            self.durable.remove(&key); // Never evict a current mutation permission.
+        }
+        self.durable
+            .insert(proof.key, (Some(proof.content), proof.stamp, true));
+    }
+    fn authorized(&mut self, key: &Digest32) -> bool {
+        let allowed = self.source != DurableSource::ClaudeCode
+            || self.durable.get(key).is_some_and(|(_, stamp, yes)| {
+                *yes && fs::symlink_metadata(self.record_path(key))
+                    .is_ok_and(|m| Stamp::of(&m) == *stamp)
+            });
+        self.counters.mutation_unproved += u64::from(!allowed);
+        allowed
     }
 
     /// The post-save write. Call only after `ScanIndex::save` succeeded, with
@@ -850,7 +984,9 @@ impl DurableTailStore {
                 continue;
             }
             // A rebuild may replace its corrupt predecessor once, after save.
+            // A verified Claude predecessor needs this pass's mutation proof.
             match self.classify(&record.binding.key, "overwrite") {
+                Ok(Some(_)) if !self.authorized(&record.binding.key) => continue,
                 Err(Refusal::Corrupt) | Ok(_) => {}
                 Err(_) => {
                     self.counters.store_write_skipped[0] += 1;
@@ -861,7 +997,7 @@ impl DurableTailStore {
             if self
                 .durable
                 .get(&record.binding.key)
-                .is_some_and(|(old, _)| *old == Some(content))
+                .is_some_and(|(old, _, _)| *old == Some(content))
             {
                 receipt.clean += 1;
             } else {
@@ -909,10 +1045,15 @@ impl DurableTailStore {
                 envelope_audit_debt: record.certificate.audit_debt_unix_seconds,
                 record,
                 index_generation: committed_generation,
-                format: FORMAT_VERSION,
+                format: self.source.properties().format,
             };
             let bytes = encode(&stored);
-            self.note_codec(pending_bytes + bytes.capacity());
+            let ack_bytes = if self.source == DurableSource::ClaudeCode {
+                BATCH_ACK_BYTES
+            } else {
+                0
+            };
+            self.note_codec(pending_bytes + bytes.capacity() + ack_bytes);
             let previous = on_disk.get(&key).copied().unwrap_or(0);
             let total = on_disk
                 .values()
@@ -930,13 +1071,21 @@ impl DurableTailStore {
                 receipt.budget_refused += 1;
                 continue;
             }
+            if ack_bytes != 0 {
+                receipt
+                    .committed
+                    .get_or_insert_with(|| Box::new([None; MAX_BATCH]));
+            }
             write_atomic(&self.dir, &path, &bytes)?;
             self.rebuilt.remove(&key);
             changed = true;
             on_disk.insert(key, bytes.len() as u64);
             let stamp = Stamp::of(&fs::symlink_metadata(&path)?);
             if self.durable.len() < MAX_RECORDS || self.durable.contains_key(&key) {
-                self.durable.insert(key, (Some(content), stamp));
+                self.durable.insert(key, (Some(content), stamp, true));
+            }
+            if let Some(acks) = receipt.committed.as_mut() {
+                acks[receipt.written] = Some((key, content, stamp));
             }
             receipt.written += 1;
             receipt.bytes_written += bytes.len() as u64;
@@ -1012,6 +1161,7 @@ impl DurableTailStore {
                 continue;
             }
             let verdict = match self.classify(&key, "delete") {
+                Ok(Some(_)) if !self.authorized(&key) => Some(len),
                 Ok(Some(header)) => {
                     // Missing membership cannot erase its debt evidence. A
                     // fresh-index cleanup has no trusted context (zero).
@@ -1102,7 +1252,7 @@ impl DurableTailStore {
         }
         for key in keys {
             let path = self.record_path(key);
-            if matches!(self.classify(key, "delete"), Ok(Some(_))) {
+            if matches!(self.classify(key, "delete"), Ok(Some(_))) && self.authorized(key) {
                 remove_if_present(&path)?;
                 removed += 1;
             }
@@ -1171,6 +1321,20 @@ fn content_digest(record: &PendingRecord) -> Digest32 {
     let mut header = Vec::with_capacity(HEADER_BYTES);
     encode_header(&mut header, record, 0);
     content_digest_parts(&header, &record.body)
+}
+
+/// The read memo's STORED representation: decode moved envelope debt out of
+/// the certificate, so put it back; the committed generation is not content.
+fn stored_digest(record: &DurableRecord) -> Digest32 {
+    let mut header = Vec::with_capacity(HEADER_BYTES);
+    encode_header(&mut header, &record.record, 0);
+    if let Some(due) = record.envelope_audit_debt {
+        // Layout tail: debt tag (1), debt value (8), body length (4).
+        let at = header.len() - 13;
+        header[at] = 1;
+        header[at + 1..at + 9].copy_from_slice(&due.to_le_bytes());
+    }
+    content_digest_parts(&header, &record.record.body)
 }
 
 fn content_digest_parts(header: &[u8], body: &[u8]) -> Digest32 {
@@ -1255,7 +1419,7 @@ fn read_private(path: &Path) -> io::Result<Option<Vec<u8>>> {
     Ok(Some(bytes))
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Stamp(u64);
 impl Stamp {
     /// Process-local memo key over (dev, ino, size, mtime, ctime).
@@ -1315,18 +1479,14 @@ fn decode_header(bytes: &[u8], key: &Digest32, source: DurableSource) -> Result<
     }
     let allowlist = c.array::<32>().ok_or(Refusal::Undecodable)?;
     let tag = c.u8().ok_or(Refusal::Undecodable)?;
-    // Both pinned v1 writers (72205c6c and ffc6c846) use these lists.
-    let pin = match tag {
-        1 => "8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c",
-        2 => "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1",
-        _ => return Err(Refusal::Unknown),
-    };
-    if format != 1 || Some(allowlist) != parse_hex_digest(pin) {
+    let admitted = DurableSource::from_tag(tag).ok_or(Refusal::Unknown)?;
+    let row = admitted.properties();
+    if format != row.format || Some(allowlist) != parse_hex_digest(row.allowlist_pin) {
         return Err(Refusal::Unknown);
     }
     let binding = (|| {
         Some(Binding {
-            source: DurableSource::from_tag(tag)?,
+            source: admitted,
             key: c.array()?,
             context: c.array()?,
             scope: c.array()?,
@@ -1465,7 +1625,7 @@ fn encode_header(out: &mut Vec<u8>, record: &PendingRecord, generation: u64) {
     let binding = &record.binding;
     let certificate = &record.certificate;
     out.extend_from_slice(&MAGIC);
-    out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    out.extend_from_slice(&binding.source.properties().format.to_le_bytes());
     out.extend_from_slice(&record.allowlist);
     out.push(binding.source.tag());
     for part in [

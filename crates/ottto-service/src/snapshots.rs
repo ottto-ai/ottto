@@ -123,6 +123,8 @@ mod local_context_points;
 pub(crate) use local_context_points::LocalContextPoint;
 use local_context_points::{local_context_points_recent, LocalContextPoints};
 pub(crate) mod codex_version;
+#[cfg(unix)]
+pub(crate) mod durable_sources;
 #[cfg(test)]
 pub(crate) mod e2_pipeline_scan_fixture;
 pub(crate) mod line_delivery;
@@ -141,7 +143,7 @@ pub(crate) fn verify_durable_body(
     let mut d = crate::durable_tail_codec::Dec::new(body);
     let nested = <SnapshotSource as crate::durable_tail_codec::Durable>::take(&mut d).ok();
     nested.and_then(sampled_scan::durable_tail::durable_source) == Some(source)
-        && sampled_jsonl::durable::verify(body).is_ok()
+        && (source.properties().verify)(body).is_ok()
 }
 #[cfg(all(test, unix))]
 pub(crate) fn durable_store_fixture_body(source: SnapshotSource, count: u64, sum: u64) -> Vec<u8> {
@@ -173,6 +175,8 @@ use claude_response_records::{
 };
 use codex_compressed_input::{refuse_compressed_codex, OpenedInput};
 pub(crate) use pi_retry_inputs::PiRetryInputs;
+#[cfg(all(test, unix))]
+pub(crate) use sampled_scan::durable_tail::tests::ContinuationDurableState;
 // Stage 1 (N2): the cursor side of a continuation page, for StateMissing's
 // adapter in `snapshot_sync` (inert while continuation pages are disabled).
 #[cfg(test)]
@@ -31856,6 +31860,15 @@ impl OwnedSourceScan {
                     dev_ino: at.dev_ino,
                 });
             }
+            #[cfg(unix)]
+            let durable_accepted = (source == SnapshotSource::ClaudeCode)
+                .then(|| {
+                    sampled_scan::durable_tail::AcceptedFloor::of(
+                        index,
+                        &local_index_key(&candidate.path),
+                    )
+                })
+                .flatten();
             let previous_snapshot_fingerprint = index.last_snapshot_fingerprint(&candidate);
             let previous_upload_body_witness = index.last_upload_body_witness(&candidate);
             let projection_adoption_required = index
@@ -32105,15 +32118,19 @@ impl OwnedSourceScan {
                         #[cfg(unix)]
                         context.cache.durable_note_scope(source, &key, &scope);
                         #[cfg(unix)]
+                        let mut retail_attempt = None;
+                        #[cfg(unix)]
                         let (retained, taken_admission, debt) = match retained {
                             None if allow_sample && !parser.reader.reader.is_compressed() => {
-                                let interpretation = sampled_scan::durable_tail::Interpretation::of(
-                                    source,
-                                    &key,
-                                    index,
-                                    claude_request_identity_capture,
-                                    &context.namespace,
-                                );
+                                let mut interpretation =
+                                    sampled_scan::durable_tail::Interpretation::of(
+                                        source,
+                                        &key,
+                                        index,
+                                        claude_request_identity_capture,
+                                        &context.namespace,
+                                    );
+                                interpretation.accepted = durable_accepted;
                                 let restore = context.cache.durable_restore(
                                     source,
                                     &key,
@@ -32125,7 +32142,41 @@ impl OwnedSourceScan {
                                 );
                                 resource_probe.full_causes.restore_outcome.record(&restore);
                                 match restore {
-                                    sampled_scan::durable_tail::RestoreOutcome::Restored(taken) => {
+                                    sampled_scan::durable_tail::RestoreOutcome::Restored(taken) => 'restored: {
+                                        if source == SnapshotSource::ClaudeCode {
+                                            let accepted_end = durable_accepted
+                                                .expect("restored accepted floor")
+                                                .end;
+                                            match context.cache.begin_retail(
+                                                source,
+                                                &key,
+                                                &taken.retained.checkpoint,
+                                                parser.reader.reader.get_ref(),
+                                                accepted_end,
+                                                std::time::Instant::now(),
+                                            ) {
+                                                Ok(attempt) => retail_attempt = Some(attempt),
+                                                Err(reason) => {
+                                                    if matches!(
+                                                        reason,
+                                                        sampled_scan::durable_tail::RetailHold::Exhausted
+                                                            | sampled_scan::durable_tail::RetailHold::AccountingLost
+                                                    ) && context.cache.retail_full(
+                                                        &key,
+                                                        parser.reader.reader.get_ref(),
+                                                        accepted_end,
+                                                        std::time::Instant::now(),
+                                                    )
+                                                    {
+                                                        break 'restored (None, taken_admission, debt);
+                                                    }
+                                                    context.cache.durable_retail_hold(
+                                                        source, reason, index, &candidate,
+                                                    );
+                                                    pending!();
+                                                }
+                                            }
+                                        }
                                         retained_offset =
                                             Some(taken.retained.checkpoint.sealed_offset());
                                         let admission = (
@@ -32134,6 +32185,31 @@ impl OwnedSourceScan {
                                             taken.retained.state.usage_witness(),
                                         );
                                         (Some(taken.retained), Some(admission), debt)
+                                    }
+                                    sampled_scan::durable_tail::RestoreOutcome::Stale(
+                                        "old_binding_no_match",
+                                    ) if source == SnapshotSource::ClaudeCode
+                                        && context
+                                            .cache
+                                            .no_match_full(
+                                                &key,
+                                                parser.reader.reader.get_ref(),
+                                                durable_accepted,
+                                            )
+                                            .is_some() =>
+                                    {
+                                        (None, taken_admission, debt)
+                                    }
+                                    sampled_scan::durable_tail::RestoreOutcome::Stale(reason)
+                                        if source == SnapshotSource::ClaudeCode
+                                            && context.cache.stale_full(&key,
+                                                parser.reader.reader.get_ref(), durable_accepted, reason) =>
+                                    {
+                                        (None, taken_admission, debt)
+                                    }
+                                    sampled_scan::durable_tail::RestoreOutcome::Stale(_) => {
+                                        context.cache.durable_stale_hold(source, index, &candidate);
+                                        pending!();
                                     }
                                     sampled_scan::durable_tail::RestoreOutcome::Miss(class) => {
                                         let rearmed = class.rearm_audit(
@@ -32184,6 +32260,34 @@ impl OwnedSourceScan {
                                 pending!();
                             }
                         };
+                        #[cfg(unix)]
+                        if source == SnapshotSource::ClaudeCode
+                            && !matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
+                            && durable_accepted.is_some_and(|a| {
+                                parser
+                                    .reader
+                                    .acquisition
+                                    .as_ref()
+                                    .map_or(true, |p| p.frozen_length() < a.end)
+                            })
+                        {
+                            context.cache.durable_hold_exit(
+                                source,
+                                crate::durable_tail_store::Refusal::BehindAccepted,
+                                index,
+                                &candidate,
+                                &mut census,
+                            );
+                            pending!();
+                        }
+                        #[cfg(unix)]
+                        if let Some(attempt) = retail_attempt {
+                            if mode == crate::transcript_acquisition::ReadMode::Tail {
+                                parser.reader.reader.put_retail(attempt);
+                            } else {
+                                attempt.finish();
+                            }
+                        }
                         // H1c: the plan uses absolute offsets; the reader's
                         // extent is relative to its Full/Tail start.
                         if source == SnapshotSource::ClaudeCode
@@ -32502,8 +32606,35 @@ impl OwnedSourceScan {
                     }
                 }
             }
-            if let Some((context, (mode, audit_due))) = sampling.as_mut().zip(planned_mode) {
-                context.record_mode(mode, audit_due);
+            if let Some(context) = sampling.as_mut() {
+                #[cfg(unix)]
+                if source == SnapshotSource::ClaudeCode
+                    // No plan is the existing unsampled native Full path.
+                    && planned_mode.map_or(true, |(mode, _)| {
+                        matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
+                    })
+                    && index
+                        .files
+                        .get(&local_index_key(&active.candidate.path))
+                        .is_some_and(|e| {
+                            !e.source_file_fingerprint.is_empty()
+                                && active.candidate.size_bytes > e.size_bytes
+                        })
+                {
+                    match context.cache.upgrade_read(
+                        &local_index_key(&active.candidate.path),
+                        active.parser.reader.reader.get_ref(),
+                    ) {
+                        Ok(Some(read)) => active.parser.reader.reader.put_upgrade(read),
+                        Ok(None) => {}
+                        // No observer/retained state was attached on failure. Keep the
+                        // existing fresh Full; fstat failure is counted as `metadata`.
+                        Err(_) => {}
+                    }
+                }
+                if let Some((mode, audit_due)) = planned_mode {
+                    context.record_mode(mode, audit_due);
+                }
             }
             if let Some(delivery) = line_delivery.as_mut() {
                 delivery.arm();
@@ -34522,6 +34653,8 @@ impl<R: BufRead> BoundedJsonlReader<R> {
                         acquisition.observe_record_fragment(&available[..offset + 1], true)?;
                     }
                     reader.consume(offset + 1);
+                    #[cfg(all(test, unix))]
+                    sampled_scan::durable_tail::record_consumed((offset + 1) as u64);
                     self.consumed += (offset + 1) as u64;
                     self.last_line_end = self.consumed;
                     line_complete = true;
@@ -34540,6 +34673,8 @@ impl<R: BufRead> BoundedJsonlReader<R> {
                         acquisition.observe_record_fragment(available, false)?;
                     }
                     reader.consume(len);
+                    #[cfg(all(test, unix))]
+                    sampled_scan::durable_tail::record_consumed(len as u64);
                     self.consumed += len as u64;
                     if overflowed {
                         skipped_this_step = skipped_this_step.saturating_add(len);

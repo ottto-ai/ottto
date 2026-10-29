@@ -868,6 +868,7 @@ impl FullCauses {
         self.restore_outcome.restored == 0
             && self.restore_outcome.held == 0
             && self.restore_outcome.miss.is_empty()
+            && self.restore_outcome.stale.is_empty()
     }
 }
 #[derive(Debug, Default, Serialize)]
@@ -878,6 +879,8 @@ pub(crate) struct RestoreCounts {
     held: u64,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     miss: BTreeMap<&'static str, u64>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    stale: BTreeMap<&'static str, u64>,
 }
 impl RestoreCounts {
     #[cfg(unix)]
@@ -887,6 +890,7 @@ impl RestoreCounts {
             RestoreOutcome::Restored(_) => &mut self.restored,
             RestoreOutcome::Held(_) => &mut self.held,
             RestoreOutcome::Miss(class) => self.miss.entry(class.label()).or_default(),
+            RestoreOutcome::Stale(reason) => self.stale.entry(reason).or_default(),
         };
         *count = count.saturating_add(1);
     }

@@ -175,8 +175,20 @@ account-family proof wait for that source; a held key is not yet terminal
 disclosed residue.
 
 An absent record is a restore `missing` outcome and keeps the existing Full
-admission; it is not a held key. There is no `upgrade_state_missing` counter or
-alarm in this format-1 bootstrap. Audit deadlines remain owned by the index,
+admission; it is not a held key. For Claude, `upgrade_state_missing` counts the
+first native read of a previously indexed key that grew while it had no record
+(observation only: no hold and no claim ledger); it is zero for Codex.
+
+Claude restore adds R2 transitional counts, each `[since, total]` and each an
+alarm when nonzero: `old_binding_no_match` (an unprovable original binding),
+`context`, `restore_semantics` and `revision_adoption_required` (stale holds),
+`retail_exhausted` (the Tail re-read allowance is spent or its accounting was
+lost). Each is one counted Full, taken only on growth past the accepted end and
+paced to one per key per six hours through one shared RAM map;
+`retail_exhausted_paced` counts growth skipped by that pace. On map overflow the
+oldest key is evicted and the read allowed; `pace_evicted` counts it and alarms
+separately from the growth counts. `t14_rebuild_full_started` is the process
+total of admitted rebuild Fulls. Audit deadlines remain owned by the index,
 and the v1 writer takes compatibility debt from the current committed index at
 write time, including after a restore dropped the envelope field. Unknown debt
 tags, absent-with-nonzero deadlines and present-with-zero deadlines are
@@ -863,6 +875,7 @@ restore-class totals on that text line are retired.
 | `restored` | Restore returned a charged, retained reduction. |
 | `held` | Restore's existing integrity guard returned Held. |
 | `miss.<class>` | Restore returned no retained reduction, with the class below. |
+| `stale.<reason>` | Claude restore kept the accepted body stale: a typed, content-free reason from the original-binding proof or restore semantics (for example `old_binding_no_match`, `context`, `restore_semantics`, `revision_adoption_required`, `descriptor`, `accepted_floor_missing`). Growth past the accepted end may take the paced counted Full on the `durable_tail` alarm. |
 
 Zero fields and an empty `full_causes` block are omitted. An absent miss
 class means zero attempts of that class, not a disabled store.

@@ -141,14 +141,18 @@ pub(crate) fn encode(
     limit: usize,
     line_cap: u64,
 ) -> Result<Vec<u8>, Refuse> {
-    let acc = &reduction.accumulator;
-    if !matches!(
-        acc.source,
-        SnapshotSource::ClaudeCode | SnapshotSource::Codex
-    ) {
-        return Err(Refuse::NotRederivable("SnapshotAccumulator.source"));
-    }
-    let rederive = rederive_digests(acc, line_cap)?;
+    let source =
+        crate::durable_tail_store::DurableSource::from_snapshot(reduction.accumulator.source)
+            .ok_or(Refuse::NotRederivable("SnapshotAccumulator.source"))?;
+    (source.properties().encode)(reduction, limit, line_cap)
+}
+
+pub(in crate::snapshots) fn encode_body(
+    reduction: &CachedJsonlReduction,
+    limit: usize,
+    line_cap: u64,
+) -> Result<Vec<u8>, Refuse> {
+    let rederive = rederive_digests(&reduction.accumulator, line_cap)?;
     let mut e = Enc::bytes(limit);
     reduction.put(&mut e)?;
     rederive.put(&mut e)?;
@@ -172,6 +176,15 @@ pub(crate) struct Decoded {
 }
 
 pub(crate) fn decode(body: &[u8], source: SnapshotSource) -> Result<Decoded, Corrupt> {
+    let source = crate::durable_tail_store::DurableSource::from_snapshot(source).ok_or(Corrupt)?;
+    let row = source.properties();
+    (row.decode)(body, row.snapshot)
+}
+
+pub(in crate::snapshots) fn decode_body(
+    body: &[u8],
+    source: SnapshotSource,
+) -> Result<Decoded, Corrupt> {
     let mut d = Dec::new(body);
     let reduction = CachedJsonlReduction::take(&mut d)?;
     let rederive = Rederive::take(&mut d)?;
@@ -380,11 +393,10 @@ pub(crate) fn rederive_parser(
         file,
         path,
         acc.source,
-        match acc.source {
-            SnapshotSource::Codex => apply_codex_line,
-            SnapshotSource::ClaudeCode => apply_claude_code_line,
-            SnapshotSource::Pi => apply_pi_line,
-        },
+        crate::durable_tail_store::DurableSource::from_snapshot(acc.source)
+            .ok_or_else(|| anyhow::anyhow!("unadmitted durable source"))?
+            .properties()
+            .apply_line,
         None,
         None,
         None,

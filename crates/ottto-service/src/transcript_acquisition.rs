@@ -624,7 +624,20 @@ fn read_sample(file: &mut File, offset: u64, len: usize, count: &mut usize) -> i
     let mut bytes = vec![0; len];
     let mut read = 0;
     while read < bytes.len() {
-        let n = file.read(&mut bytes[read..])?;
+        #[cfg(test)]
+        let read_offset = file.stream_position().map_err(|error| error.kind());
+        let result = file.read(&mut bytes[read..]);
+        #[cfg(test)]
+        SAMPLE_READS.with(|reads| {
+            if let Some(reads) = reads.borrow_mut().as_mut() {
+                reads.push(SampleRead {
+                    offset: read_offset,
+                    requested: bytes.len() - read,
+                    result: result.as_ref().copied().map_err(io::Error::kind),
+                });
+            }
+        });
+        let n = result?;
         *count += n;
         if n == 0 {
             return Err(io::Error::new(
@@ -1664,6 +1677,43 @@ pub(crate) fn set_between_guards(hook: Option<Box<dyn FnMut()>>) {
 #[cfg(test)]
 pub(crate) fn samples_match_calls() -> u64 {
     SAMPLES_MATCH_CALLS.with(|calls| calls.replace(0))
+}
+
+/// Test-only observations at the actual File::read call in read_sample.
+/// They include short/failed reads, not inferred completed-plan metrics.
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SampleRead {
+    pub(crate) offset: Result<u64, io::ErrorKind>,
+    pub(crate) requested: usize,
+    pub(crate) result: Result<usize, io::ErrorKind>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static SAMPLE_READS: std::cell::RefCell<Option<Vec<SampleRead>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn capture_sample_reads<T>(read: impl FnOnce() -> T) -> (T, Vec<SampleRead>) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SAMPLE_READS.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+    SAMPLE_READS.with(|slot| {
+        assert!(slot.borrow().is_none(), "sample capture cannot nest");
+        *slot.borrow_mut() = Some(Vec::new());
+    });
+    let _reset = Reset;
+    let value = read();
+    let reads = SAMPLE_READS.with(|slot| slot.borrow_mut().take().unwrap());
+    (value, reads)
 }
 
 #[cfg(all(test, unix))]

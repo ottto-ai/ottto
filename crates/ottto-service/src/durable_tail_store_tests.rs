@@ -295,9 +295,12 @@ fn crash_matrix_index_old_new_by_checkpoint_old_new_torn_missing() {
             let record = found(store.read(&key));
             assert_eq!(
                 record.eligible(&expected),
-                want,
+                Ok(()),
                 "index {index_label} x checkpoint {checkpoint_label}"
             );
+            // Historical save facts still gate mutation; acquisition now uses P11 in DT.
+            store.authorize(&record, &expected);
+            assert_eq!(store.authorized(&key), want.is_ok());
         }
         for (bytes, expected) in torn(&new_record) {
             put_record(&record_file(&store, &key), &bytes);
@@ -384,17 +387,24 @@ fn every_binding_mismatch_refuses() {
     ] {
         assert_eq!(check(&|b| b.scope = scope), Err(Ineligible::Scope));
     }
-    assert_eq!(
-        check(&|b| b.entry = entry_digest("fp", Some("w"))),
-        Err(Ineligible::EntryChanged)
-    );
+    assert_eq!(check(&|b| b.entry = entry_digest("fp", Some("w"))), Ok(()));
     assert_eq!(
         record.eligible(&Expected {
             binding: base.clone(),
-            committed_generation: 3,
+            committed_generation: 3
         }),
-        Err(Ineligible::GenerationAhead)
+        Ok(())
     );
+    let mut codex = record.clone();
+    codex.record.binding.source = DurableSource::Codex;
+    let mut want = Expected {
+        binding: codex.record.binding.clone(),
+        committed_generation: 3,
+    };
+    assert_eq!(codex.eligible(&want), Err(Ineligible::GenerationAhead));
+    want.committed_generation = 4;
+    want.binding.entry = entry_digest("changed", None);
+    assert_eq!(codex.eligible(&want), Err(Ineligible::EntryChanged));
 }
 
 /// A crash after the temp file is written and synced but before the rename
@@ -485,7 +495,12 @@ fn interrupted_replacement_renamed_but_directory_not_synced() {
     put_record(&record_file(&store, &new.key), &old_bytes);
     let reverted = found(store.read(&new.key));
     assert_eq!(reverted.index_generation, 1);
-    assert_eq!(reverted.eligible(&committed), Err(Ineligible::EntryChanged));
+    assert_eq!(reverted.eligible(&committed), Ok(()));
+    store.authorize(&reverted, &committed);
+    assert!(
+        !store.authorized(&new.key),
+        "reverted historical entry is not mutation proof"
+    );
 }
 
 fn set_version(bytes: &mut [u8], version: u16) {
@@ -891,7 +906,7 @@ fn store_mode_faults_are_repaired_without_rebuilds() {
     let counters = cold.counters();
     assert_eq!(counters.mode_repaired, 3);
     assert_eq!(counters.t14_rebuild, 0);
-    assert_eq!(counters.format_hold, [0; 5]);
+    assert_eq!(counters.format_hold, [0; 6]);
     assert_eq!(cold.disabled(), None);
 }
 
@@ -1631,6 +1646,14 @@ fn inventory_overflow_replaces_existing_records_and_defers_new_keys() {
     }
     // Fresh process: no RAM memo of the known record.
     let mut store = scratch.store();
+    let verified = found(store.read(&b.key));
+    store.authorize(
+        &verified,
+        &Expected {
+            binding: b.clone(),
+            committed_generation: 1,
+        },
+    );
     let mut new = b.clone();
     new.key = key_digest(DurableSource::ClaudeCode, "new-session");
     new.entry = entry_digest("fp-new", None);
@@ -1846,7 +1869,7 @@ fn access_failures_disable_instead_of_holding_and_not_found_stays_absent() {
         assert_eq!(cold.hold(&b.key), None, "{arm}");
         let missing = arm.ends_with("missing");
         assert_eq!(cold.disabled().is_some(), !missing, "{arm}");
-        assert_eq!(cold.counters().format_hold, [0; 5], "{arm}");
+        assert_eq!(cold.counters().format_hold, [0; 6], "{arm}");
         assert_eq!(cold.counters().t14_rebuild, 0, "{arm}");
         if arm == "retry" {
             assert_eq!(opens.get(), 2, "exactly one retry");
@@ -2107,7 +2130,7 @@ fn restore_read_access_failure_disables_but_disappearance_is_absence() {
         let mut cold = scratch.store();
         assert_eq!(cold.read(&b.key), ReadOutcome::Missing);
         assert_eq!(cold.disabled().is_some(), arm != "missing");
-        assert_eq!(cold.counters().format_hold, [0; 5]);
+        assert_eq!(cold.counters().format_hold, [0; 6]);
         assert_eq!(cold.counters().t14_rebuild, 0);
         assert_eq!(fs::read(&path).unwrap(), before);
     }
@@ -2147,7 +2170,7 @@ fn non_format_io_errors_disable_at_every_read_boundary_without_spending_t14() {
             }
             assert!(cold.disabled().is_some(), "{stage}/{errno}");
             assert_eq!(cold.hold(&b.key), None);
-            assert_eq!(cold.counters().format_hold, [0; 5]);
+            assert_eq!(cold.counters().format_hold, [0; 6]);
             assert_eq!(cold.counters().t14_rebuild, 0);
             assert!(cold.rebuilt.is_empty());
             assert_eq!(fs::read(&record).unwrap(), before);
@@ -2409,4 +2432,475 @@ fn read_memo_keeps_stored_debt_until_a_clean_replacement_is_written() {
         (0, 1),
         "quiet clean records remain clean"
     );
+}
+
+#[test]
+fn claude_mutations_require_exact_strict_proof_and_a_current_stamp() {
+    for seam in ["overwrite", "delete", "gc"] {
+        for arm in [
+            "unproved",
+            "wrong_entry",
+            "ahead",
+            "stamp_changed",
+            "eligible",
+        ] {
+            let scratch = Scratch::new();
+            let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+            let path = scratch.transcript("t.jsonl", b"{}\n");
+            let b = binding("acct", "scope", ("fp", None));
+            let record = pending(b.clone(), certificate(&path), 1);
+            let mut writer = scratch.store();
+            assert_eq!(
+                writer
+                    .write_after_save(&lock, 1, vec![record.clone()])
+                    .unwrap()
+                    .written,
+                1
+            );
+            let disk = record_file(&writer, &b.key);
+            let before = fs::read(&disk).unwrap();
+            let mut cold = scratch.store();
+            let decoded = found(cold.read(&b.key));
+            let mut expected = Expected {
+                binding: b.clone(),
+                committed_generation: 1,
+            };
+            match arm {
+                "wrong_entry" => expected.binding.entry = entry_digest("other", None),
+                "ahead" => expected.committed_generation = 0,
+                _ => {}
+            }
+            if arm != "unproved" {
+                cold.authorize(&decoded, &expected);
+            }
+            if arm == "stamp_changed" {
+                let alternate = disk.with_extension("replacement");
+                put_record(&alternate, &before);
+                fs::rename(alternate, &disk).unwrap();
+            }
+            match seam {
+                "overwrite" => {
+                    let receipt = cold
+                        .write_after_save(&lock, 2, vec![pending(b.clone(), certificate(&path), 2)])
+                        .unwrap();
+                    assert_eq!(
+                        receipt.written,
+                        usize::from(arm == "eligible"),
+                        "{seam} {arm}"
+                    );
+                }
+                "delete" => {
+                    assert_eq!(
+                        cold.remove_keys(&lock, &BTreeSet::from([b.key])).unwrap(),
+                        usize::from(arm == "eligible"),
+                        "{seam} {arm}"
+                    );
+                }
+                _ => cold
+                    .gc(
+                        &lock,
+                        &b.context,
+                        &placeholder_allowlist(),
+                        &BTreeMap::new(),
+                    )
+                    .unwrap(),
+            }
+            if arm == "eligible" {
+                if seam == "overwrite" {
+                    assert_ne!(fs::read(&disk).unwrap(), before);
+                } else {
+                    assert!(!disk.exists(), "{seam} {arm}");
+                }
+            } else {
+                assert_eq!(fs::read(&disk).unwrap(), before, "{seam} {arm}");
+            }
+        }
+    }
+}
+
+#[test]
+fn original_witness_survives_memo_turnover_but_never_a_different_record() {
+    for arm in [
+        "turnover",
+        "budget",
+        "entry",
+        "generation",
+        "record_generation",
+        "format",
+        "context",
+        "scope",
+        "replacement",
+        "body",
+    ] {
+        let scratch = Scratch::new();
+        let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+        let path = scratch.transcript("t.jsonl", b"{}\n");
+        let b = binding("acct", "scope", ("fp", None));
+        let old = pending(b.clone(), certificate(&path), 1);
+        let mut store = scratch.store();
+        assert_eq!(
+            store.write_after_save(&lock, 1, vec![old]).unwrap().written,
+            1
+        );
+        let mut decoded = found(store.read(&b.key));
+        let mut expected = Expected {
+            binding: b.clone(),
+            committed_generation: 1,
+        };
+        let witness = store
+            .mutation_witness(&decoded, &expected)
+            .expect("strict original proof");
+        let disk = record_file(&store, &b.key);
+        store.begin_pass();
+        store.durable.clear(); // The witness is independent of the verification optimization.
+        match arm {
+            "entry" => expected.binding.entry = entry_digest("changed", None),
+            "generation" => expected.committed_generation = 0,
+            "record_generation" => {
+                decoded.index_generation = 2;
+                expected.committed_generation = 2;
+            }
+            "format" => decoded.format = 2,
+            "context" => expected.binding.context = [11; 32],
+            "scope" => expected.binding.scope = [12; 32],
+            "replacement" => {
+                let replacement = disk.with_extension("replacement");
+                put_record(&replacement, &fs::read(&disk).unwrap());
+                fs::rename(replacement, &disk).unwrap();
+            }
+            "body" => {
+                let replacement = DurableRecord {
+                    record: pending(b.clone(), certificate(&path), 3),
+                    index_generation: 1,
+                    format: 1,
+                };
+                put_record(&disk, &encode(&replacement));
+            }
+            _ => {}
+        }
+        let before = fs::read(&disk).unwrap();
+        store.authorize_witness(&decoded, &expected, &witness);
+        let allowed = matches!(arm, "turnover" | "budget");
+        assert_eq!(store.authorized(&b.key), allowed, "{arm}");
+        if arm == "budget" {
+            let mut oversized = pending(b.clone(), certificate(&path), 2);
+            oversized.body.resize(RECORD_BYTES, 0);
+            assert_eq!(
+                store
+                    .write_after_save(&lock, 2, vec![oversized])
+                    .unwrap()
+                    .budget_refused,
+                1
+            );
+            assert_eq!(fs::read(&disk).unwrap(), before);
+            store.authorize_witness(&decoded, &expected, &witness);
+            assert!(store.authorized(&b.key));
+        }
+        let receipt = store
+            .write_after_save(&lock, 2, vec![pending(b.clone(), certificate(&path), 2)])
+            .unwrap();
+        assert_eq!(receipt.written, usize::from(allowed), "{arm}");
+        if !allowed {
+            assert_eq!(fs::read(&disk).unwrap(), before, "{arm}");
+        }
+    }
+}
+
+#[test]
+fn batch_ack_is_key_specific_and_bound_to_the_written_target_stamp() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let path = scratch.transcript("t.jsonl", b"{}\n");
+    let mut store = scratch.store();
+    let first = binding("acct", "scope", ("fp", None));
+    let mut other = first.clone();
+    other.key = key_digest(DurableSource::ClaudeCode, "other");
+    let initial = store
+        .write_after_save(
+            &lock,
+            1,
+            vec![
+                pending(first.clone(), certificate(&path), 1),
+                pending(other.clone(), certificate(&path), 1),
+            ],
+        )
+        .unwrap();
+    assert_eq!(initial.written, 2);
+    let mut proofs = Vec::new();
+    for binding in [&first, &other] {
+        let record = found(store.read(&binding.key));
+        let expected = Expected {
+            binding: binding.clone(),
+            committed_generation: 1,
+        };
+        proofs.push(
+            store
+                .mutation_witness(&record, &expected)
+                .expect("strict original"),
+        );
+        store.authorize(&record, &expected);
+    }
+    let receipt = store
+        .write_after_save(
+            &lock,
+            2,
+            vec![pending(first.clone(), certificate(&path), 2)],
+        )
+        .unwrap();
+    assert_eq!(receipt.written, 1);
+    assert!(store.replacement_committed(&proofs[0], &receipt));
+    assert!(
+        !store.replacement_committed(&proofs[1], &receipt),
+        "another key's receipt"
+    );
+    assert!(
+        !store.replacement_committed(&proofs[0], &initial),
+        "original is not its replacement"
+    );
+
+    let clean = store
+        .write_after_save(
+            &lock,
+            3,
+            vec![pending(first.clone(), certificate(&path), 2)],
+        )
+        .unwrap();
+    assert_eq!((clean.written, clean.clean), (0, 1));
+    assert!(
+        clean.committed.is_none(),
+        "clean allocates no acknowledgement"
+    );
+    assert!(!store.replacement_committed(&proofs[0], &clean));
+
+    // Identical bytes under another record inode invalidate the OLD receipt,
+    // even after a fresh read refreshes the optimization memo to those bytes.
+    let disk = record_file(&store, &first.key);
+    let replacement = disk.with_extension("identical");
+    put_record(&replacement, &fs::read(&disk).unwrap());
+    fs::rename(replacement, &disk).unwrap();
+    found(store.read(&first.key));
+    assert!(!store.replacement_committed(&proofs[0], &receipt));
+}
+
+#[test]
+fn batch_ack_never_escapes_failed_or_ambiguous_writes_or_a_clean_retry() {
+    for edge in ["pre_rename", "post_rename", "dir_sync"] {
+        let scratch = Scratch::new();
+        let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+        let path = scratch.transcript("t.jsonl", b"{}\n");
+        let mut store = scratch.store();
+        let b = binding("acct", "scope", ("fp", None));
+        store
+            .write_after_save(&lock, 1, vec![pending(b.clone(), certificate(&path), 1)])
+            .unwrap();
+        let record = found(store.read(&b.key));
+        let expected = Expected {
+            binding: b.clone(),
+            committed_generation: 1,
+        };
+        let proof = store.mutation_witness(&record, &expected).unwrap();
+        store.authorize_witness(&record, &expected, &proof);
+        let disk = record_file(&store, &b.key);
+        let before = fs::read(&disk).unwrap();
+        let reached = std::rc::Rc::new(std::cell::Cell::new(false));
+        let seen = reached.clone();
+        if edge == "dir_sync" {
+            test_hooks::set_before_dir_sync(Some(Box::new(move |_| {
+                seen.set(true);
+                Err(io::Error::other("injected directory sync failure"))
+            })));
+        } else {
+            test_hooks::set_before_rename(Some(Box::new(move |temp, target| {
+                seen.set(true);
+                if edge == "post_rename" {
+                    fs::rename(temp, target)?;
+                }
+                Err(io::Error::other("injected rename edge"))
+            })));
+        }
+        let failed =
+            store.write_after_save(&lock, 2, vec![pending(b.clone(), certificate(&path), 2)]);
+        test_hooks::set_before_rename(None);
+        test_hooks::set_before_dir_sync(None);
+        assert!(reached.get(), "actual {edge} reached");
+        assert!(failed.is_err(), "no receipt before successful batch sync");
+        assert_eq!(fs::read(&disk).unwrap() == before, edge == "pre_rename");
+        assert_eq!(store.witness_current(&proof), edge == "pre_rename");
+        if edge == "pre_rename" {
+            let retry = store
+                .write_after_save(&lock, 3, vec![pending(b.clone(), certificate(&path), 2)])
+                .unwrap();
+            assert_eq!(retry.written, 1);
+            assert!(store.replacement_committed(&proof, &retry));
+        } else {
+            // Re-authorize the ACTUAL current strict record, then mix its clean
+            // retry with a real write for another key. Aggregate written=1 is
+            // deliberately insufficient to acknowledge this original witness.
+            let target = found(store.read(&b.key));
+            store.authorize(
+                &target,
+                &Expected {
+                    binding: b.clone(),
+                    committed_generation: 2,
+                },
+            );
+            let mut other = b.clone();
+            other.key = key_digest(DurableSource::ClaudeCode, "other");
+            let retry = store
+                .write_after_save(
+                    &lock,
+                    3,
+                    vec![
+                        pending(b.clone(), certificate(&path), 2),
+                        pending(other, certificate(&path), 1),
+                    ],
+                )
+                .unwrap();
+            assert_eq!((retry.written, retry.clean), (1, 1));
+            assert!(
+                !store.replacement_committed(&proof, &retry),
+                "{edge} clean retry"
+            );
+        }
+    }
+}
+
+#[test]
+fn batch_ack_has_a_fixed_allocation_at_the_dirty_batch_limit() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let path = scratch.transcript("t.jsonl", b"{}\n");
+    let mut store = scratch.store();
+    let records = (0..MAX_BATCH + 1)
+        .map(|n| {
+            let mut b = binding("acct", "scope", ("fp", None));
+            b.key = key_digest(DurableSource::ClaudeCode, &format!("bounded-{n}"));
+            pending(b, certificate(&path), 1)
+        })
+        .collect();
+    let receipt = store.write_after_save(&lock, 1, records).unwrap();
+    assert_eq!((receipt.written, receipt.deferred), (MAX_BATCH, 1));
+    let acks = receipt.committed.as_ref().expect("real durable writes");
+    assert_eq!(acks.iter().flatten().count(), MAX_BATCH);
+    assert_eq!(std::mem::size_of_val(acks.as_ref()), BATCH_ACK_BYTES);
+    assert!(BATCH_ACK_BYTES <= MAX_BATCH * 80);
+    assert!(store.counters().peak_codec_bytes >= BATCH_ACK_BYTES as u64);
+    assert!(acks
+        .iter()
+        .flatten()
+        .all(|(key, _, _)| !receipt.deferred_keys.contains(key)));
+}
+
+#[test]
+fn claude_mutation_proof_expires_at_pass_boundary_and_unmemoized_records_survive() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let path = scratch.transcript("t.jsonl", b"{}\n");
+    let b = binding("acct", "scope", ("fp", None));
+    let mut store = scratch.store();
+    store
+        .write_after_save(&lock, 1, vec![pending(b.clone(), certificate(&path), 1)])
+        .unwrap();
+    let disk = record_file(&store, &b.key);
+    let before = fs::read(&disk).unwrap();
+    store.begin_pass();
+    store
+        .gc(
+            &lock,
+            &b.context,
+            &placeholder_allowlist(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+    assert_eq!(
+        fs::read(&disk).unwrap(),
+        before,
+        "pass reset grants no deletion"
+    );
+    let record = found(store.read(&b.key));
+    store.authorize(
+        &record,
+        &Expected {
+            binding: b.clone(),
+            committed_generation: 1,
+        },
+    );
+    store.durable.clear(); // deterministic memo eviction, no invented disk authority
+    assert_eq!(
+        store.remove_keys(&lock, &BTreeSet::from([b.key])).unwrap(),
+        0
+    );
+    assert_eq!(fs::read(&disk).unwrap(), before);
+}
+
+#[test]
+fn property_table_keeps_both_historical_v1_envelopes_byte_identical() {
+    use crate::snapshots::durable_sources::SOURCES;
+    use crate::snapshots::SnapshotSource;
+    let scratch = Scratch::new();
+    let path = scratch.transcript("synthetic.jsonl", b"{}\n");
+    assert_eq!(SOURCES.len(), 2);
+    assert_eq!(DurableSource::from_snapshot(SnapshotSource::Pi), None);
+    assert_eq!(DurableSource::from_tag(0), None);
+    assert_eq!(DurableSource::from_tag(3), None);
+    for (ordinal, row) in SOURCES.iter().enumerate() {
+        assert_eq!(row.source.slot(), ordinal);
+        assert_eq!(row.source.properties().source, row.source);
+        assert_eq!(DurableSource::from_snapshot(row.snapshot), Some(row.source));
+        assert_eq!(DurableSource::from_tag(row.tag), Some(row.source));
+        assert_eq!(row.tag, (ordinal + 1) as u8);
+        assert_eq!(row.format, 1);
+        assert_eq!(Some(row.allowlist()), parse_hex_digest(row.allowlist_pin));
+        let mut record = pending(
+            binding("acct", "scope", ("fp", None)),
+            certificate(&path),
+            1,
+        );
+        record.binding.source = row.source;
+        record.binding.key = key_digest(row.source, INDEX_KEY);
+        record.allowlist = row.allowlist();
+        record.body = crate::snapshots::durable_store_fixture_body(row.snapshot, 1, 7);
+        let stored = DurableRecord {
+            record,
+            index_generation: 17,
+            format: row.format,
+        };
+        let bytes = encode(&stored);
+        assert_eq!(bytes, pinned_v1_bytes(&stored.record, 17));
+        assert_eq!(&bytes[8..10], &1_u16.to_le_bytes());
+        assert_eq!(bytes[42], (ordinal + 1) as u8);
+        verify(&bytes, row.source).unwrap();
+        let decoded = decode(&bytes, &row.allowlist()).unwrap();
+        assert_eq!(decoded.record.body, stored.record.body);
+        assert_eq!(decoded.record.binding, stored.record.binding);
+        assert_eq!(decoded.index_generation, 17);
+        let mut unknown = bytes.clone();
+        unknown[10] ^= 1;
+        assert!(matches!(
+            decode_header(&unknown, &stored.record.binding.key, row.source),
+            Err(Refusal::Unknown)
+        ));
+    }
+}
+
+/// Frozen pass state for continuation lifecycle regressions; test-only, no filesystem reads.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ContinuationPassState {
+    pub(crate) checked: bool,
+    pub(crate) counts: [u64; 2],
+    pub(crate) rebuilt: BTreeSet<Digest32>,
+    pub(crate) authorized: BTreeSet<Digest32>,
+}
+
+pub(crate) fn continuation_pass_state(store: &DurableTailStore) -> ContinuationPassState {
+    ContinuationPassState {
+        checked: store.checked,
+        counts: store.pass,
+        rebuilt: store.rebuilt.clone(),
+        authorized: store
+            .durable
+            .iter()
+            .filter_map(|(key, (_, _, yes))| yes.then_some(*key))
+            .collect(),
+    }
 }

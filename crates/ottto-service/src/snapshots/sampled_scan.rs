@@ -11,8 +11,14 @@ use sampled_jsonl::CachedJsonlReduction;
 // separate 1MiB reserve covers bounded marker strings in existing index copies
 // and fixed acquisition/path scratch; it is not a daemon RSS allowance.
 const AUDIT_AND_SCRATCH_BYTES: usize = 1024 * 1024;
-const STATE_BYTES: usize =
-    CACHE_BYTES - crate::source_rotation::OVERLAP_BUDGET - AUDIT_AND_SCRATCH_BYTES;
+#[cfg(unix)]
+const RETAIL_RESERVE_BYTES: usize = 2 * (2 * crate::durable_tail_store::MAX_RECORDS + 1) * 1024;
+#[cfg(not(unix))]
+const RETAIL_RESERVE_BYTES: usize = 0;
+const STATE_BYTES: usize = CACHE_BYTES
+    - crate::source_rotation::OVERLAP_BUDGET
+    - AUDIT_AND_SCRATCH_BYTES
+    - RETAIL_RESERVE_BYTES;
 
 pub(super) mod codex_cursor;
 #[cfg(unix)]
@@ -509,10 +515,11 @@ impl OwnedSourceScan {
         namespace: Scope,
     ) -> Self {
         self.durable_guard = Some(Arc::downgrade(&cache));
-        if matches!(
-            self.source,
-            SnapshotSource::ClaudeCode | SnapshotSource::Codex
-        ) {
+        #[cfg(unix)]
+        let admitted = durable_tail::durable_source(self.source).is_some();
+        #[cfg(not(unix))]
+        let admitted = self.source != SnapshotSource::Pi;
+        if admitted {
             sampled_audit::normalize_marker_storage(&mut self.index);
             if self.source == SnapshotSource::ClaudeCode {
                 sampled_audit::restore_held_audit_deadlines(&mut self.index, now_seconds());
