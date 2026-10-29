@@ -710,6 +710,12 @@ pub(crate) fn claude_history_upgrade_owed_without_list(counts: &impl Serialize) 
         counts,
     );
 }
+/// Local alarm, once per park: a held Claude key's progress audit failed its
+/// secure open 8 times in a row and is parked, its audit debt still owed.
+/// Counts only; no path, id or wire event.
+pub(crate) fn claude_held_audit_open_parked(counts: &impl Serialize) {
+    traversal_point("claude_held_audit_open_parked", "claude_code", counts);
+}
 /// Local alarm, at most hourly: a complete Claude terminal kept the retired
 /// family tombstone uncertainty fence up, because more absent witnessed roots
 /// need a tombstone than fit under the cap. Counts only; no path, id or wire
