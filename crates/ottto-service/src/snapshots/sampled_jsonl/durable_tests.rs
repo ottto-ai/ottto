@@ -87,6 +87,17 @@ fn full_read(path: &Path, source: SnapshotSource) -> (CachedJsonlReduction, Chec
 /// context over an index holding the file), so the money fold is compared
 /// too.
 fn items(parser: OwnedJsonlParser, path: &Path, source: SnapshotSource) -> Value {
+    items_at(parser, path, source, None)
+}
+
+/// `items`, through the shared native body with an M3 PRE-finalization hook
+/// (`None`: the legacy wrapper itself).
+fn items_at(
+    parser: OwnedJsonlParser,
+    path: &Path,
+    source: SnapshotSource,
+    pre: Option<&mut dyn FnMut(crate::snapshots::PreFinalization<'_>)>,
+) -> Value {
     let identity = opened_object_identity(source, &mut File::open(path).unwrap()).unwrap();
     let mut index = ScanIndex::default();
     index.files.insert(
@@ -103,8 +114,8 @@ fn items(parser: OwnedJsonlParser, path: &Path, source: SnapshotSource) -> Value
             path,
             twins: &twins,
         });
-    let parsed = parser
-        .finish_with_repository_identity(
+    let parsed = match pre {
+        None => parser.finish_with_repository_identity(
             &identity,
             path,
             COLLECTED,
@@ -114,8 +125,23 @@ fn items(parser: OwnedJsonlParser, path: &Path, source: SnapshotSource) -> Value
             None,
             None,
             money,
-        )
-        .unwrap();
+        ),
+        Some(pre) => parser.finish_native(
+            crate::snapshots::FinishRequest {
+                expected_opened_object_identity: &identity,
+                path,
+                collected_at: COLLECTED,
+                source_file_fingerprint: "fp".into(),
+                codex_title_metadata: None,
+                claude_title_metadata: None,
+                attribution_context: None,
+                repository_identity: None,
+                money_context: money,
+            },
+            Some(pre),
+        ),
+    }
+    .unwrap();
     // The fold is not serialized (`serde(skip)`): compare its entity body.
     let money = parsed
         .snapshots
@@ -1861,4 +1887,104 @@ fn workspace_wrong_object_shapes_refuse_without_formatting_the_input() {
             Err(Refuse::NotRederivable("workspace_capture"))
         ));
     }
+}
+
+// M3 G1 (r6 native): the one native finish body and its PRE-finalization
+// seam. The seam is what `finish_with_repository_identity_prepared` stages
+// from; these controls pin where it runs and what it sees, without a store.
+
+/// The body bytes the seam's live view encodes to, and whether the
+/// scan-shared live inputs were detached while it ran.
+fn seam_body(live: crate::snapshots::PreFinalization<'_>) -> (Vec<u8>, bool) {
+    let detached = live.accumulator.codex_turn_traces.is_none()
+        && live.accumulator.codex_parent_ownership_ledgers.is_none();
+    let body = encode_parts(
+        live.accumulator,
+        live.report,
+        (
+            live.recognized_usage_drop_count,
+            live.positive_recognized_usage_count,
+            live.positive_usage_evidence,
+        ),
+        usize::MAX,
+        line_cap(),
+    )
+    .expect("a clean fixture encodes");
+    (body, detached)
+}
+
+#[test]
+fn m3_seam_live_bytes_equal_retained_copy_and_output_equals_legacy() {
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let scratch = Scratch::new("m3-seam");
+        let lines = match source {
+            SnapshotSource::Codex => codex_lines(),
+            _ => claude_lines(2, 2),
+        };
+        let path = scratch.write("t.jsonl", &lines);
+        let traces = || Some(std::sync::Arc::new(Default::default()));
+        // Oracle: the copy a certified completion retains, then the legacy
+        // wrapper's output over the same parser.
+        let mut legacy = parser(&path, source);
+        while !legacy.step().unwrap() {}
+        legacy.accumulator.codex_turn_traces = traces();
+        let retained = legacy.durable_test_reduction_copy();
+        let legacy = items(legacy, &path, source);
+        let mut live = parser(&path, source);
+        while !live.step().unwrap() {}
+        live.accumulator.codex_turn_traces = traces();
+        let mut seen = Vec::new();
+        let at_seam = items_at(
+            live,
+            &path,
+            source,
+            Some(&mut |view: crate::snapshots::PreFinalization<'_>| seen.push(seam_body(view))),
+        );
+        assert_eq!(seen.len(), 1, "{source:?}: the seam runs exactly once");
+        let (body, detached) = &seen[0];
+        assert!(
+            detached,
+            "{source:?}: live scan inputs are detached at the seam"
+        );
+        assert_eq!(
+            body,
+            &encode_body(&retained, usize::MAX, line_cap()).unwrap(),
+            "{source:?}: PRE-finalization live bytes are the retained copy's bytes"
+        );
+        assert_eq!(
+            at_seam, legacy,
+            "{source:?}: the shared body publishes exactly the legacy output"
+        );
+    }
+}
+
+#[test]
+fn m3_seam_never_runs_before_the_held_object_is_revalidated() {
+    let scratch = Scratch::new("m3-seam-refused");
+    let path = scratch.write("t.jsonl", &claude_lines(1, 1));
+    let request = |expected: &'static str| crate::snapshots::FinishRequest {
+        expected_opened_object_identity: expected,
+        path: &path,
+        collected_at: COLLECTED,
+        source_file_fingerprint: "fp".into(),
+        codex_title_metadata: None,
+        claude_title_metadata: None,
+        attribution_context: None,
+        repository_identity: None,
+        money_context: None,
+    };
+    let mut calls = 0;
+    // An unfinished read and a changed opened object both fail before the
+    // seam: nothing is staged, so nothing needs discarding.
+    let unfinished = parser(&path, SnapshotSource::ClaudeCode);
+    let mut count = |_: crate::snapshots::PreFinalization<'_>| calls += 1;
+    assert!(unfinished
+        .finish_native(request("unused"), Some(&mut count))
+        .is_err());
+    let mut changed = parser(&path, SnapshotSource::ClaudeCode);
+    while !changed.step().unwrap() {}
+    assert!(changed
+        .finish_native(request("another opened object"), Some(&mut count))
+        .is_err());
+    assert_eq!(calls, 0);
 }

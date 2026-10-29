@@ -30,19 +30,32 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use toml_edit::{DocumentMut, Item};
 
 /// Unique acquisition metadata; the Plain native input owns it while reading.
+/// M3: the one active lease, acquired chain and receipt debt move with it.
+/// The chain lives in `owed` while debt exists, never also in `chain`.
 #[derive(Default)]
 pub(crate) struct DurableCustody {
+    #[cfg(unix)]
+    active: Option<crate::durable_tail_store::ActiveLease>,
+    #[cfg(unix)]
+    chain: Option<sampled_scan::durable_tail::AcquiredChain>,
+    #[cfg(unix)]
+    owed: Option<sampled_scan::durable_tail::ReceiptOwed>,
     #[cfg(unix)]
     retail: Option<sampled_scan::durable_tail::RetailAttempt>,
     #[cfg(unix)]
     upgrade: Option<sampled_scan::durable_tail::UpgradeRead>,
 }
-crate::heap_layout_bound::fields!(DurableCustody; #[cfg(unix)] retail, #[cfg(unix)] upgrade);
+crate::heap_layout_bound::fields!(DurableCustody; #[cfg(unix)] active, #[cfg(unix)] chain,
+    #[cfg(unix)] owed, #[cfg(unix)] retail, #[cfg(unix)] upgrade);
 impl DurableCustody {
     pub(crate) fn is_empty(&self) -> bool {
         #[cfg(unix)]
         {
-            self.retail.is_none() && self.upgrade.is_none()
+            self.active.is_none()
+                && self.chain.is_none()
+                && self.owed.is_none()
+                && self.retail.is_none()
+                && self.upgrade.is_none()
         }
         #[cfg(not(unix))]
         {
@@ -122,6 +135,8 @@ mod codex_parent_side_read_tests;
 mod codex_parent_side_tests;
 #[cfg(test)]
 mod file_set_digest_tests;
+#[cfg(all(test, unix))]
+mod m3_native_tests;
 #[cfg(test)]
 pub(crate) use codex_counting_version::TestCutover;
 #[cfg(test)]
@@ -29259,22 +29274,108 @@ impl OwnedSourceScan {
                 };
                 let claude_grown_prefix =
                     source == SnapshotSource::ClaudeCode && parser.reader.sealed_prefix.is_some();
-                let parsed_file = parser.finish_with_repository_identity(
-                    &candidate.opened_object_identity,
-                    &candidate.path,
-                    collected_at.as_str(),
-                    source_file_fingerprint.clone(),
-                    (source == SnapshotSource::Codex).then_some(&codex_title_metadata),
-                    (source == SnapshotSource::ClaudeCode).then_some(&claude_title_metadata),
+                let finish_request = FinishRequest {
+                    expected_opened_object_identity: &candidate.opened_object_identity,
+                    path: &candidate.path,
+                    collected_at: collected_at.as_str(),
+                    source_file_fingerprint: source_file_fingerprint.clone(),
+                    codex_title_metadata: (source == SnapshotSource::Codex)
+                        .then_some(&codex_title_metadata),
+                    claude_title_metadata: (source == SnapshotSource::ClaudeCode)
+                        .then_some(&claude_title_metadata),
                     // U1a-2a B8′: a side read takes no attribution context.
-                    attribution_context.filter(|_| side_origin.is_none()),
-                    measured_repository_identity,
-                    Some(claude_request_money::e2::ReadContext {
+                    attribution_context: attribution_context.filter(|_| side_origin.is_none()),
+                    repository_identity: measured_repository_identity,
+                    money_context: Some(claude_request_money::e2::ReadContext {
                         index,
                         path: &candidate.path,
                         twins: history_upgrade.twin_groups(),
                     }),
+                };
+                // M3 G1: only an ordinary Claude plain singleton activates.
+                // Group/member, proof, side, comparison and Codex (M1 until
+                // P5) keep the legacy finish. The held descriptor is
+                // duplicated, never read, before the parser is consumed: the
+                // commit fences check it after a native Ok.
+                #[cfg(unix)]
+                let m3_route = sampling
+                    .as_ref()
+                    .zip(file_sampling.as_ref())
+                    .filter(|_| {
+                        source == SnapshotSource::ClaudeCode
+                            && !comparison_target
+                            && side_origin.is_none()
+                            && aliases.is_empty()
+                    })
+                    .and_then(|(context, active)| {
+                        let held = parser.reader.reader.get_ref().try_clone().ok()?;
+                        Some((context, active, held))
+                    });
+                #[cfg(unix)]
+                let (parsed_file, m3_disposition, m3_staged) = match m3_route {
+                    Some((context, active, held)) => {
+                        let request = NativeChainRequest {
+                            source,
+                            key: &active.key,
+                            opened_object_identity: &candidate.opened_object_identity,
+                            mode: active.mode,
+                            held: &held,
+                            index,
+                        };
+                        if let Some(completed) = completed_acquisition.as_mut() {
+                            bind_native_chain(&context.cache, completed, &request);
+                        }
+                        let attempt = parser.finish_with_repository_identity_prepared(
+                            finish_request,
+                            completed_acquisition.take(),
+                            |lease, view| context.cache.prepare_live(lease, view),
+                        );
+                        #[cfg(test)]
+                        sampled_scan::test_hooks::fire(
+                            sampled_scan::test_hooks::Point::BeforeNativeSettle,
+                        );
+                        let settled = settle_native_attempt(
+                            &context.cache,
+                            attempt,
+                            held,
+                            NativeFence {
+                                source,
+                                key: &active.key,
+                                path: &candidate.path,
+                                expected_opened_object_identity: &candidate.opened_object_identity,
+                                committed_index: index,
+                            },
+                        );
+                        completed_acquisition = settled.completed;
+                        (settled.native, settled.disposition, settled.staged)
+                    }
+                    None => (
+                        parser.finish_native(finish_request, None),
+                        NativeDisposition::Publish,
+                        false,
+                    ),
+                };
+                #[cfg(not(unix))]
+                let parsed_file = parser.finish_native(finish_request, None);
+                // A held completion has no effect at all: no cursor success,
+                // birth, census, entry, body or fold. The committed entry keeps
+                // its accepted body and witness; the key stays indexed and its
+                // grown length keeps it discoverable regardless of age.
+                #[cfg(unix)]
+                if m3_disposition == NativeDisposition::Hold && parsed_file.is_ok() {
+                    if let Some((context, publication)) =
+                        sampling.as_ref().zip(cursor_publication.take())
+                    {
+                        context.cache.cursor_published(publication, false);
+                    }
+                    pending!();
+                }
+                #[cfg(test)]
+                sampled_scan::test_hooks::fire(
+                    sampled_scan::test_hooks::Point::BeforeNativeEffects,
                 );
+                #[cfg(unix)]
+                let m3_strict_rebind = m3_disposition == NativeDisposition::PublishStrictRebind;
                 // A committed cursor attempt counts as published only now (M4).
                 if let Some((context, publication)) =
                     sampling.as_ref().zip(cursor_publication.take())
@@ -30386,6 +30487,13 @@ impl OwnedSourceScan {
                             fragment.debt,
                         );
                     }
+                    // D3 Codex: after every #865 staging above (staging
+                    // matches the fingerprint), before this entry's save
+                    // settles the degraded publication.
+                    #[cfg(unix)]
+                    if m3_strict_rebind {
+                        codex_strict_rebind(index, source, &index_key);
+                    }
                     if let Some(completed) = completed_acquisition {
                         if let Some(context) = sampling.as_ref() {
                             // A clone allocates exactly its length, and is the
@@ -30395,6 +30503,24 @@ impl OwnedSourceScan {
                             debug_assert!(file_sampling
                                 .as_ref()
                                 .map_or(true, |sampled| sampled.key.len() == key.len()));
+                            // The M3 route already decided this completion's
+                            // record (receipt or no-record disposition): it is
+                            // no longer a Claude post-save write offer.
+                            #[cfg(unix)]
+                            let admitted = if m3_staged {
+                                context.cache.insert_settled(
+                                    key,
+                                    completed,
+                                    finalization_charge.unwrap_or(0),
+                                )
+                            } else {
+                                context.cache.insert_admitted(
+                                    key,
+                                    completed,
+                                    finalization_charge.unwrap_or(0),
+                                )
+                            };
+                            #[cfg(not(unix))]
                             let admitted = context.cache.insert_admitted(
                                 key,
                                 completed,
@@ -34516,6 +34642,81 @@ impl OwnedJsonlParser {
         repository_identity: Option<crate::context_footprint::RepositoryIdentity>,
         money_context: Option<claude_request_money::e2::ReadContext<'_>>,
     ) -> Result<ParsedJsonlFile> {
+        self.finish_native(
+            FinishRequest {
+                expected_opened_object_identity,
+                path,
+                collected_at,
+                source_file_fingerprint,
+                codex_title_metadata,
+                claude_title_metadata,
+                attribution_context,
+                repository_identity,
+                money_context,
+            },
+            None,
+        )
+    }
+
+    /// M3 G1: the same native finish, staging a durable record at the checked
+    /// PRE-finalization seam: after the held FD revalidated the opened object,
+    /// before any finalization write. A retained copy is staged from its own
+    /// reduction, otherwise from the live parser state; both use the one body
+    /// engine behind `prepare`. The acquisition and staging are returned even
+    /// when the native finish fails, so the caller discards them explicitly.
+    /// Without an acquired chain nothing is staged (`preparation: None`).
+    #[cfg(unix)]
+    fn finish_with_repository_identity_prepared<F>(
+        mut self,
+        request: FinishRequest<'_>,
+        completed: Option<sampled_jsonl::CompletedNativeAcquisition>,
+        prepare: F,
+    ) -> sampled_scan::durable_tail::NativeFinishAttempt
+    where
+        F: for<'v> FnOnce(
+            &mut crate::durable_tail_store::ActiveLease,
+            sampled_scan::durable_tail::LiveFinishView<'v>,
+        ) -> sampled_scan::durable_tail::PrepareOutcome,
+    {
+        use sampled_scan::durable_tail::{FinishAcquisition, NativeFinishAttempt};
+        let mut acquisition = match completed {
+            Some(completed) => FinishAcquisition::Certified(completed),
+            // The read's own custody (lease, chain, debt) moves with it.
+            None => FinishAcquisition::Uncertified(self.completed_durable()),
+        };
+        let mut prepare = Some(prepare);
+        let mut preparation = None;
+        let mut stage = |live: PreFinalization<'_>| {
+            if let Some(prepare) = prepare.take() {
+                preparation = stage_preparation(&mut acquisition, live, prepare);
+            }
+        };
+        let native = self.finish_native(request, Some(&mut stage));
+        NativeFinishAttempt {
+            native,
+            acquisition,
+            preparation,
+        }
+    }
+
+    /// The one native finish. `pre` runs exactly once, only on the path that
+    /// reached the PRE-finalization seam; every earlier error returns first.
+    fn finish_native(
+        self,
+        request: FinishRequest<'_>,
+        pre: Option<&mut dyn FnMut(PreFinalization<'_>)>,
+    ) -> Result<ParsedJsonlFile> {
+        let FinishRequest {
+            expected_opened_object_identity,
+            path,
+            collected_at,
+            source_file_fingerprint,
+            codex_title_metadata,
+            claude_title_metadata,
+            attribution_context,
+            repository_identity,
+            money_context,
+        } = request;
         anyhow::ensure!(
             self.reader.finished && self.reader.failure.is_none(),
             "incomplete parser cannot finalize a file"
@@ -34542,6 +34743,9 @@ impl OwnedJsonlParser {
         } = self;
         let mut reader = bounded.reader;
         let report = bounded.report;
+        // The retained reduction's own count (`retain_reduction` copies it
+        // before the line-cap adjustment below); a live body must equal it.
+        let reduction_drop_count = recognized_usage_drop_count;
         // Present for a cursor job or Claude in-page read whose prefix
         // certificate passed (S12/FE1)
         // or whose lossy job holds ruling 2's same-object identity proof.
@@ -34574,6 +34778,22 @@ impl OwnedJsonlParser {
             return Err(anyhow::anyhow!(
                 "opened snapshot candidate changed while it was parsed"
             ));
+        }
+        // M3 G1 PRE-finalization seam. The live scan-shared inputs are
+        // detached exactly as a retained copy excludes them, then restored
+        // before any finalization reads them; no early exit lies between.
+        if let Some(pre) = pre {
+            let traces = accumulator.codex_turn_traces.take();
+            let parents = accumulator.codex_parent_ownership_ledgers.take();
+            pre(PreFinalization {
+                accumulator: &accumulator,
+                report: &report,
+                recognized_usage_drop_count: reduction_drop_count,
+                positive_recognized_usage_count,
+                positive_usage_evidence,
+            });
+            accumulator.codex_turn_traces = traces;
+            accumulator.codex_parent_ownership_ledgers = parents;
         }
         if source == SnapshotSource::Codex {
             if let Some(metadata) = codex_title_metadata {
@@ -34798,6 +35018,468 @@ impl OwnedJsonlParser {
             codex_parent_proof_used,
             codex_parent_proof_refusal,
         })
+    }
+}
+
+/// Native finish inputs, shared by the legacy and the M3 prepared wrapper.
+struct FinishRequest<'a> {
+    expected_opened_object_identity: &'a str,
+    path: &'a Path,
+    collected_at: &'a str,
+    source_file_fingerprint: String,
+    codex_title_metadata: Option<&'a CodexTitleMetadata>,
+    claude_title_metadata: Option<&'a ClaudeTitleMetadata>,
+    attribution_context: Option<&'a crate::session_attribution::SessionAttributionContext>,
+    repository_identity: Option<crate::context_footprint::RepositoryIdentity>,
+    money_context: Option<claude_request_money::e2::ReadContext<'a>>,
+}
+
+/// The live parser state at the PRE-finalization seam, scan-shared inputs
+/// detached; the same fields a retained reduction copies.
+struct PreFinalization<'a> {
+    accumulator: &'a SnapshotAccumulator,
+    report: &'a JsonlReadReport,
+    recognized_usage_drop_count: usize,
+    positive_recognized_usage_count: usize,
+    positive_usage_evidence: bool,
+}
+
+/// Stage one durable record from the acquisition's own chain and lease.
+/// `None`: no acquired chain, so this completion is not on the M3 route and
+/// keeps the legacy behavior. The retained reduction, when present, is the
+/// view; otherwise the live state is, through the same body engine.
+#[cfg(unix)]
+fn stage_preparation<F>(
+    acquisition: &mut sampled_scan::durable_tail::FinishAcquisition,
+    live: PreFinalization<'_>,
+    prepare: F,
+) -> Option<sampled_scan::durable_tail::PrepareOutcome>
+where
+    F: for<'v> FnOnce(
+        &mut crate::durable_tail_store::ActiveLease,
+        sampled_scan::durable_tail::LiveFinishView<'v>,
+    ) -> sampled_scan::durable_tail::PrepareOutcome,
+{
+    use sampled_scan::durable_tail::{
+        FinishAcquisition, LiveFinishView, NotPersisted, PrepareOutcome,
+    };
+    let (custody, certified) = match acquisition {
+        FinishAcquisition::Certified(completed) => (
+            &mut completed.durable,
+            Some((
+                &completed.checkpoint,
+                completed.reduction.as_ref(),
+                completed.unsealed,
+            )),
+        ),
+        FinishAcquisition::Uncertified(custody) => (custody, None),
+    };
+    let DurableCustody {
+        active,
+        chain,
+        owed,
+        ..
+    } = custody;
+    // While debt exists the chain lives only in it.
+    let chain = chain
+        .as_ref()
+        .or_else(|| owed.as_ref().map(|owed| owed.chain()))?;
+    let Some((checkpoint, reduction, unsealed)) = certified else {
+        return Some(PrepareOutcome::NotPersisted(NotPersisted::Certificate));
+    };
+    if unsealed {
+        return Some(PrepareOutcome::NotPersisted(NotPersisted::Unsealed));
+    }
+    let Some(lease) = active.as_mut() else {
+        return Some(PrepareOutcome::NotPersisted(NotPersisted::ActiveBound));
+    };
+    let (accumulator, report, (drops, positives, evidence)) = match reduction {
+        Some(reduction) => reduction.finish_view(),
+        None => (
+            live.accumulator,
+            live.report,
+            (
+                live.recognized_usage_drop_count,
+                live.positive_recognized_usage_count,
+                live.positive_usage_evidence,
+            ),
+        ),
+    };
+    Some(
+        match LiveFinishView::new(
+            accumulator,
+            report,
+            drops,
+            positives,
+            evidence,
+            checkpoint,
+            chain,
+            jsonl_line_cap() as u64,
+        ) {
+            Ok(view) => prepare(lease, view),
+            Err(refusal) => PrepareOutcome::NotPersisted(refusal),
+        },
+    )
+}
+
+/// The custody's acquired chain; while debt exists it lives only in the debt.
+#[cfg(unix)]
+fn custody_chain(custody: &DurableCustody) -> Option<&sampled_scan::durable_tail::AcquiredChain> {
+    custody
+        .chain
+        .as_ref()
+        .or_else(|| custody.owed.as_ref().map(|owed| owed.chain()))
+}
+
+/// How a native completion proceeds after its M3 settlement (G1 + D3).
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeDisposition {
+    /// Ordinary native effects: a matching receipt, a proven no-record
+    /// disposition, or a completion that is not on the M3 route.
+    Publish,
+    /// D3 Codex double failure: the store is disabled with record A on disk.
+    /// Publish only with the retained entry strictly rebound in the working
+    /// index whose save settles this publication.
+    PublishStrictRebind,
+    /// No effect this pass. The completion keeps its debt, the committed
+    /// entry its accepted body and witness, and the key stays discoverable.
+    Hold,
+}
+
+/// The facts the commit fences check against, all frozen before mutation.
+#[cfg(unix)]
+struct NativeFence<'a> {
+    source: SnapshotSource,
+    key: &'a str,
+    path: &'a Path,
+    expected_opened_object_identity: &'a str,
+    committed_index: &'a ScanIndex,
+}
+
+/// What only the native caller proves for an M3 chain: the read's actual
+/// mode and cause, its held descriptor, the opened object O and the
+/// committed index the binding is computed from. Never a newer accepted body.
+#[cfg(unix)]
+struct NativeChainRequest<'a> {
+    source: SnapshotSource,
+    key: &'a str,
+    opened_object_identity: &'a str,
+    mode: crate::transcript_acquisition::ReadMode,
+    held: &'a File,
+    index: &'a ScanIndex,
+}
+
+/// Bind this completion to its one acquisition chain before the native
+/// finish: a genuine content change first releases any D3 hold on the key;
+/// a carried (retained, restored or owed) chain moves with r_a, protocol and
+/// eligibility inherited; otherwise a fresh Legacy chain is captured from the
+/// actual mode, held O and committed index. Write-ahead eligibility is only a
+/// native byte-zero origin: a never-indexed first read or a real edit. Any
+/// refusal leaves no usable chain, so nothing is staged and the completion
+/// keeps its existing route; a held key still holds (`settle_native_attempt`).
+#[cfg(unix)]
+fn bind_native_chain(
+    cache: &sampled_scan::SharedCache,
+    completed: &mut sampled_jsonl::CompletedNativeAcquisition,
+    request: &NativeChainRequest<'_>,
+) {
+    use crate::transcript_acquisition::{FullReason, ReadMode};
+    let real_edit = matches!(
+        request.mode,
+        ReadMode::Full(
+            FullReason::Replaced
+                | FullReason::Shrunk
+                | FullReason::SameSizeEdit
+                | FullReason::HeadChanged
+                | FullReason::BoundaryChanged
+        )
+    );
+    if real_edit {
+        cache.durable_release_hold(request.source, request.key);
+    }
+    let custody = &mut completed.durable;
+    if custody.owed.is_some() {
+        // Debt owns its chain; `advance_owed` moves it under the facade.
+        return;
+    }
+    if custody.ensure_active(cache, request.source, 0).is_err() {
+        // No lease, no staging: a carried chain is kept for a later pass.
+        return;
+    }
+    if let Some(chain) = custody.chain.as_mut() {
+        if cache
+            .durable_rebind_chain(
+                chain,
+                request.opened_object_identity,
+                request.held,
+                &completed.checkpoint,
+                request.index,
+            )
+            .is_err()
+        {
+            // Never restamp a carried chain into a new binding.
+            custody.chain = None;
+        }
+        return;
+    }
+    let first_read = matches!(request.mode, ReadMode::Full(FullReason::StateMissing))
+        && !request.index.files.contains_key(request.key);
+    let Some(lease) = custody.active.as_mut() else {
+        return;
+    };
+    if let Ok(chain) = cache.durable_capture_chain(
+        lease,
+        request.source,
+        request.key,
+        request.opened_object_identity,
+        request.held,
+        &completed.checkpoint,
+        request.index,
+        first_read || real_edit,
+    ) {
+        custody.chain = Some(chain);
+    }
+}
+
+/// One settled native completion.
+#[cfg(unix)]
+struct NativeSettlement {
+    native: Result<ParsedJsonlFile>,
+    /// The certified completion the caller may still admit.
+    completed: Option<sampled_jsonl::CompletedNativeAcquisition>,
+    disposition: NativeDisposition,
+    /// The M3 route decided this completion's record; no post-save offer.
+    staged: bool,
+}
+
+/// Explicit cleanup of a staging the native finish cannot use.
+#[cfg(unix)]
+fn discard_staging(
+    cache: &sampled_scan::SharedCache,
+    staged: sampled_scan::durable_tail::PrepareOutcome,
+) {
+    use sampled_scan::durable_tail::PrepareOutcome;
+    match staged {
+        PrepareOutcome::Prepared(prepared) => cache.discard_prepared(prepared),
+        PrepareOutcome::StoreFailed(failure) => cache.discard_failed_preparation(failure),
+        PrepareOutcome::NotPersisted(_) | PrepareOutcome::Degraded(_) => {}
+    }
+}
+
+/// Settle one prepared native finish before any of its effects: dispatch the
+/// staging through the commit fences, bind receipts or register debt, end the
+/// active lease, and park a held completion as owed. Returns the native
+/// result, the certified completion the caller may still admit, and how the
+/// caller proceeds. A native error publishes nothing and keeps its debt.
+#[cfg(unix)]
+fn settle_native_attempt(
+    cache: &sampled_scan::SharedCache,
+    attempt: sampled_scan::durable_tail::NativeFinishAttempt,
+    mut held: File,
+    fence: NativeFence<'_>,
+) -> NativeSettlement {
+    use sampled_scan::durable_tail::{
+        CommitFences, FinishAcquisition, NativeFinishAttempt, OwedCompletionAdmission,
+        PrepareOutcome, Unprepared,
+    };
+    let NativeFinishAttempt {
+        native,
+        mut acquisition,
+        preparation,
+    } = attempt;
+    let staged = preparation.is_some();
+    let disposition = match preparation {
+        // Not staged (no chain or no lease). A Claude key held by D3 still
+        // never publishes over its surviving A; the query counts its growth
+        // and releases it if the held object itself changed.
+        None if native.is_ok()
+            && fence.source == SnapshotSource::ClaudeCode
+            && cache.durable_claude_hold(fence.source, fence.key, &held) =>
+        {
+            NativeDisposition::Hold
+        }
+        None => NativeDisposition::Publish,
+        Some(staged) if native.is_err() => {
+            // E4: no candidate becomes canonical; the caller's existing error
+            // exit publishes nothing. Debt keeps its discovery obligation.
+            discard_staging(cache, staged);
+            if acquisition.custody().owed.is_some() {
+                cache.retain_owed_discovery(fence.source, fence.key);
+            }
+            NativeDisposition::Publish
+        }
+        Some(staged) => {
+            // Bound before the staging is consumed: a pending or held write
+            // owes exactly this candidate, never a later one.
+            let candidate = match &staged {
+                PrepareOutcome::Prepared(prepared) => Some(prepared.identity().clone()),
+                PrepareOutcome::StoreFailed(failure) => failure.identity().cloned(),
+                PrepareOutcome::NotPersisted(_) | PrepareOutcome::Degraded(_) => None,
+            };
+            let fences = match custody_chain(acquisition.custody()) {
+                Some(chain) => CommitFences::new(
+                    &mut held,
+                    fence.path,
+                    fence.expected_opened_object_identity,
+                    acquisition.checkpoint(),
+                    chain,
+                    fence.committed_index,
+                ),
+                None => Err(sampled_scan::durable_tail::HeldCause::Fence),
+            };
+            match fences {
+                Err(_) => {
+                    // The fences, not the staging, refused: discard the stage
+                    // and hold the custody for an exact retry.
+                    discard_staging(cache, staged);
+                    owe_receipt(cache, &mut acquisition, None)
+                }
+                // Each outcome is computed (fences consumed) before the
+                // acquisition is borrowed again to bind or owe it.
+                Ok(fences) => match staged {
+                    PrepareOutcome::Prepared(prepared) => {
+                        let outcome = cache.commit_prepared(prepared, fences);
+                        write_disposition(cache, &mut acquisition, outcome, candidate.as_ref())
+                    }
+                    PrepareOutcome::StoreFailed(failure) => {
+                        let outcome = cache.resolve_failed_preparation(failure, fences);
+                        write_disposition(cache, &mut acquisition, outcome, candidate.as_ref())
+                    }
+                    PrepareOutcome::NotPersisted(reason) => {
+                        let outcome =
+                            cache.resolve_unprepared(Unprepared::NotPersisted(reason), fences);
+                        unprepared_disposition(cache, &mut acquisition, outcome)
+                    }
+                    PrepareOutcome::Degraded(reason) => {
+                        let outcome =
+                            cache.resolve_unprepared(Unprepared::Degraded(reason), fences);
+                        unprepared_disposition(cache, &mut acquisition, outcome)
+                    }
+                },
+            }
+        }
+    };
+    // Only Codex rebinds strictly. Any other source never publishes over a
+    // surviving A: its key holds (Claude's original-v1 adapter would bind A).
+    let disposition = if disposition == NativeDisposition::PublishStrictRebind
+        && fence.source != SnapshotSource::Codex
+    {
+        owe_receipt(cache, &mut acquisition, None)
+    } else {
+        disposition
+    };
+    // The process-wide lease ends before any cache admission or effect.
+    if let Some(lease) = acquisition.custody_mut().active.take() {
+        lease.release();
+    }
+    let completed = match acquisition {
+        FinishAcquisition::Certified(completed) if disposition == NativeDisposition::Hold => {
+            // Funded owed retention, or the debt survives through the
+            // index-held discovery obligation without the graph.
+            if let OwedCompletionAdmission::Refused(completed) =
+                cache.retain_owed_completion(fence.key.to_owned(), completed, 0)
+            {
+                drop(completed);
+                cache.retain_owed_discovery(fence.source, fence.key);
+            }
+            None
+        }
+        FinishAcquisition::Certified(completed) => Some(completed),
+        FinishAcquisition::Uncertified(custody) => {
+            if disposition == NativeDisposition::Hold && custody.owed.is_some() {
+                cache.retain_owed_discovery(fence.source, fence.key);
+            }
+            drop(custody);
+            None
+        }
+    };
+    NativeSettlement {
+        native,
+        completed,
+        disposition,
+        staged,
+    }
+}
+
+/// Register receipt debt for a completion that cannot publish. A refused
+/// registration still holds: the facade then keeps the conservative
+/// source-class obligation and never reports the key as free of debt.
+#[cfg(unix)]
+fn owe_receipt(
+    cache: &sampled_scan::SharedCache,
+    acquisition: &mut sampled_scan::durable_tail::FinishAcquisition,
+    candidate: Option<&sampled_scan::durable_tail::RecordIdentity>,
+) -> NativeDisposition {
+    let _held = cache.mark_receipt_owed(acquisition, candidate);
+    NativeDisposition::Hold
+}
+
+#[cfg(unix)]
+fn write_disposition(
+    cache: &sampled_scan::SharedCache,
+    acquisition: &mut sampled_scan::durable_tail::FinishAcquisition,
+    outcome: sampled_scan::durable_tail::WriteOutcome,
+    candidate: Option<&sampled_scan::durable_tail::RecordIdentity>,
+) -> NativeDisposition {
+    use sampled_scan::durable_tail::{DegradedCause, WriteOutcome};
+    match outcome {
+        // Only the exact receipt for this acquisition's candidate publishes.
+        WriteOutcome::Receipted { receipt, .. } => {
+            match cache.receipt_acquisition(acquisition, &receipt) {
+                Ok(()) => NativeDisposition::Publish,
+                Err(_) => owe_receipt(cache, acquisition, candidate),
+            }
+        }
+        WriteOutcome::ReceiptPending | WriteOutcome::FailedHeld(_) => {
+            owe_receipt(cache, acquisition, candidate)
+        }
+        WriteOutcome::FailedPublishedWithoutRecord(DegradedCause::StrictRebind) => {
+            NativeDisposition::PublishStrictRebind
+        }
+        // Verified retirement or an untouched store: degraded, no record.
+        WriteOutcome::FailedPublishedWithoutRecord(_) => NativeDisposition::Publish,
+    }
+}
+
+#[cfg(unix)]
+fn unprepared_disposition(
+    cache: &sampled_scan::SharedCache,
+    acquisition: &mut sampled_scan::durable_tail::FinishAcquisition,
+    disposition: sampled_scan::durable_tail::UnpreparedDisposition,
+) -> NativeDisposition {
+    use sampled_scan::durable_tail::UnpreparedDisposition;
+    match disposition {
+        UnpreparedDisposition::PublishRetainingPrior { .. }
+        | UnpreparedDisposition::PublishWithoutRecord { .. }
+        | UnpreparedDisposition::PublishStoreUntouched { .. } => NativeDisposition::Publish,
+        UnpreparedDisposition::Hold(_) => owe_receipt(cache, acquisition, None),
+    }
+}
+
+/// D3 Codex (SOURCE conditions 1, 2 and 4): make a surviving record A
+/// unbindable in the same working index whose save settles the degraded
+/// publication, without deleting anything. The entry, its #865 marker and
+/// deadline (`scan_identity_version`), key, membership and accepted body
+/// facts stay; only the selection witness is cleared, the existing reparse
+/// debt that settlement preserves. Both readers refuse A afterward: this
+/// build's Codex selection gate and v1 strict entry check
+/// (`durable_tail_store.rs` `DurableRecord::eligible`), and 0.1.201
+/// (`f174d111f`): selection gate `durable_tail.rs:409-417`, generation/entry
+/// check `durable_tail_store.rs:334-337` over `entry_digest` (`:227-233`).
+/// Claude never takes this path: its original-v1 adapter and account
+/// identity inputs stay unchanged (Claude holds the key instead).
+#[cfg(unix)]
+fn codex_strict_rebind(index: &mut ScanIndex, source: SnapshotSource, key: &str) -> bool {
+    if source != SnapshotSource::Codex {
+        return false;
+    }
+    match index.files.get_mut(key) {
+        Some(entry) => {
+            entry.source_file_fingerprint.clear();
+            true
+        }
+        None => false,
     }
 }
 
