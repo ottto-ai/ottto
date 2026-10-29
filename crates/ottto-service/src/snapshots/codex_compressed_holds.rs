@@ -107,7 +107,7 @@ impl codex_file_join::HeaderInventory {
         if self.custody_done {
             return true;
         }
-        if self.custody_after.is_none() {
+        if self.custody_after.is_none() && self.custody_next == 0 {
             self.headers.sort_unstable_by(|a, b| a.owner.cmp(&b.owner));
             // Fixed cursor/temporary slack: no historical population allocation.
             let mut cost =
@@ -121,6 +121,27 @@ impl codex_file_join::HeaderInventory {
         if let Some((key, entry)) = index.files.range((after, Unbounded)).next() {
             if let Some(cause) = entry.codex_compressed_hold {
                 let owners = index.codex_state_only_blocked_by_file.get(key);
+                if let Some(binding) = entry.codex_counting_owner.as_deref().filter(|binding| {
+                    valid_codex_protected_owner(binding)
+                        && !owners
+                            .into_iter()
+                            .flatten()
+                            .any(|owner| codex_protected_owner(owner) == *binding)
+                }) {
+                    // Negative accepted-owner scope, one current owner per step;
+                    // no retained-roster rescan, new map or fresh proof/ACK.
+                    let first = self.custody_next;
+                    if first < self.headers.len() {
+                        let last = first
+                            + self.headers[first..]
+                                .partition_point(|h| h.owner == self.headers[first].owner);
+                        self.custody_next = last;
+                        if codex_protected_owner(&self.headers[first].owner) == binding {
+                            self.mark_custody_range(first, last, cause);
+                        }
+                        return false;
+                    }
+                }
                 if !owners.is_some_and(|owners| !owners.is_empty()) {
                     self.custody_unknown = true;
                     // Path ids are negative scope only, never ownership proof.
@@ -139,6 +160,7 @@ impl codex_file_join::HeaderInventory {
                     self.mark_custody_owner(owner, cause);
                 }
             }
+            self.custody_next = 0;
             self.custody_after = Some(key.clone());
             return false;
         }
@@ -155,11 +177,14 @@ impl codex_file_join::HeaderInventory {
     pub(super) fn mark_custody_owner(&mut self, owner: &str, cause: CodexZstCause) {
         let first = self.headers.partition_point(|h| h.owner.as_str() < owner);
         let last = self.headers.partition_point(|h| h.owner.as_str() <= owner);
+        self.mark_custody_range(first, last, cause);
+    }
+    fn mark_custody_range(&mut self, first: usize, last: usize, cause: CodexZstCause) {
         if first == last {
             return;
         }
         if self.headers[first].custody_cause.is_none() && !self.custody_refused {
-            match self.owner_peak(first, last, owner) {
+            match self.owner_peak(first, last, &self.headers[first].owner) {
                 Some(peak) => self.custody_peak = peak,
                 None => self.refuse_custody(),
             }

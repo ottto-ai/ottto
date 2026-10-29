@@ -1240,3 +1240,60 @@ fn unattributed_path_scoped_legacy_owner_keeps_smaller_sibling_quiet_and_unrelat
         fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[test]
+fn unattributed_opaque_filename_uses_retained_counting_binding_as_negative_scope() {
+    for absent in [false, true] {
+        let root = crate::test_scratch::private_dir("custody-counting-owner-scope");
+        let original = member(&root, "sessions", OWNER, false);
+        let held = original.with_file_name("a.jsonl");
+        fs::rename(original, &held).unwrap();
+        let (mut index, accepted) = codex_file_join::tests::scan(&root, ScanIndex::default(), 10);
+        assert_eq!(accepted.snapshots.len(), 1);
+        let key = local_index_key(&held);
+        assert_eq!(
+            index.files[&key].codex_counting_owner.as_deref(),
+            Some(codex_protected_owner(OWNER).as_str())
+        );
+        assert!(index.files[&key].codex_protected_owner.is_none());
+        assert!(codex_session_id_candidates_from_path(&held).is_empty());
+        let witness = index.files[&key].last_upload_body_witness.clone();
+        assert!(witness.is_some());
+        latch(&mut index, &held);
+        index.codex_state_only_blocked_by_file.clear();
+        let smaller = held.with_file_name("b.jsonl");
+        fs::write(
+            &smaller,
+            codex_file_join::tests::member(OWNER, "shorter", 1, 1)
+                .iter()
+                .map(|v| v.to_string() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+        let unrelated = member(&root, "sessions", PARENT, false);
+        if absent {
+            fs::remove_file(&held).unwrap();
+        }
+        let saved = root.join("index.json");
+        for _ in 0..2 {
+            index.traversal = None;
+            let (mut next, result) = no_open(&held, || normal(&root, index, &[]));
+            assert_eq!(result.unreadable_path_count, 0);
+            assert!(result
+                .snapshots
+                .iter()
+                .all(|s| s.source_session_id == PARENT));
+            assert!(next.files[&local_index_key(&unrelated)]
+                .last_snapshot_fingerprint
+                .is_some());
+            assert_eq!(next.files[&key].last_upload_body_witness, witness);
+            assert_eq!(
+                next.files[&local_index_key(&smaller)].codex_compressed_hold,
+                Some(CodexZstCause::ParentLedgerUnbound)
+            );
+            next.save(&saved).unwrap();
+            index = ScanIndex::load(&saved).unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+}

@@ -14925,3 +14925,57 @@ fn shared_refused_file_obligation_survives_growth_age_cap_and_reloads_then_tails
         });
     }
 }
+
+#[test]
+fn held_foreign_path_keeps_unrelated_output_and_stale_job_retirement() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(80);
+    let path = fixture.file(SESSION);
+    let cache = Arc::new(SharedCache::default());
+    let healthy = "ffffffff-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    let mut index = ScanIndex::default();
+    index
+        .files
+        .entry(local_index_key(&path))
+        .or_default()
+        .codex_compressed_hold = Some(CodexZstCause::ParentLedgerUnbound);
+    with_test_limits(2048, 1024, 64, || {
+        let _ = paused_singleton(&fixture, &cache);
+        assert!(!cache.cursor_slot_free());
+        let resumed = counter(&cache, |c| c.jobs_resumed);
+        for n in 1..=NAMESPACE_STALE_PAGES {
+            let mut bytes = codex_line(json!({"type":"session_meta", "timestamp":NOW,
+                "payload":{"id":healthy,"timestamp":NOW}}));
+            bytes.extend(token_line(n));
+            assert!(
+                bytes.len() < 1024,
+                "unrelated singleton stays below cursor threshold"
+            );
+            fs::write(fixture.file(healthy), bytes).unwrap();
+            index.traversal = None;
+            let (next, result, _) = codex_compressed_hold_tests::no_open(&path, || {
+                page_in(&fixture, index, Some(Arc::clone(&cache)), "foreign")
+            });
+            index = next;
+            assert_eq!(result.unreadable_path_count, 0);
+            assert!(!result.snapshots.is_empty());
+            assert!(result
+                .snapshots
+                .iter()
+                .all(|s| s.source_session_id == healthy));
+            assert_eq!(counter(&cache, |c| c.jobs_resumed), resumed);
+            assert!(index.files[&local_index_key(&path)]
+                .codex_compressed_hold
+                .is_some());
+            assert_eq!(
+                counter(&cache, |c| c.jobs_lost),
+                u64::from(n == NAMESPACE_STALE_PAGES)
+            );
+        }
+        assert!(cache.cursor_slot_free());
+        assert_eq!(cache.cursor_charge(), 0);
+        assert_eq!(counter(&cache, |c| c.jobs_unavailable_ended), 0);
+    });
+}
