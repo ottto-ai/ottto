@@ -293,3 +293,9 @@ memo. Completion policy remains unchanged. These are source repairs, with fresh
 CI execution still required. No new persisted state or upload-context receipt is
 included. The receipt dependency, pending per-key release integration and branch
 Mac requirement remain.
+
+Strict R20 review identified an early-selection regression: outstanding future
+audit debt must reach native planning but cannot select an idle file before D.
+Both the selector and metadata wake retain the due-time check. The existing
+oldest-deadline selector control remains unchanged, and the new idle-cadence
+control additionally requires no rewalk for a future marker.

@@ -1096,6 +1096,22 @@ fn terminal_off_idle_cadence_never_parks_already_owed_read_work() {
         .unwrap()
         .pending_directories
         .is_empty());
+    let mut future = settled.clone();
+    future
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .set_unverified_deadline(rfc3339_unix_seconds(at).unwrap() + 100);
+    refresh_terminal_off_discovery(&mut future, &[scratch.to_path_buf()], at, false);
+    assert!(
+        future
+            .traversal
+            .as_ref()
+            .unwrap()
+            .pending_directories
+            .is_empty(),
+        "future marker debt does not bypass idle cadence"
+    );
     let before = START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get);
     let accepted = settled.accepted_snapshot_fingerprints.clone();
     for cause in [

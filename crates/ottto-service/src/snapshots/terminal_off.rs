@@ -430,7 +430,8 @@ fn refresh_terminal_off_discovery(
                 || (!entry.has_unverified_source()
                     && entry.scan_identity_version.as_deref()
                         != Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION))
-                || sampled_audit::debt_for_key(index, key, now).is_some()
+                || sampled_audit::debt_for_key(index, key, now)
+                    .is_some_and(|debt| now >= debt.due_unix_seconds)
                 || index.effective_upload_body_witness_revision_requires_adoption(key)
         });
     if !terminal_off_rediscovery_due(scope, now, changed || overflow || owed) {

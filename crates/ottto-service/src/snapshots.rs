@@ -49729,7 +49729,9 @@ impl ScanIndex {
                 return (CandidateDecision::Skip, None);
             }
         }
-        if sampled_audit::debt_for_key(self, &key, now).is_some() {
+        if sampled_audit::debt_for_key(self, &key, now)
+            .is_some_and(|debt| now >= debt.due_unix_seconds)
+        {
             return (CandidateDecision::Parse, Some(CandidateParseReason::Audit));
         }
         // A locally held Claude family above keeps its existing bounded retry
