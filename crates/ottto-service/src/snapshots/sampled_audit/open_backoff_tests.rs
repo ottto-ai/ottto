@@ -406,9 +406,135 @@ fn parked_open_is_blocked_at_common_boundary_for_all_candidate_routes_and_stat_w
     )
     .is_some());
     progress_opened(&mut index, &key);
-    assert_eq!(failed_open_debt(&key, now), None);
+    assert_eq!(
+        failed_open_debt(&key, now),
+        Some(D),
+        "open is not verification"
+    );
+    assert_eq!(held_audit_open_failed(now), (0, 0), "throttle cleared");
     assert!(
         awaits_hold_deadline_restoration(&index, &key),
         "opening is no settlement or proof"
     );
+}
+
+fn ordinary_open_keeps_other_slots_due(grown: bool) {
+    reset_open_backoff_for_test();
+    let root = Root::new(if grown {
+        "ordinary-grown"
+    } else {
+        "ordinary-unchanged"
+    });
+    let path = root.0.join("a1111111-1111-4111-8111-111111111111.jsonl");
+    fs::write(&path, b"{}\n").unwrap();
+    let key = local_index_key(&path);
+    let other = root.key("b1111111-1111-4111-8111-111111111111.jsonl");
+    let mut index = held_index(&root, &[&key, &other]);
+    // Leave no restorable marker slot. K's D lives only in the bounded
+    // failed-open map; B owns the durable scheduling turn throughout.
+    for n in 0..CACHE_ENTRIES {
+        let mut entry = index.files[&key].clone();
+        entry.set_unverified_deadline(D + 100);
+        index
+            .files
+            .insert(root.key(&format!("occupied-{n}.jsonl")), entry);
+    }
+    index.held_audit_progress = Some(HeldAuditProgress {
+        key: other.clone(),
+        due: D,
+        attempted: false,
+    });
+    assert_eq!(restore_held_audit_deadlines(&mut index, D), 0);
+    with_open_backoff(|memo| {
+        memo.record_failure(&key, D, D);
+    });
+    if grown {
+        fs::write(&path, b"{}\n{}\n").unwrap();
+    }
+    let candidate = candidate_from_traversal_path(
+        SnapshotSource::ClaudeCode,
+        ScanTraversalPath {
+            scan_root: root.0.to_path_buf(),
+            path,
+            census_member: true,
+            watcher_hint: false,
+        },
+        &mut ScanCensus::default(),
+        None,
+        183,
+        &index.files,
+    )
+    .unwrap();
+    let (candidate, _) = open_and_identify_scan_candidate_with_rescue_at(
+        SnapshotSource::ClaudeCode,
+        candidate,
+        &mut ScanCensus::default(),
+        None,
+        183,
+        &index.files,
+        true,
+        D + CAP,
+        None,
+    )
+    .unwrap();
+    // Make the unchanged variant a real Skip discriminator after exact open;
+    // the grown variant retains the old entry and owes its ordinary change too.
+    if !grown {
+        let entry = index.files.get_mut(&key).unwrap();
+        entry.size_bytes = candidate.size_bytes;
+        entry.modified_unix_seconds = candidate.modified_unix_seconds;
+        entry.modified_unix_nanos = Some(candidate.modified_unix_nanos);
+        entry
+            .source_file_fingerprint
+            .clone_from(&candidate.source_file_fingerprint);
+    }
+    progress_opened(&mut index, &key);
+    assert_eq!(
+        slot(&index),
+        Some((other.clone(), D, false)),
+        "never steal B's turn"
+    );
+    assert_eq!(held_audit_open_failed(D + CAP), (0, 0));
+    assert_eq!(failed_open_debt(&key, D + CAP), Some(D));
+    assert_eq!(
+        debt_for_key(&index, &key, D + CAP)
+            .unwrap()
+            .due_unix_seconds,
+        D
+    );
+    assert_eq!(
+        index.candidate_decision_with_reason(&candidate),
+        (CandidateDecision::Parse, Some(CandidateParseReason::Audit))
+    );
+    // A held/incomplete native read can only stage the same D. Repeated
+    // scheduling and a save/reload must never replace it with now+interval.
+    let fingerprint = index.files[&key].source_file_fingerprint.clone();
+    assert!(index.stage_sampled_audit(
+        &key,
+        &fingerprint,
+        AuditDebt {
+            due_unix_seconds: D
+        }
+    ));
+    let mut index: ScanIndex =
+        serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
+    for now in [D + CAP, D + 2 * CAP, D + 3 * CAP] {
+        assert_eq!(debt_for_key(&index, &key, now).unwrap().due_unix_seconds, D);
+        assert_eq!(slot(&index), Some((other.clone(), D, false)));
+        assert!(index.accepted_snapshot_fingerprints.is_empty());
+    }
+    assert!(!index.complete_full_audit(&key, "wrong-source"));
+    assert_eq!(failed_open_debt(&key, D + CAP), Some(D));
+    assert!(index.complete_full_audit(&key, &fingerprint));
+    assert!(debt_for_key(&index, &key, D + CAP).is_none());
+    assert!(failed_open_debt(&key, D + CAP).is_none());
+}
+
+#[test]
+fn ordinary_unchanged_open_keeps_due_with_another_slot_owner_and_saturated_markers() {
+    ordinary_open_keeps_other_slots_due(false);
+}
+#[test]
+fn ordinary_grown_open_keeps_due_with_another_slot_owner_and_saturated_markers() {
+    ordinary_open_keeps_other_slots_due(true);
 }

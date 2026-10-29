@@ -203,6 +203,7 @@ impl ScanIndex {
             .get_mut(key)
             .expect("validated entry")
             .scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
+        with_open_backoff(|backoff| backoff.keys.remove(key));
         true
     }
 }
@@ -338,7 +339,12 @@ pub(super) fn debt_for_key(index: &ScanIndex, key: &str, now: u64) -> Option<Aud
         .files
         .get(key)
         .and_then(|entry| entry.audit_obligation(now))
-        .or_else(|| progress_debt(index, key, now))
+        .into_iter()
+        .chain(progress_debt(index, key, now))
+        .map(|debt| debt.due_unix_seconds)
+        .chain(failed_open_debt(key, now))
+        .min()
+        .map(|due_unix_seconds| AuditDebt { due_unix_seconds })
 }
 
 /// A held key the slot may serve: bounded, still awaiting restoration, and
@@ -466,9 +472,10 @@ impl OpenBackoff {
     }
     fn blocked(&self, key: &str, now: u64) -> bool {
         self.keys.get(key).is_some_and(|failure| {
-            (failure.failures >= OPEN_PARK_FAILURES
-                || (self.page < failure.retry_page
-                    && now < failure.last_failed.saturating_add(OPEN_BACKOFF_CAP_SECONDS)))
+            failure.failures > 0
+                && (failure.failures >= OPEN_PARK_FAILURES
+                    || (self.page < failure.retry_page
+                        && now < failure.last_failed.saturating_add(OPEN_BACKOFF_CAP_SECONDS)))
                 && open_stamp(key) == failure.stamp
         })
     }
@@ -549,10 +556,15 @@ pub(super) fn failed_open_debt(key: &str, now: u64) -> Option<u64> {
 pub(super) fn held_audit_open_failed(now: u64) -> (usize, u64) {
     with_open_backoff(|backoff| {
         (
-            backoff.keys.len(),
             backoff
                 .keys
                 .values()
+                .filter(|failure| failure.failures > 0)
+                .count(),
+            backoff
+                .keys
+                .values()
+                .filter(|failure| failure.failures > 0)
                 .map(|failure| now.saturating_sub(failure.first_failed))
                 .max()
                 .unwrap_or(0),
@@ -573,9 +585,10 @@ pub(super) fn reset_open_backoff_for_test() {
 #[cfg(test)]
 mod open_backoff_tests;
 
-/// The queued progress Full for `key` passed its secure open: the slot's
-/// turn is spent, so the next preparation rotates to a fresh interval, and
-/// any failed-open backoff ends.
+/// Secure open spends this key's progress turn and clears throttling, NOT
+/// the owed verification. Another key may own the slot, so retain the exact
+/// numeric due in the bounded map until a marker/native acquisition carries
+/// it or a completed source verification retires it.
 pub(super) fn progress_opened(index: &mut ScanIndex, key: &str) {
     if let Some(slot) = index
         .held_audit_progress
@@ -584,7 +597,12 @@ pub(super) fn progress_opened(index: &mut ScanIndex, key: &str) {
     {
         slot.attempted = true;
     }
-    with_open_backoff(|backoff| backoff.keys.remove(key));
+    with_open_backoff(|backoff| {
+        if let Some(failure) = backoff.keys.get_mut(key) {
+            failure.failures = 0;
+            failure.retry_page = backoff.page;
+        }
+    });
 }
 
 #[derive(Serialize)]
