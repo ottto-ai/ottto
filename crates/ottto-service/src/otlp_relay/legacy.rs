@@ -7,6 +7,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64};
 use std::sync::{mpsc, Arc, LazyLock, OnceLock, RwLock};
 
+mod socket;
+
 const IDLE_SECONDS: u64 = 24 * 60 * 60;
 const REQUEST_FLUSH_SECONDS: u64 = 10 * 60;
 const RETRY_SECONDS: u64 = 60;
@@ -47,7 +49,7 @@ static SUPERVISOR: OnceLock<Endpoint> = OnceLock::new();
 #[cfg(test)]
 thread_local! {
     static TEST_ENDPOINT: std::cell::RefCell<Option<Endpoint>> = const { std::cell::RefCell::new(None) };
-    static TEST_APPROVAL: std::cell::Cell<Option<Option<u16>>> = const { std::cell::Cell::new(None) };
+    static TEST_APPROVAL: std::cell::Cell<Option<Approval>> = const { std::cell::Cell::new(None) };
 }
 
 fn endpoint() -> Option<Endpoint> {
@@ -58,12 +60,52 @@ fn endpoint() -> Option<Endpoint> {
     SUPERVISOR.get().cloned()
 }
 
-fn request_approval() -> Option<u16> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Approval {
+    Approved(u16),
+    Revoked,
+    Unknown,
+}
+
+fn approval_from_settings(
+    settings: Result<crate::control::ManagedClaudeRelaySettings, crate::LocalApiError>,
+    candidates: &[u16],
+) -> Approval {
+    use crate::control::ManagedClaudeRelaySettings;
+    let body = match settings {
+        Ok(ManagedClaudeRelaySettings::Revoked) => return Approval::Revoked,
+        Ok(ManagedClaudeRelaySettings::Body(body)) => body,
+        Ok(ManagedClaudeRelaySettings::Missing) | Err(_) => return Approval::Unknown,
+    };
+    let Ok(settings) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return Approval::Unknown;
+    };
+    match claude_managed_settings::approved_relay_port(&body) {
+        Some(port)
+            if candidates.contains(&port)
+                && settings["env"]["OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"]
+                    .as_str()
+                    .is_some_and(|endpoint| endpoint.starts_with("http://127.0.0.1:")) =>
+        {
+            Approval::Approved(port)
+        }
+        _ => Approval::Revoked,
+    }
+}
+
+fn read_approval() -> Approval {
+    approval_from_settings(
+        crate::control::read_managed_claude_relay_settings(),
+        &candidate_relay_ports(current_uid()),
+    )
+}
+
+fn request_approval() -> Approval {
     #[cfg(test)]
     if let Some(approved) = TEST_APPROVAL.with(|value| value.get()) {
         return approved;
     }
-    approved_candidate_relay_port()
+    read_approval()
 }
 
 pub(super) fn counts() -> serde_json::Value {
@@ -147,15 +189,12 @@ impl Activity {
         // Re-read settings immediately before capture, even for an accepted
         // connection whose body arrived after consent was removed.
         let approved = request_approval();
-        if approved != Some(self.approved)
-            || approved == Some(self.port)
+        if approved != Approval::Approved(self.approved)
+            || approved == Approval::Approved(self.port)
             || !self.live.load(Ordering::SeqCst)
             || self.generation != self.admission.generation.load(Ordering::SeqCst)
         {
             drop(guard);
-            if approved.is_none() {
-                revoke_now();
-            }
             return None;
         }
         Some(export())
@@ -370,14 +409,47 @@ fn load_private_record<T: DeserializeOwned + Default>(path: &Path) -> Result<T> 
     }
 }
 
+#[derive(Default)]
+struct AcceptState {
+    failures: u32,
+    retry_at: Option<Instant>,
+    log_at: Option<Instant>,
+}
+
+impl AcceptState {
+    fn ready(&self, now: Instant) -> bool {
+        self.retry_at.map_or(true, |deadline| now >= deadline)
+    }
+
+    fn failed(&mut self, now: Instant, error: &io::Error) -> (AcceptErrorAction, bool) {
+        self.failures = self.failures.saturating_add(1);
+        let action = classify_accept_error(error);
+        if action == AcceptErrorAction::Backoff {
+            self.retry_at = Some(now + relay_accept_backoff(self.failures));
+        }
+        let log = self.log_at.map_or(true, |deadline| now >= deadline);
+        if log {
+            self.log_at = Some(now + Duration::from_secs(60));
+        }
+        (action, log)
+    }
+
+    fn succeeded(&mut self) {
+        self.failures = 0;
+        self.retry_at = None;
+    }
+}
+
 struct OpenPort {
-    listener: TcpListener,
+    listener: Option<TcpListener>,
+    bound_addr: Option<SocketAddr>,
     activity: Activity,
+    accepts: AcceptState,
 }
 
 impl OpenPort {
     fn accept(&self) -> io::Result<TcpStream> {
-        let (stream, _) = self.listener.accept()?;
+        let (stream, _) = self.listener.as_ref().expect("owned listener").accept()?;
         // Accepted sockets can inherit nonblocking mode on some platforms.
         // Workers must use the primary's blocking I/O timeout semantics.
         stream.set_nonblocking(false)?;
@@ -388,7 +460,14 @@ impl OpenPort {
 impl Drop for OpenPort {
     fn drop(&mut self) {
         self.activity.live.store(false, Ordering::SeqCst);
+        if let Some(listener) = self.listener.take() {
+            release_relay_listener(listener, self.bound_addr);
+        }
         self.activity.counters.open.fetch_sub(1, Ordering::Relaxed);
+        self.activity
+            .counters
+            .closed
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -400,6 +479,8 @@ struct Supervisor {
     last_flush: u64,
     admission: Arc<Admission>,
     durable_retired: Vec<u16>,
+    revoked_ticks: u8,
+    activity_dirty: bool,
     #[cfg(test)]
     fail_save: std::cell::Cell<bool>,
 }
@@ -423,6 +504,8 @@ impl Supervisor {
             last_flush: now,
             admission: Arc::new(Admission::default()),
             durable_retired: retired.ports,
+            revoked_ticks: 0,
+            activity_dirty: false,
             #[cfg(test)]
             fail_save: std::cell::Cell::new(false),
         })
@@ -450,9 +533,6 @@ impl Supervisor {
     }
 
     fn close_all(&mut self) {
-        self.counters
-            .closed
-            .fetch_add(self.open.len() as u64, Ordering::Relaxed);
         self.open.clear();
     }
 
@@ -488,6 +568,7 @@ impl Supervisor {
     }
 
     fn revoke(&mut self) -> Result<()> {
+        self.revoked_ticks = 0;
         self.admission.generation.fetch_add(1, Ordering::SeqCst);
         let admission = self.admission.clone();
         let _exports = admission
@@ -514,9 +595,7 @@ impl Supervisor {
 
     fn remove(&mut self, port: u16) -> Result<()> {
         // Close before acknowledging primary recovery.
-        if self.open.remove(&port).is_some() {
-            self.counters.closed.fetch_add(1, Ordering::Relaxed);
-        }
+        self.open.remove(&port);
         let before = self.record.ports.len();
         self.record.ports.retain(|entry| entry.port != port);
         if self.record.ports.len() != before {
@@ -547,6 +626,9 @@ impl Supervisor {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let before = serde_json::to_vec(&self.record)?;
         self.record.observe(approved, candidates, seed);
+        for entry in &mut self.record.ports {
+            entry.idle_since.get_or_insert(now);
+        }
         let mut expired = Vec::new();
         self.record.ports.retain_mut(|entry| {
             let last = self
@@ -570,16 +652,8 @@ impl Supervisor {
             self.save_transition()?;
         }
         self.open.retain(|port, _| {
-            let keep =
-                self.record.ports.iter().any(|entry| entry.port == *port) && *port != primary;
-            if !keep && !expired.contains(port) {
-                self.counters.closed.fetch_add(1, Ordering::Relaxed);
-            }
-            keep
+            self.record.ports.iter().any(|entry| entry.port == *port) && *port != primary
         });
-        self.counters
-            .closed
-            .fetch_add(expired.len() as u64, Ordering::Relaxed);
         if changed_approval {
             if let Some(approved) = approved {
                 for open in self.open.values_mut() {
@@ -593,10 +667,7 @@ impl Supervisor {
             if entry.port == primary || self.open.contains_key(&entry.port) {
                 continue;
             }
-            match TcpListener::bind((Ipv4Addr::LOCALHOST, entry.port)).and_then(|listener| {
-                listener.set_nonblocking(true)?;
-                Ok(listener)
-            }) {
+            match socket::bind(entry.port) {
                 Ok(listener) => {
                     let first = *entry.idle_since.get_or_insert(now);
                     let activity = Activity::new(
@@ -607,8 +678,15 @@ impl Supervisor {
                         admission.clone(),
                     );
                     self.counters.open.fetch_add(1, Ordering::Relaxed);
-                    self.open
-                        .insert(entry.port, OpenPort { listener, activity });
+                    self.open.insert(
+                        entry.port,
+                        OpenPort {
+                            bound_addr: listener.local_addr().ok(),
+                            listener: Some(listener),
+                            activity,
+                            accepts: AcceptState::default(),
+                        },
+                    );
                 }
                 Err(_) => {
                     self.counters.bind_skipped.fetch_add(1, Ordering::Relaxed);
@@ -623,11 +701,111 @@ impl Supervisor {
         Ok(())
     }
 
+    fn tick(
+        &mut self,
+        now: u64,
+        approval: Approval,
+        primary: u16,
+        candidates: &[u16],
+        seed: &[u16],
+    ) -> Result<()> {
+        let approved = match approval {
+            Approval::Unknown => {
+                self.revoked_ticks = 0;
+                return Ok(());
+            }
+            Approval::Revoked => {
+                self.revoked_ticks = self.revoked_ticks.saturating_add(1);
+                if self.revoked_ticks < 2 {
+                    return Ok(());
+                }
+                None
+            }
+            Approval::Approved(port) => {
+                self.revoked_ticks = 0;
+                Some(port)
+            }
+        };
+        self.reconcile(now, approved, primary, candidates, seed)
+    }
+
+    fn accept_failed(&mut self, port: u16, now: Instant, error: &io::Error) {
+        let Some(open) = self.open.get_mut(&port) else {
+            return;
+        };
+        let (action, log) = open.accepts.failed(now, error);
+        if log {
+            relay_log!("legacy OTLP accept failed: {error}");
+        }
+        if action == AcceptErrorAction::Rebind {
+            // Drain admitted exports including success bookkeeping before
+            // taking their final clock snapshot and fencing old workers.
+            let admission = self.admission.clone();
+            let _exports = admission
+                .exports
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            open.activity.live.store(false, Ordering::SeqCst);
+            // Keep recent activity even while no socket is open. Persist it at
+            // the normal flush interval; replacing a socket must not retire a
+            // recently active port using the previous on-disk timestamp.
+            let last = open.activity.last.load(Ordering::Relaxed);
+            if let Some(entry) = self
+                .record
+                .ports
+                .iter_mut()
+                .find(|entry| entry.port == port)
+            {
+                if last > entry.idle_since.unwrap_or(0) {
+                    entry.idle_since = Some(last);
+                    self.activity_dirty = true;
+                }
+            }
+            self.open.remove(&port);
+        }
+    }
+
+    fn accept_ready(&mut self, now: Instant, mut dispatch: impl FnMut(TcpStream, Activity)) {
+        let ports: Vec<_> = self.open.keys().copied().collect();
+        for port in ports {
+            let mut failure = None;
+            let open = self.open.get_mut(&port).expect("owned legacy listener");
+            if !open.accepts.ready(now) {
+                continue;
+            }
+            for _ in 0..16 {
+                match open.accept() {
+                    Ok(stream) => {
+                        open.accepts.succeeded();
+                        dispatch(stream, open.activity.clone());
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+            }
+            if let Some(error) = failure {
+                self.accept_failed(port, now, &error);
+            }
+        }
+    }
+
+    fn wait_duration(&self, now: u64, next_tick: u64) -> Duration {
+        let until_tick = Duration::from_secs(next_tick.saturating_sub(now));
+        if self.open.is_empty() {
+            until_tick
+        } else {
+            until_tick.min(Duration::from_millis(100))
+        }
+    }
+
     fn flush_activity(&mut self, now: u64) -> Result<()> {
         if now.saturating_sub(self.last_flush) < REQUEST_FLUSH_SECONDS {
             return Ok(());
         }
-        let mut changed = false;
+        let mut changed = self.activity_dirty;
         for entry in &mut self.record.ports {
             if let Some(open) = self.open.get(&entry.port) {
                 let last = open.activity.last.load(Ordering::Relaxed);
@@ -640,6 +818,7 @@ impl Supervisor {
         if changed {
             self.save()?;
         }
+        self.activity_dirty = false;
         self.last_flush = now;
         Ok(())
     }
@@ -699,7 +878,11 @@ pub(super) fn spawn(daemon: LocalDaemon, source: SnapshotSource, primary: Arc<At
                 loop {
                     let now = now_seconds();
                     if now >= next_tick {
-                        let approved = approved_candidate_relay_port();
+                        let approval = read_approval();
+                        let approved = match approval {
+                            Approval::Approved(port) => Some(port),
+                            _ => None,
+                        };
                         let seed = if !supervisor.record.seeded && approved.is_some() {
                             seed_from_backups(
                                 &support_dir.join("config-backups/claude_code"),
@@ -710,9 +893,9 @@ pub(super) fn spawn(daemon: LocalDaemon, source: SnapshotSource, primary: Arc<At
                         } else {
                             Vec::new()
                         };
-                        supervisor.reconcile(
+                        supervisor.tick(
                             now,
-                            approved,
+                            approval,
                             primary.load(Ordering::Relaxed),
                             &candidates,
                             &seed,
@@ -720,21 +903,16 @@ pub(super) fn spawn(daemon: LocalDaemon, source: SnapshotSource, primary: Arc<At
                         next_tick = now.saturating_add(RETRY_SECONDS);
                     }
                     supervisor.flush_activity(now)?;
-                    // One nonblocking accept per socket per turn bounds work and
-                    // gives primary handoffs and the other legacy socket priority.
-                    for open in supervisor.open.values() {
-                        match open.accept() {
-                            Ok(stream) => dispatch_relay_connection_with_activity(
-                                stream,
-                                source,
-                                &daemon,
-                                Some(open.activity.clone()),
-                            ),
-                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                            Err(error) => relay_log!("legacy OTLP accept failed: {error}"),
-                        }
-                    }
-                    match receiver.recv_timeout(Duration::from_millis(100)) {
+                    supervisor.accept_ready(Instant::now(), |stream, activity| {
+                        dispatch_relay_connection_with_activity(
+                            stream,
+                            source,
+                            &daemon,
+                            Some(activity),
+                        );
+                    });
+                    let timeout = supervisor.wait_duration(now_seconds(), next_tick);
+                    match receiver.recv_timeout(timeout) {
                         Ok(command) => supervisor.handle_command(command)?,
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                         Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),

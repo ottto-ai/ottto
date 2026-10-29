@@ -3088,16 +3088,6 @@ fn local_health_blockers_for_status(
             "Claude telemetry port mismatch: restart Ottto, or reconnect Claude Code in Ottto and restart Claude Code sessions",
         ));
     }
-    if otlp_relay::legacy::recent_request() {
-        blockers.push(blocker(
-            otlp_relay::legacy::STALE_EXPORTER_CODE,
-            LocalHealthSeverity::Warning,
-            "source",
-            LocalHealthAuthority::Runtime,
-            &status.generated_at,
-            "Some Claude Code sessions still send telemetry to an older Ottto port; restart those Claude Code sessions.",
-        ));
-    }
     if account.state == LocalHealthAccountState::Connected {
         if let Some(current) = latest_setup_run_read_rejection(&status.local_health_events) {
             let (code, clear_condition) = match current.rejection {
@@ -3150,6 +3140,16 @@ fn local_health_blockers_for_status(
                     .unwrap_or("repair the source and rerun Verify"),
             ));
         }
+    }
+    if otlp_relay::legacy::recent_request() {
+        blockers.push(blocker(
+            otlp_relay::legacy::STALE_EXPORTER_CODE,
+            LocalHealthSeverity::Warning,
+            "source",
+            LocalHealthAuthority::Runtime,
+            &status.generated_at,
+            "Some Claude Code sessions still send telemetry to an older Ottto port; restart those Claude Code sessions.",
+        ));
     }
     blockers
 }
@@ -6216,6 +6216,34 @@ mod tests {
                 }
             });
         }
+    }
+
+    #[test]
+    fn stale_exporter_warning_follows_disconnected_account_blocker() {
+        otlp_relay::legacy::with_recent_request_for_test(1000, 1000, || {
+            let status = daemon().status(TOKEN).expect("status");
+            let health = status.canonical_health.expect("health");
+            assert_eq!(health.account.state, LocalHealthAccountState::NotConnected);
+            let reconnect = health
+                .blockers
+                .iter()
+                .position(|finding| finding.code == "reconnect_required")
+                .unwrap();
+            let stale = health
+                .blockers
+                .iter()
+                .position(|finding| finding.code == otlp_relay::legacy::STALE_EXPORTER_CODE)
+                .unwrap();
+            assert!(reconnect < stale);
+            assert_ne!(
+                health.overall.primary_blocker.as_deref(),
+                Some(otlp_relay::legacy::STALE_EXPORTER_CODE)
+            );
+            assert_eq!(
+                health.blockers[reconnect].severity,
+                LocalHealthSeverity::Blocking
+            );
+        });
     }
 
     #[test]

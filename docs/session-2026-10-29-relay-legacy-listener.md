@@ -20,6 +20,9 @@ recovery also requests a synchronous socket release before binding it.
 Compatibility startup or persistence failure closes only compatibility sockets.
 Legacy requests recheck current approval and their live listener generation
 before capture; refused requests return 403 without evidence or request activity.
+Approval reads distinguish approved, definitely revoked and unknown. Unknown
+reads preserve history and listeners; polling requires two consecutive definite
+revocations before retirement. Explicit disable/removal hooks remain immediate.
 Claude disable/removal hooks invalidate workers synchronously and request
 persisted retirement/socket closure with a two-second acknowledgement bound.
 Previously accepted connections are fenced, and already-admitted exports drain
@@ -33,14 +36,23 @@ unlink stale state; loading the tombstone masks replayed old allowlists.
 If both state and tombstone persistence fail, supervision exits and logs the
 residual risk of losing retirement across restart.
 
-Idle listeners close after 24 hours. First-open time is durable before serving;
+Busy ports use exclusive native IPv4 binds without reuse and a dual-stack
+wildcard probe; unavailable IPv6 still permits IPv4. Empty supervision waits until its next tick; active sockets
+drain up to 16 accepts, back off resource errors and close unusable sockets for
+tick rebind, retaining recent activity and checking descriptor ownership before
+release, with at most one accept-error log per minute per socket.
+
+Entries expire after 24 hours, including never-bound busy ports. Entry time is
+durable before serving;
 last-request time is flushed at most once per ten minutes and survives restart.
 A crash can lose that final activity interval, shortening retention rather than
 renewing it. Process-local `otlp_legacy_listener_bound`, `_busy`, `_requests`
-and `_closed` counts appear in the existing relay health response.
+and `_closed` counts appear in the existing relay health response. Busy counts
+bind attempts skipped; closed counts only released open sockets, including exit.
 A recent legacy request adds the canonical health warning
 `claude_stale_exporter_port` for one hour, with fixed text containing no ports.
-The existing health projection computes the warning in its normal pass.
+The existing health projection computes the warning after blocking account and
+source findings in its normal pass.
 
 Synthetic fixtures cover path restrictions and shared export responses,
 backup provenance, newest-two selection, seed-once and candidate filtering,

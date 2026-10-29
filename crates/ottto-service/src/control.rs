@@ -1721,15 +1721,22 @@ fn lock_managed_claude_settings() -> MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-pub(crate) fn approved_managed_claude_relay_endpoint() -> Result<Option<String>, LocalApiError> {
+pub(crate) enum ManagedClaudeRelaySettings {
+    Revoked,
+    Missing,
+    Body(String),
+}
+
+pub(crate) fn read_managed_claude_relay_settings(
+) -> Result<ManagedClaudeRelaySettings, LocalApiError> {
     if source_patch_disabled(&SourceKind::ClaudeCode) {
-        return Ok(None);
+        return Ok(ManagedClaudeRelaySettings::Revoked);
     }
     let device = FileDeviceStore::default().load().map_err(|_| {
         LocalApiError::LocalOperationFailed("read managed Claude source approval".into())
     })?;
     if !device.is_some_and(|device| device.sources.iter().any(|source| source == "claude_code")) {
-        return Ok(None);
+        return Ok(ManagedClaudeRelaySettings::Revoked);
     }
     let Some(body) = crate::agent_configs::claude_managed_settings::read_settings(&home_path(
         ".claude/settings.json",
@@ -1738,7 +1745,17 @@ pub(crate) fn approved_managed_claude_relay_endpoint() -> Result<Option<String>,
         LocalApiError::LocalOperationFailed("read approved Claude relay settings".into())
     })?
     else {
-        return Ok(None);
+        return Ok(ManagedClaudeRelaySettings::Missing);
+    };
+    Ok(ManagedClaudeRelaySettings::Body(body))
+}
+
+pub(crate) fn approved_managed_claude_relay_endpoint() -> Result<Option<String>, LocalApiError> {
+    let body = match read_managed_claude_relay_settings()? {
+        ManagedClaudeRelaySettings::Body(body) => body,
+        ManagedClaudeRelaySettings::Revoked | ManagedClaudeRelaySettings::Missing => {
+            return Ok(None)
+        }
     };
     if crate::agent_configs::claude_managed_settings::approved_relay_port(&body).is_none() {
         return Ok(None);

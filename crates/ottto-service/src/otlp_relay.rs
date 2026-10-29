@@ -820,7 +820,15 @@ fn handle_client_at(
     let request_source = source_from_request(&request).unwrap_or(source);
     let export = || local_otlp_export_response(request_source, &request, support_dir);
     let response = if let Some(activity) = legacy_activity.as_ref() {
-        let Some(response) = activity.export_if_approved(export) else {
+        let Some(response) = activity.export_if_approved(|| {
+            let response = export();
+            // Keep success bookkeeping inside admission so retirement/rebind
+            // drains the complete export before taking its final idle clock.
+            if (200..300).contains(&response.status) {
+                activity.accepted();
+            }
+            response
+        }) else {
             return write_json_response(
                 &mut stream,
                 403,
@@ -831,10 +839,6 @@ fn handle_client_at(
     } else {
         export()
     };
-    // Only a successful export keeps a legacy port alive or raises its note.
-    if let Some(activity) = legacy_activity.filter(|_| (200..300).contains(&response.status)) {
-        activity.accepted();
-    }
     write_raw_response(
         &mut stream,
         response.status,

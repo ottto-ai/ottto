@@ -625,15 +625,20 @@ approval it seeds once from retained Ottto-owned Claude settings backups,
 reading at most the newest ten JSON backups with the existing size and
 no-symlink checks. Ports must be in the current user's relay candidate list;
 seed discovery does not guess ports or connect to them. Busy ports are skipped
-and retried every 60 seconds. A port observed as the current approval is removed from legacy
-ingress; primary recovery releases that legacy socket before attempting its bind.
+and retried every 60 seconds. Legacy sockets bind without `SO_REUSEADDR`, after
+a non-reusing IPv6 wildcard probe, so existing wildcard holders veto the port.
+IPv4 remains available when the probe reports that IPv6 is unavailable.
+A port observed as the current approval is removed from legacy ingress; primary
+recovery releases that legacy socket before attempting its bind.
 
 Every legacy export rechecks Claude endpoint approval and the listener's live
 approval generation immediately before capture. Refused exports return 403 and
 store no evidence or successful-request activity. Claude disable/removal operations
 invalidate that generation synchronously and wait up to two seconds for the
-supervisor to persist retirement and close sockets. A refused request also
-signals revocation; periodic checks remain a fallback for external settings edits.
+supervisor to persist retirement and close sockets. Periodic checks retire ports
+only after two consecutive definite non-approval reads. I/O errors, missing
+settings and truncated or unparsable JSON are unknown: that export is refused,
+but listeners/history are preserved and the consecutive-revocation streak resets.
 Idle expiry also retires a port. Retirement survives restarts and prevents
 re-seeding or reopening until that port is explicitly approved again and then
 superseded. The primary listener continues its existing behavior for all sources.
@@ -646,21 +651,29 @@ to remove the stale main record. If both state and tombstone writes fail,
 compatibility supervision stops and logs the failure; retirement may be unknown
 after restart. Existing atomic-file durability guarantees apply.
 
-A listener closes after 24 hours without an accepted OTLP request. First-open
-time and request activity persist across daemon restarts; activity writes are
+A legacy entry retires after 24 hours without a successful OTLP request, starting
+when it enters the persisted record even if a busy port never binds. Entry time
+and request activity persist across daemon restarts; activity writes are
 limited to once per 10 minutes, so a crash can lose up to that much recent
 activity and shorten retention. No request content or identity is in the port
 record. The primary relay's `/healthz` response includes process-local counts
 under `legacy_relay`: `otlp_legacy_listener_bound` (current gauge),
 `otlp_legacy_listener_requests`, `otlp_legacy_listener_busy` and
-`otlp_legacy_listener_closed` (cumulative counts since process start). The closed
-count covers idle expiry, revocation, approval/history removal and primary handoff.
+`otlp_legacy_listener_closed` (cumulative counts since process start). Busy means
+bind attempts skipped. Closed counts only actually open sockets released,
+including on supervisor exit; retiring a never-bound entry adds no close.
+With no open sockets the supervisor waits until its next tick or a command.
+Live sockets drain up to 16 pending connections per turn. Resource-related
+accept failures back off; unusable sockets release for later tick rebind, keeping
+recent request activity. Release checks descriptor ownership before closing. Accept
+error logs are limited to one line per minute per socket.
 
 Canonical health reports `claude_stale_exporter_port` as a `Warning` owned by
 `source`, with runtime authority, while a legacy listener has accepted OTLP
 within the last hour in this process. Restart those Claude Code sessions to
 reload the current telemetry endpoint. The uploaded warning contains no port
-number. This restores future local evidence; it cannot recover dropped batches
+number. It follows blocking account and source findings in the blocker list.
+This restores future local evidence; it cannot recover dropped batches
 and does not change consent, account attribution or money calculations.
 
 ## Common Diagnostics Flow
