@@ -9,7 +9,8 @@
 //! It balances Rust tokens, preserves literals, removes comments/whitespace,
 //! discovers durable macros/trait impls and follows local helpers/constants.
 //! Explicit roots cover body encoding, allowlist labels, session-start content
-//! hashes, source slugs and owned-container Deref. See the tool docstring for
+//! hashes, source slugs, native body publication/store framing/verification,
+//! and owned-container inherent dispatch plus Deref/Default/From. See the tool docstring for
 //! limits and owner-reviewed rebaseline procedure. Runtime tree walking sees
 //! new non-catalog files; cfg(test)-only code is excluded. The adjacent JSON
 //! inventory enumerates helper references, pinned providers and exceptions;
@@ -60,7 +61,7 @@ pub(crate) fn seed_pinned_v1(
     bytes
 }
 
-// Pin serializer regions of the baseline units, plus one qualified extent helper.
+// Pin serializer, body-publication/store-framing regions and qualified helpers.
 // Discovery walks EVERY src/**/*.rs; non-catalog serializer regions must be empty.
 // Hashes are generated with the SAME extractor using --baseline 53d05a43;
 // unrelated source edits are ignored, and new serializer definitions refuse.
@@ -70,6 +71,16 @@ struct SourcePin {
     sha256: &'static str,
 }
 const PINNED_SOURCES: &[SourcePin] = &[
+    SourcePin {
+        path: "snapshots/sampled_scan/durable_tail.rs",
+        text: include_str!("durable_tail.rs"),
+        sha256: "1c3650f6d8d61697ef8e88f5ff803bb4e565d86e9197e9fa4e388d20e77a6640",
+    },
+    SourcePin {
+        path: "durable_tail_store.rs",
+        text: include_str!("../../durable_tail_store.rs"),
+        sha256: "fb9c44d7bedaf31bd7da8b069efb3fb8374a006413d587b22f311cd4ab614912",
+    },
     SourcePin {
         path: "codex_scan_diagnostics.rs",
         text: include_str!("../../codex_scan_diagnostics.rs"),
@@ -133,12 +144,12 @@ const PINNED_SOURCES: &[SourcePin] = &[
     SourcePin {
         path: "snapshots/sampled_jsonl/durable.rs",
         text: include_str!("../sampled_jsonl/durable.rs"),
-        sha256: "6dd31f632b2cf25258a95d346cca8ad12d368715a2be45e88e0f2751bbdd7879",
+        sha256: "6e83200e5b58c08c228ef1bfad1151b229343bbbb1eef255d1ce4f35477c4f65",
     },
     SourcePin {
         path: "snapshots/sampled_jsonl.rs",
         text: include_str!("../sampled_jsonl.rs"),
-        sha256: "877dc114bbc0b3814961b085864c8f0fb7ee4f6be6566c52ac5393820efe118e",
+        sha256: "d33615424a83737c6f6a38508957ef673421dea4c9e7e645ea7920ce673888d6",
     },
     SourcePin {
         path: "snapshots/session_start.rs",
@@ -148,12 +159,12 @@ const PINNED_SOURCES: &[SourcePin] = &[
     SourcePin {
         path: "snapshots.rs",
         text: include_str!("../../snapshots.rs"),
-        sha256: "f3f1bd26369ffc30fbc292e9d2d3c093eae55f8ea6e2cf349b56801248550cc2",
+        sha256: "df4fa458a11f4e45199884e69baeebeeb83c9a67f410ba9eac50334d384815b8",
     },
     SourcePin {
         path: "owned_heap.rs",
         text: include_str!("../../owned_heap.rs"),
-        sha256: "da08d28cb9fed8b7074c5eef16502a307578a0d8dc0c3374f29f169b9152c802",
+        sha256: "397dd734a76404232b6165da638c9b5ccc53ff73c2e2def4d5cb83fe9253b488",
     },
 ];
 
@@ -168,9 +179,21 @@ fn extract_sources(
     interpreter: &std::ffi::OsStr,
     source_root: &std::path::Path,
 ) -> Extraction {
+    extract_overrides(
+        &replacement.into_iter().collect::<Vec<_>>(),
+        interpreter,
+        source_root,
+    )
+}
+
+fn extract_overrides(
+    replacements: &[(&str, &str)],
+    interpreter: &std::ffi::OsStr,
+    source_root: &std::path::Path,
+) -> Extraction {
     use std::io::Write;
     use std::process::{Command, Stdio};
-    let sources = replacement.into_iter().collect::<BTreeMap<_, _>>();
+    let sources = replacements.iter().copied().collect::<BTreeMap<_, _>>();
     let mut child = Command::new(interpreter)
         .args([
             "-c",
@@ -500,6 +523,79 @@ fn pinned_v1_unparseable_headers_fail_loudly() {
         );
         assert!(message.contains(expected), "{message}");
     }
+}
+
+fn verify_source_tree(replacements: &[(&str, &str)]) -> Result<(), &'static str> {
+    verify_extraction(extract_overrides(
+        replacements,
+        std::ffi::OsStr::new("python3"),
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+    ))
+}
+
+#[test]
+fn pinned_v1_refuses_body_publication_and_shadowed_iterator() {
+    assert_source_drift_refused(
+        "snapshots/sampled_scan/durable_tail.rs",
+        "Ok(body) => {",
+        "Ok(mut body) => { body.reverse();",
+    );
+    assert_source_drift_refused(
+        "durable_tail_store.rs",
+        "out.extend_from_slice(&record.body);",
+        "out.extend(record.body.iter().rev());",
+    );
+    let path = "owned_heap.rs";
+    let pin = PINNED_SOURCES.iter().find(|pin| pin.path == path).unwrap();
+    let changed = format!("{}\nimpl<K, V> OwnedMap<K, V> {{ fn iter(&self) -> impl Iterator<Item = (&K, &V)> {{ self.values.iter().rev() }} }}", pin.text);
+    assert_eq!(verify_pinned_sources(Some((path, &changed))), Err(path));
+}
+
+#[test]
+fn pinned_v1_accepts_test_item_with_generic_commas() {
+    for source in [
+        "#[cfg(test)] fn fixture<T, U>(_: (T, U)) { crate::durable_tail_codec::durable_struct!(Added { N n: u64 }); }",
+        "#[cfg(test)] pub fn fixture<T, U>(_: (T, U)) where T: Marker<{ 1 + 1 }> { crate::durable_tail_codec::durable_struct!(Added { N n: u64 }); }",
+    ] {
+        assert_eq!(verify_pinned_sources(Some(("fixture_generic.rs", source))), Ok(()));
+    }
+}
+
+const ADDED_SERIALIZER: &str = "crate::durable_tail_codec::durable_struct!(Added { N n: u64 });";
+
+#[test]
+fn pinned_v1_accepts_external_tests_in_inline_modules() {
+    let lib = format!("{}\nmod fixture_parent;", include_str!("../../lib.rs"));
+    assert_eq!(verify_source_tree(&[
+        ("lib.rs", &lib),
+        ("fixture_parent.rs", "mod inner { #[cfg(test)] mod tests; #[cfg(test)] #[path = \"other.rs\"] mod other; }"),
+        ("fixture_parent/inner/tests.rs", ADDED_SERIALIZER),
+        ("fixture_parent/inner/other.rs", ADDED_SERIALIZER),
+    ]), Ok(()));
+    assert_eq!(verify_source_tree(&[
+        ("lib.rs", &lib),
+        ("fixture_parent.rs", "#[path = \"relocated\"] mod inner { #[cfg(test)] #[path = \"other.rs\"] mod other; }"),
+        ("relocated/other.rs", ADDED_SERIALIZER),
+    ]), Ok(()));
+}
+
+#[test]
+fn pinned_v1_production_module_membership_overrides_test_paths() {
+    let lib = format!("{}\n#[cfg(test)] #[path = \"fixture_parent.rs\"] mod fixtures; #[path = \"fixture_parent/production.rs\"] mod production_fixture;", include_str!("../../lib.rs"));
+    assert_eq!(
+        verify_source_tree(&[
+            ("lib.rs", &lib),
+            ("fixture_parent.rs", "#![cfg(test)]\nmod tests;"),
+            ("fixture_parent/tests.rs", ADDED_SERIALIZER),
+            ("fixture_parent/production.rs", ADDED_SERIALIZER),
+        ]),
+        Err("serializer regions outside baseline catalog")
+    );
+    let lib = format!("{}\n#[cfg(test)] #[path = \"fixture_shared.rs\"] mod test_alias; #[path = \"fixture_shared.rs\"] mod production_alias;", include_str!("../../lib.rs"));
+    assert_eq!(
+        verify_source_tree(&[("lib.rs", &lib), ("fixture_shared.rs", ADDED_SERIALIZER),]),
+        Err("serializer regions outside baseline catalog")
+    );
 }
 
 fn pinned_header(out: &mut Vec<u8>, record: &PendingRecord, generation: u64) {

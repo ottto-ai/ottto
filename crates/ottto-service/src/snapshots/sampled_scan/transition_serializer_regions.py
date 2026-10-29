@@ -3,20 +3,27 @@
 The same extractor reads the complete src tree (or git show baseline tree),
 not an include_str! catalog that cannot notice newly added files. It strips
 cfg(test)-only items and external test modules before discovering serializers.
+Module exclusion follows declaration edges with inline/path ancestry, not path
+prefixes; production reachability wins over test reachability. Unowned files
+stay included conservatively.
 Headers track generic angle depth and balanced const/type groups through where
 clauses. Unparseable impl/durable-macro headers raise instead of being skipped.
 Unknown cfg predicates stay included, so platform-specific codecs are covered.
 Every durable_struct!/durable_enum! invocation and Durable-family impl is a
 root. Referenced local constants/helpers are followed to a fixed point; explicit
-roots cover body encoding, allowlist labels, session-start hashes, source slugs
-and owned-container Deref. The serializer-only codec unit is pinned as a whole,
+roots cover body encoding, allowlist labels, session-start hashes, source slugs, body publication/restore and store framing/writing/verification,
+and owned-container inherent methods plus Deref/Default/From. The serializer-only codec unit is pinned as a whole,
 except test code. Tokens ignore whitespace/comments but preserve literal bytes.
 
 The checked JSON inventory records calls (including methods/qualified calls),
 macro invocations and constant references; unresolved references require explicit
 reviewed exceptions, never an automatic exemption. This is lexical extraction,
 not Rust type resolution: aliases, macro-generated helpers, dynamic dispatch and
-external implementations require owner review. New names in a selected region
+external implementations require owner review. Native input selection and
+admission/restore-only helpers have explicit inventory exceptions: this checks
+an admitted value's wire representation, not historical native state generation
+or arbitrary Rust name/type resolution. Every inherent OwnedVec/OwnedMap impl
+is selected so newly shadowing len/iter methods cannot silently change encoding. New names in a selected region
 change both its hash and the reviewed reference set. Import resolution changes
 must also be reviewed; the inventory names their pinned providers or exception.
 
@@ -44,10 +51,13 @@ LEXEME = re.compile(
 )
 TRAITS = {"Durable", "HDigest", "DurableKey", "HDigestKey", "DurableEmpty"}
 ROOT_FUNCTIONS = {
-    "snapshots/sampled_jsonl/durable.rs": {"encode", "allowlist_digest"},
+    "snapshots/sampled_jsonl/durable.rs": {"encode", "decode", "verify", "allowlist_digest"},
     "snapshots/session_start.rs": {"durable_content_digest", "durable_content_hash"},
-    "snapshots.rs": {"api_slug"},
+    "snapshots.rs": {"api_slug", "verify_durable_body"},
+    "snapshots/sampled_scan/durable_tail.rs": {"durable_write_after_save", "durable_restore_record", "of", "slot", "bump"},
+    "durable_tail_store.rs": {"write_after_save", "write_batch", "encode", "encode_parts", "encode_header", "write_atomic", "verify", "decode", "tag", "from_tag", "context_digest", "key_digest", "entry_digest", "replay_entry_digest", "array", "take", "u8", "u16", "u32", "u64", "i64", "of"},
     "owned_heap.rs": {"new", "push", "insert"},
+    "snapshots/sampled_jsonl.rs": {"source"},
 }
 
 
@@ -94,7 +104,7 @@ def balanced(t):
     return ends
 
 
-def body_start(t, ends, start):
+def body_start(t, ends, start, field=False):
     """Find an item body after all generic/where-clause bounds, or fail closed.
 
     Balanced groups inside <...> are const arguments/type expressions, never
@@ -107,9 +117,11 @@ def body_start(t, ends, start):
         if part == "<":
             angle += 1
         elif part == ">" and (at == start or t[at - 1] not in ("-", "=")):
-            if not angle:
+            if not angle and not field:
                 raise ValueError("unsupported item header: unmatched >")
-            angle -= 1
+            angle = max(0, angle - 1)
+        elif field and part in (",", "}") and not angle:
+            return at
         elif part == "{" and not angle:
             return at
         elif part == ";" and not angle:
@@ -206,7 +218,7 @@ def regions(path, t):
                 continue
             body, traits = impl_header(t, ends, i)
             header = t[i:body]
-            owned_deref = path == "owned_heap.rs" and traits & {"Deref", "Default", "From"} and any(
+            owned_deref = path == "owned_heap.rs" and (not traits or traits & {"Deref", "Default", "From"}) and any(
                 name in header for name in ("OwnedVec", "OwnedMap")
             )
             if body < len(t) and t[body] == "{" and (traits & TRAITS or owned_deref or ("Default" in traits and "Rederive" in header)):
@@ -274,17 +286,33 @@ def cfg_without_test(t):
     return None
 
 
+def item_keyword(t, ends, at):
+    if t[at:at + 1] == ["pub"]:
+        at += 1
+        if t[at:at + 1] == ["("]:
+            at = ends[at]
+    while t[at:at + 1] in (["async"], ["unsafe"]):
+        at += 1
+    return at
+
+
 def production_tokens(path, source):
-    """Remove test items; return external test module roots to exclude too."""
+    """Filter actual gated items; collect external module membership edges.
+
+    Module paths follow Rust Reference items.mod.outlined.path: non-mod-rs
+    owners add their stem inside inline modules; explicit top-level paths are
+    relative to the source directory. No pathname-prefix ownership inference.
+    """
     t = tokens(source)
     ends = balanced(t)
-    removed, test_modules = set(), set()
+    removed, attrs_by_item, file_test = set(), {}, False
     items = []
     for i, part in enumerate(t):
         if part in ("mod", "trait") or (part == "fn" and t[i + 1:i + 2] != ["("]):
             body = body_start(t, ends, i + 1)
             if t[body:body + 1] == ["{"]:
                 items.append((i, body, ends[body]))
+    # Inner cfg applies to its item/block; only a crate-level gate gates a file.
     for i in range(len(t)):
         if t[i:i + 3] != ["#", "!", "["]:
             continue
@@ -293,15 +321,14 @@ def production_tokens(path, source):
             continue
         blocks = [(a, end) for a, end in ends.items() if t[a] == "{" and a < i < end]
         if not blocks:
-            return [], {path}
+            file_test = True
+            continue
         body, end = max(blocks)
-        # Inner cfg belongs to its enclosing item/block, never the whole file
-        # merely because it happens inside an inline module or function body.
         start = next((a for a, block, _ in items if block == body), body)
         removed.update(range(start, end))
     at = 0
     while at < len(t):
-        if at in removed or t[at:at + 2] != ["#", "["]:
+        if t[at:at + 2] != ["#", "["]:
             at += 1
             continue
         start, attrs = at, []
@@ -309,31 +336,74 @@ def production_tokens(path, source):
             end = ends[at + 1]
             attrs.append(t[at + 2:end - 1])
             at = end
+        keyword = item_keyword(t, ends, at)
+        attrs_by_item[keyword] = attrs
         disabled = any(
             attr == ["test"] or (attr[:2] == ["cfg", "("] and
                 cfg_without_test(attr[2:-1]) is False) for attr in attrs
         )
         if not disabled:
             continue
-        # Attributes can also gate fields, enum variants and match arms.
-        # Stop at their comma/enclosing brace, without consuming the parent.
-        body = at
-        while body < len(t) and t[body] not in ("{", ";", ",", "}"):
-            body = ends.get(body, body + 1)
+        # Whole items use the SAME angle-aware header parser as impl discovery.
+        # Only fields/variants/match arms terminate at a top-level comma.
+        whole_item = t[keyword:keyword + 1] and t[keyword] in {
+            "fn", "impl", "mod", "struct", "enum", "trait", "use", "type", "const", "static", "extern"
+        }
+        body = body_start(t, ends, keyword, field=not whole_item)
         end = body if t[body:body + 1] == ["}"] else ends.get(body, body + 1)
-        header = t[at:body]
-        if "mod" in header and t[body:body + 1] == [";"]:
-            name = header[header.index("mod") + 1]
-            parent = Path(path).parent
-            explicit = [attr[2].strip('"') for attr in attrs if attr[:2] == ["path", "="]]
-            if explicit:
-                test_modules.add(str(parent / explicit[0]))
-            else:
-                base = parent if Path(path).name in ("lib.rs", "main.rs", "mod.rs") else parent / Path(path).stem
-                test_modules.update((str(base / (name + ".rs")), str(base / name / "mod.rs")))
         removed.update(range(start, end))
-        at = end
-    return [part for i, part in enumerate(t) if i not in removed], test_modules
+    parent = Path(path).parent
+    root_dir = parent if Path(path).name in ("lib.rs", "main.rs", "mod.rs") else parent / Path(path).stem
+    inline, edges = [], []
+    for i, part in enumerate(t[:-1]):
+        if part != "mod":
+            continue
+        body = body_start(t, ends, i + 1)
+        owners = [(a, directory) for a, begin, end, directory in inline if begin < i < end]
+        directory = max(owners)[1] if owners else root_dir
+        attrs = attrs_by_item.get(i, [])
+        explicit = [attr[2].strip('"') for attr in attrs if attr[:2] == ["path", "="]]
+        name = t[i + 1]
+        if explicit:
+            directory = (directory if owners else parent) / explicit[0]
+        else:
+            directory /= name
+        directory = Path(os.path.normpath(str(directory)))
+        if t[body] == "{":
+            inline.append((i, body, ends[body], directory))
+        else:
+            candidates = [str(directory)] if explicit else [str(directory) + ".rs", str(directory / "mod.rs")]
+            edges.append((candidates, i in removed or file_test))
+    filtered = [] if file_test else [part for i, part in enumerate(t) if i not in removed]
+    return filtered, edges, file_test
+
+
+def production_membership(parsed):
+    """Test-only only when module edges prove it; production wins dual reach.
+
+    Unowned/orphan files remain conservatively production. Traversal carries
+    test membership through declarations, never through directory name prefixes.
+    """
+    targets = {candidate for _, edges, _ in parsed.values()
+               for candidates, _ in edges for candidate in candidates if candidate in parsed}
+    roots = (set(parsed) - targets) | ({"lib.rs", "main.rs"} & set(parsed))
+    seen, pending = set(), [(path, False) for path in roots]
+    def drain():
+        while pending:
+            path, test = pending.pop()
+            _, edges, file_test = parsed[path]
+            test = test or file_test
+            if (path, test) in seen:
+                continue
+            seen.add((path, test))
+            for candidates, gated in edges:
+                pending.extend((target, test or gated) for target in candidates if target in parsed)
+    drain()
+    # Cycles/unresolved ownership must not silently hide serializers.
+    unowned = set(parsed) - {path for path, _ in seen}
+    pending.extend((path, False) for path in unowned)
+    drain()
+    return {path for path, test in seen if not test}
 
 
 def source_tree(root, baseline):
@@ -416,32 +486,30 @@ def reference_names(t):
 STD_REFERENCES = set("""
 .all .and_then .any .as_bytes .as_encoded_bytes .as_os_str .as_ref .as_str
 .checked_add .checked_sub .chunks_exact .collect .contains .copied
-.extend_from_slice .filter .get .is_empty .is_none .is_some .iter .iter_mut
-.keys .len .map .map_err .ok_or .position .push_str .replace .saturating_add
+.extend_from_slice .filter .get .is_none .is_some .iter_mut
+.keys .map .map_err .ok_or .position .push_str .replace .saturating_add
 .set .step_by .then_some .to_le_bytes .try_for_each .try_into .unwrap_or .values
 .with .zip .try_fold BTreeMap::new BTreeSet::new Box::new Err Fn FnMut FnOnce Ok Some
 Self::from_le_bytes Self::try_from Vec Vec::new Vec::with_capacity VecDeque::from
 allow assert! cfg_attr compile_error! concat! default derive doc format! i64::from
 matches! not str::to_string stringify! try_from u64::from u64::try_from u8::from
+.as_deref .as_mut .as_slice .capacity .clone .contains_key .create .create_new
+.custom_flags .dev .enumerate .extend .file_name .ino .is_ascii_digit .is_err
+.is_ok .is_ok_and .is_some_and .join .kind .max .min .mode .ok .ok_or_else .open
+.recursive .saturating_sub .sum .sync_all .to_str .to_vec .try_clone .write
+.write_all File::open OpenOptions::new fs::DirBuilder::new fs::Permissions::from_mode
+fs::remove_file fs::rename fs::set_permissions fs::symlink_metadata io::Error::new String::from
+u8::from_str_radix u16::from_le_bytes u32::from_le_bytes u64::from_le_bytes drop let
 usize::try_from bool i128 i32 i64 u128 u16 u32 u64 u8 usize str true false self
 """.split())
 
 
 def extract(sources):
-    parsed, excluded = {}, set()
-    for path, source in sources.items():
-        parsed[path], modules = production_tokens(path, source)
-        excluded.update(modules)
-    # An external test module's directory descendants are test-only as well.
-    def is_test(path):
-        return path in excluded or any(
-            path.startswith((item.removesuffix("/mod.rs") if item.endswith("/mod.rs")
-                             else item.removesuffix(".rs")) + "/")
-            for item in excluded
-        )
+    parsed = {path: production_tokens(path, source) for path, source in sources.items()}
+    production = production_membership(parsed)
     hashes, refs = {}, set()
-    for path, t in parsed.items():
-        if is_test(path):
+    for path, (t, _, _) in parsed.items():
+        if path not in production:
             continue
         try:
             selected = regions(path, t)

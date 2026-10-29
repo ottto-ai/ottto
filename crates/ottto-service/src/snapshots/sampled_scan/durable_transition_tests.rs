@@ -382,11 +382,15 @@ fn shared_unknown_record_holds_last_accepted_body_and_survives_gc() {
         let mut warm = f.c.raw(&f.ram, f.prior.clone(), 100, true, &[]);
         warm.enrich(&f.c);
         warm.finish();
-        assert!(warm
+        assert_ne!(SIBLING, ROOT);
+        let sibling_requests = warm
             .scan
             .snapshots
             .iter()
-            .any(|s| s.source_session_id == SIBLING));
+            .find(|s| s.source_session_id == SIBLING)
+            .unwrap()
+            .request_count;
+        assert_eq!(sibling_requests, 1);
         warm.index.record_accepted_snapshot_fingerprints(
             &warm
                 .scan
@@ -397,7 +401,15 @@ fn shared_unknown_record_holds_last_accepted_body_and_survives_gc() {
         );
         f.prior = f.disk.commit(&warm.cache, SOURCE, &mut warm.index);
         assert_eq!(f.disk.records(), 2);
-        grow(&sibling, "s2", 80);
+        append(&sibling, &line(SIBLING, "s2", AT, 80));
+        input_clock(&sibling);
+        let sibling_text = std::fs::read_to_string(&sibling).unwrap();
+        let sibling_rows: Vec<Value> = sibling_text
+            .lines()
+            .map(|row| serde_json::from_str(row).unwrap())
+            .collect();
+        assert_eq!(sibling_rows.len(), 2);
+        assert!(sibling_rows.iter().all(|row| row["sessionId"] == SIBLING));
         f.grow("r4", 40);
         let cold = f.emit_bodies(Mode::ColdFull);
         let prior_bodies = stored_bodies(&f.prior);
@@ -417,7 +429,17 @@ fn shared_unknown_record_holds_last_accepted_body_and_survives_gc() {
             .find(|(path, _)| path.file_name().unwrap() == name.as_str())
             .unwrap();
         assert!(cold.snapshots.contains_key(ROOT));
-        assert!(cold.snapshots[SIBLING]["request_count"].as_u64().unwrap() > 0);
+        assert_eq!(
+            cold.snapshots[SIBLING]["request_count"].as_u64().unwrap(),
+            sibling_requests + 1
+        );
+        let sibling_item = f.pages[&Mode::ColdFull]
+            .scan
+            .snapshots
+            .iter()
+            .find(|s| s.source_session_id == SIBLING)
+            .unwrap();
+        assert_eq!(sibling_item.request_count, sibling_requests + 1);
         unknown[8..10].copy_from_slice(&u16::MAX.to_le_bytes());
         std::fs::write(&path, &unknown).unwrap();
         for _ in 0..5 {
