@@ -119,10 +119,11 @@ fn private_dir(path: &Path) -> Result<PathBuf> {
 fn read_fixed(path: &Path, length: usize) -> Result<Vec<u8>> {
     let file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
+    let meta = file.metadata()?;
     anyhow::ensure!(
-        file.metadata()?.is_file() && file.metadata()?.len() == length as u64,
+        meta.is_file() && meta.len() == length as u64,
         "invalid fixed input"
     );
     let mut bytes = Vec::with_capacity(length);
@@ -134,10 +135,11 @@ fn read_fixed(path: &Path, length: usize) -> Result<Vec<u8>> {
 fn bounded_json(path: &Path) -> Result<serde_json::Value> {
     let file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
+    let meta = file.metadata()?;
     anyhow::ensure!(
-        file.metadata()?.is_file() && file.metadata()?.len() <= INPUT_LIMIT,
+        meta.is_file() && meta.len() <= INPUT_LIMIT,
         "manifest bound"
     );
     let mut bytes = Vec::new();
@@ -409,7 +411,8 @@ fn write_record(out: &mut File, value: &serde_json::Value) -> std::io::Result<()
 fn blinding_key(path: &Path) -> Result<Vec<u8>> {
     let file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        // A FIFO must not block open before the opened-FD regular-file check.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
     let meta = file.metadata()?;
     // SAFETY: geteuid has no preconditions. Validate the open FD before reading.
