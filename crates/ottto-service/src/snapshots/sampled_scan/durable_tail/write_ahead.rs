@@ -61,6 +61,7 @@ impl<'a> LiveFinishView<'a> {
     }
 }
 
+#[allow(clippy::large_enum_variant)] // Moves the already-funded native frame; boxing would allocate before its lease.
 pub(in crate::snapshots) enum FinishAcquisition {
     Certified(sampled_jsonl::CompletedNativeAcquisition),
     Uncertified(DurableCustody),
@@ -546,7 +547,11 @@ impl SharedCache {
             allowlist: source.properties().allowlist(),
             acquisition: store::AcquisitionFields {
                 acquired_revision: chain.acquired_revision(),
-                protocol: chain.write_protocol(),
+                protocol: if chain.write_ahead_eligible() {
+                    AcquisitionProtocol::WriteAhead
+                } else {
+                    chain.protocol()
+                },
             },
             generation: chain.committed_generation(),
             body_len,
@@ -1143,7 +1148,6 @@ pub(super) struct ClaudeHold {
 pub(super) enum HoldRelease {
     Write,
     Content,
-    Absent,
 }
 
 /// The first D3 hold in this process alarms once, on the next report.

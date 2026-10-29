@@ -6211,7 +6211,7 @@ fn prepare_sync_source_inner(
         &sampled_scope,
         request_identity_capture,
     );
-    let mut scan = crate::snapshots::OwnedSourceScan::new_with_identity_capture(
+    let mut scan = crate::snapshots::OwnedSourceScan::new_with_durable_cache(
         source,
         &roots,
         index,
@@ -6228,6 +6228,7 @@ fn prepare_sync_source_inner(
         watcher_hints.overflowed,
         context_curve_enabled,
         request_identity_capture,
+        &daemon.transcript_cache,
     )
     .with_sampled_acquisition(daemon.transcript_cache.clone(), sampled_scope.clone())
     .with_codex_side_pass(codex_side_pass)

@@ -218,6 +218,7 @@ impl<R: Read> Drop for BoundedDecoder<R> {
 /// validation. Compressed input exposes decoded bytes, but never a seek API:
 /// sampled plain-file offsets cannot be applied to compressed data. Method
 /// names match the `BufReader<File>` calls the parser already makes.
+#[allow(clippy::large_enum_variant)] // Plain input carries funded non-Clone custody inline; compressed input cannot own it.
 pub(super) enum OpenedInput {
     Plain(BufReader<NativeFile>),
     Compressed(

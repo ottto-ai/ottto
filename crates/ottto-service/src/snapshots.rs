@@ -26067,6 +26067,43 @@ impl OwnedSourceScan {
             context_curve_enabled,
             claude_request_identity_capture,
             recovery_priority,
+            None,
+        )
+    }
+
+    /// The daemon supplies existing per-key custody before the first bounded
+    /// directory page, so a held key cannot age out before sampling attaches.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_durable_cache(
+        source: SnapshotSource,
+        roots: &[PathBuf],
+        owned_index: ScanIndex,
+        collected_at: &str,
+        requested_backfill_window_days: u64,
+        file_limit: usize,
+        artifacts_enabled: bool,
+        claude_effort_support_dir: Option<&Path>,
+        hinted_paths: &[PathBuf],
+        watcher_overflowed: bool,
+        context_curve_enabled: bool,
+        claude_request_identity_capture: bool,
+        cache: &sampled_scan::SharedCache,
+    ) -> Self {
+        Self::new_selecting(
+            source,
+            roots,
+            owned_index,
+            collected_at,
+            requested_backfill_window_days,
+            file_limit,
+            artifacts_enabled,
+            claude_effort_support_dir,
+            hinted_paths,
+            watcher_overflowed,
+            context_curve_enabled,
+            claude_request_identity_capture,
+            &[],
+            Some(cache),
         )
     }
 
@@ -26175,6 +26212,7 @@ impl OwnedSourceScan {
         context_curve_enabled: bool,
         claude_request_identity_capture: bool,
         recovery_priority: &[PathBuf],
+        durable_cache: Option<&sampled_scan::SharedCache>,
     ) -> Self {
         let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(
             source == SnapshotSource::ClaudeCode,
@@ -26252,7 +26290,10 @@ impl OwnedSourceScan {
                 source,
                 traversal,
                 backfill_window_days,
-                &index.files,
+                DiscoveryRecovery {
+                    files: &index.files,
+                    cache: durable_cache,
+                },
             );
             release_codex_inventory_hold(source, traversal);
         }
@@ -26540,7 +26581,10 @@ impl OwnedSourceScan {
                     &mut census,
                     census_unix_seconds,
                     backfill_window_days,
-                    &index.files,
+                    DiscoveryRecovery {
+                        files: &index.files,
+                        cache: durable_cache,
+                    },
                 )
             })
             .collect::<Vec<_>>();
@@ -26756,7 +26800,10 @@ impl OwnedSourceScan {
                     &mut census,
                     census_unix_seconds,
                     backfill_window_days,
-                    &index.files,
+                    DiscoveryRecovery {
+                        files: &index.files,
+                        cache: durable_cache,
+                    },
                 ) else {
                     continue;
                 };
@@ -35290,9 +35337,14 @@ fn bind_native_chain(
         }
         return;
     }
-    if custody.ensure_active(cache, request.source, 0).is_err() {
-        // No lease, no staging: a carried chain is kept for a later pass.
-        return;
+    if !custody.has_active() {
+        match cache.acquire_active(request.source, 0) {
+            crate::durable_tail_store::LeaseWait::Granted(lease) => {
+                let _ = custody.attach_active(lease);
+            }
+            crate::durable_tail_store::LeaseWait::Busy
+            | crate::durable_tail_store::LeaseWait::OverBudget => return,
+        }
     }
     if let Some(chain) = custody.chain.as_mut() {
         if cache
@@ -35527,13 +35579,23 @@ fn write_disposition(
     use sampled_scan::durable_tail::{DegradedCause, WriteOutcome};
     match outcome {
         // Only the exact receipt for this acquisition's candidate publishes.
-        WriteOutcome::Receipted { receipt, .. } => {
+        WriteOutcome::Receipted {
+            generation,
+            receipt,
+        } => {
+            debug_assert_eq!(generation, receipt.generation());
             match cache.receipt_acquisition(acquisition, &receipt) {
                 Ok(()) => NativeDisposition::Publish,
                 Err(_) => owe_receipt(cache, acquisition, candidate),
             }
         }
-        WriteOutcome::ReceiptPending | WriteOutcome::FailedHeld(_) => {
+        WriteOutcome::ReceiptPending => owe_receipt(cache, acquisition, candidate),
+        WriteOutcome::FailedHeld(cause) => {
+            if cause == sampled_scan::durable_tail::HeldCause::StaleSurvivor {
+                if let Some(chain) = custody_chain(acquisition.custody()) {
+                    cache.retain_owed_discovery(chain.source(), chain.key());
+                }
+            }
             owe_receipt(cache, acquisition, candidate)
         }
         WriteOutcome::FailedPublishedWithoutRecord(DegradedCause::StrictRebind) => {
@@ -43635,28 +43697,56 @@ fn release_codex_inventory_hold(source: SnapshotSource, traversal: &mut ScanTrav
     }
 }
 
-fn advance_bounded_directory_traversal(
+#[derive(Clone, Copy)]
+struct DiscoveryRecovery<'a> {
+    files: &'a BTreeMap<String, ScanIndexEntry>,
+    cache: Option<&'a sampled_scan::SharedCache>,
+}
+impl<'a> From<&'a BTreeMap<String, ScanIndexEntry>> for DiscoveryRecovery<'a> {
+    fn from(files: &'a BTreeMap<String, ScanIndexEntry>) -> Self {
+        Self { files, cache: None }
+    }
+}
+impl DiscoveryRecovery<'_> {
+    fn requires(&self, source: SnapshotSource, path: &Path, length: u64) -> bool {
+        #[cfg(unix)]
+        if self
+            .cache
+            .is_some_and(|cache| cache.owes_discovery(source, &local_index_key(path)))
+        {
+            return true;
+        }
+        sampled_audit::path_requires_recovery(source, self.files, path, length)
+    }
+}
+
+fn advance_bounded_directory_traversal<'a>(
     source: SnapshotSource,
     traversal: &mut ScanTraversalCheckpoint,
     backfill_window_days: u64,
-    files: &BTreeMap<String, ScanIndexEntry>,
+    recovery: impl Into<DiscoveryRecovery<'a>>,
 ) {
+    let recovery = recovery.into();
+
     advance_bounded_directory_traversal_with_budget(
         source,
         traversal,
         backfill_window_days,
         MAX_SCAN_DIRECTORY_ENTRIES_PER_TICK,
-        files,
+        recovery,
     );
 }
 
-fn advance_bounded_directory_traversal_with_budget(
+fn advance_bounded_directory_traversal_with_budget<'a>(
     source: SnapshotSource,
     traversal: &mut ScanTraversalCheckpoint,
     backfill_window_days: u64,
     max_entries: usize,
-    files: &BTreeMap<String, ScanIndexEntry>,
+    recovery: impl Into<DiscoveryRecovery<'a>>,
 ) {
+    let recovery = recovery.into();
+    let files = recovery.files;
+
     let walk_issues = |counts: &ScanTraversalCounts| {
         (
             counts.directory_entry_cap_exceeded_count,
@@ -43802,7 +43892,7 @@ fn advance_bounded_directory_traversal_with_budget(
                 .ok()
                 .and_then(unix_seconds)
                 .unwrap_or_default();
-            if !sampled_audit::path_requires_recovery(source, files, &path, metadata.len())
+            if !recovery.requires(source, &path, metadata.len())
                 && census_unix_seconds.is_some_and(|now| {
                     !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
                 })
@@ -43867,14 +43957,16 @@ fn claude_absence_is_removal(source: SnapshotSource, path: &Path) -> Parent {
     }
 }
 
-fn candidate_from_traversal_path(
+fn candidate_from_traversal_path<'a>(
     source: SnapshotSource,
     pending: ScanTraversalPath,
     census: &mut ScanCensus,
     census_unix_seconds: Option<u64>,
     backfill_window_days: u64,
-    files: &BTreeMap<String, ScanIndexEntry>,
+    recovery: impl Into<DiscoveryRecovery<'a>>,
 ) -> Option<CandidateFile> {
+    let recovery = recovery.into();
+
     candidate_from_traversal_path_at(
         source,
         disappearance_diagnostics::Site::CandidateWalk,
@@ -43882,19 +43974,22 @@ fn candidate_from_traversal_path(
         census,
         census_unix_seconds,
         backfill_window_days,
-        files,
+        recovery,
     )
 }
 
-fn candidate_from_traversal_path_at(
+fn candidate_from_traversal_path_at<'a>(
     source: SnapshotSource,
     site: disappearance_diagnostics::Site,
     pending: ScanTraversalPath,
     census: &mut ScanCensus,
     census_unix_seconds: Option<u64>,
     backfill_window_days: u64,
-    files: &BTreeMap<String, ScanIndexEntry>,
+    recovery: impl Into<DiscoveryRecovery<'a>>,
 ) -> Option<CandidateFile> {
+    let recovery = recovery.into();
+    let files = recovery.files;
+
     let metadata = match fs::symlink_metadata(&pending.path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -43957,7 +44052,7 @@ fn candidate_from_traversal_path_at(
         .ok()
         .and_then(unix_seconds)
         .unwrap_or_default();
-    if !sampled_audit::path_requires_recovery(source, files, &pending.path, metadata.len())
+    if !recovery.requires(source, &pending.path, metadata.len())
         && census_unix_seconds.is_some_and(|now| {
             !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
         })
@@ -44475,6 +44570,10 @@ fn open_and_identify_scan_candidate_with_rescue(
                 return None;
             }
         };
+    #[cfg(unix)]
+    let verification_rescue = verification_rescue
+        || cache
+            .is_some_and(|cache| cache.owes_discovery(source, &local_index_key(&candidate.path)));
     if !verification_rescue
         && !sampled_audit::path_requires_recovery(
             source,
