@@ -1004,7 +1004,7 @@ fn walk_gate_counts_age_and_size_skips_without_changing_selection() {
     set_old(&file("rescued"));
     fs::File::create(file("big"))
         .unwrap()
-        .set_len(MAX_JSONL_FILE_BYTES + 1)
+        .set_len(MAX_CLAUDE_JSONL_FILE_BYTES + 1)
         .unwrap();
     let mut prepared = ScanIndex::default();
     rescue(&mut prepared.files, &file("rescued"));

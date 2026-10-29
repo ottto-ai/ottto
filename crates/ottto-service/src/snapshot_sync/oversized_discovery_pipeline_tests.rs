@@ -1,8 +1,8 @@
 // Real bounded scan -> local evidence/family fold -> binding -> upload/ACK ->
-// durable save/reload. Sparse oversized fixtures do not parse 256 MiB.
+// durable save/reload. Sparse oversized fixtures do not parse 512 MiB.
 use super::*;
 
-const OVERSIZED_BYTES: u64 = 256 * 1024 * 1024 + 1;
+const OVERSIZED_BYTES: u64 = 512 * 1024 * 1024 + 1;
 const OVERSIZED_SESSION: &str = "e9000000-0000-4000-8000-000000000009";
 
 fn oversized_path(fixture: &RearmFixture) -> PathBuf {
