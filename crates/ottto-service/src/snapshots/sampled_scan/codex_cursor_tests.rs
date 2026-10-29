@@ -15524,132 +15524,6 @@ fn custody_negative_payload_survives_save_failure_funding_refusal_and_restart() 
 }
 
 #[test]
-fn deferred_custody_tail_priority_eof_never_reopens_as_full() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let clock = TestClock;
-    clock.set(1_900_000_000);
-    with_test_limits(2048, 8192, 64, || {
-        let fixture = ScanRoot::new(40);
-        let path = fixture.file(SESSION);
-        let key = local_index_key(&path);
-        let cache = Arc::new(SharedCache::default());
-        let mut index = ScanIndex::default();
-        for _ in 0..64 {
-            index = page(&fixture, index, Some(Arc::clone(&cache))).0;
-            if counter(&cache, |c| c.jobs_certified) == 1 {
-                break;
-            }
-        }
-        let checkpoint = cache
-            .retained_checkpoint(&key)
-            .expect("accepted Tail checkpoint");
-        assert_eq!(checkpoint.sealed_offset(), fixture.len(SESSION));
-        for n in 41..=80 {
-            fixture.append(SESSION, &token_line(n));
-        }
-        let mut priority = codex_line(
-            json!({"timestamp":"2026-10-07T10:30:00Z","type":"event_msg",
-            "payload":{"type":"token_count","service_tier":"priority","info":{"model":"fixture-model",
-            "total_token_usage":{"input_tokens":8100,"cached_input_tokens":4050,"output_tokens":810},
-            "last_token_usage":{"input_tokens":100,"cached_input_tokens":50,"output_tokens":10}}}}),
-        );
-        priority.pop();
-        fixture.append(SESSION, &priority);
-        let mut paused = false;
-        for number in 1..=64 {
-            let (next, output, _) = page_at(
-                &fixture,
-                index,
-                Some(Arc::clone(&cache)),
-                "cursor-fixture",
-                &collected_at(number),
-            );
-            index = next;
-            assert!(output.snapshots.is_empty());
-            paused = cache
-                .with_cursor(|cursor| match &cursor.slot {
-                    Slot::Paused(job) => job
-                        .sampling
-                        .as_ref()
-                        .is_some_and(|acquisition| matches!(acquisition.mode, ReadMode::Tail)),
-                    _ => false,
-                })
-                .unwrap();
-            if paused {
-                break;
-            }
-        }
-        assert!(paused, "real acquired Tail paused before priority EOF");
-        let prior = index.files[&key].clone();
-        assert!(prior.last_upload_body_witness.is_some());
-        let saved = fixture._dir.0.join("priority-custody.json");
-        index.save(&saved).unwrap();
-        let mut committed = index.clone();
-        index.files.get_mut(&key).unwrap().codex_compressed_hold =
-            Some(CodexZstCause::ParentLedgerUnbound);
-        index
-            .codex_state_only_blocked_by_file
-            .insert(key.clone(), BTreeSet::from([SESSION.into()]));
-        index
-            .codex_state_only_blocked_session_ids
-            .insert(SESSION.into());
-        let mut scan = codex_scan(&fixture, index, NOW)
-            .with_sampled_acquisition(Arc::clone(&cache), Scope("cursor-fixture".into()));
-        scan.persist_custody_decisions(&mut committed, &saved)
-            .unwrap();
-        index = scan.index;
-        let started = counter(&cache, |c| c.jobs_started);
-        let eof_before = counter(&cache, |c| c.eof_record_applied);
-        for number in 65..=192 {
-            let (next, output, modes) = page_at(
-                &fixture,
-                index,
-                Some(Arc::clone(&cache)),
-                "cursor-fixture",
-                &collected_at(number),
-            );
-            index = next;
-            assert_eq!(modes.0, 0, "custody must veto protected-tier Full replay");
-            assert!(output.snapshots.is_empty());
-            assert_eq!(index.files[&key].size_bytes, prior.size_bytes);
-            assert_eq!(
-                index.files[&key].last_snapshot_fingerprint,
-                prior.last_snapshot_fingerprint
-            );
-            assert_eq!(
-                index.files[&key].last_upload_body_witness,
-                prior.last_upload_body_witness
-            );
-            if cache.cursor_slot_free() {
-                break;
-            }
-        }
-        assert!(cache.cursor_slot_free());
-        assert_eq!(counter(&cache, |c| c.jobs_started), started);
-        assert_eq!(
-            counter(&cache, |c| c.eof_record_applied),
-            eof_before + 1,
-            "priority EOF reached the replay gate"
-        );
-        let cold = Arc::new(SharedCache::default());
-        codex_compressed_hold_tests::no_open(&path, || {
-            let (_, output, modes) = page_at(
-                &fixture,
-                ScanIndex::load(&saved).unwrap(),
-                Some(Arc::clone(&cold)),
-                "cursor-fixture",
-                NOW,
-            );
-            assert!(output.snapshots.is_empty());
-            assert_eq!(modes.0, 0);
-        });
-        assert_eq!(counter(&cold, |c| c.jobs_started), 0);
-    });
-}
-
-#[test]
 fn shared_refused_file_obligation_survives_growth_age_cap_and_reloads_then_tails() {
     use crate::snapshots::sampled_scan::durable_tail::{Interpretation, RestoreOutcome};
     if !crate::heap_layout_bound::layout_supported() {
@@ -16011,5 +15885,209 @@ fn complete_negative_transaction_fences_custom_named_owner_before_publication_af
                 .codex_state_only_snapshot_fingerprints
                 .contains_key(SESSION));
         }
+    });
+}
+
+#[test]
+fn plain_cursor_resumes_unchanged_when_its_archive_sibling_is_family_held() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(80);
+    let (_, control) = page(&fixture, ScanIndex::default(), None);
+    assert_eq!(control.snapshots.len(), 1);
+    let expected = serde_json::to_vec(&control.snapshots[0]).unwrap();
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        let (mut index, members) = paused_singleton(&fixture, &cache);
+        let archive = fixture
+            .root
+            .join(format!("rollout-2026-10-07T11-00-00-{SESSION}.jsonl.zst"));
+        let bytes = fs::read(fixture.file(SESSION)).unwrap();
+        fs::write(
+            &archive,
+            zstd::stream::encode_all(bytes.as_slice(), 1).unwrap(),
+        )
+        .unwrap();
+        crate::snapshots::codex_compressed_hold_tests::seed_archive(&mut index, &archive, SESSION);
+        let mut dirs = codex_file_join::DirectoryCensus::new();
+        dirs.observe(&fixture.root, &fs::metadata(&fixture.root).unwrap());
+        let paths = BTreeSet::from([
+            local_index_key(&fixture.file(SESSION)),
+            local_index_key(&archive),
+        ]);
+        let mut inv = codex_file_join::HeaderInventory::new(
+            std::slice::from_ref(&fixture.root),
+            &paths,
+            Some(&dirs),
+        );
+        while !inv.step_with_archive(&CodexTitleMetadata::default(), &mut index, Some(&cache)) {}
+        while !inv.prepare_custody(&index) {}
+        while !inv.hold_custodied_siblings(&mut index) {}
+        assert!(inv.complete_for(Some(&SESSION.to_owned())));
+        assert!(inv.member_held(&archive));
+        assert!(index
+            .files
+            .get(&local_index_key(&fixture.file(SESSION)))
+            .map_or(true, |entry| entry.codex_compressed_hold.is_none()));
+        assert_eq!(
+            index.files[&local_index_key(&archive)].codex_compressed_hold,
+            Some(CodexZstCause::FamilyUnproven)
+        );
+        let started = counter(&cache, |c| c.jobs_started);
+        let decodes = crate::snapshots::codex_zst_refusal_tests::activity().0;
+        let mut emitted = None;
+        for _ in 0..64 {
+            let resumed = counter(&cache, |c| c.jobs_resumed);
+            let (next, scan) = continuation_page(&fixture, index, &cache, &members, |scan| {
+                scan.codex_join_inventory = Some(inv.clone());
+                scan.codex_join_prepared = false;
+            });
+            index = next;
+            assert_eq!(counter(&cache, |c| c.jobs_resumed), resumed + 1);
+            assert_eq!(
+                counter(&cache, |c| c.jobs_started),
+                started,
+                "no replacement Full"
+            );
+            assert_eq!(
+                crate::snapshots::codex_zst_refusal_tests::activity().0,
+                decodes
+            );
+            if !scan.snapshots.is_empty() {
+                emitted = Some(scan);
+                break;
+            }
+        }
+        let emitted = emitted.expect("the retained plain reader completes");
+        assert_eq!(emitted.snapshots.len(), 1);
+        assert_eq!(serde_json::to_vec(&emitted.snapshots[0]).unwrap(), expected);
+        assert!(cache.cursor_slot_free());
+    });
+}
+
+#[test]
+fn deferred_custody_tail_priority_eof_never_reopens_as_full() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let clock = TestClock;
+    clock.set(1_900_000_000);
+    with_test_limits(2048, 8192, 64, || {
+        let fixture = ScanRoot::new(40);
+        let path = fixture.file(SESSION);
+        let key = local_index_key(&path);
+        let cache = Arc::new(SharedCache::default());
+        let mut index = ScanIndex::default();
+        for _ in 0..64 {
+            index = page(&fixture, index, Some(Arc::clone(&cache))).0;
+            if counter(&cache, |c| c.jobs_certified) == 1 {
+                break;
+            }
+        }
+        let checkpoint = cache
+            .retained_checkpoint(&key)
+            .expect("accepted Tail checkpoint");
+        assert_eq!(checkpoint.sealed_offset(), fixture.len(SESSION));
+        for n in 41..=80 {
+            fixture.append(SESSION, &token_line(n));
+        }
+        let mut priority = codex_line(
+            json!({"timestamp":"2026-10-07T10:30:00Z","type":"event_msg",
+            "payload":{"type":"token_count","service_tier":"priority","info":{"model":"fixture-model",
+            "total_token_usage":{"input_tokens":8100,"cached_input_tokens":4050,"output_tokens":810},
+            "last_token_usage":{"input_tokens":100,"cached_input_tokens":50,"output_tokens":10}}}}),
+        );
+        priority.pop();
+        fixture.append(SESSION, &priority);
+        let mut paused = false;
+        for number in 1..=64 {
+            let (next, output, _) = page_at(
+                &fixture,
+                index,
+                Some(Arc::clone(&cache)),
+                "cursor-fixture",
+                &collected_at(number),
+            );
+            index = next;
+            assert!(output.snapshots.is_empty());
+            paused = cache
+                .with_cursor(|cursor| match &cursor.slot {
+                    Slot::Paused(job) => job
+                        .sampling
+                        .as_ref()
+                        .is_some_and(|acquisition| matches!(acquisition.mode, ReadMode::Tail)),
+                    _ => false,
+                })
+                .unwrap();
+            if paused {
+                break;
+            }
+        }
+        assert!(paused, "real acquired Tail paused before priority EOF");
+        let prior = index.files[&key].clone();
+        assert!(prior.last_upload_body_witness.is_some());
+        let saved = fixture._dir.0.join("priority-custody.json");
+        index.save(&saved).unwrap();
+        let mut committed = index.clone();
+        index.files.get_mut(&key).unwrap().codex_compressed_hold =
+            Some(CodexZstCause::ParentLedgerUnbound);
+        index
+            .codex_state_only_blocked_by_file
+            .insert(key.clone(), BTreeSet::from([SESSION.into()]));
+        index
+            .codex_state_only_blocked_session_ids
+            .insert(SESSION.into());
+        let mut scan = codex_scan(&fixture, index, NOW)
+            .with_sampled_acquisition(Arc::clone(&cache), Scope("cursor-fixture".into()));
+        scan.persist_custody_decisions(&mut committed, &saved)
+            .unwrap();
+        index = scan.index;
+        let started = counter(&cache, |c| c.jobs_started);
+        let eof_before = counter(&cache, |c| c.eof_record_applied);
+        for number in 65..=192 {
+            let (next, output, modes) = page_at(
+                &fixture,
+                index,
+                Some(Arc::clone(&cache)),
+                "cursor-fixture",
+                &collected_at(number),
+            );
+            index = next;
+            assert_eq!(modes.0, 0, "custody must veto protected-tier Full replay");
+            assert!(output.snapshots.is_empty());
+            assert_eq!(index.files[&key].size_bytes, prior.size_bytes);
+            assert_eq!(
+                index.files[&key].last_snapshot_fingerprint,
+                prior.last_snapshot_fingerprint
+            );
+            assert_eq!(
+                index.files[&key].last_upload_body_witness,
+                prior.last_upload_body_witness
+            );
+            if cache.cursor_slot_free() {
+                break;
+            }
+        }
+        assert!(cache.cursor_slot_free());
+        assert_eq!(counter(&cache, |c| c.jobs_started), started);
+        assert_eq!(
+            counter(&cache, |c| c.eof_record_applied),
+            eof_before + 1,
+            "priority EOF reached the replay gate"
+        );
+        let cold = Arc::new(SharedCache::default());
+        codex_compressed_hold_tests::no_open(&path, || {
+            let (_, output, modes) = page_at(
+                &fixture,
+                ScanIndex::load(&saved).unwrap(),
+                Some(Arc::clone(&cold)),
+                "cursor-fixture",
+                NOW,
+            );
+            assert!(output.snapshots.is_empty());
+            assert_eq!(modes.0, 0);
+        });
+        assert_eq!(counter(&cold, |c| c.jobs_started), 0);
     });
 }

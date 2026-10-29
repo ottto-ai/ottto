@@ -68,9 +68,12 @@ pub(crate) enum CodexZstCause {
     // Optional plain header occupancy refused an otherwise fundable decoder.
     #[serde(rename = "decoder_refused_header_occupancy")]
     DecoderRefusedHeaderOccupancy = 24,
+    #[serde(rename = "CompressedFamilyUnproven")]
+    FamilyUnproven = 25,
+
     #[doc(hidden)]
     #[serde(skip)]
-    __Count = 25,
+    __Count = 26,
 }
 impl std::fmt::Display for CodexZstCause {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1520,6 +1523,8 @@ mod tests {
             HeaderUnfunded,
             CompatibilityUnfunded,
             DecoderRefusedHeaderOccupancy,
+            FamilyUnproven,
+
         ];
         assert_eq!(ALL.len(), super::CODEX_ZST_CAUSES);
         assert_eq!(
@@ -1527,6 +1532,8 @@ mod tests {
             "decoder_refused_header_occupancy"
         );
         let mut labels = std::collections::BTreeSet::new();
+        assert_eq!(FamilyUnproven as usize + 1, super::CODEX_ZST_CAUSES);
+
         for (index, cause) in ALL.iter().enumerate() {
             assert_eq!(*cause as usize, index);
             let label = serde_json::to_string(cause).unwrap();

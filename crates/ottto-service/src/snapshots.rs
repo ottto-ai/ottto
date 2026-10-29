@@ -27568,6 +27568,9 @@ impl OwnedSourceScan {
                     let selected_count = identified_candidates.len();
                     for _ in 0..selected_count {
                         let candidate = identified_candidates.pop_front().expect("selected count");
+                        if inventory.plain_twin(&candidate.path) {
+                            continue;
+                        }
                         if inventory.member_held(&candidate.path) {
                             if !index
                                 .files
@@ -27620,6 +27623,11 @@ impl OwnedSourceScan {
                     let inventoried = inventory
                         .headers
                         .iter()
+                        // Excluded archives cannot carry protected replay evidence.
+                        .filter(|h| {
+                            !is_compressed_codex_rollout(Some(&h.candidate.path), None)
+                                || !inventory.member_held(&h.candidate.path)
+                        })
                         .map(|header| local_index_key(&header.candidate.path))
                         .collect::<BTreeSet<_>>();
                     inventory.complete &= selected.is_subset(&inventoried);
@@ -27651,6 +27659,7 @@ impl OwnedSourceScan {
                         index,
                         &current_owners,
                         absence_coverage,
+                        &inventory.absence_held,
                     );
                     let mut repurposed_protected_paths = BTreeSet::new();
                     let mut missing_protected_owners = BTreeSet::new();

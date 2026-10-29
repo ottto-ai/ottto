@@ -122,7 +122,33 @@ impl codex_file_join::HeaderInventory {
             if cost.add(OWNER_LOOKUP_SLACK).is_none() {
                 self.refuse_custody();
             }
+            if index.codex_counting_tombstones.len()
+                > codex_counting_version::MAX_COUNTING_TOMBSTONES
+            {
+                self.refuse_custody();
+            } else if !index.codex_counting_tombstones.is_empty() {
+                if crate::heap_layout_bound::tree_nodes::<String, ()>(
+                    index.codex_counting_tombstones.len(),
+                    &mut cost,
+                )
+                .is_none()
+                    || cost
+                        .add(index.codex_counting_tombstones.len().saturating_mul(128))
+                        .is_none()
+                {
+                    self.refuse_custody();
+                }
+            }
             self.custody_peak = cost.bytes;
+            if !self.custody_refused {
+                for owner in &self.held_owners {
+                    let protected = codex_protected_owner(owner);
+                    if index.codex_counting_tombstones.contains_key(&protected) {
+                        self.absence_held.insert(protected);
+                    }
+                }
+            }
+            self.classify_compressed_families();
         }
         let after = self.custody_after.as_ref().map_or(Unbounded, Excluded);
         if let Some((key, entry)) = index.files.range::<String, _>((after, Unbounded)).next() {
@@ -164,6 +190,12 @@ impl codex_file_join::HeaderInventory {
                     }
                 }
                 for owner in owners.into_iter().flatten() {
+                    if !self.custody_refused {
+                        let protected = codex_protected_owner(owner);
+                        if index.codex_counting_tombstones.contains_key(&protected) {
+                            self.absence_held.insert(protected);
+                        }
+                    }
                     self.mark_custody_owner(owner, cause);
                 }
             }
@@ -187,17 +219,31 @@ impl codex_file_join::HeaderInventory {
         self.mark_custody_range(first, last, cause);
     }
     fn mark_custody_range(&mut self, first: usize, last: usize, cause: CodexZstCause) {
-        if first == last {
+        if first == last
+            || (cause == CodexZstCause::FamilyUnproven
+                && self.headers[first..last]
+                    .iter()
+                    .all(|h| !is_compressed_codex_rollout(Some(&h.candidate.path), None)))
+        {
             return;
         }
-        if self.headers[first].custody_cause.is_none() && !self.custody_refused {
+        if self.headers[first..last]
+            .iter()
+            .all(|h| h.custody_cause.is_none())
+            && !self.custody_refused
+        {
             match self.owner_peak(first, last, &self.headers[first].owner) {
                 Some(peak) => self.custody_peak = peak,
                 None => self.refuse_custody(),
             }
         }
         for header in &mut self.headers[first..last] {
-            header.custody_cause = Some(cause);
+            if header.custody_cause != Some(CodexZstCause::ParentLedgerUnbound)
+                && (cause != CodexZstCause::FamilyUnproven
+                    || is_compressed_codex_rollout(Some(&header.candidate.path), None))
+            {
+                header.custody_cause = Some(cause);
+            }
         }
     }
     fn owner_peak(&self, first: usize, last: usize, owner: &str) -> Option<usize> {
@@ -293,7 +339,9 @@ impl codex_file_join::HeaderInventory {
             || self
                 .headers
                 .binary_search_by(|h| h.candidate.path.as_os_str().cmp(path.as_os_str()))
-                .is_ok_and(|at| self.headers[at].custody_cause.is_some())
+                .is_ok_and(|at| {
+                    self.headers[at].custody_cause.is_some() || self.headers[at].plain_twin
+                })
     }
 }
 
@@ -349,6 +397,58 @@ pub(super) fn parent_unbound(
                 && fs::symlink_metadata(archive)
                     .is_ok_and(|stat| stat.is_file() && !stat.file_type().is_symlink())
         })
+}
+
+impl codex_file_join::HeaderInventory {
+    pub(super) fn classify_compressed_families(&mut self) {
+        fn logical(path: &Path) -> &str {
+            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            name.strip_suffix(".zst").unwrap_or(name)
+        }
+        self.headers.sort_unstable_by(|a, b| {
+            a.owner
+                .cmp(&b.owner)
+                .then_with(|| logical(&a.candidate.path).cmp(logical(&b.candidate.path)))
+                .then_with(|| {
+                    is_compressed_codex_rollout(Some(&a.candidate.path), None)
+                        .cmp(&is_compressed_codex_rollout(Some(&b.candidate.path), None))
+                })
+        });
+        let mut start = 0;
+        while start < self.headers.len() {
+            let end = start
+                + self.headers[start..].partition_point(|h| h.owner == self.headers[start].owner);
+            let mut at = start;
+            let mut members = 0;
+            let mut archive = false;
+            while at < end {
+                let next = at
+                    + self.headers[at..end].partition_point(|h| {
+                        logical(&h.candidate.path) == logical(&self.headers[at].candidate.path)
+                    });
+                let plain =
+                    !is_compressed_codex_rollout(Some(&self.headers[at].candidate.path), None);
+                for i in at..next {
+                    let compressed =
+                        is_compressed_codex_rollout(Some(&self.headers[i].candidate.path), None);
+                    self.headers[i].plain_twin = plain && compressed;
+                    archive |= compressed;
+                    members += usize::from(!self.headers[i].plain_twin);
+                }
+                at = next;
+            }
+            if archive && members > 1 {
+                self.mark_custody_range(start, end, CodexZstCause::FamilyUnproven);
+            }
+            start = end;
+        }
+    }
+
+    pub(super) fn plain_twin(&self, path: &Path) -> bool {
+        self.headers
+            .binary_search_by(|h| h.candidate.path.as_os_str().cmp(path.as_os_str()))
+            .is_ok_and(|at| self.headers[at].plain_twin)
+    }
 }
 
 impl OwnedSourceScan {

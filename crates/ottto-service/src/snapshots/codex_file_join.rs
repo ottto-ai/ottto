@@ -147,6 +147,8 @@ pub(super) struct HeaderWitness {
     pub(super) candidate: CandidateFile,
     pub(super) owner: String,
     pub(super) custody_cause: Option<CodexZstCause>,
+    /// True only on the archive member of a validated plain/archive twin; skip without decoding.
+    pub(super) plain_twin: bool,
     pub(super) home: PathBuf,
     pub(super) created_unix_ms: Option<i64>,
     metadata: String,
@@ -396,6 +398,7 @@ pub(super) struct HeaderInventory {
     pub(super) custody_peak: usize,
     pub(super) custody_refused: bool,
     pub(super) custody_unknown: bool,
+    pub(super) absence_held: BTreeSet<String>,
     pub(super) read_bytes: usize,
     pub(super) held_archives: BTreeSet<String>,
     pub(super) held_owners: BTreeSet<String>,
@@ -448,10 +451,11 @@ impl HeaderInventory {
         self.complete
             && !owner.is_some_and(|owner| {
                 self.held_owners.contains(owner)
-                    || self
-                        .headers
-                        .iter()
-                        .any(|h| &h.owner == owner && h.custody_cause.is_some())
+                    || self.headers.iter().any(|h| {
+                        &h.owner == owner
+                            && h.custody_cause
+                                .is_some_and(|cause| cause != CodexZstCause::FamilyUnproven)
+                    })
             })
     }
     pub(super) fn new(
@@ -477,6 +481,7 @@ impl HeaderInventory {
             custody_peak: 0,
             custody_refused: false,
             custody_unknown: false,
+            absence_held: BTreeSet::new(),
             held_archives: BTreeSet::new(),
             held_owners: BTreeSet::new(),
             archive_work: codex_compressed_input::HeaderWork::default(),
@@ -650,6 +655,7 @@ impl HeaderInventory {
                     .stamp
                     .clone();
                 return Ok(HeaderWitness {
+                    plain_twin: false,
                     custody_cause: None,
                     home: member_home(&candidate.scan_root),
                     candidate,
@@ -698,6 +704,7 @@ impl HeaderInventory {
             };
             Ok(HeaderWitness {
                 custody_cause: None,
+                plain_twin: false,
                 home: member_home(&candidate.scan_root),
                 candidate,
                 owner: facts.owner,
@@ -807,8 +814,9 @@ impl HeaderInventory {
     }
 }
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
-crate::heap_layout_bound::fields!(HeaderWitness; custody_cause, candidate, owner, home, created_unix_ms, metadata, stamp);
-crate::heap_layout_bound::fields!(HeaderInventory; custody_next, custody_unknown, custody_after, custody_done, custody_peak, custody_refused, roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, archive_work, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, bounded_out);
+crate::heap_layout_bound::fields!(HeaderWitness; plain_twin, custody_cause, candidate, owner, home, created_unix_ms, metadata, stamp);
+crate::heap_layout_bound::fields!(HeaderInventory; custody_next, absence_held, custody_unknown, custody_after, custody_done, custody_peak, custody_refused, roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, archive_work, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, bounded_out);
+
 
 #[derive(Clone, Debug)]
 pub(super) struct Group {
