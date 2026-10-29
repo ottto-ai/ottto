@@ -182,7 +182,9 @@ impl ScanIndex {
             .map(|entry| self.withheld_seen(PARSED, entry.size_bytes, fingerprint));
         let key = memo_key(key);
         let trigger = with_state(|state| {
-            let previous = state.entries.get(&key).and_then(|entry| entry.seen);
+            let previous = (!state.refused)
+                .then(|| state.entries.get(&key).and_then(|entry| entry.seen))
+                .flatten();
             let trigger = match (previous, parsed) {
                 (None, _) => WithheldEvent::ReparseStart,
                 (Some(before), Some(now)) if before.size_bytes != now.size_bytes => {
@@ -383,6 +385,17 @@ pub(super) fn restart_for_test(key: &str) {
 }
 
 #[cfg(test)]
+pub(super) fn poison_for_test() {
+    let result = std::panic::catch_unwind(|| {
+        with_mutex(|mutex| {
+            let _guard = mutex.lock().unwrap();
+            panic!("injected full-selector advisory poison");
+        });
+    });
+    assert!(result.is_err());
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::heap_layout_bound::tree_node_bytes;
@@ -390,7 +403,12 @@ mod tests {
     #[test]
     fn held_gauge_sums_tokens_ages_from_first_seen_and_drops_on_release() {
         const DAY: u64 = 86_400;
-        let (a, b) = ("/opaque/a.jsonl", "/opaque/b.jsonl");
+        let dir = crate::test_scratch::unique_path("held-gauge-proven-absence");
+        fs::create_dir_all(&dir).unwrap();
+        let dir = fs::canonicalize(dir).unwrap();
+        let a_path = dir.join("a.jsonl");
+        let b_path = dir.join("b.jsonl");
+        let (a, b) = (a_path.to_str().unwrap(), b_path.to_str().unwrap());
         let gauge = || serde_json::to_value(held_gauge()).unwrap();
         let mut index = ScanIndex::default();
         for (key, fingerprint) in [(a, "fa"), (b, "fb")] {
@@ -430,8 +448,17 @@ mod tests {
             json!({"withheld_held_count": 1, "withheld_memo_unavailable": false, "withheld_held_tokens": 5,
                 "withheld_held_age": {"le_30d": 0, "31_90d": 1, "gt_90d": 0}})
         );
-        // b's file is proved absent (deleted): nothing is held.
+        // b's parent/root are positively readable; absence of an index entry
+        // alone is no proof. Use the real traversal's configured root.
+        ensure_bounded_traversal(
+            SnapshotSource::ClaudeCode,
+            &[dir.clone()],
+            &mut index,
+            "2026-10-07T12:00:00Z",
+            7,
+        );
         index.retain_observed_claude_account_deferred_holds(&BTreeSet::new());
+        fs::remove_dir_all(dir).unwrap();
         assert!(index.claude_account_deferred_holds.is_empty());
         assert_eq!(gauge(), Value::Null);
         super::sampled_scan::set_test_now(None);

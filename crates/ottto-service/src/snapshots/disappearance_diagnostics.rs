@@ -1508,7 +1508,7 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(source.matches(".retire_absent_account_hold(").count(), 2);
+        assert_eq!(source.matches(".retire_absent_account_hold(").count(), 3);
         let account_retirement = source
             .split_once("fn retire_absent_account_hold(")
             .unwrap()

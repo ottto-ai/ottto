@@ -2666,6 +2666,8 @@ fn completed_withheld_sampled_deletion_releases_debt_with_and_without_hint() {
             .as_u64()
             .unwrap();
         assert!(known_tokens > 0);
+        let incidence = held.file_snapshot_fingerprints[&key].clone();
+        let acknowledgements = held.accepted_snapshot_fingerprints.clone();
         take_withheld_for_test();
         fs::remove_file(&path).unwrap();
         let hints = if hinted {
@@ -2682,6 +2684,14 @@ fn completed_withheld_sampled_deletion_releases_debt_with_and_without_hint() {
         assert!(!removed.files.contains_key(&key));
         assert!(!removed.claude_account_deferred_holds.contains_key(&key));
         assert!(crate::snapshot_sync::withheld_settled_for_test(&removed));
+        // SOURCE N3 applies equally to the NO-HINT healthy-census path:
+        // removal discharges only the now-unfulfillable debt, never incidence
+        // custody or an entity ACK. Completed settlement remains unblocked.
+        assert_eq!(
+            removed.file_snapshot_fingerprints.get(&key),
+            Some(&incidence)
+        );
+        assert_eq!(removed.accepted_snapshot_fingerprints, acknowledgements);
         assert_eq!(counts["withheld_hold_released"]["deleted"], 1);
         assert_eq!(
             counts["withheld_hold_released"]["deleted_tokens"],
@@ -2859,4 +2869,246 @@ fn withheld_memo_survives_owner_cycles_and_discloses_budget_refusal() {
         "refused details are unknown, never fabricated zero"
     );
     sampled_scan::set_test_now(None);
+}
+
+/// Hold-only checkpoints must use the same positive proof as indexed holds.
+/// A clean root census cannot prove anything about a missing ancestor.
+#[test]
+fn withheld_new_completed_checkpoint_requires_positive_absence() {
+    for missing_parent in [true, false] {
+        let root = Root::new("ld-held-new-absence");
+        let parent = root.projects().join("project");
+        fs::create_dir_all(&parent).unwrap();
+        let path = parent.join(format!("{SESSION}.jsonl"));
+        let key = local_index_key(&path);
+        append(&path, &assistant_line("held-new"));
+        let previous = ScanIndex::default();
+        let (parsed, scan, _) = finish(new_scan(&root.projects(), previous.clone()));
+        let held = crate::snapshot_sync::settle_withheld_for_test(&previous, parsed, scan);
+        assert!(!held.files.contains_key(&key));
+        assert!(held.claude_account_deferred_holds.contains_key(&key));
+        let checkpoint = root.0.join("hold-only.json");
+        held.save(&checkpoint).unwrap();
+        let held = ScanIndex::load(&checkpoint).unwrap();
+        fs::remove_file(&path).unwrap();
+        if missing_parent {
+            fs::remove_dir(&parent).unwrap();
+        }
+        let recorder = Recorder::default();
+        let ((after, _, _), counts) = capture(|| {
+            finish(
+                new_scan(&root.projects(), held)
+                    .with_line_observer("test", Box::new(recorder.clone())),
+            )
+        });
+        assert!(recorder.events().is_empty(), "absence never parses");
+        assert_eq!(
+            after.claude_account_deferred_holds.contains_key(&key),
+            missing_parent
+        );
+        assert_eq!(
+            crate::snapshot_sync::withheld_settled_for_test(&after),
+            !missing_parent
+        );
+        let counts = page_counts(&counts);
+        assert_eq!(
+            counts["withheld_hold_released"]["deleted"]
+                .as_u64()
+                .unwrap_or(0),
+            u64::from(!missing_parent)
+        );
+        assert_eq!(
+            counts["audit_retired_absent"]["events"]
+                .as_u64()
+                .unwrap_or(0),
+            0
+        );
+    }
+}
+
+/// A remove hint is not authority to follow an intermediate symlink into a
+/// different tree and call its ENOENT a deletion of the original owed object.
+#[cfg(unix)]
+#[test]
+fn withheld_remove_hint_through_intermediate_symlink_keeps_both_debts() {
+    let root = Root::new("ld-held-symlink-ancestor");
+    let project = root.projects().join("project");
+    let parent = project.join("nested");
+    fs::create_dir_all(&parent).unwrap();
+    let path = parent.join(format!("{SESSION}.jsonl"));
+    let key = local_index_key(&path);
+    append(&path, &assistant_line("u1"));
+    let (previous, _, _) = finish(new_scan(&root.projects(), ScanIndex::default()));
+    append(&path, &assistant_line("u2"));
+    let (parsed, scan, _) = finish(new_scan(&root.projects(), previous.clone()));
+    let mut held = crate::snapshot_sync::settle_withheld_for_test(&previous, parsed, scan);
+    let fp = held.files[&key].source_file_fingerprint.clone();
+    assert!(held.stage_sampled_audit(
+        &key,
+        &fp,
+        crate::transcript_acquisition::AuditDebt {
+            due_unix_seconds: 1
+        }
+    ));
+    let incidence = held.file_snapshot_fingerprints[&key].clone();
+    let moved = root.0.join("original");
+    fs::rename(&project, &moved).unwrap();
+    let replacement = root.0.join("replacement");
+    fs::create_dir_all(replacement.join("nested")).unwrap();
+    std::os::unix::fs::symlink(&replacement, &project).unwrap();
+    assert!(moved
+        .join("nested")
+        .join(path.file_name().unwrap())
+        .exists());
+    let recorder = Recorder::default();
+    let ((after, _, _), counts) = capture(|| {
+        finish(
+            OwnedSourceScan::new(
+                SnapshotSource::ClaudeCode,
+                &[root.projects()],
+                held,
+                NOW,
+                7,
+                10,
+                false,
+                None,
+                &[path.clone()],
+                false,
+                true,
+            )
+            .with_line_observer("test", Box::new(recorder.clone())),
+        )
+    });
+    assert!(recorder.events().is_empty());
+    assert!(after.files[&key].has_unverified_source());
+    assert!(after.claude_account_deferred_holds.contains_key(&key));
+    assert_eq!(after.file_snapshot_fingerprints.get(&key), Some(&incidence));
+    assert!(!crate::snapshot_sync::withheld_settled_for_test(&after));
+    let counts = page_counts(&counts);
+    assert_eq!(
+        counts["withheld_hold_released"]["deleted"]
+            .as_u64()
+            .unwrap_or(0),
+        0
+    );
+    assert_eq!(
+        counts["audit_retired_absent"]["events"]
+            .as_u64()
+            .unwrap_or(0),
+        0
+    );
+}
+
+/// An unchanged revision can be account-deferred after an upload-context read.
+/// Its real Completed restore keeps the committed fingerprint; missing RAM
+/// evidence must recover once instead of falling through ordinary equality.
+#[test]
+fn withheld_equal_fingerprint_recovers_from_unusable_memo() {
+    use crate::local_resource_diagnostics::take_withheld_for_test;
+    let root = Root::new("ld-equal-held-memo-recovery");
+    let path = root.file(SESSION);
+    let key = local_index_key(&path);
+    append(&path, &assistant_line("equal-revision"));
+    let page = |index| {
+        let recorder = Recorder::default();
+        let (index, scan, _) = finish(
+            new_scan(&root.projects(), index)
+                .with_line_observer("test", Box::new(recorder.clone())),
+        );
+        (index, scan, recorder)
+    };
+    let (mut previous, _, _) = page(ScanIndex::default());
+    let fingerprint = previous.files[&key].source_file_fingerprint.clone();
+    previous.upload_context_fingerprint = "retry-context".into();
+    let (parsed, scan, recorder) = page(previous.clone());
+    assert_eq!(scan.scanned_file_count, 1);
+    assert_eq!(parsed.files[&key].source_file_fingerprint, fingerprint);
+    assert!(!recorder.events().is_empty());
+    let mut held = crate::snapshot_sync::settle_withheld_for_test(&previous, parsed, scan);
+    assert_eq!(held.files[&key].source_file_fingerprint, fingerprint);
+    assert!(held.claude_account_deferred_holds.contains_key(&key));
+    let checkpoint = root.0.join("equal-held.json");
+    held.save(&checkpoint).unwrap();
+    held = ScanIndex::load(&checkpoint).unwrap();
+    assert!(
+        page(held.clone()).2.events().is_empty(),
+        "valid CONTENT skips"
+    );
+    take_withheld_for_test();
+
+    for failure in ["missing", "refused", "poisoned", "no-birth"] {
+        // Use the full selector, with all ordinary equality premises satisfied.
+        let entry = &held.files[&key];
+        let mut candidate = CandidateFile {
+            path: path.clone(),
+            scan_root: root.projects(),
+            size_bytes: entry.size_bytes,
+            modified_unix_seconds: entry.modified_unix_seconds,
+            modified_unix_nanos: entry.modified_unix_nanos.unwrap_or_default(),
+            source_file_fingerprint: fingerprint.clone(),
+            physical_identity: None,
+            legacy_source_file_fingerprint: String::new(),
+            legacy_config_reconciliation_required: false,
+            opened_object_identity: String::new(),
+            fingerprint_changed_nanos: 0,
+            fingerprint_birth_nanos: 0,
+            withheld_content_stamp: None,
+        };
+        match failure {
+            "missing" => withheld_account::restart_for_test(&key),
+            "refused" => assert!(withheld_account::retained_bound(0).is_none()),
+            "poisoned" => withheld_account::poison_for_test(),
+            "no-birth" => {
+                // This is the production no-generation witness, not an empty
+                // fingerprint: even matching samples cannot grant a Skip.
+                candidate.withheld_content_stamp = withheld_account::content_stamp(
+                    candidate.size_bytes,
+                    None,
+                    &OpenedContentSamples {
+                        head: vec![],
+                        tail: None,
+                    },
+                );
+                assert!(candidate.withheld_content_stamp.is_none());
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            held.candidate_decision_at(&candidate, 1),
+            CandidateDecision::Parse,
+            "{failure}"
+        );
+        // The real owner discards refused/poisoned state before its next cycle.
+        // The filesystem supplies a valid birth on the recovery parse below.
+        withheld_account::discard_if_refused();
+        if failure == "no-birth" {
+            withheld_account::restart_for_test(&key);
+        }
+        let (parsed, scan, recorder) = page(held.clone());
+        assert_eq!(
+            scan.scanned_file_count, 1,
+            "{failure}: one actual recovery parse"
+        );
+        assert_eq!(
+            recorder
+                .events()
+                .iter()
+                .filter(|e| matches!(e, Event::Begin(_)))
+                .count(),
+            1
+        );
+        held = crate::snapshot_sync::settle_withheld_for_test(&held, parsed, scan);
+        held.save(&checkpoint).unwrap();
+        held = ScanIndex::load(&checkpoint).unwrap();
+        assert_eq!(held.files[&key].source_file_fingerprint, fingerprint);
+        let [_, reparses, _] = take_withheld_for_test();
+        assert_eq!(reparses, BTreeMap::from([("start", 1)]), "{failure}");
+        for _ in 0..2 {
+            assert!(
+                page(held.clone()).2.events().is_empty(),
+                "{failure}: rebuilt memo skips"
+            );
+        }
+        assert!(take_withheld_for_test()[1].is_empty());
+    }
 }

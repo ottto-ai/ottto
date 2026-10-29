@@ -42302,9 +42302,13 @@ fn reconcile_missing_index_entries_with_side(
         // probes. Missing parents/roots keep the hold, even without audit debt.
         if !observed && index.claude_account_deferred_holds.contains_key(key) {
             index.retire_absent_account_hold(key);
-            if index.claude_account_deferred_holds.contains_key(key) {
-                continue;
+            if !index.files.contains_key(key) {
+                index.drop_codex_proof_items(key, codex_side_drop);
             }
+            // Retirement is complete (including SOURCE N3 incidence custody).
+            // Uncertain absence keeps the debt. Neither may fall through to
+            // ordinary deletion and erase the retained fingerprint set.
+            continue;
         }
         if !observed
             && !index.decode_holds_file(key)
@@ -47555,17 +47559,21 @@ impl ScanIndex {
         self.claude_account_deferred_holds.len()
     }
 
-    /// A completed traversal observed every present path, so a held key that
-    /// is neither indexed nor observed is proved absent.
+    /// Census absence is only a prompt to prove removal. Hold-only keys have
+    /// no committed entry to visit during reconciliation, but own the same
+    /// debt. Inventory at most the existing 4,096-hold cap; no transcript read
+    /// or second directory walk, and missing/uncertain ancestors keep the hold.
     fn retain_observed_claude_account_deferred_holds(&mut self, observed: &BTreeSet<String>) {
-        let files = &self.files;
-        self.claude_account_deferred_holds.retain(|index_key, _| {
-            let present = files.contains_key(index_key) || observed.contains(index_key);
-            if !present {
-                withheld_account::released_deleted(index_key);
-            }
-            present
-        });
+        let unobserved = self
+            .claude_account_deferred_holds
+            .keys()
+            .filter(|key| !observed.contains(*key))
+            .take(MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS)
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in unobserved {
+            self.retire_absent_account_hold(&key);
+        }
     }
 
     /// Keys whose scanned entity set or head names a held revision.
@@ -49083,6 +49091,15 @@ impl ScanIndex {
                 CandidateParseReason::SourceChanged
             };
             (CandidateDecision::Parse, Some(reason))
+        } else if self.claude_account_deferred_holds.contains_key(&key) {
+            // Equality of the committed fingerprint cannot settle an account
+            // retry. Only the validated CONTENT memo above grants that Skip;
+            // missing/refused/poisoned/unstamped advisory state must recover
+            // through the existing counted parse, without clearing the tuple.
+            (
+                CandidateDecision::Parse,
+                Some(CandidateParseReason::SourceChanged),
+            )
         } else {
             (CandidateDecision::Skip, None)
         }
