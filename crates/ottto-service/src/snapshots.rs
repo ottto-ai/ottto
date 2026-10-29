@@ -88285,7 +88285,9 @@ mod tests {
         cases.push(("all_local_without_proof", vec![zero, usage(1)], false));
         let mut conflict = header.clone();
         conflict["ordinal"] = json!(1362);
+        conflict["payload"]["history_base"]["end_ordinal_exclusive"] = json!(1362);
         conflict["payload"]["creator_user_id"] = json!("synthetic-conflicting-user");
+        assert!(codex_creator_header_evidence(&conflict, &conflict["payload"]).is_some());
         cases.push((
             "own_conflict",
             vec![header.clone(), conflict, usage(1363)],
