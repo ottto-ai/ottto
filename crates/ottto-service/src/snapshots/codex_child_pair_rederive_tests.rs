@@ -73,6 +73,7 @@ impl Fixture {
         )
         .unwrap();
         let index_path = scratch.join("index.json");
+        test_locks::hold(scratch.as_ref());
         Self {
             scratch,
             root,
@@ -80,7 +81,7 @@ impl Fixture {
             index_path,
         }
     }
-    fn assert_restart_quiet(&self, depth2: bool, label: &str) {
+    fn assert_restart_quiet(&self, depth2: bool, label: &str, collected_at: &str) {
         let child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--ignored",
@@ -90,6 +91,7 @@ impl Fixture {
             ])
             .env("OTTTO_CHILD_PAIR_TEST_ROOT", &self.root)
             .env("OTTTO_CHILD_PAIR_TEST_INDEX", &self.index_path)
+            .env("OTTTO_CHILD_PAIR_TEST_AT", collected_at)
             .env(
                 "OTTTO_CHILD_PAIR_TEST_DEPTH2",
                 if depth2 { "1" } else { "0" },
@@ -97,7 +99,8 @@ impl Fixture {
             .output()
             .unwrap();
         assert!(
-            child.status.success(),
+            child.status.success()
+                && String::from_utf8_lossy(&child.stdout).contains("test result: ok. 1 passed;"),
             "fresh-process restart {label}: {} {}",
             String::from_utf8_lossy(&child.stdout),
             String::from_utf8_lossy(&child.stderr)
@@ -128,11 +131,21 @@ impl Fixture {
         metadata: &CodexTitleMetadata,
         faults: Option<&std::cell::Cell<usize>>,
     ) -> (ScanIndex, SourceScanResult, usize) {
+        self.run_inner_at(index, cache, metadata, faults, NOW)
+    }
+    fn run_inner_at(
+        &self,
+        index: ScanIndex,
+        cache: Option<Arc<sampled_scan::SharedCache>>,
+        metadata: &CodexTitleMetadata,
+        faults: Option<&std::cell::Cell<usize>>,
+        collected_at: &str,
+    ) -> (ScanIndex, SourceScanResult, usize) {
         let mut scan = OwnedSourceScan::new(
             SnapshotSource::Codex,
             std::slice::from_ref(&self.root),
             index,
-            NOW,
+            collected_at,
             BACKFILL_WINDOW_DAYS,
             10,
             false,
@@ -230,7 +243,8 @@ impl Fixture {
         };
         let key = local_index_key(&self.path);
         let entry = &index.files[&key];
-        let lock = test_locks::hold(self.scratch.as_ref());
+        let lock = crate::locked_state_dir::held_for(self.scratch.as_ref())
+            .expect("fixture state-directory lock is held for the process");
         let mut disk = DurableTailStore::new(
             store::store_dir_for_index(&self.index_path),
             DurableSource::Codex,
@@ -337,7 +351,7 @@ fn codex_child_pair_named_conflict_incomplete_read_once_then_two_restarts() {
         assert_eq!(reads, 0, "next pass {kind}");
         for restart in 0..2 {
             index.save(&fixture.index_path).unwrap();
-            fixture.assert_restart_quiet(kind == "depth2", &format!("{restart} {kind}"));
+            fixture.assert_restart_quiet(kind == "depth2", &format!("{restart} {kind}"), NOW);
             let loaded = ScanIndex::load(&fixture.index_path).unwrap();
             let (next, _, reads) = fixture.run(loaded, Some(fixture.cache()), &metadata);
             assert_eq!(reads, 0, "restart {restart} {kind}");
@@ -530,7 +544,8 @@ fn codex_child_pair_injected_read_failures_back_off_and_stop_after_three_retries
         }
     }
     let _clock = Clock;
-    sampled_scan::set_test_now(Some(100));
+    let mut now = rfc3339_unix_seconds(NOW).unwrap();
+    sampled_scan::set_test_now(Some(now));
     let fixture = Fixture::new("named");
     let metadata = CodexTitleMetadata::default();
     let (mut index, _, _) = fixture.run(ScanIndex::default(), None, &metadata);
@@ -538,9 +553,22 @@ fn codex_child_pair_injected_read_failures_back_off_and_stop_after_three_retries
     let key = local_index_key(&fixture.path);
     let faults = std::cell::Cell::new(0);
     let cache = fixture.cache();
-    for (attempt, now) in [(1, 100), (2, 102), (3, 106), (4, 114)] {
+    let at = |now| {
+        time::OffsetDateTime::from_unix_timestamp(now as i64)
+            .unwrap()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    };
+    for attempt in 1..=4 {
         sampled_scan::set_test_now(Some(now));
-        let (next, _, _) = fixture.run_inner(index, Some(cache.clone()), &metadata, Some(&faults));
+        let collected_at = at(now);
+        let (next, _, _) = fixture.run_inner_at(
+            index,
+            Some(cache.clone()),
+            &metadata,
+            Some(&faults),
+            &collected_at,
+        );
         index = next;
         assert_eq!(
             faults.get(),
@@ -549,8 +577,13 @@ fn codex_child_pair_injected_read_failures_back_off_and_stop_after_three_retries
         );
         index.save(&fixture.index_path).unwrap();
         index = ScanIndex::load(&fixture.index_path).unwrap();
-        let (next, _, reads) =
-            fixture.run_inner(index, Some(cache.clone()), &metadata, Some(&faults));
+        let (next, _, reads) = fixture.run_inner_at(
+            index,
+            Some(cache.clone()),
+            &metadata,
+            Some(&faults),
+            &collected_at,
+        );
         index = next;
         assert_eq!(reads, 0);
         assert_eq!(
@@ -558,18 +591,38 @@ fn codex_child_pair_injected_read_failures_back_off_and_stop_after_three_retries
             attempt,
             "backoff/stamp forbids another attempt"
         );
+        // Both existing schedulers remain authoritative: the repair delay
+        // cannot bypass an unhealthy traversal's longer persisted cooldown.
+        let repair_due = match index.files[&key].codex_child_pair_rederive {
+            Some(Stamp::Pending { retry_after, .. }) => retry_after,
+            _ => now,
+        };
+        now = index
+            .traversal
+            .as_ref()
+            .and_then(|traversal| traversal.unhealthy_retry_not_before_unix_seconds)
+            .unwrap_or(now)
+            .max(repair_due);
     }
     assert_eq!(
         index.files[&key].codex_child_pair_rederive,
         Some(Stamp::Unreadable)
     );
+    // Move beyond both backoffs before checking terminal saved-state credit.
+    now += UNHEALTHY_SCAN_RETRY_MAX_SECONDS + 1;
+    let collected_at = at(now);
     for _ in 0..2 {
-        sampled_scan::set_test_now(Some(1_000));
+        sampled_scan::set_test_now(Some(now));
         index.save(&fixture.index_path).unwrap();
-        fixture.assert_restart_quiet(false, "unreadable");
+        fixture.assert_restart_quiet(false, "unreadable", &collected_at);
         let loaded = ScanIndex::load(&fixture.index_path).unwrap();
-        let (next, _, reads) =
-            fixture.run_inner(loaded, Some(fixture.cache()), &metadata, Some(&faults));
+        let (next, _, reads) = fixture.run_inner_at(
+            loaded,
+            Some(fixture.cache()),
+            &metadata,
+            Some(&faults),
+            &collected_at,
+        );
         assert_eq!(reads, 0);
         assert_eq!(faults.get(), 4);
         index = next;
@@ -715,6 +768,8 @@ fn codex_child_pair_restart_probe() {
     let index_path = PathBuf::from(
         std::env::var_os("OTTTO_CHILD_PAIR_TEST_INDEX").expect("parent fixture index"),
     );
+    let collected_at = std::env::var("OTTTO_CHILD_PAIR_TEST_AT").unwrap();
+    sampled_scan::set_test_now(Some(rfc3339_unix_seconds(&collected_at).unwrap()));
     let index = ScanIndex::load(&index_path).unwrap();
     assert!(index
         .files
@@ -731,7 +786,7 @@ fn codex_child_pair_restart_probe() {
         SnapshotSource::Codex,
         &[root],
         index,
-        NOW,
+        &collected_at,
         BACKFILL_WINDOW_DAYS,
         10,
         false,
