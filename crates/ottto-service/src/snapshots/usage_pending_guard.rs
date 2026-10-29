@@ -299,11 +299,13 @@ impl Holds {
         );
         Growth::Recorded
     }
-    /// Request keys read while held; they still veto other families.
+    /// Request keys read while held; they still veto other families while
+    /// their family is held.
     pub(super) fn growth_hashes(&self) -> impl Iterator<Item = &String> {
         self.runtime
             .slots
             .values()
+            .filter(|slot| self.holds(&slot.root))
             .flat_map(|slot| slot.occurrences.keys())
     }
     /// The family's `window` evidence held in its slots, shaped as pending.
@@ -648,7 +650,25 @@ impl ScanIndex {
     }
     /// Install a rebuilt projection without losing runtime custody.
     pub(super) fn install_usage_guard_holds(&mut self, mut holds: Holds) {
-        holds.runtime = std::mem::take(&mut self.usage_guard_holds.runtime);
+        let mut runtime = std::mem::take(&mut self.usage_guard_holds.runtime);
+        // A family whose pending proof is gone (retired or vanished) has no
+        // window left to rejoin; its held growth goes with it.
+        let pending = &self.claude_usage_family_pending;
+        if runtime
+            .slots
+            .values()
+            .any(|slot| !pending.contains_key(&slot.root))
+        {
+            runtime
+                .slots
+                .retain(|_, slot| pending.contains_key(&slot.root));
+            runtime.slot_occurrences = runtime
+                .slots
+                .values()
+                .map(|slot| slot.occurrences.len())
+                .sum();
+        }
+        holds.runtime = runtime;
         self.usage_guard_holds = holds;
     }
     pub(super) fn refresh_usage_guard_after_native_completion(&mut self) {
@@ -881,6 +901,14 @@ pub(super) fn withheld_read(native_bytes: u64) {
         "claude_usage_held_member_growth",
         SnapshotSource::ClaudeCode.api_slug(),
         &json!({"held_member_growth_bytes":native_bytes,"withheld_full_bytes":native_bytes}),
+    );
+}
+
+pub(super) fn withheld_incomplete() {
+    crate::local_resource_diagnostics::traversal_point(
+        "claude_usage_withheld_full",
+        SnapshotSource::ClaudeCode.api_slug(),
+        &json!({"withheld_full_incomplete":1}),
     );
 }
 

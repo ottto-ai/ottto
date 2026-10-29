@@ -9102,6 +9102,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             }
             proven.insert(root_session_id.clone(), family);
         }
+        let resolved_any = !resolved_holds.is_empty();
         for (root_session_id, growth) in resolved_holds {
             index
                 .usage_guard_holds
@@ -9162,6 +9163,10 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 .claude_usage_family_witnesses
                 .insert(root_session_id.clone(), family.witness.clone());
             index.rebind_retry_pending_claude_authority(root_session_id);
+        }
+        if resolved_any {
+            // A resolved family is current evidence for the gates below.
+            index.refresh_usage_guard_holds_at(Some(census_window_end));
         }
     } else if census_complete {
         // Report availability is not evidence that a previously proven
@@ -10536,9 +10541,11 @@ fn claude_stale_pending_keeps_census_invalid(
     indexed_claude_family_ids: &BTreeSet<String>,
 ) -> bool {
     // B3 phase 1 (Lead B 4c): an Unknown-held family's retained proof is
-    // scoped like a bound quarantine. Its own items stay unresolved below;
-    // it never closes the duplicate census for unrelated families.
-    if index.usage_guard_holds.holds(root_session_id) {
+    // scoped like a bound quarantine. Its own items stay unresolved below and
+    // its request keys veto overlapping families; it never closes the
+    // duplicate census for unrelated families. An invalidated one (held
+    // growth over its cap) lost those keys and stays fail closed.
+    if index.usage_guard_holds.holds(root_session_id) && !pending.invalid {
         return false;
     }
     // Only a complete census proves that a family vanished. Old pending whose
@@ -29986,6 +29993,12 @@ impl OwnedSourceScan {
                 if source == SnapshotSource::ClaudeCode
                     && index.usage_guard_take_withheld(&local_index_key(&candidate.path))
                 {
+                    // Only a complete, loss-free parse is proof evidence or
+                    // an audit; anything else is counted and stays owed.
+                    if !parsed_file.complete() {
+                        usage_pending_guard::withheld_incomplete();
+                        pending!();
+                    }
                     index.usage_guard_record_withheld(&parsed_file.snapshots, &census_window_end);
                     index.usage_guard_mark_audited(&local_index_key(&candidate.path));
                     let budget = if completed_acquisition
