@@ -7610,7 +7610,11 @@ impl SourceScanResult {
     }
     pub(crate) fn finish_codex_capture_boundary(&self, index: &mut ScanIndex) {
         if self.census_complete {
-            index.traversal = None;
+            // Owed Codex keys ride the next generation this page started.
+            let owed = |traversal: &ScanTraversalCheckpoint| {
+                traversal.residue.codex_inventory_hold.is_some()
+            };
+            index.traversal = index.traversal.take().filter(owed);
             index.resume_after_path = None;
             index.resume_upper_bound_path = None;
             index.resume_census_window_end = None;
@@ -30530,16 +30534,13 @@ impl OwnedSourceScan {
                             );
                     }
                 }
-                // Owed Codex keys keep the generation open until the
-                // committed index proves their catch-up (`release_codex_inventory_hold`).
                 let raw_census_complete = traversal_discovery_done
                     && traversal_healthy
                     && clean_frozen_generation
                     && state_census_complete
                     && sidecar_census_complete
                     && reconciliation_complete
-                    && !parent_resolution_restart
-                    && traversal_snapshot.residue.codex_inventory_hold.is_none();
+                    && !parent_resolution_restart;
                 let needs_clean_followup =
                     raw_census_complete && index.bounded_sweep_had_unsettled_upload;
                 // Path-(a) bridge: a raw-complete census first retires every
@@ -41723,10 +41724,11 @@ fn release_removed_codex_owed(traversal: &mut ScanTraversalCheckpoint, removed: 
     }
 }
 
-/// The owed keys of a closing generation (only a restart closes with keys
-/// still owed: they keep a census open) go to the next walk.
+/// The owed keys of a closing generation go to the next walk, counted: a key
+/// on a file still being written never holds a census open.
 fn close_codex_owed(traversal: Option<&mut ScanTraversalCheckpoint>) -> Option<CodexInventoryHold> {
     let hold = traversal?.residue.codex_inventory_hold.take()?;
+    codex_owed_event(CodexOwedEvent::Carried, hold.owed.len() as u64);
     Some(CodexInventoryHold {
         owed: hold.owed,
         ..CodexInventoryHold::default()
@@ -43958,8 +43960,6 @@ impl ScanIndex {
             .filter(held_family_scope_has_writer_shape)
     }
 
-    /// The flag is authoritative: no cause without it, and
-    /// `Unattributed` for a flag with no recorded cause.
     /// Re-open discovery after a terminal unhealthy traversal. One that owes
     /// Codex keys stays, with its bounded retry due now: the caller marks the
     /// sweep unsettled, so the next page's walk replaces it and carries them
@@ -43973,6 +43973,8 @@ impl ScanIndex {
         }
     }
 
+    /// The flag is authoritative: no cause without it, and
+    /// `Unattributed` for a flag with no recorded cause.
     fn unsettled_cause_bits(&self) -> u16 {
         match (
             self.bounded_sweep_had_unsettled_upload,

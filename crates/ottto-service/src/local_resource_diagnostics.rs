@@ -136,9 +136,9 @@ pub(crate) enum UnselectedReason {
     /// The subset of size skips whose key holds a withheld-account revision.
     WithheldOversized,
 }
-/// The three reasons, the four `WithheldEvent` slots, then the eight
+/// The three reasons, the four `WithheldEvent` slots, then the nine
 /// `CodexOwedEvent` slots.
-const UNSELECTED_REASONS: usize = 15;
+const UNSELECTED_REASONS: usize = 16;
 /// Claude, Codex, Pi x reason, drained by that source's page line.
 #[cfg(not(test))]
 static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
@@ -210,6 +210,8 @@ pub(crate) enum CodexOwedEvent {
     /// and the header inventory bytes read on the pages that did it.
     WakeEvents,
     WakeInventoryBytes,
+    /// Still owed when its generation closed: handed to the next one.
+    Carried,
 }
 /// Recorded after the decision; never a gate input.
 pub(crate) fn codex_owed_event(event: CodexOwedEvent, count: u64) {
@@ -217,11 +219,12 @@ pub(crate) fn codex_owed_event(event: CodexOwedEvent, count: u64) {
         slot.fetch_add(count, Relaxed)
     });
 }
-const CODEX_OWED: [(&str, usize); 4] = [
+const CODEX_OWED: [(&str, usize); 5] = [
     ("held", 7),
     ("overflow", 8),
     ("oversized", 9),
     ("dropped", 12),
+    ("carried", 15),
 ];
 const CODEX_OWED_RELEASED: [(&str, usize); 2] = [("caught_up", 10), ("removed", 11)];
 static CODEX_OWED_OVERFLOW_TOTAL: AtomicU64 = AtomicU64::new(0);

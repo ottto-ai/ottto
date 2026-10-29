@@ -271,8 +271,10 @@ refused at a cursor start for want of reduction inputs (`Reduction`
 unreadable). They stay owed across the bounded retry and restarts until the
 committed index entry's size matches the file (checked at page start, so
 after upload acceptance, never at parse completion) or their absence is
-proved, and they keep the generation's census open. A healthy traversal
-queues an unmatched key again, so a failed upload is retried. While owed,
+proved. They never hold a census open: a generation that closes while a key
+is still owed (a file still being written, an upload not yet acknowledged)
+hands it to the next one, counted as `carried`. A healthy traversal queues an
+unmatched key again, so a failed upload is retried. While owed,
 unmoved evidence re-reads nothing until the traversal's bounded retry
 deadline, when they are queued once and the deadline re-arms;
 `counts.codex_owed_wake` counts those wakes' cheap checks: `events` (keys a
@@ -280,8 +282,9 @@ passed deadline queued) and `inventory_bytes` (header inventory bytes read on
 those pages). On Codex pages, `counts.codex_owed` counts `held` (keys that
 became owed), `overflow` (past the 10,000-key bound a new key keeps only the
 window), `oversized` (an owed key over the size cap, kept observed and unread)
-and `dropped` (owed keys lost when a red restart closes a partially settled
-sweep; an open gap that should stay zero). An overflow also raises its own
+`carried` (owed keys a closing generation handed on) and `dropped` (owed
+keys lost because no next generation started; an open gap that should stay
+zero). An overflow also raises its own
 local alarm, `codex_owed_overflow_alarm` with `overflow=[this call, process
 total]`, apart from `held` and the drained counts. A red restart of a
 partially settled sweep starts the next generation in the same page for owed

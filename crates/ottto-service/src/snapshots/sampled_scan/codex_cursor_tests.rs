@@ -14018,6 +14018,96 @@ fn reduction_refused_growth_stays_owed_and_catches_up_by_one_tail() {
     assert_eq!(fingerprints(&tail), fingerprints(&full));
 }
 
+/// Round 4, census stall: an owed key on a file written between every page
+/// never holds its generation's census open. Each close hands it on (counted
+/// `carried`, kept through `finish_codex_capture_boundary`), its growth is
+/// read by Tail every page, and the first page start that finds the
+/// committed extent equal to the file releases it. Later growth is an
+/// ordinary Tail. Zero Full, nothing dropped.
+#[test]
+fn owed_key_on_a_growing_file_does_not_hold_the_census() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let refuse = |on: bool| super::super::TEST_REFUSE_REDUCTION_DEPENDENCIES.with(|v| v.set(on));
+    let start = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let at = |secs: u64| {
+        time::OffsetDateTime::from_unix_timestamp((start + secs) as i64)
+            .unwrap()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    };
+    let day = 86_400;
+    let t0 = std::time::Instant::now();
+    let fixture = ScanRoot::new(80);
+    let key = local_index_key(&fixture.file(SESSION));
+    let owed = |index: &ScanIndex| {
+        index
+            .traversal
+            .as_ref()
+            .and_then(|traversal| traversal.residue.codex_inventory_hold.as_ref())
+            .is_some_and(|hold| hold.owed.contains(&key))
+    };
+    let cache = Arc::new(SharedCache::default());
+    let page = |index: ScanIndex, days: u64, secs: u64| {
+        let (mut index, scan, modes) = with_pace_clock(
+            Some(t0 + std::time::Duration::from_secs(days * day)),
+            false,
+            || owed_page(&fixture, index, &cache, &at(secs)),
+        );
+        // As `snapshot_sync` ends every page.
+        scan.finish_codex_capture_boundary(&mut index);
+        assert_eq!(modes.0, 0, "zero Full: {}", counters(&cache));
+        (index, scan, modes)
+    };
+    with_test_limits(2048, 1024, 64, || {
+        let mut index = ScanIndex::default();
+        for step in 0..64 {
+            index = page(index, 0, step).0;
+            if counter(&cache, |c| c.jobs_certified) == 1 {
+                break;
+            }
+        }
+        crate::local_resource_diagnostics::take_codex_owed_for_test();
+        refuse(true);
+        fixture.append(SESSION, &token_line(81));
+        let (mut index, _, _) = page(index, 1, 100);
+        refuse(false);
+        assert!(owed(&index), "premise: the refused key is owed");
+        // Past the retry deadline the bounded retry walks; the file is
+        // written before every page (inside the window).
+        index.mark_bounded_sweep_unsettled();
+        let mut completed = 0;
+        for n in 0..4 {
+            fixture.append(SESSION, &token_line(82 + n));
+            let (next, scan, modes) = page(index, 8 + n, 1_000 + n * 600);
+            index = next;
+            assert_eq!(modes, (0, 1), "page {n}: its growth by one Tail");
+            assert!(owed(&index), "page {n}: still owed, never dropped");
+            completed += usize::from(scan.census_complete);
+        }
+        // Before round 4 the owed key held every one of these censuses open.
+        assert!(completed >= 3, "the census is not held open: {completed}");
+        // Writing stops: the next page start finds it caught up.
+        let (index, quiet, modes) = page(index, 12, 3_400);
+        assert_eq!((modes, quiet.snapshots.len()), ((0, 0), 0));
+        assert!(!owed(&index), "released once caught up");
+        // Later growth is an ordinary, non-owed Tail.
+        fixture.append(SESSION, &token_line(90));
+        let (index, _, modes) = page(index, 13, 4_000);
+        assert_eq!(modes, (0, 1));
+        assert!(!owed(&index));
+        let (owed_counts, released) = crate::local_resource_diagnostics::take_codex_owed_for_test();
+        assert_eq!(owed_counts.get("held"), Some(&1));
+        assert_eq!(owed_counts.get("dropped"), None);
+        assert_eq!(owed_counts.get("carried"), Some(&(completed as u64)));
+        assert_eq!(released, BTreeMap::from([("caught_up", 1)]));
+    });
+}
+
 fn page_fixture_full(fixture: &ScanRoot) -> (ScanIndex, SourceScanResult) {
     page(fixture, ScanIndex::default(), None)
 }
