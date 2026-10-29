@@ -369,14 +369,280 @@ fn phase1_current_window_accumulation_is_not_stale_proof() {
 }
 
 #[test]
-fn phase1_refused_held_read_keeps_the_census_incomplete() {
-    let mut census = ScanCensus::default();
+fn phase1_refused_held_read_is_a_scoped_residue_not_a_red_census() {
+    // Lead B 4d: the refusal takes no census, so no unreadable cause can turn
+    // the census red; it is counted per family as held_read_refused.
+    let path = PathBuf::from(carry_key(CARRY_ROOT, None));
     let (_, rows) =
-        crate::local_resource_diagnostics::capture(|| usage_pending_guard::full_blocked(&mut census));
-    assert_eq!(census.unreadable_path_count, 1);
+        crate::local_resource_diagnostics::capture(|| usage_pending_guard::full_blocked(&path));
+    assert!(rows.iter().any(|row| row["counts"]["unknown_full_blocked"] == 1
+        && row["counts"]["held_read_refused_families"] == 1));
+}
+
+fn held_family_index() -> (ScanIndex, String, Vec<SnapshotItem>) {
+    let (dir, root, items) = claude_account_family_fixture();
+    let mut index = d2_family_index(&dir, &root);
+    accumulate_claude_usage_family_pending_with_limit(
+        &items,
+        &mut index.claude_usage_family_pending,
+        CARRY_FAILED,
+        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+    );
+    assert_eq!(index.claude_usage_family_pending[&root].member_occurrences.len(), 2);
+    index.refresh_usage_guard_holds_at(Some(CARRY_RETRY));
+    assert_eq!(
+        index.usage_guard_reason(&root),
+        Some(Unknown::MissingWitness)
+    );
+    (index, root, items)
+}
+
+fn accumulate_guarded(index: &mut ScanIndex, items: &[SnapshotItem]) -> ClaudeDuplicateCensusCounts {
+    accumulate_claude_usage_family_pending_guarded(
+        items,
+        &mut index.claude_usage_family_pending,
+        CARRY_RETRY,
+        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+        &mut index.usage_guard_holds,
+    )
+}
+
+#[test]
+fn phase1_held_member_growth_keeps_siblings_and_rewindows_after_resolution() {
+    let (mut index, root, items) = held_family_index();
+    let before = index.claude_usage_family_pending[&root].clone();
+    // A member Tail while held does not re-window the family.
+    let (counts, rows) =
+        crate::local_resource_diagnostics::capture(|| accumulate_guarded(&mut index, &items[..1]));
+    assert_eq!(counts.page_invalidated_cap_count, 0);
+    assert_eq!(index.claude_usage_family_pending[&root], before, "byte-identical");
     assert!(rows
         .iter()
-        .any(|row| row["counts"]["unknown_full_blocked"] == 1));
+        .any(|row| row["counts"]["held_member_growth_slots"] == 1));
+    // Resolution: a known (mismatching) witness ends the Unknown hold.
+    let members = before.membership().keys().cloned().collect::<Vec<_>>();
+    index.claude_usage_family_witnesses.insert(
+        root.clone(),
+        ClaudeUsageFamilyWitness {
+            evidence_fingerprint: "e".repeat(64),
+            member_request_id_fingerprints: members
+                .iter()
+                .map(|member| (member.clone(), "0".repeat(64)))
+                .collect(),
+            member_occurrence_fingerprints: members
+                .iter()
+                .map(|member| (member.clone(), "0".repeat(64)))
+                .collect(),
+            assigned_request_id_fingerprints: BTreeMap::new(),
+            legacy_excluded_request_id_hashes: BTreeMap::new(),
+            legacy_exclusion_evidence_fingerprint: None,
+            legacy_owner_roots: BTreeSet::new(),
+        },
+    );
+    index.refresh_usage_guard_holds_at(Some(CARRY_RETRY));
+    assert_eq!(index.usage_guard_reason(&root), None);
+    // The next member read re-windows, joined by the slot recorded while held.
+    accumulate_guarded(&mut index, &items[1..]);
+    let after = &index.claude_usage_family_pending[&root];
+    assert_eq!(after.census_window_end, CARRY_RETRY);
+    assert!(!after.invalid);
+    assert_eq!(after.member_occurrences.len(), 2);
+    assert_eq!(
+        after.member_occurrences[&items[0].source_session_id],
+        before.member_occurrences[&items[0].source_session_id]
+    );
+}
+
+#[test]
+fn phase1_held_member_growth_over_cap_takes_the_counted_resource_path() {
+    let (mut index, root, items) = held_family_index();
+    // Member bound: the 257th distinct member is refused.
+    for member in 0..usage_pending_guard::HELD_GROWTH_MAX_MEMBERS {
+        assert_eq!(
+            index.usage_guard_holds.record_member_growth(
+                "other",
+                &format!("member-{member}"),
+                CARRY_RETRY,
+                BTreeMap::new()
+            ),
+            usage_pending_guard::Growth::Recorded
+        );
+    }
+    let (growth, rows) = crate::local_resource_diagnostics::capture(|| {
+        index.usage_guard_holds.record_member_growth(
+            "other",
+            "member-over",
+            CARRY_RETRY,
+            BTreeMap::new(),
+        )
+    });
+    assert_eq!(growth, usage_pending_guard::Growth::OverCap);
+    assert!(rows
+        .iter()
+        .any(|row| row["counts"]["held_member_growth_over_cap"] == 1));
+    index.usage_guard_holds.take_member_growth("other", "");
+    // Occurrence bound, then the accumulator's existing counted cap path:
+    // the held family is invalidated (and so re-read), never dropped silently.
+    let big = (0..usage_pending_guard::HELD_GROWTH_MAX_OCCURRENCES)
+        .map(|n| (format!("{n:064x}"), carry_occurrence(n as u64, 1)))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        index
+            .usage_guard_holds
+            .record_member_growth("other", "member-big", CARRY_RETRY, big),
+        usage_pending_guard::Growth::Recorded
+    );
+    let counts = accumulate_guarded(&mut index, &items[..1]);
+    assert_eq!(counts.page_invalidated_cap_count, 1);
+    assert!(index.claude_usage_family_pending[&root].invalid);
+}
+
+#[test]
+fn phase1_withheld_full_needs_real_growth_and_is_paced_per_key() {
+    let mut fixture = retry_durable_fixture(0, 1);
+    let root = fixture.roots[0].clone();
+    fixture.index.claude_usage_family_witnesses.remove(&root);
+    retry_under_way(&mut fixture.index);
+    fixture.index.refresh_usage_guard_holds_at(Some(CARRY_RETRY));
+    assert!(fixture.index.usage_guard_holds.holds(&root));
+    let mut candidate = fixture.candidates[0].clone();
+    let key = local_index_key(&candidate.path);
+    // Idle or mtime-only: no real growth, no Full.
+    candidate.size_bytes = fixture.index.files[&key].size_bytes;
+    assert!(!fixture.index.usage_guard_admit_withheld_full(&candidate));
+    candidate.size_bytes += 1;
+    let (admitted, rows) = crate::local_resource_diagnostics::capture(|| {
+        fixture.index.usage_guard_admit_withheld_full(&candidate)
+    });
+    assert!(admitted);
+    assert!(rows.iter().any(|row| row["counts"]["withheld_full"] == 1
+        && row["counts"]["withheld_full_missing_witness"] == 1
+        && row["counts"]["pace_evicted"] == 0));
+    assert!(fixture.index.usage_guard_is_withheld(&key));
+    // The entry stays indexed as committed; nothing re-arms it.
+    assert!(!fixture.index.files[&key].source_file_fingerprint.is_empty());
+    // One per key per 6 h, across the projection rebuilds of later visits.
+    assert!(fixture.index.usage_guard_take_withheld(&key));
+    fixture.index.refresh_usage_guard_holds_at(Some(CARRY_RETRY));
+    let (admitted, rows) = crate::local_resource_diagnostics::capture(|| {
+        fixture.index.usage_guard_admit_withheld_full(&candidate)
+    });
+    assert!(!admitted);
+    assert!(rows
+        .iter()
+        .any(|row| row["counts"]["withheld_full_paced"] == 1));
+    // Rule 7: a full pace map evicts its oldest stamp and lets the read happen.
+    fixture.index.usage_guard_pace_for_test(
+        (0..usage_pending_guard::WITHHELD_FULL_PACE_BOUND).map(|n| format!("/paced/{n}")),
+    );
+    let (admitted, rows) = crate::local_resource_diagnostics::capture(|| {
+        fixture.index.usage_guard_admit_withheld_full(&candidate)
+    });
+    assert!(admitted);
+    assert!(rows.iter().any(|row| row["counts"]["pace_evicted"] == 1));
+    // An unheld family never takes the withheld Full.
+    let mut known = retry_durable_fixture(0, 1);
+    known.index.refresh_usage_guard_holds_at(Some(CARRY_RETRY));
+    let mut grown = known.candidates[0].clone();
+    grown.size_bytes += 1;
+    assert!(!known.index.usage_guard_admit_withheld_full(&grown));
+}
+
+#[test]
+fn phase1_held_stale_family_does_not_block_an_unrelated_owned_start() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    let path = temp_file("claude-held-unrelated-owned-start");
+    let source_session_id = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .expect("fixture stem")
+        .to_string();
+    fs::write(
+        &path,
+        format!(
+            "{{\"timestamp\":\"2026-08-20T11:01:00Z\",\"sessionId\":\"{source_session_id}\",\"type\":\"assistant\",\"requestId\":\"req_owned\",\"message\":{{\"id\":\"msg_owned\",\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":2}}}}}}\n"
+        ),
+    )
+    .expect("write fixture");
+    let mut items =
+        parse_claude_code_jsonl_file(&path, "2026-08-20T11:02:00Z", "source".to_string())
+            .expect("parse");
+    let mut api = complete_api_row(&source_session_id, "req_owned", 1, 10, 2, 0);
+    api.client_request_id.clear();
+    api.cost_usd_micros = None;
+    api.event_sequence = None;
+    api.app_version.clear();
+    api.fingerprint.clear();
+    api.fingerprint = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&api).expect("serialize API evidence"))
+    );
+    let mut trace = complete_trace_row(&source_session_id, "req_owned", "");
+    trace.client_request_id.clear();
+    trace.fingerprint.clear();
+    trace.fingerprint = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&trace).expect("serialize trace evidence"))
+    );
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        local_index_key(&path),
+        manifest_index_entry(Some("unresolved")),
+    );
+    // An unrelated Unknown-held family: stale pending, no witness, indexed.
+    let held = CARRY_ROOT;
+    let hash = "a".repeat(64);
+    index
+        .files
+        .insert(carry_key(held, None), manifest_index_entry(Some("held")));
+    index.claude_usage_family_pending.insert(
+        held.into(),
+        ClaudeUsageFamilyPending {
+            derived_request_members: BTreeSet::new(),
+            census_window_end: "2026-08-20T10:00:00Z".into(),
+            member_request_id_hashes: BTreeMap::from([(
+                carry_member(held, None),
+                BTreeSet::from([hash.clone()]),
+            )]),
+            member_occurrences: BTreeMap::from([(
+                carry_member(held, None),
+                BTreeMap::from([(hash, carry_occurrence(0, 10))]),
+            )]),
+            invalid: false,
+            idless_revision: None,
+        },
+    );
+    let before = index.claude_usage_family_pending[held].clone();
+    apply_claude_reported_usage_with_index(
+        &mut items,
+        &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+            evidence: BTreeMap::from([(source_session_id.clone(), vec![api])]),
+            health: Default::default(),
+        },
+        &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
+            evidence: BTreeMap::from([(source_session_id, vec![trace])]),
+            ..Default::default()
+        },
+        &mut index,
+        true,
+        "2026-08-20T11:02:00Z",
+    );
+    assert_eq!(index.usage_guard_reason(held), Some(Unknown::MissingWitness));
+    // The unrelated family's owned start is still verified and published.
+    assert_eq!(
+        items[0].usage_accounting_contract.as_deref(),
+        Some("session_exclusive_reported_usage:v1")
+    );
+    assert_eq!(
+        items[0]
+            .context_curve
+            .as_ref()
+            .map(|curve| curve.coverage.as_str()),
+        Some("complete")
+    );
+    // The held family keeps its scoped, byte-identical proof through the terminal.
+    assert_eq!(index.claude_usage_family_pending[held], before);
+    let _ = fs::remove_file(path);
 }
 
 /// Counts-only inventory comparison entry. Supply one frozen ScanIndex, or a
@@ -408,6 +674,14 @@ fn phase1_replay_frozen_scan_index_guard_comparison() {
     let mut old_true_unknown = 0_u64;
     let mut global_unknown = 0_u64;
     let mut checkpoints = 0_u64;
+    // Lead B 4a: retry start no longer compacts. Index 0 is today (no
+    // compaction), index 1 simulates the removed compaction of old-carried
+    // and invalid (capped) roots on the same frozen input.
+    let mut occurrences = [0_u64; 2];
+    let mut over_cap_checkpoints = [0_u64; 2];
+    let mut cap_headroom_min = [u64::MAX; 2];
+    let mut invalid_families = [0_u64; 2];
+    let mut compacted_families = 0_u64;
     for path in paths {
         let file = File::open(path).expect("frozen checkpoint unavailable");
         let mut index =
@@ -426,6 +700,28 @@ fn phase1_replay_frozen_scan_index_guard_comparison() {
             .collect::<BTreeSet<_>>();
         for root in &roots {
             recorded[usize::from(index.claude_stale_family_carry.contains(root))] += 1;
+        }
+        let old_carry = usage_pending_guard::replay_old(|| route(&index, &roots, 0));
+        let mut totals = [0_u64; 2];
+        for (root, pending) in &index.claude_usage_family_pending {
+            let count = pending
+                .member_occurrences
+                .values()
+                .map(|occurrences| occurrences.len() as u64)
+                .sum::<u64>();
+            let compacted = old_carry.contains(root) || pending.invalid;
+            compacted_families += u64::from(compacted);
+            totals[0] += count;
+            totals[1] += if compacted { 0 } else { count };
+            for with in 0..2 {
+                invalid_families[with] += u64::from(pending.invalid);
+            }
+        }
+        for with in 0..2 {
+            occurrences[with] += totals[with];
+            let cap = MAX_CLAUDE_PENDING_USAGE_OCCURRENCES as u64;
+            over_cap_checkpoints[with] += u64::from(totals[with] > cap);
+            cap_headroom_min[with] = cap_headroom_min[with].min(cap.saturating_sub(totals[with]));
         }
         for route_id in 0..3 {
             let new_carry = route(&index, &roots, route_id);
@@ -453,6 +749,12 @@ fn phase1_replay_frozen_scan_index_guard_comparison() {
         json!({"checkpoints":checkpoints,"guard_old_bool_new_match_mismatch_unknown_by_route":matrix,
         "final_carry_old_new_by_route":carry_matrix,"recorded_selected_carry_false_true":recorded,
         "known_guard_differences":known_diffs,"old_true_unknown":old_true_unknown,"global_unknown":global_unknown,
+        "pending_occurrences_without_with_compaction":occurrences,
+        "over_cap_checkpoints_without_with_compaction":over_cap_checkpoints,
+        "min_cap_headroom_without_with_compaction":cap_headroom_min,
+        "invalid_families_without_with_compaction":invalid_families,
+        "compaction_simulated_families":compacted_families,
+        "pending_occurrence_cap":MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
         "historical_decision_log_unavailable":1,"acquisition_money_replay_unavailable":1,
         "activation_zero_diff_proven":false})
     );

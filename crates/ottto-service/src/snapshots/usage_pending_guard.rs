@@ -138,8 +138,61 @@ pub(super) struct Holds {
     // Built projections answer every root; unbuilt or dirty ones fall back.
     built: bool,
     dirty: bool,
+    // Survives projection rebuilds and selected-subset composition.
+    runtime: Runtime,
 }
-crate::heap_layout_bound::fields!(Holds; roots, catchup, global, built, dirty);
+crate::heap_layout_bound::fields!(Holds; roots, catchup, global, built, dirty, runtime);
+
+/// Fixed bounds for member growth read while a family is held (Lead B P1-a).
+pub(super) const HELD_GROWTH_MAX_MEMBERS: usize = 256;
+pub(super) const HELD_GROWTH_MAX_OCCURRENCES: usize = 4096;
+/// GUARDRAILS rule 5: at most one withheld Full per key per 6 h, below the
+/// one-day discovery window (C3/D2).
+pub(super) const WITHHELD_FULL_PACE_SECONDS: u64 = 6 * 60 * 60;
+pub(super) const WITHHELD_FULL_PACE_BOUND: usize = 64;
+const _: () = assert!(WITHHELD_FULL_PACE_SECONDS < 24 * 60 * 60);
+
+#[derive(Clone, Debug)]
+struct HeldSlot {
+    root: String,
+    window: String,
+    occurrences: BTreeMap<String, ClaudeTranscriptUsageOccurrenceWitness>,
+}
+crate::heap_layout_bound::fields!(HeldSlot; root, window, occurrences);
+
+/// Runtime-only custody of the B3 hold. Nothing here is persisted.
+#[derive(Clone, Debug, Default)]
+pub(super) struct Runtime {
+    // A held family's member growth, keyed by member. Never re-windows the
+    // family; merged into its pending only after the hold resolves.
+    slots: BTreeMap<String, HeldSlot>,
+    slot_occurrences: usize,
+    // TODO(E7 pace-map): fold into A0-h's shared `retail_full_at` pacing map
+    // when this branch integrates with it; that map is not in this base.
+    paced: BTreeMap<String, u64>,
+    // Keys admitted for a withheld Full during the current candidate visit.
+    withheld: BTreeSet<String>,
+}
+crate::heap_layout_bound::fields!(Runtime; slots, slot_occurrences, paced, withheld);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Growth {
+    Recorded,
+    OverCap,
+}
+
+impl Unknown {
+    fn label(self) -> &'static str {
+        match self {
+            Self::MissingWitness => "missing_witness",
+            Self::IncompleteMember => "incomplete_member",
+            Self::CompactedOrigin => "compacted_origin",
+            Self::Decode => "decode",
+            Self::Resource => "resource",
+            Self::Dependency => "dependency",
+        }
+    }
+}
 
 fn has_root(roots: &[(String, Unknown)], root: &str) -> bool {
     roots
@@ -184,6 +237,91 @@ impl Holds {
     }
     fn fresh(&self) -> bool {
         self.built && !self.dirty
+    }
+    /// An empty projection that keeps this one's runtime custody.
+    pub(super) fn carry_runtime(&self) -> Self {
+        Self {
+            runtime: self.runtime.clone(),
+            ..Self::default()
+        }
+    }
+    /// Record a held family's member growth in its own bounded slot.
+    pub(super) fn record_member_growth(
+        &mut self,
+        root: &str,
+        member: &str,
+        window: &str,
+        occurrences: BTreeMap<String, ClaudeTranscriptUsageOccurrenceWitness>,
+    ) -> Growth {
+        let runtime = &mut self.runtime;
+        // A newer window supersedes slots recorded for an older one.
+        if runtime.slots.values().any(|slot| slot.window != window) {
+            runtime.slots.retain(|_, slot| slot.window == window);
+            runtime.slot_occurrences = runtime
+                .slots
+                .values()
+                .map(|slot| slot.occurrences.len())
+                .sum();
+        }
+        let replaced = runtime
+            .slots
+            .get(member)
+            .map_or(0, |slot| slot.occurrences.len());
+        let next = (runtime.slot_occurrences - replaced).saturating_add(occurrences.len());
+        if next > HELD_GROWTH_MAX_OCCURRENCES
+            || (!runtime.slots.contains_key(member)
+                && runtime.slots.len() >= HELD_GROWTH_MAX_MEMBERS)
+        {
+            crate::local_resource_diagnostics::traversal_point(
+                "claude_usage_held_member_growth",
+                SnapshotSource::ClaudeCode.api_slug(),
+                &json!({"held_member_growth_over_cap":1}),
+            );
+            return Growth::OverCap;
+        }
+        let count = occurrences.len();
+        runtime.slots.insert(
+            member.to_owned(),
+            HeldSlot {
+                root: root.to_owned(),
+                window: window.to_owned(),
+                occurrences,
+            },
+        );
+        runtime.slot_occurrences = next;
+        crate::local_resource_diagnostics::traversal_point(
+            "claude_usage_held_member_growth",
+            SnapshotSource::ClaudeCode.api_slug(),
+            &json!({"held_member_growth_slots":1,"held_member_growth_occurrences":count}),
+        );
+        Growth::Recorded
+    }
+    /// Remove a family's slots; those of `window` re-window it after resolution.
+    pub(super) fn take_member_growth(
+        &mut self,
+        root: &str,
+        window: &str,
+    ) -> Vec<(
+        String,
+        BTreeMap<String, ClaudeTranscriptUsageOccurrenceWitness>,
+    )> {
+        let runtime = &mut self.runtime;
+        let members = runtime
+            .slots
+            .iter()
+            .filter(|(_, slot)| slot.root == root)
+            .map(|(member, _)| member.clone())
+            .collect::<Vec<_>>();
+        let mut taken = Vec::new();
+        for member in members {
+            if let Some(slot) = runtime.slots.remove(&member) {
+                runtime.slot_occurrences -= slot.occurrences.len();
+                if slot.window == window {
+                    taken.push((member, slot.occurrences));
+                }
+            }
+        }
+        taken
     }
     // `current` is the census window being accumulated now. Its pending is
     // ordinary current evidence, not a stale token record, and is never held.
@@ -276,6 +414,7 @@ impl Holds {
                 global: false,
                 built: true,
                 dirty: false,
+                runtime: Runtime::default(),
             });
         }
         // Sorted borrowed incidence, one identity per actual pending request.
@@ -315,58 +454,121 @@ impl Holds {
             }
         }
         incidence.sort_unstable();
-        loop {
-            let before = held.len();
-            let mut at = 0;
-            while at < incidence.len() {
-                let end =
-                    at + incidence[at..].partition_point(|(hash, _)| *hash == incidence[at].0);
-                if incidence[at..end]
-                    .iter()
-                    .any(|(_, root)| has_root(&held, root))
-                {
-                    for (_, root) in &incidence[at..end] {
-                        insert_root(&mut held, root, Unknown::Dependency);
-                    }
-                }
-                at = end;
+        // Linear worklist over a CSR graph: root nodes, then one node per
+        // shared request hash. Hash groups, legacy owner links and excluded
+        // prefixes are undirected edges, so every node is visited once.
+        let mut names = Vec::new();
+        names
+            .try_reserve_exact(roots.checked_add(incidence.len())?)
+            .ok()?;
+        names.extend(index.claude_usage_family_pending.keys().map(String::as_str));
+        names.extend(
+            index
+                .claude_usage_family_witnesses
+                .keys()
+                .map(String::as_str),
+        );
+        names.extend(
+            index
+                .claude_usage_family_witnesses
+                .values()
+                .flat_map(|w| w.legacy_owner_roots.iter().map(String::as_str)),
+        );
+        names.extend(incidence.iter().map(|(_, root)| root.as_str()));
+        names.sort_unstable();
+        names.dedup();
+        let node = |root: &str| names.binary_search(&root).ok();
+        let mut groups = 0usize;
+        let mut group_of = Vec::new();
+        group_of.try_reserve_exact(incidence.len()).ok()?;
+        for (at, (hash, _)) in incidence.iter().enumerate() {
+            if at > 0 && incidence[at - 1].0 != *hash {
+                groups += 1;
             }
-            for (root, witness) in &index.claude_usage_family_witnesses {
-                if has_root(&held, root)
-                    || witness
-                        .legacy_owner_roots
-                        .iter()
-                        .any(|owner| has_root(&held, owner))
-                {
-                    insert_root(&mut held, root, Unknown::Dependency);
-                    for owner in &witness.legacy_owner_roots {
-                        insert_root(&mut held, owner, Unknown::Dependency);
-                    }
-                }
-                for hash in witness
-                    .legacy_excluded_request_id_hashes
-                    .values()
-                    .flat_map(|h| h.iter())
-                {
-                    let at = incidence.partition_point(|(key, _)| *key < hash);
-                    let end = at + incidence[at..].partition_point(|(key, _)| *key == hash);
-                    if has_root(&held, root)
-                        || incidence[at..end]
-                            .iter()
-                            .any(|(_, owner)| has_root(&held, owner))
-                    {
-                        insert_root(&mut held, root, Unknown::Dependency);
-                        for (_, owner) in &incidence[at..end] {
-                            insert_root(&mut held, owner, Unknown::Dependency);
-                        }
-                        if at == end && witness.legacy_owner_roots.is_empty() {
-                            return None; // unknown dependency scope, never a carry
-                        }
-                    }
+            group_of.push(groups);
+        }
+        let excluded = index
+            .claude_usage_family_witnesses
+            .values()
+            .try_fold(0usize, |n, w| {
+                n.checked_add(
+                    w.legacy_excluded_request_id_hashes
+                        .values()
+                        .try_fold(0usize, |n, h| n.checked_add(h.len()))?,
+                )
+            })?;
+        let edge_count = incidence
+            .len()
+            .checked_add(owners)?
+            .checked_add(excluded)?
+            .checked_mul(2)?;
+        cost.add(edge_count.checked_mul(std::mem::size_of::<(usize, usize)>())?)?;
+        cost.add(
+            names
+                .len()
+                .checked_add(groups + 1)?
+                .checked_mul(2 * std::mem::size_of::<usize>())?,
+        )?;
+        let mut edges = Vec::new();
+        edges.try_reserve_exact(edge_count).ok()?;
+        let group_node = |group: usize| names.len() + group;
+        for ((_, root), group) in incidence.iter().zip(&group_of) {
+            let root = node(root)?;
+            edges.push((root, group_node(*group)));
+            edges.push((group_node(*group), root));
+        }
+        // A held root whose excluded prefix has no incidence and no owner list
+        // has unknown dependency scope: it is a global hold, never a carry.
+        let mut unscopable = Vec::new();
+        for (root, witness) in &index.claude_usage_family_witnesses {
+            let at_root = node(root)?;
+            for owner in &witness.legacy_owner_roots {
+                let owner = node(owner)?;
+                edges.push((at_root, owner));
+                edges.push((owner, at_root));
+            }
+            for hash in witness
+                .legacy_excluded_request_id_hashes
+                .values()
+                .flat_map(|h| h.iter())
+            {
+                let at = incidence.partition_point(|(key, _)| *key < hash);
+                if at < incidence.len() && incidence[at].0 == hash {
+                    edges.push((at_root, group_node(group_of[at])));
+                    edges.push((group_node(group_of[at]), at_root));
+                } else if witness.legacy_owner_roots.is_empty() {
+                    unscopable.push(at_root);
                 }
             }
-            if held.len() == before {
-                break;
+        }
+        edges.sort_unstable();
+        let nodes = names.len() + groups + 1;
+        let mut seen = Vec::new();
+        seen.try_reserve_exact(nodes).ok()?;
+        seen.resize(nodes, false);
+        let mut work = Vec::new();
+        work.try_reserve_exact(nodes).ok()?;
+        for (root, _) in &held {
+            if let Some(at) = node(root) {
+                seen[at] = true;
+                work.push(at);
+            }
+        }
+        while let Some(at) = work.pop() {
+            let from = edges.partition_point(|(u, _)| *u < at);
+            for &(_, next) in edges[from..].iter().take_while(|(u, _)| *u == at) {
+                if !seen[next] {
+                    seen[next] = true;
+                    work.push(next);
+                }
+            }
+        }
+        if unscopable.iter().any(|at| seen[*at]) {
+            return None;
+        }
+        for (at, name) in names.iter().enumerate() {
+            if seen[at] {
+                insert_root(&mut held, name, Unknown::Dependency);
             }
         }
         // Closure may pass through a current family; that family itself
@@ -378,6 +580,7 @@ impl Holds {
             global: false,
             built: true,
             dirty: false,
+            runtime: Runtime::default(),
         })
     }
 }
@@ -407,7 +610,13 @@ impl ScanIndex {
     }
     /// A traversal start passes its new window before the checkpoint exists.
     pub(super) fn refresh_usage_guard_holds_at(&mut self, current: Option<&str>) {
-        self.usage_guard_holds = projection(self, current);
+        let holds = projection(self, current);
+        self.install_usage_guard_holds(holds);
+    }
+    /// Install a rebuilt projection without losing runtime custody.
+    pub(super) fn install_usage_guard_holds(&mut self, mut holds: Holds) {
+        holds.runtime = std::mem::take(&mut self.usage_guard_holds.runtime);
+        self.usage_guard_holds = holds;
     }
     pub(super) fn refresh_usage_guard_after_native_completion(&mut self) {
         if self.usage_guard_holds.dirty {
@@ -450,11 +659,18 @@ impl ScanIndex {
             );
         }
     }
-    pub(super) fn usage_guard_note_tail(&mut self, path: &Path) {
+    pub(super) fn usage_guard_note_tail(&mut self, path: &Path, native_bytes: u64) {
         let Some(member) = claude_index_path_member_ref(path) else {
             return;
         };
         let held = self.usage_guard_holds.holds(member.root);
+        if held {
+            crate::local_resource_diagnostics::traversal_point(
+                "claude_usage_held_member_growth",
+                SnapshotSource::ClaudeCode.api_slug(),
+                &json!({"held_member_growth_members":1,"held_member_growth_bytes":native_bytes}),
+            );
+        }
         // Retain the family's age fence: one completed member cannot prove
         // that every sibling suffix caught up. Pending custody is the
         // restart-reconstructible fence until its existing owner retires it.
@@ -474,13 +690,153 @@ impl ScanIndex {
     }
 }
 
-/// The refused read keeps the census incomplete, so terminal cleanup cannot
-/// retire the held pending proof and a later walk cannot take the Full read.
-pub(super) fn full_blocked(census: &mut ScanCensus) {
-    census.record_unreadable(UnreadableCause::Reduction, 1);
+/// Scoped residue exit (Lead B 4d): the refused held read is counted per
+/// family and leaves the census otherwise unaffected. Terminal cleanup keeps
+/// the held pending, so the hold stays reconstructible.
+pub(super) fn full_blocked(path: &Path) {
+    let families = u64::from(claude_index_path_member_ref(path).is_some());
     crate::local_resource_diagnostics::traversal_point(
         "claude_usage_unknown_acquisition",
         SnapshotSource::ClaudeCode.api_slug(),
-        &json!({"unknown_full_blocked":1}),
+        &json!({"unknown_full_blocked":1,"held_read_refused_families":families}),
+    );
+}
+
+/// The exact occurrence map the pending accumulator would record for `item`,
+/// or None where it would invalidate the family instead.
+pub(super) fn item_occurrences(
+    item: &SnapshotItem,
+) -> Option<BTreeMap<String, ClaudeTranscriptUsageOccurrenceWitness>> {
+    let hashes = claude_snapshot_request_id_hashes(item)
+        .filter(|_| item.claude_usage_occurrences.len() == item.claude_usage_request_ids.len())?;
+    let occurrences = item
+        .claude_usage_occurrences
+        .iter()
+        .map(|(request_id, occurrence)| {
+            (
+                format!("{:x}", Sha256::digest(request_id.as_bytes())),
+                ClaudeTranscriptUsageOccurrenceWitness::from(occurrence),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    occurrences.keys().eq(hashes.iter()).then_some(occurrences)
+}
+
+impl ScanIndex {
+    /// GUARDRAILS rule 5 (Lead B P1-b): a held, indexed file with real growth
+    /// and no usable Tail takes ONE withheld Full that publishes nothing,
+    /// paced to one per key per 6 h. A full pace map evicts its oldest stamp
+    /// and lets the read happen (rule 7). Counted under the hold reason.
+    pub(super) fn usage_guard_admit_withheld_full(&mut self, candidate: &CandidateFile) -> bool {
+        let key = local_index_key(&candidate.path);
+        let Some(reason) = claude_index_path_member_ref(&candidate.path)
+            .and_then(|member| self.usage_guard_holds.reason(member.root))
+        else {
+            return false;
+        };
+        // Real growth only: the opened length past the committed index end.
+        if !self
+            .files
+            .get(&key)
+            .is_some_and(|entry| candidate.size_bytes > entry.size_bytes)
+        {
+            return false;
+        }
+        let now = sampled_scan::now_seconds();
+        let runtime = &mut self.usage_guard_holds.runtime;
+        if runtime
+            .paced
+            .get(&key)
+            .is_some_and(|at| now.saturating_sub(*at) < WITHHELD_FULL_PACE_SECONDS)
+        {
+            crate::local_resource_diagnostics::traversal_point(
+                "claude_usage_withheld_full",
+                SnapshotSource::ClaudeCode.api_slug(),
+                &json!({"withheld_full_paced":1}),
+            );
+            return false;
+        }
+        let mut pace_evicted = 0_u64;
+        if !runtime.paced.contains_key(&key) && runtime.paced.len() >= WITHHELD_FULL_PACE_BOUND {
+            let oldest = runtime
+                .paced
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                runtime.paced.remove(&oldest);
+                pace_evicted = 1;
+            }
+        }
+        runtime.paced.insert(key.clone(), now);
+        runtime.withheld.insert(key);
+        let mut counts = serde_json::Map::new();
+        counts.insert("withheld_full".into(), json!(1));
+        counts.insert(format!("withheld_full_{}", reason.label()), json!(1));
+        counts.insert("pace_evicted".into(), json!(pace_evicted));
+        crate::local_resource_diagnostics::traversal_point(
+            "claude_usage_withheld_full",
+            SnapshotSource::ClaudeCode.api_slug(),
+            &Value::Object(counts),
+        );
+        true
+    }
+    /// Replace the pace map with `keys` stamped at the epoch (oldest).
+    #[cfg(test)]
+    pub(super) fn usage_guard_pace_for_test(&mut self, keys: impl IntoIterator<Item = String>) {
+        self.usage_guard_holds.runtime.paced = keys.into_iter().map(|key| (key, 0)).collect();
+    }
+    pub(super) fn usage_guard_is_withheld(&self, key: &str) -> bool {
+        self.usage_guard_holds.runtime.withheld.contains(key)
+    }
+    pub(super) fn usage_guard_take_withheld(&mut self, key: &str) -> bool {
+        self.usage_guard_holds.runtime.withheld.remove(key)
+    }
+    /// The withheld Full's parse rebuilds the members' evidence in their held
+    /// growth slots; nothing reaches the page's published snapshots.
+    pub(super) fn usage_guard_record_withheld(&mut self, items: &[SnapshotItem], window: &str) {
+        let mut members = 0_u64;
+        for item in items {
+            let root = claude_snapshot_family_root(item);
+            let Some(occurrences) = item_occurrences(item) else {
+                crate::local_resource_diagnostics::traversal_point(
+                    "claude_usage_withheld_full",
+                    SnapshotSource::ClaudeCode.api_slug(),
+                    &json!({"withheld_full_unrecordable":1}),
+                );
+                continue;
+            };
+            if self.usage_guard_holds.record_member_growth(
+                &root,
+                &item.source_session_id,
+                window,
+                occurrences,
+            ) == Growth::Recorded
+            {
+                members += 1;
+            }
+        }
+        crate::local_resource_diagnostics::traversal_point(
+            "claude_usage_held_member_growth",
+            SnapshotSource::ClaudeCode.api_slug(),
+            &json!({"held_member_growth_members":members}),
+        );
+    }
+}
+
+/// Native bytes a withheld Full read for its held member.
+pub(super) fn withheld_read(native_bytes: u64) {
+    crate::local_resource_diagnostics::traversal_point(
+        "claude_usage_held_member_growth",
+        SnapshotSource::ClaudeCode.api_slug(),
+        &json!({"held_member_growth_bytes":native_bytes,"withheld_full_bytes":native_bytes}),
+    );
+}
+
+pub(super) fn withheld_checkpoint(retained: bool) {
+    crate::local_resource_diagnostics::traversal_point(
+        "claude_usage_withheld_full",
+        SnapshotSource::ClaudeCode.api_slug(),
+        &json!({"withheld_full_checkpoint_retained":u64::from(retained),"withheld_full_checkpoint_refused":u64::from(!retained)}),
     );
 }

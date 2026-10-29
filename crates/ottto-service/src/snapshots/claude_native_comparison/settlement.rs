@@ -407,12 +407,15 @@ impl Completion {
             paid,
             targets: &self.target_charges,
         };
+        // Same fold as the unpaid path: held stale families keep their proof.
+        index.refresh_usage_guard_holds_at(Some(scan.census_window_end.as_str()));
         let counts = accumulate_claude_usage_family_pending_with_credit(
             &scan.snapshots,
             &mut index.claude_usage_family_pending,
             &scan.census_window_end,
             MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
             Some(&mut budget),
+            Some(&mut index.usage_guard_holds),
         )?;
         Ok(Some(ClaudeNativeObservations {
             counts,

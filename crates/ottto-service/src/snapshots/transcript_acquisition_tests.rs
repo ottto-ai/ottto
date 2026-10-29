@@ -4882,8 +4882,9 @@ fn claude_unknown_continuation_keeps_custody_on_full_and_reads_held_growth_as_ta
                 .native_bytes
                 > 0
         );
-        let (_, rows) =
-            crate::local_resource_diagnostics::capture(|| index.usage_guard_note_tail(&fixture.0));
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            index.usage_guard_note_tail(&fixture.0, 1)
+        });
         let bucket = if id == 2 {
             "unknown_held_tail"
         } else {
