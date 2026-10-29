@@ -141,6 +141,7 @@ mod launcher_recognition_tests;
 mod local_context_points;
 pub(crate) use local_context_points::LocalContextPoint;
 use local_context_points::{local_context_points_recent, LocalContextPoints};
+mod codex_fragment;
 pub(crate) mod codex_version;
 pub(crate) mod discovery_growth;
 #[cfg(test)]
@@ -4339,6 +4340,10 @@ fn scan_index_schema_version() -> u16 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanIndexEntry {
+    /// RAM-only custody of a certified, already-observed Codex EOF fragment.
+    /// Never serialized; missing evidence fails open to the existing read path.
+    #[serde(skip)]
+    pub(crate) codex_fragment: Option<Box<codex_fragment::BoundFragment>>,
     pub size_bytes: u64,
     pub modified_unix_seconds: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -30121,6 +30126,16 @@ impl OwnedSourceScan {
                     // the withheld record with main's EOF behavior. Without a
                     // copy it records the length read and the staged debt
                     // re-selects it at the audit cadence.
+                    let bound_fragment = cursor_fragment.and_then(|fragment| {
+                        completed_acquisition.as_ref().and_then(|completed| {
+                            (completed.reduction.is_some()
+                                && completed.checkpoint.sealed_offset() == fragment.offset)
+                                .then(|| {
+                                    codex_fragment::BoundFragment::bind(&candidate, fragment.offset)
+                                })
+                                .flatten()
+                        })
+                    });
                     let mut recorded = candidate;
                     if let Some(fragment) = cursor_fragment.filter(|_| {
                         completed_acquisition
@@ -30135,6 +30150,7 @@ impl OwnedSourceScan {
                     if let Some(entry) = index.files.get_mut(&index_key) {
                         entry.codex_counting_v2 = codex_counting_v2;
                         entry.codex_counting_owner = counting_owner.clone();
+                        entry.codex_fragment = bound_fragment.map(Box::new);
                     }
                     // Native settlement accepts disclosed terminal row loss, even
                     // though that acquisition cannot certify a verified prefix.
@@ -41753,11 +41769,20 @@ fn refresh_retained_codex_roster(
                 .ok()
                 .and_then(unix_seconds)
                 .unwrap_or_default();
-            retention.observe_growth(&path, metadata.len(), modified_unix_seconds);
+            retention.observe_stamped_growth(
+                &path,
+                metadata.len(),
+                modified_unix_seconds,
+                codex_fragment::Stamp::metadata(&metadata),
+            );
             if census_unix_seconds.is_some_and(|now| {
                 !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
-            }) && !retention.owes_with_len(source, &path, metadata.len())
-            {
+            }) && !retention.owes_stamped(
+                source,
+                &path,
+                metadata.len(),
+                codex_fragment::Stamp::metadata(&metadata),
+            ) {
                 line_delivery_unselected(source.api_slug(), UnselectedReason::Age);
                 continue;
             }
@@ -42088,11 +42113,20 @@ fn advance_bounded_directory_traversal_with_budget(
                 .ok()
                 .and_then(unix_seconds)
                 .unwrap_or_default();
-            retention.observe_growth(&path, metadata.len(), modified_unix_seconds);
+            retention.observe_stamped_growth(
+                &path,
+                metadata.len(),
+                modified_unix_seconds,
+                codex_fragment::Stamp::metadata(&metadata),
+            );
             if census_unix_seconds.is_some_and(|now| {
                 !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
-            }) && !retention.owes_with_len(source, &path, metadata.len())
-            {
+            }) && !retention.owes_stamped(
+                source,
+                &path,
+                metadata.len(),
+                codex_fragment::Stamp::metadata(&metadata),
+            ) {
                 line_delivery_unselected(source.api_slug(), UnselectedReason::Age);
                 continue;
             }
@@ -42224,7 +42258,7 @@ fn candidate_from_traversal_path_at(
         }
         return None;
     }
-    retention.observe_growth(
+    retention.observe_stamped_growth(
         &pending.path,
         metadata.len(),
         metadata
@@ -42232,6 +42266,7 @@ fn candidate_from_traversal_path_at(
             .ok()
             .and_then(unix_seconds)
             .unwrap_or_default(),
+        codex_fragment::Stamp::metadata(&metadata),
     );
     if metadata.len() > max_jsonl_file_bytes(source) {
         if pending.census_member {
@@ -42256,7 +42291,12 @@ fn candidate_from_traversal_path_at(
         .unwrap_or_default();
     if census_unix_seconds
         .is_some_and(|now| !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days))
-        && !retention.owes_with_len(source, &pending.path, metadata.len())
+        && !retention.owes_stamped(
+            source,
+            &pending.path,
+            metadata.len(),
+            codex_fragment::Stamp::metadata(&metadata),
+        )
     {
         // Watcher hints must not widen the configured activity window. The
         // same revalidation also handles an ordinary candidate whose mtime was
@@ -42546,14 +42586,24 @@ struct DiscoveryRetention<'a> {
 impl<'a> DiscoveryRetention<'a> {
     /// Reuse an existing gate's metadata, including size refusals.
     fn observe_growth(&self, path: &Path, len: u64, modified: u64) {
+        self.observe_stamped_growth(path, len, modified, None);
+    }
+
+    fn observe_stamped_growth(
+        &self,
+        path: &Path,
+        len: u64,
+        modified: u64,
+        stamp: Option<codex_fragment::Stamp>,
+    ) {
         if let Some(page) = self.growth {
             let key = local_index_key(path);
             if self
                 .files
                 .get(&key)
-                .is_some_and(|entry| len > entry.size_bytes)
+                .is_some_and(|entry| codex_fragment::grown(entry, len, stamp))
             {
-                page.observe(key, len, modified);
+                page.observe_stamped(key, len, modified, stamp);
             }
         }
     }
@@ -42566,11 +42616,22 @@ impl<'a> DiscoveryRetention<'a> {
 
     /// Use the current metadata already held by the gate, never another stat.
     /// Count an aged growth-retention decision once, even if another arm owes it.
+    #[cfg(test)]
     fn owes_with_len(&self, source: SnapshotSource, path: &Path, current_len: u64) -> bool {
+        self.owes_stamped(source, path, current_len, None)
+    }
+
+    fn owes_stamped(
+        &self,
+        source: SnapshotSource,
+        path: &Path,
+        current_len: u64,
+        stamp: Option<codex_fragment::Stamp>,
+    ) -> bool {
         let grown = self
             .files
             .get(&local_index_key(path))
-            .is_some_and(|entry| current_len > entry.size_bytes);
+            .is_some_and(|entry| codex_fragment::grown(entry, current_len, stamp));
         if grown {
             crate::local_resource_diagnostics::discovery_retained_grown(source.api_slug());
         }
@@ -42624,16 +42685,18 @@ fn codex_parent_outside_window(
         .and_then(|metadata| metadata.modified().ok())
         .and_then(unix_seconds)
         .unwrap_or_default();
-    retention.observe_growth(
+    retention.observe_stamped_growth(
         path,
-        metadata.as_ref().map_or(0, |metadata| metadata.len()),
+        metadata.as_ref().map_or(0, |m| m.len()),
         modified,
+        metadata.as_ref().and_then(codex_fragment::Stamp::metadata),
     );
     census_unix_seconds.is_some_and(|now| !is_recent_enough_at(modified, now, backfill_window_days))
-        && !retention.owes_with_len(
+        && !retention.owes_stamped(
             SnapshotSource::Codex,
             path,
-            metadata.as_ref().map_or(0, |metadata| metadata.len()),
+            metadata.as_ref().map_or(0, |m| m.len()),
+            metadata.as_ref().and_then(codex_fragment::Stamp::metadata),
         )
 }
 
@@ -42871,10 +42934,11 @@ fn open_and_identify_scan_candidate_with_rescue(
             return None;
         }
     };
-    retention.observe_growth(
+    retention.observe_stamped_growth(
         &candidate.path,
         candidate.size_bytes,
         candidate.modified_unix_seconds,
+        codex_fragment::Stamp::candidate(&candidate),
     );
     if !verification_rescue
         && !opened_candidate_is_within_frozen_window(
@@ -42882,7 +42946,12 @@ fn open_and_identify_scan_candidate_with_rescue(
             census_unix_seconds,
             backfill_window_days,
         )
-        && !retention.owes_with_len(source, &candidate.path, candidate.size_bytes)
+        && !retention.owes_stamped(
+            source,
+            &candidate.path,
+            candidate.size_bytes,
+            codex_fragment::Stamp::candidate(&candidate),
+        )
     {
         // The path can be atomically replaced after directory/candidate stat
         // but before the no-follow open. Eligibility follows the exact opened
@@ -49103,11 +49172,19 @@ impl ScanIndex {
         if withheld_unchanged {
             return (CandidateDecision::Skip, None);
         }
-        let transcript_changed = entry.size_bytes != candidate.size_bytes
-            || entry.modified_unix_seconds != candidate.modified_unix_seconds
-            || entry
-                .modified_unix_nanos
-                .is_some_and(|value| value != candidate.modified_unix_nanos);
+        let known_fragment = entry.codex_fragment.as_ref().is_some_and(|fragment| {
+            fragment.matches(
+                entry.size_bytes,
+                candidate.size_bytes,
+                codex_fragment::Stamp::candidate(candidate),
+            ) && entry.source_file_fingerprint == candidate.source_file_fingerprint
+        });
+        let transcript_changed = !known_fragment
+            && (entry.size_bytes != candidate.size_bytes
+                || entry.modified_unix_seconds != candidate.modified_unix_seconds
+                || entry
+                    .modified_unix_nanos
+                    .is_some_and(|value| value != candidate.modified_unix_nanos));
         if transcript_changed {
             return (
                 CandidateDecision::Parse,
@@ -49201,6 +49278,8 @@ impl ScanIndex {
             // retry. Only the validated CONTENT memo above grants that Skip;
             // missing/refused/poisoned/unstamped advisory state must recover
             // through the existing counted parse, without clearing the tuple.
+            // Memo-miss recovery, NOT a source change: SourceChanged is the
+            // legacy selector bucket; withheld_reparse{start} names this read.
             (
                 CandidateDecision::Parse,
                 Some(CandidateParseReason::SourceChanged),
@@ -49326,6 +49405,7 @@ impl ScanIndex {
         self.files.insert(
             key.clone(),
             ScanIndexEntry {
+                codex_fragment: None,
                 size_bytes: candidate.size_bytes,
                 modified_unix_seconds: candidate.modified_unix_seconds,
                 modified_unix_nanos: Some(candidate.modified_unix_nanos),
@@ -49382,6 +49462,7 @@ impl ScanIndex {
         self.files.insert(
             key.clone(),
             ScanIndexEntry {
+                codex_fragment: None,
                 size_bytes: candidate.size_bytes,
                 modified_unix_seconds: candidate.modified_unix_seconds,
                 modified_unix_nanos: Some(candidate.modified_unix_nanos),
@@ -52553,6 +52634,7 @@ mod tests {
             files: BTreeMap::from([(
                 "content-free-key".to_string(),
                 ScanIndexEntry {
+                    codex_fragment: None,
                     size_bytes: 42,
                     modified_unix_seconds: 1_700_000_000,
                     modified_unix_nanos: Some(1_700_000_000_000_000_000),
@@ -53942,6 +54024,7 @@ mod tests {
             files: BTreeMap::from([(
                 local_index_key(&path),
                 ScanIndexEntry {
+                    codex_fragment: None,
                     size_bytes: candidate.size_bytes,
                     modified_unix_seconds: candidate.modified_unix_seconds,
                     modified_unix_nanos: Some(candidate.modified_unix_nanos),
@@ -54394,6 +54477,7 @@ mod tests {
             files: BTreeMap::from([(
                 local_index_key(&path),
                 ScanIndexEntry {
+                    codex_fragment: None,
                     size_bytes: metadata.len(),
                     modified_unix_seconds,
                     modified_unix_nanos: None,
@@ -54491,6 +54575,7 @@ mod tests {
             files: BTreeMap::from([(
                 local_index_key(&path),
                 ScanIndexEntry {
+                    codex_fragment: None,
                     size_bytes: file_metadata.len(),
                     modified_unix_seconds,
                     modified_unix_nanos: None,
@@ -54559,6 +54644,7 @@ mod tests {
             files: BTreeMap::from([(
                 local_index_key(&path),
                 ScanIndexEntry {
+                    codex_fragment: None,
                     size_bytes: 42,
                     modified_unix_seconds: 1_777_777_777,
                     modified_unix_nanos: Some(1_777_777_777_000_000_001),
@@ -54614,6 +54700,7 @@ mod tests {
             files: BTreeMap::from([(
                 local_index_key(&path),
                 ScanIndexEntry {
+                    codex_fragment: None,
                     size_bytes: 42,
                     modified_unix_seconds: 1_777_777_777,
                     modified_unix_nanos: None,
@@ -54666,6 +54753,7 @@ mod tests {
             files: BTreeMap::from([(
                 local_index_key(&path),
                 ScanIndexEntry {
+                    codex_fragment: None,
                     size_bytes: 42,
                     modified_unix_seconds: 1_777_777_777,
                     modified_unix_nanos: None,
@@ -60449,6 +60537,7 @@ mod tests {
         let v6_key =
             source_file_fingerprint(&path, size_bytes, modified_unix_seconds, "pi_jsonl:v6");
         let legacy_entry = ScanIndexEntry {
+            codex_fragment: None,
             size_bytes,
             modified_unix_seconds,
             modified_unix_nanos: None,
@@ -84605,6 +84694,7 @@ mod tests {
         index.files.insert(
             local_index_key(&parent_path),
             ScanIndexEntry {
+                codex_fragment: None,
                 size_bytes: metadata.len(),
                 modified_unix_seconds,
                 modified_unix_nanos: Some(modified_unix_nanos),
@@ -86227,6 +86317,7 @@ mod tests {
                 .display()
                 .to_string(),
             ScanIndexEntry {
+                codex_fragment: None,
                 size_bytes: 1,
                 modified_unix_seconds: 1,
                 modified_unix_nanos: None,
@@ -86316,6 +86407,7 @@ mod tests {
                 .display()
                 .to_string(),
             ScanIndexEntry {
+                codex_fragment: None,
                 source_file_fingerprint: "file-b".to_string(),
                 ..index.files.values().next().unwrap().clone()
             },
@@ -87805,6 +87897,7 @@ mod tests {
 
     pub(super) fn manifest_index_entry(fingerprint: Option<&str>) -> ScanIndexEntry {
         ScanIndexEntry {
+            codex_fragment: None,
             size_bytes: 1,
             modified_unix_seconds: 2,
             modified_unix_nanos: Some(3),
@@ -87970,6 +88063,7 @@ mod tests {
         scanned.files.insert(
             "unchanged.jsonl".to_string(),
             ScanIndexEntry {
+                codex_fragment: None,
                 size_bytes: 42,
                 ..manifest_index_entry(Some("aa"))
             },
@@ -88895,6 +88989,7 @@ mod tests {
         index.files.insert(
             "old-file-modified-now.jsonl".to_string(),
             ScanIndexEntry {
+                codex_fragment: None,
                 size_bytes: 1,
                 modified_unix_seconds: u64::MAX,
                 modified_unix_nanos: Some(u64::MAX),
@@ -89976,7 +90071,7 @@ crate::durable_tail_codec::durable_struct!(key RowKey {
 });
 crate::heap_layout_bound::fields!(ScanCensus; causes, oversized_discovery, #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, parse_reasons, codex_selections, codex_counting_v2, claude_compaction_unlinked_parent_count);
 crate::heap_layout_bound::fields!(ScanIndex; decode_holds, claude_account_window_retention, schema_version, generation, upload_ack_retirement_handoff, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_retired_family_tombstones, claude_retired_family_tombstones_initialized, claude_retired_family_tombstones_uncertain, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_full_rearm_progress, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, codex_counting_moved_evidence, codex_counting_tombstones, codex_counting_evicted_legacy, codex_counting_evictions, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_move_not_full, claude_history_move_released, accepted_incidence_pending_census, accepted_rebuild_incidence, accepted_rebuild_pending_since_unix_seconds, accepted_rebuild_last_alarm_unix_seconds, claude_no_list_policy, claude_history_emission, reason_reoffer_retries, terminal_contract_retries, claude_history_unverified_in_process, claude_rebuild_read_load_eligible, reason_reoffer_cooldowns, retired_reread_guard, held_audit_progress, claude_money_birth_store);
-crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos);
+crate::heap_layout_bound::fields!(ScanIndexEntry; codex_fragment, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);
 crate::heap_layout_bound::fields!(ScanTraversalCounts; causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count);

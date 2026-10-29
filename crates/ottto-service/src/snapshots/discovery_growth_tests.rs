@@ -270,3 +270,216 @@ fn truncate_then_regrow_past_committed_extent_rebuilds_from_zero() {
     );
     fate(&f.save_and_report(&mut rewritten, &scan), 1, 0);
 }
+
+/// Portable certificate/selector seam: the cursor's retained-prefix completion
+/// is reproduced from a real ReadPlan seal, without a supported-layout override.
+/// The subsequent aged discovery and catch-up are ordinary production scans.
+#[test]
+fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
+    use crate::transcript_acquisition::{AuditDebt, ReadPlan, Scope};
+    let f = Fixture::new();
+    let source = SnapshotSource::Codex;
+    let token = |n| {
+        json!({"timestamp":"2026-10-06T10:00:00Z", "type":"event_msg",
+        "payload":{"type":"token_count","info":{"model":"fixture-model",
+        "total_token_usage":{"input_tokens":n,"output_tokens":n},
+        "last_token_usage":{"input_tokens":10,"output_tokens":10}}}})
+        .to_string()
+    };
+    let prefix = format!(
+        "{}\n{}\n",
+        json!({"type":"session_meta",
+        "timestamp":"2026-10-06T09:00:00Z","payload":{"id":SESSION}}),
+        token(10)
+    );
+    fs::write(&f.path, &prefix).unwrap();
+    let (mut index, baseline, _, _) = f.page(source, ScanIndex::default());
+    assert_eq!(baseline.snapshots.len(), 1, "real indexed Codex prefix");
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&f.path)
+        .unwrap()
+        .write_all(token(20).as_bytes())
+        .unwrap();
+    f.age(91); // age BEFORE binding the completion; no artificial stale witness
+    let key = local_index_key(&f.path);
+    let mut candidate = candidate_from_traversal_path(
+        source,
+        ScanTraversalPath {
+            scan_root: f.root.clone(),
+            path: f.path.clone(),
+            census_member: true,
+            watcher_hint: false,
+        },
+        &mut ScanCensus::default(),
+        None,
+        7,
+        discovery_retention!(index),
+    )
+    .unwrap();
+    prepare_owned_scan_candidate(
+        source,
+        &mut candidate,
+        &CodexTitleMetadata::default(),
+        &ClaudeTitleMetadata::default(),
+        None,
+    );
+    let (candidate, mut file) = open_and_identify_scan_candidate(
+        source,
+        candidate,
+        &mut ScanCensus::default(),
+        None,
+        7,
+        discovery_retention!(index),
+    )
+    .unwrap();
+    let now = sampled_scan::now_seconds();
+    let scope = Scope("fragment-control".into());
+    let mut plan = ReadPlan::prepare(&mut file, None, &scope, None, now).unwrap();
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).unwrap();
+    plan.observe_record_fragment(&bytes[..prefix.len()], true)
+        .unwrap();
+    plan.observe_record_fragment(&bytes[prefix.len()..], false)
+        .unwrap();
+    let checkpoint = plan
+        .commit_sealed_prefix(&mut file, true, &scope, now, now, false, bytes.len() as u64)
+        .unwrap();
+    assert_eq!(checkpoint.sealed_offset(), prefix.len() as u64);
+    let fragment = codex_fragment::BoundFragment::bind(&candidate, checkpoint.sealed_offset())
+        .expect("known object birth is required; no length-only witness");
+    let mut recorded = candidate.clone();
+    recorded.size_bytes = checkpoint.sealed_offset();
+    index.record(
+        recorded,
+        Some(baseline.snapshots[0].snapshot_fingerprint.clone()),
+        ScanParseOutcome::Snapshot,
+    );
+    index.files.get_mut(&key).unwrap().codex_fragment = Some(Box::new(fragment));
+    index.stage_sampled_audit(
+        &key,
+        &candidate.source_file_fingerprint,
+        AuditDebt {
+            due_unix_seconds: now + crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS,
+        },
+    );
+    assert!(
+        index.files[&key].has_unverified_source(),
+        "independent custody kept"
+    );
+    assert!(
+        index.candidate_decision(&candidate) == CandidateDecision::Skip,
+        "a certified unchanged fragment must not select another parse"
+    );
+    let encoded = serde_json::to_value(&index).unwrap();
+    assert!(
+        encoded["files"][&key].get("codex_fragment").is_none(),
+        "RAM only"
+    );
+    let metadata = fs::metadata(&f.path).unwrap();
+    for _ in 0..2 {
+        let page = discovery_growth::Page::default();
+        let retention = discovery_retention!(index, &page);
+        retention.observe_stamped_growth(
+            &f.path,
+            metadata.len(),
+            candidate.modified_unix_seconds,
+            codex_fragment::Stamp::metadata(&metadata),
+        );
+        let (_, rows) = capture(|| {
+            assert!(
+                retention.owes_stamped(
+                    source,
+                    &f.path,
+                    metadata.len(),
+                    codex_fragment::Stamp::metadata(&metadata)
+                ),
+                "audit still owes it"
+            )
+        });
+        assert!(!rows
+            .iter()
+            .any(|row| row.to_string().contains("\"grown\":1")));
+        assert_eq!(
+            page.counts(&index, now)
+                .discovery_retained_grown_fate
+                .still_retained,
+            0,
+            "known fragment is excluded from growth population"
+        );
+        let (next, scan, reads, rows) = f.page(source, index);
+        assert_eq!(
+            scan.scanned_file_count, 0,
+            "unchanged aged fragment: no acquisition"
+        );
+        assert!(scan.snapshots.is_empty());
+        assert!(reads.0.lock().unwrap().0.is_empty());
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row["counts"]["discovery_retained"]["grown"]
+                    .as_u64()
+                    .is_some_and(|n| n != 0)),
+            "no grown events"
+        );
+        assert!(next.files[&key].has_unverified_source());
+        index = next;
+    }
+    // Missing binding/object changes must not turn a length heuristic into Skip.
+    let mut without = index.clone();
+    without.files.get_mut(&key).unwrap().codex_fragment = None;
+    assert_eq!(
+        without.candidate_decision(&candidate),
+        CandidateDecision::Parse
+    );
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&f.path)
+        .unwrap()
+        .write_all(b"\n")
+        .unwrap();
+    f.age(91);
+    let (caught, scan, reads, _) = f.page(source, index);
+    assert_eq!(reads.0.lock().unwrap().0, vec![growth_mode()]);
+    assert_eq!(scan.snapshots.len(), 1, "terminated record catches up once");
+    assert_eq!(
+        caught.files[&key].size_bytes,
+        fs::metadata(&f.path).unwrap().len()
+    );
+    // Whole-body equality with a cold ordinary Full, not token-only equality.
+    let mut cold_scan = OwnedSourceScan::new(
+        source,
+        std::slice::from_ref(&f.root),
+        ScanIndex::default(),
+        &OffsetDateTime::now_utc().format(&Rfc3339).unwrap(),
+        BACKFILL_WINDOW_DAYS,
+        10,
+        false,
+        None,
+        &[],
+        false,
+        true,
+    );
+    let cold = loop {
+        match cold_scan.step(None) {
+            OwnedSourceScanStep::Pending(next) => cold_scan = next,
+            OwnedSourceScanStep::Complete {
+                mut scan,
+                mut index,
+                ..
+            } => {
+                apply_upload_policy(source, &mut scan.snapshots, SnapshotUploadPolicy::default());
+                finalize_scan_after_policy(source, &mut scan, &mut index);
+                break scan;
+            }
+        }
+    };
+    assert_eq!(
+        serde_json::to_value(&scan.snapshots).unwrap(),
+        serde_json::to_value(&cold.snapshots).unwrap(),
+        "catch-up body == cold Full"
+    );
+    let (_, idle, reads, _) = f.page(source, caught);
+    assert!(idle.snapshots.is_empty(), "emitted once");
+    assert!(reads.0.lock().unwrap().0.is_empty());
+}

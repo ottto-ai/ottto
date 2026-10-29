@@ -77,3 +77,17 @@ removed before account settlement, preserving exact committed ACK assertions.
 D4 limits newly sampled audit carry to account holds, including unrecorded
 account overflow; authority/family-only restores add no independent audit debt.
 E1 #870 must preserve this distinction when composing the shared restore hunks.
+
+
+## Round20 final delta
+
+An existing certified cursor completion with a retained prefix reduction binds
+its known unterminated Codex suffix to a RAM-only object/extent witness on the
+entry. Existing metadata qualifies exclusion from grown retention/fate/age; the
+selector additionally checks the existing sampled fingerprint. Independent
+audit/fragment custody stays owed. Changed/terminated content or missing binding
+uses ordinary counted acquisition; no new persisted field, stat or Full cause.
+The witness is charged through the entry's existing heap graph and disappears
+on serialized reload. Diagnostic growth admission is capped at4,096, retaining
+overflow disclosure. The memo-miss recovery comment names its counted start
+instead of implying an equal fingerprint is a source change.

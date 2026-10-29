@@ -356,7 +356,7 @@ for a key update one observation instead of multiplying its population count.
 This is page scratch in the existing resource probe and then scan result,
 charged by the scan owner's existing heap accounting. It is discarded with the
 page, adds no persisted field or cross-page ledger, and performs no additional
-stat, transcript read or directory walk. Scratch admits at most the existing
+stat, transcript read or directory walk. Scratch admits at most 4,096 observations per page, below the existing
 10,000-entry discovery-tick bound. `counts.observation_overflow` reports refused
 diagnostic observations (possibly repeated), making coverage explicitly partial
 when roster/selection observations plus walking exceed it. This diagnostic cap
@@ -380,15 +380,18 @@ They retain counted rebuilds for observed rewrites/shrink/sample mismatches;
 length-only retention grants no Tail authority. Existing sampled acquisition's
 accepted unsampled-interior-edit limitations still apply.
 
-Two retention costs are intentional and count attempts, not unique files. An
+Oversized retention costs count attempts, not unique files. An
 over-cap grown file cannot commit the unread suffix: it stays observed and is
 counted in both grown retention and size refusal on every eligible pass,
 indefinitely until its state changes. Counting has no once-per-process cap.
-Codex fragment-only growth is also retained: a cached reduction whose committed
-extent is `fragment.offset` can Tail-read the same unterminated trailing record
-on subsequent passes, including past the activity window. This extends the
-existing in-window fragment handling until completion, cache eviction or restart;
-it does not create a new Full-read cause.
+Codex's already-known unterminated EOF fragment is excluded from grown retention
+and its fate/age population when a validated cursor certificate and retained
+prefix reduction bind the entire residual to the unchanged object. This RAM-only
+binding reuses discovery metadata (no additional stat), requires known birth,
+and grants no audit completion or custody release. The selector also requires
+the existing sampled fingerprint to match, after independent audit/context gates.
+Real extra bytes, termination, replacement or missing binding use the ordinary
+counted catch-up path; a length difference alone never proves a known fragment.
 
 On Claude pages, `counts.withheld_reparse` counts re-parses of keys withheld for
 an unresolved account: `start` (first in this process), `evidence` (same size,

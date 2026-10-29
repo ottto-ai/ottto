@@ -11798,6 +11798,7 @@ mod tests {
         index.files.insert(
             "synthetic/deferred.jsonl".into(),
             crate::snapshots::ScanIndexEntry {
+                codex_fragment: None,
                 size_bytes: 1,
                 modified_unix_seconds: 1,
                 modified_unix_nanos: Some(1),

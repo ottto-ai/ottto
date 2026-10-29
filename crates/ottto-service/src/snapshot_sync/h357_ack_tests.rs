@@ -772,6 +772,7 @@ fn with_cache(item: &SnapshotItem) -> SnapshotItem {
 
 fn index_entry(source_file_fingerprint: &str) -> crate::snapshots::ScanIndexEntry {
     crate::snapshots::ScanIndexEntry {
+        codex_fragment: None,
         size_bytes: 1,
         modified_unix_seconds: 1,
         modified_unix_nanos: Some(1),

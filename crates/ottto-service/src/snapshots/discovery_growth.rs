@@ -3,16 +3,17 @@
 //! The saved index is the only authority for whether observed growth committed.
 use super::*;
 
-// Same cardinality as an ordinary discovery tick. A diagnostic overflow does
+// Diagnostic admission is smaller than the ordinary discovery tick. A diagnostic overflow does
 // not cap retention: disclose incomplete coverage rather than add a census.
-const MAX_OBSERVATIONS: usize = MAX_SCAN_DIRECTORY_ENTRIES_PER_TICK;
+const MAX_OBSERVATIONS: usize = 4_096;
 
 #[derive(Clone, Copy, Debug)]
 struct Observation {
     len: u64,
     modified: u64,
+    stamp: Option<codex_fragment::Stamp>,
 }
-crate::heap_layout_bound::fields!(Observation; len, modified);
+crate::heap_layout_bound::fields!(Observation; len, modified, stamp);
 
 #[derive(Clone, Debug, Default)]
 struct State {
@@ -71,7 +72,17 @@ pub(crate) struct Counts {
     pub(crate) observation_overflow: u64,
 }
 impl Page {
+    #[cfg(test)]
     pub(super) fn observe(&self, key: String, len: u64, modified: u64) {
+        self.observe_stamped(key, len, modified, None);
+    }
+    pub(super) fn observe_stamped(
+        &self,
+        key: String,
+        len: u64,
+        modified: u64,
+        stamp: Option<codex_fragment::Stamp>,
+    ) {
         let mut state = self.state();
         if !state.observations.contains_key(&key) {
             if state.observations.len() == MAX_OBSERVATIONS {
@@ -86,12 +97,17 @@ impl Page {
         }
         // BTreeMap keeps the original stored key on replacement, so its
         // charged capacity stays valid. Repeated gates get one fate per page.
-        state
-            .observations
-            .insert(key, Observation { len, modified });
+        state.observations.insert(
+            key,
+            Observation {
+                len,
+                modified,
+                stamp,
+            },
+        );
     }
 
-    fn counts(&self, index: &ScanIndex, now: u64) -> Counts {
+    pub(super) fn counts(&self, index: &ScanIndex, now: u64) -> Counts {
         let state = self.state();
         let mut counts = Counts {
             observation_overflow: state.overflow,
@@ -102,6 +118,13 @@ impl Page {
                 counts.discovery_retained_grown_fate.unindexed += 1;
                 continue;
             };
+            // A newly sealed prefix can leave only the already-observed
+            // fragment. It is neither outstanding grown usage nor age credit.
+            if entry.codex_fragment.as_ref().is_some_and(|fragment| {
+                fragment.matches(entry.size_bytes, observed.len, observed.stamp)
+            }) {
+                continue;
+            }
             if entry.size_bytes >= observed.len {
                 counts.discovery_retained_grown_fate.committed += 1;
                 continue;
@@ -198,6 +221,7 @@ mod tests {
 
     #[test]
     fn scratch_admission_is_bounded_and_never_changes_discovery_retention() {
+        assert_eq!(MAX_OBSERVATIONS, 4_096);
         let page = Page::default();
         for n in 0..MAX_OBSERVATIONS {
             page.observe(n.to_string(), 2, 1);
@@ -224,6 +248,10 @@ mod tests {
         page.heap_bound(&mut counter).unwrap();
         assert!(counter.visits_for_test() <= 2);
         assert!(counter.bytes >= page.state().key_bytes);
+        assert!(
+            counter.bytes < 8 * 1024 * 1024,
+            "scratch fits below frame parking budget"
+        );
         let state = page.state();
         assert_eq!(
             state.key_bytes,
