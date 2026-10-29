@@ -6953,7 +6953,8 @@ mod header_admission_tests {
         assert!(cache
             .with_cursor(|cursor| cursor.headers.is_empty())
             .unwrap());
-        drop(credit);
+        credit.refund();
+        assert_eq!(cache.cursor_reserved(), 0);
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -6982,7 +6983,8 @@ mod header_admission_tests {
         assert!(cache
             .with_cursor(|cursor| cursor.headers.is_empty())
             .unwrap());
-        drop(credit);
+        credit.refund();
+        assert_eq!(cache.cursor_reserved(), 0);
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
