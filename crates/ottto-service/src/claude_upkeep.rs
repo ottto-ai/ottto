@@ -26,8 +26,6 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 #[cfg(test)]
 use std::thread;
-#[cfg(test)]
-use std::time::Duration;
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 
 const UPKEEP_STATE_SCHEMA_VERSION: u16 = 1;
@@ -35,8 +33,6 @@ const UPKEEP_STATE_FILE: &str = "claude-background-upkeep-state.json";
 const UPKEEP_STATE_LOCK_FILE: &str = ".claude-background-upkeep-state.lock";
 /// Operational stop: absent means normal consent/network-gated GA behavior.
 pub(crate) const UPKEEP_DISABLED_FILE: &str = "claude-background-upkeep-disabled";
-#[cfg(test)]
-const DOCTOR_TIMEOUT: Duration = Duration::from_secs(20);
 
 const RELLOGIN_APPROACHING_SECONDS: i64 = 72 * 60 * 60;
 #[cfg(test)]
@@ -121,17 +117,8 @@ impl Drop for UpkeepStateGuard {
 
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ClaimToken {
-    slot_id: String,
-    due_access_expires_at: String,
-    attempted_at: String,
-    previous_failures: u32,
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq)]
 enum ClaimOutcome {
-    Claimed(ClaimToken, ClaudeConfigSlotUpkeepStatusV1),
+    Claimed(ClaudeConfigSlotUpkeepStatusV1),
     Deferred(ClaudeConfigSlotUpkeepStatusV1),
 }
 
@@ -143,59 +130,26 @@ enum DoctorProcessResult {
 }
 
 #[cfg(test)]
-trait UpkeepClock {
-    fn now(&self) -> OffsetDateTime;
-}
-
-#[cfg(test)]
 trait CredentialMetadataReader {
     fn read(&self, slot: &ClaudeConfigDirSlot) -> Option<ClaudeOAuthCredentialMetadata>;
 }
 
 #[cfg(test)]
 trait DoctorProcessRunner {
-    fn run(&self, config_dir: &str, timeout: Duration) -> DoctorProcessResult;
-
-    fn start(&self, config_dir: &str) -> DoctorProcessStart {
-        DoctorProcessStart::Finished(self.run(config_dir, DOCTOR_TIMEOUT))
-    }
-}
-
-#[cfg(test)]
-enum DoctorProcessStart {
-    Finished(DoctorProcessResult),
-}
-
-#[cfg(test)]
-impl DoctorProcessStart {
-    fn wait(self, _timeout: Duration) -> DoctorProcessResult {
-        match self {
-            Self::Finished(result) => result,
-        }
-    }
-}
-
-#[cfg(test)]
-trait FinalSpawnGate {
-    fn start_if_allowed(
-        &self,
-        descriptor: &ClaudeConfigSlotDescriptorV1,
-        process: &dyn DoctorProcessRunner,
-        config_dir: &str,
-    ) -> Result<DoctorProcessStart, ClaudeConfigSlotUpkeepResultV1>;
+    fn run(&self, config_dir: &str) -> DoctorProcessResult;
 }
 
 #[cfg(test)]
 struct ProductionFinalSpawnGate;
 
 #[cfg(test)]
-impl FinalSpawnGate for ProductionFinalSpawnGate {
+impl ProductionFinalSpawnGate {
     fn start_if_allowed(
         &self,
         descriptor: &ClaudeConfigSlotDescriptorV1,
         process: &dyn DoctorProcessRunner,
         config_dir: &str,
-    ) -> Result<DoctorProcessStart, ClaudeConfigSlotUpkeepResultV1> {
+    ) -> Result<DoctorProcessResult, ClaudeConfigSlotUpkeepResultV1> {
         FileClaudeConfigSlotSettingsStore::default()
             .with_locked_status(|status| {
                 if status.consent != ClaudeAccountUpkeepConsentState::Granted {
@@ -216,34 +170,10 @@ impl FinalSpawnGate for ProductionFinalSpawnGate {
                 if default_support_dir().join(UPKEEP_DISABLED_FILE).is_file() {
                     return Err(ClaudeConfigSlotUpkeepResultV1::UpkeepDisabled);
                 }
-                // Serialize the final consent/removal check with process spawn,
-                // then release settings before the bounded wait.
-                Ok(process.start(config_dir))
+                // The fixture process runs synchronously under the final fence.
+                Ok(process.run(config_dir))
             })
             .unwrap_or(Err(ClaudeConfigSlotUpkeepResultV1::ProbeFailed))
-    }
-}
-
-#[cfg(test)]
-impl ProductionFinalSpawnGate {
-    fn publish_preclaim_needs_login(
-        &self,
-        descriptor: &ClaudeConfigSlotDescriptorV1,
-        support_dir: &Path,
-        slot_id: &str,
-        status: &ClaudeConfigSlotUpkeepStatusV1,
-        observed_from: OffsetDateTime,
-        now: OffsetDateTime,
-    ) -> Result<Option<ClaudeConfigSlotUpkeepStatusV1>, ()> {
-        FileClaudeConfigSlotSettingsStore::default()
-            .with_locked_status(|registry| {
-                if !registered_slot_publication_allowed(registry, descriptor, support_dir) {
-                    return Ok(None);
-                }
-                persist_preclaim_needs_login(support_dir, slot_id, status, observed_from, now)
-                    .map(Some)
-            })
-            .map_err(|_| ())?
     }
 }
 
@@ -407,60 +337,15 @@ fn observe_registered_slot_upkeep_reading(
 
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-fn observe_and_publish_registered_slot_upkeep_with_gate(
-    descriptor: &ClaudeConfigSlotDescriptorV1,
-    consent: bool,
-    network_enabled: bool,
-    support_dir: &Path,
-    clock: &dyn UpkeepClock,
-    credentials: &dyn CredentialMetadataReader,
-    process: &dyn DoctorProcessRunner,
-    final_gate: &ProductionFinalSpawnGate,
-) -> ClaudeUpkeepObservation {
-    let started_at = clock.now();
-    let mut observation = observe_registered_slot_upkeep_with_gate(
-        descriptor,
-        consent,
-        network_enabled,
-        support_dir,
-        clock,
-        credentials,
-        process,
-        final_gate,
-    );
-    // Missing or expired refresh grants return before claim_attempt, so there
-    // is no durable witness for the foreground status path to read. Publish
-    // only that pre-claim terminal result. A post-claim NeedsLogin carries an
-    // attempted_at value and may represent a concurrently removed slot whose
-    // witness was deliberately pruned by the final gate.
-    if observation.status.result == ClaudeConfigSlotUpkeepResultV1::NeedsLogin
-        && observation.status.attempted_at.is_none()
-    {
-        if let Ok(Some(status)) = final_gate.publish_preclaim_needs_login(
-            descriptor,
-            support_dir,
-            &descriptor.slot_id,
-            &observation.status,
-            started_at,
-            clock.now(),
-        ) {
-            observation.status = status;
-        }
-    }
-    observation
-}
-
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
 fn observe_registered_slot_upkeep_with_gate(
     descriptor: &ClaudeConfigSlotDescriptorV1,
     consent: bool,
     network_enabled: bool,
     support_dir: &Path,
-    clock: &dyn UpkeepClock,
+    now: OffsetDateTime,
     credentials: &dyn CredentialMetadataReader,
     process: &dyn DoctorProcessRunner,
-    final_gate: &dyn FinalSpawnGate,
+    final_gate: &ProductionFinalSpawnGate,
 ) -> ClaudeUpkeepObservation {
     let Some(config_dir) = descriptor.config_dir.as_deref() else {
         // The default slot is intentionally never eligible.
@@ -473,7 +358,6 @@ fn observe_registered_slot_upkeep_with_gate(
             None,
         );
     }
-    let now = clock.now();
     let Some(before) = credentials.read(
         &ClaudeConfigDirSlot::registered(config_dir.to_string())
             .expect("registered descriptor must retain a valid exact path"),
@@ -567,7 +451,7 @@ fn observe_registered_slot_upkeep_with_gate(
             )
         }
     };
-    let (token, in_progress) = match claim {
+    let in_progress = match claim {
         ClaimOutcome::Deferred(status) => {
             let result = if status.result == ClaudeConfigSlotUpkeepResultV1::InProgress {
                 ClaudeConfigSlotUpkeepResultV1::InProgress
@@ -581,18 +465,18 @@ fn observe_registered_slot_upkeep_with_gate(
                 result_observed_at: None,
             };
         }
-        ClaimOutcome::Claimed(token, status) => (token, status),
+        ClaimOutcome::Claimed(status) => status,
     };
 
-    let process_start = match final_gate.start_if_allowed(descriptor, process, config_dir) {
+    let process_result = match final_gate.start_if_allowed(descriptor, process, config_dir) {
         Ok(result) => result,
         Err(result) => {
-            let completed = complete_attempt(support_dir, &token, result, clock.now()).unwrap_or(
-                ClaudeConfigSlotUpkeepStatusV1 {
-                    result: ClaudeConfigSlotUpkeepResultV1::ProbeFailed,
-                    ..in_progress
-                },
-            );
+            let completed =
+                complete_attempt(support_dir, &descriptor.slot_id, &in_progress, result, now)
+                    .unwrap_or(ClaudeConfigSlotUpkeepStatusV1 {
+                        result: ClaudeConfigSlotUpkeepResultV1::ProbeFailed,
+                        ..in_progress
+                    });
             if result == ClaudeConfigSlotUpkeepResultV1::NeedsLogin {
                 // A removal may commit after the initial descriptor snapshot
                 // but before the final gate. Do not recreate its stale
@@ -603,18 +487,18 @@ fn observe_registered_slot_upkeep_with_gate(
                 paused_awaiting_claude_refresh: false,
                 proceed_with_collection: false,
                 status: completed,
-                result_observed_at: format_timestamp(clock.now()).ok(),
+                result_observed_at: format_timestamp(now).ok(),
             };
         }
     };
-    let (result, proceed) = match process_start.wait(DOCTOR_TIMEOUT) {
+    let (result, proceed) = match process_result {
         DoctorProcessResult::ExitZero => match credentials.read(
             &ClaudeConfigDirSlot::registered(config_dir.to_string())
                 .expect("registered descriptor must retain a valid exact path"),
         ) {
             Some(after)
                 if parse_timestamp(after.access_expires_at.as_deref())
-                    .is_some_and(|expiry| expiry > access_expiry && expiry > clock.now()) =>
+                    .is_some_and(|expiry| expiry > access_expiry && expiry > now) =>
             {
                 (ClaudeConfigSlotUpkeepResultV1::Refreshed, true)
             }
@@ -622,17 +506,16 @@ fn observe_registered_slot_upkeep_with_gate(
             None => (ClaudeConfigSlotUpkeepResultV1::CredentialUnreadable, false),
         },
     };
-    let completed = complete_attempt(support_dir, &token, result, clock.now()).unwrap_or(
-        ClaudeConfigSlotUpkeepStatusV1 {
+    let completed = complete_attempt(support_dir, &descriptor.slot_id, &in_progress, result, now)
+        .unwrap_or(ClaudeConfigSlotUpkeepStatusV1 {
             result: ClaudeConfigSlotUpkeepResultV1::ProbeFailed,
             ..in_progress
-        },
-    );
+        });
     ClaudeUpkeepObservation {
         paused_awaiting_claude_refresh: false,
         proceed_with_collection: proceed,
         status: completed,
-        result_observed_at: format_timestamp(clock.now()).ok(),
+        result_observed_at: format_timestamp(now).ok(),
     }
 }
 
@@ -718,7 +601,7 @@ fn claim_attempt(
     let witness = PersistedUpkeepWitnessV1 {
         due_access_expires_at: due_access_expires_at.to_string(),
         refresh_token_expires_at,
-        attempted_at: Some(now_text.clone()),
+        attempted_at: Some(now_text),
         result_observed_at: None,
         preclaim_descriptor: None,
         next_allowed_attempt_at: format_timestamp(next_allowed)?,
@@ -728,29 +611,22 @@ fn claim_attempt(
     let status = witness.local_status();
     state.slots.insert(slot_id.to_string(), witness);
     write_state(support_dir, &state)?;
-    Ok(ClaimOutcome::Claimed(
-        ClaimToken {
-            slot_id: slot_id.to_string(),
-            due_access_expires_at: due_access_expires_at.to_string(),
-            attempted_at: now_text,
-            previous_failures,
-        },
-        status,
-    ))
+    Ok(ClaimOutcome::Claimed(status))
 }
 
 #[cfg(test)]
 fn complete_attempt(
     support_dir: &Path,
-    token: &ClaimToken,
+    slot_id: &str,
+    claimed: &ClaudeConfigSlotUpkeepStatusV1,
     result: ClaudeConfigSlotUpkeepResultV1,
     now: OffsetDateTime,
 ) -> Result<ClaudeConfigSlotUpkeepStatusV1, ()> {
     let _guard = upkeep_state_guard(support_dir).map_err(|_| ())?;
     let mut state = load_state(support_dir)?;
-    let witness = state.slots.get_mut(&token.slot_id).ok_or(())?;
-    if witness.due_access_expires_at != token.due_access_expires_at
-        || witness.attempted_at.as_deref() != Some(token.attempted_at.as_str())
+    let witness = state.slots.get_mut(slot_id).ok_or(())?;
+    if Some(witness.due_access_expires_at.as_str()) != claimed.due_access_expires_at.as_deref()
+        || witness.attempted_at != claimed.attempted_at
         || witness.result != ClaudeConfigSlotUpkeepResultV1::InProgress
     {
         return Err(());
@@ -768,9 +644,9 @@ fn complete_attempt(
     witness.consecutive_failures = if success {
         0
     } else if neutral {
-        token.previous_failures
+        claimed.consecutive_failures
     } else {
-        token.previous_failures.saturating_add(1)
+        claimed.consecutive_failures.saturating_add(1)
     };
     witness.next_allowed_attempt_at = if neutral {
         format_timestamp(now)?
@@ -780,62 +656,6 @@ fn complete_attempt(
     let status = witness.local_status();
     write_state(support_dir, &state)?;
     Ok(status)
-}
-
-/// Persist a pre-claim `NeedsLogin` read from the slot's actual credential.
-///
-/// `observed_from` is when this worker pass began reading that credential. A
-/// running claim still owns the slot, and a witness for a newer credential
-/// expiry that was written after this read began is a concurrent, newer fact.
-/// An older witness is only history: when it carries a later expiry than the
-/// credential just read, the credential has since been replaced or signed out,
-/// so returning that witness would present a stale vendor-command result
-/// (for example `expiry_unchanged`) instead of the current sign-in requirement.
-#[cfg(test)]
-fn persist_preclaim_needs_login(
-    support_dir: &Path,
-    slot_id: &str,
-    status: &ClaudeConfigSlotUpkeepStatusV1,
-    observed_from: OffsetDateTime,
-    now: OffsetDateTime,
-) -> Result<ClaudeConfigSlotUpkeepStatusV1, ()> {
-    let due_access_expires_at = status.due_access_expires_at.as_deref().ok_or(())?;
-    let _guard = upkeep_state_guard(support_dir).map_err(|_| ())?;
-    let mut state = load_state(support_dir)?;
-    if let Some(existing) = state.slots.get(slot_id) {
-        let existing_due = parse_timestamp(Some(&existing.due_access_expires_at));
-        let observed_due = parse_timestamp(Some(due_access_expires_at));
-        let written_during_this_read = parse_timestamp(
-            existing
-                .result_observed_at
-                .as_deref()
-                .or(existing.attempted_at.as_deref()),
-        )
-        .is_some_and(|written| written >= observed_from);
-        if existing.result == ClaudeConfigSlotUpkeepResultV1::InProgress
-            || (written_during_this_read
-                && existing_due
-                    .zip(observed_due)
-                    .is_some_and(|(left, right)| left > right))
-        {
-            return Ok(existing.local_status());
-        }
-    }
-    let now_text = format_timestamp(now)?;
-    let witness = PersistedUpkeepWitnessV1 {
-        due_access_expires_at: due_access_expires_at.to_string(),
-        refresh_token_expires_at: status.refresh_token_expires_at.clone(),
-        attempted_at: Some(now_text.clone()),
-        result_observed_at: Some(now_text.clone()),
-        preclaim_descriptor: None,
-        next_allowed_attempt_at: now_text,
-        result: ClaudeConfigSlotUpkeepResultV1::NeedsLogin,
-        consecutive_failures: 0,
-    };
-    let persisted = witness.local_status();
-    state.slots.insert(slot_id.to_string(), witness);
-    write_state(support_dir, &state)?;
-    Ok(persisted)
 }
 
 #[cfg(test)]
@@ -1001,14 +821,6 @@ mod tests {
     use std::process::Stdio;
     use std::sync::{Arc, Barrier};
 
-    struct FixedClock(OffsetDateTime);
-
-    impl UpkeepClock for FixedClock {
-        fn now(&self) -> OffsetDateTime {
-            self.0
-        }
-    }
-
     struct SequenceCredentials {
         values: Mutex<Vec<Option<ClaudeOAuthCredentialMetadata>>>,
     }
@@ -1030,7 +842,7 @@ mod tests {
     struct FixedProcess(DoctorProcessResult);
 
     impl DoctorProcessRunner for FixedProcess {
-        fn run(&self, _config_dir: &str, _timeout: Duration) -> DoctorProcessResult {
+        fn run(&self, _config_dir: &str) -> DoctorProcessResult {
             self.0
         }
     }
@@ -1258,13 +1070,13 @@ mod tests {
 
     #[test]
     #[serial]
-    fn queued_preclaim_needs_login_does_not_recreate_removed_slot_state() {
-        let root = temp_dir("queued-preclaim-removed-slot");
+    fn missing_refresh_grant_needs_login_without_claiming() {
+        let root = temp_dir("missing-refresh-no-claim");
         let _support_guard = EnvGuard::set(
             "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
             root.as_os_str().to_os_string(),
         );
-        let config_dir = root.join("removed-account");
+        let config_dir = root.join("account");
         fs::create_dir_all(&config_dir).expect("config dir");
         let store = FileClaudeConfigSlotSettingsStore::default();
         let registered = store
@@ -1281,19 +1093,12 @@ mod tests {
             .first()
             .expect("registered descriptor")
             .clone();
-        store
-            .remove(
-                CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
-                &descriptor.slot_id,
-            )
-            .expect("remove slot before queued worker publishes");
-
-        let observation = observe_and_publish_registered_slot_upkeep_with_gate(
+        let observation = observe_registered_slot_upkeep_with_gate(
             &descriptor,
             true,
             true,
             &root,
-            &FixedClock(at("2026-08-04T10:00:01Z")),
+            at("2026-08-04T10:00:01Z"),
             &SequenceCredentials::new(vec![Some(ClaudeOAuthCredentialMetadata {
                 access_expires_at: Some("2026-08-04T10:00:00Z".to_string()),
                 refresh_token_expires_at: Some("2026-09-01T00:00:00Z".to_string()),
@@ -1308,12 +1113,11 @@ mod tests {
             observation.status.result,
             ClaudeConfigSlotUpkeepResultV1::NeedsLogin
         );
+        assert!(!observation.proceed_with_collection);
+        assert!(observation.status.attempted_at.is_none());
         assert!(
-            !load_state(&root)
-                .expect("read upkeep state")
-                .slots
-                .contains_key(&descriptor.slot_id),
-            "removal must win over a queued pre-claim result"
+            !root.join(UPKEEP_STATE_FILE).exists(),
+            "a missing refresh grant must not create a claim witness"
         );
 
         let _ = fs::remove_dir_all(root);
@@ -1430,7 +1234,7 @@ mod tests {
             at("2026-08-04T10:05:00Z"),
         )
         .expect("backoff elapsed");
-        let ClaimOutcome::Claimed(_, second_status) = second else {
+        let ClaimOutcome::Claimed(second_status) = second else {
             panic!("second crash retry must claim");
         };
         assert_eq!(second_status.consecutive_failures, 1);
@@ -1457,7 +1261,7 @@ mod tests {
             at("2026-08-04T10:15:00Z"),
         )
         .expect("second backoff elapsed");
-        let ClaimOutcome::Claimed(_, third_status) = third else {
+        let ClaimOutcome::Claimed(third_status) = third else {
             panic!("third crash retry must claim");
         };
         assert_eq!(third_status.consecutive_failures, 2);
