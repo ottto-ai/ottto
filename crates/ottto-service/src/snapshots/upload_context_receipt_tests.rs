@@ -121,11 +121,18 @@ impl Fixture {
         (candidates, scan.snapshots)
     }
     fn adopt(&mut self) -> RearmCounts {
+        let committed = self.index.clone();
         let (candidates, items) = self.pending();
-        let exact = crate::snapshot_sync::upload_context_receipt_tests::exact_acks(&items);
+        let exact =
+            crate::snapshot_sync::upload_context_receipt_tests::exact_acks(self.source, &items);
+        let accepted = exact.keys().cloned().collect();
+        self.index
+            .reconcile_codex_recovery_settlement(&committed, &accepted);
+        self.index.record_accepted_snapshot_fingerprints(&accepted);
         self.index
             .accept_file_upload_context_acks(&candidates, &exact)
     }
+
     fn assert_quiet(&mut self) {
         for _ in 0..3 {
             let (scan, bytes) = self.walk(true);
@@ -177,7 +184,7 @@ fn upload_context_receipt_finalize_refused() {
 fn upload_context_receipt_quarantine_refused() {
     let mut f = Fixture::new(SnapshotSource::Codex);
     let (candidates, items) = f.pending();
-    let exact = crate::snapshot_sync::upload_context_receipt_tests::exact_acks(&items);
+    let exact = crate::snapshot_sync::upload_context_receipt_tests::exact_acks(f.source, &items);
     f.index.quarantined_snapshot_fingerprints.insert(
         items[0].snapshot_fingerprint.clone(),
         snapshot_quarantine_record(f.source),
@@ -196,7 +203,7 @@ fn upload_context_receipt_c_ack_after_switch_to_d_refused() {
     f.index
         .activate_file_upload_context(f.source, "c".repeat(64));
     let (candidates, items) = f.pending();
-    let exact = crate::snapshot_sync::upload_context_receipt_tests::exact_acks(&items);
+    let exact = crate::snapshot_sync::upload_context_receipt_tests::exact_acks(f.source, &items);
     f.index
         .activate_file_upload_context(f.source, "d".repeat(64));
     assert_eq!(
@@ -211,7 +218,7 @@ fn upload_context_receipt_c_ack_after_switch_to_d_refused() {
 fn upload_context_receipt_stale_source_witness_refused() {
     let mut f = Fixture::new(SnapshotSource::Codex);
     let (candidates, items) = f.pending();
-    let exact = crate::snapshot_sync::upload_context_receipt_tests::exact_acks(&items);
+    let exact = crate::snapshot_sync::upload_context_receipt_tests::exact_acks(f.source, &items);
     let key = f.key();
     f.index.files.get_mut(&key).unwrap().source_file_fingerprint = "e".repeat(64);
     assert_eq!(
@@ -225,7 +232,7 @@ fn upload_context_receipt_stale_source_witness_refused() {
 fn upload_context_receipt_stale_body_witness_refused() {
     let mut f = Fixture::new(SnapshotSource::Codex);
     let (candidates, items) = f.pending();
-    let exact = crate::snapshot_sync::upload_context_receipt_tests::exact_acks(&items);
+    let exact = crate::snapshot_sync::upload_context_receipt_tests::exact_acks(f.source, &items);
     let key = f.key();
     f.index
         .files
@@ -243,7 +250,7 @@ fn upload_context_receipt_stale_body_witness_refused() {
 fn upload_context_receipt_stale_generation_refused() {
     let mut f = Fixture::new(SnapshotSource::Codex);
     let (candidates, items) = f.pending();
-    let exact = crate::snapshot_sync::upload_context_receipt_tests::exact_acks(&items);
+    let exact = crate::snapshot_sync::upload_context_receipt_tests::exact_acks(f.source, &items);
     f.index.context_curve_replay_epoch += 1;
     assert_eq!(
         f.index
@@ -297,7 +304,9 @@ fn upload_context_receipt_restart_and_generation_rearm_once() {
             bytes: size
         }
     );
-    f.index = serde_json::from_slice(&serde_json::to_vec(&f.index).unwrap()).unwrap();
+    let saved_path = f._scratch.join("restart-index.json");
+    f.index.save(&saved_path).unwrap();
+    f.index = ScanIndex::load(&saved_path).unwrap();
     f.index
         .activate_file_upload_context(f.source, "d".repeat(64));
     f.assert_quiet();
@@ -331,7 +340,9 @@ fn upload_context_receipt_historical_replay_rearms_retained_entry() {
 fn legacy_round_trip(version: &str) {
     let mut f = Fixture::new(SnapshotSource::Codex);
     f.adopt();
-    let encoded = serde_json::to_value(&f.index).unwrap();
+    let saved_path = f._scratch.join("downgrade-index.json");
+    f.index.save(&saved_path).unwrap();
+    let encoded: Value = serde_json::from_slice(&fs::read(&saved_path).unwrap()).unwrap();
     // The complete released per-entry codecs are byte-identical at the two
     // pinned versions. Exercise their actual serde path on every files slot.
     let mut old = encoded.clone();
@@ -340,7 +351,8 @@ fn legacy_round_trip(version: &str) {
         *value = serde_json::to_value(decoded).unwrap();
         assert!(value.get("upload_context_receipt").is_none(), "{version}");
     }
-    f.index = serde_json::from_value(old).unwrap();
+    fs::write(&saved_path, serde_json::to_vec(&old).unwrap()).unwrap();
+    f.index = ScanIndex::load(&saved_path).unwrap();
     f.index
         .activate_file_upload_context(f.source, "d".repeat(64));
     assert!(f.entry().upload_context_receipt.is_none());
@@ -371,4 +383,63 @@ fn upload_context_receipt_current_round_trip_and_size() {
     assert_eq!(decoded.upload_context_receipt, entry.upload_context_receipt);
     assert_eq!(std::mem::size_of::<upload_context_receipt::Receipt>(), 80);
     assert_eq!(std::mem::size_of::<ScanIndexEntry>(), 560);
+}
+
+#[test]
+fn upload_context_receipt_wrong_ack_body_refused() {
+    let mut f = Fixture::new(SnapshotSource::Codex);
+    let (candidates, items) = f.pending();
+    let mut exact =
+        crate::snapshot_sync::upload_context_receipt_tests::exact_acks(f.source, &items);
+    exact.insert(items[0].snapshot_fingerprint.clone(), "e".repeat(64));
+    assert_eq!(
+        f.index
+            .accept_file_upload_context_acks(&candidates, &exact)
+            .files,
+        0
+    );
+    assert!(f.entry().upload_context_receipt.is_none());
+}
+#[test]
+fn upload_context_receipt_withheld_after_capture_refused() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    let (candidates, items) = f.pending();
+    let exact = crate::snapshot_sync::upload_context_receipt_tests::exact_acks(f.source, &items);
+    f.index
+        .exclude_effective_upload_body_witness_revision_for_source_files(&BTreeSet::from([f
+            .entry()
+            .source_file_fingerprint
+            .clone()]));
+    assert_eq!(
+        f.index
+            .accept_file_upload_context_acks(&candidates, &exact)
+            .files,
+        0
+    );
+}
+#[test]
+fn upload_context_receipt_destination_policy_precedes_admission() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    let (mut scan, _) = f.walk(false);
+    scan.snapshots[0].session_display_name = Some("Synthetic private title".into());
+    scan.snapshots[0].session_display_name_source = Some("synthetic".into());
+    apply_upload_policy(
+        f.source,
+        &mut scan.snapshots,
+        SnapshotUploadPolicy {
+            session_titles_enabled: false,
+            ..SnapshotUploadPolicy::default()
+        },
+    );
+    assert!(scan.snapshots[0].session_display_name.is_none());
+    finalize_scan_after_policy(f.source, &mut scan, &mut f.index);
+    let candidates = f.index.file_upload_context_ack_candidates(&scan.snapshots);
+    let exact =
+        crate::snapshot_sync::upload_context_receipt_tests::exact_acks(f.source, &scan.snapshots);
+    assert_eq!(
+        f.index
+            .accept_file_upload_context_acks(&candidates, &exact)
+            .files,
+        1
+    );
 }
