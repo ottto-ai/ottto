@@ -75,7 +75,10 @@ impl M1 {
         assert_eq!(disk.records(), 1, "native warm reduction must be persisted");
         // Check the actual pinned main-writer v1 artifact without relabeling it.
         let key = fixture::local_key(&path);
-        let old = fixture::seed_old_writer(&ram.cache, SOURCE, &key, &prior, pin);
+        // The writer binds the live post-save index. Loading `prior` clears
+        // runtime upload-context and projection inputs, so it is for restart,
+        // not for independently checking the artifact just written.
+        let old = fixture::seed_old_writer(&ram.cache, SOURCE, &key, &warm.index, pin);
         assert_eq!(&old[..8], b"ottto-dt");
         assert_eq!(u16::from_le_bytes(old[8..10].try_into().unwrap()), 1);
         let old_bytes = disk.record_bytes();
@@ -808,17 +811,8 @@ impl TransitionDriver for Codex24b {
             self.disk.owner(source)
         };
         scanner.versions = Some(feed.clone());
-        let mut prior = self.prior.clone();
-        if mode == Mode::Restart {
-            // Existing 24b native tests use this re-emission obligation too:
-            // missing activity selects an unchanged file without changing the
-            // record's replay binding. A truly quiet unselected file has no EOF.
-            assert!(!prior.file_snapshot_fingerprints.is_empty());
-            assert!(!prior.snapshot_activity_at.is_empty());
-            prior.snapshot_activity_at.clear();
-        }
         let ((index, scan, modes), consumed) =
-            fixture::observe_consumed(|| other_page(&self.c, &scanner, source, prior));
+            fixture::observe_consumed(|| other_page(&self.c, &scanner, source, self.prior.clone()));
         let (sample, observed, rejected) = feed.snapshot();
         let sample = sample.expect("production EOF observes restored SessionStartState");
         assert_eq!(sample.version(), Some("0.148.9"));
@@ -828,12 +822,15 @@ impl TransitionDriver for Codex24b {
         );
         assert_eq!((observed, rejected), (1, 0));
         crate::mcp_inventory::transition_fixture::assert_version(&self.c.base, &feed, "0.148.9");
-        let mut result = RouteResult::emitted(
-            mode,
-            source,
-            vec![other_wire(source, &scan)],
-            &scan.snapshots,
-        );
+        // Missing activity selects a file but does not revoke its accepted
+        // body witness. Finalization suppresses an unchanged body, so record
+        // actual zero emission rather than constructing an empty upload.
+        let bodies = if scan.snapshots.is_empty() {
+            Vec::new()
+        } else {
+            vec![other_wire(source, &scan)]
+        };
+        let mut result = RouteResult::emitted(mode, source, bodies, &scan.snapshots);
         result.modes = modes;
         result.io.consumed = consumed;
         if mode != Mode::ColdFull {
@@ -899,7 +896,7 @@ fn codex_24b_old_writer_row(require_zero_old_bytes: bool) {
         &writer.cache,
         source,
         &fixture::local_key(&path),
-        &prior,
+        &index,
         WRITERS[0],
     );
     assert_eq!(disk.record_bytes().values().next().unwrap(), &old);
@@ -919,6 +916,8 @@ fn codex_24b_old_writer_row(require_zero_old_bytes: bool) {
         input_clock(&path);
         let cold = driver.emit_bodies(Mode::ColdFull);
         assert_eq!(cold.modes, (1, 0, 0));
+        assert!(!cold.snapshots.is_empty(), "append must emit changed money");
+        assert!(!cold.batches.is_empty());
         let tail = driver.emit_bodies(Mode::DiskRestore);
         assert_eq!(tail.modes, (0, 1, 0));
         assert_eq!(tail.restored, 1);
@@ -937,6 +936,20 @@ fn codex_24b_old_writer_row(require_zero_old_bytes: bool) {
         money_oracle::assert_equivalent(&cold, &tail);
         driver.save_gc(Mode::DiskRestore);
         driver.restart();
+        // Select the unchanged file for EOF version observation without
+        // changing its replay binding or accepted money. Give BOTH the cold
+        // reference and restored arm this same post-commit selection input.
+        assert!(!driver.prior.file_snapshot_fingerprints.is_empty());
+        assert!(!driver.prior.snapshot_activity_at.is_empty());
+        driver.prior.snapshot_activity_at.clear();
+        let quiet_cold = driver.emit_bodies(Mode::ColdFull);
+        assert_eq!(quiet_cold.modes, (1, 0, 0));
+        assert_eq!(quiet_cold.restored, 0);
+        assert!(
+            quiet_cold.snapshots.is_empty(),
+            "accepted body is unchanged"
+        );
+        assert!(quiet_cold.batches.is_empty());
         let quiet = driver.emit_bodies(Mode::Restart);
         assert_eq!(quiet.modes, (0, 0, 1));
         assert_eq!(quiet.restored, 1);
@@ -947,7 +960,12 @@ fn codex_24b_old_writer_row(require_zero_old_bytes: bool) {
         if require_zero_old_bytes {
             assert_eq!(quiet.io.consumed, 0);
         }
-        money_oracle::assert_equivalent(&cold, &quiet);
+        assert!(
+            quiet.snapshots.is_empty(),
+            "quiet EOF must not re-emit money"
+        );
+        assert!(quiet.batches.is_empty());
+        money_oracle::assert_equivalent(&quiet_cold, &quiet);
         driver.save_gc(Mode::Restart);
     }
 }
