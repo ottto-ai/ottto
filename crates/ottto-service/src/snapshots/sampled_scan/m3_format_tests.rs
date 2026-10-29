@@ -247,6 +247,12 @@ fn m3_p4a_v3_dispatch_lengths_and_unknown_survivors() {
 fn m3_p4a_scope_formula_uses_canonical_counting_and_distinct_domain() {
     let acc = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
     let c = ImmutableCounting::from_accumulator(&acc).unwrap();
+    let body = crate::snapshots::durable_store_fixture_body(SnapshotSource::ClaudeCode, 3, 7);
+    let decoded =
+        crate::snapshots::sampled_jsonl::durable::decode(&body, SnapshotSource::ClaudeCode)
+            .unwrap();
+    assert_eq!(decoded.immutable_counting().unwrap(), c);
+
     let allowlist = DurableSource::ClaudeCode.properties().allowlist();
     let v3 = store::scope_digest_v3("F", &allowlist, "identity", c.bytes());
     assert_ne!(

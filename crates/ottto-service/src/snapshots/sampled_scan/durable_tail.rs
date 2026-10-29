@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(super) mod acquired;
-pub(crate) use acquired::{AcquiredChain, AcquisitionProtocol, ImmutableCounting};
+pub(crate) use acquired::{AcquisitionProtocol, ImmutableCounting};
 
 use super::super::*;
 use super::SharedCache;

@@ -138,7 +138,9 @@ fn n10_interruption_pass_clear_and_five_relabels_do_not_refund() {
     let f = Fixture::new();
     let now = Instant::now();
     // Cancellation before the first read still spends the admitted process grant.
-    drop(f.begin(now).unwrap());
+    {
+        let _interrupted = f.begin(now).unwrap();
+    }
     assert!(physical().is_empty());
     for pass in 0..5 {
         f.cache.clear();
@@ -160,9 +162,10 @@ fn n10_interruption_pass_clear_and_five_relabels_do_not_refund() {
         ));
     }
     let tomorrow = now + RETAIL_DAILY;
-    let daily = f.begin(tomorrow).unwrap();
-    assert_eq!(daily.grant(), RetailGrant::Daily);
-    drop(daily); // Failed/cancelled daily attempt also spends before reading.
+    {
+        let daily = f.begin(tomorrow).unwrap();
+        assert_eq!(daily.grant(), RetailGrant::Daily);
+    } // Failed/cancelled daily attempt also spends before reading.
     assert!(matches!(
         f.begin(tomorrow + RETAIL_DAILY - Duration::from_nanos(1)),
         Err(RetailHold::Exhausted)

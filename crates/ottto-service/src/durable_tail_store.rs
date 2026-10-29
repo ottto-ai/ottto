@@ -2586,11 +2586,6 @@ fn encode(record: &DurableRecord) -> Vec<u8> {
     out
 }
 
-fn encode_parts(out: &mut Vec<u8>, record: &PendingRecord, generation: u64) {
-    encode_header(out, record, record.format(), generation);
-    out.extend_from_slice(&record.body);
-}
-
 /// Everything before the body, ending with the body length: exactly
 /// the selected representation header length.
 fn encode_header(out: &mut Vec<u8>, record: &PendingRecord, format: u16, generation: u64) {

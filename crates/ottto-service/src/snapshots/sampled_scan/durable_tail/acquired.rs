@@ -1,7 +1,8 @@
-//! Acquisition provenance travels with the existing checkpoint custody owner.
-//! These fields never become index membership, replay permission or money ACKs.
-use super::{store, CachedJsonlReduction, SnapshotAccumulator, SnapshotSource};
-use crate::transcript_acquisition as ta;
+//! Wire protocol and immutable counting inputs for the admitted envelopes.
+//! Native acquisition custody is added with its production consumers.
+#[cfg(test)]
+use super::SnapshotAccumulator;
+use super::{store, CachedJsonlReduction, SnapshotSource};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AcquisitionProtocol {
@@ -19,6 +20,7 @@ impl ImmutableCounting {
     pub(crate) fn from_reduction(reduction: &CachedJsonlReduction) -> Result<Self, store::Refusal> {
         Self::canonical(reduction.source(), reduction.durable_counting())
     }
+    #[cfg(test)]
     pub(in crate::snapshots) fn from_accumulator(
         accumulator: &SnapshotAccumulator,
     ) -> Result<Self, store::Refusal> {
@@ -46,122 +48,10 @@ impl ImmutableCounting {
         }
         Ok(Self { bytes })
     }
+    // Inspection helper for the scope-contract controls until native v3 activation.
+    #[cfg(test)]
     pub(crate) fn bytes(&self) -> &[u8; 13] {
         &self.bytes
-    }
-}
-
-/// Non-Clone: changing graph ownership moves this exact acquisition provenance.
-pub(crate) struct AcquiredChain {
-    source: SnapshotSource,
-    key: String,
-    opened_object_identity: String,
-    file_scope: ta::Scope,
-    binding: store::Binding,
-    acquired_revision: u64,
-    protocol: AcquisitionProtocol,
-    write_ahead_eligible: bool,
-    committed_generation: u64,
-}
-impl AcquiredChain {
-    pub(crate) fn source(&self) -> SnapshotSource {
-        self.source
-    }
-    pub(crate) fn key(&self) -> &str {
-        &self.key
-    }
-    pub(crate) fn opened_object_identity(&self) -> &str {
-        &self.opened_object_identity
-    }
-    pub(crate) fn file_scope(&self) -> &ta::Scope {
-        &self.file_scope
-    }
-    pub(crate) fn binding(&self) -> &store::Binding {
-        &self.binding
-    }
-    pub(crate) fn acquired_revision(&self) -> u64 {
-        self.acquired_revision
-    }
-    pub(crate) fn protocol(&self) -> AcquisitionProtocol {
-        self.protocol
-    }
-    pub(crate) fn write_ahead_eligible(&self) -> bool {
-        self.write_ahead_eligible
-    }
-    pub(crate) fn committed_generation(&self) -> u64 {
-        self.committed_generation
-    }
-}
-
-// These constructors are visible only to the existing native/restore adapter.
-// Caller proves original O, scope, certificate, unique revision and eligibility.
-pub(super) struct ChainInputs<'a> {
-    pub(super) source: SnapshotSource,
-    pub(super) key: &'a str,
-    pub(super) opened_object_identity: &'a str,
-    pub(super) checkpoint: &'a ta::Checkpoint,
-    pub(super) binding: store::Binding,
-    pub(super) acquired_revision: u64,
-    pub(super) committed_generation: u64,
-}
-pub(super) fn capture_chain(
-    inputs: ChainInputs<'_>,
-    protocol: AcquisitionProtocol,
-    write_ahead_eligible: bool,
-    lease: &mut store::ActiveLease,
-) -> Result<AcquiredChain, store::ActiveOverBudget> {
-    let scope = inputs.checkpoint.scope();
-    // Fund fixed metadata and all three owned strings before the first allocation.
-    let bytes = std::mem::size_of::<AcquiredChain>()
-        .checked_add(inputs.key.len())
-        .and_then(|n| n.checked_add(inputs.opened_object_identity.len()))
-        .and_then(|n| n.checked_add(scope.0.len()))
-        .and_then(|n| u64::try_from(n).ok())
-        .ok_or(store::ActiveOverBudget)?;
-    lease.charge(bytes)?;
-    Ok(AcquiredChain {
-        source: inputs.source,
-        key: inputs.key.to_owned(),
-        opened_object_identity: inputs.opened_object_identity.to_owned(),
-        file_scope: scope.clone(),
-        binding: inputs.binding,
-        acquired_revision: inputs.acquired_revision,
-        protocol,
-        write_ahead_eligible,
-        committed_generation: inputs.committed_generation,
-    })
-}
-pub(super) fn restore_chain(
-    inputs: ChainInputs<'_>,
-    protocol: AcquisitionProtocol,
-    lease: &mut store::ActiveLease,
-) -> Result<AcquiredChain, store::ActiveOverBudget> {
-    // A representation rewrite cannot turn a Legacy acquisition into an eligible one.
-    capture_chain(
-        inputs,
-        protocol,
-        protocol == AcquisitionProtocol::WriteAhead,
-        lease,
-    )
-}
-
-impl crate::heap_layout_bound::HeapLayoutBound for AcquiredChain {
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        // Inline fields are charged by the enclosing owner; every owned capacity is new.
-        let Self {
-            source: _,
-            key,
-            opened_object_identity,
-            file_scope,
-            binding: _,
-            acquired_revision: _,
-            protocol: _,
-            write_ahead_eligible: _,
-            committed_generation: _,
-        } = self;
-        c.add(key.capacity())?;
-        c.add(opened_object_identity.capacity())?;
-        c.add(file_scope.0.capacity())
     }
 }
 
