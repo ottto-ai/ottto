@@ -14563,6 +14563,9 @@ fn custody_recovery_classifies_actual_first_read_and_named_non_reusable_full() {
                     .find(|r| r["counts"]["custody_group_restart_full"]["events"] == 1)
                     .expect("named exception");
                 assert_eq!(full["stage"], "durable_tail_alarm");
+                assert!(rows
+                    .iter()
+                    .all(|r| r["counts"]["custody_overflow"].is_null()));
                 assert_eq!(
                     full["counts"]["custody_group_restart_full"]["bytes"],
                     frozen

@@ -1322,6 +1322,29 @@ mod tests {
     }
 
     #[test]
+    fn custody_restart_and_overflow_alarm_independently() {
+        let ((), restart) = capture(|| custody_group_restart_full(4097));
+        assert_eq!(restart.len(), 1);
+        assert_eq!(restart[0]["stage"], "durable_tail_alarm");
+        assert_eq!(
+            restart[0]["counts"],
+            serde_json::json!({
+                "custody_group_restart_full": {"events": 1, "bytes": 4097}
+            })
+        );
+        assert!(restart[0]["counts"]["custody_overflow"].is_null());
+
+        let ((), overflow) = capture(custody_overflow);
+        assert_eq!(overflow.len(), 1);
+        assert_eq!(overflow[0]["stage"], "durable_tail_alarm");
+        assert_eq!(
+            overflow[0]["counts"],
+            serde_json::json!({"custody_overflow": {"events": 1}})
+        );
+        assert!(overflow[0]["counts"]["custody_group_restart_full"].is_null());
+    }
+
+    #[test]
     fn history_proof_correction_deferral_is_counted() {
         let ((), lines) = capture(|| {
             claude_history_proof_correction_deferred(2);
