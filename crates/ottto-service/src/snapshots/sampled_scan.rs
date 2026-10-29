@@ -2090,13 +2090,6 @@ pub(super) fn new_source_parser_with_archive_scope(
                             .disposition = ArchiveDisposition::Held {
                             cause: CodexZstCause::CorrectionUnapplied,
                         };
-                        index.hold_compressed(
-                            &candidate.path,
-                            codex_session_id_candidates_from_path(&candidate.path)
-                                .into_iter()
-                                .collect(),
-                            CodexZstCause::CorrectionUnapplied,
-                        );
                         codex_zst_refused(CodexZstCause::CorrectionUnapplied);
                         anyhow::bail!(CodexZstCause::CorrectionUnapplied);
                     }
@@ -2126,13 +2119,6 @@ pub(super) fn new_source_parser_with_archive_scope(
                                         cause: CodexZstCause::CorrectionUnapplied,
                                     };
                                 }
-                                index.hold_compressed(
-                                    &candidate.path,
-                                    codex_session_id_candidates_from_path(&candidate.path)
-                                        .into_iter()
-                                        .collect(),
-                                    CodexZstCause::CorrectionUnapplied,
-                                );
                                 codex_zst_refused(CodexZstCause::CorrectionUnapplied);
                             })?;
                         codex_compressed_input::admission_streak(&key, false);

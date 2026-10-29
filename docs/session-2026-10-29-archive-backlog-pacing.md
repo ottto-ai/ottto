@@ -15,8 +15,9 @@ publication behavior. Moves retain old evidence; oversized catch-up is held
 before decoding. A funded first read has a 1 GiB decoded limit in addition to the
 independent decoder ceiling. Held evidence never supplies an acknowledgement.
 
-This development checkpoint still requires owner-wide custody, retention,
-consumer qualification and runtime validation before activation can ship.
+Owner-wide custody is paged before cached inventory filtering and checked again
+before retained-cache takes. Omitted archives retain negative absence scope.
+Upstream cache/retention composition and runtime qualification remain release gates.
 Native power uses the continuation platform seam. Pending archive resends use
 retained reductions; synthetic fixtures are present but unexecuted.
 
@@ -43,3 +44,13 @@ archive re-emission can take them; plain acquisition and physical-prefix plans
 reject them. Header-bound evidence is valid only for the same content/object
 stamp. Missing or malformed flags load false, allowing at most one bounded
 64 KiB header decode; older decoders drop the evidence.
+
+Downgrading below the archive-activation release is unsupported. Older binaries
+ignore archive evidence and may retire accepted archive entries. A re-upgrade may
+therefore read each such archive once more as a paced A1. `archive_reupgrade_full`
+counts actual first reads with an exact semantic fingerprint in accepted history;
+retained resends never increment it. It does not reconstruct missing history.
+Whole-session bodies use latest-wins replacement. Protection against downgraded
+state-only output depends on the deployed backend authority fence; code inspection
+does not establish deployment. Accepted bodies without the exclusive contract or
+positive attributed usage have no such protection.
