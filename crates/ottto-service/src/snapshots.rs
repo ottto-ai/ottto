@@ -242,6 +242,9 @@ mod collector_version_tests {
 pub const SNAPSHOT_SCHEMA_VERSION: u16 = 6;
 pub const SNAPSHOT_ENTITY_ACK_CONTRACT: &str = "snapshot_entity_ack:v1";
 pub const SNAPSHOT_HEAD_CAS_CONTRACT: &str = "snapshot_head_etag:v1";
+/// Backend money-decrease holds: a held request-owned literal body is
+/// refused as retryable (`permanent=false`) instead of being applied.
+pub const USAGE_DECREASE_HOLD_ACK_CONTRACT: &str = "usage_decrease_hold_ack:v1";
 // SnapshotStatusRequest endpoint stayed at v5; only the batch endpoint
 // cut over to v6 in this change. Backend's AgentSessionSnapshotStatusRequest
 // is still Literal[5] (backend/app/schemas/agent_session_snapshots.py).
@@ -1518,6 +1521,16 @@ impl SnapshotBatchRequest {
     }
 }
 
+/// The batch declares `usage_decrease_hold_ack:v1`: a Claude batch carrying
+/// at least one request-owned literal body.
+pub(crate) fn declares_usage_decrease_hold_ack(request: &SnapshotBatchRequest) -> bool {
+    snapshot_source_from_api_slug(&request.source) == Some(SnapshotSource::ClaudeCode)
+        && request
+            .snapshots
+            .iter()
+            .any(claude_history_upgrade::is_request_owned_literal)
+}
+
 fn serialize_snapshot_batch<S: Serializer>(
     request: &SnapshotBatchRequest,
     enforce_head_cas: bool,
@@ -1544,7 +1557,7 @@ fn serialize_snapshot_batch<S: Serializer>(
             })
         })
         .collect::<Result<Vec<_>, S::Error>>()?;
-    let mut state = serializer.serialize_struct("SnapshotBatchRequest", 8)?;
+    let mut state = serializer.serialize_struct("SnapshotBatchRequest", 9)?;
     state.serialize_field("schema_version", &request.schema_version)?;
     state.serialize_field("source", &request.source)?;
     state.serialize_field("machine_id", &request.machine_id)?;
@@ -1553,6 +1566,14 @@ fn serialize_snapshot_batch<S: Serializer>(
     // forward-tolerant ingest model and ignore it; capable backends echo it
     // and may return a complete per-entity outcome partition.
     state.serialize_field("entity_ack_contract", SNAPSHOT_ENTITY_ACK_CONTRACT)?;
+    // Only Claude request-owned literal batches opt into money-decrease
+    // holds; every other batch keeps its released envelope bytes.
+    if declares_usage_decrease_hold_ack(request) {
+        state.serialize_field(
+            "usage_decrease_hold_ack_contract",
+            USAGE_DECREASE_HOLD_ACK_CONTRACT,
+        )?;
+    }
     if enforce_head_cas {
         state.serialize_field("head_cas_contract", SNAPSHOT_HEAD_CAS_CONTRACT)?;
     }
@@ -14896,9 +14917,9 @@ fn snapshot_upload_body_witness_payload(item: &SnapshotItem) -> serde_json::Valu
     if let Some(observations) = &item.cache_observations {
         payload.insert(
             "cache_observations_state".into(),
-            item.cache_observations_state
-                .clone()
-                .unwrap_or_else(|| cache_state_from_patch(None, observations)),
+            item.cache_observations_state.clone().unwrap_or_else(|| {
+                cache_state_from_patch(None, observations).expect("no accepted rows to parse")
+            }),
         );
     }
     if let Some(context_curve) = &item.context_curve {
@@ -20980,6 +21001,8 @@ impl SnapshotAccumulator {
             self.cache_observations =
                 codex_cache_wire_for_requests(&source_session_id, &self.cache_requests);
             if !self.cache_requests_complete {
+                // The book exceeded 65,536 records or the physical read report
+                // was incomplete: neither can certify an exact overflow count.
                 self.cache_observations = Some(CacheObservations {
                     schema_version: 1,
                     operations: Vec::new(),
@@ -31015,10 +31038,12 @@ impl OwnedSourceScan {
                         &history_upgrade,
                         index.claude_reemission_exclusions.state(),
                     );
+                    let held_audit_open_failed =
+                        sampled_audit::held_audit_open_failed(sampled_scan::now_seconds());
                     // Count-only attribution of why Claude files were selected
                     // on this page. No path, session, or identifier is named.
                     eprintln!(
-                        "local snapshot census claude parse reasons: upload_context_matches={} {} compaction_summary_unlinked_parent={} body_witness_adoption_deferred={} body_witness_adoption_excluded={} body_witness_adoption_held_no_list={} body_witness_adoption_exclusions_invalid={} body_witness_adoption_list={} body_witness_adoption_stop={} body_witness_adoption_stop_withheld_folds={} history_upgrade_owed={} history_upgrade_permitted={} history_emission_denied={} history_listed_literal_roots={} history_reowed={} history_activation_refused={} claude_reemission_family_closure_root_absent_excluded={} identity_incomplete_holds_entered_process_total={} identity_incomplete_holds_cleared_process_total={} identity_incomplete_hold_deadlines_restored_process_total={}",
+                        "local snapshot census claude parse reasons: upload_context_matches={} {} compaction_summary_unlinked_parent={} body_witness_adoption_deferred={} body_witness_adoption_excluded={} body_witness_adoption_held_no_list={} body_witness_adoption_exclusions_invalid={} body_witness_adoption_list={} body_witness_adoption_stop={} body_witness_adoption_stop_withheld_folds={} history_upgrade_owed={} history_upgrade_permitted={} history_emission_denied={} history_listed_literal_roots={} history_reowed={} history_activation_refused={} claude_reemission_family_closure_root_absent_excluded={} identity_incomplete_holds_entered_process_total={} identity_incomplete_holds_cleared_process_total={} identity_incomplete_hold_deadlines_restored_process_total={} held_audit_open_failed_keys={} held_audit_open_failed_oldest_age_seconds={} held_audit_open_backoff_evicted_keys={}",
                         index.upload_context_fingerprint == index.active_upload_context_fingerprint,
                         census_count_fields(&CANDIDATE_PARSE_REASON_NAMES, &census.parse_reasons),
                         census.claude_compaction_unlinked_parent_count,
@@ -31048,7 +31073,10 @@ impl OwnedSourceScan {
                         history_upgrade.family_closure_root_absent_excluded,
                         claude_request_census::identity_incomplete_hold_totals().0,
                         claude_request_census::identity_incomplete_hold_totals().1,
-                        claude_request_census::identity_incomplete_hold_deadlines_restored_total()
+                        claude_request_census::identity_incomplete_hold_deadlines_restored_total(),
+                        held_audit_open_failed.0,
+                        held_audit_open_failed.1,
+                        sampled_audit::held_audit_open_backoff_evicted()
                     );
                     if history_upgrade.family_closure_root_absent_excluded > 0 {
                         crate::local_resource_diagnostics::claude_reemission_family_closure_root_absent_excluded(
@@ -31810,12 +31838,10 @@ impl OwnedSourceScan {
                 &claude_title_metadata,
                 claude_effort_support_dir_ref,
             );
-            let verification_rescue = sampled_audit::progress_debt(
-                index,
-                &local_index_key(&candidate.path),
-                sampled_scan::now_seconds(),
-            )
-            .is_some();
+            let rescue_key = local_index_key(&candidate.path);
+            let verification_rescue =
+                sampled_audit::progress_debt(index, &rescue_key, sampled_scan::now_seconds())
+                    .is_some();
             let Some((mut candidate, opened_file)) = open_and_identify_scan_candidate_with_rescue(
                 source,
                 candidate,
@@ -31826,8 +31852,18 @@ impl OwnedSourceScan {
                 verification_rescue,
                 sampling.as_ref().map(|context| context.cache.as_ref()),
             ) else {
+                if verification_rescue {
+                    sampled_audit::progress_open_failed(
+                        index,
+                        &rescue_key,
+                        sampled_scan::now_seconds(),
+                    );
+                }
                 pending!();
             };
+            if verification_rescue {
+                sampled_audit::progress_opened(index, &rescue_key);
+            }
             if preflight_source_file_fingerprint
                 .as_ref()
                 .is_some_and(|fingerprint| fingerprint != &candidate.source_file_fingerprint)
@@ -36588,17 +36624,18 @@ fn apply_codex_envelope_line(value: &Value, accumulator: &mut SnapshotAccumulato
     accumulator.codex_session_meta_seen = true;
 }
 
-pub(crate) fn cache_state_from_patch(previous: Option<&Value>, patch: &CacheObservations) -> Value {
+/// Refuse a malformed accepted row rather than silently dropping its bytes/row
+/// from the cumulative bound. No patch can authorize that implicit deletion.
+pub(crate) fn cache_state_from_patch(
+    previous: Option<&Value>,
+    patch: &CacheObservations,
+) -> Option<Value> {
     let mut observations = BTreeMap::<String, cache_observations::Observation>::new();
-    if let Some(rows) = previous
-        .and_then(|state| state.get("observations"))
-        .and_then(Value::as_array)
-    {
-        for row in rows {
-            if let Ok(row) = serde_json::from_value::<cache_observations::Observation>(row.clone())
-            {
-                observations.insert(row.event_id.clone(), row);
-            }
+    if let Some(previous) = previous {
+        for row in previous.get("observations")?.as_array()? {
+            let row =
+                serde_json::from_value::<cache_observations::Observation>(row.clone()).ok()?;
+            observations.insert(row.event_id.clone(), row);
         }
     }
     for operation in &patch.operations {
@@ -36615,7 +36652,9 @@ pub(crate) fn cache_state_from_patch(previous: Option<&Value>, patch: &CacheObse
             }
         }
     }
-    json!({"schema_version":1,"observations":observations.into_values().collect::<Vec<_>>(),"coverage":patch.coverage,"omitted_observation_count":patch.omitted_observation_count})
+    Some(
+        json!({"schema_version":1,"observations":observations.into_values().collect::<Vec<_>>(),"coverage":patch.coverage,"omitted_observation_count":patch.omitted_observation_count}),
+    )
 }
 
 /// Preflight the exact wire and its completion against the ACKed predecessor.
@@ -36624,7 +36663,7 @@ pub(crate) fn prepare_cache_observations(item: &mut SnapshotItem, prior: Option<
     let Some(patch) = item.cache_observations.as_ref() else {
         return;
     };
-    let desired = cache_state_from_patch(None, patch);
+    let desired = cache_state_from_patch(None, patch).expect("no accepted rows to parse");
     let ids = desired["observations"]
         .as_array()
         .into_iter()
@@ -36633,6 +36672,19 @@ pub(crate) fn prepare_cache_observations(item: &mut SnapshotItem, prior: Option<
         .collect::<BTreeSet<_>>();
     let mut wire = patch.clone();
     if patch.coverage == "complete" {
+        // Keep the established complete-patch wire order. The selected Codex
+        // patch stays in session order for the partial fallback below.
+        wire.operations.sort_by(|a, b| {
+            let a = match a {
+                cache_observations::Operation::Upsert { observation } => &observation.event_id,
+                cache_observations::Operation::Retract { event_id } => event_id,
+            };
+            let b = match b {
+                cache_observations::Operation::Upsert { observation } => &observation.event_id,
+                cache_observations::Operation::Retract { event_id } => event_id,
+            };
+            a.cmp(b)
+        });
         for row in prior
             .and_then(|p| p["observations"].as_array())
             .into_iter()
@@ -36647,7 +36699,11 @@ pub(crate) fn prepare_cache_observations(item: &mut SnapshotItem, prior: Option<
                 }
             }
         }
-        let state = cache_state_from_patch(prior, &wire);
+        let Some(state) = cache_state_from_patch(prior, &wire) else {
+            item.cache_observations = None;
+            item.cache_observations_state = None;
+            return;
+        };
         if wire.validate() && cache_state_within_limits(&state) {
             item.cache_observations_state = Some(state);
             item.cache_observations = Some(wire);
@@ -36671,23 +36727,25 @@ pub(crate) fn prepare_cache_observations(item: &mut SnapshotItem, prior: Option<
     } else {
         None
     };
+    wire = patch.clone();
     wire.coverage = "partial".into();
     wire.operations.retain(|operation| {
         matches!(operation,
         cache_observations::Operation::Upsert { observation } if observation.status != "retracted")
     });
     loop {
-        let mut state = cache_state_from_patch(prior, &wire);
-        let missing = ids
+        let Some(mut state) = cache_state_from_patch(prior, &wire) else {
+            item.cache_observations = None;
+            item.cache_observations_state = None;
+            return;
+        };
+        let present = state["observations"]
+            .as_array()
+            .unwrap()
             .iter()
-            .filter(|id| {
-                !state["observations"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|row| row["event_id"].as_str() == Some(**id))
-            })
-            .count() as u64;
+            .filter_map(|row| row["event_id"].as_str())
+            .collect::<BTreeSet<_>>();
+        let missing = ids.difference(&present).count() as u64;
         wire.omitted_observation_count = overflow.and_then(|count| count.checked_add(missing));
         state["omitted_observation_count"] = json!(wire.omitted_observation_count);
         if wire.validate() && cache_state_within_limits(&state) {
@@ -36698,6 +36756,9 @@ pub(crate) fn prepare_cache_observations(item: &mut SnapshotItem, prior: Option<
         // Removing a shrinking replacement can INCREASE completed bytes. Always
         // recompute the actual merge; do not assume monotonic sizes.
         if wire.operations.pop().is_none() {
+            // Withholding preserves accepted evidence, including possibly stale
+            // server coverage="complete": no cache metadata reaches the server.
+            // The Claude-only reread diagnostics do not count this upload refusal.
             item.cache_observations = None;
             item.cache_observations_state = None;
             return;
@@ -36748,6 +36809,8 @@ fn cache_wire_for_requests_inner(
         }
     }
     if conflict {
+        // Conflicting duplicate slots or unparseable timestamps cannot certify
+        // an overflow count. Identical replays were deduplicated above.
         return Some(CacheObservations {
             schema_version: 1,
             operations: Vec::new(),
@@ -36756,11 +36819,10 @@ fn cache_wire_for_requests_inner(
         });
     }
     if codex_prefix {
-        let (mut rows, overflow) = cache_observations::detect_unique_prefix(session, &unique);
-        if overflow == 0 {
-            // Preserve existing under-cap wire order and canonical body bytes.
-            rows.sort_by(|a, b| a.event_id.cmp(&b.event_id));
-        }
+        // Keep at most 64 selected rows in session order, including under cap:
+        // a byte-budget fallback must trim the latest selected request first.
+        // Preparation restores event-ID wire order when a complete patch fits.
+        let (rows, overflow) = cache_observations::detect_unique_prefix(session, &unique);
         return Some(CacheObservations {
             schema_version: 1,
             operations: rows
@@ -92079,7 +92141,7 @@ pub(crate) mod cache_adapter_tests {
         assert_eq!(overflow.coverage, "partial");
         assert_eq!(overflow.omitted_observation_count, Some(65));
         let patch = cache_wire_for_requests("s", &[warm.clone(), cold]).unwrap();
-        let prior = cache_state_from_patch(None, &patch);
+        let prior = cache_state_from_patch(None, &patch).unwrap();
         let current = cache_wire_for_requests("s", &[warm]).unwrap();
         let mut item = super::tests::sample_session_artifact_item();
         item.cache_observations = Some(current);

@@ -140,8 +140,9 @@ compact memo entry remain inside the existing 1,536-byte per-entry allowance.
 
 Future virtual-audit Skip is restricted to aged positive growth admitted only
 through grown retention. Recent growth preserves main's immediate selection;
-due Audit and genuine rearm controls remain. The inherited virtual-to-marker
-deadline conversion remains E1's follow-up, with no stronger due guarantee.
+due Audit and genuine rearm controls remain. Main's #903 now fixes virtual-to-marker
+deadline conversion by carrying the minimum owed due time; only a successful
+secure open marks the slot attempted, with failed-open retries paced separately.
 Native post-memo backward-touch and changed-sample controls accompany portable
 selector/counter and replacement/identity/evidence controls.
 
@@ -172,3 +173,16 @@ freezes that exact comparison clock before either path; the complete body
 equality assertion, including every timestamp, is unchanged. A portable real-scan
 control covers two zero-delivery passes before a virtual slot and one Full when
 due, while the existing recent-growth and native failed-audit controls remain.
+
+
+## Round29 main composition
+
+Normal merge of main 8b4262e3e7ec64138c55ca277d40a21fd6c52230 includes #903
+(819e5e1fd), preserving its min-D carry, secure-open success/failure callbacks,
+attempted-after-open, stat-aware backoff/parking and counted 256-key eviction.
+The #876 aged-only virtual Skip remains unattempted and before due; the audit
+clock is sampled_scan::now_seconds(), independently of census time/window.
+Min-D carry never postpones that deadline. Failed open leaves attempted false;
+at D the future-slot Skip releases, while #903 owns retry backoff. Native 480-byte
+entry assertion, boxed Seen, memo charges and the heap-registry field union remain.
+No new test or acquisition cause; existing composed regressions requalify in CI.

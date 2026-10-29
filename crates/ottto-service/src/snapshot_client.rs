@@ -787,6 +787,15 @@ pub struct SnapshotEntityRejection {
 }
 
 impl SnapshotEntityRejection {
+    /// `usage_decrease_hold_ack:v1`: the backend kept the old head and holds
+    /// this body for review. Only these reasons may be non-permanent.
+    pub(crate) fn usage_decrease_hold(&self) -> bool {
+        matches!(
+            self.safe_reason(),
+            USAGE_DECREASE_HELD_FOR_REVIEW | USAGE_DECREASE_REFUSED_AFTER_REVIEW
+        )
+    }
+
     pub(crate) fn safe_reason(&self) -> &'static str {
         match self.reason.as_str() {
             "reserved_session_identity_separator" => "reserved_session_identity_separator",
@@ -805,10 +814,16 @@ impl SnapshotEntityRejection {
             "usage_accounting_authority_downgrade" => "usage_accounting_authority_downgrade",
             // Logged by name; persisted as the old enum value `other`.
             "original_pair_candidate_unproved" => "original_pair_candidate_unproved",
+            // Logged by name; persisted as `other` when permanent.
+            USAGE_DECREASE_HELD_FOR_REVIEW => USAGE_DECREASE_HELD_FOR_REVIEW,
+            USAGE_DECREASE_REFUSED_AFTER_REVIEW => USAGE_DECREASE_REFUSED_AFTER_REVIEW,
             _ => "other",
         }
     }
 }
+
+const USAGE_DECREASE_HELD_FOR_REVIEW: &str = "usage_decrease_held_for_review";
+const USAGE_DECREASE_REFUSED_AFTER_REVIEW: &str = "usage_decrease_refused_after_review";
 
 fn default_occurrence_count() -> u64 {
     1
@@ -941,7 +956,28 @@ impl SnapshotBatchResponse {
             )
         }))?;
         self.validate_head_cas_ack(enforce_head_cas)?;
+        self.validate_usage_decrease_holds(request)?;
         self.validate_body_witness_ack(request)
+    }
+
+    /// A retryable hold names a request-owned literal body of a batch that
+    /// declared `usage_decrease_hold_ack:v1`; any other one is foreign.
+    fn validate_usage_decrease_holds(&self, request: &SnapshotBatchRequest) -> Result<()> {
+        let declared = crate::snapshots::declares_usage_decrease_hold_ack(request);
+        for rejection in self.rejected_entities.iter().filter(|r| !r.permanent) {
+            let held_literal = declared
+                && request.snapshots.iter().any(|item| {
+                    item.source_session_id == rejection.source_session_id
+                        && item.snapshot_fingerprint == rejection.snapshot_fingerprint
+                        && crate::snapshots::claude_request_money::is_request_owned_literal(item)
+                });
+            if !held_literal {
+                return Err(anyhow!(
+                    "snapshot ACK holds a body that did not declare the hold contract"
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn validate_head_cas_ack(&self, enforce_head_cas: bool) -> Result<()> {
@@ -1076,7 +1112,7 @@ impl SnapshotBatchResponse {
                 unchanged_basis: None,
             };
             validate_snapshot_entity_ref(&reference)?;
-            if !rejection.permanent {
+            if !rejection.permanent && !rejection.usage_decrease_hold() {
                 return Err(anyhow!("snapshot ACK contains invalid rejection"));
             }
             record_snapshot_ack_occurrences(

@@ -538,9 +538,12 @@ The effect is a withheld memo Skip until binding or a real change, never a wrong
 Virtual N1 audit delay applies only to an aged grown key admitted solely by the
 grown-since-committed retention arm. A recent grown key keeps main's immediate
 TranscriptChanged selection. At its retained due time, the aged key takes the
-existing Audit cause. Inherited limitation (also on main): virtual-deadline to
-sampled-marker conversion can derive a later deadline when capacity opens;
-failed turns can schedule a fresh interval. E1 owns that separate follow-up.
+existing Audit cause. Main's #903 fixes virtual-deadline to sampled-marker
+conversion: restoration carries the minimum owed due time, and only a successful
+secure open marks the slot attempted. Failed opens preserve the owed due time;
+stat-aware backoff and parking pace retries. The RAM backoff map admits 256 keys;
+longest-quiet eviction is counted and transfers the evicted owed deadline into
+the next slot, failing toward reading rather than dropping the obligation.
 
 `counts.withheld_hold_released` counts released holds: `deleted` (the held file
 was proved absent), `deleted_tokens` (its last-known withheld tokens, when
