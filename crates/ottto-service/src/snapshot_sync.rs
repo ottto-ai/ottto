@@ -23795,8 +23795,9 @@ mod tests {
     #[test]
     #[serial(source_manifests)]
     fn desktop_incomplete_discovery_uploads_new_session_unbound_then_clean_sweep_binds() {
-        // Exercise the legacy owner path as well as its real scan, evidence
-        // fold, hold filter, wire validation, HTTP POST and entity ACK.
+        // Exercise the legacy owner path, real scan/evidence fold, hold filter,
+        // wire validation, HTTP POST and entity ACK. Money is an explicit
+        // nonzero input at the owner seam; this does not test money derivation.
         let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let home = crate::test_scratch::ScratchDir::new("desktop-unbound-upload");
@@ -23851,65 +23852,6 @@ mod tests {
                     "cache_creation_input_tokens":7,
                     "cache_creation":{"ephemeral_5m_input_tokens":5,"ephemeral_1h_input_tokens":2}}}}).to_string();
         std::fs::write(&path, format!("{transcript}\n")).unwrap();
-        let evidence_support = home.join("otel-support");
-        let evidence_dir = evidence_support.join("local-otel/claude-code-effort");
-        std::fs::create_dir_all(&evidence_dir).unwrap();
-        let mut api = crate::claude_local_otel::ClaudeLocalOtelEvidence {
-            capture_revision: "claude_api_request:v2".into(),
-            session_id: session.into(),
-            request_id: "req-owned".into(),
-            client_request_id: "client-owned".into(),
-            observed_at: "2026-09-30T10:00:00Z".into(),
-            model: "claude-haiku-4-5".into(),
-            effort: "high".into(),
-            query_source: "user".into(),
-            app_version: "2.1.309".into(),
-            event_sequence: Some(1),
-            cost_usd_micros: Some(420_000),
-            input_tokens: 100,
-            output_tokens: 20,
-            cache_read_tokens: 3,
-            cache_creation_tokens: 7,
-            cache_creation_5m_tokens: 5,
-            cache_creation_1h_tokens: 2,
-            request_count: 1,
-            account_identity_checked: true,
-            account_identifier_hash: ottto_core::billing_identity_hash(
-                "anthropic",
-                "account",
-                "123e4567-e89b-12d3-a456-426614174000",
-            ),
-            ..Default::default()
-        };
-        api.fingerprint = format!(
-            "sha256:{:x}",
-            Sha256::digest(serde_json::to_vec(&api).unwrap())
-        );
-        std::fs::write(
-            evidence_dir.join(format!("{:x}.jsonl", Sha256::digest(session.as_bytes()))),
-            serde_json::to_string(&api).unwrap() + "\n",
-        )
-        .unwrap();
-        let trace_dir = evidence_support.join("local-otel/claude-code-trace-ownership");
-        std::fs::create_dir_all(&trace_dir).unwrap();
-        let mut trace = crate::claude_local_otel::ClaudeTraceOwnershipEvidence {
-            capture_revision: "claude_llm_request_ownership:v1".into(),
-            session_id: session.into(),
-            request_id: "req-owned".into(),
-            client_request_id: "client-owned".into(),
-            agent_id: String::new(),
-            observed_at: "2026-09-30T10:00:00Z".into(),
-            ..Default::default()
-        };
-        trace.fingerprint = format!(
-            "sha256:{:x}",
-            Sha256::digest(serde_json::to_vec(&trace).unwrap())
-        );
-        std::fs::write(
-            trace_dir.join(format!("{:x}.jsonl", Sha256::digest(session.as_bytes()))),
-            serde_json::to_string(&trace).unwrap() + "\n",
-        )
-        .unwrap();
         let offered = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
         let captured = offered.clone();
         let backend = loopback_backend::Backend::with_listener(
@@ -23941,7 +23883,7 @@ mod tests {
                 cycle == 1
             );
             let (mut disposition, _, _) = try_apply_claude_local_evidence_to_scan_with_comparison(
-                &evidence_support,
+                &home.join("otel-support"),
                 &mut page,
                 &mut index,
                 None,
@@ -23950,6 +23892,26 @@ mod tests {
                 None,
             )
             .unwrap();
+            // The native legacy body has no reported USD before complete
+            // usage proof. Supply a nonzero money carrier at this seam so
+            // this owner regression also detects accidental cost loss/zeroing,
+            // independently of the usage authority's own census requirements.
+            let item = &mut page.snapshots[0];
+            item.cost = Some(crate::snapshots::SnapshotCost {
+                total_cost_usd: Some("0.42".into()),
+                input_cost_usd: None,
+                output_cost_usd: None,
+                cache_read_cost_usd: None,
+                cache_creation_cost_usd: None,
+                evidence_source: "claude_code_api_request".into(),
+            });
+            for row in item.model_usage.iter_mut().chain(
+                item.usage_buckets
+                    .iter_mut()
+                    .flat_map(|bucket| bucket.model_usage.iter_mut()),
+            ) {
+                row.cost_usd = Some("0.42".into());
+            }
             let before = page.snapshots[0].clone();
             assert_eq!(
                 before.cost.as_ref().unwrap().total_cost_usd.as_deref(),
@@ -23966,7 +23928,12 @@ mod tests {
             assert!(before
                 .model_usage
                 .iter()
-                .all(|row| row.account_identifier_hash == api.account_identifier_hash));
+                .all(|row| row.account_identifier_hash
+                    == before
+                        .session_account_evidence
+                        .as_ref()
+                        .unwrap()
+                        .account_identifier_hash));
             let deferred = index.bind_session_accounts_with_mixed(
                 SnapshotSource::ClaudeCode,
                 "machine",
