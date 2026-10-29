@@ -2129,6 +2129,10 @@ impl SnapshotApiClient {
                 };
                 match decoded {
                     Ok(response) => {
+                        #[cfg(feature = "replay-harness")]
+                        crate::snapshot_sync::replay_harness::observe_emitted_batch(
+                            request, &body,
+                        )?;
                         self.record_batch_success(
                             request,
                             status,
