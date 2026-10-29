@@ -857,10 +857,9 @@ fn fe_claude_sp11_codex_in_page_full_with_append_keeps_main_failure() {
     );
 }
 
-/// SP-11-c, Pi (GREEN): Pi has no sampled acquisition, so no in-page read
-/// for H1c-H3c to change.
+/// Pi joins the common sampled acquisition context.
 #[test]
-fn fe_claude_sp11_pi_has_no_in_page_sampled_read() {
+fn fe_claude_sp11_pi_joins_sampled_read() {
     let root = std::env::temp_dir();
     let scan = OwnedSourceScan::new(
         SnapshotSource::Pi,
@@ -879,7 +878,7 @@ fn fe_claude_sp11_pi_has_no_in_page_sampled_read() {
         Arc::new(sampled_scan::SharedCache::default()),
         Scope(NAMESPACE.into()),
     );
-    assert!(scan.sampling.is_none(), "Pi reads stay unsampled");
+    assert!(scan.sampling.is_some(), "Pi uses the common sampled reader");
 }
 
 /// SOURCE, s below the last committed size (GREEN): the last page committed
