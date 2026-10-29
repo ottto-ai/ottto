@@ -713,7 +713,6 @@ impl SessionStartState {
     }
 
     /// Where the opening content is final (`content_end`), when known.
-    #[cfg(test)]
     pub(super) fn durable_content_end(&self) -> Option<u64> {
         self.content_end
     }

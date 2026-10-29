@@ -51,6 +51,9 @@ impl Drop for ClearPreparationFault {
         sampled_jsonl::preparation_tests::set(None);
         sampled_jsonl::preparation_tests::refuse_heap(false);
         BEFORE_COLD_TRANSFER.with(|slot| slot.borrow_mut().take());
+        BEFORE_WARM_TRANSFER.with(|slot| slot.borrow_mut().take());
+    }
+} BEFORE_WARM_TRANSFER.with(|slot| slot.borrow_mut().take());
     }
 }
 
@@ -164,7 +167,9 @@ fn direct_return_keeps_attached_guard_on_heap_poison_and_self_eviction() {
             _ => unreachable!(),
         }
         let (result, counts) = observe(|| cache.return_prepared_taken("key".into(), taken));
-        let mut returned = result.expect_err("real refusal");
+        let Err(mut returned) = result else {
+            panic!("real refusal");
+        };
         assert_eq!(&*returned as *const _ as usize, address);
         assert_eq!(format!("{:?}", returned.retained.checkpoint), checkpoint);
         assert_eq!(
@@ -443,7 +448,16 @@ fn production_cold_resources_delay_lease_wait_and_read_growth_once() {
                 1,
                 "actual cold decode reached once, then idle skips"
             );
-            assert_eq!(after.0.resource_full.get(cause), Some(&1));
+            if phase == "decode" {
+                assert_eq!(after.0.active_bound[0], [1, 0], "one structural Full");
+                assert!(
+                    cache.retained().unwrap().peek(&key).is_none(),
+                    "no-record path retains no optional graph"
+                );
+                assert!(after.0.resource_full.is_empty());
+            } else {
+                assert_eq!(after.0.resource_full.get(cause), Some(&1));
+            }
             assert_eq!(after.0.ineligible.get(cause), None, "not counted pending");
         }
         store::active::set_active_budget_for_test(None);
@@ -876,7 +890,7 @@ fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
                     &key,
                     &File::open(&path).unwrap(),
                     record_end,
-                    std::time::SystemTime::now()
+                    SystemTime::now()
                 ));
             }
             let before = (retail_bytes(source, 0), retail_bytes(source, 1));
@@ -1187,7 +1201,7 @@ fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
                 &key,
                 &File::open(&path).unwrap(),
                 record_end,
-                std::time::SystemTime::now()
+                SystemTime::now()
             ));
             let mut index = index;
             for _ in 0..5 {
@@ -1349,6 +1363,24 @@ fn owned_prepare_rejects_with_original_box_graph_flags_and_unique_guard() {
                 usize::from(matches!(arm, "buffered" | "finished" | "occupied")),
                 "fixed invariant alarm, distinct from old-checkpoint I/O"
             );
+            if arm == "capture" {
+                assert!(
+                    matches!(
+                        result,
+                        Ok(crate::transcript_acquisition::ReadMode::Unchanged)
+                    ),
+                    "#840: capture-only mode is source-derived, not an incompatibility"
+                );
+                assert_eq!(parser.reader.consumed_bytes(), 0);
+                assert!(parser.accumulator.claude_request_identity_capture);
+                let mut owner = parser.reader.reader.take_durable();
+                let attempt = owner.take_retail().expect("same unique guard transferred");
+                assert_eq!((attempt.object, attempt.next, attempt.end), expected_guard);
+                attempt.finish();
+                assert!(owner.is_empty());
+                assert_eq!(cache.durable().unwrap().retail_spent.len(), 1);
+                continue;
+            }
             let rejected = match result {
                 Ok(_) => panic!("{source:?}/{arm} unexpectedly accepted"),
                 Err(rejected) => rejected,
@@ -1510,9 +1542,9 @@ fn rejected_ordinary_taken_returns_custody_rank_charge_and_held_flag_under_one_l
     *cache.retained().unwrap() = crate::transcript_cache::TranscriptCache::with_byte_limit(0);
     let original = Box::new(returned);
     let address = &*original as *const _ as usize;
-    let mut refused = cache
-        .return_prepared_taken(key.clone(), original)
-        .expect_err("cache refuses");
+    let Err(mut refused) = cache.return_prepared_taken(key.clone(), original) else {
+        panic!("cache refuses");
+    };
     assert_eq!(&*refused as *const _ as usize, address);
     refused
         .durable
@@ -2139,7 +2171,7 @@ fn oversized_active_request_refuses_without_waiting_or_opening_a_store() {
     let (result, events) = crate::local_resource_diagnostics::capture(|| {
         cache.acquire_active(SnapshotSource::Codex, store::ACTIVE_BYTES + 1)
     });
-    assert!(matches!(result, store::LeaseWait::Busy));
+    assert!(matches!(result, store::LeaseWait::OverBudget));
     assert_eq!(events.len(), 1);
     assert_eq!(events[0]["counts"]["active_budget_refused"], 1);
     assert!(cache.durable_counters(SnapshotSource::Codex).is_none());
@@ -2939,7 +2971,9 @@ fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
         let cache = SharedCache::default();
         cache.durable_begin_pass(source, &index_path, &namespace, false);
         assert_eq!(
-            cache.durable_full_hold(source, &local_index_key(&c), true),
+            cache
+                .durable_full_hold(source, &local_index_key(&c), true)
+                .unwrap(),
             None
         );
         admit(&cache, &a, "fp-a", (reduction_a, checkpoint_a));
@@ -3109,8 +3143,9 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                 // Certificate source is irrelevant for preservation; it is never restored.
                 let cert_path = root.join("certificate.jsonl");
                 std::fs::write(&cert_path, b"{}\n").unwrap();
-                // A verified known record of a key absent from every index:
-                // production fresh-index cleanup must delete it.
+                // A known record absent from every index. Cold Claude cleanup
+                // has no original-binding mutation proof, so it must preserve
+                // this survivor; Codex retains ordinary selective deletion.
                 let absent_key = store::key_digest(ds, "/synthetic/absent-known.jsonl");
                 let record = |key| PendingRecord {
                     binding: Binding {
@@ -3172,9 +3207,35 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                         &namespace,
                         false,
                     );
-                    // #865/B1 requires a proved original before Claude deletion.
-                    assert_eq!(absent_path.exists(), source == SnapshotSource::ClaudeCode,
-                        "fresh cleanup preserves unproved Claude predecessor; Codex cleanup unchanged");
+                    let claude = source == SnapshotSource::ClaudeCode;
+                    assert_eq!(
+                        absent_path.exists(),
+                        claude,
+                        "cold Claude keeps unproved records; Codex deletes verified absences"
+                    );
+                    let (_, cleanup) = cache.durable_counters(source).unwrap();
+                    // The unmarked control also has a known selected record
+                    // with no index entry: Codex collects both known absences.
+                    let selected_survives = claude || kind != "none";
+                    assert_eq!(record_path.exists(), selected_survives, "{source:?}/{kind}");
+                    assert_eq!(
+                        cleanup.gc_records_deleted,
+                        if claude {
+                            0
+                        } else {
+                            1 + u64::from(kind == "none")
+                        },
+                        "{source:?}/{kind}: exact known absent records collected"
+                    );
+                    assert_eq!(
+                        cleanup.mutation_unproved,
+                        if claude {
+                            1 + u64::from(kind == "none")
+                        } else {
+                            0
+                        },
+                        "every unproved known Claude survivor remains in custody"
+                    );
                 } else {
                     cache.durable_begin_pass(source, &index_path, &namespace, false);
                     let fingerprint = if bypass == "cleared" { "" } else { "fp" };
@@ -3341,11 +3402,15 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                 let alarmed = reachable && kind != "none";
                 assert_eq!(
                     alarms.len(),
-                    usize::from(alarmed),
+                    1 + usize::from(alarmed),
                     "{source:?}/{kind}/{bypass}"
                 );
                 if alarmed {
-                    let alarm = &alarms[0];
+                    assert!(
+                        alarms[0]["counts"]["records_read"].is_number(),
+                        "separate store counters"
+                    );
+                    let alarm = &alarms[1];
                     assert_eq!(alarm["stage"], "durable_tail_alarm");
                     assert_eq!(alarm["source"], source.api_slug());
                     let pair = |on: bool| serde_json::json!([u64::from(on), u64::from(on)]);
@@ -3444,8 +3509,17 @@ fn foreign_owned_store_alarms_once_and_holds_nothing() {
             fresh.durable_alarm(source);
         }
     });
-    assert_eq!(alarms.len(), 1, "one store-level alarm");
-    let counts = &alarms[0]["counts"];
+    assert_eq!(
+        alarms.len(),
+        3,
+        "two store snapshots plus exactly one state alarm"
+    );
+    let state: Vec<_> = alarms
+        .iter()
+        .filter(|a| !a["counts"]["store_disabled"].is_null())
+        .collect();
+    assert_eq!(state.len(), 1, "one store-level disable alarm");
+    let counts = &state[0]["counts"];
     assert_eq!(counts["store_disabled"], "foreign_owner");
     assert_eq!(counts["held_keys"], serde_json::json!([0, 0]));
     assert_eq!(counts["t14_rebuild"], serde_json::json!([0, 0]));
@@ -3593,7 +3667,16 @@ fn store_io_failures_emit_cold_production_body_without_holds() {
                 );
                 cache.durable_alarm(source);
             });
-            assert_eq!(alarms.len(), 1);
+            let disabled: Vec<_> = alarms
+                .iter()
+                .filter(|a| !a["counts"]["store_disabled"].is_null())
+                .collect();
+            assert_eq!(
+                disabled.len(),
+                1,
+                "exactly one store disable, independent of active-lease telemetry"
+            );
+            let alarms = disabled;
             assert_eq!(alarms[0]["counts"]["store_disabled"], "record_access");
             assert_eq!(alarms[0]["counts"]["held_keys"], serde_json::json!([0, 0]));
             assert_eq!(
@@ -3692,7 +3775,7 @@ fn t14_without_retention_or_encodable_reduction_holds_on_later_passes() {
             cache.durable_hold(source, &key, &ScanIndex::default(), &mut None),
             None
         );
-        assert_eq!(cache.durable_full_hold(source, &key, true), None);
+        assert_eq!(cache.durable_full_hold(source, &key, true).unwrap(), None);
         let admitted = cache.insert_admitted(
             key.clone(),
             sampled_jsonl::CompletedNativeAcquisition {
@@ -5230,7 +5313,8 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
         .unwrap();
     for pass in 0..2 {
         let mut index = ScanIndex::load(&index_path).unwrap();
-        let record = match DurableTailStore::new(dir.clone(), source).read(&record_key) {
+        let mut writer = DurableTailStore::new(dir.clone(), source);
+        let record = match writer.read(&record_key) {
             ReadOutcome::Found(record) => record,
             other => panic!("{other:?}"),
         };
@@ -5249,17 +5333,11 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
         assert_eq!(current.audit_debt_unix_seconds, Some(due));
         let mut rewritten = record.record.clone();
         rewritten.certificate = current;
-        // C/#865: generation-only saves are clean, not dirty replacements.
         let old_wire = store::tests::pinned_v1_bytes(&rewritten, record.index_generation);
-        let mut writer = DurableTailStore::new(dir.clone(), source);
-        let original = match writer.read(&record_key) {
-            ReadOutcome::Found(original) => original,
-            other => panic!("verified debt predecessor: {other:?}"),
-        };
         writer.authorize(
-            &original,
+            &record,
             &Expected {
-                binding: original.record.binding.clone(),
+                binding: record.record.binding.clone(),
                 committed_generation: index.generation,
             },
         );
@@ -5267,11 +5345,10 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
             .write_after_save(lock, index.generation, 0, vec![rewritten])
             .unwrap();
         assert_eq!(
-            (receipt.written, receipt.clean),
-            (0, 1),
-            "same stored debt is byte-clean despite later index generation"
+            (receipt.clean, receipt.written),
+            (1, 0),
+            "unchanged content does not rewrite the stored generation"
         );
-
         let record_path = dir.join(format!(
             "{}.rec",
             record_key
@@ -5361,7 +5438,7 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
             counts.ineligible.get("audit_carrier"),
             matching_context.then_some(&1)
         );
-        assert_eq!(counts.durable_held, [0; 6]);
+        assert_eq!(counts.durable_held, [0; 8]);
         assert_eq!(counts.restored, 0);
     }
     for reset in [false, true] {
@@ -5445,7 +5522,8 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
                 1,
                 "completed audit must replace the debt-bearing predecessor, not memo-skip it"
             );
-            let record = match DurableTailStore::new(dir.clone(), source).read(&record_key) {
+            let mut writer = DurableTailStore::new(dir.clone(), source);
+            let record = match writer.read(&record_key) {
                 ReadOutcome::Found(r) => r,
                 other => panic!("{other:?}"),
             };
@@ -5803,7 +5881,7 @@ fn q11_overflow_never_forgets_a_spent_key_and_pread_charges_actual_bytes() {
     assert_eq!(retail_reads(), vec![(3, 3, 3)]);
     let summary = Counters {
         retail_keys: 1,
-        ..Default::default()
+        ..Counters::default()
     };
     let line = summary.summary(SnapshotSource::ClaudeCode, &store::StoreCounters::default());
     assert!(line.contains("retail_keys=1"));
@@ -5947,7 +6025,7 @@ fn q11_complete_map_is_paid_before_the_first_key() {
     let nodes = custody_node_bytes().unwrap();
     let reserve = super::super::RETAIL_RESERVE_BYTES;
     let pace_nodes =
-        crate::heap_layout_bound::tree_node_bytes::<store::Digest32, SystemTime>().unwrap();
+        crate::heap_layout_bound::tree_node_bytes::<store::Digest32, FullPace>().unwrap();
     assert!((2 * store::MAX_RECORDS + 1) * (nodes + pace_nodes) <= reserve);
     assert_eq!(STORES_RESIDENT_BOUND, 1_452_032);
     assert_eq!(
@@ -8893,7 +8971,6 @@ fn a1t_transitional_full_requires_known_current_floor_and_strict_growth() {
     );
     let _ = std::fs::remove_dir_all(root);
 }
-
 fn a0h_row(id: &str, input: u64) -> String {
     serde_json::json!({"type":"assistant","sessionId":"1338a80a-f36e-4cbc-a5bb-50fc66430ba5",
         "timestamp":"2026-08-02T07:00:10Z","requestId":id,
@@ -8930,6 +9007,7 @@ fn a0h_scan(
     owner.scan(roots, root, index, 100, true, &BTreeMap::new(), &[])
 }
 
+
 #[test]
 fn a0h_pacing_is_funded_nonrenewing_and_evicts_oldest() {
     let root = crate::test_scratch::private_dir("a0h-pace");
@@ -8937,40 +9015,34 @@ fn a0h_pacing_is_funded_nonrenewing_and_evicts_oldest() {
     std::fs::write(&path, b"{}\n{}\n").unwrap();
     let file = File::open(&path).unwrap();
     let cache = SharedCache::default();
-    let now = std::time::Instant::now();
+    let now = std::time::SystemTime::now();
     assert!(
-        !cache.retail_full("k", &file, 6, pace_time(now)),
+        !cache.retail_full("k", &file, 6, now),
         "idle does not spend a slot"
     );
-    assert!(cache.retail_full("k", &file, 3, pace_time(now)));
+    assert!(cache.retail_full("k", &file, 3, now));
     for seconds in [0, 1, 21599] {
-        assert!(!cache.retail_full(
-            "k",
-            &file,
-            3,
-            pace_time(now + std::time::Duration::from_secs(seconds))
-        ));
+        assert!(!cache.retail_full("k", &file, 3, now + std::time::Duration::from_secs(seconds)));
     }
-    assert!(cache.retail_full(
-        "k",
-        &file,
-        3,
-        pace_time(now + std::time::Duration::from_secs(21600))
-    ));
+    assert!(
+        cache.retail_full("k", &file, 3, now - std::time::Duration::from_secs(1)),
+        "backwards wall clock expires toward reading"
+    );
+    assert!(cache.retail_full("k", &file, 3, now + std::time::Duration::from_secs(21600)));
     let later = now + std::time::Duration::from_secs(21601);
     for n in 1..2 * store::MAX_RECORDS {
-        assert!(cache.retail_full(&format!("k{n}"), &file, 3, pace_time(later)));
+        assert!(cache.retail_full(&format!("k{n}"), &file, 3, later));
     }
     assert_eq!(
         cache.durable().unwrap().retail_full_at.len(),
         2 * store::MAX_RECORDS
     );
     assert!(
-        cache.retail_full("overflow", &file, 3, pace_time(later)),
+        cache.retail_full("overflow", &file, 3, later),
         "full pace map reads safely"
     );
     assert!(
-        !cache.retail_full("overflow", &file, 3, pace_time(later)),
+        !cache.retail_full("overflow", &file, 3, later),
         "the newly admitted key is tracked and paced"
     );
     let stores = cache.durable().unwrap();
@@ -8980,21 +9052,19 @@ fn a0h_pacing_is_funded_nonrenewing_and_evicts_oldest() {
         .retail_full_at
         .contains_key(&store::key_digest(DurableSource::ClaudeCode, "k")));
     assert_eq!(
-        stores.retail_full_at[&store::key_digest(DurableSource::ClaudeCode, "overflow")],
-        pace_time(later)
+        stores.retail_full_at[&store::key_digest(DurableSource::ClaudeCode, "overflow")].at,
+        later
     );
     drop(stores);
     assert!(
-        SharedCache::default().retail_full("k", &file, 3, pace_time(later)),
+        SharedCache::default().retail_full("k", &file, 3, later),
         "RAM pacing resets on restart"
     );
     assert!(
         cache.durable().unwrap().retail_spent.is_empty(),
         "pacing mints no Q11 authority"
     );
-    let node =
-        crate::heap_layout_bound::tree_node_bytes::<store::Digest32, std::time::SystemTime>()
-            .unwrap();
+    let node = crate::heap_layout_bound::tree_node_bytes::<store::Digest32, FullPace>().unwrap();
     assert!(node <= 1024);
     assert_eq!(
         super::super::RETAIL_RESERVE_BYTES,
@@ -9002,6 +9072,7 @@ fn a0h_pacing_is_funded_nonrenewing_and_evicts_oldest() {
     );
     let _ = std::fs::remove_dir_all(root);
 }
+
 
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
@@ -9053,18 +9124,19 @@ fn a0h_native_exhaustion_growth_pacing_reselection_and_restart_body() {
         let idle_file = File::open(&path).unwrap();
         let idle_owner = E2ScanFixture::default();
         idle_owner.begin_durable(source, &root, &index_path);
-        let idle = idle_owner
-            .cache
-            .begin_retail(
-                source,
-                &key,
-                &checkpoint,
-                &idle_file,
-                accepted,
-                std::time::Instant::now(),
-            )
-            .unwrap();
-        idle.finish();
+        {
+            let _idle = idle_owner
+                .cache
+                .begin_retail(
+                    source,
+                    &key,
+                    &checkpoint,
+                    &idle_file,
+                    accepted,
+                    std::time::Instant::now(),
+                )
+                .unwrap();
+        }
         let ((_, _, idle_modes), idle_io) =
             a0h_observe(|| a0h_scan(&idle_owner, &roots, &root, prior.clone()));
         assert_eq!(idle_modes.0, 0);
@@ -9115,24 +9187,24 @@ fn a0h_native_exhaustion_growth_pacing_reselection_and_restart_body() {
         assert!(high > accepted);
         let ((), pre_spend_io) = a0h_observe(|| {
             if !overflow {
-                let guard = owner
-                    .cache
-                    .begin_retail(
-                        source,
-                        &key,
-                        &restored.retained.checkpoint,
-                        &file,
-                        accepted,
-                        now,
-                    )
-                    .unwrap();
-                // P2 terminal-drop aftermath: destroy the unread guard, never refund it.
-                guard.finish();
+                {
+                    let _guard = owner
+                        .cache
+                        .begin_retail(
+                            source,
+                            &key,
+                            &restored.retained.checkpoint,
+                            &file,
+                            accepted,
+                            now,
+                        )
+                        .unwrap();
+                    // P2 terminal-drop aftermath: destroy the unread guard, never refund it.
+                }
                 assert_eq!(
                     owner.cache.durable().unwrap().retail_spent
-                        [&store::key_digest(DurableSource::ClaudeCode, &key)]
-                        .spent,
-                    Some((high, now))
+                        [&store::key_digest(DurableSource::ClaudeCode, &key)],
+                    (high, now)
                 );
             }
         });
@@ -9157,15 +9229,9 @@ fn a0h_native_exhaustion_growth_pacing_reselection_and_restart_body() {
         assert!(
             matches!(owner.cache.begin_retail(source, &key, &checkpoint, &file, accepted, now), Err(r) if r == expected_hold)
         );
-        let spent_before = owner
-            .cache
-            .durable()
-            .unwrap()
-            .retail_spent
-            .iter()
-            .map(|(key, c)| (*key, c.spent))
-            .collect::<Vec<_>>();
-        owner.cache.durable().unwrap().retail_full_now = Some(pace_time(now));
+        let spent_before = owner.cache.durable().unwrap().retail_spent.clone();
+        let wall_now = std::time::SystemTime::now();
+        owner.cache.durable().unwrap().retail_full_now = Some(wall_now);
         let ((mut index, mut scan, modes), io) =
             a0h_observe(|| a0h_scan(&owner, &roots, &root, prior.clone()));
         assert_eq!(modes, (1, 0, 0));
@@ -9183,17 +9249,7 @@ fn a0h_native_exhaustion_growth_pacing_reselection_and_restart_body() {
         let (mut cold_index, mut cold_scan, modes) = a0h_scan(&cold, &roots, &root, prior.clone());
         assert_eq!(modes.0, 1);
         assert_eq!(actual, a0h_wire(&root, &mut cold_index, &mut cold_scan));
-        assert_eq!(
-            owner
-                .cache
-                .durable()
-                .unwrap()
-                .retail_spent
-                .iter()
-                .map(|(key, c)| (*key, c.spent))
-                .collect::<Vec<_>>(),
-            spent_before
-        );
+        assert_eq!(owner.cache.durable().unwrap().retail_spent, spent_before);
         assert_eq!(
             file.metadata().unwrap().len(),
             high,
@@ -9214,17 +9270,7 @@ fn a0h_native_exhaustion_growth_pacing_reselection_and_restart_body() {
         assert_eq!(idle_modes.0, 0);
         assert_eq!(idle_io, (0, 0));
         assert_eq!(quiet.files[&key].size_bytes, high);
-        assert_eq!(
-            owner
-                .cache
-                .durable()
-                .unwrap()
-                .retail_spent
-                .iter()
-                .map(|(key, c)| (*key, c.spent))
-                .collect::<Vec<_>>(),
-            spent_before
-        );
+        assert_eq!(owner.cache.durable().unwrap().retail_spent, spent_before);
         // Remaining pace rows deliberately keep the unacknowledged prefix C.
 
         assert_eq!(
@@ -9233,9 +9279,11 @@ fn a0h_native_exhaustion_growth_pacing_reselection_and_restart_body() {
         );
         let ((), alarm) =
             crate::local_resource_diagnostics::capture(|| owner.cache.durable_alarm(source));
-        assert_eq!(alarm.len(), 1);
+        assert_eq!(alarm.len(), 2, "store counters and one admission delta");
+        assert!(alarm[0]["counts"]["records_read"].is_number());
+        assert!(alarm.iter().all(|e| e["counts"]["pace_evicted"].is_null()));
         assert_eq!(
-            alarm[0]["counts"]["retail_exhausted"],
+            alarm[1]["counts"]["retail_exhausted"],
             serde_json::json!([1, 1])
         );
         // Simulate failed ACK/save: committed size/witness remain the old accepted prefix.
@@ -9249,18 +9297,15 @@ fn a0h_native_exhaustion_growth_pacing_reselection_and_restart_body() {
             owner.evict();
             owner.begin_durable(source, &root, &index_path);
             owner.cache.durable().unwrap().retail_full_now =
-                Some(pace_time(now + std::time::Duration::from_secs(seconds)));
-            let (((held, scan, modes), io), samples) =
-                crate::transcript_acquisition::capture_sample_reads(|| {
+                Some(wall_now + std::time::Duration::from_secs(seconds));
+            let (((held, scan, modes), io), sample_bytes) =
+                crate::transcript_acquisition::capture_sample_bytes(|| {
                     a0h_observe(|| a0h_scan(&owner, &roots, &root, prior.clone()))
                 });
             assert_eq!(
-                samples
-                    .iter()
-                    .map(|r| r.result.as_ref().copied().unwrap())
-                    .sum::<usize>(),
-                2 * accepted.min(4096) as usize,
-                "certificate proof separately disclosed"
+                sample_bytes,
+                4 * accepted.min(4096) as usize,
+                "restore certificate and pre-retail native planning proof separately disclosed"
             );
             assert_eq!(modes.0, 0);
             assert_eq!(io, (0, 0));
@@ -9289,9 +9334,76 @@ fn a0h_native_exhaustion_growth_pacing_reselection_and_restart_body() {
                 )
             );
         }
+        // F3: a live recovery stamp and exhausted/full spend ledger cannot
+        // veto independent native audit/clock Full decisions. No spend refund.
+        {
+            struct ResetClock;
+            impl Drop for ResetClock {
+                fn drop(&mut self) {
+                    super::super::set_test_now(None);
+                }
+            }
+            let _clock = ResetClock;
+            let before_pace = owner.cache.durable_counters(source).unwrap().0.retail_full;
+            for (now, cause) in [
+                (
+                    checkpoint.last_full_verified()
+                        + crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS,
+                    FullReason::AuditDue,
+                ),
+                (
+                    checkpoint.last_full_verified() - 1,
+                    FullReason::ClockChanged,
+                ),
+            ] {
+                super::super::set_test_now(Some(now));
+                let plan = crate::transcript_acquisition::ReadPlan::prepare(
+                    &mut File::open(&path).unwrap(),
+                    Some(&checkpoint),
+                    checkpoint.scope(),
+                    None,
+                    now,
+                )
+                .unwrap();
+                assert_eq!(
+                    plan.mode(),
+                    crate::transcript_acquisition::ReadMode::Full(cause)
+                );
+                drop(plan);
+                owner.evict();
+                owner.begin_durable(source, &root, &index_path);
+                let ((mut recovered, mut output, modes), io) =
+                    a0h_observe(|| a0h_scan(&owner, &roots, &root, prior.clone()));
+                assert_eq!(modes, (1, 0, 0), "{cause:?}: native Full despite live pace");
+                assert_eq!(io.1, file.metadata().unwrap().len());
+                assert!(io.0 > 0);
+                assert_eq!(
+                    (
+                        output.snapshots[0].input_tokens,
+                        output.snapshots[0].request_count
+                    ),
+                    (700, 3)
+                );
+                let actual = a0h_wire(&root, &mut recovered, &mut output);
+                let cold = E2ScanFixture::default();
+                let (mut cold_index, mut cold_output, _) =
+                    a0h_scan(&cold, &roots, &root, prior.clone());
+                assert_eq!(actual, a0h_wire(&root, &mut cold_index, &mut cold_output));
+                assert_eq!(owner.cache.durable().unwrap().retail_spent, spent_before);
+                assert_eq!(
+                    owner.cache.durable_counters(source).unwrap().0.retail_full,
+                    before_pace,
+                    "independent Full neither spends nor delays the recovery allowance"
+                );
+                assert_eq!(
+                    owner.cache.durable().unwrap().retail_full_at[&full_pace_key(source, &key)].at,
+                    wall_now
+                );
+            }
+        }
         owner.evict();
         owner.cache.durable().unwrap().retail_full_now =
-            Some(pace_time(now + std::time::Duration::from_secs(21600)));
+            Some(wall_now + std::time::Duration::from_secs(21600));
         let ((mut index, mut scan, modes), io) =
             a0h_observe(|| a0h_scan(&owner, &roots, &root, prior.clone()));
         assert_eq!(modes, (1, 0, 0));
@@ -9321,6 +9433,7 @@ fn a0h_native_exhaustion_growth_pacing_reselection_and_restart_body() {
         let _ = std::fs::remove_dir_all(root);
     }
 }
+
 
 #[test]
 fn a0h_pace_evicted_alone_emits_one_alarm_without_a_full_delta() {
@@ -11078,12 +11191,10 @@ fn accepted_floor_missing_record_is_neutral_and_freezes_before_mutation() {
         &path,
         3
     ));
-    assert!(sampled_audit::path_requires_recovery(
-        source,
-        &index.files,
-        &path,
-        7
-    ));
+    assert!(
+        sampled_audit::path_requires_recovery(source, &index.files, &path, 7),
+        "retain partial safeguard until E3 #876 supplies old-directory rescue"
+    );
     assert!(!sampled_audit::path_requires_recovery(
         source,
         &index.files,
@@ -11108,7 +11219,9 @@ fn shared_recovery_pace_uses_wall_clock_and_overflow_fails_toward_reading() {
         false,
     );
     let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
-    let pace = |key: &str, now| cache.paced_growth_full(source, key, &file, 3, now);
+    let pace = |key: &str, now| {
+        cache.paced_growth_full(source, key, &file, 3, now, "retail_exhausted_full")
+    };
     assert!(pace("key", at));
     assert!(!pace("key", at + std::time::Duration::from_secs(1)));
     assert!(
@@ -11121,7 +11234,7 @@ fn shared_recovery_pace_uses_wall_clock_and_overflow_fails_toward_reading() {
         "absurd forward jump expires"
     );
     assert!(
-        !cache.paced_growth_full(source, "quiet", &file, 6, at),
+        !cache.paced_growth_full(source, "quiet", &file, 6, at, "retail_exhausted_full"),
         "quiet files gain no Full"
     );
     cache.durable().unwrap().retail_full_at.clear();
@@ -11132,11 +11245,13 @@ fn shared_recovery_pace_uses_wall_clock_and_overflow_fails_toward_reading() {
         } else {
             store::key_digest(ds, &n.to_string())
         };
-        cache
-            .durable()
-            .unwrap()
-            .retail_full_at
-            .insert(key, at + std::time::Duration::from_secs(u64::from(n != 0)));
+        cache.durable().unwrap().retail_full_at.insert(
+            key,
+            FullPace {
+                at: at + std::time::Duration::from_secs(u64::from(n != 0)),
+                structural: false,
+            },
+        );
     }
     let (allowed, events) = crate::local_resource_diagnostics::capture(|| {
         let allowed = pace("overflow", at + std::time::Duration::from_secs(2));
@@ -11252,13 +11367,9 @@ fn growth_hold_wall_expiry_restart_recovers_exact_body_without_prefix_duplicatio
         .unwrap()
         .write_all(suffix.as_bytes())
         .unwrap();
-    File::open(&path)
-        .unwrap()
-        .set_times(
-            std::fs::FileTimes::new()
-                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)),
-        )
-        .unwrap();
+    // E3 #876 supplies old-directory growth rescue at r2-integrate; this
+    // isolated custody fixture keeps growth inside W until recovery.
+
     let file = File::open(&path).unwrap();
     // An interrupted Tail spends its entire frozen grant, without settling.
     cache
@@ -11274,7 +11385,7 @@ fn growth_hold_wall_expiry_restart_recovers_exact_body_without_prefix_duplicatio
         .finish();
     let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000);
     cache.durable().unwrap().retail_full_now = Some(at);
-    assert!(cache.retail_full(&key, &file, accepted, std::time::SystemTime::now())); // Earlier interrupted Full attempt.
+    assert!(cache.retail_full(&key, &file, accepted, SystemTime::now())); // Earlier interrupted Full attempt.
     let accepted_entry = serde_json::to_value(&index.files[&key]).unwrap();
     let accepted_census = index.claude_request_census.get(&key).unwrap().clone();
     let (held, result, modes) = run(cache.clone(), index);
@@ -11287,8 +11398,8 @@ fn growth_hold_wall_expiry_restart_recovers_exact_body_without_prefix_duplicatio
     );
     assert_eq!(held.claude_request_census.get(&key), Some(&accepted_census));
     assert_eq!(cache.durable().unwrap().counters.retail_full, [1, 1, 0]);
-    // Independent cold Full under the same accepted entry; discovery is rescued
-    // by length > committed end (#876), never by a fabricated audit/ACK marker.
+    // Independent cold Full under the same accepted entry, without fabricated
+    // audit/ACK markers. #876 past-W growth qualification remains a dependency.
     let (_, oracle, _) = run(Arc::new(SharedCache::default()), held.clone());
     assert_eq!(oracle.snapshots.len(), 1);
     cache.durable().unwrap().retail_full_now =
@@ -11355,6 +11466,7 @@ fn s2_unknown_is_same_and_only_independent_replacement_skips_floor() {
         generation: 1,
         entry,
         strict: true,
+        verified_extent: true,
     };
     assert!(
         !accepted_object_changed(&record, a, 1, 2, 100),
@@ -12850,4 +12962,1294 @@ pub(crate) fn expire_full_pace(cache: &SharedCache, key: &str) {
     if let Some(at) = stores.retail_full_at.get(&digest).copied() {
         stores.retail_full_now = Some(at + std::time::Duration::from_secs(PACE_SECS));
     }
+}
+
+
+pub(super) fn before_warm_transfer() {
+    let hook = BEFORE_WARM_TRANSFER.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// An indexed record-old/index-clean audit crash must not hide an independently
+/// proved shrink behind its retained envelope debt or accepted-body floor.
+#[test]
+fn indexed_debt_carrier_preserves_proven_shrink_before_audit_rearm() {
+    let root = crate::test_scratch::private_dir("ottto-indexed-carrier-edit");
+    let lock = test_locks::hold(&root);
+    let path = root.join("source.jsonl");
+    std::fs::write(&path, b"{}\n{}\n").unwrap();
+    let source = SnapshotSource::ClaudeCode;
+    let ds = DurableSource::ClaudeCode;
+    let namespace = Scope("indexed-carrier-edit".into());
+    let key = local_index_key(&path);
+    let index_path = root.join("index.json");
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        key.clone(),
+        serde_json::from_value(serde_json::json!({
+            "size_bytes":6, "modified_unix_seconds":1,
+            "source_file_fingerprint":"verified-carrier-edit"
+        }))
+        .unwrap(),
+    );
+    index.save(&index_path).unwrap();
+    let interpretation = Interpretation::of(source, &key, &index, false, &namespace);
+    let original = expected(ds, source, &key, &namespace, &index, &interpretation, None).unwrap();
+    let mut cert = certificate(&path, &namespace);
+    cert.audit_debt_unix_seconds = Some(1_800_000_060);
+    let mut disk = DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+    assert_eq!(
+        disk.write_after_save(
+            lock,
+            index.generation,
+            0,
+            vec![PendingRecord {
+                binding: original.binding,
+                certificate: cert,
+                body: crate::snapshots::durable_store_fixture_body(source, 0, 0),
+                allowlist: codec::allowlist_digest(source),
+            }]
+        )
+        .unwrap()
+        .written,
+        1
+    );
+    let record_key = store::key_digest(ds, &key);
+    let record = store::tests::found(disk.read(&record_key));
+    assert!(!audit_carrier_matches(&record, &index, &key, 1_800_000_000));
+    let record_path = disk.dir().join(format!(
+        "{}.rec",
+        record_key
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    ));
+    let before = std::fs::read(&record_path).unwrap();
+    let mut held = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    held.set_len(3).unwrap();
+    assert!(
+        interpretation.accepted.unwrap().behind(3),
+        "the floor would otherwise hold"
+    );
+    let cache = SharedCache::default();
+    cache.durable_begin_pass(source, &index_path, &namespace, false);
+    assert!(matches!(
+        cache.durable_restore(
+            source,
+            &key,
+            &path,
+            &namespace,
+            &mut held,
+            &index,
+            &interpretation
+        ),
+        RestoreOutcome::Miss(MissClass::RealEdit(FullReason::Shrunk))
+    ));
+    let (counts, _) = cache.durable_counters(source).unwrap();
+    assert_eq!(counts.certificate_refused.get("shrunk"), Some(&1));
+    assert_eq!(counts.ineligible.get("audit_carrier"), None);
+    assert_eq!(counts.durable_held, [0; 8]);
+    assert_eq!(counts.restored, 0);
+    assert_eq!(std::fs::read(&record_path).unwrap(), before);
+    assert_eq!(
+        index.files[&key].size_bytes, 6,
+        "no forged index settlement"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// The growth/shrink discovery backstop must never let a warm optional copy
+/// erase S2. Same inode plus unknown/reused birth is not replacement proof.
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "requires qualified native heap layout"
+)]
+fn verified_warm_shrink_reads_exact_changed_body_once_and_preserves_ack() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    use std::io::Write;
+    assert!(crate::heap_layout_bound::layout_supported());
+    let _gate = claude_request_money::e2::GateForTest::set(true);
+    let root = crate::test_scratch::ScratchDir::new("p3-warm-floor");
+    let sessions = root.join("sessions");
+    std::fs::create_dir(&sessions).unwrap();
+    let path = sessions.join("11111111-2222-4333-8444-555555555555.jsonl");
+    native_fixture(&path);
+    let prefix = std::fs::metadata(&path).unwrap().len();
+    let row = serde_json::json!({"type":"assistant","sessionId":"11111111-2222-4333-8444-555555555555",
+        "timestamp":"2026-10-07T10:01:00Z","requestId":"req-p3-warm",
+        "message":{"id":"msg-p3-warm","model":"fixture-model","usage":{"input_tokens":25,"output_tokens":3}}});
+    writeln!(
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap(),
+        "{row}"
+    )
+    .unwrap();
+    let source = SnapshotSource::ClaudeCode;
+    let namespace = Scope("p3-warm-s2".into());
+    let cache = Arc::new(SharedCache::default());
+    let run = |cache: Arc<SharedCache>, index| {
+        let mut scan = OwnedSourceScan::new_with_identity_capture(
+            source,
+            std::slice::from_ref(&sessions),
+            index,
+            "2026-10-29T12:00:00Z",
+            365,
+            100,
+            false,
+            None,
+            &[],
+            false,
+            true,
+            true,
+        )
+        .with_sampled_acquisition(cache, namespace.clone());
+        let mut modes = (0, 0, 0);
+        for _ in 0..10_000 {
+            if let Some(context) = scan.sampling.as_ref() {
+                modes = (context.full_files, context.tail_files, context.native_bytes);
+            }
+            match scan.step(None) {
+                OwnedSourceScanStep::Pending(next) => scan = next,
+                OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan, modes),
+            }
+        }
+        panic!("warm S2 fixture did not finish");
+    };
+    let (accepted, first, _) = run(cache.clone(), ScanIndex::default());
+    let key = local_index_key(&path);
+    assert_eq!(first.snapshots[0].input_tokens, 125);
+    assert!(
+        cache.retained().unwrap().peek(&key).is_some(),
+        "real warm premise"
+    );
+    let witness = accepted.files[&key].last_upload_body_witness.clone();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(prefix)
+        .unwrap();
+    File::open(&path)
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)),
+        )
+        .unwrap();
+    assert!(sampled_audit::path_requires_recovery(
+        source,
+        &accepted.files,
+        &path,
+        prefix
+    ));
+    let prior = accepted.clone();
+    let ((changed, body, modes), events) =
+        crate::local_resource_diagnostics::capture(|| run(cache.clone(), accepted));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["counts"]["full_reads"]["real_edit"]["shrunk"] == 1)
+            .count(),
+        1,
+        "one named A2 admission at the actual native Full boundary"
+    );
+    assert_eq!(body.snapshots.len(), 1);
+    assert_eq!(
+        body.snapshots[0].input_tokens, 100,
+        "A2: actual changed body"
+    );
+    assert_eq!(body.unreadable_path_count, 0);
+    assert_eq!(modes, (1, 0, prefix));
+    assert_eq!(changed.files[&key].size_bytes, prefix);
+    assert_eq!(
+        changed.files[&key].last_upload_body_witness, witness,
+        "acquisition grants no ACK"
+    );
+    let (_, cold, cold_modes) = run(Arc::new(SharedCache::default()), prior);
+    assert_eq!(cold_modes, (1, 0, prefix));
+    assert_eq!(
+        serde_json::to_value(&body.snapshots).unwrap(),
+        serde_json::to_value(&cold.snapshots).unwrap()
+    );
+    let (_, idle, modes) = run(cache, changed);
+    assert!(idle.snapshots.is_empty());
+    assert_eq!(modes, (0, 0, 0), "changed body acquired exactly once");
+}
+
+/// Every retained #865 probe needs input credit even on a memo hit. The
+/// settlement probe remains read-only and missing membership recovers due.
+#[test]
+fn member_settlement_and_final_full_probes_reserve_before_any_classifier_io() {
+    let _reset = ResetActiveBudget;
+    let root = crate::test_scratch::ScratchDir::new("p3-probe-credit");
+    let lock = test_locks::hold(&root);
+    let source = SnapshotSource::Codex;
+    let ds = DurableSource::Codex;
+    let namespace = Scope("probe-credit".into());
+    let path = root.join("t.jsonl");
+    std::fs::write(&path, b"{}\n").unwrap();
+    let key = local_index_key(&path);
+    let index_path = root.join("index.json");
+    let index = ScanIndex::default(); // missing membership, no manufactured audit marker
+    let mut binding = store::tests::binding("acct", "file", ("fp", None));
+    binding.source = ds;
+    binding.key = store::key_digest(ds, &key);
+    binding.context = store::context_digest(
+        &namespace.0,
+        index.active_upload_context_fingerprint.as_deref(),
+    );
+    let mut cert = store::tests::certificate(&path);
+    cert.audit_debt_unix_seconds = Some(1);
+    let pending = PendingRecord {
+        binding,
+        certificate: cert,
+        body: crate::snapshots::durable_store_fixture_body(source, 0, 0),
+        allowlist: codec::allowlist_digest(source),
+    };
+    DurableTailStore::new(store::store_dir_for_index(&index_path), ds)
+        .write_after_save(lock, 1, 0, vec![pending])
+        .unwrap();
+    let cache = SharedCache::default();
+    cache.durable_begin_pass(source, &index_path, &namespace, false);
+    let before = cache.durable_counters(source).unwrap().1;
+    store::active::set_active_budget_for_test(Some(0));
+    let mut due = None;
+    assert!(cache
+        .durable_member_hold(source, &key, &index, &mut due)
+        .is_err());
+    assert_eq!(due, None);
+    assert!(cache.durable_carrier_reprobe(source, &key, &index).is_err());
+    assert!(cache.durable_full_hold(source, &key, true).is_err());
+    assert_eq!(
+        cache.durable_counters(source).unwrap().1,
+        before,
+        "no header/envelope/body I/O, debt import, corruption grant or Full count before funding"
+    );
+    store::active::set_active_budget_for_test(None);
+    assert_eq!(
+        cache.durable_carrier_reprobe(source, &key, &index).unwrap(),
+        Some(1)
+    );
+    let after_read_only = cache.durable_counters(source).unwrap().1;
+    assert_eq!(
+        after_read_only.t14_rebuild_full_started,
+        before.t14_rebuild_full_started
+    );
+    assert_eq!(after_read_only.t14_rebuild, before.t14_rebuild);
+    assert!(after_read_only.guard_header_bytes > before.guard_header_bytes);
+    assert_eq!(
+        cache
+            .durable_member_hold(source, &key, &index, &mut due)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        due,
+        Some(1),
+        "funded group-start recovers exact member deadline"
+    );
+    assert_eq!(cache.durable_full_hold(source, &key, true).unwrap(), None);
+    assert_eq!(
+        cache
+            .durable_counters(source)
+            .unwrap()
+            .1
+            .t14_rebuild_full_started,
+        0
+    );
+}
+
+/// A persistent b3b resource cause shares A0-h's source+key stamp; one reason
+/// cannot bypass another reason's grant. Spend custody is never evicted/refunded.
+#[test]
+fn resource_and_retail_recoveries_share_one_wall_clock_stamp() {
+    let root = crate::test_scratch::ScratchDir::new("p3-resource-pace");
+    let path = root.join("t.jsonl");
+    std::fs::write(&path, b"{}\n{}\n").unwrap();
+    let key = local_index_key(&path);
+    let file = File::open(&path).unwrap();
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        key.clone(),
+        serde_json::from_value(serde_json::json!({
+            "size_bytes":3,"modified_unix_seconds":1,"source_file_fingerprint":"accepted"
+        }))
+        .unwrap(),
+    );
+    let cache = SharedCache::default();
+    let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+    cache.durable().unwrap().retail_full_now = Some(at);
+    let outcome = cache.restore_resource_pending(
+        SnapshotSource::ClaudeCode,
+        "rederive_unfunded",
+        &key,
+        &file,
+        &index,
+    );
+    assert!(matches!(
+        outcome,
+        RestoreOutcome::Miss(MissClass::Resource("rederive_unfunded"))
+    ));
+    assert!(
+        !cache.retail_full(&key, &file, 3, SystemTime::now()),
+        "same stamp prevents a second grant under retail cause"
+    );
+    assert!(matches!(
+        cache.restore_resource_pending(SnapshotSource::ClaudeCode, "decode", &key, &file, &index),
+        RestoreOutcome::Pending
+    ));
+    cache.durable().unwrap().retail_full_now =
+        Some(at + std::time::Duration::from_secs(RECOVERY_PACE_SECONDS));
+    assert!(matches!(
+        cache.restore_resource_pending(SnapshotSource::ClaudeCode, "decode", &key, &file, &index),
+        RestoreOutcome::Miss(MissClass::Resource("decode"))
+    ));
+    let stores = cache.durable().unwrap();
+    assert_eq!(stores.retail_full_at.len(), 1);
+    assert!(stores.retail_spent.is_empty());
+    assert_eq!(stores.counters.retail_full, [2, 2, 0]);
+    assert_eq!(
+        stores.counters.resource_full.get("rederive_unfunded"),
+        Some(&1)
+    );
+    assert_eq!(stores.counters.resource_full.get("decode"), Some(&1));
+}
+
+/// Real scanner, native content-bearing v1 writer, RAM loss and no seeded debt.
+/// Both A2 edits must be acquired once, despite persistent rederive refusal;
+/// quiet >W/retirement and restart must not re-emit the accepted changed body.
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "requires qualified native heap layout"
+)]
+fn content_v1_resource_refusal_cannot_hide_equal_edit_or_truncate_then_restart() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    use std::io::Write;
+    assert!(crate::heap_layout_bound::layout_supported());
+    let _gate = claude_request_money::e2::GateForTest::set(true);
+    let source = SnapshotSource::ClaudeCode;
+    for edit in ["equal", "truncate"] {
+        let root = crate::test_scratch::ScratchDir::new("p3-resource-a2");
+        let lock = test_locks::hold(&root);
+        let sessions = root.join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let path = sessions.join("11111111-2222-4333-8444-555555555555.jsonl");
+        native_fixture(&path);
+        let content =
+            serde_json::json!({"type":"user","sessionId":"11111111-2222-4333-8444-555555555555",
+            "timestamp":"2026-10-07T10:00:01Z","uuid":"prompt-p3-a2","cwd":"/tmp/synthetic-p3-a2",
+            "message":{"role":"user","content":"synthetic prompt requiring rederive"}})
+            .to_string()
+                + "\n";
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(content.as_bytes())
+            .unwrap();
+        let prefix = std::fs::metadata(&path).unwrap().len();
+        let suffix = serde_json::json!({"type":"assistant","sessionId":"11111111-2222-4333-8444-555555555555",
+            "timestamp":"2026-10-07T10:01:00Z","requestId":"req-p3-a2",
+            "message":{"id":"msg-p3-a2","model":"fixture-model","usage":{"input_tokens":25,"output_tokens":3}}}).to_string()+"\n";
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(suffix.as_bytes())
+            .unwrap();
+        let index_path = root.join("index.json");
+        let key = local_index_key(&path);
+        let namespace = Scope("p3-a2-resource".into());
+        let cache = Arc::new(SharedCache::default());
+        cache.durable_begin_pass(source, &index_path, &namespace, true);
+        let run = |cache: Arc<SharedCache>, index, at: &str| {
+            let mut scan = OwnedSourceScan::new_with_identity_capture(
+                source,
+                std::slice::from_ref(&sessions),
+                index,
+                at,
+                365,
+                100,
+                false,
+                None,
+                &[],
+                false,
+                true,
+                true,
+            )
+            .with_sampled_acquisition(cache, namespace.clone());
+            let mut modes = (0, 0, 0);
+            for _ in 0..10_000 {
+                if let Some(context) = scan.sampling.as_ref() {
+                    modes = (context.full_files, context.tail_files, context.native_bytes);
+                }
+                match scan.step(None) {
+                    OwnedSourceScanStep::Pending(next) => scan = next,
+                    OwnedSourceScanStep::Complete { index, scan, .. } => {
+                        return (index, scan, modes)
+                    }
+                }
+            }
+            panic!("native edit scanner did not finish");
+        };
+        let (mut index, first, _) =
+            run(cache.clone(), ScanIndex::default(), "2026-10-29T12:00:00Z");
+        assert_eq!(first.snapshots[0].input_tokens, 125);
+        assert!(
+            !index.files[&key].has_unverified_source(),
+            "genuine Full, no seeded debt"
+        );
+        index.save(&index_path).unwrap();
+        assert_eq!(
+            cache
+                .durable_write_after_save(lock, source, &index)
+                .unwrap()
+                .written,
+            1
+        );
+        let record = {
+            let mut stores = cache.durable().unwrap();
+            store::tests::found(
+                stores
+                    .slot(DurableSource::ClaudeCode)
+                    .as_mut()
+                    .unwrap()
+                    .store
+                    .read(&store::key_digest(DurableSource::ClaudeCode, &key)),
+            )
+        };
+        assert_eq!(record.format, 1);
+        let decoded = codec::decode(&record.record.body, source).unwrap();
+        assert!(
+            decoded.without_rederive().is_err(),
+            "non-default X-content production premise"
+        );
+        cache.retained().unwrap().clear();
+        let original_len = std::fs::metadata(&path).unwrap().len();
+        if edit == "equal" {
+            let bytes = std::fs::read_to_string(&path)
+                .unwrap()
+                .replace("\"input_tokens\":25", "\"input_tokens\":75");
+            assert!(bytes.contains("\"input_tokens\":75"));
+            std::fs::write(&path, bytes).unwrap();
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), original_len);
+        } else {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(prefix)
+                .unwrap();
+        }
+        // Same inode, explicit mtime change: independent existing A2 input.
+        File::open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_793_275_201),
+            ))
+            .unwrap();
+        let (mut changed, body, modes) = run(cache.clone(), index, "2026-10-29T12:00:00Z");
+        assert_eq!(body.snapshots.len(), 1, "{edit}: changed body acquired");
+        assert_eq!(
+            body.snapshots[0].input_tokens,
+            if edit == "equal" { 175 } else { 100 }
+        );
+        assert_eq!(modes, (1, 0, std::fs::metadata(&path).unwrap().len()));
+        assert_eq!(body.unreadable_path_count, 0);
+        assert!(!changed.files[&key].has_unverified_source());
+        let counters = cache.durable_counters(source).unwrap().0;
+        assert_eq!(
+            counters.certificate_refused.get(if edit == "equal" {
+                "same_size_edit"
+            } else {
+                "shrunk"
+            }),
+            Some(&1)
+        );
+        assert!(
+            counters.resource_full.is_empty(),
+            "A2 is independent of resource fallback/pacer"
+        );
+        changed.save(&index_path).unwrap();
+        cache
+            .durable_write_after_save(lock, source, &changed)
+            .unwrap();
+        let (changed, idle, modes) = run(cache.clone(), changed, "2026-10-29T12:00:00Z");
+        assert!(idle.snapshots.is_empty());
+        assert_eq!(modes, (0, 0, 0));
+        assert_eq!(
+            changed.claude_request_census.get(&key).unwrap().retired(),
+            None
+        );
+        // Forty days crosses35-day census retirement and >one-year crosses W.
+        let (retired, idle, modes) = run(cache.clone(), changed, "2026-12-15T12:00:00Z");
+        assert!(idle.snapshots.is_empty());
+        assert_eq!(modes, (0, 0, 0));
+        assert!(
+            retired
+                .claude_request_census
+                .get(&key)
+                .unwrap()
+                .retired()
+                .is_some(),
+            "actual35-day retirement premise"
+        );
+        let (mut aged, idle, modes) = run(cache, retired, "2028-12-15T12:00:00Z");
+        assert!(idle.snapshots.is_empty());
+        assert_eq!(modes, (0, 0, 0));
+        aged.save(&index_path).unwrap();
+        let restarted = Arc::new(SharedCache::default());
+        restarted.durable_begin_pass(source, &index_path, &namespace, true);
+        let (_, idle, modes) = run(
+            restarted,
+            ScanIndex::load(&index_path).unwrap(),
+            "2028-12-15T12:00:00Z",
+        );
+        assert!(
+            idle.snapshots.is_empty(),
+            "no second changed body after retirement/W/restart"
+        );
+        assert_eq!(modes, (0, 0, 0));
+    }
+}
+
+/// D-DISABLED and absent stores require no classifier allocation: native
+/// recovery must not wait for unrelated input credit or execute the batch.
+#[test]
+fn absent_and_disabled_member_batches_bypass_unavailable_input_credit() {
+    let _reset = ResetActiveBudget;
+    let root = crate::test_scratch::ScratchDir::new("p3-disabled-probe");
+    let cache = SharedCache::default();
+    let source = SnapshotSource::Codex;
+    let index = ScanIndex::default();
+    store::active::set_active_budget_for_test(Some(0));
+    for absent in [true, false] {
+        if !absent {
+            cache.durable_begin_pass(
+                source,
+                &root.join("index.json"),
+                &Scope("disabled".into()),
+                false,
+            );
+            cache
+                .durable()
+                .unwrap()
+                .slot(DurableSource::Codex)
+                .as_mut()
+                .unwrap()
+                .store
+                .disable("test_disabled");
+        }
+        assert!(!cache
+            .durable_funded_member_batch(source, |_| panic!(
+                "bypassed batch cannot classify or consume grants"
+            ))
+            .unwrap());
+        assert_eq!(
+            cache
+                .durable_carrier_reprobe(source, "key", &index)
+                .unwrap(),
+            None
+        );
+        assert_eq!(cache.durable_full_hold(source, "key", true).unwrap(), None);
+    }
+    let (_, counts) = cache.durable_counters(source).unwrap();
+    assert_eq!(counts.guard_header_bytes, 0);
+    assert_eq!(counts.guard_verify_bytes, 0);
+    assert_eq!(counts.t14_rebuild_full_started, 0);
+}
+
+#[test]
+fn b4_shared_pace_cross_cause_clock_anomalies_and_single_eviction_owner() {
+    let root = crate::test_scratch::ScratchDir::new("b4-pace-owner");
+    let cache = SharedCache::default();
+    let claude = SnapshotSource::ClaudeCode;
+    let codex = SnapshotSource::Codex;
+    for source in [claude, codex] {
+        cache.durable_begin_pass(
+            source,
+            &root.join(source.api_slug()),
+            &Scope("alarm".into()),
+            false,
+        );
+        let _ = crate::local_resource_diagnostics::capture(|| cache.durable_alarm(source));
+    }
+    let now = std::time::SystemTime::now();
+    assert!(cache.paced_full(claude, "same", now, false, false, true));
+    assert!(!cache.paced_full(claude, "same", now, true, false, true));
+    assert!(cache.paced_full(codex, "same", now, true, false, true));
+    for n in 2..2 * store::MAX_RECORDS {
+        assert!(cache.paced_full(claude, &format!("fill-{n}"), now, false, false, true));
+    }
+    let ((), events) = crate::local_resource_diagnostics::capture(|| {
+        assert!(cache.paced_full(
+            codex,
+            "overflow",
+            now + std::time::Duration::from_secs(1),
+            true,
+            false,
+            true
+        ));
+        // Repeated ordinary alarms from BOTH sources cannot emit this again.
+        for _ in 0..2 {
+            cache.durable_alarm(claude);
+            cache.durable_alarm(codex);
+        }
+    });
+    let evictions: Vec<_> = events
+        .iter()
+        .filter(|e| !e["counts"]["pace_evicted"].is_null())
+        .collect();
+    assert_eq!(evictions.len(), 1);
+    assert_eq!(evictions[0]["source"], codex.api_slug());
+    assert_eq!(
+        evictions[0]["counts"]["pace_evicted"],
+        serde_json::json!([1, 1])
+    );
+    assert_eq!(cache.durable_counters(claude).unwrap().0.retail_full[2], 0);
+    assert_eq!(cache.durable_counters(codex).unwrap().0.retail_full[2], 1);
+    assert_eq!(
+        cache.durable().unwrap().retail_full_at.len(),
+        2 * store::MAX_RECORDS
+    );
+    assert!(
+        cache.paced_full(codex, "overflow", now, true, false, true),
+        "backwards jump EXPIRES"
+    );
+    assert!(!cache.paced_full(codex, "overflow", now, true, false, true));
+    assert!(
+        cache.paced_full(
+            codex,
+            "overflow",
+            now + std::time::Duration::from_secs(PACE_SANITY_SECS + 1),
+            true,
+            false,
+            true
+        ),
+        "large forward jump EXPIRES"
+    );
+    assert!(
+        !cache.paced_full(
+            codex,
+            "overflow",
+            now + std::time::Duration::from_secs(PACE_SANITY_SECS + 2),
+            true,
+            false,
+            true
+        ),
+        "anomalous read enrols again"
+    );
+}
+
+#[test]
+fn b4_near_cap_uses_each_existing_source_cap() {
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let cap = max_jsonl_file_bytes(source);
+        assert_eq!(
+            cap,
+            match source {
+                SnapshotSource::ClaudeCode => 512 * 1024 * 1024,
+                SnapshotSource::Codex => 2 * 1024 * 1024 * 1024,
+                SnapshotSource::Pi => 256 * 1024 * 1024,
+            }
+        );
+        assert!(!near_source_cap(source, cap - cap / 10 - 1));
+        assert!(near_source_cap(source, cap - cap / 10));
+    }
+}
+
+/// A real production restore with the enabled obligation, including the
+/// certificate fences; funding refusal is tested with an unreadable FD.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "validated native decode layout")]
+fn b4_workspace_positive_restore_and_funding_before_read() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    assert!(crate::heap_layout_bound::layout_supported());
+    let root = crate::test_scratch::ScratchDir::new("b4-workspace-production");
+    let path = root.join("source.jsonl");
+    std::fs::write(
+        &path,
+        b"{\"type\":\"progress\",\"cwd\":\"/tmp/synthetic-workspace\"}\n",
+    )
+    .unwrap();
+    let source = SnapshotSource::ClaudeCode;
+    let scope = Scope("b4-content".into());
+    let native = native_record(&path, &scope).0;
+    let body = codec::encode(&native, store::BODY_BYTES, jsonl_line_cap() as u64).unwrap();
+    let decoded = codec::decode(&body, source).unwrap();
+    assert!(
+        decoded.without_rederive().is_err(),
+        "real nonempty obligation"
+    );
+    let binding = store::tests::binding("account", "scope", ("fp-a", None));
+    let expected = Expected {
+        binding: binding.clone(),
+        committed_generation: 1,
+    };
+    let record = store::DurableRecord {
+        envelope_audit_debt: None,
+        format: store::FORMAT_VERSION,
+        index_generation: 1,
+        record: PendingRecord {
+            binding,
+            certificate: certificate(&path, &scope),
+            body,
+            allowlist: codec::allowlist_digest(source),
+        },
+    };
+    let cache = SharedCache::default();
+    let store::LeaseWait::Granted(mut lease) = cache.acquire_prepared_transfer(source) else {
+        panic!("owner")
+    };
+    let (checkpoint, bounded, receipt) = cache
+        .durable_restore_record(
+            source,
+            &record,
+            &expected,
+            &path,
+            &scope,
+            &mut File::open(&path).unwrap(),
+            &mut lease,
+        )
+        .unwrap();
+    assert_eq!(
+        codec::encode(&bounded, store::BODY_BYTES, jsonl_line_cap() as u64).unwrap(),
+        codec::encode(&native, store::BODY_BYTES, jsonl_line_cap() as u64).unwrap()
+    );
+    assert_eq!(receipt.head_bytes, std::fs::metadata(&path).unwrap().len());
+    assert_eq!(checkpoint.sealed_offset(), receipt.head_bytes);
+    drop(bounded);
+    drop(checkpoint);
+    lease.release();
+    // The decoded graph and scope fit, but content credit is one byte short.
+    // F1's cheap certificate samples run; content extraction reads zero bytes.
+    let store::LeaseWait::Granted(mut lease) = cache.acquire_prepared_transfer(source) else {
+        panic!("owner")
+    };
+    let before = lease.charged_for_test();
+    let decoded = codec::decode_bounded(&record.record.body, source, &mut lease).unwrap();
+    let decode_bytes = lease.charged_for_test() - before;
+    let content_bytes = decoded.content_charge().unwrap();
+    assert!(content_bytes > 0);
+    drop(decoded);
+    lease
+        .charge(
+            store::ACTIVE_BYTES
+                - lease.charged_for_test()
+                - decode_bytes
+                - scope.0.len() as u64
+                - content_bytes
+                + 1,
+        )
+        .unwrap();
+    let before_input = rederive_head_bytes_total(source);
+    let ((result, native_io), samples) =
+        crate::transcript_acquisition::capture_sample_bytes(|| {
+            a0h_observe(|| {
+                cache.durable_restore_record(
+                    source,
+                    &record,
+                    &expected,
+                    &path,
+                    &scope,
+                    &mut File::open(&path).unwrap(),
+                    &mut lease,
+                )
+            })
+        });
+    assert!(matches!(
+        result,
+        Err(Failure::Resource("rederive_unfunded"))
+    ));
+    assert_eq!(
+        samples,
+        2 * std::fs::metadata(&path).unwrap().len().min(4096) as usize
+    );
+    assert_eq!(native_io, (0, 0));
+    assert_eq!(
+        rederive_head_bytes_total(source),
+        before_input,
+        "unfunded extractor reads nothing"
+    );
+    lease.release();
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "validated native decode layout")]
+fn b4_structural_growth_paced_no_record_reselection_no_prune_and_restart() {
+    b4_structural_transition(false);
+    b4_structural_transition(true);
+}
+
+fn b4_structural_transition(near_cap: bool) {
+    use std::io::Write;
+    struct ResetCap;
+    impl Drop for ResetCap {
+        fn drop(&mut self) {
+            TEST_JSONL_FILE_CAP.set(None);
+        }
+    }
+    let _cap = ResetCap;
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    assert!(crate::heap_layout_bound::layout_supported());
+    let _gate = claude_request_money::e2::GateForTest::set(true);
+    let _reset = ResetActiveBudget;
+    let root = crate::test_scratch::ScratchDir::new("b4-structural-growth");
+    let lock = test_locks::hold(&root);
+    let sessions = root.join("sessions");
+    std::fs::create_dir(&sessions).unwrap();
+    let path = sessions.join("11111111-2222-4333-8444-555555555555.jsonl");
+    native_fixture(&path);
+    let source = SnapshotSource::ClaudeCode;
+    let key = local_index_key(&path);
+    let namespace = Scope("b4-structural".into());
+    let index_path = root.join("index.json");
+    let cache = Arc::new(SharedCache::default());
+    cache.durable_begin_pass(source, &index_path, &namespace, true);
+    let run = |cache: Arc<SharedCache>, index, at: &str| {
+        let mut scan = OwnedSourceScan::new_with_identity_capture(
+            source,
+            std::slice::from_ref(&sessions),
+            index,
+            at,
+            1,
+            100,
+            false,
+            None,
+            &[],
+            false,
+            true,
+            true,
+        )
+        .with_sampled_acquisition(cache, namespace.clone());
+        let mut modes = (0, 0, 0);
+        for _ in 0..10_000 {
+            if let Some(c) = scan.sampling.as_ref() {
+                modes = (c.full_files, c.tail_files, c.native_bytes);
+            }
+            match scan.step(None) {
+                OwnedSourceScanStep::Pending(next) => scan = next,
+                OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan, modes),
+            }
+        }
+        panic!("scan did not finish");
+    };
+    let (mut index, mut first, _) =
+        run(cache.clone(), ScanIndex::default(), "2026-10-29T12:00:00Z");
+    assert_eq!(first.snapshots.len(), 1);
+    assert!(index.claude_request_census.get(&key).is_some());
+    a0h_wire(&root, &mut index, &mut first);
+    index.record_accepted_snapshot_fingerprints(
+        &first
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect(),
+    );
+    assert!(
+        index
+            .accepted_rebuild_incidence
+            .get(&key)
+            .is_some_and(|set| !set.is_empty()),
+        "real accepted incidence before holding growth"
+    );
+    index.save(&index_path).unwrap();
+    assert_eq!(
+        cache
+            .durable_write_after_save(lock, source, &index)
+            .unwrap()
+            .written,
+        1
+    );
+    cache.retained().unwrap().clear();
+    let original_disk = store_snapshot(&store::store_dir_for_index(&index_path));
+    let append =
+        |id: &str| {
+            let text = a0h_row(id, 25).replace(
+                "1338a80a-f36e-4cbc-a5bb-50fc66430ba5",
+                "11111111-2222-4333-8444-555555555555",
+            );
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(text.as_bytes())
+                .unwrap();
+            // Actual opened source is idle beyond requested 1-day window.
+            File::open(&path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(1793059200),
+                ))
+                .unwrap();
+        };
+    append("growth-1");
+    let end = std::fs::metadata(&path).unwrap().len();
+    let now = std::time::SystemTime::now();
+    cache.durable().unwrap().retail_full_now = Some(now);
+    // Exactly enough for input + transferred graph reserve, but not typed
+    // decode. This is structural even when the global FIFO is idle.
+    let limit = store::RESTORE_INPUT_BYTES
+        + (store::RECORD_BYTES + super::super::AUDIT_AND_SCRATCH_BYTES) as u64
+        + 4 * key.len() as u64;
+    store::active::set_active_budget_for_test(Some(limit));
+    let oracle_prior = index.clone();
+    let ((mut next, mut caught, modes), reads) =
+        a0h_observe(|| run(cache.clone(), index, "2026-10-29T12:00:00Z"));
+    assert_eq!(modes, (1, 0, end));
+    assert_eq!(reads.1, end, "actual single Full input extent");
+    assert_eq!(caught.snapshots[0].input_tokens, 125);
+    assert_eq!(
+        next.files[&key].size_bytes, end,
+        "paced read commits catch-up"
+    );
+    assert!(
+        cache.retained().unwrap().peek(&key).is_none(),
+        "no-record publication"
+    );
+    assert_eq!(
+        store_snapshot(&store::store_dir_for_index(&index_path)),
+        original_disk
+    );
+    let actual = a0h_wire(&root, &mut next, &mut caught);
+    let (mut oracle_index, mut oracle, oracle_modes) = run(
+        Arc::new(SharedCache::default()),
+        oracle_prior,
+        "2026-10-29T12:00:00Z",
+    );
+    assert_eq!(oracle_modes, (1, 0, end), "independent cold Full control");
+    assert_eq!(oracle.snapshots.len(), 1);
+    assert_eq!(actual, a0h_wire(&root, &mut oracle_index, &mut oracle));
+    next.record_accepted_snapshot_fingerprints(
+        &caught
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect(),
+    );
+    next.save(&index_path).unwrap();
+    index = next;
+    append("growth-2");
+    let old_incidence = index.accepted_rebuild_incidence.clone();
+    assert!(
+        old_incidence.get(&key).is_some_and(|set| !set.is_empty()),
+        "nonempty prune premise"
+    );
+    let old_census = serde_json::to_value(&index.claude_request_census).unwrap();
+    for _ in 0..2 {
+        let ((held, output, modes), reads) =
+            a0h_observe(|| run(cache.clone(), index, "2026-10-29T12:00:00Z"));
+        assert!(output.snapshots.is_empty());
+        assert_eq!(modes, (0, 0, 0));
+        assert_eq!(reads.1, 0);
+        assert_eq!(
+            held.files[&key].size_bytes, end,
+            "old size retained for Parse"
+        );
+        assert_eq!(
+            held.accepted_rebuild_incidence, old_incidence,
+            "no incidence prune"
+        );
+        assert_eq!(
+            serde_json::to_value(&held.claude_request_census).unwrap(),
+            old_census,
+            "no census prune"
+        );
+        assert_eq!(output.oversized_file_count, 0, "no size prune");
+        index = held;
+    }
+    assert_eq!(cache.durable().unwrap().counters.active_bound[0], [1, 2]);
+    if near_cap {
+        // Scale the SAME discovery cap and pace threshold, preserving actual
+        // accepted-prefix/native-read/terminal-settlement transitions.
+        let before = std::fs::metadata(&path).unwrap().len();
+        let row = a0h_row("growth-3", 25);
+        let cap = before + row.len() as u64 + 1;
+        TEST_JSONL_FILE_CAP.set(Some(cap));
+        assert!(
+            !near_source_cap(source, before),
+            "prior refusal was below 90%"
+        );
+        append("growth-3");
+        let high = std::fs::metadata(&path).unwrap().len();
+        assert!(high < cap && near_source_cap(source, high));
+        let (((caught_index, caught, modes), reads), events) =
+            crate::local_resource_diagnostics::capture(|| {
+                a0h_observe(|| run(cache.clone(), index, "2026-10-29T12:00:00Z"))
+            });
+        assert_eq!(modes, (1, 0, high));
+        assert_eq!(reads.1, high, "near cap bypass reads immediately within 6h");
+        assert_eq!(caught.snapshots[0].input_tokens, 175);
+        assert_eq!(caught_index.files[&key].size_bytes, high);
+        assert!(events.iter().any(|e| e["counts"]["near_cap"] == 1
+            && e["counts"]["degraded_no_record"]["active_bound"] == serde_json::json!([1, 2])));
+        append("growth-4");
+        assert!(std::fs::metadata(&path).unwrap().len() > cap);
+        let ((oversized, disclosure, modes), reads) =
+            a0h_observe(|| run(cache.clone(), caught_index, "2026-10-29T12:00:00Z"));
+        assert_eq!(modes, (0, 0, 0));
+        assert_eq!(reads.1, 0);
+        assert!(
+            disclosure.oversized_file_count > 0,
+            "pre-existing SIZE loss disclosure"
+        );
+        assert_eq!(oversized.files[&key].size_bytes, high);
+        return;
+    }
+    cache.durable().unwrap().retail_full_now =
+        Some(now + std::time::Duration::from_secs(PACE_SECS));
+    let (mut index, caught, modes) = run(cache.clone(), index, "2026-10-29T12:00:00Z");
+    let final_end = std::fs::metadata(&path).unwrap().len();
+    assert_eq!(modes, (1, 0, final_end));
+    assert_eq!(caught.snapshots[0].input_tokens, 150);
+    assert_eq!(index.files[&key].size_bytes, final_end);
+    assert_eq!(cache.durable().unwrap().counters.active_bound[0], [2, 2]);
+    index.save(&index_path).unwrap();
+    drop(cache);
+    let restarted = Arc::new(SharedCache::default());
+    restarted.durable_begin_pass(source, &index_path, &namespace, true);
+    let (index, idle, modes) = run(
+        restarted,
+        ScanIndex::load(&index_path).unwrap(),
+        "2026-10-29T12:00:00Z",
+    );
+    assert!(idle.snapshots.is_empty());
+    assert_eq!(modes, (0, 0, 0));
+    // After catch-up normal quiet-file retirement is safe; the restart
+    // contract here is zero reacquisition and no duplicate publication.
+    drop(index);
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "validated native restore layout")]
+fn b4_structural_memo_does_not_hold_same_size_shrink_or_approved_replay() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    assert!(crate::heap_layout_bound::layout_supported());
+    let root = crate::test_scratch::ScratchDir::new("b4-memo-correction");
+    let path = root.join("source.jsonl");
+    std::fs::write(&path, b"{}\n").unwrap();
+    let key = local_index_key(&path);
+    let source = SnapshotSource::ClaudeCode;
+    let scope = Scope("memo-correction".into());
+    let cache = SharedCache::default();
+    cache.durable_begin_pass(source, &root.join("index.json"), &scope, false);
+    assert!(cache.paced_full(
+        source,
+        &key,
+        std::time::SystemTime::now(),
+        true,
+        false,
+        true
+    ));
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        key.clone(),
+        serde_json::from_value(serde_json::json!({
+            "size_bytes":3, "modified_unix_seconds":1, "source_file_fingerprint":"fp"
+        }))
+        .unwrap(),
+    );
+    for length in [3, 6, 1] {
+        index.files.get_mut(&key).unwrap().size_bytes = length;
+        if length == 1 {
+            index.activate_effective_upload_body_witness_revision(3);
+            assert!(index.effective_upload_body_witness_revision_requires_adoption(&key));
+        }
+        let interpretation = Interpretation::of(source, &key, &index, false, &scope);
+        let outcome = cache.durable_restore(
+            source,
+            &key,
+            &path,
+            &scope,
+            &mut File::open(&path).unwrap(),
+            &index,
+            &interpretation,
+        );
+        if length == 6 {
+            assert!(
+                matches!(outcome, RestoreOutcome::FloorHeld),
+                "S2 preserves unknown original on a smaller body"
+            );
+        } else {
+            assert!(
+                matches!(outcome, RestoreOutcome::Miss(_)),
+                "same-size/owed replay bypass growth-only memo"
+            );
+        }
+        assert_eq!(
+            cache.durable_counters(source).unwrap().0.active_bound[0],
+            [1, 0],
+            "none consumes structural pace"
+        );
+    }
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "validated native retained layout")]
+fn b4_warm_busy_keeps_aged_census_through_terminal_then_catches_up() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    let _gate = claude_request_money::e2::GateForTest::set(true);
+    let _clear = ClearPreparationFault;
+    let root = crate::test_scratch::ScratchDir::new("b4-warm-busy-aged");
+    let lock = test_locks::hold(&root);
+    let sessions = root.join("sessions");
+    std::fs::create_dir(&sessions).unwrap();
+    let path = sessions.join("11111111-2222-4333-8444-555555555555.jsonl");
+    native_fixture(&path);
+    let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1790812800);
+    File::open(&path)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    let key = local_index_key(&path);
+    let source = SnapshotSource::ClaudeCode;
+    let namespace = Scope("b4-warm-aged".into());
+    let index_path = root.join("index.json");
+    let cache = Arc::new(SharedCache::default());
+    cache.durable_begin_pass(source, &index_path, &namespace, true);
+    let run = |index, at: &str| {
+        let mut scan = OwnedSourceScan::new_with_identity_capture(
+            source,
+            std::slice::from_ref(&sessions),
+            index,
+            at,
+            365,
+            100,
+            false,
+            None,
+            &[],
+            false,
+            true,
+            true,
+        )
+        .with_sampled_acquisition(cache.clone(), namespace.clone());
+        let mut modes = (0, 0, 0);
+        for _ in 0..10_000 {
+            if let Some(c) = scan.sampling.as_ref() {
+                modes = (c.full_files, c.tail_files, c.native_bytes);
+            }
+            match scan.step(None) {
+                OwnedSourceScanStep::Pending(next) => scan = next,
+                OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan, modes),
+            }
+        }
+        panic!("warm scan did not settle");
+    };
+    let (mut index, mut first, _) = run(ScanIndex::default(), "2026-10-20T12:00:00Z");
+    a0h_wire(&root, &mut index, &mut first);
+    index.record_accepted_snapshot_fingerprints(
+        &first
+            .snapshots
+            .iter()
+            .map(|s| s.snapshot_fingerprint.clone())
+            .collect(),
+    );
+    index.save(&index_path).unwrap();
+    assert_eq!(
+        cache
+            .durable_write_after_save(lock, source, &index)
+            .unwrap()
+            .written,
+        1
+    );
+    let end = index.files[&key].size_bytes;
+    let census = serde_json::to_value(&index.claude_request_census).unwrap();
+    assert!(
+        !index
+            .claude_request_census
+            .get(&key)
+            .unwrap()
+            .request_hashes()
+            .is_empty(),
+        "real nonempty census evidence"
+    );
+    let incidence = index.accepted_rebuild_incidence.clone();
+    assert!(incidence.get(&key).is_some_and(|s| !s.is_empty()));
+    use std::io::Write;
+    let row = a0h_row("warm-growth", 25).replace(
+        "1338a80a-f36e-4cbc-a5bb-50fc66430ba5",
+        "11111111-2222-4333-8444-555555555555",
+    );
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(row.as_bytes())
+        .unwrap();
+    File::open(&path)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    let blocked = Arc::new(Mutex::new(None));
+    let owner = blocked.clone();
+    let pressure = cache.clone();
+    let lookup = key.clone();
+    BEFORE_WARM_TRANSFER.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move || {
+            // This hook is downstream of durable_guard's successful release.
+            assert!(pressure.retained().unwrap().peek(&lookup).is_some());
+            let store::LeaseWait::Granted(lease) =
+                pressure.acquire_active(SnapshotSource::Codex, store::ACTIVE_BYTES)
+            else {
+                panic!("competing Codex owner");
+            };
+            *owner.lock().unwrap() = Some(lease);
+            store::ActiveLease::timeout_next_acquire_for_test(std::time::Duration::from_millis(5));
+        }))
+    });
+    // Forty days after the real committed mtime: retirement is eligible.
+    let (((held, output, modes), reads), events) =
+        crate::local_resource_diagnostics::capture(|| {
+            a0h_observe(|| run(index, "2026-11-10T12:00:00Z"))
+        });
+    assert!(events.iter().any(|e| e["counts"]["active_wait_busy"] == 1));
+    assert_eq!(modes, (0, 0, 0));
+    assert_eq!(reads.1, 0);
+    assert!(output.snapshots.is_empty());
+    assert!(
+        output.census_complete,
+        "healthy terminal invokes census retirement"
+    );
+    assert_eq!(held.files[&key].size_bytes, end);
+    assert_eq!(
+        serde_json::to_value(&held.claude_request_census).unwrap(),
+        census,
+        "no census prune at terminal"
+    );
+    assert_eq!(held.accepted_rebuild_incidence, incidence);
+    blocked
+        .lock()
+        .unwrap()
+        .take()
+        .expect("real competing lease")
+        .release();
+    let (caught, output, modes) = run(held, "2026-11-10T12:00:00Z");
+    assert_eq!(modes.0 + modes.1, 1);
+    assert_eq!(output.snapshots[0].input_tokens, 125);
+    assert_eq!(
+        caught.files[&key].size_bytes,
+        std::fs::metadata(&path).unwrap().len()
+    );
 }

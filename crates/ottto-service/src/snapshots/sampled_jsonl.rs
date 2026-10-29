@@ -197,7 +197,7 @@ impl OwnedJsonlParser {
                 e2_held_new_file: false,
             })
         });
-        self.prepare_acquisition_inner(taken, scope, debt, now, false, |_, _| Ok(true))
+        self.prepare_acquisition_inner(taken, scope, debt, now, false, None, |_, _| Ok(true))
             .map_err(|rejected| rejected.error)
     }
 
@@ -207,6 +207,19 @@ impl OwnedJsonlParser {
         scope: &Scope,
         debt: Option<AuditDebt>,
         now: u64,
+    ) -> std::result::Result<ReadMode, PrepareRejected> {
+        self.prepare_acquisition_owned_planned(taken, scope, debt, now, None)
+    }
+
+    /// The restore caller may plan under its paid transfer lease before Q11.
+    /// Reuse that same held-FD/checkpoint/scope plan; never repeat sample I/O.
+    pub(in crate::snapshots) fn prepare_acquisition_owned_planned(
+        &mut self,
+        taken: Option<Box<crate::transcript_cache::Taken<CachedJsonlReduction>>>,
+        scope: &Scope,
+        debt: Option<AuditDebt>,
+        now: u64,
+        planned: Option<ReadPlan>,
     ) -> std::result::Result<ReadMode, PrepareRejected> {
         #[cfg(test)]
         if let Some(original) = taken.as_ref() {
@@ -218,7 +231,7 @@ impl OwnedJsonlParser {
                 });
             }
         }
-        self.prepare_acquisition_inner(taken, scope, debt, now, true, |_, _| Ok(true))
+        self.prepare_acquisition_inner(taken, scope, debt, now, true, planned, |_, _| Ok(true))
     }
     #[cfg(test)]
     pub(super) fn prepare_acquisition_with_reuse_gate(
@@ -238,7 +251,7 @@ impl OwnedJsonlParser {
                 e2_held_new_file: false,
             })
         });
-        self.prepare_acquisition_inner(taken, scope, debt, now, false, reuse)
+        self.prepare_acquisition_inner(taken, scope, debt, now, false, None, reuse)
             .map_err(|rejected| rejected.error)
     }
 
@@ -260,7 +273,7 @@ impl OwnedJsonlParser {
                 });
             }
         }
-        self.prepare_acquisition_inner(taken, scope, debt, now, true, reuse)
+        self.prepare_acquisition_inner(taken, scope, debt, now, true, None, reuse)
     }
 
     fn prepare_acquisition_inner(
@@ -270,6 +283,7 @@ impl OwnedJsonlParser {
         debt: Option<AuditDebt>,
         now: u64,
         preserve: bool,
+        planned: Option<ReadPlan>,
         mut reuse: impl FnMut(&Checkpoint, &File) -> Result<bool>,
     ) -> std::result::Result<ReadMode, PrepareRejected> {
         let checked = (|| -> Result<()> {
@@ -358,12 +372,17 @@ impl OwnedJsonlParser {
             });
         }
         let old = taken.as_ref().map(|taken| &taken.retained);
-        let mut plan = match ReadPlan::prepare(
-            self.reader.reader.get_mut(),
-            old.as_ref().map(|old| &old.checkpoint),
-            scope,
-            debt,
-            now,
+        let mut plan = match planned.map_or_else(
+            || {
+                ReadPlan::prepare(
+                    self.reader.reader.get_mut(),
+                    old.as_ref().map(|old| &old.checkpoint),
+                    scope,
+                    debt,
+                    now,
+                )
+            },
+            Ok,
         ) {
             Ok(plan) => plan,
             Err(error) => {

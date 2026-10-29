@@ -1293,7 +1293,7 @@ fn budget_bounds_hold() {
     // Beside the cache, outside its state budget: both stores' digest maps.
     assert_eq!(
         crate::snapshots::sampled_scan::durable_tail::STORES_RESIDENT_BOUND,
-        926_720
+        1_452_032
     );
     // Per write pass: at most MAX_BATCH records of at most RECORD_BYTES.
     assert_eq!(MAX_BATCH, 32);
@@ -1697,4 +1697,167 @@ fn no_input_completion_requires_every_rederive_digest_absent() {
     let (_, receipt) = result.unwrap();
     assert_eq!(receipt, RederiveReceipt::default());
     assert_eq!(stats.allocations, 0);
+}
+
+/// Differential projection of the enabled workspace class from the actual
+/// codec corpus. Other digest obligations are deliberately left unsupported;
+/// this projection is NOT a claim that the complete rich records restore.
+#[test]
+fn bounded_workspace_matches_native_corpus_and_refuses_other_classes() {
+    let scratch = Scratch::new("bounded-workspace");
+    let cases = [
+        (SnapshotSource::ClaudeCode, claude_lines(3, 3)),
+        (SnapshotSource::Codex, codex_lines()),
+    ];
+    for (source, mut lines) in cases {
+        // Compaction, title updates, later cwd and unknown nested payloads
+        // cannot overwrite native first-write-wins workspace selection.
+        lines.push(
+            json!({"type":"system", "subtype":"compact_boundary",
+            "cwd":"/later-workspace", "customTitle":"Later title",
+            "payload":{"cwd":"/other-later"},
+            "ignored":{"many":[{"content":"skip me"}]}})
+            .to_string(),
+        );
+        let path = scratch.write(source.api_slug(), &lines);
+        let (native, _) = full_read(&path, source);
+        let body = encode(&native, crate::durable_tail_store::BODY_BYTES, line_cap()).unwrap();
+        let decoded = decode(&body, source).unwrap();
+        assert!(decoded.rederive.workspace.is_some());
+        assert!(
+            decoded.content_charge().is_err(),
+            "rich record remains unsupported"
+        );
+        let oracle = restore(&path, &body, source).unwrap().0;
+        let mut workspace = decode(&body, source).unwrap();
+        workspace.rederive = Rederive {
+            workspace: workspace.rederive.workspace,
+            ..Default::default()
+        };
+        let charge = workspace.content_charge().unwrap();
+        assert!(charge >= workspace.head_end().unwrap());
+        let mut wrong = decode(&body, source).unwrap();
+        wrong.rederive = Rederive {
+            workspace: Some([0; 32]),
+            ..Default::default()
+        };
+        wrong.content_charge().unwrap();
+        assert!(matches!(
+            wrong.rederive_content(&File::open(&path).unwrap()),
+            Err(Refuse::NotRederivable("workspace_digest"))
+        ));
+        let (bounded, receipt) = workspace
+            .rederive_content(&File::open(&path).unwrap())
+            .unwrap();
+        assert_eq!(
+            bounded.accumulator.workspace_path,
+            oracle.accumulator.workspace_path
+        );
+        assert_eq!(
+            bounded.accumulator.workspace_path,
+            native.accumulator.workspace_path
+        );
+        assert_eq!(receipt.named_lines, 0);
+        assert_eq!(receipt.line_bytes, 0);
+        assert_eq!(
+            receipt.head_bytes,
+            native.accumulator.durable_marks.workspace.unwrap()
+        );
+        // Every excluded class refuses before any I/O, independently.
+        for class in 0..4 {
+            let mut excluded = decode(&body, source).unwrap();
+            excluded.rederive = Rederive::default();
+            match class {
+                0 => excluded.rederive.first_prompt = Some([1; 32]),
+                1 => excluded.rederive.title = Some([1; 32]),
+                2 => excluded.rederive.agent_label = Some([1; 32]),
+                _ => excluded.rederive.session_start = Some([1; 32]),
+            }
+            assert!(excluded.content_charge().is_err());
+        }
+    }
+}
+
+#[test]
+fn bounded_workspace_cap_and_escaped_text_keep_native_values_or_refuse() {
+    let scratch = Scratch::new("workspace-cap");
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        for length in [4095, 4096, 4097] {
+            let cwd = "x".repeat(length);
+            let line = match source {
+                SnapshotSource::ClaudeCode => json!({"type":"progress", "cwd":cwd}),
+                _ => json!({"type":"session_meta", "payload":{"id":CODEX_SESSION,
+                    "cwd":cwd, "source":"cli"}}),
+            };
+            let path = scratch.write(
+                &format!("{}-{length}", source.api_slug()),
+                &[line.to_string()],
+            );
+            let (native, _) = full_read(&path, source);
+            let body = encode(&native, crate::durable_tail_store::BODY_BYTES, line_cap()).unwrap();
+            let mut decoded = decode(&body, source).unwrap();
+            assert!(decoded.rederive.workspace.is_some());
+            decoded.rederive = Rederive {
+                workspace: decoded.rederive.workspace,
+                ..Default::default()
+            };
+            decoded.content_charge().unwrap();
+            let actual = decoded.rederive_content(&File::open(&path).unwrap());
+            if length > 4096 {
+                assert!(matches!(
+                    actual,
+                    Err(Refuse::NotRederivable("workspace_capture"))
+                ));
+            } else {
+                assert_eq!(
+                    actual.unwrap().0.accumulator.workspace_path,
+                    native.accumulator.workspace_path
+                );
+            }
+        }
+    }
+    let path = scratch.write("escaped", &[r#"{"type":"progress","cwd":"  /tmp/a\u0062\u0063  ","ignored":[{"key":"not captured"}]}"#.into()]);
+    let (native, _) = full_read(&path, SnapshotSource::ClaudeCode);
+    let body = encode(&native, crate::durable_tail_store::BODY_BYTES, line_cap()).unwrap();
+    let mut decoded = decode(&body, SnapshotSource::ClaudeCode).unwrap();
+    decoded.rederive = Rederive {
+        workspace: decoded.rederive.workspace,
+        ..Default::default()
+    };
+    decoded.content_charge().unwrap();
+    assert_eq!(
+        decoded
+            .rederive_content(&File::open(&path).unwrap())
+            .unwrap()
+            .0
+            .accumulator
+            .workspace_path,
+        Some(PathBuf::from("/tmp/abc"))
+    );
+}
+
+#[test]
+fn workspace_wrong_object_shapes_refuse_without_formatting_the_input() {
+    let scratch = Scratch::new("workspace-shape-error");
+    for field in ["payload", "session_meta", "turn_context"] {
+        let path = scratch.write(
+            "wrong-shape",
+            &[json!({"type":"progress", "cwd":"/tmp/synthetic",
+            field: "\u{0080}".repeat(100_000)})
+            .to_string()],
+        );
+        let (native, _) = full_read(&path, SnapshotSource::ClaudeCode);
+        let body = encode(&native, crate::durable_tail_store::BODY_BYTES, line_cap()).unwrap();
+        let mut decoded = decode(&body, SnapshotSource::ClaudeCode).unwrap();
+        decoded.rederive = Rederive {
+            workspace: decoded.rederive.workspace,
+            ..Default::default()
+        };
+        assert!(decoded.rederive.workspace.is_some());
+        decoded.content_charge().unwrap();
+        assert!(matches!(
+            decoded.rederive_content(&File::open(&path).unwrap()),
+            Err(Refuse::NotRederivable("workspace_capture"))
+        ));
+    }
 }

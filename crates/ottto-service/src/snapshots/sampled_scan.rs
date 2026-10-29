@@ -467,6 +467,8 @@ crate::heap_layout_bound::fields!(Context; cache, namespace, audit_metadata_supp
     completion_overdue_seconds, admission);
 
 pub(super) struct Active {
+    /// Structural fallback keeps cursor/scope metadata but retains no graph.
+    pub(super) no_record: bool,
     pub(super) key: String,
     pub(super) scope: Scope,
     pub(super) mode: ReadMode,
@@ -485,7 +487,7 @@ pub(super) struct Active {
     pub(super) retained_usage: Option<u64>,
     pub(super) reinsertion: crate::local_resource_diagnostics::claude_reread::Reinsertion,
 }
-crate::heap_layout_bound::fields!(Active; key, scope, mode, audit_due, retained_hint,
+crate::heap_layout_bound::fields!(Active; no_record, key, scope, mode, audit_due, retained_hint,
     retained_finalization_charge, retained_usage, reinsertion);
 
 impl Context {

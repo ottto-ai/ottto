@@ -624,6 +624,26 @@ fn earlier_debt(a: Option<AuditDebt>, b: Option<AuditDebt>) -> Option<AuditDebt>
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static SAMPLE_READ_BYTES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Physical certificate input observer; production reads/credit are unchanged.
+#[cfg(test)]
+pub(crate) fn capture_sample_bytes<T>(run: impl FnOnce() -> T) -> (T, usize) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SAMPLE_READ_BYTES.set(None);
+        }
+    }
+    assert!(SAMPLE_READ_BYTES.replace(Some(0)).is_none());
+    let _reset = Reset;
+    let output = run();
+    (output, SAMPLE_READ_BYTES.get().unwrap())
+}
+
 fn read_sample(file: &mut File, offset: u64, len: usize, count: &mut usize) -> io::Result<Vec<u8>> {
     file.seek(SeekFrom::Start(offset))?;
     let mut bytes = vec![0; len];
@@ -643,6 +663,12 @@ fn read_sample(file: &mut File, offset: u64, len: usize, count: &mut usize) -> i
             }
         });
         let n = result?;
+        #[cfg(test)]
+        SAMPLE_READ_BYTES.with(|bytes| {
+            if let Some(total) = bytes.get() {
+                bytes.set(Some(total + n));
+            }
+        });
         *count += n;
         if n == 0 {
             return Err(io::Error::new(
@@ -1617,11 +1643,13 @@ impl DurableCertificate {
         }
     }
 
-    #[allow(clippy::type_complexity)]
-    fn admit_samples(
-        &self,
-        file: &mut File,
-    ) -> Result<(DurableAdmission, Vec<u8>, Vec<u8>, FileStamp), CertificateRefusal> {
+    /// The existing allocation-free certificate edits. Keep these before
+    /// typed decode/rederive admission so resource pressure cannot hide A2.
+    pub(crate) fn check_metadata(&self, file: &File) -> Result<(), CertificateRefusal> {
+        self.checked_stamp(file).map(|_| ())
+    }
+
+    fn checked_stamp(&self, file: &File) -> Result<FileStamp, CertificateRefusal> {
         let metadata = file.metadata().map_err(|_| CertificateRefusal::ReadError)?;
         let stamp =
             FileStamp::capture(metadata.clone()).map_err(|_| CertificateRefusal::ReadError)?;
@@ -1640,10 +1668,19 @@ impl DurableCertificate {
         if stamp.length < self.length {
             return Err(CertificateRefusal::Changed(FullReason::Shrunk));
         }
-        let unchanged = stamp.length == self.length;
-        if unchanged && stamp.modified != self.modified {
+        if stamp.length == self.length && stamp.modified != self.modified {
             return Err(CertificateRefusal::Changed(FullReason::SameSizeEdit));
         }
+        Ok(stamp)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn admit_samples(
+        &self,
+        file: &mut File,
+    ) -> Result<(DurableAdmission, Vec<u8>, Vec<u8>, FileStamp), CertificateRefusal> {
+        let stamp = self.checked_stamp(file)?;
+        let unchanged = stamp.length == self.length;
         let len = self.sample_len as usize;
         let mut read = 0;
         #[cfg(test)]

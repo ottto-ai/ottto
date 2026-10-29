@@ -219,8 +219,9 @@ pub(super) fn path_requires_verification(
         .is_some_and(ScanIndexEntry::has_unverified_source)
 }
 
-/// E3 #876: growth is never age-filtered. S2 also retains shorter extents
-/// and future accepted revisions: pruning those entries would erase the floor.
+/// Retain the existing partial growth safeguard and S2 shorter/future floors
+/// until E3 #876 joins through main with its bounded old-directory rescue.
+/// This predicate alone does NOT implement or qualify that dependency.
 /// Discovery grants no ACK, census proof or independent read permission.
 pub(super) fn path_requires_recovery(
     source: SnapshotSource,

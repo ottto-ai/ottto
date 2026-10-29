@@ -27826,17 +27826,43 @@ impl OwnedSourceScan {
                 ) {
                     // Each member's missing-carrier deadline rides with the
                     // job across pause and defer to its own native entry.
-                    if let Some((member, reason)) = group_members.iter().find_map(|member| {
-                        let mut due = None;
-                        let key = local_index_key(&member.path);
-                        let held = cache.durable_member_hold(source, &key, index, &mut due);
-                        if let Some(at) = group.members.iter().position(|m| m.path == member.path) {
-                            group.recovered[at] = due;
+                    // One admission BEFORE any member consumes a T14 start.
+                    // No later per-member credit failure can strand earlier grants.
+                    let checked = cache.durable_funded_member_batch(source, |cache| {
+                        let mut refused = false;
+                        for member in &group_members {
+                            let mut due = None;
+                            let key = local_index_key(&member.path);
+                            let held =
+                                cache.durable_member_hold_active(source, &key, index, &mut due);
+                            if let Some(at) =
+                                group.members.iter().position(|m| m.path == member.path)
+                            {
+                                group.recovered[at] = due;
+                            }
+                            if let Some(reason) = held {
+                                refused = true;
+                                cache.durable_hold_exit(source, reason, index, member, &mut census);
+                            }
                         }
-                        held.map(|reason| (member, reason))
-                    }) {
-                        cache.durable_hold_exit(source, reason, index, member, &mut census);
-                        pending!();
+                        refused
+                    });
+                    match checked {
+                        Ok(false) => {}
+                        Ok(true) => {
+                            pending!();
+                        }
+                        Err(_) => {
+                            for member in &group_members {
+                                cache.durable_custody_hold(
+                                    source,
+                                    "member_input_pending",
+                                    index,
+                                    member,
+                                );
+                            }
+                            pending!();
+                        }
                     }
                 }
                 active_file = Some(job);
@@ -27959,7 +27985,7 @@ impl OwnedSourceScan {
                         for member in &group.members {
                             let key = local_index_key(&member.path);
                             match cache.durable_funded_guard(source, &key, |cache| {
-                                cache.durable_full_hold(source, &key, false)
+                                cache.durable_full_hold_active(source, &key, false)
                             }) {
                                 Ok(None) => {}
                                 Ok(Some(reason)) => {
@@ -28480,6 +28506,44 @@ impl OwnedSourceScan {
                 // `finish_job` consumes the acquisition's start offset. An
                 // exact-stamp memo below must not cover anything past them.
                 let attempt_read_end = sampled_scan::codex_cursor::read_end(&active);
+                // R1 funding admission precedes finish_job/rotation.complete.
+                // A busy probe parks the exact EOF job with its cursor lease;
+                // retry cannot be fenced out before settlement exists.
+                #[cfg(unix)]
+                let mut settlement_reprobed_due = None;
+                #[cfg(unix)]
+                if active.cursor.is_some() && active.side_origin.is_none() {
+                    if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
+                        let checked =
+                            (|| -> Result<(), crate::durable_tail_store::ActiveOverBudget> {
+                                if let Some(group) = active.group.as_mut() {
+                                    for (member, due) in
+                                        group.members.iter().zip(group.recovered.iter_mut())
+                                    {
+                                        let key = local_index_key(&member.path);
+                                        if due.is_none() && !index.files.contains_key(&key) {
+                                            *due = cache
+                                                .durable_carrier_reprobe(source, &key, index)?;
+                                        }
+                                    }
+                                } else {
+                                    let key = local_index_key(&active.candidate.path);
+                                    if active.recovered_audit_due.is_none()
+                                        && !index.files.contains_key(&key)
+                                    {
+                                        settlement_reprobed_due =
+                                            cache.durable_carrier_reprobe(source, &key, index)?;
+                                        active.recovered_audit_due = settlement_reprobed_due;
+                                    }
+                                }
+                                Ok(())
+                            })();
+                        if checked.is_err() {
+                            active_file = Some(active);
+                            pending!();
+                        }
+                    }
+                }
                 // S6: a cursor job commits only through its sealed-prefix
                 // certificate; an invalidated attempt publishes nothing.
                 let mut cursor_certificate = None;
@@ -28734,8 +28798,6 @@ impl OwnedSourceScan {
                     codex_legacy_join_baselines.extend(group.take_legacy_baselines());
                     std::mem::take(&mut group.recovered)
                 });
-                #[cfg(unix)]
-                let paged = cursor_certificate.is_some();
                 let mut parser = parser;
                 // The repository identity X_out measured, if any (#665 U3).
                 let mut measured_repository_identity = None;
@@ -28815,7 +28877,8 @@ impl OwnedSourceScan {
                 // compact records and their selector table were already charged
                 // by copy_budget_step. A refusal disables retention, preserving
                 // the ordinary native finish and its loss/output semantics.
-                let cache_compatible = sampled_scan::compatible_reduction(&parser.accumulator)
+                let cache_compatible = !file_sampling.as_ref().is_some_and(|a| a.no_record)
+                    && sampled_scan::compatible_reduction(&parser.accumulator)
                     && aliases.is_empty()
                     && applied_receipts.values().all(Option::is_none);
                 // Retain the reduction only when every applied byte is in
@@ -30018,35 +30081,14 @@ impl OwnedSourceScan {
                         }
                     }
                 }
-                // R1: a paged job parked across a fresh index load captured
-                // no due for a file now without an entry. Re-probe the same
-                // live-context, clamped debt (read only) before recording;
-                // no restart. A re-probed singleton miss counts here.
                 #[cfg(unix)]
-                let (member_dues, recovered_audit_due, reprobed_due) = {
-                    let mut dues = (member_dues, recovered_audit_due, None);
-                    if let Some(cache) = durable_guard
-                        .as_ref()
-                        .and_then(std::sync::Weak::upgrade)
-                        .filter(|_| paged && parse_complete)
-                    {
-                        let absent = |key: &str| !index.files.contains_key(key);
-                        for (member, due) in aliases.iter().zip(dues.0.iter_mut()) {
-                            let key = local_index_key(&member.path);
-                            if due.is_none() && absent(&key) {
-                                *due = cache.durable_carrier_reprobe(source, &key, index);
-                            }
-                        }
-                        if dues.0.is_empty() && dues.1.is_none() && absent(&index_key) {
-                            dues.2 = cache.durable_carrier_reprobe(source, &index_key, index);
-                            dues.1 = dues.2;
-                            if dues.2.is_some() {
-                                cache.durable_note_carrier("audit_carrier");
-                            }
-                        }
+                let reprobed_due = settlement_reprobed_due.filter(|_| parse_complete);
+                #[cfg(unix)]
+                if reprobed_due.is_some() {
+                    if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
+                        cache.durable_note_carrier("audit_carrier");
                     }
-                    dues
-                };
+                }
                 #[cfg(not(unix))]
                 let reprobed_due: Option<u64> = None;
                 if parse_complete && !aliases.is_empty() {
@@ -31374,6 +31416,22 @@ impl OwnedSourceScan {
             ) else {
                 pending!();
             };
+            // A2: a current, source-verified census independently proves that
+            // THIS committed object shrank. Read its new body even without a
+            // reusable optional record; unknown/downgrade floors remain holds.
+            #[cfg(unix)]
+            let native_edit_proven = source == SnapshotSource::ClaudeCode
+                && accepted_floor.is_some_and(|a| a.permits_real_edit())
+                && claude_request_census::proves_indexed_shrink(
+                    index,
+                    &local_index_key(&candidate.path),
+                    candidate.size_bytes,
+                    candidate.physical_identity,
+                );
+            #[cfg(unix)]
+            if native_edit_proven {
+                restore_floor = None;
+            }
             if preflight_source_file_fingerprint
                 .as_ref()
                 .is_some_and(|fingerprint| fingerprint != &candidate.source_file_fingerprint)
@@ -31741,6 +31799,7 @@ impl OwnedSourceScan {
                             pending!();
                         }
                         Err(_) => {
+                            residue_index_keys.insert(local_index_key(&candidate.path));
                             cache.durable_custody_hold(
                                 source,
                                 "active_input_pending",
@@ -32171,6 +32230,7 @@ impl OwnedSourceScan {
             #[cfg(unix)]
             let mut paced_full_granted = false;
             let mut migration_floor = None;
+            let mut active_bound_degraded = false;
             // U1a-2a G7: a side read's acquisition is a fresh `Full` read
             // under the side scope: no retained take, no admission observes
             // or counters, no debt. Failures are its charged attempt.
@@ -32188,6 +32248,7 @@ impl OwnedSourceScan {
                     Ok(mode) => {
                         sampled_scan::configure_tier_replay(&mut parser, &candidate, index);
                         file_sampling = Some(sampled_scan::Active {
+                            no_record: active_bound_degraded,
                             key: local_index_key(&candidate.path),
                             scope,
                             mode,
@@ -32213,6 +32274,7 @@ impl OwnedSourceScan {
                     Ok(Some((taken, lease))) => (Some(taken), Some(lease)),
                     Ok(None) => (None, None),
                     Err(()) => {
+                        residue_index_keys.insert(key.clone());
                         context.cache.durable_custody_hold(
                             source,
                             "prepared_funding_pending",
@@ -32224,6 +32286,18 @@ impl OwnedSourceScan {
                 };
                 #[cfg(not(unix))]
                 let taken = context.cache.take(&key);
+                #[cfg(unix)]
+                let taken = if native_edit_proven {
+                    // A real edit invalidates the old graph; no Tail spend or
+                    // guardless reuse. Drop it before releasing transfer credit.
+                    drop(taken);
+                    if let Some(lease) = preparation_lease.take() {
+                        lease.release();
+                    }
+                    None
+                } else {
+                    taken
+                };
                 // The original and its funding move together if ordinary cache
                 // admission refuses. The active frame retries before any read.
                 macro_rules! return_original {
@@ -32411,7 +32485,7 @@ impl OwnedSourceScan {
                         // Keep S2 even when sampling itself is unavailable.
                         #[cfg(unix)]
                         if !allow_sample
-                            && accepted_floor.is_some_and(|a| {
+                            && restore_floor.is_some_and(|a| {
                                 parser
                                     .reader
                                     .reader
@@ -32451,6 +32525,7 @@ impl OwnedSourceScan {
                         #[cfg(unix)]
                         let (mut retained, taken_admission, debt) = match retained {
                             None if allow_sample
+                                && !native_edit_proven
                                 && !parser.reader.reader.is_compressed()
                                 // Existing index-owned due Full is independent of
                                 // reuse. A stale cache record cannot hold it idle.
@@ -32464,8 +32539,7 @@ impl OwnedSourceScan {
                                         claude_request_identity_capture,
                                         &context.namespace,
                                     );
-                                interpretation.accepted = accepted_floor;
-                                restore_floor = accepted_floor;
+                                interpretation.accepted = restore_floor;
                                 let restore = context.cache.durable_restore(
                                     source,
                                     &key,
@@ -32502,6 +32576,7 @@ impl OwnedSourceScan {
                                         pending!();
                                     }
                                     sampled_scan::durable_tail::RestoreOutcome::Pending => {
+                                        residue_index_keys.insert(key.clone());
                                         context.cache.durable_custody_hold(
                                             source,
                                             "prepared_funding_pending",
@@ -32509,6 +32584,10 @@ impl OwnedSourceScan {
                                             &candidate,
                                         );
                                         pending!();
+                                    }
+                                    sampled_scan::durable_tail::RestoreOutcome::Degraded => {
+                                        active_bound_degraded = true;
+                                        (None, taken_admission, debt)
                                     }
                                     sampled_scan::durable_tail::RestoreOutcome::StaleUnregistered(reason, _) => {
                                         let granted = source == SnapshotSource::ClaudeCode
@@ -32572,7 +32651,7 @@ impl OwnedSourceScan {
                                     sampled_scan::durable_tail::RestoreOutcome::Miss(class) => {
                                         if matches!(
                                             class,
-                                            sampled_scan::durable_tail::MissClass::RealEdit
+                                            sampled_scan::durable_tail::MissClass::RealEdit(_)
                                         ) {
                                             restore_floor = None;
                                         }
@@ -32609,6 +32688,8 @@ impl OwnedSourceScan {
                                 return_original!(taken, Some("eligibility"));
                             }
                         }
+                        #[cfg(not(unix))]
+                        let restored_plan = None;
                         let old = retained;
                         context.admission.prepare_started =
                             context.admission.prepare_started.saturating_add(1);
@@ -32821,6 +32902,7 @@ impl OwnedSourceScan {
                             !matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
                         });
                         file_sampling = Some(sampled_scan::Active {
+                            no_record: active_bound_degraded,
                             key,
                             scope,
                             mode,
@@ -32892,6 +32974,7 @@ impl OwnedSourceScan {
                         sampled_scan::configure_tier_replay(&mut parser, &candidate, index);
                         planned_mode = Some((mode, recovered_audit_due));
                         file_sampling = Some(sampled_scan::Active {
+                            no_record: active_bound_degraded,
                             key,
                             scope,
                             mode,
@@ -32933,7 +33016,7 @@ impl OwnedSourceScan {
             }
             // S2 is a publication floor, including warm, census/dependency
             // fallback and unsampled routes. Only the strict cold-record
-            // replacement proof above may clear it. No plan means use the
+            // replacement or independently bound native shrink proof may clear it. No plan means use the
             // actual held extent, never a fabricated zero or a skipped guard.
             #[cfg(unix)]
             if restore_floor.is_some_and(|a| {
@@ -33136,21 +33219,59 @@ impl OwnedSourceScan {
                         cache.durable_stale_hold(source, index, &active.candidate);
                         pending!();
                     }
-                    if let Some(reason) = cache.durable_full_hold(
+                    match cache.durable_full_hold(
                         source,
                         &local_index_key(&active.candidate.path),
                         true,
                     ) {
-                        cache.durable_hold_exit(
-                            source,
-                            reason,
-                            index,
-                            &active.candidate,
-                            &mut census,
-                        );
+                        Ok(None) => {}
+                        Ok(Some(reason)) => {
+                            cache.durable_hold_exit(
+                                source,
+                                reason,
+                                index,
+                                &active.candidate,
+                                &mut census,
+                            );
+                            pending!();
+                        }
+                        Err(_) => {
+                            cache.durable_custody_hold(
+                                source,
+                                "full_input_pending",
+                                index,
+                                &active.candidate,
+                            );
+                            // No body or Full-start count yet. Re-offer the
+                            // candidate; accepted state and spend stay intact.
+                            identified_candidates.push_front(active.candidate);
+                            pending!();
+                        }
+                    }
+                }
+            }
+            if active_bound_degraded {
+                if let Some(context) = sampling.as_ref() {
+                    let key = local_index_key(&active.candidate.path);
+                    if !context.cache.start_active_bound_full(
+                        source,
+                        &key,
+                        active.parser.reader.reader.get_ref(),
+                    ) {
+                        residue_index_keys.insert(key);
+                        // A concurrent same-key start can win after the probe.
+                        // Return any pre-input cursor slot before retrying.
+                        drop(codex_cursor_lease.take());
                         pending!();
                     }
                 }
+            }
+            #[cfg(unix)]
+            if native_edit_proven {
+                crate::local_resource_diagnostics::durable_tail_alarm(
+                    source.api_slug(),
+                    &serde_json::json!({"full_reads": {"real_edit": {"shrunk": 1}}}),
+                );
             }
             if let Some(context) = sampling.as_mut() {
                 #[cfg(unix)]
@@ -33183,6 +33304,12 @@ impl OwnedSourceScan {
                 }
                 if let Some((mode, audit_due)) = planned_mode {
                     context.record_mode(mode, audit_due);
+                    if active_bound_degraded {
+                        crate::local_resource_diagnostics::durable_tail_alarm(
+                            source.api_slug(),
+                            &serde_json::json!({"full_reads": {"degraded_no_record": {"active_bound": 1}}}),
+                        );
+                    }
                 }
                 if planned_mode.is_some_and(|(mode, _)| {
                     matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
@@ -43187,7 +43314,17 @@ fn effective_backfill_window_days(requested_backfill_window_days: u64) -> u64 {
     requested_backfill_window_days.min(BACKFILL_WINDOW_DAYS)
 }
 
+#[cfg(test)]
+thread_local! {
+    // Scale the existing SIZE boundary in synthetic transition fixtures only.
+    static TEST_JSONL_FILE_CAP: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
 fn max_jsonl_file_bytes(source: SnapshotSource) -> u64 {
+    #[cfg(test)]
+    if let Some(cap) = TEST_JSONL_FILE_CAP.get() {
+        return cap;
+    }
     match source {
         SnapshotSource::Codex => MAX_CODEX_JSONL_FILE_BYTES,
         SnapshotSource::ClaudeCode => MAX_CLAUDE_JSONL_FILE_BYTES,

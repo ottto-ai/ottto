@@ -1620,6 +1620,7 @@ fn group_with_legacy_tee_is_byte_charged() {
     )
     .unwrap();
     let sampling = active.sampling.replace(sampled_scan::Active {
+        no_record: false,
         key: String::new(),
         scope: Scope("group-fixture".into()),
         mode: crate::transcript_acquisition::ReadMode::Tail,
@@ -2966,7 +2967,7 @@ fn spent_known_corrupt_group_keeps_census_healthy_and_peer_progresses() {
     let cache = Arc::new(SharedCache::default());
     cache.durable_begin_pass(source, &index_path, &scope, false);
     assert_eq!(
-        cache.durable_full_hold(source, &key, true),
+        cache.durable_full_hold(source, &key, true).unwrap(),
         None,
         "initial group rebuild attempt"
     );
@@ -3025,6 +3026,7 @@ fn durable_hold_on_one_member_holds_the_joined_group() {
     for refused_members in 0..=2 {
         let held = refused_members > 0;
         let (root, _) = fixture();
+        let _writer = crate::locked_state_dir::test_locks::hold(&root);
         let cache = Arc::new(SharedCache::default());
         let index_path = root.join("index.json");
         let namespace = Scope("group-fixture".into());

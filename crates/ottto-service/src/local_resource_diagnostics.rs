@@ -931,6 +931,10 @@ impl RestoreCounts {
                 *attribution = attribution.saturating_add(1);
                 self.stale.entry(reason).or_default()
             }
+            RestoreOutcome::Degraded => self
+                .miss
+                .entry("degraded_no_record.active_bound")
+                .or_default(),
         };
         *count = count.saturating_add(1);
     }

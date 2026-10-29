@@ -841,7 +841,9 @@ mod tests {
         let (result, events) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
             cache.insert_taken_reserving("unfrozen".into(), taken, 0)
         });
-        let returned = result.expect_err("unfrozen refuses");
+        let Err(returned) = result else {
+            panic!("unfrozen refuses");
+        };
         assert_eq!(&*returned as *const _ as usize, pointer);
         assert_eq!(returned.retained.state.0, "unfrozen");
         assert_eq!(events.insert_frozen_charge_refused, 1);
@@ -858,7 +860,7 @@ mod tests {
             cache.insert_taken_reserving("key".into(), taken, 0)
         });
         assert_eq!(
-            &*result.err().expect("layout refuses") as *const _ as usize,
+            &*result.expect_err("layout refuses") as *const _ as usize,
             pointer
         );
         assert_eq!(events.insert_disabled_or_layout_refused, 1);
@@ -967,9 +969,9 @@ mod tests {
         let allocation = taken.retained.state.as_ptr() as usize;
         let mut cache = TranscriptCache::<String>::default();
         cache.byte_limit = heap_layout_bound::bound(&cache, usize::MAX).unwrap();
-        let mut returned = cache
-            .insert_taken_reserving("synthetic".into(), taken, 0)
-            .expect_err("virtual self eviction");
+        let Err(mut returned) = cache.insert_taken_reserving("synthetic".into(), taken, 0) else {
+            panic!("virtual self eviction");
+        };
         assert_eq!(&*returned as *const _ as usize, pointer);
         assert_eq!(
             returned.durable.retail_mut().unwrap() as *mut _ as usize,

@@ -3812,7 +3812,7 @@ fn no_record_keys_keep_existing_full_admission_after_restart() {
             source,
             &index_path,
             &namespace,
-            source == SnapshotSource::ClaudeCode,
+            true, // Match production_scan's cfg(test) identity capture.
         );
         let loaded = ScanIndex::load(&index_path).unwrap();
         let (_, scan, modes) = production_scan(
@@ -4542,7 +4542,7 @@ fn missing_carrier_future_debt_clamps_only_in_live_context_for_both_sources() {
                 source,
                 &index_path,
                 &namespace,
-                source == SnapshotSource::ClaudeCode,
+                true, // Match production_scan's cfg(test) identity capture.
             );
             begin_durable_pass(
                 &cache,
@@ -4551,7 +4551,7 @@ fn missing_carrier_future_debt_clamps_only_in_live_context_for_both_sources() {
                 &index_path,
                 true,
                 &namespace,
-                source == SnapshotSource::ClaudeCode,
+                true, // Match production_scan's cfg(test) identity capture.
             );
             assert_eq!(
                 fs::read(&record_path).unwrap(),
