@@ -816,15 +816,16 @@ fn held_retry_cannot_stage_against_a_quiet_slot_before_partial_save() {
         fixture
             .file
             .append(&held_row(130 + turn * 30, turn as usize + 1));
-        let ((working, _, modes), diagnostics) = crate::local_resource_diagnostics::capture(|| {
-            production_scan(
-                &fixture,
-                source,
-                index,
-                Some(cache.clone()),
-                "held-reservation",
-            )
-        });
+        let ((working, mut raw, modes), diagnostics) =
+            crate::local_resource_diagnostics::capture(|| {
+                production_scan(
+                    &fixture,
+                    source,
+                    index,
+                    Some(cache.clone()),
+                    "held-reservation",
+                )
+            });
         assert_eq!(*order.lock().unwrap(), ["quiet", "held"]);
         sampled_scan::test_hooks::clear();
         assert_eq!(modes, (0, 1, 1), "held Tail is never a cap Full");
@@ -844,6 +845,27 @@ fn held_retry_cannot_stage_against_a_quiet_slot_before_partial_save() {
         );
         let reparse_held = working.file_snapshot_fingerprints[&held_key].clone();
         assert!(!reparse_held.is_empty());
+        let working = if turn == 1 {
+            let released = crate::snapshot_sync::accept_account_release_for_test(
+                working,
+                &committed,
+                &mut raw,
+                &cache,
+                std::slice::from_ref(&fixture.root),
+                None,
+            );
+            assert!(!released
+                .claude_account_deferred_holds
+                .contains_key(&held_key));
+            assert!(released.files[&held_key].source_file_fingerprint.is_empty());
+            assert!(
+                !released.files[&held_key].has_unverified_source(),
+                "release cannot spend A's provisional slot"
+            );
+            released
+        } else {
+            working
+        };
         let mut selected = working.committable_subset_with_local_holds(
             &committed,
             &BTreeSet::new(),
@@ -863,5 +885,196 @@ fn held_retry_cannot_stage_against_a_quiet_slot_before_partial_save() {
             crate::transcript_cache::CACHE_ENTRIES,
             "partial save cannot restore a 257th marker",
         );
+    }
+}
+
+#[test]
+fn post_scan_account_release_keeps_unfunded_debt_selectable_across_restart() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _clock = Clock::at(START);
+    let source = SnapshotSource::ClaudeCode;
+    for marked in [
+        crate::transcript_cache::CACHE_ENTRIES - 1,
+        crate::transcript_cache::CACHE_ENTRIES,
+    ] {
+        sampled_scan::set_test_now(Some(START));
+        let fixture = ScanFixture::new(source);
+        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let namespace = "post-scan-release";
+        let (mut index, _, modes) = production_scan(
+            &fixture,
+            source,
+            ScanIndex::default(),
+            Some(cache.clone()),
+            namespace,
+        );
+        assert_eq!(modes, (1, 0, 0));
+        let key = local_index_key(&fixture.file.0);
+        let fingerprint = index.files[&key].source_file_fingerprint.clone();
+        let held = index.file_snapshot_fingerprints[&key].clone();
+        assert!(!held.is_empty());
+        assert!(index
+            .record_claude_account_deferred_holds([(key.as_str(), fingerprint.as_str())], &held));
+        let due = START + crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS;
+        fill_unavailable_audits(&mut index, &key, marked, due);
+        let committed = index.clone();
+        fixture.file.append(&usage(source, 130, 1, "fixture-model"));
+        let ((scanned, _, mut candidates, modes, _), diagnostics) =
+            crate::local_resource_diagnostics::capture(|| {
+                production_scan_page_at_with_setup(
+                    &fixture,
+                    source,
+                    index,
+                    Some(cache.clone()),
+                    namespace,
+                    NOW,
+                    |_| {},
+                )
+            });
+        assert_eq!(modes, (0, 1, 0), "held release generation is Tail");
+        assert_held_audit_diagnostics(&diagnostics, 0);
+        assert!(
+            !candidates.snapshots.is_empty(),
+            "changed accepted generation"
+        );
+        assert!(scanned.claude_account_deferred_holds.contains_key(&key));
+        assert!(cache
+            .retained_checkpoint(&key)
+            .unwrap()
+            .audit_debt()
+            .is_some());
+        assert_eq!(
+            scanned.files[&key].has_unverified_source(),
+            marked < crate::transcript_cache::CACHE_ENTRIES
+        );
+        // Actual post-scan classifier removes the hold, then the production
+        // completed-upload selector commits the accepted release generation.
+        let (mut accepted, release_diagnostics) =
+            crate::local_resource_diagnostics::capture(|| {
+                crate::snapshot_sync::accept_account_release_for_test(
+                    scanned,
+                    &committed,
+                    &mut candidates,
+                    &cache,
+                    std::slice::from_ref(&fixture.root),
+                    None,
+                )
+            });
+        assert!(!accepted.claude_account_deferred_holds.contains_key(&key));
+        assert_eq!(
+            accepted
+                .files
+                .values()
+                .filter(|e| e.has_unverified_source())
+                .count(),
+            crate::transcript_cache::CACHE_ENTRIES
+        );
+        if marked == crate::transcript_cache::CACHE_ENTRIES {
+            assert!(!accepted.files[&key].has_unverified_source());
+            assert!(accepted.files[&key].source_file_fingerprint.is_empty());
+            assert!(accepted
+                .traversal
+                .as_ref()
+                .unwrap()
+                .pending_candidates
+                .iter()
+                .any(|candidate| candidate.path == fixture.file.0 && candidate.watcher_hint));
+            assert!(release_diagnostics
+                .iter()
+                .any(|record| record["stage"] == "sampled_audit_account_release"
+                    && record["counts"]["retry_queued"] == 1));
+        }
+        let path = fixture.dir.join("released-index.json");
+        accepted.save(&path).unwrap();
+        // Make the file quiet far beyond the activity window WITHOUT changing
+        // its stamp or either sample. The equal-length file still owes service.
+        let modified = fs::metadata(&fixture.file.0).unwrap().modified().unwrap();
+        let modified_secs = unix_seconds(modified).unwrap();
+        let future = modified_secs + (BACKFILL_WINDOW_DAYS + 2) * 86_400;
+        let collected = OffsetDateTime::from_unix_timestamp(future as i64)
+            .unwrap()
+            .format(&Rfc3339)
+            .unwrap();
+        sampled_scan::set_test_now(Some(due + 1));
+        let loaded = ScanIndex::load(&path).unwrap();
+        // Force a traversal reset too: the durable reparse/marker witness
+        // must survive loss of the optional queue's old context.
+        let mut loaded = loaded;
+        loaded.traversal = None;
+        let restart = Arc::new(sampled_scan::SharedCache::default());
+        if marked < crate::transcript_cache::CACHE_ENTRIES {
+            // A record-backed/retained quiet read can perform counted
+            // retirement instead of Full; retain this positive sample control.
+            let copy = cache.take(&key).unwrap();
+            restart.insert(
+                key.clone(),
+                sampled_jsonl::CompletedNativeAcquisition {
+                    checkpoint: copy.retained.checkpoint,
+                    reduction: Some(copy.retained.state),
+                    released: None,
+                    unsealed: false,
+                },
+                0,
+            );
+        }
+        drop(cache);
+        let ((mut serviced, _, modes, _), diagnostics) =
+            crate::local_resource_diagnostics::capture(|| {
+                production_scan_at_with_setup(
+                    &fixture,
+                    source,
+                    loaded,
+                    Some(restart.clone()),
+                    namespace,
+                    &collected,
+                    |_| {},
+                )
+            });
+        assert_eq!(
+            modes,
+            if marked == crate::transcript_cache::CACHE_ENTRIES {
+                (1, 0, 0)
+            } else {
+                (0, 0, 1)
+            }
+        );
+        assert!(!serviced.files[&key].has_unverified_source());
+        assert!(!serviced.files[&key].source_file_fingerprint.is_empty());
+        let page = diagnostics
+            .iter()
+            .find(|record| record["stage"] == "native_collection_page")
+            .unwrap();
+        let counts = &page["counts"]["sampled_acquisition"];
+        assert_eq!(
+            counts["index_state_at_page_end"]["audit_cap_full"],
+            usize::from(marked == crate::transcript_cache::CACHE_ENTRIES)
+        );
+        assert_eq!(
+            counts["index_state_at_page_end"]["audit_quiet_retired"],
+            usize::from(marked < crate::transcript_cache::CACHE_ENTRIES)
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|record| record["stage"] == "sampled_audit_cap_alarm")
+                .count(),
+            usize::from(marked == crate::transcript_cache::CACHE_ENTRIES)
+        );
+        serviced.save(&path).unwrap();
+        let loaded = ScanIndex::load(&path).unwrap();
+        assert!(!loaded.files[&key].has_unverified_source());
+        let (_, _, modes, _) = production_scan_at_with_setup(
+            &fixture,
+            source,
+            loaded,
+            Some(restart),
+            namespace,
+            &collected,
+            |_| {},
+        );
+        assert_eq!(modes, (0, 0, 0), "discharge is once, not an hourly Full");
     }
 }

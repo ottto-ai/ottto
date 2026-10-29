@@ -4475,3 +4475,95 @@ fn native_comparison_matching_prepays_hit_and_no_hit_before_scratch_allocation()
         eprintln!("native_comparison_matching_budget: hit={hit} pressure={pressure} unknown={unknown} refused_before_alloc={} protected_recovery={recovery_bytes} input_unchanged=true", pressure || unknown);
     }
 }
+
+#[test]
+fn account_audit_release_waits_for_cache_heads_and_native_selected_restore() {
+    if !native_positive_layout_for_test(
+        "account_audit_release_waits_for_cache_heads_and_native_selected_restore",
+    ) {
+        return;
+    }
+    for partial in [false, true] {
+        let (fixture, mut index, mut scan, mut fallback, mut previous, path) =
+            native_comparison_selected_fallback_fixture();
+        assert!(
+            index.traversal.is_none(),
+            "terminal is held by SelectedFallback"
+        );
+        let key = local_index_key(&fixture.dir.join(format!("{FALLBACK_HEALTHY}.jsonl")));
+        assert!(index.files.contains_key(&key));
+        let entry = index.files[&key].clone();
+        previous.files.insert(key.clone(), entry.clone());
+        previous
+            .file_snapshot_fingerprints
+            .insert(key.clone(), index.file_snapshot_fingerprints[&key].clone());
+        previous
+            .claude_account_deferred_holds
+            .insert(key.clone(), entry.source_file_fingerprint.clone());
+        index
+            .claude_account_deferred_holds
+            .insert(key.clone(), entry.source_file_fingerprint.clone());
+        for n in 0..crate::transcript_cache::CACHE_ENTRIES {
+            let audit_key = format!("/synthetic-unavailable-release/{n}.jsonl");
+            let mut audit_entry = entry.clone();
+            audit_entry.set_unverified_deadline(1);
+            index.files.insert(audit_key.clone(), audit_entry.clone());
+            previous.files.insert(audit_key, audit_entry);
+        }
+        // No optional copy remains: the same release path must preserve
+        // unknown acquisition custody without touching the retained terminal.
+        let cache = sampled_scan::SharedCache::default();
+        let selected = if partial {
+            let progress = fixture.dir.join("released-fallback-progress.json");
+            crate::snapshot_sync::checkpoint_account_release_for_test(
+                index,
+                &previous,
+                &mut scan,
+                &cache,
+                std::slice::from_ref(&fixture.dir),
+                &mut fallback,
+                (&path, &progress),
+            )
+            .unwrap()
+        } else {
+            let mut selected = crate::snapshot_sync::accept_account_release_for_test(
+                index,
+                &previous,
+                &mut scan,
+                &cache,
+                std::slice::from_ref(&fixture.dir),
+                Some(&mut fallback),
+            );
+            selected.save(&path).unwrap();
+            selected
+        };
+        assert!(!selected.claude_account_deferred_holds.contains_key(&key));
+        assert!(selected.files[&key].source_file_fingerprint.is_empty());
+        assert_eq!(
+            selected
+                .files
+                .values()
+                .filter(|entry| entry.has_unverified_source())
+                .count(),
+            crate::transcript_cache::CACHE_ENTRIES
+        );
+        let copy = local_index_key(&fixture.dir.join(format!("{FALLBACK_COPY}.jsonl")));
+        assert_eq!(
+            serde_json::to_value(&selected.files[&copy]).unwrap(),
+            serde_json::to_value(&previous.files[&copy]).unwrap(),
+            "fallback retains prior copy"
+        );
+        let restarted = ScanIndex::load(&path).unwrap();
+        assert!(restarted.files[&key].source_file_fingerprint.is_empty());
+        assert!(restarted
+            .traversal
+            .as_ref()
+            .unwrap()
+            .pending_candidates
+            .iter()
+            .any(|candidate| local_index_key(&candidate.path) == key));
+        if partial {
+            assert!(restarted.bounded_sweep_had_unsettled_upload());
+        }
+    }
+}

@@ -145,3 +145,32 @@ The existing cache count is reused without raising a resource limit. The
 with no minimum event count or cooldown. Held quiet/release and saturated held
 retry fixtures complement the partial-save slot-reservation regression; native
 execution and fresh money/SOURCE/selection reviews remain owed.
+
+Round 10 preserves acquisition debt when account classification releases a hold
+AFTER scanning. With committed capacity it keeps the sampled marker; otherwise
+it queues the existing exact retry and clears the existing source fingerprint
+as an explicit reparse witness. That witness survives traversal resets and
+bypasses activity filtering, including for a quiet equal-size file. On its next
+nonheld visit the ordinary per-file cap policy applies; no marker 257 is minted
+and working retirements never refund a committed slot. Missing retained custody
+keeps a retry rather than implying that an obligation was discharged. This
+changes scheduling, not account attribution, accepted bodies or audit credit.
+
+Release pairing is blocked on the debt-carrying writer: #865 must merge first;
+then this branch merges main (never rebases) and proves quiet retirement rewrites
+the record with no debt through that writer. Required native cases are record-
+present restart with zero Full, and index-saved/old-record crash window with at
+most one counted Full. Existing old-writer fixtures do not qualify that pairing.
+Both changes ship in the same release. The previous 0.1.201 map/default decoder
+contract is pinned for the ordinary identity written by marker retirement.
+
+Same-size interior rewrites (or truncate/regrow) completed before opening, with
+restored mtime and matching head/boundary samples, may retire stale scheduling
+debt: this is the existing #819/§13 same-stat forgery residual, not whole-content
+verification. No ctime-based reread or additional Full authority is introduced.
+
+The cap stays 256 and cap Full must stay exceptional. After release the release
+owner reports the highest pending-marker count observed on the M4 using existing
+diagnostics. A nonzero audit_cap_full in normal use requires named Ron approval
+or a cap redesign; never silently raise it. Exact-head Linux and macOS native
+fixtures must pass before merge; local Clippy compilation is not test execution.
