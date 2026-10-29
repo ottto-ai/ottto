@@ -6944,6 +6944,12 @@ fn finish_sync_source(
                 stats.full_rearm_suppression.full_rearm_skipped_invalid_unchanged
             );
         }
+        if stats.terminal_fold_deferred.is_some() {
+            // No settlement/checkpoint/upload of a rejected terminal offer.
+            // The last durable page (including pending/ACK/body/holds) stands.
+            // Current-page collection ran, and its uncommitted rows stay owed.
+            return Err(anyhow!("terminal_fold_deferred: terminal offer incomplete"));
+        }
         if let Ok(counts) = serde_json::to_string(&stats.context_file_birth) {
             eprintln!("local snapshot sync: claude context basis counts={counts}");
         }
@@ -8393,6 +8399,7 @@ pub struct ClaudeLocalEvidenceStats {
     pub explicit_owned_start_session_count: usize,
     pub session_exclusive_reported_usage_count: usize,
     pub effort_evidence_load_failed: bool,
+    pub terminal_fold_deferred: Option<crate::snapshots::ClaudeTerminalFoldDeferred>,
     pub own_request_complete_root_count: usize,
     pub own_request_unknown_root_count: usize,
     pub duplicate_census: crate::snapshots::ClaudeDuplicateCensusCounts,
@@ -8830,6 +8837,24 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     ),
     crate::source_rotation::LocalRefusal,
 > {
+    // Scanner admission precedes raw terminal side effects. Direct/audit
+    // callers also preflight before any flag capture, observation or fold.
+    index.ensure_claude_evidence_offer();
+    if scan_result.census_complete && !index.claude_terminal_fold_checked() {
+        index.preflight_claude_terminal_fold(Some(support_dir), &scan_result.snapshots);
+    }
+    if let Some(deferred) = index.claude_terminal_fold_deferred() {
+        scan_result.census_complete = false;
+        scan_result.scan_cap_hit = true;
+        return Ok((
+            Default::default(),
+            true,
+            ClaudeLocalEvidenceStats {
+                terminal_fold_deferred: Some(deferred),
+                ..Default::default()
+            },
+        ));
+    }
     // Actual native occurrences are recorded once BEFORE emission filtering.
     // The authoritative fold still sees the actual terminal census decision.
     let observations = match comparison.as_deref_mut() {
@@ -9246,6 +9271,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             item.usage_accounting_contract.as_deref() == Some("session_exclusive_reported_usage:v1")
         })
         .count();
+    disposition.duplicate_census.rearm_scoped = index.claude_scoped_rearm_counts();
     stats.duplicate_census = disposition.duplicate_census;
     stats.full_rearm_suppression = disposition.full_rearm_suppression;
     stats.context_file_birth = disposition.context_file_birth.clone();

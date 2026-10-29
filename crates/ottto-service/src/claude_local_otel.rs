@@ -1864,6 +1864,21 @@ fn append_evidence_bytes(
     Ok(())
 }
 
+/// Whole-cohort admission uses metadata only. Unknown/nonregular paths are
+/// not absence and refuse terminal work. No file is opened here.
+pub(crate) fn claude_terminal_sidecar_bytes(support: &Path, session: &str) -> Option<u64> {
+    [
+        evidence_path(support, session),
+        trace_evidence_path(support, session),
+    ]
+    .into_iter()
+    .try_fold(0_u64, |sum, path| match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => sum.checked_add(metadata.len()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(sum),
+        _ => None,
+    })
+}
+
 fn evidence_path(support_dir: &Path, session_id: &str) -> PathBuf {
     let digest = Sha256::digest(session_id.as_bytes());
     support_dir
