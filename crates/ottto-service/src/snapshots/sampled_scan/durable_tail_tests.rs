@@ -5401,6 +5401,13 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
             assert_eq!(checkpoint.audit_debt(), None);
             assert!(missing.complete_full_audit(&key, "debt-source"));
             missing.save(&index_path).unwrap();
+            disk.authorize(
+                &record,
+                &Expected {
+                    binding: record.record.binding.clone(),
+                    committed_generation: loaded.generation,
+                },
+            );
             let mut replacement = record.record;
             replacement.certificate = certificate_at(&key, &checkpoint, &missing, now).unwrap();
             assert_eq!(
