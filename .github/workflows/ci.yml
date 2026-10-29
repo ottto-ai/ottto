@@ -7,6 +7,11 @@ on:
   push:
     branches:
       - main
+  # Daily main-ref run refreshes the macOS cargo cache (save-if needs
+  # refs/heads/main) now that main pushes skip Rust contracts: one hosted Mac
+  # run per day instead of one per merge. Quiet hour, away from queue Macs.
+  schedule:
+    - cron: "30 2 * * *"
   workflow_dispatch:
     inputs:
       money_equivalence:
@@ -47,7 +52,7 @@ on:
         default: false
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}${{ inputs.money_equivalence && '-money-equivalence' || '' }}${{ inputs.scan_stack_margin && '-scan-stack-margin' || '' }}
+  group: ${{ github.workflow }}-${{ github.ref }}${{ inputs.money_equivalence && '-money-equivalence' || '' }}${{ inputs.scan_stack_margin && '-scan-stack-margin' || '' }}${{ github.event_name == 'schedule' && '-cache-refresh' || '' }}
   cancel-in-progress: true
 
 permissions:
@@ -56,12 +61,15 @@ permissions:
 jobs:
   rust:
     name: Rust contracts
-    # macOS runs only in the merge queue, on main pushes and on dispatch: GitHub
-    # Free allows five hosted Macs org-wide. On a PR the skipped job reports
-    # success for the required check; the ruleset's merge_queue rule makes every
-    # merge pass this job in the queue. Rollback: remove this line FIRST, and
-    # only then the queue rule; never leave the skip without the queue.
-    if: ${{ github.event_name != 'pull_request' && !(github.event_name == 'workflow_dispatch' && (inputs.money_e2_bench || inputs.money_equivalence || inputs.scan_stack_margin)) }}
+    # macOS runs only in the merge queue, on dispatch and on the daily main
+    # cache-refresh schedule: GitHub Free allows five hosted Macs org-wide.
+    # Main pushes skip the repeat because the queue already tests the exact
+    # merged commit. On a PR the skipped job reports success for the required
+    # check; the ruleset's merge_queue rule makes every merge pass this job in
+    # the queue. Rollback: revert step 3 (Mac on PRs) FIRST, then the queue
+    # rule; never leave the PR skip without the queue. Step 4 (this main-push
+    # skip) can be reverted on its own at any time.
+    if: ${{ github.event_name != 'pull_request' && github.event_name != 'push' && !(github.event_name == 'workflow_dispatch' && (inputs.money_e2_bench || inputs.money_equivalence || inputs.scan_stack_margin)) }}
     # Main's own queue run takes about 38 min (runs 40321546891, 40331916601,
     # 40348583388); 40 cancelled #791 (run 40378483829). Headroom, not a target.
     timeout-minutes: 55
@@ -81,7 +89,10 @@ jobs:
       - name: Install validated Rust toolchain
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt --component clippy
 
-      # Only main runs save; PRs restore main's cache. Workspace crates are not cached.
+      # save-if stays refs/heads/main: only the schedule and manual main
+      # dispatches save. merge_group runs restore main's cache, which can be
+      # up to 24 h old. If queue builds slow down, add a second cron; do NOT
+      # save from queue refs. Workspace crates are not cached.
       - name: Rust cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
@@ -300,10 +311,15 @@ jobs:
           (ref / rel).write_text(head + "use reference_hook as e2_hook;" + tail)
           sync = ref / "crates/ottto-service/src/snapshot_sync.rs"
           source = sync.read_text()
+          backend = "crates/ottto-service/src/snapshot_sync/loopback_backend.rs"
+          (ref / backend).write_text((cand / backend).read_text())
+          if "mod loopback_backend;" not in source:
+              source = "mod loopback_backend;\n" + source
           if "snapshot_sync/money_e2_bench_tests.rs" not in source:
               anchor = '    include!("snapshot_sync/request_identity_pipeline_tests.rs");\n'
               assert source.count(anchor) == 1, "reference include anchor"
-              sync.write_text(source.replace(anchor, anchor + '    mod money_e2_bench_tests {\n        include!("snapshot_sync/money_e2_bench_tests.rs");\n    }\n'))
+              source = source.replace(anchor, anchor + '    mod money_e2_bench_tests {\n        include!("snapshot_sync/money_e2_bench_tests.rs");\n    }\n')
+          sync.write_text(source)
           PY
           cd "$RUNNER_TEMP/reference"
           export CARGO_TARGET_DIR="$RUNNER_TEMP/target"

@@ -660,15 +660,38 @@ fn cached_context_and_hourly_audit_debt_survive_telemetry_only_cycles() {
     let key = local_index_key(&f.path);
     let debt = prior.files[&key].audit_obligation(now_seconds());
     assert_eq!(debt.is_some(), crate::heap_layout_bound::layout_supported());
+    let old_full = cache
+        .retained_checkpoint(&key)
+        .map(|c| c.last_full_verified());
     f.write_rows(
         false,
         &[f.api[0].clone(), f.api[1].clone(), f.api[0].clone()],
     );
-    let unchanged = enriched(&f, raw_scan(&f, prior.clone(), Some(cache.clone()), |_| {}));
+    let (unchanged, diagnostics) = crate::local_resource_diagnostics::capture(|| {
+        enriched(&f, raw_scan(&f, prior.clone(), Some(cache.clone()), |_| {}))
+    });
     assert_layout_mode(unchanged.modes, (0, 0, 1));
     assert_oracle(&f, &unchanged, prior);
     let prior = settle(unchanged);
     assert_eq!(prior.files[&key].audit_obligation(now_seconds()), debt);
+    assert_eq!(
+        cache.retained_checkpoint(&key).and_then(|c| c.audit_debt()),
+        debt
+    );
+    assert_eq!(
+        cache
+            .retained_checkpoint(&key)
+            .map(|c| c.last_full_verified()),
+        old_full
+    );
+    let page = diagnostics
+        .iter()
+        .find(|row| row["stage"] == "native_collection_page")
+        .unwrap();
+    assert_eq!(
+        page["counts"]["sampled_acquisition"]["index_state_at_page_end"]["audit_quiet_retired"], 0,
+        "telemetry refresh is not a scheduled audit retirement"
+    );
     // Force a legitimately due existing obligation without changing intervals.
     let mut due = prior;
     let now = now_seconds();
@@ -680,12 +703,33 @@ fn cached_context_and_hourly_audit_debt_survive_telemetry_only_cycles() {
             due_unix_seconds: now.saturating_sub(1)
         }
     ));
-    let audited = raw_scan(&f, due, Some(cache), |_| {});
+    let (audited, diagnostics) = crate::local_resource_diagnostics::capture(|| {
+        raw_scan(&f, due, Some(cache.clone()), |_| {})
+    });
     assert_layout_mode(audited.modes, (0, 0, 1));
     assert_eq!(
         audited.reasons[FullReason::AuditDue.slot()],
         0,
         "audit age never labels a native Full, even without a checkpoint"
+    );
+    let page = diagnostics
+        .iter()
+        .find(|row| row["stage"] == "native_collection_page")
+        .unwrap();
+    assert_eq!(
+        page["counts"]["sampled_acquisition"]["index_state_at_page_end"]["audit_quiet_retired"],
+        u64::from(crate::heap_layout_bound::layout_supported()),
+        "only the due, sampled validation retires the obligation"
+    );
+    assert_eq!(
+        cache.retained_checkpoint(&key).and_then(|c| c.audit_debt()),
+        None
+    );
+    assert_eq!(
+        cache
+            .retained_checkpoint(&key)
+            .map(|c| c.last_full_verified()),
+        old_full
     );
 }
 

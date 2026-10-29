@@ -12,6 +12,7 @@ pub(crate) mod claude_contract;
 pub(crate) mod claude_reread;
 pub(crate) mod codex_memo_lifecycle;
 pub(crate) mod codex_side_lifecycle;
+pub(crate) mod rearm_cause;
 
 /// Closed, content-free refusal labels; cumulative process counters on #799.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -40,8 +41,12 @@ pub(crate) enum CodexZstCause {
     CompatibilityUnfunded,
     #[serde(rename = "CompressedAdmissionRefused")]
     AdmissionRefused,
+    // Subset of decoder refusals: the unchanged free-only floor would fit
+    // without optional header entries. Attempts, not files or lost usage.
+    #[serde(rename = "decoder_refused_header_occupancy")]
+    DecoderRefusedHeaderOccupancy,
 }
-const CODEX_ZST_CAUSES: usize = CodexZstCause::AdmissionRefused as usize + 1;
+const CODEX_ZST_CAUSES: usize = CodexZstCause::DecoderRefusedHeaderOccupancy as usize + 1;
 static CODEX_ZST_REFUSED: [AtomicU64; CODEX_ZST_CAUSES] =
     [const { AtomicU64::new(0) }; CODEX_ZST_CAUSES];
 
@@ -70,6 +75,20 @@ pub(crate) fn codex_state_only_ambiguous_identity(observations: u64, tokens: u64
                 ("codex_state_only_ambiguous_identity", observations),
                 ("codex_state_only_ambiguous_identity_tokens", tokens),
             ]),
+        );
+    }
+}
+
+/// One terminal append call, before later policy/no-op suppression; never wire data.
+pub(crate) fn codex_state_only(scanned: usize, emitted: usize, noops: usize) {
+    if scanned != 0 || emitted != 0 || noops != 0 {
+        traversal_point(
+            "codex_state_only",
+            "codex",
+            &BTreeMap::from([(
+                "codex_state_only",
+                BTreeMap::from([("scanned", scanned), ("emitted", emitted), ("noops", noops)]),
+            )]),
         );
     }
 }
@@ -387,8 +406,33 @@ pub(crate) struct Probe {
     pub(crate) page_events: claude_reread::Counts,
     pub(crate) full_causes: FullCauses,
     pub(crate) line_delivery: Option<(&'static str, LineDeliveryCounts)>,
+    #[cfg(feature = "replay-harness")]
+    index_reuse_skips: std::cell::Cell<u64>,
+}
+impl Drop for Probe {
+    fn drop(&mut self) {
+        rearm_cause::finish_page(self.started);
+    }
 }
 impl Probe {
+    pub(crate) fn rearm_full_selected(
+        &self,
+        key: &str,
+        mode: crate::transcript_acquisition::ReadMode,
+    ) {
+        rearm_cause::selected(self.started, key, mode);
+    }
+    pub(crate) fn rearm_full_completed(
+        &self,
+        key: &str,
+        mode: crate::transcript_acquisition::ReadMode,
+        bytes: u64,
+    ) {
+        rearm_cause::completed(self.started, key, mode, bytes);
+    }
+    pub(crate) fn rearm_fulls(&self) -> rearm_cause::Counts {
+        rearm_cause::page(self.started)
+    }
     pub(crate) fn start() -> Self {
         Self {
             started: Instant::now(),
@@ -396,7 +440,14 @@ impl Probe {
             page_events: Default::default(),
             full_causes: Default::default(),
             line_delivery: None,
+            #[cfg(feature = "replay-harness")]
+            index_reuse_skips: std::cell::Cell::new(0),
         }
+    }
+    #[cfg(feature = "replay-harness")]
+    pub(crate) fn index_reuse_skip(&self) {
+        self.index_reuse_skips
+            .set(self.index_reuse_skips.get().saturating_add(1));
     }
     fn observation(&self) -> Observation {
         Observation::between(
@@ -419,6 +470,8 @@ impl Probe {
         struct Counts {
             #[serde(flatten)]
             collection: CollectionCounts,
+            #[cfg(feature = "replay-harness")]
+            index_reuse_skips: u64,
             #[serde(flatten)]
             pending: Option<ClaudeAccountRetainedPending>,
             #[serde(flatten)]
@@ -436,6 +489,8 @@ impl Probe {
         }
         let claude = source == "claude_code";
         let counts = Counts {
+            #[cfg(feature = "replay-harness")]
+            index_reuse_skips: self.index_reuse_skips.replace(0),
             line_delivery: self
                 .line_delivery
                 .filter(|(_, counts)| *counts != LineDeliveryCounts::default())
@@ -1168,6 +1223,8 @@ pub(crate) fn sampled_audit_comparison(
 }
 #[derive(Debug, Serialize)]
 pub(crate) struct PageEvents {
+    #[serde(skip_serializing_if = "rearm_cause::Counts::is_empty")]
+    pub(crate) full_cause: rearm_cause::Counts,
     pub(crate) full_reasons: FullReasons,
     pub(crate) priority_full_replays: usize,
     pub(crate) audits_started: usize,
@@ -1279,7 +1336,7 @@ struct Record<T: Serialize> {
 }
 fn emit(record: &impl Serialize) {
     if let Ok(json) = serde_json::to_string(record) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "replay-harness"))]
         if TEST_OUTPUT.with(|output| {
             if let Some(output) = output.borrow_mut().as_mut() {
                 output.push(json.clone());
@@ -1299,11 +1356,11 @@ fn write_line(json: &str, writer: &mut impl Write) {
     let _ = writeln!(writer, "ottto-service: local_resources {json}");
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "replay-harness"))]
 thread_local! {
     static TEST_OUTPUT: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
 }
-#[cfg(test)]
+#[cfg(any(test, feature = "replay-harness"))]
 pub(crate) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<serde_json::Value>) {
     struct Reset;
     impl Drop for Reset {
@@ -1345,8 +1402,13 @@ mod tests {
             HeaderUnfunded,
             CompatibilityUnfunded,
             AdmissionRefused,
+            DecoderRefusedHeaderOccupancy,
         ];
         assert_eq!(ALL.len(), super::CODEX_ZST_CAUSES);
+        assert_eq!(
+            serde_json::to_value(DecoderRefusedHeaderOccupancy).unwrap(),
+            "decoder_refused_header_occupancy"
+        );
         for (index, cause) in ALL.iter().enumerate() {
             assert_eq!(*cause as usize, index);
         }
@@ -1586,6 +1648,7 @@ mod tests {
                 prepare_failed: usize::MAX,
             },
             page_events: PageEvents {
+                full_cause: Default::default(),
                 full_reasons: FullReasons([usize::MAX / 11; 11]),
                 priority_full_replays: usize::MAX,
                 audits_started: usize::MAX,

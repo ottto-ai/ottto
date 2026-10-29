@@ -443,6 +443,47 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
         let rank = admission_rank(retained.checkpoint.modified_hint(), now);
         self.admit_at_rank(key, retained, live_bytes, finalization_charge, rank)
     }
+    /// Read-only admission preflight: the same entry/key/layout gates and
+    /// victim rank as `admit_at_rank`. With `victims`, count only residents
+    /// that outlive the incoming entry; equal-rank residents are older uses.
+    pub(crate) fn insertion_fits(
+        &self,
+        key: &String,
+        retained: &Retained<S>,
+        reserved: usize,
+        rank: (i64, i64),
+        victims: bool,
+    ) -> bool {
+        (|| {
+            if self.count_limit == 0
+                || self.clock == u64::MAX
+                || !retained.state.supports_frozen_charge()
+            {
+                return None;
+            }
+            let heap = heap_layout_bound::bound(retained, self.entry_limit)?
+                .checked_sub(std::mem::size_of_val(retained))?;
+            let entry = std::mem::size_of::<Entry<S>>().checked_add(heap)?;
+            heap_layout_bound::bound(key, self.entry_limit.checked_sub(entry)?)?;
+            let limit = self.byte_limit.checked_sub(reserved)?;
+            let mut bytes = heap_layout_bound::bound(&Self::new(0, 0, 0), limit)?
+                .checked_add(entry_slot_bytes::<S>(key.capacity())?)?
+                .checked_add(heap)?;
+            let mut count = 1_usize;
+            for (other, entry) in &self.entries {
+                if other == key || (victims && entry.modified_hint <= rank) {
+                    continue;
+                }
+                count = count.checked_add(1)?;
+                bytes = bytes
+                    .checked_add(entry_slot_bytes::<S>(other.capacity())?)?
+                    .checked_add(entry.heap_bytes)?;
+            }
+            // Header eviction can relieve bytes, never retained-entry count.
+            ((!victims || count <= self.count_limit) && bytes <= limit).then_some(())
+        })()
+        .is_some()
+    }
     /// `admit` with the entry's victim-order hint already ranked
     /// (`admission_rank`).
     fn admit_at_rank(
@@ -551,6 +592,38 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
 mod tests {
     use super::*;
 
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+    fn insertion_preflight_matches_real_rank_and_reservation_outcomes() {
+        for reserved in [0, 32 * 1024, 96 * 1024, 128 * 1024] {
+            for rank in [(9, 0), (10, 0), (20, 0), (30, 0)] {
+                let mut cache = TranscriptCache::new(128 * 1024, 8192, 2);
+                for (key, rank) in [("old", (10, 0)), ("newer", (20, 0))] {
+                    assert!(cache.insert_reserving_at_rank(
+                        key.into(),
+                        retained("state".into()),
+                        0,
+                        0,
+                        Some(rank)
+                    ));
+                }
+                let incoming = retained("incoming".into());
+                let key = String::from("new");
+                if reserved == 0 {
+                    assert!(
+                        cache.insertion_fits(&key, &incoming, reserved, rank, false),
+                        "count pressure alone must not evict optional headers"
+                    );
+                }
+                let predicted = cache.insertion_fits(&key, &incoming, reserved, rank, true);
+                assert_eq!(
+                    predicted,
+                    cache.insert_reserving_at_rank(key, incoming, reserved, 0, Some(rank)),
+                    "{reserved} {rank:?}"
+                );
+            }
+        }
+    }
     #[test]
     fn cache_lifecycle_counts_real_transfers_refusals_and_eviction_causes() {
         use crate::local_resource_diagnostics::cache_lifecycle::observe;

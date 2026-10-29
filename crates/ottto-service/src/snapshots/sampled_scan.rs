@@ -229,15 +229,16 @@ impl SharedCache {
             ))),
         }
     }
-    /// Copy-refusal release: evicts retained copies only. The paused cursor
-    /// job, the held-singleton memo, parked records and rotation state are
-    /// charged and bounded in `heap_bound`, and survive (K6).
+    /// Copy-refusal release: evicts retained copies and optional header facts.
+    /// The paused cursor job, held-singleton memo, parked records and rotation
+    /// state are charged and bounded in `heap_bound`, and survive (K6).
     pub(super) fn clear(&self) {
         if let Ok(mut cache) = self.retained() {
             cache.clear();
         } else {
             record(Event::ClearPoisonedLock);
         }
+        self.with_cursor(|cursor| cursor.headers.clear());
     }
     /// M1: evict retained copies in victim order until they fit the state
     /// budget beside the cursor state and `pinned` bytes, measured under
@@ -426,19 +427,19 @@ impl SharedCache {
                 let live_bytes_in = live_bytes;
                 #[cfg(unix)]
                 let touched = key.clone();
-                let reserved = live_bytes
-                    .saturating_add(self.cursor_resident_for_main())
-                    .saturating_add(side_ledger::SIDE_LEDGER_BYTES);
-                let admitted = cache.insert_reserving_at_rank(
-                    key,
-                    crate::transcript_cache::Retained {
-                        checkpoint: completed.checkpoint,
-                        state,
-                    },
-                    reserved,
-                    live_bytes,
-                    completed.released,
-                );
+                let retained = crate::transcript_cache::Retained {
+                    checkpoint: completed.checkpoint,
+                    state,
+                };
+                let rank = completed.released.unwrap_or_else(|| {
+                    crate::transcript_cache::admission_rank(
+                        retained.checkpoint.modified_hint(),
+                        crate::transcript_cache::admission_now(),
+                    )
+                });
+                let reserved = self.retained_reservation(&cache, &key, &retained, live_bytes, rank);
+                let admitted =
+                    cache.insert_reserving_at_rank(key, retained, reserved, live_bytes, Some(rank));
                 self.drop_suspended_proof_if_over(&cache, live_bytes_in);
                 // M1: an admitted copy is a durable write candidate after the
                 // next successful index save (the durable lock is a leaf).
@@ -1226,6 +1227,9 @@ pub(super) fn copy_budget_step(
     let room = remaining
         .zip(used)
         .and_then(|(remaining, used)| remaining.checked_sub(used));
+    if let Some(room) = room {
+        context.cache.retire_headers_over_room(room);
+    }
     let budget = room.map_or(0, |room| room / 2);
     (
         budget,

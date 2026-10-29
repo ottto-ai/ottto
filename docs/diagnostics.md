@@ -113,8 +113,12 @@ Delayed paths keep their committed size and clear the existing source
 fingerprint as a durable reparse witness. It remains age-exempt across partial
 saves, restarts and context-changing traversal replacements; the watcher queue
 alone is not its custody.
+The clear uses the process-local rearm wrapper: a later Full reports
+`rearm_cleared{audit_cap_delay}` with its count and completed native bytes.
+That tag survives an index reload in the same process; a process restart loses
+the diagnostic tag while retaining the persisted retry witness.
 
-Complete-c quiet retirement requires both samples, stable EOF/stamp and native
+Due complete-c quiet retirement requires both samples, stable EOF/stamp and native
 completion/RAM admission. With an active durable store the scheduling marker
 remains until the same writer durably stores no debt and a second index CAS
 clears the marker. The existing diagnostics carrier then emits
@@ -125,6 +129,9 @@ Freed slots become usable on the next committed scan; the current page reserves
 them because partial-save reconciliation can restore an unacknowledged marker.
 Quiet retirement keeps the old Full verification time and grants no
 `audits_completed`, source, census or ACK credit.
+Before the deadline, incidental telemetry-only Unchanged reuse keeps the exact
+index and checkpoint debt. A cap Full keeps its frozen acquisition extent even
+though it cannot sample; independent grown-prefix/marker refusals still apply.
 
 `audit_retired_absent{events}` counts an obligation retired on positively proven absence:
 ENOENT on a no-follow descriptor chain from a readable configured root.
