@@ -415,25 +415,25 @@ fn attribution_capture_toggle_refuses_the_previous_claude_record() {
     if !crate::test_isolation::run_here() {
         return;
     }
-    let root = crate::test_scratch::private_dir("ottto-dt-attribution");
-    let lock = test_locks::hold(&root);
-    let source = SnapshotSource::ClaudeCode;
-    let namespace = Scope("attribution-test".into());
-    let scope = Scope("attribution-file".into());
-    let index_path = root.join("index.json");
-    let path = root.join("11111111-2222-4333-8444-555555555555.jsonl");
-    native_fixture(&path);
-    let key = local_index_key(&path);
-    let mut index = ScanIndex::default();
-    index.files.insert(
-        key.clone(),
-        serde_json::from_value(serde_json::json!({
-            "size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"fp"
-        }))
-        .unwrap(),
-    );
-    index.save(&index_path).unwrap();
     for before in [false, true] {
+        let root = crate::test_scratch::private_dir("ottto-dt-attribution");
+        let lock = test_locks::hold(&root);
+        let source = SnapshotSource::ClaudeCode;
+        let namespace = Scope("attribution-test".into());
+        let scope = Scope("attribution-file".into());
+        let index_path = root.join("index.json");
+        let path = root.join("11111111-2222-4333-8444-555555555555.jsonl");
+        native_fixture(&path);
+        let key = local_index_key(&path);
+        let mut index = ScanIndex::default();
+        index.files.insert(
+            key.clone(),
+            serde_json::from_value(serde_json::json!({
+                "size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"fp"
+            }))
+            .unwrap(),
+        );
+        index.save(&index_path).unwrap();
         // Isolated child process: no concurrent test can observe the env.
         std::env::set_var(
             "OTTTO_CLAUDE_ATTRIBUTION_CAPTURE",
@@ -458,7 +458,7 @@ fn attribution_capture_toggle_refuses_the_previous_claude_record() {
             store::store_dir_for_index(&index_path),
             durable_source(source).unwrap(),
         );
-        store
+        let receipt = store
             .write_after_save(
                 lock,
                 index.generation,
@@ -471,6 +471,10 @@ fn attribution_capture_toggle_refuses_the_previous_claude_record() {
                 }],
             )
             .unwrap();
+        assert_eq!(
+            receipt.written, 1,
+            "each toggle starts from its own persisted binding"
+        );
         std::env::set_var(
             "OTTTO_CLAUDE_ATTRIBUTION_CAPTURE",
             if before { "0" } else { "1" },
@@ -515,8 +519,8 @@ fn attribution_capture_toggle_refuses_the_previous_claude_record() {
         assert_eq!(counts.ineligible.get("old_binding_no_match"), Some(&1));
         assert_eq!(counts.restored, 0);
         assert_eq!(disk.records_read, 1);
+        let _ = std::fs::remove_dir_all(root);
     }
-    let _ = std::fs::remove_dir_all(root);
 }
 
 /// A Codex transcript whose open call's id is `call_id_bytes` long: the id
@@ -3107,6 +3111,13 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
             assert_eq!(checkpoint.audit_debt(), None);
             assert!(missing.complete_full_audit(&key, "debt-source"));
             missing.save(&index_path).unwrap();
+            disk.authorize(
+                &record,
+                &Expected {
+                    binding: record.record.binding.clone(),
+                    committed_generation: loaded.generation,
+                },
+            );
             let mut replacement = record.record;
             replacement.certificate = certificate_at(&key, &checkpoint, &missing, now).unwrap();
             assert_eq!(
