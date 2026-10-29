@@ -2175,16 +2175,10 @@ fn bound_archive_mixed_owner_plain_publishes_identical_and_hold_stays_quiet() {
                 .map(snapshot_upload_body_witness)
                 .collect::<Vec<_>>()
         );
-        assert!(matches!(
-            next.files[&local_index_key(&f.0)]
-                .archive
-                .as_ref()
-                .unwrap()
-                .disposition,
-            ArchiveDisposition::Held {
-                cause: CodexZstCause::FamilyUnproven
-            }
-        ));
+        assert_eq!(
+            next.files[&local_index_key(&f.0)].codex_compressed_hold,
+            Some(CodexZstCause::FamilyUnproven)
+        );
         state = next;
     }
 }

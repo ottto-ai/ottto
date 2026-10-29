@@ -29954,7 +29954,7 @@ impl OwnedSourceScan {
                     )
                     && index
                         .files
-                        .get(&index_key)
+                        .get(&local_index_key(&candidate.path))
                         .and_then(|entry| entry.archive.as_deref())
                         .is_some_and(|archive| {
                             archive.decode_attempts == 1 && !archive.user_change

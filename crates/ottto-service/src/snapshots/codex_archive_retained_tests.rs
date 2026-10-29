@@ -222,16 +222,10 @@ fn twin_without_content_equivalence_holds_archive_and_preserves_plain_body() {
             snapshot_upload_body_witness(&result.snapshots[0]),
             snapshot_upload_body_witness(&control.snapshots[0])
         );
-        assert!(matches!(
-            index.files[&local_index_key(&f.0)]
-                .archive
-                .as_ref()
-                .unwrap()
-                .disposition,
-            ArchiveDisposition::Held {
-                cause: CodexZstCause::FamilyUnproven
-            }
-        ));
+        assert_eq!(
+            index.files[&local_index_key(&f.0)].codex_compressed_hold,
+            Some(CodexZstCause::FamilyUnproven)
+        );
     }
 }
 
@@ -283,16 +277,10 @@ fn prior_plain_carrier_or_tombstone_holds_move_before_any_content_read() {
             before["codex_counting_tombstones"]
         );
         assert_eq!(after["files"][&plain], before["files"][&plain]);
-        assert!(matches!(
-            index.files[&local_index_key(&f.0)]
-                .archive
-                .as_ref()
-                .unwrap()
-                .disposition,
-            ArchiveDisposition::Held {
-                cause: CodexZstCause::ArchiveEquivalenceUnproven
-            }
-        ));
+        assert_eq!(
+            index.files[&local_index_key(&f.0)].codex_compressed_hold,
+            Some(CodexZstCause::ArchiveEquivalenceUnproven)
+        );
     }
 }
 
