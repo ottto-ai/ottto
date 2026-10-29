@@ -533,7 +533,6 @@ impl ApcFixture {
                 &mut scan,
                 &mut index,
                 None,
-                None,
                 native_completion.as_mut(),
                 None,
             )
@@ -589,7 +588,6 @@ impl ApcFixture {
             SnapshotSource::ClaudeCode,
             &mut scan,
             &mut index,
-            true,
             |snapshot| {
                 effective_snapshot_upload_body_witness(
                     snapshot,
@@ -1421,6 +1419,8 @@ fn changed_proof_after_terminal_authority_owes_one_exact_correction() {
 #[test]
 #[serial(source_manifests)]
 fn account_held_member_stays_owed_while_owed_siblings_drain_across_passes() {
+    // Subject: the legacy account path contract 5 now leaves to untagged bodies.
+    let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
     // Reported-authority replacement/proof corrections; E2 literals never demote to native.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _source_manifests = SourceManifestTestGuard::new();
@@ -1614,7 +1614,6 @@ fn crash_and_shed_before_settlement_keep_the_grant_unchanged() {
 fn superseded_revision_ack_never_drains_the_current_revision() {
     // Reported-authority replacement/proof corrections; E2 literals never demote to native.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    let _reread_clock = crate::snapshots::reread_guard::TestClock::at(current_unix_seconds());
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-superseded", false);
     let (_, grant) = fixture.reach_grant();
@@ -1961,6 +1960,8 @@ fn natural_owed_members_drain_on_separate_bounded_pages() {
 #[test]
 #[serial(source_manifests)]
 fn controlled_three_owed_members_settle_on_their_own_pages_while_one_is_account_held() {
+    // Subject: the legacy account path contract 5 now leaves to untagged bodies.
+    let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
     // Reported-authority replacement/proof corrections; E2 literals never demote to native.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _source_manifests = SourceManifestTestGuard::new();

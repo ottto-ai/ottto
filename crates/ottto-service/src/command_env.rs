@@ -30,6 +30,47 @@ pub(crate) fn executable_path(program: &str) -> Option<PathBuf> {
     first_program_in(executable_search_dirs_for_program(program), program)
 }
 
+/// Interactive launches search the inherited daemon PATH before native/npm prefixes and
+/// finally Codex desktop bundles. Claude Desktop's private CLI is excluded.
+pub(crate) fn interactive_cli_path(program: &str, home: &Path) -> Option<PathBuf> {
+    if program == "claude" {
+        return claude_default_login_executable_path(home);
+    }
+    let mut dirs = executable_search_dirs_from(
+        env::var_os(COMMAND_SEARCH_PATH_ENV).or_else(|| env::var_os("PATH")),
+        Some(home.as_os_str().to_owned()),
+        true,
+    );
+    if program == "codex" && env::var_os(COMMAND_SEARCH_PATH_ENV).is_none() {
+        dirs.extend(codex_desktop_bundle_dirs(&[
+            PathBuf::from("/Applications"),
+            home.join("Applications"),
+        ]));
+    }
+    dirs.into_iter()
+        .map(|dir| dir.join(program))
+        .find(|path| is_absolute_executable(path))
+}
+
+/// The daemon may locate a CLI outside launchd's minimal PATH. Its shebang
+/// interpreter must be found in the same install's bin directory at probe time.
+pub(crate) fn interactive_probe_path(home: &Path, program: &Path) -> Option<OsString> {
+    let mut dirs = Vec::new();
+    if let Some(parent) = program.parent().filter(|parent| parent.is_absolute()) {
+        dirs.push(parent.into());
+    }
+    for dir in executable_search_dirs_from(
+        env::var_os(COMMAND_SEARCH_PATH_ENV).or_else(|| env::var_os("PATH")),
+        Some(home.as_os_str().to_owned()),
+        true,
+    ) {
+        if dir.is_absolute() {
+            push_unique(&mut dirs, dir);
+        }
+    }
+    env::join_paths(dirs).ok()
+}
+
 fn first_program_in(dirs: impl IntoIterator<Item = PathBuf>, program: &str) -> Option<PathBuf> {
     dirs.into_iter().find_map(|dir| {
         let candidate = dir.join(program);

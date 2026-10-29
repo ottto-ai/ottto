@@ -44,3 +44,18 @@ self/other eviction, cursor-room eviction, clear, poisoned locks, native body an
 audit-debt parity, and paused-cursor preservation. Existing native full/tail,
 selected-save, ACK and resource guards remain relevant. CI supplies execution;
 no installed-performance benefit or root-cause attribution is claimed here.
+
+Unknown durable representations hold acquisition. A known corrupt record is
+read Full once (counted) and replaced after the save; nothing deletes it first.
+More than max(20, 2%) corrupt records in one pass, a store owned by another
+user or a store path that is not a directory make the store memory-only for
+the process, with one alarm. Mode drift on our own store is repaired in place.
+The `durable_tail` diagnostics count holds by class, retained or invalidated
+census records, verification bytes and records beyond the bounded inventory.
+Held files keep their last accepted output as stale; no zero-usage replacement
+is emitted. A held original keeps its census record while its committed entry
+is unchanged, even if the file grew. A held key turns its source's census red
+for the whole hold (counted per source in `durable_tail_alarm`); making a hold
+terminal disclosed residue is a separate change. A rollback holds
+newer-format files until re-upgrade. Beyond 24 hours the operator chooses
+continued hold or an explicitly counted reread; default: hold.

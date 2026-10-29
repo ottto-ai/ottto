@@ -94,7 +94,6 @@ No lock change was needed.
 - `missing_persisted_deadline_with_expired_live_access_hands_refresh_to_one_worker`
 - `missing_persisted_deadline_and_unreadable_live_metadata_stays_unreadable`
 - `persisted_deadline_skips_the_live_metadata_read`
-- `production_worker_queue_admits_one_refresher_per_slot`
 - `failed_auth_status_with_valid_credential_is_a_transient_probe_failure`
 - `failed_auth_status_with_expired_credential_stays_credential_unavailable`
 - `failed_auth_status_reporting_signed_out_stays_credential_unavailable`

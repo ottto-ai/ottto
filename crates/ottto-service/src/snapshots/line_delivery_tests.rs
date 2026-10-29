@@ -2,6 +2,7 @@
 //! excluded reads, K10 counters and E3's selection-identity conditions.
 use super::line_delivery::{DeliveryEnd, DeliveryMode, FileView, LineObserver, PhysicalLine, Want};
 use super::*;
+use crate::codex_prelude_footprint::tests::metric;
 use crate::local_resource_diagnostics::{capture, CollectionCounts, Probe};
 use crate::transcript_acquisition::FileObject;
 use std::cell::RefCell;
@@ -21,6 +22,7 @@ enum Event {
 #[derive(Clone, Default)]
 struct Recorder {
     events: Arc<Mutex<Vec<Event>>>,
+    offsets: Arc<Mutex<Vec<(u64, u64)>>>,
     skip: bool,
 }
 impl Recorder {
@@ -55,7 +57,8 @@ impl LineObserver for Recorder {
             Want::Lines
         }
     }
-    fn line(&mut self, _: &FileView, line: &PhysicalLine<'_>) {
+    fn line(&mut self, file: &FileView, line: &PhysicalLine<'_>) {
+        self.offsets.lock().unwrap().push((file.start, line.end));
         self.push(Event::Line(line.value.cloned()));
     }
     fn end(&mut self, _: &FileView, end: &DeliveryEnd) {
@@ -437,6 +440,10 @@ fn unplanned_claude_read_delivers_all_lines_from_zero_and_counts_them() {
         Some(&recorder),
         None,
     );
+    assert!(recorder
+        .events()
+        .iter()
+        .any(|e| matches!(e, Event::Begin(v) if v.source == SnapshotSource::ClaudeCode)));
     assert_eq!(result.scanned_file_count, 1);
 
     let held = fs::metadata(&path).unwrap();
@@ -445,6 +452,8 @@ fn unplanned_claude_read_delivers_all_lines_from_zero_and_counts_them() {
         object: FileObject::of(&fs::File::open(&path).unwrap()).unwrap().0,
         mtime: held.modified().ok(),
         mode: DeliveryMode::Full,
+        root: Some(0),
+        start: 0,
     })];
     let values = [Some(first), None, None, None, Some(inherited)];
     expected.extend(values.into_iter().map(Event::Line));
@@ -590,7 +599,7 @@ fn side_read_calls_no_observer() {
     scan.line_delivery
         .as_mut()
         .unwrap()
-        .begin_armed(scan.active_file.as_deref().unwrap());
+        .begin_armed(scan.active_file.as_deref().unwrap(), &scan.roots);
     let active = scan.active_file.as_deref_mut().unwrap();
     active.side_origin.take().unwrap().end();
     finish(scan);
@@ -617,6 +626,14 @@ fn codex_group_member_reads_call_no_observer() {
         false,
     )
     .with_line_observer("test", Box::new(recorder.clone()));
+    scan = step_until(scan, |s| {
+        s.active_file.as_deref().is_some_and(|a| a.group.is_some())
+    });
+    assert!(!scan
+        .active_file
+        .as_deref()
+        .unwrap()
+        .is_primary_for(SnapshotSource::Codex));
     let result = loop {
         match scan.step(None) {
             OwnedSourceScanStep::Pending(next) => scan = next,
@@ -694,6 +711,84 @@ fn dropped_pass_ends_open_file_once_incomplete() {
     );
     drop(scan);
     assert_eq!(recorder.ends(), vec![DeliveryEnd::Incomplete]);
+}
+
+/// Linux too: a real Tail plan positions the held reader; production begin
+/// and physical-line delivery preserve its nonzero absolute byte origin.
+#[test]
+fn planned_tail_delivers_absolute_offsets_on_linux() {
+    use crate::transcript_acquisition::{ReadMode, ReadPlan, Scope};
+    use std::io::Read as _;
+
+    let root = Root::new("ld-planned-offsets");
+    let path = root.file(SESSION);
+    let prefix = [raw(&row("/w/prefix", "u0")), b"\n".to_vec()].concat();
+    fs::write(&path, &prefix).unwrap();
+    let scope = Scope("ld-planned-offsets".into());
+    let mut file = File::open(&path).unwrap();
+    let mut full = ReadPlan::prepare(&mut file, None, &scope, None, 100).unwrap();
+    let mut read = Vec::new();
+    file.read_to_end(&mut read).unwrap();
+    full.observe_complete_records(&read).unwrap();
+    let checkpoint = full
+        .commit_after_native_completion(&file, &scope, 100)
+        .unwrap();
+    let rows = [row("/w/one", "u1"), row("/w/two-longer", "u2")];
+    let bytes = rows
+        .clone()
+        .map(|value| [raw(&value), b"\n".to_vec()].concat());
+    for row in &bytes {
+        append(&path, row);
+    }
+
+    let recorder = Recorder::default();
+    let mut scan = step_until(
+        new_scan(&root.projects(), ScanIndex::default())
+            .with_line_observer("test", Box::new(recorder.clone())),
+        |scan| scan.active_file.is_some(),
+    );
+    let mut active = scan.active_file.take().unwrap();
+    let reader = &mut active.parser.reader;
+    assert_eq!(reader.consumed_bytes(), 0);
+    let tail = ReadPlan::prepare(
+        reader.reader.get_mut(),
+        Some(&checkpoint),
+        &scope,
+        None,
+        101,
+    )
+    .unwrap();
+    assert_eq!(tail.mode(), ReadMode::Tail);
+    let start = tail.start_offset();
+    assert_eq!(start, prefix.len() as u64);
+    assert!(start > 0);
+    reader.set_extent_limit(tail.frozen_length() - start);
+    reader.acquisition = Some(tail);
+    let delivery = scan.line_delivery.as_mut().unwrap();
+    delivery.begin_armed(&active, &scan.roots);
+    let Some(Event::Begin(view)) = recorder.events().first().cloned() else {
+        panic!("expected begin");
+    };
+    assert_eq!(view.mode, DeliveryMode::Tail);
+    assert_eq!(view.start, start);
+
+    let mut consumed = 0;
+    for (n, bytes) in bytes.iter().enumerate() {
+        assert!(!delivery.step(&mut active.parser).unwrap());
+        consumed += bytes.len() as u64;
+        assert_eq!(active.parser.reader.consumed_bytes(), consumed);
+        let offsets = recorder.offsets.lock().unwrap();
+        assert_eq!(offsets.len(), n + 1);
+        assert_eq!(offsets[n], (start, start + consumed));
+        assert_ne!(offsets[n].1, consumed, "end must be absolute");
+    }
+    assert!(delivery.step(&mut active.parser).unwrap());
+    assert_eq!(
+        recorder.lines(),
+        rows.map(|value| Event::Line(Some(value))),
+        "only the appended rows were delivered"
+    );
+    assert_eq!(recorder.ends(), [DeliveryEnd::Complete]);
 }
 
 /// Sampled acquisition (layout-supported builds): a Full starts at 0; after
@@ -875,6 +970,7 @@ fn unselected_page(source: &str) -> Value {
                 scanned_files: 0,
                 semantic_noops: 0,
                 sampled_acquisition: None,
+                full_causes: Default::default(),
             },
         )
     });
@@ -920,7 +1016,7 @@ fn walk_gate_counts_age_and_size_skips_without_changing_selection() {
     set_old(&file("rescued"));
     fs::File::create(file("big"))
         .unwrap()
-        .set_len(MAX_JSONL_FILE_BYTES + 1)
+        .set_len(MAX_CLAUDE_JSONL_FILE_BYTES + 1)
         .unwrap();
     let mut prepared = ScanIndex::default();
     rescue(&mut prepared.files, &file("rescued"));
@@ -1032,4 +1128,551 @@ fn roster_gate_counts_age_and_size_skips_without_changing_selection() {
     assert_eq!(first, (selected, 4, 1));
     assert_eq!(counted, json!({"age": 1, "size": 1}));
     assert_eq!(recounted, counted);
+}
+
+/// An unplanned reader from zero includes malformed, invalid and paused-overlong
+/// bytes in its absolute ends. Unterminated bytes remain undelivered.
+#[test]
+fn physical_ends_include_skipped_bytes_across_reader_yields() {
+    let data = [
+        b"\n{bad\n\xff\n".to_vec(),
+        format!("{}\n", "x".repeat(400)).into_bytes(),
+        b"{}\nlast".to_vec(),
+    ]
+    .concat();
+    let mut reader = BoundedJsonlReader::new(
+        std::io::BufReader::with_capacity(16, Cursor::new(data.clone())),
+        32,
+        false,
+    );
+    reader.set_chunked_skip(16);
+    let mut ends = Vec::new();
+    loop {
+        let step = reader
+            .step_lines(
+                |_| {},
+                Some(&mut |_, line: &PhysicalLine<'_>| ends.push(line.end)),
+            )
+            .unwrap();
+        if matches!(step, JsonlReaderStep::Complete(_)) {
+            break;
+        }
+    }
+    let expected = data
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| **b == b'\n')
+        .map(|(i, _)| i as u64 + 1)
+        .collect::<Vec<_>>();
+    assert_eq!(ends, expected);
+}
+
+#[test]
+fn codex_prelude_registration_preserves_money_receipts_proofs_and_body_with_salvage() {
+    let root = Root::new("prelude-money");
+    let sessions = root.0.join("sessions");
+    fs::create_dir(&sessions).unwrap();
+    let id = "019fa111-2222-7333-8444-555555555555";
+    let path = sessions.join(format!("rollout-2026-10-07T10-00-00-{id}.jsonl"));
+    let usage = |n| json!({"type":"event_msg","timestamp":"2026-10-07T10:00:02Z","payload":{"type":"token_count","service_tier":"priority","info":{"model_context_window":200000,"model":"gpt-5","last_token_usage":{"input_tokens":n,"output_tokens":2,"total_tokens":n+2},"total_token_usage":{"input_tokens":n,"output_tokens":2,"total_tokens":n+2}}}});
+    for overlong in [false, true] {
+        let mut data=[raw(&json!({"type":"session_meta","timestamp":"2026-10-07T10:00:00Z","payload":{"id":id,"cwd":root.0,"timestamp":"2026-10-07T10:00:00Z","context_window":200000}})),b"\n".to_vec(),raw(&usage(100)),b"\n".to_vec()].concat();
+        if overlong {
+            data.extend(format!("{{\"timestamp\":\"2026-10-07T10:00:01Z\",\"ordinal\":2,\"type\":\"response_item\",\"payload\":\"{}\"}}\n","x".repeat(MAX_JSONL_LINE_BYTES+1)).as_bytes());
+        }
+        data.extend(raw(&usage(140)));
+        data.push(b'\n');
+        fs::write(&path, data).unwrap();
+        let page = |observer: bool| {
+            let feed = Arc::new(crate::codex_prelude_footprint::CodexPreludeFeed::default());
+            let cache = Arc::new(sampled_scan::SharedCache::default());
+            let result = capture(|| {
+                let scan = OwnedSourceScan::new(
+                    SnapshotSource::Codex,
+                    std::slice::from_ref(&sessions),
+                    ScanIndex::default(),
+                    NOW,
+                    BACKFILL_WINDOW_DAYS,
+                    10,
+                    false,
+                    None,
+                    &[],
+                    false,
+                    true,
+                )
+                .with_sampled_acquisition(
+                    cache,
+                    crate::transcript_acquisition::Scope("prelude-money".into()),
+                );
+                let scan = if observer {
+                    scan.with_line_observer(
+                        "codex_prelude",
+                        feed.observer(std::slice::from_ref(&sessions)),
+                    )
+                } else {
+                    scan
+                };
+                finish(scan)
+            });
+            (result, feed.metrics())
+        };
+        let (((bare_index, bare, bare_steps), bare_counts), _) = page(false);
+        let (((seen_index, seen, seen_steps), seen_counts), metrics) = page(true);
+        assert!(metrics.split_whitespace().any(|m| m == "feed_files=1"));
+        assert!(metrics.split_whitespace().any(|m| m == "root_missing=0"));
+        assert!(
+            page_counts(&seen_counts)["line_delivery"]["codex_prelude"]["lines"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0
+        );
+        assert_eq!(bare_steps, seen_steps);
+        assert!(!bare.snapshots.is_empty());
+        assert_eq!(
+            serde_json::to_vec(&bare.snapshots).unwrap(),
+            serde_json::to_vec(&seen.snapshots).unwrap(),
+            "token totals and emitted bodies"
+        );
+        assert_eq!(
+            serde_json::to_value(&bare_index.files).unwrap(),
+            serde_json::to_value(&seen_index.files).unwrap(),
+            "TierReplay receipts and ownership checkpoints"
+        );
+        assert_eq!(
+            serde_json::to_value(&bare_index.codex_parent_prefix_proofs).unwrap(),
+            serde_json::to_value(&seen_index.codex_parent_prefix_proofs).unwrap(),
+            "fresh-session proof maps may both be empty; inherited proof is not covered"
+        );
+        assert!(
+            bare_index
+                .files
+                .values()
+                .any(|e| e.codex_captured_tier_receipt.is_some()
+                    || e.codex_applied_tier_receipt.is_some()),
+            "nonempty TierReplay evidence"
+        );
+        assert_eq!(bare.over_line_cap_count, usize::from(overlong));
+        let a = page_counts(&bare_counts);
+        let b = page_counts(&seen_counts);
+        for key in [
+            "completed_native_bytes",
+            "completed_guard_bytes",
+            "full_selections",
+            "tail_selections",
+            "unchanged_selections",
+        ] {
+            assert_eq!(
+                a["sampled_acquisition"][key], b["sampled_acquisition"][key],
+                "equal tracked acquisition work, not interception of every open: {key}"
+            );
+        }
+    }
+}
+
+#[test]
+fn codex_scan_destruction_counts_nonterminal_prelude_gap() {
+    let root = Root::new("prelude-drop");
+    let sessions = root.0.join("sessions");
+    fs::create_dir(&sessions).unwrap();
+    let id = "019fa111-2222-7333-8444-555555555555";
+    let path = sessions.join(format!("rollout-2026-10-07T10-00-00-{id}.jsonl"));
+    append(
+        &path,
+        &[
+            raw(&json!({"type":"session_meta","payload":{"id":id}})),
+            b"\n".to_vec(),
+            raw(&json!({"type":"token_usage_record","payload":{"usage":{"input_tokens":9}}})),
+            b"\n".to_vec(),
+        ]
+        .concat(),
+    );
+    let feed = Arc::new(crate::codex_prelude_footprint::CodexPreludeFeed::default());
+    let scan = OwnedSourceScan::new(
+        SnapshotSource::Codex,
+        std::slice::from_ref(&sessions),
+        ScanIndex::default(),
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+        10,
+        false,
+        None,
+        &[],
+        false,
+        true,
+    )
+    .with_line_observer(
+        "codex_prelude",
+        feed.observer(std::slice::from_ref(&sessions)),
+    );
+    let scan = step_until(scan, |s| {
+        s.active_file
+            .as_ref()
+            .is_some_and(|a| a.parser.reader.consumed_bytes() > 0)
+    });
+    drop(scan);
+    // The terminal parser row was beyond the interrupted page. A resumed
+    // suffix is deliberately unarmed before LD2 and cannot repair this prefix.
+    assert_eq!(metric(&feed, "codex_prelude_gap_dropped"), 1);
+    assert_eq!(metric(&feed, "pending"), 0);
+}
+
+#[test]
+fn codex_cursor_yield_drops_prefix_before_late_token_record() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let root = Root::new("prelude-cursor");
+    let sessions = root.0.join("sessions");
+    fs::create_dir(&sessions).unwrap();
+    let id = "019fa111-2222-7333-8444-555555555555";
+    let path = sessions.join(format!("rollout-2026-10-07T10-00-00-{id}.jsonl"));
+    append(&path,&[raw(&json!({"type":"session_meta","timestamp":"2026-10-07T10:00:00Z","payload":{"id":id,"cwd":root.0,"context_window":200000}})),b"\n".to_vec()].concat());
+    for _ in 0..60 {
+        append(
+            &path,
+            &[raw(&json!({"padding":"x".repeat(100)})), b"\n".to_vec()].concat(),
+        );
+    }
+    append(&path,&[raw(&json!({"type":"event_msg","timestamp":"2026-10-07T10:00:01Z","payload":{"type":"token_count","info":{"model":"gpt-5","last_token_usage":{"input_tokens":100,"output_tokens":2},"total_token_usage":{"input_tokens":100,"output_tokens":2}}}})),b"\n".to_vec()].concat());
+    let feed = Arc::new(crate::codex_prelude_footprint::CodexPreludeFeed::default());
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    sampled_scan::codex_cursor::with_test_limits(2048, 1024, 64, || {
+        let mut index = ScanIndex::default();
+        let mut completion_page = None;
+        for page in 0..16 {
+            let scan = OwnedSourceScan::new(
+                SnapshotSource::Codex,
+                std::slice::from_ref(&sessions),
+                index,
+                NOW,
+                BACKFILL_WINDOW_DAYS,
+                10,
+                false,
+                None,
+                &[],
+                false,
+                true,
+            )
+            .with_sampled_acquisition(
+                Arc::clone(&cache),
+                crate::transcript_acquisition::Scope("prelude-cursor".into()),
+            )
+            .with_line_observer(
+                "codex_prelude",
+                feed.observer(std::slice::from_ref(&sessions)),
+            );
+            let (next, result, _) = finish(scan);
+            index = next;
+            assert_eq!(metric(&feed, "pending"), 0);
+            assert_eq!(metric(&feed, "codex_prelude_gap_dropped"), 1);
+            if !result.snapshots.is_empty() {
+                completion_page = Some(page);
+                break;
+            }
+        }
+        let page = completion_page.expect("cursor never completed");
+        assert!(page > 0);
+    });
+}
+
+/// A feed restart with the same warm RAM acquisition cache; no process restart
+/// or disk restore is exercised.
+#[test]
+fn codex_warm_acquisition_after_feed_restart_is_unseen_not_a_new_prelude() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let root = Root::new("prelude-warm-restart");
+    let sessions = root.0.join("sessions");
+    fs::create_dir(&sessions).unwrap();
+    let id = "019fa111-2222-7333-8444-555555555555";
+    let path = sessions.join(format!("rollout-2026-10-07T10-00-00-{id}.jsonl"));
+    let token = |n| json!({"type":"event_msg","timestamp":"2026-10-07T10:00:01Z","payload":{"type":"token_count","info":{"model":"gpt-5","model_context_window":200000,"last_token_usage":{"input_tokens":n,"output_tokens":2},"total_token_usage":{"input_tokens":n,"output_tokens":2}}}});
+    append(
+        &path,
+        &[
+            raw(&json!({"type":"session_meta","payload":{"id":id,"cwd":root.0}})),
+            b"\n".to_vec(),
+            raw(&token(100)),
+            b"\n".to_vec(),
+        ]
+        .concat(),
+    );
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let page = |index, feed: &Arc<crate::codex_prelude_footprint::CodexPreludeFeed>| {
+        let scan = OwnedSourceScan::new(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&sessions),
+            index,
+            NOW,
+            BACKFILL_WINDOW_DAYS,
+            10,
+            false,
+            None,
+            &[],
+            false,
+            true,
+        )
+        .with_sampled_acquisition(
+            Arc::clone(&cache),
+            crate::transcript_acquisition::Scope("prelude-restart".into()),
+        )
+        .with_line_observer(
+            "codex_prelude",
+            feed.observer(std::slice::from_ref(&sessions)),
+        );
+        finish(scan).0
+    };
+    let feed = Arc::new(crate::codex_prelude_footprint::CodexPreludeFeed::default());
+    let index = page(ScanIndex::default(), &feed);
+    append(&path, &[raw(&token(140)), b"\n".to_vec()].concat());
+    let restarted = Arc::new(crate::codex_prelude_footprint::CodexPreludeFeed::default());
+    let index = page(index, &restarted);
+    page(index, &restarted);
+    assert_eq!(metric(&restarted, "codex_prelude_unseen_prefix"), 1);
+    assert_eq!(metric(&restarted, "pending"), 0);
+    assert_eq!(Recorder::default().declared_heap_bytes(), 64 * 1024);
+    assert_eq!(
+        feed.observer(std::slice::from_ref(&sessions))
+            .declared_heap_bytes(),
+        256 * 1024
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_symlinked_root_leaf_resolves_home_and_delivers_lines() {
+    let root = Root::new("prelude-symlink-root");
+    let home = root.0.join("home");
+    let real = root.0.join("relocated");
+    fs::create_dir(&home).unwrap();
+    fs::create_dir(&real).unwrap();
+    let sessions = home.join("sessions");
+    std::os::unix::fs::symlink(&real, &sessions).unwrap();
+    let id = "019fa111-2222-7333-8444-555555555555";
+    let path = real.join(format!("rollout-2026-10-07T10-00-00-{id}.jsonl"));
+    let data = [raw(&json!({"type":"session_meta","timestamp":"2026-10-07T10:00:00Z","payload":{"id":id,"cwd":home,"context_window":200000}})), b"\n".to_vec(), raw(&json!({"type":"event_msg","timestamp":"2026-10-07T10:00:01Z","payload":{"type":"token_count","info":{"model":"gpt-5","model_context_window":200000,"last_token_usage":{"input_tokens":100,"output_tokens":2},"total_token_usage":{"input_tokens":100,"output_tokens":2}}}})), b"\n".to_vec()].concat();
+    fs::write(path, data).unwrap();
+    let feed = Arc::new(crate::codex_prelude_footprint::CodexPreludeFeed::default());
+    let scan = OwnedSourceScan::new(
+        SnapshotSource::Codex,
+        std::slice::from_ref(&sessions),
+        ScanIndex::default(),
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+        10,
+        false,
+        None,
+        &[],
+        false,
+        true,
+    )
+    .with_line_observer(
+        "codex_prelude",
+        feed.observer(std::slice::from_ref(&sessions)),
+    );
+    let (_, counts) = capture(|| finish(scan));
+    assert!(feed
+        .metrics()
+        .split_whitespace()
+        .any(|m| m == "feed_files=1"));
+    assert!(feed
+        .metrics()
+        .split_whitespace()
+        .any(|m| m == "root_missing=0"));
+    assert!(
+        page_counts(&counts)["line_delivery"]["codex_prelude"]["lines"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+    );
+}
+
+/// Drive the physical reader into the live production observer. The second
+/// fixture reader starts at the last complete newline after an actual append;
+/// this checks delivery, not acquisition's sealed-fragment restart policy.
+#[test]
+fn codex_live_observer_waits_for_the_physical_newline_then_observes_once() {
+    use std::io::{Seek, SeekFrom};
+    let root = Root::new("prelude-live-newline");
+    let path = root.file("fixture");
+    let meta = raw(
+        &json!({"type":"session_meta","payload":{"id":"live","cwd":root.0,"context_window":200000}}),
+    );
+    let usage = raw(&json!({"type":"token_usage_record","payload":{"usage":{"input_tokens":17}}}));
+    fs::write(
+        &path,
+        [meta.clone(), b"\n".to_vec(), usage.clone()].concat(),
+    )
+    .unwrap();
+    let (object, held) = FileObject::of(&fs::File::open(&path).unwrap()).unwrap();
+    let view = FileView {
+        source: SnapshotSource::Codex,
+        object,
+        mtime: held.modified().ok(),
+        mode: DeliveryMode::Full,
+        root: Some(0),
+        start: 0,
+    };
+    let roots = [root.projects()];
+    let feed = Arc::new(crate::codex_prelude_footprint::CodexPreludeFeed::default());
+    let mut observer = feed.observer(&roots);
+    assert_eq!(observer.begin(&view), Want::Lines);
+    let mut reader = BoundedJsonlReader::new(
+        std::io::BufReader::new(fs::File::open(&path).unwrap()),
+        1024,
+        false,
+    );
+    let mut delivered = Vec::new();
+    loop {
+        let step = reader
+            .step_lines(
+                |_| {},
+                Some(&mut |_, line: &PhysicalLine<'_>| {
+                    delivered.push((line.end, line.value.cloned()));
+                    observer.line(&view, line);
+                }),
+            )
+            .unwrap();
+        if matches!(step, JsonlReaderStep::Complete(_)) {
+            break;
+        }
+    }
+    observer.end(&view, &DeliveryEnd::Complete);
+    let complete_end = meta.len() as u64 + 1;
+    assert_eq!(
+        delivered,
+        vec![(complete_end, Some(serde_json::from_slice(&meta).unwrap()))]
+    );
+    assert!(feed.done_for_test().is_empty());
+    assert_eq!(metric(&feed, "pending"), 1);
+    append(&path, b"\n");
+    let mut file = fs::File::open(&path).unwrap();
+    file.seek(SeekFrom::Start(complete_end)).unwrap();
+    let tail = FileView {
+        mode: DeliveryMode::Tail,
+        start: complete_end,
+        ..view
+    };
+    let mut observer = feed.observer(&roots);
+    assert_eq!(observer.begin(&tail), Want::Lines);
+    let mut reader = BoundedJsonlReader::new(std::io::BufReader::new(file), 1024, false);
+    let mut appended = Vec::new();
+    loop {
+        let step = reader
+            .step_lines(
+                |_| {},
+                Some(&mut |_, line: &PhysicalLine<'_>| {
+                    // An unplanned test reader starts at zero; LD adds ReadPlan.start
+                    // in production. Supply that same absolute origin for this Tail.
+                    let line = PhysicalLine {
+                        end: complete_end + line.end,
+                        ..*line
+                    };
+                    appended.push(line.value.cloned());
+                    observer.line(&tail, &line);
+                }),
+            )
+            .unwrap();
+        if matches!(step, JsonlReaderStep::Complete(_)) {
+            break;
+        }
+    }
+    observer.end(&tail, &DeliveryEnd::Complete);
+    assert_eq!(
+        appended,
+        vec![Some(serde_json::from_slice(&usage).unwrap())]
+    );
+    let done = feed.done_for_test();
+    assert_eq!(done.len(), 1);
+    assert_eq!(done[0].1.first_input_tokens, Some(17));
+    assert_eq!(metric(&feed, "pending"), 0);
+    assert_eq!(metric(&feed, "codex_prelude_gap_dropped"), 0);
+    let mut observer = feed.observer(&roots);
+    assert_eq!(
+        observer.begin(&FileView {
+            start: fs::metadata(&path).unwrap().len(),
+            ..tail
+        }),
+        Want::Skip
+    );
+    observer.end(&tail, &DeliveryEnd::Complete);
+    assert_eq!(feed.done_for_test().len(), 1);
+}
+
+#[test]
+fn codex_live_observer_skips_an_actual_overlong_row_before_terminal_usage() {
+    let root = Root::new("prelude-live-overlong");
+    let path = root.file("fixture");
+    let meta = raw(
+        &json!({"type":"session_meta","payload":{"id":"live","cwd":root.0,"context_window":200000}}),
+    );
+    let oversized = raw(
+        &json!({"type":"token_usage_record","padding":"x".repeat(4096),"payload":{"usage":{"input_tokens":777}}}),
+    );
+    let usage = raw(&json!({"type":"token_usage_record","payload":{"usage":{"input_tokens":19}}}));
+    fs::write(
+        &path,
+        [
+            meta,
+            b"\n".to_vec(),
+            oversized,
+            b"\n".to_vec(),
+            usage,
+            b"\n".to_vec(),
+        ]
+        .concat(),
+    )
+    .unwrap();
+    let (object, held) = FileObject::of(&fs::File::open(&path).unwrap()).unwrap();
+    let view = FileView {
+        source: SnapshotSource::Codex,
+        object,
+        mtime: held.modified().ok(),
+        mode: DeliveryMode::Full,
+        root: Some(0),
+        start: 0,
+    };
+    let feed = Arc::new(crate::codex_prelude_footprint::CodexPreludeFeed::default());
+    let mut observer = feed.observer(&[root.projects()]);
+    assert_eq!(observer.begin(&view), Want::Lines);
+    let mut reader = BoundedJsonlReader::new(
+        std::io::BufReader::with_capacity(64, fs::File::open(&path).unwrap()),
+        1024,
+        true,
+    );
+    reader.set_chunked_skip(64);
+    let mut delivered = Vec::new();
+    let report = loop {
+        let step = reader
+            .step_lines(
+                |_| {},
+                Some(&mut |_, line: &PhysicalLine<'_>| {
+                    delivered.push((line.end, line.value.cloned()));
+                    observer.line(&view, line);
+                }),
+            )
+            .unwrap();
+        if let JsonlReaderStep::Complete(report) = step {
+            break report;
+        }
+    };
+    observer.end(&view, &DeliveryEnd::Complete);
+    assert_eq!(report.over_line_cap_count, 1);
+    assert_eq!(delivered.len(), 3);
+    assert_eq!(delivered[0].1.as_ref().unwrap()["type"], "session_meta");
+    assert_eq!(delivered[1].1, None);
+    assert_eq!(
+        delivered[2].1.as_ref().unwrap()["payload"]["usage"]["input_tokens"],
+        19
+    );
+    assert_eq!(delivered[2].0, fs::metadata(&path).unwrap().len());
+    let done = feed.done_for_test();
+    assert_eq!(done.len(), 1);
+    assert_eq!(
+        done[0].1.first_input_tokens,
+        Some(19),
+        "777 must not terminate the live observer"
+    );
+    assert_eq!(metric(&feed, "codex_prelude_gap_dropped"), 0);
 }

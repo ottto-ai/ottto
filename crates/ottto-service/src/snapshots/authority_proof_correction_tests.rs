@@ -887,7 +887,6 @@ fn apc_empty_page(
         SnapshotSource::ClaudeCode,
         &mut scan,
         index,
-        true,
         snapshot_upload_body_witness,
     );
     assert!(scan.snapshots.is_empty(), "an empty parse offers no body");
@@ -1246,7 +1245,6 @@ fn a1_earlier_partial_empty_page_advances_only_the_map_then_a_complete_census_dr
         SnapshotSource::ClaudeCode,
         &mut scan,
         &mut index,
-        true,
         snapshot_upload_body_witness,
     );
     let outside = apc_outside(&index);
@@ -1766,7 +1764,6 @@ fn cutoff_only_completion_carries_its_selected_empty_facts_or_stays_owed() {
             SnapshotSource::ClaudeCode,
             &mut scan,
             &mut index,
-            true,
             snapshot_upload_body_witness,
         );
         if rollback {
@@ -1859,7 +1856,6 @@ fn partial_cutoff_keeps_the_remaining_body_on_the_exact_ack_path() {
             SnapshotSource::ClaudeCode,
             &mut scan,
             &mut index,
-            true,
             snapshot_upload_body_witness,
         );
         index.settle_cutoff_claude_proof_corrections(&cutoff_candidates);

@@ -926,9 +926,12 @@ impl Host for ProductionHost<'_> {
         Some(destination_digest(&namespace))
     }
     fn authority(&mut self) -> Option<[u8; 32]> {
-        let current = ottto_core::FileDeviceStore::default().load().ok()??;
+        let current = crate::local_resource_diagnostics::credential_file_read(
+            ottto_core::FileDeviceStore::default().load(),
+        )
+        .ok()??;
         let account = self.daemon.snapshot_scan_account_witness().ok()?;
-        current_authority(&current, &snapshot_api_base_url(), &account)
+        current_authority(&current, &snapshot_api_base_url().ok()?, &account)
     }
     fn complete_eof(&mut self, completion: EofCompletion) -> Result<()> {
         let completed = completion

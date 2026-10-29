@@ -604,6 +604,10 @@ crate::durable_tail_codec::durable_struct!(SessionStartState {
 });
 
 impl SessionStartState {
+    pub(super) fn client_version(&self) -> Option<&str> {
+        self.client_version.as_deref()
+    }
+
     pub(super) fn note_user_turn(&mut self) {
         self.user_turns = (self.user_turns + 1).min(2);
     }

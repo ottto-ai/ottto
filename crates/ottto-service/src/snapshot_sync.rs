@@ -677,17 +677,20 @@ fn commit_completed_with_local_holds(
     progress_blocking: bool,
     held_family_roots: Option<&BTreeSet<String>>,
 ) -> ScanIndex {
-    if !progress_blocking
-        && index.locally_held_keys_restorable(
+    if !progress_blocking {
+        if index.locally_held_keys_restorable(
             committed_index,
             locally_held_fingerprints,
             account_deferred_held_fingerprints,
-        )
-    {
-        return index.into_locally_held_keys_reverted(
-            committed_index,
-            locally_held_fingerprints,
-            account_deferred_held_fingerprints,
+        ) {
+            return index.into_locally_held_keys_reverted(
+                committed_index,
+                locally_held_fingerprints,
+                account_deferred_held_fingerprints,
+            );
+        }
+        crate::local_resource_diagnostics::claude_reread::held_reason(
+            crate::local_resource_diagnostics::claude_reread::HeldReason::NotRestorable,
         );
     }
     let mut accepted_fingerprints = upload_progress.accepted_fingerprints.clone();
@@ -3316,6 +3319,7 @@ struct SyncCounts {
     over_line_cap_count: u64,
     recognized_usage_drop_count: u64,
     ownership_incomplete_file_count: u64,
+    causes: crate::snapshots::ownership_diagnostics::Summary,
     snapshot_unproven_terminal_count: u64,
     snapshot_superseded_terminal_count: u64,
     cooldown_conflict_deferred: usize,
@@ -3439,6 +3443,9 @@ impl SyncCounts {
             over_line_cap_count: scan_result.over_line_cap_count as u64,
             recognized_usage_drop_count: scan_result.recognized_usage_drop_count as u64,
             ownership_incomplete_file_count: scan_result.ownership_incomplete_file_count as u64,
+            causes: scan_result
+                .causes
+                .summary(scan_result.ownership_incomplete_file_count),
             snapshot_unproven_terminal_count: 0,
             snapshot_superseded_terminal_count: 0,
             cooldown_conflict_deferred: 0,
@@ -3466,7 +3473,7 @@ impl SyncCounts {
     }
 
     fn terminal_census_line(&self, source: &str) -> String {
-        format!(
+        let mut line = format!(
             "snapshot terminal_census source={source} census_complete={} scanned_files={} \
              uploaded={} unproven_terminal={} superseded_terminal={} \
              ownership_incomplete_files={} zero_snapshot_usage_evidence_files={} \
@@ -3482,7 +3489,11 @@ impl SyncCounts {
             self.cooldown_conflict_deferred,
             crate::snapshots::terminal_contract_retry::local_count(),
             crate::snapshots::terminal_contract_retry::exhausted_count(),
-        )
+        );
+        if source == "codex" {
+            line.push_str(&crate::snapshots::ownership_diagnostics::line(self.causes));
+        }
+        line
     }
 
     fn with_snapshot_terminal_counts(mut self, index: &ScanIndex) -> Self {
@@ -4251,7 +4262,7 @@ fn sync_once_with_retry(
     let account_witness = daemon
         .snapshot_scan_account_witness()
         .map_err(|_| anyhow!("snapshot account authority unavailable"))?;
-    let client = snapshot_cycle_client(support_dir, daemon);
+    let client = snapshot_cycle_client(support_dir, daemon)?;
     let enabled_sources = enabled_snapshot_sources(&device);
 
     if let Some(source) = enabled_sources.first().copied() {
@@ -4332,7 +4343,7 @@ fn sync_once_with_retry(
 }
 
 /// The cycle's API client, with the receipt state and context every cycle uses.
-fn snapshot_cycle_client(support_dir: &Path, daemon: &LocalDaemon) -> SnapshotApiClient {
+fn snapshot_cycle_client(support_dir: &Path, daemon: &LocalDaemon) -> Result<SnapshotApiClient> {
     let device_label = daemon
         .machine_for_trusted_client()
         .ok()
@@ -4341,9 +4352,9 @@ fn snapshot_cycle_client(support_dir: &Path, daemon: &LocalDaemon) -> SnapshotAp
         .account_for_trusted_client()
         .ok()
         .map(|account| account.state);
-    SnapshotApiClient::new(snapshot_api_base_url())
+    Ok(SnapshotApiClient::new(snapshot_api_base_url()?)
         .with_receipt_state_dir(support_dir)
-        .with_receipt_context(device_label, account_binding)
+        .with_receipt_context(device_label, account_binding))
 }
 
 /// A continuation job's EOF completion, called with `SNAPSHOT_SYNC_LOCK` held:
@@ -4367,7 +4378,7 @@ fn complete_continuation_eof(
     let account_witness = daemon
         .snapshot_scan_account_witness()
         .map_err(|_| anyhow!("snapshot account authority unavailable"))?;
-    let client = snapshot_cycle_client(support_dir, daemon);
+    let client = snapshot_cycle_client(support_dir, daemon)?;
     let mut transport_cycle = crate::net_resilience::TransportCycleOutcome::default();
     let mut failed_sources = Vec::new();
     SnapshotCycleOwner {
@@ -4631,7 +4642,7 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
         // Read before the scan is consumed; kept only if the finish succeeds.
         let continuation_ticket =
             (continuation::ENABLED && source == SnapshotSource::Codex).then(|| {
-                let endpoint = snapshot_api_base_url();
+                let endpoint = snapshot_api_base_url().ok()?;
                 let authority = self
                     .client
                     .matches_api_base(&endpoint)
@@ -4655,7 +4666,13 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
                     continuation::ticket_lifetime(self.codex_started),
                 )
                 // K2: moved out only when a ticket was minted.
-                .map(|ticket| ticket.with_inputs(take_continuation_inputs(&mut completed.0)))
+                .map(|ticket| {
+                    ticket.with_inputs(take_continuation_inputs(
+                        &mut completed.0,
+                        &self.daemon.codex_preludes,
+                        self.daemon.codex_versions.clone(),
+                    ))
+                })
             });
         let finished = crate::local_resource_diagnostics::source_finish(source.api_slug(), || {
             self.finish_completed(completed)
@@ -4691,14 +4708,18 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
         self.started.elapsed()
     }
     fn retained_bound(&self, limit: usize) -> Option<usize> {
+        let versions = crate::heap_layout_bound::bound(&self.daemon.codex_versions, limit)?;
         let native = if crate::snapshots::claude_native_comparison::enabled() {
-            self.daemon.native_comparison.retained_bound(limit)?
+            self.daemon
+                .native_comparison
+                .retained_bound(limit.checked_sub(versions)?)?
         } else {
             0
         };
+        let owned = versions.checked_add(native)?;
         // Stage 1 (K2): a held continuation ticket's inputs; zero while inert.
-        let continuation = continuation::retained_bound(limit.checked_sub(native)?)?;
-        native.checked_add(continuation)
+        let continuation = continuation::retained_bound(limit.checked_sub(owned)?)?;
+        owned.checked_add(continuation)
     }
     fn discard_retained(&mut self) {
         if crate::snapshots::claude_native_comparison::enabled() {
@@ -4720,7 +4741,7 @@ pub fn upload_local_health_projection_now(daemon: &LocalDaemon) -> Result<()> {
     let Some(source) = enabled_snapshot_sources(&device).first().copied() else {
         return Err(anyhow!("registered device has no enabled sources"));
     };
-    let client = SnapshotApiClient::new(snapshot_api_base_url());
+    let client = SnapshotApiClient::new(snapshot_api_base_url()?);
     upload_local_health_projection_reporting(
         &client,
         &device,
@@ -4742,7 +4763,7 @@ fn upload_local_health_projection_reporting(
     // The binding this pass's requests are for, captured before any of them.
     // A failure is recorded against it, never against a setup run attached
     // while a request was in flight.
-    let binding = setup_run_refresh_binding(device, device_secret, source);
+    let binding = setup_run_refresh_binding(device, device_secret, source)?;
     let relay_binding = client.relay_auth_binding(device, device_secret, source);
     if let Some(held) = setup_run_refresh_hold_for(&binding) {
         // No request at all while held: the last `AuthRejected` upload event
@@ -4878,14 +4899,14 @@ fn setup_run_refresh_binding(
     device: &LocalDeviceBinding,
     device_secret: &str,
     source: SnapshotSource,
-) -> [u8; 32] {
+) -> Result<[u8; 32]> {
     let mut digest = Sha256::new();
     digest.update(b"ottto:setup-run-refresh-hold:v1\0");
     digest.update(device.device_id.as_bytes());
     digest.update(b"\0");
     digest.update(device_secret.as_bytes());
     digest.update(crate::relay_auth::binding_key(
-        &snapshot_api_base_url(),
+        &snapshot_api_base_url()?,
         device,
         device_secret,
         source.api_slug(),
@@ -4896,7 +4917,7 @@ fn setup_run_refresh_binding(
         digest.update(b"\0");
         digest.update(connection.api_base_url.as_bytes());
     }
-    digest.finalize().into()
+    Ok(digest.finalize().into())
 }
 
 fn setup_run_refresh_hold_duration(failures: u32) -> Duration {
@@ -5066,7 +5087,7 @@ pub fn upload_agent_status_snapshots(snapshots: &[AgentStatusSnapshot]) -> Resul
     let Some(machine_id) = snapshot_machine_id(&device)? else {
         return Err(anyhow!("machine identity is missing"));
     };
-    let client = SnapshotApiClient::new(snapshot_api_base_url());
+    let client = SnapshotApiClient::new(snapshot_api_base_url()?);
 
     let mut uploaded = 0;
     let mut failed_sources = Vec::new();
@@ -5085,7 +5106,7 @@ pub fn upload_agent_status_snapshots(snapshots: &[AgentStatusSnapshot]) -> Resul
         if source_snapshots.is_empty() {
             continue;
         }
-        let relay_token = match client.issue_relay_token(&device, &device_secret, source) {
+        let relay_token = match client.issue_status_relay_token(&device, &device_secret, source) {
             Ok(token) => token,
             Err(error) => {
                 transport_cycle.note_error(&error);
@@ -5462,17 +5483,7 @@ impl SourcePreparation {
                 }
                 SourcePreparationStep::Refused(self, reason)
             }
-            Ok(crate::snapshots::OwnedSourceScanStep::Pending(mut next)) => {
-                if next
-                    .persist_reread_reservations(&mut self.committed_index, &self.index_path)
-                    .is_err()
-                {
-                    self.scan = Some(next);
-                    return SourcePreparationStep::Refused(
-                        self,
-                        crate::source_rotation::LocalRefusal("reread reservation save refused"),
-                    );
-                }
+            Ok(crate::snapshots::OwnedSourceScanStep::Pending(next)) => {
                 self.scan = Some(next);
                 SourcePreparationStep::Pending(self)
             }
@@ -5664,20 +5675,6 @@ fn try_collect_native_preparation_with_rotation_observed(
     }
     owner.completed.context("owned source completion")
 }
-/// This cycle's contract-5 permit, from its authenticated hint only. Never
-/// cached across cycles, so a revoked token takes effect on the next fetch;
-/// prepare (capture) and finish (emission) both derive it here.
-fn cycle_request_identity_permit(
-    source: SnapshotSource,
-    activity_hint: &crate::snapshot_client::ActivityHintResponse,
-) -> Option<crate::snapshots::claude_request_identity::EmissionPermit> {
-    crate::snapshots::claude_request_identity::emission_permit(
-        source,
-        activity_hint.session_request_identity_contract.as_deref(),
-    )
-    .ok()
-}
-
 /// The upload-context fingerprint a cycle activates on its index (pure; the
 /// ordinary prepare and a Stage 1 continuation page share it).
 fn cycle_upload_context(
@@ -5839,47 +5836,22 @@ fn prepare_sync_source_inner(
         diagnostic.emit();
     }
     let scan_started_at = current_rfc3339();
-    let count_failure = |error, fetch| {
-        if source == SnapshotSource::ClaudeCode {
-            claude_contract::note(|counts| {
-                let permit = &mut counts.request_identity_permit;
-                if fetch {
-                    permit.fetch_failed += 1;
-                } else {
-                    permit.hint_failed += 1;
-                }
-            });
-        }
-        error
-    };
-    let relay_token = client
-        .issue_relay_token(device, device_secret, source)
-        .map_err(|error| count_failure(error, true))?;
-    let mut activity_hint = client
-        .get_activity_hint(&relay_token)
-        .map_err(|error| count_failure(error, false))?;
+    let relay_token = client.issue_status_relay_token(device, device_secret, source)?;
+    let mut activity_hint = client.get_activity_hint(&relay_token)?;
     // Treat the activity hint as the only authority for the semantic evidence
     // window. Missing/malformed hints already fail JSON decoding; future
     // out-of-contract widths fail here before any scan or receipt can
     // manufacture a fallback policy. Zero is an explicit tombstone control.
-    let receipt_window_days = validated_receipt_window_days(activity_hint.backfill_window_days)
-        .map_err(|error| count_failure(error, false))?;
+    let receipt_window_days = validated_receipt_window_days(activity_hint.backfill_window_days)?;
     let context_curve_enabled = source != SnapshotSource::Pi
         && activity_hint.session_context_curve_contract.as_deref()
             == Some(CONTEXT_CURVE_CONTRACT_VERSION);
     let cache_observations_enabled = source != SnapshotSource::Pi
         && activity_hint.session_cache_observations_contract.as_deref()
             == Some("session_cache_observations:v1");
-    // Contract-5 marker capture and the Desktop census witness are local work
-    // only an emitting cycle uses, so they follow this cycle's permit, not the
-    // compiled switch alone. Finish recomputes the permit from the same hint.
-    let request_identity_capture = cycle_request_identity_permit(source, &activity_hint).is_some();
-    if source == SnapshotSource::ClaudeCode {
-        claude_contract::note(|counts| {
-            counts.request_identity_permit.permitted += u64::from(request_identity_capture);
-            counts.request_identity_permit.denied += u64::from(!request_identity_capture);
-        });
-    }
+    // Contract 5 is always on: every Claude cycle captures markers and keeps
+    // the Desktop census witness; the hint's identity token is never read.
+    let request_identity_capture = crate::snapshots::claude_request_identity::captures(source);
     // The server's scan directive was parsed and discarded before this. It is a
     // cost lever, so it may only lengthen the local cadence (see
     // `negotiated_wait`), never shorten it.
@@ -6236,12 +6208,9 @@ fn prepare_sync_source_inner(
         index.adopt_effective_upload_body_witness_revision_monotonically();
         index.load_claude_reemission_exclusions(support_dir);
         crate::snapshots::claude_request_money::e2::apply_money_rules(&mut index);
-        // Identity adoption lowers paced revision debt. Capture it BEFORE
-        // the committed baseline, so an unaccepted/shed page cannot restore
-        // revision 3 while retaining the newly observed identity contract.
-        index.observe_claude_request_identity_contract(
-            cycle_request_identity_permit(source, &activity_hint).is_some(),
-        );
+        // Observe the always-on contract BEFORE the committed baseline, so an
+        // unaccepted/shed page keeps it and its latch. It re-owes no history.
+        index.observe_claude_request_identity_contract(true);
     }
     let committed_index = index.clone();
     let reoffer_paths =
@@ -6276,6 +6245,7 @@ fn prepare_sync_source_inner(
             &activity_hint,
             &upload_destination_namespace,
             &backfill_state,
+            client.api_base_seal(),
         )
     } else {
         None
@@ -6315,11 +6285,13 @@ fn prepare_sync_source_inner(
         context_curve_enabled,
         request_identity_capture,
     )
-    .with_reread_persistence()
     .with_sampled_acquisition(daemon.transcript_cache.clone(), sampled_scope.clone())
-    .with_codex_side_pass(codex_side_pass);
+    .with_codex_side_pass(codex_side_pass)
+    .with_codex_versions(daemon.codex_versions.clone());
     if source == SnapshotSource::ClaudeCode {
         scan = scan.with_line_observer("footprint", daemon.footprint_cwds.observer());
+    } else if source == SnapshotSource::Codex {
+        scan = scan.with_line_observer("codex_prelude", daemon.codex_preludes.observer(&roots));
     }
     if crate::snapshots::claude_native_comparison::enabled() {
         scan.enable_native_comparison();
@@ -6374,6 +6346,8 @@ fn prepare_sync_source_inner(
 /// every other end. Charged as process-retained memory
 /// (`continuation::retained_bound`).
 struct ContinuationInputs {
+    codex_preludes: std::sync::Arc<crate::codex_prelude_footprint::CodexPreludeFeed>,
+    codex_versions: std::sync::Arc<crate::snapshots::codex_version::CodexVersionFeed>,
     account_witness: [u8; 32],
     activity_hint: crate::snapshot_client::ActivityHintResponse,
     receipt_window_days: u64,
@@ -6388,10 +6362,10 @@ struct ContinuationInputs {
     upload_progress_path: PathBuf,
 }
 
-crate::heap_layout_bound::fields!(ContinuationInputs; account_witness, activity_hint,
+crate::heap_layout_bound::fields!(ContinuationInputs; codex_preludes, account_witness, activity_hint,
     receipt_window_days, context_curve_enabled, cache_observations_enabled,
     scan_agent_status_collection, attribution_context, upload_policy,
-    upload_destination_namespace, receipt_client, index_path, upload_progress_path);
+    upload_destination_namespace, receipt_client, index_path, upload_progress_path; shared codex_versions);
 
 impl ContinuationInputs {
     /// Whether the moved attribution context is present (tests read this
@@ -6406,13 +6380,19 @@ impl ContinuationInputs {
 /// page, taken before its finish. `finish_sync_source` never reads the
 /// attribution context, so moving it out changes nothing for the finish.
 /// Called only while continuation pages are enabled and a ticket was minted.
-fn take_continuation_inputs(preparation: &mut SourcePreparation) -> ContinuationInputs {
+fn take_continuation_inputs(
+    preparation: &mut SourcePreparation,
+    codex_preludes: &std::sync::Arc<crate::codex_prelude_footprint::CodexPreludeFeed>,
+    codex_versions: std::sync::Arc<crate::snapshots::codex_version::CodexVersionFeed>,
+) -> ContinuationInputs {
     let mut activity_hint = preparation.activity_hint.clone();
     // The prepare took the raw key out of its hint already; never keep one.
     if let Some(mut key) = activity_hint.session_attribution_hmac_key.take() {
         key.zeroize();
     }
     ContinuationInputs {
+        codex_preludes: std::sync::Arc::clone(codex_preludes),
+        codex_versions,
         account_witness: preparation.account_witness,
         activity_hint,
         receipt_window_days: preparation.receipt_window_days,
@@ -6685,7 +6665,6 @@ fn prepare_continuation_source(
         ordinary_equivalent,
     )
     .with_continuation_deadline(deadline)
-    .with_reread_persistence()
     .with_sampled_acquisition(
         std::sync::Arc::clone(cache),
         // K5: the ordinary Codex page's scope; Codex never captures.
@@ -6697,7 +6676,9 @@ fn prepare_continuation_source(
             false,
         ),
     )
-    .with_codex_side_pass(Some(codex_side_pass));
+    .with_codex_side_pass(Some(codex_side_pass))
+    .with_line_observer("codex_prelude", inputs.codex_preludes.observer(&roots))
+    .with_codex_versions(inputs.codex_versions.clone());
     Ok(Ok(SourcePreparation {
         native_comparison_reservation: None,
         native_comparison_lease: None,
@@ -6972,7 +6953,6 @@ fn finish_sync_source(
             support_dir,
             &mut scan_result,
             &mut index,
-            cycle_request_identity_permit(source, &activity_hint),
             prepared_claude_evidence,
             comparison_completion.as_mut(),
             native_comparison_lease.as_ref(),
@@ -7138,7 +7118,6 @@ fn finish_sync_source(
         source,
         &mut scan_result,
         &mut index,
-        cycle_request_identity_permit(source, &activity_hint).is_some(),
         |snapshot| {
             let witness = effective_snapshot_upload_body_witness(
                 snapshot,
@@ -8816,28 +8795,13 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
     bool,
     ClaudeLocalEvidenceStats,
 ) {
-    apply_claude_local_evidence_to_scan_with_permit(support_dir, scan_result, index, None)
-}
-
-/// Contract-5 evidence is built only under this cycle's emission permit.
-pub(crate) fn apply_claude_local_evidence_to_scan_with_permit(
-    support_dir: &Path,
-    scan_result: &mut crate::snapshots::SourceScanResult,
-    index: &mut ScanIndex,
-    permit: Option<crate::snapshots::claude_request_identity::EmissionPermit>,
-) -> (
-    crate::snapshots::ClaudeUsageAuthorityDisposition,
-    bool,
-    ClaudeLocalEvidenceStats,
-) {
-    apply_claude_local_evidence_to_scan_with_prepared(support_dir, scan_result, index, permit, None)
+    apply_claude_local_evidence_to_scan_with_prepared(support_dir, scan_result, index, None)
 }
 
 fn apply_claude_local_evidence_to_scan_with_prepared(
     support_dir: &Path,
     scan_result: &mut crate::snapshots::SourceScanResult,
     index: &mut ScanIndex,
-    permit: Option<crate::snapshots::claude_request_identity::EmissionPermit>,
     prepared: Option<PreparedClaudeLocalEvidence>,
 ) -> (
     crate::snapshots::ClaudeUsageAuthorityDisposition,
@@ -8848,7 +8812,6 @@ fn apply_claude_local_evidence_to_scan_with_prepared(
         support_dir,
         scan_result,
         index,
-        permit,
         prepared,
         None,
         None,
@@ -8859,7 +8822,6 @@ fn apply_claude_local_evidence_to_scan_with_comparison(
     support_dir: &Path,
     scan_result: &mut SourceScanResult,
     index: &mut ScanIndex,
-    permit: Option<crate::snapshots::claude_request_identity::EmissionPermit>,
     prepared: Option<PreparedClaudeLocalEvidence>,
     comparison: Option<&mut crate::snapshots::claude_native_comparison::Completion>,
     lease: Option<&crate::snapshots::claude_native_comparison::lifecycle::Lease>,
@@ -8872,7 +8834,6 @@ fn apply_claude_local_evidence_to_scan_with_comparison(
         support_dir,
         scan_result,
         index,
-        permit,
         prepared,
         comparison,
         lease,
@@ -8894,7 +8855,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     support_dir: &Path,
     scan_result: &mut SourceScanResult,
     index: &mut ScanIndex,
-    permit: Option<crate::snapshots::claude_request_identity::EmissionPermit>,
     mut prepared: Option<PreparedClaudeLocalEvidence>,
     mut comparison: Option<&mut crate::snapshots::claude_native_comparison::Completion>,
     lease: Option<&crate::snapshots::claude_native_comparison::lifecycle::Lease>,
@@ -8919,7 +8879,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     {
         fallback.withhold(scan_result);
     }
-    let emission_permitted = permit.is_some();
+    let builds_evidence = crate::snapshots::claude_request_identity::builds_evidence();
     let census_complete = scan_result.census_complete;
     // Preserve this scan's original carrier independently from later request
     // logins; only a fully qualified mixed body may undo the legacy login veto.
@@ -9027,7 +8987,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             if !paired && !crate::claude_local_otel::claude_sidecars_absent(support_dir, session_id)
             {
                 full_rearm_evidence_complete = false;
-                if emission_permitted || request_owned(session_id) {
+                if builds_evidence || request_owned(session_id) {
                     identity_unhealthy_roots.insert(session_id.clone());
                 }
             }
@@ -9083,7 +9043,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             if let Some(rows) = api.evidence.remove(&root_session_id) {
                 veto_api_rows.insert(root_session_id.clone(), rows);
             }
-            if emission_permitted || request_owned(&root_session_id) {
+            if builds_evidence || request_owned(&root_session_id) {
                 identity_unhealthy_roots.insert(root_session_id);
             }
             continue;
@@ -9110,7 +9070,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             stats.exact_request_set_root_count += 1;
         } else {
             stats.request_set_mismatch_root_count += 1;
-            full_rearm_evidence_complete = false;
             stats.api_only_request_count += api_request_ids.difference(&trace_request_ids).count();
             stats.trace_only_request_count +=
                 trace_request_ids.difference(&api_request_ids).count();
@@ -9123,6 +9082,12 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             stats.trace_evidence_row_count += rows.len();
             trace_report.evidence.insert(root_session_id, rows);
         }
+    }
+    if stats.request_set_mismatch_root_count > 0 {
+        index.note_claude_ignored_rearm_veto(
+            &scan_result.census_window_end,
+            crate::local_resource_diagnostics::claude_reread::IgnoredVeto::EvidenceGap.bit(),
+        );
     }
     // E2 side calls need the trace-named owner, so they follow the trace read.
     let side_calls_unresolved = crate::snapshots::claude_request_money::e2::side_calls_page(
@@ -9140,9 +9105,9 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         // families: the same seam keeps their owed history for a later page.
         index.hold_claude_history_for_unhealthy_telemetry_roots(&side_calls_unresolved);
     }
-    // Contract-5 evidence exists only under this cycle's permit; the reported
-    // rebuild then classifies and groups each request as it places it.
-    let identity_evidence = emission_permitted.then(|| {
+    // Contract-5 evidence is always built; the reported rebuild then
+    // classifies and groups each request as it places it.
+    let identity_evidence = builds_evidence.then(|| {
         crate::snapshots::claude_request_identity::ScanEvidence::new(
             &api_report,
             &trace_report,
@@ -9291,12 +9256,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         }
     }
     disposition.mixed_uploads = qualification.mixed;
-    if emission_permitted {
-        // Request identity is not the session owner: admit only this scan's
-        // exact contract-5 bodies, never rewriting a retained owner.
-        for item in &scan_result.snapshots {
-            disposition.mixed_uploads.admit_request_identity(item);
-        }
+    // Request identity is not the session owner: admit only this scan's
+    // exact contract-5 bodies, never rewriting a retained owner.
+    for item in &scan_result.snapshots {
+        disposition.mixed_uploads.admit_request_identity(item);
     }
     stats.identity_complete_session_count = scan_result
         .snapshots
@@ -11089,7 +11052,7 @@ fn collector_checkin_once() -> Result<()> {
     if enabled_sources.is_empty() {
         return Err(anyhow!("registered device has no enabled sources"));
     }
-    let client = SnapshotApiClient::new(snapshot_api_base_url());
+    let client = SnapshotApiClient::new(snapshot_api_base_url()?);
     let mut failed_sources = Vec::new();
     for source in enabled_sources {
         if report_checkin_status_with_fresh_relay_token(
@@ -11140,15 +11103,23 @@ pub(crate) fn enabled_snapshot_sources(device: &LocalDeviceBinding) -> Vec<Snaps
     .collect()
 }
 
-pub(crate) fn snapshot_api_base_url() -> String {
-    normalize_api_base_url(
-        FileConnectionStore::default()
-            .load()
-            .ok()
-            .flatten()
-            .map(|binding| binding.api_base_url),
+pub(crate) fn snapshot_api_base_url() -> Result<String> {
+    snapshot_api_base_url_from(
+        FileConnectionStore::default().load(),
         std::env::var("OTTTO_API_BASE_URL").ok(),
     )
+}
+fn snapshot_api_base_url_from(
+    connection: Result<Option<ottto_core::LocalConnectionBinding>>,
+    env_value: Option<String>,
+) -> Result<String> {
+    // Read/parse/cap errors are not an absent binding: never redirect secrets
+    // to the environment/default destination after a persisted binding fails.
+    let connection = crate::local_resource_diagnostics::connection_binding_read(connection)?;
+    Ok(normalize_api_base_url(
+        connection.map(|binding| binding.api_base_url),
+        env_value,
+    ))
 }
 
 fn normalize_api_base_url(connection_value: Option<String>, env_value: Option<String>) -> String {
@@ -11350,10 +11321,11 @@ fn ensure_snapshot_scan_authority(
             operation: "source authority changed during owned scan",
         })
     };
-    let current = ottto_core::FileDeviceStore::default()
-        .load()
-        .map_err(|_| rejected())?
-        .ok_or_else(rejected)?;
+    let current = crate::local_resource_diagnostics::credential_file_read(
+        ottto_core::FileDeviceStore::default().load(),
+    )
+    .map_err(|_| rejected())?
+    .ok_or_else(rejected)?;
     let account = daemon
         .snapshot_scan_account_witness()
         .map_err(|_| rejected())?;
@@ -11361,7 +11333,7 @@ fn ensure_snapshot_scan_authority(
         expected_device,
         &current,
         source,
-        client.matches_api_base(&snapshot_api_base_url()),
+        client.matches_api_base(&snapshot_api_base_url().map_err(|_| rejected())?),
         expected_account,
         &account,
     )
@@ -11537,7 +11509,9 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("; ");
-    if text.contains("relay device") {
+    if text.contains("connection binding") {
+        "connection binding is unavailable or invalid; reconnect this device".to_string()
+    } else if text.contains("relay device") {
         "relay device credentials are unavailable".to_string()
     } else if text.contains("machine identity") {
         "machine identity is unavailable".to_string()
@@ -11683,7 +11657,6 @@ mod tests {
             None,
             None,
             None,
-            None,
         )
         .unwrap();
         let owner = std::sync::Arc::new(lifecycle::Lifecycle::default());
@@ -11697,7 +11670,6 @@ mod tests {
                 &support,
                 &mut scan,
                 &mut index,
-                None,
                 None,
                 completion.as_mut(),
                 Some(&lease),
@@ -12936,7 +12908,6 @@ mod tests {
                 SnapshotSource::Codex,
                 &mut effective_scan,
                 &mut effective_index,
-                true,
                 |item| {
                     effective_snapshot_upload_body_witness(
                         item,
@@ -13076,7 +13047,6 @@ mod tests {
             SnapshotSource::Codex,
             &mut off,
             &mut index,
-            true,
             |item| {
                 effective_snapshot_upload_body_witness(
                     item,
@@ -13174,7 +13144,6 @@ mod tests {
             SnapshotSource::Codex,
             &mut on,
             &mut index,
-            true,
             |item| {
                 effective_snapshot_upload_body_witness(
                     item,
@@ -13244,7 +13213,6 @@ mod tests {
             SnapshotSource::Codex,
             &mut enriched,
             &mut loaded,
-            true,
             |item| {
                 effective_snapshot_upload_body_witness(
                     item,
@@ -13359,7 +13327,6 @@ mod tests {
             SnapshotSource::Codex,
             &mut next,
             &mut index,
-            true,
             |item| {
                 effective_snapshot_upload_body_witness(
                     item,
@@ -13434,7 +13401,6 @@ mod tests {
             SnapshotSource::Codex,
             &mut retry,
             &mut retry_index,
-            true,
             |item| {
                 effective_snapshot_upload_body_witness(
                     item,
@@ -13555,7 +13521,6 @@ mod tests {
             SnapshotSource::Codex,
             &mut off,
             &mut index,
-            true,
             |item| {
                 effective_snapshot_upload_body_witness(
                     item, &progress, false, false, &legacy, &held,
@@ -13627,7 +13592,6 @@ mod tests {
             SnapshotSource::Codex,
             &mut on,
             &mut index,
-            true,
             |item| {
                 effective_snapshot_upload_body_witness(item, &progress, true, false, &legacy, &held)
             },
@@ -13754,7 +13718,6 @@ mod tests {
             SnapshotSource::Codex,
             &mut repeated,
             &mut index,
-            true,
             |item| {
                 effective_snapshot_upload_body_witness(item, &progress, true, false, &legacy, &held)
             },
@@ -14345,6 +14308,63 @@ mod tests {
             std::fs::write(output, serde_json::to_vec_pretty(&json!({"contract_version":"paired_creator_cache_revision_corpus:v1","cases":cases})).unwrap()).unwrap();
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cache_overcap_byte_trim_witness_network_and_ack_use_identical_completion() {
+        let (patch, prior) =
+            crate::snapshots::cache_overcap_tests::large_prior_and_replacement_fixture();
+        let mut raw = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+        raw.context_curve = None;
+        raw.cache_observations = Some(patch);
+        raw.cache_observations_state = None;
+        let key = cache_session_key(&raw.source_session_id);
+        let mut progress = test_upload_progress();
+        progress
+            .accepted_cache_states
+            .insert(key.clone(), prior.clone());
+        progress
+            .accepted_cache_heads
+            .insert(key.clone(), "e".repeat(64));
+        let witness = effective_snapshot_upload_body_witness(
+            &raw,
+            &progress,
+            true,
+            true,
+            &BTreeSet::new(),
+            &crate::snapshots::ClaudeUsageAuthorityDisposition::default(),
+        );
+        let mut network = raw.clone();
+        prepare_snapshot_cache_for_upload(&mut network, &progress, true, true, &BTreeSet::new());
+        assert_eq!(witness, snapshot_upload_body_witness(&network));
+        assert_eq!(
+            progress.accepted_cache_states[&key], prior,
+            "projection does not advance accepted state"
+        );
+        let wire = network.cache_observations.as_ref().unwrap();
+        assert!(wire.validate());
+        let expected = crate::snapshots::cache_state_from_patch(Some(&prior), wire);
+        assert_eq!(network.cache_observations_state.as_ref(), Some(&expected));
+        assert!(
+            crate::canonical_json::canonicalize(&expected)
+                .unwrap()
+                .len()
+                <= crate::snapshots::cache_observations::MAX_WIRE_BYTES
+        );
+        progress.record_cache_state(&network, false).unwrap();
+        assert_eq!(
+            progress.accepted_cache_states[&key], expected,
+            "ACK completion applies the actual uploaded patch"
+        );
+        progress.record_cache_state(&network, false).unwrap();
+        assert_eq!(
+            progress.accepted_cache_states[&key], expected,
+            "ACK retry is idempotent"
+        );
+        assert!(
+            raw.cache_observations_state.is_none(),
+            "local evidence is retained"
+        );
     }
 
     #[test]
@@ -18290,6 +18310,83 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn endpoint_load_failure_during_scan_is_local_state() {
+        if !crate::test_isolation::run_here() {
+            return;
+        }
+        let root = test_dir("scan-endpoint-load-failure");
+        std::fs::create_dir_all(&root).unwrap();
+        let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+        let device = LocalDeviceBinding {
+            sources: vec!["pi".into()],
+            ..bounded_native_device()
+        };
+        FileDeviceStore::default().save(&device).unwrap();
+        let daemon = test_daemon(&"a".repeat(64));
+        let account = daemon.snapshot_scan_account_witness().unwrap();
+        let client = SnapshotApiClient::new("https://synthetic.invalid");
+        for bytes in [b"invalid-json".to_vec(), vec![b' '; 64 * 1024 + 1]] {
+            std::fs::write(root.join("connection.json"), bytes).unwrap();
+            let load_error = snapshot_api_base_url().unwrap_err();
+            assert_eq!(
+                safe_error(&load_error),
+                "connection binding is unavailable or invalid; reconnect this device"
+            );
+            let error = ensure_snapshot_scan_authority(
+                &device,
+                SnapshotSource::Pi,
+                &client,
+                &account,
+                &daemon,
+            )
+            .unwrap_err();
+            assert_eq!(
+                snapshot_upload_error_class(&error),
+                Some(SnapshotUploadErrorClass::LocalState)
+            );
+            assert_eq!(safe_error(&error), "local snapshot state failed");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn connection_cap_refusal_never_selects_environment_or_default_endpoint() {
+        use std::fs;
+        let root = test_dir("connection-cap-endpoint");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("connection.json");
+        let store = FileConnectionStore::new(&path);
+        let mut bytes = serde_json::to_vec(&serde_json::json!({
+            "setup_run_id": "synthetic", "setup_run_token_expires_at": "synthetic",
+            "machine_id": null, "api_base_url": "https://custom.invalid"
+        }))
+        .unwrap();
+        bytes.resize(64 * 1024, b' ');
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            snapshot_api_base_url_from(store.load(), None).unwrap(),
+            "https://custom.invalid"
+        );
+        bytes.push(b' ');
+        fs::write(&path, &bytes).unwrap();
+        for env in [None, Some("https://fallback.invalid".to_owned())] {
+            let mut client_created = false;
+            let result = snapshot_api_base_url_from(store.load(), env).map(|base| {
+                client_created = true;
+                SnapshotApiClient::new(base)
+            });
+            assert!(result.is_err());
+            assert!(!client_created);
+        }
+        assert_eq!(
+            snapshot_api_base_url_from(Ok(None), Some("https://fallback.invalid".into())).unwrap(),
+            "https://fallback.invalid"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn api_base_url_prefers_persisted_connection_then_env() {
         assert_eq!(
             normalize_api_base_url(
@@ -19890,6 +19987,56 @@ mod tests {
             settled.ownership_incomplete_file_count,
             settled.terminal_ownership_incomplete_file_count
         );
+    }
+
+    #[test]
+    fn completed_hold_reason_names_only_the_actual_failed_restore_branch() {
+        use crate::local_resource_diagnostics::claude_reread::Scope;
+        let key = "/opaque/projects/family-root.jsonl";
+        let scanned = claude_index_with(serde_json::json!({
+            "files": {key: {
+                "size_bytes": 1, "modified_unix_seconds": 2,
+                "source_file_fingerprint": "new-source",
+                "last_snapshot_fingerprint": "held",
+                "scan_identity_version": "semantic_sync:v2"
+            }},
+            "file_snapshot_fingerprints": {key: ["held"]},
+            "claude_usage_family_witnesses": {"family-root": {
+                "evidence_fingerprint": "e".repeat(64),
+                "member_request_id_fingerprints": {},
+                "member_occurrence_fingerprints": {},
+                "assigned_request_id_fingerprints": {}
+            }}
+        }));
+        let held = BTreeSet::from(["held".to_owned()]);
+        for (previous, blocking, expected) in [
+            (
+                ScanIndex::default(),
+                false,
+                serde_json::json!({"not_restorable": 1}),
+            ),
+            (ScanIndex::default(), true, serde_json::json!(null)),
+            (scanned.clone(), false, serde_json::json!(null)),
+        ] {
+            let scope = Scope::begin(true);
+            let committed = commit_completed_with_local_holds(
+                scanned.clone(),
+                &previous,
+                &test_upload_progress(),
+                &held,
+                &BTreeSet::new(),
+                blocking,
+                None,
+            );
+            assert_eq!(
+                committed.bounded_sweep_had_unsettled_upload(),
+                previous.files.is_empty()
+            );
+            assert_eq!(
+                serde_json::to_value(scope.finish()).unwrap()["claude_reread"]["held_reason"],
+                expected
+            );
+        }
     }
 
     /// A completed upload whose holds can still change in this traversal keeps
@@ -22518,9 +22665,6 @@ mod tests {
                 mod oversized_discovery_pipeline_tests {
                     include!("snapshot_sync/oversized_discovery_pipeline_tests.rs");
                 }
-                mod structural_reread_guard_tests {
-                    include!("snapshot_sync/structural_reread_guard_tests.rs");
-                }
             }
         }
     }
@@ -23598,6 +23742,8 @@ mod tests {
     }
     #[test]
     fn claude_p92_typed_mixed_uses_full_enrichment_order() {
+        // Subject: the legacy account path contract 5 now leaves to untagged bodies.
+        let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
         // Legacy session-account wire shape; E2 emits request-owned account partitions.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         use crate::claude_local_otel::ClaudeIdentityDisposition;
@@ -23976,3 +24122,38 @@ crate::heap_layout_bound::fields!(PermanentSnapshotRejection; body_witness, reas
 
 crate::heap_layout_bound::fields!(PreparedTraceRead; generation, report);
 crate::heap_layout_bound::fields!(PreparedClaudeLocalEvidence; sessions, api, api_failed, trace_rows, traces, healthy_roots);
+
+#[cfg(test)]
+mod ownership_census_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_appends_scanner_partition_only_for_codex_and_keeps_unproven_separate() {
+        let mut contributions = [0; 8];
+        contributions[0] = 2;
+        let counts = SyncCounts {
+            ownership_incomplete_file_count: 5,
+            snapshot_unproven_terminal_count: 3,
+            causes: (contributions, [0, 77, 0]),
+            ..SyncCounts::default()
+        };
+        let line = counts.terminal_census_line("codex");
+        assert!(line.contains("unproven_terminal=3"));
+        assert!(line.contains("ownership_incomplete_files=5"));
+        assert!(line.contains("ownership_incomplete_contributions{bucket=\"inventory_hold\"}=2"));
+        assert!(line.contains("ownership_incomplete_generation_start=77"));
+        assert!(!line.contains("ownership_incomplete_distinct_paths{"));
+        assert!(!line.contains("bucket=\"unattributed\""));
+        assert!(
+            line.find("terminal_contract_retry_exhausted=").unwrap()
+                < line
+                    .find("ownership_incomplete_contributions{bucket=")
+                    .unwrap()
+        );
+        for source in ["claude_code", "pi"] {
+            assert!(!counts
+                .terminal_census_line(source)
+                .contains("ownership_incomplete_contributions{bucket="));
+        }
+    }
+}

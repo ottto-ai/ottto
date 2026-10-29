@@ -188,7 +188,7 @@ impl ClientHealthPoster {
         let Some(machine_id) = crate::snapshot_sync::snapshot_machine_id(&device)? else {
             return Err(anyhow!("machine identity is missing"));
         };
-        let api_base_url = crate::snapshot_sync::snapshot_api_base_url();
+        let api_base_url = crate::snapshot_sync::snapshot_api_base_url()?;
         Ok(Self {
             client: SnapshotApiClient::new(api_base_url.clone()),
             destination: destination_identity(&device, &machine_id, &api_base_url),
@@ -502,7 +502,7 @@ fn run_if_due(home: &Path, support_dir: &Path, worktrees: &mut WorktreeCache) ->
     let Some(machine_id) = crate::snapshot_sync::snapshot_machine_id(&device)? else {
         return Err(anyhow!("machine identity is missing"));
     };
-    let api_base_url = crate::snapshot_sync::snapshot_api_base_url();
+    let api_base_url = crate::snapshot_sync::snapshot_api_base_url()?;
     let enabled = crate::snapshot_sync::enabled_snapshot_sources(&device);
     let destination = destination_identity(&device, &machine_id, &api_base_url);
     // Persist attempts before root discovery, identity-state loading or network
@@ -681,7 +681,7 @@ fn print_metrics(source: Source, stats: &SourceStats, now: OffsetDateTime) {
     let at = now.format(&Rfc3339).unwrap_or_default();
     let lines = &stats.lines;
     eprintln!(
-        "context_composition_v2_metrics at={at} source={} bytes_new={} bytes_repair={} bytes_head={} bytes_failed={} files_read={} files_failed={} quarantined={} new_files={} dormant_found={} install_forward_only={} verdict_deferred={} lines={} prefix_skipped={} classifier_skipped={} too_long={} bad_lines={} dropped_calls={} dropped_items={} unnamed_files={} name_lookups_skipped={} web_search_in_call={} scan_errors={} repair_waiting={} repair_waiting_bytes={} repair_restarted={} cold_compacted={} cold_restarted={} bad_state={} agent_resets={} scopes_quarantined={} files_quarantined={} checkpoint_restarts={} pins_rebuilt={} moved={} switched={} archived={} duplicates={} unscoped={} scopes_committed={} scopes_failed={} uploaded={} upload_unchanged={} upload_failed={} upload_dropped_non_v2={} upload_dropped_unsafe={} upload_payload_bytes={} upload_rows_written={} files_checked={} full_read_waiting_files={} full_read_backlog_bytes={} bytes_read={} cut={} cpu_ms={} wall_ms={} peak_accounted_bytes={} state_bytes={}",
+        "context_composition_v2_metrics at={at} source={} bytes_new={} bytes_repair={} bytes_head={} bytes_failed={} files_read={} files_failed={} quarantined={} new_files={} dormant_found={} install_forward_only={} verdict_deferred={} lines={} prefix_skipped={} classifier_skipped={} too_long={} bad_lines={} dropped_calls={} dropped_items={} unnamed_files={} name_lookups_skipped={} web_search_in_call={} scan_errors={} repair_waiting={} repair_waiting_bytes={} repair_restarted={} cold_compacted={} cold_restarted={} bad_state={} agent_resets={} scopes_quarantined={} files_quarantined={} checkpoint_restarts={} pins_rebuilt={} moved={} switched={} archived={} archived_unpinned={} duplicates={} unscoped={} scopes_committed={} scopes_failed={} uploaded={} upload_unchanged={} upload_failed={} upload_dropped_non_v2={} upload_dropped_unsafe={} upload_payload_bytes={} upload_rows_written={} files_checked={} full_read_waiting_files={} full_read_backlog_bytes={} bytes_read={} cut={} cpu_ms={} wall_ms={} peak_accounted_bytes={} state_bytes={}",
         source.label(),
         stats.bytes_new,
         stats.bytes_repair,
@@ -719,6 +719,7 @@ fn print_metrics(source: Source, stats: &SourceStats, now: OffsetDateTime) {
         stats.moved,
         stats.switched,
         stats.archived,
+        stats.archived_unpinned,
         stats.duplicates,
         stats.unscoped,
         stats.scopes_committed,
@@ -895,6 +896,11 @@ pub(super) struct SourceStats {
     /// A larger copy holding the same read bytes took over a pin.
     pub(super) switched: u64,
     pub(super) archived: u64,
+    /// Codex archives (`.jsonl.zst`) found this run with no plain copy and no
+    /// pin: never read while plain, or read and then forgotten after
+    /// `FORGET_MISSING_DAYS`. Composition never decodes an archive
+    /// (`CompressedCompositionUnsupported`).
+    pub(super) archived_unpinned: u64,
     pub(super) duplicates: u64,
     pub(super) unscoped: u64,
     pub(super) scan_errors: u64,
@@ -1516,6 +1522,8 @@ fn run_source_inner(
                 pin.done = true;
                 stats.archived += 1;
             }
+        } else {
+            stats.archived_unpinned += 1;
         }
     }
     index

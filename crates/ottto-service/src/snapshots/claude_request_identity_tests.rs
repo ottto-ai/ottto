@@ -1254,79 +1254,20 @@ fn trace_owned_requests_refuse_before_any_transcript_basis() {
     );
 }
 
+/// Contract 5 is always on for Claude Code and never for Codex or Pi; no
+/// activity-hint token, present, absent or unknown, changes that. Replaces
+/// `contract5_permit_needs_emission_claude_code_and_the_exact_hint_token` and
+/// `contract5_permit_is_revoked_by_the_next_cycles_hint` (the permit and its
+/// exact-token match are retired).
 #[test]
-fn contract5_permit_needs_emission_claude_code_and_the_exact_hint_token() {
-    use identity::CohortDenial;
-    let token = Some(identity::COHORT_HINT_TOKEN);
-    assert_eq!(identity::COHORT_HINT_TOKEN, "own_request_identity_rows:v1");
-    assert!(identity::permit_when(true, SnapshotSource::ClaudeCode, token).is_ok());
-    for (offered, denial) in [
-        (None, CohortDenial::NoToken),
-        (Some(""), CohortDenial::UnknownToken),
-        // The collector name is not the hint token.
-        (Some(identity::COLLECTOR), CohortDenial::UnknownToken),
-        (Some("own_request_identity_rows:v2"), CohortDenial::UnknownToken),
-        (Some(" own_request_identity_rows:v1"), CohortDenial::UnknownToken),
-        (Some("own_request_identity_rows:v1 "), CohortDenial::UnknownToken),
-        (Some("OWN_REQUEST_IDENTITY_ROWS:V1"), CohortDenial::UnknownToken),
-    ] {
-        assert_eq!(
-            identity::permit_when(true, SnapshotSource::ClaudeCode, offered),
-            Err(denial),
-            "{offered:?}"
-        );
-    }
-    for source in [SnapshotSource::Codex, SnapshotSource::Pi] {
-        assert_eq!(
-            identity::permit_when(true, source, token),
-            Err(CohortDenial::OtherSource)
-        );
-    }
-    assert_eq!(
-        identity::permit_when(false, SnapshotSource::ClaudeCode, token),
-        Err(CohortDenial::EmissionDisabled)
-    );
-    // This build: emission is compiled on, so only the exact token permits.
-    assert!(identity::emission_permit(SnapshotSource::ClaudeCode, token).is_ok());
-    for offered in [None, Some(""), Some(" own_request_identity_rows:v1")] {
-        assert!(identity::emission_permit(SnapshotSource::ClaudeCode, offered).is_err());
-    }
-    assert_eq!(
-        identity::emission_permit(SnapshotSource::Codex, token),
-        Err(CohortDenial::OtherSource)
-    );
-}
-
-/// Each cycle's permit comes from that cycle's hint alone: a token dropped by
-/// the server denies on the next fetched cycle, with nothing carried over.
-#[test]
-fn contract5_permit_is_revoked_by_the_next_cycles_hint() {
-    let hint = |extra: &str| -> crate::snapshot_client::ActivityHintResponse {
-        serde_json::from_str(&format!(
-            r#"{{"source":"claude_code","server_time":"2026-10-14T10:00:00Z","last_data_at":null,
-                "record_count_15m":0,"record_count_24h":0,"local_usage_reconciliation_enabled":true,
-                "backfill_window_days":183,"recommended_scan_after":"2026-10-14T10:05:00Z"{extra}}}"#
-        ))
-        .unwrap()
-    };
-    let cycle = |hint: &crate::snapshot_client::ActivityHintResponse| {
-        identity::permit_when(
-            true,
-            SnapshotSource::ClaudeCode,
-            hint.session_request_identity_contract.as_deref(),
-        )
-        .is_ok()
-    };
-    let cycles = [
-        hint(r#","session_request_identity_contract":"own_request_identity_rows:v1""#),
-        hint(r#","session_request_identity_contract":null"#),
-        hint(r#","session_request_identity_contract":"own_request_identity_rows:v1""#),
-        hint(""),
-    ];
-    assert_eq!(
-        cycles.iter().map(cycle).collect::<Vec<_>>(),
-        [true, false, true, false]
-    );
+fn contract5_capture_is_always_on_for_claude_code_only() {
+    assert!(identity::captures(SnapshotSource::ClaudeCode));
+    assert!(!identity::captures(SnapshotSource::Codex));
+    assert!(!identity::captures(SnapshotSource::Pi));
+    // A capturing cycle builds bodies under the full collector; `""` remains
+    // only as a record written by a permit-era build without the permit.
+    assert_eq!(identity::cycle_contract(true), identity::COLLECTOR);
+    assert_eq!(identity::cycle_contract(false), "");
 }
 
 #[test]
@@ -2978,11 +2919,11 @@ fn coverage(
     ledger
 }
 
-// Released builds compile contract-5 emission on (still gated per cycle by the
-// cohort hint token) and keep `transcript_email` and its feed compiled out, and
+// Released builds capture contract 5 for Claude Code always (no cohort
+// token) and keep `transcript_email` and its feed compiled out, and
 // `transcript_sole_login` suppressed independently of the email gate.
 const _: () = assert!(
-    identity::EMISSION_ENABLED
+    identity::captures(SnapshotSource::ClaudeCode)
         && !identity::TRANSCRIPT_EMAIL_ENABLED
         && !identity::TRANSCRIPT_SOLE_LOGIN_ENABLED
 );

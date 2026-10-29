@@ -13,6 +13,53 @@ pub(crate) mod claude_reread;
 pub(crate) mod codex_memo_lifecycle;
 pub(crate) mod codex_side_lifecycle;
 
+/// Closed, content-free refusal labels; cumulative process counters on #799.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub(crate) enum CodexZstCause {
+    #[serde(rename = "CompressedReplayNotAuthorized")]
+    ReplayNotAuthorized,
+    #[serde(rename = "CompressedProofParentUnsupported")]
+    ProofParentUnsupported,
+    #[serde(rename = "CompressedProofChildUnsupported")]
+    ProofChildUnsupported,
+    #[serde(rename = "CompressedParentSideUnsupported")]
+    ParentSideUnsupported,
+    #[serde(rename = "CompressedDurableTailUnsupported")]
+    DurableTailUnsupported,
+    #[serde(rename = "CompressedGroupProbeUnsupported")]
+    GroupProbeUnsupported,
+    #[serde(rename = "CompressedGroupReadUnsupported")]
+    GroupReadUnsupported,
+    #[serde(rename = "CompressedParentLedgerUnbound")]
+    ParentLedgerUnbound,
+    #[serde(rename = "CompressedPhysicalOffsetUnsupported")]
+    PhysicalOffsetUnsupported,
+    #[serde(rename = "CompressedHeaderUnfunded")]
+    HeaderUnfunded,
+    #[serde(rename = "CompressedCompatibilityUnfunded")]
+    CompatibilityUnfunded,
+    #[serde(rename = "CompressedAdmissionRefused")]
+    AdmissionRefused,
+}
+const CODEX_ZST_CAUSES: usize = CodexZstCause::AdmissionRefused as usize + 1;
+static CODEX_ZST_REFUSED: [AtomicU64; CODEX_ZST_CAUSES] =
+    [const { AtomicU64::new(0) }; CODEX_ZST_CAUSES];
+
+pub(crate) fn codex_zst_refused(cause: CodexZstCause) {
+    let counter = &CODEX_ZST_REFUSED[cause as usize];
+    let previous = counter
+        .fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)))
+        .unwrap_or_else(|n| n);
+    traversal_point(
+        "codex_zst_refused",
+        "codex",
+        &BTreeMap::from([(
+            "codex_zst_refused",
+            BTreeMap::from([(cause, previous.saturating_add(1))]),
+        )]),
+    );
+}
+
 /// Nonzero-only counters on the existing native_collection_page line.
 #[derive(Default, Serialize)]
 struct ClaudeRecordCaps {
@@ -114,6 +161,72 @@ pub(crate) fn line_delivery_unselected(source: &str, reason: UnselectedReason) {
 }
 
 const SCHEMA_VERSION: u8 = 2;
+
+pub(crate) fn connection_binding_read<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
+    credential_file_read(result).inspect_err(|_| {
+        traversal_point(
+            "connection_binding_read",
+            "unknown",
+            &serde_json::json!({"connection_binding_unreadable": 1}),
+        );
+    })
+}
+
+#[cfg(not(test))]
+static CREDENTIAL_FILE_CAP_REFUSED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+#[cfg(test)]
+thread_local! {
+    static CREDENTIAL_FILE_CAP_REFUSED: [AtomicU64; 4] = const { [const { AtomicU64::new(0) }; 4] };
+}
+/// Observe typed cap errors before snapshot callers replace their detail.
+/// Ordinary snapshot sync and retained retry use these same authority loads.
+pub(crate) fn credential_file_read<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
+    use ottto_core::{CredentialFileCapRefused, TokenStoreError};
+    let kind = result.as_ref().err().and_then(|error| {
+        error.chain().find_map(|cause| {
+            if let Some(TokenStoreError::OversizeRefused) = cause.downcast_ref::<TokenStoreError>()
+            {
+                return Some(CredentialFileCapRefused::FileSecret);
+            }
+            cause
+                .downcast_ref::<CredentialFileCapRefused>()
+                .or_else(|| {
+                    cause
+                        .downcast_ref::<std::io::Error>()?
+                        .get_ref()?
+                        .downcast_ref::<CredentialFileCapRefused>()
+                })
+                .copied()
+        })
+    });
+    if let Some(kind) = kind {
+        let (slot, file_kind) = match kind {
+            CredentialFileCapRefused::DeviceBinding => (0, "device_binding"),
+            CredentialFileCapRefused::FileSecret => (1, "file_secret"),
+            CredentialFileCapRefused::ConnectionBinding => (2, "connection_binding"),
+            CredentialFileCapRefused::PendingDeviceCredential => (3, "pending_device_credential"),
+        };
+        let increment = |counts: &[AtomicU64; 4]| {
+            counts[slot]
+                .fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)))
+                .map_or(u64::MAX, |n| n.saturating_add(1))
+        };
+        #[cfg(not(test))]
+        let total = increment(&CREDENTIAL_FILE_CAP_REFUSED);
+        #[cfg(test)]
+        let total = CREDENTIAL_FILE_CAP_REFUSED.with(increment);
+        traversal_point(
+            "credential_file_cap_refusal",
+            "unknown",
+            &serde_json::json!({
+                "file_kind": file_kind,
+                "credential_file_cap_refused": 1,
+                "credential_file_cap_refused_total": total,
+            }),
+        );
+    }
+    result
+}
 
 /// Cumulative shared-process totals, NOT events attributed to the finishing
 /// page/source. No CPU/RSS probe, lookup, new collection trigger or wire event.
@@ -248,6 +361,7 @@ pub(crate) struct Probe {
     started: Instant,
     process: Option<ProcessSample>,
     pub(crate) page_events: claude_reread::Counts,
+    pub(crate) full_causes: FullCauses,
     pub(crate) line_delivery: Option<(&'static str, LineDeliveryCounts)>,
 }
 impl Probe {
@@ -256,6 +370,7 @@ impl Probe {
             started: Instant::now(),
             process: process_sample(),
             page_events: Default::default(),
+            full_causes: Default::default(),
             line_delivery: None,
         }
     }
@@ -307,7 +422,7 @@ impl Probe {
                 .filter(|(_, count)| *count > 0)
                 .collect(),
             reread: if claude {
-                self.page_events.with_current()
+                self.page_events.with_current().without_terminal_rearm()
             } else {
                 Default::default()
             },
@@ -340,6 +455,34 @@ impl Probe {
     }
 }
 
+// Terminal scheduling runs after collection. Same carrier, zero scan counts,
+// no process sampling or draining another producer's identity/money counters.
+fn rearm_collection(rearm: claude_reread::Counts) {
+    #[derive(Serialize)]
+    struct Counts {
+        #[serde(flatten)]
+        collection: CollectionCounts,
+        #[serde(flatten)]
+        rearm: claude_reread::Counts,
+    }
+    emit(&Record {
+        schema_version: SCHEMA_VERSION,
+        process_id: std::process::id(),
+        stage: "native_collection_page",
+        source: Source::from_slug("claude_code"),
+        observation: Observation::between(0, None, None),
+        counts: Counts {
+            collection: CollectionCounts {
+                scanned_files: 0,
+                semantic_noops: 0,
+                sampled_acquisition: None,
+                full_causes: Default::default(),
+            },
+            rearm,
+        },
+    });
+}
+
 /// All retained account-pending families, including held/incomplete families;
 /// a conservative local-only gauge, never an authority or eviction decision.
 #[derive(Debug, Serialize)]
@@ -349,9 +492,11 @@ pub(crate) struct ClaudeAccountRetainedPending {
     pub(crate) claude_account_retained_pending_bytes: u64,
 }
 impl crate::heap_layout_bound::HeapLayoutBound for Probe {
-    const INLINE_ONLY: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(
+            &self.full_causes.restore_outcome.miss,
+            c,
+        )
     }
 }
 
@@ -575,7 +720,12 @@ pub(crate) fn claude_reemission_stop_latched(reminder: bool, counts: &impl Seria
     };
     traversal_point(stage, "claude_code", counts);
 }
-fn traversal_point(stage: &'static str, source: &str, counts: &impl Serialize) {
+/// Local alarm (5a1b): durable-store holds, T14 rebuilds, mode repairs and a
+/// disabled store, as [since last, total] counts. No path, id or wire event.
+pub(crate) fn durable_tail_alarm(source: &str, counts: &impl Serialize) {
+    traversal_point("durable_tail_alarm", source, counts);
+}
+pub(crate) fn traversal_point(stage: &'static str, source: &str, counts: &impl Serialize) {
     emit(&Record {
         schema_version: SCHEMA_VERSION,
         process_id: std::process::id(),
@@ -696,7 +846,7 @@ impl NativeDecision {
             "claude_code",
             &Counts {
                 decision: self.0.get(),
-                events: self.1.get().with_current(),
+                events: self.1.get().with_current().without_terminal_rearm(),
             },
         );
     }
@@ -708,6 +858,40 @@ impl crate::heap_layout_bound::HeapLayoutBound for NativeDecision {
     }
 }
 
+/// Per-page restore attempts. A miss class never authorizes a body read.
+#[derive(Debug, Default, Serialize)]
+pub(crate) struct FullCauses {
+    pub(crate) restore_outcome: RestoreCounts,
+}
+impl FullCauses {
+    fn is_empty(&self) -> bool {
+        self.restore_outcome.restored == 0
+            && self.restore_outcome.held == 0
+            && self.restore_outcome.miss.is_empty()
+    }
+}
+#[derive(Debug, Default, Serialize)]
+pub(crate) struct RestoreCounts {
+    #[serde(skip_serializing_if = "is_zero")]
+    restored: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    held: u64,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    miss: BTreeMap<&'static str, u64>,
+}
+impl RestoreCounts {
+    #[cfg(unix)]
+    pub(crate) fn record(&mut self, outcome: &crate::snapshots::sampled_scan::RestoreOutcome) {
+        use crate::snapshots::sampled_scan::RestoreOutcome;
+        let count = match outcome {
+            RestoreOutcome::Restored(_) => &mut self.restored,
+            RestoreOutcome::Held(_) => &mut self.held,
+            RestoreOutcome::Miss(class) => self.miss.entry(class.label()).or_default(),
+        };
+        *count = count.saturating_add(1);
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct CollectionCounts {
     pub(crate) scanned_files: usize,
@@ -716,6 +900,8 @@ pub(crate) struct CollectionCounts {
     /// total filesystem reads: byte counts exclude failed plans, joins,
     /// discovery and sidecars. Selection counts can include failed/repeated plans.
     pub(crate) sampled_acquisition: Option<ReadCounts>,
+    #[serde(skip_serializing_if = "FullCauses::is_empty")]
+    pub(crate) full_causes: FullCauses,
 }
 #[derive(Debug, Serialize)]
 pub(crate) struct ReadCounts {
@@ -1104,7 +1290,184 @@ pub(crate) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<serde_json::Value>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compressed_causes_have_distinct_pinned_indices() {
+        use super::CodexZstCause::*;
+        const ALL: [super::CodexZstCause; super::CODEX_ZST_CAUSES] = [
+            ReplayNotAuthorized,
+            ProofParentUnsupported,
+            ProofChildUnsupported,
+            ParentSideUnsupported,
+            DurableTailUnsupported,
+            GroupProbeUnsupported,
+            GroupReadUnsupported,
+            ParentLedgerUnbound,
+            PhysicalOffsetUnsupported,
+            HeaderUnfunded,
+            CompatibilityUnfunded,
+            AdmissionRefused,
+        ];
+        assert_eq!(ALL.len(), super::CODEX_ZST_CAUSES);
+        for (index, cause) in ALL.iter().enumerate() {
+            assert_eq!(*cause as usize, index);
+        }
+    }
+
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_counts_are_sparse_saturating_and_page_scoped() {
+        use crate::snapshots::sampled_scan::{MissClass, RestoreOutcome};
+        let mut probe = Probe::start();
+        let collection = |full_causes| CollectionCounts {
+            scanned_files: 0,
+            semantic_noops: 0,
+            sampled_acquisition: None,
+            full_causes,
+        };
+        let (_, rows) = capture(|| {
+            probe.collection("codex", collection(Default::default()));
+            probe
+                .full_causes
+                .restore_outcome
+                .record(&RestoreOutcome::Miss(MissClass::Missing));
+            probe
+                .full_causes
+                .restore_outcome
+                .record(&RestoreOutcome::Miss(MissClass::Missing));
+            probe
+                .full_causes
+                .restore_outcome
+                .record(&RestoreOutcome::Held(
+                    crate::durable_tail_store::Refusal::Unknown,
+                ));
+            let counts = std::mem::take(&mut probe.full_causes);
+            probe.collection("codex", collection(counts));
+            let counts = std::mem::take(&mut probe.full_causes);
+            probe.collection("codex", collection(counts));
+        });
+        assert!(rows[0]["counts"].get("full_causes").is_none());
+        let counts = &rows[1]["counts"]["full_causes"]["restore_outcome"];
+        assert_eq!(counts["miss"]["missing"], 2);
+        assert_eq!(counts["held"], 1);
+        assert!(counts.get("restored").is_none());
+        assert_eq!(rows[1]["schema_version"], 2);
+        assert!(rows[1]["counts"]["sampled_acquisition"].is_null());
+        assert!(rows[2]["counts"].get("full_causes").is_none());
+        let counts = &mut probe.full_causes.restore_outcome;
+        counts.held = u64::MAX;
+        counts.record(&RestoreOutcome::Held(
+            crate::durable_tail_store::Refusal::Unknown,
+        ));
+        assert_eq!(counts.held, u64::MAX);
+        counts.restored = 1;
+        let json = serde_json::to_value(&probe.full_causes).unwrap();
+        assert_eq!(json["restore_outcome"]["restored"], 1);
+    }
+
+    #[test]
+    fn connection_binding_failures_are_counted_without_sensitive_detail() {
+        let (_, lines) = capture(|| {
+            assert!(connection_binding_read(Ok::<_, anyhow::Error>(None::<()>))
+                .unwrap()
+                .is_none());
+            assert_eq!(connection_binding_read(Ok(7)).unwrap(), 7);
+            for message in [
+                "open connection binding /private/synthetic",
+                "parse connection binding https://synthetic.invalid",
+            ] {
+                let error =
+                    connection_binding_read::<()>(Err(anyhow::anyhow!(message))).unwrap_err();
+                assert_eq!(error.to_string(), message);
+            }
+            let error = anyhow::Error::new(ottto_core::CredentialFileCapRefused::ConnectionBinding);
+            assert!(connection_binding_read::<()>(Err(error)).is_err());
+        });
+        let unreadable: Vec<_> = lines
+            .iter()
+            .filter(|r| r["stage"] == "connection_binding_read")
+            .collect();
+        assert_eq!(unreadable.len(), 3);
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|r| r["stage"] == "credential_file_cap_refusal")
+                .count(),
+            1
+        );
+        for line in unreadable {
+            assert_eq!(line["schema_version"], 2);
+            assert_eq!(line["source"], "unknown");
+            assert_eq!(
+                line["counts"],
+                serde_json::json!({"connection_binding_unreadable": 1})
+            );
+            let text = line.to_string();
+            assert!(!text.contains("/private") && !text.contains("synthetic.invalid"));
+        }
+    }
+
+    #[test]
+    fn typed_credential_cap_errors_use_existing_carrier_and_preserve_result() {
+        use ottto_core::{CredentialFileCapRefused, FileDeviceStore, TokenStoreError};
+        CREDENTIAL_FILE_CAP_REFUSED.with(|counts| counts.iter().for_each(|n| n.store(0, Relaxed)));
+        let path = std::env::temp_dir().join(format!("credential-carrier-{}", std::process::id()));
+        std::fs::write(&path, vec![b' '; 64 * 1024 + 1]).unwrap();
+        let store = FileDeviceStore::new(&path);
+        let (_, lines) = capture(|| {
+            let error = credential_file_read(store.load()).unwrap_err();
+            assert!(format!("{error:#}").contains("exceeds 64 KiB"));
+            assert!(credential_file_read(store.load_with_credential_generation()).is_err());
+            assert!(
+                credential_file_read(ottto_core::FileConnectionStore::new(&path).load()).is_err()
+            );
+            assert!(credential_file_read(
+                ottto_core::FilePendingDeviceCredentialStore::new(&path).load()
+            )
+            .is_err());
+            // The core secret store preserves this typed variant across its API.
+            let secret: anyhow::Result<()> = Err(TokenStoreError::OversizeRefused.into());
+            assert!(credential_file_read(secret)
+                .unwrap_err()
+                .is::<TokenStoreError>());
+            // Growth refusals carry the same typed inner error through io::Error.
+            let growth: anyhow::Result<()> = Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                CredentialFileCapRefused::FileSecret,
+            )
+            .into());
+            assert!(credential_file_read(growth).is_err());
+            assert_eq!(credential_file_read(Ok(7)).unwrap(), 7);
+            let other: anyhow::Result<()> = Err(anyhow::anyhow!("ordinary read failure"));
+            assert!(credential_file_read(other).is_err());
+        });
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(lines.len(), 6);
+        for (i, line) in lines.iter().enumerate() {
+            assert_eq!(line["schema_version"], 2);
+            assert_eq!(line["stage"], "credential_file_cap_refusal");
+            assert_eq!(line["source"], "unknown");
+            assert_eq!(
+                line["counts"]["file_kind"],
+                match i {
+                    0 | 1 => "device_binding",
+                    2 => "connection_binding",
+                    3 => "pending_device_credential",
+                    _ => "file_secret",
+                }
+            );
+            assert_eq!(line["counts"]["credential_file_cap_refused"], 1);
+            assert_eq!(
+                line["counts"]["credential_file_cap_refused_total"],
+                match i {
+                    0 | 2 | 3 | 4 => 1,
+                    _ => 2,
+                }
+            );
+            assert_eq!(line["counts"].as_object().unwrap().len(), 3);
+        }
+    }
 
     #[test]
     fn history_proof_correction_deferral_is_counted() {
@@ -1557,6 +1920,7 @@ mod tests {
                     scanned_files: 1,
                     semantic_noops: 0,
                     sampled_acquisition: None,
+                    full_causes: Default::default(),
                 },
             );
             probe.collection(
@@ -1565,6 +1929,7 @@ mod tests {
                     scanned_files: 0,
                     semantic_noops: 0,
                     sampled_acquisition: None,
+                    full_causes: Default::default(),
                 },
             );
             let scope = claude_reread::Scope::begin(true);
@@ -1591,6 +1956,75 @@ mod tests {
         for row in rows {
             assert_eq!(row["schema_version"], 2);
             assert!(serde_json::to_string(&row).unwrap().len() < 4096);
+        }
+    }
+
+    #[test]
+    fn terminal_rearm_counts_use_page_carrier_once_and_do_not_drain_other_producers() {
+        let (_, rows) = capture(|| {
+            let scope = claude_reread::Scope::begin(true);
+            claude_record_cap_half_file();
+            claude_reread::clear(claude_reread::ClearSite::OwnedStart, true);
+            claude_reread::terminal_rearm(
+                claude_reread::IgnoredVeto::WithheldAccount.bit(),
+                7,
+                false,
+            );
+            claude_reread::terminal_rearm(0, 0, true);
+            // Zero deltas never manufacture a scheduling row.
+            claude_reread::terminal_rearm(0, 99, false);
+            NativeDecision::new().emit();
+            let counts = scope.finish();
+            assert_eq!(counts.rearm_structural_native_duplicate, 1);
+            assert_eq!(counts.rearm_fingerprints_preserved, 7);
+            // The ordinary page still owns its cap observation. It must not
+            // repeat terminal counters from the parent scope or kept counts.
+            let mut probe = Probe::start();
+            probe.page_events = counts;
+            probe.collection(
+                "claude_code",
+                CollectionCounts {
+                    scanned_files: 1,
+                    semantic_noops: 0,
+                    sampled_acquisition: None,
+                    full_causes: Default::default(),
+                },
+            );
+            // Disabled comparison must omit these fields too.
+            claude_reread::emit_without_lease(counts);
+        });
+        assert_eq!(rows.len(), 5);
+        for row in &rows[..2] {
+            assert_eq!(row["stage"], "native_collection_page");
+            assert_eq!(row["source"], "claude_code");
+            assert_eq!(row["schema_version"], 2);
+            assert_eq!(row["counts"]["scanned_files"], 0);
+            assert_eq!(row["counts"]["semantic_noops"], 0);
+            assert!(row["counts"]
+                .get("claude_money_record_cap_half_files")
+                .is_none());
+        }
+        assert_eq!(
+            rows[0]["counts"]["rearm_veto_ignored"],
+            serde_json::json!({"withheld_account": 1})
+        );
+        assert_eq!(rows[0]["counts"]["rearm_fingerprints_preserved"], 7);
+        assert_eq!(rows[1]["counts"]["rearm_structural_native_duplicate"], 1);
+        assert_eq!(rows[2]["stage"], "native_comparison_decision");
+        assert_eq!(rows[2]["counts"]["claude_reread"]["owned_start_cleared"], 1);
+        assert_eq!(rows[3]["counts"]["claude_money_record_cap_half_files"], 1);
+        assert_eq!(rows[4]["stage"], "native_comparison_decision");
+        for row in &rows[2..] {
+            for key in [
+                "rearm_veto_ignored",
+                "rearm_fingerprints_preserved",
+                "rearm_structural_native_duplicate",
+            ] {
+                assert!(
+                    row["counts"].get(key).is_none(),
+                    "terminal delta repeated: {row}"
+                );
+            }
         }
     }
 
@@ -1773,6 +2207,7 @@ mod tests {
                                 scanned_files: usize::MAX,
                                 semantic_noops: usize::MAX,
                                 sampled_acquisition: Some(max_read_counts()),
+                                full_causes: Default::default(),
                             },
                         );
                     }
@@ -1854,6 +2289,7 @@ mod tests {
                     scanned_files: usize::MAX,
                     semantic_noops: usize::MAX,
                     sampled_acquisition: Some(max_read_counts()),
+                    full_causes: Default::default(),
                 },
             );
             source_finish("secret/path/provider", || Ok(())).unwrap();
