@@ -252,3 +252,8 @@ pub(crate) fn parked_native_opens_for_test() -> Vec<PathBuf> {
 pub(crate) fn refuse_parked_metadata_once_for_test(path: PathBuf) {
     PARKED_METADATA_REFUSAL.with(|slot| *slot.borrow_mut() = Some(path));
 }
+
+#[cfg(test)]
+pub(crate) fn parked_metadata_refusal_consumed_for_test() -> bool {
+    PARKED_METADATA_REFUSAL.with(|slot| slot.borrow().is_none())
+}

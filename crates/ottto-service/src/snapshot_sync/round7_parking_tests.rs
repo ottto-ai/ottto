@@ -499,6 +499,7 @@ fn directory_replacement_after_metadata_refusal_discovers_new_file_without_a_hin
     let refused = std::fs::read_dir(project(&home)).unwrap().nth(offset as usize + 10).unwrap().unwrap().path();
     crate::snapshots::refuse_parked_metadata_once_for_test(refused);
     let (p, i, s) = prepare(&mut home);
+    assert!(crate::snapshots::parked_metadata_refusal_consumed_for_test(), "fixture actually discards the reader on error");
     assert!(!s.census_complete);
     home.finish(p, i, s).unwrap();
     std::fs::rename(project(&home), home.fixture.base.join("retired-project")).unwrap();
