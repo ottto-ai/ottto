@@ -831,6 +831,7 @@ pub fn isolated_test_secret_dir() -> Option<PathBuf> {
     None
 }
 
+#[cfg(target_os = "macos")]
 fn explicit_file_secret_store() -> bool {
     test_secret_store_enabled() || std::env::var_os(OTTTO_SECRET_FALLBACK_DIR_ENV).is_some()
 }

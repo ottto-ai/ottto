@@ -572,7 +572,7 @@ fn codec_views_protect_each_others_records_from_gc_and_overwrite() {
         DurableSource::ClaudeCode,
     );
     assert!(matches!(
-        native.read(&key, &codec::allowlist()),
+        native.read(&key),
         ReadOutcome::Refused(store::Refusal::Unknown)
     ));
     native
@@ -584,7 +584,7 @@ fn codec_views_protect_each_others_records_from_gc_and_overwrite() {
         )
         .unwrap();
     assert!(native.inventory().unwrap().contains(&key));
-    let mut proposed = reader.store.read(&key, &codec::allowlist());
+    let mut proposed = reader.store.read(&key);
     let ReadOutcome::Found(record) = &mut proposed else {
         panic!("real sidecar record");
     };
@@ -627,7 +627,7 @@ fn codec_views_protect_each_others_records_from_gc_and_overwrite() {
         1
     );
     assert!(matches!(
-        reader.store.read(&native_key, &codec::allowlist()),
+        reader.store.read(&native_key),
         ReadOutcome::Refused(store::Refusal::Unknown)
     ));
     let keep = BTreeMap::from([(key, Some(reader.binding("scope").scope))]);

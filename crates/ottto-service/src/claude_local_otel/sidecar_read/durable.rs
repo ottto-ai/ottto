@@ -150,7 +150,7 @@ impl Reader {
     }
     fn restore(&mut self, session: &str) -> io::Result<Pair> {
         let binding = self.binding(session);
-        match self.store.read(&binding.key, &codec::allowlist()) {
+        match self.store.read(&binding.key) {
             ReadOutcome::Missing if self.store.disabled().is_none() => Ok(Pair {
                 parser: codec::PARSER,
                 session: session.into(),
@@ -300,7 +300,7 @@ impl Reader {
     /// Other codec kinds and unknown representations remain untouched.
     pub(super) fn restore_pending(&mut self) -> io::Result<()> {
         for key in self.store.inventory()? {
-            if let ReadOutcome::Found(record) = self.store.read(&key, &codec::allowlist()) {
+            if let ReadOutcome::Found(record) = self.store.read(&key) {
                 if record.index_generation > self.generation
                     || record.record.binding.context != self.context
                 {
