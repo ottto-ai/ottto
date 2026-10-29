@@ -579,8 +579,8 @@ pub(crate) fn collection(
     expires_at: String,
     manual: bool,
 ) -> Result<Arc<AgentStatusCollection>, LocalApiError> {
-    #[cfg(test)]
-    if let Some(collection) = TEST_COLLECTION.with(|slot| slot.borrow().clone()) {
+    #[cfg(any(test, feature = "replay-harness"))]
+    if let Some(collection) = SCOPED_COLLECTION.with(|slot| slot.borrow().clone()) {
         return Ok(collection);
     }
     match owner() {
@@ -642,28 +642,32 @@ pub(crate) fn active() -> bool {
     owner().is_some()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "replay-harness"))]
 thread_local! {
-    static TEST_COLLECTION: std::cell::RefCell<Option<Arc<AgentStatusCollection>>> =
+    static SCOPED_COLLECTION: std::cell::RefCell<Option<Arc<AgentStatusCollection>>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// Runs `run` with `collection` as this thread's status collection, so a test
-/// that drives a sync cycle reads no provider or credential state.
+/// Scoped input for an isolated, synchronous snapshot cycle. Serve never installs
+/// it. Keep the production owner/provider fallback below `collection` unchanged.
+#[cfg(any(test, feature = "replay-harness"))]
+pub(crate) fn with_collection<T>(collection: AgentStatusCollection, run: impl FnOnce() -> T) -> T {
+    struct Reset(Option<Arc<AgentStatusCollection>>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SCOPED_COLLECTION.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let _reset = Reset(SCOPED_COLLECTION.with(|slot| slot.replace(Some(Arc::new(collection)))));
+    run()
+}
+
 #[cfg(test)]
 pub(crate) fn with_test_collection<T>(
     collection: AgentStatusCollection,
     run: impl FnOnce() -> T,
 ) -> T {
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            TEST_COLLECTION.with(|slot| slot.borrow_mut().take());
-        }
-    }
-    TEST_COLLECTION.with(|slot| *slot.borrow_mut() = Some(Arc::new(collection)));
-    let _reset = Reset;
-    run()
+    with_collection(collection, run)
 }
 pub fn request(source: &SourceKind) {
     if let Some(owner) = owner() {
