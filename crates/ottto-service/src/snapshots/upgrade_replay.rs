@@ -45,7 +45,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for KeyHash {
         Some(())
     }
 }
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub(super) struct State {
     replayed: BTreeMap<String, BTreeSet<KeyHash>>,
     closed: bool,
@@ -54,6 +54,17 @@ pub(super) struct State {
     reservations: BTreeMap<KeyHash, (bool, bool)>, // saved, claimed
 }
 crate::heap_layout_bound::fields!(State; replayed, closed, reservations);
+// An index copy carries only negative evidence, never a live permission.
+impl Clone for State {
+    fn clone(&self) -> Self {
+        Self {
+            replayed: self.replayed.clone(),
+            closed: self.closed,
+            reservations: BTreeMap::new(),
+        }
+    }
+}
+
 impl<'de> Deserialize<'de> for State {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
@@ -154,5 +165,30 @@ impl OwnedSourceScan {
         self.index.o3_replay.saved();
         committed.o3_replay.saved();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn saved_upgrade_spend_survives_restart_and_index_copy_without_grant() {
+        let root = crate::test_scratch::private_dir("o3-negative-reservation");
+        let path = root.join("index.json");
+        let mut index = ScanIndex::default();
+        assert!(!index.o3_replay.upgrade_missing("file", true));
+        assert!(index.o3_replay.needs_save());
+        index.save(&path).unwrap();
+        index.o3_replay.saved();
+        let mut copied = index.clone();
+        assert!(!copied.o3_replay.upgrade_missing("file", true));
+        let mut restarted = ScanIndex::load(&path).unwrap();
+        assert!(!restarted.o3_replay.upgrade_missing("file", true));
+        assert!(index.o3_replay.upgrade_missing("file", true));
+        assert!(
+            !index.o3_replay.upgrade_missing("file", true),
+            "one live claim only"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

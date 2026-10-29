@@ -905,10 +905,8 @@ impl RestoreCounts {
             RestoreOutcome::Miss(class) => self.miss.entry(class.label()).or_default(),
             RestoreOutcome::Stale(reason) => self.stale.entry(reason).or_default(),
             RestoreOutcome::StaleUnregistered(reason, obligation) => {
-                let label = crate::snapshots::sampled_scan::durable_tail::MissClass::Unregistered(
-                    *obligation,
-                )
-                .label();
+                let label =
+                    crate::snapshots::sampled_scan::MissClass::Unregistered(*obligation).label();
                 let attribution = self.stale_attribution.entry(label).or_default();
                 *attribution = attribution.saturating_add(1);
                 self.stale.entry(reason).or_default()

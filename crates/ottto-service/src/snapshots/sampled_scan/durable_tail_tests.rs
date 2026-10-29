@@ -5525,7 +5525,15 @@ fn a1t_no_match_growth_full_restart_recounts_without_dropping_or_adding_the_pref
             "{arm}: no Full even on selection clear or mtime-only change"
         );
         assert_eq!(body, 0, "{arm}");
-        assert!(samples.is_empty(), "{arm}: no certificate/body read");
+        if arm == "mtime" {
+            assert_eq!(
+                samples.len(),
+                2,
+                "bounded content evidence, no Full/body read"
+            );
+        } else {
+            assert!(samples.is_empty(), "{arm}: no certificate/body read");
+        }
         assert_eq!(scan.unreadable_path_count, 0, "{arm}: known hold is not RU");
         assert_eq!(
             index.files[&key].last_upload_body_witness,
@@ -8073,7 +8081,11 @@ fn o3_completion_replaces_no_match_idle_zero_restart_tail_and_money_equals_cold(
         });
     assert_eq!(modes, (1, 0, 0));
     assert_eq!(bytes, std::fs::metadata(&f.path).unwrap().len());
-    assert!(samples.is_empty());
+    assert_eq!(
+        samples.len(),
+        4,
+        "bounded old-content probes before reserve and after saved reserve"
+    );
     assert_eq!(scan.unreadable_path_count, 0);
     let counts = owner.cache.durable_counters(source).unwrap().0;
     assert_eq!((counts.migration[2], counts.upgrade_state_missing), (1, 1));

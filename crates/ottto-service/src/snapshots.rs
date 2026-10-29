@@ -3894,7 +3894,8 @@ pub struct ScanIndex {
         deserialize_with = "deserialize_lenient_map"
     )]
     codex_counting_tombstones: BTreeMap<String, codex_counting_version::CountingTombstone>,
-    /// retired_<old>: decode-only placeholder; keeps positional slots; never written.
+    /// Compatibility slot: only O3's negative release/key spend is live.
+    /// Generic reread budgets and selection holds remain retired.
     #[serde(
         rename = "reread_guard",
         default,
