@@ -938,3 +938,98 @@ fn sticky_already_refused_rows_cannot_inflate_the_bound_and_evict_a_fitting_open
     assert_eq!(identity::item_bytes(&padded), identity::MAX_ITEM_BYTES);
     sticky_assert_reconciled(&padded);
 }
+
+#[test]
+fn sticky_unreconcilable_newer_accepted_money_does_not_erase_an_older_joint_pair() {
+    let requests = [
+        display_request(Some("max"), HOUR_10, 1, login_key(OWNER_A), Some(HOUR_10)),
+        display_request(Some("max"), HOUR_11, 1, login_key(OWNER_A), Some(HOUR_11)),
+        display_request(
+            Some("pro"),
+            "2026-09-01T12:00:00Z",
+            1,
+            login_key(D64),
+            Some("2026-09-01T12:00:00Z"),
+        ),
+    ];
+    let (mut item, timed) = display_item(&requests);
+    item.collected_at = "2026-09-01T12:05:00Z".into();
+    item.session_display_name = Some("x".into());
+    item.workspace_display_label = Some("x".into());
+    item.repository_label = Some("x".into());
+    let mut proof = timed.into_iter().map(|(c, _)| c).collect::<Vec<_>>();
+    for index in [0, 2] {
+        item.usage_buckets[index].model_usage[0].cost_usd = Some("0.000001".into());
+        proof[index].usage.costs = UsageCosts {
+            observed: true,
+            reported: true,
+            total: Some(1_000_000),
+            ..Default::default()
+        };
+    }
+    proof[1].usage.costs = UsageCosts {
+        observed: true,
+        reported: false,
+        ..Default::default()
+    };
+    item.model_usage
+        .iter_mut()
+        .find(|row| row.subscription_product.as_deref() == Some("pro"))
+        .unwrap()
+        .cost_usd = Some("0.000001".into());
+    let mut accepted = identity::AcceptedBuckets::default();
+    identity::apply_with_accepted_for_test(&mut item, &proof, &accepted).unwrap();
+    sticky_assert_reconciled(&item);
+    accepted.record(&serde_json::to_value(&item).unwrap());
+    // A new unpriced, untagged pro row cannot poison D64's own known share.
+    let mut unpriced = item.usage_buckets[2].clone();
+    unpriced.bucket_start = "2026-09-01T09:00:00Z".into();
+    let row = &mut unpriced.model_usage[0];
+    row.account_identifier_hash = None;
+    row.evidence_ref = None;
+    row.identity_parts = None;
+    row.cost_usd = None;
+    let mut usage = proof[2].usage.clone();
+    usage.costs = UsageCosts {
+        observed: true,
+        reported: false,
+        ..Default::default()
+    };
+    proof.push(Contribution {
+        bucket_start: unpriced.bucket_start.clone(),
+        row_key: row_key_from_model_usage(row),
+        usage,
+        identity: RequestIdentity::Missing,
+    });
+    item.usage_buckets.push(unpriced);
+    let pro = item
+        .model_usage
+        .iter_mut()
+        .find(|row| row.subscription_product.as_deref() == Some("pro"))
+        .unwrap();
+    pro.input_tokens += 1;
+    pro.request_count += 1;
+    pro.cost_usd = None;
+    let mut clean = stripped(&item);
+    clean.provenance.collector = identity::COLLECTOR.into();
+    let mut pair = clean.clone();
+    let mut pair_proof = proof.clone();
+    pair_proof[2].identity = RequestIdentity::Missing;
+    identity::apply_with_accepted_for_test(
+        &mut pair,
+        &pair_proof,
+        &identity::AcceptedBuckets::default(),
+    )
+    .unwrap();
+    pair.request_identity_refusals = 1;
+    sticky_assert_reconciled(&pair);
+    let extra = identity::item_bytes(&pair) - identity::item_bytes(&clean);
+    let (mut padded, filler_proof) = sticky_pad_to_bytes(&clean, identity::MAX_ITEM_BYTES - extra);
+    proof.extend(filler_proof);
+    identity::apply_with_accepted_for_test(&mut padded, &proof, &accepted).unwrap();
+    assert!(sticky_tagged(&padded.usage_buckets[0].model_usage[0]));
+    assert!(sticky_tagged(&padded.usage_buckets[1].model_usage[0]));
+    assert!(!sticky_tagged(&padded.usage_buckets[2].model_usage[0]));
+    assert_eq!(padded.request_identity_refusals, 1);
+    sticky_assert_reconciled(&padded);
+}

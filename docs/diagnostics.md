@@ -1161,6 +1161,14 @@ lower bound can exclude an impossible bucket before the collective check.
 Row byte deltas and reference widths are updated incrementally; allocation
 does not serialize the growing item for each candidate or removal.
 
+Before eviction, a bounded dependency pass excludes money shares that cannot
+reconcile with an unreported top-level cost. A known tagged cost needs a
+currently proved unpriced share of the same row and authority; an untagged
+residual cannot supply that witness. Missing witnesses propagate through the
+candidate set, with each bucket and dependency removed at most once. This
+prevents an independently impossible bucket from discarding other accepted
+buckets that reconcile only together.
+
 The destination-scoped upload progress stores class L priority hints only:
 hashed session keys and sorted bucket-start timestamps, with no identities.
 Only stored-body ACKs update them; an unchanged response that did not store the

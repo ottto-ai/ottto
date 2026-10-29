@@ -321,6 +321,86 @@ fn intrinsically_fits(
     })
 }
 
+// A known tagged cost under an unreported top row needs an unpriced share
+// of that same row and authority to reconcile. Untagged money cannot provide
+// that witness. Remove impossible candidates before ordered cap eviction;
+// otherwise an independent bad bucket can destroy a jointly valid pair.
+fn money_candidates(
+    item: &SnapshotItem,
+    grouping: &Grouping,
+    row_index: &BTreeMap<RowKey, usize>,
+    mut possible: Vec<bool>,
+) -> Option<Vec<bool>> {
+    #[derive(Default)]
+    struct Node {
+        witnesses: usize,
+        dependents: Vec<usize>,
+    }
+    let mut indexes = BTreeMap::new();
+    let mut nodes: Vec<Node> = Vec::new();
+    let mut witnesses = vec![Vec::new(); possible.len()];
+    for (index, bucket) in item.usage_buckets.iter().enumerate() {
+        if !possible[index] {
+            continue;
+        }
+        let mut required = BTreeSet::new();
+        let mut supplied = BTreeSet::new();
+        for row in &bucket.model_usage {
+            let row_key = row_key_from_model_usage(row);
+            let top = *row_index.get(&row_key)?;
+            let group = grouping.get(&bucket.bucket_start, &row_key)?;
+            for (key, amount) in &group.by_key {
+                let Some(key) = key.as_ref().filter(|_| amount.counts != [0; 8]) else {
+                    continue;
+                };
+                for (field, parent) in row_costs(&item.model_usage[top]).into_iter().enumerate() {
+                    if parent.is_some() {
+                        continue;
+                    }
+                    let node = *indexes.entry((top, key, field)).or_insert_with(|| {
+                        nodes.push(Node::default());
+                        nodes.len() - 1
+                    });
+                    if row_costs(row)[field].is_some() && amount.wire(field).is_some() {
+                        required.insert(node);
+                    } else {
+                        supplied.insert(node);
+                    }
+                }
+            }
+        }
+        for node in required {
+            nodes[node].dependents.push(index);
+        }
+        for node in supplied {
+            nodes[node].witnesses += 1;
+            witnesses[index].push(node);
+        }
+    }
+    // Each bucket and dependency is removed at most once. Propagate missing
+    // witnesses so an impossible candidate cannot certify another candidate.
+    let mut missing = nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, node)| (node.witnesses == 0).then_some(index))
+        .collect::<std::collections::VecDeque<_>>();
+    while let Some(node) = missing.pop_front() {
+        for bucket in std::mem::take(&mut nodes[node].dependents) {
+            if !possible[bucket] {
+                continue;
+            }
+            possible[bucket] = false;
+            for &witness in &witnesses[bucket] {
+                nodes[witness].witnesses -= 1;
+                if nodes[witness].witnesses == 0 {
+                    missing.push_back(witness);
+                }
+            }
+        }
+    }
+    Some(possible)
+}
+
 fn change_bucket(
     item: &SnapshotItem,
     grouping: &Grouping,
@@ -574,15 +654,26 @@ pub(super) fn select(
         .copied()
         .filter(|&index| is_accepted[index])
         .collect::<Vec<_>>();
+    let possible = money_candidates(
+        item,
+        grouping,
+        &row_index,
+        (0..item.usage_buckets.len())
+            .map(|index| {
+                tagged[index]
+                    && intrinsically_fits(
+                        item,
+                        grouping,
+                        index,
+                        base_bytes,
+                        additional_refusal_rows,
+                        mandatory_refusals,
+                    )
+            })
+            .collect(),
+    )?;
     for &index in &accepted_order {
-        if !intrinsically_fits(
-            item,
-            grouping,
-            index,
-            base_bytes,
-            additional_refusal_rows,
-            mandatory_refusals,
-        ) {
+        if !possible[index] {
             continue;
         }
         let Some((next, rows)) =
@@ -608,7 +699,7 @@ pub(super) fn select(
     }
     // One unencodable candidate cannot discard independent accepted proof.
     for index in order {
-        if kept[index] {
+        if kept[index] || !possible[index] {
             continue;
         }
         let Some((next, identities)) =
