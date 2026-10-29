@@ -211,11 +211,13 @@ fn abrupt_helper_death_leaves_child_owning_transaction() {
     // The outer shell models the helper, the inner shell a launchctl child.
     // Both inherit the lock; only the helper is killed. read is a builtin,
     // and closing the gate on any assertion failure makes the child exit.
+    // The gate descriptor must not overwrite the inherited lock descriptor:
+    // its number varies with parallel test activity.
+    let gate_fd = if lock.0.as_raw_fd() == 9 { 8 } else { 9 };
+    let script =
+        format!("exec {gate_fd}<&0; /bin/sh -c 'printf ready; read release' <&{gate_fd} & wait");
     command
-        .args([
-            "-c",
-            "exec 3<&0; /bin/sh -c 'printf ready; read release' <&3 & wait",
-        ])
+        .args(["-c", &script])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped());
     let mut owner = Reap(lock.spawn(&mut command).unwrap());
