@@ -848,7 +848,13 @@ fn authorize_strict(
         // An ambiguous prior receipt still owns its unresolved custody. It is
         // not permission for the freshly verified current record: prove that
         // record independently so later dirty writes can make progress.
-        slot.store.authorize(&record, &expected);
+        if let Some(proof) = prior.as_ref().filter(|p| slot.store.witness_current(p)) {
+            // A current predecessor witness also survives verification-memo
+            // turnover; rebuilding permission must not require a memo slot.
+            slot.store.authorize_witness(&record, &expected, proof);
+        } else {
+            slot.store.authorize(&record, &expected);
+        }
     }
 }
 
