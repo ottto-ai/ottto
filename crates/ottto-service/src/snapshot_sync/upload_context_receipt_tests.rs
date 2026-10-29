@@ -357,12 +357,13 @@ impl Uploader {
     ) {
         activate_source_upload_context(source, context, index, &mut self.progress);
     }
-    pub(crate) fn prepare_for_scan(&mut self, source: SnapshotSource, index: &mut ScanIndex) {
-        self.activate(
-            source,
-            index.active_upload_context_fingerprint.clone().unwrap(),
-            index,
-        );
+    pub(crate) fn prepare_for_scan(
+        &mut self,
+        source: SnapshotSource,
+        context: String,
+        index: &mut ScanIndex,
+    ) {
+        self.activate(source, context, index);
         let replay_generation =
             cycle_replay_generation(source, true, index, "context-real-uploader");
         let now = reason_reoffer::now_unix_seconds();

@@ -182,7 +182,14 @@ impl Fixture {
                     quiet_call + 1
                 );
             }
-            self.uploader.prepare_for_scan(self.source, &mut self.index);
+            self.uploader.prepare_for_scan(
+                self.source,
+                self.index
+                    .active_upload_context_fingerprint
+                    .clone()
+                    .unwrap(),
+                &mut self.index,
+            );
             let previous = self.index.clone();
             let (((scan, bytes), parses), group_bytes) =
                 terminal_contract_retry::group_body_bytes(|| {
