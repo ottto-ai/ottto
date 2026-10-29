@@ -7458,3 +7458,49 @@ fn content_v1_resource_refusal_cannot_hide_equal_edit_or_truncate_then_restart()
         assert_eq!(modes, (0, 0, 0));
     }
 }
+
+/// D-DISABLED and absent stores require no classifier allocation: native
+/// recovery must not wait for unrelated input credit or execute the batch.
+#[test]
+fn absent_and_disabled_member_batches_bypass_unavailable_input_credit() {
+    let _reset = ResetActiveBudget;
+    let root = crate::test_scratch::ScratchDir::new("p3-disabled-probe");
+    let cache = SharedCache::default();
+    let source = SnapshotSource::Codex;
+    let index = ScanIndex::default();
+    store::active::set_active_budget_for_test(Some(0));
+    for absent in [true, false] {
+        if !absent {
+            cache.durable_begin_pass(
+                source,
+                &root.join("index.json"),
+                &Scope("disabled".into()),
+                false,
+            );
+            cache
+                .durable()
+                .unwrap()
+                .slot(DurableSource::Codex)
+                .as_mut()
+                .unwrap()
+                .store
+                .disable("test_disabled");
+        }
+        assert!(!cache
+            .durable_funded_member_batch(source, |_| panic!(
+                "bypassed batch cannot classify or consume grants"
+            ))
+            .unwrap());
+        assert_eq!(
+            cache
+                .durable_carrier_reprobe(source, "key", &index)
+                .unwrap(),
+            None
+        );
+        assert_eq!(cache.durable_full_hold(source, "key", true).unwrap(), None);
+    }
+    let (_, counts) = cache.durable_counters(source).unwrap();
+    assert_eq!(counts.guard_header_bytes, 0);
+    assert_eq!(counts.guard_verify_bytes, 0);
+    assert_eq!(counts.t14_rebuild_full_started, 0);
+}

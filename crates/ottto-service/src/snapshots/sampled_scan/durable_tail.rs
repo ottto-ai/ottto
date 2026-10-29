@@ -57,10 +57,6 @@ pub(crate) const WRITE_PASS_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const STORES_RESIDENT_BOUND: usize =
     2 * store::MAX_RECORDS * 256 + 2 * (store::MAX_BATCH + 1) * 4096 + super::RETAIL_RESERVE_BYTES;
 
-/// Head re-parse bytes of restores, per source, for the process lifetime.
-/// Existing class-X re-derivation is bounded at `HEAD_BOUND`, on a RAM
-/// miss only, so the census pass line reports it beside the guard's own
-/// counters (SOURCE N1).
 #[cfg(test)]
 thread_local! {
     static BEFORE_CARRIER_PROBE: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
@@ -73,6 +69,10 @@ pub(in crate::snapshots) fn set_before_carrier_probe(hook: Option<Box<dyn FnMut(
 const RECOVERY_PACE_SECONDS: u64 = 6 * 3600;
 const _: () = assert!(RECOVERY_PACE_SECONDS < 24 * 3600);
 
+/// Head re-parse bytes of restores, per source, for the process lifetime.
+/// Existing class-X re-derivation is bounded at `HEAD_BOUND`, on a RAM
+/// miss only, so the census pass line reports it beside the guard's own
+/// counters (SOURCE N1).
 static REDERIVE_HEAD_BYTES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
 pub(crate) fn rederive_head_bytes_total(source: SnapshotSource) -> u64 {
@@ -1079,6 +1079,9 @@ impl SharedCache {
         key: &str,
         index: &ScanIndex,
     ) -> Result<Option<u64>, store::ActiveOverBudget> {
+        if !self.durable_classifier_enabled(source)? {
+            return Ok(None);
+        }
         #[cfg(test)]
         BEFORE_CARRIER_PROBE.with(|slot| {
             if let Some(hook) = slot.borrow_mut().as_mut() {
@@ -1164,20 +1167,8 @@ impl SharedCache {
         key: &str,
         guard: impl FnOnce(&Self) -> Option<store::Refusal>,
     ) -> Result<Option<store::Refusal>, store::ActiveOverBudget> {
-        let Some(ds) = durable_source(source) else {
-            return Ok(None);
-        };
-        {
-            let Some(mut stores) = self.durable() else {
-                return Err(store::ActiveOverBudget);
-            };
-            if stores
-                .slot(ds)
-                .as_ref()
-                .map_or(true, |slot| slot.store.disabled().is_some())
-            {
-                return Ok(None); // Disabled stores never hold native acquisition.
-            }
+        if !self.durable_classifier_enabled(source)? {
+            return Ok(None); // D-DISABLED/absent: no input allocation is needed.
         }
         if let Some(reason) = self.reconcile_pending_key(source, key) {
             return Ok(Some(reason));
@@ -1185,7 +1176,34 @@ impl SharedCache {
         self.durable_funded_probe(source, guard)
     }
 
-    pub(in crate::snapshots) fn durable_funded_probe<T>(
+    fn durable_classifier_enabled(
+        &self,
+        source: SnapshotSource,
+    ) -> Result<bool, store::ActiveOverBudget> {
+        let Some(ds) = durable_source(source) else {
+            return Ok(false);
+        };
+        let Some(mut stores) = self.durable() else {
+            return Err(store::ActiveOverBudget);
+        };
+        Ok(stores
+            .slot(ds)
+            .as_ref()
+            .is_some_and(|slot| slot.store.disabled().is_none()))
+    }
+
+    pub(in crate::snapshots) fn durable_funded_member_batch(
+        &self,
+        source: SnapshotSource,
+        members: impl FnOnce(&Self) -> bool,
+    ) -> Result<bool, store::ActiveOverBudget> {
+        if !self.durable_classifier_enabled(source)? {
+            return Ok(false); // No classifier/no T14 grant; native group proceeds.
+        }
+        self.durable_funded_probe(source, members)
+    }
+
+    fn durable_funded_probe<T>(
         &self,
         source: SnapshotSource,
         probe: impl FnOnce(&Self) -> T,

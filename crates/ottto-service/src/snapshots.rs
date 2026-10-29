@@ -27744,7 +27744,7 @@ impl OwnedSourceScan {
                     // job across pause and defer to its own native entry.
                     // One admission BEFORE any member consumes a T14 start.
                     // No later per-member credit failure can strand earlier grants.
-                    let checked = cache.durable_funded_probe(source, |cache| {
+                    let checked = cache.durable_funded_member_batch(source, |cache| {
                         let mut refused = false;
                         for member in &group_members {
                             let mut due = None;
