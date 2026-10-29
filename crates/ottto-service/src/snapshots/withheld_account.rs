@@ -452,7 +452,7 @@ mod tests {
         // alone is no proof. Use the real traversal's configured root.
         ensure_bounded_traversal(
             SnapshotSource::ClaudeCode,
-            &[dir.clone()],
+            std::slice::from_ref(&dir),
             &mut index,
             "2026-10-07T12:00:00Z",
             7,

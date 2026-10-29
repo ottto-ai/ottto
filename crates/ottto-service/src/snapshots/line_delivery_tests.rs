@@ -2675,7 +2675,13 @@ fn completed_withheld_sampled_deletion_releases_debt_with_and_without_hint() {
         } else {
             Vec::new()
         };
+        let deletion_baseline = held.clone();
         let (removed, scan, recorder, counts) = page(held, &hints);
+        let removed = crate::snapshot_sync::settle_withheld_for_test(
+            &deletion_baseline,
+            removed,
+            scan.clone(),
+        );
         assert!(
             recorder.events().is_empty(),
             "removal never acquires a transcript"
@@ -2972,7 +2978,7 @@ fn withheld_remove_hint_through_intermediate_symlink_keeps_both_debts() {
                 10,
                 false,
                 None,
-                &[path.clone()],
+                std::slice::from_ref(&path),
                 false,
                 true,
             )
