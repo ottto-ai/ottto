@@ -8733,6 +8733,21 @@ fn claude_slot_collection_state_path() -> PathBuf {
     default_support_dir().join(CLAUDE_CONFIG_SLOT_COLLECTION_STATE_FILE)
 }
 
+#[cfg(test)]
+pub(crate) fn publish_blocked_claude_slot_for_test(
+    descriptor: &ClaudeConfigSlotDescriptorV1,
+    candidate: &ClaudeConfigSlotCollectionStatusV1,
+) -> std::io::Result<Option<ClaudeConfigSlotCollectionStatusV1>> {
+    persist_claude_slot_collection_states(
+        &BTreeMap::from([(descriptor.slot_id.clone(), candidate.clone())]),
+        &[],
+        &BTreeMap::from([(descriptor.slot_id.clone(), descriptor.clone())]),
+    )?;
+    Ok(read_persisted_claude_slot_collection_state()
+        .slots
+        .remove(&descriptor.slot_id))
+}
+
 fn persist_claude_slot_collection_states(
     slots: &BTreeMap<String, ClaudeConfigSlotCollectionStatusV1>,
     unresolved_accounts: &[ClaudeUnresolvedAccountDescriptorV1],

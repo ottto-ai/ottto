@@ -3,6 +3,68 @@
 // receipt client names an offline address and is never called, and the
 // attribution key is a synthetic sentinel, never printed.
 
+#[test]
+fn snapshot_owner_charges_the_shared_version_allocation_once() {
+    use crate::snapshots::codex_version::CodexVersionFeed;
+    use crate::source_rotation::Owner;
+    let mut daemon = test_daemon("otm_test");
+    let charge = |daemon: &LocalDaemon, limit| {
+        let device = LocalDeviceBinding {
+            device_id: "version-owner".into(),
+            machine_id: Some("otm_test".into()),
+            sources: vec!["codex".into()],
+        };
+        let client = SnapshotApiClient::new("http://127.0.0.1:1");
+        let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
+        let mut transport = crate::net_resilience::TransportCycleOutcome::default();
+        let mut failed = Vec::new();
+        let owner = SnapshotCycleOwner {
+            retry: &mut retry,
+            account_witness: [0; 32],
+            client: &client,
+            device: &device,
+            device_secret: "synthetic",
+            machine_id: "otm_test",
+            home: Path::new("synthetic-home"),
+            support_dir: Path::new("synthetic-support"),
+            daemon,
+            transport_cycle: &mut transport,
+            failed_sources: &mut failed,
+            started: Instant::now(),
+            codex_started: None,
+        };
+        owner.retained_bound(limit)
+    };
+    daemon.codex_versions = Arc::new(CodexVersionFeed::new(Some(Path::new("short"))));
+    if !crate::heap_layout_bound::layout_supported() {
+        assert_eq!(charge(&daemon, usize::MAX), None);
+        return;
+    }
+    let small = charge(&daemon, usize::MAX).unwrap();
+    daemon.codex_versions = Arc::new(CodexVersionFeed::new(Some(Path::new(&"x".repeat(100_000)))));
+    let large = charge(&daemon, usize::MAX).unwrap();
+    assert!(
+        large > small,
+        "root capacity is included at daemon ownership"
+    );
+    assert_eq!(
+        large,
+        crate::heap_layout_bound::bound(&daemon.codex_versions, usize::MAX).unwrap()
+    );
+    assert_eq!(charge(&daemon, large), Some(large));
+    assert_eq!(charge(&daemon, large - 1), None);
+    let consumers: Vec<_> = (0..4).map(|_| daemon.codex_versions.clone()).collect();
+    assert_eq!(
+        Arc::strong_count(&daemon.codex_versions),
+        consumers.len() + 1
+    );
+    assert_eq!(
+        charge(&daemon, usize::MAX),
+        Some(large),
+        "clones do not multiply the owner charge"
+    );
+}
+
 /// A destination namespace hash: a snapshot fingerprint (64 lowercase hex),
 /// or the upload-progress load quarantines the file as invalid.
 const CONTINUATION_NAMESPACE: &str =
@@ -232,7 +294,11 @@ impl ContinuationFixture {
         let cache = std::sync::Arc::new(crate::snapshots::sampled_scan::SharedCache::default());
         self.ordinary_side_pass(&cache, true);
         let mut minted = self.preparation(true);
-        let mut inputs = take_continuation_inputs(&mut minted);
+        let mut inputs = take_continuation_inputs(
+            &mut minted,
+            &std::sync::Arc::default(),
+            std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
+        );
         let before = self.disk();
         assert_eq!(self.prepare_on(&cache, &mut inputs).err(), Some(refusal));
         assert_eq!(self.disk(), before, "no save, no claim, no reset");
@@ -249,7 +315,11 @@ pub(super) fn continuation_inputs_for_test(
 ) -> (ContinuationInputs, std::sync::Arc<AgentStatusCollection>) {
     let fixture = ContinuationFixture::quiescent("continuation-inputs-for-test");
     let mut preparation = fixture.preparation(attribution);
-    let inputs = take_continuation_inputs(&mut preparation);
+    let inputs = take_continuation_inputs(
+        &mut preparation,
+        &std::sync::Arc::default(),
+        std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
+    );
     let sentinel = std::sync::Arc::clone(&preparation.scan_agent_status_collection);
     drop(preparation);
     (inputs, sentinel)
@@ -264,7 +334,11 @@ fn continuation_inputs_move_the_context_and_cache_no_raw_key() {
         .activity_hint
         .session_attribution_hmac_key
         .is_some());
-    let inputs = take_continuation_inputs(&mut preparation);
+    let inputs = take_continuation_inputs(
+        &mut preparation,
+        &std::sync::Arc::default(),
+        std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
+    );
     assert!(
         preparation.attribution_context.is_none(),
         "moved out, not copied"
@@ -292,7 +366,11 @@ fn continuation_inputs_move_the_context_and_cache_no_raw_key() {
 fn the_continuation_prepare_matches_the_ordinary_tail_on_a_quiescent_fixture() {
     let fixture = ContinuationFixture::quiescent("continuation-prepare-parity");
     let mut minted = fixture.preparation(true);
-    let mut inputs = take_continuation_inputs(&mut minted);
+    let mut inputs = take_continuation_inputs(
+        &mut minted,
+        &std::sync::Arc::default(),
+        std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
+    );
     let before = fixture.disk();
     let prepared = fixture
         .prepare(&mut inputs)
@@ -411,7 +489,11 @@ fn a_pending_historical_replay_refuses_the_continuation_prepare() {
     )
     .unwrap();
     let mut minted = fixture.preparation(true);
-    let mut inputs = take_continuation_inputs(&mut minted);
+    let mut inputs = take_continuation_inputs(
+        &mut minted,
+        &std::sync::Arc::default(),
+        std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
+    );
     let before = fixture.disk();
     assert_eq!(
         fixture.prepare(&mut inputs).err(),
@@ -525,7 +607,11 @@ fn the_always_on_sampled_scope_keeps_the_permit_era_bytes() {
 fn no_continuation_output_serializes_the_attribution_key() {
     let fixture = ContinuationFixture::quiescent("continuation-no-key-output");
     let mut minted = fixture.preparation(true);
-    let mut inputs = take_continuation_inputs(&mut minted);
+    let mut inputs = take_continuation_inputs(
+        &mut minted,
+        &std::sync::Arc::default(),
+        std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
+    );
     let prepared = fixture
         .prepare(&mut inputs)
         .unwrap_or_else(|refusal| panic!("refused: {}", refusal.label()));
@@ -707,7 +793,11 @@ fn a_prepared_continuation_page_keeps_the_ordinary_side_gate() {
         let cache = std::sync::Arc::new(crate::snapshots::sampled_scan::SharedCache::default());
         assert!(fixture.ordinary_side_pass(&cache, ordinary_saved));
         let mut minted = fixture.preparation(true);
-        let mut inputs = take_continuation_inputs(&mut minted);
+        let mut inputs = take_continuation_inputs(
+            &mut minted,
+            &std::sync::Arc::default(),
+            std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
+        );
         let before = fixture.disk();
         let prepared = fixture
             .prepare_on(&cache, &mut inputs)

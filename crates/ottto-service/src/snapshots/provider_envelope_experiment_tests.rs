@@ -43,6 +43,7 @@ fn native_comparison_target_body_retention_pays_exact_peak_before_buffer_growth(
             snapshots: state.snapshots,
             report: JsonlReadReport::default(),
             recognized_usage_drop_count: 0,
+            cause: ownership::PARSER,
             ownership_incomplete_file_count: 0,
             zero_snapshot_usage_evidence: false,
             dropped_usage_record_count: 0,
@@ -4474,4 +4475,36 @@ fn native_comparison_matching_prepays_hit_and_no_hit_before_scratch_allocation()
         assert_eq!(serde_json::to_vec(&item).unwrap(), body_before);
         eprintln!("native_comparison_matching_budget: hit={hit} pressure={pressure} unknown={unknown} refused_before_alloc={} protected_recovery={recovery_bytes} input_unchanged=true", pressure || unknown);
     }
+}
+
+#[test]
+fn ownership_diagnostics_preserve_real_claude_terminal_completed_heap_and_paid_completion() {
+    let fixture = NativePreparationFixture::new();
+    let (_, scan, terminal) = complete_native_with_terminal_owner(fixture.paused());
+    assert!(scan.census_complete);
+    assert!(scan.causes.is_empty(), "exercise the empty diagnostic case");
+    let terminal = terminal.expect("actual clean Claude terminal traversal");
+    use crate::heap_layout_bound::HeapLayoutBound;
+    let mut bound = crate::heap_layout_bound::Counter::new(usize::MAX);
+    assert!(terminal.completed_heap_bound(&mut bound).is_some());
+    if !crate::heap_layout_bound::layout_supported() {
+        return; // full paid-completion layout qualification remains a native CI check
+    }
+    assert!(crate::heap_layout_bound::completed_bound(&terminal, usize::MAX).is_some());
+    let mut credit = crate::source_rotation::PaidReservation::from_remainder(
+        Some(crate::source_rotation::PARKED_BUDGET),
+        0,
+        0,
+    );
+    let controller = claude_native_comparison::Controller::new_paid(
+        claude_native_comparison::Qualification::default(),
+        scan.snapshots.len(),
+        &mut credit,
+    )
+    .unwrap();
+    let completion = controller
+        .complete_paid(&scan, Some(terminal), true, &mut credit)
+        .expect("empty diagnostic metadata cannot refuse real Claude terminal completion");
+    assert!(completion.fallback.is_none());
+    assert!(crate::heap_layout_bound::completed_bound(&completion, usize::MAX).is_some());
 }

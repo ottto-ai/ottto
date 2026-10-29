@@ -253,6 +253,8 @@ pub struct LocalDaemon {
     session_launch: Arc<Mutex<session_launch::Registry>>,
     transcript_cache: Arc<snapshots::sampled_scan::SharedCache>,
     footprint_cwds: Arc<context_footprint::CwdProjection>,
+    codex_preludes: Arc<codex_prelude_footprint::CodexPreludeFeed>,
+    codex_versions: Arc<snapshots::codex_version::CodexVersionFeed>,
     native_comparison: Arc<snapshots::claude_native_comparison::lifecycle::Lifecycle>,
     inner: Arc<Mutex<DaemonState>>,
     control_token: ControlToken,
@@ -470,6 +472,10 @@ impl LocalDaemon {
             session_launch: Arc::default(),
             transcript_cache: Arc::new(snapshots::sampled_scan::SharedCache::default()),
             footprint_cwds: Arc::default(),
+            codex_preludes: Arc::default(),
+            codex_versions: Arc::new(snapshots::codex_version::CodexVersionFeed::new(
+                snapshot_sync::home_dir().ok().as_deref(),
+            )),
             native_comparison: Arc::new(
                 snapshots::claude_native_comparison::lifecycle::Lifecycle::default(),
             ),

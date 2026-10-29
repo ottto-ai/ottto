@@ -350,10 +350,12 @@ impl<A: HeapLayoutBound, B: HeapLayoutBound, D: HeapLayoutBound> HeapLayoutBound
     }
 }
 macro_rules! fields {
-    ($t:ty; $($(#[$field_attr:meta])* $f:ident),* $(,)?) => {
+    ($t:ty; $($(#[$field_attr:meta])* $f:ident),* $(,)? $(; shared $($shared:ident),+)? ) => {
         impl crate::heap_layout_bound::HeapLayoutBound for $t {
             fn stable_heap(&self)->bool {
-                let Self { $($(#[$field_attr])* $f),* } = self;
+                // Shared daemon allocations are charged by SnapshotCycleOwner::retained_bound.
+                // Their pointer is already included in the enclosing inline size.
+                let Self { $($(#[$field_attr])* $f,)* $($($shared: _,)+)? } = self;
                 let stable = true;
                 $( $(#[$field_attr])* let stable = stable && crate::heap_layout_bound::HeapLayoutBound::stable_heap($f);)*
                 stable
@@ -361,12 +363,16 @@ macro_rules! fields {
             fn heap_bound(&self,c:&mut crate::heap_layout_bound::Counter)->Option<()> {
                 // Exhaustive destructuring makes a newly added owned field a
                 // compile error until admission accounts for it.
-                let Self { $($(#[$field_attr])* $f),* } = self;
+                // Shared daemon allocations are charged by SnapshotCycleOwner::retained_bound.
+                // Their pointer is already included in the enclosing inline size.
+                let Self { $($(#[$field_attr])* $f,)* $($($shared: _,)+)? } = self;
                 $( $(#[$field_attr])* crate::heap_layout_bound::HeapLayoutBound::heap_bound($f,c)?;)*
                 Some(())
             }
             fn completed_heap_bound(&self,c:&mut crate::heap_layout_bound::Counter)->Option<()> {
-                let Self { $($(#[$field_attr])* $f),* } = self;
+                // Shared daemon allocations are charged by SnapshotCycleOwner::retained_bound.
+                // Their pointer is already included in the enclosing inline size.
+                let Self { $($(#[$field_attr])* $f,)* $($($shared: _,)+)? } = self;
                 $( $(#[$field_attr])* crate::heap_layout_bound::HeapLayoutBound::completed_heap_bound($f,c)?;)*
                 Some(())
             }

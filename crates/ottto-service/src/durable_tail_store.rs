@@ -665,6 +665,7 @@ impl DurableTailStore {
 
     /// U holds. T14 permits one rebuild; the adapter checks RAM before holding.
     pub(crate) fn hold(&mut self, key: &Digest32) -> Option<Refusal> {
+        // has_index=true short-circuits debt import, so this live-context sentinel is unused.
         self.guard_with_carrier(key, true, &[0; 32]).err()
     }
 
