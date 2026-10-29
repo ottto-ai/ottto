@@ -2209,7 +2209,7 @@ fn overdue_durable_cursor_tail_publishes_and_next_restart_reads_no_suffix() {
             third.durable_begin_pass(source, &index_path, &namespace, true);
             let restart_index = ScanIndex::load(&index_path).unwrap();
             let mut correction_index = restart_index.clone();
-            let ((next, raw, result, modes, bytes), retirement_diagnostics) =
+            let ((mut next, raw, result, modes, bytes), retirement_diagnostics) =
                 crate::local_resource_diagnostics::capture(|| {
                     production_scan_page_at_with_setup(
                         &fixture,

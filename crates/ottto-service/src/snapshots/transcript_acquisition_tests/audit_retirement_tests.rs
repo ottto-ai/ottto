@@ -459,7 +459,7 @@ fn partial_saves_cannot_reuse_quiet_slots_before_retirement_commits() {
             .collect();
         // The exact production subset used by shed/error checkpointing. Its
         // accepted set includes emitted B only, never suppressed quiet A.
-        let selected = working.committable_subset(&committed, &accepted, &BTreeMap::new());
+        let mut selected = working.committable_subset(&committed, &accepted, &BTreeMap::new());
         assert!(
             selected.files[&quiet_key].has_unverified_source(),
             "partial save restored A"
@@ -490,7 +490,7 @@ fn partial_saves_cannot_reuse_quiet_slots_before_retirement_commits() {
     // ACK, body-witness or census credit is fabricated for that retirement.
     fs::remove_file(&fixture.file.0).unwrap();
     fixture.file.0 = quiet_path;
-    let (healthy, _, modes) =
+    let (mut healthy, _, modes) =
         production_scan(&fixture, source, index, Some(cache.clone()), "partial-cap");
     assert_eq!(modes, (0, 0, 1));
     assert!(!healthy.files[&quiet_key].has_unverified_source());
@@ -606,7 +606,7 @@ fn held_quiet_audit_retires_only_after_release_and_committed_save() {
         assert_eq!(after.last_full_verified(), checkpoint.last_full_verified());
         // Exercise the actual partial-save/held-body reconciliation. An
         // unaccepted withheld body must neither retire nor release a slot.
-        let selected = working.committable_subset_with_local_holds(
+        let mut selected = working.committable_subset_with_local_holds(
             &committed,
             &BTreeSet::new(),
             &BTreeMap::new(),
@@ -632,17 +632,18 @@ fn held_quiet_audit_retires_only_after_release_and_committed_save() {
         &BTreeSet::new(),
     ));
     assert!(!index.claude_account_deferred_holds.contains_key(&key));
-    let ((retired, _, modes, _), diagnostics) = crate::local_resource_diagnostics::capture(|| {
-        production_scan_at_with_setup(
-            &fixture,
-            source,
-            index,
-            Some(cache.clone()),
-            "held-quiet",
-            NOW,
-            |scan| assert_eq!(scan.sampling.as_ref().unwrap().audit_slots, 0),
-        )
-    });
+    let ((mut retired, _, modes, _), diagnostics) =
+        crate::local_resource_diagnostics::capture(|| {
+            production_scan_at_with_setup(
+                &fixture,
+                source,
+                index,
+                Some(cache.clone()),
+                "held-quiet",
+                NOW,
+                |scan| assert_eq!(scan.sampling.as_ref().unwrap().audit_slots, 0),
+            )
+        });
     assert_eq!(modes, (0, 0, 1));
     assert_held_audit_diagnostics(&diagnostics, 1);
     assert!(!retired.files[&key].has_unverified_source());
@@ -843,7 +844,7 @@ fn held_retry_cannot_stage_against_a_quiet_slot_before_partial_save() {
         );
         let reparse_held = working.file_snapshot_fingerprints[&held_key].clone();
         assert!(!reparse_held.is_empty());
-        let selected = working.committable_subset_with_local_holds(
+        let mut selected = working.committable_subset_with_local_holds(
             &committed,
             &BTreeSet::new(),
             &BTreeMap::new(),
