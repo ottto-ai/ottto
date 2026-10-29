@@ -85,3 +85,36 @@ fn fresh_duplicate_dirty_offers_produce_one_exact_completion() {
     assert!(clean.completed.is_empty());
     assert_eq!(clean.clean, 1);
 }
+
+#[test]
+fn failed_immediate_cleanup_is_retried_by_same_process_gc() {
+    let case = Case::new();
+    let mut store = case.store("orphan");
+    store::test_hooks::set_before_rename(Some(Box::new(|_, _| {
+        Err(io::Error::other("rename EIO"))
+    })));
+    store::test_hooks::set_before_unlink(Some(Box::new(|_| Err(io::Error::other("unlink EIO")))));
+    let result = store.write_after_save(case.writer, 7, 0, vec![case.record.clone()]);
+    store::test_hooks::set_before_rename(None);
+    store::test_hooks::set_before_unlink(None);
+    result.unwrap();
+    let temps = || {
+        fs::read_dir(case.root.join("orphan"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "tmp"))
+            .count()
+    };
+    assert_eq!(temps(), 1, "both cleanup attempts were refused");
+    assert!(store.counters().temp_discard_failed >= 2);
+    store
+        .gc(
+            case.writer,
+            &case.record.binding.context,
+            &case.record.allowlist,
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
+    assert_eq!(temps(), 0);
+    assert_eq!(store.counters().gc_temps_deleted, 1);
+}

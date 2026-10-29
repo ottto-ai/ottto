@@ -1749,17 +1749,37 @@ struct OwnedTemp {
 
 impl OwnedTemp {
     fn prepare(dir: &Path, path: &Path, cleanup: Arc<TempCleanupCounts>) -> io::Result<Self> {
+        static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+        Self::create(
+            dir,
+            path,
+            cleanup,
+            Some(NEXT_TEMP.fetch_add(1, Ordering::Relaxed)),
+        )
+    }
+    fn prepare_atomic(
+        dir: &Path,
+        path: &Path,
+        cleanup: Arc<TempCleanupCounts>,
+    ) -> io::Result<Self> {
+        // This owner never leaves Stores. GC can retry abandoned same-process
+        // M1 temps after a failed explicit and unwind cleanup.
+        Self::create(dir, path, cleanup, None)
+    }
+    fn create(
+        dir: &Path,
+        path: &Path,
+        cleanup: Arc<TempCleanupCounts>,
+        serial: Option<u64>,
+    ) -> io::Result<Self> {
         let name = path
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "record name"))?;
-        static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
-        let serial = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-        let temp = dir.join(format!(
-            ".{name}.{}.{}{TEMP_SUFFIX}",
-            std::process::id(),
-            serial
-        ));
+        let temp = dir.join(match serial {
+            Some(serial) => format!(".{name}.{}.{}{TEMP_SUFFIX}", std::process::id(), serial),
+            None => format!(".{name}.{}{TEMP_SUFFIX}", std::process::id()),
+        });
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1945,7 +1965,7 @@ fn write_atomic<W: SingleWriter>(
         }
     }
     let mut attempt = Attempt {
-        temp: OwnedTemp::prepare(dir, path, cleanup)?,
+        temp: OwnedTemp::prepare_atomic(dir, path, cleanup)?,
         writer,
     };
     let result = (|| {
