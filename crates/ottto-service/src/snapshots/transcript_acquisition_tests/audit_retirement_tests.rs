@@ -84,6 +84,9 @@ fn unavailable_codex_cohorts_cannot_grow_markers_past_cap_or_disable_marked_tail
             } else {
                 fs::remove_file(&fixture.file.0).unwrap();
                 fs::remove_dir(&unavailable_parent).unwrap();
+                // ENOTDIR is uncertain under E3's hardened proof; a truly
+                // missing intermediate beneath a readable root would retire.
+                fs::write(&unavailable_parent, b"unavailable mount placeholder").unwrap();
             }
             ordinal += 1;
         }
@@ -514,7 +517,14 @@ fn partial_saves_cannot_reuse_quiet_slots_before_retirement_commits() {
         let state = &page["counts"]["sampled_acquisition"]["index_state_at_page_end"];
         assert_eq!(state["audit_quiet_retired"], 1);
         assert_eq!(state["audit_cap_full"], usize::from(reads_full));
-        assert_eq!(state["audit_cap_delay"], usize::from(!reads_full));
+        let delays = diagnostics
+            .iter()
+            .filter(|row| row["stage"] == "sampled_audit_cap_delay")
+            .collect::<Vec<_>>();
+        assert_eq!(delays.len(), usize::from(!reads_full));
+        if !reads_full {
+            assert_eq!(delays[0]["counts"]["audit_cap_delay"], 1);
+        }
         selected.save(&index_path).unwrap();
         index = ScanIndex::load(&index_path).unwrap();
     }
@@ -1208,7 +1218,17 @@ fn cap_pace_overflow_is_counted_and_alarms_on_the_production_full() {
         .unwrap();
     let state = &page["counts"]["sampled_acquisition"]["index_state_at_page_end"];
     assert_eq!(state["audit_cap_full"], 1);
-    assert_eq!(state["pace_evicted"], 1);
+    assert!(
+        state.get("pace_evicted").is_none(),
+        "pacing has its own bounded carrier"
+    );
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|row| row["stage"] == "sampled_audit_pace_alarm")
+            .count(),
+        1
+    );
     assert!(diagnostics.iter().any(
         |row| row["stage"] == "sampled_audit_pace_alarm" && row["counts"]["pace_evicted"] == 1
     ));
@@ -1468,13 +1488,13 @@ fn durable_quiet_retirement_keeps_scheduling_until_writer_and_index_receipts() {
 }
 
 #[test]
-fn proven_absence_retires_and_frees_slot_but_missing_parent_keeps_debt() {
+fn proven_absence_retires_missing_intermediate_but_keeps_unsafe_ancestor_debt() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
     let _clock = Clock::at(START);
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
-        for missing_parent in [false, true] {
+        for ancestor in ["present", "missing", "unsafe"] {
             let mut fixture = ScanFixture::new(source);
             let parent = fixture.root.join("absence-parent");
             fs::create_dir(&parent).unwrap();
@@ -1510,8 +1530,11 @@ fn proven_absence_retires_and_frees_slot_but_missing_parent_keeps_debt() {
             }
             let contents = fs::read(&fixture.file.0).unwrap();
             fs::remove_file(&fixture.file.0).unwrap();
-            if missing_parent {
+            if ancestor != "present" {
                 fs::remove_dir(&parent).unwrap();
+            }
+            if ancestor == "unsafe" {
+                fs::write(&parent, b"not a readable directory").unwrap();
             }
             let ((mut retired, _, modes), diagnostics) =
                 crate::local_resource_diagnostics::capture(|| {
@@ -1529,9 +1552,9 @@ fn proven_absence_retires_and_frees_slot_but_missing_parent_keeps_debt() {
                     .iter()
                     .filter(|row| row["stage"] == "audit_retired_absent")
                     .count(),
-                usize::from(!missing_parent)
+                usize::from(ancestor != "unsafe")
             );
-            if missing_parent {
+            if ancestor == "unsafe" {
                 assert!(retired.files[&key].has_unverified_source());
                 if source == SnapshotSource::ClaudeCode {
                     assert!(retired.claude_account_deferred_holds.contains_key(&key));
@@ -1552,6 +1575,7 @@ fn proven_absence_retires_and_frees_slot_but_missing_parent_keeps_debt() {
             let index_path = fixture.dir.join("absence-index.json");
             retired.save(&index_path).unwrap();
             drop(cache);
+            fs::create_dir_all(&parent).unwrap();
             fs::write(&fixture.file.0, contents).unwrap();
             let cold_owner = Arc::new(sampled_scan::SharedCache::default());
             let ((recreated, _, modes), diagnostics) =
@@ -1700,6 +1724,118 @@ fn audit_absence_preserves_legacy_counting_evidence_or_retains_its_entry() {
             );
         }
     }
+}
+
+#[test]
+fn hold_only_inventory_requires_secure_absence_and_keeps_observed_keys() {
+    use std::os::unix::fs::symlink;
+    for ancestor in [
+        "present",
+        "missing",
+        "symlink",
+        "dangling",
+        "file",
+        "root_missing",
+    ] {
+        let fixture = ScanFixture::new(SnapshotSource::ClaudeCode);
+        let parent = fixture.root.join("held-parent");
+        fs::create_dir(&parent).unwrap();
+        let path = parent.join("held-new.jsonl");
+        match ancestor {
+            "missing" => fs::remove_dir(&parent).unwrap(),
+            "symlink" => {
+                fs::remove_dir(&parent).unwrap();
+                symlink(&fixture.dir, &parent).unwrap();
+            }
+            "dangling" => {
+                fs::remove_dir(&parent).unwrap();
+                symlink("unavailable-target", &parent).unwrap();
+            }
+            "file" => {
+                fs::remove_dir(&parent).unwrap();
+                fs::write(&parent, b"not a directory").unwrap();
+            }
+            "root_missing" => fs::remove_dir_all(&fixture.root).unwrap(),
+            _ => {}
+        }
+        let key = local_index_key(&path);
+        let mut index = ScanIndex::default();
+        index
+            .claude_account_deferred_holds
+            .insert(key.clone(), "withheld-new-revision".into());
+        ensure_bounded_traversal(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&fixture.root),
+            &mut index,
+            NOW,
+            BACKFILL_WINDOW_DAYS,
+        );
+        assert!(index.files.is_empty(), "held-new has no committed entry");
+        index.retain_observed_claude_account_deferred_holds(&BTreeSet::from([key.clone()]));
+        assert!(
+            index.claude_account_deferred_holds.contains_key(&key),
+            "observation alone keeps custody"
+        );
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            index.retain_observed_claude_account_deferred_holds(&BTreeSet::new())
+        });
+        let removed = matches!(ancestor, "present" | "missing");
+        assert_eq!(
+            !index.claude_account_deferred_holds.contains_key(&key),
+            removed,
+            "{ancestor}"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["stage"] == "withheld_hold_released"
+                    && row["counts"]["withheld_hold_released"]["deleted"] == 1)
+                .count(),
+            usize::from(removed)
+        );
+        assert!(index.files.is_empty(), "no membership invented");
+    }
+}
+
+#[test]
+fn hold_only_absence_inventory_never_exceeds_existing_4096_bound() {
+    let fixture = ScanFixture::new(SnapshotSource::ClaudeCode);
+    let blocked = fixture.root.join("a-unavailable");
+    fs::write(&blocked, b"not a directory").unwrap();
+    let eligible = local_index_key(&fixture.root.join("z-positively-missing.jsonl"));
+    let mut index = ScanIndex::default();
+    for n in 0..MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS {
+        index.claude_account_deferred_holds.insert(
+            local_index_key(&blocked.join(format!("{n:05}.jsonl"))),
+            "held".into(),
+        );
+    }
+    index
+        .claude_account_deferred_holds
+        .insert(eligible.clone(), "held-new".into());
+    ensure_bounded_traversal(
+        SnapshotSource::ClaudeCode,
+        std::slice::from_ref(&fixture.root),
+        &mut index,
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+    );
+    index.retain_observed_claude_account_deferred_holds(&BTreeSet::new());
+    assert_eq!(
+        index.claude_account_deferred_holds.len(),
+        MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS + 1
+    );
+    assert!(
+        index.claude_account_deferred_holds.contains_key(&eligible),
+        "over-bound imported tail was not probed or dropped"
+    );
+    index
+        .claude_account_deferred_holds
+        .retain(|key, _| key == &eligible);
+    index.retain_observed_claude_account_deferred_holds(&BTreeSet::new());
+    assert!(
+        index.claude_account_deferred_holds.is_empty(),
+        "the next bounded inventory proves eligible absence"
+    );
 }
 
 /// Pi has no durable source, so a quiet retirement clears the index marker in

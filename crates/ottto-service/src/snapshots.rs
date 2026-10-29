@@ -31282,6 +31282,10 @@ impl OwnedSourceScan {
                         crate::local_resource_diagnostics::traversal_point("sampled_audit_cap_alarm", source.api_slug(),
                             &serde_json::json!({"audit_cap_full": context.audit_cap_full, "pending_audits": pending}));
                     }
+                    if context.audit_cap_delay > 0 {
+                        crate::local_resource_diagnostics::traversal_point("sampled_audit_cap_delay", source.api_slug(),
+                            &serde_json::json!({"audit_cap_delay": context.audit_cap_delay}));
+                    }
                     if context.pace_evicted > 0 {
                         crate::local_resource_diagnostics::traversal_point("sampled_audit_pace_alarm", source.api_slug(),
                             &serde_json::json!({"pace_evicted": context.pace_evicted}));
@@ -31306,8 +31310,6 @@ impl OwnedSourceScan {
                         index_state_at_page_end: crate::local_resource_diagnostics::IndexState {
                             audit_quiet_retired: context.audit_quiet_retired,
                             audit_cap_full: context.audit_cap_full,
-                            audit_cap_delay: context.audit_cap_delay,
-                            pace_evicted: context.pace_evicted,
                             pending_audits: pending,
                             overdue_audits: overdue,
                             oldest_due_age_seconds: oldest_due_age,
@@ -42613,15 +42615,16 @@ fn reconcile_missing_index_entries_with_side(
             .as_ref()
             .is_some_and(|traversal| traversal.observed_index_keys.contains(key));
         if !observed && index.claude_account_deferred_holds.contains_key(key) {
-            if index.retire_absent_account_hold(key) {
-                continue;
+            index.retire_absent_account_hold(key);
+            if !index.files.contains_key(key) {
+                index.drop_codex_proof_items(key, codex_side_drop);
             }
-            if index.claude_account_deferred_holds.contains_key(key) {
-                continue;
-            }
+            // Complete this item, preserving SOURCE N3 incidence. An unsafe
+            // or uncertain ancestor keeps its obligation and also stops here.
+            continue;
         }
         // An unobserved marked entry still needs positive filesystem proof;
-        // missing parents, mounts and permission failures keep its obligation.
+        // unsafe ancestors, missing roots and permission failures keep debt.
         if !observed
             && !index.decode_holds_file(key)
             && index
@@ -47781,12 +47784,21 @@ impl ScanIndex {
         self.claude_account_deferred_holds.len()
     }
 
-    /// A completed traversal observed every present path, so a held key that
-    /// is neither indexed nor observed is proved absent.
+    /// Census absence is only a prompt to prove removal. Hold-only keys have
+    /// no committed entry to visit during reconciliation, but own the same
+    /// debt. Inventory at most the existing 4,096-hold cap; no transcript read
+    /// or second directory walk; unreadable or unsafe ancestors keep the hold.
     fn retain_observed_claude_account_deferred_holds(&mut self, observed: &BTreeSet<String>) {
-        let files = &self.files;
-        self.claude_account_deferred_holds
-            .retain(|index_key, _| files.contains_key(index_key) || observed.contains(index_key));
+        let unobserved = self
+            .claude_account_deferred_holds
+            .keys()
+            .filter(|key| !observed.contains(*key))
+            .take(MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS)
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in unobserved {
+            self.retire_absent_account_hold(&key);
+        }
     }
 
     /// Keys whose scanned entity set or head names a held revision.
@@ -48682,6 +48694,7 @@ impl ScanIndex {
         {
             return false;
         }
+        let census_record = self.claude_request_census.get(key).is_some();
         let protected = self
             .files
             .get(key)
@@ -48715,6 +48728,12 @@ impl ScanIndex {
         );
         if !protected && !audit {
             self.remove_file_entry_unless_held(key, true);
+        }
+        if census_record && self.claude_request_census.get(key).is_none() {
+            disappearance_diagnostics::vanished(
+                SnapshotSource::ClaudeCode,
+                disappearance_diagnostics::Vanished::RequestCensusRemoved,
+            );
         }
         true
     }

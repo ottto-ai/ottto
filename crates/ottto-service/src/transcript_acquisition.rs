@@ -2013,8 +2013,20 @@ mod tests {
                 "quiet restore is not zero I/O"
             );
             assert_eq!(restored.last_full_verified(), 1_000);
-            let mut plan =
-                ReadPlan::prepare(&mut file, Some(&restored), &scope(), None, now).unwrap();
+            assert_eq!(
+                restored.audit_debt(),
+                None,
+                "#865: no envelope debt fallback"
+            );
+            let current_index_debt = due.map(|due_unix_seconds| AuditDebt { due_unix_seconds });
+            let mut plan = ReadPlan::prepare(
+                &mut file,
+                Some(&restored),
+                &scope(),
+                current_index_debt,
+                now,
+            )
+            .unwrap();
             assert_eq!(
                 plan.mode(),
                 if append {
