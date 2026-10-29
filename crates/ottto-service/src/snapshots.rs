@@ -61475,6 +61475,7 @@ mod tests {
             .unwrap()
             .pending_candidates
             .push_back(ScanTraversalPath {
+                order_modified: None,
                 scan_root: root.clone(),
                 path: last,
                 census_member: true,

@@ -2320,6 +2320,7 @@ fn held_archive_replay_does_not_settle_from_historical_fingerprint_alone() {
             let traversal = index.traversal.as_mut().unwrap();
             traversal.pending_directories.clear();
             traversal.pending_candidates.push_back(ScanTraversalPath {
+                order_modified: None,
                 scan_root: roots[0].clone(),
                 path: path.clone(),
                 census_member: true,

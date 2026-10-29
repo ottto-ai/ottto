@@ -1,3 +1,10 @@
+fn funded_header_work() -> HeaderWork {
+    HeaderWork {
+        allowed: true,
+        ..HeaderWork::default()
+    }
+}
+
 // Models a saved checkpoint from the acquisition-only release. Production
 // activation is unconditional; this override exists only in the test binary.
 thread_local! {
