@@ -744,7 +744,7 @@ impl LocalHoldSettlement {
         let account_holds_recorded = source == SnapshotSource::ClaudeCode
             && index.record_claude_account_deferred_holds(
                 scan_result.completed_parses(),
-                &account_deferred_fingerprints,
+                &disposition.account_deferred_tokens(&scan_result.snapshots),
             );
         let progress_blocking_held_fingerprints = disposition.progress_blocking_held_fingerprints(
             &scan_result.snapshots,

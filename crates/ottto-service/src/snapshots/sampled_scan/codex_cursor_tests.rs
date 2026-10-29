@@ -1832,7 +1832,7 @@ fn singleton_aggregate_page_budget_defers_via_pending_keeps_hint() {
         SnapshotSource::Codex,
         traversal,
         BACKFILL_WINDOW_DAYS,
-        &index.files,
+        discovery_retention!(index),
     );
     for pending in &mut traversal.pending_candidates {
         pending.watcher_hint = true;
@@ -3469,7 +3469,7 @@ fn watcher_hint_for_a_processed_codex_path_is_next_generation_evidence() {
         SnapshotSource::Codex,
         walked,
         BACKFILL_WINDOW_DAYS,
-        &index.files,
+        discovery_retention!(index),
     );
     let processed = fixture.file(SESSION);
     let pending = fixture.file(SESSION_B);
@@ -3780,7 +3780,7 @@ fn freshness_selection_keeps_a_fitting_census_page_together() {
         SnapshotSource::Codex,
         index.traversal.as_mut().unwrap(),
         BACKFILL_WINDOW_DAYS,
-        &index.files,
+        discovery_retention!(index),
     );
     let mut body = codex_line(json!({"timestamp": "2026-10-07T10:00:00Z",
         "type": "session_meta", "payload": {"id": SESSION_B}}));
@@ -3883,7 +3883,7 @@ fn fresh_sessions_bypass_2800_owed_rereads_within_two_pages() {
         SnapshotSource::Codex,
         index.traversal.as_mut().unwrap(),
         BACKFILL_WINDOW_DAYS,
-        &index.files,
+        discovery_retention!(index),
     );
     // SESSION already finished its census read; growth must not re-enroll it.
     index
@@ -4042,7 +4042,7 @@ fn only_roster_discovered_directories_mark_their_sessions_fresh() {
         SnapshotSource::Codex,
         index.traversal.as_mut().unwrap(),
         BACKFILL_WINDOW_DAYS,
-        &index.files,
+        discovery_retention!(index),
     );
     let flags = |index: &ScanIndex, path: &PathBuf| {
         index
@@ -4080,7 +4080,7 @@ fn only_roster_discovered_directories_mark_their_sessions_fresh() {
         SnapshotSource::Codex,
         index.traversal.as_mut().unwrap(),
         BACKFILL_WINDOW_DAYS,
-        &index.files,
+        discovery_retention!(index),
     );
     assert!(!index
         .traversal
@@ -4092,7 +4092,7 @@ fn only_roster_discovered_directories_mark_their_sessions_fresh() {
         SnapshotSource::Codex,
         index.traversal.as_mut().unwrap(),
         BACKFILL_WINDOW_DAYS,
-        &index.files,
+        discovery_retention!(index),
     );
     assert!(index
         .traversal
@@ -4142,7 +4142,7 @@ fn new_date_directory_session_bypasses_2800_owed_rereads_within_two_pages() {
         SnapshotSource::Codex,
         index.traversal.as_mut().unwrap(),
         BACKFILL_WINDOW_DAYS,
-        &index.files,
+        discovery_retention!(index),
     );
     let budget = fixture.len(SESSION) * 4;
     cache.clear();
