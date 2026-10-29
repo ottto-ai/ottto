@@ -121,6 +121,18 @@ fn quiet_pending_discloses_a_bodyless_current_attempt_despite_historical_output(
             assert!(!rows
                 .iter()
                 .any(|row| row["stage"] == "archive_terminal_residue"));
+            let gauges = rows
+                .iter()
+                .filter(|row| row["stage"] == "archive_quiet_pending_unacked")
+                .map(|row| &row["counts"])
+                .collect::<Vec<_>>();
+            assert_eq!(
+                gauges,
+                vec![&serde_json::json!({
+                    "archive_quiet_pending_unacked_count": usize::from(current_body.is_some()),
+                })],
+                "one page gauge contains only the current unACKed-body count"
+            );
             assert_eq!(archive_evidence(&next, &f).body_witness, current_body);
             assert_eq!(
                 next.files[&key].last_upload_body_witness.as_deref(),

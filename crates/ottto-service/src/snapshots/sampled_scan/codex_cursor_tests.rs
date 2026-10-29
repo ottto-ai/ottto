@@ -14492,3 +14492,16 @@ fn invalid_archive_owner_holds_paused_singleton_without_more_reads() {
         }
     });
 }
+
+/// Seed already-accounted provenance so custody decisions run on every platform.
+/// This bypasses optional heap admission only in synthetic tests, not release.
+pub(in crate::snapshots) fn seed_join_provenance(cache: &SharedCache, owner: &str, key: &str) {
+    assert!(join_members_well_formed(key));
+    cache
+        .with_cursor(|cursor| {
+            cursor
+                .join_owners
+                .insert(owner.to_owned(), (0, key.to_owned()));
+        })
+        .expect("synthetic cursor lock");
+}

@@ -7571,25 +7571,28 @@ fn finish_sync_source(
     // obligations this full scan references before any selection (#794 F1).
     let ack_scan_referenced =
         upload_progress.ack_retirement_scan_references(&committed_index, &index);
-    // Settle exact current bodies before selection can restore older file facts.
-    let submitted = scan_result
-        .snapshots
-        .iter()
-        .map(|s| {
-            (
-                s.snapshot_fingerprint.clone(),
-                snapshot_upload_body_witness(s),
-            )
-        })
-        .collect();
-    index.settle_archive_outcome(
-        &upload_progress.accepted_body_witnesses,
-        matches!(
-            &upload_result,
-            Ok(ResumableUploadResult::Completed | ResumableUploadResult::Rejected { .. })
-        ),
-        Some(&submitted),
-    );
+    // Plain-only cycles have no archive settlement obligation or witness work.
+    if index.files.values().any(|entry| entry.archive.is_some()) {
+        // Settle exact current bodies before selection can restore older file facts.
+        let submitted = scan_result
+            .snapshots
+            .iter()
+            .map(|s| {
+                (
+                    s.snapshot_fingerprint.clone(),
+                    snapshot_upload_body_witness(s),
+                )
+            })
+            .collect();
+        index.settle_archive_outcome(
+            &upload_progress.accepted_body_witnesses,
+            matches!(
+                &upload_result,
+                Ok(ResumableUploadResult::Completed | ResumableUploadResult::Rejected { .. })
+            ),
+            Some(&submitted),
+        );
+    }
     match upload_result {
         Ok(ResumableUploadResult::Completed) => {
             clear_shed_streak(source);
