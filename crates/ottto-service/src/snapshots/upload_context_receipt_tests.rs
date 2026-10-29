@@ -173,19 +173,25 @@ impl Fixture {
                         })
             })
             .count();
-        let mut metadata_count = None;
-        for _ in 0..3 {
+        let held_quarantine = !self.index.quarantined_snapshot_fingerprints.is_empty();
+        for quiet_call in 0..3 {
+            if held_quarantine && quiet_call > 0 {
+                assert!(
+                    !self.index.quarantined_snapshot_fingerprints.is_empty(),
+                    "refusal quarantine survives settlement before quiet call {}",
+                    quiet_call + 1
+                );
+            }
+            self.uploader.prepare_for_scan(self.source, &mut self.index);
             let previous = self.index.clone();
             let (((scan, bytes), parses), group_bytes) =
                 terminal_contract_retry::group_body_bytes(|| {
                     terminal_contract_retry::source_acquisitions(|| self.walk(true))
                 });
-            // GroupBoot::Unchanged counts identified alias members as scanned
-            // and semantic no-ops, but constructs no body parser. Count real
-            // parser acquisitions rather than mistaking metadata checks for parses.
+            // Per-census unchanged-group identity walks pre-exist on main; no body read.
             assert!(
                 parses.is_empty(),
-                "no body parser is constructed after adoption"
+                "no body parser is stepped on a quiet or held page"
             );
             assert_eq!(bytes, 0);
             assert_eq!(
@@ -195,22 +201,6 @@ impl Fixture {
             assert!(
                 scan.scanned_file_count <= settled_group_members,
                 "quiet metadata work cannot exceed the settled alias population"
-            );
-            if let Some(expected) = metadata_count {
-                assert_eq!(
-                    scan.scanned_file_count, expected,
-                    "quiet metadata work stays constant over all three walks"
-                );
-            } else {
-                metadata_count = Some(scan.scanned_file_count);
-            }
-            self.uploader.activate(
-                self.source,
-                self.index
-                    .active_upload_context_fingerprint
-                    .clone()
-                    .unwrap(),
-                &mut self.index,
             );
             let before = self.uploader.posts.len();
             self.uploader

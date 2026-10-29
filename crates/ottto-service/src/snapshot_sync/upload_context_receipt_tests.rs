@@ -357,6 +357,30 @@ impl Uploader {
     ) {
         activate_source_upload_context(source, context, index, &mut self.progress);
     }
+    pub(crate) fn prepare_for_scan(&mut self, source: SnapshotSource, index: &mut ScanIndex) {
+        self.activate(
+            source,
+            index.active_upload_context_fingerprint.clone().unwrap(),
+            index,
+        );
+        let replay_generation =
+            cycle_replay_generation(source, true, index, "context-real-uploader");
+        let now = reason_reoffer::now_unix_seconds();
+        // Import durable refusals through the same prepare path as the service,
+        // before scanning: an empty disposable ledger must not erase a hold.
+        prepare_upload_progress_for_cycle_with_reoffer(
+            &mut self.progress,
+            index,
+            &replay_generation,
+            false,
+            Some(&reason_reoffer::Scope {
+                index,
+                now,
+                window_start_unix_seconds: now
+                    .saturating_sub(crate::snapshots::BACKFILL_WINDOW_DAYS * 86_400),
+            }),
+        );
+    }
     pub(crate) fn send(
         &mut self,
         source: SnapshotSource,

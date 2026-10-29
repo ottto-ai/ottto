@@ -1,5 +1,12 @@
 # Per-file upload-context acceptance
 
+Settled joined groups are identity-checked once per census; no body read. This
+unchanged-group walk pre-exists on main and stays bounded by settled membership.
+Quiet fixtures separately check zero parser acquisitions, sampled/native bytes,
+physical group-body bytes and POSTs while source context remains unadopted.
+Held-file fixtures call the service's real progress prepare/refusal-import path
+before scanning and require quarantine to survive into quiet calls two and three.
+
 Claude Code and Codex retain source-wide upload context only after a complete
 census. An incomplete census can therefore reselect an already delivered file
 on every subsequent walk. A local optional `ScanIndexEntry.upload_context_receipt`
