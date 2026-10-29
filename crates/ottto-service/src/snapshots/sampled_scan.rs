@@ -364,19 +364,19 @@ impl SharedCache {
                 let live_bytes_in = live_bytes;
                 #[cfg(unix)]
                 let touched = key.clone();
-                let reserved = live_bytes
-                    .saturating_add(self.cursor_resident_for_main())
-                    .saturating_add(side_ledger::SIDE_LEDGER_BYTES);
-                let admitted = cache.insert_reserving_at_rank(
-                    key,
-                    crate::transcript_cache::Retained {
-                        checkpoint: completed.checkpoint,
-                        state,
-                    },
-                    reserved,
-                    live_bytes,
-                    completed.released,
-                );
+                let retained = crate::transcript_cache::Retained {
+                    checkpoint: completed.checkpoint,
+                    state,
+                };
+                let rank = completed.released.unwrap_or_else(|| {
+                    crate::transcript_cache::admission_rank(
+                        retained.checkpoint.modified_hint(),
+                        crate::transcript_cache::admission_now(),
+                    )
+                });
+                let reserved = self.retained_reservation(&cache, &key, &retained, live_bytes, rank);
+                let admitted =
+                    cache.insert_reserving_at_rank(key, retained, reserved, live_bytes, Some(rank));
                 self.drop_suspended_proof_if_over(&cache, live_bytes_in);
                 // M1: an admitted copy is a durable write candidate after the
                 // next successful index save (the durable lock is a leaf).

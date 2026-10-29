@@ -1322,12 +1322,14 @@ thread_local! {
 }
 
 /// U1a-2a (R2-B3): `bound(value, limit)` as main measures it, with any
-/// suspended proof charged as `ProofHolder::None`, mirroring
-/// `state_for_main`. One walk under the same `try_lock` discipline as
+/// suspended proof charged as empty, mirroring `state_for_main`. Copy
+/// measures also leave optional header facts out. One walk under the same `try_lock` discipline as
 /// `bound` (a busy lock still reads as unbounded). Main's copy budget
 /// measures this, so optional proof work never shrinks it; main's
 /// admission and insert retire the proof where its room is needed
-/// (`admit_locked`, ss-6).
+/// (`admit_locked`, ss-6). Copy/shape-F allocation uses the existing
+/// `retire_proof_beside_copy` edge to release optional headers before spending
+/// this view's room. Non-allocating steps retain them.
 pub(in crate::snapshots) fn bound_for_main<T: HeapLayoutBound>(
     value: &T,
     limit: usize,
@@ -2368,7 +2370,11 @@ impl HeapLayoutBound for CursorState {
             Slot::Empty | Slot::ActiveElsewhere { .. } => c.add(0)?,
             Slot::Paused(_) => c.add(*slot_charge)?,
         }
-        headers.charge(c)?;
+        if MAIN_VIEW.with(std::cell::Cell::get) {
+            codex_file_join::HeaderCache::default().charge(c)?;
+        } else {
+            headers.charge(c)?;
+        }
         slot_key.heap_bound(c)?;
         slot_members.heap_bound(c)?;
         // Owner strings and joined member keys are visited (one each).
@@ -4040,23 +4046,14 @@ fn admit_locked(
     mandatory: bool,
     admitter: Admitter,
 ) -> bool {
-    if !cursor.headers.is_empty() && !proof_free_room(retained, cursor, charge) {
-        // Optional header facts yield before native progress or older copies.
-        // Prove feasibility without them before dropping anything; hopeless
-        // charges retain the cache, just as they retain other resident state.
-        let headers = std::mem::take(&mut cursor.headers);
-        let feasible = if admitter == Admitter::Proof {
+    let needed = !cursor.headers.is_empty() && !proof_free_room(retained, cursor, charge);
+    reclaim_headers(cursor, needed, |cursor| {
+        if admitter == Admitter::Proof {
             proof_free_room(retained, cursor, charge)
         } else {
             admission_feasible(cursor, charge, mandatory)
-        };
-        if !feasible {
-            cursor.headers = headers;
-            return false;
         }
-        cursor.headers = headers;
-        cursor.headers.clear();
-    }
+    });
     if admitter == Admitter::Proof {
         debug_assert!(!mandatory, "a proof admission is never mandatory");
         return !mandatory && proof_free_room(retained, cursor, charge);
@@ -4104,6 +4101,25 @@ fn admit_locked(
     }
 }
 
+// Both locks are held (retained then cursor). Never discard optional facts
+// for a hopeless claim; clearing preserves the pending eviction count.
+fn reclaim_headers(
+    cursor: &mut CursorState,
+    needed: bool,
+    feasible: impl FnOnce(&CursorState) -> bool,
+) -> bool {
+    if !needed || cursor.headers.is_empty() {
+        return false;
+    }
+    let headers = std::mem::take(&mut cursor.headers);
+    let fits = feasible(cursor);
+    cursor.headers = headers;
+    if fits {
+        cursor.headers.clear();
+    }
+    fits
+}
+
 // Header facts are only scalar/string graphs. Use the shared field walker
 // and budget on portable builds too; native cursor admission keeps its existing
 // layout-supported gate. Opaque or over-visit resident graphs refuse caching.
@@ -4120,6 +4136,28 @@ fn header_room(retained: &super::RetainedCache, cursor: &CursorState, charge: us
 }
 
 impl SharedCache {
+    pub(super) fn retained_reservation(
+        &self,
+        retained: &super::RetainedCache,
+        key: &String,
+        incoming: &crate::transcript_cache::Retained<super::CachedJsonlReduction>,
+        live: usize,
+        rank: (i64, i64),
+    ) -> usize {
+        self.with_cursor(|cursor| {
+            let reservation = |cursor: &CursorState| {
+                live.saturating_add(state_for_main(cursor).unwrap_or(STATE_BYTES))
+                    .saturating_add(super::side_ledger::SIDE_LEDGER_BYTES)
+            };
+            let needed = !cursor.headers.is_empty()
+                && !retained.insertion_fits(key, incoming, reservation(cursor), rank, false);
+            reclaim_headers(cursor, needed, |cursor| {
+                retained.insertion_fits(key, incoming, reservation(cursor), rank, true)
+            });
+            reservation(cursor)
+        })
+        .unwrap_or(STATE_BYTES)
+    }
     pub(in crate::snapshots) fn refresh_header(
         &self,
         key: String,
@@ -4171,7 +4209,13 @@ impl SharedCache {
                 let admitted = if free_only {
                     charge
                         .checked_add(super::ENTRY_BYTES + super::side_ledger::SIDE_LEDGER_BYTES)
-                        .is_some_and(|with_floor| proof_free_room(&retained, cursor, with_floor))
+                        .is_some_and(|with_floor| {
+                            let needed = !proof_free_room(&retained, cursor, with_floor);
+                            reclaim_headers(cursor, needed, |cursor| {
+                                proof_free_room(&retained, cursor, with_floor)
+                            });
+                            proof_free_room(&retained, cursor, with_floor)
+                        })
                 } else {
                     admit_locked(&mut retained, cursor, charge, true, Admitter::Main)
                 };
@@ -4226,6 +4270,7 @@ impl SharedCache {
     /// it, without the suspended proof (`state_for_main`). The retained
     /// insert reserves this, then `drop_suspended_proof_if_over` retires the
     /// proof if the insert took its room.
+    #[cfg(test)]
     pub(super) fn cursor_resident_for_main(&self) -> usize {
         self.with_cursor(|cursor| state_for_main(cursor))
             .flatten()
@@ -4253,7 +4298,8 @@ impl SharedCache {
     /// U1a-2a (R2-B3, r79, fix round 2 DB1): where main allocates against
     /// its copy budget (`retire_proof_beside_copy`), both shares leave
     /// `room` bytes in main's view (`bound_for_main`). A suspended proof
-    /// larger than that would spend bytes main is about to use, so it is
+    /// plus optional header facts larger than that would spend bytes main
+    /// is about to use. Headers yield first; any remaining excess proof is
     /// retired here (retained, then cursor; the job is freed under them,
     /// its entry `seq`s kept for the index's next hook), counted
     /// `side_proof_drops`. Otherwise nothing is
@@ -4261,7 +4307,11 @@ impl SharedCache {
     /// under the locks, never skipped.
     pub(in crate::snapshots) fn retire_proof_over_room(&self, room: usize) {
         let over = match self.cursor.try_lock() {
-            Ok(cursor) => cursor.proof.charge() > room,
+            Ok(cursor) => cursor
+                .headers
+                .optional_bytes()
+                .and_then(|bytes| bytes.checked_add(cursor.proof.charge()))
+                .map_or(true, |bytes| bytes > room),
             Err(std::sync::TryLockError::WouldBlock) => true,
             Err(std::sync::TryLockError::Poisoned(_)) => false,
         };
@@ -4272,6 +4322,14 @@ impl SharedCache {
             return;
         };
         self.with_cursor(|cursor| {
+            if cursor
+                .headers
+                .optional_bytes()
+                .and_then(|bytes| bytes.checked_add(cursor.proof.charge()))
+                .map_or(true, |bytes| bytes > room)
+            {
+                cursor.headers.clear();
+            }
             if cursor.proof.charge() > room {
                 retire_holder(cursor);
                 record_proof_drop();
@@ -4297,13 +4355,15 @@ impl SharedCache {
         &self,
         retained: &super::RetainedCache,
         pinned: usize,
-        reachable: impl FnOnce(usize) -> bool,
+        reachable: impl Fn(usize) -> bool,
     ) -> Option<usize> {
         self.with_cursor(|cursor| {
-            let room = STATE_BYTES
-                .checked_sub(state_for_main(cursor)?)?
-                .checked_sub(pinned)
-                .filter(|room| reachable(*room))?;
+            let room = |cursor: &CursorState| STATE_BYTES.checked_sub(state_for_main(cursor)?)?
+                .checked_sub(pinned);
+            let needed = !room(cursor).zip(crate::heap_layout_bound::bound(retained, STATE_BYTES))
+                .is_some_and(|(room, copies)| copies <= room);
+            reclaim_headers(cursor, needed, |cursor| room(cursor).is_some_and(&reachable));
+            let room = room(cursor).filter(|room| reachable(*room))?;
             if retire_suspended_proof_over(retained, cursor, pinned, Some(STATE_BYTES)) {
                 crate::local_resource_diagnostics::codex_side_lifecycle::record(
                     crate::local_resource_diagnostics::codex_side_lifecycle::Event::ProofReleaseDrop,

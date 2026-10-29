@@ -328,6 +328,11 @@ impl HeaderCache {
             .and_then(|()| header.heap_bound(&mut c))
             .map_or(usize::MAX, |()| c.bytes)
     }
+    pub(in crate::snapshots) fn optional_bytes(&self) -> Option<usize> {
+        crate::heap_layout_bound::tree_node_bytes::<String, CachedHeader>()?
+            .checked_mul(self.entries.len())?
+            .checked_add(self.heap_bytes)
+    }
     pub(in crate::snapshots) fn charge(
         &self,
         c: &mut crate::heap_layout_bound::Counter,
@@ -353,6 +358,7 @@ pub(super) struct HeaderInventory {
     pub(super) reuse_misses: usize,
     pub(super) bytes_avoided: usize,
     pub(super) reuse_evictions: usize,
+    cache_pruned: bool,
     /// Roster files whose first record was refused, each with the metadata
     /// witness seen at the refusal (`None` when it could not be read). This is
     /// the evidence a held page waits on; see `CodexInventoryHold`.
@@ -390,6 +396,7 @@ impl HeaderInventory {
             reuse_misses: 0,
             bytes_avoided: 0,
             reuse_evictions: 0,
+            cache_pruned: false,
             refused: BTreeMap::new(),
             bounded_out: paths.len() > MAX_HEADER_FILES
                 || !directories.is_some_and(|value| value.stable),
@@ -413,7 +420,8 @@ impl HeaderInventory {
         metadata: &CodexTitleMetadata,
         cache: Option<&sampled_scan::SharedCache>,
     ) -> bool {
-        if self.headers.is_empty() && self.refused.is_empty() && self.read_bytes == 0 {
+        if !self.cache_pruned {
+            self.cache_pruned = true;
             if let Some(cache) = cache {
                 cache.with_cursor(|cursor| cursor.headers.retain_roster(&self.pending));
             }
@@ -445,6 +453,10 @@ impl HeaderInventory {
             self.bounded_out = true;
             return false;
         };
+        // 11b-0b composition: skip a currently held file BEFORE any header
+        // lookup. Reuse only owner/time/stamp/read-count facts; rebuild custody
+        // cause, owner fences, completeness, membership and exclusions each pass.
+        // The second landing must preserve 11b's early skip and test warm -> held.
         let key = local_index_key(&path);
         self.reuse_misses += 1;
         let result = (|| -> Result<HeaderWitness> {
@@ -597,7 +609,7 @@ impl HeaderInventory {
 }
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
 crate::heap_layout_bound::fields!(HeaderWitness; candidate, owner, home, created_unix_ms, metadata);
-crate::heap_layout_bound::fields!(HeaderInventory; roots, pending, headers, directories, complete, read_bytes, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, refused, bounded_out);
+crate::heap_layout_bound::fields!(HeaderInventory; roots, pending, headers, directories, complete, read_bytes, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, bounded_out);
 
 #[derive(Clone, Debug)]
 pub(super) struct Group {
@@ -4107,12 +4119,12 @@ pub(super) mod tests {
 }
 
 #[cfg(all(test, unix))]
-mod header_cache_tests {
+pub(in crate::snapshots) mod header_cache_tests {
     use super::*;
     thread_local! {
-        pub(super) static READ_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        pub(in crate::snapshots) static READ_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
-    fn page(
+    pub(in crate::snapshots) fn page(
         root: &Path,
         paths: &BTreeSet<String>,
         cache: &sampled_scan::SharedCache,

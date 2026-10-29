@@ -10755,6 +10755,104 @@ fn a_retained_insert_decides_without_the_proof_and_retires_it_when_needed() {
     });
 }
 
+/// R2 optional-header composition uses the existing main copy measure and
+/// production allocation callback, including the shape-F measure's view.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn header_facts_never_shrink_the_main_copy_budget_and_yield_before_allocation() {
+    let (root, fixture) = codex_file_join::tests::fixture();
+    let paths = fixture
+        .headers
+        .iter()
+        .map(|header| local_index_key(&header.candidate.path))
+        .collect();
+    let cache = Arc::new(SharedCache::default());
+    let credit = cache
+        .cursor_reserve(
+            STATE_BYTES - admission_floor(&cache) - cache.cursor_resident() - 128 * 1024,
+        )
+        .unwrap();
+    let first = codex_file_join::header_cache_tests::page(&root, &paths, &cache);
+    assert!(first.complete);
+    assert_eq!(first.reuse_misses, 2);
+    let bytes = cache
+        .with_cursor(|cursor| cursor.headers.optional_bytes().unwrap())
+        .unwrap();
+    assert!(bytes > 0);
+    let context = main_context(&cache);
+    let (budget, step) = super::super::copy_budget_step(Some(&context), None, true);
+    assert!(budget > 0 && budget < super::super::ENTRY_BYTES);
+    let headers = cache
+        .with_cursor(|cursor| std::mem::take(&mut cursor.headers))
+        .unwrap();
+    let (cold_budget, cold_step) = super::super::copy_budget_step(Some(&context), None, true);
+    cache
+        .with_cursor(|cursor| cursor.headers = headers)
+        .unwrap();
+    assert_eq!((budget, step), (cold_budget, cold_step));
+    assert_eq!(
+        cache
+            .with_cursor(|cursor| cursor.headers.optional_bytes().unwrap())
+            .unwrap(),
+        bytes,
+        "measurement alone cannot evict"
+    );
+    super::super::retire_proof_beside_copy(Some(&context), budget, step);
+    assert!(cache
+        .with_cursor(|cursor| cursor.headers.is_empty())
+        .unwrap());
+    assert!(super::super::copy_retire_probe().unwrap().fits());
+    let next = codex_file_join::header_cache_tests::page(&root, &paths, &cache);
+    assert_eq!(
+        (next.reuse_hits, next.reuse_misses, next.reuse_evictions),
+        (0, 2, 2)
+    );
+    credit.refund();
+    assert_eq!(cache.cursor_reserved(), 0);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn release_paths_reclaim_headers_only_when_the_ranked_fit_is_reachable() {
+    for path in 0..3 {
+        let (root, fixture) = codex_file_join::tests::fixture();
+        let paths = fixture
+            .headers
+            .iter()
+            .map(|header| local_index_key(&header.candidate.path))
+            .collect();
+        let cache = SharedCache::default();
+        let first = codex_file_join::header_cache_tests::page(&root, &paths, &cache);
+        assert!(first.complete);
+        let before = cache
+            .with_cursor(|cursor| cursor.headers.optional_bytes().unwrap())
+            .unwrap();
+        assert!(before > 0);
+        let release = |pinned| match path {
+            0 => cache.release_to_fit(pinned),
+            1 => cache.release_older_to_fit(pinned, (1, 0)),
+            _ => cache.release_older_prefix_to_fit(pinned, (1, 0), 0),
+        };
+        assert!(!release(STATE_BYTES), "hopeless claims evict nothing");
+        assert_eq!(
+            cache
+                .with_cursor(|cursor| cursor.headers.optional_bytes().unwrap())
+                .unwrap(),
+            before
+        );
+        let pinned =
+            STATE_BYTES - cache.cursor_resident_for_main() + before - retained_floor(&cache);
+        assert!(release(pinned));
+        assert!(cache
+            .with_cursor(|cursor| cursor.headers.is_empty())
+            .unwrap());
+        let next = codex_file_join::header_cache_tests::page(&root, &paths, &cache);
+        assert_eq!((next.reuse_hits, next.reuse_evictions), (0, 2));
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
 fn main_context(cache: &Arc<SharedCache>) -> super::super::Context {
     super::super::Context {
         cache: Arc::clone(cache),

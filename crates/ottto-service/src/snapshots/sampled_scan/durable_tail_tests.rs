@@ -2499,3 +2499,206 @@ fn a_permit_era_record_restores_under_the_always_on_capture() {
     drop(restored);
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// Real inventory -> disk restore -> native Tail. The scaled cache keeps the
+/// same admission mechanism; optional facts must lose before a usable record.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
+    use crate::heap_layout_bound::bound;
+    use crate::snapshots::codex_file_join::header_cache_tests::{page, READ_CALLS};
+    use crate::snapshots::sampled_scan::{codex_cursor, STATE_BYTES};
+    use crate::transcript_acquisition::ReadMode;
+    use crate::transcript_cache::{FrozenCacheState, Retained, TranscriptCache};
+    const LIMIT: usize = 256 * 1024;
+    let root = crate::test_scratch::private_dir("ottto-header-restore");
+    let lock = test_locks::hold(&root);
+    let sessions = root.join("sessions");
+    std::fs::create_dir(&sessions).unwrap();
+    let source = SnapshotSource::Codex;
+    let namespace = Scope("header-restore".into());
+    let scope = Scope("header-restore-file".into());
+    let path = sessions.join("target.jsonl");
+    let session = "0199f7a0-0000-7000-8000-0000000d7a11";
+    codex_budget_fixture(&path, session, Some(32 * 1024));
+    let key = local_index_key(&path);
+    let mut paths = BTreeSet::from([key.clone()]);
+    for number in 0..512 {
+        let header = sessions.join(format!("header-{number:04}.jsonl"));
+        std::fs::write(
+            &header,
+            format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session}\"}}}}\n"),
+        )
+        .unwrap();
+        paths.insert(local_index_key(&header));
+    }
+    let index_path = root.join("index.json");
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        key.clone(),
+        serde_json::from_value(serde_json::json!({
+            "size_bytes":std::fs::metadata(&path).unwrap().len(),
+            "modified_unix_seconds":1,"source_file_fingerprint":"fp"
+        }))
+        .unwrap(),
+    );
+    index.save(&index_path).unwrap();
+    let interpretation = Interpretation::of(source, &key, &index, false, &namespace);
+    let binding = expected(
+        DurableSource::Codex,
+        source,
+        &key,
+        &scope,
+        &index,
+        &interpretation,
+    )
+    .unwrap()
+    .binding;
+    let (reduction, checkpoint) = native_record_of(&path, &scope, source);
+    assert!(reduction.supports_frozen_charge());
+    let incoming = Retained {
+        checkpoint,
+        state: reduction,
+    };
+    assert!(bound(&incoming, crate::transcript_cache::ENTRY_BYTES).is_some());
+    let mut store = DurableTailStore::new(
+        store::store_dir_for_index(&index_path),
+        DurableSource::Codex,
+    );
+    store
+        .write_after_save(
+            lock,
+            index.generation,
+            vec![PendingRecord {
+                binding,
+                certificate: certificate(&path, &scope),
+                body: codec::encode(
+                    &incoming.state,
+                    store::RECORD_BYTES,
+                    jsonl_line_cap() as u64,
+                )
+                .unwrap(),
+                allowlist: codec::allowlist_digest(source),
+            }],
+        )
+        .unwrap();
+    let records = || {
+        std::fs::read_dir(store.dir())
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (path.clone(), std::fs::read(path).unwrap())
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    let saved = records();
+    assert_eq!(saved.len(), 1);
+    let suffix = b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n";
+    std::io::Write::write_all(
+        &mut std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap(),
+        suffix,
+    )
+    .unwrap();
+    let rank = crate::transcript_cache::admission_rank(
+        incoming.checkpoint.modified_hint(),
+        crate::transcript_cache::admission_now(),
+    );
+    for (fits, limit) in [(true, LIMIT), (false, 1)] {
+        let cache = SharedCache::default();
+        *cache.retained().unwrap() = TranscriptCache::with_byte_limit(limit);
+        cache.durable_begin_pass(source, &index_path, &namespace, false);
+        READ_CALLS.with(|count| count.set(0));
+        let inventory = codex_cursor::with_test_state_budget(LIMIT, || page(&root, &paths, &cache));
+        assert!(inventory.complete);
+        assert_eq!(inventory.reuse_misses, paths.len());
+        assert_eq!(READ_CALLS.with(std::cell::Cell::get), paths.len());
+        let before = cache
+            .with_cursor(|cursor| cursor.headers.optional_bytes().unwrap())
+            .unwrap();
+        assert!(
+            before > LIMIT / 2,
+            "real inventory fills the header allowance"
+        );
+        {
+            let retained = cache.retained().unwrap();
+            cache
+                .with_cursor(|cursor| {
+                    let reserved = bound(cursor, STATE_BYTES).unwrap()
+                        + crate::snapshots::sampled_scan::side_ledger::SIDE_LEDGER_BYTES;
+                    assert!(!retained.insertion_fits(&key, &incoming, reserved, rank, true));
+                    let headers = std::mem::take(&mut cursor.headers);
+                    let reserved = bound(cursor, STATE_BYTES).unwrap()
+                        + crate::snapshots::sampled_scan::side_ledger::SIDE_LEDGER_BYTES;
+                    assert_eq!(
+                        retained.insertion_fits(&key, &incoming, reserved, rank, true),
+                        fits
+                    );
+                    cursor.headers = headers;
+                })
+                .unwrap();
+        }
+        let restored = cache.durable_restore(
+            source,
+            &key,
+            &path,
+            &scope,
+            &mut File::open(&path).unwrap(),
+            &index,
+            &interpretation,
+        );
+        if fits {
+            let taken = match restored {
+                RestoreOutcome::Restored(taken) => taken,
+                _ => panic!("fitting durable record must restore, never miss or hold"),
+            };
+            let mut parser = OwnedJsonlParser::new(
+                File::open(&path).unwrap(),
+                &path,
+                source,
+                apply_codex_line,
+                None,
+                None,
+                None,
+                false,
+                true,
+            )
+            .unwrap();
+            assert_eq!(
+                parser
+                    .prepare_acquisition(Some(taken.retained), &scope, None, 1_800_000_001)
+                    .unwrap(),
+                ReadMode::Tail
+            );
+            while !parser.step().unwrap() {}
+            assert_eq!(parser.reader.consumed_bytes(), suffix.len() as u64);
+            let next = codex_cursor::with_test_state_budget(LIMIT, || page(&root, &paths, &cache));
+            assert!(next.complete);
+            assert_eq!(next.reuse_hits, 0);
+            assert_eq!(next.reuse_misses, paths.len());
+            assert!(next.reuse_evictions > 0);
+            assert!(next.read_bytes <= paths.len() * (64 * 1024 + 1));
+        } else {
+            assert!(matches!(
+                restored,
+                RestoreOutcome::Miss(MissClass::BudgetRefused)
+            ));
+            assert_eq!(
+                cache
+                    .with_cursor(|cursor| cursor.headers.optional_bytes().unwrap())
+                    .unwrap(),
+                before
+            );
+            let next = codex_cursor::with_test_state_budget(LIMIT, || page(&root, &paths, &cache));
+            assert!(next.reuse_hits > 0);
+            assert_eq!(next.reuse_evictions, 0, "hopeless restore preserves facts");
+        }
+        let (counts, _) = cache.durable_counters(source).unwrap();
+        assert_eq!(counts.restored, u64::from(fits));
+        assert_eq!(counts.budget_refused, u64::from(!fits));
+        assert_eq!(records(), saved, "restore cannot change durable authority");
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
