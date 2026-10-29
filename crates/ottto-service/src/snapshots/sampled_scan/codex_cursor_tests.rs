@@ -15016,7 +15016,9 @@ fn deferred_custody_saves_decision_before_frozen_continuation_and_restart() {
             &paths,
             Some(&dirs),
         );
-        while !inventory.step_with_archive(&CodexTitleMetadata::default(), &mut index, None) {}
+        while inventory.step_with_archive(&CodexTitleMetadata::default(), &mut index, None)
+            != codex_file_join::HeaderStep::Complete
+        {}
         assert!(inventory.complete);
         let mut committed = index.clone();
         let before = committed.files.get(&key).cloned().unwrap_or_default();
@@ -15278,7 +15280,9 @@ fn deferred_group_preserves_accepted_extent_and_releases_through_existing_ends()
                 &paths,
                 Some(&dirs),
             );
-            while !inventory.step_with_archive(&CodexTitleMetadata::default(), &mut index, None) {}
+            while inventory.step_with_archive(&CodexTitleMetadata::default(), &mut index, None)
+                != codex_file_join::HeaderStep::Complete
+            {}
             assert!(inventory.complete);
             let before = index.files.clone();
             let mut committed = index.clone();
@@ -15628,7 +15632,9 @@ fn shared_refused_file_obligation_survives_growth_age_cap_and_reloads_then_tails
                 &BTreeSet::from([key.clone()]),
                 Some(&directories),
             );
-            while !inv.step_with_archive(&CodexTitleMetadata::default(), &mut index, None) {}
+            while inv.step_with_archive(&CodexTitleMetadata::default(), &mut index, None)
+                != codex_file_join::HeaderStep::Complete
+            {}
             assert_eq!(inv.headers.len(), 1);
             assert!(inv.headers[0].custody_cause.is_none());
             // The first retained key is the ordinary P entry. The later held
@@ -15980,7 +15986,9 @@ fn plain_cursor_resumes_unchanged_when_its_archive_sibling_is_family_held() {
         );
         // Synthetic future-admission seam; cached headers still need QoS permission.
         inv.archive_work.allowed = true;
-        while !inv.step_with_archive(&CodexTitleMetadata::default(), &mut index, Some(&cache)) {}
+        while inv.step_with_archive(&CodexTitleMetadata::default(), &mut index, Some(&cache))
+            != codex_file_join::HeaderStep::Complete
+        {}
         while !inv.prepare_custody(&index) {}
         while !inv.hold_custodied_siblings(&mut index) {}
         assert!(inv.complete_for(Some(&SESSION.to_owned())));
@@ -16258,7 +16266,9 @@ fn deferred_custody_group_money_main_pass_and_withhold_then_quiet_restart() {
                 &members,
                 Some(&dirs),
             );
-            while !inventory.step_with_archive(&CodexTitleMetadata::default(), &mut index, None) {}
+            while inventory.step_with_archive(&CodexTitleMetadata::default(), &mut index, None)
+                != codex_file_join::HeaderStep::Complete
+            {}
             assert!(inventory.complete);
             let before = index.files[&plain].clone();
             let mut committed = index.clone();

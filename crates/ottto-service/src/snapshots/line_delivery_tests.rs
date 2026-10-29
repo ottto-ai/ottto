@@ -1790,6 +1790,7 @@ fn candidate_and_open_gates_keep_withheld_account_keys() {
         let opened = candidate_from_traversal_path(
             SnapshotSource::ClaudeCode,
             ScanTraversalPath {
+                order_modified: None,
                 scan_root: root.projects(),
                 path: path.to_path_buf(),
                 census_member: true,

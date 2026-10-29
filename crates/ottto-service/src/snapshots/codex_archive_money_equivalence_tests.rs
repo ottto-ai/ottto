@@ -14,7 +14,7 @@ fn discovered_scan(f: &ArchiveFixture, mut index: ScanIndex, limit: usize) -> Ow
         SnapshotSource::Codex,
         traversal,
         BACKFILL_WINDOW_DAYS,
-        &index.files,
+        DiscoveryRetention::unverified(&index.files),
     );
     OwnedSourceScan::new(
         SnapshotSource::Codex,
@@ -299,14 +299,24 @@ fn watcher_retained_refresh_and_bounded_walk_admit_exact_codex_archives() {
             .pending_candidates
             .iter()
             .all(|p| p.path == plain || (source == SnapshotSource::Codex && p.path == f.0)));
-        refresh_retained_codex_roster(source, traversal, BACKFILL_WINDOW_DAYS, &index.files);
+        refresh_retained_codex_roster(
+            source,
+            traversal,
+            BACKFILL_WINDOW_DAYS,
+            DiscoveryRetention::unverified(&index.files),
+        );
         assert_eq!(
             traversal
                 .codex_rollout_paths
                 .contains(&local_index_key(&f.0)),
             source == SnapshotSource::Codex
         );
-        advance_bounded_directory_traversal(source, traversal, BACKFILL_WINDOW_DAYS, &index.files);
+        advance_bounded_directory_traversal(
+            source,
+            traversal,
+            BACKFILL_WINDOW_DAYS,
+            DiscoveryRetention::unverified(&index.files),
+        );
         assert!(traversal
             .pending_candidates
             .iter()

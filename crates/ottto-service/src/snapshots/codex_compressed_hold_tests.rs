@@ -579,7 +579,9 @@ fn write_codex_zst_downgrade_fixture() {
     assert!(entry.codex_applied_tier_receipt.is_none());
     assert!(entry.codex_joined_member_set.is_none());
     let archive = entry.archive.as_mut().unwrap();
-    archive.header_bound_reached = true;
+    let mut raw = serde_json::to_value(&**archive).unwrap();
+    raw["header_bound_reached"] = json!(true);
+    **archive = serde_json::from_value(raw).unwrap();
     archive.owner = Some(OWNER.into());
     archive.decode_attempts = 1;
     archive.disposition = ArchiveDisposition::Acquired;

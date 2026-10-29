@@ -27682,6 +27682,7 @@ impl OwnedSourceScan {
                             {
                                 if let Some(traversal) = index.traversal.as_mut() {
                                     traversal.pending_candidates.push_back(ScanTraversalPath {
+                                        order_modified: None,
                                         scan_root: candidate.scan_root,
                                         path: candidate.path,
                                         census_member: true,
