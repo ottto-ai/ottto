@@ -228,6 +228,7 @@ pub(crate) fn decode(body: &[u8], source: SnapshotSource) -> Result<Decoded, Cor
     (row.decode)(body, row.snapshot)
 }
 
+#[cfg(test)]
 pub(in crate::snapshots) fn decode_body(
     body: &[u8],
     source: SnapshotSource,
@@ -248,6 +249,18 @@ pub(in crate::snapshots) fn decode_body(
 /// Funds typed decode only; re-derivation is a separate allocation boundary.
 #[cfg(unix)]
 pub(crate) fn decode_bounded(
+    body: &[u8],
+    source: SnapshotSource,
+    lease: &mut crate::durable_tail_store::ActiveLease,
+) -> Result<Decoded, crate::durable_tail_codec::DecodeFailure> {
+    let source = crate::durable_tail_store::DurableSource::from_snapshot(source)
+        .ok_or(crate::durable_tail_codec::DecodeFailure::Integrity)?;
+    let row = source.properties();
+    (row.decode_bounded)(body, row.snapshot, lease)
+}
+
+#[cfg(unix)]
+pub(in crate::snapshots) fn decode_body_bounded(
     body: &[u8],
     source: SnapshotSource,
     lease: &mut crate::durable_tail_store::ActiveLease,

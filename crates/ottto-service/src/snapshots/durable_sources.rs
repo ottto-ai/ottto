@@ -11,8 +11,17 @@ pub(crate) struct Properties {
     pub(crate) format: u16,
     pub(crate) allowlist_pin: &'static str,
     pub(super) encode: fn(&CachedJsonlReduction, usize, u64) -> Result<Vec<u8>, Refuse>,
+    #[cfg(test)]
     pub(super) decode: fn(&[u8], SnapshotSource) -> Result<durable::Decoded, Corrupt>,
+    #[cfg(unix)]
+    pub(super) decode_bounded:
+        fn(
+            &[u8],
+            SnapshotSource,
+            &mut crate::durable_tail_store::ActiveLease,
+        ) -> Result<durable::Decoded, crate::durable_tail_codec::DecodeFailure>,
     pub(super) verify: fn(&[u8]) -> Result<(), Corrupt>,
+    #[cfg(test)]
     pub(super) apply_line: fn(&Value, &mut SnapshotAccumulator),
 }
 
@@ -26,8 +35,12 @@ pub(crate) const SOURCES: &[Properties] = &[
         format: 1,
         allowlist_pin: "8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c",
         encode: durable::encode_body,
+        #[cfg(test)]
         decode: durable::decode_body,
+        #[cfg(unix)]
+        decode_bounded: durable::decode_body_bounded,
         verify: durable::verify,
+        #[cfg(test)]
         apply_line: apply_claude_code_line,
     },
     Properties {
@@ -37,8 +50,12 @@ pub(crate) const SOURCES: &[Properties] = &[
         format: 1,
         allowlist_pin: "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1",
         encode: durable::encode_body,
+        #[cfg(test)]
         decode: durable::decode_body,
+        #[cfg(unix)]
+        decode_bounded: durable::decode_body_bounded,
         verify: durable::verify,
+        #[cfg(test)]
         apply_line: apply_codex_line,
     },
 ];

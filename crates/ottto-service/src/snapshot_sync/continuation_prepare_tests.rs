@@ -927,7 +927,7 @@ fn ordinary_durable_continuation_to_eof(
             writer,
         );
         state.assert_preserved(&cache);
-        for page in 0..64 {
+        for _ in 0..64 {
             let result = run_continuation_scan(
                 &fixture.home,
                 &fixture.support_dir,

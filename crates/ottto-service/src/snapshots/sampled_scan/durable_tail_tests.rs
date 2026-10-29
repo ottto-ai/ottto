@@ -5834,9 +5834,7 @@ fn q11_strict_restore_real_plain_reader_tail_then_retry_holds() {
 
 #[test]
 fn q11_complete_map_is_paid_before_the_first_key() {
-    let nodes =
-        crate::heap_layout_bound::tree_node_bytes::<store::Digest32, (u64, std::time::Instant)>()
-            .unwrap();
+    let nodes = custody_node_bytes().unwrap();
     let reserve = super::super::RETAIL_RESERVE_BYTES;
     assert!((2 * store::MAX_RECORDS + 1) * nodes <= reserve);
     assert_eq!(STORES_RESIDENT_BOUND, 926_720);
@@ -7378,9 +7376,11 @@ fn a1a_strict_writer_preserves_cleared_and_reverted_predecessors_after_restore_p
             1,
             "restore earned exact record permission"
         );
+        let (taken, lease) = taken.into_parts();
         assert!(cache.insert_admitted(
             key.clone(),
             sampled_jsonl::CompletedNativeAcquisition {
+                durable: taken.durable,
                 checkpoint: taken.retained.checkpoint,
                 reduction: Some(taken.retained.state),
                 released: None,
@@ -7388,6 +7388,7 @@ fn a1a_strict_writer_preserves_cleared_and_reverted_predecessors_after_restore_p
             },
             0
         ));
+        lease.release(); // The funded graph has transferred into the bounded cache.
         cache.durable_note_selection(&key, "new-working-selection");
         if arm == "cleared" {
             index
