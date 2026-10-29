@@ -2937,13 +2937,15 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
             ReadMode::Full(FullReason::AuditDue)
         );
     }
-    // Third case: a surviving debt-bearing record with a missing/reset carrier
-    // is held through the production restore entry, before any certificate I/O.
+    // Third case: absent entries hold without inventing membership. Reset
+    // carriers re-arm an immediate current-index audit before any source read.
+    // A completed Full whose durable replacement failed has the same state.
     let saved = ScanIndex::load(&index_path).unwrap();
     for reset in [false, true] {
         let mut missing = saved.clone();
         if reset {
-            missing.files.get_mut(&key).unwrap().scan_identity_version = None;
+            assert!(missing.complete_full_audit(&key, "debt-source"));
+            missing.save(&index_path).unwrap(); // crash before record replacement
         } else {
             missing.files.remove(&key);
         }
@@ -2951,23 +2953,73 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
         cache.durable_begin_pass(SnapshotSource::ClaudeCode, &index_path, &scope, true);
         let interpretation =
             Interpretation::of(SnapshotSource::ClaudeCode, &key, &missing, true, &scope);
-        // A write-only FD fails any attempted transcript read.
         let mut held = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        assert!(
-            matches!(
-                cache.durable_restore(
-                    SnapshotSource::ClaudeCode,
-                    &key,
-                    &path,
-                    &scope,
-                    &mut held,
-                    &missing,
-                    &interpretation
-                ),
-                RestoreOutcome::Held(store::Refusal::Unbindable)
-            ),
-            "reset={reset}"
+        let outcome = cache.durable_restore(
+            SnapshotSource::ClaudeCode,
+            &key,
+            &path,
+            &scope,
+            &mut held,
+            &missing,
+            &interpretation,
         );
+        if reset {
+            let RestoreOutcome::Miss(class @ MissClass::AuditCarrier) = outcome else {
+                panic!("reset must re-arm, not hold");
+            };
+            let rearmed = class.rearm_audit(&mut missing, &key, now).unwrap();
+            assert_eq!(
+                sampled_audit::debt_for_key(&missing, &key, now),
+                Some(rearmed)
+            );
+            assert_eq!(
+                ReadPlan::prepare(&mut held, None, &scope, Some(rearmed), now)
+                    .unwrap()
+                    .mode(),
+                ReadMode::Full(FullReason::AuditDue)
+            );
+            missing.save(&index_path).unwrap();
+            let loaded = ScanIndex::load(&index_path).unwrap();
+            let mut disk = DurableTailStore::new(dir.clone(), source);
+            let record = match disk.read(&record_key) {
+                ReadOutcome::Found(r) => r,
+                other => panic!("{other:?}"),
+            };
+            assert!(audit_carrier_matches(&record, &loaded, &key, now));
+            // The retry completes a real Full, then publishes a clean replacement.
+            let mut file = File::open(&path).unwrap();
+            let mut plan = ReadPlan::prepare(&mut file, None, &scope, Some(rearmed), now).unwrap();
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).unwrap();
+            plan.observe_complete_records(&bytes).unwrap();
+            let checkpoint = plan
+                .commit_after_native_completion(&file, &scope, now)
+                .unwrap();
+            assert_eq!(checkpoint.audit_debt(), None);
+            assert!(missing.complete_full_audit(&key, "debt-source"));
+            missing.save(&index_path).unwrap();
+            let mut replacement = record.record;
+            replacement.certificate = certificate_at(&key, &checkpoint, &missing, now).unwrap();
+            disk.write_after_save(lock, missing.generation, vec![replacement])
+                .unwrap();
+            let record = match DurableTailStore::new(dir.clone(), source).read(&record_key) {
+                ReadOutcome::Found(r) => r,
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(record.envelope_audit_debt, None);
+            assert!(audit_carrier_matches(
+                &record,
+                &ScanIndex::load(&index_path).unwrap(),
+                &key,
+                now
+            ));
+        } else {
+            assert!(matches!(
+                outcome,
+                RestoreOutcome::Held(store::Refusal::Unbindable)
+            ));
+            assert!(!missing.files.contains_key(&key));
+        }
         assert_eq!(
             cache
                 .durable_counters(SnapshotSource::ClaudeCode)

@@ -31735,7 +31735,7 @@ impl OwnedSourceScan {
                         .reduction_dependencies_available
                         .observe(reduction_sidecar.is_some());
                     if let Some(reduction_sidecar) = reduction_sidecar {
-                        let debt =
+                        let mut debt =
                             sampled_audit::debt_for_key(index, &key, sampled_scan::now_seconds());
                         let protected_entry = index.files.get(&key);
                         context
@@ -31836,7 +31836,17 @@ impl OwnedSourceScan {
                                         );
                                         (Some(taken.retained), Some(admission))
                                     }
-                                    sampled_scan::durable_tail::RestoreOutcome::Miss(_) => {
+                                    sampled_scan::durable_tail::RestoreOutcome::Miss(class) => {
+                                        let rearmed = class.rearm_audit(
+                                            index,
+                                            &key,
+                                            sampled_scan::now_seconds(),
+                                        );
+                                        if rearmed.is_some() && debt.is_none() {
+                                            context.audit_slots =
+                                                context.audit_slots.saturating_sub(1);
+                                        }
+                                        debt = rearmed.or(debt);
                                         (None, taken_admission)
                                     }
                                     sampled_scan::durable_tail::RestoreOutcome::Held(reason) => {

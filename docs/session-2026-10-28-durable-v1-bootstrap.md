@@ -9,8 +9,10 @@ bytes are checked and dropped on decode without changing their wire offsets.
 The v1 writer takes that field from the current committed index obligation,
 so a decoded checkpoint cannot erase debt needed by downgrade readers. Invalid
 debt tags or inconsistent flag/deadline pairs are preserved as Unbindable holds.
-A debt-bearing record with an absent/reset index carrier or a postponed deadline
-is held before transcript reads. The envelope never restores checkpoint debt;
+A debt-bearing record with an absent index entry is held before transcript
+reads. An existing entry with a reset/postponed carrier re-arms an immediate
+index audit, recovering the normal completed-audit/index-saved/record-old crash
+window through Full(AuditDue). The envelope never restores checkpoint debt;
 the index remains deadline authority and later offers cannot postpone it.
 Ordinary replacement failure or budget refusal retains valid v1 authority.
 
@@ -27,7 +29,9 @@ Fixed v1 scope/replay digests, headers and complete writer-output literals
 (nonzero and zero audit debt, both sources) pin the historical serializers.
 The full writer goldens use an opaque fixed body; production body decoding and
 restoration are covered separately. A two-reload debt fixture rewrites from the
-current index, checks downgrade-visible bytes and holds missing/reset carriers.
+current index, checks downgrade-visible bytes, holds absent entries and re-arms
+reset carriers. A native crash-window fixture audits, saves without replacing,
+restarts, completes the re-armed audit and proves replacement permits Tail.
 GC representation lookup is bounded to store-header bytes, charged to GC, and
 has a direct header-only fixture with the synthetic transcript unavailable. Native restart fixtures
 cover old restore, Tail, ordinary save/GC and a second restore with zero Fulls;

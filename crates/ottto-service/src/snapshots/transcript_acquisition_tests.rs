@@ -3846,3 +3846,143 @@ fn no_record_keys_keep_existing_full_admission_after_restart() {
         );
     }
 }
+
+/// Index save may clear a completed audit before its durable replacement.
+/// Restart must re-arm the audit, not freeze the old debt-bearing record.
+#[cfg(unix)]
+#[test]
+fn completed_full_audit_before_durable_replacement_recovers_after_restart() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let fixture = ScanFixture::new(source);
+        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+        let namespace = Scope("audit-replacement-crash".into());
+        let state = fixture.dir.join("state");
+        fs::create_dir_all(&state).unwrap();
+        let lock = crate::locked_state_dir::test_locks::hold(&state);
+        let index_path = state.join("index.json");
+        let begin = || {
+            let cache = Arc::new(sampled_scan::SharedCache::default());
+            cache.durable_begin_pass(
+                source,
+                &index_path,
+                &namespace,
+                source == SnapshotSource::ClaudeCode,
+            );
+            cache
+        };
+        let cache = begin();
+        let (mut index, _, modes) = production_scan(
+            &fixture,
+            source,
+            ScanIndex::default(),
+            Some(cache.clone()),
+            &namespace.0,
+        );
+        assert_eq!(modes.0, 1);
+        index.save(&index_path).unwrap();
+        assert_eq!(
+            cache
+                .durable_write_after_save(lock, source, &index)
+                .unwrap()
+                .written,
+            1
+        );
+        fixture.file.append(&usage(source, 130, 1, "fixture-model"));
+        let (mut index, _, modes) =
+            production_scan(&fixture, source, index, Some(cache.clone()), &namespace.0);
+        assert_eq!(modes, (0, 1, 0));
+        let key = local_index_key(&fixture.file.0);
+        assert!(index.files[&key].has_unverified_source());
+        index.save(&index_path).unwrap();
+        assert_eq!(
+            cache
+                .durable_write_after_save(lock, source, &index)
+                .unwrap()
+                .written,
+            1
+        );
+        drop(cache);
+        let record_path = fs::read_dir(crate::durable_tail_store::store_dir_for_index(&index_path))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let old = fs::read(&record_path).unwrap();
+        assert_eq!(old[311], 1, "predecessor owes an audit");
+        let now = unix_seconds(SystemTime::now()).unwrap();
+        let fingerprint = index.files[&key].source_file_fingerprint.clone();
+        assert!(index.stage_sampled_audit(
+            &key,
+            &fingerprint,
+            crate::transcript_acquisition::AuditDebt {
+                due_unix_seconds: now
+            }
+        ));
+        let audit = begin();
+        let (mut audited, _, modes) =
+            production_scan(&fixture, source, index, Some(audit.clone()), &namespace.0);
+        assert_eq!(modes.0, 1);
+        assert!(
+            !audited.files[&key].has_unverified_source(),
+            "completed actual Full cleared carrier"
+        );
+        audited.save(&index_path).unwrap();
+        // Crash/failure/deferral before durable_write_after_save: old bytes survive.
+        drop(audit);
+        assert_eq!(fs::read(&record_path).unwrap(), old);
+        fixture.file.append(&usage(source, 160, 2, "fixture-model"));
+        let restart = begin();
+        let loaded = ScanIndex::load(&index_path).unwrap();
+        let (mut repaired, scan, modes) = production_scan(
+            &fixture,
+            source,
+            loaded.clone(),
+            Some(restart.clone()),
+            &namespace.0,
+        );
+        let (_, cold, _) = production_scan(&fixture, source, loaded, None, &namespace.0);
+        assert_eq!(modes.0, 1, "immediate re-armed audit progresses");
+        assert_eq!(
+            restart
+                .durable_counters(source)
+                .unwrap()
+                .0
+                .ineligible
+                .get("audit_carrier"),
+            Some(&1)
+        );
+        assert_eq!(
+            restart.durable_counters(source).unwrap().0.durable_held,
+            [0; 5]
+        );
+        assert_eq!(production_body(source, scan), production_body(source, cold));
+        assert!(!repaired.files[&key].has_unverified_source());
+        repaired.save(&index_path).unwrap();
+        assert_eq!(
+            restart
+                .durable_write_after_save(lock, source, &repaired)
+                .unwrap()
+                .written,
+            1
+        );
+        assert_eq!(fs::read(&record_path).unwrap()[311], 0);
+        drop(restart);
+        fixture.file.append(&usage(source, 190, 3, "fixture-model"));
+        let (_, _, modes) = production_scan(
+            &fixture,
+            source,
+            ScanIndex::load(&index_path).unwrap(),
+            Some(begin()),
+            &namespace.0,
+        );
+        assert_eq!(
+            modes,
+            (0, 1, 0),
+            "successful replacement does not renew repair"
+        );
+    }
+}

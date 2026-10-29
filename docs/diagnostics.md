@@ -164,7 +164,7 @@ calling these measurements installed evidence.
 A `durable_tail_alarm` record (schema 2 additive) follows a post-save pass
 whose durable-store counts for that source changed. Each count is
 `[since the last alarm, process total]`: `held_keys` (unknown, newer,
-undecodable or unbindable records, including missing audit carriers), `t14_rebuild` (known corrupt records
+undecodable or unbindable records, including debt with a missing index entry), `t14_rebuild` (known corrupt records
 read Full once and replaced after the save) and `mode_repaired` (store
 directory or records restored to owner-only). `store_disabled` appears once,
 with `foreign_owner`, `not_directory`, `mode_unrepairable` or `t14_breaker`
@@ -181,10 +181,14 @@ and the v1 writer takes compatibility debt from the current committed index at
 write time, including after a restore dropped the envelope field. Unknown debt
 tags, absent-with-nonzero deadlines and present-with-zero deadlines are
 `unbindable` holds, preserved byte for byte. A debt-bearing record whose index
-carrier is absent, reset or later than its recorded deadline is held before
-certificate/re-derivation reads; `ineligible.audit_carrier` counts these restore
-refusals. It is also included in the existing `durable_held` unbindable slot and
-held-key alarm when the acquisition exits held. No record means no carrier hold.
+entry is absent is held before certificate/re-derivation reads, without
+inventing index membership. An existing entry with reset/postponed debt instead
+re-arms an immediate index audit and plans Full(`audit_due`); this also recovers
+an index-new/record-old crash after a successful audit. `ineligible.audit_carrier`
+counts both restore refusals; only the missing-entry held exit increments the
+`durable_held` unbindable slot and held-key alarm. Re-arming changes no accepted
+body, witness or ACK, and completion alone can clear the obligation. No record
+means no carrier hold.
 The `format_hold` and `durable_held` arrays keep five slots:
 `newer,unknown,undecodable,unbindable,known_corrupt`.
 

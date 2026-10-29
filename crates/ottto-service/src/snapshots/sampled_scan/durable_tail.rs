@@ -642,7 +642,9 @@ impl SharedCache {
             interpretation,
         ) {
             Ok(taken) => RestoreOutcome::Restored(Box::new(taken)),
-            Err(MissClass::AuditCarrier) => RestoreOutcome::Held(store::Refusal::Unbindable),
+            Err(MissClass::AuditCarrier) if !index.files.contains_key(key) => {
+                RestoreOutcome::Held(store::Refusal::Unbindable)
+            }
             Err(class) => self
                 .durable_guard(snapshot_source, key, true)
                 .map_or(RestoreOutcome::Miss(class), RestoreOutcome::Held),
@@ -1214,6 +1216,29 @@ pub(crate) enum MissClass {
 }
 
 impl MissClass {
+    /// A cleared carrier may be an index-new/record-old completed-audit crash.
+    /// Re-arm an immediate INDEX obligation; never restore envelope debt into
+    /// a checkpoint or invent membership for an absent entry.
+    pub(crate) fn rearm_audit(
+        self,
+        index: &mut ScanIndex,
+        key: &str,
+        now: u64,
+    ) -> Option<crate::transcript_acquisition::AuditDebt> {
+        if !matches!(self, Self::AuditCarrier) {
+            return None;
+        }
+        let entry = index.files.get_mut(key)?;
+        let due = entry
+            .unverified_deadline()
+            .filter(|due| *due > 0)
+            .map_or(now, |due| due.min(now));
+        entry.set_unverified_deadline(due);
+        Some(crate::transcript_acquisition::AuditDebt {
+            due_unix_seconds: due,
+        })
+    }
+
     pub(crate) fn label(self) -> &'static str {
         // Restore's producers use this closed set of content-free suffixes.
         // Refuse::UnknownLabel uses the existing static_label class.
