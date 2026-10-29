@@ -1,29 +1,8 @@
 // Emergency containment. Admission never reads sidecar content and never
 // interprets a withheld cohort as empty. Paging is deliberately a separate fix.
 const CLAUDE_TERMINAL_MAX_ROOTS: usize = 64;
-const CLAUDE_TERMINAL_MAX_INPUT_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const CLAUDE_TERMINAL_MAX_INPUT_BYTES: u64 = 16 * 1024 * 1024;
 const CLAUDE_TERMINAL_MAX_EST_DECODED_BYTES: u64 = 512 * 1024 * 1024;
-const CLAUDE_SCOPED_REARM_MAX_FILES: usize = 32;
-const CLAUDE_SCOPED_REARM_MAX_BYTES: u64 = 512 * 1024 * 1024;
-
-/// An armed clear must survive evidence processing until ordinary traversal
-/// selection owns its reparse. The bit is scheduling only, never authority.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ClaudeScopedRearmDebt {
-    fingerprint: String,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    armed: bool,
-}
-impl From<String> for ClaudeScopedRearmDebt {
-    fn from(fingerprint: String) -> Self {
-        Self {
-            fingerprint,
-            armed: false,
-        }
-    }
-}
-crate::heap_layout_bound::fields!(ClaudeScopedRearmDebt; fingerprint, armed);
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct ClaudeTerminalFoldDeferred {
     pub roots: usize,
@@ -33,18 +12,9 @@ pub struct ClaudeTerminalFoldDeferred {
     pub stat_skipped: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
-pub struct ClaudeScopedRearmCounts {
-    pub families: usize,
-    pub files: usize,
-    pub bytes: u64,
-    pub deferred: usize,
-}
-
 crate::heap_layout_bound::fields!(ClaudeTerminalFoldDeferred; roots, est_bytes, sidecar_bytes, stat_skipped);
-crate::heap_layout_bound::fields!(ClaudeScopedRearmCounts; families, files, bytes, deferred);
 
-fn claude_terminal_cohort(index: &ScanIndex, snapshots: &[SnapshotItem]) -> BTreeSet<String> {
+pub(crate) fn claude_terminal_cohort(index: &ScanIndex, snapshots: &[SnapshotItem]) -> BTreeSet<String> {
     let mut roots = claude_pending_family_session_ids(index)
         .into_iter()
         .collect::<BTreeSet<_>>();
@@ -94,31 +64,17 @@ impl ScanIndex {
         self.claude_full_rearm_progress.terminal_fold_checked
     }
 
-    pub(crate) fn claude_scoped_rearm_counts(&self) -> ClaudeScopedRearmCounts {
-        self.claude_full_rearm_progress.rearm_scoped
-    }
-
-    pub(crate) fn ensure_claude_evidence_offer(&mut self) {
-        if !self.claude_full_rearm_progress.rearm_offer_started {
-            self.begin_claude_evidence_offer();
-        }
-    }
-
-    pub(crate) fn begin_claude_evidence_offer(&mut self) {
-        self.claude_full_rearm_progress.rearm_offer_started = true;
-        self.claude_full_rearm_progress.rearm_scoped = Default::default();
-        self.claude_full_rearm_progress.scoped_rearm_cleared.clear();
-        self.claude_full_rearm_progress
-            .rearm_scoped_families
-            .clear();
-    }
-
     pub(crate) fn preflight_claude_terminal_fold(
         &mut self,
         support: Option<&Path>,
         snapshots: &[SnapshotItem],
     ) {
         self.claude_full_rearm_progress.terminal_fold_checked = support.is_some();
+        if support.is_none() {
+            // Standalone native scans have no terminal sidecar consumer.
+            self.claude_full_rearm_progress.terminal_fold_deferred = None;
+            return;
+        }
         let roots = claude_terminal_cohort(self, snapshots);
         // Root admission is independent: never stat thousands of sidecars
         // when cardinality alone already refuses the whole offer.
@@ -143,6 +99,8 @@ impl ScanIndex {
         });
         self.claude_full_rearm_progress.terminal_fold_deferred = deferred;
         if let Some(counts) = deferred {
+            self.claude_full_rearm_progress.terminal_effects = None;
+            self.claude_full_rearm_progress.complete_rebuild_read = None;
             crate::local_resource_diagnostics::traversal_point(
                 "terminal_fold_deferred",
                 "claude_code",
@@ -186,60 +144,146 @@ impl ScanIndex {
         }
     }
 
-    /// Re-derive deferred need from the exact source revision which incurred
-    /// the correction. Changed/already-cleared/removed files retire only this
-    /// scheduling debt, never account/usage/ACK evidence. No cursor or grant.
-    fn drain_claude_scoped_rearms(&mut self) -> ClaudeScopedRearmCounts {
-        if self.claude_terminal_fold_deferred().is_some() {
-            return self.claude_full_rearm_progress.rearm_scoped;
-        }
-        let progress = &mut self.claude_full_rearm_progress;
+}
 
-        let mut files = progress.rearm_scoped.files;
-        let mut bytes = progress.rearm_scoped.bytes;
-        progress.scoped_rearm_pending.retain(|key, debt| {
-            let Some(entry) = self.files.get_mut(key) else {
-                return false;
-            };
-            let Some(member) = claude_index_path_member_ref(Path::new(key)) else {
-                return false;
-            };
-            if debt.armed {
-                return true; // Awaiting a one-time transfer to ordinary selection.
+/// Process-local transaction plan. No witness/index map is cloned for rollback,
+/// and no plan is serialized: the existing traversal is the parked checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClaudeTerminalEffects {
+    removals: Vec<(String, bool)>,
+    reconcile: bool,
+    raw_complete: bool,
+    needs_clean_followup: bool,
+    restart_after_hints: bool,
+    cursor_scope: String,
+}
+crate::heap_layout_bound::fields!(ClaudeTerminalEffects; removals, reconcile, raw_complete, needs_clean_followup, restart_after_hints, cursor_scope);
+
+impl ScanIndex {
+    pub(crate) fn claude_terminal_effects_staged(&self) -> bool {
+        self.claude_full_rearm_progress.terminal_effects.is_some()
+    }
+
+    pub(crate) fn defer_claude_terminal_read(&mut self, snapshots: &[SnapshotItem]) {
+        let roots = claude_terminal_cohort(self, snapshots).len();
+        let counts = ClaudeTerminalFoldDeferred {
+            roots,
+            est_bytes: u64::MAX,
+            sidecar_bytes: u64::MAX,
+            stat_skipped: false,
+        };
+        self.claude_full_rearm_progress.terminal_effects = None;
+        self.claude_full_rearm_progress.complete_rebuild_read = None;
+        self.claude_full_rearm_progress.terminal_fold_deferred = Some(counts);
+        crate::local_resource_diagnostics::traversal_point("terminal_fold_deferred", "claude_code", &counts);
+        eprintln!("ALARM terminal_fold_deferred roots={roots}: bounded terminal read refused; ordinary page continues with parked traversal");
+    }
+
+    /// Called only after ALL terminal API/trace reads (including fallbacks)
+    /// have finished within one shared reader allowance. Consumers thereafter
+    /// use the frozen owned readset, so no late reread can follow this commit.
+    pub(crate) fn commit_claude_terminal_effects(
+        &mut self,
+        scan: &mut SourceScanResult,
+        comparison_active: bool,
+    ) -> Option<Box<claude_native_comparison::TerminalTraversal>> {
+        let effects = self.claude_full_rearm_progress.terminal_effects.take()?;
+        for (key, vanished) in &effects.removals {
+            if let Some(traversal) = self.traversal.as_mut() {
+                traversal.observed_index_keys.remove(key);
             }
-            if entry.source_file_fingerprint.is_empty() {
-                debt.armed = true;
-                return true;
+            if !(*vanished && self.retire_vanished_claude_audit_debt_entry(key)) {
+                self.remove_file_entry_unless_held(key, *vanished);
             }
-            if entry.source_file_fingerprint != debt.fingerprint {
-                return false;
+        }
+        let reconciled = effects.reconcile && reconcile_missing_index_entries_bounded(self, None);
+        self.prune_terminal_jsonl_dispositions();
+        let raw_complete = effects.raw_complete && reconciled;
+        if !raw_complete && !effects.restart_after_hints {
+            scan.census_complete = false;
+            scan.scan_cap_hit = true;
+            return None;
+        }
+        let traversal = self.traversal.as_ref()?.clone();
+        if raw_complete {
+            if let Err(refusal) = self.retire_positively_absent_claude_families(&traversal, &effects.cursor_scope) {
+                eprintln!("local snapshot census kept RetryPending families: absence retirement refused ({})", refusal.as_str());
             }
-            if files >= CLAUDE_SCOPED_REARM_MAX_FILES
-                || entry.size_bytes > CLAUDE_SCOPED_REARM_MAX_BYTES.saturating_sub(bytes)
-            {
-                return true;
+            self.drain_claude_retired_family_tombstone_fence(&traversal);
+            scan.census_complete = !effects.needs_clean_followup
+                && self.claude_usage_authority_pending_count() == 0
+                && self.decode_holds.is_empty();
+            if scan.census_complete {
+                scan.claude_request_census_shadow = Some(
+                    claude_request_census::settle_claude_request_census_terminal(
+                        self, &traversal.observed_index_keys, &traversal.residue.index_keys,
+                        &scan.census_window_end,
+                    ));
+                self.accepted_rebuild_incidence.retain(|key, _| {
+                    key.is_empty() || traversal.observed_index_keys.contains(key)
+                        || traversal.residue.index_keys.contains(key) || self.files.contains_key(key)
+                });
+                self.accepted_incidence_pending_census = !self.accepted_rebuild_incidence.is_empty();
             }
-            files += 1;
-            bytes = bytes.saturating_add(entry.size_bytes);
-            progress
-                .rearm_scoped_families
-                .insert(member.root.to_owned());
-            progress
-                .scoped_rearm_cleared
-                .insert(key.clone(), debt.fingerprint.clone());
-            entry.source_file_fingerprint.clear();
-            debt.armed = true;
-            true
-        });
-        // All entry points in one offer share the same count/byte allowance.
-        progress.rearm_scoped.families = progress.rearm_scoped_families.len();
-        progress.rearm_scoped.files = files;
-        progress.rearm_scoped.bytes = bytes;
-        progress.rearm_scoped.deferred = progress
-            .scoped_rearm_pending
-            .values()
-            .filter(|debt| !debt.armed)
-            .count();
-        progress.rearm_scoped
+            self.record_scan_residue_witness(SnapshotSource::ClaudeCode, &traversal);
+            if let Some(witness) = self.scan_residue_witness.as_ref() {
+                scan.census_residue_index_key_count = witness.index_keys.len();
+                scan.census_residue_archived_rollout_count = witness.archived_residue_file_count();
+                scan.census_residue_blocked_session_count = witness.codex_state_only_blocked_session_ids.len();
+            }
+            scan.zero_snapshot_confirmed_count = self.confirmed_empty_files.len();
+            self.retain_observed_claude_account_deferred_holds(&traversal.observed_index_keys);
+        }
+        scan.scan_cap_hit |= !scan.census_complete;
+        traversal_transition::retiring(
+            SnapshotSource::ClaudeCode, self.generation, &traversal, raw_complete,
+            self.unsettled_cause_bits(),
+            Some((with_claude_absence_counters(|counts| *counts), self.claude_retired_family_tombstones_uncertain)),
+            CensusGates {
+                discovery_done: true, traversal_healthy: true,
+                frozen_generation: !traversal.watcher_hint_seen,
+                state_complete: scan.state_census_complete,
+                sidecar_complete: scan.sidecar_census_complete,
+                reconciliation_complete: reconciled, parent_restart: false,
+                clean_followup: effects.needs_clean_followup,
+                census_complete: scan.census_complete,
+            },
+        );
+        let terminal = claude_native_comparison::TerminalTraversal::take(
+            self, SnapshotSource::ClaudeCode, comparison_active, raw_complete, &scan.census_window_end,
+        );
+        self.traversal = None;
+        self.resume_after_path = None;
+        self.resume_upper_bound_path = None;
+        self.resume_census_window_end = None;
+        terminal
+    }
+}
+
+impl ScanIndex {
+    fn retain_deferred_page_retries(&self, previous: &ScanIndex, safe_keys: &BTreeSet<String>, selected: &mut ScanIndex) {
+        if self.claude_terminal_fold_deferred().is_none() { return; }
+        let Some(traversal) = selected.traversal.as_mut() else { return; };
+        for (key, working) in &self.files {
+            if safe_keys.contains(key) || self.decode_holds_file(key) { continue; }
+            if previous.files.get(key).is_some_and(|old| {
+                old.source_file_fingerprint == working.source_file_fingerprint
+                    && old.last_snapshot_fingerprint == working.last_snapshot_fingerprint
+                    && old.last_upload_body_witness == working.last_upload_body_witness
+            }) { continue; }
+            let path = Path::new(key);
+            let Some(root) = traversal.scan_roots.iter().filter(|root| path.starts_with(root))
+                .max_by_key(|root| root.components().count()) else { continue; };
+            if !traversal.pending_candidates.iter().any(|candidate| candidate.path == path) {
+                // A partial save restored this changed/current-page file. With
+                // a parked terminal there is no next fresh walk to rediscover
+                // it: keep retry demand in the EXISTING traversal queue. No
+                // source fingerprint clear, replay grant or new durable field.
+                traversal.pending_candidates.push_back(ScanTraversalPath {
+                    scan_root: root.clone(), path: path.to_path_buf(),
+                    census_member: true, watcher_hint: false,
+                });
+            }
+        }
     }
 }

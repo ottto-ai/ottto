@@ -57,6 +57,11 @@ fn record_pending_snapshot_paths(source: SnapshotSource, paths: &BTreeSet<PathBu
     }
 }
 
+#[cfg(test)]
+pub(crate) fn hint_snapshot_path_for_test(source: SnapshotSource, path: PathBuf) {
+    record_pending_snapshot_paths(source, &BTreeSet::from([path]));
+}
+
 fn record_raw_watcher_overflow() {
     pending_snapshot_paths()
         .lock()

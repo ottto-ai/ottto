@@ -454,11 +454,8 @@ fn non_structural_invalidation_rearms() {
     );
 }
 
-/// F1a: an unrecorded contract never skips. A set contract-5 latch still
-/// re-reads every family file once through its identity contract re-arm,
-/// which clears the latch; since the contract-5 cutover (Lead B) the latch
-/// alone no longer also takes the due liveness re-arm, so the same terminal
-/// counts as a skip.
+/// An unrecorded contract cannot skip. Suppressing corpus replay does not
+/// spend a live identity latch or manufacture completed E2 adoption.
 #[test]
 fn identity_contract_latch_or_unrecorded_contract_rearms() {
     let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
@@ -482,9 +479,26 @@ fn identity_contract_latch_or_unrecorded_contract_rearms() {
         latched.rearmed_files, 0,
         "unproven identity-wide replay is disabled"
     );
-    assert!(!index.claude_request_identity_contract_changed);
+    assert!(index.claude_request_identity_contract_changed,
+        "a suppressed full replay cannot clear the conservative latch");
     let skipped = rearm.terminal(&mut index, &rearm.items);
     assert!(skipped.suppression.full_rearm_suppressed, "{skipped:?}");
+    assert!(index.claude_request_identity_contract_changed);
+    assert_eq!(scope.finish().contract.identity_contract_latch.cleared, 0);
+}
+
+#[test]
+fn spent_contract_cutover_can_clear_latch_on_a_settled_recorded_terminal() {
+    let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+    let rearm = Rearm::new();
+    let mut index = rearm.index();
+    rearm.establish(&mut index, &rearm.items);
+    index.claude_request_identity_contract_changed = true;
+    index.claude_full_rearm_progress.contract_cutover = CLAUDE_CONTRACT_CUTOVER_SPENT;
+    let run = rearm.terminal(&mut index, &rearm.items);
+    assert!(!run.counts.full_rearm);
+    assert!(!index.claude_request_identity_contract_changed,
+        "only an already spent cutover permits this latch clear");
     assert_eq!(scope.finish().contract.identity_contract_latch.cleared, 1);
 }
 
@@ -1159,10 +1173,7 @@ fn pipeline_sidecar_health_vetoes_but_fixed_evidence_refusals_do_not() {
                     record.skipped_full_rearms += 1;
                 }
             } else {
-                if let Some(record) = &mut record {
-                    record.suppressed_since_unix_seconds = None;
-                    record.skipped_full_rearms = 0;
-                }
+                // No corpus replay executed, so its baseline counters stand.
                 assert!(run.counts.rearm_full_suppressed == 1, "{cause}: {run:?}");
                 assert!(!run.suppression.full_rearm_suppressed, "{cause}");
                 assert_eq!(run.rearmed_files, 0, "{cause}");
@@ -2591,10 +2602,10 @@ fn late_account_telemetry_reselects_the_family_without_whole_index_rearm() {
         assert!(index
             .files
             .values()
-            .all(|entry| entry.source_file_fingerprint.is_empty()));
+            .all(|entry| !entry.source_file_fingerprint.is_empty()));
 
-        // Consume the first paid re-arm's real scanner window, then verify
-        // that the unchanged, withheld family no longer requests a re-arm.
+        // Whole-index replay is suppressed. A quiet ordinary scanner window
+        // retains unchanged files; later sidecar change still selects its family.
         let mut paid = scan(&mut index, WINDOW);
         enrich(&mut paid, &mut index);
         let quiet = rearm.terminal(&mut index, &paid.snapshots);

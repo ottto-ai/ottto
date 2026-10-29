@@ -1341,7 +1341,8 @@ impl AckFinishHome {
         .unwrap()
         .expect("actual due source preparation");
         let (preparation, index, mut scan) = collect_native_preparation_with_rotation(frame, false);
-        assert!(scan.census_complete, "{cycle}: the real scan is clean");
+        assert!(scan.census_complete || index.claude_terminal_fold_deferred().is_some(),
+            "{cycle}: the real scan is clean or its oversized terminal cohort is demoted");
         assert_eq!(
             scan.snapshots.len(),
             1,
@@ -1661,7 +1662,7 @@ fn deferred_terminal_uploads_and_saves_parked_traversal_across_passes() {
                 .home
                 .join(".claude/projects/-synthetic-repo")
                 .join(format!("{IDENTITY_PIPELINE_ROOT}.jsonl"));
-            let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+            let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
             writeln!(file, "{}", serde_json::json!({
                 "timestamp": current_rfc3339(), "type": "assistant", "sessionId": IDENTITY_PIPELINE_ROOT,
                 "requestId": format!("req_deferred_{pass}"), "message": {
@@ -1669,6 +1670,7 @@ fn deferred_terminal_uploads_and_saves_parked_traversal_across_passes() {
                     "usage": {"input_tokens": 10, "output_tokens": pass}
                 }
             })).unwrap();
+            crate::snapshot_watcher::hint_snapshot_path_for_test(source, path);
         }
         let frame =
             crate::agent_status_refresh::with_test_collection(AckFinishHome::collection(), || {
@@ -1713,7 +1715,9 @@ fn deferred_terminal_uploads_and_saves_parked_traversal_across_passes() {
             snapshot_quarantine_witness(source),
         )
         .unwrap();
-        assert!(progress.accepted_body_witnesses.contains_key(fingerprint));
+        assert!(progress.accepted_body_witnesses.contains_key(fingerprint)
+            || saved.files.iter().any(|(key, entry)| key.ends_with(&format!("{IDENTITY_PIPELINE_ROOT}.jsonl")) && entry.last_upload_body_witness.is_some()),
+            "exact accepted body witness is retained in progress or the settled index");
         let value = serde_json::to_value(&saved).unwrap();
         let traversal = &value["traversal"];
         assert!(traversal.is_object(), "parked traversal saved");
@@ -1741,4 +1745,22 @@ fn deferred_terminal_uploads_and_saves_parked_traversal_across_passes() {
                     && line["counts"]["passes"].as_u64().is_some_and(|n| n >= 3)));
         }
     }
+}
+
+#[test]
+fn frozen_terminal_readset_is_consumed_once_without_a_second_allowance() {
+    let support = test_dir("frozen-terminal-one-allowance");
+    let mut index = ScanIndex::default();
+    let snapshots = Vec::new();
+    let frozen = PreparedClaudeLocalEvidence::freeze_terminal(&support, &snapshots, &index, None);
+    let mut prepared = Some(frozen);
+    let mut scan = crate::snapshots::scan_source_roots(
+        SnapshotSource::ClaudeCode, &[], &mut index, "2026-08-02T07:10:00Z", 183,
+    ).unwrap();
+    scan.census_complete = true;
+    let (second_budget, terminal) = prepare_claude_terminal_read(&support, &mut scan, &mut index, &mut prepared, false);
+    assert!(second_budget.is_none());
+    assert!(terminal.is_none());
+    assert!(prepared.unwrap().terminal_frozen);
+    let _ = std::fs::remove_dir_all(support);
 }

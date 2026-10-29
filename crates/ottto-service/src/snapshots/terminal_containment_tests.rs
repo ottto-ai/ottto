@@ -132,187 +132,6 @@ fn first_due_full_rearm_keeps_corpus_and_fence_closed() {
 }
 
 #[test]
-fn scoped_proof_debt_is_capped_survives_restart_and_eventually_drains() {
-    let mut index = ScanIndex::default();
-    for n in 0..70 {
-        let key = format!("/opaque/family-{n:03}.jsonl");
-        let mut entry = manifest_index_entry(Some("prior-body"));
-        entry.size_bytes = 32 * 1024 * 1024;
-        index
-            .claude_full_rearm_progress
-            .scoped_rearm_pending
-            .insert(key.clone(), entry.source_file_fingerprint.clone().into());
-        index.files.insert(key, entry);
-    }
-    let mut total = 0;
-    for _ in 0..5 {
-        index.begin_claude_evidence_offer();
-        let counts = index.drain_claude_scoped_rearms();
-        assert!(counts.files <= CLAUDE_SCOPED_REARM_MAX_FILES);
-        assert!(counts.bytes <= CLAUDE_SCOPED_REARM_MAX_BYTES);
-        assert_eq!(counts.families, counts.files);
-        total += counts.files;
-        index
-            .claude_full_rearm_progress
-            .scoped_rearm_pending
-            .retain(|_, debt| !debt.armed);
-        index = serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
-    }
-    assert_eq!(total, 70);
-    assert!(index
-        .claude_full_rearm_progress
-        .scoped_rearm_pending
-        .is_empty());
-    assert!(index
-        .files
-        .values()
-        .all(|entry| entry.source_file_fingerprint.is_empty()));
-}
-
-#[test]
-fn scoped_rearm_stale_revision_and_terminal_deferral_veto_clears() {
-    let mut index = ScanIndex::default();
-    let key = "/opaque/family.jsonl".to_owned();
-    index
-        .files
-        .insert(key.clone(), manifest_index_entry(Some("prior-body")));
-    let prior = index.files[&key].source_file_fingerprint.clone();
-    index
-        .claude_full_rearm_progress
-        .scoped_rearm_pending
-        .insert(key.clone(), String::from("stale-revision").into());
-    assert_eq!(index.drain_claude_scoped_rearms().files, 0);
-    assert_eq!(index.files[&key].source_file_fingerprint, prior);
-    index
-        .claude_full_rearm_progress
-        .scoped_rearm_pending
-        .insert(key.clone(), prior.clone().into());
-    index.claude_full_rearm_progress.terminal_fold_deferred = claude_terminal_budget(65, 0);
-    assert_eq!(index.drain_claude_scoped_rearms().files, 0);
-    assert_eq!(index.files[&key].source_file_fingerprint, prior);
-    assert_eq!(
-        index.claude_full_rearm_progress.scoped_rearm_pending.len(),
-        1
-    );
-}
-
-#[test]
-fn scoped_account_reproof_observes_large_family_in_one_census_window() {
-    let root = temp_dir("terminal-scoped-family-window");
-    let parent = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5";
-    let child_dir = root.join(parent).join("subagents");
-    fs::create_dir_all(&child_dir).unwrap();
-    let mut rows = Vec::new();
-    for n in 0..70 {
-        let agent = format!("{n:017x}");
-        let request = format!("req_scoped_{n}");
-        let line = serde_json::json!({
-            "timestamp":"2026-08-02T07:00:00Z", "type":"assistant",
-            "sessionId":parent, "agentId":agent, "isSidechain":true,
-            "requestId":request,
-            "message":{"model":"claude-haiku-4-5","usage":{"input_tokens":10,"output_tokens":10}}
-        });
-        fs::write(
-            child_dir.join(format!("agent-{agent}.jsonl")),
-            format!("{line}\n"),
-        )
-        .unwrap();
-        rows.push(complete_api_row(parent, &request, n, 10, 10, 0));
-    }
-    let mut index = ScanIndex::default();
-    // Establish the unchanged physical revisions through the real scanner.
-    for _ in 0..20 {
-        let mut scan = scan_source_roots_with_test_limit(
-            SnapshotSource::ClaudeCode,
-            std::slice::from_ref(&root),
-            &mut index,
-            "2026-08-02T07:10:00Z",
-            BACKFILL_WINDOW_DAYS,
-            8,
-            true,
-        )
-        .unwrap();
-        finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
-        if scan.census_complete {
-            break;
-        }
-    }
-    assert_eq!(index.files.len(), 70);
-    assert!(index.traversal.is_none());
-    index.claude_account_family_witnesses.insert(
-        parent.into(),
-        ClaudeAccountFamilyWitness {
-            account_identifier_hash: "a".repeat(64),
-            evidence_request_count: 70,
-            members: BTreeMap::new(),
-            member_request_id_fingerprints: BTreeMap::from([(
-                parent.into(),
-                "legacy-input".into(),
-            )]),
-        },
-    );
-    let first = scan_source_roots_with_test_limit(
-        SnapshotSource::ClaudeCode,
-        std::slice::from_ref(&root),
-        &mut index,
-        "2026-08-02T07:20:00Z",
-        BACKFILL_WINDOW_DAYS,
-        8,
-        true,
-    )
-    .unwrap();
-    assert!(!first.census_complete);
-    apply_claude_effort_evidence_with_index(
-        &mut [],
-        &BTreeMap::new(),
-        &mut index,
-        false,
-        &first.census_window_end,
-    );
-    assert_eq!(index.claude_scoped_rearm_counts().files, 32);
-    assert_eq!(index.claude_scoped_rearm_counts().deferred, 38);
-    let evidence = BTreeMap::from([(parent.to_owned(), rows)]);
-    let mut window = Some(first.census_window_end);
-    let mut completed = false;
-    for _ in 0..20 {
-        let mut scan = scan_source_roots_with_test_limit(
-            SnapshotSource::ClaudeCode,
-            std::slice::from_ref(&root),
-            &mut index,
-            "2026-08-02T07:20:00Z",
-            BACKFILL_WINDOW_DAYS,
-            8,
-            true,
-        )
-        .unwrap();
-        assert!(index.claude_scoped_rearm_counts().files <= 32);
-        assert_eq!(
-            window.get_or_insert(scan.census_window_end.clone()),
-            &scan.census_window_end
-        );
-        apply_claude_effort_evidence_with_index(
-            &mut scan.snapshots,
-            &evidence,
-            &mut index,
-            scan.census_complete,
-            &scan.census_window_end,
-        );
-        finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
-        if scan.census_complete {
-            completed = true;
-            break;
-        }
-    }
-    assert!(completed);
-    assert_eq!(
-        index.claude_account_family_witnesses[parent].members.len(),
-        70,
-        "paced invalidations must not discard same-window account reproof"
-    );
-    let _ = fs::remove_dir_all(root);
-}
-
-#[test]
 fn terminal_admission_counts_sparse_sidecar_metadata_without_decoding() {
     let support = temp_dir("terminal-budget-stat-only");
     let session = "stat-root";
@@ -342,132 +161,132 @@ fn terminal_admission_counts_sparse_sidecar_metadata_without_decoding() {
 }
 
 #[test]
-#[cfg(unix)]
-fn scoped_debt_dispatch_uses_resolved_configured_root() {
-    let (root, _, _) = claude_account_family_fixture();
-    let alias = root.with_extension("configured-link");
-    std::os::unix::fs::symlink(&root, &alias).unwrap();
-    let canonical = fs::canonicalize(&root).unwrap();
-    let key = local_index_key(&canonical.join("1338a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl"));
-    let mut index = ScanIndex::default();
-    let mut entry = manifest_index_entry(Some("prior-body"));
-    let mut debt: ClaudeScopedRearmDebt = entry.source_file_fingerprint.clone().into();
-    debt.armed = true;
-    entry.source_file_fingerprint.clear();
-    index.files.insert(key.clone(), entry);
-    index
-        .claude_full_rearm_progress
-        .scoped_rearm_pending
-        .insert(key, debt);
-    let scan = scan_source_roots_with_test_limit(
-        SnapshotSource::ClaudeCode,
-        std::slice::from_ref(&alias),
-        &mut index,
-        "2026-08-02T07:20:00Z",
-        BACKFILL_WINDOW_DAYS,
-        100,
-        true,
-    )
-    .unwrap();
-    assert!(index
-        .claude_full_rearm_progress
-        .scoped_rearm_pending
-        .is_empty());
-    assert!(
-        scan.census_complete,
-        "a configured symlink cannot strand armed debt"
-    );
-    let _ = fs::remove_file(alias);
-    let _ = fs::remove_dir_all(root);
-}
-
-#[test]
-fn selected_checkpoint_recovers_only_uncommitted_scoped_clears() {
-    let key = "/opaque/family.jsonl".to_owned();
-    let mut previous = ScanIndex::default();
-    previous
-        .files
-        .insert(key.clone(), manifest_index_entry(Some("prior")));
-    let expected = previous.files[&key].source_file_fingerprint.clone();
-    let mut working = previous.clone();
-    working
-        .files
-        .get_mut(&key)
-        .unwrap()
-        .last_snapshot_fingerprint = Some("corrected".into());
-    working
-        .files
-        .get_mut(&key)
-        .unwrap()
-        .last_upload_body_witness = Some("corrected-body".into());
-    working
-        .claude_full_rearm_progress
-        .scoped_rearm_cleared
-        .insert(key.clone(), expected);
-    let accepted = BTreeSet::from(["corrected".to_owned()]);
-    let selected = working.committable_subset_with_local_holds(
-        &previous,
-        &accepted,
-        &BTreeMap::new(),
-        &BTreeSet::new(),
-    );
-    assert!(
-        selected
-            .claude_full_rearm_progress
-            .scoped_rearm_pending
-            .is_empty(),
-        "an accepted correction must not be cleared again on partial save"
-    );
-    let held = BTreeSet::from(["corrected".to_owned()]);
-    let restored =
-        working.committable_subset_with_local_holds(&previous, &accepted, &BTreeMap::new(), &held);
-    assert_eq!(
-        restored.files[&key].last_snapshot_fingerprint.as_deref(),
-        Some("prior")
-    );
-    assert!(
-        !restored.claude_full_rearm_progress.scoped_rearm_pending[&key].armed,
-        "a restored prior revision retains its owed, uncommitted clear"
-    );
-}
-
-#[test]
-fn owned_start_proof_corrections_share_the_scoped_allowance() {
-    let mut index = ScanIndex::default();
-    for n in 0..40 {
-        let root = format!("owned-{n:03}");
-        index.files.insert(
-            format!("/opaque/{root}.jsonl"),
-            manifest_index_entry(Some("prior")),
-        );
-        index.claude_owned_start_census.insert(
-            root,
-            ClaudeOwnedStartCensusWitness {
-                marker_source_file_fingerprint: "marker".into(),
-                verified_source_file_fingerprint: Some("verified".into()),
-                emitted_source_file_fingerprint: None,
-            },
-        );
+fn terminal_reader_growth_refuses_before_any_staged_completion_effect() {
+    for during_trace in [false, true] {
+        let support = temp_dir("terminal-reader-growth-support");
+        let root = temp_dir("terminal-reader-growth-transcripts");
+        let mut index = ScanIndex {
+            claude_retired_family_tombstones_uncertain: true,
+            ..Default::default()
+        };
+        index.claude_usage_family_pending.insert("growing".into(), ClaudeUsageFamilyPending {
+            census_window_end: "2026-08-01T00:00:00Z".into(),
+            member_request_id_hashes: BTreeMap::new(), member_occurrences: BTreeMap::new(),
+            invalid: false, idless_revision: None,
+        });
+        index.files.insert("/opaque/retained.jsonl".into(), manifest_index_entry(Some("prior-body")));
+        let (api, trace) = crate::claude_local_otel::terminal_sidecar_paths_for_test(&support, "growing");
+        fs::create_dir_all(api.parent().unwrap()).unwrap();
+        fs::create_dir_all(trace.parent().unwrap()).unwrap();
+        fs::write(&api, b"").unwrap();
+        fs::write(&trace, b"\n").unwrap();
+        let before = witness_bytes(&index);
+        let mut scan = scan_source_roots_with_test_limit_and_claude_support(
+            std::slice::from_ref(&root), &mut index, "2026-08-02T07:10:00Z", BACKFILL_WINDOW_DAYS, 100, &support,
+        ).unwrap();
+        assert!(index.claude_terminal_effects_staged());
+        assert!(index.claude_terminal_fold_deferred().is_none(), "stat admission fits");
+        assert_eq!(witness_bytes(&index), before, "raw effects are only staged");
+        let _hook = crate::claude_local_otel::terminal_growth_hook_for_test(during_trace, |path| {
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+            file.write_all(&vec![b'x'; CLAUDE_TERMINAL_MAX_INPUT_BYTES as usize + 1]).unwrap();
+        });
+        let (overrun, bytes) = crate::snapshot_sync::bounded_terminal_read_for_test(&support, &mut scan, &mut index);
+        assert!(overrun, "growth during_trace={during_trace} exhausts the reader allowance");
+        assert!(bytes <= CLAUDE_TERMINAL_MAX_INPUT_BYTES);
+        assert!(!scan.census_complete);
+        assert!(scan.scan_cap_hit);
+        assert!(index.traversal.is_some(), "late refusal parks the existing traversal");
+        assert_eq!(witness_bytes(&index), before,
+            "no missing-file reconciliation, tombstone, retirement, prune, ACK carry or adoption");
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(support);
     }
-    apply_claude_reported_usage_with_index_and_limits(
-        &mut [],
-        &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
-        &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
-        &mut index,
-        false,
-        "2026-08-02T07:20:00Z",
-        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-        MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
-        None,
-    );
-    assert_eq!(index.claude_scoped_rearm_counts().files, 32);
-    assert_eq!(index.claude_scoped_rearm_counts().deferred, 8);
-    assert_eq!(
-        index
-            .files
-            .values()
-            .filter(|e| e.source_file_fingerprint.is_empty())
-            .count(),
-        32
-    );
+}
+
+#[test]
+fn terminal_containment_adds_no_persisted_fields() {
+    let mut index = ScanIndex::default();
+    index.preflight_claude_terminal_fold(None, &[]);
+    index.note_claude_terminal_fold_offer(true);
+    let value = serde_json::to_value(index).unwrap();
+    let progress = &value["claude_full_rearm_progress"];
+    for name in ["scoped_rearm_pending", "terminal_fold_deferred", "terminal_fold_checked", "terminal_effects", "terminal_fold_deferred_consecutive"] {
+        assert!(progress.get(name).is_none(), "{name} must never persist");
+    }
+}
+
+#[test]
+fn admitted_terminal_commits_staged_effects_after_bounded_read() {
+    let support = temp_dir("terminal-stage-commit-support");
+    let root = temp_dir("terminal-stage-commit-transcripts");
+    let mut index = ScanIndex::default();
+    index.files.insert("/opaque/vanished.jsonl".into(), manifest_index_entry(Some("old-body")));
+    let mut scan = scan_source_roots_with_test_limit_and_claude_support(
+        std::slice::from_ref(&root), &mut index, "2026-08-02T07:10:00Z", BACKFILL_WINDOW_DAYS, 100, &support,
+    ).unwrap();
+    assert!(index.claude_terminal_effects_staged());
+    assert!(index.files.contains_key("/opaque/vanished.jsonl"));
+    let (overrun, bytes) = crate::snapshot_sync::bounded_terminal_read_for_test(&support, &mut scan, &mut index);
+    assert!(!overrun);
+    assert_eq!(bytes, 0);
+    assert!(scan.census_complete);
+    assert!(index.traversal.is_none());
+    assert!(!index.files.contains_key("/opaque/vanished.jsonl"));
+    assert!(scan.claude_request_census_shadow.is_some());
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(support);
+}
+
+#[test]
+fn corrupt_small_sidecar_keeps_family_health_scoped_without_global_deferral() {
+    let support = temp_dir("terminal-corrupt-health-support");
+    let root = temp_dir("terminal-corrupt-health-transcripts");
+    let mut index = ScanIndex::default();
+    index.claude_usage_family_pending.insert("corrupt".into(), ClaudeUsageFamilyPending {
+        census_window_end: "2026-08-01T00:00:00Z".into(),
+        member_request_id_hashes: BTreeMap::new(), member_occurrences: BTreeMap::new(),
+        invalid: false, idless_revision: None,
+    });
+    let (api, trace) = crate::claude_local_otel::terminal_sidecar_paths_for_test(&support, "corrupt");
+    fs::create_dir_all(api.parent().unwrap()).unwrap();
+    fs::create_dir_all(trace.parent().unwrap()).unwrap();
+    fs::write(api, b"\xff\n").unwrap();
+    fs::write(trace, b"").unwrap();
+    let mut scan = scan_source_roots_with_test_limit_and_claude_support(
+        std::slice::from_ref(&root), &mut index, "2026-08-02T07:10:00Z", BACKFILL_WINDOW_DAYS, 100, &support,
+    ).unwrap();
+    let (overrun, _) = crate::snapshot_sync::bounded_terminal_read_for_test(&support, &mut scan, &mut index);
+    assert!(!overrun, "corrupt content is not an aggregate input overflow");
+    assert!(index.claude_terminal_fold_deferred().is_none());
+    assert!(scan.census_complete);
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(support);
+}
+
+#[test]
+fn partial_deferred_page_keeps_unsettled_file_in_existing_traversal_queue() {
+    let root = temp_dir("terminal-deferred-retry");
+    let key = local_index_key(&root.join("retry.jsonl"));
+    let previous = ScanIndex::default();
+    let mut working = ScanIndex::default();
+    let mut entry = manifest_index_entry(Some("owed-body"));
+    entry.source_file_fingerprint = "current-revision".into();
+    working.files.insert(key.clone(), entry);
+    ensure_bounded_traversal(SnapshotSource::ClaudeCode, std::slice::from_ref(&root), &mut working, "2026-08-02T07:10:00Z", BACKFILL_WINDOW_DAYS);
+    let traversal = working.traversal.as_mut().unwrap();
+    traversal.pending_directories.clear();
+    traversal.pending_candidates.clear();
+    working.claude_full_rearm_progress.terminal_fold_deferred = claude_terminal_budget(65, 0);
+    let selected = working.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
+    assert!(!selected.files.contains_key(&key), "unsettled output cannot commit its file");
+    let queued = &selected.traversal.as_ref().unwrap().pending_candidates;
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].path, Path::new(&key));
+    assert!(queued[0].census_member);
+    assert!(!working.files[&key].source_file_fingerprint.is_empty(), "retry scheduling never clears the source witness");
+    let accepted = working.committable_subset(&previous, &BTreeSet::from(["owed-body".into()]), &BTreeMap::new());
+    assert!(accepted.traversal.as_ref().unwrap().pending_candidates.is_empty(), "settled files are not queued again");
+    let _ = fs::remove_dir_all(root);
 }

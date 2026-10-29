@@ -6776,8 +6776,8 @@ fn finish_sync_source(
     let SourcePreparation {
         mut native_comparison_reservation,
         mut native_comparison_lease,
-        prepared_claude_evidence,
-        terminal_native_traversal,
+        mut prepared_claude_evidence,
+        mut terminal_native_traversal,
         native_comparison_controller,
         retry_authority,
         source,
@@ -6811,6 +6811,24 @@ fn finish_sync_source(
             &scan_result.census_window_end,
             scan_result.scanned_file_count,
         );
+    }
+    let (_terminal_read_budget, staged_terminal) = prepare_claude_terminal_read(
+        support_dir,
+        &mut scan_result,
+        &mut index,
+        &mut prepared_claude_evidence,
+        native_comparison_controller.is_some()
+            || crate::snapshots::claude_native_comparison::enabled(),
+    );
+    if staged_terminal.is_some() {
+        terminal_native_traversal = staged_terminal;
+    }
+    if index.claude_terminal_fold_deferred().is_some() {
+        // The controller still owns selected fallback dependencies. Revoke
+        // eligibility, retaining recovery/withholding for dependent bodies.
+        if let Some(lease) = native_comparison_lease.as_mut() {
+            lease.revoke();
+        }
     }
     // Recheck the same owner after native continuation. A failed comparison
     // carries its unresolved exact dependencies into selected-state fallback.
@@ -8422,7 +8440,8 @@ struct PreparedTraceRead {
 
 /// One moving owner for the permissive effort rows and strict paired view.
 /// Preflight borrows rows; finish consumes them after the original effort fold.
-/// A changed/unknown opened generation always falls back to the existing load.
+/// Before a terminal freeze, changed/unknown generations use the canonical
+/// fallback. The frozen readset then consumes without I/O for this offer.
 struct PreparedClaudeLocalEvidence {
     sessions: BTreeSet<String>,
     api: crate::claude_local_otel::ClaudeApiEvidenceRead,
@@ -8430,9 +8449,77 @@ struct PreparedClaudeLocalEvidence {
     trace_rows: BTreeMap<String, Vec<crate::claude_local_otel::ClaudeTraceOwnershipEvidence>>,
     traces: BTreeMap<String, PreparedTraceRead>,
     healthy_roots: BTreeSet<String>,
+    /// Raw terminal effects may commit only after this owned readset is
+    /// frozen; consumption then performs no I/O or fallback.
+    terminal_frozen: bool,
 }
 
 impl PreparedClaudeLocalEvidence {
+    fn freeze_terminal(
+        support_dir: &Path,
+        snapshots: &[SnapshotItem],
+        index: &ScanIndex,
+        mut prepared: Option<Self>,
+    ) -> Self {
+        let sessions = crate::snapshots::claude_terminal_cohort(index, snapshots);
+        let loaded = match prepared.as_mut() {
+            Some(read) => read.take_api_for_sessions(support_dir, &sessions),
+            None => {
+                crate::claude_local_otel::ClaudeApiEvidenceRead::load(support_dir, sessions.clone())
+            }
+        };
+        let api_failed = loaded.is_err();
+        let mut api = loaded.unwrap_or_default();
+        let mut traces = BTreeMap::new();
+        let mut trace_rows = BTreeMap::new();
+        let mut healthy_roots = BTreeSet::new();
+        for root in &sessions {
+            if crate::claude_local_otel::claude_effort_sidecar_fingerprint(support_dir, root)
+                .is_empty()
+                || crate::claude_local_otel::claude_trace_ownership_sidecar_fingerprint(
+                    support_dir,
+                    root,
+                )
+                .is_empty()
+            {
+                continue;
+            }
+            api.refresh_strict_root(support_dir, root);
+            let before = crate::claude_local_otel::claude_trace_read_generation(support_dir, root);
+            let mut report = match prepared.as_mut() {
+                Some(read) => read.take_trace(support_dir, root),
+                None => crate::claude_local_otel::load_claude_trace_ownership_evidence(
+                    support_dir,
+                    [root.clone()],
+                ),
+            };
+            let generation = before.filter(|generation| {
+                Some(generation)
+                    == crate::claude_local_otel::claude_trace_read_generation(support_dir, root)
+                        .as_ref()
+            });
+            if report.is_complete()
+                && generation.is_some()
+                && api.strict_generation_matches(support_dir, root)
+            {
+                healthy_roots.insert(root.clone());
+            }
+            if let Some(rows) = report.evidence.remove(root) {
+                trace_rows.insert(root.clone(), rows);
+            }
+            traces.insert(root.clone(), PreparedTraceRead { generation, report });
+        }
+        Self {
+            sessions,
+            api,
+            api_failed,
+            traces,
+            trace_rows,
+            healthy_roots,
+            terminal_frozen: true,
+        }
+    }
+
     fn load_paid_eligible<'a>(
         support_dir: &Path,
         index: &ScanIndex,
@@ -8457,6 +8544,7 @@ impl PreparedClaudeLocalEvidence {
             trace_rows: BTreeMap::new(),
             traces: BTreeMap::new(),
             healthy_roots: BTreeSet::new(),
+            terminal_frozen: false,
         };
         let mut root_string_bytes = 0usize;
         let mut retained_decoded_bytes = 0usize;
@@ -8632,6 +8720,7 @@ impl PreparedClaudeLocalEvidence {
             trace_rows,
             traces,
             healthy_roots,
+            terminal_frozen: false,
         }
     }
 
@@ -8682,6 +8771,12 @@ impl PreparedClaudeLocalEvidence {
         support_dir: &Path,
         session_ids: &BTreeSet<String>,
     ) -> Result<crate::claude_local_otel::ClaudeApiEvidenceRead> {
+        if self.terminal_frozen {
+            if self.api_failed {
+                return Err(anyhow!("terminal permissive API read failed"));
+            }
+            return Ok(self.api.complete_frozen(session_ids));
+        }
         if self.api_failed {
             self.api = Default::default();
         }
@@ -8694,9 +8789,13 @@ impl PreparedClaudeLocalEvidence {
         root: &str,
     ) -> crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
         if let Some(mut read) = self.traces.remove(root) {
-            if read.generation.is_some()
-                && read.generation
-                    == crate::claude_local_otel::claude_trace_read_generation(support_dir, root)
+            if self.terminal_frozen
+                || (read.generation.is_some()
+                    && read.generation
+                        == crate::claude_local_otel::claude_trace_read_generation(
+                            support_dir,
+                            root,
+                        ))
             {
                 if let Some(rows) = self.trace_rows.remove(root) {
                     read.report.evidence.insert(root.to_owned(), rows);
@@ -8705,6 +8804,12 @@ impl PreparedClaudeLocalEvidence {
             }
         }
         self.trace_rows.remove(root);
+        if self.terminal_frozen {
+            return crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
+                unreadable_lines: 1,
+                ..Default::default()
+            };
+        }
         crate::claude_local_otel::load_claude_trace_ownership_evidence(
             support_dir,
             [root.to_owned()],
@@ -8750,6 +8855,78 @@ pub(crate) fn prepared_claude_pair_for_test(
         healthy,
         permissive_rows,
     )
+}
+
+fn prepare_claude_terminal_read(
+    support_dir: &Path,
+    scan: &mut SourceScanResult,
+    index: &mut ScanIndex,
+    prepared: &mut Option<PreparedClaudeLocalEvidence>,
+    comparison_active: bool,
+) -> (
+    Option<crate::claude_local_otel::TerminalReadBudget>,
+    Option<Box<crate::snapshots::claude_native_comparison::TerminalTraversal>>,
+) {
+    if prepared.as_ref().is_some_and(|read| read.terminal_frozen) {
+        // Finish already paid/validated this exact owner. Never establish a
+        // second allowance or perform another fallback after raw commit.
+        return (None, None);
+    }
+    if scan.source != SnapshotSource::ClaudeCode {
+        return (None, None);
+    }
+    if index.claude_terminal_fold_deferred().is_none()
+        && (scan.census_complete || index.claude_terminal_effects_staged())
+    {
+        index.preflight_claude_terminal_fold(Some(support_dir), &scan.snapshots);
+    }
+    if index.claude_terminal_fold_deferred().is_some() {
+        scan.census_complete = false;
+        scan.scan_cap_hit = true;
+        return (None, None);
+    }
+    if !index.claude_terminal_effects_staged() && !scan.census_complete {
+        return (None, None);
+    }
+    let budget = crate::claude_local_otel::TerminalReadBudget::begin(
+        crate::snapshots::CLAUDE_TERMINAL_MAX_INPUT_BYTES,
+    );
+    let frozen = PreparedClaudeLocalEvidence::freeze_terminal(
+        support_dir,
+        &scan.snapshots,
+        index,
+        prepared.take(),
+    );
+    if budget.exceeded() {
+        index.defer_claude_terminal_read(&scan.snapshots);
+        scan.census_complete = false;
+        scan.scan_cap_hit = true;
+        // This terminal attempt is finished. Ordinary current-page enrichment
+        // keeps its baseline allowance, rather than inheriting exhausted credit.
+        drop(budget);
+        (None, None)
+    } else {
+        *prepared = Some(frozen);
+        let terminal = index.commit_claude_terminal_effects(scan, comparison_active);
+        (Some(budget), terminal)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn bounded_terminal_read_for_test(
+    support: &Path,
+    scan: &mut SourceScanResult,
+    index: &mut ScanIndex,
+) -> (bool, u64) {
+    let (budget, _) = prepare_claude_terminal_read(support, scan, index, &mut None, false);
+    if let Some(budget) = budget {
+        (budget.exceeded(), budget.bytes())
+    } else {
+        (
+            index.claude_terminal_fold_deferred().is_some(),
+            crate::claude_local_otel::terminal_last_read_bytes_for_test(),
+        )
+    }
 }
 
 /// The dark path: contract-5 bodies are never built.
@@ -8834,9 +9011,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     ),
     crate::source_rotation::LocalRefusal,
 > {
+    let (_direct_terminal_read_budget, _) =
+        prepare_claude_terminal_read(support_dir, scan_result, index, &mut prepared, false);
     // Scanner admission precedes raw terminal side effects. Direct/audit
     // callers also preflight before any flag capture, observation or fold.
-    index.ensure_claude_evidence_offer();
     if scan_result.census_complete && !index.claude_terminal_fold_checked() {
         index.preflight_claude_terminal_fold(Some(support_dir), &scan_result.snapshots);
     }
@@ -8891,6 +9069,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         &mut scan_result.snapshots,
         index,
     );
+    let terminal_frozen = prepared.as_ref().is_some_and(|read| read.terminal_frozen);
     let mut api_read = crate::claude_local_otel::ClaudeApiEvidenceRead::default();
     let mut full_rearm_evidence_complete = true;
     let api_load = match prepared.as_mut() {
@@ -9007,7 +9186,11 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     // sidecar may hold no rows for the root, so evidence keys cannot say this.
     let mut strict_healthy_roots = BTreeSet::new();
     for root_session_id in usage_roots {
-        let mut api = api_read.take_strict_report(support_dir, &root_session_id);
+        let mut api = if terminal_frozen {
+            api_read.take_frozen_report(&root_session_id)
+        } else {
+            api_read.take_strict_report(support_dir, &root_session_id)
+        };
         let mut trace = match prepared.as_mut() {
             Some(read) => read.take_trace(support_dir, &root_session_id),
             None => crate::claude_local_otel::load_claude_trace_ownership_evidence(
@@ -9266,7 +9449,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             item.usage_accounting_contract.as_deref() == Some("session_exclusive_reported_usage:v1")
         })
         .count();
-    disposition.duplicate_census.rearm_scoped = index.claude_scoped_rearm_counts();
     stats.duplicate_census = disposition.duplicate_census;
     stats.full_rearm_suppression = disposition.full_rearm_suppression;
     stats.context_file_birth = disposition.context_file_birth.clone();
@@ -24106,7 +24288,7 @@ mod h357_ack_tests;
 crate::heap_layout_bound::fields!(PermanentSnapshotRejection; body_witness, reason, reoffer);
 
 crate::heap_layout_bound::fields!(PreparedTraceRead; generation, report);
-crate::heap_layout_bound::fields!(PreparedClaudeLocalEvidence; sessions, api, api_failed, trace_rows, traces, healthy_roots);
+crate::heap_layout_bound::fields!(PreparedClaudeLocalEvidence; sessions, api, api_failed, trace_rows, traces, healthy_roots, terminal_frozen);
 
 #[cfg(test)]
 mod ownership_census_tests {

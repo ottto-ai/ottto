@@ -19,6 +19,10 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
+mod terminal_read_budget;
+use terminal_read_budget::EvidenceReader;
+pub(crate) use terminal_read_budget::TerminalReadBudget;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -710,6 +714,7 @@ thread_local! {
     // Actual API file opens and consumed bytes, isolated from parallel tests.
     static API_BEFORE_OPEN: std::cell::RefCell<Option<ApiReadHook>> = const { std::cell::RefCell::new(None) };
     static API_AFTER_READ: std::cell::RefCell<Option<ApiReadHook>> = const { std::cell::RefCell::new(None) };
+    static TRACE_DURING_READ: std::cell::RefCell<Option<ApiReadHook>> = const { std::cell::RefCell::new(None) };
     static API_READ_RECEIPT: std::cell::Cell<(usize, usize, bool)> = const { std::cell::Cell::new((0, 0, false)) };
 }
 
@@ -921,6 +926,61 @@ impl ClaudeApiEvidenceRead {
         Ok(complete)
     }
 
+    pub(crate) fn refresh_strict_root(&mut self, support_dir: &Path, root: &str) {
+        if !self.strict_generation_matches(support_dir, root) {
+            self.evidence.remove(root);
+            self.reads.remove(root);
+            let (rows, witness) = decode_api_sidecar(support_dir, root).unwrap_or_else(|_| {
+                (
+                    Vec::new(),
+                    ApiReadWitness {
+                        health: ClaudeLocalOtelLoadHealth {
+                            unreadable_lines: 1,
+                            ..Default::default()
+                        },
+                        generation: None,
+                    },
+                )
+            });
+            if !rows.is_empty() {
+                self.evidence.insert(root.to_owned(), rows);
+            }
+            self.reads.insert(root.to_owned(), witness);
+        }
+    }
+
+    pub(crate) fn complete_frozen(&mut self, session_ids: &BTreeSet<String>) -> Self {
+        let mut complete = Self::default();
+        for id in session_ids {
+            if let Some(witness) = self.reads.remove(id) {
+                complete.reads.insert(id.clone(), witness);
+                if let Some(rows) = self.evidence.remove(id) {
+                    complete.evidence.insert(id.clone(), rows);
+                }
+            }
+        }
+        complete
+    }
+
+    pub(crate) fn take_frozen_report(&mut self, session_id: &str) -> ClaudeLocalOtelLoadReport {
+        let health = self
+            .reads
+            .remove(session_id)
+            .map(|witness| witness.health)
+            .unwrap_or_else(|| ClaudeLocalOtelLoadHealth {
+                unreadable_lines: 1,
+                ..Default::default()
+            });
+        let mut report = ClaudeLocalOtelLoadReport {
+            health,
+            ..Default::default()
+        };
+        if let Some(rows) = self.evidence.remove(session_id) {
+            report.evidence.insert(session_id.to_owned(), rows);
+        }
+        report
+    }
+
     pub(crate) fn move_remaining_for_strict(&mut self, early: &mut Self, roots: &BTreeSet<String>) {
         early.retain_roots(roots);
         // The effort consumer has priority if a future caller supplies an
@@ -1094,6 +1154,7 @@ fn decode_api_sidecar(
         anyhow::bail!("Claude effort evidence is not a regular file");
     }
     if metadata.len() >= MAX_EVIDENCE_FILE_BYTES {
+        terminal_read_budget::refuse_oversized_input();
         health.oversized_files += 1;
         return Ok(empty(health));
     }
@@ -1125,12 +1186,13 @@ fn decode_api_sidecar(
         anyhow::bail!("opened Claude effort evidence is not a regular file");
     }
     if opened.len() >= MAX_EVIDENCE_FILE_BYTES {
+        terminal_read_budget::refuse_oversized_input();
         health.oversized_files += 1;
         return Ok(empty(health));
     }
     let before_opened = api_file_generation(&opened);
     // A concurrent writer must not defeat the existing per-file read bound.
-    let mut reader = BufReader::new((&file).take(MAX_EVIDENCE_FILE_BYTES));
+    let mut reader = BufReader::new(EvidenceReader((&file).take(MAX_EVIDENCE_FILE_BYTES)));
     let (rows, bytes) = decode_api_rows(&mut reader, session_id, &mut health);
     #[cfg(test)]
     API_AFTER_READ.with(|hook| {
@@ -1139,6 +1201,7 @@ fn decode_api_sidecar(
         }
     });
     if bytes >= MAX_EVIDENCE_FILE_BYTES {
+        terminal_read_budget::refuse_oversized_input();
         health.oversized_files += 1;
         return Ok(empty(health));
     }
@@ -1256,6 +1319,7 @@ pub fn load_claude_trace_ownership_evidence(
             continue;
         }
         if metadata.len() >= MAX_EVIDENCE_FILE_BYTES {
+            terminal_read_budget::refuse_oversized_input();
             report.oversized_files += 1;
             continue;
         }
@@ -1267,15 +1331,32 @@ pub fn load_claude_trace_ownership_evidence(
         TRACE_READ_RECEIPT.with(|count| count.set(count.get() + 1));
         let mut decoder = TraceSidecarDecoder::new(&session_id, Vec::new());
         decoder.report = report;
-        for line in BufReader::new(file).lines() {
-            let line = match line {
-                Ok(line) => line,
+        let mut reader = BufReader::new(EvidenceReader(file.take(MAX_EVIDENCE_FILE_BYTES)));
+        let mut line = Vec::new();
+        let mut read_bytes = 0_u64;
+        loop {
+            line.clear();
+            match reader.read_until(b'\n', &mut line) {
+                Ok(0) => break,
+                Ok(read) => {
+                    read_bytes += read as u64;
+                    #[cfg(test)]
+                    TRACE_DURING_READ.with(|hook| {
+                        if let Some(hook) = hook.borrow_mut().take() {
+                            hook(&path);
+                        }
+                    });
+                    decoder.push_line(&line);
+                }
                 Err(_) => {
                     decoder.report.unreadable_lines += 1;
-                    continue;
+                    break; // An exhausted byte allowance must never spin.
                 }
-            };
-            decoder.push_line(line.as_bytes());
+            }
+        }
+        if read_bytes >= MAX_EVIDENCE_FILE_BYTES {
+            terminal_read_budget::refuse_oversized_input();
+            decoder.report.oversized_files += 1;
         }
         decoder.finish_eof(None);
         let (rows, decoded_report) = decoder.into_output();
@@ -1877,6 +1958,41 @@ pub(crate) fn claude_terminal_sidecar_bytes(support: &Path, session: &str) -> Op
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(sum),
         _ => None,
     })
+}
+
+#[cfg(test)]
+pub(crate) fn terminal_last_read_bytes_for_test() -> u64 {
+    terminal_read_budget::last_read_bytes_for_test()
+}
+
+#[cfg(test)]
+pub(crate) fn terminal_sidecar_paths_for_test(support: &Path, root: &str) -> (PathBuf, PathBuf) {
+    (
+        evidence_path(support, root),
+        trace_evidence_path(support, root),
+    )
+}
+
+#[cfg(test)]
+pub(crate) struct TerminalGrowthHook;
+#[cfg(test)]
+impl Drop for TerminalGrowthHook {
+    fn drop(&mut self) {
+        API_BEFORE_OPEN.with(|slot| slot.borrow_mut().take());
+        TRACE_DURING_READ.with(|slot| slot.borrow_mut().take());
+    }
+}
+#[cfg(test)]
+pub(crate) fn terminal_growth_hook_for_test(
+    trace: bool,
+    hook: impl FnOnce(&Path) + 'static,
+) -> TerminalGrowthHook {
+    if trace {
+        TRACE_DURING_READ.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    } else {
+        API_BEFORE_OPEN.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+    TerminalGrowthHook
 }
 
 fn evidence_path(support_dir: &Path, session_id: &str) -> PathBuf {
