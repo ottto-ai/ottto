@@ -66,41 +66,54 @@ impl Drop for Fixture {
         API_BEFORE_OPEN.with(|hook| {
             hook.borrow_mut().take();
         });
+        API_AFTER_READ.with(|hook| {
+            hook.borrow_mut().take();
+        });
         store::test_hooks::set_before_rename(None);
         store::test_hooks::set_before_dir_sync(None);
         self.writer.take();
         fs::remove_dir_all(&self.dir).unwrap();
     }
 }
-fn fingerprint(text: &str) -> String {
-    Sha256::digest(text.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+fn sign_api(row: &mut ClaudeLocalOtelEvidence) {
+    row.fingerprint.clear();
+    row.fingerprint = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&*row).unwrap())
+    );
+}
+fn sign_trace(row: &mut ClaudeTraceOwnershipEvidence) {
+    row.fingerprint.clear();
+    row.fingerprint = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&*row).unwrap())
+    );
 }
 fn api_row(request: &str) -> ClaudeLocalOtelEvidence {
-    ClaudeLocalOtelEvidence {
+    let mut row = ClaudeLocalOtelEvidence {
         capture_revision: API_REQUEST_CAPTURE_REVISION.into(),
         session_id: "scope".into(),
         request_id: request.into(),
-        fingerprint: fingerprint(request),
         input_tokens: 17,
         output_tokens: 9,
         request_count: 1,
         cost_usd_micros: Some(123),
         observed_at: "2026-01-01T00:00:00Z".into(),
         ..Default::default()
-    }
+    };
+    sign_api(&mut row);
+    row
 }
 fn trace_row(request: &str) -> ClaudeTraceOwnershipEvidence {
-    ClaudeTraceOwnershipEvidence {
+    let mut row = ClaudeTraceOwnershipEvidence {
         capture_revision: TRACE_OWNERSHIP_CAPTURE_REVISION.into(),
         session_id: "scope".into(),
         request_id: request.into(),
-        fingerprint: fingerprint(request),
         observed_at: "2026-01-01T00:00:00Z".into(),
         ..Default::default()
-    }
+    };
+    sign_trace(&mut row);
+    row
 }
 fn line<T: Serialize>(row: &T) -> Vec<u8> {
     let mut bytes = serde_json::to_vec(row).unwrap();
@@ -179,7 +192,10 @@ fn every_byte_append_preserves_sealed_projection_and_quiet_fragment_zero_body() 
     let mut fixture = Fixture::new("sidecar-byte-splits");
     let mut api_row = api_row("split");
     api_row.model = "synthetic-é\"\\\n".into();
-    let (api, trace) = (line(&api_row), line(&trace_row("split")));
+    sign_api(&mut api_row);
+    let (mut api, mut trace) = (line(&api_row), line(&trace_row("split")));
+    api.insert(api.len() - 1, b'\r');
+    trace.insert(trace.len() - 1, b'\r');
     fixture.write("scope", b"", b"");
     let (mut reader, empty) = load(fixture.reader(), &fixture.dir);
     assert_eq!(empty, frozen(b"", b""));
@@ -460,13 +476,13 @@ fn late_api_trace_both_orders_and_identity_upgrade_replay_equal_frozen() {
         assert_eq!(actual, frozen(&api, &trace));
         fixture.save(&mut reader);
         let mut richer = api_row("upgrade");
-        richer.fingerprint = fingerprint("richer");
         richer.request_identity = Some(ClaudeRequestIdentityEvidence {
             identity_hash_scheme: "synthetic".into(),
             account: identity_missing(),
             organization: identity_missing(),
             disposition: ClaudeIdentityDisposition::Missing,
         });
+        sign_api(&mut richer);
         let upgrade = line(&richer);
         fixture.append(Kind::Api, &upgrade);
         api.extend(upgrade);
@@ -638,12 +654,21 @@ fn codec_has_no_raw_fragment_or_runtime_fingerprint_memo() {
     fixture.write("scope", &api, &trace);
     let (reader, reports) = load(fixture.reader(), &fixture.dir);
     assert!(!reports.0.health.is_complete());
+    assert!(reader.entries["scope"].pair.api.state.rows[0]
+        .fingerprint_check
+        .get_or_check(|| true));
     let encoded = codec::encode(&reader.entries["scope"].pair).unwrap();
     assert!(!encoded
         .windows(b"RAW_FRAGMENT_CANARY".len())
         .any(|bytes| bytes == b"RAW_FRAGMENT_CANARY"));
     assert!(codec::verify(&encoded));
     let restored = codec::decode(&encoded).unwrap();
+    assert!(
+        !restored.api.state.rows[0]
+            .fingerprint_check
+            .get_or_check(|| false),
+        "runtime fingerprint memo must reset on restore"
+    );
     assert_eq!(restored, reader.entries["scope"].pair);
 }
 
@@ -713,10 +738,11 @@ fn sealed_health_and_continuation_maps_survive_tail_and_restore() {
     fixture.save(&mut reader);
     let mut conflicting = api_row("conflict");
     conflicting.output_tokens = 11;
-    conflicting.fingerprint = fingerprint("different");
+    sign_api(&mut conflicting);
     let a = line(&conflicting);
     let mut different_trace = trace_row("conflict");
-    different_trace.fingerprint = fingerprint("different");
+    different_trace.agent_id = "other-agent".into();
+    sign_trace(&mut different_trace);
     let t = line(&different_trace);
     fixture.append(Kind::Api, &a);
     fixture.append(Kind::Trace, &t);
@@ -799,4 +825,73 @@ fn unknown_representation_keeps_owner_pending_and_never_reacquires_or_overwrites
     assert!(reader.counts[0].persistent_failures > 0);
     fixture.save(&mut reader);
     assert_eq!(fs::read(path).unwrap(), unknown);
+}
+
+#[test]
+fn api_generation_witness_is_the_acquired_generation_not_a_later_stat() {
+    let fixture = Fixture::new("sidecar-api-generation-race");
+    let (mut api, trace) = bytes("first");
+    fixture.write("scope", &api, &trace);
+    let (append, _) = bytes("late");
+    let injected = append.clone();
+    API_AFTER_READ.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |path| {
+            OpenOptions::new()
+                .append(true)
+                .open(path)
+                .unwrap()
+                .write_all(&injected)
+                .unwrap();
+        }))
+    });
+    let (_, ()) = with_reader(fixture.reader(), || {
+        let mut read = ClaudeApiEvidenceRead::load(&fixture.dir, ["scope".into()]).unwrap();
+        assert_eq!(read.evidence["scope"].len(), 1);
+        assert_eq!(
+            fs::metadata(evidence_path(&fixture.dir, "scope"))
+                .unwrap()
+                .len(),
+            (api.len() + append.len()) as u64
+        );
+        assert!(!read.strict_generation_matches(&fixture.dir, "scope"));
+        api.extend(&append);
+        let strict = read.take_strict_report(&fixture.dir, "scope");
+        assert_eq!(strict, frozen(&api, &trace).0);
+        assert_eq!(strict.evidence["scope"].len(), 2);
+    });
+}
+
+#[test]
+fn fatal_api_directory_or_open_error_vetoes_the_whole_permissive_cohort() {
+    for directory in [true, false] {
+        let fixture = Fixture::new("sidecar-cohort-error-veto");
+        let (api, trace) = bytes("first");
+        fixture.write("scope", &api, &trace);
+        if directory {
+            let bad = evidence_path(&fixture.dir, "bad");
+            fs::create_dir_all(bad).unwrap();
+            assert!(
+                ClaudeApiEvidenceRead::load(&fixture.dir, ["scope".into(), "bad".into()]).is_err()
+            );
+            let (_, result) = with_reader(fixture.reader(), || {
+                ClaudeApiEvidenceRead::load(&fixture.dir, ["scope".into(), "bad".into()])
+            });
+            assert!(result.is_err(), "healthy rows cannot hide a fatal API path");
+        } else {
+            fixture.write("bad", &api, &trace);
+            let held = fixture.dir.join("after-stat-api.jsonl");
+            API_BEFORE_OPEN.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |path| {
+                    fs::rename(path, held).unwrap();
+                }))
+            });
+            let (_, result) = with_reader(fixture.reader(), || {
+                ClaudeApiEvidenceRead::load(&fixture.dir, ["bad".into(), "scope".into()])
+            });
+            assert!(
+                result.is_err(),
+                "stat success followed by open failure stays fatal"
+            );
+        }
+    }
 }

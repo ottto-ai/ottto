@@ -253,6 +253,7 @@ pub(super) const PARSER: u16 = 1;
 pub(super) fn allowlist() -> [u8; 32] {
     let mut shape = Shape::default();
     shape.push("claude-sidecar-pair:v1");
+    shape.push("fingerprint_tag=sha256:");
     Pair::shape(&mut shape);
     shape.digest()
 }
@@ -260,6 +261,15 @@ pub(super) fn encode(pair: &Pair) -> Result<Vec<u8>, Refuse> {
     if !valid_continuation(pair) {
         return Err(Refuse::UnknownLabel);
     }
+    // The row producers use tagged hashes. Keep the shared H codec's bare
+    // digest representation unchanged for native records. This temporary
+    // normalized view is part of the pending codec/clone allocation charge.
+    let mut pair = pair.clone();
+    map_fingerprints(&mut pair, |text| {
+        text.strip_prefix("sha256:")
+            .map(str::to_owned)
+            .ok_or(Refuse::NotDigest("sidecar.fingerprint"))
+    })?;
     let mut e = Enc::bytes(
         crate::durable_tail_store::RECORD_BYTES - crate::durable_tail_store::HEADER_BYTES - 32,
     );
@@ -272,8 +282,9 @@ pub(super) fn verify(bytes: &[u8]) -> bool {
 }
 pub(super) fn decode(bytes: &[u8]) -> Result<Pair, Corrupt> {
     let mut d = Dec::new(bytes);
-    let pair = Pair::take(&mut d)?;
+    let mut pair = Pair::take(&mut d)?;
     d.finish()?;
+    map_fingerprints(&mut pair, |text| Ok::<_, Corrupt>(format!("sha256:{text}")))?;
     if !valid_continuation(&pair)
         || pair.parser != PARSER
         || !pair.trace.state.health.evidence.is_empty()
@@ -313,6 +324,33 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Pair, Corrupt> {
         }
     }
     Ok(pair)
+}
+
+fn map_fingerprints<E>(pair: &mut Pair, map: impl Fn(&str) -> Result<String, E>) -> Result<(), E> {
+    for row in &mut pair.api.state.rows {
+        row.fingerprint = map(&row.fingerprint)?;
+    }
+    for row in &mut pair.trace.state.rows {
+        row.fingerprint = map(&row.fingerprint)?;
+    }
+    pair.api.state.seen = pair
+        .api
+        .state
+        .seen
+        .iter()
+        .map(|text| map(text))
+        .collect::<Result<_, _>>()?;
+    pair.trace.state.seen = pair
+        .trace
+        .state
+        .seen
+        .iter()
+        .map(|text| map(text))
+        .collect::<Result<_, _>>()?;
+    for value in pair.trace.state.requests.values_mut() {
+        *value = map(value)?;
+    }
+    Ok(())
 }
 
 fn valid_continuation(pair: &Pair) -> bool {

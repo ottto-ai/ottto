@@ -17,6 +17,8 @@ mod tests;
 use codec::{ApiSlot, ApiState, Pair, TraceSlot, TraceState};
 
 pub(super) type Reports = (ClaudeLocalOtelLoadReport, ClaudeTraceOwnershipLoadReport);
+type ApiOutput = (Vec<ClaudeLocalOtelEvidence>, ApiReadWitness);
+type TraceOutput = (ClaudeTraceOwnershipLoadReport, ClaudeTraceReadGeneration);
 // Every admissible file fits a fresh pass. This is a pass byte allowance, not
 // permission for a second bootstrap. Production source caps remain unchanged.
 const BOOTSTRAP_PASS_BYTES: u64 = MAX_EVIDENCE_FILE_BYTES;
@@ -66,6 +68,9 @@ struct Entry {
     dirty: bool,
     failures: u32,
     write_failures: u32,
+    api_generation: Option<ApiFileGeneration>,
+    trace_generation: Option<ApiFileGeneration>,
+    api_fatal: Option<io::ErrorKind>,
 }
 
 pub(super) struct Reader {
@@ -194,6 +199,9 @@ impl Reader {
                     dirty: false,
                     failures: 0,
                     write_failures: 0,
+                    api_generation: None,
+                    trace_generation: None,
+                    api_fatal: None,
                 },
             );
         }
@@ -204,13 +212,26 @@ impl Reader {
             session,
             bootstrap_left: &mut self.bootstrap_left,
             counts: &mut self.counts,
+            fatal_api: None,
+            failure_health: std::array::from_fn(|_| ClaudeLocalOtelLoadHealth::default()),
         };
         let api = acquire.slot(Kind::Api, &mut entry.pair.api);
         let trace = acquire.slot(Kind::Trace, &mut entry.pair.trace);
+        let fatal_api = acquire.fatal_api.take();
+        let failure_health = acquire.failure_health;
+        entry.api_fatal = fatal_api.map(|error| error.kind());
+        entry.api_generation = api
+            .as_ref()
+            .ok()
+            .and_then(|acquired| acquired.generation.clone());
+        entry.trace_generation = trace
+            .as_ref()
+            .ok()
+            .and_then(|acquired| acquired.generation.clone());
         let failed = api.is_err() || trace.is_err();
         entry.pair.pending = failed || eof_incomplete(&entry.pair);
-        entry.dirty |= api.as_ref().copied().unwrap_or(false)
-            || trace.as_ref().copied().unwrap_or(false)
+        entry.dirty |= api.as_ref().is_ok_and(|acquired| acquired.changed)
+            || trace.as_ref().is_ok_and(|acquired| acquired.changed)
             || entry.pair.pending
             || was_pending != entry.pair.pending;
         if failed {
@@ -229,12 +250,24 @@ impl Reader {
         // Never return stale cumulative rows as complete on an I/O refusal.
         let mut reports = reports(&entry.pair);
         if api.is_err() {
-            reports.0.health.unreadable_lines += 1;
+            reports.0.health = failure_health[0].clone();
+            if reports.0.health.is_complete() {
+                reports.0.health.unreadable_lines = 1;
+            }
             reports.0.evidence.remove(session);
         }
         if trace.is_err() {
-            reports.1.unreadable_lines += 1;
-            reports.1.evidence.remove(session);
+            let health = &failure_health[1];
+            reports.1 = ClaudeTraceOwnershipLoadReport {
+                missing_files: health.missing_files,
+                oversized_files: health.oversized_files,
+                unreadable_lines: if health.is_complete() {
+                    1
+                } else {
+                    health.unreadable_lines
+                },
+                ..Default::default()
+            };
         }
         publish_counts(before_counts, self.counts);
         Ok(reports)
@@ -284,6 +317,9 @@ impl Reader {
                         dirty: false,
                         failures: 0,
                         write_failures: 0,
+                        api_generation: None,
+                        trace_generation: None,
+                        api_fatal: None,
                     });
                 }
             }
@@ -507,14 +543,43 @@ struct Acquire<'a> {
     session: &'a str,
     bootstrap_left: &'a mut u64,
     counts: &'a mut [Counts; 2],
+    fatal_api: Option<io::Error>,
+    failure_health: [ClaudeLocalOtelLoadHealth; 2],
+}
+struct Acquired {
+    changed: bool,
+    generation: Option<ApiFileGeneration>,
 }
 impl Acquire<'_> {
-    fn slot<S: Slot>(&mut self, kind: Kind, retained: &mut S) -> io::Result<bool> {
+    fn slot<S: Slot>(&mut self, kind: Kind, retained: &mut S) -> io::Result<Acquired> {
         let counts = &mut self.counts[kind.index()];
         counts.selected += 1;
         let path = kind.path(self.support, self.session);
-        let metadata = fs::metadata(&path)?;
-        if !metadata.is_file() || metadata.len() >= MAX_EVIDENCE_FILE_BYTES {
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                if error.kind() == io::ErrorKind::NotFound {
+                    self.failure_health[kind.index()].missing_files = 1;
+                } else {
+                    self.failure_health[kind.index()].unreadable_lines = 1;
+                }
+                return Err(error);
+            }
+        };
+        if !metadata.is_file() {
+            if matches!(kind, Kind::Api) {
+                self.fatal_api = Some(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "sidecar API nonregular input",
+                ));
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "sidecar nonregular input",
+            ));
+        }
+        if metadata.len() >= MAX_EVIDENCE_FILE_BYTES {
+            self.failure_health[kind.index()].oversized_files = 1;
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "sidecar input admission",
@@ -531,9 +596,35 @@ impl Acquire<'_> {
         let mut options = OpenOptions::new();
         use std::os::unix::fs::OpenOptionsExt;
         options.read(true).custom_flags(libc::O_NONBLOCK);
-        let mut file = options.open(&path)?;
+        let mut file = match options.open(&path) {
+            Ok(file) => file,
+            Err(error) => {
+                if matches!(kind, Kind::Api) {
+                    self.fatal_api = Some(io::Error::new(error.kind(), "open sidecar API"));
+                }
+                return Err(error);
+            }
+        };
         counts.opened += 1;
-        let before = file.metadata()?;
+        let before = match file.metadata() {
+            Ok(metadata) if metadata.is_file() => metadata,
+            result => {
+                let error = result.err().unwrap_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "opened sidecar nonregular")
+                });
+                if matches!(kind, Kind::Api) {
+                    self.fatal_api = Some(io::Error::new(error.kind(), "stat opened sidecar API"));
+                }
+                return Err(error);
+            }
+        };
+        if before.len() >= MAX_EVIDENCE_FILE_BYTES {
+            self.failure_health[kind.index()].oversized_files = 1;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "opened sidecar cap",
+            ));
+        }
         let stamp = FileStamp::capture(before.clone())?;
         if !before_path.same_content(&stamp) {
             return Err(io::Error::new(
@@ -568,8 +659,12 @@ impl Acquire<'_> {
                             counts.fragments += 1;
                         }
                         let changed = retained.certificate().as_ref() != Some(&certificate);
+                        let generation = api_file_generation(&before);
                         retained.set_certificate(certificate);
-                        return Ok(changed);
+                        return Ok(Acquired {
+                            changed,
+                            generation,
+                        });
                     }
                     previous = Some(checkpoint);
                 }
@@ -647,9 +742,20 @@ impl Acquire<'_> {
                 "sidecar path changed during acquisition",
             ));
         }
+        let generation = api_file_generation(&before);
         candidate.set_certificate(certificate);
         *retained = candidate;
-        Ok(true)
+        if matches!(kind, Kind::Api) {
+            API_AFTER_READ.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().take() {
+                    hook(&path);
+                }
+            });
+        }
+        Ok(Acquired {
+            changed: true,
+            generation,
+        })
     }
 }
 
@@ -783,4 +889,44 @@ fn publish_counts(before: [Counts; 2], after: [Counts; 2]) {
 
 pub(in crate::claude_local_otel) fn prepared_fixture(check: impl FnOnce(&Path, &Reports)) {
     tests::prepared_fixture(check);
+}
+
+pub(super) fn active_api(support: &Path, session: &str) -> Option<io::Result<ApiOutput>> {
+    ACTIVE.with(|active| {
+        let mut active = active.borrow_mut();
+        let reader = active.as_mut().filter(|reader| reader.support == support)?;
+        Some(reader.load(session).and_then(|(mut api, _)| {
+            if let Some(kind) = reader.entries[session].api_fatal {
+                return Err(io::Error::new(kind, "fatal sidecar API acquisition"));
+            }
+            let generation = if api.health.is_complete() {
+                reader.entries[session].api_generation.clone()
+            } else {
+                None
+            };
+            let rows = api.evidence.remove(session).unwrap_or_default();
+            Ok((
+                rows,
+                ApiReadWitness {
+                    health: api.health,
+                    generation,
+                },
+            ))
+        }))
+    })
+}
+pub(super) fn active_paid_trace(support: &Path, session: &str) -> Option<io::Result<TraceOutput>> {
+    ACTIVE.with(|active| {
+        let mut active = active.borrow_mut();
+        let reader = active.as_mut().filter(|reader| reader.support == support)?;
+        Some(reader.load(session).and_then(|(_, report)| {
+            let opened = reader.entries[session]
+                .trace_generation
+                .clone()
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "trace generation unavailable")
+                })?;
+            Ok((report, ClaudeTraceReadGeneration { opened }))
+        }))
+    })
 }

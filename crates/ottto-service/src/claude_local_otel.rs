@@ -741,6 +741,7 @@ struct ApiReadWitness {
 // Length/mtime alone cannot detect same-size replacement or restored mtimes.
 // This witness never becomes a persisted sidecar/candidate fingerprint.
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(test, derive(Clone))]
 struct ApiFileGeneration {
     device: u64,
     inode: u64,
@@ -997,6 +998,7 @@ impl ClaudeApiEvidenceRead {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(test, derive(Clone))]
 pub(crate) struct ClaudeTraceReadGeneration {
     opened: ApiFileGeneration,
 }

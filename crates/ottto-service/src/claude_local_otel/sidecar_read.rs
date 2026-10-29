@@ -14,23 +14,8 @@ pub(super) fn api(
     session_id: &str,
 ) -> Result<(Vec<ClaudeLocalOtelEvidence>, ApiReadWitness)> {
     #[cfg(all(test, unix))]
-    if let Some(result) = durable::active_load(support_dir, session_id) {
-        let (mut api, _) = result?;
-        let generation = if api.health.is_complete() {
-            fs::metadata(evidence_path(support_dir, session_id))
-                .ok()
-                .and_then(|m| api_file_generation(&m))
-        } else {
-            None
-        };
-        let rows = api.evidence.remove(session_id).unwrap_or_default();
-        return Ok((
-            rows,
-            ApiReadWitness {
-                health: api.health,
-                generation,
-            },
-        ));
+    if let Some(result) = durable::active_api(support_dir, session_id) {
+        return Ok(result?);
     }
     // E1 approved v1 post-save, at-least-once durability. Promote the same
     // harness path here after proof; do not relabel it a write-ahead receipt.
@@ -92,9 +77,7 @@ pub(super) fn paid_trace(
     #[cfg(all(test, unix))]
     if let Some(support) = durable::active_path(path, session_id, durable::Kind::Trace) {
         durable::pay_active(session_id, paid, occupied)?;
-        let report = trace(&support, [session_id.into()]);
-        let generation = claude_trace_read_generation(&support, session_id)?;
-        return Some((report, generation));
+        return durable::active_paid_trace(&support, session_id)?.ok();
     }
     bounded_read::trace(path, session_id, paid, occupied)
 }

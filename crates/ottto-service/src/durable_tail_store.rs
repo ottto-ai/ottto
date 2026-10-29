@@ -475,6 +475,12 @@ impl DurableTailStore {
     /// This confers no write-ahead receipt or index/settlement authority.
     pub(crate) fn retry_directory_sync<W: SingleWriter>(&self, writer: &W) -> io::Result<()> {
         self.check_writer(writer)?;
+        if self.disabled.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "store disabled",
+            ));
+        }
         sync_dir(&self.dir)
     }
 
