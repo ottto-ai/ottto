@@ -4145,8 +4145,9 @@ fn a0h_native_exhaustion_growth_pacing_reselection_and_restart_body() {
                 drop(guard);
                 assert_eq!(
                     owner.cache.durable().unwrap().retail_spent
-                        [&store::key_digest(DurableSource::ClaudeCode, &key)],
-                    (high, now)
+                        [&store::key_digest(DurableSource::ClaudeCode, &key)]
+                        .spent,
+                    Some((high, now))
                 );
             }
         });
@@ -4228,7 +4229,17 @@ fn a0h_native_exhaustion_growth_pacing_reselection_and_restart_body() {
         assert_eq!(idle_modes.0, 0);
         assert_eq!(idle_io, (0, 0));
         assert_eq!(quiet.files[&key].size_bytes, high);
-        assert_eq!(owner.cache.durable().unwrap().retail_spent, spent_before);
+        assert_eq!(
+            owner
+                .cache
+                .durable()
+                .unwrap()
+                .retail_spent
+                .iter()
+                .map(|(key, c)| (*key, c.spent))
+                .collect::<Vec<_>>(),
+            spent_before
+        );
         // Remaining pace rows deliberately keep the unacknowledged prefix C.
 
         assert_eq!(
