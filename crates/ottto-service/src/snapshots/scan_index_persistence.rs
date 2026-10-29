@@ -207,6 +207,10 @@ impl LegacyRecovery {
 }
 
 impl LoadedRoot {
+    pub(crate) fn observed_missing() -> Self {
+        Self(Arc::new(Root::Missing))
+    }
+
     pub(crate) fn generation(&self) -> Option<u64> {
         match &*self.0 {
             Root::Sharded { manifest, .. } => Some(manifest.generation),
@@ -1142,6 +1146,44 @@ impl LockedStore {
         }
     }
 
+    /// An observed fresh load may write progress during its first sync pass.
+    /// Keep that custody through publication, but reject ANY intervening root/
+    /// quarantine witness. This check does not discard files or infer freshness.
+    fn check_initial_cas(&self) -> Result<()> {
+        if self.authorized_legacy_replacement.get() {
+            return Ok(());
+        }
+        ensure!(
+            !self.prior_root_seen.get(),
+            "scan_index_prior_state_requires_repair"
+        );
+        let root = self.root_name.to_str()?;
+        let stem = root.strip_suffix(".json").unwrap_or(root);
+        let family = stem.strip_suffix("-v2").unwrap_or(stem);
+        let temp_prefix = format!("{root}.storage-tmp-");
+        visit_storage_directory(&self.parent, |name| {
+            let text = name
+                .to_str()
+                .map_err(|_| anyhow::anyhow!("scan_index_prior_state_unknown"))?;
+            if text.starts_with(family) {
+                if text == format!("{stem}-upload-progress.lock")
+                    || text == format!("{stem}-upload-progress.json")
+                    || text == format!("{root}.lock")
+                    || text == format!("{stem}.lock")
+                {
+                    Stamp::capture(&open_at(&self.parent, name, libc::O_RDONLY)?, false)?;
+                } else if text.strip_prefix(&temp_prefix).is_some_and(|suffix| {
+                    suffix.len() == 32 && suffix.bytes().all(|b| b.is_ascii_hexdigit())
+                }) {
+                    Stamp::capture(&open_at(&self.parent, name, libc::O_RDONLY)?, true)?;
+                } else {
+                    bail!("scan_index_prior_state_requires_repair");
+                }
+            }
+            Ok(())
+        })
+    }
+
     /// Bounded manifest-only CAS on an already loaded sharded baseline. No old
     /// logical decode. Legacy callers still perform their original full CAS.
     pub(crate) fn compare(&self, expected: &LoadedRoot) -> Result<()> {
@@ -1151,7 +1193,10 @@ impl LockedStore {
         );
         let (_, current) = self.current()?;
         let same = match (&*expected.0, &current) {
-            (Root::Missing, Root::Missing) => true,
+            (Root::Missing, Root::Missing) => {
+                self.check_initial_cas()?;
+                true
+            }
             (Root::Legacy { digest: a, .. }, Root::Legacy { digest: b, .. }) => a == b,
             (
                 Root::Sharded {

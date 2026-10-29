@@ -144,22 +144,35 @@ pub(super) fn open_storage(
     drain_stats(store, source);
     result
 }
-pub(super) fn check_missing(path: &Path, source: &'static str) -> Result<()> {
-    if let Some(binding) = scan_index_storage_binding(path) {
-        if path.parent().is_some_and(Path::exists) {
-            let _lock = CheckpointLock::acquire(path)?;
-            let store =
-                scan_index_persistence::LockedStore::new(path, binding, lenient_decode::FIELDS)?;
-            anyhow::ensure!(
-                matches!(
-                    open_storage(&store, source)?,
-                    scan_index_persistence::Opened::Missing(_)
-                ),
-                "scan_index_root_appeared_requires_reload"
-            );
+pub(super) fn check_missing(
+    path: &Path,
+    source: &'static str,
+) -> Result<
+    Option<(
+        scan_index_persistence::Binding,
+        scan_index_persistence::LoadedRoot,
+    )>,
+> {
+    let Some(binding) = scan_index_storage_binding(path) else {
+        return Ok(None);
+    };
+    let root = if path.parent().is_some_and(Path::exists) {
+        let _lock = CheckpointLock::acquire(path)?;
+        let store = scan_index_persistence::LockedStore::new(
+            path,
+            binding.clone(),
+            lenient_decode::FIELDS,
+        )?;
+        match open_storage(&store, source)? {
+            scan_index_persistence::Opened::Missing(root) => root,
+            _ => return Err(anyhow::anyhow!("scan_index_root_appeared_requires_reload")),
         }
-    }
-    Ok(())
+    } else {
+        // The namespace does not exist yet. Keep this observed absence without
+        // creating a directory during load; publication still checks its CAS.
+        scan_index_persistence::LoadedRoot::observed_missing()
+    };
+    Ok(Some((binding, root)))
 }
 pub(super) fn storage_decode_error(error: anyhow::Error) -> anyhow::Error {
     if matches!(
