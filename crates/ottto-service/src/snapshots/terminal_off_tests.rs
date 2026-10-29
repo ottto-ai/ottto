@@ -840,3 +840,34 @@ fn terminal_off_unproven_pending_is_counted_without_settlement_or_proof() {
     let _ = index.terminal_off_retention(rfc3339_unix_seconds(W2).unwrap() + 100);
     assert_eq!(serde_json::to_value(&index).unwrap(), before);
 }
+
+#[test]
+fn terminal_off_pending_behind_old_witness_is_still_counted_and_unproven() {
+    let scratch = crate::test_scratch::ScratchDir::new("terminal-off-old-proof-gauge");
+    let root = scratch.join("projects");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join(format!("{OFF_ROOT}.jsonl")),
+        off_line(OFF_ROOT, "X"),
+    )
+    .unwrap();
+    let mut index = off_index();
+    let scan = off_scan(&mut index, &root, W1, 8);
+    assert!(!scan.census_complete);
+    let revision = index
+        .files
+        .values()
+        .next()
+        .unwrap()
+        .source_file_fingerprint
+        .clone();
+    index.insert_unproven_terminal_claude_authority_for_test(OFF_ROOT, &revision);
+    assert!(index.claude_usage_family_witnesses.contains_key(OFF_ROOT));
+    let before = serde_json::to_value(&index).unwrap();
+    let debt = index.terminal_off_retention(rfc3339_unix_seconds(W2).unwrap());
+    assert_eq!(debt.delayed_proof_families.items, 1);
+    assert_eq!(debt.accepted_index_acks.items, 0);
+    assert_eq!(debt.owed_correction_members.items, 0);
+    assert!(!claude_terminal_authority(&index, true, W2));
+    assert_eq!(serde_json::to_value(&index).unwrap(), before);
+}

@@ -632,14 +632,15 @@ impl ScanIndex {
                     .observe(correction.owed_member_ids.len(), clock, now);
             }
         }
-        for (root, pending) in &self.claude_usage_family_pending {
-            if !self.claude_usage_family_witnesses.contains_key(root) {
-                debt.delayed_proof_families.observe(
-                    1,
-                    rfc3339_unix_seconds(&pending.census_window_end),
-                    now,
-                );
-            }
+        // An older witness does not settle this pending census or prove a
+        // changed revision. Count all retained pending, including future
+        // correction/reconstruction debt behind an existing witness.
+        for pending in self.claude_usage_family_pending.values() {
+            debt.delayed_proof_families.observe(
+                1,
+                rfc3339_unix_seconds(&pending.census_window_end),
+                now,
+            );
         }
         for entry in self.files.values() {
             let clock = (entry.modified_unix_seconds > 0).then_some(entry.modified_unix_seconds);
