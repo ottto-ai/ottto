@@ -1008,6 +1008,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                         &candidate,
                         &scan.codex_title_metadata,
                         &scan.claude_title_metadata,
+                        None,
                         None
                     )
                     .is_none());

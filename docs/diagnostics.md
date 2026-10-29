@@ -979,9 +979,16 @@ not distinct sessions, decoded bytes or money. No path or session id is included
 | `CompressedGroupReadUnsupported` | Initial member, member swap and legacy tee |
 | `CompressedParentLedgerUnbound` | Parent identity without archive ledger binding |
 | `CompressedPhysicalOffsetUnsupported` | Physical acquisition, cursor and memo offsets |
-| `CompressedHeaderUnfunded` | Temporary header inventory/dependency refusal |
-| `CompressedCompatibilityUnfunded` | Temporary compatibility/plain-parser refusal |
+| `CompressedHeaderUnfunded` | Archive reaches the raw plain-header reader without decoder funding, including group-member header reads; no decoded header is returned |
+| `CompressedCompatibilityUnfunded` | Reserved main compatibility-reader funding refusal label; currently no emitter (the compatibility reader uses `CompressedCompatibilityUnsupported`) |
+| `decoder_refused_header_occupancy` | Paid archive decoder credit refused because optional plain header facts occupy the remaining budget; no credit, decoder or header reclamation on this refusal |
 | `CompressedAdmissionRefused` | Transient decoder reservation or singleton yield |
+| `CompressedDecodeFailed` | Invalid/truncated frame or checksum failure |
+| `CompressedOwnerUnproven` | Decoded owner does not prove logical rollout identity |
+| `CompressedOutputHeld` | Definitively incomplete native output |
+| `CompressedSettlementStuck` | Three failed or interrupted first-read attempts |
+| `CompressedConstructorUnfunded` | Plain-parser constructor backstop for an archive |
+| `CompressedDecodedOverLimit` | Decoded bytes exceed the existing 2 GiB cap |
 
 These refusals authorize neither discovery nor a decoder. A refusal publishes no
 empty or zero-cost replacement body: previous accepted output remains stale, or
@@ -997,13 +1004,16 @@ A short reservation or busy singleton yields `None`, counts
 `CompressedAdmissionRefused` on `codex_zst_refused`, and changes no acquisition
 evidence. Callers disclose the yielded file in the unreadable census.
 
-On close, `codex_zst_input` on the #799 carrier reports consumed
-`codex_zst_compressed_bytes`, produced `codex_zst_decoded_bytes` and decoder thread
-`codex_zst_cpu_micros`, including failures. There is no content or path in these
-counts. Callers close the decoder and explicitly release after Stores drops.
-Fallback Drop release counts `codex_zst_owner.counts.leaked_release`; it is a
-cancellation/unwind safety net. Stores-held debug assertions guard admission and
-explicit release, including real durable I/O paths.
+A funded main-scan archive attempt emits `codex_zst_input` once when its decoder
+closes. Counts `codex_zst_compressed_bytes`, `codex_zst_decoded_bytes`, and
+`codex_zst_cpu_micros` measure physical File input (including read-ahead), decoded
+output and thread CPU spent decoding, including failed attempts.
+`codex_zst_compressed_consumed_bytes` separately measures input consumption in
+successful decoder steps. The counts contain no path, owner or content. Decoder credit is held through the shared cache admission; only one
+funded decoder may be live in the process. Physical offset certificates remain
+unsupported for archives.
+
+Callers explicitly release after Stores drops; Drop release is a cancellation safety net.
 
 The tag-1 audit-safe bootstrap core is a hard release pair with the grouped
 custody and stored-representation binding completion. The first part preserves
@@ -1011,6 +1021,185 @@ main's narrower current-representation binding formula. Grouped Codex members
 still have main's index-reset recovery gap there; the paired completion closes
 it for every member/alias. Both parts must ship in the same release, in order;
 the first is not a standalone recovery-complete release.
+
+Archive disposition stays `pending` until exact current-body ACK settlement.
+Each admitted attempt clears its own body witness; only successful output
+finalization binds a new witness. Old body facts/ACKs cannot settle a failed
+current attempt. Validated logical-id coverage preserves the accepted token/model
+breakdown during quiet pending scans. No empty or zero-cost replacement is made.
+The existing scan/sync checkpoint persists the reservation before any decode;
+save failure closes the decoder, restores committed evidence and emits no retry
+or retry alarm. Read permission is process-local and grants no ACK authority.
+
+The first body acquisition is A1. Further first-read recovery is the named
+`codex_zst_first_read_retry` EXCEPTION to one A1 per object, **Lead A approved
+2026-10-29**, until **11b-1b resume from retained acquisition** replaces it.
+There is no retained acquisition/output resume on this prerequisite head.
+An unchanged stamp permits at most six committed A1/recovery decode reservations,
+including reservations interrupted before bytes, with six-hour retry deadlines.
+Three DURABLY RECORDED terminal upload failures stop recovery; Completed without
+the current body ACK and Rejected are terminal, while Shed/Deferred/transport
+errors are not. Terminal outcomes increment in RAM and may be lost before the
+next index save. Repeated crashes there can reach Stuck(`decode_budget`) instead
+of Stuck(`CompressedSettlementStuck`), never more than six A1/recovery decodes.
+Stuck retains accepted money, stale/unknown, never $0. An exact current-body ACK
+can revive either settlement hold. No counter resets on ordinary retry/restart.
+
+For under-cap compressed size C and decoded size D, A1/recovery attempts together read
+at most 6C physical / 6D decoded bytes per stamp (over-limit probes add at most one
+decoded byte per attempt); header work has its separate bounds below. Changing
+content stamps starts a new budget; evidence retirement is outside this bound.
+Approved activation requires ≤1 GiB per catch-up decode, real AC/utility QoS and
+≤10% of one core pacing. This prerequisite still uses the 2 GiB Codex decoder
+ceiling and has no production pacing; discovery stays OFF until 11b-1a/1b close
+both gaps. These future limits are not current-head execution evidence.
+
+A saved retry emits `codex_zst_first_read_retry: 1` and
+`codex_zst_retry_alarm: 1` at stages of the same names on `local_resources`, once
+per committed retry, even if the process crashes before bytes. Alarm condition
+is any saved first-read retry (decode attempt >1); `decode_attempt` is the ordinal,
+not an additive counter. It flags use of the exception, not a claim of cap breach.
+Failed/repeated reservation saves emit neither. `codex_zst_input` records actual
+decoder activity/bytes, including recovery; it does not create another A1 grant.
+LD observes each admitted delivery and deduplicates by opened object.
+Post-release counts line: `codex_zst_first_read_retry`, `codex_zst_retry_alarm`,
+`codex_zst_input`, `codex_zst_refused`, `archive_terminal_residue`,
+`archive_terminal_residue_session_count`, `codex_zst_admission_alarm`.
+Counters/events are counts-only; do not sum ordinal or running gauge fields.
+
+Terminal Held/Refused archives use scoped residue, including quiet skipped
+stamps; they do not add sweep-wide unreadable (RU). Bodyless Pending is the
+bounded Z-PENDING RU exception. Admission denial spends no decode reservation;
+yields 1–11 use Z-ADMISSION RU and yield 12 onward uses scoped admission_starved.
+Frame/checksum/truncation, decoded-limit and owner failures remain sticky.
+Transient read/identity I/O or parent-pending/deferred output stays pending under
+the first-read retry bound. Unknown/stuck money is never $0.
+Decoder safety-net release emits `codex_zst_owner.counts.leaked_release`; normal
+success/error releases explicitly after Stores guards drop.
+
+A3 user-setting corrections use separate once-only grants, described below.
+Quiet settled/empty/held/refused stamps decode zero bytes.
+
+Decoder admission keeps fixed headroom of one 8 MiB primary entry plus side-ledger
+bytes; the resident cache is charged once. The Darwin decoder credit is
+14,352,384 bytes (zstd 1.5.7, window log 23, native 514 MiB fixture peak
+13,009,088 plus 10%, rounded to 64 KiB); other platforms keep 9,830,400 bytes.
+The checked sum is `R + C + D + F + 2*S <= 31 MiB`, where R and C are the
+whole retained/cursor bounds, D is decoder credit, F is the 8 MiB primary floor
+and S is the 125,840-byte fixed side reservation. This leaves F+S free and raises
+the STATE ceiling by zero. Larger D can yield more under warm/cursor pressure;
+the 12-yield alarm is the signal. No resident is evicted by decoder admission. Each admission yield increments
+the cumulative `codex_zst_refused` counter once per attempted archive per pass. After
+12 consecutive yields for an archive, `codex_zst_admission_alarm` discloses the
+starvation once, with `consecutive_yields: 12`. RAM-only process streaks survive
+index reloads, reset on admission or process restart, and are cleared when a key
+is retired. A bounded process map holds at most 256 SHA-256
+identities and byte counters; at capacity, a new identity evicts the lowest hash.
+Actual header-inventory decoder-claim refusals share this per-key streak with
+body admission; successful funding resets it. Header power/QoS/CPU/scope
+deferrals and an absent header cache never increment it. No streak is serialized or changes archive
+evidence. Decoder input and leaked-release fields are per-event counts.
+Archive inventory uses a stamp-bound `header_validated` projection with no
+acquisition, money, checkpoint or ACK authority. One paid attempt per stamp emits
+only `codex_zst_inventory`, never `codex_zst_input`. Its counters include
+`codex_aux_reads.header_read_attempts.inventory`, `header_read_bytes.inventory`
+(physical File input including read-ahead), `codex_zst_inventory_physical_bytes`,
+`codex_zst_inventory_compressed_consumed_bytes` (successful decoder steps),
+`codex_zst_inventory_decoded_bytes` and `codex_zst_inventory_cpu_micros`.
+Both existing stages (`codex_zst_input` and `codex_zst_inventory`) append
+`codex_zst_decoder_native_peak_bytes`, a per-decoder high-water gauge of native
+allocations including allocator headers, tracker and live resize overlap.
+Darwin charges actual `malloc_size`; other platforms charge requested bytes.
+This gauge excludes the two separately prepaid 8 KiB I/O buffers and boxed
+reader; it is not whole-process RSS. Do not sum it as a byte counter.
+`codex_zst_decoder_allocation_refusals` is the per-input saturating count of
+native allocation callback refusals, including size-class preflight and actual
+charge-limit checks. These are backstop failures after funding, not admission
+yields. Both labels are counts/bytes only on the existing local carrier; neither
+adds persisted authority. No logging or allocation is added inside the callback.
+
+Inventory uses an 8 KiB output buffer, retains only the first newline-terminated
+record in a Vec capped at 64 KiB, and caps physical input at 128 KiB. Read-ahead
+can decode beyond that newline; zstd internal block work also costs CPU. Those
+bytes and CPU are measured. Physical bytes charge inventory's read bound;
+actual physical bytes also charge E2-4's per-pass singleton budget. HeaderWork's
+CPU accumulator stops new header attempts at 30 CPU-s. 11b-1 must supply actual
+AC/utility-QoS permission and fold that CPU into its shared catch-up accumulator;
+permission defaults to denied. This slice does not activate discovery/catch-up.
+
+`CompressedHeaderInvalid` is a counted per-archive hold when no projection can be
+used. That member is excluded without making unrelated owners' inventory incomplete.
+Full acquisition can capture a complete first line up to the JSONL line cap;
+64 KiB is only the inventory bound. An inventory-bound failure remains held
+until a separately authorized full acquisition establishes its projection and
+owner membership. Inventory never writes the acquisition owner.
+These are validation/selection effects; there is no money formula change.
+Archive identity requires `payload.id` plus a matching filename candidate;
+double-UUID names outside that set receive counted `CompressedOwnerUnproven`
+holds. Universal archive coverage is not claimed.
+`CompressedParserStateRequired` identifies an accidental plain-constructor call
+for an archive; the paid main parser uses its stateful factory.
+Nonterminal `codex_zst_refused` reader failures enter the unreadable census at
+their caller; terminal archive holds use the scoped residue above. The direct
+compatibility API has no census. Refusals retain prior output.
+
+Terminal archive holds/refusals use `archive_terminal_residue{cause}` instead of
+a sweep-wide unreadable count. `archive_terminal_residue_session_count` is the
+running distinct-session count for that page (not an additive counter). Affected
+sessions remain unknown for state-only, absence retirement and departed-owner
+release decisions; other files can complete census. The existing durable residue
+witness retains the affected keys/session blocks; terminal receipts disclose its
+cardinalities instead of clean success, without making this loss retryable.
+Bodyless Pending remains
+unreadable within its bounded recovery window. Admission uses unreadable until
+that archive's twelfth consecutive yield, then `admission_starved` residue.
+`codex_zst_admission_alarm.admission_starved_count` counts currently starved keys
+in the existing bounded process map; unrelated admissions never reset them.
+Restart or map eviction loses the RAM-only streak; no durable lifetime bound is
+claimed.
+
+User upload-policy/attribution choices bind A3 `full_reads.user_change` with
+`compressed_user_change`, once per affected archive per observed setting generation.
+The user-only context is a domain-separated SHA-256 digest of policy choices;
+backend label capability, key epochs and internal cache churn do not grant A3.
+A→B→A makes two independent generations, rather than reusing an old context grant.
+`user_generation` increases on an observed user-context change; at reservation
+`user_change_spent` binds that generation before bytes, conservatively including
+a crash before the first byte. Counters survive restart. Missing generation/spent
+fields on an older pending correction fail closed; malformed/absent context never
+authorizes a correction. No reading-record codec or identity version is repinned.
+
+`user_change` is separate output/ACK debt, cleared only by exact current-body
+ACK. After a lost/Shed/Deferred/failed ACK or a reservation-only crash, the spent
+generation holds `CompressedCorrectionUnapplied` with scoped unknown/stale residue,
+zero further decode even after six hours/restart. Existing body/incidence custody
+is retained when available, never fake settlement. A retained exact correction
+ACK can settle this debt; old or missing body evidence cannot. Recovery without
+retained custody waits for a separately allowed generation/recovery path.
+
+A3 consumes neither A1's six-reservation budget nor its terminal-failure counters.
+A sixth-attempt A1 success and any number of ACKed independent changes therefore
+leave the next genuine setting change available. The total read envelope is six
+A1/recovery decodes per stamp plus at most one per independent A3 generation,
+not six across all future user changes. Each A3 delivery emits only its A3 count,
+never the first-read retry count/alarm. HeaderWork's existing fail-closed AC/utility
+permission and shared 30 CPU-s accumulator gate corrections; activation must still
+install real platform pacing and the 1 GiB decoded bound before discovery.
+
+Unapproved A4 code replay/body-revision changes preserve historical body, incidence
+and acceptance, holding `CompressedCorrectionUnapplied` without new decode or ACK
+credit. No A4 grant or replay is added. Post-release counts also include
+`full_reads.user_change` and `compressed_user_change`. The A3/A4 prerequisite
+ships in the same stable release as archive activation, or earlier.
+
+The native parser-construction error boundary permits archive RU only for an
+actual typed admission yield (Z-ADMISSION, until that archive's twelfth yield) or
+bodyless Pending (Z-PENDING). It does not infer a yield from a generic error or
+an old streak. Known settlement exhaustion stays terminal scoped residue;
+other construction failures without those exceptions disclose scoped
+`CompressedConstructorUnfunded` residue. Actual read/decode I/O keeps its separate
+failure classification. Quiet Held/Refused and native terminal OutputHeld also
+use scoped residue, letting healthy siblings complete census-gated work.
 
 ## Codex ownership-incomplete causes
 

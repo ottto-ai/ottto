@@ -167,6 +167,8 @@ pub(super) fn member_home(root: &Path) -> PathBuf {
 // witnesses both use it. Only inventory performs native header decoding.
 fn read_header_bytes(candidate: &CandidateFile) -> Result<(Vec<u8>, String, usize, FileStamp)> {
     refuse_compressed_codex(Some(&candidate.path), None, CodexZstCause::HeaderUnfunded)?;
+    #[cfg(test)]
+    tests::header_read_started(&candidate.path);
     let file = open_candidate_beneath_root(candidate)?;
     let before = file.metadata()?;
     anyhow::ensure!(before.is_file(), "Codex header is not a regular file");
@@ -247,7 +249,16 @@ pub(super) fn path_witness(path: &Path) -> Option<String> {
 }
 /// Raw header digest for a file whose owning header the native inventory has
 /// already established. No extra decoded Value is retained or allocated.
-pub(super) fn header_reduction_witness(candidate: &CandidateFile) -> Result<String> {
+pub(super) fn header_reduction_witness(
+    candidate: &CandidateFile,
+    archive: Option<&codex_compressed_input::ValidatedHeader>,
+) -> Result<String> {
+    if is_compressed_codex_rollout(Some(&candidate.path), None) {
+        return archive.map(|header| header.digest.clone()).ok_or_else(|| {
+            crate::local_resource_diagnostics::codex_zst_refused(CodexZstCause::HeaderInvalid);
+            anyhow::anyhow!("archive header evidence unavailable")
+        });
+    }
     read_header_bytes(candidate).map(|(bytes, _, _, _)| format!("{:x}", Sha256::digest(bytes)))
 }
 
@@ -275,9 +286,10 @@ impl HeaderCache {
         let heap_bytes = &mut self.heap_bytes;
         let evictions = &mut self.evictions;
         self.entries.retain(|key, header| {
-            let keep = paths
-                .binary_search_by(|path| path.as_os_str().cmp(Path::new(key).as_os_str()))
-                .is_ok();
+            let keep = !is_compressed_codex_rollout(Some(Path::new(key)), None)
+                && paths
+                    .binary_search_by(|path| path.as_os_str().cmp(Path::new(key).as_os_str()))
+                    .is_ok();
             if !keep {
                 *evictions = evictions.saturating_add(1);
                 *heap_bytes = heap_bytes.saturating_sub(Self::entry_heap(key.capacity(), header));
@@ -304,16 +316,25 @@ impl HeaderCache {
             .checked_add(Self::entry_heap(key_capacity, header))
     }
     pub(in crate::snapshots) fn get(&self, key: &str) -> Option<CachedHeader> {
+        #[cfg(all(test, unix))]
+        header_cache_tests::cache_operation("get", key);
+        if is_compressed_codex_rollout(Some(Path::new(key)), None) {
+            return None;
+        }
         self.entries.get(key).cloned()
     }
     pub(in crate::snapshots) fn refresh(&mut self, key: String, header: Option<CachedHeader>) {
+        #[cfg(all(test, unix))]
+        header_cache_tests::cache_operation("refresh", &key);
         if let Some((key, old)) = self.entries.remove_entry(&key) {
             self.evictions = self.evictions.saturating_add(1);
             self.heap_bytes = self
                 .heap_bytes
                 .saturating_sub(Self::entry_heap(key.capacity(), &old));
         }
-        if let Some(header) = header {
+        if let Some(header) =
+            header.filter(|_| !is_compressed_codex_rollout(Some(Path::new(&key)), None))
+        {
             if self.entries.len() < MAX_HEADER_FILES {
                 self.heap_bytes = self
                     .heap_bytes
@@ -355,6 +376,9 @@ pub(super) struct HeaderInventory {
     pub(super) directories: DirectoryCensus,
     pub(super) complete: bool,
     pub(super) read_bytes: usize,
+    pub(super) held_archives: BTreeSet<String>,
+    pub(super) held_owners: BTreeSet<String>,
+    pub(super) archive_work: codex_compressed_input::HeaderWork,
     pub(super) reuse_hits: usize,
     pub(super) reuse_misses: usize,
     pub(super) bytes_avoided: usize,
@@ -376,6 +400,9 @@ fn group_key(home: &Path, owner: &str) -> String {
 }
 
 impl HeaderInventory {
+    pub(super) fn complete_for(&self, owner: Option<&String>) -> bool {
+        self.complete && !owner.is_some_and(|owner| self.held_owners.contains(owner))
+    }
     pub(super) fn new(
         roots: &[PathBuf],
         paths: &BTreeSet<String>,
@@ -393,6 +420,9 @@ impl HeaderInventory {
             complete: paths.len() <= MAX_HEADER_FILES
                 && directories.is_some_and(|value| value.stable),
             read_bytes: 0,
+            held_archives: BTreeSet::new(),
+            held_owners: BTreeSet::new(),
+            archive_work: codex_compressed_input::HeaderWork::default(),
             reuse_hits: 0,
             reuse_misses: 0,
             bytes_avoided: 0,
@@ -423,12 +453,30 @@ impl HeaderInventory {
 
     #[cfg(test)]
     pub(super) fn step(&mut self, metadata: &CodexTitleMetadata) -> bool {
-        self.step_cached(metadata, None)
+        self.step_with_archive(metadata, &mut ScanIndex::default(), None)
     }
+    #[cfg(test)]
     pub(super) fn step_cached(
         &mut self,
         metadata: &CodexTitleMetadata,
         cache: Option<&sampled_scan::SharedCache>,
+    ) -> bool {
+        self.step_inner(metadata, &mut ScanIndex::default(), cache, None)
+    }
+    pub(super) fn step_with_archive(
+        &mut self,
+        metadata: &CodexTitleMetadata,
+        index: &mut ScanIndex,
+        cache: Option<&Arc<sampled_scan::SharedCache>>,
+    ) -> bool {
+        self.step_inner(metadata, index, cache.map(Arc::as_ref), cache)
+    }
+    fn step_inner(
+        &mut self,
+        metadata: &CodexTitleMetadata,
+        index: &mut ScanIndex,
+        cache: Option<&sampled_scan::SharedCache>,
+        archive_cache: Option<&Arc<sampled_scan::SharedCache>>,
     ) -> bool {
         if !self.cache_pruned {
             self.cache_pruned = true;
@@ -463,12 +511,22 @@ impl HeaderInventory {
             self.bounded_out = true;
             return false;
         };
-        // 11b-0b composition: skip a currently held file BEFORE any header
-        // lookup. Reuse only owner/time/stamp/read-count facts; rebuild custody
-        // cause, owner fences, completeness, membership and exclusions each pass.
-        // The second landing must preserve 11b's early skip and test warm -> held.
+        // Held plain files still need the existing cold owning-header read:
+        // group/owner gates scope their custody hold without stalling siblings.
+        // Warm facts must not supply or refresh that evidence while held.
         let key = local_index_key(&path);
-        self.reuse_misses += 1;
+        if self.held_archives.contains(&key) {
+            return false;
+        }
+        let compressed = is_compressed_codex_rollout(Some(&path), None);
+        let decode_held = index.decode_holds_file(&key);
+        if compressed && decode_held {
+            self.complete = false;
+            self.refused.insert(key, path_witness(&path));
+            return false;
+        }
+        let cache = cache.filter(|_| !decode_held);
+        let mut excluded = false;
         let result = (|| -> Result<HeaderWitness> {
             let stat = fs::symlink_metadata(&path)?;
             anyhow::ensure!(
@@ -501,6 +559,41 @@ impl HeaderInventory {
                 &ClaudeTitleMetadata::default(),
                 None,
             );
+            if compressed {
+                // Archives have their own FD-bound evidence and never consult
+                // or populate the optional plain header fact cache.
+                let before = self.archive_work.physical_bytes;
+                let result = index.inventory_archive_header(
+                    &candidate,
+                    archive_cache,
+                    &mut self.archive_work,
+                );
+                excluded = index
+                    .files
+                    .get(&key)
+                    .and_then(|e| e.archive.as_ref())
+                    .is_some_and(|a| a.invalid_header(&candidate.path, &stat));
+                self.read_bytes = self
+                    .read_bytes
+                    .saturating_add((self.archive_work.physical_bytes - before) as usize);
+                let (header, _) = result?;
+                let stamp = index
+                    .files
+                    .get(&key)
+                    .and_then(|e| e.archive.as_ref())
+                    .context("archive header stamp unavailable")?
+                    .stamp
+                    .clone();
+                return Ok(HeaderWitness {
+                    home: member_home(&candidate.scan_root),
+                    candidate,
+                    owner: header.owner,
+                    created_unix_ms: header.created_unix_ms,
+                    metadata: metadata_witness(&stat),
+                    stamp,
+                });
+            }
+            self.reuse_misses += 1;
             let mut reused = None;
             if let Some(cached) = cache.and_then(|cache| {
                 cache
@@ -548,13 +641,24 @@ impl HeaderInventory {
         })();
         match result {
             Ok(header) => self.headers.push(header),
+            Err(_) if excluded => {
+                self.held_owners
+                    .extend(codex_session_id_candidates_from_path(
+                        &Path::new(&key).with_extension(""),
+                    ));
+                self.held_archives.insert(key);
+            }
             Err(_) => {
-                if let Some(cache) = cache {
-                    cache.refresh_header(key.clone(), None);
+                if !compressed {
+                    if let Some(cache) = cache {
+                        cache.refresh_header(key.clone(), None);
+                    }
                 }
                 self.complete = false;
                 // A failed read may have consumed its whole bounded prefix.
-                self.read_bytes = self.read_bytes.saturating_add(MAX_HEADER_BYTES + 1);
+                if !compressed {
+                    self.read_bytes = self.read_bytes.saturating_add(MAX_HEADER_BYTES + 1);
+                }
                 let witness = path_witness(Path::new(&key));
                 self.refused.insert(key, witness);
             }
@@ -608,6 +712,15 @@ impl HeaderInventory {
             if metadata_witness(&stat) == header.metadata {
                 continue;
             }
+            if is_compressed_codex_rollout(Some(&header.candidate.path), None) {
+                anyhow::ensure!(
+                    header
+                        .stamp
+                        .same_content(&crate::transcript_acquisition::FileStamp::capture(stat)?),
+                    "archive header stamp changed"
+                );
+                continue;
+            }
             let (current, _) = read_header(&header.candidate)?;
             anyhow::ensure!(
                 current.owner == header.owner
@@ -620,7 +733,7 @@ impl HeaderInventory {
 }
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
 crate::heap_layout_bound::fields!(HeaderWitness; candidate, owner, home, created_unix_ms, metadata, stamp);
-crate::heap_layout_bound::fields!(HeaderInventory; roots, pending, headers, directories, complete, read_bytes, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, bounded_out);
+crate::heap_layout_bound::fields!(HeaderInventory; roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, archive_work, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, bounded_out);
 
 #[derive(Clone, Debug)]
 pub(super) struct Group {
@@ -1009,9 +1122,7 @@ pub(super) enum JoinRefusal {
     CandidateCopy,
     V2UiOnlyTurn,
     V2UnboundUi,
-    /// A `history_base.thread_id` names no member of this owner's group:
-    /// typically a compressed (`.zst`, not yet scanned) predecessor, or
-    /// another owner's file named without `forked_from_id`.
+    /// A `history_base.thread_id` names no member of this owner's group.
     MissingPredecessor,
     /// A chain refusal (`Gap`, `Overlap`) of a legacy group replayed in
     /// chronological order because its probes exceeded their budget (R1-M1,
@@ -1750,6 +1861,45 @@ impl crate::heap_layout_bound::HeapLayoutBound for Tokens {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    thread_local! {
+        static HEADER_READ_PROBE: std::cell::RefCell<Option<BTreeMap<PathBuf, usize>>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+    pub(in crate::snapshots) fn header_read_started(path: &Path) {
+        HEADER_READ_PROBE.with(|probe| {
+            if let Some(reads) = probe.borrow_mut().as_mut() {
+                *reads.entry(path.to_owned()).or_default() += 1;
+            }
+        });
+    }
+    /// Opt-in instrumentation at the real header I/O entry, including retries.
+    pub(in crate::snapshots) fn header_reads<T>(
+        run: impl FnOnce() -> T,
+    ) -> (T, BTreeMap<PathBuf, usize>) {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                HEADER_READ_PROBE.with(|probe| *probe.borrow_mut() = None);
+            }
+        }
+        HEADER_READ_PROBE.with(|probe| {
+            assert!(probe.borrow().is_none());
+            *probe.borrow_mut() = Some(BTreeMap::new());
+        });
+        let _reset = Reset;
+        let result = run();
+        let reads = HEADER_READ_PROBE.with(|probe| probe.borrow_mut().take().unwrap());
+        (result, reads)
+    }
+    pub(in crate::snapshots) fn count_header_reads<T>(
+        path: &Path,
+        run: impl FnOnce() -> T,
+    ) -> (T, usize) {
+        let (result, reads) = header_reads(run);
+        (result, reads.get(path).copied().unwrap_or_default())
+    }
 
     pub(crate) fn usage(input: u64) -> Value {
         json!({"input_tokens":input,"cached_input_tokens":0,"cache_write_input_tokens":0,
@@ -4134,6 +4284,30 @@ pub(in crate::snapshots) mod header_cache_tests {
     use super::*;
     thread_local! {
         pub(in crate::snapshots) static READ_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static CACHE_OPERATIONS: std::cell::RefCell<Option<Vec<(&'static str, String)>>> = const { std::cell::RefCell::new(None) };
+    }
+    pub(super) fn cache_operation(operation: &'static str, key: &str) {
+        CACHE_OPERATIONS.with(|calls| {
+            if let Some(calls) = calls.borrow_mut().as_mut() {
+                calls.push((operation, key.to_owned()));
+            }
+        });
+    }
+    fn cache_operations<T>(run: impl FnOnce() -> T) -> (T, Vec<(&'static str, String)>) {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                CACHE_OPERATIONS.with(|calls| *calls.borrow_mut() = None);
+            }
+        }
+        CACHE_OPERATIONS.with(|calls| {
+            assert!(calls.borrow().is_none());
+            *calls.borrow_mut() = Some(Vec::new());
+        });
+        let _reset = Reset;
+        let result = run();
+        let calls = CACHE_OPERATIONS.with(|calls| calls.borrow_mut().take().unwrap());
+        (result, calls)
     }
     pub(in crate::snapshots) fn page(
         root: &Path,
@@ -4176,6 +4350,357 @@ pub(in crate::snapshots) mod header_cache_tests {
             })
             .collect()
     }
+    #[test]
+    fn warm_plain_facts_never_cover_archives_and_changed_archive_stamp_is_revalidated() {
+        use codex_compressed_input::{
+            ArchiveDisposition, ArchiveEvidence, HeaderWork, ValidatedHeader,
+        };
+        let _lock = codex_compressed_input::tests::DECODER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (root, fixture) = tests::fixture();
+        let paths = paths(&fixture);
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let cold = page(&root, &paths, &cache);
+        assert_eq!(cold.reuse_misses, paths.len());
+        assert_eq!(page(&root, &paths, &cache).reuse_hits, paths.len());
+        let plain_key = paths.first().unwrap();
+        let facts = cache
+            .with_cursor(|cursor| cursor.headers.get(plain_key))
+            .unwrap()
+            .unwrap();
+        let archive = root.join("sessions/rollout-cached-archive.jsonl.zst");
+        fs::write(&archive, b"archive-old-stamp").unwrap();
+        let key = local_index_key(&archive);
+        // Both boundaries deny even perfectly valid warm plain facts under an
+        // archive key, and lookup refuses a hypothetical stale RAM entry too.
+        cache.refresh_header(key.clone(), Some(facts.clone()));
+        assert!(cache
+            .with_cursor(|cursor| cursor.headers.get(&key))
+            .unwrap()
+            .is_none());
+        cache
+            .with_cursor(|cursor| assert!(!cursor.headers.entries.contains_key(&key)))
+            .unwrap();
+        let mut stale = HeaderCache::default();
+        stale.entries.insert(key.clone(), facts);
+        assert!(stale.get(&key).is_none());
+        let header = ValidatedHeader::from_bytes(
+            b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"cached-archive\"}}\n",
+        )
+        .unwrap();
+        let mut evidence =
+            ArchiveEvidence::begin(&File::open(&archive).unwrap(), &archive, None).unwrap();
+        evidence.header_validated = Some(header);
+        evidence.disposition = ArchiveDisposition::HeaderValidated;
+        let mut saved = serde_json::to_value(evidence).unwrap();
+        saved["header_attempted"] = serde_json::json!(true);
+        let evidence: ArchiveEvidence = serde_json::from_value(saved).unwrap();
+        let mut index = ScanIndex::default();
+        index.files.entry(key.clone()).or_default().archive = Some(Box::new(evidence));
+        let before = serde_json::to_value(&index.files[&key]).unwrap();
+        let candidate = codex_zst_refusal_tests::candidate(&archive);
+        let mut work = HeaderWork {
+            allowed: true,
+            cpu_micros: 30_000_000,
+            ..Default::default()
+        };
+        // Same-stamp ArchiveEvidence, independently of the warm plain cache,
+        // can supply metadata before the fresh-decode CPU gate.
+        assert_eq!(
+            index
+                .inventory_archive_header(&candidate, Some(&cache), &mut work)
+                .unwrap()
+                .1,
+            0
+        );
+        assert!(index.archive_header(&archive).is_some());
+        let mut all = paths.clone();
+        all.insert(key.clone());
+        let run = |index: &mut ScanIndex| {
+            let sessions = root.join("sessions");
+            let mut census = DirectoryCensus::new();
+            census.observe(&sessions, &fs::metadata(&sessions).unwrap());
+            let mut inventory = HeaderInventory::new(&[sessions], &all, Some(&census));
+            inventory.archive_work.allowed = true;
+            inventory.archive_work.cpu_micros = 30_000_000;
+            while !inventory.step_with_archive(&CodexTitleMetadata::default(), index, Some(&cache))
+            {
+            }
+            inventory
+        };
+        let constructions = codex_zst_refusal_tests::decoder_construction_count();
+        let same = run(&mut index);
+        assert!(same.complete);
+        assert_eq!(same.reuse_hits, paths.len());
+        assert_eq!(
+            same.reuse_misses, 0,
+            "archives are outside plain cache accounting"
+        );
+        assert_eq!(same.headers.len(), paths.len() + 1);
+        assert_eq!(same.read_bytes, 0);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&archive)
+            .unwrap()
+            .write_all(b"changed")
+            .unwrap();
+        assert!(
+            index.archive_header(&archive).is_none(),
+            "archive's own stamp invalidates the old header"
+        );
+        assert!(!index.files[&key]
+            .archive
+            .as_ref()
+            .unwrap()
+            .matches(&File::open(&archive).unwrap()));
+        // FD mismatch must reach the CPU refusal rather than return the stale
+        // ArchiveEvidence header or any warm plain-cache fact; no decoder paid.
+        assert!(index
+            .inventory_archive_header(&candidate, Some(&cache), &mut work)
+            .is_err());
+        let changed = run(&mut index);
+        assert!(!changed.complete);
+        assert!(changed.refused.contains_key(&key));
+        assert!(changed.headers.iter().all(|h| h.candidate.path != archive));
+        assert_eq!(changed.reuse_hits, paths.len());
+        assert_eq!(changed.reuse_misses, 0);
+        assert_eq!(changed.read_bytes, 0);
+        assert_eq!(
+            codex_zst_refusal_tests::decoder_construction_count(),
+            constructions
+        );
+        assert_eq!(serde_json::to_value(&index.files[&key]).unwrap(), before);
+        cache
+            .with_cursor(|cursor| assert!(!cursor.headers.entries.contains_key(&key)))
+            .unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn warm_plain_facts_are_skipped_before_lookup_when_the_file_becomes_decode_held() {
+        let (root, fixture) = tests::fixture();
+        let paths = paths(&fixture);
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        page(&root, &paths, &cache);
+        let held = paths.first().unwrap();
+        assert!(cache
+            .with_cursor(|cursor| cursor.headers.get(held))
+            .unwrap()
+            .is_some());
+        let mut value = serde_json::to_value(ScanIndex::default()).unwrap();
+        value["files"][held] = serde_json::json!({"unknown": 1});
+        let mut index = lenient_decode::read_bounded(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(index.decode_holds_file(held));
+        let before = serde_json::to_value(&index).unwrap();
+        let sessions = root.join("sessions");
+        let mut census = DirectoryCensus::new();
+        census.observe(&sessions, &fs::metadata(&sessions).unwrap());
+        let mut inventory = HeaderInventory::new(&[sessions], &paths, Some(&census));
+        READ_CALLS.with(|calls| calls.set(0));
+        let (_, operations) = cache_operations(|| {
+            while !inventory.step_with_archive(
+                &CodexTitleMetadata::default(),
+                &mut index,
+                Some(&cache),
+            ) {}
+        });
+        assert!(
+            inventory.complete,
+            "cold headers restore parent inventory semantics"
+        );
+        assert_eq!(inventory.reuse_hits, paths.len() - 1);
+        assert_eq!(inventory.reuse_misses, 1);
+        assert!(!inventory.refused.contains_key(held));
+        assert!(inventory
+            .headers
+            .iter()
+            .any(|h| local_index_key(&h.candidate.path) == *held));
+        assert!(operations.iter().all(|(_, key)| key != held));
+        assert!(operations.iter().any(|(operation, _)| *operation == "get"));
+        READ_CALLS.with(|calls| assert_eq!(calls.get(), 1));
+        assert_eq!(
+            serde_json::to_value(&index).unwrap(),
+            before,
+            "custody unchanged"
+        );
+        // The unknown raw owner still blocks selection globally downstream;
+        // inventory itself follows the parents' cold-read path. No held-file
+        // fact was inserted or refreshed, and unholding needs no further read.
+        READ_CALLS.with(|calls| calls.set(0));
+        let repaired = page(&root, &paths, &cache);
+        assert!(repaired.complete);
+        assert_eq!(repaired.reuse_hits, paths.len());
+        READ_CALLS.with(|calls| assert_eq!(calls.get(), 0));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn decode_held_owner_uses_cold_headers_and_unrelated_growth_emits_with_warm_facts() {
+        use std::io::Write;
+        for known_owner in [true, false] {
+            let (root, fixture) = tests::fixture();
+            let owner = fixture.headers[0].owner.clone();
+            let healthy = "ffffffff-1111-4111-8111-ffffffffffff";
+            let healthy_path = root
+                .join("sessions")
+                .join(format!("rollout-{healthy}.jsonl"));
+            let rows = tests::member(healthy, "healthy-first", 100, 100);
+            fs::write(
+                &healthy_path,
+                rows.iter()
+                    .map(|row| row.to_string() + "\n")
+                    .collect::<String>(),
+            )
+            .unwrap();
+            let (mut previous, mut initial) = tests::scan(&root, ScanIndex::default(), 100);
+            assert!(initial.census_complete);
+            assert!(initial
+                .snapshots
+                .iter()
+                .any(|item| item.source_session_id == healthy && item.input_tokens == 100));
+            finalize_scan_after_policy(SnapshotSource::Codex, &mut initial, &mut previous);
+            initial.finish_codex_capture_boundary(&mut previous);
+            let accepted = initial
+                .snapshots
+                .iter()
+                .map(|item| item.snapshot_fingerprint.clone())
+                .collect();
+            previous =
+                previous.committable_subset(&ScanIndex::default(), &accepted, &BTreeMap::new());
+            let healthy_key = local_index_key(&healthy_path);
+            assert!(previous.files.contains_key(&healthy_key));
+            assert!(previous.files[&healthy_key]
+                .codex_joined_member_set
+                .is_none());
+            assert!(previous.files[&healthy_key]
+                .codex_applied_tier_receipt
+                .is_none());
+            let mut paths = paths(&fixture);
+            paths.insert(healthy_key.clone());
+            let held = local_index_key(&fixture.headers[0].candidate.path);
+            let cache = Arc::new(sampled_scan::SharedCache::default());
+            assert!(page(&root, &paths, &cache).complete);
+            assert_eq!(page(&root, &paths, &cache).reuse_hits, paths.len());
+            let old_len = fs::metadata(&healthy_path).unwrap().len();
+            let growth = tests::member(healthy, "healthy-growth", 100, 200)
+                .into_iter()
+                .skip(1)
+                .map(|row| row.to_string() + "\n")
+                .collect::<String>();
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&healthy_path)
+                .unwrap()
+                .write_all(growth.as_bytes())
+                .unwrap();
+            assert!(fs::metadata(&healthy_path).unwrap().len() > old_len);
+            let mut wire = serde_json::to_value(&previous).unwrap();
+            wire["files"][&held] = serde_json::json!({"unknown": 1});
+            if known_owner {
+                wire["files"][&held]["codex_protected_owner"] =
+                    serde_json::json!(codex_protected_owner(&owner));
+            }
+            let index = lenient_decode::read_bounded(&serde_json::to_vec(&wire).unwrap()).unwrap();
+            assert!(index.decode_holds_file(&held));
+            assert_eq!(
+                index.decode_held_codex_owners().any(|o| o.is_none()),
+                !known_owner
+            );
+            let raw_held = serde_json::to_value(&index).unwrap()["files"][&held].clone();
+            let mut owned = OwnedSourceScan::new(
+                SnapshotSource::Codex,
+                &[root.join("sessions")],
+                index,
+                "2026-10-06T23:00:00Z",
+                7,
+                100,
+                false,
+                None,
+                &[],
+                false,
+                false,
+            );
+            // Feed the production scanner its real completed inventory using
+            // warm RAM facts. Body acquisition remains the ordinary portable
+            // path; this does not require native sampled-decoder layout.
+            let ((mut index, mut scan), reads) = tests::header_reads(|| {
+                let mut inventoried = false;
+                for _ in 0..1000 {
+                    if !inventoried {
+                        if let Some(inventory) = owned.codex_join_inventory.as_mut() {
+                            let before = serde_json::to_value(&owned.index).unwrap();
+                            let (_, operations) = cache_operations(|| {
+                                while !inventory.step_with_archive(
+                                    &CodexTitleMetadata::default(),
+                                    &mut owned.index,
+                                    Some(&cache),
+                                ) {}
+                            });
+                            assert_eq!(serde_json::to_value(&owned.index).unwrap(), before);
+                            assert!(inventory.complete);
+                            assert!(inventory.refused.is_empty());
+                            assert_eq!(inventory.reuse_hits, paths.len() - 2);
+                            assert_eq!(inventory.reuse_misses, 2);
+                            assert_eq!(
+                                inventory.owner_for_path(Path::new(&held)),
+                                Some(owner.as_str())
+                            );
+                            assert!(
+                                operations.iter().all(|(_, key)| key != &held),
+                                "held key has no cache lookup, invalidation or insertion"
+                            );
+                            assert!(operations.iter().any(|(operation, _)| *operation == "get"));
+                            inventoried = true;
+                        }
+                    }
+                    match owned.step(None) {
+                        OwnedSourceScanStep::Pending(next) => owned = next,
+                        OwnedSourceScanStep::Complete { index, scan, .. } => {
+                            assert!(inventoried);
+                            return (index, scan);
+                        }
+                    }
+                }
+                panic!("held-owner scan did not finish");
+            });
+            assert_eq!(
+                reads.get(Path::new(&held)),
+                Some(&1),
+                "exactly the existing cold header read"
+            );
+            assert!(
+                scan.snapshots
+                    .iter()
+                    .all(|item| item.source_session_id != owner),
+                "held group never publishes"
+            );
+            assert_eq!(
+                serde_json::to_value(&index).unwrap()["files"][&held],
+                raw_held
+            );
+            finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
+            scan.finish_codex_capture_boundary(&mut index);
+            if known_owner {
+                let emitted = scan
+                    .snapshots
+                    .iter()
+                    .filter(|item| item.source_session_id == healthy)
+                    .collect::<Vec<_>>();
+                assert_eq!(emitted.len(), 1, "unrelated growing file emits its body");
+                assert_eq!(emitted[0].input_tokens, 200);
+                assert!(scan.codex_join_validation.is_none(),
+                    "held group has no completed join proof; current inventory completeness was asserted before selection");
+            } else {
+                assert!(
+                    scan.snapshots.is_empty(),
+                    "unknown raw owner retains the parents' global selection hold"
+                );
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
     #[test]
     fn unchanged_pages_reuse_without_reading_and_restart_is_cold() {
         let (root, fixture) = tests::fixture();

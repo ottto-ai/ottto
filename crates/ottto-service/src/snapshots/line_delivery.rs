@@ -154,11 +154,17 @@ impl LineDelivery {
             _ => parser.step(),
         };
         match stepped {
-            Ok(true) => self.end_open(DeliveryEnd::Complete),
+            Ok(true) if !parser.reader.reader.is_compressed() => {
+                self.end_open(DeliveryEnd::Complete)
+            }
+            Ok(true) => {}
             Ok(false) => {}
             Err(_) => self.end_open(DeliveryEnd::Incomplete),
         }
         stepped
+    }
+    pub(super) fn archive_complete(&mut self) {
+        self.end_open(DeliveryEnd::Complete);
     }
     /// The active file is gone: an armed one never began, an open one ends.
     pub(super) fn left_active(&mut self) {

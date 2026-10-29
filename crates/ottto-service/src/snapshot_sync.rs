@@ -3394,6 +3394,8 @@ impl SyncCounts {
         self.ownership_incomplete_file_count > 0
             || self.zero_snapshot_usage_evidence_count > 0
             || self.dropped_usage_record_count > 0
+            || self.census_residue_blocked_session_count > 0
+            || self.census_residue_index_key_count > 0
     }
 
     fn disclosed_loss(&self) -> DisclosedLoss {
@@ -5431,7 +5433,17 @@ impl SourcePreparation {
                 }
                 SourcePreparationStep::Refused(self, reason)
             }
-            Ok(crate::snapshots::OwnedSourceScanStep::Pending(next)) => {
+            Ok(crate::snapshots::OwnedSourceScanStep::Pending(mut next)) => {
+                if next
+                    .persist_archive_reservation(&mut self.committed_index, &self.index_path)
+                    .is_err()
+                {
+                    self.scan = Some(next);
+                    return SourcePreparationStep::Refused(
+                        self,
+                        crate::source_rotation::LocalRefusal("archive reservation save refused"),
+                    );
+                }
                 self.scan = Some(next);
                 SourcePreparationStep::Pending(self)
             }
@@ -5640,6 +5652,55 @@ fn cycle_upload_context(
         )
     } else {
         upload_context
+    }
+}
+
+// A3 binds user choices only: backend capability and HMAC-key epochs are A4 debt.
+fn archive_user_context(mut policy: SnapshotUploadPolicy) -> String {
+    policy.session_attribution_labels_enabled = false;
+    format!(
+        "{:x}",
+        Sha256::new()
+            .chain_update(b"ottto:codex-archive-user-context:v1\0")
+            .chain_update(snapshot_upload_context_fingerprint(policy, None))
+            .finalize()
+    )
+}
+
+#[cfg(test)]
+#[test]
+fn archive_a3_context_ignores_capability_and_key_epoch_but_tracks_user_choices() {
+    let policy = SnapshotUploadPolicy::default();
+    let baseline = archive_user_context(policy);
+    let capability = SnapshotUploadPolicy {
+        session_attribution_labels_enabled: !policy.session_attribution_labels_enabled,
+        ..policy
+    };
+    assert_eq!(archive_user_context(capability), baseline);
+    assert_ne!(
+        snapshot_upload_context_fingerprint(policy, Some("key-old")),
+        snapshot_upload_context_fingerprint(policy, Some("key-new"))
+    );
+    assert_eq!(archive_user_context(policy), baseline); // archive context has no key-epoch input
+    for changed in [
+        SnapshotUploadPolicy {
+            session_titles_enabled: !policy.session_titles_enabled,
+            ..policy
+        },
+        SnapshotUploadPolicy {
+            workspace_labels_enabled: !policy.workspace_labels_enabled,
+            ..policy
+        },
+        SnapshotUploadPolicy {
+            session_artifacts_enabled: !policy.session_artifacts_enabled,
+            ..policy
+        },
+        SnapshotUploadPolicy {
+            session_attribution_enabled: !policy.session_attribution_enabled,
+            ..policy
+        },
+    ] {
+        assert_ne!(archive_user_context(changed), baseline);
     }
 }
 
@@ -6029,6 +6090,7 @@ fn prepare_sync_source_inner(
             cache_observations_enabled,
         );
     }
+    index.activate_archive_user_context(archive_user_context(upload_policy));
     let upload_context = cycle_upload_context(
         upload_policy,
         checkpoint_namespace.as_deref(),
@@ -6598,6 +6660,7 @@ fn prepare_continuation_source(
         .attribution_context
         .as_ref()
         .map(SessionAttributionContext::checkpoint_namespace);
+    index.activate_archive_user_context(archive_user_context(inputs.upload_policy));
     index.activate_upload_context(cycle_upload_context(
         inputs.upload_policy,
         checkpoint_namespace.as_deref(),
@@ -7531,6 +7594,28 @@ fn finish_sync_source(
     // obligations this full scan references before any selection (#794 F1).
     let ack_scan_referenced =
         upload_progress.ack_retirement_scan_references(&committed_index, &index);
+    // Plain-only cycles have no archive settlement obligation or witness work.
+    if index.files.values().any(|entry| entry.archive.is_some()) {
+        // Settle exact current bodies before selection can restore older file facts.
+        let submitted = scan_result
+            .snapshots
+            .iter()
+            .map(|s| {
+                (
+                    s.snapshot_fingerprint.clone(),
+                    snapshot_upload_body_witness(s),
+                )
+            })
+            .collect();
+        index.settle_archive_outcome(
+            &upload_progress.accepted_body_witnesses,
+            matches!(
+                &upload_result,
+                Ok(ResumableUploadResult::Completed | ResumableUploadResult::Rejected { .. })
+            ),
+            Some(&submitted),
+        );
+    }
     match upload_result {
         Ok(ResumableUploadResult::Completed) => {
             clear_shed_streak(source);
@@ -11793,6 +11878,7 @@ mod tests {
                 codex_counting_v2: false,
                 codex_counting_owner: None,
                 effective_upload_body_witness_revision: 0,
+                archive: None,
                 opened_changed_nanos: 0,
                 opened_birth_nanos: 0,
             },
@@ -24227,5 +24313,20 @@ mod ownership_census_tests {
                 .terminal_census_line(source)
                 .contains("ownership_incomplete_contributions{bucket="));
         }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn archive_residue_receipt_discloses_terminal_loss_without_retryable_error() {
+    for (keys, sessions) in [(0, 1), (1, 0)] {
+        let counts = SyncCounts {
+            census_complete: true,
+            census_residue_index_key_count: keys,
+            census_residue_blocked_session_count: sessions,
+            ..SyncCounts::default()
+        };
+        assert_eq!(counts.disclosed_loss(), DisclosedLoss::Terminal);
+        assert!(!counts.has_retryable_problems());
     }
 }

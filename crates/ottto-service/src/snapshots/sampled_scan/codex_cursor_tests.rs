@@ -7458,6 +7458,7 @@ fn memo_digest_fences_receipt_contents_context_census_flags_and_members() {
                 codex_captured_uncommitted: false,
                 codex_counting_v2: false,
                 codex_counting_owner: None,
+                archive: None,
                 opened_changed_nanos: 0,
                 opened_birth_nanos: 0,
             },
@@ -14231,6 +14232,121 @@ fn decoder_fixed_floor_admits_a_warm_cache_without_evicting_it() {
 
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
+fn decoder_production_budget_admits_seven_mib_without_eviction_or_yields() {
+    let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let clock = TestClock;
+    clock.set(1_900_000_000);
+    assert_eq!(state_budget(), 31 * 1024 * 1024, "production STATE_BYTES");
+    with_test_limits(2048, 8192, 64, || {
+        let fixture = ScanRoot::new(40);
+        let cache = Arc::new(SharedCache::default());
+        let key = local_index_key(&fixture.file(SESSION));
+        let mut index = ScanIndex::default();
+        for _ in 0..64 {
+            let (next, _) = page(&fixture, index, Some(Arc::clone(&cache)));
+            index = next;
+            if cache.retained_checkpoint(&key).is_some() {
+                break;
+            }
+        }
+        let copy = cache.take(&key).expect("real retained reduction").retained;
+        // Charge the actual retained graph first: main can add state without
+        // changing the seven-MiB admission premise or widening its assertion.
+        for key in ["a", "b", key.as_str()] {
+            assert!(cache.retained().unwrap().insert(
+                key.to_owned(),
+                crate::transcript_cache::Retained {
+                    checkpoint: copy.checkpoint.clone(),
+                    state: copy.state.clone(),
+                }
+            ));
+        }
+        let target = 7 * 1024 * 1024 + 128 * 1024;
+        let baseline = retained_floor(&cache);
+        assert!(
+            baseline < target,
+            "fixture state fits below the warm target"
+        );
+        let padding = (target - baseline) / 2;
+        let warm_key = "a".repeat(1 + padding);
+        let peer_key = "b".repeat(1 + padding);
+        for (old, key) in [("a", &warm_key), ("b", &peer_key)] {
+            let retained = cache.take(old).unwrap().retained;
+            assert!(cache.retained().unwrap().insert(key.clone(), retained));
+        }
+        let warm = retained_floor(&cache);
+        assert!((7 * 1024 * 1024..7 * 1024 * 1024 + 256 * 1024).contains(&warm));
+        let credit = codex_compressed_input::compressed_input_credit().unwrap();
+        let root = crate::test_scratch::ScratchDir::new("decoder-production-budget");
+        let archive = root.join("rollout-synthetic.jsonl.zst");
+        let bytes = zstd::stream::encode_all(&b"synthetic archive"[..], 1).unwrap();
+        fs::write(&archive, bytes).unwrap();
+        let candidate = crate::snapshots::codex_zst_refusal_tests::candidate(&archive);
+        let archive_key = local_index_key(&archive);
+        let streak = |yielded| codex_compressed_input::admission_streak(&archive_key, yielded);
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            // Twelve passes through the real admission point. Each starts one
+            // yield short of the alarm, so any yield would raise it.
+            for pass in 0..12 {
+                streak(false);
+                for _ in 0..11 {
+                    streak(true);
+                }
+                let mut parser = crate::snapshots::sampled_scan::new_source_parser(
+                    File::open(&archive).unwrap(),
+                    &candidate,
+                    SnapshotSource::Codex,
+                    &CodexTitleMetadata::default(),
+                    None,
+                    None,
+                    false,
+                    false,
+                    false,
+                    &mut ScanIndex::default(),
+                    Some(&cache),
+                )
+                .expect("production warm cache admits without eviction");
+                assert_eq!(streak(true), 1, "admission reset the archive's streak to 0");
+                streak(false);
+                let input = &mut parser.reader.reader;
+                assert!(input.is_compressed());
+                input.read_exact(&mut [0; 1]).unwrap();
+                assert_eq!(cache.cursor_reserved(), credit);
+                assert!(
+                    cache.cursor_resident() + admission_floor(&cache) + ENTRY_BYTES
+                        <= state_budget(),
+                    "primary Tail headroom stays available"
+                );
+                assert!(cache.retained_checkpoint(&warm_key).is_some());
+                assert!(cache.retained_checkpoint(&peer_key).is_some());
+                assert!(cache.retained_checkpoint(&key).is_some());
+                if pass == 0 {
+                    fixture.append(SESSION, &token_line(41));
+                    index.traversal = None;
+                    let (next, scan, modes) =
+                        page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture");
+                    index = next;
+                    assert_eq!(modes, (0, 1), "primary remains a real Tail");
+                    assert_eq!(scan.snapshots.len(), 1);
+                }
+                assert!(cache.retained_checkpoint(&warm_key).is_some());
+                assert!(cache.retained_checkpoint(&peer_key).is_some());
+                parser.reader.reader.close();
+                assert_eq!(cache.cursor_reserved(), 0);
+            }
+        });
+        assert!(!rows.iter().any(
+            |r| r["stage"] == "codex_zst_refused" || r["stage"] == "codex_zst_admission_alarm"
+        ));
+        assert_eq!(streak(true), 1, "no yield was recorded for the archive");
+        streak(false);
+    });
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
 fn decoder_drop_under_cursor_strands_credit_without_relocking() {
     let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
         .lock()
@@ -14487,4 +14603,173 @@ fn parked_singleton_across_fresh_index_reprobes_record_debt() {
         Some(&1)
     );
     assert_eq!(durable.restored, 0);
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
+fn inventory_decoder_releases_without_waiting_for_stores_bounded_join() {
+    let _lock = crate::snapshots::codex_compressed_input::tests::ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let root = crate::test_scratch::private_dir("header-lock-order");
+    let path = root.join("rollout-synthetic.jsonl.zst");
+    std::fs::write(
+        &path,
+        zstd::stream::encode_all(
+            &b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"synthetic\"}}\n"[..],
+            1,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let cache = Arc::new(SharedCache::default());
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let held_cache = cache.clone();
+    let holder = std::thread::spawn(move || {
+        let guard = held_cache.durable.lock().unwrap();
+        ready_tx.send(()).unwrap();
+        let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+        drop(guard);
+    });
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    let worker_cache = cache.clone();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let mut state = ScanIndex::default();
+        let candidate = crate::snapshots::codex_zst_refusal_tests::candidate(&path);
+        let success = state
+            .inventory_archive_header(
+                &candidate,
+                Some(&worker_cache),
+                &mut crate::snapshots::codex_compressed_input::HeaderWork {
+                    allowed: true,
+                    ..Default::default()
+                },
+            )
+            .is_ok();
+        done_tx
+            .send((success, worker_cache.cursor_reserved()))
+            .unwrap();
+    });
+    let completed = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    worker.join().unwrap();
+    assert_eq!(
+        completed.unwrap(),
+        (true, 0),
+        "decode and refund never enter Stores"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A failed archive header must hold an already paused same-owner singleton,
+/// even though unrelated inventory members still have a complete census.
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "funded decoder needs validated heap layout"
+)]
+fn invalid_archive_owner_holds_paused_singleton_without_more_reads() {
+    let _lock = crate::snapshots::codex_compressed_input::tests::ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let fixture = ScanRoot::new(80);
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        let (mut index, _) = paused_singleton(&fixture, &cache);
+        let archive = fixture.file(SESSION).with_extension("jsonl.zst");
+        assert!(
+            codex_session_id_candidates_from_path(&archive.with_extension(""))
+                .contains(&SESSION.to_owned())
+        );
+        fs::write(&archive, b"corrupt archive").unwrap();
+        let mut candidate = crate::snapshots::codex_zst_refusal_tests::candidate(&archive);
+        candidate.scan_root = fixture.root.clone();
+        candidate.size_bytes = fs::metadata(&archive).unwrap().len();
+        let mut work = codex_compressed_input::HeaderWork {
+            allowed: true,
+            ..Default::default()
+        };
+        let (attempt, rows) = crate::local_resource_diagnostics::capture(|| {
+            index.inventory_archive_header(&candidate, Some(&cache), &mut work)
+        });
+        assert!(attempt.is_err());
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r["stage"] == "codex_zst_inventory")
+                .count(),
+            1
+        );
+        let mut directories = codex_file_join::DirectoryCensus::new();
+        directories.observe(&fixture.root, &fs::metadata(&fixture.root).unwrap());
+        let paths = BTreeSet::from([
+            local_index_key(&archive),
+            local_index_key(&fixture.file(SESSION)),
+        ]);
+        let mut inventory = codex_file_join::HeaderInventory::new(
+            std::slice::from_ref(&fixture.root),
+            &paths,
+            Some(&directories),
+        );
+        let ((), rows) = crate::local_resource_diagnostics::capture(|| {
+            while !inventory.step_with_archive(
+                &CodexTitleMetadata::default(),
+                &mut index,
+                Some(&cache),
+            ) {}
+        });
+        assert!(inventory.complete);
+        assert!(inventory.held_owners.contains(SESSION));
+        assert!(!inventory.complete_for(Some(&SESSION.to_owned())));
+        assert!(inventory.complete_for(Some(&SESSION_B.to_owned())));
+        assert!(rows
+            .iter()
+            .all(|r| r["stage"] != "codex_zst_inventory" && r["stage"] != "codex_zst_input"));
+        let position = |cache: &SharedCache| {
+            cache
+                .with_cursor(|cursor| match &cursor.slot {
+                    Slot::Paused(job) => Some(job.parser.reader.last_complete_line_end()),
+                    _ => None,
+                })
+                .flatten()
+        };
+        let before = position(&cache).expect("paused reader");
+        let certified = counter(&cache, |c| c.jobs_certified);
+        for _ in 0..3 {
+            let ((next, scan), rows) = crate::local_resource_diagnostics::capture(|| {
+                continuation_page(&fixture, index, &cache, |scan| {
+                    scan.codex_join_inventory = Some(inventory.clone());
+                    scan.codex_join_prepared = false;
+                })
+            });
+            index = next;
+            assert!(scan.snapshots.is_empty(), "no partial owner body");
+            assert_eq!(
+                position(&cache),
+                Some(before),
+                "the held reader did not advance"
+            );
+            assert_eq!(counter(&cache, |c| c.jobs_certified), certified);
+            assert!(rows
+                .iter()
+                .all(|r| r["stage"] != "codex_zst_inventory" && r["stage"] != "codex_zst_input"));
+        }
+    });
+}
+
+/// Seed already-accounted provenance so custody decisions run on every platform.
+/// This bypasses optional heap admission only in synthetic tests, not release.
+pub(in crate::snapshots) fn seed_join_provenance(cache: &SharedCache, owner: &str, key: &str) {
+    assert!(join_members_well_formed(key));
+    cache
+        .with_cursor(|cursor| {
+            cursor
+                .join_owners
+                .insert(owner.to_owned(), (0, key.to_owned()));
+        })
+        .expect("synthetic cursor lock");
 }

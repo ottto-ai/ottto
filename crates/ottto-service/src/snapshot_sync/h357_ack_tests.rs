@@ -790,6 +790,7 @@ fn index_entry(source_file_fingerprint: &str) -> crate::snapshots::ScanIndexEntr
         codex_counting_v2: false,
         codex_counting_owner: None,
         effective_upload_body_witness_revision: 0,
+        archive: None,
         opened_changed_nanos: 0,
         opened_birth_nanos: 0,
     }
