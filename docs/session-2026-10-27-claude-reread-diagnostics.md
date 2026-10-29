@@ -108,3 +108,11 @@ Cached entries retain their canonical Desktop-store scope while that profile's
 directory disappears/reappears during backoff. Inventory discovery must not split
 one cached store into per-file scopes and invalidate unchanged child lineage.
 The scoped re-emission fixture includes this OWN-profile flap in both directions.
+
+For an ambiguous parent Desktop id, the child's dependency hash also includes
+only those candidate parents' indexed size, mtime and birth metadata. A fresh
+import can resolve before either parent has been indexed; the next cycle then
+selects only the dependent child to recover its parent fact. Missing windows
+remain pending, with at most one resolution pass per cycle. No census transcript
+IO or recursive source-fingerprint dependency is introduced. Unrelated sessions
+and unambiguous parent links do not acquire these window dependencies.

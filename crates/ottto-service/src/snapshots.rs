@@ -16058,6 +16058,7 @@ struct ClaudeTitleMetadata {
     /// Only ambiguous stores need transcript-window resolution. Defer it until
     /// an independently selected file finalizes, never during the census.
     deferred_lineage_stores: Vec<Vec<ClaudeDesktopTitleIndexEntry>>,
+    deferred_lineage_attempted: bool,
     /// This cycle's existing held retries with recovered proof; counts only.
     recovered_account_holds: BTreeSet<String>,
     legacy_sidecar_fingerprint: String,
@@ -16251,19 +16252,26 @@ impl ClaudeTitleMetadata {
     }
 
     fn resolve_deferred_lineage(&mut self, index: &ScanIndex) {
-        if self.deferred_lineage_stores.is_empty() {
+        if self.deferred_lineage_stores.is_empty() || self.deferred_lineage_attempted {
             return;
         }
+        // At most one window pass per cycle. Missing parents remain pending;
+        // their indexed physical metadata selects only dependent children on
+        // the next cycle, including a fresh import with an initially empty index.
+        self.deferred_lineage_attempted = true;
+        let mut missing_window = false;
         self.spawn_lineage =
-            Self::resolve_lineage_stores(self.deferred_lineage_stores.drain(..).map(|entries| {
+            Self::resolve_lineage_stores(self.deferred_lineage_stores.iter().map(|entries| {
                 let lineage = claude_desktop_spawn_lineage(entries.iter(), |cli_session_id| {
                     let file_name = format!("{cli_session_id}.jsonl");
-                    claude_transcript_live_window(index.files.keys().map(Path::new).filter(
-                        |path| {
+                    let window = claude_transcript_live_window(
+                        index.files.keys().map(Path::new).filter(|path| {
                             path.file_name().and_then(|name| name.to_str())
                                 == Some(file_name.as_str())
-                        },
-                    ))
+                        }),
+                    );
+                    missing_window |= window.is_none();
+                    window
                 });
                 entries
                     .iter()
@@ -16277,6 +16285,9 @@ impl ClaudeTitleMetadata {
                     })
                     .collect::<Vec<_>>()
             }));
+        if !missing_window {
+            self.deferred_lineage_stores.clear();
+        }
     }
 
     fn resolve_lineage_stores(
@@ -16626,7 +16637,7 @@ impl ClaudeTitleMetadata {
             })
             .map(|entry| entry.cli_session_id.as_str())
             .collect();
-        let mut needs_windows = false;
+        let mut window_states: BTreeMap<&str, Vec<String>> = BTreeMap::new();
         for entries in by_store.values() {
             let mut by_desktop: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
             for entry in entries {
@@ -16637,14 +16648,49 @@ impl ClaudeTitleMetadata {
                         .insert(&entry.cli_session_id);
                 }
             }
-            needs_windows |= entries.iter().any(|entry| {
-                entry
+            for entry in entries {
+                if let Some(clis) = entry
                     .spawned_from_desktop_session_id
                     .as_deref()
                     .and_then(|id| by_desktop.get(id))
-                    .is_some_and(|clis| clis.len() > 1)
-            });
-            for (child, revision) in claude_desktop_lineage_revisions(entries, &linked) {
+                    .filter(|clis| clis.len() > 1)
+                {
+                    for &cli in clis {
+                        window_states.entry(cli).or_default();
+                    }
+                }
+            }
+        }
+        // No filesystem IO here. Window dependencies use only already indexed
+        // parent size/mtime/birth, never recursive source/session fingerprints.
+        // Build once so many children sharing a parent do not rescan the index.
+        if !window_states.is_empty() {
+            for (path, state) in &index.files {
+                let Some(states) = Path::new(path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.strip_suffix(".jsonl"))
+                    .and_then(|cli| window_states.get_mut(cli))
+                else {
+                    continue;
+                };
+                states.push(
+                    serde_json::to_string(&(
+                        path,
+                        state.size_bytes,
+                        state.modified_unix_seconds,
+                        state.modified_unix_nanos,
+                        state.opened_birth_nanos,
+                    ))
+                    .expect("indexed parent metadata serializes"),
+                );
+            }
+        }
+        let needs_windows = !window_states.is_empty();
+        for entries in by_store.values() {
+            for (child, revision) in
+                claude_desktop_lineage_revisions(entries, &linked, &window_states)
+            {
                 metadata
                     .lineage_revisions
                     .entry(child)
@@ -16693,12 +16739,13 @@ impl ClaudeTitleMetadata {
     }
 }
 
-/// Hash only the child's metadata and its reachable parent metadata in one
-/// store. Unrelated sessions/profiles and census completeness cannot change it.
+/// Hash the child's reachable store metadata and, only for ambiguous parents,
+/// their indexed physical metadata. Unrelated profiles/coverage cannot change it.
 /// This is selection evidence only; the existing resolver still decides links.
 fn claude_desktop_lineage_revisions(
     entries: &[&ClaudeDesktopTitleIndexEntry],
     linked: &BTreeSet<&str>,
+    window_states: &BTreeMap<&str, Vec<String>>,
 ) -> BTreeMap<String, String> {
     if linked.is_empty() {
         return BTreeMap::new();
@@ -16738,6 +16785,22 @@ fn claude_desktop_lineage_revisions(
                     .as_deref()
                     .and_then(|id| by_desktop.get(id))
                 {
+                    let parent_ids: BTreeSet<_> = parents
+                        .iter()
+                        .map(|parent| parent.cli_session_id.as_str())
+                        .collect();
+                    if parent_ids.len() > 1 {
+                        for id in parent_ids {
+                            seen.insert(
+                                serde_json::to_string(&(
+                                    "parent_window_index:v1",
+                                    id,
+                                    window_states.get(id),
+                                ))
+                                .expect("parent window dependency serializes"),
+                            );
+                        }
+                    }
                     for parent in parents {
                         // Schedule each CLI id once, before enqueueing: copied
                         // entries and cycles cannot create quadratic scratch.
@@ -91099,7 +91162,7 @@ crate::durable_tail_codec::durable_struct!(ClaudeResponseObservation {
     N desktop_request: bool,
 });
 crate::heap_layout_bound::fields!(ClaudeTitleCandidate; title, user_set);
-crate::heap_layout_bound::fields!(ClaudeTitleMetadata; titles, account_identifier_hashes, original_identity_evidence, spawn_lineage, lineage_revisions, deferred_lineage_stores, recovered_account_holds, legacy_sidecar_fingerprint, sidecar_census_incomplete, original_identity_census_incomplete);
+crate::heap_layout_bound::fields!(ClaudeTitleMetadata; titles, account_identifier_hashes, original_identity_evidence, spawn_lineage, lineage_revisions, deferred_lineage_stores, deferred_lineage_attempted, recovered_account_holds, legacy_sidecar_fingerprint, sidecar_census_incomplete, original_identity_census_incomplete);
 crate::heap_layout_bound::fields!(ClaudeTranscriptUsageOccurrence; sequence, usage, model, selector, reasoning_effort, timestamp, event_clock_complete, desktop_request, effective_input_context, telemetry_attached, e2_inherited);
 crate::heap_layout_bound::fields!(ClaudeTranscriptUsageOccurrenceWitness; sequence, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, model, speed_mode, reasoning_effort);
 crate::heap_layout_bound::fields!(ClaudeUsageAuthorityQuarantineRecord; contract, proven_witness_fingerprint, member_source_file_fingerprints, failed_reconstruction_count, disposition, retry_after_unix_seconds, proof_correction);

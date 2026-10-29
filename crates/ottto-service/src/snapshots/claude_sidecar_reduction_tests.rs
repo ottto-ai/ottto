@@ -1509,6 +1509,105 @@ fn desktop_metadata_reemit_is_session_scoped_even_during_inventory_backoff() {
 }
 
 #[test]
+fn desktop_fresh_import_retries_only_child_when_ambiguous_parents_become_indexed() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    let home = crate::test_scratch::ScratchDir::new("desktop-fresh-lineage");
+    let mut f = Fixture::new(1);
+    let old_dir = f.dir.clone();
+    f.dir = home.join(".claude/projects");
+    fs::create_dir_all(&f.dir).unwrap();
+    let path = f.dir.join(format!("{}.jsonl", f.session));
+    fs::rename(&f.path, &path).unwrap();
+    f.path = path;
+    fs::remove_dir_all(old_dir).unwrap();
+    let parents = [
+        "ffffffff-ffff-4fff-8fff-fffffffffff1",
+        "ffffffff-ffff-4fff-8fff-fffffffffff2",
+    ];
+    let store = home
+        .join("Library/Application Support/Claude/claude-code-sessions")
+        .join("123e4567-e89b-12d3-a456-426614174000")
+        .join("123e4567-e89b-12d3-a456-426614174001");
+    fs::create_dir_all(&store).unwrap();
+    for (id, at) in parents
+        .into_iter()
+        .zip(["2026-08-02T06:59:00Z", "2026-08-02T08:00:00Z"])
+    {
+        fs::write(
+            f.dir.join(format!("{id}.jsonl")),
+            json!({
+                "timestamp":at,"type":"assistant","sessionId":id,"requestId":id,
+                "message":{"model":"claude-haiku-4-5","usage":{"input_tokens":3,"output_tokens":2}}
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+        fs::write(
+            store.join(format!("{id}.json")),
+            json!({
+                "cliSessionId":id,"sessionId":"local_parent"
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+    fs::write(
+        store.join("child.json"),
+        json!({
+            "cliSessionId":f.session,"sessionId":"local_child",
+            "spawnedFrom":{"sessionId":"local_parent"},"createdAt":"2026-08-02T06:59:00Z"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let cache = Arc::new(SharedCache::default());
+    let run = |index, at| raw_scan_at(&f, index, Some(cache.clone()), true, at, |_| {});
+    let first = run(ScanIndex::default(), COLLECTED);
+    assert_eq!(first.result.snapshots.len(), 3);
+    let child = first
+        .result
+        .snapshots
+        .iter()
+        .find(|item| item.source_session_id == f.session)
+        .unwrap();
+    assert!(
+        child
+            .attribution_facts
+            .iter()
+            .all(|fact| fact.evidence.source_version != "claude_desktop_spawn:v1"),
+        "the first deferred pass sees an empty native index"
+    );
+    let before = first.metadata_fingerprint.clone();
+    let (recovered, rows) =
+        crate::local_resource_diagnostics::capture(|| run(settle(first), "2026-08-02T07:12:00Z"));
+    assert_ne!(recovered.metadata_fingerprint, before);
+    assert_eq!(
+        recovered.result.snapshots.len(),
+        1,
+        "only the dependent child retries"
+    );
+    let child = &recovered.result.snapshots[0];
+    assert_eq!(child.source_session_id, f.session);
+    assert!(child
+        .attribution_facts
+        .iter()
+        .any(|fact| fact.field == "parent_session_ref" && fact.value == parents[0]));
+    assert_eq!(recovered.native_bytes, fs::metadata(&f.path).unwrap().len());
+    assert_eq!(
+        rows.iter()
+            .filter_map(
+                |row| row["counts"]["desktop_metadata"]["source_revision_body_rereads"].as_u64()
+            )
+            .sum::<u64>(),
+        1
+    );
+    let quiet = run(settle(recovered), "2026-08-02T07:14:00Z");
+    assert!(quiet.result.snapshots.is_empty());
+    assert_eq!(quiet.native_bytes, 0);
+}
+
+#[test]
 fn desktop_completed_census_counts_existing_held_retry_reads() {
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let home = crate::test_scratch::ScratchDir::new("desktop-held-recovery");
