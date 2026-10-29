@@ -270,11 +270,10 @@ impl Page {
         Vec<Vec<u8>>,
         Vec<Vec<String>>,
     ) {
-        let context = self
-            .index
-            .active_upload_context_fingerprint
-            .clone()
-            .unwrap();
+        let context =
+            crate::snapshots::e2_pipeline_scan_fixture::active_upload_context(&self.index)
+                .expect("active fixture upload context")
+                .to_owned();
         activate_source_upload_context(
             SnapshotSource::ClaudeCode,
             context,
