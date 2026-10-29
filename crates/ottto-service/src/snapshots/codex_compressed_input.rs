@@ -196,7 +196,10 @@ impl Read for NativeFile {
         if let Some(attempt) = self.custody.retail_mut() {
             return attempt.read(&mut self.file, bytes);
         }
-        self.file.read(bytes)
+        let read = self.file.read(bytes);
+        #[cfg(all(test, unix))]
+        super::sampled_scan::durable_tail::tests::a0h_record_read(&read);
+        read
     }
 }
 impl io::Seek for NativeFile {

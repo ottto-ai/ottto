@@ -31947,7 +31947,7 @@ impl OwnedSourceScan {
                                     sampled_scan::durable_tail::RestoreOutcome::Restored(
                                         mut taken,
                                         lease,
-                                    ) => {
+                                    ) => 'restored: {
                                         preparation_lease = Some(lease);
                                         if source == SnapshotSource::ClaudeCode {
                                             let accepted_end =
@@ -31962,6 +31962,24 @@ impl OwnedSourceScan {
                                             ) {
                                                 Ok(attempt) => taken.durable.put_retail(attempt),
                                                 Err(reason) => {
+                                                    if matches!(
+                                                        reason,
+                                                        sampled_scan::durable_tail::RetailHold::Exhausted
+                                                            | sampled_scan::durable_tail::RetailHold::AccountingLost
+                                                    ) && context.cache.retail_full(
+                                                        &key,
+                                                        parser.reader.reader.get_ref(),
+                                                        accepted_end,
+                                                        std::time::Instant::now(),
+                                                    )
+                                                    {
+                                                        // Ordinary Full: no grant, no guardless copy.
+                                                        drop(taken);
+                                                        if let Some(lease) = preparation_lease.take() {
+                                                            lease.release();
+                                                        }
+                                                        break 'restored (None, taken_admission);
+                                                    }
                                                     context.cache.durable_retail_hold(
                                                         source, reason, index, &candidate,
                                                     );

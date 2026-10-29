@@ -12,7 +12,7 @@ use sampled_jsonl::CachedJsonlReduction;
 // and fixed acquisition/path scratch; it is not a daemon RSS allowance.
 const AUDIT_AND_SCRATCH_BYTES: usize = 1024 * 1024;
 #[cfg(unix)]
-const RETAIL_RESERVE_BYTES: usize = (2 * crate::durable_tail_store::MAX_RECORDS + 1) * 1024;
+const RETAIL_RESERVE_BYTES: usize = 2 * (2 * crate::durable_tail_store::MAX_RECORDS + 1) * 1024;
 #[cfg(not(unix))]
 const RETAIL_RESERVE_BYTES: usize = 0;
 const STATE_BYTES: usize = CACHE_BYTES
