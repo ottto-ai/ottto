@@ -3002,6 +3002,9 @@ fn checkpoint_partial_snapshot_index_with_comparison(
     } else {
         committable.save(index_path)?;
     }
+    if let Some(scan) = correction_scan {
+        scan.report_discovery_growth_after_save(&committable);
+    }
     Ok(committable)
 }
 
@@ -8026,6 +8029,7 @@ fn finish_sync_source(
         &manifest_window_start,
         &manifest_window_end,
     )?;
+    scan_result.report_discovery_growth_after_save(&index);
     note_codex_side_saved(daemon, &index_path, true, side_mark);
     #[cfg(unix)]
     crate::snapshots::durable_after_save(&daemon.transcript_cache, support_dir, source, &index);

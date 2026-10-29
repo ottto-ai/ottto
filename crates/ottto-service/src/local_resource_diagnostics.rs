@@ -136,7 +136,7 @@ pub(crate) enum UnselectedReason {
     /// The subset of size skips whose key holds a withheld-account revision.
     WithheldOversized,
 }
-/// Three reasons, seven withheld events, then one grown-retention event.
+/// Three reasons, seven withheld events, growth, deleted tokens and audit retirement.
 const UNSELECTED_REASONS: usize = 13;
 /// Claude, Codex, Pi x reason, drained by that source's page line.
 #[cfg(not(test))]
@@ -202,6 +202,13 @@ pub(crate) fn audit_retired_absent(source: &str) {
 /// One aged gate retained a grown indexed file (not a unique-file count).
 pub(crate) fn discovery_retained_grown(source: &str) {
     line_unselected(source, 10, |slot| slot.fetch_add(1, Relaxed));
+}
+/// Post-save fate and current estimated age of this page's observed growth.
+pub(crate) fn discovery_growth_fate(
+    source: &str,
+    counts: &crate::snapshots::discovery_growth::Counts,
+) {
+    traversal_point("discovery_growth_fate", source, counts);
 }
 const WITHHELD_RELEASED: [(&str, usize); 3] =
     [("deleted", 3), ("resolved", 7), ("deleted_tokens", 11)];
@@ -420,6 +427,7 @@ pub(crate) struct Probe {
     pub(crate) page_events: claude_reread::Counts,
     pub(crate) full_causes: FullCauses,
     pub(crate) line_delivery: Option<(&'static str, LineDeliveryCounts)>,
+    pub(crate) discovery_growth: crate::snapshots::discovery_growth::Page,
 }
 impl Probe {
     pub(crate) fn start() -> Self {
@@ -429,6 +437,7 @@ impl Probe {
             page_events: Default::default(),
             full_causes: Default::default(),
             line_delivery: None,
+            discovery_growth: Default::default(),
         }
     }
     fn observation(&self) -> Observation {
@@ -579,7 +588,8 @@ impl crate::heap_layout_bound::HeapLayoutBound for Probe {
         crate::heap_layout_bound::HeapLayoutBound::heap_bound(
             &self.full_causes.restore_outcome.miss,
             c,
-        )
+        )?;
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.discovery_growth, c)
     }
 }
 

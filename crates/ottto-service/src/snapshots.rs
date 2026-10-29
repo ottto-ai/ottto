@@ -32,10 +32,17 @@ use toml_edit::{DocumentMut, Item};
 /// The owed-key `DiscoveryRetention` of a `ScanIndex`, borrowing only its
 /// registered fields so the traversal can stay mutably borrowed.
 macro_rules! discovery_retention {
+    ($index:expr, $growth:expr) => {
+        $crate::snapshots::DiscoveryRetention {
+            growth: Some($growth),
+            ..discovery_retention!($index)
+        }
+    };
     ($index:expr) => {
         $crate::snapshots::DiscoveryRetention {
             files: &$index.files,
             account_holds: &$index.claude_account_deferred_holds,
+            growth: None,
         }
     };
 }
@@ -135,6 +142,9 @@ mod local_context_points;
 pub(crate) use local_context_points::LocalContextPoint;
 use local_context_points::{local_context_points_recent, LocalContextPoints};
 pub(crate) mod codex_version;
+pub(crate) mod discovery_growth;
+#[cfg(test)]
+mod discovery_growth_tests;
 #[cfg(test)]
 pub(crate) mod e2_pipeline_scan_fixture;
 pub(crate) mod line_delivery;
@@ -7434,6 +7444,8 @@ pub struct SourceScanResult {
     pub census_residue_blocked_session_count: usize,
     pub snapshots: Vec<SnapshotItem>,
     pending_finalization: Vec<PendingIndexFinalization>,
+    /// RAM-only observations of this bounded page; never serialized or uploaded.
+    discovery_growth: discovery_growth::Page,
     pub(crate) local_codex_diagnostics: Option<CodexScanDiagnostics>,
     /// Local-only V2 counting receipts of this scan, moved out of its census.
     /// `None` when no configured counting parse finished (never a zero block).
@@ -7462,6 +7474,11 @@ impl CodexJoinValidator {
     }
 }
 impl SourceScanResult {
+    /// Call only after the selected index was saved, including partial saves.
+    pub(crate) fn report_discovery_growth_after_save(&self, index: &ScanIndex) {
+        self.discovery_growth.report(self.source, index);
+    }
+
     pub(crate) fn take_continuation_evidence(&mut self) -> Option<CodexContinuationEvidence> {
         self.continuation_evidence.take()?.lock().ok()?.take()
     }
@@ -26244,7 +26261,7 @@ impl OwnedSourceScan {
                 source,
                 traversal,
                 backfill_window_days,
-                discovery_retention!(index),
+                discovery_retention!(index, &resource_probe.discovery_growth),
             );
             next_generation_hints =
                 enqueue_watcher_hints(source, traversal, hinted_paths, watcher_overflowed);
@@ -26252,7 +26269,7 @@ impl OwnedSourceScan {
                 source,
                 traversal,
                 backfill_window_days,
-                discovery_retention!(index),
+                discovery_retention!(index, &resource_probe.discovery_growth),
             );
             release_codex_inventory_hold(source, traversal);
         }
@@ -26540,7 +26557,7 @@ impl OwnedSourceScan {
                     &mut census,
                     census_unix_seconds,
                     backfill_window_days,
-                    discovery_retention!(index),
+                    discovery_retention!(index, &resource_probe.discovery_growth),
                 )
             })
             .collect::<Vec<_>>();
@@ -26579,7 +26596,7 @@ impl OwnedSourceScan {
                         &mut census,
                         census_unix_seconds,
                         backfill_window_days,
-                        discovery_retention!(index),
+                        discovery_retention!(index, &resource_probe.discovery_growth),
                     )
                     .map(|(candidate, _)| candidate)
                 })
@@ -26678,7 +26695,7 @@ impl OwnedSourceScan {
                         &mut ScanCensus::default(),
                         census_unix_seconds,
                         backfill_window_days,
-                        discovery_retention!(index),
+                        discovery_retention!(index, &resource_probe.discovery_growth),
                     ) {
                         Some((twin, _)) => {
                             index.candidate_decision(&twin) == CandidateDecision::Parse
@@ -26756,7 +26773,7 @@ impl OwnedSourceScan {
                     &mut census,
                     census_unix_seconds,
                     backfill_window_days,
-                    discovery_retention!(index),
+                    discovery_retention!(index, &resource_probe.discovery_growth),
                 ) else {
                     continue;
                 };
@@ -26767,7 +26784,7 @@ impl OwnedSourceScan {
                     &mut census,
                     census_unix_seconds,
                     backfill_window_days,
-                    discovery_retention!(index),
+                    discovery_retention!(index, &resource_probe.discovery_growth),
                 ) {
                     identified_candidates.push(opened.0);
                 }
@@ -30292,6 +30309,7 @@ impl OwnedSourceScan {
                         index: index_storage,
                         terminal_native_traversal: None,
                         scan: SourceScanResult {
+                            discovery_growth: std::mem::take(&mut resource_probe.discovery_growth),
                             continuation_ticket,
                             continuation_evidence,
                             ..SourceScanResult::empty(SnapshotSource::Codex)
@@ -30993,6 +31011,7 @@ impl OwnedSourceScan {
                     );
                 }
                 let scan = SourceScanResult {
+                    discovery_growth: std::mem::take(&mut resource_probe.discovery_growth),
                     source,
                     backfill_window_days,
                     backfill_file_limit: file_limit,
@@ -31225,7 +31244,7 @@ impl OwnedSourceScan {
                 &mut census,
                 census_unix_seconds,
                 backfill_window_days,
-                discovery_retention!(index),
+                discovery_retention!(index, &resource_probe.discovery_growth),
                 verification_rescue,
                 sampling.as_ref().map(|context| context.cache.as_ref()),
             ) else {
@@ -41728,6 +41747,7 @@ fn refresh_retained_codex_roster(
                 .ok()
                 .and_then(unix_seconds)
                 .unwrap_or_default();
+            retention.observe_growth(&path, metadata.len(), modified_unix_seconds);
             if census_unix_seconds.is_some_and(|now| {
                 !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
             }) && !retention.owes_with_len(source, &path, metadata.len())
@@ -42062,6 +42082,7 @@ fn advance_bounded_directory_traversal_with_budget(
                 .ok()
                 .and_then(unix_seconds)
                 .unwrap_or_default();
+            retention.observe_growth(&path, metadata.len(), modified_unix_seconds);
             if census_unix_seconds.is_some_and(|now| {
                 !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
             }) && !retention.owes_with_len(source, &path, metadata.len())
@@ -42197,6 +42218,15 @@ fn candidate_from_traversal_path_at(
         }
         return None;
     }
+    retention.observe_growth(
+        &pending.path,
+        metadata.len(),
+        metadata
+            .modified()
+            .ok()
+            .and_then(unix_seconds)
+            .unwrap_or_default(),
+    );
     if metadata.len() > max_jsonl_file_bytes(source) {
         if pending.census_member {
             census.oversized_file_count += 1;
@@ -42502,9 +42532,25 @@ struct DiscoveryRetention<'a> {
     files: &'a BTreeMap<String, ScanIndexEntry>,
     /// Claude keys withheld for an unresolved account (`withheld_account`).
     account_holds: &'a BTreeMap<String, String>,
+    /// Bounded page diagnostics only; never a retention/selection input.
+    growth: Option<&'a discovery_growth::Page>,
 }
 
 impl<'a> DiscoveryRetention<'a> {
+    /// Reuse an existing gate's metadata, including size refusals.
+    fn observe_growth(&self, path: &Path, len: u64, modified: u64) {
+        if let Some(page) = self.growth {
+            let key = local_index_key(path);
+            if self
+                .files
+                .get(&key)
+                .is_some_and(|entry| len > entry.size_bytes)
+            {
+                page.observe(key, len, modified);
+            }
+        }
+    }
+
     /// Owed by a registered source: the discovery window does not apply.
     fn owes(&self, path: &Path) -> bool {
         sampled_audit::path_requires_verification(self.files, path)
@@ -42540,6 +42586,7 @@ impl<'a> DiscoveryRetention<'a> {
         Self {
             files,
             account_holds: &NONE,
+            growth: None,
         }
     }
 }
@@ -42570,6 +42617,11 @@ fn codex_parent_outside_window(
         .and_then(|metadata| metadata.modified().ok())
         .and_then(unix_seconds)
         .unwrap_or_default();
+    retention.observe_growth(
+        path,
+        metadata.as_ref().map_or(0, |metadata| metadata.len()),
+        modified,
+    );
     census_unix_seconds.is_some_and(|now| !is_recent_enough_at(modified, now, backfill_window_days))
         && !retention.owes_with_len(
             SnapshotSource::Codex,
@@ -42789,6 +42841,11 @@ fn open_and_identify_scan_candidate_with_rescue(
             if error.kind() == std::io::ErrorKind::InvalidData
                 && candidate.size_bytes > max_jsonl_file_bytes(source) =>
         {
+            retention.observe_growth(
+                &candidate.path,
+                candidate.size_bytes,
+                candidate.modified_unix_seconds,
+            );
             census.oversized_file_count += 1;
             census
                 .observed_index_keys
@@ -42807,6 +42864,11 @@ fn open_and_identify_scan_candidate_with_rescue(
             return None;
         }
     };
+    retention.observe_growth(
+        &candidate.path,
+        candidate.size_bytes,
+        candidate.modified_unix_seconds,
+    );
     if !verification_rescue
         && !opened_candidate_is_within_frozen_window(
             &candidate,

@@ -331,6 +331,55 @@ the existing per-pass walk budget. Tail starts at the committed extent where the
 RAM layout is supported. Unsupported layout, restart or eviction takes the
 existing counted Full fallback; shrink retains A2.
 
+After a successful index save, the existing `local_resources` schema also emits
+`stage: discovery_growth_fate` for any page that observed indexed growth. The
+same `DiscoveryRetention` collects metadata already available to the walk,
+roster, candidate and open gates, including size refusals, for **all sources**
+(Claude, Codex and Pi). `counts.discovery_retained_grown_fate` gives one outcome
+per observed key: `committed` when the saved index extent catches up to the
+observed length, `still_retained` when it remains behind, and `unindexed` when
+no saved entry remains. This is evaluated after held-key restoration and index
+save, including partial checkpoints; a completed parse alone cannot count as a
+commit. It is an extent comparison, not an upload ACK or verification grant.
+The row is a snapshot of that saved page, not an additive lifetime total. The
+older `discovery_retained.grown` remains the separate per-age-gate flow counter.
+
+`counts.discovery_retained_grown_age` counts only the still-retained keys in
+that snapshot: `le_30d`, `d31_90`, `gt_90d`, and `unknown`. Age is a **wall-clock
+estimate since the last available file mtime**, recomputed at save time, not a
+persisted growth/hold start time or a retry deadline. Touches can reset this
+estimate; missing or future mtimes are unknown. A page includes recent growth
+as well as age-exempt growth. It does not estimate undiscovered keys, unparsed
+usage or bytes appended after its last metadata observation. Repeated gates
+for a key update one observation instead of multiplying its population count.
+
+This is page scratch in the existing resource probe and then scan result,
+charged by the scan owner's existing heap accounting. It is discarded with the
+page, adds no persisted field or cross-page ledger, and performs no additional
+stat, transcript read or directory walk. Scratch admits at most the existing
+10,000-entry discovery-tick bound. `counts.observation_overflow` reports refused
+diagnostic observations (possibly repeated), making coverage explicitly partial
+when roster/selection observations plus walking exceed it. This diagnostic cap
+never caps growth retention. A failed save emits no committed outcome; a page
+that never reaches a save has no fate row. Population/age rows describe bounded
+page observations, not a whole-index census.
+
+Retention changes no refusal/backoff or acquisition decision. Unchanged account
+refusals keep the existing content memo skip; oversized growth remains observed
+without parsing each pass. The dedicated `discovery_growth_tests` fixtures cover
+real account-hold classification, Completed restoration and two unchanged passes
+with zero extra body bytes, saved catch-up, and oversized aging in all three
+sources. Existing identity/anchor controls remain in
+`reread_trigger_content_tests::truncate_regrow_with_unchanged_samples_is_reread_by_mtime`,
+`transcript_acquisition::tests::head_and_old_boundary_edits_growing_file_reset_to_full`,
+`transcript_acquisition::tests::shrink_and_replacement_reset_even_with_identical_samples`,
+`fe_claude_sp5a_truncate_then_regrow_after_short_eof_keeps_main_failure`,
+`fe_claude_sp5b_regrow_after_reader_passes_frozen_with_new_head_refuses`,
+and `sampled_scan::durable_tail_tests::certificate_sample_truncation_is_shrunk_for_both_windows`.
+They retain counted rebuilds for observed rewrites/shrink/sample mismatches;
+length-only retention grants no Tail authority. Existing sampled acquisition's
+accepted unsampled-interior-edit limitations still apply.
+
 On Claude pages, `counts.withheld_reparse` counts re-parses of keys withheld for
 an unresolved account: `start` (first in this process), `evidence` (same size,
 but the sampled content, the file object, its api/trace sidecar stamps or the

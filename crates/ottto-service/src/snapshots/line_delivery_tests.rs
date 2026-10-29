@@ -1258,6 +1258,7 @@ fn candidate_and_open_gates_keep_withheld_account_keys() {
             crate::snapshots::DiscoveryRetention {
                 files: &BTreeMap::new(),
                 account_holds: holds,
+                growth: None,
             },
         )
         .map(|candidate| {
@@ -1270,6 +1271,7 @@ fn candidate_and_open_gates_keep_withheld_account_keys() {
                 crate::snapshots::DiscoveryRetention {
                     files: &BTreeMap::new(),
                     account_holds: holds,
+                    growth: None,
                 },
             )
             .is_some()
