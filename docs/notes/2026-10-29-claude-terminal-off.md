@@ -258,3 +258,38 @@ that key; count `withheld_hold_released{removed_proven,removed_proven_tokens}`.
 Those helpers are not on main yet, so no deletion-release implementation or
 combined-runtime fixture is claimed by this head. It does not select the
 suspend-only fallback or grant any aggregate authority.
+
+### Round 20: admitted roots, owed opens and discovery cadence
+
+The final candidate boundary now upserts the actual acquisition root even when
+constructor selection already recorded the same path. A real constructor and
+sampled-progress replacement control exercises held and failed selected-save
+reload, compares native Scope and requires Unchanged rather than ScopeChanged
+Full. Removing the configured acquisition root still rejects retry insertion.
+Carry-cancellation replay still infers the deepest configured root, and missing
+due-family seeding still uses the first matching root. Those pre-existing
+admission policies are unchanged; current-page custody is not a claim that every
+historic insertion preserves its original root.
+
+Successful ordinary opens clear retry throttling while retaining the numeric
+owed deadline in the existing bounded map. Selection/native planning takes the
+earlier marker, progress-slot and failed-open deadline. Source verification
+retires it; an open, held read, incomplete plan or ACK cannot. Two-key saturated
+controls keep the other key's turn, require native Full(AuditDue) at the original
+D for unchanged and grown inputs, and preserve D through held save/reload.
+
+Linux 40952069266 at the previous head failed 89 cases, 33 newly failing. Source
+and log triage assigns 12 to cadence suppressing admitted reconstruction,
+legacy-identity, history or audit work; 15 to fixed-clock native-reader controls;
+one to a counterfactual preview consuming the real owner's memo turn; four to
+explicit mutation/metadata discovery service; and one to an obsolete diagnostic
+scalar used as scheduling authority. Cadence now parks idle discovery, while
+existing owed work wakes the bounded metadata walk. Ordinary privacy, retry,
+history and byte-budget gates still decide body reads. Healthy idle reloads keep
+the 300-second deadline. No money, exact ACK, cost, token or zero-read assertions
+were relaxed. The reader/classifier fixture drivers explicitly service metadata
+cadence at their fixed clocks; immutable-page previews restore the test-local
+memo. Completion policy remains unchanged. These are source repairs, with fresh
+CI execution still required. No new persisted state or upload-context receipt is
+included. The receipt dependency, pending per-key release integration and branch
+Mac requirement remain.
