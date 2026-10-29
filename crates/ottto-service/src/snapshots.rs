@@ -26851,6 +26851,26 @@ impl OwnedSourceScan {
                     if !done {
                         pending!();
                     }
+                    if inventory.custody_incomplete
+                        || index
+                            .files
+                            .values()
+                            .any(|entry| entry.codex_compressed_hold.is_some())
+                    {
+                        inventory.complete = false;
+                        if let Some(traversal) = index.traversal.as_mut() {
+                            for candidate in identified_candidates.drain(..) {
+                                traversal.pending_candidates.push_back(ScanTraversalPath {
+                                    scan_root: candidate.scan_root,
+                                    path: candidate.path,
+                                    census_member: true,
+                                    watcher_hint: false,
+                                });
+                            }
+                        }
+                        codex_join_prepared = true;
+                        pending!();
+                    }
                     let unresolved = &inventory.held_owners;
                     residue_blocked_session_ids.extend(unresolved.iter().cloned());
                     codex_state_only_blocked_session_ids.extend(unresolved.iter().cloned());

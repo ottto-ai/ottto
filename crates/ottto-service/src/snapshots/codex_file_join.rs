@@ -260,6 +260,7 @@ pub(super) struct HeaderInventory {
     pub(super) headers: Vec<HeaderWitness>,
     pub(super) directories: DirectoryCensus,
     pub(super) complete: bool,
+    pub(super) custody_incomplete: bool,
     pub(super) read_bytes: usize,
     pub(super) held_archives: BTreeSet<String>,
     pub(super) held_owners: BTreeSet<String>,
@@ -300,6 +301,7 @@ impl HeaderInventory {
             complete: paths.len() <= MAX_HEADER_FILES
                 && directories.is_some_and(|value| value.stable),
             read_bytes: 0,
+            custody_incomplete: false,
             held_archives: BTreeSet::new(),
             held_owners: BTreeSet::new(),
             archive_work: codex_compressed_input::HeaderWork::default(),
@@ -353,7 +355,8 @@ impl HeaderInventory {
             .get(&key)
             .is_some_and(|entry| entry.codex_compressed_hold.is_some())
         {
-            // Custody owns this file only; absence authority is fenced by the index.
+            self.custody_incomplete = true;
+            self.complete = false;
             return false;
         }
         let compressed = is_compressed_codex_rollout(Some(&path), None);
@@ -513,7 +516,7 @@ impl HeaderInventory {
 }
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
 crate::heap_layout_bound::fields!(HeaderWitness; candidate, owner, home, created_unix_ms, metadata, archive_stamp);
-crate::heap_layout_bound::fields!(HeaderInventory; roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, archive_work, refused, bounded_out);
+crate::heap_layout_bound::fields!(HeaderInventory; custody_incomplete, roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, archive_work, refused, bounded_out);
 
 #[derive(Clone, Debug)]
 pub(super) struct Group {

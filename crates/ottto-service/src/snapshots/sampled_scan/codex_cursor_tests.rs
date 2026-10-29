@@ -11753,7 +11753,8 @@ fn held_growth_survives_old_window_cap_and_reload_then_synthetic_release_tails()
                 length > max_jsonl_file_bytes(SnapshotSource::Codex),
                 over_cap
             );
-            // An unrelated small plain file must remain selectable at this cut.
+            // Loaded later-build custody conservatively drains at the foundation;
+            // no native producer exists until the bounded owner-admission cut.
             let other = fs::read(fixture.file(SESSION)).unwrap();
             let other = String::from_utf8(other)
                 .unwrap()
@@ -11791,12 +11792,11 @@ fn held_growth_survives_old_window_cap_and_reload_then_synthetic_release_tails()
                     .iter()
                     .all(|s| s.source_session_id != SESSION));
             }
-            assert!(
-                index.files[&local_index_key(&fixture.file(SESSION_B))]
-                    .last_snapshot_fingerprint
-                    .is_some(),
-                "unrelated plain progresses"
-            );
+            assert!(index
+                .files
+                .get(&local_index_key(&fixture.file(SESSION_B)))
+                .and_then(|entry| entry.last_snapshot_fingerprint.as_ref())
+                .is_none());
             // Synthetic 11c handoff: the fixture owns the obligation while
             // admitting its aged/over-cap FD directly to the existing Tail
             // engine. Production release/admission remains unimplemented.
