@@ -29,3 +29,12 @@ OutputHeld finish. Parser construction now distinguishes a typed admission yield
 from other errors; only Z-ADMISSION and bodyless Z-PENDING use archive RU there.
 The fixtures check zero terminal RU, named residue and healthy state-only progress;
 execution remains deferred to the authorized validation lane.
+
+No released writer persisted these fields. Released entry shapes have no archive
+object at all, so activation cannot turn them into a stranded correction hold.
+The Linux fixture restores both pinned released entry shapes, activates unchanged
+policy, scans without funding and saves/restarts three times with zero A3 count.
+Partial correction fields model unreleased intermediate builds only; they can
+conservatively retain unresolved debt without further reads. The previous
+unreleased policy digest has no supported migration path and needs no workaround.
+See the archive downgrade compatibility note for pins and the release contingency.

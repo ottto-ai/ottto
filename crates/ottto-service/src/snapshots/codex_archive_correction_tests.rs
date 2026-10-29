@@ -989,6 +989,7 @@ fn sixth_first_read_success_and_repeated_acked_a3_generations_are_independent() 
     }
 }
 
+// Partial fields model unreleased intermediate builds, not a released writer.
 #[test]
 fn missing_spent_fields_and_malformed_context_never_mint_a3_permission() {
     let f = ArchiveFixture::new(b"stamp-only");
