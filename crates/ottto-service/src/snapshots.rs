@@ -27660,13 +27660,15 @@ impl OwnedSourceScan {
                         let Some(twin) = inventory.family_held.get(&key) else {
                             return true;
                         };
-                        let held = open_candidate_beneath_root(candidate).and_then(|file| {
-                            index.hold_archive(
-                                &file,
-                                &candidate.path,
-                                CodexZstCause::FamilyUnproven,
-                            )
-                        });
+                        let held = open_candidate_beneath_root(candidate)
+                            .map_err(anyhow::Error::from)
+                            .and_then(|file| {
+                                index.hold_archive(
+                                    &file,
+                                    &candidate.path,
+                                    CodexZstCause::FamilyUnproven,
+                                )
+                            });
                         if held.is_err() {
                             // Keep transient failures owed; no manufactured hold.
                             sampled_scan::codex_cursor::requeue(

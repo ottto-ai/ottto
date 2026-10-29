@@ -2366,7 +2366,7 @@ fn sibling_inventory_at_population_cap_counts_shared_physical_keys_once() {
     inventory.first_read_archives = paths.clone();
     let shared = paths.last().unwrap().clone();
     inventory.deferred_archives.insert(shared.clone());
-    inventory.defer_bound_siblings();
+    inventory.classify_bound_archives();
     assert_eq!(
         inventory.deferred_archives,
         BTreeSet::from([shared.clone()]),
@@ -2377,13 +2377,21 @@ fn sibling_inventory_at_population_cap_counts_shared_physical_keys_once() {
     inventory.held_archives.insert(held_peer);
     inventory.deferred_archives.insert(deferred_peer.clone());
     assert_eq!(paths.len() + 2, codex_file_join::MAX_HEADER_FILES);
-    inventory.defer_bound_siblings();
+    inventory.classify_bound_archives();
+    assert_eq!(
+        inventory
+            .family_held
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["/synthetic/rollout-owner-00001.jsonl.zst".to_owned()]),
+        "a resolved held peer gives a named family hold, not a transient deferral"
+    );
     assert_eq!(
         inventory.deferred_archives,
         BTreeSet::from([
             shared,
             deferred_peer,
-            "/synthetic/rollout-owner-00001.jsonl.zst".to_owned(),
             "/synthetic/rollout-owner-00002.jsonl.zst".to_owned(),
         ])
     );
