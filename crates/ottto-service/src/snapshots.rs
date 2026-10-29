@@ -49041,19 +49041,23 @@ impl ScanIndex {
                 return (CandidateDecision::Skip, None);
             }
         }
+        let withheld_unchanged = !entry.source_file_fingerprint.is_empty()
+            && self.withheld_account_unchanged(&key, candidate);
         // A withheld key's audit debt (carried onto its reverted entry) cannot
         // settle while held; an unchanged one defers it to its next counted
         // re-parse, usually the binding read, instead of a Full every pass.
-        let audit = entry.audit_requires_full(now)
-            && (entry.source_file_fingerprint.is_empty()
-                || !self.withheld_account_unchanged(&key, candidate));
+        let audit = entry.audit_requires_full(now) && !withheld_unchanged;
         if audit || sampled_audit::progress_debt(self, &key, now).is_some() {
             return (CandidateDecision::Parse, Some(CandidateParseReason::Audit));
         }
         // A locally held Claude family above keeps its existing bounded retry
         // gate. Otherwise a projection change selects even an unchanged v2
         // file under an already admitted context, independently of parser age.
+        // Completed restores the old revision while account-held. Its memo is
+        // scoped to the active revision/context, so repeating that adoption
+        // cannot settle it; a new activation still selects a counted parse.
         if body_witness_adoption
+            && !withheld_unchanged
             && self.effective_upload_body_witness_revision_requires_adoption(&key)
         {
             return (
@@ -49072,10 +49076,14 @@ impl ScanIndex {
             .get(&key)
             .is_some_and(|fingerprints| {
                 fingerprints.iter().any(|fingerprint| {
-                    !self
-                        .snapshot_activity_at
-                        .get(fingerprint)
-                        .is_some_and(valid_snapshot_activity)
+                    // Missing activity on the restored tuple cannot settle an
+                    // account hold either. An actual quarantine retry remains
+                    // independent authority to re-read, even with CONTENT.
+                    (!withheld_unchanged
+                        && !self
+                            .snapshot_activity_at
+                            .get(fingerprint)
+                            .is_some_and(valid_snapshot_activity))
                         || self.quarantine_retry_selects_file(fingerprint, &key)
                 })
             })
@@ -49087,9 +49095,7 @@ impl ScanIndex {
         }
         // A withheld key keeps its old committed revision; unless re-armed it
         // re-parses only once per process or on a stamp/evidence change.
-        if !entry.source_file_fingerprint.is_empty()
-            && self.withheld_account_unchanged(&key, candidate)
-        {
+        if withheld_unchanged {
             return (CandidateDecision::Skip, None);
         }
         let transcript_changed = entry.size_bytes != candidate.size_bytes

@@ -130,10 +130,26 @@ impl ScanIndex {
     /// Capture at validated parse completion, even before its first hold is
     /// recorded. The completion owner carries this RAM-only value to classify.
     pub(super) fn withheld_completed_seen(&self, candidate: &CandidateFile) -> Option<Seen> {
-        candidate
-            .withheld_content_stamp
-            .as_deref()
-            .map(|stamp| self.withheld_seen(CONTENT, candidate.size_bytes, stamp))
+        candidate.withheld_content_stamp.as_deref().map(|stamp| {
+            // Restored body/activity debt may be deferred only under the
+            // authority that completed this parse. A revision or context
+            // activation must invalidate CONTENT even with equal samples.
+            let mut seen = self.withheld_seen(CONTENT, candidate.size_bytes, stamp);
+            let authority = digest(&[
+                CONTENT,
+                &self
+                    .active_effective_upload_body_witness_revision
+                    .to_string(),
+                self.active_upload_context_fingerprint
+                    .as_deref()
+                    .unwrap_or("\0none"),
+            ]);
+            let mut hash = Sha256::new();
+            hash.update(seen.evidence);
+            hash.update(authority);
+            seen.evidence = hash.finalize().into();
+            seen
+        })
     }
 
     /// Call after recording the hold, using only the completed parse witness.

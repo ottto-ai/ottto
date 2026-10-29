@@ -3127,16 +3127,87 @@ fn withheld_remove_hint_through_intermediate_symlink_keeps_both_debts() {
     );
 }
 
-/// An unchanged revision can be account-deferred after an upload-context read.
-/// Its real Completed restore keeps the committed fingerprint; missing RAM
-/// evidence must recover once instead of falling through ordinary equality.
+/// Build the same opened-object/sidecar CONTENT witness used by the real
+/// scan, so selector controls do not accidentally invalidate every memo.
+fn withheld_recovery_candidate(root: &Root, path: &Path, index: &ScanIndex) -> CandidateFile {
+    let entry = &index.files[&local_index_key(path)];
+    let mut candidate = CandidateFile {
+        path: path.to_path_buf(),
+        scan_root: root.projects(),
+        size_bytes: entry.size_bytes,
+        modified_unix_seconds: entry.modified_unix_seconds,
+        modified_unix_nanos: entry.modified_unix_nanos.unwrap_or_default(),
+        source_file_fingerprint: String::new(),
+        physical_identity: None,
+        legacy_source_file_fingerprint: String::new(),
+        legacy_config_reconciliation_required: false,
+        opened_object_identity: String::new(),
+        fingerprint_changed_nanos: 0,
+        fingerprint_birth_nanos: 0,
+        withheld_content_stamp: None,
+    };
+    let scan = new_scan(&root.projects(), index.clone());
+    prepare_owned_scan_candidate(
+        SnapshotSource::ClaudeCode,
+        &mut candidate,
+        &scan.codex_title_metadata,
+        &scan.claude_title_metadata,
+        None,
+    );
+    open_and_identify_scan_candidate(
+        SnapshotSource::ClaudeCode,
+        candidate,
+        &mut ScanCensus::default(),
+        None,
+        BACKFILL_WINDOW_DAYS,
+        DiscoveryRetention {
+            files: &index.files,
+            account_holds: &index.claude_account_deferred_holds,
+            growth: None,
+        },
+    )
+    .unwrap()
+    .0
+}
+
+/// Every trigger reads unchanged committed content, creates its hold through
+/// real classify/Completed/save/load, then recovers its missing advisory state.
 fn withheld_equal_fingerprint_recovers_after(failure: &str) {
+    for reason in [
+        CandidateParseReason::UploadContext,
+        CandidateParseReason::BodyWitnessAdoption,
+        CandidateParseReason::ActivityOrQuarantineRetry,
+    ] {
+        withheld_equal_fingerprint_recovers_for_reason(failure, reason);
+    }
+}
+
+fn withheld_equal_fingerprint_recovers_for_reason(failure: &str, reason: CandidateParseReason) {
     use crate::local_resource_diagnostics::take_withheld_for_test;
+    struct ClockReset;
+    impl Drop for ClockReset {
+        fn drop(&mut self) {
+            sampled_scan::set_test_now(None);
+        }
+    }
+    let _clock_reset = ClockReset;
+    const DAY: u64 = 86_400;
+    sampled_scan::set_test_now(Some(200 * DAY));
     let root = Root::new("ld-equal-held-memo-recovery");
     let path = root.file(SESSION);
     let key = local_index_key(&path);
     append(&path, &assistant_line("equal-revision"));
-    let page = |index| {
+    let revision =
+        crate::snapshot_sync::effective_upload_body_witness_revision(SnapshotSource::ClaudeCode);
+    let activate = |index: &mut ScanIndex, revision| {
+        index.activate_quarantine_witness(SnapshotSource::ClaudeCode);
+        index.activate_effective_upload_body_witness_revision(revision);
+        index.adopt_effective_upload_body_witness_revision_monotonically();
+    };
+    let page = |mut index: ScanIndex, revision| {
+        // Production reactivates these RAM fields after EVERY load, before
+        // taking the committed baseline. A zero revision would hide the loop.
+        activate(&mut index, revision);
         let recorder = Recorder::default();
         let (index, scan, _) = finish(
             new_scan(&root.projects(), index)
@@ -3144,10 +3215,42 @@ fn withheld_equal_fingerprint_recovers_after(failure: &str) {
         );
         (index, scan, recorder)
     };
-    let (mut previous, _, _) = page(ScanIndex::default());
+    let old_revision = if reason == CandidateParseReason::BodyWitnessAdoption {
+        revision - 1
+    } else {
+        revision
+    };
+    let (mut previous, _, _) = page(ScanIndex::default(), old_revision);
     let fingerprint = previous.files[&key].source_file_fingerprint.clone();
-    previous.upload_context_fingerprint = Some("retry-context".into());
-    let (parsed, scan, recorder) = page(previous.clone());
+    assert_eq!(
+        previous.files[&key].effective_upload_body_witness_revision,
+        old_revision
+    );
+    match reason {
+        CandidateParseReason::UploadContext => {
+            previous.upload_context_fingerprint = Some("retry-context".into());
+        }
+        CandidateParseReason::BodyWitnessAdoption => {}
+        CandidateParseReason::ActivityOrQuarantineRetry => {
+            // A legacy checkpoint lacks the activity map. Its repair selects
+            // the unchanged file through the actual activity/retry gate.
+            for fingerprint in &previous.file_snapshot_fingerprints[&key] {
+                previous.snapshot_activity_at.remove(fingerprint);
+            }
+        }
+        _ => unreachable!(),
+    }
+    activate(&mut previous, revision);
+    let candidate = withheld_recovery_candidate(&root, &path, &previous);
+    assert_eq!(candidate.source_file_fingerprint, fingerprint);
+    assert_eq!(
+        previous.candidate_decision_with_reason_at(&candidate, 1),
+        (CandidateDecision::Parse, Some(reason)),
+    );
+    let accepted = previous.accepted_snapshot_fingerprints.clone();
+    let previous_body = previous.files[&key].last_upload_body_witness.clone();
+    let previous_entities = previous.file_snapshot_fingerprints[&key].clone();
+    let (parsed, scan, recorder) = page(previous.clone(), revision);
     assert_eq!(scan.scanned_file_count, 1);
     assert_eq!(parsed.files[&key].source_file_fingerprint, fingerprint);
     assert!(!recorder.events().is_empty());
@@ -3155,86 +3258,246 @@ fn withheld_equal_fingerprint_recovers_after(failure: &str) {
     assert_eq!(held.files[&key].source_file_fingerprint, fingerprint);
     assert!(held.claude_account_deferred_holds.contains_key(&key));
     let checkpoint = root.0.join("equal-held.json");
-    held.save(&checkpoint).unwrap();
-    held = ScanIndex::load(&checkpoint).unwrap();
-    assert!(
-        page(held.clone()).2.events().is_empty(),
-        "valid CONTENT skips"
-    );
-    take_withheld_for_test();
-
-    {
-        // Use the full selector, with all ordinary equality premises satisfied.
-        let entry = &held.files[&key];
-        let mut candidate = CandidateFile {
-            path: path.clone(),
-            scan_root: root.projects(),
-            size_bytes: entry.size_bytes,
-            modified_unix_seconds: entry.modified_unix_seconds,
-            modified_unix_nanos: entry.modified_unix_nanos.unwrap_or_default(),
-            source_file_fingerprint: fingerprint.clone(),
-            physical_identity: None,
-            legacy_source_file_fingerprint: String::new(),
-            legacy_config_reconciliation_required: false,
-            opened_object_identity: String::new(),
-            fingerprint_changed_nanos: 0,
-            fingerprint_birth_nanos: 0,
-            withheld_content_stamp: None,
-        };
-        match failure {
-            "missing" => withheld_account::restart_for_test(&key),
-            "refused" => assert!(withheld_account::retained_bound(0).is_none()),
-            "poisoned" => withheld_account::poison_for_test(),
-            "no-birth" => {
-                // This is the production no-generation witness, not an empty
-                // fingerprint: even matching samples cannot grant a Skip.
-                candidate.withheld_content_stamp = withheld_account::content_stamp(
-                    candidate.size_bytes,
-                    None,
-                    &OpenedContentSamples {
-                        head: vec![],
-                        tail: None,
-                    },
-                );
-                assert!(candidate.withheld_content_stamp.is_none());
-            }
-            _ => unreachable!(),
-        }
+    let reload = |index: &ScanIndex| {
+        index.save(&checkpoint).unwrap();
+        let mut index = ScanIndex::load(&checkpoint).unwrap();
+        activate(&mut index, revision);
+        index
+    };
+    let no_credit = |index: &ScanIndex| {
         assert_eq!(
-            held.candidate_decision_at(&candidate, 1),
-            CandidateDecision::Parse,
-            "{failure}"
+            index.files[&key].effective_upload_body_witness_revision,
+            old_revision
         );
-        // The real owner discards refused/poisoned state before its next cycle.
-        // The filesystem supplies a valid birth on the recovery parse below.
-        withheld_account::discard_if_refused();
-        let (parsed, scan, recorder) = page(held.clone());
+        assert_eq!(index.files[&key].last_upload_body_witness, previous_body);
+        assert_eq!(index.file_snapshot_fingerprints[&key], previous_entities);
         assert_eq!(
-            scan.scanned_file_count, 1,
-            "{failure}: one actual recovery parse"
+            index.accepted_snapshot_fingerprints, accepted,
+            "no new ACK credit"
         );
+        assert!(!crate::snapshot_sync::withheld_settled_for_test(index));
+    };
+    let gauge = || serde_json::to_value(withheld_account::held_gauge()).unwrap();
+    let available = |bucket: &str| {
+        let row = gauge();
+        assert_eq!(row["withheld_held_count"], 1);
+        assert_eq!(row["withheld_memo_unavailable"], false);
+        assert_eq!(row["withheld_held_tokens"], 30);
+        assert_eq!(row["withheld_held_age"][bucket], 1);
         assert_eq!(
-            recorder
-                .events()
-                .iter()
-                .filter(|e| matches!(e, Event::Begin(_)))
-                .count(),
+            row["withheld_held_age"]
+                .as_object()
+                .unwrap()
+                .values()
+                .map(|count| count.as_u64().unwrap())
+                .sum::<u64>(),
             1
         );
-        held = crate::snapshot_sync::settle_withheld_for_test(&held, parsed, scan);
-        held.save(&checkpoint).unwrap();
-        held = ScanIndex::load(&checkpoint).unwrap();
-        assert_eq!(held.files[&key].source_file_fingerprint, fingerprint);
-        let [_, reparses, _] = take_withheld_for_test();
-        assert_eq!(reparses, BTreeMap::from([("start", 1)]), "{failure}");
-        for _ in 0..2 {
-            assert!(
-                page(held.clone()).2.events().is_empty(),
-                "{failure}: rebuilt memo skips"
-            );
-        }
-        assert!(take_withheld_for_test()[1].is_empty());
+    };
+    held = reload(&held);
+    no_credit(&held);
+    available("le_30d");
+    for pass in 0..3 {
+        let (quiet, scan, recorder) = page(held.clone(), revision);
+        assert!(
+            recorder.events().is_empty(),
+            "valid CONTENT skips: {reason:?}, {pass}"
+        );
+        assert_eq!(scan.scanned_file_count, 0);
+        no_credit(&quiet);
+        available("le_30d");
     }
+    take_withheld_for_test();
+
+    let mut candidate = withheld_recovery_candidate(&root, &path, &held);
+    assert!(held.withheld_account_unchanged(&key, &candidate));
+    // Keep the ordinary stale-activity decision present explicitly: Completed
+    // can repair it when the entity hash stays the same, but a restored older
+    // entity set need not have that clock. CONTENT defers only this local debt.
+    let mut missing_activity = held.clone();
+    for fingerprint in &previous_entities {
+        missing_activity.snapshot_activity_at.remove(fingerprint);
+    }
+    assert_eq!(
+        missing_activity.candidate_decision_at(&candidate, 1),
+        CandidateDecision::Skip
+    );
+    // New retry authority must still precede that Skip.
+    let entity_fingerprint = previous_entities.iter().next().unwrap();
+    let mut retry = held.clone();
+    let mut quarantine = snapshot_quarantine_record(SnapshotSource::ClaudeCode);
+    quarantine.retry_after_unix_seconds = 0;
+    retry
+        .quarantined_snapshot_fingerprints
+        .insert(entity_fingerprint.clone(), quarantine);
+    assert_eq!(
+        retry.candidate_decision_with_reason_at(&candidate, 1),
+        (
+            CandidateDecision::Parse,
+            Some(CandidateParseReason::ActivityOrQuarantineRetry)
+        )
+    );
+    let mut authority = held.clone();
+    let (family, member) = claude_index_path_family_member(&path).unwrap();
+    let proof = authority
+        .claude_usage_family_witnesses
+        .get(&family)
+        .map(claude_usage_family_witness_fingerprint)
+        .unwrap_or_default();
+    authority.claude_usage_authority_quarantine.insert(
+        family,
+        ClaudeUsageAuthorityQuarantineRecord {
+            contract: CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION.into(),
+            proven_witness_fingerprint: proof.clone(),
+            member_source_file_fingerprints: BTreeMap::from([(
+                member.clone(),
+                fingerprint.clone(),
+            )]),
+            failed_reconstruction_count: 1,
+            disposition: ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal,
+            retry_after_unix_seconds: u64::MAX,
+            proof_correction: Some(ClaudeAuthorityProofCorrection {
+                proof_witness_fingerprint: proof,
+                owed_member_ids: BTreeSet::from([member]),
+            }),
+        },
+    );
+    assert_eq!(
+        authority.candidate_decision_with_reason_at(&candidate, 1),
+        (
+            CandidateDecision::Parse,
+            Some(CandidateParseReason::AuthorityQuarantine)
+        )
+    );
+    let mut audited = held.clone();
+    assert!(audited.stage_sampled_audit(
+        &key,
+        &fingerprint,
+        crate::transcript_acquisition::AuditDebt {
+            due_unix_seconds: 1
+        }
+    ));
+    assert!(audited.files[&key].audit_requires_full(2));
+    assert_eq!(
+        audited.candidate_decision_at(&candidate, 2),
+        CandidateDecision::Skip
+    );
+    audited
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .source_file_fingerprint
+        .clear();
+    assert_eq!(
+        audited.candidate_decision_with_reason_at(&candidate, 2),
+        (CandidateDecision::Parse, Some(CandidateParseReason::Audit))
+    );
+    let mut context = held.clone();
+    context.activate_upload_context("new-authority".into());
+    assert!(!context.withheld_account_unchanged(&key, &candidate));
+    assert_eq!(
+        context.candidate_decision_at(&candidate, 1),
+        CandidateDecision::Parse
+    );
+    let mut other_revision = held.clone();
+    activate(&mut other_revision, revision - 1);
+    assert!(!other_revision.withheld_account_unchanged(&key, &candidate));
+    assert_eq!(
+        other_revision.candidate_decision_at(&candidate, 1),
+        CandidateDecision::Parse
+    );
+    let mut rearmed = held.clone();
+    rearmed
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .source_file_fingerprint
+        .clear();
+    assert_eq!(
+        rearmed.candidate_decision_at(&candidate, 1),
+        CandidateDecision::Parse
+    );
+    let mut evidence = candidate.clone();
+    evidence.withheld_content_stamp = Some("different-account-evidence".into());
+    assert_eq!(
+        held.candidate_decision_at(&evidence, 1),
+        CandidateDecision::Parse
+    );
+
+    match failure {
+        "missing" => withheld_account::restart_for_test(&key),
+        "refused" => assert!(withheld_account::retained_bound(0).is_none()),
+        "poisoned" => withheld_account::poison_for_test(),
+        "no-birth" => {
+            // The production no-generation witness, with a nonempty committed
+            // fingerprint: matching samples alone cannot grant a Skip.
+            candidate.withheld_content_stamp = withheld_account::content_stamp(
+                candidate.size_bytes,
+                None,
+                &OpenedContentSamples {
+                    head: vec![],
+                    tail: None,
+                },
+            );
+            assert!(candidate.withheld_content_stamp.is_none());
+        }
+        _ => unreachable!(),
+    }
+    assert_eq!(
+        held.candidate_decision_at(&candidate, 1),
+        CandidateDecision::Parse,
+        "{failure}"
+    );
+    if failure != "no-birth" {
+        let row = gauge();
+        assert_eq!(row["withheld_held_count"], 1);
+        assert_eq!(row["withheld_memo_unavailable"], true);
+        assert!(row.get("withheld_held_tokens").is_none());
+        assert!(row.get("withheld_held_age").is_none());
+    }
+    // The real owner discards refused/poisoned state before its next cycle.
+    // The filesystem supplies a valid birth on the recovery parse below.
+    withheld_account::discard_if_refused();
+    let (parsed, scan, recorder) = page(held.clone(), revision);
+    assert_eq!(
+        scan.scanned_file_count, 1,
+        "{failure}: one actual recovery parse"
+    );
+    assert_eq!(
+        recorder
+            .events()
+            .iter()
+            .filter(|e| matches!(e, Event::Begin(_)))
+            .count(),
+        1
+    );
+    held = crate::snapshot_sync::settle_withheld_for_test(&held, parsed, scan);
+    held = reload(&held);
+    assert_eq!(
+        held.files[&key].source_file_fingerprint,
+        candidate.source_file_fingerprint
+    );
+    no_credit(&held);
+    available("le_30d");
+    let [_, reparses, _] = take_withheld_for_test();
+    assert_eq!(reparses, BTreeMap::from([("start", 1)]), "{failure}");
+    for pass in 0..3 {
+        let (quiet, scan, recorder) = page(held.clone(), revision);
+        assert!(
+            recorder.events().is_empty(),
+            "{failure}: rebuilt memo skips {pass}"
+        );
+        assert_eq!(scan.scanned_file_count, 0);
+        no_credit(&quiet);
+        available("le_30d");
+    }
+    sampled_scan::set_test_now(Some(231 * DAY));
+    let (quiet, scan, recorder) = page(held, revision);
+    assert!(recorder.events().is_empty());
+    assert_eq!(scan.scanned_file_count, 0);
+    no_credit(&quiet);
+    available("31_90d");
+    assert!(take_withheld_for_test()[1].is_empty());
 }
 
 #[test]
