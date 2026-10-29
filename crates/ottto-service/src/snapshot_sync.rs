@@ -24326,8 +24326,52 @@ fn archive_residue_receipt_discloses_terminal_loss_without_retryable_error() {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static ARCHIVE_POWER_TEST: std::cell::RefCell<Option<std::collections::VecDeque<Option<bool>>>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(crate) fn with_archive_power<T>(states: &[Option<bool>], run: impl FnOnce() -> T) -> T {
+    struct Reset(Option<std::collections::VecDeque<Option<bool>>>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ARCHIVE_POWER_TEST.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    assert!(!states.is_empty());
+    let _reset =
+        Reset(ARCHIVE_POWER_TEST.with(|slot| slot.replace(Some(states.iter().copied().collect()))));
+    run()
+}
+#[cfg(test)]
+fn archive_test_power() -> Option<bool> {
+    ARCHIVE_POWER_TEST.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let states = slot.as_mut()?;
+        let state = if states.len() > 1 {
+            states.pop_front()?
+        } else {
+            *states.front()?
+        };
+        Some(state.unwrap_or(false))
+    })
+}
+/// Re-query native power at acquisition boundaries. Existing unit fixtures may
+/// supply a fixed pass permission; transition fixtures override the producer.
+pub(crate) fn archive_acquisition_power_ready(_fixture_permission: bool) -> bool {
+    #[cfg(test)]
+    {
+        archive_test_power().unwrap_or(_fixture_permission)
+    }
+    #[cfg(not(test))]
+    archive_power_ready()
+}
 /// Use the same native power policy as continuation pages; unknown denies work.
 pub(crate) fn archive_power_ready() -> bool {
+    #[cfg(test)]
+    if let Some(allowed) = archive_test_power() {
+        return allowed;
+    }
     archive_power_ready_with(&mut continuation::MacPlatformSignals::default())
 }
 

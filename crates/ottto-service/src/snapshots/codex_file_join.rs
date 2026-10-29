@@ -409,6 +409,9 @@ pub(super) struct HeaderInventory {
     pub(super) held_owners: BTreeSet<String>,
     // Negative protected-owner hashes from raw decode custody, never facts.
     decode_held_owners: BTreeSet<String>,
+    decode_after: Option<String>,
+    decode_done: bool,
+    decode_unknown: bool,
     pub(super) first_read_archives: BTreeSet<String>,
     pub(super) deferred_archives: BTreeSet<String>,
     /// Bound archives held by name with a resolved family sibling (value: twin).
@@ -442,6 +445,62 @@ pub(super) enum HeaderStep {
 }
 
 impl HeaderInventory {
+    fn record_decode_custody(&mut self, index: &ScanIndex, key: &str) {
+        if let Some(owner) = index.decode_held_codex_owner(key) {
+            if !self.decode_held_owners.contains(&owner) {
+                let cost = crate::heap_layout_bound::tree_node_bytes::<String, ()>()
+                    .and_then(|node| node.checked_add(owner.capacity()))
+                    .and_then(|node| self.feed_peak.checked_add(node))
+                    .filter(|cost| *cost <= crate::source_rotation::PARKED_BUDGET / 2);
+                let Some(cost) = cost else {
+                    self.complete = false;
+                    self.bounded_out = true;
+                    self.decode_unknown = true;
+                    return;
+                };
+                self.feed_peak = cost;
+                self.decode_held_owners.insert(owner);
+            }
+        } else {
+            self.decode_unknown = true;
+            self.complete = false;
+            self.refused
+                .insert(key.to_owned(), path_witness(Path::new(key)));
+            if codex_archive_path(Path::new(key)) {
+                crate::local_resource_diagnostics::traversal_point(
+                    "codex_archive_unknown_owner_hold",
+                    "codex",
+                    &BTreeMap::from([("codex_archive_unknown_owner_holds", 1_u64)]),
+                );
+            }
+        }
+    }
+    pub(super) fn prepare_decode_custody(&mut self, index: &ScanIndex) -> bool {
+        if self.decode_done {
+            return true;
+        }
+        if let Some(key) = index.decode_held_file_after(self.decode_after.as_deref()) {
+            // The continuation cursor is charged before copying its raw key,
+            // alongside the existing owner scratch (not a new allowance).
+            let Some(cost) = self
+                .feed_peak
+                .checked_add(key.len())
+                .filter(|cost| *cost <= crate::source_rotation::PARKED_BUDGET / 2)
+            else {
+                self.decode_unknown = true;
+                self.complete = false;
+                self.bounded_out = true;
+                self.decode_done = true;
+                return true;
+            };
+            self.feed_peak = cost;
+            self.record_decode_custody(index, key);
+            self.decode_after = Some(key.to_owned());
+            return false;
+        }
+        self.decode_done = true;
+        true
+    }
     pub(super) fn refresh_custody(&mut self, index: &ScanIndex) {
         for header in &mut self.headers {
             if let Some(cause) = index
@@ -532,11 +591,13 @@ impl HeaderInventory {
         self.family_held = held;
     }
     pub(super) fn resumable_for(&self, owner: Option<&String>, custody_deferred: bool) -> bool {
-        !owner.is_some_and(|id| self.decode_held_owners.contains(&codex_protected_owner(id)))
+        !self.decode_unknown
+            && !owner.is_some_and(|id| self.decode_held_owners.contains(&codex_protected_owner(id)))
             && (self.complete_for(owner) || (custody_deferred && self.complete))
     }
     pub(super) fn complete_for(&self, owner: Option<&String>) -> bool {
         self.complete
+            && !self.decode_unknown
             && !owner.is_some_and(|id| self.decode_held_owners.contains(&codex_protected_owner(id)))
             && !owner.is_some_and(|owner| {
                 self.held_owners.contains(owner)
@@ -578,6 +639,9 @@ impl HeaderInventory {
             held_archives: BTreeSet::new(),
             held_owners: BTreeSet::new(),
             decode_held_owners: BTreeSet::new(),
+            decode_after: None,
+            decode_done: false,
+            decode_unknown: false,
             first_read_archives: BTreeSet::new(),
             deferred_archives: BTreeSet::new(),
             family_held: BTreeMap::new(),
@@ -667,8 +731,10 @@ impl HeaderInventory {
         );
         // One extra probe detects debt; never truncate and claim complete.
         let remaining = iter.next().is_some();
-        self.complete =
-            index.archive_pass.prep_after.is_none() && !remaining && self.directories.stable;
+        self.complete = index.archive_pass.prep_after.is_none()
+            && !remaining
+            && self.directories.stable
+            && !self.decode_unknown;
         self.bounded_out = !self.complete;
         if remaining {
             last
@@ -773,27 +839,9 @@ impl HeaderInventory {
             // Existing raw owner / same-object archive evidence scopes the
             // negative hold downstream, just as for a held plain member. No
             // header acquisition or cache operation is allowed on this path.
-            if let Some(owner) = index.decode_held_codex_owner(&key) {
-                if !self.decode_held_owners.contains(&owner) {
-                    let cost = crate::heap_layout_bound::tree_node_bytes::<String, ()>()
-                        .and_then(|node| node.checked_add(owner.capacity()))
-                        .and_then(|node| self.feed_peak.checked_add(node))
-                        .filter(|cost| *cost <= crate::source_rotation::PARKED_BUDGET / 2);
-                    let Some(cost) = cost else {
-                        self.complete = false;
-                        self.bounded_out = true;
-                        return HeaderStep::Pending;
-                    };
-                    self.feed_peak = cost;
-                    self.decode_held_owners.insert(owner);
-                }
-                return HeaderStep::Pending;
+            if !self.decode_done {
+                self.record_decode_custody(index, &key);
             }
-            // Unknown ownership retains the ordinary refused-header hold and
-            // its bounded retry generation. Never buy a Full to resolve it.
-            self.complete = false;
-            self.refused.insert(key, path_witness(&path));
-
             return HeaderStep::Pending;
         }
         let cache = cache.filter(|_| !decode_held);
@@ -1077,7 +1125,7 @@ impl HeaderInventory {
 }
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
 crate::heap_layout_bound::fields!(HeaderWitness; plain_twin, custody_cause, candidate, owner, home, created_unix_ms, metadata, stamp);
-crate::heap_layout_bound::fields!(HeaderInventory; cached_archives_only, feed_prepared, feed_after, feed_peak, custody_next, absence_held, custody_unknown, custody_after, custody_done, custody_peak, custody_refused, roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, decode_held_owners, archive_work, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, bounded_out, first_read_archives, deferred_archives, family_held);
+crate::heap_layout_bound::fields!(HeaderInventory; cached_archives_only, feed_prepared, feed_after, feed_peak, custody_next, absence_held, custody_unknown, custody_after, custody_done, custody_peak, custody_refused, roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, decode_held_owners, decode_after, decode_done, decode_unknown, archive_work, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, bounded_out, first_read_archives, deferred_archives, family_held);
 
 #[derive(Clone, Debug)]
 pub(super) struct Group {
@@ -5348,6 +5396,242 @@ pub(in crate::snapshots) mod header_cache_tests {
             );
             fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[test]
+    fn omitted_raw_archive_scope_is_collected_before_roster_and_survives_reload() {
+        use codex_compressed_input::{ArchiveEvidence, ValidatedHeader};
+        for control in ["same", "changed", "missing"] {
+            let (root, fixture) = tests::fixture();
+            let owner = fixture.headers[0].owner.clone();
+            let archive_root = crate::test_scratch::ScratchDir::new("omitted-raw-archive");
+            let archive = archive_root
+                .as_ref()
+                .join(format!("rollout-{owner}.jsonl.zst"));
+            fs::write(&archive, b"already validated object").unwrap();
+            let key = local_index_key(&archive);
+            let mut evidence =
+                ArchiveEvidence::begin(&File::open(&archive).unwrap(), &archive, None).unwrap();
+            evidence.header_validated = ValidatedHeader::from_bytes(
+                format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{owner}\"}}}}\n")
+                    .as_bytes(),
+            );
+            evidence.owner = Some(owner.clone());
+            let mut wire = serde_json::to_value(ScanIndex::default()).unwrap();
+            wire["files"][&key] =
+                serde_json::json!({"size_bytes":[],"archive":evidence,"future":17});
+            let index =
+                lenient_decode::read_bounded(&serde_json::to_vec_pretty(&wire).unwrap()).unwrap();
+            let saved = archive_root.as_ref().join("index.json");
+            let mut index = index;
+            index.save(&saved).unwrap();
+            let mut index = ScanIndex::load(&saved).unwrap();
+            assert!(index.decode_holds_file(&key));
+            if control == "changed" {
+                fs::write(&archive, b"new object bytes").unwrap();
+            }
+            if control == "missing" {
+                fs::remove_file(&archive).unwrap();
+            }
+            let before = serde_json::to_value(&index).unwrap()["files"][&key].clone();
+            let paths = paths(&fixture);
+            assert!(!paths.contains(&key));
+            let cache = Arc::new(sampled_scan::SharedCache::default());
+            let mut census = DirectoryCensus::new();
+            let sessions = root.join("sessions");
+            census.observe(&sessions, &fs::metadata(&sessions).unwrap());
+            let mut inv = HeaderInventory::new(&[sessions], &paths, Some(&census));
+            let decoders = codex_zst_refusal_tests::decoder_construction_count();
+            let ((steps, rows), operations) = cache_operations(|| {
+                crate::local_resource_diagnostics::capture(|| {
+                    let mut steps = 0;
+                    while !inv.prepare_feed_custody(&index) {
+                        steps += 1;
+                        assert!(steps < 10);
+                    }
+                    inv.retain_cached_archives(&index, &paths);
+                    while inv.step_with_archive(
+                        &CodexTitleMetadata::default(),
+                        &mut index,
+                        Some(&cache),
+                    ) != HeaderStep::Complete
+                    {}
+                    steps
+                })
+            });
+            assert_eq!(
+                steps, 1,
+                "one raw slot per continuation, independent of roster"
+            );
+            for deferred in [false, true] {
+                assert!(!inv.resumable_for(Some(&owner), deferred));
+                assert_eq!(
+                    inv.resumable_for(Some(&"unrelated".into()), deferred),
+                    control == "same"
+                );
+            }
+            assert_eq!(inv.complete, control == "same");
+            assert_eq!(
+                rows.iter()
+                    .filter(|r| r["stage"] == "codex_archive_unknown_owner_hold")
+                    .count(),
+                usize::from(control != "same")
+            );
+            assert_eq!(
+                codex_zst_refusal_tests::decoder_construction_count(),
+                decoders
+            );
+            assert!(operations
+                .iter()
+                .all(|(_, operation_key)| operation_key != &key));
+            assert_eq!(serde_json::to_value(&index).unwrap()["files"][&key], before);
+            assert!(inv.feed_peak <= crate::source_rotation::PARKED_BUDGET / 2);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn repaired_raw_archive_releases_owner_once_without_duplicate_plain_body() {
+        use codex_compressed_input::{ArchiveEvidence, ValidatedHeader};
+        let (root, fixture) = tests::fixture();
+        let owner = fixture.headers[0].owner.clone();
+        let (_, control) = tests::scan(&root, ScanIndex::default(), 100);
+        let expected = serde_json::to_value(&control.snapshots).unwrap();
+        let archive = root
+            .join("sessions")
+            .join(format!("rollout-{owner}.jsonl.zst"));
+        let bytes = fs::read(&fixture.headers[0].candidate.path).unwrap();
+        fs::write(
+            &archive,
+            zstd::stream::encode_all(bytes.as_slice(), 1).unwrap(),
+        )
+        .unwrap();
+        let key = local_index_key(&archive);
+        let mut evidence =
+            ArchiveEvidence::begin(&File::open(&archive).unwrap(), &archive, None).unwrap();
+        evidence.header_validated = ValidatedHeader::from_bytes(
+            &bytes[..bytes.iter().position(|b| *b == b'\n').unwrap() + 1],
+        );
+        evidence.disposition = codex_compressed_input::ArchiveDisposition::HeaderValidated;
+        let mut wire = serde_json::to_value(ScanIndex::default()).unwrap();
+        wire["files"][&key] = serde_json::json!({"size_bytes":[],"archive":evidence});
+        let held = lenient_decode::read_bounded(&serde_json::to_vec(&wire).unwrap()).unwrap();
+        assert!(held.decode_holds_file(&key));
+        let decoders = codex_zst_refusal_tests::decoder_construction_count();
+        let (held, result) = tests::scan(&root, held, 100);
+        assert!(result.snapshots.is_empty());
+        // A compatible writer repairs the representation; the scanner never
+        // guesses that a raw held record is repaired from transcript bytes.
+        let mut repaired = serde_json::to_value(&held).unwrap();
+        repaired["files"][&key]["size_bytes"] =
+            serde_json::json!(fs::metadata(&archive).unwrap().len());
+        let mut repaired =
+            lenient_decode::read_bounded(&serde_json::to_vec(&repaired).unwrap()).unwrap();
+        assert!(!repaired.decode_holds_file(&key));
+        repaired.traversal = None;
+        let (mut index, mut scan) = tests::scan(&root, repaired, 100);
+        assert_eq!(
+            serde_json::to_value(&scan.snapshots).unwrap(),
+            expected,
+            "same ordinary plain union, no archive replacement"
+        );
+        assert!(scan
+            .snapshots
+            .iter()
+            .all(|s| s.source_session_id == owner && s.input_tokens == 300));
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
+        scan.finish_codex_capture_boundary(&mut index);
+        let accepted = scan
+            .snapshots
+            .iter()
+            .map(|s| s.snapshot_fingerprint.clone())
+            .collect();
+        let mut index =
+            index.committable_subset(&ScanIndex::default(), &accepted, &BTreeMap::new());
+        for _ in 0..3 {
+            index = lenient_decode::read_bounded(&serde_json::to_vec(&index).unwrap()).unwrap();
+            let (next, scan) = tests::scan(&root, index, 100);
+            index = next;
+            assert!(
+                scan.snapshots.is_empty(),
+                "accepted plain union is never duplicated by repaired archive"
+            );
+        }
+        assert_eq!(
+            codex_zst_refusal_tests::decoder_construction_count(),
+            decoders
+        );
+        assert_eq!(
+            index.files[&key].codex_compressed_hold,
+            Some(CodexZstCause::FamilyUnproven)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unknown_archive_scope_uses_counted_bounded_retry_without_per_pass_header_spin() {
+        let (root, fixture) = tests::fixture();
+        let owner = fixture.headers[0].owner.clone();
+        let archive = root
+            .join("sessions")
+            .join(format!("rollout-{owner}.jsonl.zst"));
+        fs::write(&archive, b"opaque held archive").unwrap();
+        let key = local_index_key(&archive);
+        let mut wire = serde_json::to_value(ScanIndex::default()).unwrap();
+        wire["files"][&key] = serde_json::json!({"size_bytes":[],"future":1});
+        let index = lenient_decode::read_bounded(&serde_json::to_vec(&wire).unwrap()).unwrap();
+        let ((mut index, scan), rows) =
+            crate::local_resource_diagnostics::capture(|| tests::scan(&root, index, 100));
+        assert!(scan.snapshots.is_empty());
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r["stage"] == "codex_archive_unknown_owner_hold")
+                .count(),
+            1
+        );
+        let checkpoint = index.traversal.as_ref().unwrap();
+        assert!(checkpoint
+            .residue
+            .codex_inventory_hold
+            .as_ref()
+            .unwrap()
+            .refused_headers
+            .contains_key(&key));
+        assert!(checkpoint.unhealthy_retry_attempt > 0);
+        let deadline = checkpoint.unhealthy_retry_not_before_unix_seconds.unwrap();
+        let attempt = checkpoint.unhealthy_retry_attempt;
+        let decoders = codex_zst_refusal_tests::decoder_construction_count();
+        for _ in 0..5 {
+            index = lenient_decode::read_bounded(&serde_json::to_vec(&index).unwrap()).unwrap();
+            let (((next, scan), rows), reads) = tests::header_reads(|| {
+                crate::local_resource_diagnostics::capture(|| tests::scan(&root, index, 100))
+            });
+            index = next;
+            assert!(scan.snapshots.is_empty());
+            assert!(
+                reads.is_empty(),
+                "unchanged held inventory has no per-pass header reads"
+            );
+            assert!(!rows
+                .iter()
+                .any(|r| r["stage"] == "codex_archive_unknown_owner_hold"));
+            let t = index.traversal.as_ref().unwrap();
+            assert_eq!(t.unhealthy_retry_attempt, attempt);
+            assert_eq!(t.unhealthy_retry_not_before_unix_seconds, Some(deadline));
+        }
+        assert_eq!(
+            codex_zst_refusal_tests::decoder_construction_count(),
+            decoders
+        );
+        assert!(
+            unhealthy_scan_retry_delay_seconds(UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS)
+                <= UNHEALTHY_SCAN_RETRY_MAX_SECONDS
+        );
+        assert_eq!(
+            unhealthy_scan_retry_delay_seconds(u8::MAX),
+            UNHEALTHY_SCAN_RETRY_MAX_SECONDS
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

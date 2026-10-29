@@ -112,6 +112,9 @@ impl codex_file_join::HeaderInventory {
     /// Whole retained roster, paged before the F3 filter. Hashes here are only
     /// negative scope; they never certify membership, ownership or an ACK.
     pub(super) fn prepare_feed_custody(&mut self, index: &ScanIndex) -> bool {
+        if !self.prepare_decode_custody(index) {
+            return false;
+        }
         use std::ops::Bound::{Excluded, Unbounded};
         let after = self.feed_after.as_ref().map_or(Unbounded, Excluded);
         let Some((key, entry)) = index.files.range::<String, _>((after, Unbounded)).next() else {

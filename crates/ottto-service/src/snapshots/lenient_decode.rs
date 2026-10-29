@@ -2219,6 +2219,16 @@ impl ScanIndex {
             || claude_index_path_member_ref(Path::new(key))
                 .is_some_and(|member| self.decode_holds_family(member.root))
     }
+    /// One bounded raw slot per inventory continuation, independent of roster.
+    pub(super) fn decode_held_file_after(&self, after: Option<&str>) -> Option<&str> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        self.decode_holds
+            .0
+            .get("files")?
+            .range::<str, _>((after.map_or(Unbounded, Excluded), Unbounded))
+            .next()
+            .map(|(key, _)| key.as_str())
+    }
     pub(crate) fn decode_held_file_keys(&self) -> impl Iterator<Item = &str> {
         self.decode_holds.file_keys()
     }

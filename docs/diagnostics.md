@@ -1402,3 +1402,11 @@ fingerprints, activity and manifest coverage are retained.
 
 Post-release counts: `custody_latch_deferred.count`; observe its `pages` and
 `oldest_age` lifetime gauges and distinct deferral alarm alongside existing held-growth and native read counts.
+
+
+`codex_archive_unknown_owner_hold` reports `codex_archive_unknown_owner_holds`
+(Codex, count of raw archive slots classified with unknown current owner in one
+inventory). It grants no read or settlement permission. Unchanged refused
+witnesses remain quiet until the existing bounded scan retry (persisted attempt
+counter capped at seven, delay capped at one hour) or a changed witness. The
+counter counts classifications, not unique files or uploads.

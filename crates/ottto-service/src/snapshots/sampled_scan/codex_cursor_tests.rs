@@ -16722,3 +16722,146 @@ fn custody_hold_counts_survive_worker_save_failure_once_across_threads() {
         "a new worker retries durable debt without minting/counting it again"
     );
 }
+
+#[test]
+fn omitted_raw_archive_fences_paused_singleton_and_group_across_reload() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    use crate::snapshots::codex_compressed_input::{ArchiveEvidence, ValidatedHeader};
+    for grouped in [false, true] {
+        for control in ["same", "changed", "missing"] {
+            for deferred in [false, true] {
+                with_test_limits(2048, 1024, 64, || {
+                    let (fixture, mut index, cache) = if grouped {
+                        let (f, i, c, _, _) = deferred_group_fixture_with_loss(false, false);
+                        (f, i, c)
+                    } else {
+                        let f = ScanRoot::new(80);
+                        let c = Arc::new(SharedCache::default());
+                        let (i, _) = paused_singleton(&f, &c);
+                        (f, i, c)
+                    };
+                    let external = crate::test_scratch::ScratchDir::new("cursor-omitted-raw-home");
+                    let archive = external
+                        .as_ref()
+                        .join(format!("rollout-{SESSION}.jsonl.zst"));
+                    fs::write(&archive, b"previous FD-validated archive").unwrap();
+                    let key = local_index_key(&archive);
+                    assert!(!index
+                        .traversal
+                        .as_ref()
+                        .unwrap()
+                        .codex_rollout_paths
+                        .contains(&key));
+                    let mut evidence =
+                        ArchiveEvidence::begin(&File::open(&archive).unwrap(), &archive, None)
+                            .unwrap();
+                    evidence.header_validated = ValidatedHeader::from_bytes(&codex_line(
+                        json!({"type":"session_meta","payload":{"id":SESSION}}),
+                    ));
+                    evidence.owner = Some(SESSION.into());
+                    let mut wire = serde_json::to_value(&index).unwrap();
+                    wire["files"][&key] = json!({"size_bytes":[],"archive":evidence,"future":1});
+                    let bytes = serde_json::to_vec_pretty(&wire).unwrap();
+                    let saved = external.as_ref().join("index.json");
+                    fs::write(&saved, bytes).unwrap();
+                    index = ScanIndex::load(&saved).unwrap();
+                    index.save(&saved).unwrap();
+                    index = ScanIndex::load(&saved).unwrap();
+                    assert!(index.decode_holds_file(&key));
+                    assert!(index.files.get(&key).is_none());
+                    if control == "changed" {
+                        fs::write(&archive, b"changed bytes").unwrap();
+                    }
+                    if control == "missing" {
+                        fs::remove_file(&archive).unwrap();
+                    }
+                    let raw = serde_json::to_value(&index).unwrap()["files"][&key].clone();
+                    let paths = cache.paused_members_for_test().unwrap();
+                    assert_eq!(paths.len(), if grouped { 2 } else { 1 });
+                    let codex =
+                        CodexTitleMetadata::load_from_roots(std::slice::from_ref(&fixture.root));
+                    let mut dirs = codex_file_join::DirectoryCensus::new();
+                    dirs.observe(&fixture.root, &fs::metadata(&fixture.root).unwrap());
+                    let mut inventory = codex_file_join::HeaderInventory::new(
+                        std::slice::from_ref(&fixture.root),
+                        &paths,
+                        Some(&dirs),
+                    );
+                    while !inventory.prepare_feed_custody(&index) {}
+                    inventory.retain_cached_archives(&index, &paths);
+                    while inventory.step_with_archive(&codex, &mut index, Some(&cache))
+                        != codex_file_join::HeaderStep::Complete
+                    {}
+                    assert!(!inventory.resumable_for(Some(&SESSION.into()), deferred));
+                    assert_eq!(
+                        inventory.resumable_for(Some(&SESSION_B.into()), deferred),
+                        control == "same"
+                    );
+                    let before = cache
+                        .with_cursor(|cursor| {
+                            let Slot::Paused(job) = &mut cursor.slot else {
+                                panic!("actual paused job");
+                            };
+                            assert_eq!(job.group.is_some(), grouped);
+                            if deferred {
+                                job.cursor.as_mut().unwrap().custody_deferred = Some((0, 0));
+                            }
+                            job.parser.reader.consumed_bytes()
+                        })
+                        .unwrap();
+                    let certified = counter(&cache, |c| c.jobs_certified);
+                    let decoders =
+                        crate::snapshots::codex_zst_refusal_tests::decoder_construction_count();
+                    let (next, output) = continuation_page(&fixture, index, &cache, |scan| {
+                        scan.codex_join_inventory = Some(inventory.clone());
+                        scan.codex_join_prepared = false;
+                    });
+                    index = next;
+                    assert!(output.snapshots.is_empty());
+                    assert_eq!(counter(&cache, |c| c.jobs_certified), certified);
+                    assert_eq!(
+                        cache
+                            .with_cursor(|cursor| match &cursor.slot {
+                                Slot::Paused(job) => Some(job.parser.reader.consumed_bytes()),
+                                _ => None,
+                            })
+                            .flatten(),
+                        Some(before)
+                    );
+                    assert_eq!(
+                        crate::snapshots::codex_zst_refusal_tests::decoder_construction_count(),
+                        decoders
+                    );
+                    assert_eq!(serde_json::to_value(&index).unwrap()["files"][&key], raw);
+                    // A real ordinary scan still publishes unrelated U while
+                    // known O is withheld; changed/missing evidence stays global.
+                    fs::write(
+                        fixture.file(SESSION_B),
+                        [
+                            codex_line(json!({"type":"session_meta","payload":{"id":SESSION_B}})),
+                            token_line(7),
+                        ]
+                        .concat(),
+                    )
+                    .unwrap();
+                    let mut ordinary = index.clone();
+                    ordinary.traversal = None;
+                    let (_, output) = page(&fixture, ordinary, None);
+                    assert!(output
+                        .snapshots
+                        .iter()
+                        .all(|item| item.source_session_id != SESSION));
+                    assert_eq!(
+                        output
+                            .snapshots
+                            .iter()
+                            .any(|item| item.source_session_id == SESSION_B),
+                        control == "same"
+                    );
+                });
+            }
+        }
+    }
+}

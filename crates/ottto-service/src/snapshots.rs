@@ -33064,6 +33064,19 @@ impl OwnedSourceScan {
                         )
                     })
                 });
+            // Header classification may have completed since the preceding
+            // permission check. A new body claim needs current AC permission;
+            // retain the candidate and all paid/header/CPU/work evidence.
+            if source == SnapshotSource::Codex
+                && codex_archive_path(&candidate.path)
+                && !index.archive_pass.ready(
+                    codex_page.singleton_remaining(sampled_scan::codex_cursor::Limits::current()),
+                )
+            {
+                sampled_scan::codex_cursor::requeue(index, &codex_selected_flags, &candidate);
+                residue_index_keys.insert(local_index_key(&candidate.path));
+                pending!();
+            }
             let mut parser = match sampled_scan::new_source_parser_with_archive_scope(
                 opened_file,
                 &candidate,

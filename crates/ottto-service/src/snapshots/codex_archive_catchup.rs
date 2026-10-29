@@ -18,6 +18,7 @@ impl Pass {
     }
     pub fn ready(&self, remaining: u64) -> bool {
         self.power
+            && crate::snapshot_sync::archive_acquisition_power_ready(self.power)
             && self.cpu < 30_000_000
             && remaining > 0
             && crate::snapshot_sync::archive_work_ready(self.work)
@@ -157,6 +158,12 @@ impl ScanIndex {
         }
         if budget.singleton_remaining(sampled_scan::codex_cursor::Limits::current())
             < 2 * codex_file_join::MAX_HEADER_BYTES as u64
+        {
+            return Ok(Admission::Deferred);
+        }
+        if !self
+            .archive_pass
+            .ready(budget.singleton_remaining(sampled_scan::codex_cursor::Limits::current()))
         {
             return Ok(Admission::Deferred);
         }

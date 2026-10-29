@@ -3007,3 +3007,227 @@ fn header_deferred_gates_and_absent_cache_do_not_increment_admission_streak() {
     );
     admission_streak(&key, false);
 }
+
+fn power_plain_sibling(f: &ArchiveFixture) -> CandidateFile {
+    let path = f.0.with_file_name("rollout-unrelated.jsonl");
+    let mut bytes = Vec::new();
+    for row in synthetic_rollout()
+        .split(|b| *b == b'\n')
+        .filter(|r| !r.is_empty())
+    {
+        let mut value: Value = serde_json::from_slice(row).unwrap();
+        if value["type"] == "session_meta" {
+            value["payload"]["id"] = json!("unrelated");
+        }
+        serde_json::to_writer(&mut bytes, &value).unwrap();
+        bytes.push(b'\n');
+    }
+    fs::write(&path, bytes).unwrap();
+    let mut candidate = codex_zst_refusal_tests::candidate(&path);
+    candidate.size_bytes = fs::metadata(path).unwrap().len();
+    candidate
+}
+
+#[test]
+fn archive_power_loss_after_construction_defers_without_read_or_attempt_and_plain_progresses() {
+    for denied in [Some(false), None] {
+        // Refused and Unknown both deny.
+        let f =
+            ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+        let plain = power_plain_sibling(&f);
+        let key = local_index_key(&f.0);
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let decoders = codex_zst_refusal_tests::decoder_construction_count();
+        let (((state, result), rows), before) =
+            crate::snapshot_sync::with_archive_power(&[Some(true), denied], || {
+                let mut scan = selector_scan(
+                    &f,
+                    ScanIndex::default(),
+                    cache,
+                    VecDeque::from([plain, f.candidate()]),
+                    false,
+                );
+                assert!(scan.index.archive_pass.power, "constructed while Allowed");
+                scan.index.archive_pass.cpu = 123;
+                scan.index.archive_pass.work = 456;
+                let before = (scan.index.archive_pass.cpu, scan.index.archive_pass.work);
+                (
+                    crate::local_resource_diagnostics::capture(|| finish_selector(scan)),
+                    before,
+                )
+            });
+        assert_eq!(result.snapshots.len(), 1);
+        assert_eq!(result.snapshots[0].source_session_id, "unrelated");
+        assert!(result.snapshots[0].input_tokens > 0);
+        assert!(!state.files.contains_key(&key));
+        assert_eq!(
+            codex_zst_refusal_tests::decoder_construction_count(),
+            decoders
+        );
+        assert_eq!(decoded_archive_bytes(&rows), 0);
+        assert!(!rows.iter().any(|r| r["stage"] == "codex_zst_frame_header"));
+        assert!(state.archive_pass.cpu >= before.0 && state.archive_pass.work >= before.1);
+        assert_eq!(
+            state
+                .traversal
+                .as_ref()
+                .unwrap()
+                .pending_candidates
+                .iter()
+                .filter(|p| p.path == f.0)
+                .count(),
+            1
+        );
+        assert_eq!(
+            admission_starved_count(Some(&key)),
+            0,
+            "power refusal is not a claim"
+        );
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "funded decoder needs validated heap layout"
+)]
+fn archive_power_loss_between_header_and_body_preserves_paid_header_and_plain_progress() {
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    for denied in [Some(false), None] {
+        let f =
+            ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+        let plain = power_plain_sibling(&f);
+        let key = local_index_key(&f.0);
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let decoders = codex_zst_refusal_tests::decoder_construction_count();
+        let ((state, result), rows) = crate::snapshot_sync::with_archive_power(
+            &[Some(true), Some(true), Some(true), denied],
+            || {
+                let scan = selector_scan(
+                    &f,
+                    ScanIndex::default(),
+                    cache,
+                    VecDeque::from([plain, f.candidate()]),
+                    false,
+                );
+                crate::local_resource_diagnostics::capture(|| finish_selector(scan))
+            },
+        );
+        assert_eq!(result.snapshots.len(), 1);
+        assert_eq!(result.snapshots[0].source_session_id, "unrelated");
+        let evidence = state.files[&key].archive.as_ref().unwrap();
+        assert!(evidence.header_validated.is_some());
+        assert_eq!(
+            evidence.decode_attempts, 0,
+            "body reservation was never installed"
+        );
+        assert!(evidence.body_witness.is_none());
+        assert_eq!(
+            codex_zst_refusal_tests::decoder_construction_count() - decoders,
+            1,
+            "only the allowed header decoder"
+        );
+        assert_eq!(decodes(&rows), 1);
+        assert!(!rows.iter().any(|r| r["stage"] == "codex_zst_input"));
+        assert_eq!(
+            state
+                .traversal
+                .as_ref()
+                .unwrap()
+                .pending_candidates
+                .iter()
+                .filter(|p| p.path == f.0)
+                .count(),
+            1
+        );
+        assert_eq!(admission_starved_count(Some(&key)), 0);
+        let (state, result, retry_rows, _) = selector_archive_pass(&f, checkpoint(&state));
+        assert_eq!(
+            decodes(&retry_rows),
+            1,
+            "cached paid header; one body after AC returns"
+        );
+        assert_eq!(result.snapshots.len(), 1);
+        assert_eq!(
+            state.files[&key].archive.as_ref().unwrap().decode_attempts,
+            1
+        );
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "funded decoder needs validated heap layout"
+)]
+fn activated_selector_reaches_inherited_header_claim_starvation_and_resets_on_progress() {
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+    let key = local_index_key(&f.0);
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let occupied = OpenedInput::funded(File::open(&f.0).unwrap(), &cache)
+        .unwrap()
+        .unwrap();
+    admission_streak(&key, false);
+    for attempt in 1..=14 {
+        let scan = selector_scan(
+            &f,
+            ScanIndex::default(),
+            cache.clone(),
+            VecDeque::from([f.candidate()]),
+            false,
+        );
+        let ((index, result), rows) =
+            crate::local_resource_diagnostics::capture(|| finish_selector(scan));
+        assert!(index.files.get(&key).is_none());
+        assert!(result.snapshots.is_empty());
+        assert_eq!(decoded_archive_bytes(&rows), 0);
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r["stage"] == "codex_zst_admission_alarm")
+                .count(),
+            usize::from(attempt == 12)
+        );
+        assert_eq!(
+            admission_starved_count(Some(&key)),
+            usize::from(attempt >= 12)
+        );
+        assert_eq!(
+            index
+                .traversal
+                .as_ref()
+                .unwrap()
+                .pending_candidates
+                .iter()
+                .filter(|p| p.path == f.0)
+                .count(),
+            1
+        );
+    }
+    occupied.close();
+    let scan = selector_scan(
+        &f,
+        ScanIndex::default(),
+        cache,
+        VecDeque::from([f.candidate()]),
+        false,
+    );
+    let ((index, result), rows) =
+        crate::local_resource_diagnostics::capture(|| finish_selector(scan));
+    assert_eq!(decodes(&rows), 2);
+    assert_eq!(result.snapshots.len(), 1);
+    assert_eq!(
+        index.files[&key].archive.as_ref().unwrap().decode_attempts,
+        1
+    );
+    assert_eq!(
+        admission_streak(&key, true),
+        1,
+        "successful funding reset the inherited streak"
+    );
+    admission_streak(&key, false);
+}
