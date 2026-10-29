@@ -3,8 +3,10 @@
 A direct cold restore must classify a verified same-context audit carrier before
 asking for an entry-derived expected binding. An absent index entry is precisely
 one missing-custody case. Returning NoEntry first hid that evidence and skipped
-the audit-carrier diagnostic. Carrier validation now precedes expected binding
-construction, matching the existing predecessor branch and main ordering. It
+the audit-carrier diagnostic. For an absent entry, carrier validation now precedes expected binding
+construction, matching the existing predecessor branch and main ordering.
+Indexed entries keep real-edit and accepted-floor checks ahead of carrier rearm;
+a combined clean-index/debt-bearing-record/shrink control pins that precedence. It
 imports no membership, checkpoint debt, mutation proof or ACK. Regression arms
 use a write-only transcript descriptor: the matching context must return exactly
 AuditCarrier and count it once; a foreign context must return exactly NoEntry

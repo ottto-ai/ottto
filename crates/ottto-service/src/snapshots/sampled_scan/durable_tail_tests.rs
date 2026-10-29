@@ -5532,6 +5532,94 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+/// An indexed record-old/index-clean audit crash must not hide an independently
+/// proved shrink behind its retained envelope debt or accepted-body floor.
+#[test]
+fn indexed_debt_carrier_preserves_proven_shrink_before_audit_rearm() {
+    let root = crate::test_scratch::private_dir("ottto-indexed-carrier-edit");
+    let lock = test_locks::hold(&root);
+    let path = root.join("source.jsonl");
+    std::fs::write(&path, b"{}\n{}\n").unwrap();
+    let source = SnapshotSource::ClaudeCode;
+    let ds = DurableSource::ClaudeCode;
+    let namespace = Scope("indexed-carrier-edit".into());
+    let key = local_index_key(&path);
+    let index_path = root.join("index.json");
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        key.clone(),
+        serde_json::from_value(serde_json::json!({
+            "size_bytes":6, "modified_unix_seconds":1,
+            "source_file_fingerprint":"verified-carrier-edit"
+        }))
+        .unwrap(),
+    );
+    index.save(&index_path).unwrap();
+    let interpretation = Interpretation::of(source, &key, &index, false, &namespace);
+    let original = expected(ds, source, &key, &namespace, &index, &interpretation, None).unwrap();
+    let mut cert = certificate(&path, &namespace);
+    cert.audit_debt_unix_seconds = Some(1_800_000_060);
+    let mut disk = DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+    assert_eq!(
+        disk.write_after_save(
+            lock,
+            index.generation,
+            0,
+            vec![PendingRecord {
+                binding: original.binding,
+                certificate: cert,
+                body: crate::snapshots::durable_store_fixture_body(source, 0, 0),
+                allowlist: codec::allowlist_digest(source),
+            }]
+        )
+        .unwrap()
+        .written,
+        1
+    );
+    let record_key = store::key_digest(ds, &key);
+    let record = store::tests::found(disk.read(&record_key));
+    assert!(!audit_carrier_matches(&record, &index, &key, 1_800_000_000));
+    let record_path = disk.dir().join(format!(
+        "{}.rec",
+        record_key
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    ));
+    let before = std::fs::read(&record_path).unwrap();
+    let mut held = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    held.set_len(3).unwrap();
+    assert!(
+        interpretation.accepted.unwrap().behind(3),
+        "the floor would otherwise hold"
+    );
+    let cache = SharedCache::default();
+    cache.durable_begin_pass(source, &index_path, &namespace, false);
+    assert!(matches!(
+        cache.durable_restore(
+            source,
+            &key,
+            &path,
+            &namespace,
+            &mut held,
+            &index,
+            &interpretation
+        ),
+        RestoreOutcome::Miss(MissClass::RealEdit(FullReason::Shrunk))
+    ));
+    let (counts, _) = cache.durable_counters(source).unwrap();
+    assert_eq!(counts.certificate_refused.get("shrunk"), Some(&1));
+    assert_eq!(counts.ineligible.get("audit_carrier"), None);
+    assert_eq!(counts.durable_held, [0; 7]);
+    assert_eq!(counts.restored, 0);
+    assert_eq!(std::fs::read(&record_path).unwrap(), before);
+    assert_eq!(
+        index.files[&key].size_bytes, 6,
+        "no forged index settlement"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 /// Contract-5 cutover (Lead B, byte-stable keys): a record a permit-era
 /// permitted Claude cycle wrote (capture on, the E2 contract recorded)
 /// keeps its identity interpretation byte for byte under the always-on

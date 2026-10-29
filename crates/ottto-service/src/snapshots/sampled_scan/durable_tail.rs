@@ -1760,28 +1760,31 @@ impl SharedCache {
             }
         };
         // Missing membership is itself missing audit custody. Check the verified
-        // same-context carrier BEFORE expected(), which requires that membership.
-        if record.record.binding.context
-            == store::context_digest(
-                &interpretation.namespace.0,
-                index.active_upload_context_fingerprint.as_deref(),
-            )
-            && !audit_carrier_matches(
-                &record,
-                index,
-                key,
-                unix_seconds(SystemTime::now()).unwrap_or(0),
-            )
-        {
-            Counters::bump(
-                &mut self
-                    .durable()
-                    .ok_or(MissClass::Unavailable)?
-                    .counters
-                    .ineligible,
-                "audit_carrier",
-            );
-            return Err(MissClass::AuditCarrier);
+        // same-context carrier before the entry-dependent binding; indexed keys
+        // retain their existing real-edit and accepted-floor precedence below.
+        if !index.files.contains_key(key) {
+            if record.record.binding.context
+                == store::context_digest(
+                    &interpretation.namespace.0,
+                    index.active_upload_context_fingerprint.as_deref(),
+                )
+                && !audit_carrier_matches(
+                    &record,
+                    index,
+                    key,
+                    unix_seconds(SystemTime::now()).unwrap_or(0),
+                )
+            {
+                Counters::bump(
+                    &mut self
+                        .durable()
+                        .ok_or(MissClass::Unavailable)?
+                        .counters
+                        .ineligible,
+                    "audit_carrier",
+                );
+                return Err(MissClass::AuditCarrier);
+            }
         }
         let expected = expected(
             source,
@@ -1853,6 +1856,28 @@ impl SharedCache {
                 }
                 return Err(MissClass::AcceptedFloor);
             }
+        }
+        if record.record.binding.context
+            == store::context_digest(
+                &interpretation.namespace.0,
+                index.active_upload_context_fingerprint.as_deref(),
+            )
+            && !audit_carrier_matches(
+                &record,
+                index,
+                key,
+                unix_seconds(SystemTime::now()).unwrap_or(0),
+            )
+        {
+            Counters::bump(
+                &mut self
+                    .durable()
+                    .ok_or(MissClass::Unavailable)?
+                    .counters
+                    .ineligible,
+                "audit_carrier",
+            );
+            return Err(MissClass::AuditCarrier);
         }
         index.files.get(key).ok_or(MissClass::NoEntry)?;
 
