@@ -26669,7 +26669,7 @@ impl OwnedSourceScan {
                             .filter(|key| {
                                 let path = Path::new(key);
                                 is_compressed_codex_rollout(Some(path), None)
-                                    && !transcript_path_admitted(path)
+                                    && !transcript_path_admitted(source, path)
                                     && traversal
                                         .scan_roots
                                         .iter()
@@ -26685,7 +26685,7 @@ impl OwnedSourceScan {
                                 let path = Path::new(key);
                                 entry.archive.is_some()
                                     && is_compressed_codex_rollout(Some(path), None)
-                                    && !transcript_path_admitted(path)
+                                    && !transcript_path_admitted(source, path)
                                     && traversal
                                         .scan_roots
                                         .iter()
@@ -26704,7 +26704,7 @@ impl OwnedSourceScan {
                         .filter(|key| {
                             let path = Path::new(key);
                             is_compressed_codex_rollout(Some(path), None)
-                                && !transcript_path_admitted(path)
+                                && !transcript_path_admitted(source, path)
                         })
                         .map(PathBuf::from),
                 );
@@ -26712,14 +26712,14 @@ impl OwnedSourceScan {
                 // Drop only queue/roster membership; retain entry custody and
                 // disclose excluded archives as scoped holds below.
                 traversal.pending_candidates.retain(|pending| {
-                    let admitted = transcript_path_admitted(&pending.path);
+                    let admitted = transcript_path_admitted(source, &pending.path);
                     if !admitted {
                         admission_holds.insert(pending.path.clone());
                     }
                     admitted
                 });
                 traversal.codex_rollout_paths.retain(|key| {
-                    let admitted = transcript_path_admitted(Path::new(key));
+                    let admitted = transcript_path_admitted(source, Path::new(key));
                     if !admitted {
                         admission_holds.insert(PathBuf::from(key));
                     }
@@ -42853,10 +42853,20 @@ fn codex_fresh_data_pending(
     })
 }
 
-// Shared by fresh discovery and retained work. Archive activation must change
-// this admission boundary before persisted archive paths may be selected.
-fn transcript_path_admitted(path: &Path) -> bool {
+// One boundary for fresh, persisted and held work. Admission is scheduling only:
+// archive decoding still requires live power, CPU/byte budget and a funded reader.
+fn transcript_path_admitted(source: SnapshotSource, path: &Path) -> bool {
     path.extension().and_then(|value| value.to_str()) == Some("jsonl")
+        || (source == SnapshotSource::Codex && codex_archive_path(path) && {
+            #[cfg(test)]
+            {
+                codex_compressed_input::tests::archive_discovery_enabled()
+            }
+            #[cfg(not(test))]
+            {
+                true
+            }
+        })
 }
 
 /// Returns how many Codex hints re-entered as next-generation evidence.
@@ -42880,7 +42890,7 @@ fn enqueue_watcher_hints(
         .map(|(position, candidate)| (candidate.path.clone(), position))
         .collect::<BTreeMap<_, _>>();
     for path in hinted_paths.iter().take(MAX_BACKFILL_FILES_PER_SOURCE) {
-        if !transcript_path_admitted(path)
+        if !transcript_path_admitted(source, path)
             || (source == SnapshotSource::ClaudeCode
                 && claude_transcript_excluded_from_snapshots(path))
         {
@@ -42958,11 +42968,33 @@ fn refresh_retained_codex_roster(
     if source != SnapshotSource::Codex || !traversal.pending_directories.is_empty() {
         return;
     }
-    let moved = match traversal.codex_join_directory_census.as_ref() {
+    let mut moved = match traversal.codex_join_directory_census.as_ref() {
         // An unproved walk stays unproved until a fresh generation.
         Some(census) if census.local_diagnostic_counts().0 => census.moved_directories(),
         _ => return,
     };
+    // Old denied archive keys can be absent from a retained roster even when
+    // directory metadata did not move. Relist only their parent directories,
+    // through the existing bounded refresh, so activation sees every sibling
+    // before it grants archive-family completeness. Never requeue known plain
+    // members merely because intake changed.
+    if let Some(hold) = traversal.residue.codex_inventory_hold.as_ref() {
+        let parents = hold
+            .refused_headers
+            .keys()
+            .chain(hold.outside_roster.keys())
+            .chain(&hold.owed)
+            .filter(|key| {
+                codex_archive_path(Path::new(key))
+                    && transcript_path_admitted(source, Path::new(key))
+                    && !traversal.codex_rollout_paths.contains(*key)
+            })
+            .filter_map(|key| Path::new(key).parent().map(Path::to_owned))
+            .collect::<BTreeSet<_>>();
+        moved.extend(parents);
+        moved.sort_unstable();
+        moved.dedup();
+    }
     let census_unix_seconds = rfc3339_unix_seconds(&traversal.census_window_end);
     let mut remaining = MAX_SCAN_DIRECTORY_ENTRIES_PER_TICK;
     for directory in moved {
@@ -43016,7 +43048,7 @@ fn refresh_retained_codex_roster(
                 }
                 continue;
             }
-            if !file_type.is_file() || !transcript_path_admitted(&path) {
+            if !file_type.is_file() || !transcript_path_admitted(source, &path) {
                 continue;
             }
             let key = local_index_key(&path);
@@ -43164,17 +43196,41 @@ fn release_codex_inventory_hold(source: SnapshotSource, traversal: &mut ScanTrav
     let moved = |key: &String, witness: &Option<String>| {
         codex_file_join::path_witness(Path::new(key)) != *witness
     };
-    let released = hold.awaiting_directories
+    // Archives denied by the old intake can have an unchanged refused witness
+    // forever. A now-admitted, listed regular archive releases that old debt
+    // once. Ordinary archive inventory is metadata-only: a same-stamp regular
+    // archive cannot mint a fresh global refused-header hold in this binary.
+    // Missing/symlink/malformed metadata witnesses still need a real change.
+    let activated_archive = |key: &String| {
+        let path = Path::new(key);
+        codex_archive_path(path)
+            && transcript_path_admitted(source, path)
+            && traversal.codex_rollout_paths.contains(key)
+            && fs::symlink_metadata(path)
+                .is_ok_and(|stat| stat.is_file() && !stat.file_type().is_symlink())
+    };
+    let archive_debt = hold
+        .refused_headers
+        .keys()
+        .filter(|key| activated_archive(key))
+        .count()
+        + hold
+            .outside_roster
+            .keys()
+            .filter(|key| !hold.refused_headers.contains_key(*key) && activated_archive(key))
+            .count();
+    let released = archive_debt != 0
+        || hold.awaiting_directories
         || hold.refused_headers.iter().any(|(key, witness)| {
             // A record that vanished before its read has no witness to move;
             // leaving the roster is its evidence.
             // Admission exclusion is not a changed-file witness. Keep the
             // saved debt quiet until admitted evidence actually moves.
-            transcript_path_admitted(Path::new(key))
+            transcript_path_admitted(source, Path::new(key))
                 && (!traversal.codex_rollout_paths.contains(key) || moved(key, witness))
         })
         || hold.outside_roster.iter().any(|(key, witness)| {
-            transcript_path_admitted(Path::new(key))
+            transcript_path_admitted(source, Path::new(key))
                 && (traversal.codex_rollout_paths.contains(key) || moved(key, witness))
         });
     if !released {
@@ -43185,6 +43241,18 @@ fn release_codex_inventory_hold(source: SnapshotSource, traversal: &mut ScanTrav
         .codex_inventory_hold
         .take()
         .expect("hold checked above");
+    if archive_debt != 0 {
+        // Queueing is not an acquisition grant: plain work sorts first, F3
+        // preparation is bounded, and archive admission uses the carried pass
+        // gates before any prefix/body decoder can be constructed.
+        crate::local_resource_diagnostics::traversal_point(
+            "codex_archive_inventory_debt_released",
+            "codex",
+            &serde_json::json!({"codex_archive_inventory_debt_released": 1,
+                "codex_archive_inventory_debt_keys": archive_debt,
+                "codex_archive_inventory_debt_owed": hold.owed.len()}),
+        );
+    }
     let mut pending = traversal
         .pending_candidates
         .iter()
@@ -43354,7 +43422,7 @@ fn advance_bounded_directory_traversal_with_budget(
                 });
                 continue;
             }
-            if !file_type.is_file() || !transcript_path_admitted(&path) {
+            if !file_type.is_file() || !transcript_path_admitted(source, &path) {
                 continue;
             }
             if source == SnapshotSource::ClaudeCode
@@ -43729,7 +43797,7 @@ fn collect_recent_jsonl_files(
         if !file_type.is_file() {
             continue;
         }
-        if !snapshot_transcript_path(source, &path) {
+        if !transcript_path_admitted(source, &path) {
             continue;
         }
         // Claude's Workflow-tool journal is bookkeeping, never a session. Drop
@@ -51826,11 +51894,6 @@ fn sha256_hex_owned(parts: &[String]) -> String {
     format!("{:x}", digest.finalize())
 }
 
-fn snapshot_transcript_path(source: SnapshotSource, path: &Path) -> bool {
-    path.extension().and_then(|s| s.to_str()) == Some("jsonl")
-        || (source == SnapshotSource::Codex && codex_archive_path(path))
-}
-
 /// Identity comparisons only. The open path, index key and ACK stay physical.
 fn codex_logical_rollout_path(path: &Path) -> std::borrow::Cow<'_, Path> {
     if codex_archive_path(path) {
@@ -51850,7 +51913,7 @@ pub fn paths_from_events(
 ) -> BTreeSet<PathBuf> {
     paths
         .into_iter()
-        .filter(|path| transcript_path_admitted(path))
+        .filter(|path| transcript_path_admitted(source, path))
         .collect()
 }
 

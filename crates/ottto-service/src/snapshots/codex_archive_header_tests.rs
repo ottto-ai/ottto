@@ -1,8 +1,23 @@
-fn funded_header_work() -> HeaderWork {
-    HeaderWork {
-        allowed: true,
-        ..HeaderWork::default()
+// Models a saved checkpoint from the acquisition-only release. Production
+// activation is unconditional; this override exists only in the test binary.
+thread_local! {
+    static ARCHIVE_DISCOVERY: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+pub(in crate::snapshots) fn archive_discovery_enabled() -> bool {
+    ARCHIVE_DISCOVERY.with(std::cell::Cell::get)
+}
+struct ArchiveDiscovery(bool);
+impl Drop for ArchiveDiscovery {
+    fn drop(&mut self) {
+        ARCHIVE_DISCOVERY.with(|slot| slot.set(self.0));
     }
+}
+fn archive_discovery_scope(enabled: bool) -> ArchiveDiscovery {
+    ArchiveDiscovery(ARCHIVE_DISCOVERY.with(|slot| slot.replace(enabled)))
+}
+fn with_archive_discovery<T>(enabled: bool, run: impl FnOnce() -> T) -> T {
+    let _reset = archive_discovery_scope(enabled);
+    run()
 }
 
 #[test]
@@ -807,6 +822,7 @@ fn unreadable_segment_holds_its_filename_owner_but_not_unrelated_plain() {
 
 #[test]
 fn retained_archive_queue_and_roster_obey_discovery_off_after_restart() {
+    let _discovery = archive_discovery_scope(false);
     for disposition in [
         Some(ArchiveDisposition::HeaderValidated),
         Some(ArchiveDisposition::Pending {
@@ -959,7 +975,7 @@ fn retained_archive_queue_and_roster_obey_discovery_off_after_restart() {
                     .unwrap()
                     .codex_rollout_paths
                     .iter()
-                    .all(|key| transcript_path_admitted(Path::new(key))));
+                    .all(|key| transcript_path_admitted(SnapshotSource::Codex, Path::new(key))));
                 assert!(scan
                     .identified_candidates
                     .iter()
@@ -1118,11 +1134,12 @@ fn cached_archive_header_does_not_bypass_permission_gate() {
     let before = serde_json::to_value(&index.files[&key]).unwrap();
     let cache = Arc::new(sampled_scan::SharedCache::default());
     let mut work = HeaderWork::default();
-    super::super::codex_zst_refusal_tests::assert_refused(CodexZstCause::AdmissionRefused, || {
-        assert!(index
+    assert!(matches!(
+        index
             .inventory_archive_header(&f.candidate(), Some(&cache), &mut work)
-            .is_err());
-    });
+            .unwrap(),
+        HeaderRead::Deferred
+    ));
     assert_eq!(serde_json::to_value(&index.files[&key]).unwrap(), before);
     assert_eq!((work.physical_bytes, work.decoded_bytes), (0, 0));
     assert_eq!(cache.cursor_reserved(), 0);
@@ -1134,6 +1151,7 @@ fn cached_archive_header_does_not_bypass_permission_gate() {
 
 #[test]
 fn excluded_archive_inventory_hold_survives_restart_without_plain_header_reread() {
+    let _discovery = archive_discovery_scope(false);
     use codex_file_join::{tests::count_header_reads, DirectoryCensus, HeaderInventory};
     for outside_roster in [false, true] {
         let mut f = ArchiveFixture::new(b"refused-archive-stamp");
@@ -1839,7 +1857,8 @@ fn changed_stamp_preserves_historical_logical_identity_but_resets_acquisition_st
     );
 }
 
-// Discovery remains off: inject only the roster/candidates, leaving the native
+// Inject the roster/candidates while retaining the native
+
 // inventory, selector, parser, owner finish, upload policy and checkpoint intact.
 fn selector_scan(
     f: &ArchiveFixture,
@@ -2537,4 +2556,214 @@ fn warm_archive_evidence_changed_stamp_defers_without_unselected_header_read() {
     assert_eq!(decodes(&rows), 0);
     assert_eq!(decoded_archive_bytes(&rows), 0);
     assert_eq!(serde_json::to_value(&index.files[&key]).unwrap(), before);
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "funded decoder needs validated heap layout"
+)]
+fn denied_archive_inventory_debt_releases_once_and_paces_without_plain_body_reread() {
+    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let mut f =
+        ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+    let state = f.0.parent().unwrap().to_owned();
+    let root = state.join("sessions");
+    fs::create_dir(&root).unwrap();
+    let archive = root.join(f.0.file_name().unwrap());
+    fs::rename(&f.0, &archive).unwrap();
+    f.0 = archive;
+    let roots = [root.clone()];
+    let plain = root.join("rollout-stable-plain.jsonl");
+    fs::write(
+        &plain,
+        String::from_utf8(synthetic_rollout())
+            .unwrap()
+            .replace("compressed-fixture", "stable-plain"),
+    )
+    .unwrap();
+    let mut archives = BTreeSet::from([local_index_key(&f.0)]);
+    for owner in ["second-archive", "third-archive"] {
+        let path = root.join(format!("rollout-{owner}.jsonl.zst"));
+        let body = String::from_utf8(synthetic_rollout())
+            .unwrap()
+            .replace("compressed-fixture", owner);
+        fs::write(&path, zstd::stream::encode_all(body.as_bytes(), 1).unwrap()).unwrap();
+        archives.insert(local_index_key(&path));
+    }
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let (mut index, baseline) = with_archive_discovery(false, || {
+        finish_selector(
+            OwnedSourceScan::new(
+                SnapshotSource::Codex,
+                &roots,
+                ScanIndex::default(),
+                NOW,
+                BACKFILL_WINDOW_DAYS,
+                10,
+                false,
+                None,
+                &[],
+                false,
+                false,
+            )
+            .with_sampled_acquisition(cache.clone(), Scope("activation-held-debt".into())),
+        )
+    });
+    assert_eq!(baseline.snapshots.len(), 1);
+    assert_eq!(baseline.snapshots[0].source_session_id, "stable-plain");
+    index.record_accepted_snapshot_fingerprints(&BTreeSet::from([baseline.snapshots[0]
+        .snapshot_fingerprint
+        .clone()]));
+    let plain_key = local_index_key(&plain);
+    let before = serde_json::to_value(&index.files[&plain_key]).unwrap();
+    let saved = state.join("held.json");
+    with_archive_discovery(false, || {
+        assert!(!transcript_path_admitted(SnapshotSource::Codex, &f.0));
+        ensure_bounded_traversal(
+            SnapshotSource::Codex,
+            &roots,
+            &mut index,
+            NOW,
+            BACKFILL_WINDOW_DAYS,
+        );
+        let traversal = index.traversal.as_mut().unwrap();
+        traversal.pending_directories.clear();
+        traversal.pending_candidates.clear();
+        traversal.codex_rollout_paths = BTreeSet::from([plain_key.clone()]);
+        traversal
+            .observed_index_keys
+            .extend(archives.iter().cloned());
+        traversal.observed_index_keys.insert(plain_key.clone());
+        let mut dirs = codex_file_join::DirectoryCensus::new();
+        dirs.observe(&root, &fs::metadata(&root).unwrap());
+        traversal.codex_join_directory_census = Some(dirs);
+        traversal.residue.codex_inventory_hold = Some(CodexInventoryHold {
+            owed: archives.clone(),
+            refused_headers: BTreeMap::from([(
+                local_index_key(&f.0),
+                codex_file_join::path_witness(&f.0),
+            )]),
+            ..Default::default()
+        });
+        traversal
+            .counts
+            .record_unreadable(UnreadableCause::AliasParser, 1);
+        traversal.unhealthy_retry_not_before_unix_seconds =
+            Some(rfc3339_unix_seconds(NOW).unwrap() + 1800);
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            release_codex_inventory_hold(SnapshotSource::Codex, traversal)
+        });
+        assert_eq!(
+            archive_event_count(&rows, "codex_archive_inventory_debt_released"),
+            0
+        );
+        assert!(traversal.pending_candidates.is_empty());
+        assert!(traversal.residue.codex_inventory_hold.is_some());
+        index.save(&saved).unwrap();
+    });
+    assert!(transcript_path_admitted(SnapshotSource::Codex, &f.0));
+    let (((mut index, _), rows), acquisitions) =
+        terminal_contract_retry::source_acquisitions(|| {
+            crate::local_resource_diagnostics::capture(|| {
+                let mut scan = OwnedSourceScan::new(
+                    SnapshotSource::Codex,
+                    &roots,
+                    ScanIndex::load(&saved).unwrap(),
+                    NOW,
+                    BACKFILL_WINDOW_DAYS,
+                    1,
+                    false,
+                    None,
+                    &[],
+                    false,
+                    false,
+                )
+                .with_sampled_acquisition(cache.clone(), Scope("activation-held-debt".into()));
+                assert!(scan
+                    .index
+                    .traversal
+                    .as_ref()
+                    .unwrap()
+                    .residue
+                    .codex_inventory_hold
+                    .is_none());
+                scan.index.archive_pass.power = false;
+                scan.index.archive_pass.cpu = 30_000_000;
+                finish_selector(scan)
+            })
+        });
+    assert_eq!(
+        archive_event_count(&rows, "codex_archive_inventory_debt_released"),
+        1
+    );
+    assert_eq!(
+        decoded_archive_bytes(&rows),
+        0,
+        "metadata release never grants a paid decoder"
+    );
+    assert_eq!(acquisitions.get(&plain).copied().unwrap_or(0), 0);
+    let mut bodies = 0;
+    for _ in 0..8 {
+        index.save(&saved).unwrap();
+        let (((mut next, result), rows), acquisitions) =
+            terminal_contract_retry::source_acquisitions(|| {
+                crate::local_resource_diagnostics::capture(|| {
+                    let mut scan = OwnedSourceScan::new(
+                        SnapshotSource::Codex,
+                        &roots,
+                        ScanIndex::load(&saved).unwrap(),
+                        NOW,
+                        BACKFILL_WINDOW_DAYS,
+                        1,
+                        false,
+                        None,
+                        &[],
+                        false,
+                        false,
+                    )
+                    .with_sampled_acquisition(cache.clone(), Scope("activation-held-debt".into()));
+                    scan.index.archive_pass.power = true;
+                    finish_selector(scan)
+                })
+            });
+        assert_eq!(
+            archive_event_count(&rows, "codex_archive_inventory_debt_released"),
+            0,
+            "save/restart cannot release consumed debt again"
+        );
+        assert_eq!(
+            acquisitions.get(&plain).copied().unwrap_or(0),
+            0,
+            "unchanged plain native body is never re-read"
+        );
+        assert_eq!(
+            serde_json::to_value(&next.files[&plain_key]).unwrap(),
+            before
+        );
+        assert!(
+            result.snapshots.len() <= 1,
+            "ordinary one-file page bounds the archive burst"
+        );
+        bodies += result.snapshots.len();
+        next.settle_archive_bodies(&ack_bodies(&result));
+        next.record_accepted_snapshot_fingerprints(
+            &result
+                .snapshots
+                .iter()
+                .map(|body| body.snapshot_fingerprint.clone())
+                .collect(),
+        );
+        index = next;
+        if bodies == archives.len() {
+            break;
+        }
+    }
+    assert_eq!(bodies, archives.len());
+    for key in archives {
+        assert!(matches!(
+            index.files[&key].archive.as_ref().unwrap().disposition,
+            ArchiveDisposition::Acquired
+        ));
+    }
 }
