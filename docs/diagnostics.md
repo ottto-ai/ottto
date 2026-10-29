@@ -76,6 +76,10 @@ the `sampled acquisition` text line: full-read reasons now come from
 Version 1 readers that need reasons must retain their text fallback while
 accepting version 1 binaries; there is no version negotiation.
 
+| Stage | Local fields | Meaning |
+| --- | --- | --- |
+| `claude_request_identity_over_cap` | `counts.claude_request_identity_over_cap`: `evidence_entries`, `authority_keys`, `parts_per_row`, `parts_per_item`, `rows`, `bytes`; `counts.claude_request_identity_last_over_cap_item_bytes` | Cumulative, saturating process counters per cap reason, plus the attempted tagged item's last measured compact JSON byte size. One attempt can increment several reasons; retries count separately. Recorded before full-strip fallback. Labels are append-only. No row content or identity is logged or uploaded. |
+
 Each completed `native_collection_page` records existing scanned-file and
 semantic-no-op counts. `sampled_acquisition` is `null` when unavailable. Its
 full/tail/unchanged selection counts describe acquisition decisions, including

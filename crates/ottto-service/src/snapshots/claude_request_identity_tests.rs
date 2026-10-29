@@ -897,6 +897,78 @@ fn builder_enforces_the_declared_parts_per_item_cap() {
     assert!(identity::item_bytes(&item) <= identity::MAX_ITEM_BYTES);
 }
 
+#[test]
+fn over_cap_diagnostics_increment_each_reason_and_record_last_size() {
+    use identity::OverCap;
+    let reasons = BTreeSet::from([
+        OverCap::EvidenceEntries,
+        OverCap::AuthorityKeys,
+        OverCap::PartsPerRow,
+        OverCap::PartsPerItem,
+        OverCap::Rows,
+        OverCap::Bytes,
+    ]);
+    let (_, records) = crate::local_resource_diagnostics::capture(|| {
+        crate::local_resource_diagnostics::claude_identity_over_cap(&reasons, 700_000);
+        crate::local_resource_diagnostics::claude_identity_over_cap(&reasons, 800_000);
+    });
+    assert_eq!(records.len(), 2);
+    let before = &records[0]["counts"]["claude_request_identity_over_cap"];
+    let after = &records[1]["counts"]["claude_request_identity_over_cap"];
+    for label in [
+        "evidence_entries",
+        "authority_keys",
+        "parts_per_row",
+        "parts_per_item",
+        "rows",
+        "bytes",
+    ] {
+        assert_eq!(
+            after[label].as_u64().unwrap(),
+            before[label].as_u64().unwrap() + 1
+        );
+    }
+    assert_eq!(
+        records[1]["counts"]["claude_request_identity_last_over_cap_item_bytes"],
+        800_000
+    );
+    assert!(serde_json::to_vec(&records[1]).unwrap().len() < 2048);
+}
+
+#[test]
+fn byte_cap_diagnostic_measures_tagged_attempt_and_preserves_full_strip() {
+    let mut item = one_row_item(&[(10, None)]);
+    let request = contribution(&item, 10, None, login_key(OWNER_A));
+    identity::apply(&mut item, std::slice::from_ref(&request)).unwrap();
+    // Unrelated body bytes can leave no room even for a single tagged bucket.
+    item.session_display_name = Some("x".repeat(identity::MAX_ITEM_BYTES));
+    let attempted_bytes = identity::item_bytes(&item);
+    let mut expected = stripped(&item);
+    expected.provenance.collector = identity::COLLECTOR.to_owned();
+    expected.request_identity_refusals = 1;
+    expected.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, &expected);
+    let (result, records) = crate::local_resource_diagnostics::capture(|| {
+        identity::apply(&mut item, &[request]).unwrap()
+    });
+    let Tagged::Fallback { over_cap, refusals } = result else {
+        panic!("{result:?}");
+    };
+    assert!(over_cap.contains(&identity::OverCap::Bytes));
+    assert_eq!(refusals, 1);
+    assert_eq!(
+        serde_json::to_vec(&item).unwrap(),
+        serde_json::to_vec(&expected).unwrap()
+    );
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0]["counts"]["claude_request_identity_last_over_cap_item_bytes"],
+        attempted_bytes
+    );
+    assert!(records[0]["counts"]["claude_request_identity_over_cap"]["bytes"]
+        .as_u64()
+        .unwrap() > 0);
+}
+
 // --- Classification ---------------------------------------------------------
 
 const ROOT: &str = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5";

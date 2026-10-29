@@ -889,17 +889,20 @@ pub(crate) fn apply_grouped(
         .flatten()
         .filter(|identity| !matches!(identity, RowIdentity::Untagged))
         .count() as u64;
-    if over_cap.is_empty() {
-        // In place: an over-size result is stripped below to the same
-        // fallback the untouched item would get, so no item copy is needed.
-        install(item, &evidence, top_identities, bucket_identities, refusals);
-        if item_bytes(item) <= MAX_ITEM_BYTES {
-            item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
-            item.claude_account_display = display(grouping.unowned_request);
-            return Ok(Tagged::Sent { refusals });
-        }
+    // Measure the attempted tagged body even when another cap failed. Only
+    // byte counts and closed reason labels enter local diagnostics; the same
+    // full strip below still owns every over-cap wire body and its display.
+    install(item, &evidence, top_identities, bucket_identities, refusals);
+    let attempted_bytes = item_bytes(item);
+    if attempted_bytes > MAX_ITEM_BYTES {
         over_cap.insert(OverCap::Bytes);
     }
+    if over_cap.is_empty() {
+        item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
+        item.claude_account_display = display(grouping.unowned_request);
+        return Ok(Tagged::Sent { refusals });
+    }
+    crate::local_resource_diagnostics::claude_identity_over_cap(&over_cap, attempted_bytes);
     let refusals = lost.max(1).saturating_add(prior_refusals);
     strip(item);
     item.provenance.collector = COLLECTOR.to_string();
