@@ -909,3 +909,45 @@ fn real_uploader_privacy_reducing_context_uses_destination_policy() {
         .get("session_display_name")
         .map_or(true, serde_json::Value::is_null));
 }
+
+#[test]
+fn context_catchup_fresh_priority_classifies_backlog_once_and_preserves_fifo() {
+    let path = |n| ScanTraversalPath {
+        scan_root: PathBuf::from("synthetic"),
+        path: PathBuf::from(format!("{n:04}")),
+        census_member: true,
+        watcher_hint: false,
+    };
+    let mut pending = (0..200).map(path).collect::<VecDeque<_>>();
+    let mut selected = Vec::new();
+    let mut metadata_calls = 0;
+    select_context_fresh_paths(&mut pending, &mut selected, 51, true, |candidate| {
+        metadata_calls += 1;
+        candidate.path.to_string_lossy().parse::<usize>().unwrap() >= 100
+    });
+    assert_eq!(selected.len(), 50);
+    assert!(metadata_calls <= 200, "at most one stat per queued path");
+    let retained = pending
+        .into_iter()
+        .map(|p| p.path.to_string_lossy().parse::<usize>().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(retained, (0..100).chain(150..200).collect::<Vec<_>>());
+}
+#[test]
+fn context_catchup_fresh_priority_cannot_spend_single_reserved_census_slot() {
+    let path = |name: &str, hinted| ScanTraversalPath {
+        scan_root: PathBuf::from("synthetic"),
+        path: PathBuf::from(name),
+        census_member: !hinted,
+        watcher_hint: hinted,
+    };
+    let mut pending = VecDeque::from([path("old-census", false), path("new-hint", true)]);
+    let mut selected = Vec::new();
+    select_context_fresh_paths(&mut pending, &mut selected, 1, true, |_| true);
+    assert!(selected.is_empty());
+    assert_eq!(
+        pending.pop_front().unwrap().path,
+        PathBuf::from("old-census")
+    );
+    // The following normal census selection still owns that one slot.
+}

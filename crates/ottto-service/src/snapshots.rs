@@ -26833,20 +26833,20 @@ impl OwnedSourceScan {
             .saturating_sub(pending_paths.len())
             .min(carry_replay.len());
         pending_paths.extend(carry_replay.drain(..replayed));
-        // Context catch-up consumes ordinary page slots only after queued new
-        // or grown native files. Keep recovery/deadline reservations above.
-        while matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex)
-            && pending_paths.len() < selection_limit
+        // Promote fresh work once, within the existing census reservation.
+        if matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex)
+            && index.upload_context_fingerprint != index.active_upload_context_fingerprint
         {
-            let Some(position) = traversal.pending_candidates.iter().position(|candidate| {
-                !index.files.contains_key(&local_index_key(&candidate.path))
-                    || codex_fresh_data_pending(candidate, &index.files)
-            }) else {
-                break;
-            };
-            if let Some(candidate) = traversal.pending_candidates.remove(position) {
-                pending_paths.push(candidate);
-            }
+            select_context_fresh_paths(
+                &mut traversal.pending_candidates,
+                &mut pending_paths,
+                selection_limit,
+                ordinary_census_pending,
+                |candidate| {
+                    !index.files.contains_key(&local_index_key(&candidate.path))
+                        || codex_fresh_data_pending(candidate, &index.files)
+                },
+            );
         }
         while pending_paths.len() < selection_limit {
             let Some(position) = traversal
@@ -42136,6 +42136,28 @@ fn codex_selection_may_exhaust_page(
 /// Priority only, never read admission. Byte length is content-relevant;
 /// ctime, inode, permissions and mtime alone cannot promote an unchanged file.
 /// New paths need a watcher/roster hint so a cold history walk stays FIFO.
+/// A single FIFO-preserving pass; metadata is assessed at most once per path.
+/// Fresh context work cannot spend the ordinary census's reserved slot.
+fn select_context_fresh_paths(
+    pending: &mut VecDeque<ScanTraversalPath>,
+    selected: &mut Vec<ScanTraversalPath>,
+    limit: usize,
+    census_pending: bool,
+    mut fresh: impl FnMut(&ScanTraversalPath) -> bool,
+) {
+    let fresh_limit = limit.saturating_sub(usize::from(census_pending));
+    for _ in 0..pending.len() {
+        let Some(candidate) = pending.pop_front() else {
+            break;
+        };
+        if selected.len() < fresh_limit && fresh(&candidate) {
+            selected.push(candidate);
+        } else {
+            pending.push_back(candidate);
+        }
+    }
+}
+
 fn codex_fresh_data_pending(
     candidate: &ScanTraversalPath,
     files: &BTreeMap<String, ScanIndexEntry>,
