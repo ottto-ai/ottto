@@ -90,9 +90,9 @@ fn header_cache_production_wake_output_equivalence_join_parent_counting() {
             "last_token_usage":tests::usage(last)}}})
     };
     let first_usage = usage("2026-08-02T08:00:02Z", 100, 100);
-    for (name, rows) in [
+    for (id, rows) in [
         (
-            "c-parent",
+            parent,
             vec![
                 json!({"timestamp":"2026-08-02T08:00:00Z","type":"session_meta",
                 "payload":{"id":parent,"timestamp":"2026-08-02T08:00:00Z","thread_source":"user"}}),
@@ -104,7 +104,7 @@ fn header_cache_production_wake_output_equivalence_join_parent_counting() {
             ],
         ),
         (
-            "d-child",
+            child,
             vec![
                 json!({"timestamp":"2026-08-02T08:20:00Z","type":"session_meta",
                 "payload":{"id":child,"timestamp":"2026-08-02T08:20:00Z",
@@ -118,7 +118,7 @@ fn header_cache_production_wake_output_equivalence_join_parent_counting() {
         ),
     ] {
         fs::write(
-            root.join("sessions").join(format!("{name}.jsonl")),
+            root.join("sessions").join(format!("rollout-{id}.jsonl")),
             rows.iter()
                 .map(|row| serde_json::to_string(row).unwrap() + "\n")
                 .collect::<String>(),
