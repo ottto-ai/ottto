@@ -1570,7 +1570,44 @@ pub(crate) fn item_bytes(item: &SnapshotItem) -> usize {
         session_attribution_enabled: false,
         session_attribution_labels_enabled: false,
     };
-    let mut envelope = super::snapshot_semantic_envelope(SnapshotSource::ClaudeCode, item, policy);
+    // Hash contents do not affect their encoded size. Do not rebuild semantic
+    // leaves just to count bytes: that duplicates per-row allocations on the
+    // ordinary, under-cap path. Keep the real envelope/wire serializers here;
+    // fixtures compare this shape with the upload serializer.
+    let source = SnapshotSource::ClaudeCode;
+    let hash = "0".repeat(64);
+    let mut component_hashes = [
+        "usage_accounting",
+        "lifecycle_activity",
+        "latency",
+        "display_identity",
+        "attribution",
+        "artifacts",
+    ]
+    .into_iter()
+    .map(|name| (name, hash.clone()))
+    .collect::<BTreeMap<_, _>>();
+    if source.derives_context_posture() {
+        component_hashes.insert("context_posture", hash.clone());
+    }
+    if item.activity_summary.is_some() {
+        component_hashes.insert("activity_summary", hash.clone());
+    }
+    let mut envelope = super::SnapshotSemanticEnvelope {
+        component_contract_version: super::SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
+        revision_contract_version: super::SNAPSHOT_REVISION_CONTRACT_VERSION,
+        upload_policy: policy,
+        component_hashes,
+        revision_hash: hash.clone(),
+        revision_v2_contract_version: super::SNAPSHOT_REVISION_V2_CONTRACT_VERSION,
+        revision_v2_canonicalization: crate::canonical_json::CANONICAL_JSON_CONTRACT_VERSION,
+        revision_v2_parser_version: source.parser_version(),
+        revision_v2_scan_identity_version: source.scan_identity_version(),
+        revision_v2_hash: hash.clone(),
+        content_hash: hash,
+        hash_epoch: super::SNAPSHOT_CONTENT_HASH_EPOCH,
+        base_head_etag: item.cache_base_head_etag.clone(),
+    };
     if envelope.base_head_etag.is_none()
         && (item.cache_observations.is_some()
             || item.cache_observations_state.is_some()

@@ -463,7 +463,10 @@ fn sticky_partial_body_displays_only_the_kept_newest_own_account() {
 fn sticky_partial_money_absence_cannot_emit_unreconciled_known_cost_shares() {
     let (mut item, mut proof) = sticky_session(576);
     for (hour, bucket) in item.usage_buckets.iter_mut().enumerate() {
-        let reported = ![0, 24, 48, 72].contains(&hour);
+        // The newest day's authority has no unpriced companion. Other
+        // authorities do, so recovery must preserve their reconciled shares
+        // while refusing the newest bucket's unreconcilable known costs.
+        let reported = ![0, 24, 48].contains(&hour);
         bucket.model_usage[0].cost_usd = reported.then(|| "0.000003".into());
         for c in &mut proof[hour * 3..hour * 3 + 3] {
             c.usage.costs = UsageCosts {
@@ -485,6 +488,51 @@ fn sticky_partial_money_absence_cannot_emit_unreconciled_known_cost_shares() {
     assert!(item.request_identity_refusals > 0);
     assert!(!sticky_tagged(&item.usage_buckets[575].model_usage[0]));
     sticky_assert_reconciled(&item);
+}
+
+#[test]
+fn sticky_size_budget_matches_real_wire_with_optional_envelope_components() {
+    let (item, _) = sticky_session(2);
+    for activity in [false, true] {
+        for cache_head in [false, true] {
+            let mut request = valid_v6_batch_request();
+            request.source = "claude_code".into();
+            request.upload_policy = SnapshotUploadPolicy {
+                session_titles_enabled: false,
+                workspace_labels_enabled: false,
+                session_artifacts_enabled: false,
+                session_attribution_enabled: false,
+                session_attribution_labels_enabled: false,
+            };
+            let mut item = item.clone();
+            item.cache_base_head_etag = cache_head.then(|| "a".repeat(64));
+            item.activity_summary = activity.then(|| SnapshotActivitySummary {
+                capability_collection_version: None,
+                tool_calls: 1,
+                shell_commands: 0,
+                patch_operations: 0,
+                changed_files: 0,
+                lines_added: 0,
+                lines_deleted: 0,
+                web_searches: 0,
+                mcp_calls: 0,
+                subagent_spawns: 0,
+                tool_counts: vec![],
+                mcp_tool_counts: vec![],
+                capability_counts: vec![],
+                capability_buckets: vec![],
+                skills: vec![],
+            });
+            let budgeted = identity::item_bytes(&item);
+            request.snapshots = vec![item];
+            let wire = serde_json::to_value(&request).unwrap();
+            assert_eq!(
+                budgeted,
+                serde_json::to_vec(&wire["snapshots"][0]).unwrap().len(),
+                "activity={activity}, cache_head={cache_head}",
+            );
+        }
+    }
 }
 
 #[test]

@@ -1175,6 +1175,9 @@ row completions are cached until selection changes. The byte budget includes
 the existing semantic envelope, the largest policy flag encoding, and a
 possible cache predecessor when the item carries cache material. The complete
 wire size is checked again after allocation; the 640 KiB wire cap is unchanged.
+Sizing uses fixed-width hash placeholders with the existing envelope serializer,
+avoiding a second semantic-hash computation solely to count bytes. Fixtures
+compare its size with real upload envelopes, including optional components.
 
 The destination-scoped upload progress stores class L priority hints only:
 hashed session keys and sorted bucket-start timestamps, with no identities.
