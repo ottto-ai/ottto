@@ -3008,8 +3008,7 @@ fn withheld_remove_hint_through_intermediate_symlink_keeps_both_debts() {
 /// An unchanged revision can be account-deferred after an upload-context read.
 /// Its real Completed restore keeps the committed fingerprint; missing RAM
 /// evidence must recover once instead of falling through ordinary equality.
-#[test]
-fn withheld_equal_fingerprint_recovers_from_unusable_memo() {
+fn withheld_equal_fingerprint_recovers_after(failure: &str) {
     use crate::local_resource_diagnostics::take_withheld_for_test;
     let root = Root::new("ld-equal-held-memo-recovery");
     let path = root.file(SESSION);
@@ -3042,7 +3041,7 @@ fn withheld_equal_fingerprint_recovers_from_unusable_memo() {
     );
     take_withheld_for_test();
 
-    for failure in ["missing", "refused", "poisoned", "no-birth"] {
+    {
         // Use the full selector, with all ordinary equality premises satisfied.
         let entry = &held.files[&key];
         let mut candidate = CandidateFile {
@@ -3117,4 +3116,21 @@ fn withheld_equal_fingerprint_recovers_from_unusable_memo() {
         }
         assert!(take_withheld_for_test()[1].is_empty());
     }
+}
+
+#[test]
+fn withheld_equal_fingerprint_recovers_from_missing_memo() {
+    withheld_equal_fingerprint_recovers_after("missing");
+}
+#[test]
+fn withheld_equal_fingerprint_recovers_from_refused_memo() {
+    withheld_equal_fingerprint_recovers_after("refused");
+}
+#[test]
+fn withheld_equal_fingerprint_recovers_from_poisoned_memo() {
+    withheld_equal_fingerprint_recovers_after("poisoned");
+}
+#[test]
+fn withheld_equal_fingerprint_recovers_without_birth_identity() {
+    withheld_equal_fingerprint_recovers_after("no-birth");
 }
