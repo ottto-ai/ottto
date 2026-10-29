@@ -32712,6 +32712,7 @@ fn append_codex_state_only_snapshots(
     // Cover accepted header owners as well as main's uniquely resolved filenames.
     let mut covered_in_prior_runs = BTreeSet::new();
     let mut ambiguous_observations = 0_u64;
+    let mut ambiguous_tokens = 0_u64;
     for (path, entry) in &index.files {
         if entry.last_snapshot_fingerprint.is_none() {
             continue; // No body was produced: preserve main's state-only fallback.
@@ -32724,12 +32725,20 @@ fn append_codex_state_only_snapshots(
                 .filter(|identity| metadata.has_identity_evidence(identity))
                 .collect::<Vec<_>>();
             if supported.len() == 2 {
+                for identity in &supported {
+                    if let Some(thread) = metadata.state_threads.get(identity) {
+                        ambiguous_tokens = ambiguous_tokens.saturating_add(thread.tokens_used);
+                    }
+                }
                 covered_in_prior_runs.extend(supported);
                 ambiguous_observations += 1;
             }
         }
     }
-    crate::local_resource_diagnostics::codex_state_only_ambiguous_identity(ambiguous_observations);
+    crate::local_resource_diagnostics::codex_state_only_ambiguous_identity(
+        ambiguous_observations,
+        ambiguous_tokens,
+    );
     let mut scanned_session_count = 0;
     let protected = index
         .files
@@ -59169,34 +59178,42 @@ mod tests {
 
     #[test]
     fn codex_ambiguous_filename_without_committed_owner_withholds_and_counts() {
-        for binding in [None, Some("malformed".to_string())] {
-            let (metadata, mut index, _) =
-                ambiguous_state_only_fixture("019e253c-9999-7000-9000-cccccccccccc");
-            index
-                .files
-                .values_mut()
-                .next()
-                .unwrap()
-                .codex_counting_owner = binding;
-            let mut replacements = Vec::new();
-            let ((count, _), rows) = crate::local_resource_diagnostics::capture(|| {
-                append_codex_state_only_snapshots(
-                    &mut replacements,
-                    &metadata,
-                    "2026-05-14T11:04:00Z",
-                    &mut index,
-                    &BTreeSet::new(),
-                )
-            });
-            assert_eq!(count, 0);
-            assert!(replacements.is_empty());
-            assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0]["stage"], "codex_state_only_ambiguous_identity");
-            assert_eq!(rows[0]["source"], "codex");
-            assert_eq!(
-                rows[0]["counts"],
-                json!({"codex_state_only_ambiguous_identity": 1})
-            );
+        for (tokens, expected_sum) in [([900, 900], 1800), ([0, 0], 0), ([u64::MAX, 1], u64::MAX)] {
+            for binding in [None, Some("malformed".to_string())] {
+                let (mut metadata, mut index, _) =
+                    ambiguous_state_only_fixture("019e253c-9999-7000-9000-cccccccccccc");
+                for (thread, tokens_used) in metadata.state_threads.values_mut().zip(tokens) {
+                    thread.tokens_used = tokens_used;
+                }
+                index
+                    .files
+                    .values_mut()
+                    .next()
+                    .unwrap()
+                    .codex_counting_owner = binding;
+                let mut replacements = Vec::new();
+                let ((count, _), rows) = crate::local_resource_diagnostics::capture(|| {
+                    append_codex_state_only_snapshots(
+                        &mut replacements,
+                        &metadata,
+                        "2026-05-14T11:04:00Z",
+                        &mut index,
+                        &BTreeSet::new(),
+                    )
+                });
+                assert_eq!(count, 0);
+                assert!(replacements.is_empty());
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0]["stage"], "codex_state_only_ambiguous_identity");
+                assert_eq!(rows[0]["source"], "codex");
+                assert_eq!(
+                    rows[0]["counts"],
+                    json!({
+                        "codex_state_only_ambiguous_identity": 1,
+                        "codex_state_only_ambiguous_identity_tokens": expected_sum,
+                    })
+                );
+            }
         }
         let (metadata, mut index, _) =
             ambiguous_state_only_fixture("019e253c-9999-7000-9000-cccccccccccc");
@@ -59368,7 +59385,10 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0]["counts"],
-            json!({"codex_state_only_ambiguous_identity": 2})
+            json!({
+                "codex_state_only_ambiguous_identity": 2,
+                "codex_state_only_ambiguous_identity_tokens": 3600,
+            })
         );
         let mut zero = CodexTitleMetadata::default();
         zero.state_threads.insert(

@@ -1007,7 +1007,13 @@ one `codex_state_only_ambiguous_identity` line per state-only pass, whose
 `counts.codex_state_only_ambiguous_identity` is the number of ambiguous entry
 observations in that pass. Repeated passes observe the same entries again: this
 is NOT a distinct-entry/file/session count, and sums must not be reported as
-files. No path, identity or token value is logged.
+files. Alongside the count, `counts.codex_state_only_ambiguous_identity_tokens`
+is the saturating sum of the supported state threads' `tokens_used` per observed
+ambiguous entry in that pass (units: tokens). The token sum is an UPPER BOUND on
+possibly withheld state-only usage: repeated candidates and already-covered
+usage can contribute again. A zero-token observation reports zero tokens. Only
+aggregate counts and token sums are logged, with no paths, ids or per-session
+values.
 
 A later complete native parse still emits its exclusive body for a session with
 an earlier state-only row. An emitted total alone does not prove a server-side
