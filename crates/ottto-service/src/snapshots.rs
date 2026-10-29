@@ -30791,11 +30791,13 @@ impl OwnedSourceScan {
                     index.mark_bounded_sweep_unsettled();
                 }
                 // Only a settled close starts the next generation in this
-                // page. A partially settled sweep (including a decode hold
-                // just marked) keeps its marker for the clean follow-up the
-                // next page starts, and that walk re-reads the stale files.
-                if (!carried_next_generation.is_empty() || carried_codex_owed.is_some())
-                    && !index.bounded_sweep_had_unsettled_upload
+                // page for its hints. A partially settled sweep (including a
+                // decode hold just marked) otherwise keeps its marker for the
+                // clean follow-up the next page starts, and that walk re-reads
+                // the stale files. Owed Codex keys start that follow-up here
+                // instead, so they ride it rather than being dropped.
+                let settled = !index.bounded_sweep_had_unsettled_upload;
+                if (settled && !carried_next_generation.is_empty()) || carried_codex_owed.is_some()
                 {
                     ensure_bounded_traversal(
                         source,
@@ -30805,13 +30807,14 @@ impl OwnedSourceScan {
                         backfill_window_days,
                     );
                     if let Some(next) = index.traversal.as_mut() {
-                        enqueue_watcher_hints(source, next, &carried_next_generation, false);
+                        if settled {
+                            enqueue_watcher_hints(source, next, &carried_next_generation, false);
+                        }
                         next.residue.codex_inventory_hold = carried_codex_owed.take();
                     }
                 }
                 if let Some(lost) = carried_codex_owed {
-                    // A red restart of a partially settled sweep: the clean
-                    // follow-up walk starts on the next page without them.
+                    // No next traversal started: an open gap.
                     codex_owed_event(CodexOwedEvent::Dropped, lost.owed.len() as u64);
                 }
                 if source == SnapshotSource::ClaudeCode {

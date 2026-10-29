@@ -3079,6 +3079,29 @@ pub(super) mod tests {
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
+    fn red_parent_restart_mid_sweep_keeps_the_owed_key() {
+        // G1 (a): a parent-resolution restart closes a partially settled
+        // sweep while a key is owed. The in-page next generation starts
+        // anyway and carries it: nothing is dropped and nothing is read.
+        let (root, mut held_index, _, new, _) = held_behind_unreadable_header();
+        let key = local_index_key(&new);
+        held_index
+            .traversal
+            .as_mut()
+            .unwrap()
+            .codex_parent_resolution_retry_required = true;
+        held_index.mark_bounded_sweep_unsettled();
+        crate::local_resource_diagnostics::take_codex_owed_for_test();
+        let (index, page) = retained_page(&root, held_index, &[]);
+        assert_eq!(page.scanned_file_count, 0, "no re-read, no Full");
+        assert!(page.snapshots.is_empty(), "{:?}", page.snapshots);
+        // Before G1 the restart dropped the traversal and its owed keys.
+        assert!(inventory_hold(&index).is_some_and(|hold| hold.owed.contains(&key)));
+        let (owed, _) = crate::local_resource_diagnostics::take_codex_owed_for_test();
+        assert_eq!(owed.get("dropped"), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn retired_sources_keep_protected_history_and_quiet_retry_is_idempotent() {
         let root = native_join_fixture_root(true);
         let (mut working, mut result) = scan(&root, ScanIndex::default(), 3);
