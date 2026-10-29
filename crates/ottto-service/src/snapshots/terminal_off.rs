@@ -284,6 +284,71 @@ fn claude_terminal_rewind(traversal: &mut ScanTraversalCheckpoint) {
     }
 }
 
+// Scheduling only: ordinary ScanIndex reloads must not reset the cadence.
+// Fixed-size hashed scopes retain no transcript/path strings. Eviction and a
+// process restart fail toward one metadata rewalk, never toward proof.
+const TERMINAL_OFF_REDISCOVERY_SCOPES: usize = 64;
+#[cfg(not(test))]
+static TERMINAL_OFF_REDISCOVERY: std::sync::Mutex<BTreeMap<String, u64>> =
+    std::sync::Mutex::new(BTreeMap::new());
+#[cfg(test)]
+thread_local! {
+    static TERMINAL_OFF_REDISCOVERY: std::cell::RefCell<BTreeMap<String, u64>> =
+        const { std::cell::RefCell::new(BTreeMap::new()) };
+}
+fn terminal_off_rediscovery_due(scope: String, now: u64, force: bool) -> bool {
+    let check = |memo: &mut BTreeMap<String, u64>| {
+        if !force && memo.get(&scope).is_some_and(|due| now < *due) {
+            return false;
+        }
+        if !memo.contains_key(&scope) && memo.len() >= TERMINAL_OFF_REDISCOVERY_SCOPES {
+            if let Some(oldest) = memo
+                .iter()
+                .min_by_key(|(_, due)| **due)
+                .map(|(key, _)| key.clone())
+            {
+                memo.remove(&oldest);
+                eprintln!("claude_terminal_off rediscovery_memo_evicted=1 capacity=64");
+            }
+        }
+        memo.insert(scope, now.saturating_add(300));
+        true
+    };
+    #[cfg(not(test))]
+    {
+        check(
+            &mut TERMINAL_OFF_REDISCOVERY
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+    #[cfg(test)]
+    TERMINAL_OFF_REDISCOVERY.with(|memo| check(&mut memo.borrow_mut()))
+}
+fn terminal_off_rediscovery_scope(index: &ScanIndex) -> Option<String> {
+    let traversal = index.traversal.as_ref()?;
+    let mut digest = Sha256::new();
+    for value in [
+        "terminal-off-rediscovery:v1",
+        index
+            .active_upload_context_fingerprint
+            .as_deref()
+            .unwrap_or("none"),
+        index
+            .historical_replay_generation
+            .as_deref()
+            .unwrap_or("none"),
+        &traversal.context_fingerprint,
+        &traversal.census_window_end,
+    ] {
+        update_length_prefixed(&mut digest, value.as_bytes());
+    }
+    for root in &traversal.scan_roots {
+        update_length_prefixed(&mut digest, local_index_key(root).as_bytes());
+    }
+    Some(format!("{:x}", digest.finalize()))
+}
+
 fn refresh_terminal_off_discovery(
     index: &mut ScanIndex,
     roots: &[PathBuf],
@@ -291,9 +356,6 @@ fn refresh_terminal_off_discovery(
     overflow: bool,
 ) {
     let now = rfc3339_unix_seconds(at).unwrap_or_default();
-    let due = index
-        .claude_full_rearm_progress
-        .terminal_off_rediscovery_after;
     // Revalidate configured targets EVERY pass, before selecting retained
     // paths, even when the readdir cadence is not due. A retargeted symlink
     // must not leave its old canonical target authorized for collection.
@@ -323,9 +385,11 @@ fn refresh_terminal_off_discovery(
             .replay
             .retain(|p| traversal.scan_roots.contains(&p.scan_root));
     }
-    if !changed && !overflow && due != 0 && now < due {
+    let scope = terminal_off_rediscovery_scope(index).expect("retained traversal");
+    if !terminal_off_rediscovery_due(scope, now, changed || overflow) {
         return;
     }
+    let traversal = index.traversal.as_mut().expect("retained traversal");
     if !traversal.pending_directories.is_empty() {
         return;
     }

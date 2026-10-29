@@ -919,3 +919,113 @@ fn terminal_off_cancellation_replay_precedes_repeated_held_fifo_on_one_file_page
     );
     assert_eq!(queue.len(), 1, "held custody remains queued, never settled");
 }
+
+#[test]
+fn terminal_off_rediscovery_deadline_survives_two_save_load_cycles() {
+    let scratch = crate::test_scratch::ScratchDir::new("terminal-off-reload-cadence");
+    fs::write(
+        scratch.join(format!("{OFF_ROOT}.jsonl")),
+        off_line(OFF_ROOT, "X"),
+    )
+    .unwrap();
+    let mut index = off_index();
+    let first = off_scan(&mut index, &scratch, W1, 10);
+    off_accept(&mut index, &first);
+    let scope = terminal_off_rediscovery_scope(&index).unwrap();
+    let due = TERMINAL_OFF_REDISCOVERY.with(|memo| memo.borrow()[&scope]);
+    let index_path = scratch.join("index.json");
+    for at in ["2026-08-20T10:03:00Z", "2026-08-20T10:04:00Z"] {
+        index.save(&index_path).unwrap();
+        index = ScanIndex::load(&index_path).unwrap();
+        index.activate_upload_context("settled-destination".into());
+        assert_eq!(
+            index
+                .claude_full_rearm_progress
+                .terminal_off_rediscovery_after,
+            0
+        );
+        let samples = START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get);
+        refresh_terminal_off_discovery(&mut index, &[scratch.to_path_buf()], at, false);
+        assert!(
+            index
+                .traversal
+                .as_ref()
+                .unwrap()
+                .pending_directories
+                .is_empty(),
+            "reload before due must not rewalk"
+        );
+        assert_eq!(
+            START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get),
+            samples
+        );
+        assert_eq!(
+            TERMINAL_OFF_REDISCOVERY.with(|memo| memo.borrow()[&scope]),
+            due
+        );
+    }
+    refresh_terminal_off_discovery(
+        &mut index,
+        &[scratch.to_path_buf()],
+        "2026-08-20T10:07:00Z",
+        false,
+    );
+    assert_eq!(
+        index.traversal.as_ref().unwrap().pending_directories.len(),
+        1,
+        "due metadata walk"
+    );
+    index
+        .traversal
+        .as_mut()
+        .unwrap()
+        .pending_directories
+        .clear();
+    refresh_terminal_off_discovery(
+        &mut index,
+        &[scratch.to_path_buf()],
+        "2026-08-20T10:07:01Z",
+        true,
+    );
+    assert_eq!(
+        index.traversal.as_ref().unwrap().pending_directories.len(),
+        1,
+        "watcher loss bypasses cadence"
+    );
+    index
+        .traversal
+        .as_mut()
+        .unwrap()
+        .pending_directories
+        .clear();
+    index.activate_upload_context("different-destination".into());
+    refresh_terminal_off_discovery(
+        &mut index,
+        &[scratch.to_path_buf()],
+        "2026-08-20T10:07:02Z",
+        false,
+    );
+    assert_eq!(
+        index.traversal.as_ref().unwrap().pending_directories.len(),
+        1,
+        "destination scopes cannot share scheduling suppression"
+    );
+    assert!(!first.census_complete);
+}
+
+#[test]
+fn terminal_off_rediscovery_memo_is_bounded_and_eviction_fails_toward_rewalk() {
+    TERMINAL_OFF_REDISCOVERY.with(|memo| memo.borrow_mut().clear());
+    for n in 0..TERMINAL_OFF_REDISCOVERY_SCOPES + 1 {
+        assert!(terminal_off_rediscovery_due(
+            format!("scope-{n}"),
+            n as u64,
+            false
+        ));
+    }
+    TERMINAL_OFF_REDISCOVERY.with(|memo| {
+        assert_eq!(memo.borrow().len(), TERMINAL_OFF_REDISCOVERY_SCOPES);
+        assert!(!memo.borrow().contains_key("scope-0"));
+    });
+    assert!(terminal_off_rediscovery_due("scope-0".into(), 100, false));
+}
