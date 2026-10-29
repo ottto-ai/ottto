@@ -207,11 +207,12 @@ fn stamp_matching_header_inventory_never_decodes_archives() {
     let mut scan = discovered_scan(&f, state, 1);
     let mut inventory = scan.codex_join_inventory.take().unwrap();
     let (_, rows) = crate::local_resource_diagnostics::capture(|| {
-        while !inventory.step_with_archive(
+        while inventory.step_with_archive(
             &CodexTitleMetadata::default(),
             &mut scan.index,
             Some(&cache),
-        ) {}
+        ) != codex_file_join::HeaderStep::Complete
+        {}
     });
     assert_eq!(decodes(&rows), 0);
     assert!(inventory.complete);
@@ -226,11 +227,14 @@ fn stamp_matching_header_inventory_never_decodes_archives() {
     assert!(scan.index.archive_header(&f.0).is_none());
     let mut replaced = discovered_scan(&f, scan.index, 1);
     let inventory = replaced.codex_join_inventory.as_mut().unwrap();
-    assert!(inventory.step_with_archive(
-        &CodexTitleMetadata::default(),
-        &mut replaced.index,
-        Some(&cache)
-    ));
+    assert_eq!(
+        inventory.step_with_archive(
+            &CodexTitleMetadata::default(),
+            &mut replaced.index,
+            Some(&cache)
+        ),
+        codex_file_join::HeaderStep::Complete
+    );
     assert!(
         inventory.complete,
         "unacquired replacement cannot poison plain inventory"
