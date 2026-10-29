@@ -515,3 +515,48 @@ fn only_pending_sibling_resolves_to_another_owner_then_exactly_one_a1() {
         ArchiveDisposition::Acquired
     ));
 }
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "funded decoder needs validated heap layout"
+)]
+fn retained_archive_scope_mismatch_is_quiet_correction_residue_not_eviction_credit() {
+    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let key = local_index_key(&f.0);
+    let (mut index, first) = finish_selector(retained_archive_scan(
+        &f,
+        ScanIndex::default(),
+        cache.clone(),
+    ));
+    assert_eq!(first.snapshots.len(), 1);
+    assert!(cache.retained_checkpoint(&key).is_some());
+    let attempt = index.files[&key].archive.as_ref().unwrap().decode_attempts;
+    retry_due(&mut index, &key);
+    let mut scan = retained_archive_scan(&f, index, cache.clone());
+    scan.sampling.as_mut().unwrap().namespace = Scope("changed-interpretation".into());
+    let ((index, held), rows) =
+        crate::local_resource_diagnostics::capture(|| finish_selector(scan));
+    assert_eq!(decoded_archive_bytes(&rows), 0);
+    assert!(held.snapshots.is_empty());
+    assert_eq!(
+        index.files[&key].archive.as_ref().unwrap().decode_attempts,
+        attempt
+    );
+    assert!(matches!(
+        index.files[&key].archive.as_ref().unwrap().disposition,
+        ArchiveDisposition::Held {
+            cause: CodexZstCause::CorrectionUnapplied
+        }
+    ));
+    let ((_, held), rows) = crate::local_resource_diagnostics::capture(|| {
+        finish_selector(retained_archive_scan(&f, index, cache))
+    });
+    assert_eq!(decoded_archive_bytes(&rows), 0);
+    assert_eq!(
+        held.unreadable_path_count, 0,
+        "terminal custody uses PR A scoped residue"
+    );
+}
