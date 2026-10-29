@@ -951,6 +951,9 @@ not distinct sessions, decoded bytes or money. No path or session id is included
 | `CompressedGroupReadUnsupported` | Initial member, member swap and legacy tee |
 | `CompressedParentLedgerUnbound` | Parent identity without archive ledger binding |
 | `CompressedPhysicalOffsetUnsupported` | Physical acquisition, cursor and memo offsets |
+| `CompressedHeaderUnfunded` | Archive reaches the raw plain-header reader without decoder funding, including group-member header reads; no decoded header is returned |
+| `CompressedCompatibilityUnfunded` | Reserved main compatibility-reader funding refusal label; currently no emitter (the compatibility reader uses `CompressedCompatibilityUnsupported`) |
+| `decoder_refused_header_occupancy` | Paid archive decoder credit refused because optional plain header facts occupy the remaining budget; no credit, decoder or header reclamation on this refusal |
 | `CompressedAdmissionRefused` | Transient decoder reservation or singleton yield |
 | `CompressedDecodeFailed` | Invalid/truncated frame or checksum failure |
 | `CompressedOwnerUnproven` | Decoded owner does not prove logical rollout identity |
