@@ -269,11 +269,14 @@ hold) registers as one field plus its lines in `discovery_retention!`,
 Codex owed keys are candidates held by an incomplete header inventory or
 refused at a cursor start for want of reduction inputs (`Reduction`
 unreadable). They stay owed across the bounded retry and restarts until the
-committed index entry's size matches the file (checked at page start, so
-after upload acceptance, never at parse completion) or their absence is
-proved. They never hold a census open: a generation that closes while a key
-is still owed (a file still being written, an upload not yet acknowledged)
-hands it to the next one, counted as `carried`. A healthy traversal queues an
+committed index entry's size and mtime nanos match the file (checked at page
+start, so after upload acceptance, never at parse completion or by a
+same-size rewrite) or their absence is proved: only an unlisted key gone with
+ENOENT is removed; any other stat error keeps it owed, counted as
+`access_error`. They never hold a census open: a generation that closes, or a
+historical replay that resets the traversal, while a key is still owed (a file
+still being written, an upload not yet acknowledged) hands it to the next one,
+counted as `carried`. A healthy traversal queues an
 unmatched key again, so a failed upload is retried. While owed,
 unmoved evidence re-reads nothing until the traversal's bounded retry
 deadline, when they are queued once and the deadline re-arms;
@@ -282,7 +285,8 @@ passed deadline queued) and `inventory_bytes` (header inventory bytes read on
 those pages). On Codex pages, `counts.codex_owed` counts `held` (keys that
 became owed), `overflow` (past the 10,000-key bound a new key keeps only the
 window), `oversized` (an owed key over the size cap, kept observed and unread)
-`carried` (owed keys a closing generation handed on) and `dropped` (owed
+`carried` (owed keys a closing generation handed on), `access_error` (an
+owed key whose stat failed other than ENOENT, kept) and `dropped` (owed
 keys lost because no next generation started; an open gap that should stay
 zero). An overflow also raises its own
 local alarm, `codex_owed_overflow_alarm` with `overflow=[this call, process
@@ -290,7 +294,12 @@ total]`, apart from `held` and the drained counts. A red restart of a
 partially settled sweep starts the next generation in the same page for owed
 keys only; #867's generation marker then moves once.
 `counts.codex_owed_released` counts `caught_up` and `removed`. All three are
-drained like `line_delivery_unselected`.
+drained like `line_delivery_unselected`. The gauge `counts.codex_owed_gauge`
+reports `count` (keys owed at the last Codex walk) and `oldest_age_s` (seconds
+this process has continuously seen a non-empty owed set: a process-local lower
+bound, since no owe time is persisted). Past 24 hours it raises its own local
+alarm, `codex_owed_age_alarm` with `count` and `oldest_age_s`, at most
+hourly.
 
 `counts.line_delivery_unselected` counts discovery skip decisions for the
 page's source: `age` (outside the backfill window, not held for verification

@@ -3154,6 +3154,71 @@ pub(super) mod tests {
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
+    fn same_size_rewrite_is_not_a_caught_up_release() {
+        // C1: the release proof is the committed size and mtime nanos.
+        let (root, held_index, unreadable, new, _) = held_behind_unreadable_header();
+        fs::remove_file(&unreadable).unwrap();
+        let (index, page) = retained_page(&root, held_index, &[]);
+        assert_eq!(page.scanned_file_count, 1, "premise: caught up by a parse");
+        // Rewritten in place after that parse: same size, new mtime.
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        let file = fs::File::options().write(true).open(&new).unwrap();
+        file.set_modified(later).unwrap();
+        crate::local_resource_diagnostics::take_codex_owed_for_test();
+        let (index, _) = retained_page(&root, index, &[]);
+        // Before round 5 the size alone released it as caught up.
+        let key = local_index_key(&new);
+        assert!(inventory_hold(&index).is_some_and(|hold| hold.owed.contains(&key)));
+        let (_, released) = crate::local_resource_diagnostics::take_codex_owed_for_test();
+        assert_eq!(released.get("caught_up"), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn owed_key_stat_errors_keep_it_owed_and_only_enoent_removes_it() {
+        // C4: ENOENT of an unlisted key is a removal; any other stat error
+        // (here ENOTDIR) keeps it owed, counted as `access_error`.
+        let (root, mut held_index, _, new, _) = held_behind_unreadable_header();
+        let blocked = format!("{}/not-a-directory", local_index_key(&new));
+        let gone = local_index_key(&root.join("sessions/gone.jsonl"));
+        let traversal = held_index.traversal.as_mut().unwrap();
+        assert!(
+            traversal.pending_directories.is_empty(),
+            "premise: release runs"
+        );
+        let hold = traversal.residue.codex_inventory_hold.as_mut().unwrap();
+        hold.owed.extend([blocked.clone(), gone.clone()]);
+        crate::local_resource_diagnostics::take_codex_owed_for_test();
+        release_codex_inventory_hold(
+            SnapshotSource::Codex,
+            traversal,
+            &held_index.files,
+            RETAINED_AT,
+        );
+        let hold = inventory_hold(&held_index).unwrap();
+        // Before round 5 any stat failure released the key as removed.
+        assert!(hold.owed.contains(&blocked));
+        assert!(!hold.owed.contains(&gone));
+        let (owed, released) = crate::local_resource_diagnostics::take_codex_owed_for_test();
+        assert_eq!(owed.get("access_error"), Some(&1));
+        assert_eq!(released.get("removed"), Some(&1));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn historical_replay_carries_the_owed_set() {
+        // C4: replay resets the traversal; owed keys ride the fresh one.
+        let (root, mut held_index, _, new, _) = held_behind_unreadable_header();
+        let key = local_index_key(&new);
+        assert!(held_index.prepare_historical_replay("owed-replay".into()));
+        // Before round 5 the replay dropped the traversal and the owed set.
+        assert!(inventory_hold(&held_index).is_some_and(|hold| hold.owed.contains(&key)));
+        crate::local_resource_diagnostics::take_codex_owed_for_test();
+        let (index, _) = retained_page(&root, held_index, &[]);
+        assert!(inventory_hold(&index).is_some_and(|hold| hold.owed.contains(&key)));
+        let (owed, _) = crate::local_resource_diagnostics::take_codex_owed_for_test();
+        assert_eq!(owed.get("dropped"), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn retired_sources_keep_protected_history_and_quiet_retry_is_idempotent() {
         let root = native_join_fixture_root(true);
         let (mut working, mut result) = scan(&root, ScanIndex::default(), 3);

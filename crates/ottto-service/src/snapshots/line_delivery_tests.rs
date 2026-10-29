@@ -2239,3 +2239,33 @@ fn codex_owed_overflow_raises_its_own_alarm() {
         "not counted as held"
     );
 }
+
+/// C3: the owed gauge reports the count and the oldest owed age; past 24 h it
+/// raises its own alarm, at most hourly; the clock restarts once none is owed.
+#[test]
+fn codex_owed_gauge_reports_age_and_alarms_past_a_day() {
+    use crate::local_resource_diagnostics::{codex_owed_gauge, take_codex_owed_gauge_for_test};
+    let t = 1_000_000;
+    let ((), records) = capture(|| {
+        codex_owed_gauge(3, t);
+        codex_owed_gauge(3, t + 86_401);
+        codex_owed_gauge(2, t + 86_402);
+    });
+    let alarms = records
+        .iter()
+        .filter(|record| record["stage"] == "codex_owed_age_alarm")
+        .collect::<Vec<_>>();
+    assert_eq!(alarms.len(), 1, "at most hourly: {records:?}");
+    assert_eq!(alarms[0]["counts"]["oldest_age_s"], 86_401);
+    let gauge = take_codex_owed_gauge_for_test();
+    assert_eq!(
+        gauge,
+        BTreeMap::from([("count", 2), ("oldest_age_s", 86_402)])
+    );
+    codex_owed_gauge(0, t + 90_000);
+    codex_owed_gauge(1, t + 90_001);
+    assert_eq!(
+        take_codex_owed_gauge_for_test(),
+        BTreeMap::from([("count", 1)])
+    );
+}

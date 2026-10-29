@@ -7,7 +7,7 @@ use crate::local_resource_diagnostics::claude_absence::Parent;
 use crate::local_resource_diagnostics::claude_contract;
 use crate::local_resource_diagnostics::claude_reread::IgnoredVeto;
 use crate::local_resource_diagnostics::{
-    codex_owed_event, line_delivery_unselected, CodexOwedEvent, UnselectedReason,
+    codex_owed_event, codex_owed_gauge, line_delivery_unselected, CodexOwedEvent, UnselectedReason,
 };
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
@@ -2727,12 +2727,10 @@ const MAX_CODEX_INVENTORY_HOLD_KEYS: usize = MAX_BACKFILL_FILES_PER_SOURCE;
 /// is fine: an unreadable first record may belong to any of them. Those
 /// candidates leave the traversal queue, so without this record they waited
 /// for their next write or the next walk. They are queued again once the
-/// recorded evidence moves or the bounded retry falls due (see
-/// `release_codex_inventory_hold`), and pass the unchanged inventory and
-/// ownership gates like any other candidate. While the evidence stays put
-/// and no retry is due nothing is re-read. `owed` is a `DiscoveryRetention`
-/// source: it outlives the walk that recorded it and leaves only by an
-/// accepted catch-up (the committed size matches the file) or proven removal.
+/// recorded evidence moves or the bounded retry falls due, like any other
+/// candidate (`release_codex_inventory_hold`). `owed` is a
+/// `DiscoveryRetention` source; it leaves only by an ACK'd catch-up or a
+/// proved removal.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 struct CodexInventoryHold {
@@ -2748,6 +2746,16 @@ struct CodexInventoryHold {
     outside_roster: BTreeMap<String, Option<String>>,
     /// The walk still had directories to visit. Released once it has none.
     awaiting_directories: bool,
+}
+impl CodexInventoryHold {
+    /// The keys stay owed; their spent wake evidence goes.
+    fn owed_only(self) -> Self {
+        let owed = self.owed;
+        Self {
+            owed,
+            ..Self::default()
+        }
+    }
 }
 
 /// Durable record of the residue disclosed by the last census that completed
@@ -7610,11 +7618,7 @@ impl SourceScanResult {
     }
     pub(crate) fn finish_codex_capture_boundary(&self, index: &mut ScanIndex) {
         if self.census_complete {
-            // Owed Codex keys ride the next generation this page started.
-            let owed = |traversal: &ScanTraversalCheckpoint| {
-                traversal.residue.codex_inventory_hold.is_some()
-            };
-            index.traversal = index.traversal.take().filter(owed);
+            index.keep_owed_traversal();
             index.resume_after_path = None;
             index.resume_upper_bound_path = None;
             index.resume_census_window_end = None;
@@ -26133,6 +26137,11 @@ impl OwnedSourceScan {
             traversal.residue.codex_inventory_hold = codex_hold;
             codex_owed_woken =
                 release_codex_inventory_hold(source, traversal, &index.files, collected_at) > 0;
+            if source == SnapshotSource::Codex {
+                let hold = traversal.residue.codex_inventory_hold.as_ref();
+                let now = rfc3339_unix_seconds(collected_at).unwrap_or_default();
+                codex_owed_gauge(hold.map_or(0, |hold| hold.owed.len() as u64), now);
+            }
         }
         if source == SnapshotSource::Codex {
             // L-SB: an index from before blocked-set attribution moves its
@@ -30185,13 +30194,11 @@ impl OwnedSourceScan {
                         traversal.residue.index_keys.remove(index_key);
                     }
                     release_removed_codex_owed(traversal, &census.removed_index_keys);
-                    if let Some(inventory) = codex_join_inventory
+                    let bytes = codex_join_inventory
                         .as_ref()
-                        .filter(|_| census.codex_owed_woken)
-                    {
-                        let bytes = inventory.read_bytes as u64;
-                        codex_owed_event(CodexOwedEvent::WakeInventoryBytes, bytes);
-                    }
+                        .map_or(0, |i| i.read_bytes as u64);
+                    let bytes = bytes * u64::from(census.codex_owed_woken);
+                    codex_owed_event(CodexOwedEvent::WakeInventoryBytes, bytes);
                     if let Some(inventory) = codex_join_inventory
                         .as_ref()
                         .filter(|inventory| !inventory.complete)
@@ -30794,11 +30801,8 @@ impl OwnedSourceScan {
                 // Only a settled close starts the next generation in this
                 // page for its hints. A partially settled sweep (including a
                 // decode hold just marked) otherwise keeps its marker for the
-                // clean follow-up the next page starts, and that walk re-reads
-                // the stale files. Owed Codex keys start that follow-up here
-                // instead, so they ride it rather than being dropped; only they
-                // are carried, and #867's generation marker moves once, to this
-                // start's census boundary (`causes.page` on the next page).
+                // clean follow-up the next page starts. Owed Codex keys start
+                // it here and ride it (only they); #867's marker moves once.
                 let settled = !index.bounded_sweep_had_unsettled_upload;
                 if (settled && !carried_next_generation.is_empty()) || carried_codex_owed.is_some()
                 {
@@ -41280,10 +41284,7 @@ fn ensure_bounded_traversal(
         .traversal
         .as_mut()
         .and_then(|traversal| traversal.residue.codex_inventory_hold.take())
-        .map(|hold| CodexInventoryHold {
-            owed: hold.owed,
-            ..CodexInventoryHold::default()
-        });
+        .map(CodexInventoryHold::owed_only);
     index.traversal = Some(ScanTraversalCheckpoint {
         context_fingerprint,
         census_window_end: collected_at.to_string(),
@@ -41729,29 +41730,20 @@ fn release_removed_codex_owed(traversal: &mut ScanTraversalCheckpoint, removed: 
 fn close_codex_owed(traversal: Option<&mut ScanTraversalCheckpoint>) -> Option<CodexInventoryHold> {
     let hold = traversal?.residue.codex_inventory_hold.take()?;
     codex_owed_event(CodexOwedEvent::Carried, hold.owed.len() as u64);
-    Some(CodexInventoryHold {
-        owed: hold.owed,
-        ..CodexInventoryHold::default()
-    })
+    Some(hold.owed_only())
 }
 
-/// Queue the owed candidates of a `CodexInventoryHold` again once its
-/// evidence has moved: a refused first record changed, was replaced, is gone
-/// or left the roster; a held candidate outside the roster joined it or is
-/// gone; or the walk finished its directories. The check costs one `lstat`
-/// per recorded path. Unmoved evidence queues nothing until the traversal's
-/// bounded retry deadline passes; that retry is charged to the deadline,
-/// which the page re-arms with its saturating hourly backoff. So a hold that
-/// cannot be resolved re-reads no transcript body, and an idle file whose
-/// inputs came back is still caught up. Only candidates still in the roster
-/// are queued, at the back, after any watcher hints, and they meet the same
-/// inventory, ownership, capture, send and checkpoint gates as any
-/// candidate. If the evidence still does not prove the page, it is held and
-/// recorded again. A key stays owed until the committed index entry's size
-/// matches the file, so after upload acceptance, not after its parse; a
-/// healthy traversal queues an unmatched key again (a failed upload's
-/// retry). One the finished walk did not list and that is gone is released
-/// as removed. Returns the keys a passed deadline queued.
+/// Queue the owed candidates of a `CodexInventoryHold` again (roster members
+/// only, at the back, through every ordinary gate) once its evidence moved:
+/// a refused first record changed or left the roster, a held candidate
+/// outside the roster joined it, or the walk finished. One `lstat` per path.
+/// Unmoved evidence waits for the bounded retry deadline (hourly backoff), so
+/// an unresolvable hold re-reads no body and a file whose inputs came back is
+/// still caught up. A key is released when the committed (ACK'd) size and
+/// mtime nanos match the file, never at parse or by a same-size rewrite; a
+/// healthy traversal re-queues an unmatched one (a failed upload's retry).
+/// An unlisted key gone with ENOENT is removed; any other stat error keeps it
+/// owed (`access_error`). Returns the keys a passed deadline queued.
 fn release_codex_inventory_hold(
     source: SnapshotSource,
     traversal: &mut ScanTraversalCheckpoint,
@@ -41784,21 +41776,25 @@ fn release_codex_inventory_hold(
             .outside_roster
             .iter()
             .any(|(key, witness)| roster.contains(key) || moved(key, witness));
-    let mut removed = 0;
+    let mut counts = [0; 3];
     hold.owed.retain(|key| {
-        let gone = !roster.contains(key) && codex_file_join::path_witness(Path::new(key)).is_none();
-        removed += u64::from(gone);
-        !gone
+        let (event, release) = match fs::symlink_metadata(key) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (0, !roster.contains(key)),
+            Err(_) => (2, true),
+            Ok(stat) => (1, {
+                let entry = files
+                    .get(key)
+                    .map(|e| (e.size_bytes, e.modified_unix_nanos));
+                stat.modified()
+                    .is_ok_and(|at| entry == Some((stat.len(), unix_nanos(at))))
+            }),
+        };
+        counts[event] += u64::from(release);
+        !release || event == 2
     });
-    codex_owed_event(CodexOwedEvent::Removed, removed);
-    let mut caught_up = 0;
-    hold.owed.retain(|key| {
-        let on_disk = fs::symlink_metadata(key).map(|metadata| metadata.len());
-        let accepted = on_disk.is_ok_and(|len| files.get(key).is_some_and(|e| e.size_bytes == len));
-        caught_up += u64::from(accepted);
-        !accepted
-    });
-    codex_owed_event(CodexOwedEvent::CaughtUp, caught_up);
+    codex_owed_event(CodexOwedEvent::Removed, counts[0]);
+    codex_owed_event(CodexOwedEvent::CaughtUp, counts[1]);
+    codex_owed_event(CodexOwedEvent::AccessError, counts[2]);
     let mut woken = 0;
     if released || !traversal.counts.has_errors() {
         if retry_due {
@@ -41834,11 +41830,9 @@ fn release_codex_inventory_hold(
             woken += u64::from(retry_due);
         }
         codex_owed_event(CodexOwedEvent::WakeEvents, woken);
-        // The spent evidence goes; the keys stay owed.
         hold = CodexInventoryHold {
-            owed: hold.owed,
             outside_roster: unlisted,
-            ..CodexInventoryHold::default()
+            ..hold.owed_only()
         };
     }
     if !hold.owed.is_empty() {
@@ -43960,16 +43954,21 @@ impl ScanIndex {
             .filter(held_family_scope_has_writer_shape)
     }
 
+    /// Drop the traversal unless it owes Codex keys: those ride the next
+    /// one, which `ensure_bounded_traversal` starts and carries them into.
+    fn keep_owed_traversal(&mut self) {
+        let owed = |t: &ScanTraversalCheckpoint| t.residue.codex_inventory_hold.is_some();
+        self.traversal = self.traversal.take().filter(owed);
+    }
+
     /// Re-open discovery after a terminal unhealthy traversal. One that owes
     /// Codex keys stays, with its bounded retry due now: the caller marks the
     /// sweep unsettled, so the next page's walk replaces it and carries them
     /// (`ensure_bounded_traversal`), where dropping it would lose them.
     fn reopen_terminal_traversal(&mut self) {
-        match self.traversal.as_mut() {
-            Some(traversal) if traversal.residue.codex_inventory_hold.is_some() => {
-                traversal.unhealthy_retry_not_before_unix_seconds = None;
-            }
-            _ => self.traversal = None,
+        self.keep_owed_traversal();
+        if let Some(traversal) = self.traversal.as_mut() {
+            traversal.unhealthy_retry_not_before_unix_seconds = None;
         }
     }
 
@@ -45953,7 +45952,7 @@ impl ScanIndex {
         self.bounded_sweep_had_unsettled_upload = false;
         self.bounded_sweep_unsettled_causes = 0;
         self.claude_full_rearm_progress.held_family_roots = None;
-        self.traversal = None;
+        self.keep_owed_traversal();
         self.scan_residue_witness = None;
         self.confirmed_empty_files.clear();
         self.file_snapshot_fingerprints.clear();

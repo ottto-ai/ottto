@@ -13822,6 +13822,12 @@ fn ownership_disclosure_replays_preserve_cause_and_group_strict_uses_group_bucke
 
 // ---- E3: Codex owed keys after a cursor-start InputsUnavailable (N1) ----
 
+thread_local! {
+    /// The last `owed_page`'s full reads by reason (`FullReason::slot`).
+    static OWED_FULL_REASONS: std::cell::Cell<[usize; 11]> =
+        const { std::cell::Cell::new([0; 11]) };
+}
+
 /// One page with a 7-day request, finalized like `page_selections`.
 fn owed_page(
     fixture: &ScanRoot,
@@ -13847,6 +13853,7 @@ fn owed_page(
     loop {
         if let Some(context) = scan.sampling.as_ref() {
             modes = (context.full_files, context.tail_files);
+            OWED_FULL_REASONS.with(|reasons| reasons.set(context.full_reasons));
         }
         match scan.step(None) {
             OwnedSourceScanStep::Pending(next) => scan = next,
@@ -14105,6 +14112,95 @@ fn owed_key_on_a_growing_file_does_not_hold_the_census() {
         assert_eq!(owed_counts.get("dropped"), None);
         assert_eq!(owed_counts.get("carried"), Some(&(completed as u64)));
         assert_eq!(released, BTreeMap::from([("caught_up", 1)]));
+    });
+}
+
+/// Round 5 (C6): a committed large rollout grows while its reduction inputs
+/// are unavailable, so it is owed; then `lose` happens before its release.
+/// The catch-up must be one Tail (never a Full outside A1/A2), the release
+/// follows it, and nothing is dropped.
+fn owed_release_after(lose: impl Fn(ScanIndex, &mut Arc<SharedCache>) -> ScanIndex) {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(80);
+    let key = local_index_key(&fixture.file(SESSION));
+    let owed = |index: &ScanIndex| {
+        index
+            .traversal
+            .as_ref()
+            .and_then(|traversal| traversal.residue.codex_inventory_hold.as_ref())
+            .is_some_and(|hold| hold.owed.contains(&key))
+    };
+    let mut cache = Arc::new(SharedCache::default());
+    let t0 = std::time::Instant::now();
+    let page = |index: ScanIndex, cache: &Arc<SharedCache>, days: u64, step: u64| {
+        with_pace_clock(
+            Some(t0 + std::time::Duration::from_secs(days * 86_400)),
+            false,
+            || owed_page(&fixture, index, cache, &collected_at(step)),
+        )
+    };
+    let refuse = |on: bool| super::super::TEST_REFUSE_REDUCTION_DEPENDENCIES.with(|v| v.set(on));
+    with_test_limits(2048, 1024, 64, || {
+        let mut index = ScanIndex::default();
+        for step in 0..64 {
+            index = page(index, &cache, 0, step).0;
+            if counter(&cache, |c| c.jobs_certified) == 1 {
+                break;
+            }
+        }
+        crate::local_resource_diagnostics::take_codex_owed_for_test();
+        refuse(true);
+        fixture.append(SESSION, &token_line(81));
+        let (index, _, _) = page(index, &cache, 1, 100);
+        refuse(false);
+        assert!(owed(&index), "premise: owed");
+        let index = lose(index, &mut cache);
+        assert!(owed(&index), "the owed set survives");
+        // Past the retry deadline the wake queues it once.
+        let (index, tail, modes) = page(index, &cache, 2, 1_000);
+        let reasons = OWED_FULL_REASONS.with(std::cell::Cell::get);
+        assert_eq!((modes, reasons), ((0, 1), [0; 11]), "one Tail, no Full");
+        let emitted = tail.snapshots.iter();
+        assert_eq!(
+            emitted.filter(|s| s.source_session_id == SESSION).count(),
+            1
+        );
+        assert!(owed(&index), "owed until the next page finds it accepted");
+        let (index, _, modes) = page(index, &cache, 3, 1_060);
+        assert_eq!(modes, (0, 0));
+        assert!(!owed(&index));
+        let (owed_counts, released) = crate::local_resource_diagnostics::take_codex_owed_for_test();
+        assert_eq!(
+            owed_counts,
+            BTreeMap::from([("held", 1)]),
+            "nothing dropped"
+        );
+        assert_eq!(released, BTreeMap::from([("caught_up", 1)]));
+    });
+}
+
+/// C6, restart before release: the owed set survives a save and load of the
+/// index (the retained checkpoint is the daemon's, kept here).
+#[test]
+fn owed_set_survives_save_and_load_before_release() {
+    owed_release_after(|index, _| {
+        serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap()
+    });
+}
+
+/// C6 / DoD 12, RAM eviction between refusal and release. Strict: the
+/// catch-up must not be a Full (StateMissing is not an allowed cause). Today
+/// the shared acquisition gate reads it Full(StateMissing): an acquisition
+/// binding defect owned by E1's cause gate / R1 restore, not by E3's release
+/// (which only queues the key). Kept strict, never weakened.
+#[test]
+#[ignore = "acquisition binding defect: Full(StateMissing) after RAM eviction (E1 cause gate / R1)"]
+fn owed_release_after_ram_eviction_is_not_a_full() {
+    owed_release_after(|index, cache| {
+        cache.clear();
+        index
     });
 }
 
