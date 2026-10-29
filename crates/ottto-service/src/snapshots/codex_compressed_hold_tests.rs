@@ -921,6 +921,9 @@ fn scratch_overflow_serves_unheld_plain_in_one_page_and_discloses_pending_custod
         .iter()
         .any(|r| r["stage"] == "durable_tail_alarm"
             && r["counts"]["custody_overflow"]["events"] == 1));
+    assert!(rows
+        .iter()
+        .all(|r| r["counts"]["custody_group_restart_full"].is_null()));
     let saved = root.join("index.json");
     index.save(&saved).unwrap();
     let reloaded = ScanIndex::load(&saved).unwrap();
