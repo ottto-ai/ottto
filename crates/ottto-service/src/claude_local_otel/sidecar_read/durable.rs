@@ -284,14 +284,13 @@ impl Reader {
     fn classify_selected(&mut self, sessions: &BTreeSet<String>) {
         let before = self.counts;
         for session in sessions {
-            if self.newer.contains(session) {
-                let _ = self.failed_restore(session, RestoreFailure::NewerFormat);
-            } else if !self.entries.contains_key(session)
-                && self.probed.insert(session.clone())
-                && matches!(
-                    self.store.sidecar_refusal(&self.binding(session).key),
-                    Some(store::Refusal::Unknown | store::Refusal::NewerFormat)
-                )
+            if self.newer.contains(session)
+                || (!self.entries.contains_key(session)
+                    && self.probed.insert(session.clone())
+                    && matches!(
+                        self.store.sidecar_refusal(&self.binding(session).key),
+                        Some(store::Refusal::Unknown | store::Refusal::NewerFormat)
+                    ))
             {
                 let _ = self.failed_restore(session, RestoreFailure::NewerFormat);
             }
