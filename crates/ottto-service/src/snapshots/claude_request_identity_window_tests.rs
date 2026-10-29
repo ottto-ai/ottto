@@ -214,6 +214,24 @@ fn sticky_budget_preserves_accepted_old_bucket_and_refuses_new_when_full() {
             .status,
         identity::CURRENT_UNKNOWN
     );
+    let display = second.claude_account_display.as_ref().unwrap();
+    assert_eq!(display.current.status, identity::CURRENT_UNKNOWN);
+    assert!(display.history.iter().all(|entry| !entry.current));
+    assert_eq!(
+        display
+            .history
+            .iter()
+            .filter(|entry| entry.account_identifier_hash.is_some())
+            .map(|entry| entry.request_count)
+            .sum::<u64>(),
+        second
+            .usage_buckets
+            .iter()
+            .filter(|bucket| sticky_tagged(&bucket.model_usage[0]))
+            .map(|bucket| bucket.model_usage[0].request_count)
+            .sum::<u64>(),
+        "retained rows still prove their named account history",
+    );
     sticky_assert_reconciled(&second);
     let (mut again, proof) = sticky_session(24 * 24 + 1);
     identity::apply_with_accepted_for_test(&mut again, &proof, &accepted).unwrap();
@@ -622,6 +640,70 @@ fn sticky_individually_over_parts_bucket_preserves_joint_accepted_money_proof() 
     sticky_assert_joint_pair_survives(true);
 }
 
+fn sticky_pad_to_bytes(clean: &SnapshotItem, target: usize) -> (SnapshotItem, Vec<Contribution>) {
+    let mut filler = clean.usage_buckets[0].model_usage[0].clone();
+    filler.model = "claude-filler".into();
+    filler.input_tokens = 1;
+    filler.request_count = 1;
+    let start = OffsetDateTime::parse("2026-01-01T00:00:00Z", &Rfc3339).unwrap();
+    let with_fillers = |count: usize| {
+        let mut candidate = clean.clone();
+        let mut top = filler.clone();
+        top.input_tokens = count as u64;
+        top.request_count = count as u64;
+        candidate.model_usage.push(top);
+        candidate.input_tokens += count as u64;
+        candidate.request_count += count as u64;
+        for hour in 0..count {
+            candidate.usage_buckets.push(SnapshotUsageBucket {
+                bucket_start: (start + time::Duration::hours(hour as i64))
+                    .format(&Rfc3339)
+                    .unwrap(),
+                model_usage: vec![filler.clone()],
+                first_activity_at: None,
+                last_activity_at: None,
+            });
+        }
+        candidate
+    };
+    // A bounded binary search pads with valid untagged hourly rows. Three
+    // bounded display labels fill the final sub-bucket byte gap exactly.
+    let (mut low, mut high) = (1usize, 5_000usize - clean.usage_buckets.len());
+    while low < high {
+        let middle = (low + high).div_ceil(2);
+        if identity::item_bytes(&with_fillers(middle)) <= target {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    let mut padded = with_fillers(low);
+    let mut gap = target - identity::item_bytes(&padded);
+    for label in [
+        &mut padded.session_display_name,
+        &mut padded.workspace_display_label,
+        &mut padded.repository_label,
+    ] {
+        let take = gap.min(254);
+        label.as_mut().unwrap().push_str(&"x".repeat(take));
+        gap -= take;
+    }
+    assert_eq!(gap, 0);
+    assert_eq!(identity::item_bytes(&padded), target);
+    let filler_proof = padded
+        .usage_buckets
+        .iter()
+        .skip(clean.usage_buckets.len())
+        .map(|bucket| Contribution {
+            bucket_start: bucket.bucket_start.clone(),
+            row_key: row_key_from_model_usage(&filler),
+            usage: holder_usage(&filler, None),
+            identity: RequestIdentity::Missing,
+        })
+        .collect();
+    (padded, filler_proof)
+}
+
 fn sticky_assert_collective_byte_pair(newer_bad: bool, refusal_gap: bool) {
     let bad_hour = if newer_bad {
         "2026-09-01T12:00:00Z"
@@ -742,65 +824,10 @@ fn sticky_assert_collective_byte_pair(newer_bad: bool, refusal_gap: bool) {
         (pair_extra + single_extra) / 2
     };
     let target = identity::MAX_ITEM_BYTES - headroom;
-    let mut filler = clean.usage_buckets[0].model_usage[0].clone();
-    filler.model = "claude-filler".into();
-    filler.input_tokens = 1;
-    filler.request_count = 1;
-    let start = OffsetDateTime::parse("2026-01-01T00:00:00Z", &Rfc3339).unwrap();
-    let with_fillers = |count: usize| {
-        let mut candidate = clean.clone();
-        let mut top = filler.clone();
-        top.input_tokens = count as u64;
-        top.request_count = count as u64;
-        candidate.model_usage.push(top);
-        candidate.input_tokens += count as u64;
-        candidate.request_count += count as u64;
-        for hour in 0..count {
-            candidate.usage_buckets.push(SnapshotUsageBucket {
-                bucket_start: (start + time::Duration::hours(hour as i64))
-                    .format(&Rfc3339)
-                    .unwrap(),
-                model_usage: vec![filler.clone()],
-                first_activity_at: None,
-                last_activity_at: None,
-            });
-        }
-        candidate
-    };
-    // A bounded binary search pads with valid untagged hourly rows. Three
-    // bounded display labels fill the final sub-bucket byte gap exactly.
-    let (mut low, mut high) = (1usize, 4_997usize);
-    while low < high {
-        let middle = (low + high).div_ceil(2);
-        if identity::item_bytes(&with_fillers(middle)) <= target {
-            low = middle;
-        } else {
-            high = middle - 1;
-        }
-    }
-    let mut padded = with_fillers(low);
-    let mut gap = target - identity::item_bytes(&padded);
-    for label in [
-        &mut padded.session_display_name,
-        &mut padded.workspace_display_label,
-        &mut padded.repository_label,
-    ] {
-        let take = gap.min(254);
-        label.as_mut().unwrap().push_str(&"x".repeat(take));
-        gap -= take;
-    }
-    assert_eq!(gap, 0);
-    assert_eq!(identity::item_bytes(&padded), target);
+    let (mut padded, filler_proof) = sticky_pad_to_bytes(&clean, target);
     assert!(target + pair_extra <= identity::MAX_ITEM_BYTES);
     assert!(target + single_extra > identity::MAX_ITEM_BYTES);
-    for bucket in padded.usage_buckets.iter().skip(3) {
-        proof.push(Contribution {
-            bucket_start: bucket.bucket_start.clone(),
-            row_key: row_key_from_model_usage(&filler),
-            usage: holder_usage(&filler, None),
-            identity: RequestIdentity::Missing,
-        });
-    }
+    proof.extend(filler_proof);
     identity::apply_with_accepted_for_test(&mut padded, &proof, &accepted).unwrap();
     let bad_index = if newer_bad { 2 } else { 0 };
     for (index, bucket) in padded.usage_buckets.iter().take(3).enumerate() {
@@ -809,10 +836,7 @@ fn sticky_assert_collective_byte_pair(newer_bad: bool, refusal_gap: bool) {
             .iter()
             .all(|row| sticky_tagged(row) == (index != bad_index)));
     }
-    assert_eq!(
-        padded.request_identity_refusals,
-        if newer_bad { 2 } else { 1 }
-    );
+    assert_eq!(padded.request_identity_refusals, bad_rows);
     sticky_assert_reconciled(&padded);
 }
 
@@ -828,4 +852,89 @@ fn sticky_byte_cap_keeps_joint_accepted_pair_when_open_bucket_metadata_cannot_fi
 #[test]
 fn sticky_byte_cap_charges_unavoidable_refusal_metadata_before_open_priority() {
     sticky_assert_collective_byte_pair(true, true);
+}
+
+#[test]
+fn sticky_already_refused_rows_cannot_inflate_the_bound_and_evict_a_fitting_open_bucket() {
+    let mut requests = Vec::new();
+    // Nine rows already carry a refusal and a proved share. Removing their
+    // tags must not turn nine mandatory refusals into a fictitious tenth.
+    for at in [
+        "2026-09-01T00:00:00Z",
+        "2026-09-01T01:00:00Z",
+        "2026-09-01T02:00:00Z",
+        "2026-09-01T03:00:00Z",
+        "2026-09-01T04:00:00Z",
+        "2026-09-01T05:00:00Z",
+        "2026-09-01T06:00:00Z",
+        "2026-09-01T07:00:00Z",
+        "2026-09-01T08:00:00Z",
+    ] {
+        requests.push(display_request(
+            Some("pro"),
+            at,
+            1,
+            login_key(OWNER_A),
+            Some(at),
+        ));
+        requests.push(display_request(
+            Some("pro"),
+            at,
+            1,
+            RequestIdentity::Refused(Refusal::Pending),
+            Some(at),
+        ));
+    }
+    requests.push(display_request(
+        Some("max"),
+        HOUR_10,
+        1,
+        login_key(D64),
+        Some(HOUR_10),
+    ));
+    let (mut item, timed) = display_item(&requests);
+    item.collected_at = "2026-09-01T10:05:00Z".into();
+    item.input_tokens = 19;
+    item.request_count = 19;
+    item.output_tokens = 0;
+    item.cache_read_tokens = 0;
+    item.cache_creation_5m_tokens = 0;
+    item.cache_creation_1h_tokens = 0;
+    item.reasoning_output_tokens = 0;
+    item.unattributed_total_tokens = 0;
+    item.cost = None;
+    item.session_display_name = Some("x".into());
+    item.workspace_display_label = Some("x".into());
+    item.repository_label = Some("x".into());
+    let mut proof = timed.into_iter().map(|(c, _)| c).collect::<Vec<_>>();
+    let mut accepted = identity::AcceptedBuckets::default();
+    identity::apply_with_accepted_for_test(&mut item, &proof, &accepted).unwrap();
+    accepted.record(&serde_json::to_value(&item).unwrap());
+    let mut clean = stripped(&item);
+    clean.provenance.collector = identity::COLLECTOR.into();
+    let mut open_only = clean.clone();
+    let mut open_proof = proof.clone();
+    for c in open_proof.iter_mut().take(18) {
+        if matches!(c.identity, RequestIdentity::Tagged(_)) {
+            c.identity = RequestIdentity::Missing;
+        }
+    }
+    identity::apply_with_accepted_for_test(
+        &mut open_only,
+        &open_proof,
+        &identity::AcceptedBuckets::default(),
+    )
+    .unwrap();
+    assert_eq!(open_only.request_identity_refusals, 9);
+    let extra = identity::item_bytes(&open_only) - identity::item_bytes(&clean);
+    let (mut padded, filler_proof) = sticky_pad_to_bytes(&clean, identity::MAX_ITEM_BYTES - extra);
+    proof.extend(filler_proof);
+    identity::apply_with_accepted_for_test(&mut padded, &proof, &accepted).unwrap();
+    assert!(sticky_tagged(&padded.usage_buckets[9].model_usage[0]));
+    assert!(padded.usage_buckets[..9]
+        .iter()
+        .all(|bucket| !sticky_tagged(&bucket.model_usage[0])));
+    assert_eq!(padded.request_identity_refusals, 9);
+    assert_eq!(identity::item_bytes(&padded), identity::MAX_ITEM_BYTES);
+    sticky_assert_reconciled(&padded);
 }

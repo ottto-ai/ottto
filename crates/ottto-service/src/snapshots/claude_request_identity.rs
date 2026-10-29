@@ -992,18 +992,11 @@ fn apply_grouped_with_accepted(
                 }
             }
         }
-        let latest_kept = visible.latest.ties.iter().all(|(bucket, row, key)| {
-            key.as_ref().is_some_and(|key| {
-                visible
-                    .get(bucket, row)
-                    .is_some_and(|group| group.by_key.contains_key(&Some(key.clone())))
-            })
-        });
         item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
-        item.claude_account_display = Some(Box::new(account_display(
-            &visible,
-            visible.unowned_request || !latest_kept,
-        )));
+        // account_display checks the newest request against the filtered rows.
+        // Withholding only that request must not anonymize retained history.
+        item.claude_account_display =
+            Some(Box::new(account_display(&visible, visible.unowned_request)));
         return Ok(Tagged::Sent {
             refusals: item.request_identity_refusals,
         });
