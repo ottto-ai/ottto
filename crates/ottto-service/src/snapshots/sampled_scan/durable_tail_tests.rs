@@ -4321,7 +4321,7 @@ fn a0h_scan(
 }
 
 #[test]
-fn a0h_pacing_is_funded_nonrenewing_and_overflow_reads() {
+fn a0h_pacing_is_funded_nonrenewing_and_evicts_oldest() {
     let root = crate::test_scratch::private_dir("a0h-pace");
     let path = root.join("t.jsonl");
     std::fs::write(&path, b"{}\n{}\n").unwrap();
@@ -4338,7 +4338,7 @@ fn a0h_pacing_is_funded_nonrenewing_and_overflow_reads() {
     }
     assert!(!cache.retail_full("k", &file, 3, now - std::time::Duration::from_secs(1)));
     assert!(cache.retail_full("k", &file, 3, now + std::time::Duration::from_secs(21600)));
-    let later = now + std::time::Duration::from_secs(21600);
+    let later = now + std::time::Duration::from_secs(21601);
     for n in 1..2 * store::MAX_RECORDS {
         assert!(cache.retail_full(&format!("k{n}"), &file, 3, later));
     }
@@ -4351,10 +4351,20 @@ fn a0h_pacing_is_funded_nonrenewing_and_overflow_reads() {
         "full pace map reads safely"
     );
     assert!(
-        cache.retail_full("overflow", &file, 3, later),
-        "explicit unpaced overflow exception"
+        !cache.retail_full("overflow", &file, 3, later),
+        "the newly admitted key is tracked and paced"
     );
-    assert_eq!(cache.durable().unwrap().counters.retail_full[2], 2);
+    let stores = cache.durable().unwrap();
+    assert_eq!(stores.counters.retail_full[2], 1);
+    assert_eq!(stores.retail_full_at.len(), 2 * store::MAX_RECORDS);
+    assert!(!stores
+        .retail_full_at
+        .contains_key(&store::key_digest(DurableSource::ClaudeCode, "k")));
+    assert_eq!(
+        stores.retail_full_at[&store::key_digest(DurableSource::ClaudeCode, "overflow")],
+        later
+    );
+    drop(stores);
     assert!(
         SharedCache::default().retail_full("k", &file, 3, later),
         "RAM pacing resets on restart"
@@ -4693,7 +4703,7 @@ fn a0h_native_exhaustion_growth_pacing_reselection_and_restart_body() {
 }
 
 #[test]
-fn a0h_pacing_overflow_alone_emits_one_alarm_without_a_full_delta() {
+fn a0h_pace_evicted_alone_emits_one_alarm_without_a_full_delta() {
     let root = crate::test_scratch::private_dir("a0h-overflow-alarm");
     let cache = SharedCache::default();
     let source = SnapshotSource::ClaudeCode;
@@ -4718,7 +4728,7 @@ fn a0h_pacing_overflow_alone_emits_one_alarm_without_a_full_delta() {
     assert_eq!(alarms.len(), 1);
     assert_eq!(alarms[0]["stage"], "durable_tail_alarm");
     assert_eq!(
-        alarms[0]["counts"]["retail_pacing_overflow"],
+        alarms[0]["counts"]["pace_evicted"],
         serde_json::json!([1, 1])
     );
     assert_eq!(
@@ -4729,6 +4739,14 @@ fn a0h_pacing_overflow_alone_emits_one_alarm_without_a_full_delta() {
         alarms[0]["counts"]["retail_exhausted_paced"],
         serde_json::json!([0, 0])
     );
+    for cause in [
+        "old_binding_no_match",
+        "context",
+        "restore_semantics",
+        "revision_adoption_required",
+    ] {
+        assert_eq!(alarms[0]["counts"][cause], serde_json::json!([0, 0]));
+    }
     let ((), repeated) = crate::local_resource_diagnostics::capture(|| cache.durable_alarm(source));
     assert!(repeated.is_empty());
     let _ = std::fs::remove_dir_all(root);
@@ -4905,6 +4923,49 @@ fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
         let ((_, _, mode), io) = a0h_observe(|| a0h_scan(&owner, &roots, &root, prior.clone()));
         assert_eq!(mode.0, 0);
         assert_eq!(io, (0, 0));
+        // Real metadata-only selection. Certificate SameSizeEdit precedes codec decoding.
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(mtime + std::time::Duration::from_secs(2))
+            .unwrap();
+        let metadata_owner = E2ScanFixture::default();
+        metadata_owner.begin_durable(source, &root, &index_path);
+        let ((mut mi, mut ms, mm), mio) =
+            a0h_observe(|| a0h_scan(&metadata_owner, &roots, &root, prior.clone()));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), accepted);
+        assert_eq!(
+            metadata_owner
+                .cache
+                .durable_counters(source)
+                .unwrap()
+                .0
+                .stale_full,
+            [0; 3]
+        );
+        if reason == "restore_semantics" {
+            assert_eq!(mm, (1, 0, 0), "pre-existing certificate Full");
+            assert_eq!(mio.1, accepted);
+            let cold = E2ScanFixture::default();
+            let (mut ci, mut cs, _) = a0h_scan(&cold, &roots, &root, prior.clone());
+            assert_eq!(
+                a0h_wire(&root, &mut mi, &mut ms),
+                a0h_wire(&root, &mut ci, &mut cs)
+            );
+        } else {
+            assert_eq!(mm.0, 0, "{reason}: never reaches certificate fallback");
+            assert_eq!(mio, (0, 0));
+            assert_eq!(mi.files[&key].size_bytes, accepted);
+            assert_eq!(mi.files[&key].last_upload_body_witness, witness);
+        }
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
         std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
@@ -5030,14 +5091,13 @@ fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
     }
 }
 
-fn b1g_scan(
+fn b1g_owned(
     owner: &crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture,
     roots: &[PathBuf],
     root: &Path,
-    index_path: &Path,
-    committed: &mut ScanIndex,
-) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
-    let mut owned = OwnedSourceScan::new_with_identity_capture(
+    committed: &ScanIndex,
+) -> OwnedSourceScan {
+    OwnedSourceScan::new_with_identity_capture(
         SnapshotSource::ClaudeCode,
         roots,
         committed.clone(),
@@ -5051,7 +5111,17 @@ fn b1g_scan(
         true,
         false,
     )
-    .with_sampled_acquisition(owner.cache.clone(), Scope("e2-pipeline".into()));
+    .with_sampled_acquisition(owner.cache.clone(), Scope("e2-pipeline".into()))
+}
+
+fn b1g_scan(
+    owner: &crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture,
+    roots: &[PathBuf],
+    root: &Path,
+    index_path: &Path,
+    committed: &mut ScanIndex,
+) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
+    let mut owned = b1g_owned(owner, roots, root, committed);
     for _ in 0..100_000 {
         let c = owned.sampling.as_ref().unwrap();
         let mode = (c.full_files, c.tail_files, c.unchanged_files);
@@ -5073,7 +5143,9 @@ fn b1g_absent_growth_twice_overflow_closed_restart_exact_body_and_idle() {
     use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
     use std::io::Write;
     let _gate = claude_request_money::e2::GateForTest::set(true);
-    for arm in ["ordinary", "capacity", "closed"] {
+    for arm in [
+        "ordinary", "capacity", "closed", "spent", "lost", "metadata",
+    ] {
         let root = crate::test_scratch::private_dir("absent-growth");
         let projects = root.join("projects");
         std::fs::create_dir_all(&projects).unwrap();
@@ -5128,6 +5200,27 @@ fn b1g_absent_growth_twice_overflow_closed_restart_exact_body_and_idle() {
             a0h_observe(|| b1g_scan(&owner, &roots, &root, &index_path, &mut committed));
         assert_eq!(mode.0, 0);
         assert_eq!(read, (0, 0), "idle is never a new growth grant");
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(mtime + std::time::Duration::from_secs(2))
+            .unwrap();
+        let ((held, _, mode), read) =
+            a0h_observe(|| b1g_scan(&owner, &roots, &root, &index_path, &mut committed));
+        assert_eq!(mode.0, 0, "{arm}: absent-record mtime-only");
+        assert_eq!(read, (0, 0));
+        assert_eq!(
+            held.files[&key].size_bytes,
+            committed.files[&key].size_bytes
+        );
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
         for (id, input, total, requests) in [("growth", 200, 300, 2), ("next-growth", 400, 700, 3)]
         {
             owner.evict();
@@ -5138,14 +5231,50 @@ fn b1g_absent_growth_twice_overflow_closed_restart_exact_body_and_idle() {
                 .unwrap()
                 .write_all(a0h_row(id, input).as_bytes())
                 .unwrap();
+            if matches!(arm, "spent" | "lost") {
+                let interrupted =
+                    b1g_claim_before_read(&owner, &roots, &root, &index_path, &mut committed);
+                assert!(interrupted.index.reread_guard.upgrade_claimed(&key));
+                committed.reread_guard = interrupted.index.reread_guard.clone();
+                drop(interrupted); // Lose FD/observer without issuing a read.
+                if arm == "lost" {
+                    committed.reread_guard = serde_json::from_value(
+                        serde_json::to_value(&committed.reread_guard).unwrap(),
+                    )
+                    .unwrap();
+                    assert!(!committed.reread_guard.upgrade_claimed(&key));
+                }
+            }
+            let claims_before = owner
+                .cache
+                .durable_counters(source)
+                .unwrap()
+                .0
+                .upgrade_claimed;
+            let metadata_before = owner
+                .cache
+                .durable_counters(source)
+                .unwrap()
+                .0
+                .ineligible
+                .get("metadata")
+                .copied()
+                .unwrap_or(0);
             let before = owner
                 .cache
                 .durable_counters(source)
                 .unwrap()
                 .0
                 .upgrade_state_missing;
-            let (page, body) =
-                observe_consumed(|| b1g_scan(&owner, &roots, &root, &index_path, &mut committed));
+            let (page, body) = observe_consumed(|| {
+                if arm == "metadata" {
+                    b1_with_metadata_failure(|| {
+                        b1g_scan(&owner, &roots, &root, &index_path, &mut committed)
+                    })
+                } else {
+                    b1g_scan(&owner, &roots, &root, &index_path, &mut committed)
+                }
+            });
             let (mut index, mut scan, mode) = page;
             assert_eq!(mode, (1, 0, 0), "{arm}: counted native Full on each growth");
             assert_eq!(body, std::fs::metadata(&path).unwrap().len());
@@ -5156,9 +5285,27 @@ fn b1g_absent_growth_twice_overflow_closed_restart_exact_body_and_idle() {
                     .unwrap()
                     .0
                     .upgrade_state_missing,
-                before + 1,
-                "actual first native read counted even with full custody or a closed ledger"
+                before + u64::from(arm != "metadata"),
+                "metadata failure has no observer; ordinary Full and metadata attempt remain counted"
             );
+            if arm == "spent" {
+                assert_eq!(
+                    owner
+                        .cache
+                        .durable_counters(source)
+                        .unwrap()
+                        .0
+                        .upgrade_claimed,
+                    claims_before,
+                    "same spent growth never renews a grant"
+                );
+            }
+            if arm == "metadata" {
+                assert_eq!(
+                    owner.cache.durable_counters(source).unwrap().0.ineligible["metadata"],
+                    metadata_before + 1
+                );
+            }
             let actual = a0h_wire(&root, &mut index, &mut scan);
             assert_eq!(
                 (
@@ -5224,6 +5371,235 @@ fn b1g_absent_growth_twice_overflow_closed_restart_exact_body_and_idle() {
                 .0
                 .upgrade_state_missing,
             1
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[test]
+fn stale_full_evicts_oldest_shared_stamp_and_paces_the_new_key() {
+    let root = crate::test_scratch::private_dir("stale-eviction");
+    let path = root.join("t.jsonl");
+    std::fs::write(&path, b"{}\n{}\n").unwrap();
+    let file = File::open(&path).unwrap();
+    let cache = SharedCache::default();
+    let source = SnapshotSource::ClaudeCode;
+    cache.durable_begin_pass(
+        source,
+        &root.join("index.json"),
+        &Scope("evict".into()),
+        false,
+    );
+    let now = std::time::Instant::now();
+    for n in 0..2 * store::MAX_RECORDS {
+        assert!(cache.retail_full(
+            &format!("k{n}"),
+            &file,
+            3,
+            now + std::time::Duration::from_secs(u64::from(n != 0))
+        ));
+    }
+    let _ = crate::local_resource_diagnostics::capture(|| cache.durable_alarm(source));
+    cache.durable().unwrap().retail_full_now = Some(now + std::time::Duration::from_secs(2));
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        "new".into(),
+        serde_json::from_value(serde_json::json!({
+            "size_bytes":3,"source_file_fingerprint":"accepted",
+            "effective_upload_body_witness_revision":effective_revision(source)
+        }))
+        .unwrap(),
+    );
+    let floor = AcceptedFloor::of(&index, "new").unwrap();
+    assert!(cache.stale_full("new", &file, Some(floor), "context"));
+    {
+        let stores = cache.durable().unwrap();
+        assert_eq!(stores.counters.stale_full, [1, 0, 0]);
+        assert_eq!(stores.counters.retail_full[2], 1);
+        assert_eq!(stores.retail_full_at.len(), 2 * store::MAX_RECORDS);
+        assert!(!stores
+            .retail_full_at
+            .contains_key(&store::key_digest(DurableSource::ClaudeCode, "k0")));
+        assert!(stores
+            .retail_full_at
+            .contains_key(&store::key_digest(DurableSource::ClaudeCode, "new")));
+    }
+    let ((), alarms) = crate::local_resource_diagnostics::capture(|| cache.durable_alarm(source));
+    assert_eq!(alarms.len(), 1);
+    assert_eq!(
+        alarms[0]["counts"]["pace_evicted"],
+        serde_json::json!([1, 1])
+    );
+    assert_eq!(alarms[0]["counts"]["context"], serde_json::json!([1, 1]));
+    assert!(!cache.stale_full("new", &file, Some(floor), "restore_semantics"));
+    assert!(!cache.retail_full("new", &file, 3, now + std::time::Duration::from_secs(2)));
+    assert_eq!(cache.durable().unwrap().counters.retail_full[2], 1);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+thread_local! {
+    static B1_METADATA_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+pub(super) fn b1_metadata_fails() -> bool {
+    B1_METADATA_FAIL.with(|v| v.get())
+}
+fn b1_with_metadata_failure<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            B1_METADATA_FAIL.with(|v| v.set(false));
+        }
+    }
+    B1_METADATA_FAIL.with(|v| v.set(true));
+    let _reset = Reset;
+    f()
+}
+
+fn b1g_claim_before_read(
+    owner: &crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture,
+    roots: &[PathBuf],
+    root: &Path,
+    index_path: &Path,
+    committed: &mut ScanIndex,
+) -> OwnedSourceScan {
+    let mut owned = b1g_owned(owner, roots, root, committed);
+    for _ in 0..100_000 {
+        let OwnedSourceScanStep::Pending(mut next) = owned.step(None) else {
+            panic!("no saved claim");
+        };
+        next.persist_reread_reservations(committed, index_path)
+            .unwrap();
+        if let Some(active) = next.active_file.as_ref() {
+            let key = local_index_key(&active.candidate.path);
+            assert_eq!(active.parser.reader.consumed_bytes(), 0);
+            assert!(next.index.reread_guard.upgrade_claimed(&key));
+            return next;
+        }
+        owned = next;
+    }
+    panic!("saved claim was never reached");
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
+fn b1_future_accepted_floor_blocks_saved_and_closed_claims_before_read() {
+    use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
+    use std::io::Write;
+    let _gate = claude_request_money::e2::GateForTest::set(true);
+    for arm in ["saved", "spent", "closed"] {
+        let root = crate::test_scratch::private_dir("absent-future-floor");
+        let projects = root.join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        let path = projects.join("1338a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl");
+        let key = local_index_key(&path);
+        let roots = vec![projects];
+        let index_path = root.join("index.json");
+        let source = SnapshotSource::ClaudeCode;
+        std::fs::write(&path, a0h_row("prefix", 100)).unwrap();
+        let warm = E2ScanFixture::default();
+        let (mut prior, mut scan, mode) = a0h_scan(&warm, &roots, &root, ScanIndex::default());
+        assert_eq!(mode.0, 1);
+        a0h_wire(&root, &mut prior, &mut scan);
+        prior.record_accepted_snapshot_fingerprints(
+            &scan
+                .snapshots
+                .iter()
+                .map(|s| s.snapshot_fingerprint.clone())
+                .collect(),
+        );
+        prior.save(&index_path).unwrap();
+        drop(warm);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(a0h_row("growth", 200).as_bytes())
+            .unwrap();
+        let owner = E2ScanFixture::default();
+        owner.begin_durable(source, &root, &index_path);
+        assert!(owner
+            .cache
+            .durable()
+            .unwrap()
+            .claude
+            .as_ref()
+            .unwrap()
+            .store
+            .absent(&store::key_digest(DurableSource::ClaudeCode, &key)));
+        if arm == "closed" {
+            let mut state = serde_json::to_value(&prior.reread_guard).unwrap();
+            state["closed"] = serde_json::json!(true);
+            prior.reread_guard = serde_json::from_value(state).unwrap();
+        } else {
+            let interrupted = b1g_claim_before_read(&owner, &roots, &root, &index_path, &mut prior);
+            assert!(interrupted.index.reread_guard.upgrade_claimed(&key));
+            prior.reread_guard = interrupted.index.reread_guard.clone();
+            drop(interrupted);
+            if arm == "saved" {
+                // Release the spent RAM ticket, then save a distinct growth stamp.
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(a0h_row("second-growth", 400).as_bytes())
+                    .unwrap();
+                let mut pending = b1g_owned(&owner, &roots, &root, &prior);
+                loop {
+                    let OwnedSourceScanStep::Pending(mut next) = pending.step(None) else {
+                        panic!("no reservation");
+                    };
+                    if next.index.reread_guard.needs_save() {
+                        next.persist_reread_reservations(&mut prior, &index_path)
+                            .unwrap();
+                        assert!(!next.index.reread_guard.upgrade_claimed(&key));
+                        prior.reread_guard = next.index.reread_guard.clone();
+                        break;
+                    }
+                    pending = next;
+                }
+            }
+        }
+        prior
+            .files
+            .get_mut(&key)
+            .unwrap()
+            .effective_upload_body_witness_revision = effective_revision(source) + 1;
+        prior.active_effective_upload_body_witness_revision = effective_revision(source);
+        let accepted = prior.files[&key].size_bytes;
+        let witness = prior.files[&key].last_upload_body_witness.clone();
+        assert!(witness.is_some());
+        assert!(std::fs::metadata(&path).unwrap().len() > accepted);
+        let claim = prior.reread_guard.upgrade_claimed(&key);
+        let ledger = serde_json::to_value(&prior.reread_guard).unwrap();
+        let needs_save = prior.reread_guard.needs_save();
+        let counts = owner.cache.durable_counters(source).unwrap().0;
+        let ((held, scan, mode), io) =
+            a0h_observe(|| b1g_scan(&owner, &roots, &root, &index_path, &mut prior));
+        assert_eq!(io, (0, 0), "{arm}: no native body read");
+        assert_eq!(mode.0, 0);
+        assert!(scan.snapshots.is_empty());
+        assert_eq!(
+            scan.unreadable_path_count, 0,
+            "correctness hold stays disclosed, not RU"
+        );
+        assert_eq!(held.files[&key].size_bytes, accepted);
+        assert_eq!(held.files[&key].last_upload_body_witness, witness);
+        assert_eq!(
+            held.files[&key].effective_upload_body_witness_revision,
+            effective_revision(source) + 1
+        );
+        assert_eq!(
+            serde_json::to_value(&held.reread_guard).unwrap()["replayed"],
+            ledger["replayed"]
+        );
+        assert_eq!(held.reread_guard.needs_save(), needs_save);
+        assert_eq!(held.reread_guard.upgrade_claimed(&key), claim);
+        let after = owner.cache.durable_counters(source).unwrap().0;
+        assert_eq!(after.upgrade_claimed, counts.upgrade_claimed);
+        assert_eq!(after.upgrade_state_missing, counts.upgrade_state_missing);
+        assert_eq!(
+            after.durable_held[store::Refusal::BehindAccepted as usize],
+            counts.durable_held[store::Refusal::BehindAccepted as usize] + 1
         );
         let _ = std::fs::remove_dir_all(root);
     }
