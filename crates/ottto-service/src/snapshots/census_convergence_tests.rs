@@ -1074,7 +1074,7 @@ fn bound_terminal_hold_skips_until_family_changes() {
 #[test]
 fn claude_account_deferred_holds_are_durable_bounded_and_pruned_by_proof() {
     let dir = crate::test_scratch::ScratchDir::new("account-hold-rooted-proof");
-    let scan_root = fs::canonicalize(dir.to_path_buf()).unwrap();
+    let scan_root = fs::canonicalize(&dir).unwrap();
     let held_path = scan_root.join("deferred.jsonl");
     let other_path = scan_root.join("other.jsonl");
     fs::write(&held_path, b"owed\n").unwrap();

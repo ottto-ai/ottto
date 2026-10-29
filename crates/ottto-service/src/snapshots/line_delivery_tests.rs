@@ -3250,7 +3250,10 @@ fn withheld_equal_fingerprint_recovers_for_reason(failure: &str, reason: Candida
     let accepted = previous.accepted_snapshot_fingerprints.clone();
     let previous_body = previous.files[&key].last_upload_body_witness.clone();
     let previous_entities = previous.file_snapshot_fingerprints[&key].clone();
-    let (parsed, scan, recorder) = page(previous.clone(), revision);
+    let (mut parsed, scan, recorder) = page(previous.clone(), revision);
+    // finish() simulates upload ACKs for reader fixtures. Account settlement
+    // happens before upload, so keep only the real committed ACK baseline.
+    parsed.accepted_snapshot_fingerprints = accepted.clone();
     assert_eq!(scan.scanned_file_count, 1);
     assert_eq!(parsed.files[&key].source_file_fingerprint, fingerprint);
     assert!(!recorder.events().is_empty());
@@ -3258,7 +3261,7 @@ fn withheld_equal_fingerprint_recovers_for_reason(failure: &str, reason: Candida
     assert_eq!(held.files[&key].source_file_fingerprint, fingerprint);
     assert!(held.claude_account_deferred_holds.contains_key(&key));
     let checkpoint = root.0.join("equal-held.json");
-    let reload = |index: &ScanIndex| {
+    let reload = |index: &mut ScanIndex| {
         index.save(&checkpoint).unwrap();
         let mut index = ScanIndex::load(&checkpoint).unwrap();
         activate(&mut index, revision);
@@ -3294,7 +3297,7 @@ fn withheld_equal_fingerprint_recovers_for_reason(failure: &str, reason: Candida
             1
         );
     };
-    held = reload(&held);
+    held = reload(&mut held);
     no_credit(&held);
     available("le_30d");
     for pass in 0..3 {
@@ -3458,7 +3461,8 @@ fn withheld_equal_fingerprint_recovers_for_reason(failure: &str, reason: Candida
     // The real owner discards refused/poisoned state before its next cycle.
     // The filesystem supplies a valid birth on the recovery parse below.
     withheld_account::discard_if_refused();
-    let (parsed, scan, recorder) = page(held.clone(), revision);
+    let (mut parsed, scan, recorder) = page(held.clone(), revision);
+    parsed.accepted_snapshot_fingerprints = accepted.clone();
     assert_eq!(
         scan.scanned_file_count, 1,
         "{failure}: one actual recovery parse"
@@ -3472,7 +3476,7 @@ fn withheld_equal_fingerprint_recovers_for_reason(failure: &str, reason: Candida
         1
     );
     held = crate::snapshot_sync::settle_withheld_for_test(&held, parsed, scan);
-    held = reload(&held);
+    held = reload(&mut held);
     assert_eq!(
         held.files[&key].source_file_fingerprint,
         candidate.source_file_fingerprint

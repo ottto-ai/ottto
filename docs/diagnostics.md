@@ -403,7 +403,14 @@ refused or poisoned advisory state recovers through the existing counted parse;
 genuine authority/correction/rearm constraints retain priority. Unknown object
 generation (including missing birth identity) fails closed to that same path. A
 past-due sampled audit on such a key is deferred to its next counted re-parse
-(it cannot settle while held). The memo behind that skip is RAM only.
+(it cannot settle while held). Restored upload-context, body-witness adoption
+and missing-activity repair debt likewise cannot settle an account hold on
+unchanged content. The completed CONTENT witness is scoped to the active body
+revision and upload context: within that authority it defers repeated local
+adoption/activity repair, including after one counted restart/discard recovery.
+A newly activated revision/context, actual quarantine retry, family correction
+or genuine external rearm still selects independently. W2 token/age disclosure
+remains available while the memo is admitted. The memo behind that skip is RAM only.
 `counts.withheld_hold_released` counts released holds: `deleted` (the held file
 was proved absent), `deleted_tokens` (its last-known withheld tokens, when
 available), and `resolved` (a parse bound the account). A held audit obligation

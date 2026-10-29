@@ -65,3 +65,15 @@ Held-key absence retirement also counts request-census removal, through the same
 wrapper as deletion/audit counters. Oversized growth repeats grown/size counts
 on each pass; Codex fragment-only suffixes retain the existing cached Tail retry
 behavior past the activity window. Both costs are explicit in diagnostics.
+
+Round18 completes Claude delta D1–D6. The active upload context and body revision
+scope the existing completed CONTENT evidence digest (RAM only); restored local
+adoption/missing-activity repair cannot override a valid account memo. Actual
+quarantine retry and independent correction/rearm remain prior constraints.
+Three unchanged-content creation paths now run through real classification,
+Completed/save/reload, explicit restart/refusal/poison/unknown-generation recovery,
+then repeated Skip and W2 token/age checks. Reader-only finish() ACK simulation is
+removed before account settlement, preserving exact committed ACK assertions.
+D4 limits newly sampled audit carry to account holds, including unrecorded
+account overflow; authority/family-only restores add no independent audit debt.
+E1 #870 must preserve this distinction when composing the shared restore hunks.

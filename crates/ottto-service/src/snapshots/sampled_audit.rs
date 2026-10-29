@@ -1149,7 +1149,7 @@ mod absence_tests {
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
         for directory in [path.parent().unwrap().parent().unwrap(), root.as_path()] {
             let permissions = fs::metadata(directory).unwrap().permissions();
-            fs::set_permissions(directory, fs::Permissions::from_mode(0)).unwrap();
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o0)).unwrap();
             let absent = proven_absent(&path, &fixture.roots());
             fs::set_permissions(directory, permissions).unwrap();
             assert!(!absent);
