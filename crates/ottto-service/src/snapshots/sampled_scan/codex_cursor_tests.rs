@@ -13988,6 +13988,7 @@ fn reduction_refused_growth_stays_owed_and_catches_up_by_one_tail() {
         // D2: a healthy walk arms no retry deadline, so no deadline wake;
         // past its hourly pace the walk retries it, no body read.
         crate::local_resource_diagnostics::take_codex_owed_wake_for_test();
+        fixture.append(SESSION, &token_line(83));
         let (index, woken, modes) = page(index, 9, 8 * day + 7_200);
         assert_eq!(deferred(), 3, "one cheap retry an hour later");
         assert_eq!((modes, woken.snapshots.len()), ((0, 0), 0), "no body read");
@@ -14386,9 +14387,16 @@ fn owed_input_retry_is_paced_hourly_then_every_six_hours() {
         let t = 100;
         let (mut index, _, _) = page(index, t);
         assert_eq!(deferred(), 1, "premise: N1 refused the start");
-        // Generations within the hour: no attempt. Before round 7 each one
-        // re-attempted it.
+        // The file keeps growing (a real retry each time; round 8 skips an
+        // unchanged one). Generations within the hour: no attempt. Before
+        // round 7 each one re-attempted it.
+        let mut line = 82;
+        let mut grow = || {
+            fixture.append(SESSION, &token_line(line));
+            line += 1;
+        };
         for secs in [t + 600, t + 1_200, t + 3_000] {
+            grow();
             let (next, scan, modes) = page(index, secs);
             index = next;
             assert_eq!((modes, scan.snapshots.len()), ((0, 0), 0));
@@ -14397,6 +14405,7 @@ fn owed_input_retry_is_paced_hourly_then_every_six_hours() {
         assert_eq!(deferred(), 1, "at most one attempt per hour");
         // Hourly until the 24th refusal.
         for n in 1..24 {
+            grow();
             index = page(index, t + n * hour).0;
             assert_eq!(deferred(), 1 + n, "one attempt an hour");
         }
@@ -14406,10 +14415,12 @@ fn owed_input_retry_is_paced_hourly_then_every_six_hours() {
         // Disabled: still owed; the next attempt waits 6 h, not 1 h.
         let last = t + 23 * hour;
         for secs in [last + hour, last + 5 * hour] {
+            grow();
             index = page(index, secs).0;
             assert_eq!(deferred(), 24, "every 6 h once disabled");
             assert!(owed(&index), "still owed, never dropped");
         }
+        grow();
         index = page(index, last + 6 * hour).0;
         assert_eq!(deferred(), 25);
         // The inputs return: one Tail at the next 6-hourly attempt, then the

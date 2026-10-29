@@ -3210,6 +3210,49 @@ pub(super) mod tests {
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
+    fn owed_set_decodes_with_the_previous_release_shape() {
+        // SOURCE Q1 (4): the owed set is the existing `CodexInventoryHold`
+        // field, unchanged in shape since #578 (b51fc6379, before 0.1.201),
+        // so the previous reader decodes an index carrying it, keeps the keys,
+        // and nothing rejects it (`serde(default)`, no `deny_unknown_fields`).
+        // Mirrors that release's declarations like the 0.1.201 contract in
+        // `lenient_decode_tests`; the vendored released decoders (E2) can
+        // replace the mirror once they land.
+        #[derive(Default, serde::Deserialize, serde::Serialize)]
+        #[serde(default)]
+        struct PreviousHold {
+            owed: BTreeSet<String>,
+            refused_headers: BTreeMap<String, Option<String>>,
+            outside_roster: BTreeMap<String, Option<String>>,
+            awaiting_directories: bool,
+        }
+        #[derive(Default, serde::Deserialize)]
+        #[serde(default)]
+        struct PreviousResidue {
+            codex_inventory_hold: Option<PreviousHold>,
+        }
+        #[derive(Default, serde::Deserialize)]
+        #[serde(default)]
+        struct PreviousTraversal {
+            residue: PreviousResidue,
+        }
+        #[derive(Default, serde::Deserialize)]
+        #[serde(default)]
+        struct PreviousIndex {
+            traversal: Option<PreviousTraversal>,
+        }
+        let (root, held_index, _, new, _) = held_behind_unreadable_header();
+        let bytes = serde_json::to_vec(&held_index).unwrap();
+        let old: PreviousIndex = serde_json::from_slice(&bytes).expect("the previous reader");
+        let hold = old.traversal.unwrap().residue.codex_inventory_hold.unwrap();
+        assert!(hold.owed.contains(&local_index_key(&new)));
+        // Re-upgrade: what the previous writer saves, the current one loads.
+        let saved = serde_json::to_vec(&hold).unwrap();
+        let current: super::super::CodexInventoryHold = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(Some(&current), inventory_hold(&held_index));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn historical_replay_carries_the_owed_set() {
         // C4: replay resets the traversal; owed keys ride the fresh one.
         let (root, mut held_index, _, new, _) = held_behind_unreadable_header();
