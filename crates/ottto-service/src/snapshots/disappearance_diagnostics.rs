@@ -1481,8 +1481,9 @@ mod tests {
             source.matches("claude_absence_is_removal(source, ").count(),
             2
         );
-        // Only those two parent-present branches mark a key vanished, and
-        // only the page merge drops its audit debt or counts its retirement.
+        // Only those two parent-present branches mark a key vanished. Audit
+        // retirement also serves the bounded account-hold absence path; it
+        // requires the stronger readable-parent/root proof before counting.
         assert_eq!(
             source
                 .matches("census.claude_vanished_index_keys.insert(")
@@ -1493,14 +1494,38 @@ mod tests {
             source
                 .matches(".retire_vanished_claude_audit_debt_entry(")
                 .count(),
+            2
+        );
+        assert_eq!(
+            source
+                .matches("index.retire_vanished_claude_audit_debt_entry(")
+                .count(),
             1
         );
+        assert_eq!(
+            source
+                .matches("self.retire_vanished_claude_audit_debt_entry(")
+                .count(),
+            1
+        );
+        assert_eq!(source.matches(".retire_absent_account_hold(").count(), 2);
+        let account_retirement = source
+            .split_once("fn retire_absent_account_hold(")
+            .unwrap()
+            .1
+            .split_once("/// SOURCE N2:")
+            .unwrap()
+            .0;
+        assert!(account_retirement.contains("sampled_audit::proven_absent("));
+        assert!(account_retirement.contains("audit_retired_absent(\"claude_code\")"));
+        assert!(!account_retirement.contains("disappeared_file_count"));
         let vanished = calls("vanished");
-        assert_eq!(vanished.len(), 2);
-        for (call, kind) in vanished
-            .into_iter()
-            .zip(["AuditDebtDropped", "RequestCensusRemoved"])
-        {
+        assert_eq!(vanished.len(), 3);
+        for (call, kind) in vanished.into_iter().zip([
+            "AuditDebtDropped",
+            "RequestCensusRemoved",
+            "AuditDebtDropped",
+        ]) {
             assert!(call.contains(&format!("Vanished::{kind}")));
         }
         assert_eq!(source.matches("Site::CandidateWalk,").count(), 1);
