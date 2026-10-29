@@ -103,23 +103,43 @@ impl Sampler {
             };
             slots = guard;
             if elapsed.timed_out() {
-                self.sample(&slots);
+                drop(slots);
+                self.sample();
+                let Ok(guard) = self.slots.lock() else {
+                    return;
+                };
+                slots = guard;
             }
         }
     }
-    fn sample(&self, slots: &Slots) {
-        if slots.iter().any(Option::is_some) {
-            let sample = (self.read)();
-            for counters in slots.iter().flatten() {
-                counters.record(sample);
+    /// The OS read runs outside the registry lock, so a slow reader never
+    /// delays stage entry or exit. The sample lands only on stages that were
+    /// open before the read and are still open after it.
+    fn sample(&self) {
+        let Some(open) = self.slots.lock().ok().map(|slots| slots.clone()) else {
+            return;
+        };
+        if open.iter().all(Option::is_none) {
+            return;
+        }
+        let sample = (self.read)();
+        let Ok(slots) = self.slots.lock() else {
+            return;
+        };
+        for (now, before) in slots.iter().zip(open.iter()) {
+            if let (Some(now), Some(before)) = (now, before) {
+                if Arc::ptr_eq(now, before) {
+                    now.record(sample);
+                }
             }
         }
     }
     fn begin(self: &Arc<Self>) -> Option<Stage> {
+        let start = (self.read)();
         let mut slots = self.slots.lock().ok()?;
         let idle = slots.iter().all(Option::is_none);
         let index = slots.iter().position(Option::is_none)?;
-        let counters = Arc::new(Counters::new((self.read)()));
+        let counters = Arc::new(Counters::new(start));
         slots[index] = Some(counters.clone());
         if idle {
             self.wake.notify_one();
@@ -149,15 +169,21 @@ impl Stage {
             .begin()
     }
     pub(super) fn finish(&self) -> Observation {
-        if let Ok(mut slots) = self.sampler.slots.lock() {
-            if slots[self.index]
+        let open = |slots: &Slots| {
+            slots[self.index]
                 .as_ref()
                 .is_some_and(|c| Arc::ptr_eq(c, &self.counters))
-            {
-                let end = (self.sampler.read)();
-                self.counters.end.store(end.unwrap_or(UNKNOWN), Relaxed);
-                self.counters.record(end);
-                slots[self.index] = None;
+        };
+        // Read the endpoint outside the registry lock; close under it.
+        let still_open = self.sampler.slots.lock().is_ok_and(|slots| open(&slots));
+        if still_open {
+            let end = (self.sampler.read)();
+            if let Ok(mut slots) = self.sampler.slots.lock() {
+                if open(&slots) {
+                    self.counters.end.store(end.unwrap_or(UNKNOWN), Relaxed);
+                    self.counters.record(end);
+                    slots[self.index] = None;
+                }
             }
         }
         self.counters.observation()
@@ -247,10 +273,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn slow_reader_never_holds_the_registry_lock() {
+        static IN_READ: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        static RELEASE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        fn read() -> Option<u64> {
+            IN_READ.store(true, Relaxed);
+            while !RELEASE.load(Relaxed) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Some(10)
+        }
+        let sampler = Arc::new(Sampler::new(|| Some(10)));
+        let stage = sampler.begin().unwrap();
+        let slow = Arc::new(Sampler {
+            slots: Mutex::new(sampler.slots.lock().unwrap().clone()),
+            wake: Condvar::new(),
+            read,
+        });
+        let worker = slow.clone();
+        let handle = std::thread::spawn(move || worker.sample());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !IN_READ.load(Relaxed) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(IN_READ.load(Relaxed));
+        // The registry stays free for stage entry/exit during the OS read.
+        assert!(slow.slots.try_lock().is_ok());
+        slow.slots.lock().unwrap()[stage.index] = None;
+        RELEASE.store(true, Relaxed);
+        handle.join().unwrap();
+        // The stage closed mid-read, so the late sample never lands on it.
+        assert_eq!(stage.counters.samples.load(Relaxed), 1);
+        drop(stage);
+    }
+
+    #[test]
     fn unavailable_samples_are_unknown_and_counted() {
         let sampler = Arc::new(Sampler::new(|| None));
         let stage = sampler.begin().unwrap();
-        sampler.sample(&sampler.slots.lock().unwrap());
+        sampler.sample();
         let observation = stage.finish();
         assert!(observation.stage_start_footprint_bytes.is_none());
         assert!(observation.stage_peak_footprint_bytes.is_none());
@@ -269,9 +330,9 @@ mod tests {
         let sampler = Arc::new(Sampler::new(read));
         let first = sampler.begin().unwrap(); // 10
         let second = sampler.begin().unwrap(); // 20
-        sampler.sample(&sampler.slots.lock().unwrap()); // 30, both
+        sampler.sample(); // 30, both
         let first_row = first.finish(); // 40
-        sampler.sample(&sampler.slots.lock().unwrap()); // 50, second only
+        sampler.sample(); // 50, second only
         let second_row = second.finish(); // 60
         assert_eq!(first_row.stage_start_footprint_bytes, Some(10));
         assert_eq!(first_row.stage_peak_footprint_bytes, Some(40));
