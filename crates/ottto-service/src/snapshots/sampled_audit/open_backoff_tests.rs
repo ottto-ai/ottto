@@ -318,3 +318,97 @@ fn held_open_backoff_overflow_evicts_oldest_and_keeps_its_due_owed() {
     );
     assert_eq!(held_audit_open_backoff_evicted(), 1);
 }
+
+#[test]
+fn parked_open_is_blocked_at_common_boundary_for_all_candidate_routes_and_stat_wakes() {
+    reset_open_backoff_for_test();
+    let root = Root::new("common-boundary");
+    let path = root.0.join("a1111111-1111-4111-8111-111111111111.jsonl");
+    std::fs::write(&path, "{}\n").unwrap();
+    let key = local_index_key(&path);
+    let mut index = held_index(&root, &[&key]);
+    let candidate = candidate_from_traversal_path(
+        SnapshotSource::ClaudeCode,
+        ScanTraversalPath {
+            scan_root: root.0.to_path_buf(),
+            path: path.clone(),
+            census_member: true,
+            watcher_hint: false,
+        },
+        &mut ScanCensus::default(),
+        None,
+        183,
+        &index.files,
+    )
+    .unwrap();
+    index.held_audit_progress = Some(HeldAuditProgress {
+        key: key.clone(),
+        due: D,
+        attempted: false,
+    });
+    // Model a secure-open denial with a successful, stable stat. No chmod
+    // dependence on root/admin privileges; use the real failure recorder.
+    for n in 0..OPEN_PARK_FAILURES {
+        progress_open_failed(&mut index, &key, D + u64::from(n) * CAP);
+    }
+    let now = D + 20 * CAP;
+    assert!(candidate_open_blocked(&key, now));
+    let before = START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get);
+    for _ in 0..3 {
+        // Directory rediscovery / retained retry / grown-file admission all
+        // enter this same boundary. Even a forced verification rescue cannot
+        // bypass the park, nor count a skipped open as another failure.
+        assert!(open_and_identify_scan_candidate(
+            SnapshotSource::ClaudeCode,
+            candidate.clone(),
+            &mut ScanCensus::default(),
+            None,
+            183,
+            &index.files,
+            now
+        )
+        .is_none());
+        assert!(open_and_identify_scan_candidate_with_rescue(
+            SnapshotSource::ClaudeCode,
+            candidate.clone(),
+            &mut ScanCensus::default(),
+            None,
+            183,
+            &index.files,
+            true,
+            now,
+            None
+        )
+        .is_none());
+    }
+    assert_eq!(
+        START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get),
+        before,
+        "no open/sample/body work"
+    );
+    with_open_backoff(|memo| assert_eq!(memo.keys[&key].failures, OPEN_PARK_FAILURES));
+    assert!(awaits_hold_deadline_restoration(&index, &key));
+    assert_eq!(failed_open_debt(&key, now), Some(D));
+    assert!(index.accepted_snapshot_fingerprints.is_empty());
+    // A real stat change wakes ordinary and rescue admissions immediately.
+    std::fs::write(&path, "{ }\n").unwrap();
+    assert!(!candidate_open_blocked(&key, now));
+    assert!(open_and_identify_scan_candidate_with_rescue(
+        SnapshotSource::ClaudeCode,
+        candidate,
+        &mut ScanCensus::default(),
+        None,
+        183,
+        &index.files,
+        true,
+        now,
+        None
+    )
+    .is_some());
+    progress_opened(&mut index, &key);
+    assert_eq!(failed_open_debt(&key, now), None);
+    assert!(
+        awaits_hold_deadline_restoration(&index, &key),
+        "opening is no settlement or proof"
+    );
+}

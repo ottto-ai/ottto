@@ -530,6 +530,23 @@ fn claude_p92_mixed_body_capability_and_restart_refusals() {
         true,
         "2026-08-02T08:30:00Z",
     );
+    assert!(
+        multihour[0].usage_accounting_contract.is_none(),
+        "a new cohort receives no terminal proof"
+    );
+    // Account-binding coverage below consumes an independently reconstructed
+    // old-reader witness, as the earlier single-hour controls do. No release
+    // completion override, token/cost change or guessed account is involved.
+    let root = claude_snapshot_family_root(&multihour[0]);
+    census.restore_historical_claude_family_for_test(&root, &api, &trace, false);
+    apply_claude_reported_usage_with_index(
+        &mut multihour,
+        &api,
+        &trace,
+        &mut census,
+        false,
+        "2026-08-02T08:30:00Z",
+    );
     assert_eq!(
         multihour[0].usage_accounting_contract.as_deref(),
         Some("session_exclusive_reported_usage:v1")

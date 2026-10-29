@@ -536,6 +536,14 @@ fn open_blocked(key: &str, now: u64) -> bool {
     with_open_backoff(|backoff| backoff.blocked(key, now))
 }
 
+/// All candidate admissions share this stat-wake check, before secure open.
+pub(super) fn candidate_open_blocked(key: &str, now: u64) -> bool {
+    open_blocked(key, now)
+}
+pub(super) fn failed_open_debt(key: &str, now: u64) -> Option<u64> {
+    with_open_backoff(|backoff| backoff.owed(key)).filter(|due| now >= *due)
+}
+
 /// Census-line counts: keys whose progress open failed and are still owed
 /// (backing off or parked), and the age of the oldest first failure.
 pub(super) fn held_audit_open_failed(now: u64) -> (usize, u64) {
@@ -575,8 +583,8 @@ pub(super) fn progress_opened(index: &mut ScanIndex, key: &str) {
         .filter(|slot| slot.key == key)
     {
         slot.attempted = true;
-        with_open_backoff(|backoff| backoff.keys.remove(key));
     }
+    with_open_backoff(|backoff| backoff.keys.remove(key));
 }
 
 #[derive(Serialize)]
@@ -584,6 +592,27 @@ struct HeldAuditOpenParked {
     held_audit_open_failures: u8,
     held_audit_open_owed_age_seconds: u64,
     held_audit_open_failed_keys: usize,
+}
+
+// All actual failed opens of an already owed key, including constructor
+// preflight, share the bounded failure record. No census/ACK state changes.
+fn record_open_failure(key: &str, due: u64, now: u64) -> RecordedFailure {
+    let (recorded, keys) =
+        with_open_backoff(|backoff| (backoff.record_failure(key, due, now), backoff.keys.len()));
+    if let Some(parked) = recorded.parked.as_ref() {
+        // Counts only; no path or id. Once per park.
+        crate::local_resource_diagnostics::claude_held_audit_open_parked(&HeldAuditOpenParked {
+            held_audit_open_failures: parked.failures,
+            held_audit_open_owed_age_seconds: now.saturating_sub(parked.owed_due),
+            held_audit_open_failed_keys: keys,
+        });
+    }
+    recorded
+}
+pub(super) fn candidate_open_failed(key: &str, now: u64) {
+    if let Some(due) = failed_open_debt(key, now) {
+        record_open_failure(key, due, now);
+    }
 }
 
 /// The queued progress Full for `key` failed its secure open. Back the key
@@ -596,18 +625,19 @@ pub(super) fn progress_open_failed(index: &mut ScanIndex, key: &str, now: u64) {
         .as_ref()
         .filter(|slot| slot.key == key && !slot.attempted)
         .map(|slot| slot.due)
+        .or_else(|| failed_open_debt(key, now))
     else {
         return;
     };
-    let (recorded, keys) =
-        with_open_backoff(|backoff| (backoff.record_failure(key, due, now), backoff.keys.len()));
-    if let Some(parked) = recorded.parked {
-        // Counts only; no path or id. Once per park.
-        crate::local_resource_diagnostics::claude_held_audit_open_parked(&HeldAuditOpenParked {
-            held_audit_open_failures: parked.failures,
-            held_audit_open_owed_age_seconds: now.saturating_sub(parked.owed_due),
-            held_audit_open_failed_keys: keys,
-        });
+    let recorded = record_open_failure(key, due, now);
+    // An ordinary admission can be a previously failed key while another
+    // member owns the progress slot. Its failure must not steal that turn.
+    if index
+        .held_audit_progress
+        .as_ref()
+        .is_some_and(|slot| slot.key != key)
+    {
+        return;
     }
     let previous = index.held_audit_progress.take();
     // Rule 7: an overflow-evicted key may retry, so it takes the next turn,

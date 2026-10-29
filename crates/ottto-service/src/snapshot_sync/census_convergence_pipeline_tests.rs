@@ -1962,12 +1962,10 @@ fn assert_real_rejected_hold(
     }
 
     // Independent accepted-fold oracle: A retains its accepted revision;
-    // refused B contributes nothing, C contributes its newly ACKed body, and
-    // D keeps its baseline body. The held key never enters this update.
+    // A refusal is no authority to retire an earlier accepted body. Keep B's
+    // accepted baseline, C's newly exact-ACKed body and D's baseline. No
+    // rejected/held revision enters this update or a published manifest.
     let mut expected = baseline.clone();
-    let refused_key = PipelineFixture::key(baseline, PIPELINE_REFUSED_SESSION);
-    expected.files.remove(&refused_key);
-    expected.file_snapshot_fingerprints.remove(&refused_key);
     let accepted_key = PipelineFixture::key(baseline, PIPELINE_SESSIONS[2]);
     let accepted_body = first.progress.accepted_fingerprints.iter().next().unwrap();
     assert!(!baseline

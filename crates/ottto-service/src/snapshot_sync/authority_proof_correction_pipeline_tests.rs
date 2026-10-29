@@ -1252,8 +1252,8 @@ impl ApcFixture {
                 "the family's pending proof stays with its record"
             );
             assert!(
-                !last.fully_settled,
-                "hour {hour}: the pending correction keeps backfill and replay unsettled"
+                historical.claude_authority_proof_correction_pending(),
+                "hour {hour}: the restored old-reader correction remains durably owed; the preceding page could not grant it"
             );
             assert!(!held.is_empty(), "the terminal hold held real bodies");
             let root = apc_member_session(None);
@@ -3071,10 +3071,12 @@ fn returning_family_is_held_until_it_reproves_then_reoffered_and_untombstoned() 
     }
     assert_eq!(ApcFixture::family_keys(&page.index).len(), family.len());
 
-    // 5. Exact bodies settle, but terminal-off keeps the old tombstone.
-    let cleared = pages_until("settled bodies retain tombstone custody", &|page| {
-        page.record().is_none() && page.index.claude_family_tombstoned_for_test(APC_ROOT)
-    });
+    // 5. Positive per-family reconstruction of a retained witness may clear
+    // its tombstone; aggregate absence/completion authority remains vetoed.
+    let cleared = pages_until(
+        "settled reconstructed family clears its tombstone",
+        &|page| page.record().is_none() && !page.index.claude_family_tombstoned_for_test(APC_ROOT),
+    );
     let last = cleared.last().unwrap();
     assert!(last.record().is_none());
     assert_eq!(ApcFixture::family_keys(&last.index).len(), family.len());
@@ -3258,7 +3260,11 @@ fn e2_returning_tombstoned_family_publishes_once_and_clears_its_tombstone() {
             || page.index.scan_traversal_exhausted_for_test()
     });
     for page in &quiet {
-        assert!(page.index.claude_family_tombstoned_for_test(APC_ROOT));
+        assert!(!page.index.claude_family_tombstoned_for_test(APC_ROOT));
+        assert!(
+            !page.scan.census_complete,
+            "per-family positive recovery grants no source completion"
+        );
         assert!(page.record().is_none());
         assert!(
             page.offered_bodies.keys().all(|s| !family.contains(s)),

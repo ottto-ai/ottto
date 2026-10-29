@@ -1429,14 +1429,13 @@ fn complete_census_recovers_a_stale_full_cap_and_allows_new_unrelated_upload() {
         progress.admit_upload_input(&mut items, &saved).is_none(),
         "unproven absence retains the over-cap ACK ledger and refuses new admission"
     );
-    assert!(
-        items.is_empty(),
-        "capacity delays the new body without offering it"
+    assert_eq!(
+        items.len(),
+        1,
+        "failed admission preserves the unoffered body for retry"
     );
-    f.upload(&mut progress, &items, |_| {
-        panic!("capacity stop must not POST")
-    })
-    .unwrap();
+    // None is the transport admission veto; callers never POST this vector.
+    assert_eq!(items[0].snapshot_fingerprint, f.item.snapshot_fingerprint);
     assert!(!saved.accepted_snapshot_fingerprint_recorded(&f.item.snapshot_fingerprint));
 }
 

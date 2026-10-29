@@ -25937,6 +25937,8 @@ pub(crate) struct OwnedSourceScan {
     roots: Vec<PathBuf>,
     index: ScanIndex,
     collected_at: String,
+    /// One service clock for this page, including cooperative yields.
+    audit_now: u64,
     backfill_window_days: u64,
     file_limit: usize,
     artifacts_enabled: bool,
@@ -26487,6 +26489,7 @@ impl OwnedSourceScan {
             roots: roots.to_vec(),
             index: owned_index,
             collected_at: collected_at.to_owned(),
+            audit_now: sampled_scan::now_seconds(),
             backfill_window_days: effective_backfill_window_days(requested_backfill_window_days),
             file_limit,
             artifacts_enabled,
@@ -26559,6 +26562,7 @@ impl OwnedSourceScan {
         claude_request_identity_capture: bool,
         recovery_priority: &[PathBuf],
     ) -> Self {
+        let audit_now = sampled_scan::now_seconds();
         let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(
             source == SnapshotSource::ClaudeCode,
         );
@@ -26848,7 +26852,6 @@ impl OwnedSourceScan {
                 pending_paths.push(candidate);
             }
         }
-        let audit_now = sampled_scan::now_seconds();
         while pending_paths.len() < selection_limit {
             let Some(position) = traversal.pending_candidates.iter().position(|candidate| {
                 index
@@ -26993,6 +26996,7 @@ impl OwnedSourceScan {
                         census_unix_seconds,
                         backfill_window_days,
                         &index.files,
+                        audit_now,
                     )
                     .map(|(candidate, _)| candidate)
                 })
@@ -27092,6 +27096,7 @@ impl OwnedSourceScan {
                         census_unix_seconds,
                         backfill_window_days,
                         &index.files,
+                        audit_now,
                     ) {
                         Some((twin, _)) => {
                             index.candidate_decision(&twin) == CandidateDecision::Parse
@@ -27181,6 +27186,7 @@ impl OwnedSourceScan {
                     census_unix_seconds,
                     backfill_window_days,
                     &index.files,
+                    audit_now,
                 ) {
                     identified_candidates.push(opened.0);
                 }
@@ -27222,6 +27228,7 @@ impl OwnedSourceScan {
             roots: roots.to_vec(),
             index: owned_index,
             collected_at: collected_at.to_owned(),
+            audit_now,
             backfill_window_days,
             file_limit,
             artifacts_enabled,
@@ -27411,6 +27418,7 @@ impl OwnedSourceScan {
             source,
             roots,
             collected_at,
+            audit_now,
             backfill_window_days,
             file_limit,
             artifacts_enabled,
@@ -28791,11 +28799,7 @@ impl OwnedSourceScan {
                         }
                     }
                     let acquisition = active.sampling.as_mut().expect("sampled acquisition");
-                    let debt = sampled_audit::debt_for_key(
-                        index,
-                        &acquisition.key,
-                        sampled_scan::now_seconds(),
-                    );
+                    let debt = sampled_audit::debt_for_key(index, &acquisition.key, audit_now);
                     let Ok(mode) = parser.prepare_acquisition(
                         None,
                         &acquisition.scope,
@@ -30314,8 +30318,7 @@ impl OwnedSourceScan {
                 }
                 // N2: a withheld final record is owed, never verified.
                 let held_progress_audit =
-                    sampled_audit::progress_debt(index, &index_key, sampled_scan::now_seconds())
-                        .is_some();
+                    sampled_audit::progress_debt(index, &index_key, audit_now).is_some();
                 let source_verified = cursor_fragment.is_none()
                     && completed_acquisition
                         .as_ref()
@@ -30881,6 +30884,12 @@ impl OwnedSourceScan {
                 }
                 let terminal_effects_allowed = source != SnapshotSource::ClaudeCode
                     || claude_terminal_authority(index, true, &census_window_end);
+                // TODO(withheld-discovery integration): per-key held-account
+                // release belongs OUTSIDE this aggregate terminal gate. Reuse
+                // sampled_audit::proven_absent + retire_absent_account_hold
+                // once available; two consecutive stable-parent NotFound
+                // observations >=10m apart (or verified unlink), <=4096 holds.
+                // No observed-only pruning, census or manifest credit.
                 if !terminal_effects_allowed
                     && index.traversal.as_ref().is_some_and(|t| {
                         t.pending_directories.is_empty()
@@ -30996,8 +31005,7 @@ impl OwnedSourceScan {
                         &history_upgrade,
                         index.claude_reemission_exclusions.state(),
                     );
-                    let held_audit_open_failed =
-                        sampled_audit::held_audit_open_failed(sampled_scan::now_seconds());
+                    let held_audit_open_failed = sampled_audit::held_audit_open_failed(audit_now);
                     // Count-only attribution of why Claude files were selected
                     // on this page. No path, session, or identifier is named.
                     eprintln!(
@@ -31655,7 +31663,6 @@ impl OwnedSourceScan {
                     rearm_cause::retain(index);
                 }
                 let sampled_acquisition = sampling.as_ref().map(|context| {
-                    let audit_now = sampled_scan::now_seconds();
                     let pending = index
                         .files
                         .values()
@@ -31751,6 +31758,26 @@ impl OwnedSourceScan {
                     pending!();
                 }
             }
+            if source == SnapshotSource::ClaudeCode
+                && claude_terminal_off()
+                && !index
+                    .claude_full_rearm_progress
+                    .terminal_off_admitted
+                    .iter()
+                    .any(|p| p.path == candidate.path)
+            {
+                // Sampling may inject one progress candidate after constructor
+                // selection. Capture its actual root too, within this page.
+                index
+                    .claude_full_rearm_progress
+                    .terminal_off_admitted
+                    .push(ScanTraversalPath {
+                        scan_root: candidate.scan_root.clone(),
+                        path: candidate.path.clone(),
+                        census_member: false,
+                        watcher_hint: false,
+                    });
+            }
             // Path-(a) tombstone: a returning, unindexed member of a family
             // this index retired as absent. It is never skipped forever and
             // never read as a fresh file: the candidate decision routes it
@@ -31791,9 +31818,13 @@ impl OwnedSourceScan {
                 claude_effort_support_dir_ref,
             );
             let rescue_key = local_index_key(&candidate.path);
-            let verification_rescue =
-                sampled_audit::progress_debt(index, &rescue_key, sampled_scan::now_seconds())
-                    .is_some();
+            let open_parked = source == SnapshotSource::ClaudeCode
+                && sampled_audit::candidate_open_blocked(&rescue_key, audit_now);
+            let failed_open_retry =
+                sampled_audit::failed_open_debt(&rescue_key, audit_now).is_some();
+            let verification_rescue = sampled_audit::progress_debt(index, &rescue_key, audit_now)
+                .is_some()
+                || failed_open_retry;
             let Some((mut candidate, opened_file)) = open_and_identify_scan_candidate_with_rescue(
                 source,
                 candidate,
@@ -31802,14 +31833,11 @@ impl OwnedSourceScan {
                 backfill_window_days,
                 &index.files,
                 verification_rescue,
+                audit_now,
                 sampling.as_ref().map(|context| context.cache.as_ref()),
             ) else {
-                if verification_rescue {
-                    sampled_audit::progress_open_failed(
-                        index,
-                        &rescue_key,
-                        sampled_scan::now_seconds(),
-                    );
+                if verification_rescue && !failed_open_retry && !open_parked {
+                    sampled_audit::progress_open_failed(index, &rescue_key, audit_now);
                 }
                 pending!();
             };
@@ -33207,6 +33235,7 @@ impl OwnedSourceScan {
             roots,
             index: index_storage,
             collected_at,
+            audit_now,
             backfill_window_days,
             file_limit,
             artifacts_enabled,
@@ -43412,6 +43441,7 @@ fn open_and_identify_scan_candidate(
     census_unix_seconds: Option<u64>,
     backfill_window_days: u64,
     files: &BTreeMap<String, ScanIndexEntry>,
+    audit_now: u64,
 ) -> Option<(CandidateFile, File)> {
     open_and_identify_scan_candidate_with_rescue(
         source,
@@ -43421,6 +43451,7 @@ fn open_and_identify_scan_candidate(
         backfill_window_days,
         files,
         false,
+        audit_now,
         None,
     )
 }
@@ -43434,53 +43465,71 @@ fn open_and_identify_scan_candidate_with_rescue(
     backfill_window_days: u64,
     files: &BTreeMap<String, ScanIndexEntry>,
     verification_rescue: bool,
+    audit_now: u64,
     cache: Option<&sampled_scan::SharedCache>,
 ) -> Option<(CandidateFile, File)> {
-    let (mut opened_file, live) =
-        match open_candidate_file_stat_retained(source, &mut candidate, cache) {
-            Ok(opened) => opened,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if claude_absence_is_removal(source, &candidate.path).is_removal(&candidate.path) {
-                    // Removed after its candidate stat. Drop this page's
-                    // observation too, so the page merge retires the key.
-                    disappearance_diagnostics::not_found_removal(
-                        source,
-                        disappearance_diagnostics::Site::Open,
-                    );
-                    let index_key = local_index_key(&candidate.path);
-                    census.observed_index_keys.remove(&index_key);
-                    census.claude_vanished_index_keys.insert(index_key.clone());
-                    census.removed_index_keys.insert(index_key);
-                } else {
-                    disappearance_diagnostics::not_found(
-                        &mut census.disappeared_file_count,
-                        source,
-                        disappearance_diagnostics::Site::Open,
-                    );
-                }
-                return None;
-            }
-            Err(error)
-                if error.kind() == std::io::ErrorKind::InvalidData
-                    && candidate.size_bytes > max_jsonl_file_bytes(source) =>
-            {
-                census.oversized_file_count += 1;
-                census
-                    .observed_index_keys
-                    .insert(local_index_key(&candidate.path));
-                oversized_discovery::record(
+    // Common boundary: ordinary discovery, retained retries, forced family
+    // preflight and synthetic progress all obey the same failed-open park.
+    // Stat change/overflow/restart still fail toward trying the real open.
+    if source == SnapshotSource::ClaudeCode
+        && sampled_audit::candidate_open_blocked(&local_index_key(&candidate.path), audit_now)
+    {
+        // Omission is not absence. Preserve observation and explicit unread
+        // debt even in completion-path fixtures; no failed attempt is charged.
+        census
+            .observed_index_keys
+            .insert(local_index_key(&candidate.path));
+        census.record_unreadable(UnreadableCause::OpenRead, 1);
+        return None;
+    }
+    let opened = open_candidate_file_stat_retained(source, &mut candidate, cache);
+    if source == SnapshotSource::ClaudeCode && opened.is_err() {
+        sampled_audit::candidate_open_failed(&local_index_key(&candidate.path), audit_now);
+    }
+    let (mut opened_file, live) = match opened {
+        Ok(opened) => opened,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if claude_absence_is_removal(source, &candidate.path).is_removal(&candidate.path) {
+                // Removed after its candidate stat. Drop this page's
+                // observation too, so the page merge retires the key.
+                disappearance_diagnostics::not_found_removal(
                     source,
-                    &candidate.scan_root,
-                    &candidate.path,
-                    &mut census.oversized_discovery,
+                    disappearance_diagnostics::Site::Open,
                 );
-                return None;
+                let index_key = local_index_key(&candidate.path);
+                census.observed_index_keys.remove(&index_key);
+                census.claude_vanished_index_keys.insert(index_key.clone());
+                census.removed_index_keys.insert(index_key);
+            } else {
+                disappearance_diagnostics::not_found(
+                    &mut census.disappeared_file_count,
+                    source,
+                    disappearance_diagnostics::Site::Open,
+                );
             }
-            Err(_) => {
-                census.record_unreadable(UnreadableCause::OpenRead, 1);
-                return None;
-            }
-        };
+            return None;
+        }
+        Err(error)
+            if error.kind() == std::io::ErrorKind::InvalidData
+                && candidate.size_bytes > max_jsonl_file_bytes(source) =>
+        {
+            census.oversized_file_count += 1;
+            census
+                .observed_index_keys
+                .insert(local_index_key(&candidate.path));
+            oversized_discovery::record(
+                source,
+                &candidate.scan_root,
+                &candidate.path,
+                &mut census.oversized_discovery,
+            );
+            return None;
+        }
+        Err(_) => {
+            census.record_unreadable(UnreadableCause::OpenRead, 1);
+            return None;
+        }
+    };
     if !verification_rescue
         && !sampled_audit::path_requires_verification(files, &candidate.path)
         && !opened_candidate_is_within_frozen_window(
@@ -65884,10 +65933,10 @@ mod tests {
             .claude_usage_authority_quarantine
             .contains_key(&root_session_id));
         assert!(
-            index
+            !index
                 .claude_usage_family_pending
                 .contains_key(&root_session_id),
-            "reconstruction can settle old authority without retiring the unproven census window"
+            "positive reconstruction of the retained witness settles this family; no source census proof is granted"
         );
 
         let _ = fs::remove_dir_all(root);
@@ -91985,7 +92034,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, recovered_audit_due, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
-crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery; shared codex_versions);
+crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, audit_now, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery; shared codex_versions);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
@@ -92600,7 +92649,8 @@ mod census_unreadable_tests {
             &mut census,
             None,
             30,
-            &BTreeMap::new()
+            &BTreeMap::new(),
+            sampled_scan::now_seconds(),
         )
         .is_none());
         assert_eq!(

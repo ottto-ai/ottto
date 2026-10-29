@@ -227,3 +227,34 @@ its original assertions byte-unchanged. A separate production-default wire
 fixture checks unchanged money and exact ACK, rejecting a wrong body witness,
 while strict cache/curve proof stays off. The completion knob remains absent
 from money, upload, history, correction and census pipeline suites.
+
+
+Round18 keeps rediscovery's scheduling deadline in a bounded, process-owned
+64-scope memo keyed by destination, replay generation, resolved roots and retained
+traversal identity/window. Ordinary index save/load no longer starts another
+metadata walk before the 300-second deadline; watcher loss and a real scope
+change still wake discovery. Eviction/restart permits another metadata walk.
+Generic held/failed-page retries serialize their admitted acquisition root,
+including overlapping-root cases; retry insertion cannot invent ScopeChanged.
+The current-page root inventory is omitted from serialization and bounded by
+that page's admitted candidates, including its synthetic progress candidate.
+
+Failed-open parking is checked before the common secure-open boundary for
+ordinary, retained, forced/preflight and synthetic admissions. Skipped attempts
+keep explicit unread/observed custody and spend no failed-open attempt. A real
+stat change wakes the key; existing bounded backoff/eviction rules remain.
+The page captures its service clock once for preparation, rescue and failure
+hooks, separately from the frozen census eligibility window.
+
+Held-account per-key deletion release is an OPEN integration dependency on the
+withheld-discovery retention change. The integration must reuse its no-follow
+`sampled_audit::proven_absent` and `retire_absent_account_hold` helpers, not
+restore observed-only pruning or copy weaker stat logic. The approved release
+requires this key's NotFound on consecutive passes with the same parent listing,
+at least ten minutes from the first stable observation, or a verified unlink;
+other errors and reappearance reset that observation. Sweep only the bounded
+hold map (4096), outside aggregate terminal/absence/manifest gates. Release only
+that key; count `withheld_hold_released{removed_proven,removed_proven_tokens}`.
+Those helpers are not on main yet, so no deletion-release implementation or
+combined-runtime fixture is claimed by this head. It does not select the
+suspend-only fallback or grant any aggregate authority.
