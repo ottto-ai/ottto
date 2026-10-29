@@ -763,7 +763,10 @@ LD observes each admitted delivery and deduplicates by opened object.
 Post-release counts line: `codex_zst_first_read_retry`, `codex_zst_retry_alarm`,
 `codex_zst_input`, `codex_zst_refused`, `archive_terminal_residue`,
 `archive_terminal_residue_session_count`, `codex_zst_admission_alarm`,
-`custody_group_progress_dropped.events`, `custody_group_progress_dropped.bytes`.
+`custody_group_progress_dropped.events`, `custody_group_progress_dropped.bytes`,
+`custody_group_progress_dropped.tail.{events,bytes}`,
+`custody_group_progress_dropped.first_read.{events,bytes}`,
+`custody_group_restart_full.{events,bytes}`, `custody_overflow.events`.
 Counters/events are counts-only; do not sum ordinal or running gauge fields.
 
 Correctness custody retains an age-independent file recovery obligation in the
