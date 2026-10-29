@@ -1,15 +1,36 @@
-//! One dispatch table for admitted durable sources. Rows retain the v1 wire contract.
+//! One dispatch table for admitted durable sources. Each source admits exact v1/v3 representations.
 use super::sampled_jsonl::{durable, CachedJsonlReduction};
 use super::*;
 use crate::durable_tail_codec::{Corrupt, Refuse};
 use crate::durable_tail_store::{Digest32, DurableSource};
 
+pub(crate) struct Representation {
+    pub(crate) format: u16,
+    pub(crate) allowlist_pin: &'static str,
+    pub(crate) header_bytes: usize,
+}
+
+const fn representations(pin: &'static str) -> [Representation; 2] {
+    [
+        Representation {
+            format: 1,
+            allowlist_pin: pin,
+            header_bytes: crate::durable_tail_store::HEADER_BYTES,
+        },
+        Representation {
+            format: 3,
+            allowlist_pin: pin,
+            header_bytes: crate::durable_tail_store::HEADER_V3_BYTES,
+        },
+    ]
+}
+
 pub(crate) struct Properties {
     pub(crate) source: DurableSource,
     pub(crate) snapshot: SnapshotSource,
     pub(crate) tag: u8,
-    pub(crate) format: u16,
-    pub(crate) allowlist_pin: &'static str,
+    pub(crate) write_format: u16,
+    pub(crate) representations: &'static [Representation],
     pub(super) encode: fn(&CachedJsonlReduction, usize, u64) -> Result<Vec<u8>, Refuse>,
     #[cfg(test)]
     pub(super) decode: fn(&[u8], SnapshotSource) -> Result<durable::Decoded, Corrupt>,
@@ -32,8 +53,10 @@ pub(crate) const SOURCES: &[Properties] = &[
         source: DurableSource::ClaudeCode,
         snapshot: SnapshotSource::ClaudeCode,
         tag: 1,
-        format: 1,
-        allowlist_pin: "8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c",
+        write_format: 3,
+        representations: &representations(
+            "8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c",
+        ),
         encode: durable::encode_body,
         #[cfg(test)]
         decode: durable::decode_body,
@@ -47,8 +70,10 @@ pub(crate) const SOURCES: &[Properties] = &[
         source: DurableSource::Codex,
         snapshot: SnapshotSource::Codex,
         tag: 2,
-        format: 1,
-        allowlist_pin: "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1",
+        write_format: 3,
+        representations: &representations(
+            "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1",
+        ),
         encode: durable::encode_body,
         #[cfg(test)]
         decode: durable::decode_body,
@@ -78,6 +103,18 @@ impl DurableSource {
 }
 
 impl Properties {
+    pub(crate) fn representation(
+        &self,
+        format: u16,
+        allowlist: &Digest32,
+    ) -> Option<&'static Representation> {
+        self.representations.iter().find(|r| {
+            r.format == format
+                && crate::durable_tail_store::parse_hex_digest(r.allowlist_pin).as_ref()
+                    == Some(allowlist)
+        })
+    }
+
     pub(crate) fn allowlist(&self) -> Digest32 {
         sampled_jsonl::durable::allowlist_digest(self.snapshot)
     }

@@ -296,12 +296,14 @@ pub(crate) struct RederiveReceipt {
 }
 
 impl CachedJsonlReduction {
-    #[cfg(test)]
     pub(in crate::snapshots) fn durable_counting(&self) -> Option<(Option<i64>, u8, u8)> {
-        self.accumulator
-            .codex_counting
-            .as_deref()
-            .map(|c| c.durable_contract())
+        self.accumulator.durable_counting()
+    }
+}
+impl SnapshotAccumulator {
+    /// Immutable counting input and mutable ACK evidence remain distinct.
+    pub(in crate::snapshots) fn durable_counting(&self) -> Option<(Option<i64>, u8, u8)> {
+        self.codex_counting.as_deref().map(|c| c.durable_contract())
     }
 }
 #[cfg(unix)]
@@ -331,7 +333,11 @@ impl Decoded {
         Ok((self.reduction, RederiveReceipt::default()))
     }
 
-    #[cfg(test)]
+    pub(in crate::snapshots) fn immutable_counting(
+        &self,
+    ) -> Result<crate::snapshots::ImmutableCounting, crate::durable_tail_store::Refusal> {
+        crate::snapshots::ImmutableCounting::from_reduction(&self.reduction)
+    }
     pub(crate) fn counting(&self) -> Option<(Option<i64>, u8, u8)> {
         self.reduction.durable_counting()
     }
