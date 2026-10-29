@@ -1,0 +1,737 @@
+//! Advisory replay of cloned transcripts through the real snapshot page owner.
+//! The manifest's private containing directory is the clone boundary. Nothing
+//! here starts serve, provider status, relays, MCP, login recovery or launchd.
+use super::loopback_backend::{synthetic_device, Backend, EnvVarGuard};
+use super::*;
+use crate::source_rotation::{Owner, Step};
+use hmac::{Hmac, Mac};
+use std::cell::RefCell;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::sync::Arc;
+
+const MARKER: &str = ".replay-harness";
+const MARKER_BYTES: &[u8] = b"ottto isolated replay v1\n";
+const INPUT_LIMIT: u64 = 1024 * 1024;
+
+#[derive(Debug, clap::Args)]
+pub struct Args {
+    #[arg(long)]
+    pub support_dir: PathBuf,
+    /// Private clone boundary: the directory containing this manifest.
+    #[arg(long)]
+    pub roots_manifest: PathBuf,
+    #[arg(long, value_enum)]
+    pub pass: Pass,
+    /// Aggregate JSONL file inside the scratch support directory.
+    #[arg(long)]
+    pub out: PathBuf,
+    /// Optional {"files": [clone-relative paths]} inventory, prepared by the driver.
+    /// The driver truncates/appends copies; the harness never edits transcripts.
+    #[arg(long)]
+    pub hold_back: Option<PathBuf>,
+    #[arg(long)]
+    pub kill_after_pages: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, Serialize)]
+pub enum Pass {
+    #[value(name = "P0")]
+    P0,
+    #[value(name = "P1")]
+    P1,
+    #[value(name = "P2")]
+    P2,
+    #[value(name = "P3")]
+    P3,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Roots {
+    claude: Vec<PathBuf>,
+    codex: Vec<PathBuf>,
+    pi: Vec<PathBuf>,
+}
+impl Roots {
+    fn get(&self, source: SnapshotSource) -> &[PathBuf] {
+        match source {
+            SnapshotSource::ClaudeCode => &self.claude,
+            SnapshotSource::Codex => &self.codex,
+            SnapshotSource::Pi => &self.pi,
+        }
+    }
+}
+thread_local! {
+    // An in-memory fake slot registry, installed only after isolation validation.
+    static REGISTRY: RefCell<Option<Roots>> = const { RefCell::new(None) };
+}
+pub(crate) fn registered_roots(source: SnapshotSource) -> Option<Vec<PathBuf>> {
+    REGISTRY.with(|registry| {
+        registry
+            .borrow()
+            .as_ref()
+            .map(|roots| roots.get(source).to_vec())
+    })
+}
+struct RegistryGuard;
+impl Drop for RegistryGuard {
+    fn drop(&mut self) {
+        REGISTRY.with(|registry| registry.borrow_mut().take());
+    }
+}
+
+struct Isolation {
+    support: PathBuf,
+    secrets: PathBuf,
+    roots: Roots,
+    out: PathBuf,
+    held_files: usize,
+}
+
+fn private_dir(path: &Path) -> Result<PathBuf> {
+    let metadata = fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "private directory required"
+    );
+    // SAFETY: geteuid has no preconditions.
+    anyhow::ensure!(
+        metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o077 == 0,
+        "private directory required"
+    );
+    Ok(fs::canonicalize(path)?)
+}
+
+fn read_fixed(path: &Path, length: usize) -> Result<Vec<u8>> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    anyhow::ensure!(
+        file.metadata()?.is_file() && file.metadata()?.len() == length as u64,
+        "invalid fixed input"
+    );
+    let mut bytes = Vec::with_capacity(length);
+    file.take(length as u64 + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len() == length, "invalid fixed input");
+    Ok(bytes)
+}
+
+fn bounded_json(path: &Path) -> Result<serde_json::Value> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    anyhow::ensure!(
+        file.metadata()?.is_file() && file.metadata()?.len() <= INPUT_LIMIT,
+        "manifest bound"
+    );
+    let mut bytes = Vec::new();
+    file.take(INPUT_LIMIT + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len() as u64 <= INPUT_LIMIT, "manifest bound");
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// Reject symlinks (including nested ones), hard links, special files and
+/// escapes before collection. APFS copy-on-write clones have independent inodes.
+/// Private, driver-owned directories must not be edited concurrently with a pass.
+fn isolated_tree(path: &Path, boundary: &Path) -> Result<()> {
+    fn visit(path: &Path, boundary: &Path, depth: usize) -> Result<()> {
+        anyhow::ensure!(depth <= 128, "directory depth bound");
+        let meta = fs::symlink_metadata(path)?;
+        anyhow::ensure!(!meta.file_type().is_symlink(), "symlink refused");
+        anyhow::ensure!(
+            fs::canonicalize(path)?.starts_with(boundary),
+            "path escapes clone"
+        );
+        if meta.is_dir() {
+            for entry in fs::read_dir(path)? {
+                visit(&entry?.path(), boundary, depth + 1)?;
+            }
+        } else {
+            anyhow::ensure!(
+                meta.is_file() && meta.nlink() == 1,
+                "non-private file refused"
+            );
+        }
+        Ok(())
+    }
+    visit(path, boundary, 0)
+}
+
+impl Isolation {
+    fn validate(args: &Args) -> Result<Self> {
+        let support = private_dir(&args.support_dir)?;
+        // The account database still identifies live provider/support roots
+        // when the driver has already replaced HOME with a scratch directory.
+        let account_home = ottto_core::session_launch::launch_user()
+            .ok_or_else(|| anyhow!("account home unavailable"))?
+            .home;
+        let mut homes = vec![fs::canonicalize(account_home)?];
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = fs::canonicalize(home)?;
+            if !homes.contains(&home) {
+                homes.push(home);
+            }
+        }
+        let configured = std::env::var_os("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR")
+            .ok_or_else(|| anyhow!("scratch support environment required"))?;
+        anyhow::ensure!(fs::canonicalize(configured)? == support, "support mismatch");
+        let secrets = std::env::var_os(ottto_core::OTTTO_SECRET_FALLBACK_DIR_ENV)
+            .ok_or_else(|| anyhow!("file secrets required"))?;
+        let secrets = private_dir(Path::new(&secrets))?;
+        anyhow::ensure!(secrets.starts_with(&support), "secrets outside scratch");
+        isolated_tree(&support, &support)?;
+        // An empty directory is admitted once. Subsequent passes must carry our
+        // marker; an existing daemon state cannot accidentally become scratch.
+        if support.join(MARKER).exists() {
+            anyhow::ensure!(
+                read_fixed(&support.join(MARKER), MARKER_BYTES.len())? == MARKER_BYTES,
+                "scratch marker invalid"
+            );
+        } else {
+            anyhow::ensure!(
+                fs::read_dir(&support)?.all(|entry| entry.is_ok_and(|e| e.path() == secrets
+                    && secrets != support
+                    && fs::read_dir(&secrets).is_ok_and(|mut entries| entries.next().is_none()))),
+                "non-scratch support refused"
+            );
+        }
+        let manifest = fs::canonicalize(&args.roots_manifest)?;
+        let clone = private_dir(
+            manifest
+                .parent()
+                .ok_or_else(|| anyhow!("clone boundary missing"))?,
+        )?;
+        anyhow::ensure!(
+            !homes.iter().any(|home| home.starts_with(&clone))
+                && !support.starts_with(&clone)
+                && !clone.starts_with(&support),
+            "clone and scratch must be separate private directories"
+        );
+        let mut protected = Vec::new();
+        for home in &homes {
+            for provider in [
+                ".claude",
+                ".codex",
+                ".pi",
+                "Library/Application Support/Ottto",
+            ] {
+                protected.push(home.join(provider));
+            }
+        }
+        for variable in ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "PI_CODING_AGENT_DIR"] {
+            if let Some(path) = std::env::var_os(variable) {
+                protected.push(path.into());
+            }
+        }
+        for path in protected {
+            let physical = match fs::canonicalize(&path) {
+                Ok(path) => Some(path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            for live in std::iter::once(path).chain(physical) {
+                anyhow::ensure!(
+                    !clone.starts_with(&live)
+                        && !live.starts_with(&clone)
+                        && !support.starts_with(&live)
+                        && !live.starts_with(&support),
+                    "live provider or support directory refused"
+                );
+            }
+        }
+        isolated_tree(&clone, &clone)?;
+        anyhow::ensure!(
+            !support.join("connection.json").exists(),
+            "scratch connection binding refused"
+        );
+        let mut roots: Roots = serde_json::from_value(bounded_json(&manifest)?)?;
+        for root in roots
+            .claude
+            .iter_mut()
+            .chain(&mut roots.codex)
+            .chain(&mut roots.pi)
+        {
+            let original = if root.is_absolute() {
+                root.clone()
+            } else {
+                clone.join(&*root)
+            };
+            // Refuse symlink components even when their target happens to be in clone.
+            let canonical = fs::canonicalize(&original)?;
+            anyhow::ensure!(
+                canonical.starts_with(&clone) && canonical != clone,
+                "root outside clone"
+            );
+            for ancestor in original.ancestors() {
+                if fs::canonicalize(ancestor)? == clone {
+                    break;
+                }
+                anyhow::ensure!(
+                    !fs::symlink_metadata(ancestor)?.file_type().is_symlink(),
+                    "root symlink refused"
+                );
+            }
+            anyhow::ensure!(canonical.is_dir(), "transcript root must be a directory");
+            isolated_tree(&canonical, &clone)?;
+            *root = canonical;
+        }
+        anyhow::ensure!(
+            !roots.claude.is_empty() || !roots.codex.is_empty() || !roots.pi.is_empty(),
+            "no roots"
+        );
+        let out_parent = fs::canonicalize(
+            args.out
+                .parent()
+                .ok_or_else(|| anyhow!("output parent missing"))?,
+        )?;
+        anyhow::ensure!(
+            out_parent.starts_with(&support)
+                && args.out.extension().is_some_and(|ext| ext == "jsonl"),
+            "output must be scratch JSONL"
+        );
+        let out = out_parent.join(
+            args.out
+                .file_name()
+                .ok_or_else(|| anyhow!("output name missing"))?,
+        );
+        if out.exists() {
+            anyhow::ensure!(
+                fs::symlink_metadata(&out)?.is_file(),
+                "output must be regular"
+            );
+        }
+        anyhow::ensure!(
+            args.kill_after_pages.is_none()
+                || (args.pass == Pass::P3 && args.kill_after_pages.is_some_and(|n| n > 0)),
+            "kill requires P3 and a positive page count"
+        );
+        let held_files = if let Some(path) = &args.hold_back {
+            let path = fs::canonicalize(path)?;
+            anyhow::ensure!(path.starts_with(&clone), "hold-back outside clone");
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Held {
+                files: Vec<PathBuf>,
+            }
+            let held: Held = serde_json::from_value(bounded_json(&path)?)?;
+            for path in &held.files {
+                let path = fs::canonicalize(clone.join(path))?;
+                anyhow::ensure!(
+                    roots
+                        .claude
+                        .iter()
+                        .chain(&roots.codex)
+                        .chain(&roots.pi)
+                        .any(|root| path.starts_with(root)),
+                    "hold-back outside registered roots"
+                );
+            }
+            held.files.len()
+        } else {
+            0
+        };
+        Ok(Self {
+            support,
+            secrets,
+            roots,
+            out,
+            held_files,
+        })
+    }
+}
+
+/// Main uses explicit exit codes and a content-free error message. Source errors
+/// never become the public CLI error, which could disclose cloned paths.
+pub fn run(args: Args) -> i32 {
+    let isolation = match Isolation::validate(&args) {
+        Ok(isolation) => isolation,
+        Err(_) => {
+            eprintln!("replay-harness: isolation refused");
+            return 2;
+        }
+    };
+    match execute(&args, isolation) {
+        Ok(()) => 0,
+        Err(_) => {
+            eprintln!("replay-harness: pass failed");
+            3
+        }
+    }
+}
+
+fn open_private(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+fn write_record(out: &mut File, value: &serde_json::Value) -> std::io::Result<()> {
+    serde_json::to_writer(&mut *out, value)?;
+    out.write_all(b"\n")?;
+    out.sync_data()
+}
+fn blinding_key(support: &Path) -> Result<Vec<u8>> {
+    let path = support.join("replay-blinding-key");
+    if !path.exists() {
+        let mut key = [0; 32];
+        getrandom::fill(&mut key).map_err(|_| anyhow!("random key unavailable"))?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)?;
+        file.write_all(&key)?;
+        file.sync_all()?;
+        File::open(support)?.sync_all()?;
+    }
+    let key = read_fixed(&path, 32)?;
+    anyhow::ensure!(key.len() == 32, "invalid blinding key");
+    Ok(key)
+}
+fn blinded(key: &[u8], domain: &[u8], value: &[u8]) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(domain);
+    mac.update(value);
+    format!("{:x}", mac.finalize().into_bytes())
+}
+fn observe_batch(
+    out: &mut File,
+    key: &[u8],
+    pass: Pass,
+    batch: &serde_json::Value,
+) -> std::io::Result<()> {
+    let source = match batch["source"].as_str() {
+        Some("claude_code") => "claude_code",
+        Some("codex") => "codex",
+        Some("pi") => "pi",
+        _ => return Err(std::io::Error::other("unknown synthetic batch source")),
+    };
+    for item in batch["snapshots"]
+        .as_array()
+        .ok_or_else(|| std::io::Error::other("missing snapshots"))?
+    {
+        let id = item["source_session_id"]
+            .as_str()
+            .ok_or_else(|| std::io::Error::other("missing session identity"))?;
+        let mut totals = serde_json::Map::new();
+        for name in [
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_creation_5m_tokens",
+            "cache_creation_1h_tokens",
+            "reasoning_output_tokens",
+            "unattributed_total_tokens",
+        ] {
+            // The wire contract omits this one field precisely when zero.
+            let value = if name == "unattributed_total_tokens" && item.get(name).is_none() {
+                0
+            } else {
+                item[name]
+                    .as_u64()
+                    .ok_or_else(|| std::io::Error::other("missing numeric token total"))?
+            };
+            totals.insert(name.into(), serde_json::Value::from(value));
+        }
+        // Digest the actual emitted entity, excluding only its collection clock.
+        // No normalization of money, identity, accounting contracts or tool rows.
+        let mut body = item.clone();
+        if let Some(body) = body.as_object_mut() {
+            body.remove("collected_at");
+        }
+        let bytes = crate::canonical_json::canonicalize(&body).map_err(std::io::Error::other)?;
+        write_record(
+            out,
+            &serde_json::json!({"kind":"session", "pass":pass,
+            "blinded_session_hash":blinded(key, b"replay-session-v1\0", format!("{source}\0{id}").as_bytes()),
+            "source":source, "token_totals":totals, "entity_count":1,
+            "emitted_body_digest":blinded(key, b"replay-emitted-body-v1\0", &bytes)}),
+        )?;
+    }
+    Ok(())
+}
+
+fn fake_collection(source: SnapshotSource) -> AgentStatusCollection {
+    use ottto_protocol::{AgentStatusCollectionMethod, AgentStatusState};
+    let status = AgentStatusSnapshot {
+        source: source_kind(source),
+        status: AgentStatusState::Available,
+        collection_method: AgentStatusCollectionMethod::ManualFallback,
+        captured_at: current_rfc3339(),
+        expires_at: "2099-01-01T00:00:00Z".into(),
+        account: None,
+        model: None,
+        quota_windows: Vec::new(),
+        credit_balances: Vec::new(),
+        context: None,
+        capabilities: Vec::new(),
+        plan_observations: Vec::new(),
+        diagnostics: Vec::new(),
+        runtime_defaults: None,
+    };
+    AgentStatusCollection {
+        snapshots: vec![status.clone()],
+        source_health_snapshot: status,
+        codex_scan_homes: Vec::new(),
+        codex_home_bindings: Vec::new(),
+    }
+}
+
+struct ReplayOwner<'a> {
+    inner: SnapshotCycleOwner<'a>,
+    complete: Option<bool>,
+}
+impl Owner for ReplayOwner<'_> {
+    type Source = SnapshotSource;
+    type Frame = SourcePreparation;
+    type Completed = (SourcePreparation, ScanIndex, SourceScanResult);
+    fn prepare(
+        &mut self,
+        source: SnapshotSource,
+        remaining: Option<usize>,
+    ) -> Result<Option<Self::Frame>> {
+        self.inner.prepare(source, remaining)
+    }
+    fn validate(&mut self, frame: &Self::Frame) -> Result<()> {
+        self.inner.validate(frame)
+    }
+    fn step(
+        &mut self,
+        frame: Self::Frame,
+        remaining: Option<usize>,
+    ) -> Step<Self::Frame, Self::Completed> {
+        self.inner.step(frame, remaining)
+    }
+    fn bound(&self, frame: &Self::Frame, limit: usize) -> Option<usize> {
+        self.inner.bound(frame, limit)
+    }
+    fn finish(&mut self, completed: Self::Completed, remaining: Option<usize>) -> Result<()> {
+        let complete = completed.2.census_complete;
+        self.inner.finish(completed, remaining)?;
+        self.complete = Some(complete);
+        Ok(())
+    }
+    fn outcome(&mut self, source: SnapshotSource, result: Result<()>) {
+        self.inner.outcome(source, result)
+    }
+    fn monotonic(&self) -> Duration {
+        self.inner.monotonic()
+    }
+    fn parked(&mut self, bytes: usize) {
+        self.inner.parked(bytes)
+    }
+    fn retained_bound(&self, limit: usize) -> Option<usize> {
+        self.inner.retained_bound(limit)
+    }
+    fn discard_retained(&mut self) {
+        self.inner.discard_retained()
+    }
+    fn boundary(&mut self, busy: impl Iterator<Item = SnapshotSource>) {
+        self.inner.boundary(busy)
+    }
+}
+
+fn execute(args: &Args, isolation: Isolation) -> Result<()> {
+    // The exact listener address is known before any scratch mutation.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let url = format!("http://{}", listener.local_addr()?);
+    let endpoint_ok =
+        std::env::var_os("OTTTO_API_BASE_URL").map_or(true, |value| value == url.as_str());
+    let connection_ok = FileConnectionStore::default()
+        .load()?
+        .map_or(true, |binding| binding.api_base_url == url);
+    if !endpoint_ok || !connection_ok {
+        eprintln!("replay-harness: isolation refused");
+        std::process::exit(2);
+    }
+    let locked = crate::locked_state_dir::LockedStateDir::acquire(&isolation.support)?;
+    crate::locked_state_dir::hold_for_process(locked);
+    let output = Arc::new(Mutex::new(open_private(&isolation.out)?));
+    let key = blinding_key(&isolation.support)?;
+    let pass = args.pass;
+    let sink = Arc::clone(&output);
+    let backend = Backend::with_listener(
+        listener,
+        Some(Arc::new(move |batch| {
+            observe_batch(
+                &mut *sink
+                    .lock()
+                    .map_err(|_| std::io::Error::other("output poisoned"))?,
+                &key,
+                pass,
+                batch,
+            )
+        })),
+    )?;
+    fs::write(isolation.support.join(MARKER), MARKER_BYTES)?;
+    let home = isolation.support.join("home");
+    fs::create_dir_all(&home)?;
+    fs::set_permissions(&home, fs::Permissions::from_mode(0o700))?;
+    let _home = EnvVarGuard::set_path("HOME", &home);
+    let _pi = EnvVarGuard::set_path("PI_CODING_AGENT_DIR", &home.join(".pi/agent"));
+    let _claude = EnvVarGuard::set_path("CLAUDE_CONFIG_DIR", &home.join(".claude"));
+    let _codex = EnvVarGuard::set_path("CODEX_HOME", &home.join(".codex"));
+    let sources: Vec<_> = [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ]
+    .into_iter()
+    .filter(|source| !isolation.roots.get(*source).is_empty())
+    .collect();
+    let (device, _environment) = synthetic_device(
+        &isolation.support,
+        &isolation.secrets,
+        &backend.url,
+        sources
+            .iter()
+            .map(|source| source.api_slug().into())
+            .collect(),
+    )?;
+    REGISTRY.with(|registry| *registry.borrow_mut() = Some(isolation.roots));
+    let _registry = RegistryGuard;
+    let daemon = LocalDaemon::new(
+        ottto_protocol::MachineIdentity {
+            machine_id: "otm_test".into(),
+            installation_id: "install_test".into(),
+            display_name: "Synthetic replay".into(),
+            hostname: "synthetic.invalid".into(),
+            os: ottto_protocol::OperatingSystem::Macos,
+            arch: "arm64".into(),
+            local_platform_version: ottto_core::compiled_release_version(),
+            hardware_uuid: None,
+            account_scope: None,
+        },
+        crate::ControlToken::new("synthetic-replay-control")?,
+        current_rfc3339(),
+    );
+    let _proxies: Vec<_> = [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ]
+    .into_iter()
+    .map(EnvVarGuard::remove)
+    .collect();
+    let client = SnapshotApiClient::new(backend.url.clone());
+    let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
+    let mut transport = crate::net_resilience::TransportCycleOutcome::default();
+    let mut totals = Totals::default();
+    let mut pages = 0;
+    write_record(
+        &mut *output.lock().map_err(|_| anyhow!("output poisoned"))?,
+        &serde_json::json!({"kind":"pass_started", "pass":args.pass, "held_files":isolation.held_files}),
+    )?;
+    for source in sources {
+        loop {
+            // The CLI explicitly requests already-due pages, without sleeping
+            // for serve's cadence between pages. No receipt/index state resets.
+            source_cadences()
+                .lock()
+                .map_err(|_| anyhow!("cadence poisoned"))?
+                .remove(source.api_slug());
+            let mut failed = Vec::new();
+            let (complete, records) = crate::local_resource_diagnostics::capture(|| {
+                crate::agent_status_refresh::with_collection(fake_collection(source), || {
+                    let mut owner = ReplayOwner {
+                        inner: SnapshotCycleOwner {
+                            retry: &mut retry,
+                            account_witness: daemon.snapshot_scan_account_witness()?,
+                            client: &client,
+                            device: &device,
+                            device_secret: "device-secret",
+                            machine_id: "otm_test",
+                            home: &home,
+                            support_dir: &isolation.support,
+                            daemon: &daemon,
+                            transport_cycle: &mut transport,
+                            failed_sources: &mut failed,
+                            started: Instant::now(),
+                            codex_started: None,
+                        },
+                        complete: None,
+                    };
+                    crate::source_rotation::run(
+                        &mut owner,
+                        &[source],
+                        crate::source_rotation::PARKED_BUDGET,
+                    );
+                    Ok::<_, anyhow::Error>(owner.complete)
+                })
+            });
+            let complete = complete?;
+            let mut out = output.lock().map_err(|_| anyhow!("output poisoned"))?;
+            for record in records {
+                totals.observe(&record);
+                write_record(
+                    &mut out,
+                    &serde_json::json!({"kind":"local_resources", "pass":args.pass, "record":record}),
+                )?;
+            }
+            anyhow::ensure!(
+                failed.is_empty() && complete.is_some(),
+                "source page failed or deferred"
+            );
+            pages += 1;
+            write_record(
+                &mut out,
+                &serde_json::json!({"kind":"page_finished", "pass":args.pass, "pages":pages, "source":source.api_slug(), "census_complete":complete}),
+            )?;
+            if args.kill_after_pages == Some(pages) {
+                // Aggregate records and emitted entities are durable before this
+                // deterministic edge. The OS releases the real state-dir lock.
+                unsafe {
+                    libc::kill(libc::getpid(), libc::SIGKILL);
+                }
+                return Err(anyhow!("kill injection failed"));
+            }
+            if complete == Some(true) {
+                break;
+            }
+        }
+    }
+    write_record(
+        &mut *output.lock().map_err(|_| anyhow!("output poisoned"))?,
+        &serde_json::json!({"kind":"pass_totals", "pass":args.pass, "pages":pages,
+        "full_reads":(!totals.unknown).then_some(totals.full), "tail_reads":(!totals.unknown).then_some(totals.tail), "restored":totals.restored, "bytes_read":(!totals.unknown).then_some(totals.bytes),
+        "emitted_entities":backend.stats.items.load(std::sync::atomic::Ordering::Relaxed),
+        "read_units":"sampled acquisition selections; completed native + guard bytes", "advisory_only":true}),
+    )?;
+    Ok(())
+}
+
+#[derive(Default)]
+struct Totals {
+    unknown: bool,
+    full: u64,
+    tail: u64,
+    restored: u64,
+    bytes: u64,
+}
+impl Totals {
+    fn observe(&mut self, row: &serde_json::Value) {
+        if row["stage"] != "native_collection_page" {
+            return;
+        }
+        let counts = &row["counts"];
+        let reads = &counts["sampled_acquisition"];
+        self.unknown |= !reads.is_object();
+        self.full += reads["full_selections"].as_u64().unwrap_or(0);
+        self.tail += reads["tail_selections"].as_u64().unwrap_or(0);
+        self.bytes += reads["completed_native_bytes"].as_u64().unwrap_or(0)
+            + reads["completed_guard_bytes"].as_u64().unwrap_or(0);
+        self.restored += counts["full_causes"]["restore_outcome"]["restored"]
+            .as_u64()
+            .unwrap_or(0);
+    }
+}

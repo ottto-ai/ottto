@@ -1,3 +1,7 @@
+mod loopback_backend;
+/// Isolated, advisory replay of production snapshot pages.
+#[doc(hidden)]
+pub mod replay_harness;
 use crate::adaptive_collector::{CadenceConfig, SourceCadence};
 use crate::agent_status::AgentStatusCollection;
 #[cfg(test)]

@@ -24,8 +24,8 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
+use super::super::loopback_backend::{Backend, EnvVarGuard, synthetic_device, thread_cpu_us};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
@@ -1093,163 +1093,6 @@ fn rusage() -> (u64, u64) {
     (us(usage.ru_utime) + us(usage.ru_stime), rss)
 }
 
-fn thread_cpu_us() -> u64 {
-    let mut now = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: clock_gettime fills `now`.
-    assert_eq!(
-        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) },
-        0
-    );
-    now.tv_sec as u64 * 1_000_000 + now.tv_nsec as u64 / 1_000
-}
-
-#[derive(Default)]
-struct BackendStats {
-    /// CPU of the backend thread, which shares this process; subtracted from
-    /// every page's process CPU.
-    cpu_us: AtomicU64,
-    batches: AtomicU64,
-    items: AtomicU64,
-    literal_items: AtomicU64,
-    body_bytes: AtomicU64,
-    fingerprints: Mutex<Vec<String>>,
-}
-
-/// In-process backend that accepts everything with entity ACKs (the routes
-/// of the reason re-offer pipeline's accept path).
-struct Backend {
-    url: String,
-    stop: Arc<AtomicBool>,
-    worker: Option<std::thread::JoinHandle<()>>,
-    stats: Arc<BackendStats>,
-}
-
-fn entity_ack(item: &serde_json::Value) -> serde_json::Value {
-    let mut payload = serde_json::Map::new();
-    for key in [
-        "session_account_evidence",
-        "tool_usage",
-        "tool_usage_truncated",
-    ] {
-        if let Some(value) = item.get(key) {
-            payload.insert(key.into(), value.clone());
-        }
-    }
-    let exclusive = item
-        .get("usage_accounting_contract")
-        .and_then(|v| v.as_str())
-        == Some("session_exclusive_reported_usage:v1");
-    let version = item
-        .get("session_account_evidence")
-        .is_some()
-        .then_some(if exclusive { 8u64 } else { 7u64 });
-    let digest = format!(
-        "{:x}",
-        Sha256::digest(
-            crate::canonical_json::canonicalize(&serde_json::Value::Object(payload)).unwrap()
-        )
-    );
-    serde_json::json!({"source_session_id": item["source_session_id"],
-        "snapshot_fingerprint": item["snapshot_fingerprint"], "occurrence_count": 1,
-        "body_witness_version": version, "body_witness_digest": version.map(|_| digest)})
-}
-
-impl Backend {
-    fn start() -> Self {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let stop = Arc::new(AtomicBool::new(false));
-        let stats = Arc::new(BackendStats::default());
-        let (done, seen) = (stop.clone(), stats.clone());
-        let worker = std::thread::spawn(move || {
-            while !done.load(Ordering::Relaxed) {
-                let (mut stream, _) = match listener.accept() {
-                    Ok(accepted) => accepted,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(2));
-                        continue;
-                    }
-                    Err(error) => panic!("bench backend accept: {error}"),
-                };
-                let started = thread_cpu_us();
-                stream.set_nonblocking(false).unwrap();
-                let request = read_complete_http_request(&mut stream);
-                assert!(
-                    http_request_complete(request.as_bytes()),
-                    "complete request"
-                );
-                let head = request.lines().next().unwrap_or_default().to_string();
-                let raw = request.split_once("\r\n\r\n").map_or("", |(_, body)| body);
-                let value: serde_json::Value = if raw.is_empty() {
-                    serde_json::Value::Null
-                } else {
-                    serde_json::from_str(raw).unwrap()
-                };
-                let response = if head.contains("/relay-token") {
-                    serde_json::json!({"token": "synthetic-e2-bench-token", "expires_at": "2099-01-01T00:00:00Z"})
-                } else if head.contains("/activity-hints") {
-                    serde_json::json!({"source": "claude_code", "server_time": current_rfc3339(),
-                        "last_data_at": null, "record_count_15m": 0, "record_count_24h": 0,
-                        "local_usage_reconciliation_enabled": true, "backfill_window_days": 183,
-                        "recommended_scan_after": "2099-01-01T00:00:00Z"})
-                } else if head.contains("/agent-status/snapshots") {
-                    serde_json::json!({"accepted": 1, "machine_id": "otm_test", "sources": ["claude_code"]})
-                } else if let Some(items) = value.get("snapshots").and_then(|v| v.as_array()) {
-                    seen.batches.fetch_add(1, Ordering::Relaxed);
-                    seen.items.fetch_add(items.len() as u64, Ordering::Relaxed);
-                    seen.body_bytes
-                        .fetch_add(raw.len() as u64, Ordering::Relaxed);
-                    let literal = items
-                        .iter()
-                        .filter(|item| {
-                            item["usage_accounting_contract"].as_str()
-                                == Some(crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT)
-                        })
-                        .count();
-                    seen.literal_items
-                        .fetch_add(literal as u64, Ordering::Relaxed);
-                    seen.fingerprints
-                        .lock()
-                        .unwrap()
-                        .extend(items.iter().filter_map(|item| {
-                            item["snapshot_fingerprint"].as_str().map(str::to_string)
-                        }));
-                    serde_json::json!({"accepted": items.len(), "sessions_reconciled": items.len(),
-                        "session_ids": [], "disabled": false, "disabled_reason": null,
-                        "entity_ack_contract": crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT,
-                        "accepted_entities": items.iter().map(entity_ack).collect::<Vec<_>>(),
-                        "unchanged_entities": [], "rejected_entities": [], "conflict_entities": []})
-                } else {
-                    serde_json::json!({"accepted": true, "source": "claude_code", "machine_id": "otm_test", "disabled": false})
-                };
-                bounded_native_response(&mut stream, "200 OK", &response.to_string());
-                seen.cpu_us
-                    .fetch_add(thread_cpu_us().saturating_sub(started), Ordering::Relaxed);
-            }
-        });
-        Self {
-            url,
-            stop,
-            worker: Some(worker),
-            stats,
-        }
-    }
-}
-
-impl Drop for Backend {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        let result = self.worker.take().unwrap().join();
-        if !std::thread::panicking() {
-            result.unwrap();
-        }
-    }
-}
-
 /// The production owner, observing the completed scan before its finish.
 struct BenchOwner<'a> {
     last_sample: Instant,
@@ -1426,22 +1269,7 @@ impl Harness {
         let native = crate::snapshots::claude_native_comparison::enable_for_test();
         let cadence = IdentityPipelineCadence::new();
         let backend = Backend::start();
-        let guards = vec![
-            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support),
-            EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets),
-            EnvVarGuard::set_str("OTTTO_API_BASE_URL", &backend.url),
-        ];
-        let device = LocalDeviceBinding {
-            device_id: "e2-bench-device".into(),
-            machine_id: Some("otm_test".into()),
-            sources: vec!["claude_code".into()],
-        };
-        FileDeviceStore::default().save(&device).unwrap();
-        std::fs::write(
-            secrets.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
-            "device-secret",
-        )
-        .unwrap();
+        let (device, guards) = synthetic_device(&support, &secrets, &backend.url, vec!["claude_code".into()]).unwrap();
         Self {
             client: SnapshotApiClient::new(backend.url.clone()),
             backend,
