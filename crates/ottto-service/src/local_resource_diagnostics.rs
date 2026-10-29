@@ -137,7 +137,7 @@ pub(crate) enum UnselectedReason {
     WithheldOversized,
 }
 /// Three reasons, seven withheld events, growth, deleted tokens and audit retirement.
-const UNSELECTED_REASONS: usize = 13;
+const UNSELECTED_REASONS: usize = 15;
 /// Claude, Codex, Pi x reason, drained by that source's page line.
 #[cfg(not(test))]
 static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
@@ -202,6 +202,11 @@ pub(crate) fn audit_retired_absent(source: &str) {
 /// One aged gate retained a grown indexed file (not a unique-file count).
 pub(crate) fn discovery_retained_grown(source: &str) {
     line_unselected(source, 10, |slot| slot.fetch_add(1, Relaxed));
+}
+/// Actual aged, unchanged fragment-only Tail completions; bytes exclude samples.
+pub(crate) fn codex_fragment_tail_repeat(bytes: u64) {
+    line_unselected("codex", 13, |slot| slot.fetch_add(1, Relaxed));
+    line_unselected("codex", 14, |slot| slot.fetch_add(bytes, Relaxed));
 }
 /// Post-save fate and current estimated age of this page's observed growth.
 pub(crate) fn discovery_growth_fate(
@@ -480,6 +485,8 @@ impl Probe {
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             discovery_retained: BTreeMap<&'static str, u64>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            codex_fragment_tail_repeat: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             withheld_hold_released: BTreeMap<&'static str, u64>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             withheld_reparse: BTreeMap<&'static str, u64>,
@@ -502,6 +509,7 @@ impl Probe {
             ),
             audit_retired_absent: drain(source, &[("events", 12)]),
             discovery_retained: drain(source, &[("grown", 10)]),
+            codex_fragment_tail_repeat: drain(source, &[("files", 13), ("bytes", 14)]),
             withheld_hold_released: drain(source, &WITHHELD_RELEASED),
             withheld_reparse: drain(source, &WITHHELD_REPARSE),
             withheld_hold_unrecorded: drain(source, &WITHHELD_UNRECORDED),

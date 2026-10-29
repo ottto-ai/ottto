@@ -91,3 +91,16 @@ The witness is charged through the entry's existing heap graph and disappears
 on serialized reload. Diagnostic growth admission is capped at4,096, retaining
 overflow disclosure. The memo-miss recovery comment names its counted start
 instead of implying an equal fingerprint is a source change.
+
+## Round22 fragment-repeat disclosure
+
+`codex_fragment_tail_repeat{files, bytes}` on the Codex #799 page counts actual
+aged, unchanged fragment-only Tail ranges when the RAM witness is absent. It
+adds no read, stat, persisted field or acquisition gate. The byte count excludes
+identity/guard samples. Ordinary due-source preparations and admitted Codex
+continuation worker pages each reload their index; parked-frame steps do not.
+The retained-cache residual is bounded to one fragment Tail per preparation,
+not per process/day. Cache loss, unsupported layouts and due audits retain their
+separate existing Full causes. Cache-retained fragment witness remains a
+follow-up. The complete-body fixture now injects the same collection timestamp
+into its cold scan, preserving every compared field and assertion.

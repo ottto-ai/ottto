@@ -398,6 +398,31 @@ isn't retained across index reloads yet, so an aged, unchanged unterminated-frag
 Codex file may be counted grown and Tail-read once per preparation past the window
 (bounded; never Full). Follow-up: cache-retained witness.
 
+The retained-cache residual is **at most one Tail per unchanged unterminated
+fragment per source preparation; never Full; fail-open; fragment bytes only
+(from the committed fragment offset to EOF)**. A preparation is a fresh source
+scan frame: the ordinary rotation offers each due source once per sync cycle
+(`snapshot_sync.rs:4569`, index reload `:6051`), after its negotiated cadence and
+backend-backoff gates. Resuming a parked frame's `step` does not reload it.
+Each admitted Codex continuation worker page also prepares and reloads its own
+frame (`snapshot_sync/continuation.rs:1078`, `snapshot_sync.rs:6528,6594`); it is
+not limited to once per outer sync cycle. Thus the bound is per preparation,
+not per process or per day.
+
+On the #799 Codex `native_collection_page` line,
+`counts.codex_fragment_tail_repeat{files, bytes}` counts this residual using the
+approved fallback: actual aged Tail completions with no RAM fragment witness,
+an unchanged sampled source fingerprint, a start equal to the committed prefix,
+an end at the observed EOF and no newly terminated record. `files` counts read
+attempts, not unique paths; `bytes` is the native fragment range, excluding
+identity/guard samples. It is recorded after reading, never used to select or
+pace a read, and drained per emitted page. It does not count Full reads, real
+appends/completed records, or in-preparation Skips with a retained witness.
+The literal never-Full bound describes the retained, valid prefix-cache case;
+true cache loss, unsupported layouts and due audits retain their separately
+named existing Full causes and are outside this Tail-repeat counter.
+
+
 On Claude pages, `counts.withheld_reparse` counts re-parses of keys withheld for
 an unresolved account: `start` (first in this process), `evidence` (same size,
 but the sampled content, the file object, its api/trace sidecar stamps or the

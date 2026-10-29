@@ -424,8 +424,84 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
                     .is_some_and(|n| n != 0)),
             "no grown events"
         );
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row["counts"].get("codex_fragment_tail_repeat").is_some()),
+            "retained witness within a preparation: zero repeat counter"
+        );
         assert!(next.files[&key].has_unverified_source());
         index = next;
+    }
+    // Portable completion seam: two ordinary index reloads lose only the RAM
+    // witness. A real revalidated Tail plan/native reader consumes the known
+    // fragment only. This does not claim a native cache-owner test on Linux.
+    for _preparation in 0..2 {
+        let reloaded: ScanIndex =
+            serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
+        let entry = &reloaded.files[&key];
+        assert!(entry.codex_fragment.is_none());
+        let mut file = File::open(&f.path).unwrap();
+        let plan = ReadPlan::prepare(&mut file, Some(&checkpoint), &scope, None, now).unwrap();
+        assert_eq!(plan.mode(), crate::transcript_acquisition::ReadMode::Tail);
+        let start = plan.start_offset();
+        assert_eq!(start, entry.size_bytes);
+        let len = candidate.size_bytes - start;
+        let mut reader = BoundedJsonlReader::new(BufReader::new(file), 1024 * 1024, false);
+        reader.set_extent_limit(len);
+        reader.acquisition = Some(plan);
+        while let JsonlReaderStep::Line | JsonlReaderStep::Partial = reader
+            .step(|_| panic!("unterminated fragment must remain withheld"))
+            .unwrap()
+        {}
+        assert!(reader.sealed_fragment());
+        assert_eq!(reader.last_complete_line_end(), 0);
+        assert_eq!(reader.consumed_bytes(), len);
+        let (_, rows) = capture(|| {
+            codex_fragment::note_tail_repeat(
+                entry,
+                &candidate,
+                codex_fragment::TailRead {
+                    mode: reader.acquisition.as_ref().unwrap().mode(),
+                    start,
+                    end: start + reader.consumed_bytes(),
+                    terminated_end: reader.last_complete_line_end(),
+                },
+                Some(now),
+                7,
+            );
+            crate::local_resource_diagnostics::Probe::start().collection(
+                "codex",
+                crate::local_resource_diagnostics::CollectionCounts {
+                    scanned_files: 0,
+                    semantic_noops: 0,
+                    sampled_acquisition: None,
+                    full_causes: Default::default(),
+                },
+            );
+        });
+        assert_eq!(
+            rows[0]["counts"]["codex_fragment_tail_repeat"],
+            json!({"files":1,"bytes":len}),
+            "one fragment-only Tail per reloaded preparation"
+        );
+        let (_, rows) = capture(|| {
+            crate::local_resource_diagnostics::Probe::start().collection(
+                "codex",
+                crate::local_resource_diagnostics::CollectionCounts {
+                    scanned_files: 0,
+                    semantic_noops: 0,
+                    sampled_acquisition: None,
+                    full_causes: Default::default(),
+                },
+            )
+        });
+        assert!(
+            rows[0]["counts"]
+                .get("codex_fragment_tail_repeat")
+                .is_none(),
+            "counter drained per page"
+        );
     }
     // Missing binding/object changes must not turn a length heuristic into Skip.
     let mut without = index.clone();
@@ -441,7 +517,22 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         .write_all(b"\n")
         .unwrap();
     f.age(91);
-    let (caught, scan, reads, _) = f.page(source, index);
+    let (caught, scan, reads, rows) = f.page(source, index);
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row["counts"].get("codex_fragment_tail_repeat").is_some()),
+        "real terminated growth is not a fragment repeat"
+    );
+    assert!(
+        rows.iter()
+            .map(|row| row["counts"]["discovery_retained"]["grown"]
+                .as_u64()
+                .unwrap_or(0))
+            .sum::<u64>()
+            > 0,
+        "real aged growth has positive grown credit"
+    );
     assert_eq!(reads.0.lock().unwrap().0, vec![growth_mode()]);
     assert_eq!(scan.snapshots.len(), 1, "terminated record catches up once");
     assert_eq!(
@@ -453,7 +544,7 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         source,
         std::slice::from_ref(&f.root),
         ScanIndex::default(),
-        &OffsetDateTime::now_utc().format(&Rfc3339).unwrap(),
+        &scan.snapshots[0].collected_at,
         BACKFILL_WINDOW_DAYS,
         10,
         false,

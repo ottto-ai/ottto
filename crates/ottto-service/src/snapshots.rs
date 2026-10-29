@@ -28451,6 +28451,32 @@ impl OwnedSourceScan {
                 // #631 review M1: the bytes this attempt read, taken before
                 // `finish_job` consumes the acquisition's start offset. An
                 // exact-stamp memo below must not cover anything past them.
+                if source == SnapshotSource::Codex
+                    && active.group.is_none()
+                    && active.side_origin.is_none()
+                {
+                    if let (Some(entry), Some(plan)) = (
+                        active
+                            .sampling
+                            .as_ref()
+                            .and_then(|sampled| index.files.get(&sampled.key)),
+                        active.parser.reader.acquisition.as_ref(),
+                    ) {
+                        let start = plan.start_offset();
+                        codex_fragment::note_tail_repeat(
+                            entry,
+                            &active.candidate,
+                            codex_fragment::TailRead {
+                                mode: plan.mode(),
+                                start,
+                                end: start.saturating_add(active.parser.reader.consumed_bytes()),
+                                terminated_end: active.parser.reader.last_complete_line_end(),
+                            },
+                            census_unix_seconds,
+                            backfill_window_days,
+                        );
+                    }
+                }
                 let attempt_read_end = sampled_scan::codex_cursor::read_end(&active);
                 // S6: a cursor job commits only through its sealed-prefix
                 // certificate; an invalidated attempt publishes nothing.
