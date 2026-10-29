@@ -14014,6 +14014,122 @@ fn decoder_floor_preserves_a_real_primary_tail_and_other_retained_copy() {
     });
 }
 
+/// Header occupancy is observable, never a decoder eviction or a promise
+/// that an unrelated progress admission will run before the next attempt.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
+fn decoder_header_occupancy_refusal_is_counted_without_reclamation() {
+    use crate::local_resource_diagnostics::capture;
+    let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let clock = TestClock;
+    clock.set(1_900_000_000);
+    with_test_limits(2048, 8192, 64, || {
+        let fixture = ScanRoot::new(40);
+        let cache = Arc::new(SharedCache::default());
+        let key = local_index_key(&fixture.file(SESSION));
+        let mut index = ScanIndex::default();
+        for _ in 0..64 {
+            let (next, _) = page(&fixture, index, Some(Arc::clone(&cache)));
+            index = next;
+            if cache.retained_checkpoint(&key).is_some() {
+                break;
+            }
+        }
+        assert!(cache.retained_checkpoint(&key).is_some());
+        let resident = cache.cursor_resident();
+        let headers = cache
+            .with_cursor(|cursor| cursor.headers.optional_bytes().unwrap())
+            .unwrap();
+        assert!(headers > 0, "production inventory warmed header facts");
+        let cursor = cursor_without_header_facts(&cache);
+        assert_eq!(resident, cursor + headers);
+        let retained = retained_floor(&cache);
+        let credit = codex_compressed_input::compressed_input_credit().unwrap();
+        let side = super::super::side_ledger::SIDE_LEDGER_BYTES;
+        // T is the exact free-only decoder boundary WITHOUT optional facts:
+        // C + R + D + ENTRY_BYTES + 2*SIDE. With facts it needs T + H.
+        let budget = cursor + retained + credit + ENTRY_BYTES + 2 * side;
+        let archive = Temp::new(
+            "decoder-header-occupancy",
+            &zstd::stream::encode_all(&b"synthetic archive"[..], 1).unwrap(),
+        );
+        let cause = "decoder_refused_header_occupancy";
+        let refuse = |limit, expected: usize| {
+            let ((), rows) = capture(|| {
+                with_test_state_budget(limit, || {
+                    assert!(OpenedInput::funded(File::open(&archive.0).unwrap(), &cache)
+                        .unwrap()
+                        .is_none());
+                });
+            });
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row["counts"]["codex_zst_refused"][cause].is_u64())
+                    .count(),
+                expected
+            );
+            assert_eq!(rows.len(), expected + 1, "only refusal count records");
+            assert!(rows.iter().any(|row| {
+                row["counts"]["codex_zst_refused"]["CompressedAdmissionRefused"].is_u64()
+            }));
+            assert_eq!(cache.cursor_resident(), resident, "no header reclamation");
+            assert!(cache.retained_checkpoint(&key).is_some());
+            assert_eq!(cache.cursor_reserved(), 0);
+        };
+        refuse(budget - 1, 0); // Even without facts it cannot fit.
+        for _ in 0..2 {
+            refuse(budget, 1); // Count each attempt; no bounded retry is claimed.
+        }
+        let other = Arc::new(SharedCache::default());
+        let owner = DecoderOwner::acquire(&other, 1).unwrap();
+        refuse(budget, 0); // Singleton busy is not header-occupancy refusal.
+        owner.release();
+
+        // An actual decoder fits with the measured H bytes available, and
+        // success produces no occupancy refusal or header eviction.
+        let ((), rows) = capture(|| {
+            with_test_state_budget(budget + headers, || {
+                let mut input = OpenedInput::funded(File::open(&archive.0).unwrap(), &cache)
+                    .unwrap()
+                    .unwrap();
+                input.read_exact(&mut [0; 1]).unwrap();
+                assert_eq!(cache.cursor_reserved(), credit);
+                input.close();
+            });
+        });
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["stage"], "codex_zst_input");
+        assert!(
+            rows[0]["counts"]["codex_zst_decoded_bytes"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert_eq!(cache.cursor_resident(), resident);
+        assert_eq!(cache.cursor_reserved(), 0);
+
+        // Test-only counterfactual control, not a production reclaim path:
+        // release ONLY H, then the same decoder fits the original exact T.
+        cache.with_cursor(|cursor| cursor.headers.clear()).unwrap();
+        assert_eq!(cache.cursor_resident(), cursor);
+        let ((), rows) = capture(|| {
+            with_test_state_budget(budget, || {
+                let input = OpenedInput::funded(File::open(&archive.0).unwrap(), &cache)
+                    .unwrap()
+                    .unwrap();
+                input.close();
+            });
+        });
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["stage"], "codex_zst_input");
+        assert_eq!(rows[0]["counts"]["codex_zst_decoded_bytes"], 0);
+        assert!(cache.retained_checkpoint(&key).is_some());
+        assert_eq!(cache.cursor_reserved(), 0);
+    });
+}
+
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
 fn decoder_release_and_unwind_follow_the_production_stores_guard() {

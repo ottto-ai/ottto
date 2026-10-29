@@ -1461,6 +1461,26 @@ fn proof_free_room(retained: &super::RetainedCache, cursor: &CursorState, charge
         .is_some()
 }
 
+/// Diagnostic counterfactual only: retain every proof/claim/root and subtract
+/// exactly the optional header entries. Never changes admission or reclaims.
+fn decoder_fits_without_headers(
+    retained: &super::RetainedCache,
+    cursor: &CursorState,
+    charge: usize,
+) -> bool {
+    use crate::heap_layout_bound::bound;
+    (|| {
+        let headers = cursor.headers.optional_bytes().filter(|bytes| *bytes > 0)?;
+        let state = bound(cursor, STATE_BYTES.checked_add(headers)?)?.checked_sub(headers)?;
+        let resident = bound(retained, STATE_BYTES)?;
+        admission_budget()?
+            .checked_sub(state)?
+            .checked_sub(resident)?
+            .checked_sub(charge)
+    })()
+    .is_some()
+}
+
 /// U1a-2a (cc rows 2–3): drop the suspended proof when the full state (the
 /// proof included), the retained copies and `reserve` more bytes do not fit
 /// `budget`: main's admission or insert, which measured without the proof,
@@ -4196,6 +4216,7 @@ impl SharedCache {
     }
     fn cursor_claim(self: &Arc<Self>, charge: usize, free_only: bool) -> Option<CursorCredit> {
         let mut retained = self.retained().ok()?;
+        let mut header_occupancy_refused = false;
         let claimed = self
             .with_cursor(|cursor| {
                 let admitted = if free_only {
@@ -4205,7 +4226,12 @@ impl SharedCache {
                             // Decoders use free room only: preserve the real primary
                             // tail floor without evicting any resident state. Header
                             // reclamation belongs to feasible progress/retained admission.
-                            proof_free_room(&retained, cursor, with_floor)
+                            let admitted = proof_free_room(&retained, cursor, with_floor);
+                            if !admitted {
+                                header_occupancy_refused =
+                                    decoder_fits_without_headers(&retained, cursor, with_floor);
+                            }
+                            admitted
                         })
                 } else {
                     admit_locked(&mut retained, cursor, charge, true, Admitter::Main)
@@ -4216,8 +4242,16 @@ impl SharedCache {
                 cursor.reserved = cursor.reserved.checked_add(charge)?;
                 Some(cursor.id)
             })
-            .flatten()?;
+            .flatten();
         drop(retained);
+        // #799 logging may perform I/O: the retained and cursor guards have
+        // both ended. A refusal still creates no credit and evicts nothing.
+        if header_occupancy_refused {
+            crate::local_resource_diagnostics::codex_zst_refused(
+                crate::local_resource_diagnostics::CodexZstCause::DecoderRefusedHeaderOccupancy,
+            );
+        }
+        let claimed = claimed?;
         Some(CursorCredit {
             cache: Arc::clone(self),
             cursor: claimed,
