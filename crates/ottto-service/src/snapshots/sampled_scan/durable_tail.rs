@@ -9,8 +9,9 @@
 //!   without content obligations is then charged through
 //!   the ordinary cache admission and taken like any retained copy, so the
 //!   existing `prepare_acquisition` decides Unchanged, Tail or Full. Any
-//!   resource refusal is Pending with no reusable guardless RAM entry.
-//!   Restore advances no
+//!   resource refusal is Pending with no reusable guardless RAM entry; on
+//!   a file grown past its committed end, any but a busy lease is a Miss
+//!   (ordinary counted Full), so no hold drops growth. Restore advances no
 //!   ACK, ledger, census, absence, unchanged-proof, binding or payer state.
 //! - Write runs after a successful index save: only entries admitted this
 //!   pass, still resident, kept by that save and changed since their last
@@ -84,6 +85,8 @@ pub(crate) struct Counters {
     pub(crate) corrupt_body: u64,
     pub(crate) not_rederived: BTreeMap<&'static str, u64>,
     pub(crate) budget_refused: u64,
+    /// Non-transient resource refusals whose held file grew: ordinary Full.
+    pub(crate) resource_full: BTreeMap<&'static str, u64>,
     pub(crate) rederive_head_bytes: u64,
     pub(crate) rederive_named_lines: u64,
     pub(crate) rederive_line_bytes: u64,
@@ -116,7 +119,7 @@ impl Counters {
         format!(
             "ottto-service: durable_tail source={} restore_attempts={} restored={} missing={} \
              retail_attempts={} retail_keys={} tail_read_bytes={} budget_refused_retail_old_bytes={} repeated_physical_old_bytes={} refused_record={} upgrade_state_missing={} ineligible={{{}}} certificate_refused={{{}}} corrupt_body={} \
-             not_rederived={{{}}} budget_refused={} rederive_head_bytes={} \
+             not_rederived={{{}}} budget_refused={} resource_full={{{}}} rederive_head_bytes={} \
              rederive_named_lines={} rederive_line_bytes={} not_persisted={{{}}} \
              write_deferred={} write_unlocked={} peak_body_bytes={} store_write_failed[setup,inventory,statvfs]={:?} disk_records={} disk_bytes={} \
              bytes_written={} records_written={} records_clean={} store_budget_refused={} \
@@ -141,6 +144,7 @@ impl Counters {
             self.corrupt_body,
             classes(&self.not_rederived),
             self.budget_refused,
+            classes(&self.resource_full),
             self.rederive_head_bytes,
             self.rederive_named_lines,
             self.rederive_line_bytes,
@@ -932,7 +936,7 @@ impl SharedCache {
         tests::before_cold_transfer();
         let store::LeaseWait::Granted(mut lease) = self.acquire_prepared_transfer(snapshot_source)
         else {
-            return self.restore_resource_pending(snapshot_source, "active_wait");
+            return self.restore_resource_pending(snapshot_source, "active_wait", false);
         };
         // Incoming key, admission scratch/stored key and dirty-candidate key.
         // The initial transfer reserve separately covers one <=8MiB victim key.
@@ -943,7 +947,11 @@ impl SharedCache {
             .is_none_or(|bytes| lease.charge(bytes).is_err())
         {
             lease.release();
-            return self.restore_resource_pending(snapshot_source, "cache_key");
+            return self.restore_resource_pending(
+                snapshot_source,
+                "cache_key",
+                grown(held, index, key),
+            );
         }
         let result = self.restore_known(
             snapshot_source,
@@ -968,13 +976,17 @@ impl SharedCache {
                     refused => {
                         drop(refused); // Original graph/temporary custody before its credit.
                         lease.release();
-                        self.restore_resource_pending(snapshot_source, "cache_transit")
+                        self.restore_resource_pending(
+                            snapshot_source,
+                            "cache_transit",
+                            grown(held, index, key),
+                        )
                     }
                 }
             }
             Some(Err(phase)) => {
                 lease.release();
-                self.restore_resource_pending(snapshot_source, phase)
+                self.restore_resource_pending(snapshot_source, phase, grown(held, index, key))
             }
             None => {
                 let result = self
@@ -986,20 +998,39 @@ impl SharedCache {
         }
     }
 
+    /// A busy lease is a bounded FIFO delay. Every other phase repeats for
+    /// this record and cache state (e.g. `rederive_unfunded` until b4), so a
+    /// file grown past its committed end takes the ordinary counted Full
+    /// (a fresh native parse, its own funding) instead of an idle-drop hold.
     fn restore_resource_pending(
         &self,
         source: SnapshotSource,
         phase: &'static str,
+        grown: bool,
     ) -> RestoreOutcome {
+        let full = grown && phase != "active_wait";
         if let Some(mut stores) = self.durable() {
-            stores.counters.budget_refused += 1;
-            Counters::bump(&mut stores.counters.ineligible, phase);
+            if full {
+                Counters::bump(&mut stores.counters.resource_full, phase);
+            } else {
+                stores.counters.budget_refused += 1;
+                Counters::bump(&mut stores.counters.ineligible, phase);
+            }
         }
+        let event = if full {
+            "restore_resource_full"
+        } else {
+            "restore_resource_pending"
+        };
         crate::local_resource_diagnostics::durable_tail_alarm(
             source.api_slug(),
-            &serde_json::json!({"restore_resource_pending":{(phase):1}}),
+            &serde_json::json!({(event):{(phase):1}}),
         );
-        RestoreOutcome::Pending
+        if full {
+            RestoreOutcome::Miss
+        } else {
+            RestoreOutcome::Pending
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1679,6 +1710,12 @@ mod restore_test {
             }
         }
     }
+}
+
+/// Held-FD length past the committed end; metadata only, no read.
+fn grown(held: &File, index: &ScanIndex, key: &str) -> bool {
+    let committed = index.files.get(key).map_or(0, |e| e.size_bytes);
+    held.metadata().is_ok_and(|m| m.len() > committed)
 }
 
 enum Failure {

@@ -264,6 +264,8 @@ fn assert_rederive_pending(
 ) {
     assert!(matches!(outcome, RestoreOutcome::Pending));
     assert!(cache.retained().unwrap().peek(key).is_none());
+    let resource_full = cache.durable_counters(source).unwrap().0.resource_full;
+    assert!(resource_full.is_empty(), "idle: no growth Full");
     assert!(cache
         .durable_counters(source)
         .unwrap()
@@ -280,11 +282,13 @@ impl Drop for ResetActiveBudget {
     }
 }
 
-// Actual OwnedSourceScan cold caller: guard and decoded-result refusals are
-// pending, preserve the predecessor, never spend Q11 or read native Tail.
+// Actual OwnedSourceScan cold caller after RAM clear and append: a busy lease
+// is a fair delay (pending, predecessor kept, no Q11 or native Tail). Every
+// repeating refusal reads that growth once by the ordinary counted Full,
+// publishing the cumulative body (no duplicated prefix), then idles at 0 reads.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native admission layout")]
-fn production_cold_resources_hold_five_passes_without_native_reads() {
+fn production_cold_resources_delay_lease_wait_and_read_growth_once() {
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -390,13 +394,30 @@ fn production_cold_resources_hold_five_passes_without_native_reads() {
         let old_bytes = (retail_bytes(source, 0), retail_bytes(source, 1));
         store::active::set_active_budget_for_test(Some(limit));
         sampled_jsonl::preparation_tests::refuse_heap(phase == "cache");
-        for _ in 0..5 {
+        let cause = match phase {
+            "rederive" => "rederive_unfunded",
+            "cache" => "cache_transit",
+            other => other,
+        };
+        let mut entry = entry;
+        for pass in 0..5 {
             let (next, result, modes) = finish(start(index));
-            assert!(result.snapshots.is_empty());
             assert_eq!(result.unreadable_path_count, 0);
-            assert_eq!(modes, (0, 0, 0), "no Full, Tail or native body bytes");
+            if phase != "guard" && pass == 0 {
+                let len = std::fs::metadata(&path).unwrap().len();
+                assert_eq!(modes, (1, 0, len), "{phase}: one ordinary Full");
+                assert_eq!(result.snapshots.len(), 1);
+                assert_eq!(result.snapshots[0].input_tokens, 125, "cumulative once");
+                assert_eq!(next.files[&key].size_bytes, len);
+                entry = serde_json::to_value(&next.files[&key]).unwrap();
+            } else {
+                assert!(result.snapshots.is_empty());
+                assert_eq!(modes, (0, 0, 0), "no Full, Tail or native body bytes");
+            }
             assert_eq!(serde_json::to_value(&next.files[&key]).unwrap(), entry);
-            assert!(cache.retained().unwrap().peek(&key).is_none());
+            if phase == "guard" {
+                assert!(cache.retained().unwrap().peek(&key).is_none());
+            }
             assert_eq!(
                 (retail_bytes(source, 0), retail_bytes(source, 1)),
                 old_bytes
@@ -414,38 +435,28 @@ fn production_cold_resources_hold_five_passes_without_native_reads() {
         } else {
             assert_eq!(
                 after.1.records_read - before.1.records_read,
-                5,
-                "actual cold decode reached"
+                1,
+                "actual cold decode reached once, then idle skips"
             );
+            assert_eq!(after.0.resource_full.get(cause), Some(&1));
+            assert_eq!(after.0.ineligible.get(cause), None, "not counted pending");
         }
         store::active::set_active_budget_for_test(None);
         sampled_jsonl::preparation_tests::refuse_heap(false);
-        if phase == "cache" {
-            assert_eq!(after.0.ineligible.get("cache_transit"), Some(&5));
-        }
-        if phase == "rederive" {
-            assert_eq!(after.0.ineligible.get("rederive_unfunded"), Some(&5));
+        if phase != "guard" {
             assert_eq!(
                 (after.0.rederive_head_bytes, after.0.rederive_line_bytes),
                 (0, 0)
             );
-            let (next, held, modes) = finish(start(index));
-            assert!(held.snapshots.is_empty());
-            assert_eq!(held.unreadable_path_count, 0);
-            assert_eq!(modes, (0, 0, 0));
-            assert_eq!(serde_json::to_value(&next.files[&key]).unwrap(), entry);
-            assert_eq!(
-                (retail_bytes(source, 0), retail_bytes(source, 1)),
-                old_bytes
-            );
             let store::LeaseWait::Granted(lease) =
                 cache.acquire_active(source, store::ACTIVE_BYTES)
             else {
-                panic!("rederive refusal leaked credit")
+                panic!("{phase} refusal leaked credit")
             };
             lease.release();
             continue;
         }
+        assert!(after.0.resource_full.is_empty(), "a busy lease never reads");
         let (_, result, modes) = finish(start(index));
         assert_eq!(result.snapshots.len(), 1);
         assert_eq!(result.snapshots[0].input_tokens, 125);
@@ -3436,7 +3447,7 @@ fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites(
             let namespace = Scope("v1-bindings".into());
             let scope = Scope("v1-file-scope".into());
             let mut index = ScanIndex::default();
-            index.files.insert(key.clone(),serde_json::from_value(serde_json::json!({"size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"real-native"})).unwrap());
+            index.files.insert(key.clone(),serde_json::from_value(serde_json::json!({"size_bytes":std::fs::metadata(&path).unwrap().len(),"modified_unix_seconds":1,"source_file_fingerprint":"real-native"})).unwrap());
             index.save(&index_path).unwrap();
             let interp = Interpretation::of(source, &key, &index, false, &namespace);
             let ds = durable_source(source).unwrap();
@@ -3664,7 +3675,7 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
         let namespace = Scope("counting-namespace".into());
         let index_path = root.join("index.json");
         let mut index = ScanIndex::default();
-        let mut entry: ScanIndexEntry=serde_json::from_value(serde_json::json!({"size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"native-owned"})).unwrap();
+        let mut entry: ScanIndexEntry=serde_json::from_value(serde_json::json!({"size_bytes":std::fs::metadata(&path).unwrap().len(),"modified_unix_seconds":1,"source_file_fingerprint":"native-owned"})).unwrap();
         if evidence == AckEvidence::LegacyAcked {
             entry.last_snapshot_fingerprint = Some("prior-Legacy-ACK".into());
         }
