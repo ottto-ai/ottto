@@ -137,8 +137,8 @@ pub(crate) enum UnselectedReason {
     WithheldOversized,
 }
 /// The three reasons, the four `WithheldEvent` slots, the ten
-/// `CodexOwedEvent` slots, then the owed gauge and its two clock slots.
-const UNSELECTED_REASONS: usize = 21;
+/// `CodexOwedEvent` slots.
+const UNSELECTED_REASONS: usize = 17;
 /// Claude, Codex, Pi x reason, drained by that source's page line.
 #[cfg(not(test))]
 static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
@@ -243,32 +243,6 @@ pub(crate) fn codex_owed_overflow_alarm(keys: u64) {
     traversal_point("codex_owed_overflow_alarm", "codex", &counts);
 }
 const CODEX_OWED_WAKE: [(&str, usize); 2] = [("events", 13), ("inventory_bytes", 14)];
-const CODEX_OWED_GAUGE: [(&str, usize); 2] = [("count", 17), ("oldest_age_s", 18)];
-/// Gauge on #799: the owed Codex keys and how long, at least, this process
-/// has seen some owed (the hold persists no owe time; slot 19 keeps that
-/// start, slot 20 the last alarm). Past 24 h it raises its own alarm, at
-/// most hourly. Counts only; no path or id.
-pub(crate) fn codex_owed_gauge(count: u64, now: u64) {
-    let since = line_unselected("codex", 19, |since| match count {
-        0 => since.swap(0, Relaxed),
-        _ => since
-            .compare_exchange(0, now, Relaxed, Relaxed)
-            .map_or_else(|since| since, |_| now),
-    });
-    let oldest_age_s = now.saturating_sub(since);
-    if count == 0 {
-        return;
-    }
-    for ((_, slot), value) in CODEX_OWED_GAUGE.into_iter().zip([count, oldest_age_s]) {
-        line_unselected("codex", slot, |gauge| gauge.swap(value, Relaxed));
-    }
-    let last = line_unselected("codex", 20, |alarmed| alarmed.load(Relaxed));
-    if oldest_age_s > 86_400 && last.saturating_add(3_600) <= now {
-        line_unselected("codex", 20, |alarmed| alarmed.swap(now, Relaxed));
-        let counts = serde_json::json!({ "count": count, "oldest_age_s": oldest_age_s });
-        traversal_point("codex_owed_age_alarm", "codex", &counts);
-    }
-}
 #[cfg(test)]
 pub(crate) fn take_codex_owed_for_test(
 ) -> (BTreeMap<&'static str, u64>, BTreeMap<&'static str, u64>) {
@@ -280,10 +254,6 @@ pub(crate) fn take_codex_owed_for_test(
 #[cfg(test)]
 pub(crate) fn take_codex_owed_wake_for_test() -> BTreeMap<&'static str, u64> {
     drain("codex", &CODEX_OWED_WAKE)
-}
-#[cfg(test)]
-pub(crate) fn take_codex_owed_gauge_for_test() -> BTreeMap<&'static str, u64> {
-    drain("codex", &CODEX_OWED_GAUGE)
 }
 const WITHHELD_RELEASED: [(&str, usize); 1] = [("deleted", 3)];
 const WITHHELD_REPARSE: [(&str, usize); 3] = [("start", 4), ("evidence", 5), ("growth", 6)];
@@ -558,8 +528,6 @@ impl Probe {
             codex_owed_released: BTreeMap<&'static str, u64>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             codex_owed_wake: BTreeMap<&'static str, u64>,
-            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-            codex_owed_gauge: BTreeMap<&'static str, u64>,
         }
         let claude = source == "claude_code";
         let counts = Counts {
@@ -579,7 +547,6 @@ impl Probe {
             codex_owed: drain(source, &CODEX_OWED),
             codex_owed_released: drain(source, &CODEX_OWED_RELEASED),
             codex_owed_wake: drain(source, &CODEX_OWED_WAKE),
-            codex_owed_gauge: drain(source, &CODEX_OWED_GAUGE),
             reread: if claude {
                 self.page_events.with_current().without_terminal_rearm()
             } else {

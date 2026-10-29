@@ -298,12 +298,7 @@ total]`, apart from `held` and the drained counts. A red restart of a
 partially settled sweep starts the next generation in the same page for owed
 keys only; #867's generation marker then moves once.
 `counts.codex_owed_released` counts `caught_up` and `removed`. All three are
-drained like `line_delivery_unselected`. The gauge `counts.codex_owed_gauge`
-reports `count` (keys owed at the last Codex walk) and `oldest_age_s` (seconds
-this process has continuously seen a non-empty owed set: a process-local lower
-bound, since no owe time is persisted). Past 24 hours it raises its own local
-alarm, `codex_owed_age_alarm` with `count` and `oldest_age_s`, at most
-hourly.
+drained like `line_delivery_unselected`.
 
 `counts.line_delivery_unselected` counts discovery skip decisions for the
 page's source: `age` (outside the backfill window, not held for verification

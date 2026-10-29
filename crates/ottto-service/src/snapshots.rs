@@ -7,7 +7,7 @@ use crate::local_resource_diagnostics::claude_absence::Parent;
 use crate::local_resource_diagnostics::claude_contract;
 use crate::local_resource_diagnostics::claude_reread::IgnoredVeto;
 use crate::local_resource_diagnostics::{
-    codex_owed_event, codex_owed_gauge, line_delivery_unselected, CodexOwedEvent, UnselectedReason,
+    codex_owed_event, line_delivery_unselected, CodexOwedEvent, UnselectedReason,
 };
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
@@ -26136,11 +26136,6 @@ impl OwnedSourceScan {
             traversal.residue.codex_inventory_hold = codex_hold;
             codex_owed_woken =
                 release_codex_inventory_hold(source, traversal, &index.files, collected_at) > 0;
-            if source == SnapshotSource::Codex {
-                let hold = traversal.residue.codex_inventory_hold.as_ref();
-                let now = rfc3339_unix_seconds(collected_at).unwrap_or_default();
-                codex_owed_gauge(hold.map_or(0, |hold| hold.owed.len() as u64), now);
-            }
         }
         if source == SnapshotSource::Codex {
             // L-SB: an index from before blocked-set attribution moves its
