@@ -936,10 +936,73 @@ fn every_binding_mismatch_refuses() {
     );
 }
 
-/// A crash after the temp file is written and synced but before the rename
-/// leaves the old record readable and a temp that GC removes.
 #[test]
-fn interrupted_replacement_temp_present_keeps_the_old_record() {
+fn private_temp_commit_and_discard_never_grant_a_receipt() {
+    let scratch = Scratch::new();
+    let path = scratch.root.join("stage.rec");
+    let mut counters = StoreCounters::default();
+    let mut temp = TempRecord::prepare(&scratch.root, &path, &mut counters).unwrap();
+    temp.file.as_mut().unwrap().write_all(b"synthetic").unwrap();
+    temp.sync().unwrap();
+    let temp_path = temp.path.clone();
+    assert!(temp_path.exists());
+    assert!(!path.exists());
+    temp.commit(&path, None).unwrap();
+    temp.discard().unwrap(); // No unlink after a successful rename.
+    drop(temp);
+    assert_eq!(fs::read(&path).unwrap(), b"synthetic");
+    assert!(!temp_path.exists());
+    assert_eq!(counters.temp_drop_fallback, 0);
+    assert_eq!(counters.temp_discard_failed, 0);
+    assert_eq!(counters.records_written, 0, "only the store can receipt");
+}
+
+#[test]
+fn private_temp_replacement_cannot_be_committed_or_discarded() {
+    let scratch = Scratch::new();
+    let path = scratch.root.join("stage.rec");
+    let mut counters = StoreCounters::default();
+    let mut temp = TempRecord::prepare(&scratch.root, &path, &mut counters).unwrap();
+    temp.file.as_mut().unwrap().write_all(b"owned").unwrap();
+    temp.sync().unwrap();
+    let temp_path = temp.path.clone();
+    fs::rename(&temp_path, scratch.root.join("held-original")).unwrap();
+    fs::write(&temp_path, b"replacement").unwrap();
+    assert!(temp.commit(&path, None).is_err());
+    assert!(temp.discard().is_err());
+    assert!(!path.exists());
+    drop(temp);
+    assert_eq!(fs::read(&temp_path).unwrap(), b"replacement");
+    assert_eq!(counters.temp_discard_failed, 2);
+    assert_eq!(counters.temp_drop_fallback, 1);
+}
+
+#[test]
+fn private_temp_discard_retries_directory_sync_without_unlinking_records() {
+    let scratch = Scratch::new();
+    let path = scratch.root.join("stage.rec");
+    fs::write(&path, b"predecessor").unwrap();
+    let mut counters = StoreCounters::default();
+    let mut temp = TempRecord::prepare(&scratch.root, &path, &mut counters).unwrap();
+    let temp_path = temp.path.clone();
+    test_hooks::set_before_dir_sync(Some(Box::new(|_| Err(io::Error::other("sync EIO")))));
+    let failed = temp.discard();
+    test_hooks::set_before_dir_sync(None);
+    assert!(failed.is_err());
+    assert!(!temp_path.exists());
+    assert!(temp.file.is_some(), "unverified cleanup remains owned");
+    temp.discard().unwrap();
+    assert!(temp.file.is_none());
+    drop(temp);
+    assert_eq!(fs::read(&path).unwrap(), b"predecessor");
+    assert_eq!(counters.temp_discard_failed, 1);
+    assert_eq!(counters.temp_drop_fallback, 0);
+}
+
+/// Unwinding after temp sync keeps the old record and exercises counted Drop
+/// cleanup. Real SIGKILL edges (which cannot run Drop) remain in the crash matrix.
+#[test]
+fn interrupted_replacement_unwind_discards_temp_and_keeps_the_old_record() {
     let scratch = Scratch::new();
     let lock = LockedStateDir::acquire(&scratch.root).unwrap();
     let transcript = scratch.transcript("t.jsonl", b"{}\n");
@@ -973,7 +1036,9 @@ fn interrupted_replacement_temp_present_keeps_the_old_record() {
         .filter_map(Result::ok)
         .filter(|entry| entry.file_name().to_string_lossy().ends_with(TEMP_SUFFIX))
         .count();
-    assert_eq!(temps, 1, "the synced temp is left behind");
+    assert_eq!(temps, 0, "unwinding discards only the owned temp");
+    assert_eq!(store.counters().temp_drop_fallback, 1);
+    assert_eq!(store.counters().temp_discard_failed, 0);
     assert_eq!(
         store.read(&old.key, &allowlist),
         ReadOutcome::Refused(Refusal::ReceiptPending)
@@ -985,7 +1050,7 @@ fn interrupted_replacement_temp_present_keeps_the_old_record() {
     let mut keep = BTreeMap::new();
     keep.insert(old.key, Some(old.scope));
     store.gc(&lock, &old.context, &allowlist, &keep).unwrap();
-    assert_eq!(store.counters().gc_temps_deleted, 1);
+    assert_eq!(store.counters().gc_temps_deleted, 0);
     assert!(store.receipt_pending(&old.key));
     assert_eq!(
         found(restarted.read(&old.key, &allowlist)).record.binding,

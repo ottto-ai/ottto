@@ -384,6 +384,10 @@ pub(crate) struct StoreCounters {
     pub(crate) receipt_pending_held: u64,
     pub(crate) receipt_pending_records: u64,
     pub(crate) durable_write_failed_published: u64,
+    /// Failed explicit/fallback temp cleanup attempts, per pass.
+    pub(crate) temp_discard_failed: u64,
+    /// Temp cleanup reached through unwinding or a missed explicit exit.
+    pub(crate) temp_drop_fallback: u64,
     /// Failed physical attempt boundaries: setup, inventory, statvfs.
     pub(crate) store_write_failed: [u64; 3],
     /// Per-pass read I/O.
@@ -987,7 +991,7 @@ impl DurableTailStore {
                     stored.record.allowlist,
                 ),
             );
-            if write_atomic(&self.dir, &path, &bytes, prior)
+            if write_atomic(&self.dir, &path, &bytes, prior, &mut self.counters)
                 .and_then(|_| self.sync_store())
                 .is_err()
             {
@@ -1497,27 +1501,53 @@ fn remove_if_present(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Temp file (create-new, 0600), write, fsync, rename. The caller syncs the
-/// directory and its parent before issuing a receipt.
-fn write_atomic(dir: &Path, path: &Path, bytes: &[u8], prior: Option<Stamp>) -> io::Result<()> {
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "record name"))?;
-    let temp = dir.join(format!(".{name}.{}{TEMP_SUFFIX}", std::process::id()));
-    remove_if_present(&temp)?;
-    let result = (|| {
-        let mut file = OpenOptions::new()
+/// Private ownership of a create-new temp. A temp is never record authority.
+/// Keep its descriptor until commit/discard so pathname reuse cannot authorize
+/// removing or promoting another inode.
+struct TempRecord<'a> {
+    path: PathBuf,
+    file: Option<File>,
+    counters: &'a mut StoreCounters,
+}
+
+impl<'a> TempRecord<'a> {
+    fn prepare(dir: &Path, path: &Path, counters: &'a mut StoreCounters) -> io::Result<Self> {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "record name"))?;
+        let temp = dir.join(format!(".{name}.{}{TEMP_SUFFIX}", std::process::id()));
+        remove_if_present(&temp)?;
+        let file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&temp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
+        Ok(Self {
+            path: temp,
+            file: Some(file),
+            counters,
+        })
+    }
+
+    fn sync(&self) -> io::Result<()> {
+        self.file.as_ref().expect("owned temp").sync_all()
+    }
+
+    fn verify(&self) -> io::Result<()> {
+        let held = self.file.as_ref().expect("owned temp").metadata()?;
+        let actual = fs::symlink_metadata(&self.path)?;
+        if Stamp::of(&held) != Stamp::of(&actual) {
+            return Err(io::Error::other("temp changed"));
+        }
+        Ok(())
+    }
+
+    fn commit(&mut self, path: &Path, prior: Option<Stamp>) -> io::Result<()> {
         #[cfg(test)]
-        test_hooks::before_rename(&temp, path)?;
+        test_hooks::before_rename(&self.path, path)?;
+        self.verify()?;
         let actual = match fs::symlink_metadata(path) {
             Ok(metadata) => Some(Stamp::of(&metadata)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
@@ -1526,10 +1556,62 @@ fn write_atomic(dir: &Path, path: &Path, bytes: &[u8], prior: Option<Stamp>) -> 
         if actual != prior {
             return Err(io::Error::other("predecessor changed"));
         }
-        fs::rename(&temp, path)
+        fs::rename(&self.path, path)?;
+        self.file.take(); // The caller still owes store/parent sync for a receipt.
+        Ok(())
+    }
+
+    fn discard(&mut self) -> io::Result<()> {
+        if self.file.is_none() {
+            return Ok(());
+        }
+        let result = (|| {
+            match self.verify() {
+                Ok(()) => remove_if_present(&self.path)?,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            sync_dir(self.path.parent().expect("temp directory"))?;
+            if !fs::symlink_metadata(&self.path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+            {
+                return Err(io::Error::other("temp cleanup unverified"));
+            }
+            self.file.take();
+            Ok(())
+        })();
+        if result.is_err() {
+            self.counters.temp_discard_failed += 1;
+        }
+        result
+    }
+}
+
+impl Drop for TempRecord<'_> {
+    fn drop(&mut self) {
+        if self.file.is_some() {
+            self.counters.temp_drop_fallback += 1;
+            let _ = self.discard();
+        }
+    }
+}
+
+/// Same post-save writer: prepare/write/sync/commit, with explicit discard on
+/// every error. The caller syncs the store and parent before issuing a receipt.
+fn write_atomic(
+    dir: &Path,
+    path: &Path,
+    bytes: &[u8],
+    prior: Option<Stamp>,
+    counters: &mut StoreCounters,
+) -> io::Result<()> {
+    let mut temp = TempRecord::prepare(dir, path, counters)?;
+    let result = (|| {
+        temp.file.as_mut().expect("owned temp").write_all(bytes)?;
+        temp.sync()?;
+        temp.commit(path, prior)
     })();
     if result.is_err() {
-        let _ = fs::remove_file(&temp);
+        let _ = temp.discard();
     }
     result
 }
