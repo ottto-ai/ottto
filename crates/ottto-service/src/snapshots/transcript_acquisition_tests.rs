@@ -4090,7 +4090,11 @@ fn missing_index_debt_carrier_recovers_by_full_in_one_pass_for_both_sources() {
             diagnostics
                 .iter()
                 .filter(|row| row["stage"] == "native_collection_page")
-                .filter_map(|row| row["counts"]["sampled_acquisition"]["audits_completed"].as_u64())
+                .map(|row| {
+                    row["counts"]["sampled_acquisition"]["page_events"]["audits_completed"]
+                        .as_u64()
+                        .expect("production page_events exposes the completion counter")
+                })
                 .sum::<u64>(),
             1,
             "verified-first recovery uses the existing completion counter"
