@@ -1525,7 +1525,6 @@ mod tests {
             CompatibilityUnfunded,
             DecoderRefusedHeaderOccupancy,
             FamilyUnproven,
-
         ];
         assert_eq!(ALL.len(), super::CODEX_ZST_CAUSES);
         assert_eq!(

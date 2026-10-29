@@ -814,7 +814,6 @@ crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
 crate::heap_layout_bound::fields!(HeaderWitness; plain_twin, custody_cause, candidate, owner, home, created_unix_ms, metadata, stamp);
 crate::heap_layout_bound::fields!(HeaderInventory; custody_next, absence_held, custody_unknown, custody_after, custody_done, custody_peak, custody_refused, roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, archive_work, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, bounded_out);
 
-
 #[derive(Clone, Debug)]
 pub(super) struct Group {
     pub(super) owner: String,
@@ -4779,6 +4778,65 @@ pub(in crate::snapshots) mod header_cache_tests {
             }
             fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[test]
+    fn warm_plain_facts_do_not_cache_custody_or_same_owner_fences() {
+        let (root, fixture) = tests::fixture();
+        let paths = paths(&fixture);
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let warm = page(&root, &paths, &cache);
+        let held = paths.first().unwrap();
+        let owner = warm.owner_for_path(Path::new(held)).unwrap().to_owned();
+        assert!(cache
+            .with_cursor(|cursor| cursor.headers.get(held))
+            .unwrap()
+            .is_some());
+        let mut index = ScanIndex::default();
+        index.hold_compressed(
+            Path::new(held),
+            BTreeSet::from([owner.clone()]),
+            CodexZstCause::ParentLedgerUnbound,
+        );
+        let before = serde_json::to_value(&index).unwrap();
+        let sessions = root.join("sessions");
+        let mut census = DirectoryCensus::new();
+        census.observe(&sessions, &fs::metadata(&sessions).unwrap());
+        let mut inventory = HeaderInventory::new(&[sessions], &paths, Some(&census));
+        READ_CALLS.with(|calls| calls.set(0));
+        while !inventory.step_with_archive(&CodexTitleMetadata::default(), &mut index, Some(&cache))
+        {
+        }
+        assert_eq!(inventory.reuse_hits, paths.len() - 1);
+        assert_eq!(inventory.reuse_misses, 0);
+        assert!(inventory
+            .headers
+            .iter()
+            .all(|h| local_index_key(&h.candidate.path) != *held));
+        READ_CALLS.with(|calls| assert_eq!(calls.get(), 0));
+        assert_eq!(serde_json::to_value(&index).unwrap(), before);
+        while !inventory.prepare_custody(&index) {}
+        assert!(!inventory.complete_for(Some(&owner)));
+        assert!(
+            inventory.groups().is_empty(),
+            "same-owner debt is rebuilt from custody"
+        );
+        // A new index without custody uses the same warm facts, but inherits no
+        // held cause, owner fence, membership exclusion or incompleteness.
+        let clear = page(&root, &paths, &cache);
+        assert!(clear.complete_for(Some(&owner)));
+        assert_eq!(clear.reuse_hits, paths.len());
+        assert!(clear.headers.iter().all(|h| h.custody_cause.is_none()));
+        assert_eq!(
+            clear
+                .groups()
+                .values()
+                .map(|g| g.members.len())
+                .sum::<usize>(),
+            paths.len()
+        );
+        READ_CALLS.with(|calls| assert_eq!(calls.get(), 0));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
