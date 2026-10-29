@@ -46,6 +46,7 @@ pub(crate) const WRITE_PASS_BYTES: usize = 8 * 1024 * 1024;
 /// Upper bound of both stores' resident digest maps (two sources).
 /// Pin history: Lead A approved 65,536 -> 401,408 bytes on 2026-10-29:
 /// memo 2*256*256 = 131,072; pending 2*(32+1)*4096 = 270,336 bytes.
+/// Total also includes A0's 525,312-byte retail reserve: 926,720 bytes.
 /// Any further growth requires a new owner decision. Native/container evidence
 /// remains required; this pin is not enforcement by the cache's heap walk.
 pub(crate) const STORES_RESIDENT_BOUND: usize =
@@ -817,17 +818,24 @@ impl SharedCache {
         index: &mut ScanIndex,
         candidate: &CandidateFile,
     ) {
+        let class = match reason {
+            RetailHold::Exhausted => "retail_hold.exhausted",
+            RetailHold::AccountingLost => "retail_hold.accounting_lost",
+            RetailHold::Ineligible => "retail_hold.ineligible",
+        };
+        self.durable_custody_hold(source, class, index, candidate);
+    }
+    pub(in crate::snapshots) fn durable_custody_hold(
+        &self,
+        source: SnapshotSource,
+        class: &'static str,
+        index: &mut ScanIndex,
+        candidate: &CandidateFile,
+    ) {
         let kept = source == SnapshotSource::ClaudeCode
             && claude_request_census::retain_held(index, candidate);
         if let Some(mut stores) = self.durable() {
-            Counters::bump(
-                &mut stores.counters.ineligible,
-                match reason {
-                    RetailHold::Exhausted => "retail_hold.exhausted",
-                    RetailHold::AccountingLost => "retail_hold.accounting_lost",
-                    RetailHold::Ineligible => "retail_hold.ineligible",
-                },
-            );
+            Counters::bump(&mut stores.counters.ineligible, class);
             stores.counters.held_census[usize::from(!kept)] += 1;
             if let Some(ds) = durable_source(source) {
                 if let Some(slot) = stores.slot(ds).as_mut() {
@@ -897,7 +905,16 @@ impl SharedCache {
             index,
             interpretation,
         ) {
-            Some(taken) => RestoreOutcome::Restored(Box::new(taken)),
+            Some(()) => match self.take_prepared(snapshot_source, key) {
+                Ok(Some((taken, lease))) => {
+                    if let Some(mut stores) = self.durable() {
+                        stores.counters.restored += 1;
+                    }
+                    RestoreOutcome::Restored(Box::new(taken), lease)
+                }
+                Ok(None) => RestoreOutcome::Pending,
+                Err(()) => RestoreOutcome::Pending,
+            },
             None => self
                 .durable_hold(snapshot_source, key)
                 .map_or(RestoreOutcome::Miss, RestoreOutcome::Held),
@@ -914,7 +931,7 @@ impl SharedCache {
         held: &mut File,
         index: &ScanIndex,
         interpretation: &Interpretation<'_>,
-    ) -> Option<Taken<CachedJsonlReduction>> {
+    ) -> Option<()> {
         let source = durable_source(snapshot_source)?;
         let store_key = store::key_digest(source, key);
         let allowlist = codec::allowlist_digest(snapshot_source);
@@ -1018,9 +1035,8 @@ impl SharedCache {
             stores.counters.budget_refused += 1;
             return None;
         }
-        stores.counters.restored += 1;
         drop(stores);
-        self.take(key)
+        Some(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1100,6 +1116,28 @@ impl SharedCache {
         if let Some(mut stores) = self.durable() {
             if stores.touched.len() < store::MAX_RECORDS * 2 {
                 stores.touched.insert(key.to_string());
+            }
+        }
+    }
+
+    pub(in crate::snapshots) fn take_prepared(
+        &self,
+        source: SnapshotSource,
+        key: &str,
+    ) -> Result<Option<(Taken<CachedJsonlReduction>, store::ActiveLease)>, ()> {
+        // Every admitted graph+key <= ENTRY_BYTES; cover moved Box/carrier and
+        // fixed acquisition scratch too. This is transfer funding, not decode.
+        let store::LeaseWait::Granted(lease) = self.acquire_active(
+            source,
+            (store::RECORD_BYTES + super::AUDIT_AND_SCRATCH_BYTES) as u64,
+        ) else {
+            return Err(());
+        };
+        match self.take(key) {
+            Some(taken) => Ok(Some((taken, lease))),
+            None => {
+                lease.release();
+                Ok(None)
             }
         }
     }
@@ -1509,7 +1547,8 @@ impl SharedCache {
 }
 
 pub(crate) enum RestoreOutcome {
-    Restored(Box<Taken<CachedJsonlReduction>>),
+    Restored(Box<Taken<CachedJsonlReduction>>, store::ActiveLease),
+    Pending,
     Miss,
     Held(store::Refusal),
 }

@@ -42,7 +42,40 @@ crate::durable_tail_codec::durable_struct!(CachedJsonlReduction {
 /// M1 durable warm-cache reuse: the record body and its re-derivation.
 #[cfg(unix)]
 pub(super) mod durable;
+#[cfg(test)]
+pub(super) mod preparation_tests {
+    use super::*;
+    type Hook = Box<dyn FnMut(&crate::transcript_cache::Taken<CachedJsonlReduction>) -> Result<()>>;
+    thread_local! {
+        static FAULT: std::cell::RefCell<Option<Hook>> = const { std::cell::RefCell::new(None) };
+        pub(super) static HEAP_REFUSAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    pub(super) fn check(
+        taken: &crate::transcript_cache::Taken<CachedJsonlReduction>,
+    ) -> Result<()> {
+        FAULT.with(|fault| {
+            fault
+                .borrow_mut()
+                .as_mut()
+                .map_or(Ok(()), |fault| fault(taken))
+        })
+    }
+    pub(in crate::snapshots) fn set(hook: Option<Hook>) {
+        FAULT.with(|fault| *fault.borrow_mut() = hook);
+    }
+    pub(in crate::snapshots) fn refuse_heap(value: bool) {
+        HEAP_REFUSAL.with(|flag| flag.set(value));
+    }
+    pub(in crate::snapshots) fn heap_refused() -> bool {
+        HEAP_REFUSAL.with(|flag| flag.get())
+    }
+}
+
 impl CachedJsonlReduction {
+    #[cfg(test)]
+    pub(in crate::snapshots) fn accumulator_for_test(&mut self) -> &mut SnapshotAccumulator {
+        &mut self.accumulator
+    }
     /// The copy's usage witness (`SnapshotAccumulator::usage_witness`), kept
     /// beside a taken copy for P1-RETAIN R0's Q-PR15 guard.
     pub(super) fn usage_witness(&self) -> u64 {
@@ -168,6 +201,12 @@ impl OwnedJsonlParser {
         debt: Option<AuditDebt>,
         now: u64,
     ) -> std::result::Result<ReadMode, PrepareRejected> {
+        #[cfg(test)]
+        if let Some(original) = taken.as_ref() {
+            if let Err(error) = preparation_tests::check(original) {
+                return Err(PrepareRejected { error, taken });
+            }
+        }
         self.prepare_acquisition_inner(taken, scope, debt, now, true)
     }
     fn prepare_acquisition_inner(
@@ -244,6 +283,16 @@ impl OwnedJsonlParser {
                 });
             }
             taken = None;
+        }
+        if preserve
+            && taken
+                .as_ref()
+                .is_some_and(|taken| taken.retained.checkpoint.scope() != scope)
+        {
+            return Err(PrepareRejected {
+                error: anyhow::anyhow!("incompatible acquisition scope"),
+                taken,
+            });
         }
         let old = taken.as_ref().map(|taken| &taken.retained);
         let plan = match ReadPlan::prepare(

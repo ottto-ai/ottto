@@ -100,6 +100,20 @@ pub(crate) struct Taken<S> {
     pub(crate) e2_held_new_file: bool,
 }
 
+impl<S: HeapLayoutBound> HeapLayoutBound for Taken<S> {
+    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
+        let Self {
+            retained,
+            durable,
+            modified_hint: _,
+            finalization_charge: _,
+            e2_held_new_file: _,
+        } = self;
+        retained.heap_bound(c)?;
+        durable.heap_bound(c)
+    }
+}
+
 // Preserve the caller's storage as well as its state on refusal. Ordinary
 // optional-copy admission stays inline; the lossless caller keeps its box.
 pub(crate) trait Incoming<S>: std::borrow::Borrow<Taken<S>> {
@@ -212,18 +226,6 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
             Event::TakeAbsent
         });
         taken
-    }
-    /// Current custody is fixed inline metadata, already charged in Entry's slot.
-    pub(crate) fn restore_custody(
-        &mut self,
-        key: &str,
-        durable: crate::snapshots::DurableCustody,
-        held_new: bool,
-    ) {
-        if let Some(entry) = self.entries.get_mut(key) {
-            entry.durable = durable;
-            entry.e2_held_new_file = held_new;
-        }
     }
     /// Allocation-free update of inline eligibility on existing residents.
     /// `None` leaves an unvisited resident alone; no new registry or entry.

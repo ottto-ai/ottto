@@ -239,6 +239,11 @@ pub(crate) struct Checkpoint {
 }
 
 impl Checkpoint {
+    /// The interpretation scope this checkpoint was made under.
+    pub(crate) fn scope(&self) -> &Scope {
+        &self.scope
+    }
+
     /// A cache admission hint only. Source validation still uses the complete
     /// stamp, scope, samples and independent audit obligation.
     pub(crate) fn modified_hint(&self) -> (i64, i64) {
@@ -1448,10 +1453,6 @@ pub(crate) fn birth_unix_nanos(metadata: &Metadata) -> u64 {
 impl Checkpoint {
     /// This checkpoint as a content-free durable certificate. `None` when its
     /// samples are not valid for its stamp (such a checkpoint never admits).
-    /// The interpretation scope this checkpoint was made under.
-    pub(crate) fn scope(&self) -> &Scope {
-        &self.scope
-    }
 
     pub(crate) fn durable_certificate(&self, birth_nanos: u64) -> Option<DurableCertificate> {
         if !self.samples.valid_for(self.stamp.length)

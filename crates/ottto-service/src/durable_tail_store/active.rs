@@ -104,6 +104,16 @@ impl ActiveLease {
         }
     }
 }
+impl crate::heap_layout_bound::HeapLayoutBound for ActiveLease {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        let Self {
+            source: _,
+            bytes: _,
+            released: _,
+        } = self;
+        c.add(0) // Fixed fields only; the process owner is static, never walked.
+    }
+}
 impl Drop for ActiveLease {
     fn drop(&mut self) {
         self.finish(true);

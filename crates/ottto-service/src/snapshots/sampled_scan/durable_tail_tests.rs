@@ -34,6 +34,477 @@ fn owned_parser(source: SnapshotSource, path: &Path, file: File) -> OwnedJsonlPa
     OwnedJsonlParser::new(file, path, source, apply, None, None, None, false, true).unwrap()
 }
 
+struct ClearPreparationFault;
+impl Drop for ClearPreparationFault {
+    fn drop(&mut self) {
+        sampled_jsonl::preparation_tests::set(None);
+        sampled_jsonl::preparation_tests::refuse_heap(false);
+    }
+}
+
+// Direct owned API: reason precedence cannot turn an incompatible scope into
+// an audit/clock Full. The write-only FD also makes any body read fail.
+#[test]
+fn empty_custody_scope_rejection_precedes_audit_clock_and_all_body_reads() {
+    use crate::transcript_acquisition::{AuditDebt, ReadMode};
+    use std::io::Seek;
+    let _clear = ClearPreparationFault;
+    for reason in ["ordinary", "audit", "clock"] {
+        let root = crate::test_scratch::ScratchDir::new("scope-before-read");
+        let path = root.join("source.jsonl");
+        let scope = Scope("original".into());
+        let taken = owned_fixture(SnapshotSource::ClaudeCode, &path, &scope);
+        assert!(taken.durable.is_empty());
+        let address = &*taken as *const _ as usize;
+        let body = codec::encode(
+            &taken.retained.state,
+            store::BODY_BYTES,
+            jsonl_line_cap() as u64,
+        )
+        .unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let mut parser = owned_parser(SnapshotSource::ClaudeCode, &path, file);
+        let debt = (reason == "audit").then_some(AuditDebt {
+            due_unix_seconds: 1,
+        });
+        let now = if reason == "clock" { 1 } else { 1_800_000_000 };
+        let result =
+            parser.prepare_acquisition_owned(Some(taken), &Scope("changed".into()), debt, now);
+        assert_eq!(
+            usize::from(matches!(&result, Ok(ReadMode::Full(_)))),
+            0,
+            "0 Full"
+        );
+        let rejected = match result {
+            Err(error) => error,
+            Ok(_) => panic!("scope reused"),
+        };
+        assert!(rejected.error.to_string().contains("scope"));
+        let original = rejected.taken.unwrap();
+        assert_eq!(&*original as *const _ as usize, address);
+        assert_eq!(
+            codec::encode(
+                &original.retained.state,
+                store::BODY_BYTES,
+                jsonl_line_cap() as u64
+            )
+            .unwrap(),
+            body
+        );
+        assert_eq!(parser.reader.consumed_bytes(), 0, "0 body bytes");
+        assert!(parser.reader.reader.buffer().is_empty());
+        assert!(parser.reader.acquisition.is_none());
+        assert_eq!(parser.reader.reader.get_mut().stream_position().unwrap(), 0);
+    }
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "validated native admission layout")]
+fn direct_return_keeps_attached_guard_on_heap_poison_and_self_eviction() {
+    use crate::local_resource_diagnostics::cache_lifecycle::observe;
+    assert!(crate::heap_layout_bound::layout_supported());
+    let _clear = ClearPreparationFault;
+    for arm in ["heap", "poison", "self"] {
+        let root = crate::test_scratch::ScratchDir::new("return-original-refusal");
+        let path = root.join("source.jsonl");
+        let cache = SharedCache::default();
+        let mut taken = owned_fixture(SnapshotSource::ClaudeCode, &path, &Scope("original".into()));
+        let guard = cache
+            .begin_retail(
+                SnapshotSource::ClaudeCode,
+                "key",
+                &taken.retained.checkpoint,
+                &File::open(&path).unwrap(),
+                taken.retained.checkpoint.sealed_offset(),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        let guard_facts = (guard.object, guard.next, guard.end, guard.old_end);
+        taken.durable.put_retail(guard);
+        let address = &*taken as *const _ as usize;
+        let checkpoint = format!("{:?}", taken.retained.checkpoint);
+        let body = codec::encode(
+            &taken.retained.state,
+            store::BODY_BYTES,
+            jsonl_line_cap() as u64,
+        )
+        .unwrap();
+        match arm {
+            "heap" => sampled_jsonl::preparation_tests::refuse_heap(true),
+            "poison" => cache.poison_retained(),
+            "self" => {
+                let floor = crate::heap_layout_bound::bound(
+                    &crate::transcript_cache::TranscriptCache::<CachedJsonlReduction>::default(),
+                    usize::MAX,
+                )
+                .unwrap();
+                let limit = floor
+                    + taken.finalization_charge
+                    + cache.cursor_resident_for_main()
+                    + super::super::side_ledger::SIDE_LEDGER_BYTES;
+                *cache.retained().unwrap() =
+                    crate::transcript_cache::TranscriptCache::with_byte_limit(limit);
+            }
+            _ => unreachable!(),
+        }
+        let (result, counts) = observe(|| cache.return_prepared_taken("key".into(), taken));
+        let mut returned = result.err().expect("real refusal");
+        assert_eq!(&*returned as *const _ as usize, address);
+        assert_eq!(format!("{:?}", returned.retained.checkpoint), checkpoint);
+        assert_eq!(
+            codec::encode(
+                &returned.retained.state,
+                store::BODY_BYTES,
+                jsonl_line_cap() as u64
+            )
+            .unwrap(),
+            body
+        );
+        assert_eq!(returned.modified_hint, (17, 19));
+        assert_eq!(returned.finalization_charge, 23);
+        assert!(returned.e2_held_new_file);
+        let guard = returned.durable.take_retail().expect("attached at refusal");
+        assert_eq!(
+            (guard.object, guard.next, guard.end, guard.old_end),
+            guard_facts
+        );
+        guard.finish();
+        match arm {
+            "heap" => assert_eq!(counts.insert_entry_bound_refused, 1),
+            "poison" => {
+                assert!(cache.lock_poisoned_for_test(super::super::TestLock::Retained));
+                assert_eq!(counts.insert_poisoned_lock, 1);
+            }
+            "self" => assert_eq!(counts.insert_self_evicted, 1),
+            _ => unreachable!(),
+        }
+        sampled_jsonl::preparation_tests::refuse_heap(false);
+    }
+}
+
+#[test]
+fn direct_completed_absence_and_heap_refusal_return_checkpoint_and_custody() {
+    let _clear = ClearPreparationFault;
+    for absent in [true, false] {
+        let root = crate::test_scratch::ScratchDir::new("completed-refusal");
+        let path = root.join("source.jsonl");
+        let cache = SharedCache::default();
+        let mut taken = owned_fixture(SnapshotSource::ClaudeCode, &path, &Scope("original".into()));
+        let guard = cache
+            .begin_retail(
+                SnapshotSource::ClaudeCode,
+                "key",
+                &taken.retained.checkpoint,
+                &File::open(&path).unwrap(),
+                taken.retained.checkpoint.sealed_offset(),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        taken.durable.put_retail(guard);
+        let checkpoint = format!("{:?}", taken.retained.checkpoint);
+        let original = sampled_jsonl::CompletedNativeAcquisition {
+            checkpoint: taken.retained.checkpoint,
+            reduction: (!absent).then_some(taken.retained.state),
+            durable: taken.durable,
+            released: Some((17, 19)),
+            unsealed: true,
+        };
+        if !absent {
+            sampled_jsonl::preparation_tests::refuse_heap(true);
+        }
+        let mut returned = cache
+            .insert_with_custody("key".into(), original, 23, true, false)
+            .err()
+            .expect("no destructive refusal");
+        assert_eq!(format!("{:?}", returned.checkpoint), checkpoint);
+        assert_eq!(returned.reduction.is_none(), absent);
+        assert_eq!(returned.released, Some((17, 19)));
+        assert!(returned.unsealed);
+        returned
+            .durable
+            .take_retail()
+            .expect("same actual guard")
+            .finish();
+    }
+}
+
+// Actual production caller, not the direct API fixtures above. The accepted
+// frontier is the record's frontier: this fixture's exact old-byte overlap is0;
+// its positive Tail and physical guarded bytes discriminate the lost-guard bug.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "validated native admission layout")]
+fn production_cold_prepare_error_returns_guard_then_next_pass_reads_accounted_tail() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    assert!(crate::heap_layout_bound::layout_supported());
+    let _gate = claude_request_money::e2::GateForTest::set(true);
+    let _clear = ClearPreparationFault;
+    for return_mode in ["accept", "capacity", "poison", "spent"] {
+        let refuse_return = matches!(return_mode, "capacity" | "poison");
+        let root = crate::test_scratch::ScratchDir::new("cold-prepare-return-tail");
+        let lock = test_locks::hold(&root);
+        let sessions = root.join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let path = sessions.join("11111111-2222-4333-8444-555555555555.jsonl");
+        native_fixture(&path);
+        let key = local_index_key(&path);
+        let source = SnapshotSource::ClaudeCode;
+        let namespace = Scope("cold-owned-prepare".into());
+        let index_path = root.join("index.json");
+        let cache = Arc::new(SharedCache::default());
+        cache.durable_begin_pass(source, &index_path, &namespace, true);
+        let start = |index| {
+            OwnedSourceScan::new_with_identity_capture(
+                source,
+                std::slice::from_ref(&sessions),
+                index,
+                "2026-10-20T12:00:00Z",
+                365,
+                100,
+                false,
+                None,
+                &[],
+                false,
+                true,
+                true,
+            )
+            .with_sampled_acquisition(cache.clone(), namespace.clone())
+        };
+        let finish = |mut scan: OwnedSourceScan| {
+            let mut modes = (0, 0, 0);
+            for _ in 0..10_000 {
+                if let Some(context) = scan.sampling.as_ref() {
+                    modes = (context.full_files, context.tail_files, context.native_bytes);
+                }
+                match scan.step(None) {
+                    OwnedSourceScanStep::Pending(next) => scan = next,
+                    OwnedSourceScanStep::Complete { index, scan, .. } => {
+                        return (index, scan, modes)
+                    }
+                }
+            }
+            panic!("scan did not complete");
+        };
+        let (index, first, _) = finish(start(ScanIndex::default()));
+        assert_eq!(first.snapshots.len(), 1);
+        assert_eq!(first.snapshots[0].input_tokens, 100);
+        assert!(cache.retained().unwrap().peek(&key).is_some());
+        index.save(&index_path).unwrap();
+        assert_eq!(
+            cache
+                .durable_write_after_save(lock, source, &index)
+                .unwrap()
+                .written,
+            1
+        );
+        cache.retained().unwrap().clear();
+        let record_end = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(index.files[&key].size_bytes, record_end);
+        let suffix = serde_json::json!({"type":"assistant","sessionId":"11111111-2222-4333-8444-555555555555",
+            "timestamp":"2026-10-07T10:01:00Z","requestId":"req-tail",
+            "message":{"id":"msg-tail","model":"fixture-model","usage":{"input_tokens":25,"output_tokens":3}}}).to_string()+"\n";
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(suffix.as_bytes())
+            .unwrap();
+        let granted = Arc::new(Mutex::new(None));
+        let observation = granted.clone();
+        let pressure = cache.clone();
+        sampled_jsonl::preparation_tests::set(Some(Box::new(move |taken| {
+            let guard = taken
+                .durable
+                .retail
+                .as_ref()
+                .expect("guard BEFORE owned prepare");
+            let facts = (
+                guard.object,
+                guard.next,
+                guard.end,
+                guard.old_end,
+                taken.modified_hint,
+                taken.finalization_charge,
+                taken.e2_held_new_file,
+                taken as *const _ as usize,
+                guard as *const _ as usize,
+            );
+            *observation.lock().unwrap() = Some(facts);
+            if return_mode == "poison" {
+                pressure.poison_retained();
+            } else if refuse_return {
+                *pressure.retained().unwrap() =
+                    crate::transcript_cache::TranscriptCache::with_byte_limit(0);
+            }
+            anyhow::bail!("injected native prepare failure")
+        })));
+        let before = (retail_bytes(source, 0), retail_bytes(source, 1));
+        let mut scan = start(index);
+        for _ in 0..10_000 {
+            scan = match scan.step(None) {
+                OwnedSourceScanStep::Pending(next) => next,
+                _ => panic!("error must retain a pending pass"),
+            };
+            if granted.lock().unwrap().is_some() {
+                break;
+            }
+        }
+        let facts = granted
+            .lock()
+            .unwrap()
+            .expect("real cold path reached hook");
+        assert_eq!(facts.1, record_end);
+        assert_eq!(facts.2, record_end + suffix.len() as u64);
+        assert_eq!(facts.3, record_end);
+        assert_eq!(
+            (retail_bytes(source, 0), retail_bytes(source, 1)),
+            before,
+            "prepare failure reads no suffix"
+        );
+        assert_eq!(cache.durable().unwrap().retail_spent.len(), 1);
+        assert_eq!(cache.durable().unwrap().counters.retail_attempts, 1);
+        assert_eq!(scan.sampling.as_ref().unwrap().full_files, 0);
+        assert_eq!(scan.sampling.as_ref().unwrap().native_bytes, 0);
+        if return_mode == "poison" {
+            let active = scan.active_file.as_ref().expect("funded poison hold");
+            assert!(active
+                .parser
+                .pending_taken
+                .as_ref()
+                .unwrap()
+                .durable
+                .retail
+                .is_some());
+            assert!(active.parser.pending_funding.is_some());
+            assert!(cache.lock_poisoned_for_test(super::super::TestLock::Retained));
+            let (_, events) = crate::local_resource_diagnostics::capture(|| drop(scan));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["counts"]["active_drop_release"] == 1)
+                    .count(),
+                1,
+                "cancelled owner uses the counted release net"
+            );
+            let store::LeaseWait::Granted(lease) =
+                cache.acquire_active(source, store::ACTIVE_BYTES)
+            else {
+                panic!("cancel leaked funding")
+            };
+            lease.release();
+            assert_eq!((retail_bytes(source, 0), retail_bytes(source, 1)), before);
+            assert_eq!(cache.durable().unwrap().retail_spent.len(), 1);
+            sampled_jsonl::preparation_tests::set(None);
+            continue;
+        }
+        if refuse_return {
+            let active = scan
+                .active_file
+                .as_deref_mut()
+                .expect("funded actual native owner");
+            let taken = active.parser.pending_taken.as_mut().expect("original held");
+            assert!(active.parser.pending_funding.is_some());
+            assert_eq!(
+                &**taken as *const _ as usize, facts.7,
+                "same original through refused return"
+            );
+            assert_eq!(
+                taken.durable.retail_mut().unwrap() as *mut _ as usize,
+                facts.8,
+                "same one guard"
+            );
+            assert!(
+                active.parser.step().is_err(),
+                "held original cannot read through parser"
+            );
+            *cache.retained().unwrap() = crate::transcript_cache::TranscriptCache::default();
+        } else {
+            assert!(cache.retained().unwrap().peek(&key).is_some());
+        }
+        sampled_jsonl::preparation_tests::set(None);
+        let index = if refuse_return {
+            // Return to RAM before reading, then re-offer the same candidate.
+            scan = match scan.step(None) {
+                OwnedSourceScanStep::Pending(next) => next,
+                _ => panic!("return is a continuation"),
+            };
+            assert!(scan.active_file.is_none());
+            assert!(cache.retained().unwrap().peek(&key).is_some());
+            let (index, result, modes) = finish(scan);
+            assert_eq!(result.snapshots.len(), 1);
+            assert_eq!(result.snapshots[0].input_tokens, 125);
+            assert_eq!(modes.0, 0);
+            assert_eq!(modes.1, 1);
+            index
+        } else {
+            let (index, result, modes) = finish(scan);
+            assert!(
+                result.snapshots.is_empty(),
+                "failed attempt publishes nothing"
+            );
+            assert_eq!(modes.0, 0);
+            index
+        };
+        if return_mode == "spent" {
+            let mut old = cache.take(&key).expect("returned original");
+            old.durable.take_retail().expect("one grant").finish();
+            drop(old); // Model cancellation: never reinsert an explicitly ended guard.
+            let mut index = index;
+            for _ in 0..5 {
+                let (next, result, modes) = finish(start(index));
+                assert!(result.snapshots.is_empty());
+                assert_eq!((modes.0, modes.1, modes.2), (0, 0, 0));
+                assert!(
+                    cache.retained().unwrap().peek(&key).is_none(),
+                    "spent guard cannot leave reusable A"
+                );
+                assert_eq!((retail_bytes(source, 0), retail_bytes(source, 1)), before);
+                index = next;
+            }
+            assert_eq!(cache.durable().unwrap().counters.retail_attempts, 1);
+            let store::LeaseWait::Granted(lease) =
+                cache.acquire_active(source, store::ACTIVE_BYTES)
+            else {
+                panic!("denied grant leaked funding")
+            };
+            lease.release();
+            continue;
+        }
+        if !refuse_return {
+            let (_, result, modes) = finish(start(index));
+            assert_eq!(result.snapshots.len(), 1);
+            assert_eq!(result.snapshots[0].input_tokens, 125);
+            assert_eq!(modes.0, 0);
+            assert_eq!(modes.1, 1);
+        }
+        assert_eq!(retail_bytes(source, 0) - before.0, suffix.len() as u64);
+        assert_eq!(
+            retail_bytes(source, 1) - before.1,
+            0,
+            "exact old accepted overlap"
+        );
+        assert_eq!(
+            cache.durable().unwrap().retail_spent.len(),
+            1,
+            "no second Q11 grant"
+        );
+        assert_eq!(cache.durable().unwrap().counters.retail_attempts, 1);
+        let (_, events) = crate::local_resource_diagnostics::capture(|| {
+            let store::LeaseWait::Granted(lease) =
+                cache.acquire_active(source, store::ACTIVE_BYTES)
+            else {
+                panic!("lease leaked")
+            };
+            lease.release();
+        });
+        assert!(!events
+            .iter()
+            .any(|event| event["counts"]["active_drop_release"] == 1));
+    }
+}
+
 #[test]
 fn owned_prepare_rejects_with_original_box_graph_flags_and_unique_guard() {
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
@@ -70,14 +541,14 @@ fn owned_prepare_rejects_with_original_box_graph_flags_and_unique_guard() {
                 taken
                     .retained
                     .state
-                    .accumulator
+                    .accumulator_for_test()
                     .claude_request_identity_capture = true;
             }
             if arm == "priority" {
                 taken
                     .retained
                     .state
-                    .accumulator
+                    .accumulator_for_test()
                     .codex_observed_priority_turns =
                     Some(BTreeMap::from([("turn-1".into(), true)]));
             }
@@ -246,7 +717,7 @@ fn rejected_ordinary_taken_returns_custody_rank_charge_and_held_flag_under_one_l
         jsonl_line_cap() as u64,
     )
     .unwrap();
-    assert!(cache.return_prepared_taken(key.clone(), taken));
+    assert!(cache.return_prepared_taken(key.clone(), taken).is_ok());
     assert!(
         cache.durable().unwrap().touched.is_empty(),
         "a rejected acquisition is not a fresh M1 writer candidate"
@@ -255,11 +726,7 @@ fn rejected_ordinary_taken_returns_custody_rank_charge_and_held_flag_under_one_l
     assert_eq!(returned.modified_hint, (17, 19));
     assert_eq!(returned.finalization_charge, 23);
     assert!(returned.e2_held_new_file);
-    returned
-        .durable
-        .take_retail()
-        .expect("guard retained through admission")
-        .finish();
+    assert!(returned.durable.retail_mut().is_some());
     assert_eq!(
         codec::encode(
             &returned.retained.state,
@@ -270,7 +737,18 @@ fn rejected_ordinary_taken_returns_custody_rank_charge_and_held_flag_under_one_l
         body
     );
     *cache.retained().unwrap() = crate::transcript_cache::TranscriptCache::with_byte_limit(0);
-    assert!(!cache.return_prepared_taken(key.clone(), Box::new(returned)));
+    let original = Box::new(returned);
+    let address = &*original as *const _ as usize;
+    let mut refused = cache
+        .return_prepared_taken(key.clone(), original)
+        .err()
+        .expect("cache refuses");
+    assert_eq!(&*refused as *const _ as usize, address);
+    refused
+        .durable
+        .take_retail()
+        .expect("refused guard still attached")
+        .finish();
     assert!(cache.take(&key).is_none());
     assert_eq!(cache.durable().unwrap().retail_spent.len(), 1);
 }
@@ -780,6 +1258,7 @@ fn m1_setup_inventory_and_statvfs_failures_are_counted_and_retry_with_original_p
             assert!(cache.insert_admitted(
                 key.clone(),
                 sampled_jsonl::CompletedNativeAcquisition {
+                    durable: Default::default(),
                     checkpoint,
                     reduction: Some(reduction),
                     released: None,
@@ -3072,10 +3551,7 @@ fn q11_complete_map_is_paid_before_the_first_key() {
             .unwrap();
     let reserve = super::super::RETAIL_RESERVE_BYTES;
     assert!((2 * store::MAX_RECORDS + 1) * nodes <= reserve);
-    assert_eq!(
-        STORES_RESIDENT_BOUND,
-        2 * store::MAX_RECORDS * 256 + 2 * (store::MAX_BATCH + 1) * 4096 + reserve
-    );
+    assert_eq!(STORES_RESIDENT_BOUND, 926_720);
     assert_eq!(
         super::super::STATE_BYTES
             + reserve
