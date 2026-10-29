@@ -25568,6 +25568,8 @@ pub(crate) struct OwnedSourceScan {
 struct OwnedActiveFile {
     comparison_target: bool,
     sampling: Option<sampled_scan::Active>,
+    // Survives paging and missing preparation; only source verification retires it.
+    recovered_audit_due: Option<u64>,
     candidate: CandidateFile,
     decision: CandidateDecision,
     previous_snapshot_fingerprint: Option<String>,
@@ -27774,11 +27776,20 @@ impl OwnedSourceScan {
                     }
                 }
                 #[cfg(unix)]
-                if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
+                if let (Some(cache), Some(group)) = (
+                    durable_guard.as_ref().and_then(std::sync::Weak::upgrade),
+                    job.group.as_mut(),
+                ) {
+                    // Each member's missing-carrier deadline rides with the
+                    // job across pause and defer to its own native entry.
                     if let Some((member, reason)) = group_members.iter().find_map(|member| {
-                        cache
-                            .durable_full_hold(source, &local_index_key(&member.path), true)
-                            .map(|reason| (member, reason))
+                        let mut due = None;
+                        let key = local_index_key(&member.path);
+                        let held = cache.durable_member_hold(source, &key, index, &mut due);
+                        if let Some(at) = group.members.iter().position(|m| m.path == member.path) {
+                            group.recovered[at] = due;
+                        }
+                        held.map(|reason| (member, reason))
                     }) {
                         cache.durable_hold_exit(source, reason, index, member, &mut census);
                         pending!();
@@ -28605,6 +28616,7 @@ impl OwnedSourceScan {
                 let OwnedActiveFile {
                     comparison_target,
                     sampling: file_sampling,
+                    recovered_audit_due,
                     candidate,
                     decision,
                     previous_snapshot_fingerprint,
@@ -28620,9 +28632,12 @@ impl OwnedSourceScan {
                     group,
                     side_origin,
                 } = *active;
-                if let Some(mut group) = group {
+                let member_dues = group.map_or_else(Vec::new, |mut group| {
                     codex_legacy_join_baselines.extend(group.take_legacy_baselines());
-                }
+                    std::mem::take(&mut group.recovered)
+                });
+                #[cfg(unix)]
+                let paged = cursor_certificate.is_some();
                 let mut parser = parser;
                 // The repository identity X_out measured, if any (#665 U3).
                 let mut measured_repository_identity = None;
@@ -29902,6 +29917,37 @@ impl OwnedSourceScan {
                         }
                     }
                 }
+                // R1: a paged job parked across a fresh index load captured
+                // no due for a file now without an entry. Re-probe the same
+                // live-context, clamped debt (read only) before recording;
+                // no restart. A re-probed singleton miss counts here.
+                #[cfg(unix)]
+                let (member_dues, recovered_audit_due, reprobed_due) = {
+                    let mut dues = (member_dues, recovered_audit_due, None);
+                    if let Some(cache) = durable_guard
+                        .as_ref()
+                        .and_then(std::sync::Weak::upgrade)
+                        .filter(|_| paged && parse_complete)
+                    {
+                        let absent = |key: &str| !index.files.contains_key(key);
+                        for (member, due) in aliases.iter().zip(dues.0.iter_mut()) {
+                            let key = local_index_key(&member.path);
+                            if due.is_none() && absent(&key) {
+                                *due = cache.durable_carrier_reprobe(source, &key, index);
+                            }
+                        }
+                        if dues.0.is_empty() && dues.1.is_none() && absent(&index_key) {
+                            dues.2 = cache.durable_carrier_reprobe(source, &index_key, index);
+                            dues.1 = dues.2;
+                            if dues.2.is_some() {
+                                cache.durable_note_carrier("audit_carrier");
+                            }
+                        }
+                    }
+                    dues
+                };
+                #[cfg(not(unix))]
+                let reprobed_due: Option<u64> = None;
                 if parse_complete && !aliases.is_empty() {
                     for alias in &aliases {
                         if alias.path == candidate.path {
@@ -30056,6 +30102,42 @@ impl OwnedSourceScan {
                         entry.codex_counting_v2 = codex_counting_v2;
                         entry.codex_counting_owner = counting_owner.clone();
                     }
+                    // Each grouped member, aliases included, settles its own
+                    // recovered debt on its native-created entry: unverified
+                    // stages the existing marker; verified retires and counts.
+                    for (member, &due) in aliases.iter().zip(&member_dues) {
+                        let key = local_index_key(&member.path);
+                        let marked = index
+                            .files
+                            .get(&key)
+                            .and_then(ScanIndexEntry::unverified_deadline);
+                        let staged = !source_verified
+                            && due.is_some_and(|due_unix_seconds| {
+                                index.stage_sampled_audit(
+                                    &key,
+                                    &member.source_file_fingerprint,
+                                    crate::transcript_acquisition::AuditDebt { due_unix_seconds },
+                                )
+                            });
+                        debug_assert!(staged || source_verified || due.is_none());
+                        if let Some(context) = sampling.as_mut() {
+                            if let Some(owed) = marked.or(due).filter(|_| source_verified) {
+                                context.complete_audit(owed);
+                            }
+                            #[cfg(unix)]
+                            for (counted, class) in [
+                                (due.is_some(), "audit_carrier"),
+                                (
+                                    staged && marked.is_none(),
+                                    "audit_carrier_staged_unverified",
+                                ),
+                            ] {
+                                if counted {
+                                    context.cache.durable_note_carrier(class);
+                                }
+                            }
+                        }
+                    }
                     // Native settlement accepts disclosed terminal row loss, even
                     // though that acquisition cannot certify a verified prefix.
                     // Its sampled publication still owes the prepared deadline;
@@ -30074,7 +30156,14 @@ impl OwnedSourceScan {
                                     due_unix_seconds,
                                 },
                             ),
-                    };
+                    }
+                    .or(recovered_audit_due
+                        .filter(|_| !source_verified)
+                        .map(
+                            |due_unix_seconds| crate::transcript_acquisition::AuditDebt {
+                                due_unix_seconds,
+                            },
+                        ));
                     if let Some(debt) = obligation {
                         let was_pending = index
                             .files
@@ -30085,10 +30174,23 @@ impl OwnedSourceScan {
                         {
                             if let Some(context) = sampling.as_mut() {
                                 context.audit_slots = context.audit_slots.saturating_sub(1);
+                                #[cfg(unix)]
+                                if recovered_audit_due.is_some() && !source_verified {
+                                    context
+                                        .cache
+                                        .durable_note_carrier("audit_carrier_staged_unverified");
+                                }
                             }
                         }
                     } else if source_verified {
                         index.complete_full_audit(&index_key, &source_file_fingerprint);
+                        // A re-probed singleton due retires like a captured one, once.
+                        if let Some((context, due)) = sampling
+                            .as_mut()
+                            .zip(reprobed_due.filter(|_| !sampled_audit_verified))
+                        {
+                            context.complete_audit(due);
+                        }
                     }
                     if source == SnapshotSource::ClaudeCode {
                         if claude_grown_prefix {
@@ -31509,10 +31611,15 @@ impl OwnedSourceScan {
                 CandidateDecision::ReconcileLegacy | CandidateDecision::Parse => {}
             }
             #[cfg(unix)]
+            let mut recovered_audit_due = None;
+            #[cfg(not(unix))]
+            let recovered_audit_due = None;
+            #[cfg(unix)]
             if side_plan.is_none() {
                 if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
+                    let key = local_index_key(&candidate.path);
                     if let Some(reason) =
-                        cache.durable_hold(source, &local_index_key(&candidate.path))
+                        cache.durable_hold(source, &key, index, &mut recovered_audit_due)
                     {
                         cache.durable_hold_exit(source, reason, index, &candidate, &mut census);
                         pending!();
@@ -32032,7 +32139,10 @@ impl OwnedSourceScan {
                         .observe(reduction_sidecar.is_some());
                     if let Some(reduction_sidecar) = reduction_sidecar {
                         let debt =
-                            sampled_audit::debt_for_key(index, &key, sampled_scan::now_seconds());
+                            sampled_audit::debt_for_key(index, &key, sampled_scan::now_seconds())
+                                .or(recovered_audit_due.map(|due_unix_seconds| {
+                                    crate::transcript_acquisition::AuditDebt { due_unix_seconds }
+                                }));
                         let protected_entry = index.files.get(&key);
                         context
                             .admission
@@ -32102,7 +32212,7 @@ impl OwnedSourceScan {
                         #[cfg(unix)]
                         context.cache.durable_note_scope(source, &key, &scope);
                         #[cfg(unix)]
-                        let (retained, taken_admission) = match retained {
+                        let (retained, taken_admission, debt) = match retained {
                             None if allow_sample && !parser.reader.reader.is_compressed() => {
                                 let interpretation = sampled_scan::durable_tail::Interpretation::of(
                                     source,
@@ -32130,10 +32240,19 @@ impl OwnedSourceScan {
                                             taken.finalization_charge,
                                             taken.retained.state.usage_witness(),
                                         );
-                                        (Some(taken.retained), Some(admission))
+                                        (Some(taken.retained), Some(admission), debt)
                                     }
-                                    sampled_scan::durable_tail::RestoreOutcome::Miss(_) => {
-                                        (None, taken_admission)
+                                    sampled_scan::durable_tail::RestoreOutcome::Miss(class) => {
+                                        let rearmed = class.rearm_audit(
+                                            index,
+                                            &key,
+                                            sampled_scan::now_seconds(),
+                                        );
+                                        if rearmed.is_some() && debt.is_none() {
+                                            context.audit_slots =
+                                                context.audit_slots.saturating_sub(1);
+                                        }
+                                        (None, taken_admission, rearmed.or(debt))
                                     }
                                     sampled_scan::durable_tail::RestoreOutcome::Held(reason) => {
                                         context.cache.durable_hold_exit(
@@ -32147,7 +32266,7 @@ impl OwnedSourceScan {
                                     }
                                 }
                             }
-                            retained => (retained, taken_admission),
+                            retained => (retained, taken_admission, debt),
                         };
                         let old = retained.filter(|_| allow_sample);
                         context.admission.prepare_started =
@@ -32198,6 +32317,7 @@ impl OwnedSourceScan {
                             .acquisition
                             .as_ref()
                             .and_then(|plan| plan.metrics().audit_due)
+                            .or(recovered_audit_due)
                             .or_else(|| {
                                 // A grown Full without an older obligation
                                 // still owes a quiet audit. Prepare its bound
@@ -32291,12 +32411,12 @@ impl OwnedSourceScan {
                             }
                         };
                         sampled_scan::configure_tier_replay(&mut parser, &candidate, index);
-                        planned_mode = Some((mode, None));
+                        planned_mode = Some((mode, recovered_audit_due));
                         file_sampling = Some(sampled_scan::Active {
                             key,
                             scope,
                             mode,
-                            audit_due: None,
+                            audit_due: recovered_audit_due,
                             retained_hint: None,
                             retained_finalization_charge: 0,
                             retained_usage: None,
@@ -32308,6 +32428,7 @@ impl OwnedSourceScan {
             let mut active = Box::new(OwnedActiveFile {
                 comparison_target,
                 sampling: file_sampling,
+                recovered_audit_due,
                 candidate,
                 decision,
                 previous_snapshot_fingerprint,
@@ -90013,7 +90134,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_ledger_identity_used, codex_parent_resolution_pending, codex_parent_ownership_ledger,
     codex_parent_unresolvable, codex_parent_ledger_unusable, codex_parent_ledger_consulted,
     codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
-crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
+crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, recovered_audit_due, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
 crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery; shared codex_versions);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);

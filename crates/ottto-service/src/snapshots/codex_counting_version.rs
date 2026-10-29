@@ -20,7 +20,7 @@ thread_local! {
 
 /// The compiled cutover.
 #[cfg(not(test))]
-fn cutover_unix_ms() -> Option<i64> {
+pub(super) fn cutover_unix_ms() -> Option<i64> {
     CODEX_COUNTING_V2_CUTOVER_UNIX_MS
 }
 
@@ -28,7 +28,7 @@ fn cutover_unix_ms() -> Option<i64> {
 /// so fixtures stamped with the wall clock cannot switch rule once the
 /// compiled instant passes.
 #[cfg(test)]
-fn cutover_unix_ms() -> Option<i64> {
+pub(super) fn cutover_unix_ms() -> Option<i64> {
     TEST_CUTOVER_UNIX_MS.with(std::cell::Cell::get)
 }
 
