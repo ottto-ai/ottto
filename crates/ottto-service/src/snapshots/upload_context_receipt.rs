@@ -65,6 +65,11 @@ impl ScanIndex {
     }
 
     pub(super) fn file_upload_context_requires_adoption(&self, key: &str) -> bool {
+        // Per-file evidence narrows the existing source-wide debt. An already
+        // adopted source stays quiet even without receipts (including upgrades).
+        if self.upload_context_fingerprint == self.active_upload_context_fingerprint {
+            return false;
+        }
         if !self.file_upload_context_enabled || self.confirmed_empty_files.contains(key) {
             // A suppressed/empty result has no ACK receipt. Keep its existing
             // census-context gate so a new policy can make it uploadable.

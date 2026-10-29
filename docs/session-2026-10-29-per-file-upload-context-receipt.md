@@ -3,7 +3,10 @@
 Claude Code and Codex retain source-wide upload context only after a complete
 census. An incomplete census can therefore reselect an already delivered file
 on every subsequent walk. A local optional `ScanIndexEntry.upload_context_receipt`
-now lets each file settle independently of that source-wide witness.
+now lets each file settle independently while the source-wide witness differs
+from the active context. A matching source-wide witness already suppresses this
+debt, even without receipts. Selection and finalizer no-op bypass share this
+conjunction, so a quiet upgraded index needs no catch-up read or upload.
 
 The receipt holds the existing context H digest, numeric capability replay epoch,
 source H digest, and effective upload-body-set H digest. It never enters an upload.
@@ -47,14 +50,30 @@ this is 4,408,000 bytes, or 4.20 MiB (maximum 4,683,500 bytes). On supported 64-
 layouts the receipt adds 80 inline bytes; three digest strings add 192 payload
 bytes before allocator and tree-node overhead. Entry size grows 480 to 560 bytes;
 heap-bound accounting includes the receipt. This estimate reuses the existing
-file count; no live transcript inventory was read for this change.
+file count as an all-populated storage envelope, not an upgrade catch-up
+estimate; no live transcript inventory was read for this change.
 
 The 0.1.201 and 0.1.202 complete entry codecs are frozen in the regression fixture
 with their source pins. They ignore the optional field and drop it on save.
-A downgrade-then-upgrade costs one re-upload pass. The same drop behavior applies
+A downgrade-then-upgrade costs one re-upload pass where source-wide context
+still differs; already adopted sources stay quiet. The same drop behavior applies
 to 0.1.203. Current encode/decode retains the receipt.
 
-Regression fixtures cover three quiet walks for both sources, a blocked Codex
+Mixed Codex files that cannot earn a whole-file receipt can still loop while
+the source-wide context differs, as in base. Mixed-file backoff belongs to #899
+(C1), not this repair. Confirmed-empty files keep the source-wide gate. A
+counts-only read of current indexes at 2026-10-29 16:44 UTC found zero files
+with both a quarantined entity and an accepted sibling in either source. There
+were 57 confirmed-empty Codex files (8,438,034 indexed source bytes) and 2,598
+Claude files (79,992,500 bytes). These retained cohorts do not measure active
+policy eligibility, per-day reads or wire bytes; other withheld/mismatched groups
+are not sized by this classification. UploadContext-only reads become zero for
+unchanged files that settle, not for every residual file. A path move while
+context debt exists can cause one wire re-upload, with no additional read.
+
+Regression fixtures cover matched-context upgrades without receipts and mixed
+accepted/quarantined file groups (three relists, zero parses and native bytes),
+three quiet walks for both sources, a blocked Codex
 census, context switches, restart, generation replay, held/refused backoff,
 parse/finalize/quarantine/prior-context refusals, stale witnesses and old decoders.
 Validation for this change is local all-target Clippy compilation and formatting;

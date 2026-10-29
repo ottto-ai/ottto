@@ -169,6 +169,68 @@ fn claude_fresh_index_and_context_change_are_quiet_after_adoption() {
     f.assert_quiet();
 }
 #[test]
+fn claude_source_context_matched_without_receipts_is_quiet_for_three_relists() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    let (_, items) = f.pending();
+    f.index.record_accepted_snapshot_fingerprints(
+        &items
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect(),
+    );
+    f.index.upload_context_fingerprint = f.index.active_upload_context_fingerprint.clone();
+    assert!(f.entry().upload_context_receipt.is_none());
+    assert!(!f.index.file_upload_context_requires_adoption(&f.key()));
+    for _ in 0..3 {
+        let (scan, bytes) = f.walk(true);
+        assert_eq!(
+            (scan.scanned_file_count, bytes, scan.snapshots.len()),
+            (0, 0, 0)
+        );
+        assert!(f.entry().upload_context_receipt.is_none());
+    }
+}
+#[test]
+fn claude_source_context_matched_mixed_file_is_quiet_for_three_relists() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    let (mut scan, _) = f.walk(false);
+    // Model a post-policy file group with two distinct entities, through the
+    // real finalizer, before settling only one of its entities.
+    assert_eq!(scan.snapshots.len(), 1);
+    let mut sibling = scan.snapshots[0].clone();
+    sibling.source_session_id = "019fa111-2222-7333-8444-666666666666".into();
+    scan.snapshots.push(sibling);
+    finalize_scan_after_policy(f.source, &mut scan, &mut f.index);
+    assert_eq!(f.index.file_snapshot_fingerprints[&f.key()].len(), 2);
+    let accepted = scan.snapshots[0].snapshot_fingerprint.clone();
+    let refused = scan.snapshots[1].snapshot_fingerprint.clone();
+    assert_ne!(accepted, refused);
+    f.index
+        .record_accepted_snapshot_fingerprints(&BTreeSet::from([accepted.clone()]));
+    let mut quarantine = snapshot_quarantine_record(f.source);
+    quarantine.witness = f.index.active_quarantine_witness.clone().unwrap();
+    quarantine.upload_body_witness = Some(snapshot_upload_body_witness(&scan.snapshots[1]));
+    f.index
+        .quarantined_snapshot_fingerprints
+        .insert(refused.clone(), quarantine);
+    f.index.upload_context_fingerprint = f.index.active_upload_context_fingerprint.clone();
+    assert!(f.entry().upload_context_receipt.is_none());
+    assert!(!f.index.file_upload_context_requires_adoption(&f.key()));
+    for _ in 0..3 {
+        let (scan, bytes) = f.walk(true);
+        assert_eq!(
+            (scan.scanned_file_count, bytes, scan.snapshots.len()),
+            (0, 0, 0)
+        );
+        assert_eq!(f.index.file_snapshot_fingerprints[&f.key()].len(), 2);
+        assert!(f
+            .index
+            .quarantined_snapshot_fingerprints
+            .contains_key(&refused));
+        assert!(f.entry().upload_context_receipt.is_none());
+    }
+}
+#[test]
 fn upload_context_receipt_parse_refused() {
     let mut f = Fixture::new(SnapshotSource::Codex);
     f.walk(false);
