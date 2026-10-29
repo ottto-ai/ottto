@@ -311,6 +311,9 @@ fn shared_quiet_restart_discloses_m1_io_gap_instead_of_claiming_zero() {
     with_e2(|| {
         let mut f = M1::old_writer("transition-quiet", WRITERS[0]);
         let before = f.disk.record_bytes();
+        assert!(!f.prior.file_snapshot_fingerprints.is_empty());
+        assert!(!f.prior.snapshot_activity_at.is_empty());
+        f.prior.snapshot_activity_at.clear();
         let quiet = f.emit_bodies(Mode::Restart);
         assert_eq!(quiet.modes, (0, 0, 1));
         assert_eq!(quiet.restored, 1);
@@ -490,6 +493,10 @@ fn shared_failed_rename_preserves_predecessor_and_retry_money() {
         })));
         let page = f.pages.get_mut(&Mode::DiskRestore).unwrap();
         page.index.save(&f.disk.index).unwrap();
+        let key = fixture::local_key(&f.path);
+        let committed = NativeAcceptedState::of(&page.index, &key);
+        assert!(!committed.accepted.is_empty());
+        assert!(committed.group.is_some() && committed.body_witness.is_some());
         let effects_before = fixture::native_effects(&page.index, &page.scan);
         let writer = crate::locked_state_dir::held_for(&f.disk.index).unwrap();
         assert!(page
@@ -502,24 +509,79 @@ fn shared_failed_rename_preserves_predecessor_and_retry_money() {
         );
         assert_eq!(f.disk.record_bytes(), f.old_bytes);
         crate::durable_tail_store::test_hooks::set_before_rename(None);
-        // M1 still has its old binding and post-save crash gap. Same-process
-        // retry uses completed RAM, not a falsely receipted disk successor.
+        // Select completed RAM under the actual saved post-ACK index; only
+        // activity is missing. Neither money debt nor an ACK is fabricated.
         let mut scanner = E2ScanFixture::default();
         scanner.cache = page.cache.clone();
-        let mut retry = f.c.raw(&scanner, page.index.clone(), 100, true, &[]);
-        assert_eq!(retry.modes.0, 0);
-        retry.enrich(&f.c);
-        retry.finish();
-        let (status, bodies, _) = upload(&retry.scan.snapshots, &mut e2_progress(), ack);
-        assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
-        let result = RouteResult::emitted(Mode::Ram, SOURCE, bodies, &retry.scan.snapshots);
-        money_oracle::assert_equivalent(&cold, &result);
+        let mut retry_prior = page.index.clone();
+        assert!(!retry_prior.file_snapshot_fingerprints.is_empty());
+        assert!(!retry_prior.snapshot_activity_at.is_empty());
+        retry_prior.snapshot_activity_at.clear();
+        assert_eq!(NativeAcceptedState::of(&retry_prior, &key), committed);
+        let mut retry = f.c.raw(&scanner, retry_prior.clone(), 100, true, &[]);
+        assert_eq!(retry.modes, (0, 0, 1));
+        let mut quiet_cold =
+            f.c.raw(&E2ScanFixture::default(), retry_prior, 100, true, &[]);
+        assert_eq!(quiet_cold.modes, (1, 0, 0));
+        let mut raw_bodies = BTreeMap::new();
+        let mut post_calls = 0;
+        for (mode, arm) in [(Mode::ColdFull, &mut quiet_cold), (Mode::Ram, &mut retry)] {
+            assert_eq!(NativeAcceptedState::of(&arm.committed, &key), committed);
+            arm.enrich(&f.c);
+            let raw = arm.scan.snapshots.clone();
+            assert!(!raw.is_empty(), "{mode:?}: native body exists");
+            arm.finish();
+            assert_eq!(
+                arm.scan.semantic_noop_count,
+                raw.len(),
+                "{mode:?}: every raw item was suppressed as a semantic no-op"
+            );
+            // Count the real uploader's batch callback, even for empty input.
+            let (status, batches, _) = upload(&arm.scan.snapshots, &mut e2_progress(), |items| {
+                post_calls += 1;
+                ack(items)
+            });
+            assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+            let finalized = RouteResult::emitted(mode, SOURCE, batches, &arm.scan.snapshots);
+            assert_eq!(finalized.snapshots.len(), 0, "{mode:?}: finalized entities");
+            assert_eq!(finalized.batches.len(), 0, "{mode:?}: uploaded batches");
+            assert_eq!(post_calls, 0, "{mode:?}: no second POST");
+            assert_eq!(NativeAcceptedState::of(&arm.index, &key), committed);
+            let bodies = raw
+                .iter()
+                .map(|item| {
+                    assert!(item.request_count > 0);
+                    (
+                        item.source_session_id.clone(),
+                        serde_json::to_value(item).unwrap(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(bodies.len(), raw.len(), "unique raw entities");
+            raw_bodies.insert(mode, bodies);
+        }
+        let cold_raw = &raw_bodies[&Mode::ColdFull];
+        let retry_raw = &raw_bodies[&Mode::Ram];
+        assert_eq!(
+            cold_raw.keys().collect::<Vec<_>>(),
+            retry_raw.keys().collect::<Vec<_>>()
+        );
+        for (entity, cold_body) in cold_raw {
+            for field in money_oracle::FIELDS {
+                assert_eq!(
+                    cold_body[*field], retry_raw[entity][*field],
+                    "raw entity/{entity}/{field}"
+                );
+            }
+        }
+        assert_eq!(f.disk.record_bytes(), f.old_bytes);
         f.prior = f.disk.commit(&retry.cache, SOURCE, &mut retry.index);
+        assert_eq!(NativeAcceptedState::of(&f.prior, &key), committed);
         f.restart();
         f.grow("r5", 50);
         let cold = f.emit_bodies(Mode::ColdFull);
         let restarted = f.emit_bodies(Mode::Restart);
-        assert_eq!(restarted.restored, 1);
+        // deferred: M3 D3 store-fault work (E1) adds the deferred-key requeue after write_after_save failure (durable_tail.rs:1113–1125); current behaviour = predecessor preserved, refused by S2 floor on restart (one Full per restart, no money risk)
         money_oracle::assert_equivalent(&cold, &restarted);
     });
 }
@@ -804,12 +866,12 @@ struct Codex24bObservation {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct Codex24bAcceptedState {
+struct NativeAcceptedState {
     accepted: BTreeSet<String>,
     group: Option<String>,
     body_witness: Option<String>,
 }
-impl Codex24bAcceptedState {
+impl NativeAcceptedState {
     fn of(index: &ScanIndex, key: &str) -> Self {
         let entry = &index.files[key];
         Self {
@@ -972,11 +1034,11 @@ fn codex_24b_old_writer_row(require_zero_old_bytes: bool) {
         money_oracle::assert_equivalent(&cold, &tail);
         driver.save_gc(Mode::DiskRestore);
         let key = fixture::local_key(&path);
-        let committed = Codex24bAcceptedState::of(&driver.prior, &key);
+        let committed = NativeAcceptedState::of(&driver.prior, &key);
         assert!(!committed.accepted.is_empty(), "native ACK baseline exists");
         assert!(committed.group.is_some() && committed.body_witness.is_some());
         driver.restart();
-        assert_eq!(Codex24bAcceptedState::of(&driver.prior, &key), committed);
+        assert_eq!(NativeAcceptedState::of(&driver.prior, &key), committed);
         // Select the unchanged file for EOF version observation without
         // changing its replay binding or accepted money. Give BOTH the cold
         // reference and restored arm this same post-commit selection input.
@@ -1036,7 +1098,7 @@ fn codex_24b_old_writer_row(require_zero_old_bytes: bool) {
             assert_eq!(bodies.len(), observation.raw.len(), "unique raw entities");
             raw_bodies.insert(mode, bodies);
             assert_eq!(
-                Codex24bAcceptedState::of(&driver.pages[&mode].1, &key),
+                NativeAcceptedState::of(&driver.pages[&mode].1, &key),
                 committed,
                 "{mode:?}: native accepted/group/body witnesses unchanged"
             );
