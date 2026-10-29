@@ -61,7 +61,6 @@ pub(crate) const STORES_RESIDENT_BOUND: usize =
 /// Existing class-X re-derivation is bounded at `HEAD_BOUND`, on a RAM
 /// miss only, so the census pass line reports it beside the guard's own
 /// counters (SOURCE N1).
-
 static REDERIVE_HEAD_BYTES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
 pub(crate) fn rederive_head_bytes_total(source: SnapshotSource) -> u64 {

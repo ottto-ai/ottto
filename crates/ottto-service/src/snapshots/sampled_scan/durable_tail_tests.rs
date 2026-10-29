@@ -5866,6 +5866,11 @@ fn q11_complete_map_is_paid_before_the_first_key() {
         0
     );
 }
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "requires the qualified native heap layout"
+)]
 fn receipt_retry_bound_reads_growth_after_quiet_window_and_restart_is_idle() {
     use std::io::Write;
     assert!(crate::heap_layout_bound::layout_supported());
@@ -11038,6 +11043,11 @@ fn shared_recovery_pace_uses_wall_clock_and_overflow_fails_toward_reading() {
     );
 }
 
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "requires qualified native heap layout"
+)]
 fn growth_hold_wall_expiry_restart_recovers_exact_body_without_prefix_duplication() {
     if !crate::test_isolation::run_here() {
         return;
@@ -11273,6 +11283,11 @@ fn s2_unknown_is_same_and_only_independent_replacement_skips_floor() {
     .behind(100));
 }
 
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "requires qualified native heap layout"
+)]
 fn warm_shortened_old_file_keeps_accepted_body_floor_without_publication() {
     if !crate::test_isolation::run_here() {
         return;
