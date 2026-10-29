@@ -589,14 +589,16 @@ impl SharedCache {
         }
     }
 
-    /// A grouped member's `durable_full_hold` at job start, also taking its
-    /// once-clamped live-context missing-carrier deadline (Addendum 6). The
-    /// group settlement counts it once per member that publishes.
+    /// A grouped member's `durable_full_hold` at job start (`start`), also
+    /// taking its once-clamped live-context missing-carrier deadline
+    /// (Addendum 6); settlement re-probes without `start` (R1). The group
+    /// settlement counts it once per member that publishes.
     pub(crate) fn durable_member_hold(
         &self,
         snapshot_source: SnapshotSource,
         key: &str,
         index: &ScanIndex,
+        start: bool,
         recovered_audit_due: &mut Option<u64>,
     ) -> Option<store::Refusal> {
         let source = durable_source(snapshot_source)?;
@@ -608,7 +610,7 @@ impl SharedCache {
         );
         match slot.store.full_guard(
             &store::key_digest(source, key),
-            true,
+            start,
             index.files.contains_key(key),
             &live_context,
         ) {

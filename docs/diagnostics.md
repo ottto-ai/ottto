@@ -207,10 +207,15 @@ to the native-created entry's unverified marker; the earlier
 staged transitions and uses the existing `audits_completed` counter. Later retries
 and later deadline offers cannot renew the recovered obligation.
 Grouped Codex members, aliases included, take the same live-context, once-clamped
-deadline at group job start (not at the preflight hold check); it rides with the
-job through paging and deferral. At settlement each member's native-created entry
-stages the existing marker when the group publishes unverified; a verified group
-Full retires each recovered or marked member through `audits_completed`. Both
+deadline at group job start (not at the preflight hold check); a paused paged job
+carries it, while a deferred group recaptures at its later start. At settlement
+each member's native-created entry stages the existing marker when the group
+publishes unverified; a verified group Full retires each recovered or marked
+member through `audits_completed`. Group retirements have no `audits_started`
+counterpart (groups never plan a sampled mode), so `audits_completed` may exceed
+`audits_started`. A paged group member or singleton that captured no deadline but
+has no index entry at settlement (a fresh index loaded while the job was parked)
+re-probes the same handoff before recording; the job is not invalidated. Both
 carrier counters advance once per settled member, never on preflight or pause.
 Post-save GC preserves same-context debt-bearing records whose key is absent
 from the index; fresh-index cleanup without a trusted context preserves their

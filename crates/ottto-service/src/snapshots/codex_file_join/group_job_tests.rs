@@ -3462,3 +3462,85 @@ fn grouped_missing_carrier_requires_live_context_and_clamps_future_debt() {
     );
     fs::remove_dir_all(root).unwrap();
 }
+
+/// R1: a paged group captures its dues while both members are indexed (none
+/// owed), then parks; the per-pass index loses their entries (a fresh load).
+/// On resume the job keeps its progress, and settlement re-probes each absent
+/// member's record and stages its own marker, counted once. The singleton
+/// paged re-probe is the same settlement block (`dues.1`, via the singleton
+/// guard), so this group fixture covers the shared path.
+#[cfg(unix)]
+#[test]
+fn parked_group_across_fresh_index_reprobes_member_debt_on_resume() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::Codex;
+    let root = paged_corpus("missing-carrier-r1");
+    fs::write(root.join("session_index.jsonl"), "{not valid json}\n").unwrap();
+    let (mut index, seed) = sampled(
+        &root,
+        ScanIndex::default(),
+        10,
+        &Arc::new(SharedCache::default()),
+    );
+    assert!(seed
+        .snapshots
+        .iter()
+        .any(|item| item.source_session_id == OWNER));
+    let lock = crate::locked_state_dir::test_locks::hold(&root);
+    let now = sampled_scan::now_seconds();
+    let dues = [now - 120, now - 60];
+    let seeded = seed_member_debts(&root, lock, &[("a", dues[0], None), ("b", dues[1], None)]);
+    append_rows(
+        &root.join("sessions/b.jsonl"),
+        &chain_rows(OWNER, "b2", "2026-10-01T10:30:00Z", 600, 5)[1..],
+    );
+    let cache = Arc::new(SharedCache::default());
+    cache.durable_begin_pass(
+        source,
+        &root.join("index.json"),
+        &Scope("group-fixture".into()),
+        false,
+    );
+    index.traversal = None;
+    let collected_at = "2026-10-06T23:01:00Z";
+    let (fresh, done) = with_test_limits(2048, 1024, 64, || {
+        let (mut index, _, _) = pages_at(&root, index, &cache, collected_at, || {
+            cache.paused_group_position().is_some()
+        });
+        assert!(seeded
+            .iter()
+            .all(|(path, _)| index.files.contains_key(&local_index_key(path))));
+        // The per-pass index loads without the members' entries.
+        index.files.clear();
+        let (index, result, _) = pages_at(&root, index, &cache, collected_at, || {
+            completions(&cache) > 0
+        });
+        (index, result)
+    });
+    assert!(done
+        .snapshots
+        .iter()
+        .any(|item| item.source_session_id == OWNER));
+    let counted = counters(&cache);
+    assert_eq!(
+        counted.groups_started, 1,
+        "resumed, not rebooted: {counted:?}"
+    );
+    assert_eq!(counted.jobs_invalidated, 0, "{counted:?}");
+    for ((path, _), due) in seeded.iter().zip(dues) {
+        assert_eq!(
+            fresh.files[&local_index_key(path)].unverified_deadline(),
+            Some(due),
+            "{path:?}: staged from the record on resume"
+        );
+    }
+    let (durable, _) = cache.durable_counters(source).unwrap();
+    assert_eq!(durable.ineligible.get("audit_carrier"), Some(&2));
+    assert_eq!(
+        durable.ineligible.get("audit_carrier_staged_unverified"),
+        Some(&2)
+    );
+    fs::remove_dir_all(root).unwrap();
+}

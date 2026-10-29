@@ -27725,7 +27725,7 @@ impl OwnedSourceScan {
                     if let Some((member, reason)) = group_members.iter().find_map(|member| {
                         let mut due = None;
                         let key = local_index_key(&member.path);
-                        let held = cache.durable_member_hold(source, &key, index, &mut due);
+                        let held = cache.durable_member_hold(source, &key, index, true, &mut due);
                         if let Some(at) = group.members.iter().position(|m| m.path == member.path) {
                             group.recovered[at] = due;
                         }
@@ -28566,6 +28566,8 @@ impl OwnedSourceScan {
                     codex_legacy_join_baselines.extend(group.take_legacy_baselines());
                     std::mem::take(&mut group.recovered)
                 });
+                #[cfg(unix)]
+                let paged = cursor_certificate.is_some();
                 let mut parser = parser;
                 // The repository identity X_out measured, if any (#665 U3).
                 let mut measured_repository_identity = None;
@@ -29849,6 +29851,30 @@ impl OwnedSourceScan {
                         }
                     }
                 }
+                // R1: a paged job parked across a fresh index load captured
+                // no due for a file now without an entry. Re-probe the same
+                // live-context, clamped handoff before recording; no restart.
+                #[cfg(unix)]
+                let (member_dues, recovered_audit_due) = {
+                    let mut dues = (member_dues, recovered_audit_due);
+                    if let Some(cache) = durable_guard
+                        .as_ref()
+                        .and_then(std::sync::Weak::upgrade)
+                        .filter(|_| paged && parse_complete)
+                    {
+                        let absent = |key: &str| !index.files.contains_key(key);
+                        for (member, due) in aliases.iter().zip(dues.0.iter_mut()) {
+                            let key = local_index_key(&member.path);
+                            if due.is_none() && absent(&key) {
+                                cache.durable_member_hold(source, &key, index, false, due);
+                            }
+                        }
+                        if dues.0.is_empty() && dues.1.is_none() && absent(&index_key) {
+                            cache.durable_hold(source, &index_key, index, &mut dues.1);
+                        }
+                    }
+                    dues
+                };
                 if parse_complete && !aliases.is_empty() {
                     for alias in &aliases {
                         if alias.path == candidate.path {
@@ -30020,6 +30046,7 @@ impl OwnedSourceScan {
                                     crate::transcript_acquisition::AuditDebt { due_unix_seconds },
                                 )
                             });
+                        debug_assert!(staged || source_verified || due.is_none());
                         if let Some(context) = sampling.as_mut() {
                             if let Some(owed) = marked.or(due).filter(|_| source_verified) {
                                 context.complete_audit(owed);

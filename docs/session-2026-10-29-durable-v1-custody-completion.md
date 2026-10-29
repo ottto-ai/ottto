@@ -13,11 +13,16 @@ Grouped Codex missing-carrier recovery. At group job start every member,
 aliases included, passes the existing T14-aware full hold, which now also
 returns the core's validated same-live-context deadline clamped once to
 min(envelope due, now). The deadline is kept per member on the running group
-job (runtime-only, sized at boot, heap-accounted), so it survives paging,
-pause and deferral. Settlement handles each member's own native-created entry:
-an unverified publication stages the existing unverified-source marker; a
+job (runtime-only, sized at boot, heap-accounted), so a paused paged job
+carries it; a deferred group has not captured yet and recaptures at its later
+start. Settlement handles each member's own native-created entry: an
+unverified publication stages the existing unverified-source marker; a
 source-verified group Full retires recovered and marked members through the
-existing `audits_completed` counter. `ineligible.audit_carrier` and
+existing `audits_completed` counter, which has no `audits_started` counterpart
+for groups. If a fresh index loaded while a paged group or singleton job was
+parked, a member or file with no captured deadline and no index entry
+re-probes the same live-context, clamped handoff at settlement before it is
+recorded; the parked job keeps its progress. `ineligible.audit_carrier` and
 `ineligible.audit_carrier_staged_unverified` advance once per settled member.
 Preflight hold checks and pauses neither capture nor count. No store, map,
 persisted field, Full cause or schedule is added; membership is never inferred
@@ -28,4 +33,6 @@ inventory + incomplete sidecar census, paged and unpaged: publication, a marker
 per member with its own deadline, save/post-save GC/restart, selection past the
 window and verified retirement. A grouped control proves a foreign-context
 alias contributes nothing and a future live-member deadline clamps once.
+A paged group parked across a fresh index load stages each member's marker
+from its record on resume; the singleton re-probe shares that settlement block.
 Exact-head CI and native qualification remain required.
