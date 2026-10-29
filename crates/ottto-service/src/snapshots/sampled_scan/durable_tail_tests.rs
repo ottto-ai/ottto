@@ -6,6 +6,16 @@ use std::io::Read;
 
 const INDEX_KEYS: usize = 20_000;
 
+thread_local! {
+    static BEFORE_COLD_TRANSFER: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+pub(super) fn before_cold_transfer() {
+    let hook = BEFORE_COLD_TRANSFER.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 fn owned_fixture(
     source: SnapshotSource,
     path: &Path,
@@ -39,6 +49,7 @@ impl Drop for ClearPreparationFault {
     fn drop(&mut self) {
         sampled_jsonl::preparation_tests::set(None);
         sampled_jsonl::preparation_tests::refuse_heap(false);
+        BEFORE_COLD_TRANSFER.with(|slot| slot.borrow_mut().take());
     }
 }
 
@@ -233,14 +244,21 @@ fn direct_completed_absence_and_heap_refusal_return_checkpoint_and_custody() {
 // its positive Tail and physical guarded bytes discriminate the lost-guard bug.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native admission layout")]
-fn production_cold_prepare_error_returns_guard_then_next_pass_reads_accounted_tail() {
+fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
     if !crate::test_isolation::run_here() {
         return;
     }
     assert!(crate::heap_layout_bound::layout_supported());
     let _gate = claude_request_money::e2::GateForTest::set(true);
     let _clear = ClearPreparationFault;
-    for return_mode in ["accept", "capacity", "poison", "spent"] {
+    for return_mode in [
+        "accept",
+        "capacity",
+        "poison",
+        "spent",
+        "funding",
+        "funding_spent",
+    ] {
         let refuse_return = matches!(return_mode, "capacity" | "poison");
         let root = crate::test_scratch::ScratchDir::new("cold-prepare-return-tail");
         let lock = test_locks::hold(&root);
@@ -298,6 +316,13 @@ fn production_cold_prepare_error_returns_guard_then_next_pass_reads_accounted_ta
                 .written,
             1
         );
+        let checkpoint = cache
+            .retained()
+            .unwrap()
+            .peek(&key)
+            .unwrap()
+            .checkpoint
+            .clone();
         cache.retained().unwrap().clear();
         let record_end = std::fs::metadata(&path).unwrap().len();
         assert_eq!(index.files[&key].size_bytes, record_end);
@@ -311,6 +336,149 @@ fn production_cold_prepare_error_returns_guard_then_next_pass_reads_accounted_ta
             .unwrap()
             .write_all(suffix.as_bytes())
             .unwrap();
+        if return_mode.starts_with("funding") {
+            let spent = return_mode == "funding_spent";
+            let suffix_bytes = suffix.len() as u64;
+            let attempts_before = cache.durable().unwrap().counters.restore_attempts;
+            let records_before = cache.durable_counters(source).unwrap().1.records_read;
+            if spent {
+                cache
+                    .begin_retail(
+                        source,
+                        &key,
+                        &checkpoint,
+                        &File::open(&path).unwrap(),
+                        record_end,
+                        std::time::Instant::now(),
+                    )
+                    .unwrap()
+                    .finish();
+            }
+            let before = (retail_bytes(source, 0), retail_bytes(source, 1));
+            let census = index.claude_request_census.get(&key).unwrap().clone();
+            let blocked = Arc::new(Mutex::new(None));
+            let owner = blocked.clone();
+            let pressure = cache.clone();
+            let lookup = key.clone();
+            BEFORE_COLD_TRANSFER.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    // Actual decode/rederive completed; the final transfer has not acquired.
+                    assert!(pressure.retained().unwrap().peek(&lookup).is_none());
+                    assert_eq!(
+                        pressure.durable().unwrap().counters.restore_attempts,
+                        attempts_before + 1
+                    );
+                    assert_eq!(
+                        pressure.durable_counters(source).unwrap().1.records_read,
+                        records_before + 1
+                    );
+                    let store::LeaseWait::Granted(lease) =
+                        pressure.acquire_active(source, store::ACTIVE_BYTES)
+                    else {
+                        panic!("competing active owner must win after cold restore")
+                    };
+                    *owner.lock().unwrap() = Some(lease);
+                    // Exercise the real owner/FIFO deadline path, not a fabricated Busy.
+                    store::ActiveLease::timeout_next_acquire_for_test(
+                        std::time::Duration::from_millis(5),
+                    );
+                }))
+            });
+            let ((pending_index, result, modes), events) =
+                crate::local_resource_diagnostics::capture(|| finish(start(index)));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["counts"]["active_wait_busy"] == 1)
+                    .count(),
+                1
+            );
+            assert!(!events
+                .iter()
+                .any(|event| event["counts"]["active_drop_release"] == 1));
+            assert!(result.snapshots.is_empty());
+            assert_eq!((modes.0, modes.1, modes.2), (0, 0, 0));
+            assert!(
+                cache.retained().unwrap().peek(&key).is_none(),
+                "Pending leaves no guardless RAM A"
+            );
+            assert_eq!(pending_index.claude_request_census.get(&key), Some(&census));
+            assert_eq!((retail_bytes(source, 0), retail_bytes(source, 1)), before);
+            {
+                let stores = cache.durable().unwrap();
+                assert_eq!(
+                    stores.counters.ineligible.get("prepared_funding_pending"),
+                    Some(&1)
+                );
+                assert_eq!(stores.counters.held_census, [1, 0]);
+                assert_eq!(stores.counters.restored, 0);
+                assert_eq!(stores.retail_spent.len(), usize::from(spent));
+                assert_eq!(stores.counters.retail_attempts, u64::from(spent));
+            }
+            blocked
+                .lock()
+                .unwrap()
+                .take()
+                .expect("actual competing owner")
+                .release();
+            let observed = Arc::new(Mutex::new(0));
+            let observed_guard = observed.clone();
+            sampled_jsonl::preparation_tests::set(Some(Box::new(move |taken| {
+                let guard = taken
+                    .durable
+                    .retail
+                    .as_ref()
+                    .expect("next-pass cold Tail requires Q11");
+                assert_eq!(
+                    (guard.next, guard.end, guard.old_end),
+                    (record_end, record_end + suffix_bytes, record_end)
+                );
+                *observed_guard.lock().unwrap() += 1;
+                Ok(())
+            })));
+            let (next_index, result, modes) = finish(start(pending_index));
+            sampled_jsonl::preparation_tests::set(None);
+            assert_eq!(modes.0, 0);
+            if spent {
+                assert_eq!(*observed.lock().unwrap(), 0, "spent gate precedes prepare");
+                assert!(result.snapshots.is_empty());
+                assert_eq!((modes.1, modes.2), (0, 0));
+                assert_eq!(
+                    cache
+                        .durable()
+                        .unwrap()
+                        .counters
+                        .ineligible
+                        .get("retail_hold.exhausted"),
+                    Some(&1)
+                );
+                assert_eq!(cache.durable().unwrap().counters.held_census, [2, 0]);
+                assert_eq!((retail_bytes(source, 0), retail_bytes(source, 1)), before);
+                assert_eq!(next_index.claude_request_census.get(&key), Some(&census));
+                assert!(cache.retained().unwrap().peek(&key).is_none());
+            } else {
+                assert_eq!(*observed.lock().unwrap(), 1);
+                assert_eq!(result.snapshots.len(), 1);
+                assert_eq!(result.snapshots[0].input_tokens, 125);
+                assert_eq!(modes.1, 1);
+                assert_eq!(modes.2, suffix_bytes);
+                assert_eq!(retail_bytes(source, 0) - before.0, suffix.len() as u64);
+                assert_eq!(
+                    retail_bytes(source, 1) - before.1,
+                    0,
+                    "exact accepted overlap"
+                );
+            }
+            assert_eq!(cache.durable().unwrap().retail_spent.len(), 1);
+            assert_eq!(cache.durable().unwrap().counters.retail_attempts, 1);
+            let store::LeaseWait::Granted(lease) =
+                cache.acquire_active(source, store::ACTIVE_BYTES)
+            else {
+                panic!("Pending or spent refusal leaked transfer funding")
+            };
+            lease.release();
+            continue;
+        }
         let granted = Arc::new(Mutex::new(None));
         let observation = granted.clone();
         let pressure = cache.clone();
@@ -2257,7 +2425,13 @@ impl RestoreTestOutcome for sampled_scan::durable_tail::RestoreOutcome {
         self,
     ) -> Option<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>> {
         match self {
-            Self::Restored(taken) => Some(*taken),
+            Self::Restored(taken, lease) => {
+                // Direct synchronous fixtures own the copy; no native pending owner.
+                assert!(taken.durable.is_empty(), "direct restore has no Q11 grant");
+                lease.release();
+                Some(*taken)
+            }
+            Self::Pending => panic!("ordinary direct restore unexpectedly resource Pending"),
             Self::Miss => None,
             Self::Held(reason) => panic!("ordinary restore unexpectedly Held: {reason:?}"),
         }

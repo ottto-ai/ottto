@@ -25,7 +25,15 @@ pub(crate) struct ActiveLease {
 }
 impl ActiveLease {
     pub(crate) fn acquire(source: &'static str) -> LeaseWait {
+        #[cfg(test)]
+        if let Some(timeout) = tests::NEXT_TIMEOUT.with(|slot| slot.take()) {
+            return Self::acquire_for(source, timeout);
+        }
         Self::acquire_for(source, WAIT)
+    }
+    #[cfg(test)]
+    pub(crate) fn timeout_next_acquire_for_test(timeout: Duration) {
+        tests::NEXT_TIMEOUT.with(|slot| slot.set(Some(timeout)));
     }
     fn acquire_for(source: &'static str, timeout: Duration) -> LeaseWait {
         let start = Instant::now();
@@ -141,6 +149,7 @@ mod tests {
 
     thread_local! {
         static QUEUED: std::cell::RefCell<Option<mpsc::Sender<u64>>> = const { std::cell::RefCell::new(None) };
+        pub(super) static NEXT_TIMEOUT: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
     }
     pub(super) fn registered(ticket: u64) {
         QUEUED.with(|sender| {

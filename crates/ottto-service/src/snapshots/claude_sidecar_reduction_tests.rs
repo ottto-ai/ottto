@@ -1344,7 +1344,13 @@ impl RestoreTestOutcome for sampled_scan::durable_tail::RestoreOutcome {
         self,
     ) -> Option<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>> {
         match self {
-            Self::Restored(taken) => Some(*taken),
+            Self::Restored(taken, lease) => {
+                // Direct synchronous fixtures own the copy; no native pending owner.
+                assert!(taken.durable.is_empty(), "direct restore has no Q11 grant");
+                lease.release();
+                Some(*taken)
+            }
+            Self::Pending => panic!("ordinary direct restore unexpectedly resource Pending"),
             Self::Miss => None,
             Self::Held(reason) => panic!("ordinary restore unexpectedly Held: {reason:?}"),
         }

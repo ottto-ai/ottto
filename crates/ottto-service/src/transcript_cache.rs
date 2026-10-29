@@ -415,7 +415,7 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
     /// Native output/active copies keep this room while entries are admitted.
     /// `finalization_charge` (within `live_bytes`) is this entry's own
     /// finalization copy, carried to its next take (P1-RETAIN β). Production
-    /// admits through `insert_reserving_at_rank`.
+    /// admits through the lossless `insert_taken_reserving` primitive.
     #[cfg(test)]
     pub(crate) fn insert_reserving(
         &mut self,
@@ -431,6 +431,7 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
     /// `admission_rank` of this checkpoint's mtime), so the entry's hint is
     /// exactly the one its release ranked residents against and no later clock
     /// read moves it. `None` ranks it now, as every other admission does.
+    #[cfg(test)]
     pub(crate) fn insert_reserving_at_rank(
         &mut self,
         key: String,
@@ -463,6 +464,7 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
     /// `live_bytes` is the whole reservation kept beside the entries;
     /// `finalization_charge` is the part of it owned by this entry's own
     /// finalization copy, kept on the entry for its next take (β).
+    #[cfg(test)]
     fn admit(
         &mut self,
         key: String,
@@ -476,6 +478,7 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
     }
     /// `admit` with the entry's victim-order hint already ranked
     /// (`admission_rank`).
+    #[cfg(test)]
     fn admit_at_rank(
         &mut self,
         key: String,

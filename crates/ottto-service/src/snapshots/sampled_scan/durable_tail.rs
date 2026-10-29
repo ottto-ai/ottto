@@ -8,7 +8,8 @@
 //!   and its content fields must re-derive. The copy is then charged through
 //!   the ordinary cache admission and taken like any retained copy, so the
 //!   existing `prepare_acquisition` decides Unchanged, Tail or Full. Any
-//!   refusal leaves nothing behind: the read is Full. Restore advances no
+//!   admission refusal leaves the read Full; transfer-funding refusal is Pending
+//!   with no reusable RAM entry. Restore advances no
 //!   ACK, ledger, census, absence, unchanged-proof, binding or payer state.
 //! - Write runs after a successful index save: only entries admitted this
 //!   pass, still resident, kept by that save and changed since their last
@@ -872,7 +873,7 @@ impl SharedCache {
     }
 
     /// Restores `key` from the durable store into the RAM cache and takes it,
-    /// or `None` (the read is then Full, with nothing left behind). `held` is
+    /// or Miss (Full) / Pending (resource hold), with nothing left behind. `held` is
     /// the parser's opened FD for `path`, not yet read; a duplicate of it
     /// serves the bounded re-derivation, and the read plan repositions it.
     #[allow(clippy::too_many_arguments)]
@@ -896,7 +897,7 @@ impl SharedCache {
             return RestoreOutcome::Held(reason);
         }
         // The common guard held U/T14 before acquisition; this sees class changes since.
-        match self.restore_known(
+        let Some(completed) = self.restore_known(
             snapshot_source,
             key,
             path,
@@ -904,20 +905,39 @@ impl SharedCache {
             held,
             index,
             interpretation,
-        ) {
-            Some(()) => match self.take_prepared(snapshot_source, key) {
-                Ok(Some((taken, lease))) => {
-                    if let Some(mut stores) = self.durable() {
-                        stores.counters.restored += 1;
-                    }
-                    RestoreOutcome::Restored(Box::new(taken), lease)
-                }
-                Ok(None) => RestoreOutcome::Pending,
-                Err(()) => RestoreOutcome::Pending,
-            },
-            None => self
+        ) else {
+            return self
                 .durable_hold(snapshot_source, key)
-                .map_or(RestoreOutcome::Miss, RestoreOutcome::Held),
+                .map_or(RestoreOutcome::Miss, RestoreOutcome::Held);
+        };
+        #[cfg(test)]
+        tests::before_cold_transfer();
+        // Acquire before visibility: Pending must never leave a cold, guardless
+        // copy that the next RAM hit could reuse without the Q11 spent gate.
+        let store::LeaseWait::Granted(lease) = self.acquire_prepared_transfer(snapshot_source)
+        else {
+            return RestoreOutcome::Pending;
+        };
+        if !self.insert_admitted(key.to_string(), completed, 0) {
+            if let Some(mut stores) = self.durable() {
+                stores.counters.budget_refused += 1;
+            }
+            lease.release();
+            return self
+                .durable_hold(snapshot_source, key)
+                .map_or(RestoreOutcome::Miss, RestoreOutcome::Held);
+        }
+        match self.take(key) {
+            Some(taken) => {
+                if let Some(mut stores) = self.durable() {
+                    stores.counters.restored += 1;
+                }
+                RestoreOutcome::Restored(Box::new(taken), lease)
+            }
+            None => {
+                lease.release();
+                RestoreOutcome::Pending
+            }
         }
     }
 
@@ -931,7 +951,7 @@ impl SharedCache {
         held: &mut File,
         index: &ScanIndex,
         interpretation: &Interpretation<'_>,
-    ) -> Option<()> {
+    ) -> Option<sampled_jsonl::CompletedNativeAcquisition> {
         let source = durable_source(snapshot_source)?;
         let store_key = store::key_digest(source, key);
         let allowlist = codec::allowlist_digest(snapshot_source);
@@ -1017,26 +1037,13 @@ impl SharedCache {
         stores.counters.rederive_named_lines += receipt.named_lines;
         stores.counters.rederive_line_bytes += receipt.line_bytes;
         drop(stores);
-        // The restored copy is charged to the RAM cache exactly as a retained
-        // copy is admitted; a refused charge leaves the read Full.
-        let admitted = self.insert_admitted(
-            key.to_string(),
-            sampled_jsonl::CompletedNativeAcquisition {
-                durable: Default::default(),
-                checkpoint,
-                reduction: Some(reduction),
-                released: None,
-                unsealed: false,
-            },
-            0,
-        );
-        let mut stores = self.durable()?;
-        if !admitted {
-            stores.counters.budget_refused += 1;
-            return None;
-        }
-        drop(stores);
-        Some(())
+        Some(sampled_jsonl::CompletedNativeAcquisition {
+            durable: Default::default(),
+            checkpoint,
+            reduction: Some(reduction),
+            released: None,
+            unsealed: false,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1125,12 +1132,7 @@ impl SharedCache {
         source: SnapshotSource,
         key: &str,
     ) -> Result<Option<(Taken<CachedJsonlReduction>, store::ActiveLease)>, ()> {
-        // Every admitted graph+key <= ENTRY_BYTES; cover moved Box/carrier and
-        // fixed acquisition scratch too. This is transfer funding, not decode.
-        let store::LeaseWait::Granted(lease) = self.acquire_active(
-            source,
-            (store::RECORD_BYTES + super::AUDIT_AND_SCRATCH_BYTES) as u64,
-        ) else {
+        let store::LeaseWait::Granted(lease) = self.acquire_prepared_transfer(source) else {
             return Err(());
         };
         match self.take(key) {
@@ -1140,6 +1142,15 @@ impl SharedCache {
                 Ok(None)
             }
         }
+    }
+
+    fn acquire_prepared_transfer(&self, source: SnapshotSource) -> store::LeaseWait {
+        // Every admitted graph+key <= ENTRY_BYTES; cover moved Box/carrier and
+        // fixed acquisition scratch too. This is transfer funding, not decode.
+        self.acquire_active(
+            source,
+            (store::RECORD_BYTES + super::AUDIT_AND_SCRATCH_BYTES) as u64,
+        )
     }
 
     pub(crate) fn acquire_active(
