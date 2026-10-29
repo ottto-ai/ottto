@@ -126,7 +126,7 @@ them because partial-save reconciliation can restore an unacknowledged marker.
 Quiet retirement keeps the old Full verification time and grants no
 `audits_completed`, source, census or ACK credit.
 
-`audit_retired_absent` counts an obligation retired on positively proven absence:
+`audit_retired_absent{events}` counts an obligation retired on positively proven absence:
 ENOENT on a no-follow descriptor chain from a readable configured root.
 A missing intermediate directory counts only beneath the nearest securely
 opened readable ancestor; all pinned directories are revalidated. Symlinks,
@@ -138,7 +138,11 @@ The absence predicate is shared with the hardened account-hold proof. The
 `audit_retired_absent` and deleted-hold counts currently use temporary traversal
 point carriers; integration must replace them with the shared account/absence
 diagnostics, preserving both retirement paths without double counting.
-Both objects are absent when sampling is null.
+Both keys and their count meanings are shared with the integrated diagnostics.
+Deleted-hold tokens aren't reported until the shared withheld-account
+bookkeeping lands. Whichever change integrates second must use one emitter for
+each count; the deletion fixture pins one emission per key, then none on retry.
+The sampled acquisition objects are absent when sampling is null.
 
 Additive version 2 Claude counts on the existing page/check-in carrier classify
 refused census-member NotFounds by the **existing immediate-parent metadata

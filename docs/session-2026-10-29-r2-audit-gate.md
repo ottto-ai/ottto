@@ -279,3 +279,13 @@ its diagnostic carriers do not. Both audit retirement and deleted-account-hold
 release currently emit temporary traversal-point counts. Integration with the
 shared diagnostics must preserve both carve-outs and replace those emitters
 without duplicate counts. No new persisted field or cap increase is introduced.
+
+Round16 pins the accepted temporary diagnostic contract through the actual
+deleted-account-hold scan: audit_retired_absent{events} and
+withheld_hold_released{deleted} each emit once, with the shared source/schema
+and count meaning, and neither emits on the next generation. Counting all
+records makes duplicate carriers fail the fixture. The temporary audit count
+now uses the same events object as the integrated diagnostics. Deleted-hold
+tokens remain unreported until shared withheld-account bookkeeping lands.
+Whichever implementation integrates second must unify onto one emitter per
+count and retain the exactly-once fixture; both retirement paths stay present.
