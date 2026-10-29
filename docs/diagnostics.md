@@ -90,7 +90,8 @@ and upload. A capped/partial page is still a completed page.
 When sampling is present, `page_events` records existing full-read reasons as a
 sparse map of closed snake_case keys (`state_missing`, `audit_due`,
 `clock_changed`, `scope_changed`, `invalid_checkpoint`, `replaced`, `shrunk`,
-`same_size_edit`, `head_changed`, `boundary_changed`, `unsupported_identity`).
+`same_size_edit`, `head_changed`, `boundary_changed`, `unsupported_identity`,
+`codex_child_rederive_full_first`, `codex_child_rederive_full_crash_retry`).
 Their sum equals `full_selections`. It also records `priority_full_replays`,
 `audits_started`, `audits_completed`, `max_start_overdue_seconds` and
 `max_completion_overdue_seconds`. Separate `index_state_at_page_end` gauges
@@ -1129,39 +1130,51 @@ A later complete native parse still emits its exclusive body for a session with
 an earlier state-only row. An emitted total alone does not prove a server-side
 overwrite; backend authority rules independently govern successor acceptance.
 
-The existing `durable_tail` summary also carries
-`codex_child_pair_rederive[children,bytes,named,conflict,incomplete,unreadable]`.
-`children` and `bytes` count newly considered unstamped repair candidates and
-their summed **index-recorded source size in bytes**, measured before staging
-any reads. They are process-lifetime totals; persisted pending/terminal markers
-prevent recounting admitted entries. They are not actual I/O bytes. If the
-population or its accumulated budget exceeds 5,000,000,000 bytes, that cohort
-stages no repairs and repair admission stops for the process, requiring
-an operator decision. Repair causes count only here, never as `audit_due`,
-`audits_started` or `audits_completed`. The approved per-entry marker selects
-an existing cold native Full directly, without creating AuditDebt, changing
-independent audit deadlines or reserving audit slots. General physical Full
-and byte totals still include the real work. A verified Full may discharge
-existing independent debt; an unsuccessful repair leaves that debt intact. The four outcome columns
-are process-lifetime terminal-entry counts. Retries do not increment outcomes;
-I/O failures get at most three delayed retries after the initial attempt.
+The existing `durable_tail` summary also carries these process-lifetime counters:
 
-This one-time state fix selects only cached native Codex forks with old creator
-conflict, or native depth-2 children with old conflict/absent creator pair, and
-no existing per-entry validation marker. Depth-2 selection combines cached raw
-subagent/direct-parent evidence with the already-loaded provider spawn graph;
-it does not inspect a transcript header to select the file. Plain depth-1
-children and parent sessions are excluded. Terminal markers survive normal
-save, upload failure and restart. Older writers tolerate the optional field;
-an old writer dropping it may cause one additional counted validation per
-subsequent downgrade/upgrade cycle. Markers grant no account or money authority.
-A proven native pair may correct the displayed account; genuine conflict stays
-Unknown. Real population/byte totals are reported from these counters after
-release; the supplied local estimate is not a runtime measurement.
-The selector inspects persisted predecessors: RAM from the old binary cannot
-survive an upgrade. It validates the known codec/allowlist, source, key,
-context, entry and committed generation without pretending to validate current
-acquisition scope (which requires header witnesses). A joined repair cannot
-pull in an otherwise quiet, excluded member: its audit remains pending until
-that member has ordinary read work or a separate grant. It publishes no partial
-joined replacement.
+- `codex_child_pair_rederive[children,bytes,named,conflict,incomplete,unreadable]`:
+  newly considered unstamped repair candidates, summed **index-recorded source
+  bytes**, then terminal-entry outcomes. Selection measures bytes before reads;
+  these are not physical I/O bytes. Retries do not increment outcomes.
+- `codex_child_pair_rederive_deferred[children,bytes]`: distinct candidates denied
+  admission by the 64-child or 410,000,000-index-byte process cap, or the bounded
+  negative-custody ledger. They remain unstamped and eligible in a later process;
+  spent custody is never evicted to make room.
+- `codex_child_rederive_full[first,crash_retry]`: successful forced negative-spend
+  reservations under the two dedicated Full causes. They never count as
+  `state_missing`, `audit_due`, `audits_started` or `audits_completed`.
+- `codex_child_rederive_crash_held[keys,oldest_age]`: current held-key count and
+  maximum age in seconds since their last persisted reservation. This is a gauge,
+  including idle passes; age saturates at zero on clock rollback.
+
+Only cached native Codex forks with old creator conflict, or native depth-2
+children with old conflict/absent creator pair, qualify. Depth-2 selection uses
+cached native subagent/direct-parent evidence and the loaded provider spawn
+graph, without opening a transcript to select it. Plain depth-1 children and
+parents are excluded. Selection runs once per process against bounded existing
+store inventory and does not count as a cache restore.
+
+Every repair attempt requires a successful forced index save before its read.
+The per-key negative reading record preserves the original extent and spent
+bytes across normal save/restart; attempts are limited to two, first plus
+crash_retry. A real I/O failure permits only one retry after two seconds, then
+Unreadable. The former three retries and 4/8-second delays are superseded by
+this cap. Two interrupted running reservations produce CrashHeld, which holds
+only repair Full acquisition until an A4 grant. Ordinary new-growth Tail and
+uploads continue at existing attribution or Unknown. No usage is zeroed by the
+hold. Busy/setup refusal must precede reservation and consumes no attempt.
+
+Repair causes never stage AuditDebt, reserve audit slots, reschedule independent
+deadlines, or satisfy/retire independent audit debt, even after a verified Full.
+General physical Full and byte totals still include real work. An unchanged body
+keeps its comparison witness and does not emit a redundant replacement. A genuine
+own-header conflict settles Conflict once; copied-parent evidence is never
+inherited. Markers supply no account or money authority.
+
+The optional top-level reading-map encoding is a proposal pending persisted-state
+owner approval. Old object readers tolerate it but old saves drop it; tolerance
+alone does not prove the two-attempt-ever invariant through a downgrade/save.
+The native decode lease, shared pace admission, grown-since-committed discovery
+retention and old-writer custody proof must be integrated before release. Real
+cohort/byte totals come from index counters after release; the supplied estimate
+of 33 files/~203 MB is not a runtime measurement.

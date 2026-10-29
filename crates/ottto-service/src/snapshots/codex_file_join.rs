@@ -1790,6 +1790,7 @@ pub(super) mod tests {
                     })
                 }
                 Boot::Strict | Boot::Unchanged => return Err(GroupEnd::Strict),
+                Boot::IoFailure => return Err(GroupEnd::IoFailure),
             }
         }
         let metadata = CodexTitleMetadata::default();

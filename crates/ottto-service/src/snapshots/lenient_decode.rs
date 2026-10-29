@@ -220,6 +220,7 @@ impl Serialize for ScanIndex {
         }
         field!(schema_version);
         field!(generation);
+        field!(codex_child_pair_reading, BTreeMap::is_empty);
         field!(upload_context_fingerprint, Option::is_none);
         map.serialize_entry(
             "files",
@@ -420,6 +421,7 @@ pub(super) const FIELDS: &[&str] = &[
     "held_audit_progress",
     "claude_money_birth_store",
     "claude_desktop_store_inventory",
+    "codex_child_pair_reading",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -478,6 +480,7 @@ fn header_field(name: &str) -> bool {
 /// identity carry, and the accepted ledger keeps the load's rule
 /// that a malformed fingerprint vouched for nothing.
 pub(super) const IDENTITY_CARRY_FIELDS: &[&str] = &[
+    "codex_child_pair_reading",
     // These gate authority re-entry. Carry their own lenient, fail-closed
     // decoding policy, including uncertainty after lost retirement evidence.
     "claude_retired_family_tombstones",
@@ -1572,6 +1575,16 @@ impl<R: BufRead + Seek> Decoder<R> {
                         } => {}
                         "schema_version" => index.schema_version = self.typed(value)?,
                         "generation" => index.generation = self.typed(value)?,
+                        "codex_child_pair_reading" => {
+                            if value.len > 256 * 1024 {
+                                return Err(Error::Refused("child repair custody budget"));
+                            }
+                            let ledger = self.typed(value)?;
+                            if !codex_child_pair_rederive::valid_ledger(&ledger) {
+                                return Err(Error::Refused("child repair custody"));
+                            }
+                            index.codex_child_pair_reading = ledger;
+                        }
                         "reread_guard" => {} // TOMBSTONE: decode-and-drop.
                         "upload_ack_retirement_handoff" => {
                             // Damaged cleanup authority delays retirement; it must

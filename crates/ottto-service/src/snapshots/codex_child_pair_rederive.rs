@@ -2,9 +2,11 @@
 //! This metadata selects a counted native Full; it never supplies account evidence.
 use super::*;
 
-#[cfg(unix)]
-pub(super) const MAX_BYTES: u64 = 5_000_000_000;
-const MAX_ATTEMPTS: u8 = 4; // initial attempt, then at most three retries
+pub(super) const MAX_BYTES: u64 = 410_000_000;
+pub(super) const MAX_CHILDREN: usize = 64;
+pub(super) const MAX_SPENT_BYTES: u64 = MAX_BYTES * 2;
+const MAX_LEDGER_BYTES: usize = 256 * 1024;
+const MAX_ATTEMPTS: u8 = 2; // first + crash_retry, never renewed on restart
 
 /// SOURCE class L: optional per-entry marker, no content or provider ids.
 /// Pending is scheduling only; terminal variants never authorize a checkpoint.
@@ -15,12 +17,12 @@ pub(crate) enum Stamp {
         attempts: u8,
         retry_after: u64,
         running: bool,
-        previous_due: Option<u64>,
     },
     Named,
     Conflict,
     Incomplete,
     Unreadable,
+    CrashHeld,
 }
 impl crate::heap_layout_bound::HeapLayoutBound for Stamp {
     const INLINE_ONLY: bool = true;
@@ -31,22 +33,33 @@ impl crate::heap_layout_bound::HeapLayoutBound for Stamp {
                 attempts: _,
                 retry_after: _,
                 running: _,
-                previous_due: _,
             }
             | Self::Named
             | Self::Conflict
             | Self::Incomplete
-            | Self::Unreadable => c.add(0),
+            | Self::Unreadable
+            | Self::CrashHeld => c.add(0),
         }
     }
 }
 
-pub(super) fn deserialize_stamp<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<Option<Stamp>, D::Error> {
-    let raw = Option::<Value>::deserialize(deserializer)?;
-    // Unknown future state must not erase once-only credit or drop the entry.
-    Ok(raw.map(|raw| serde_json::from_value(raw).unwrap_or(Stamp::Unreadable)))
+/// Proposed SOURCE class-L per-key reading record. This is negative spend,
+/// independent of upload ACK, ordinary audit debt and file-entry replacement.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Reading {
+    pub(crate) stamp: Stamp,
+    pub(crate) source_file_fingerprint: String,
+    pub(crate) reserved_extent: u64,
+    pub(crate) spent_bytes: u64,
+    pub(crate) reserved_at: u64,
+}
+crate::heap_layout_bound::fields!(Reading; stamp, source_file_fingerprint, reserved_extent, spent_bytes, reserved_at);
+
+pub(super) fn stamp(index: &ScanIndex, key: &str) -> Option<Stamp> {
+    index
+        .codex_child_pair_reading
+        .get(key)
+        .map(|reading| reading.stamp)
 }
 
 #[cfg(unix)]
@@ -96,126 +109,337 @@ pub(super) fn stage(
     if cache.durable_child_pair_budget_stopped() {
         return;
     }
-    let abandoned = index
-        .files
-        .iter()
-        .filter_map(|(key, entry)| {
-            matches!(
-                entry.codex_child_pair_rederive,
-                Some(Stamp::Pending { running: true, .. })
-            )
-            .then_some(key)
-        })
-        .filter(|key| !cache.cursor_job_owns(key))
-        .cloned()
-        .collect::<Vec<_>>();
-    for key in abandoned {
-        if failed(index, &key, sampled_scan::now_seconds()) {
-            cache.durable_child_pair_count(5, 1);
-        }
-    }
-    let keys = index
-        .files
-        .iter()
-        .filter_map(|(key, entry)| {
-            if entry.codex_child_pair_rederive.is_some() {
-                return None;
-            }
-            cache
-                .durable_child_pair_candidate(key, index, metadata)
-                .then(|| key.clone())
-        })
-        .collect::<Vec<_>>();
-    let bytes: u128 = keys
-        .iter()
-        .map(|key| u128::from(index.files[key].size_bytes))
-        .sum();
-    cache.durable_child_pair_count(0, keys.len() as u64);
-    cache.durable_child_pair_count(1, u64::try_from(bytes).unwrap_or(u64::MAX));
-    if bytes > u128::from(MAX_BYTES) || cache.durable_child_pair_budget_stopped() {
+    let now = sampled_scan::now_seconds();
+    // Recover only on process entry; a paused cursor keeps its running grant.
+    if !cache.durable_child_pair_select_once() {
         return;
     }
-    let now = sampled_scan::now_seconds();
+    for reading in index.codex_child_pair_reading.values_mut() {
+        if let Stamp::Pending {
+            attempts,
+            running: true,
+            ..
+        } = reading.stamp
+        {
+            reading.stamp = if attempts >= MAX_ATTEMPTS {
+                Stamp::CrashHeld
+            } else {
+                Stamp::Pending {
+                    attempts,
+                    retry_after: now.saturating_add(2),
+                    running: false,
+                }
+            };
+        }
+    }
+    cache.durable_child_pair_alarm(index, now);
+    let inventory = cache.durable_child_pair_inventory();
+    let keys = index
+        .files
+        .keys()
+        .filter(|key| {
+            inventory.contains(&crate::durable_tail_store::key_digest(
+                crate::durable_tail_store::DurableSource::Codex,
+                key,
+            ))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     for key in keys {
-        let entry = index.files.get_mut(&key).expect("selected entry");
-        entry.codex_child_pair_rederive = Some(Stamp::Pending {
-            attempts: 0,
-            retry_after: now,
-            running: false,
-            previous_due: entry.unverified_deadline(),
-        });
+        if index.codex_child_pair_reading.contains_key(&key)
+            || !cache.durable_child_pair_candidate(&key, index, metadata)
+        {
+            continue;
+        }
+        let entry = &index.files[&key];
+        cache.durable_child_pair_count(0, 1);
+        cache.durable_child_pair_count(1, entry.size_bytes);
+        if index.codex_child_pair_reading.len() >= crate::transcript_cache::CACHE_ENTRIES
+            || ledger_byte_bound(&index.codex_child_pair_reading)
+                .and_then(|bytes| {
+                    bytes.checked_add(reading_byte_bound(&key, &entry.source_file_fingerprint)?)
+                })
+                .map_or(true, |bytes| bytes > MAX_LEDGER_BYTES)
+        {
+            cache.durable_child_pair_defer(&key, entry.size_bytes);
+            continue; // negative custody is never evicted to admit a new key
+        }
+        if !cache.durable_child_pair_admit(&key, entry.size_bytes) {
+            continue; // unstamped; a later process can select this candidate
+        }
+        index.codex_child_pair_reading.insert(
+            key,
+            Reading {
+                stamp: Stamp::Pending {
+                    attempts: 0,
+                    retry_after: now,
+                    running: false,
+                },
+                source_file_fingerprint: entry.source_file_fingerprint.clone(),
+                reserved_extent: entry.size_bytes,
+                spent_bytes: 0,
+                reserved_at: 0,
+            },
+        );
     }
 }
 
 pub(super) fn pending(index: &ScanIndex, key: &str) -> bool {
-    index.files.get(key).is_some_and(pending_entry)
+    matches!(stamp(index, key), Some(Stamp::Pending { .. }))
 }
 
-pub(super) fn pending_entry(entry: &ScanIndexEntry) -> bool {
-    matches!(entry.codex_child_pair_rederive, Some(Stamp::Pending { .. }))
+pub(super) fn waiting(index: &ScanIndex, key: &str, now: u64) -> bool {
+    matches!(stamp(index, key), Some(Stamp::Pending { retry_after, running: false, .. }) if retry_after > now)
 }
 
-pub(super) fn waiting(entry: &ScanIndexEntry, now: u64) -> bool {
-    matches!(entry.codex_child_pair_rederive, Some(Stamp::Pending { retry_after, .. }) if retry_after > now && retry_after <= now.saturating_add(8))
+/// Force only negative spend into the committed index. Never publish working
+/// scan entries, body witnesses, census or ACK state ahead of their owner.
+/// Any failure (including an ambiguous post-rename fsync) denies this read.
+pub(super) fn reserve(
+    index: &mut ScanIndex,
+    key: &str,
+    extent: u64,
+    path: &Path,
+    now: u64,
+) -> bool {
+    reserve_many(index, &[(key.to_owned(), extent)], path, now)
 }
 
-pub(super) fn begin(index: &mut ScanIndex, key: &str, now: u64) -> bool {
-    let Some(Stamp::Pending {
-        attempts,
-        retry_after,
-        running,
-        ..
-    }) = index
-        .files
-        .get_mut(key)
-        .and_then(|entry| entry.codex_child_pair_rederive.as_mut())
+fn reserve_many(index: &mut ScanIndex, requests: &[(String, u64)], path: &Path, now: u64) -> bool {
+    if requests.is_empty() {
+        return false;
+    }
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    let Ok(mut committed) = lenient_decode::read_file(file, "child_rederive_reservation", "codex")
     else {
         return false;
     };
-    if *retry_after > now && *retry_after <= now.saturating_add(8) {
+    if committed.generation != index.generation {
         return false;
     }
-    if !*running {
-        *attempts = attempts.saturating_add(1);
-        *running = true;
+    // A group obtains all negative reservations in one save. A refused member
+    // cannot strand another member's running grant without a RAM owner.
+    let mut reservations = BTreeMap::new();
+    for (key, extent) in requests {
+        let Some(reading) = index.codex_child_pair_reading.get(key) else {
+            return false;
+        };
+        let Stamp::Pending {
+            attempts,
+            retry_after,
+            running,
+        } = reading.stamp
+        else {
+            return false;
+        };
+        if running
+            || attempts >= MAX_ATTEMPTS
+            || retry_after > now
+            || *extent > reading.reserved_extent
+            || reservations.contains_key(key)
+            || committed
+                .files
+                .get(key)
+                .map(|entry| &entry.source_file_fingerprint)
+                != Some(&reading.source_file_fingerprint)
+            || committed
+                .files
+                .get(key)
+                .map(|entry| &entry.source_file_fingerprint)
+                != index
+                    .files
+                    .get(key)
+                    .map(|entry| &entry.source_file_fingerprint)
+        {
+            return false;
+        }
+        let mut reservation = reading.clone();
+        reservation.stamp = Stamp::Pending {
+            attempts: attempts + 1,
+            retry_after,
+            running: true,
+        };
+        reservation.reserved_at = now;
+        reservation.spent_bytes = reservation.spent_bytes.saturating_add(*extent);
+        reservations.insert(key.clone(), reservation);
     }
+    // Carry prior negative custody without publishing unACKed scan state.
+    for (key, reading) in &index.codex_child_pair_reading {
+        committed
+            .codex_child_pair_reading
+            .entry(key.clone())
+            .or_insert_with(|| reading.clone());
+    }
+    for (key, reading) in &reservations {
+        committed
+            .codex_child_pair_reading
+            .insert(key.clone(), reading.clone());
+    }
+    let spent = committed
+        .codex_child_pair_reading
+        .values()
+        .try_fold(0_u64, |sum, record| sum.checked_add(record.spent_bytes));
+    if !valid_ledger(&committed.codex_child_pair_reading)
+        || spent.map_or(true, |spent| spent > MAX_SPENT_BYTES)
+        || committed.save(path).is_err()
+    {
+        return false;
+    }
+    index.generation = committed.generation;
+    index.codex_child_pair_reading.extend(reservations);
     true
 }
 
-/// Preserve unrelated audit debt. Retiring a repair after a refused or lossy
-/// read is not Full verification and must never call complete_full_audit.
-fn retire(index: &mut ScanIndex, key: &str, stamp: Stamp) -> bool {
-    let Some(entry) = index.files.get_mut(key) else {
+pub(super) fn holds_item(index: &ScanIndex, item: &SnapshotItem) -> bool {
+    index.codex_child_pair_reading.iter().any(|(key, reading)| {
+        reading.stamp == Stamp::CrashHeld
+            && index.files.get(key).is_some_and(|entry| {
+                item.source_file_fingerprint.as_deref()
+                    == Some(entry.source_file_fingerprint.as_str())
+            })
+    })
+}
+
+// JSON escaping takes at most six bytes per input byte; 256 covers every
+// fixed field name, enum tag, punctuation and maximal integer in a Reading.
+// This conservative price keeps every emitted map below the decoder's span
+// ceiling without allocating another encoded ledger just to admit a key.
+fn reading_byte_bound(key: &str, fingerprint: &str) -> Option<usize> {
+    key.len()
+        .checked_add(fingerprint.len())?
+        .checked_mul(6)?
+        .checked_add(256)
+}
+fn ledger_byte_bound(ledger: &BTreeMap<String, Reading>) -> Option<usize> {
+    ledger.iter().try_fold(2_usize, |bytes, (key, reading)| {
+        bytes.checked_add(reading_byte_bound(key, &reading.source_file_fingerprint)?)
+    })
+}
+
+pub(super) fn valid_ledger(ledger: &BTreeMap<String, Reading>) -> bool {
+    ledger.len() <= crate::transcript_cache::CACHE_ENTRIES
+        && ledger_byte_bound(ledger).is_some_and(|bytes| bytes <= MAX_LEDGER_BYTES)
+        && ledger.iter().all(|(key, reading)| {
+            let attempts = match reading.stamp {
+                Stamp::Pending { attempts, .. } => attempts,
+                _ => MAX_ATTEMPTS,
+            };
+            !key.is_empty()
+                && key.len() <= 8192
+                && !reading.source_file_fingerprint.is_empty()
+                && reading.source_file_fingerprint.len() <= 256
+                && attempts <= MAX_ATTEMPTS
+                && reading.reserved_extent <= MAX_BYTES
+                && reading.spent_bytes
+                    <= reading.reserved_extent.saturating_mul(u64::from(attempts))
+        })
+}
+
+pub(super) fn full_reason(
+    index: &ScanIndex,
+    key: &str,
+) -> crate::transcript_acquisition::FullReason {
+    use crate::transcript_acquisition::FullReason;
+    if matches!(stamp(index, key), Some(Stamp::Pending { attempts: 2, .. })) {
+        FullReason::CodexChildRederiveCrashRetry
+    } else {
+        FullReason::CodexChildRederiveFirst
+    }
+}
+
+#[cfg(unix)]
+pub(super) fn reserve_cached(
+    index: &mut ScanIndex,
+    candidate: &CandidateFile,
+    cache: &sampled_scan::SharedCache,
+) -> bool {
+    let key = local_index_key(&candidate.path);
+    let Some(path) = cache.durable_child_pair_index_path() else {
         return false;
     };
-    if !matches!(entry.codex_child_pair_rederive, Some(Stamp::Pending { .. })) {
+    if !cache.durable_child_pair_admit(
+        &key,
+        index
+            .files
+            .get(&key)
+            .map_or(candidate.size_bytes, |entry| entry.size_bytes),
+    ) {
         return false;
     }
-    // The repair owns no audit debt. Failure must not clear or reschedule
-    // the independent marker, including debt staged while this read ran.
-    entry.codex_child_pair_rederive = Some(stamp);
+    if !reserve(
+        index,
+        &key,
+        candidate.size_bytes,
+        &path,
+        sampled_scan::now_seconds(),
+    ) {
+        return false;
+    }
+    cache.durable_child_pair_full(matches!(
+        stamp(index, &key),
+        Some(Stamp::Pending { attempts: 2, .. })
+    ));
     true
 }
 
+#[cfg(unix)]
+pub(super) fn reserve_group_cached(
+    index: &mut ScanIndex,
+    members: &[CandidateFile],
+    cache: &sampled_scan::SharedCache,
+) -> bool {
+    let Some(path) = cache.durable_child_pair_index_path() else {
+        return false;
+    };
+    if !group_allowed(index, members) {
+        return false;
+    }
+    let requests = members
+        .iter()
+        .map(|member| (local_index_key(&member.path), member.size_bytes))
+        .collect::<Vec<_>>();
+    if requests
+        .iter()
+        .any(|(key, extent)| !cache.durable_child_pair_admit(key, *extent))
+        || !reserve_many(index, &requests, &path, sampled_scan::now_seconds())
+    {
+        return false;
+    }
+    for (key, _) in requests {
+        cache.durable_child_pair_full(matches!(
+            stamp(index, &key),
+            Some(Stamp::Pending { attempts: 2, .. })
+        ));
+    }
+    true
+}
+
+/// Only real I/O failure calls this. Busy/setup refusal preserves its grant.
 pub(super) fn failed(index: &mut ScanIndex, key: &str, now: u64) -> bool {
-    let Some(Stamp::Pending {
+    let Some(reading) = index.codex_child_pair_reading.get_mut(key) else {
+        return false;
+    };
+    let Stamp::Pending {
         attempts,
-        retry_after,
-        running,
+        running: true,
         ..
-    }) = index
-        .files
-        .get_mut(key)
-        .and_then(|entry| entry.codex_child_pair_rederive.as_mut())
+    } = reading.stamp
     else {
         return false;
     };
-    *running = false;
-    if *attempts >= MAX_ATTEMPTS {
-        return retire(index, key, Stamp::Unreadable);
+    if attempts >= MAX_ATTEMPTS {
+        reading.stamp = Stamp::Unreadable;
+        true
+    } else {
+        reading.stamp = Stamp::Pending {
+            attempts,
+            running: false,
+            retry_after: now.saturating_add(2),
+        };
+        false
     }
-    *retry_after = now.saturating_add(1_u64 << u32::from(*attempts).min(3));
-    false
 }
 
 pub(super) fn outcome(
@@ -225,10 +449,7 @@ pub(super) fn outcome(
     complete: bool,
     conflicted: bool,
 ) -> Option<Stamp> {
-    if !matches!(
-        index.files.get(key)?.codex_child_pair_rederive,
-        Some(Stamp::Pending { .. })
-    ) {
+    if !matches!(stamp(index, key), Some(Stamp::Pending { .. })) {
         return None;
     }
     Some(if !complete {
@@ -261,25 +482,35 @@ pub(super) fn verified_full_current(
         && checkpoint.stamp_matches(file).unwrap_or(false)
 }
 
-pub(super) fn finish(index: &mut ScanIndex, key: &str, stamp: Stamp, verified: bool) {
-    if verified {
-        if let Some(entry) = index.files.get_mut(key) {
-            entry.codex_child_pair_rederive = Some(stamp);
-        }
-    } else {
-        retire(index, key, stamp);
+pub(super) fn retire(index: &mut ScanIndex, key: &str, stamp: Stamp) -> bool {
+    let Some(reading) = index.codex_child_pair_reading.get_mut(key) else {
+        return false;
+    };
+    if !matches!(reading.stamp, Stamp::Pending { .. }) {
+        return false;
     }
+    reading.stamp = stamp;
+    true
 }
 
-pub(super) fn carry(retained: &mut ScanIndexEntry, working: &ScanIndexEntry) {
-    if let Some(stamp) = working.codex_child_pair_rederive {
-        if retained.source_file_fingerprint == working.source_file_fingerprint
-            && !matches!(stamp, Stamp::Pending { .. })
-        {
-            retained.scan_identity_version = working.scan_identity_version.clone();
-        }
-        retained.codex_child_pair_rederive = Some(stamp);
-    }
+pub(super) fn finish(index: &mut ScanIndex, key: &str, stamp: Stamp, _verified: bool) {
+    // Terminal credit never satisfies, creates or retires #865 debt.
+    retire(index, key, stamp);
+}
+
+#[cfg(test)]
+pub(super) fn put_stamp(index: &mut ScanIndex, key: &str, stamp: Stamp) {
+    let entry = &index.files[key];
+    index.codex_child_pair_reading.insert(
+        key.to_owned(),
+        Reading {
+            stamp,
+            source_file_fingerprint: entry.source_file_fingerprint.clone(),
+            reserved_extent: entry.size_bytes,
+            spent_bytes: 0,
+            reserved_at: 0,
+        },
+    );
 }
 
 #[cfg(unix)]
@@ -289,54 +520,71 @@ pub(super) fn outcome_slot(stamp: Stamp) -> Option<usize> {
         Stamp::Conflict => Some(3),
         Stamp::Incomplete => Some(4),
         Stamp::Unreadable => Some(5),
-        Stamp::Pending { .. } => None,
+        Stamp::Pending { .. } | Stamp::CrashHeld => None,
     }
 }
 
 /// A retry delay belongs only to this repair. Compare the ordinary selector
 /// ignoring only its Pending marker; every other cause keeps its priority.
-fn ordinary_decision(index: &ScanIndex, candidate: &CandidateFile) -> CandidateDecision {
+/// Discovery has no opened-object fingerprint yet. Project only that missing
+/// witness from the index, after requiring unchanged physical metadata. Natural
+/// growth and every independent non-audit cause keep their ordinary path.
+pub(super) fn repair_candidate(index: &ScanIndex, candidate: &CandidateFile) -> bool {
+    let key = local_index_key(&candidate.path);
+    let Some(entry) = index.files.get(&key) else {
+        return false;
+    };
+    if entry.size_bytes != candidate.size_bytes
+        || entry.modified_unix_seconds != candidate.modified_unix_seconds
+        || entry
+            .modified_unix_nanos
+            .is_some_and(|nanos| nanos != candidate.modified_unix_nanos)
+    {
+        return false;
+    }
+    let mut projected = candidate.clone();
+    projected.source_file_fingerprint = entry.source_file_fingerprint.clone();
+    matches!(
+        index.candidate_decision_with_repair_gate(
+            &projected,
+            sampled_scan::now_seconds(),
+            true,
+            true
+        ),
+        (CandidateDecision::Skip, _)
+            | (CandidateDecision::Parse, Some(CandidateParseReason::Audit))
+    )
+}
+
+pub(super) fn ordinary_decision(index: &ScanIndex, candidate: &CandidateFile) -> CandidateDecision {
     index
         .candidate_decision_with_repair_gate(candidate, sampled_scan::now_seconds(), true, true)
         .0
 }
 
 pub(super) fn delay_only_repair(index: &ScanIndex, candidate: &CandidateFile, now: u64) -> bool {
-    let key = local_index_key(&candidate.path);
-    index
-        .files
-        .get(&key)
-        .is_some_and(|entry| waiting(entry, now))
+    waiting(index, &local_index_key(&candidate.path), now)
         && ordinary_decision(index, candidate) == CandidateDecision::Skip
 }
 
-/// Existing joined custody may not broaden a physical-key repair grant.
-/// Ordinary growth/context/adoption retains its original whole-group path.
-pub(super) fn group_allowed(index: &ScanIndex, members: &[CandidateFile]) -> bool {
-    let pending = |index: &ScanIndex, member: &CandidateFile| {
-        matches!(
-            index
-                .files
-                .get(&local_index_key(&member.path))
-                .and_then(|entry| entry.codex_child_pair_rederive),
-            Some(Stamp::Pending { .. })
-        )
-    };
-    if !members.iter().any(|member| pending(index, member)) {
-        return true;
-    }
-    if members
+/// Independent debt retains its real deadline. A repair grant requires EVERY
+/// quiet member, regardless of other members' unrelated work or future debt.
+pub(super) fn group_requires_repair(index: &ScanIndex, members: &[CandidateFile]) -> bool {
+    members
         .iter()
-        .any(|member| ordinary_decision(index, member) != CandidateDecision::Skip)
-    {
+        .any(|member| pending(index, &local_index_key(&member.path)))
+        && members
+            .iter()
+            .all(|member| ordinary_decision(index, member) == CandidateDecision::Skip)
+}
+
+pub(super) fn group_allowed(index: &ScanIndex, members: &[CandidateFile]) -> bool {
+    if !group_requires_repair(index, members) {
         return true;
     }
     members.iter().all(|member| {
-        pending(index, member)
-            && !index
-                .files
-                .get(&local_index_key(&member.path))
-                .is_some_and(|entry| waiting(entry, sampled_scan::now_seconds()))
+        let key = local_index_key(&member.path);
+        pending(index, &key) && !waiting(index, &key, sampled_scan::now_seconds())
     })
 }
 

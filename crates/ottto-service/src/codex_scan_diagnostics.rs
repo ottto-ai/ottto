@@ -158,6 +158,9 @@ pub(crate) struct UnreadableCauses {
     counts: [u64; 8],
 }
 impl UnreadableCauses {
+    pub(crate) fn count(&self, cause: UnreadableCause) -> u64 {
+        self.counts[cause as usize]
+    }
     pub(crate) fn record(&mut self, cause: UnreadableCause, count: u64) {
         let slot = &mut self.counts[cause as usize];
         *slot = slot.saturating_add(count);

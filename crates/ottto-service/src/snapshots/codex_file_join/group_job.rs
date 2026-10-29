@@ -193,6 +193,7 @@ pub(in crate::snapshots) enum Boot {
     /// Every member is unchanged and joined under this exact member set.
     Unchanged,
     Strict,
+    IoFailure,
     /// A header-derived refusal: terminal debt, decided at no replay cost.
     Refused(JoinRefusal),
     Ready,
@@ -203,6 +204,7 @@ pub(in crate::snapshots) struct GroupBoot {
     pub(in crate::snapshots) group: Group,
     pub(in crate::snapshots) key: String,
     identified: usize,
+    pub(in crate::snapshots) repair_reserved: bool,
     stamps: Vec<OpenStamp>,
     wake_identities: BTreeMap<String, String>,
     headers: Vec<MemberHeader>,
@@ -227,7 +229,7 @@ pub(in crate::snapshots) struct GroupBoot {
     legacy_expected: BTreeMap<String, String>,
     evidence: codex_counting_version::AckEvidence,
 }
-crate::heap_layout_bound::fields!(GroupBoot; group, key, identified, stamps, wake_identities, headers, plan,
+crate::heap_layout_bound::fields!(GroupBoot; group, key, identified, repair_reserved, stamps, wake_identities, headers, plan,
     probes, probed, ordered, admitted, probe_bound, probe_limit_bound, own_page, probe_allowance,
     charge, previous_receipts, receipt_scope, legacy_expected, evidence);
 
@@ -259,6 +261,7 @@ impl GroupBoot {
             key: job_key(&group),
             group,
             identified: 0,
+            repair_reserved: false,
             stamps: Vec::new(),
             wake_identities: BTreeMap::new(),
             headers: Vec::new(),
@@ -345,7 +348,7 @@ impl GroupBoot {
         if self.headers.len() < n {
             let member = &self.group.members[self.headers.len()];
             let Ok((bytes, _, read, _)) = read_header_bytes(member) else {
-                return Boot::Strict;
+                return Boot::IoFailure;
             };
             self.charge = self.charge.saturating_add(read as u64);
             return match MemberHeader::parse(&bytes, member) {
@@ -427,10 +430,14 @@ impl GroupBoot {
             false,
             cache,
         ) else {
-            return Boot::Strict;
+            return if census.unreadable_causes.count(UnreadableCause::OpenRead) > 0 {
+                Boot::IoFailure
+            } else {
+                Boot::Strict
+            };
         };
         let Ok(stamp) = OpenStamp::capture(&file) else {
-            return Boot::Strict;
+            return Boot::IoFailure;
         };
         let identity = cache.map_or_else(
             || opened.opened_object_identity.clone(),
@@ -514,7 +521,7 @@ impl GroupBoot {
             }
         })();
         let Ok((before, bound, read)) = result else {
-            return Boot::Strict;
+            return Boot::IoFailure;
         };
         self.probe_limit_bound |= bound && cap == PROBE_BYTES as u64;
         self.charge = self.charge.saturating_add(read);
@@ -596,6 +603,7 @@ impl GroupBoot {
             headers,
             plan,
             probe_bound,
+            repair_reserved,
             probe_limit_bound,
             own_page,
             previous_receipts,
@@ -689,6 +697,7 @@ impl GroupBoot {
             // U1a-2a: a group job is never a side read.
             side_origin: None,
             group: Some(Box::new(GroupJob {
+                repair_owned: repair_reserved,
                 key,
                 owner: group.owner,
                 home: group.home,
@@ -740,7 +749,7 @@ fn open_member_file(member: &mut CandidateFile) -> std::result::Result<File, Gro
         Ok(file) => Ok(file),
         // The member vanished or was renamed: membership changed.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(GroupEnd::Changed),
-        Err(_) => Err(GroupEnd::Strict),
+        Err(_) => Err(GroupEnd::IoFailure),
     }
 }
 
@@ -767,7 +776,7 @@ fn legacy_tee(
     if !legacy_expected.contains_key(&local_index_key(&member.path)) {
         return Ok(None);
     }
-    let clone = file.try_clone().map_err(|_| GroupEnd::Strict)?;
+    let clone = file.try_clone().map_err(|_| GroupEnd::IoFailure)?;
     OwnedJsonlParser::new(
         clone,
         &member.path,
@@ -785,6 +794,7 @@ fn legacy_tee(
 
 /// The running group job, carried by its `OwnedActiveFile`.
 pub(in crate::snapshots) struct GroupJob {
+    pub(in crate::snapshots) repair_owned: bool,
     pub(in crate::snapshots) key: String,
     pub(in crate::snapshots) owner: String,
     pub(in crate::snapshots) home: PathBuf,
@@ -823,7 +833,7 @@ pub(in crate::snapshots) struct GroupJob {
     /// input cumulatively, so a member swap needs no walk (R2-L3).
     pub(in crate::snapshots) consumed_before: u64,
 }
-crate::heap_layout_bound::fields!(GroupJob; key, owner, home, members, recovered, stamps, digests, current,
+crate::heap_layout_bound::fields!(GroupJob; repair_owned, key, owner, home, members, recovered, stamps, digests, current,
     finished, previous_receipts, receipt_scope, legacy_expected, tee, legacy_baselines, lines,
     charge, probe_bound, probe_limit_bound, own_page, dependencies, memo_digest, scope, walked,
     consumed_before);
@@ -890,8 +900,10 @@ pub(in crate::snapshots) enum GroupEnd {
         offset: u64,
         at_eof: bool,
     },
-    /// Open/read failure, line loss, receipts, owner or creator conflict.
+    /// Structural/receipt/line-loss refusal, never inferred to be I/O.
     Strict,
+    CreatorConflict,
+    IoFailure,
     /// A member changed or vanished: a necessary invalidation.
     Changed,
     /// The live member's acquisition evidence is unavailable this page (K9).
@@ -1112,9 +1124,10 @@ fn member_eof(
             .source_session_id
             .as_deref()
             .map(resolve_codex_identity);
-        if active.parser.accumulator.codex_creator_evidence_conflicted
-            || owner.as_deref() != Some(group.owner.as_str())
-        {
+        if active.parser.accumulator.codex_creator_evidence_conflicted {
+            return Err(GroupEnd::CreatorConflict);
+        }
+        if owner.as_deref() != Some(group.owner.as_str()) {
             return Err(GroupEnd::Strict);
         }
         active.parser.reader.report.physical_line_count = group.lines.0;
@@ -1286,6 +1299,33 @@ pub(in crate::snapshots) fn end_group(
     let Some(group) = active.group.as_deref() else {
         return;
     };
+    // Preserve the actual terminal/error class before ordinary custody cleanup.
+    for member in group.members.iter().filter(|_| group.repair_owned) {
+        let key = local_index_key(&member.path);
+        if !codex_child_pair_rederive::pending(index, &key) {
+            continue;
+        }
+        let outcome = match &end {
+            GroupEnd::CreatorConflict => Some(codex_child_pair_rederive::Stamp::Conflict),
+            GroupEnd::Strict | GroupEnd::Changed | GroupEnd::Refused { .. } => {
+                Some(codex_child_pair_rederive::Stamp::Incomplete)
+            }
+            GroupEnd::IoFailure => {
+                codex_child_pair_rederive::failed(index, &key, sampled_scan::now_seconds())
+                    .then_some(codex_child_pair_rederive::Stamp::Unreadable)
+            }
+            _ => None,
+        };
+        if let Some(outcome) = outcome {
+            codex_child_pair_rederive::finish(index, &key, outcome, false);
+            #[cfg(unix)]
+            if let Some(context) = sampling {
+                if let Some(slot) = codex_child_pair_rederive::outcome_slot(outcome) {
+                    context.cache.durable_child_pair_count(slot, 1);
+                }
+            }
+        }
+    }
     match end {
         // R1-M1: the chronological fallback order may itself break the
         // chain (a budget artifact, not a property of the files): strict,
@@ -1412,7 +1452,11 @@ pub(in crate::snapshots) fn end_group(
                 cursor::defer_group_lease(lease);
             }
         }
-        GroupEnd::Strict | GroupEnd::Changed | GroupEnd::Unavailable => {
+        GroupEnd::Strict
+        | GroupEnd::CreatorConflict
+        | GroupEnd::IoFailure
+        | GroupEnd::Changed
+        | GroupEnd::Unavailable => {
             if let Some(lease) = lease {
                 lease.release();
             }

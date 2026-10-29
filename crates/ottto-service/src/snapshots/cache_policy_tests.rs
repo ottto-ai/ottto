@@ -224,7 +224,7 @@ fn retained_reduction(fixture: &ScanFixture) -> Retained<sampled_jsonl::CachedJs
 struct Observed {
     index: ScanIndex,
     modes: (usize, usize, usize),
-    full_reasons: [usize; 11],
+    full_reasons: [usize; 13],
     /// Step starts whose active file is a sampled tail (it holds borrowed
     /// retained state) and whose copy budget is zero.
     tail_zero_budget_steps: usize,
@@ -268,7 +268,7 @@ fn observed_scan(
 ) -> Observed {
     let mut scan = cached_scan(fixture, source, index, cache);
     let mut modes = (0, 0, 0);
-    let mut full_reasons = [0; 11];
+    let mut full_reasons = [0; 13];
     let mut tail_zero_budget_steps = 0;
     loop {
         if let Some(context) = scan.sampling.as_ref() {

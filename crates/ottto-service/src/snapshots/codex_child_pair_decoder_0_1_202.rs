@@ -1,4 +1,4 @@
-// Frozen ScanIndexEntry serde codec from a0f0b6a63.
+// Frozen ScanIndexEntry serde codec from 79488a7297817edfe1eb5cfc34b779408d511726 (0.1.202).
 // The old files-map loader delegates each entry to this derive. Keep frozen.
 use super::*;
 #[derive(Debug, Clone, Serialize, Deserialize)]

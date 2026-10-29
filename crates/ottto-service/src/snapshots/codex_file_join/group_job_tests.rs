@@ -3560,7 +3560,8 @@ fn child_pair_repair_group_checks_identified_members_and_honors_backoff_and_grow
     }
     let _clock = Clock;
     sampled_scan::set_test_now(Some(100));
-    for both_pending in [false, true] {
+    for (both_pending, future_debt) in [(false, false), (true, false), (false, true), (true, true)]
+    {
         let root = temp_root("child-repair-group");
         let a = root.join("sessions/a.jsonl");
         let b = root.join("sessions/b.jsonl");
@@ -3571,12 +3572,25 @@ fn child_pair_repair_group_checks_identified_members_and_honors_backoff_and_grow
         assert_eq!(initial.snapshots.len(), 2, "settled native group premise");
         for path in std::iter::once(&a).chain(both_pending.then_some(&b)) {
             let key = local_index_key(path);
-            index.files.get_mut(&key).unwrap().codex_child_pair_rederive = Some(Stamp::Pending {
-                attempts: 1,
-                retry_after: 108,
-                running: false,
-                previous_due: None,
-            });
+            if future_debt {
+                let fp = index.files[&key].source_file_fingerprint.clone();
+                assert!(index.stage_sampled_audit(
+                    &key,
+                    &fp,
+                    crate::transcript_acquisition::AuditDebt {
+                        due_unix_seconds: 3700
+                    }
+                ));
+            }
+            codex_child_pair_rederive::put_stamp(
+                &mut index,
+                &key,
+                Stamp::Pending {
+                    attempts: 1,
+                    retry_after: 108,
+                    running: false,
+                },
+            );
         }
         let mut boot = GroupBoot::new(group_of(&root), &index);
         for _ in 0..2 {

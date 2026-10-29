@@ -6826,6 +6826,9 @@ fn finish_sync_source(
         active_legacy_reconciliation,
         scan: _,
     } = preparation;
+    if source == SnapshotSource::Codex {
+        index.refresh_child_rederive_committed(&mut committed_index, &index_path)?;
+    }
     // Resets the census-wait count on every exit that is not a capacity stop.
     let mut census_wait = ack_retention::CapacityStopCensusCount::begin(source);
     if let Some(lease) = native_comparison_lease.as_mut() {
@@ -11759,7 +11762,6 @@ mod tests {
         index.files.insert(
             "synthetic/deferred.jsonl".into(),
             crate::snapshots::ScanIndexEntry {
-                codex_child_pair_rederive: None,
                 size_bytes: 1,
                 modified_unix_seconds: 1,
                 modified_unix_nanos: Some(1),

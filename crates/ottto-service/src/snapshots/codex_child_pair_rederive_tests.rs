@@ -19,6 +19,7 @@ struct Fixture {
     root: PathBuf,
     path: PathBuf,
     index_path: PathBuf,
+    last_reads: std::cell::RefCell<BTreeMap<PathBuf, usize>>,
 }
 impl Fixture {
     fn new(kind: &str) -> Self {
@@ -79,6 +80,7 @@ impl Fixture {
             root,
             path,
             index_path,
+            last_reads: Default::default(),
         }
     }
     fn assert_restart_quiet(&self, depth2: bool, label: &str, collected_at: &str) {
@@ -147,7 +149,7 @@ impl Fixture {
             index,
             collected_at,
             BACKFILL_WINDOW_DAYS,
-            10,
+            MAX_CHILDREN + 1,
             false,
             None,
             &[],
@@ -189,19 +191,20 @@ impl Fixture {
             if let Some(active) = scan.active_file.as_deref() {
                 let key = local_index_key(&active.candidate.path);
                 if matches!(
-                    scan.index
-                        .files
-                        .get(&key)
-                        .and_then(|entry| entry.codex_child_pair_rederive),
-                    Some(Stamp::Pending { .. })
-                ) {
+                    stamp(&scan.index, &key),
+                    Some(Stamp::Pending { running: true, .. })
+                ) && active.sampling.as_ref().is_some_and(|acquisition| {
+                    matches!(acquisition.mode, ReadMode::Full(
+                        crate::transcript_acquisition::FullReason::CodexChildRederiveFirst
+                        | crate::transcript_acquisition::FullReason::CodexChildRederiveCrashRetry))
+                }) {
                     assert_eq!(
                         active
                             .sampling
                             .as_ref()
                             .expect("repair uses cold native acquisition plan")
                             .mode,
-                        ReadMode::Full(FullReason::StateMissing)
+                        ReadMode::Full(full_reason(&scan.index, &key))
                     );
                 }
             }
@@ -236,13 +239,18 @@ impl Fixture {
                 }
             }
         });
+        self.last_reads.replace(reads.clone());
         (index, result, reads.get(&self.path).copied().unwrap_or(0))
     }
     fn seed(&self, index: &ScanIndex, conflicted: bool, absent_pair: bool) {
+        self.seed_path(index, &self.path, conflicted, absent_pair);
+    }
+    fn seed_path(&self, index: &ScanIndex, path: &Path, conflicted: bool, absent_pair: bool) {
+        fs::write(&self.index_path, serde_json::to_vec(index).unwrap()).unwrap();
         let scope = Scope("synthetic-old-cache".into());
         let mut parser = OwnedJsonlParser::new(
-            File::open(&self.path).unwrap(),
-            &self.path,
+            File::open(path).unwrap(),
+            path,
             SnapshotSource::Codex,
             apply_codex_line,
             None,
@@ -268,7 +276,7 @@ impl Fixture {
             sampled_jsonl::SideCertificate::Certified { completed, .. } => completed.checkpoint,
             _ => panic!("native seed must certify"),
         };
-        let key = local_index_key(&self.path);
+        let key = local_index_key(path);
         let entry = &index.files[&key];
         let lock = crate::locked_state_dir::held_for(self.scratch.as_ref())
             .expect("fixture state-directory lock is held for the process");
@@ -298,7 +306,7 @@ impl Fixture {
                     ),
                 },
                 certificate: checkpoint
-                    .durable_certificate(birth_unix_nanos(&fs::metadata(&self.path).unwrap()))
+                    .durable_certificate(birth_unix_nanos(&fs::metadata(path).unwrap()))
                     .unwrap(),
                 body: codec::encode(&reduction, store::RECORD_BYTES, jsonl_line_cap() as u64)
                     .unwrap(),
@@ -326,6 +334,23 @@ fn codex_child_pair_named_conflict_incomplete_read_once_then_two_restarts() {
         let (mut index, oracle, _) = fixture.run(ScanIndex::default(), None, &metadata);
         let key = local_index_key(&fixture.path);
         assert!(index.files.contains_key(&key));
+        let previous_fingerprint = index.files[&key].last_snapshot_fingerprint.clone();
+        if expected == Stamp::Named {
+            // Model the old Unknown upload body while retaining its semantic
+            // fingerprint; correcting creator evidence must re-emit this body.
+            let witnesses = oracle
+                .snapshots
+                .iter()
+                .cloned()
+                .map(|mut item| {
+                    item.session_account_evidence = None;
+                    snapshot_upload_body_witness(&item)
+                })
+                .collect::<BTreeSet<_>>();
+            index.files.get_mut(&key).unwrap().last_upload_body_witness =
+                Some(snapshot_file_upload_body_set_hex(&witnesses));
+        }
+        let previous_witness = index.files[&key].last_upload_body_witness.clone();
         index.save(&fixture.index_path).unwrap();
         fixture.seed(&index, kind != "depth2", kind == "depth2");
         let cache = fixture.cache();
@@ -335,20 +360,37 @@ fn codex_child_pair_named_conflict_incomplete_read_once_then_two_restarts() {
                 fixture.run(index, Some(cache.clone()), &metadata)
             });
         assert_audit_counts(&diagnostics, [0, 0, 0]);
+        let reasons = diagnostics
+            .iter()
+            .filter(|row| row["stage"] == "native_collection_page")
+            .map(|row| &row["counts"]["sampled_acquisition"]["page_events"]["full_reasons"])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reasons
+                .iter()
+                .map(|counts| counts["codex_child_rederive_full_first"]
+                    .as_u64()
+                    .unwrap_or(0))
+                .sum::<u64>(),
+            1
+        );
+        assert_eq!(
+            reasons
+                .iter()
+                .map(|counts| counts["state_missing"].as_u64().unwrap_or(0))
+                .sum::<u64>(),
+            0
+        );
         let reason_lines = take_codex_parse_reason_lines_for_test();
         assert!(!reason_lines.is_empty());
         assert!(reason_lines
             .iter()
             .all(|line| line.contains("comparison_target=0")));
         assert_eq!(reads, 1, "{kind}");
-        assert_eq!(
-            index.files[&key].codex_child_pair_rederive,
-            Some(expected),
-            "{kind}"
-        );
+        assert_eq!(stamp(&index, &key), Some(expected), "{kind}");
         assert!(
             !index.files[&key].has_unverified_source(),
-            "repair debt retired: {kind}"
+            "repair cannot create audit debt: {kind}"
         );
         let counts = cache.durable_counters(SnapshotSource::Codex).unwrap().0;
         assert_eq!(counts.codex_child_pair_rederive[0], 1);
@@ -360,7 +402,25 @@ fn codex_child_pair_named_conflict_incomplete_read_once_then_two_restarts() {
             counts.codex_child_pair_rederive[outcome_slot(expected).unwrap()],
             1
         );
-        assert_eq!(oracle.snapshots.len(), repaired.snapshots.len());
+        if expected == Stamp::Named {
+            assert_eq!(
+                oracle.snapshots.len(),
+                repaired.snapshots.len(),
+                "account correction re-emits the whole body"
+            );
+            assert_ne!(index.files[&key].last_upload_body_witness, previous_witness);
+        } else {
+            assert!(
+                repaired.snapshots.is_empty(),
+                "an unchanged outcome must not POST again"
+            );
+            assert_eq!(
+                index.files[&key].last_snapshot_fingerprint,
+                previous_fingerprint
+            );
+            assert_eq!(index.files[&key].last_upload_body_witness, previous_witness);
+            assert!(repaired.semantic_noop_count > 0);
+        }
         for (old, new) in oracle.snapshots.iter().zip(&repaired.snapshots) {
             let mut old = serde_json::to_value(old).unwrap();
             let mut new = serde_json::to_value(new).unwrap();
@@ -374,7 +434,7 @@ fn codex_child_pair_named_conflict_incomplete_read_once_then_two_restarts() {
         }
         if kind == "conflict" {
             assert_eq!(
-                repaired.snapshots[0]
+                oracle.snapshots[0]
                     .session_account_evidence
                     .as_ref()
                     .unwrap()
@@ -406,9 +466,7 @@ fn codex_child_pair_selector_excludes_good_plain_depth_one_and_non_native() {
         let cache = fixture.cache();
         let (index, _, reads) = fixture.run(index, Some(cache.clone()), &metadata);
         assert_eq!(reads, 0, "{kind}");
-        assert!(index.files[&local_index_key(&fixture.path)]
-            .codex_child_pair_rederive
-            .is_none());
+        assert!(stamp(&index, &local_index_key(&fixture.path)).is_none());
         assert_eq!(
             cache
                 .durable_counters(SnapshotSource::Codex)
@@ -430,7 +488,7 @@ fn codex_child_pair_bytes_are_index_sizes_and_over_budget_stages_nothing() {
     fixture.seed(&index, true, false);
     let cache = fixture.cache();
     with_transcript_io_denied(|| stage(&mut index, &cache, &metadata));
-    assert!(index.files[&key].codex_child_pair_rederive.is_none());
+    assert!(stamp(&index, &key).is_none());
     assert!(!index.files[&key].has_unverified_source());
     assert_eq!(
         &cache
@@ -443,7 +501,7 @@ fn codex_child_pair_bytes_are_index_sizes_and_over_budget_stages_nothing() {
 }
 
 #[test]
-fn codex_child_pair_three_retries_then_unreadable_preserve_independent_debt() {
+fn codex_child_pair_two_attempts_then_unreadable_preserve_independent_debt() {
     for previous_due in [None, Some(7)] {
         let fixture = Fixture::new("named");
         let metadata = CodexTitleMetadata::default();
@@ -457,30 +515,49 @@ fn codex_child_pair_three_retries_then_unreadable_preserve_independent_debt() {
                 crate::transcript_acquisition::AuditDebt { due_unix_seconds },
             ));
         }
-        index.files.get_mut(&key).unwrap().codex_child_pair_rederive = Some(Stamp::Pending {
-            attempts: 0,
-            retry_after: 100,
-            running: false,
-            previous_due,
-        });
+        put_stamp(
+            &mut index,
+            &key,
+            Stamp::Pending {
+                attempts: 0,
+                retry_after: 100,
+                running: false,
+            },
+        );
+        fs::write(&fixture.index_path, serde_json::to_vec(&index).unwrap()).unwrap();
         let mut now = 100;
-        for attempt in 1..=4 {
-            assert!(begin(&mut index, &key, now));
-            assert_eq!(failed(&mut index, &key, now), attempt == 4);
+        for attempt in 1..=2 {
+            assert!(reserve(
+                &mut index,
+                &key,
+                fixture.path.metadata().unwrap().len(),
+                &fixture.index_path,
+                now
+            ));
+            assert_eq!(failed(&mut index, &key, now), attempt == 2);
             index.save(&fixture.index_path).unwrap();
             index = ScanIndex::load(&fixture.index_path).unwrap();
-            if attempt < 4 {
-                assert!(waiting(&index.files[&key], now));
-                assert!(!begin(&mut index, &key, now));
+            if attempt < 2 {
+                assert!(waiting(&index, &key, now));
+                assert!(!reserve(
+                    &mut index,
+                    &key,
+                    fixture.path.metadata().unwrap().len(),
+                    &fixture.index_path,
+                    now
+                ));
                 now += 1 << attempt.min(3);
             }
         }
-        assert_eq!(
-            index.files[&key].codex_child_pair_rederive,
-            Some(Stamp::Unreadable)
-        );
+        assert_eq!(stamp(&index, &key), Some(Stamp::Unreadable));
         assert_eq!(index.files[&key].unverified_deadline(), previous_due);
-        assert!(!begin(&mut index, &key, now + 1_000));
+        assert!(!reserve(
+            &mut index,
+            &key,
+            fixture.path.metadata().unwrap().len(),
+            &fixture.index_path,
+            now + 1_000
+        ));
         assert!(!failed(&mut index, &key, now + 1_000));
     }
 }
@@ -491,20 +568,28 @@ mod old_201 {
 mod old_202 {
     include!("codex_child_pair_decoder_0_1_202.rs");
 }
+mod old_203 {
+    include!("codex_child_pair_decoder_0_1_203.rs");
+}
 
 #[test]
-fn codex_child_pair_old_decoders_tolerate_marker_and_202_save_costs_one_more_read() {
+fn codex_child_pair_old_entry_decoders_tolerate_and_old_save_drops_proposed_ledger() {
     let fixture = Fixture::new("named");
     let metadata = CodexTitleMetadata::default();
     let (mut index, _, _) = fixture.run(ScanIndex::default(), None, &metadata);
     let key = local_index_key(&fixture.path);
-    index.files.get_mut(&key).unwrap().codex_child_pair_rederive = Some(Stamp::Named);
+    put_stamp(&mut index, &key, Stamp::Named);
     index.save(&fixture.index_path).unwrap();
     let mut old_index: Value =
         serde_json::from_slice(&fs::read(&fixture.index_path).unwrap()).unwrap();
     let entry = old_index["files"][&key].clone();
     let old_201: old_201::ScanIndexEntry = serde_json::from_value(entry.clone()).unwrap();
-    let old_202: old_202::ScanIndexEntry = serde_json::from_value(entry).unwrap();
+    let old_202: old_202::ScanIndexEntry = serde_json::from_value(entry.clone()).unwrap();
+    let old_203: old_203::ScanIndexEntry = serde_json::from_value(entry).unwrap();
+    assert_eq!(
+        old_203.source_file_fingerprint,
+        old_202.source_file_fingerprint
+    );
     assert_eq!(
         old_201.source_file_fingerprint,
         index.files[&key].source_file_fingerprint
@@ -514,18 +599,20 @@ fn codex_child_pair_old_decoders_tolerate_marker_and_202_save_costs_one_more_rea
         index.files[&key].last_upload_body_witness
     );
     old_index["files"][&key] = serde_json::to_value(&old_202).unwrap();
+    old_index
+        .as_object_mut()
+        .unwrap()
+        .remove("codex_child_pair_reading");
     fs::write(&fixture.index_path, serde_json::to_vec(&old_index).unwrap()).unwrap();
     let dropped = ScanIndex::load(&fixture.index_path).unwrap();
-    assert!(dropped.files[&key].codex_child_pair_rederive.is_none());
-    // Worst case: the old binary also leaves/recreates the old conflicted
-    // cache. The upgraded writer must spend at most one more counted Full.
+    assert!(stamp(&dropped, &key).is_none());
+    // Compatibility limitation, NOT a proof of two attempts EVER: an old
+    // top-level save drops custody, allowing another counted Full. SOURCE
+    // must resolve this loss before this proposed format can ship.
     fixture.seed(&dropped, true, false);
     let (mut upgraded, _, reads) = fixture.run(dropped, Some(fixture.cache()), &metadata);
     assert_eq!(reads, 1);
-    assert_eq!(
-        upgraded.files[&key].codex_child_pair_rederive,
-        Some(Stamp::Named)
-    );
+    assert_eq!(stamp(&upgraded, &key), Some(Stamp::Named));
     for _ in 0..2 {
         upgraded.save(&fixture.index_path).unwrap();
         let loaded = ScanIndex::load(&fixture.index_path).unwrap();
@@ -541,33 +628,31 @@ fn codex_child_pair_unknown_marker_is_fail_closed_and_partial_save_carries_credi
     let (mut previous, _, _) =
         fixture.run(ScanIndex::default(), None, &CodexTitleMetadata::default());
     let key = local_index_key(&fixture.path);
-    previous
-        .files
-        .get_mut(&key)
-        .unwrap()
-        .codex_child_pair_rederive = Some(Stamp::Pending {
-        attempts: 1,
-        retry_after: 100,
-        running: true,
-        previous_due: None,
-    });
+    put_stamp(
+        &mut previous,
+        &key,
+        Stamp::Pending {
+            attempts: 1,
+            retry_after: 100,
+            running: true,
+        },
+    );
     let mut working = previous.clone();
     assert!(retire(&mut working, &key, Stamp::Incomplete));
     let subset = working.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
     let retained = subset.files[&key].clone();
-    assert_eq!(retained.codex_child_pair_rederive, Some(Stamp::Incomplete));
+    assert_eq!(stamp(&subset, &key), Some(Stamp::Incomplete));
     assert!(!retained.has_unverified_source());
-    let mut value = serde_json::to_value(&retained).unwrap();
-    value["codex_child_pair_rederive"] = json!({"future_marker":"synthetic-canary"});
-    let decoded: ScanIndexEntry = serde_json::from_value(value).unwrap();
-    assert_eq!(decoded.codex_child_pair_rederive, Some(Stamp::Unreadable));
-    assert!(!serde_json::to_string(&decoded)
-        .unwrap()
-        .contains("synthetic-canary"));
+    let mut value = serde_json::to_value(&subset.codex_child_pair_reading[&key]).unwrap();
+    value["stamp"] = json!({"future_marker":"synthetic-canary"});
+    assert!(
+        serde_json::from_value::<Reading>(value).is_err(),
+        "unknown custody cannot silently drop spend"
+    );
 }
 
 #[test]
-fn codex_child_pair_injected_read_failures_back_off_and_stop_after_three_retries() {
+fn codex_child_pair_injected_read_failures_back_off_and_stop_after_one_retry() {
     struct Clock;
     impl Drop for Clock {
         fn drop(&mut self) {
@@ -590,7 +675,7 @@ fn codex_child_pair_injected_read_failures_back_off_and_stop_after_three_retries
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap()
     };
-    for attempt in 1..=4 {
+    for attempt in 1..=2 {
         sampled_scan::set_test_now(Some(now));
         let collected_at = at(now);
         let (next, _, _) = fixture.run_inner_at(
@@ -624,7 +709,7 @@ fn codex_child_pair_injected_read_failures_back_off_and_stop_after_three_retries
         );
         // Both existing schedulers remain authoritative: the repair delay
         // cannot bypass an unhealthy traversal's longer persisted cooldown.
-        let repair_due = match index.files[&key].codex_child_pair_rederive {
+        let repair_due = match stamp(&index, &key) {
             Some(Stamp::Pending { retry_after, .. }) => retry_after,
             _ => now,
         };
@@ -635,10 +720,7 @@ fn codex_child_pair_injected_read_failures_back_off_and_stop_after_three_retries
             .unwrap_or(now)
             .max(repair_due);
     }
-    assert_eq!(
-        index.files[&key].codex_child_pair_rederive,
-        Some(Stamp::Unreadable)
-    );
+    assert_eq!(stamp(&index, &key), Some(Stamp::Unreadable));
     // Move beyond both backoffs before checking terminal saved-state credit.
     now += UNHEALTHY_SCAN_RETRY_MAX_SECONDS + 1;
     let collected_at = at(now);
@@ -655,7 +737,7 @@ fn codex_child_pair_injected_read_failures_back_off_and_stop_after_three_retries
             &collected_at,
         );
         assert_eq!(reads, 0);
-        assert_eq!(faults.get(), 4);
+        assert_eq!(faults.get(), 2);
         index = next;
     }
 }
@@ -756,10 +838,7 @@ fn codex_child_pair_independent_audit_staged_during_repair_survives_terminal_and
     let subset = working.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
     assert_eq!(working.files[&key].unverified_deadline(), Some(7));
     assert_eq!(subset.files[&key].unverified_deadline(), Some(7));
-    assert_eq!(
-        subset.files[&key].codex_child_pair_rederive,
-        Some(Stamp::Incomplete)
-    );
+    assert_eq!(stamp(&subset, &key), Some(Stamp::Incomplete));
 }
 
 #[test]
@@ -801,11 +880,10 @@ fn codex_child_pair_restart_probe() {
     );
     let collected_at = std::env::var("OTTTO_CHILD_PAIR_TEST_AT").unwrap();
     sampled_scan::set_test_now(Some(rfc3339_unix_seconds(&collected_at).unwrap()));
+    let crash = std::env::var_os("OTTTO_CHILD_PAIR_CRASH").is_some();
+    let drain = std::env::var_os("OTTTO_CHILD_PAIR_DRAIN").is_some();
     let index = ScanIndex::load(&index_path).unwrap();
-    assert!(index
-        .files
-        .values()
-        .any(|entry| entry.codex_child_pair_rederive.is_some()));
+    assert!(crash || !index.codex_child_pair_reading.is_empty());
     let cache = Arc::new(sampled_scan::SharedCache::default());
     cache.durable_begin_pass(
         SnapshotSource::Codex,
@@ -819,7 +897,7 @@ fn codex_child_pair_restart_probe() {
         index,
         &collected_at,
         BACKFILL_WINDOW_DAYS,
-        10,
+        MAX_CHILDREN + 1,
         false,
         None,
         &[],
@@ -835,18 +913,66 @@ fn codex_child_pair_restart_probe() {
             .insert(PARENT.into(), ROOT.into());
     }
     scan = scan.with_sampled_acquisition(cache, Scope(NAMESPACE.into()));
-    let (_, reads) = terminal_contract_retry::source_acquisitions(|| loop {
-        match scan.step(None) {
-            OwnedSourceScanStep::Pending(next) => scan = next,
-            OwnedSourceScanStep::Complete { scan: result, .. } => {
-                assert!(result.snapshots.is_empty());
-                break;
+    // Recovery backoff elapses in this new process without another selection walk.
+    if crash {
+        sampled_scan::set_test_now(Some(rfc3339_unix_seconds(&collected_at).unwrap() + 3));
+    }
+    let receipt = std::env::var_os("OTTTO_CHILD_PAIR_CRASH_RECEIPT").map(PathBuf::from);
+    let (_, reads) = with_after_reader_eof(
+        move |active| {
+            if crash {
+                use std::io::Write;
+                assert!(matches!(
+                    active.sampling.as_ref().unwrap().mode,
+                    ReadMode::Full(
+                        FullReason::CodexChildRederiveFirst
+                            | FullReason::CodexChildRederiveCrashRetry
+                    )
+                ));
+                assert_eq!(
+                    active.parser.reader.consumed_bytes(),
+                    active
+                        .parser
+                        .reader
+                        .reader
+                        .get_ref()
+                        .metadata()
+                        .unwrap()
+                        .len()
+                );
+                fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(receipt.as_ref().unwrap())
+                    .unwrap()
+                    .write_all(b"read\n")
+                    .unwrap();
+                std::process::exit(92);
             }
-        }
-    });
-    assert!(
-        reads.is_empty(),
-        "a stamped child never reacquires in a fresh process"
+        },
+        || {
+            terminal_contract_retry::source_acquisitions(|| loop {
+                match scan.step(None) {
+                    OwnedSourceScanStep::Pending(next) => scan = next,
+                    OwnedSourceScanStep::Complete {
+                        scan: result,
+                        mut index,
+                        ..
+                    } => {
+                        if crash || drain {
+                            index.save(&index_path).unwrap();
+                        }
+                        assert!(result.snapshots.is_empty());
+                        break;
+                    }
+                }
+            })
+        },
+    );
+    assert_eq!(
+        reads.values().sum::<usize>(),
+        usize::from(drain),
+        "only an unstamped deferred child acquires in a fresh process"
     );
 }
 
@@ -886,7 +1012,6 @@ fn codex_child_pair_old_positional_entry_keeps_nondefault_tail_neighbors() {
     let current: ScanIndexEntry = serde_json::from_value(positional).unwrap();
     assert_eq!(current.opened_changed_nanos, 111);
     assert_eq!(current.opened_birth_nanos, 222);
-    assert!(current.codex_child_pair_rederive.is_none());
 }
 
 fn assert_audit_counts(rows: &[Value], expected: [u64; 3]) {
@@ -903,8 +1028,8 @@ fn assert_audit_counts(rows: &[Value], expected: [u64; 3]) {
         totals[2] += events["audits_completed"].as_u64().unwrap();
         if expected == [0; 3] {
             assert_eq!(
-                events["full_reasons"],
-                json!({}),
+                events["full_reasons"]["audit_due"].as_u64().unwrap_or(0),
+                0,
                 "repair has only the codex_child_pair_rederive cause tally"
             );
         }
@@ -913,7 +1038,7 @@ fn assert_audit_counts(rows: &[Value], expected: [u64; 3]) {
 }
 
 #[test]
-fn codex_child_pair_verified_full_discharges_existing_debt_without_audit_tally() {
+fn codex_child_pair_verified_full_never_retires_existing_debt() {
     for due in [7, u64::MAX] {
         let fixture = Fixture::new("named");
         let metadata = CodexTitleMetadata::default();
@@ -933,13 +1058,11 @@ fn codex_child_pair_verified_full_discharges_existing_debt_without_audit_tally()
             fixture.run(index, Some(cache.clone()), &metadata)
         });
         assert_eq!(reads, 1);
+        assert_eq!(stamp(&index, &key), Some(Stamp::Named));
         assert_eq!(
-            index.files[&key].codex_child_pair_rederive,
-            Some(Stamp::Named)
-        );
-        assert!(
-            !index.files[&key].has_unverified_source(),
-            "real verified Full discharges existing debt"
+            index.files[&key].unverified_deadline(),
+            Some(due),
+            "a repair Full never satisfies independent audit debt"
         );
         assert_audit_counts(&rows, [0; 3]);
         assert_eq!(
@@ -1033,10 +1156,7 @@ fn codex_child_pair_other_due_audit_starts_same_pass_with_all_audit_slots_reserv
         fixture.run(index, Some(cache.clone()), &metadata)
     });
     assert_eq!(reads, 1);
-    assert_eq!(
-        index.files[&key].codex_child_pair_rederive,
-        Some(Stamp::Named)
-    );
+    assert_eq!(stamp(&index, &key), Some(Stamp::Named));
     assert!(
         !index.files[&other_key].has_unverified_source(),
         "other due file completed on schedule"
@@ -1106,4 +1226,655 @@ fn codex_child_pair_grown_prefix_never_verifies_independent_audit_debt() {
             "a repair prefix cannot discharge an independent audit"
         );
     }
+}
+
+#[test]
+fn codex_child_pair_crashes_five_fresh_processes_spend_at_most_two_fulls() {
+    let fixture = Fixture::new("named");
+    let metadata = CodexTitleMetadata::default();
+    let (index, _, _) = fixture.run(ScanIndex::default(), None, &metadata);
+    fixture.seed(&index, true, false);
+    let receipt = fixture.scratch.join("crash-native-reads");
+    for crash in 0..5 {
+        let at = time::OffsetDateTime::from_unix_timestamp(1_800_000_000 + crash * 10)
+            .unwrap()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "snapshots::codex_child_pair_rederive::tests::codex_child_pair_restart_probe",
+                "--nocapture",
+            ])
+            .env("OTTTO_CHILD_PAIR_TEST_ROOT", &fixture.root)
+            .env("OTTTO_CHILD_PAIR_TEST_INDEX", &fixture.index_path)
+            .env("OTTTO_CHILD_PAIR_TEST_AT", at)
+            .env("OTTTO_CHILD_PAIR_TEST_DEPTH2", "0")
+            .env("OTTTO_CHILD_PAIR_CRASH", "1")
+            .env("OTTTO_CHILD_PAIR_CRASH_RECEIPT", &receipt)
+            .output()
+            .unwrap();
+        if crash < 2 {
+            assert_eq!(
+                output.status.code(),
+                Some(92),
+                "crash after real native EOF: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        } else {
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout)
+                        .contains("test result: ok. 1 passed;"),
+                "{} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+    assert_eq!(fs::read_to_string(receipt).unwrap().lines().count(), 2);
+    let index = ScanIndex::load(&fixture.index_path).unwrap();
+    let key = local_index_key(&fixture.path);
+    assert_eq!(stamp(&index, &key), Some(Stamp::CrashHeld));
+    assert_eq!(
+        index.codex_child_pair_reading[&key].spent_bytes,
+        2 * fixture.path.metadata().unwrap().len()
+    );
+    let cache = fixture.cache();
+    let (_, _, reads) = fixture.run(index, Some(cache.clone()), &metadata);
+    assert_eq!(reads, 0);
+    assert_eq!(
+        cache
+            .durable_counters(SnapshotSource::Codex)
+            .unwrap()
+            .0
+            .codex_child_rederive_crash_held[0],
+        1
+    );
+}
+
+#[test]
+fn codex_child_pair_failed_reservation_save_does_not_start_or_spend() {
+    let fixture = Fixture::new("named");
+    let (mut index, _, _) = fixture.run(ScanIndex::default(), None, &CodexTitleMetadata::default());
+    let key = local_index_key(&fixture.path);
+    put_stamp(
+        &mut index,
+        &key,
+        Stamp::Pending {
+            attempts: 0,
+            running: false,
+            retry_after: 0,
+        },
+    );
+    let before = index.clone();
+    let missing_parent = fixture.scratch.join("absent/index.json");
+    assert!(!reserve(
+        &mut index,
+        &key,
+        fixture.path.metadata().unwrap().len(),
+        &missing_parent,
+        100
+    ));
+    assert_eq!(
+        index.codex_child_pair_reading,
+        before.codex_child_pair_reading
+    );
+    assert_eq!(index.generation, before.generation);
+    fs::write(&fixture.index_path, serde_json::to_vec(&index).unwrap()).unwrap();
+    let mut changed = index.clone();
+    changed.generation += 1;
+    fs::write(&fixture.index_path, serde_json::to_vec(&changed).unwrap()).unwrap();
+    assert!(
+        !reserve(
+            &mut index,
+            &key,
+            fixture.path.metadata().unwrap().len(),
+            &fixture.index_path,
+            100
+        ),
+        "stale CAS cannot grant a read"
+    );
+    assert_eq!(
+        index.codex_child_pair_reading,
+        before.codex_child_pair_reading
+    );
+}
+
+#[test]
+fn codex_child_pair_65_candidates_read_64_then_drain_deferred_in_fresh_process() {
+    let fixture = Fixture::new("named");
+    let original = fs::read_to_string(&fixture.path).unwrap();
+    let mut paths = vec![fixture.path.clone()];
+    for child in 0..64 {
+        let id = format!("019fa111-2222-7333-8444-{child:012x}");
+        let path = fixture
+            .root
+            .join(format!("rollout-2026-10-07T10-00-00-{id}.jsonl"));
+        fs::write(&path, original.replace(CHILD, &id)).unwrap();
+        paths.push(path);
+    }
+    let metadata = CodexTitleMetadata::default();
+    let (index, _, _) = fixture.run(ScanIndex::default(), None, &metadata);
+    assert_eq!(index.files.len(), 65, "complete native population premise");
+    for path in &paths {
+        fixture.seed_path(&index, path, true, false);
+    }
+    let cache = fixture.cache();
+    let (index, _, _) = fixture.run(index, Some(cache.clone()), &metadata);
+    assert_eq!(fixture.last_reads.borrow().values().sum::<usize>(), 64);
+    assert_eq!(
+        index
+            .codex_child_pair_reading
+            .values()
+            .filter(|reading| reading.stamp == Stamp::Named)
+            .count(),
+        64
+    );
+    let counts = cache.durable_counters(SnapshotSource::Codex).unwrap().0;
+    assert_eq!(counts.codex_child_pair_rederive[0], 65);
+    assert_eq!(counts.codex_child_pair_rederive_deferred[0], 1);
+    let deferred = paths
+        .iter()
+        .find(|path| {
+            !index
+                .codex_child_pair_reading
+                .contains_key(&local_index_key(path))
+        })
+        .unwrap();
+    assert_eq!(
+        counts.codex_child_pair_rederive_deferred[1],
+        index.files[&local_index_key(deferred)].size_bytes
+    );
+    let mut index = index;
+    index.save(&fixture.index_path).unwrap();
+    let drained = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "snapshots::codex_child_pair_rederive::tests::codex_child_pair_restart_probe",
+            "--nocapture",
+        ])
+        .env("OTTTO_CHILD_PAIR_TEST_ROOT", &fixture.root)
+        .env("OTTTO_CHILD_PAIR_TEST_INDEX", &fixture.index_path)
+        .env("OTTTO_CHILD_PAIR_TEST_AT", NOW)
+        .env("OTTTO_CHILD_PAIR_DRAIN", "1")
+        .output()
+        .unwrap();
+    assert!(
+        drained.status.success(),
+        "deferred process failed: {} {}",
+        String::from_utf8_lossy(&drained.stdout),
+        String::from_utf8_lossy(&drained.stderr)
+    );
+    let next = ScanIndex::load(&fixture.index_path).unwrap();
+    assert_eq!(next.codex_child_pair_reading.len(), 65);
+    assert!(next
+        .codex_child_pair_reading
+        .values()
+        .all(|reading| reading.stamp == Stamp::Named));
+}
+
+#[test]
+fn codex_child_pair_selector_is_once_per_process_and_never_counts_restores() {
+    let fixture = Fixture::new("named");
+    let metadata = CodexTitleMetadata::default();
+    let (mut index, _, _) = fixture.run(ScanIndex::default(), None, &metadata);
+    fixture.seed(&index, true, false);
+    let cache = fixture.cache();
+    let before = cache.durable_counters(SnapshotSource::Codex).unwrap().1;
+    stage(&mut index, &cache, &metadata);
+    let once = cache.durable_counters(SnapshotSource::Codex).unwrap();
+    assert_eq!(once.1.bytes_read, before.bytes_read);
+    assert_eq!(once.1.records_read, before.records_read);
+    assert_eq!(once.0.codex_child_pair_rederive[0], 1);
+    for _ in 0..5 {
+        stage(&mut index, &cache, &metadata);
+    }
+    let after = cache.durable_counters(SnapshotSource::Codex).unwrap();
+    assert_eq!(
+        after.0.codex_child_pair_rederive,
+        once.0.codex_child_pair_rederive
+    );
+    assert_eq!(after.1.bytes_read, before.bytes_read);
+}
+
+#[test]
+fn codex_child_pair_future_audit_does_not_bypass_repair_cooldown() {
+    struct Clock;
+    impl Drop for Clock {
+        fn drop(&mut self) {
+            sampled_scan::set_test_now(None);
+        }
+    }
+    let _clock = Clock;
+    let now = rfc3339_unix_seconds(NOW).unwrap();
+    sampled_scan::set_test_now(Some(now));
+    let fixture = Fixture::new("named");
+    let metadata = CodexTitleMetadata::default();
+    let (mut index, _, _) = fixture.run(ScanIndex::default(), None, &metadata);
+    let key = local_index_key(&fixture.path);
+    let fp = index.files[&key].source_file_fingerprint.clone();
+    assert!(index.stage_sampled_audit(
+        &key,
+        &fp,
+        crate::transcript_acquisition::AuditDebt {
+            due_unix_seconds: now + 1000
+        }
+    ));
+    put_stamp(
+        &mut index,
+        &key,
+        Stamp::Pending {
+            attempts: 1,
+            running: false,
+            retry_after: now + 2,
+        },
+    );
+    fixture.seed(&index, true, false);
+    let (index, _, reads) = fixture.run(index, Some(fixture.cache()), &metadata);
+    assert_eq!(reads, 0);
+    assert_eq!(index.files[&key].unverified_deadline(), Some(now + 1000));
+    assert_eq!(
+        stamp(&index, &key),
+        Some(Stamp::Pending {
+            attempts: 1,
+            running: false,
+            retry_after: now + 2
+        })
+    );
+}
+
+#[test]
+fn codex_child_pair_unchanged_incomplete_body_is_a_noop() {
+    let fixture = Fixture::new("incomplete");
+    let metadata = CodexTitleMetadata::default();
+    let (index, _, _) = fixture.run(ScanIndex::default(), None, &metadata);
+    fixture.seed(&index, true, false);
+    let key = local_index_key(&fixture.path);
+    let witness = index.files[&key].last_upload_body_witness.clone();
+    assert!(witness.is_some());
+    let (next, result, reads) = fixture.run(index, Some(fixture.cache()), &metadata);
+    assert_eq!(reads, 1);
+    assert_eq!(stamp(&next, &key), Some(Stamp::Incomplete));
+    assert_eq!(next.files[&key].last_upload_body_witness, witness);
+    assert!(
+        result.snapshots.is_empty(),
+        "unchanged body must not require a redundant POST"
+    );
+    assert!(result.semantic_noop_count > 0);
+}
+
+#[test]
+fn codex_child_pair_crash_hold_allows_tail_growth_and_keeps_old_attribution() {
+    use std::io::Write;
+    for known in [false, true] {
+        let fixture = Fixture::new("named");
+        let metadata = CodexTitleMetadata::default();
+        let cache = fixture.cache();
+        let (mut index, _, _) = fixture.run(ScanIndex::default(), Some(cache.clone()), &metadata);
+        let key = local_index_key(&fixture.path);
+        put_stamp(&mut index, &key, Stamp::CrashHeld);
+        index
+            .codex_child_pair_reading
+            .get_mut(&key)
+            .unwrap()
+            .reserved_at = 100;
+        let binding_key = sha256_hex(&["session_owner:v1", "synthetic-machine", CHILD]);
+        if known {
+            index.session_account_bindings.insert(
+                binding_key,
+                SessionAccountBinding {
+                    account_identifier_hash: "synthetic-previously-uploaded-account".into(),
+                    workspace_identifier_hash: None,
+                },
+            );
+        }
+        let row = json!({"type":"event_msg","ordinal":2,"timestamp":"2026-10-07T11:30:00Z","payload":{"type":"token_count","info":{"model":"gpt-5.5","total_token_usage":{"input_tokens":200,"output_tokens":10},"last_token_usage":{"input_tokens":100,"output_tokens":5}}}});
+        writeln!(
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&fixture.path)
+                .unwrap(),
+            "{row}"
+        )
+        .unwrap();
+        let ((mut index, mut result, reads), diagnostics) =
+            crate::local_resource_diagnostics::capture(|| {
+                fixture.run(index, Some(cache.clone()), &metadata)
+            });
+        assert_eq!(reads, 1, "ordinary growth acquisition");
+        assert_eq!(stamp(&index, &key), Some(Stamp::CrashHeld));
+        assert!(
+            !result.snapshots.is_empty(),
+            "new positive usage must remain uploadable"
+        );
+        let tail: u64 = diagnostics
+            .iter()
+            .filter(|row| row["stage"] == "native_collection_page")
+            .map(|row| {
+                row["counts"]["sampled_acquisition"]["tail_selections"]
+                    .as_u64()
+                    .unwrap_or(0)
+            })
+            .sum();
+        assert_eq!(tail, 1, "growth uses the existing Tail, not a repair Full");
+        for item in &mut result.snapshots {
+            for model in item.model_usage.iter_mut().chain(
+                item.usage_buckets
+                    .iter_mut()
+                    .flat_map(|bucket| bucket.model_usage.iter_mut()),
+            ) {
+                model.auth_mode = Some("oauth".into());
+            }
+        }
+        let homes = [crate::agent_status::CodexHomeBinding {
+            home: fixture.root.parent().unwrap().to_path_buf(),
+            account_identifier_hash: "synthetic-current-home-account".into(),
+            workspace_identifier_hash: "synthetic-current-workspace".into(),
+            auth_modified_at: SystemTime::now(),
+        }];
+        let negative_template = result
+            .snapshots
+            .iter()
+            .find_map(|item| item.session_account_evidence.clone())
+            .expect("native creator evidence");
+        index.bind_session_accounts(
+            SnapshotSource::Codex,
+            "synthetic-machine",
+            &mut result.snapshots,
+            &homes,
+        );
+        for item in &result.snapshots {
+            assert!(item.session_account_evidence.is_none());
+            for model in item.model_usage.iter().chain(
+                item.usage_buckets
+                    .iter()
+                    .flat_map(|bucket| bucket.model_usage.iter()),
+            ) {
+                assert_eq!(
+                    model.account_identifier_hash.as_deref(),
+                    known.then_some("synthetic-previously-uploaded-account")
+                );
+            }
+        }
+        for disposition in ["missing", "conflict"] {
+            let mut negative = result.snapshots.clone();
+            for item in &mut negative {
+                let mut evidence = negative_template.clone();
+                evidence.account_identifier_hash = None;
+                evidence.provider_workspace_hash = None;
+                evidence.identity_disposition = Some(disposition);
+                item.session_account_evidence = Some(evidence);
+            }
+            index.bind_session_accounts(
+                SnapshotSource::Codex,
+                "synthetic-machine",
+                &mut negative,
+                &homes,
+            );
+            for item in &negative {
+                assert_eq!(
+                    item.session_account_evidence
+                        .as_ref()
+                        .unwrap()
+                        .identity_disposition,
+                    Some(disposition)
+                );
+                assert!(
+                    item.model_usage
+                        .iter()
+                        .chain(
+                            item.usage_buckets
+                                .iter()
+                                .flat_map(|bucket| bucket.model_usage.iter())
+                        )
+                        .all(|model| model.account_identifier_hash.is_none()),
+                    "explicit creator-negative outranks even the held previous binding"
+                );
+            }
+        }
+        cache.durable_child_pair_alarm(&index, sampled_scan::now_seconds());
+        let counts = cache.durable_counters(SnapshotSource::Codex).unwrap().0;
+        assert_eq!(counts.codex_child_rederive_full, [0, 0]);
+        assert_eq!(counts.codex_child_rederive_crash_held[0], 1);
+    }
+}
+
+#[test]
+fn codex_child_pair_cooldown_keeps_independent_due_and_growth_work() {
+    use std::io::Write;
+    struct Clock;
+    impl Drop for Clock {
+        fn drop(&mut self) {
+            sampled_scan::set_test_now(None);
+        }
+    }
+    let _clock = Clock;
+    let now = rfc3339_unix_seconds(NOW).unwrap();
+    sampled_scan::set_test_now(Some(now));
+    for growth in [false, true] {
+        let fixture = Fixture::new("named");
+        let metadata = CodexTitleMetadata::default();
+        let (mut index, _, _) = fixture.run(ScanIndex::default(), None, &metadata);
+        let key = local_index_key(&fixture.path);
+        if !growth {
+            let fp = index.files[&key].source_file_fingerprint.clone();
+            assert!(index.stage_sampled_audit(
+                &key,
+                &fp,
+                crate::transcript_acquisition::AuditDebt {
+                    due_unix_seconds: 7
+                }
+            ));
+        }
+        put_stamp(
+            &mut index,
+            &key,
+            Stamp::Pending {
+                attempts: 1,
+                running: false,
+                retry_after: now + 2,
+            },
+        );
+        fixture.seed(&index, true, false);
+        if growth {
+            let row = json!({"type":"event_msg","ordinal":2,"timestamp":"2026-10-07T11:30:00Z","payload":{"type":"token_count","info":{"model":"gpt-5.5","total_token_usage":{"input_tokens":200,"output_tokens":10},"last_token_usage":{"input_tokens":100,"output_tokens":5}}}});
+            writeln!(
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(&fixture.path)
+                    .unwrap(),
+                "{row}"
+            )
+            .unwrap();
+        }
+        let cache = fixture.cache();
+        let ((next, _, reads), rows) = crate::local_resource_diagnostics::capture(|| {
+            fixture.run(index, Some(cache.clone()), &metadata)
+        });
+        assert_eq!(reads, 1, "independent work runs during repair cooldown");
+        assert_eq!(
+            cache
+                .durable_counters(SnapshotSource::Codex)
+                .unwrap()
+                .0
+                .codex_child_rederive_full,
+            [0, 0]
+        );
+        assert_eq!(next.codex_child_pair_reading[&key].spent_bytes, 0);
+        assert_eq!(
+            stamp(&next, &key),
+            Some(Stamp::Pending {
+                attempts: 1,
+                running: false,
+                retry_after: now + 2,
+            }),
+            "ordinary work cannot terminalize a repair from an old retained reduction"
+        );
+        if !growth {
+            assert_audit_counts(&rows, [1, 1, 1]);
+            assert!(
+                !next.files[&key].has_unverified_source(),
+                "ordinary audit owns its completion"
+            );
+        }
+    }
+}
+
+#[test]
+fn codex_child_pair_group_reservation_is_atomic_on_member_refusal() {
+    let fixture = Fixture::new("named");
+    let metadata = CodexTitleMetadata::default();
+    let (mut index, _, _) = fixture.run(ScanIndex::default(), None, &metadata);
+    let key = local_index_key(&fixture.path);
+    put_stamp(
+        &mut index,
+        &key,
+        Stamp::Pending {
+            attempts: 0,
+            running: false,
+            retry_after: 0,
+        },
+    );
+    index.save(&fixture.index_path).unwrap();
+    let before = fs::read(&fixture.index_path).unwrap();
+    let generation = index.generation;
+    assert!(!reserve_many(
+        &mut index,
+        &[
+            (key.clone(), fs::metadata(&fixture.path).unwrap().len()),
+            ("synthetic-missing-member".into(), 1)
+        ],
+        &fixture.index_path,
+        100
+    ));
+    assert_eq!(index.generation, generation);
+    assert_eq!(fs::read(&fixture.index_path).unwrap(), before);
+    assert_eq!(
+        stamp(&index, &key),
+        Some(Stamp::Pending {
+            attempts: 0,
+            running: false,
+            retry_after: 0
+        })
+    );
+}
+
+#[test]
+fn codex_child_pair_full_negative_ledger_defers_without_eviction() {
+    let fixture = Fixture::new("named");
+    let metadata = CodexTitleMetadata::default();
+    let (mut index, _, _) = fixture.run(ScanIndex::default(), None, &metadata);
+    let key = local_index_key(&fixture.path);
+    put_stamp(&mut index, &key, Stamp::Named);
+    let reading = index.codex_child_pair_reading.remove(&key).unwrap();
+    for n in 0..crate::transcript_cache::CACHE_ENTRIES {
+        index
+            .codex_child_pair_reading
+            .insert(format!("synthetic-spent-{n}"), reading.clone());
+    }
+    assert!(valid_ledger(&index.codex_child_pair_reading));
+    fixture.seed(&index, true, false);
+    let cache = fixture.cache();
+    let (next, _, reads) = fixture.run(index, Some(cache.clone()), &metadata);
+    assert_eq!(reads, 0);
+    assert_eq!(
+        next.codex_child_pair_reading.len(),
+        crate::transcript_cache::CACHE_ENTRIES
+    );
+    assert!(!next.codex_child_pair_reading.contains_key(&key));
+    assert!(valid_ledger(&next.codex_child_pair_reading));
+    let counts = cache.durable_counters(SnapshotSource::Codex).unwrap().0;
+    assert_eq!(
+        counts.codex_child_pair_rederive_deferred,
+        [1, next.files[&key].size_bytes]
+    );
+}
+
+#[test]
+fn codex_child_pair_negative_ledger_always_fits_its_decoder_span() {
+    let fingerprint = "f".repeat(64);
+    let key = "\n".repeat(4000);
+    let mut ledger = BTreeMap::new();
+    for n in 0..256 {
+        ledger.insert(
+            format!("{key}{n}"),
+            Reading {
+                stamp: Stamp::Pending {
+                    attempts: 2,
+                    running: true,
+                    retry_after: u64::MAX,
+                },
+                source_file_fingerprint: fingerprint.clone(),
+                reserved_extent: MAX_BYTES,
+                spent_bytes: MAX_SPENT_BYTES,
+                reserved_at: u64::MAX,
+            },
+        );
+        if ledger_byte_bound(&ledger).is_some_and(|bytes| bytes <= MAX_LEDGER_BYTES) {
+            assert!(serde_json::to_vec(&ledger).unwrap().len() <= MAX_LEDGER_BYTES);
+        } else {
+            assert!(!valid_ledger(&ledger));
+            break;
+        }
+    }
+}
+
+#[test]
+fn codex_child_pair_reservation_refreshes_only_the_saved_commit_baseline() {
+    let fixture = Fixture::new("named");
+    let metadata = CodexTitleMetadata::default();
+    let (mut working, _, _) = fixture.run(ScanIndex::default(), None, &metadata);
+    let key = local_index_key(&fixture.path);
+    put_stamp(
+        &mut working,
+        &key,
+        Stamp::Pending {
+            attempts: 0,
+            running: false,
+            retry_after: 0,
+        },
+    );
+    working.save(&fixture.index_path).unwrap();
+    let mut committed = ScanIndex::load(&fixture.index_path).unwrap();
+    let original_body = committed.files[&key].last_upload_body_witness.clone();
+    assert!(reserve(
+        &mut working,
+        &key,
+        fs::metadata(&fixture.path).unwrap().len(),
+        &fixture.index_path,
+        100
+    ));
+    working
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .last_upload_body_witness = Some("synthetic-unACKed-body".into());
+    finish(&mut working, &key, Stamp::Named, true);
+    working
+        .refresh_child_rederive_committed(&mut committed, &fixture.index_path)
+        .unwrap();
+    assert_eq!(committed.generation, working.generation);
+    assert_eq!(
+        committed.files[&key].last_upload_body_witness,
+        original_body
+    );
+    assert_eq!(
+        stamp(&committed, &key),
+        Some(Stamp::Pending {
+            attempts: 1,
+            running: true,
+            retry_after: 0
+        })
+    );
+    // The later committed-only capture/save can pass its CAS without
+    // publishing the working body's unACKed comparison witness.
+    committed.save(&fixture.index_path).unwrap();
+    assert_eq!(
+        ScanIndex::load(&fixture.index_path).unwrap().files[&key].last_upload_body_witness,
+        original_body
+    );
 }

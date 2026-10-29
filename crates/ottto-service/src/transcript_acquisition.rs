@@ -556,6 +556,8 @@ pub(crate) enum FullReason {
     HeadChanged,
     BoundaryChanged,
     UnsupportedIdentity,
+    CodexChildRederiveFirst,
+    CodexChildRederiveCrashRetry,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -580,6 +582,8 @@ impl FullReason {
             Self::HeadChanged => 8,
             Self::BoundaryChanged => 9,
             Self::UnsupportedIdentity => 10,
+            Self::CodexChildRederiveFirst => 11,
+            Self::CodexChildRederiveCrashRetry => 12,
         }
     }
 }
@@ -841,6 +845,13 @@ impl ReadPlan {
             guard_bytes_read,
             pending_record: None,
         })
+    }
+
+    /// The caller already reserved this explicit A5 spend. Cold native Full
+    /// semantics are unchanged; only its owned acquisition cause is replaced.
+    pub(crate) fn set_reserved_full_reason(&mut self, reason: FullReason) {
+        debug_assert!(matches!(self.mode, ReadMode::Full(_)) && self.debt.is_none());
+        self.mode = ReadMode::Full(reason);
     }
 
     pub(crate) fn mode(&self) -> ReadMode {

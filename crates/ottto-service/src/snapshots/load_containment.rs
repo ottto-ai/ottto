@@ -829,6 +829,7 @@ impl ScanIndex {
         &mut self,
         mut carry: ScanIndex,
     ) -> std::result::Result<(), lenient_decode::Error> {
+        self.codex_child_pair_reading = carry.codex_child_pair_reading;
         self.session_account_bindings = carry.session_account_bindings;
         self.claude_account_deferred_holds = carry.claude_account_deferred_holds;
         self.claude_request_identity_contract = carry.claude_request_identity_contract;

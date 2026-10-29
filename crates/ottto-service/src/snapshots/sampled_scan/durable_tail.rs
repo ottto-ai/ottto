@@ -44,7 +44,8 @@ pub(crate) const WRITE_PASS_BYTES: usize = 8 * 1024 * 1024;
 
 /// Upper bound of both stores' resident digest maps (two sources).
 #[cfg(test)]
-pub(crate) const STORES_RESIDENT_BOUND: usize = 2 * store::MAX_RECORDS * 128;
+pub(crate) const STORES_RESIDENT_BOUND: usize = 2 * store::MAX_RECORDS * 128
+    + (codex_child_pair_rederive::MAX_CHILDREN + 2 * crate::transcript_cache::CACHE_ENTRIES) * 96;
 
 /// Head re-parse bytes of restores, per source, for the process lifetime.
 /// Existing class-X re-derivation is bounded at `HEAD_BOUND`, on a RAM
@@ -64,6 +65,9 @@ pub(crate) fn rederive_head_bytes_total(source: SnapshotSource) -> u64 {
 pub(crate) struct Counters {
     /// children, indexed bytes, named, conflict, incomplete, unreadable.
     pub(crate) codex_child_pair_rederive: [u64; 6],
+    pub(crate) codex_child_pair_rederive_deferred: [u64; 2],
+    pub(crate) codex_child_rederive_full: [u64; 2],
+    pub(crate) codex_child_rederive_crash_held: [u64; 2],
     pub(crate) restore_attempts: u64,
     pub(crate) restored: u64,
     pub(crate) missing: u64,
@@ -113,7 +117,7 @@ impl Counters {
              guard_header_bytes={} guard_verify_bytes={} delete_verify_bytes={} overwrite_verify_bytes={} \
              uninventoried_records={} store_write_skipped[unknown,inventory_overflow]={:?} \
              gc_records_deleted={} gc_records_read={} gc_bytes_read={} gc_keep_peak={} \
-             records_invalidated={} peak_codec_bytes={} t14_rebuild_full_started={} codex_child_pair_rederive[children,bytes,named,conflict,incomplete,unreadable]={:?}",
+             records_invalidated={} peak_codec_bytes={} t14_rebuild_full_started={} codex_child_pair_rederive[children,bytes,named,conflict,incomplete,unreadable]={:?} codex_child_pair_rederive_deferred[children,bytes]={:?} codex_child_rederive_full[first,crash_retry]={:?} codex_child_rederive_crash_held[keys,oldest_age]={:?}",
             source.api_slug(),
             self.rederive_head_bytes,
             self.rederive_named_lines,
@@ -147,12 +151,16 @@ impl Counters {
             store.peak_codec_bytes,
             store.t14_rebuild_full_started,
             self.codex_child_pair_rederive,
+            self.codex_child_pair_rederive_deferred,
+            self.codex_child_rederive_full,
+            self.codex_child_rederive_crash_held,
         )
     }
 }
 
 struct Slot {
     dir: PathBuf,
+    index_path: PathBuf,
     store: DurableTailStore,
     /// File scopes decided this pass, by key: GC drops a record bound to
     /// another scope. Keys not decided this pass keep their records.
@@ -179,6 +187,10 @@ pub(crate) struct Stores {
     /// reverts or clears the entry makes it refuse (F2).
     selected: BTreeMap<String, String>,
     counters: Counters,
+    child_pair_selection_done: bool,
+    child_pair_admitted: BTreeSet<store::Digest32>,
+    child_pair_admitted_bytes: u64,
+    child_pair_deferred: BTreeSet<store::Digest32>,
 }
 
 impl Stores {
@@ -426,6 +438,8 @@ fn full_reason_class(reason: FullReason) -> &'static str {
         FullReason::HeadChanged => "head_changed",
         FullReason::BoundaryChanged => "boundary_changed",
         FullReason::UnsupportedIdentity => "unsupported_identity",
+        FullReason::CodexChildRederiveFirst => "codex_child_rederive_full_first",
+        FullReason::CodexChildRederiveCrashRetry => "codex_child_rederive_full_crash_retry",
     }
 }
 
@@ -495,6 +509,85 @@ impl Drop for StoresGuard<'_> {
 }
 
 impl SharedCache {
+    pub(in crate::snapshots) fn durable_child_pair_alarm(&self, index: &ScanIndex, now: u64) {
+        let Some(mut stores) = self.durable() else {
+            return;
+        };
+        let mut alarm = [0, 0];
+        for reading in index.codex_child_pair_reading.values() {
+            if reading.stamp == codex_child_pair_rederive::Stamp::CrashHeld {
+                alarm[0] += 1;
+                alarm[1] = alarm[1].max(now.saturating_sub(reading.reserved_at));
+            }
+        }
+        stores.counters.codex_child_rederive_crash_held = alarm;
+    }
+    pub(in crate::snapshots) fn durable_child_pair_full(&self, retry: bool) {
+        if let Some(mut stores) = self.durable() {
+            stores.counters.codex_child_rederive_full[usize::from(retry)] += 1;
+        }
+    }
+
+    pub(in crate::snapshots) fn durable_child_pair_select_once(&self) -> bool {
+        let Some(mut stores) = self.durable() else {
+            return false;
+        };
+        !std::mem::replace(&mut stores.child_pair_selection_done, true)
+    }
+
+    pub(in crate::snapshots) fn durable_child_pair_inventory(&self) -> BTreeSet<store::Digest32> {
+        self.durable()
+            .and_then(|mut stores| stores.codex.as_mut()?.store.inventory().ok())
+            .map(|keys| {
+                keys.into_iter()
+                    .take(crate::transcript_cache::CACHE_ENTRIES)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(in crate::snapshots) fn durable_child_pair_index_path(&self) -> Option<PathBuf> {
+        let stores = self.durable()?;
+        Some(stores.codex.as_ref()?.index_path.clone())
+    }
+
+    pub(in crate::snapshots) fn durable_child_pair_defer(&self, key: &str, bytes: u64) {
+        let Some(mut stores) = self.durable() else {
+            return;
+        };
+        let key = store::key_digest(DurableSource::Codex, key);
+        if stores.child_pair_deferred.insert(key) {
+            stores.counters.codex_child_pair_rederive_deferred[0] += 1;
+            stores.counters.codex_child_pair_rederive_deferred[1] =
+                stores.counters.codex_child_pair_rederive_deferred[1].saturating_add(bytes);
+        }
+    }
+
+    pub(in crate::snapshots) fn durable_child_pair_admit(&self, key: &str, bytes: u64) -> bool {
+        let Some(mut stores) = self.durable() else {
+            return false;
+        };
+        let key = store::key_digest(DurableSource::Codex, key);
+        if stores.child_pair_admitted.contains(&key) {
+            return true;
+        }
+        if stores.child_pair_admitted.len() >= codex_child_pair_rederive::MAX_CHILDREN
+            || bytes
+                > codex_child_pair_rederive::MAX_BYTES
+                    .saturating_sub(stores.child_pair_admitted_bytes)
+        {
+            if stores.child_pair_deferred.insert(key) {
+                stores.counters.codex_child_pair_rederive_deferred[0] += 1;
+                stores.counters.codex_child_pair_rederive_deferred[1] =
+                    stores.counters.codex_child_pair_rederive_deferred[1].saturating_add(bytes);
+            }
+            return false;
+        }
+        stores.child_pair_admitted.insert(key);
+        stores.child_pair_admitted_bytes += bytes;
+        true
+    }
+
     pub(in crate::snapshots) fn durable_child_pair_count(&self, slot: usize, count: u64) {
         if let Some(mut stores) = self.durable() {
             stores.counters.codex_child_pair_rederive[slot] =
@@ -526,9 +619,9 @@ impl SharedCache {
             let Some(slot) = stores.slot(DurableSource::Codex).as_mut() else {
                 return false;
             };
-            let ReadOutcome::Found(record) = slot
+            let Some(record) = slot
                 .store
-                .read(&store::key_digest(DurableSource::Codex, key))
+                .read_selection_metadata(&store::key_digest(DurableSource::Codex, key))
             else {
                 return false;
             };
@@ -603,6 +696,7 @@ impl SharedCache {
             *slot = Some(Slot {
                 store: DurableTailStore::new(dir.clone(), source),
                 dir,
+                index_path: index_path.to_path_buf(),
                 decided: BTreeMap::new(),
                 namespace: namespace.clone(),
                 identity_capture,

@@ -1286,7 +1286,7 @@ fn page_steps(
 struct Selections {
     modes: Modes,
     unchanged: usize,
-    full_reasons: [usize; 11],
+    full_reasons: [usize; 13],
 }
 
 /// `page_steps` that also reports `Selections`.
@@ -2839,7 +2839,7 @@ fn certify_job(
     now: &mut u64,
     page_number: &mut u64,
     append_mid_read: bool,
-) -> (ScanIndex, u64, u64, [usize; 11]) {
+) -> (ScanIndex, u64, u64, [usize; 13]) {
     let step = crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS / 2;
     let certified = counter(cache, |c| c.jobs_certified);
     let mut opened = None;
@@ -7440,7 +7440,6 @@ fn memo_digest_fences_receipt_contents_context_census_flags_and_members() {
         index.files.insert(
             local_index_key(&candidate.path),
             ScanIndexEntry {
-                codex_child_pair_rederive: None,
                 size_bytes: 8,
                 modified_unix_seconds: 0,
                 modified_unix_nanos: None,
@@ -10739,7 +10738,7 @@ fn proof_room_keeps_the_headroom() {
         unchanged_files: 0,
         native_bytes: 0,
         sample_bytes: 0,
-        full_reasons: [0; 11],
+        full_reasons: [0; 13],
         priority_replays: 0,
         audits_started: 0,
         audits_completed: 0,
@@ -10964,7 +10963,7 @@ fn main_context(cache: &Arc<SharedCache>) -> super::super::Context {
         unchanged_files: 0,
         native_bytes: 0,
         sample_bytes: 0,
-        full_reasons: [0; 11],
+        full_reasons: [0; 13],
         priority_replays: 0,
         audits_started: 0,
         audits_completed: 0,
