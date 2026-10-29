@@ -384,6 +384,8 @@ pub(crate) struct StoreCounters {
     pub(crate) receipt_pending_held: u64,
     pub(crate) receipt_pending_records: u64,
     pub(crate) durable_write_failed_published: u64,
+    /// Owned temps verified absent after directory sync, counted once.
+    pub(crate) temp_discard_verified: u64,
     /// Failed explicit/fallback temp cleanup attempts, per pass.
     pub(crate) temp_discard_failed: u64,
     /// Temp cleanup reached through unwinding or a missed explicit exit.
@@ -1576,6 +1578,7 @@ impl<'a> TempRecord<'a> {
             {
                 return Err(io::Error::other("temp cleanup unverified"));
             }
+            self.counters.temp_discard_verified += 1;
             self.file.take();
             Ok(())
         })();
