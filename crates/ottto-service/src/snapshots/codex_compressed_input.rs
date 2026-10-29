@@ -805,6 +805,14 @@ impl std::fmt::Display for ArchiveAdmissionYield {
     }
 }
 impl std::error::Error for ArchiveAdmissionYield {}
+#[derive(Debug)]
+pub(super) struct ArchiveScopeDeferred;
+impl std::fmt::Display for ArchiveScopeDeferred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("archive retained scope is not currently provable")
+    }
+}
+impl std::error::Error for ArchiveScopeDeferred {}
 impl super::ScanCensus {
     pub(super) fn archive_parser_failure(
         &mut self,
@@ -817,6 +825,10 @@ impl super::ScanCensus {
             .files
             .get(&super::local_index_key(path))
             .and_then(|e| e.archive.as_deref());
+        if source == super::SnapshotSource::Codex && error.is::<ArchiveScopeDeferred>() {
+            self.archive_residue(path, archive, CodexZstCause::OutputHeld);
+            return;
+        }
         let bodyless_pending = archive.is_some_and(|a| {
             matches!(a.disposition, ArchiveDisposition::Pending { .. }) && a.body_witness.is_none()
         });

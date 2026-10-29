@@ -560,3 +560,39 @@ fn retained_archive_scope_mismatch_is_quiet_correction_residue_not_eviction_cred
         "terminal custody uses PR A scoped residue"
     );
 }
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "funded decoder needs validated heap layout"
+)]
+fn unavailable_retained_archive_scope_keeps_copy_and_defers_without_decode_credit() {
+    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let key = local_index_key(&f.0);
+    let (mut index, first) = finish_selector(retained_archive_scan(
+        &f,
+        ScanIndex::default(),
+        cache.clone(),
+    ));
+    assert_eq!(first.snapshots.len(), 1);
+    assert!(cache.retained_checkpoint(&key).is_some());
+    let attempt = index.files[&key].archive.as_ref().unwrap().decode_attempts;
+    retry_due(&mut index, &key);
+    let mut scan = retained_archive_scan(&f, index, cache.clone());
+    scan.state_census_complete = false;
+    let ((index, held), rows) =
+        crate::local_resource_diagnostics::capture(|| finish_selector(scan));
+    assert_eq!(decoded_archive_bytes(&rows), 0);
+    assert_eq!(archive_event_count(&rows, "codex_zst_first_read_retry"), 0);
+    assert_eq!(held.unreadable_path_count, 0);
+    assert!(
+        cache.retained_checkpoint(&key).is_some(),
+        "no take without current scope authority"
+    );
+    assert_eq!(
+        index.files[&key].archive.as_ref().unwrap().decode_attempts,
+        attempt
+    );
+}
