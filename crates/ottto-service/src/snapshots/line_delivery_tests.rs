@@ -1159,7 +1159,7 @@ fn walk_gate_keeps_withheld_account_keys_until_their_hold_resolves() {
     }
     fs::File::create(file("big"))
         .unwrap()
-        .set_len(MAX_JSONL_FILE_BYTES + 1)
+        .set_len(MAX_CLAUDE_JSONL_FILE_BYTES + 1)
         .unwrap();
     let mut held = ScanIndex::default();
     withhold(&mut held, &file("held"));
@@ -1221,7 +1221,7 @@ fn candidate_and_open_gates_keep_withheld_account_keys() {
     let big = root.file("big");
     fs::File::create(&big)
         .unwrap()
-        .set_len(MAX_JSONL_FILE_BYTES + 1)
+        .set_len(MAX_CLAUDE_JSONL_FILE_BYTES + 1)
         .unwrap();
     let census_at = rfc3339_unix_seconds(NOW);
     assert!(census_at.is_some(), "the window is applied");
