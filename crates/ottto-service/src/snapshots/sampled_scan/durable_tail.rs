@@ -72,6 +72,7 @@ pub(crate) struct Counters {
     pub(crate) s2_skipped_object_changed: u64,
     pub(crate) retail_attempts: u64,
     pub(crate) retail_keys: u64,
+    pub(crate) retail_full: [u64; 3],
     pub(crate) missing: u64,
     pub(crate) upgrade_state_missing: u64,
     pub(crate) refused_record: u64,
@@ -113,7 +114,7 @@ impl Counters {
         };
         format!(
             "ottto-service: durable_tail source={} restore_attempts={} restored={} original_v1_mapped={} durable_restore_after_selection_clear={} objects[same,unknown,changed]={:?} s2_skipped_object_changed={} missing={} \
-             retail_attempts={} retail_keys={} tail_read_bytes={} budget_refused_retail_old_bytes={} repeated_physical_old_bytes={} refused_record={} upgrade_state_missing={} ineligible={{{}}} certificate_refused={{{}}} corrupt_body={} \
+             retail_attempts={} retail_keys={} retail_exhausted[full,paced,overflow]={:?} tail_read_bytes={} budget_refused_retail_old_bytes={} repeated_physical_old_bytes={} refused_record={} upgrade_state_missing={} ineligible={{{}}} certificate_refused={{{}}} corrupt_body={} \
              not_rederived={{{}}} budget_refused={} rederive_head_bytes={} \
              rederive_named_lines={} rederive_line_bytes={} not_persisted={{{}}} \
              write_deferred={} write_unlocked={} peak_body_bytes={} disk_records={} disk_bytes={} \
@@ -133,6 +134,7 @@ impl Counters {
             self.missing,
             self.retail_attempts,
             self.retail_keys,
+            self.retail_full,
             retail_bytes(source, 0),
             retail_bytes(source, 1),
             retail_bytes(source, 1),
@@ -191,7 +193,7 @@ struct Slot {
     /// old_binding_no_match].
     held: u64,
     old_binding_no_match: u64,
-    reported: [u64; 6],
+    reported: [u64; 9],
 }
 
 /// Process-lifetime durable state beside the RAM cache.
@@ -209,6 +211,10 @@ pub(crate) struct Stores {
     counters: Counters,
     // Source+key only: never clear on passes, scope changes or cache eviction.
     retail_spent: BTreeMap<store::Digest32, (u64, std::time::Instant)>,
+    // Independently paid pacing, never used to renew Q11 spent authority.
+    retail_full_at: BTreeMap<store::Digest32, std::time::Instant>,
+    #[cfg(test)]
+    retail_full_now: Option<std::time::Instant>,
 }
 
 impl Stores {
@@ -733,6 +739,44 @@ impl SharedCache {
             old_end: accepted_end,
         })
     }
+    /// Ordinary Full admission, not another Tail allowance. Overflow reads safely.
+    pub(crate) fn retail_full(
+        &self,
+        key: &str,
+        file: &File,
+        accepted_end: u64,
+        now: std::time::Instant,
+    ) -> bool {
+        if !file.metadata().is_ok_and(|m| m.len() > accepted_end) {
+            return false;
+        }
+        let Some(mut stores) = self.durable() else {
+            return true;
+        };
+        #[cfg(test)]
+        let now = stores.retail_full_now.unwrap_or(now);
+        let interval = std::time::Duration::from_secs(6 * 3600);
+        stores.retail_full_at.retain(|_, at| {
+            now.checked_duration_since(*at)
+                .is_none_or(|age| age < interval)
+        });
+        let key = store::key_digest(DurableSource::ClaudeCode, key);
+        if stores.retail_full_at.contains_key(&key) {
+            stores.counters.retail_full[1] += 1;
+            return false;
+        }
+        if stores.retail_full_at.len() < 2 * store::MAX_RECORDS
+            && crate::heap_layout_bound::tree_node_bytes::<store::Digest32, std::time::Instant>()
+                .is_some_and(|n| n <= 1024)
+        {
+            stores.retail_full_at.insert(key, now);
+        } else {
+            stores.counters.retail_full[2] += 1;
+        }
+        stores.counters.retail_full[0] += 1;
+        true
+    }
+
     fn durable(&self) -> Option<std::sync::MutexGuard<'_, Stores>> {
         self.durable.lock().ok()
     }
@@ -777,7 +821,7 @@ impl SharedCache {
                 identity_capture,
                 held: 0,
                 old_binding_no_match: 0,
-                reported: [0; 6],
+                reported: [0; 9],
             });
         }
     }
@@ -1529,6 +1573,9 @@ impl SharedCache {
         struct Alarm {
             held_keys: [u64; 2],
             old_binding_no_match: [u64; 2],
+            retail_exhausted: [u64; 2],
+            retail_exhausted_paced: [u64; 2],
+            retail_pacing_overflow: [u64; 2],
             upgrade_state_missing: [u64; 2],
             t14_rebuild: [u64; 2],
             mode_repaired: [u64; 2],
@@ -1542,6 +1589,11 @@ impl SharedCache {
             return;
         };
         let upgrade = stores.counters.upgrade_state_missing;
+        let retail = if source == DurableSource::ClaudeCode {
+            stores.counters.retail_full
+        } else {
+            [0; 3]
+        };
         let Some(slot) = stores.slot(source).as_mut() else {
             return;
         };
@@ -1553,6 +1605,9 @@ impl SharedCache {
             u64::from(disabled.is_some()),
             upgrade,
             slot.old_binding_no_match,
+            retail[0],
+            retail[1],
+            retail[2],
         ];
         let last = std::mem::replace(&mut slot.reported, now);
         drop(stores);
@@ -1563,6 +1618,9 @@ impl SharedCache {
                 &Alarm {
                     held_keys: pair(0),
                     old_binding_no_match: pair(5),
+                    retail_exhausted: pair(6),
+                    retail_exhausted_paced: pair(7),
+                    retail_pacing_overflow: pair(8),
                     upgrade_state_missing: pair(4),
                     t14_rebuild: pair(1),
                     mode_repaired: pair(2),
@@ -1579,7 +1637,10 @@ impl SharedCache {
     ) -> Option<(Counters, store::StoreCounters)> {
         let source = durable_source(snapshot_source)?;
         let mut stores = self.durable()?;
-        let counters = stores.counters.clone();
+        let mut counters = stores.counters.clone();
+        if source != DurableSource::ClaudeCode {
+            counters.retail_full = [0; 3];
+        }
         let store = stores.slot(source).as_ref()?.store.counters();
         Some((counters, store))
     }
@@ -1642,7 +1703,7 @@ pub(crate) fn record_consumed(bytes: u64) {
 
 #[cfg(test)]
 #[path = "durable_tail_tests.rs"]
-mod tests;
+pub(crate) mod tests;
 
 #[cfg(test)]
 pub(crate) fn seed_pinned_v1(
