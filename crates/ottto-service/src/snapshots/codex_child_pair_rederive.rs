@@ -249,6 +249,18 @@ pub(super) fn outcome(
     })
 }
 
+/// A debt-free prefix is not necessarily a verified Full of the current
+/// file. Reuse the checkpoint's shared content-stamp and clock witnesses.
+pub(super) fn verified_full_current(
+    checkpoint: &crate::transcript_acquisition::Checkpoint,
+    file: &File,
+    now: u64,
+) -> bool {
+    checkpoint.audit_debt().is_none()
+        && checkpoint.last_full_verified() <= now
+        && checkpoint.stamp_matches(file).unwrap_or(false)
+}
+
 pub(super) fn finish(index: &mut ScanIndex, key: &str, stamp: Stamp, verified: bool) {
     if verified {
         if let Some(entry) = index.files.get_mut(key) {

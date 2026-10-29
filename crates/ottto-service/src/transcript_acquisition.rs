@@ -280,7 +280,6 @@ impl Checkpoint {
     pub(crate) fn audit_debt(&self) -> Option<AuditDebt> {
         self.audit_debt
     }
-    #[cfg(test)]
     pub(crate) fn last_full_verified(&self) -> u64 {
         self.last_full_verified_unix_seconds
     }

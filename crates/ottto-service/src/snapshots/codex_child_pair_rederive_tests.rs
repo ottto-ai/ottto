@@ -1068,3 +1068,42 @@ fn codex_child_pair_other_due_audit_starts_same_pass_with_all_audit_slots_reserv
         1
     );
 }
+
+#[test]
+fn codex_child_pair_grown_prefix_never_verifies_independent_audit_debt() {
+    use std::io::Write;
+    for elapsed in [1, crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS + 1] {
+        let fixture = Fixture::new("named");
+        let mut file = File::open(&fixture.path).unwrap();
+        let scope = Scope("grown-repair-proof".into());
+        let mut plan =
+            crate::transcript_acquisition::ReadPlan::prepare(&mut file, None, &scope, None, 100)
+                .unwrap();
+        let bytes = fs::read(&fixture.path).unwrap();
+        plan.observe_complete_records(&bytes).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&fixture.path)
+            .unwrap()
+            .write_all(b"{}\n")
+            .unwrap();
+        let now = 100 + elapsed;
+        let checkpoint = plan
+            .commit_sealed_prefix(&mut file, true, &scope, 100, now, false, bytes.len() as u64)
+            .unwrap();
+        assert!(checkpoint.sealed_offset() < file.metadata().unwrap().len());
+        assert_eq!(checkpoint.last_full_verified(), 100);
+        if elapsed == 1 {
+            assert!(
+                checkpoint.audit_debt().is_none(),
+                "short grown prefix reproduces the misleading debt-free checkpoint"
+            );
+        } else {
+            assert!(checkpoint.audit_debt().is_some());
+        }
+        assert!(
+            !verified_full_current(&checkpoint, &file, now),
+            "a repair prefix cannot discharge an independent audit"
+        );
+    }
+}

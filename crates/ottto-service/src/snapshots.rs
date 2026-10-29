@@ -28471,6 +28471,14 @@ impl OwnedSourceScan {
                 let mut cursor_certificate = None;
                 let mut cursor_publication = None;
                 let mut cursor_fragment = None;
+                let repair_pending = source == SnapshotSource::Codex
+                    && (codex_child_pair_rederive::pending(
+                        index,
+                        &local_index_key(&active.candidate.path),
+                    ) || active.aliases.iter().any(|member| {
+                        codex_child_pair_rederive::pending(index, &local_index_key(&member.path))
+                    }));
+                let mut repair_full_current = true;
                 // U1a-2a (row 39a): a certified job's unsealed bit for P's side
                 // record (row 8), captured before `cursor_published`.
                 let mut cursor_side_unsealed = None;
@@ -28528,6 +28536,14 @@ impl OwnedSourceScan {
                             publication,
                             fragment,
                         } => {
+                            if repair_pending {
+                                repair_full_current = !grown
+                                    && codex_child_pair_rederive::verified_full_current(
+                                        &checkpoint,
+                                        active.parser.reader.reader.get_ref(),
+                                        sampled_scan::now_seconds(),
+                                    );
+                            }
                             // N2: a withheld record keeps the path pending, so
                             // the next page tails it from `s`.
                             let next_generation = grown && fragment.is_none() && job_in_generation;
@@ -28565,6 +28581,9 @@ impl OwnedSourceScan {
                             publication,
                             fragment,
                         } => {
+                            if repair_pending {
+                                repair_full_current = false;
+                            }
                             // N2: a withheld record keeps the path pending, so
                             // the next page tails it from `s`.
                             let next_generation = grown && fragment.is_none() && job_in_generation;
@@ -29161,6 +29180,16 @@ impl OwnedSourceScan {
                 };
                 let claude_grown_prefix =
                     source == SnapshotSource::ClaudeCode && parser.reader.sealed_prefix.is_some();
+                if repair_pending {
+                    repair_full_current &=
+                        completed_acquisition.as_ref().map_or(true, |completed| {
+                            codex_child_pair_rederive::verified_full_current(
+                                &completed.checkpoint,
+                                parser.reader.reader.get_ref(),
+                                sampled_scan::now_seconds(),
+                            )
+                        });
+                }
                 let repair_conflicted = parser.accumulator.codex_creator_evidence_conflicted;
                 let parsed_file = parser.finish_with_repository_identity(
                     &candidate.opened_object_identity,
@@ -29963,6 +29992,9 @@ impl OwnedSourceScan {
                             recognized_usage_drop_count,
                             dropped_usage_record_count,
                         ));
+                // A grown/partial checkpoint can be debt-free before the audit
+                // interval. Repair never discharges independent debt from it.
+                let source_verified = source_verified && (!repair_pending || repair_full_current);
                 if source == SnapshotSource::ClaudeCode {
                     index.claude_full_rearm_progress.rebuild_read_full &= parse_complete
                         && source_verified
