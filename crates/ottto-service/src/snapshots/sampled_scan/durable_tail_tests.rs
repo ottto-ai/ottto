@@ -1694,10 +1694,7 @@ fn known_corrupt_replacement_case(fail_replacement: bool) {
     if fail_replacement {
         assert_eq!(std::fs::read(&record).unwrap(), corrupt);
     } else {
-        assert!(matches!(
-            disk.read(&digest, &codec::allowlist_digest(source)),
-            store::ReadOutcome::Found(_)
-        ));
+        assert!(matches!(disk.read(&digest), store::ReadOutcome::Found(_)));
         cache.retained().unwrap().remove(&key);
         assert_eq!(
             cache.durable_hold(source, &key),
