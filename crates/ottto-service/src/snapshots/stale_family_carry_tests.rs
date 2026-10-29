@@ -4859,3 +4859,57 @@ mod terminal_off_admission_tests {
         );
     }
 }
+
+#[test]
+fn stale_start_clear_cause_matches_the_actual_traversal_start_reason() {
+    use crate::transcript_acquisition::{FullReason, ReadMode};
+    use rearm_cause::Cause;
+    for (cause, days, no_traversal, label) in [
+        (
+            Cause::TerminalUnhealthyRetry,
+            BACKFILL_WINDOW_DAYS,
+            false,
+            "terminal_unhealthy_retry",
+        ),
+        (
+            Cause::ContextChanged,
+            BACKFILL_WINDOW_DAYS + 1,
+            false,
+            "context_changed",
+        ),
+        (
+            Cause::NoRetainedTraversal,
+            BACKFILL_WINDOW_DAYS,
+            true,
+            "no_retained_traversal",
+        ),
+    ] {
+        let mut index = carry_index();
+        // Containment suppresses redundant stale debt. This provenance control
+        // needs a real semantic invalidation to exercise an actual clear.
+        index.claude_request_identity_contract_changed = true;
+        if no_traversal {
+            index.traversal = None;
+        }
+        let _base = KeepStaleClaudeFamilyRearmForTest::new();
+        let start = carry_start(&mut index, CARRY_RETRY, days);
+        assert_eq!(start["reason"], label);
+        let key = carry_key(CARRY_UNWITNESSED, None);
+        assert!(index.files[&key].source_file_fingerprint.is_empty());
+        let mode = ReadMode::Full(FullReason::StateMissing);
+        let probe = crate::local_resource_diagnostics::Probe::start();
+        probe.rearm_full_selected(&key, mode);
+        probe.rearm_full_completed(&key, mode, 123);
+        assert_eq!(
+            serde_json::to_value(probe.rearm_fulls()).unwrap(),
+            json!({
+                format!("rearm_cleared{{{label}}}"): {"count": 1, "completed_native_bytes": 123}
+            })
+        );
+        // The expected cause is a closed enum rather than a stored string.
+        let mut entry = index.files[&key].clone();
+        entry.source_file_fingerprint = "proven".into();
+        rearm_cause::clear(&key, &mut entry, cause);
+        rearm_cause::reproven(&key);
+    }
+}
