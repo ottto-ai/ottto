@@ -3192,8 +3192,8 @@ fn b1_absent_o3_fixture(sidecar_census_complete: bool, cancel_before_read: bool)
                         !ScanIndex::load(&index_path)
                             .unwrap()
                             .reread_guard
-                            .upgrade_missing(&key, true),
-                        "saved once evidence refuses restart even before native I/O"
+                            .upgrade_claimed(&key),
+                        "restart has no live claim before native I/O"
                     );
                     let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
                         owner.cache.durable_alarm(source)
@@ -3249,7 +3249,7 @@ fn b1_absent_o3_fixture(sidecar_census_complete: bool, cancel_before_read: bool)
     assert!(!ScanIndex::load(&index_path)
         .unwrap()
         .reread_guard
-        .upgrade_missing(&key, true));
+        .upgrade_claimed(&key));
     if !sidecar_census_complete {
         assert!(!scan.snapshots.is_empty(), "unsampled native output");
         assert!(owner.cache.retained_checkpoint(&key).is_none());
@@ -3281,7 +3281,7 @@ fn b1_absent_o3_fixture(sidecar_census_complete: bool, cancel_before_read: bool)
     );
     for _ in 0..2 {
         let mut prior = ScanIndex::load(&index_path).unwrap();
-        assert!(!prior.reread_guard.upgrade_missing(&key, true));
+        assert!(!prior.reread_guard.upgrade_claimed(&key));
         prior
             .files
             .get_mut(&key)
@@ -4688,6 +4688,205 @@ fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
                 .unwrap()
                 .0
                 .stale_full[cause],
+            1
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+fn b1g_scan(
+    owner: &crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture,
+    roots: &[PathBuf],
+    root: &Path,
+    index_path: &Path,
+    committed: &mut ScanIndex,
+) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
+    let mut owned = OwnedSourceScan::new_with_identity_capture(
+        SnapshotSource::ClaudeCode,
+        roots,
+        committed.clone(),
+        "2026-08-02T08:00:00Z",
+        183,
+        100,
+        false,
+        Some(root),
+        &[],
+        false,
+        true,
+        false,
+    )
+    .with_sampled_acquisition(owner.cache.clone(), Scope("e2-pipeline".into()));
+    for _ in 0..100_000 {
+        let c = owned.sampling.as_ref().unwrap();
+        let mode = (c.full_files, c.tail_files, c.unchanged_files);
+        match owned.step(None) {
+            OwnedSourceScanStep::Pending(mut next) => {
+                next.persist_reread_reservations(committed, index_path)
+                    .unwrap();
+                owned = next;
+            }
+            OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan, mode),
+        }
+    }
+    panic!("absent growth failed to complete");
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
+fn b1g_absent_growth_twice_overflow_closed_restart_exact_body_and_idle() {
+    use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
+    use std::io::Write;
+    let _gate = claude_request_money::e2::GateForTest::set(true);
+    for arm in ["ordinary", "capacity", "closed"] {
+        let root = crate::test_scratch::private_dir("absent-growth");
+        let projects = root.join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        let path = projects.join("1338a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl");
+        let roots = vec![projects];
+        let index_path = root.join("index.json");
+        let key = local_index_key(&path);
+        let source = SnapshotSource::ClaudeCode;
+        std::fs::write(&path, a0h_row("prefix", 100)).unwrap();
+        let warm = E2ScanFixture::default();
+        warm.begin_durable(source, &root, &index_path);
+        let (mut committed, mut scan, mode) = a0h_scan(&warm, &roots, &root, ScanIndex::default());
+        assert_eq!(mode.0, 1);
+        a0h_wire(&root, &mut committed, &mut scan);
+        committed.record_accepted_snapshot_fingerprints(
+            &scan
+                .snapshots
+                .iter()
+                .map(|s| s.snapshot_fingerprint.clone())
+                .collect(),
+        );
+        committed.save(&index_path).unwrap();
+        drop(warm); // Deliberately published without a record: ordinary DNR/capacity case.
+        let owner = E2ScanFixture::default();
+        owner.begin_durable(source, &root, &index_path);
+        assert!(owner
+            .cache
+            .durable()
+            .unwrap()
+            .claude
+            .as_ref()
+            .unwrap()
+            .store
+            .absent(&store::key_digest(DurableSource::ClaudeCode, &key)));
+        if arm == "capacity" {
+            let mut stores = owner.cache.durable().unwrap();
+            for n in 0..2 * store::MAX_RECORDS {
+                assert!(stores.fund_key(store::key_digest(
+                    DurableSource::ClaudeCode,
+                    &format!("other-{n}")
+                )));
+            }
+            assert_eq!(stores.retail_spent.len(), 2 * store::MAX_RECORDS);
+        }
+        if arm == "closed" {
+            let mut state = serde_json::to_value(&committed.reread_guard).unwrap();
+            state["closed"] = serde_json::json!(true);
+            committed.reread_guard = serde_json::from_value(state).unwrap();
+            committed.save(&index_path).unwrap();
+        }
+        let ((_, _, mode), read) =
+            a0h_observe(|| b1g_scan(&owner, &roots, &root, &index_path, &mut committed));
+        assert_eq!(mode.0, 0);
+        assert_eq!(read, (0, 0), "idle is never a new growth grant");
+        for (id, input, total, requests) in [("growth", 200, 300, 2), ("next-growth", 400, 700, 3)]
+        {
+            owner.evict();
+            owner.begin_durable(source, &root, &index_path);
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(a0h_row(id, input).as_bytes())
+                .unwrap();
+            let before = owner
+                .cache
+                .durable_counters(source)
+                .unwrap()
+                .0
+                .upgrade_state_missing;
+            let (page, body) =
+                observe_consumed(|| b1g_scan(&owner, &roots, &root, &index_path, &mut committed));
+            let (mut index, mut scan, mode) = page;
+            assert_eq!(mode, (1, 0, 0), "{arm}: counted native Full on each growth");
+            assert_eq!(body, std::fs::metadata(&path).unwrap().len());
+            assert_eq!(
+                owner
+                    .cache
+                    .durable_counters(source)
+                    .unwrap()
+                    .0
+                    .upgrade_state_missing,
+                before + 1,
+                "actual first native read counted even with full custody or a closed ledger"
+            );
+            let actual = a0h_wire(&root, &mut index, &mut scan);
+            assert_eq!(
+                (
+                    scan.snapshots[0].input_tokens,
+                    scan.snapshots[0].request_count
+                ),
+                (total, requests)
+            );
+            let cold = E2ScanFixture::default();
+            let (mut ci, mut cs, mode) = a0h_scan(&cold, &roots, &root, committed.clone());
+            assert_eq!(mode.0, 1);
+            assert_eq!(actual, a0h_wire(&root, &mut ci, &mut cs));
+            assert!(index.files.contains_key(&key));
+            assert_eq!(scan.unreadable_path_count, 0);
+            // Valid ACK advances accepted size, but record capacity stays absent.
+            index.record_accepted_snapshot_fingerprints(
+                &scan
+                    .snapshots
+                    .iter()
+                    .map(|s| s.snapshot_fingerprint.clone())
+                    .collect(),
+            );
+            index.save(&index_path).unwrap();
+            committed = index;
+            if arm == "capacity" {
+                assert_eq!(
+                    owner.cache.durable().unwrap().retail_spent.len(),
+                    2 * store::MAX_RECORDS
+                );
+            }
+        }
+        owner.evict();
+        let ((_, _, mode), read) =
+            a0h_observe(|| b1g_scan(&owner, &roots, &root, &index_path, &mut committed));
+        assert_eq!(mode.0, 0);
+        assert_eq!(read, (0, 0));
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(a0h_row("restart-growth", 800).as_bytes())
+            .unwrap();
+        let restarted = E2ScanFixture::default();
+        restarted.begin_durable(source, &root, &index_path);
+        let (page, body) =
+            observe_consumed(|| b1g_scan(&restarted, &roots, &root, &index_path, &mut committed));
+        let (mut index, mut scan, mode) = page;
+        assert_eq!(mode.0, 1);
+        assert_eq!(body, std::fs::metadata(&path).unwrap().len());
+        a0h_wire(&root, &mut index, &mut scan);
+        assert_eq!(
+            (
+                scan.snapshots[0].input_tokens,
+                scan.snapshots[0].request_count
+            ),
+            (1500, 4)
+        );
+        assert_eq!(
+            restarted
+                .cache
+                .durable_counters(source)
+                .unwrap()
+                .0
+                .upgrade_state_missing,
             1
         );
         let _ = std::fs::remove_dir_all(root);

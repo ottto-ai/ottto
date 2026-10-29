@@ -111,8 +111,9 @@ struct Reservation {
     claimed: bool,
     replay: bool,
     upgrade: bool,
+    growth: Option<KeyHash>,
 }
-crate::heap_layout_bound::fields!(Reservation; wall, born, saved, claimed, replay, upgrade);
+crate::heap_layout_bound::fields!(Reservation; wall, born, saved, claimed, replay, upgrade, growth);
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub(super) struct State {
@@ -291,6 +292,16 @@ impl State {
     /// O3: use the existing durable replay ledger and pre-read reservation
     /// receipt. Restart loses the unused ticket, never the spent release/key.
     pub(super) fn upgrade_missing(&mut self, key: &str, consume: bool) -> bool {
+        self.upgrade_bound(key, consume, None)
+    }
+    pub(super) fn upgrade_growth(&mut self, key: &str, c: &CandidateFile, consume: bool) -> bool {
+        let stamp = KeyHash::of(&format!(
+            "upgrade-growth:{key}:{}:{}",
+            c.size_bytes, c.modified_unix_nanos
+        ));
+        self.upgrade_bound(key, consume, Some(stamp))
+    }
+    fn upgrade_bound(&mut self, key: &str, consume: bool, growth: Option<KeyHash>) -> bool {
         if self.closed {
             return false;
         }
@@ -298,7 +309,7 @@ impl State {
         if let Some(r) = self
             .reservations
             .get_mut(&id)
-            .filter(|r| r.upgrade && r.saved && !r.claimed)
+            .filter(|r| r.upgrade && r.saved && !r.claimed && r.growth == growth)
         {
             r.claimed = consume;
             return true;
@@ -307,9 +318,18 @@ impl State {
             "upgrade_state_missing:{}",
             ottto_core::compiled_release_version()
         );
-        // One hash per indexed file/release, not a 256-file grant cap.
-        // Keep other releases: rollback/re-upgrade must not mint another grant.
-        if !self.replayed.entry(release).or_default().insert(id) {
+        // Retain one persisted key/release. Growth binding is RAM-only;
+        // restart may mint one extra grant under the transitional hold rule.
+        let new_growth = growth.is_some()
+            && self
+                .reservations
+                .get(&id)
+                .is_none_or(|r| r.growth != growth);
+        let spent = self.replayed.entry(release).or_default();
+        if new_growth {
+            spent.remove(&id);
+        }
+        if !spent.insert(id) {
             return false;
         }
         self.reservations.insert(
@@ -321,6 +341,7 @@ impl State {
                 claimed: false,
                 replay: true,
                 upgrade: true,
+                growth,
             },
         );
         false
@@ -548,6 +569,7 @@ impl State {
                 claimed: durable,
                 replay,
                 upgrade: false,
+                growth: None,
             },
         );
         Admission::Admit(Ticket {
