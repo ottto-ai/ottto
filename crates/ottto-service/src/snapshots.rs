@@ -32209,9 +32209,21 @@ impl OwnedSourceScan {
                     }
                 }
             }
-            // MAIN reads even when optional reduction dependencies/census refuse
-            // reuse. This plan counts that raw Full; it grants no retention.
-            if returned_refusal.is_some() && planned_mode.is_none() {
+            // Count MAIN's raw Full without supplying a missing cursor capability.
+            // Large Codex with unavailable inputs must keep its no-plan refusal.
+            if returned_refusal.is_some()
+                && planned_mode.is_none()
+                && (source != SnapshotSource::Codex
+                    || parser
+                        .reader
+                        .reader
+                        .get_ref()
+                        .metadata()
+                        .is_ok_and(|metadata| {
+                            metadata.len()
+                                <= sampled_scan::codex_cursor::Limits::current().singleton()
+                        }))
+            {
                 let context = sampling.as_ref().expect("returned sampled original");
                 let Ok(mode) = parser.prepare_acquisition_owned(
                     None,

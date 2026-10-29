@@ -770,6 +770,12 @@ impl ReadPlan {
             scope,
             now,
             |at| {
+                #[cfg(test)]
+                if OLD_SAMPLE_IO_ERROR.with(std::cell::Cell::get) {
+                    return Err(io::Error::other(
+                        "injected persistent old-checkpoint sample I/O",
+                    ));
+                }
                 let old = checkpoint.expect("samples are compared only with a checkpoint");
                 match at {
                     SampleAt::Head => sample_at(file, 0, &old.samples.head, &mut guard_bytes_read),
@@ -1593,6 +1599,7 @@ impl DurableCertificate {
 
 #[cfg(test)]
 thread_local! {
+    pub(crate) static OLD_SAMPLE_IO_ERROR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static SAMPLES_MATCH_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static BETWEEN_GUARDS: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
         const { std::cell::RefCell::new(None) };
