@@ -218,7 +218,9 @@ mod tests {
             assert!(!first.is_null());
             let live = charge.live.get();
             assert!(live >= 512 + HEADER);
-            charge.limit = 2 * live - 1;
+            // Force preflight refusal even if malloc_good_size understates
+            // this allocator's actual class; peak must then remain unchanged.
+            charge.limit = live + 512 + HEADER - 1;
             assert!(
                 allocate(opaque, 512).is_null(),
                 "old + new must fit together"
