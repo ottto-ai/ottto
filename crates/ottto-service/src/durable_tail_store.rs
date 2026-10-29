@@ -304,10 +304,8 @@ pub(crate) struct MutationWitness {
     content: Digest32,
     stamp: Stamp,
     // The current binding is folded into original for migration witnesses.
-    // One is ordinary custody; a migration stores its nonzero floor plus one.
-    // A real Unix file extent cannot be u64::MAX. The NonZero niche keeps
-    // Option<MutationWitness> compact beside the exact filesystem stamp.
-    migration_floor: std::num::NonZeroU64,
+    // Keep the immutable floor inline without growing the prepaid custody node.
+    migration_floor: Option<std::num::NonZeroU64>,
 }
 fn original_digest(record: &DurableRecord, content: &Digest32) -> Digest32 {
     digest(
@@ -1045,7 +1043,7 @@ impl DurableTailStore {
             original: original_digest(record, &digest),
             content: digest,
             stamp: *stamp,
-            migration_floor: std::num::NonZeroU64::MIN,
+            migration_floor: None,
         };
         (*content == digest && self.witness_current(&proof)).then_some(proof)
     }
@@ -1142,8 +1140,7 @@ impl DurableTailStore {
         original.binding.entry = record.record.binding.entry;
         let mut proof = self.mutation_witness(record, &original)?;
         proof.original = migration_binding(&proof.original, current);
-        proof.migration_floor =
-            std::num::NonZeroU64::new(floor.checked_add(1).filter(|encoded| *encoded > 1)?)?;
+        proof.migration_floor = Some(std::num::NonZeroU64::new(floor)?);
         Some(proof)
     }
     pub(crate) fn migration_matches(
@@ -1155,7 +1152,7 @@ impl DurableTailStore {
         proof.key == current.binding.key
             && record.record.binding.key == proof.key
             && record.record.binding.context == current.binding.context
-            && proof.is_migration()
+            && proof.migration_floor.is_some()
             && proof.original
                 == migration_binding(&original_digest(record, &record_digest(record)), current)
             && proof.content == record_digest(record)
@@ -1177,8 +1174,8 @@ impl DurableTailStore {
                 && replacement.birth_nanos != 0
                 && old.birth_nanos != replacement.birth_nanos)
             || !proof
-                .migration_floor()
-                .is_some_and(|floor| replacement.sealed_offset >= floor)
+                .migration_floor
+                .is_some_and(|floor| replacement.sealed_offset >= floor.get())
         {
             return;
         }
@@ -1656,13 +1653,10 @@ impl DurableTailStore {
 
 impl MutationWitness {
     pub(crate) fn migration_floor(&self) -> Option<u64> {
-        self.migration_floor
-            .get()
-            .checked_sub(1)
-            .filter(|floor| *floor != 0)
+        self.migration_floor.map(|floor| floor.get())
     }
     pub(crate) fn is_migration(&self) -> bool {
-        self.migration_floor.get() != 1
+        self.migration_floor.is_some()
     }
 }
 

@@ -12318,11 +12318,6 @@ fn o3_observation_fits_the_prepaid_full_custody_node() {
         root_and_shared_counter <= 1024,
         "the shared counter fits the already-paid root credit"
     );
-    assert_eq!(
-        std::mem::size_of::<Option<store::MutationWitness>>(),
-        std::mem::size_of::<store::MutationWitness>()
-    );
-
     assert!(
         custody_node_bytes().unwrap() <= 1024,
         "full node + Box + unchanged Arc allowance"

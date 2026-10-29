@@ -3727,15 +3727,7 @@ fn o3_witness_rejects_unclassified_source_context_format_and_future_record() {
         )
         .unwrap();
     let record = found(store.read(&old.key));
-    for arm in [
-        "source",
-        "context",
-        "key",
-        "format",
-        "future",
-        "zero-floor",
-        "overflow-floor",
-    ] {
+    for arm in ["source", "context", "key", "format", "future", "zero-floor"] {
         let mut candidate = record.clone();
         let mut current = Expected {
             binding: old.clone(),
@@ -3754,13 +3746,7 @@ fn o3_witness_rejects_unclassified_source_context_format_and_future_record() {
                 .migration_witness(
                     &candidate,
                     &current,
-                    if arm == "zero-floor" {
-                        0
-                    } else if arm == "overflow-floor" {
-                        u64::MAX
-                    } else {
-                        3
-                    }
+                    if arm == "zero-floor" { 0 } else { 3 }
                 )
                 .is_none(),
             "{arm}"

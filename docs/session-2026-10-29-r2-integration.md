@@ -18,11 +18,12 @@ Codex resource-recovery pacing starts after page and cursor admission. AuditDue
 and ClockChanged retain the acquisition behavior of this main endpoint.
 
 Round 3 repairs composition against the Linux failure receipt. The mutation
-witness keeps its key, content, exact filesystem stamp and immutable floor;
-a nonzero floor encoding removes the outer optional tag. Per-key accounting
-charges its observer flag, while the shared process counter fits the already
-paid root credit. The custody node remains within 1024 bytes without increasing
-the reserve or enabling unsupported cache layouts. Empty store-counter alarms
+witness keeps its original representation, key, content, exact filesystem stamp
+and immutable floor. Custody accounting uses the Box's requested size, which
+already includes type padding, plus its per-key observer flag Arc. The one shared
+process counter fits the already paid root credit. The custody node remains
+within 1024 bytes without increasing the reserve or enabling unsupported cache
+layouts. Empty store-counter alarms
 are suppressed beside cause-only reports; nonzero store observations remain.
 
 P3's neutral S2 floor outcome takes precedence over the earlier Claude-specific

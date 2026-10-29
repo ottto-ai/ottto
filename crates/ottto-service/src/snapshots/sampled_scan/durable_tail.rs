@@ -372,7 +372,9 @@ struct KeyCustody {
 }
 fn custody_node_bytes() -> Option<usize> {
     crate::heap_layout_bound::tree_node_bytes::<store::Digest32, Box<KeyCustody>>()?
-        .checked_add(std::mem::size_of::<KeyCustody>() + std::mem::align_of::<KeyCustody>())?
+        // Box::new requests Layout::new::<KeyCustody>(); size_of already
+        // includes the type's tail padding, so adding alignment double-counts it.
+        .checked_add(std::mem::size_of::<KeyCustody>())?
         .checked_add(arc_allocation_bytes::<std::sync::atomic::AtomicBool>()?)
 }
 
