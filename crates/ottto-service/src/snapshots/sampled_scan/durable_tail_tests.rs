@@ -3433,3 +3433,166 @@ fn b1_strict_tail_writer_retries_with_the_original_witness_after_memo_loss() {
     drop(stores);
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "native retained layout")]
+fn c_strict_writer_retires_only_a_successfully_acknowledged_replacement() {
+    for edge in ["ordinary", "pre_rename", "post_rename", "dir_sync"] {
+        use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
+        use std::io::Write;
+        let _gate = claude_request_money::e2::GateForTest::set(true);
+        let root = crate::test_scratch::private_dir("ottto-c-batch-ack");
+        let lock = test_locks::hold(&root);
+        let projects = root.join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        let path = projects.join("1338a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl");
+        let roots = vec![projects];
+        let key = local_index_key(&path);
+        let digest = store::key_digest(DurableSource::ClaudeCode, &key);
+        let source = SnapshotSource::ClaudeCode;
+        let index_path = root.join("index.json");
+        std::fs::write(&path, a1a_row("first", 100)).unwrap();
+        let warm = E2ScanFixture::default();
+        warm.begin_durable(source, &root, &index_path);
+        let (mut index, mut scan, modes) = a1a_scan_at(
+            &warm,
+            &roots,
+            &root,
+            ScanIndex::default(),
+            "2026-08-02T08:00:00Z",
+        );
+        assert_eq!(modes.0, 1);
+        a1a_wire(&root, &mut index, &mut scan);
+        index.record_accepted_snapshot_fingerprints(
+            &scan
+                .snapshots
+                .iter()
+                .map(|s| s.snapshot_fingerprint.clone())
+                .collect(),
+        );
+        index.save(&index_path).unwrap();
+        assert_eq!(
+            warm.cache
+                .durable_write_after_save(lock, source, &index)
+                .unwrap()
+                .written,
+            1
+        );
+        let dir = store::store_dir_for_index(&index_path);
+        let disk = std::fs::read_dir(&dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let original = std::fs::read(&disk).unwrap();
+        drop(warm);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(a1a_row("second", 200).as_bytes())
+            .unwrap();
+        index
+            .files
+            .get_mut(&key)
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+        let owner = E2ScanFixture::default();
+        owner.begin_durable(source, &root, &index_path);
+        let (mut index, mut scan, modes) =
+            a1a_scan_at(&owner, &roots, &root, index, "2026-08-02T08:01:00Z");
+        assert_eq!(modes, (0, 1, 0));
+        assert_eq!(owner.cache.durable_counters(source).unwrap().0.restored, 1);
+        a1a_wire(&root, &mut index, &mut scan);
+        index.record_accepted_snapshot_fingerprints(
+            &scan
+                .snapshots
+                .iter()
+                .map(|s| s.snapshot_fingerprint.clone())
+                .collect(),
+        );
+        index.save(&index_path).unwrap();
+        let spent = {
+            let mut stores = owner.cache.durable().unwrap();
+            let custody = &stores.retail_spent[&digest];
+            assert!(custody.original.is_some());
+            let spent = custody.spent.expect("retail high water retained");
+            stores.claude.as_mut().unwrap().store =
+                DurableTailStore::new(dir.clone(), DurableSource::ClaudeCode);
+            spent
+        };
+
+        let reached = std::rc::Rc::new(std::cell::Cell::new(false));
+        let seen = reached.clone();
+        match edge {
+            "dir_sync" => store::test_hooks::set_before_dir_sync(Some(Box::new(move |_| {
+                seen.set(true);
+                Err(std::io::Error::other("c injected directory sync"))
+            }))),
+            "pre_rename" | "post_rename" => {
+                store::test_hooks::set_before_rename(Some(Box::new(move |temp, target| {
+                    seen.set(true);
+                    if edge == "post_rename" {
+                        std::fs::rename(temp, target)?;
+                    }
+                    Err(std::io::Error::other("c injected rename edge"))
+                })))
+            }
+            "ordinary" => {}
+            _ => unreachable!(),
+        }
+        let receipt = owner.cache.durable_write_after_save(lock, source, &index);
+        store::test_hooks::set_before_rename(None);
+        store::test_hooks::set_before_dir_sync(None);
+        if edge == "ordinary" {
+            assert_eq!(receipt.unwrap().written, 1);
+            assert_ne!(std::fs::read(&disk).unwrap(), original);
+            let stores = owner.cache.durable().unwrap();
+            assert!(stores.retail_spent[&digest].original.is_none());
+            assert_eq!(stores.retail_spent[&digest].spent, Some(spent));
+        } else {
+            assert!(reached.get(), "real {edge} edge reached");
+            assert!(receipt.is_none(), "no durable acknowledgement on error");
+            let ambiguous = edge != "pre_rename";
+            let after_failure = std::fs::read(&disk).unwrap();
+            assert_eq!(after_failure != original, ambiguous, "{edge}");
+            {
+                let stores = owner.cache.durable().unwrap();
+                let proof = stores.retail_spent[&digest]
+                    .original
+                    .as_ref()
+                    .expect("original custody on error");
+                assert_eq!(
+                    stores.claude.as_ref().unwrap().store.witness_current(proof),
+                    !ambiguous
+                );
+                assert_eq!(stores.retail_spent[&digest].spent, Some(spent));
+                assert!(stores.touched.contains(&key));
+                assert_eq!(
+                    stores.selected.get(&key),
+                    Some(&index.files[&key].source_file_fingerprint)
+                );
+            }
+            let retry = owner
+                .cache
+                .durable_write_after_save(lock, source, &index)
+                .unwrap();
+            assert_eq!(retry.written, usize::from(!ambiguous));
+            let stores = owner.cache.durable().unwrap();
+            assert_eq!(
+                stores.retail_spent[&digest].original.is_some(),
+                ambiguous,
+                "Ok/changed Stamp alone must never retire an ambiguous predecessor"
+            );
+            assert_eq!(stores.retail_spent[&digest].spent, Some(spent));
+            if ambiguous {
+                assert_eq!(std::fs::read(&disk).unwrap(), after_failure);
+            } else {
+                assert_ne!(std::fs::read(&disk).unwrap(), original);
+            }
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+}

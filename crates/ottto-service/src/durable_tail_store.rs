@@ -419,6 +419,10 @@ pub(crate) struct StoreCounters {
     pub(crate) peak_codec_bytes: u64,
 }
 
+/// Fixed-size key/content/target identities for the strict Claude caller.
+type BatchAcks = [Option<(Digest32, Digest32, Stamp)>; MAX_BATCH];
+const BATCH_ACK_BYTES: usize = std::mem::size_of::<BatchAcks>();
+
 /// What one post-save batch did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct BatchReceipt {
@@ -430,6 +434,8 @@ pub(crate) struct BatchReceipt {
     pub(crate) deferred_keys: Vec<Digest32>,
     pub(crate) budget_refused: usize,
     pub(crate) bytes_written: u64,
+    /// Fixed allocation; no acknowledgement escapes a failed directory sync.
+    committed: Option<Box<BatchAcks>>,
 }
 
 /// One store directory. The in-RAM map of last durable content digests
@@ -739,6 +745,25 @@ impl DurableTailStore {
         fs::symlink_metadata(self.record_path(&proof.key))
             .is_ok_and(|m| Stamp::of(&m) == proof.stamp)
     }
+    /// Key-specific durable write, still the exact target observed by that write.
+    /// A clean retry, stale receipt or another key cannot retire custody.
+    pub(crate) fn replacement_committed(
+        &self,
+        proof: &MutationWitness,
+        receipt: &BatchReceipt,
+    ) -> bool {
+        receipt.committed.as_ref().is_some_and(|acks| {
+            acks.iter().flatten().any(|(key, content, stamp)| {
+                *key == proof.key
+                    && *content != proof.content
+                    && self.durable.get(key).is_some_and(|(have, current, _)| {
+                        *have == Some(*content) && current == stamp
+                    })
+                    && fs::symlink_metadata(self.record_path(key))
+                        .is_ok_and(|m| Stamp::of(&m) == *stamp)
+            })
+        })
+    }
     pub(crate) fn authorize_witness(
         &mut self,
         record: &DurableRecord,
@@ -870,7 +895,12 @@ impl DurableTailStore {
                 format: FORMAT_VERSION,
             };
             let bytes = encode(&stored);
-            self.note_codec(pending_bytes + bytes.capacity());
+            let ack_bytes = if self.source == DurableSource::ClaudeCode {
+                BATCH_ACK_BYTES
+            } else {
+                0
+            };
+            self.note_codec(pending_bytes + bytes.capacity() + ack_bytes);
             let previous = on_disk.get(&key).copied().unwrap_or(0);
             let total = on_disk
                 .values()
@@ -894,12 +924,20 @@ impl DurableTailStore {
                 receipt.budget_refused += 1;
                 continue;
             }
+            if ack_bytes != 0 {
+                receipt
+                    .committed
+                    .get_or_insert_with(|| Box::new([None; MAX_BATCH]));
+            }
             write_atomic(&self.dir, &path, &bytes)?;
             changed = true;
             on_disk.insert(key, bytes.len() as u64);
             let stamp = Stamp::of(&fs::symlink_metadata(&path)?);
             if self.durable.len() < MAX_RECORDS || self.durable.contains_key(&key) {
                 self.durable.insert(key, (Some(content), stamp, true));
+            }
+            if let Some(acks) = receipt.committed.as_mut() {
+                acks[receipt.written] = Some((key, content, stamp));
             }
             receipt.written += 1;
             receipt.bytes_written += bytes.len() as u64;
@@ -1191,7 +1229,7 @@ fn read_private(path: &Path) -> io::Result<Option<Vec<u8>>> {
     Ok(Some(bytes))
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Stamp(u64);
 impl Stamp {
     /// Process-local memo key over (dev, ino, size, mtime, ctime).

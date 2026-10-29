@@ -1515,12 +1515,12 @@ impl SharedCache {
             for digest in offered.keys() {
                 if let Some(c) = stores.retail_spent.get_mut(digest) {
                     if c.original.as_ref().is_some_and(|p| {
-                        !stores
+                        stores
                             .claude
                             .as_ref()
                             .expect("slot")
                             .store
-                            .witness_current(p)
+                            .replacement_committed(p, &receipt)
                     }) {
                         c.original = None;
                     }

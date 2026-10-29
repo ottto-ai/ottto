@@ -1914,6 +1914,191 @@ fn original_witness_survives_memo_turnover_but_never_a_different_record() {
 }
 
 #[test]
+fn batch_ack_is_key_specific_and_bound_to_the_written_target_stamp() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let path = scratch.transcript("t.jsonl", b"{}\n");
+    let mut store = scratch.store();
+    let first = binding("acct", "scope", ("fp", None));
+    let mut other = first.clone();
+    other.key = key_digest(DurableSource::ClaudeCode, "other");
+    let initial = store
+        .write_after_save(
+            &lock,
+            1,
+            vec![
+                pending(first.clone(), certificate(&path), 1),
+                pending(other.clone(), certificate(&path), 1),
+            ],
+        )
+        .unwrap();
+    assert_eq!(initial.written, 2);
+    let mut proofs = Vec::new();
+    for binding in [&first, &other] {
+        let record = found(store.read(&binding.key, &placeholder_allowlist()));
+        let expected = Expected {
+            binding: binding.clone(),
+            committed_generation: 1,
+        };
+        proofs.push(
+            store
+                .mutation_witness(&record, &expected)
+                .expect("strict original"),
+        );
+        store.authorize(&record, &expected);
+    }
+    let receipt = store
+        .write_after_save(
+            &lock,
+            2,
+            vec![pending(first.clone(), certificate(&path), 2)],
+        )
+        .unwrap();
+    assert_eq!(receipt.written, 1);
+    assert!(store.replacement_committed(&proofs[0], &receipt));
+    assert!(
+        !store.replacement_committed(&proofs[1], &receipt),
+        "another key's receipt"
+    );
+    assert!(
+        !store.replacement_committed(&proofs[0], &initial),
+        "original is not its replacement"
+    );
+
+    let clean = store
+        .write_after_save(
+            &lock,
+            3,
+            vec![pending(first.clone(), certificate(&path), 2)],
+        )
+        .unwrap();
+    assert_eq!((clean.written, clean.clean), (0, 1));
+    assert!(
+        clean.committed.is_none(),
+        "clean allocates no acknowledgement"
+    );
+    assert!(!store.replacement_committed(&proofs[0], &clean));
+
+    // Identical bytes under another record inode invalidate the OLD receipt,
+    // even after a fresh read refreshes the optimization memo to those bytes.
+    let disk = record_file(&store, &first.key);
+    let replacement = disk.with_extension("identical");
+    put_record(&replacement, &fs::read(&disk).unwrap());
+    fs::rename(replacement, &disk).unwrap();
+    found(store.read(&first.key, &placeholder_allowlist()));
+    assert!(!store.replacement_committed(&proofs[0], &receipt));
+}
+
+#[test]
+fn batch_ack_never_escapes_failed_or_ambiguous_writes_or_a_clean_retry() {
+    for edge in ["pre_rename", "post_rename", "dir_sync"] {
+        let scratch = Scratch::new();
+        let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+        let path = scratch.transcript("t.jsonl", b"{}\n");
+        let mut store = scratch.store();
+        let b = binding("acct", "scope", ("fp", None));
+        store
+            .write_after_save(&lock, 1, vec![pending(b.clone(), certificate(&path), 1)])
+            .unwrap();
+        let record = found(store.read(&b.key, &placeholder_allowlist()));
+        let expected = Expected {
+            binding: b.clone(),
+            committed_generation: 1,
+        };
+        let proof = store.mutation_witness(&record, &expected).unwrap();
+        store.authorize_witness(&record, &expected, &proof);
+        let disk = record_file(&store, &b.key);
+        let before = fs::read(&disk).unwrap();
+        let reached = std::rc::Rc::new(std::cell::Cell::new(false));
+        let seen = reached.clone();
+        if edge == "dir_sync" {
+            test_hooks::set_before_dir_sync(Some(Box::new(move |_| {
+                seen.set(true);
+                Err(io::Error::other("injected directory sync failure"))
+            })));
+        } else {
+            test_hooks::set_before_rename(Some(Box::new(move |temp, target| {
+                seen.set(true);
+                if edge == "post_rename" {
+                    fs::rename(temp, target)?;
+                }
+                Err(io::Error::other("injected rename edge"))
+            })));
+        }
+        let failed =
+            store.write_after_save(&lock, 2, vec![pending(b.clone(), certificate(&path), 2)]);
+        test_hooks::set_before_rename(None);
+        test_hooks::set_before_dir_sync(None);
+        assert!(reached.get(), "actual {edge} reached");
+        assert!(failed.is_err(), "no receipt before successful batch sync");
+        assert_eq!(fs::read(&disk).unwrap() == before, edge == "pre_rename");
+        assert_eq!(store.witness_current(&proof), edge == "pre_rename");
+        if edge == "pre_rename" {
+            let retry = store
+                .write_after_save(&lock, 3, vec![pending(b.clone(), certificate(&path), 2)])
+                .unwrap();
+            assert_eq!(retry.written, 1);
+            assert!(store.replacement_committed(&proof, &retry));
+        } else {
+            // Re-authorize the ACTUAL current strict record, then mix its clean
+            // retry with a real write for another key. Aggregate written=1 is
+            // deliberately insufficient to acknowledge this original witness.
+            let target = found(store.read(&b.key, &placeholder_allowlist()));
+            store.authorize(
+                &target,
+                &Expected {
+                    binding: b.clone(),
+                    committed_generation: 2,
+                },
+            );
+            let mut other = b.clone();
+            other.key = key_digest(DurableSource::ClaudeCode, "other");
+            let retry = store
+                .write_after_save(
+                    &lock,
+                    3,
+                    vec![
+                        pending(b.clone(), certificate(&path), 2),
+                        pending(other, certificate(&path), 1),
+                    ],
+                )
+                .unwrap();
+            assert_eq!((retry.written, retry.clean), (1, 1));
+            assert!(
+                !store.replacement_committed(&proof, &retry),
+                "{edge} clean retry"
+            );
+        }
+    }
+}
+
+#[test]
+fn batch_ack_has_a_fixed_allocation_at_the_dirty_batch_limit() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let path = scratch.transcript("t.jsonl", b"{}\n");
+    let mut store = scratch.store();
+    let records = (0..MAX_BATCH + 1)
+        .map(|n| {
+            let mut b = binding("acct", "scope", ("fp", None));
+            b.key = key_digest(DurableSource::ClaudeCode, &format!("bounded-{n}"));
+            pending(b, certificate(&path), 1)
+        })
+        .collect();
+    let receipt = store.write_after_save(&lock, 1, records).unwrap();
+    assert_eq!((receipt.written, receipt.deferred), (MAX_BATCH, 1));
+    let acks = receipt.committed.as_ref().expect("real durable writes");
+    assert_eq!(acks.iter().flatten().count(), MAX_BATCH);
+    assert_eq!(std::mem::size_of_val(acks.as_ref()), BATCH_ACK_BYTES);
+    assert!(BATCH_ACK_BYTES <= MAX_BATCH * 80);
+    assert!(store.counters().peak_codec_bytes >= BATCH_ACK_BYTES as u64);
+    assert!(acks
+        .iter()
+        .flatten()
+        .all(|(key, _, _)| !receipt.deferred_keys.contains(key)));
+}
+
+#[test]
 fn claude_mutation_proof_expires_at_pass_boundary_and_unmemoized_records_survive() {
     let scratch = Scratch::new();
     let lock = LockedStateDir::acquire(&scratch.root).unwrap();
