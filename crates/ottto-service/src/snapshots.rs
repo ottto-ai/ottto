@@ -31735,7 +31735,7 @@ impl OwnedSourceScan {
                         .reduction_dependencies_available
                         .observe(reduction_sidecar.is_some());
                     if let Some(reduction_sidecar) = reduction_sidecar {
-                        let mut debt =
+                        let debt =
                             sampled_audit::debt_for_key(index, &key, sampled_scan::now_seconds());
                         let protected_entry = index.files.get(&key);
                         context
@@ -31806,7 +31806,7 @@ impl OwnedSourceScan {
                         #[cfg(unix)]
                         context.cache.durable_note_scope(source, &key, &scope);
                         #[cfg(unix)]
-                        let (retained, taken_admission) = match retained {
+                        let (retained, taken_admission, debt) = match retained {
                             None if allow_sample && !parser.reader.reader.is_compressed() => {
                                 let interpretation = sampled_scan::durable_tail::Interpretation::of(
                                     source,
@@ -31834,7 +31834,7 @@ impl OwnedSourceScan {
                                             taken.finalization_charge,
                                             taken.retained.state.usage_witness(),
                                         );
-                                        (Some(taken.retained), Some(admission))
+                                        (Some(taken.retained), Some(admission), debt)
                                     }
                                     sampled_scan::durable_tail::RestoreOutcome::Miss(class) => {
                                         let rearmed = class.rearm_audit(
@@ -31846,8 +31846,7 @@ impl OwnedSourceScan {
                                             context.audit_slots =
                                                 context.audit_slots.saturating_sub(1);
                                         }
-                                        debt = rearmed.or(debt);
-                                        (None, taken_admission)
+                                        (None, taken_admission, rearmed.or(debt))
                                     }
                                     sampled_scan::durable_tail::RestoreOutcome::Held(reason) => {
                                         context.cache.durable_hold_exit(
@@ -31861,7 +31860,7 @@ impl OwnedSourceScan {
                                     }
                                 }
                             }
-                            retained => (retained, taken_admission),
+                            retained => (retained, taken_admission, debt),
                         };
                         let old = retained.filter(|_| allow_sample);
                         context.admission.prepare_started =
