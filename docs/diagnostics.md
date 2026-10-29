@@ -264,6 +264,15 @@ after the existing decision, are drained by that source's next completed page,
 and count repeated decisions, not distinct files or bytes. They are recorded
 whether or not an observer is registered.
 
+On Claude pages, `counts.withheld_reparse` counts re-parses of keys withheld for
+an unresolved account: `start` (first in this process), `evidence` (the
+transcript fingerprint, which folds in its api/trace sidecar stamps, or the
+request identity contract changed) and `growth` (the transcript stamp changed).
+An unchanged withheld key is skipped and not counted; the memo behind that skip
+is RAM only. `counts.withheld_hold_released.deleted` counts holds released
+because the held file was proved absent. Both are drained like
+`line_delivery_unselected`.
+
 ## Context Footprint Discovery
 
 Context footprint opens no transcript. Its workspaces come from the cwds of
