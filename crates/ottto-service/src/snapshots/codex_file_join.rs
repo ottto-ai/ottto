@@ -5198,6 +5198,13 @@ pub(in crate::snapshots) mod header_cache_tests {
                             .headers
                             .iter()
                             .all(|h| h.candidate.path != archive));
+                        assert!(
+                            !codex_counting_version::absence_coverage_complete(
+                                &owned.index,
+                                inventory
+                            ),
+                            "scoped publication does not certify absent raw archive history"
+                        );
                         inventoried = true;
                     }
                     match owned.step(None) {

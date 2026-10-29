@@ -401,6 +401,9 @@ pub(super) fn absence_coverage_complete(
     inventory: &codex_file_join::HeaderInventory,
 ) -> bool {
     inventory.complete
+        // Scoped publication may proceed around an opaque archive, but its
+        // omitted raw history can never certify a departed owner's absence.
+        && !index.decode_held_file_keys().any(|key| codex_archive_path(Path::new(key)))
         // Negative attribution is not a fresh owner census after replacement.
         && !index.files.values().any(|entry| entry.codex_compressed_hold.is_some())
         && !inventory.custody_refused
