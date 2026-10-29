@@ -243,18 +243,21 @@ fn sticky_overflow_protects_open_hour_drops_oldest_as_differs_and_restores_only_
         .position(|b| sticky_tagged(&b.model_usage[0]))
         .unwrap();
     let (mut grown, mut proof) = sticky_session(576);
-    // Grow the still-open accepted bucket with one more independent key.
-    let mut extra = proof.last().unwrap().clone();
-    extra.identity = RequestIdentity::Tagged(AuthorityKey {
-        login: Some("e".repeat(64)),
-        org: Some("f".repeat(64)),
-        basis: identity::TELEMETRY,
-    });
-    proof.push(extra);
-    grown.model_usage[0].input_tokens += 1;
-    grown.model_usage[0].request_count += 1;
-    grown.usage_buckets[575].model_usage[0].input_tokens += 1;
-    grown.usage_buckets[575].model_usage[0].request_count += 1;
+    // Three new keys force overflow regardless of a partial bucket's byte
+    // margin, while keeping the global key and per-row part caps valid.
+    for login in ['c', 'd', 'e'] {
+        let mut extra = proof.last().unwrap().clone();
+        extra.identity = RequestIdentity::Tagged(AuthorityKey {
+            login: Some(login.to_string().repeat(64)),
+            org: Some("f".repeat(64)),
+            basis: identity::TELEMETRY,
+        });
+        proof.push(extra);
+    }
+    grown.model_usage[0].input_tokens += 3;
+    grown.model_usage[0].request_count += 3;
+    grown.usage_buckets[575].model_usage[0].input_tokens += 3;
+    grown.usage_buckets[575].model_usage[0].request_count += 3;
     let _ = identity::take_identity_counts();
     identity::apply_with_accepted_for_test(&mut grown, &proof, &accepted).unwrap();
     let counts = serde_json::to_value(identity::take_identity_counts()).unwrap();
@@ -387,4 +390,38 @@ fn sticky_bucket_hint_does_not_refuse_a_legitimately_missing_sibling_row() {
     assert_eq!(item.request_identity_refusals, 0);
     let measured = identity::measure_identity_cap(&item, &accepted).unwrap();
     assert_eq!(measured.item_bytes, identity::item_bytes(&item));
+}
+
+#[test]
+fn sticky_partial_body_displays_only_the_kept_newest_own_account() {
+    let (mut item, mut proof) = sticky_session(576);
+    proof.truncate(proof.len() - 2);
+    item.model_usage[0].input_tokens -= 2;
+    item.model_usage[0].request_count -= 2;
+    item.usage_buckets[575].model_usage[0].input_tokens -= 2;
+    item.usage_buckets[575].model_usage[0].request_count -= 2;
+    item.input_tokens -= 2;
+    item.request_count -= 2;
+    identity::apply_with_accepted_for_test(
+        &mut item,
+        &proof,
+        &identity::AcceptedBuckets::default(),
+    )
+    .unwrap();
+    assert!(item.request_identity_refusals > 0);
+    let display = item.claude_account_display.as_ref().unwrap();
+    assert_eq!(display.current.status, identity::CURRENT_KNOWN);
+    assert_eq!(
+        display.current.account_identifier_hash,
+        Some(format!("{:064x}", 3))
+    );
+    assert_eq!(
+        display
+            .history
+            .iter()
+            .map(|entry| entry.request_count)
+            .sum::<u64>(),
+        item.request_count
+    );
+    sticky_assert_reconciled(&item);
 }
