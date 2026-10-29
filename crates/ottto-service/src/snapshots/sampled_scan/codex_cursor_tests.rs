@@ -14514,6 +14514,12 @@ fn custody_recovery_classifies_actual_first_read_and_named_non_reusable_full() {
                     .count(),
                 1
             );
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&candidate.path)
+                .unwrap()
+                .write_all(b"\n")
+                .unwrap();
             let file = File::open(&candidate.path).unwrap();
             let mut parser = OwnedJsonlParser::new(
                 file,
@@ -14541,14 +14547,14 @@ fn custody_recovery_classifies_actual_first_read_and_named_non_reusable_full() {
                 mode,
                 crate::transcript_acquisition::ReadMode::Full(_)
             ));
+            let frozen = parser.reader.acquisition.as_ref().unwrap().frozen_length();
+            assert_eq!(
+                frozen,
+                candidate.size_bytes + 1,
+                "growth after candidate capture"
+            );
             let (_, rows) = crate::local_resource_diagnostics::capture(|| {
-                cache.cursor_custody_recovery(
-                    &namespace,
-                    &candidate,
-                    &index,
-                    mode,
-                    candidate.size_bytes,
-                );
+                cache.cursor_custody_recovery(&namespace, &candidate, &index, mode, frozen);
                 while !parser.step().unwrap() {}
             });
             if prior {
@@ -14559,7 +14565,7 @@ fn custody_recovery_classifies_actual_first_read_and_named_non_reusable_full() {
                 assert_eq!(full["stage"], "durable_tail_alarm");
                 assert_eq!(
                     full["counts"]["custody_group_restart_full"]["bytes"],
-                    candidate.size_bytes
+                    frozen
                 );
                 assert!(rows
                     .iter()
@@ -14590,13 +14596,7 @@ fn custody_recovery_classifies_actual_first_read_and_named_non_reusable_full() {
             for _ in 0..5 {
                 let (_, rows) = crate::local_resource_diagnostics::capture(|| {
                     assert!(!cache.cursor_end_custody(&namespace, &index, None));
-                    cache.cursor_custody_recovery(
-                        &namespace,
-                        &candidate,
-                        &index,
-                        mode,
-                        candidate.size_bytes,
-                    );
+                    cache.cursor_custody_recovery(&namespace, &candidate, &index, mode, frozen);
                 });
                 assert!(rows.is_empty(), "receipt consumed once");
             }
