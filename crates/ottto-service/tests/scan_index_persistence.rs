@@ -918,3 +918,85 @@ fn gc_retry_never_skips_an_orphan_that_failed_validation() {
     assert!(!orphan.exists());
     assert_eq!(load(&store).0, Fixture::new(1, 0).logical(1));
 }
+
+#[test]
+fn refused_headers_and_manifest_errors_never_echo_input() {
+    const CANARY: &str = "private-canary-path-or-title";
+    for damage in 0..4 {
+        let scratch = Scratch::new();
+        let store = scratch.store();
+        store
+            .commit(&missing(&store), 1, &Fixture::new(1, 0).plan())
+            .unwrap();
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(scratch.root()).unwrap()).unwrap();
+        match damage {
+            0 => manifest[CANARY] = json!(true),
+            1 => manifest["binding"]["source"] = json!(CANARY),
+            2 => manifest["schema_version"] = json!(CANARY.repeat(20_000)),
+            3 => manifest["generation"] = json!(CANARY.repeat(20_000)),
+            _ => unreachable!(),
+        }
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        fs::write(scratch.root(), &bytes).unwrap();
+        let error = match store.open() {
+            Err(error) => error,
+            Ok(_) => panic!("malformed input must refuse"),
+        };
+        assert!(!format!("{error:#}").contains(CANARY));
+        assert_eq!(fs::read(scratch.root()).unwrap(), bytes);
+    }
+    // Escaped control-name aliases and positional headers have the same bound.
+    for bytes in [
+        format!("{{\"schema\\u005fversion\":\"{}\"}}", CANARY.repeat(20_000)),
+        format!("[2,\"{}\"]", CANARY.repeat(20_000)),
+    ] {
+        let scratch = Scratch::new();
+        let store = scratch.store();
+        fs::write(scratch.root(), &bytes).unwrap();
+        let error = match store.open() {
+            Err(error) => error,
+            Ok(_) => panic!("invalid header string must refuse"),
+        };
+        assert!(!format!("{error:#}").contains(CANARY));
+        assert_eq!(fs::read_to_string(scratch.root()).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn compatibility_sentinel_is_not_logical_files_and_orphan_reuse_is_not_a_write() {
+    let scratch = Scratch::new();
+    let store = scratch.store();
+    let mut fixture = Fixture::new(1, 0);
+    fixture.metadata["files"] = json!({"synthetic-nondefault-file": {"size": 191, "offset": 113}});
+    let first = store.commit(&missing(&store), 1, &fixture.plan()).unwrap();
+    let manifest: Value = serde_json::from_slice(&fs::read(scratch.root()).unwrap()).unwrap();
+    assert_eq!(manifest["files"], json!({}));
+    assert!(!fixture.metadata["files"].as_object().unwrap().is_empty());
+    assert_eq!(load(&store).0, fixture.logical(1));
+    let mut changed = Fixture::new(2, 0);
+    changed.metadata["files"] = fixture.metadata["files"].clone();
+    let error = store
+        .commit_observed(&first.root, 2, &changed.plan(), &mut |edge| {
+            if edge == Edge::PayloadRename {
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            } else {
+                Ok(())
+            }
+        })
+        .err()
+        .unwrap();
+    assert!(error.downcast_ref::<CommitPublished>().is_none());
+    assert_eq!(load(&store).0, fixture.logical(1));
+    let recovered = store.commit(&first.root, 2, &changed.plan()).unwrap();
+    assert_eq!(recovered.stats.written_objects, 0);
+    assert_eq!(recovered.stats.written_bytes, 0);
+    assert_eq!(recovered.stats.unchanged_objects, 1);
+    assert_eq!(load(&store).0, changed.logical(2));
+    let mut invalid: Value = serde_json::from_slice(&fs::read(scratch.root()).unwrap()).unwrap();
+    invalid["files"] = json!({"synthetic-forbidden": {}});
+    let bytes = serde_json::to_vec(&invalid).unwrap();
+    fs::write(scratch.root(), &bytes).unwrap();
+    assert!(store.open().is_err());
+    assert_eq!(fs::read(scratch.root()).unwrap(), bytes);
+}

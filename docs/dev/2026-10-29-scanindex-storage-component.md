@@ -38,6 +38,7 @@ The strict, bounded manifest schema is:
 ```json
 {
   "schema_version": 3,
+  "files": {},
   "storage_format": 1,
   "logical_schema_version": 2,
   "generation": 1,
@@ -50,6 +51,11 @@ The strict, bounded manifest schema is:
   ]
 }
 ```
+
+The manifest's required `files: {}` is an empty old-reader compatibility
+sentinel. Old header visitors require its presence before checking schema;
+it contains no logical file state and never feeds the new logical view. A
+nonempty sentinel refuses. Actual files remain entirely in metadata.
 
 `source` admits `claude`, `codex`, `pi`; bucket field admits `account_pending`,
 `usage_pending`, `request_census`; bucket is u8. At most 769 ordered, unique
@@ -117,7 +123,8 @@ The synthetic target covers legacy migration, sparse/no-op/dense/empty writes,
 seeking, two restart decodes, same-generation changed manifests, stale/missing
 roots, corrupt/truncated/missing/unsafe payloads, unknown manifests, bounded GC,
 ENOSPC/EIO injection, changing serializers and SIGKILL children at every exposed
-write edge. It also verifies real production old-reader refusal in a subprocess.
+write edge. Canary fixtures verify that refused header/manifest errors never
+echo input, including oversized invalid string controls and escaped names. It also verifies real production old-reader refusal in a subprocess.
 Local tests are prohibited; CI runs this target as part of the existing Linux
 suite. The prescribed guarded package Clippy check compiles all targets.
 

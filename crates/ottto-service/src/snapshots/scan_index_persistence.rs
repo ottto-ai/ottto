@@ -7,9 +7,9 @@
 //! interiors without decoding values or materializing the reconstructed index.
 //! Candidate format constants/domains require SOURCE signoff before integration.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -116,6 +116,9 @@ impl Object {
 #[serde(deny_unknown_fields)]
 struct Manifest {
     schema_version: u16,
+    // The pinned old header visitor requires this field BEFORE its schema
+    // check. It is always empty and is NEVER the logical index's files map.
+    files: BTreeMap<String, serde_json::Value>,
     storage_format: u16,
     logical_schema_version: u16,
     generation: u64,
@@ -534,14 +537,25 @@ impl LockedStore {
             let outer = std::cell::Cell::new(false);
             let mut decoder = serde_json::Deserializer::from_reader(BufReader::with_capacity(
                 BUFFER_BYTES,
-                KeyGuard::new(&mut file),
+                KeyGuard::headers(&mut file),
             ));
             match serde::de::Deserializer::deserialize_any(&mut decoder, Probe(&outer)) {
                 Ok(header) => header,
                 // Deliberate visitor ERROR, not a partial successful map:
                 // serde's end_map contract must not consume its next comma.
                 Err(_) if outer.get() => (OUTER_SCHEMA, 0),
-                Err(error) => return Err(error).context("scan_index_representation_refused"),
+                Err(error) => {
+                    // JSON errors may echo attacker-controlled strings/tags.
+                    // Retain only allowlisted resource reasons, never input.
+                    let text = error.to_string();
+                    if text.starts_with("scan_index_key_size") {
+                        bail!("scan_index_key_size");
+                    }
+                    if text.starts_with("scan_index_json_depth") {
+                        bail!("scan_index_json_depth");
+                    }
+                    bail!("scan_index_representation_refused");
+                }
             }
         };
         file.seek(SeekFrom::Start(0))?;
@@ -556,8 +570,8 @@ impl LockedStore {
                 .take(MAX_ROOT_BYTES as u64 + 1)
                 .read_to_end(&mut bytes)?;
             ensure!(bytes.len() <= MAX_ROOT_BYTES, "scan_index_root_size");
-            let manifest: Manifest =
-                serde_json::from_slice(&bytes).context("scan_index_manifest_refused")?;
+            let manifest: Manifest = serde_json::from_slice(&bytes)
+                .map_err(|_| anyhow::anyhow!("scan_index_manifest_refused"))?;
             self.validate_manifest(&manifest)?;
             Root::Sharded {
                 digest: root_digest(&bytes),
@@ -595,6 +609,7 @@ impl LockedStore {
                 && manifest.logical_schema_version == LOGICAL_SCHEMA,
             "scan_index_representation_refused"
         );
+        ensure!(manifest.files.is_empty(), "scan_index_compatibility_fence");
         ensure!(manifest.binding == self.binding, "scan_index_binding");
         ensure!(
             !manifest.objects.is_empty() && manifest.objects.len() <= MAX_OBJECTS,
@@ -804,12 +819,18 @@ impl LockedStore {
                 stats.unchanged_objects += 1;
                 stamp
             } else {
-                let stamp = self.install_object(&dir, &object, fragments, observe)?;
-                stats.written_bytes = stats
-                    .written_bytes
-                    .checked_add(object.bytes)
-                    .context("scan_index_length_overflow")?;
-                stats.written_objects += 1;
+                let (stamp, written) = self.install_object(&dir, &object, fragments, observe)?;
+                if written {
+                    stats.written_bytes = stats
+                        .written_bytes
+                        .checked_add(object.bytes)
+                        .context("scan_index_length_overflow")?;
+                    stats.written_objects += 1;
+                } else {
+                    // A complete orphan from a failed predecessor attempt is
+                    // verified and reused; no new payload bytes were written.
+                    stats.unchanged_objects += 1;
+                }
                 stamp
             };
             objects.push(object);
@@ -822,6 +843,7 @@ impl LockedStore {
         observe(Edge::PayloadDirectorySync)?;
         let mut manifest = Manifest {
             schema_version: OUTER_SCHEMA,
+            files: BTreeMap::new(),
             storage_format: STORAGE_FORMAT,
             logical_schema_version: LOGICAL_SCHEMA,
             generation,
@@ -890,21 +912,24 @@ impl LockedStore {
         object: &Object,
         fragments: &impl Fragments,
         observe: &mut impl FnMut(Edge) -> io::Result<()>,
-    ) -> Result<Stamp> {
+    ) -> Result<(Stamp, bool)> {
         let name = cstring(object.filename().as_bytes())?;
         match open_at(dir, &name, libc::O_RDONLY) {
-            Ok(_) => return self.validate_object(dir, object),
+            Ok(_) => return Ok((self.validate_object(dir, object)?, false)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
         let temp = Temp::new(dir)?;
         observe(Edge::PayloadTempCreated)?;
         let mut hash = HashWriter::new(
-            ObservedWriter {
-                file: &temp.file,
-                observe,
-                first: true,
-            },
+            BufWriter::with_capacity(
+                BUFFER_BYTES,
+                ObservedWriter {
+                    file: &temp.file,
+                    observe,
+                    first: true,
+                },
+            ),
             &self.binding,
             object.slot,
         )?;
@@ -921,7 +946,7 @@ impl LockedStore {
         // occurs except our own create_new temp -> absent immutable name.
         rename_at(dir, &temp.name, dir, &name)?;
         observe(Edge::PayloadRename)?;
-        self.validate_object(dir, object)
+        Ok((self.validate_object(dir, object)?, true))
     }
 
     /// Strictly current-generation reachability; never traverses any other store.
@@ -1184,7 +1209,14 @@ struct ObservedWriter<'a, F> {
 }
 impl<F: FnMut(Edge) -> io::Result<()>> Write for ObservedWriter<'_, F> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let n = self.file.write(bytes)?;
+        // Force a real partial first physical write even for a tiny buffered
+        // fragment, so the SIGKILL edge cannot merely mean a completed object.
+        let part = if self.first && bytes.len() > 1 {
+            bytes.len() / 2
+        } else {
+            bytes.len()
+        };
+        let n = self.file.write(&bytes[..part])?;
         if self.first && n > 0 {
             self.first = false;
             (self.observe)(Edge::PayloadPartialWrite)?;
@@ -1253,6 +1285,11 @@ struct KeyGuard<R> {
     escaped: bool,
     key: bool,
     key_bytes: usize,
+    headers: bool,
+    header_key: [u8; 128],
+    header_key_len: usize,
+    control_value: bool,
+    array_position: usize,
 }
 impl<R: Read> KeyGuard<R> {
     fn new(inner: R) -> Self {
@@ -1263,6 +1300,17 @@ impl<R: Read> KeyGuard<R> {
             escaped: false,
             key: false,
             key_bytes: 0,
+            headers: false,
+            header_key: [0; 128],
+            header_key_len: 0,
+            control_value: false,
+            array_position: 0,
+        }
+    }
+    fn headers(inner: R) -> Self {
+        Self {
+            headers: true,
+            ..Self::new(inner)
         }
     }
 }
@@ -1271,6 +1319,14 @@ impl<R: Read> Read for KeyGuard<R> {
         let n = self.inner.read(output)?;
         for byte in &output[..n] {
             if self.string {
+                if self.headers
+                    && self.key
+                    && self.stack.len() == 1
+                    && self.header_key_len < self.header_key.len()
+                {
+                    self.header_key[self.header_key_len] = *byte;
+                    self.header_key_len += 1;
+                }
                 if self.key {
                     self.key_bytes += 1;
                     if self.key_bytes > MAX_KEY_BYTES * 6 + 1 {
@@ -1283,6 +1339,16 @@ impl<R: Read> Read for KeyGuard<R> {
                     self.escaped = true;
                 } else if *byte == b'"' {
                     self.string = false;
+                    if self.headers && self.key && self.stack.len() == 1 {
+                        // Control names are at most 14 decoded bytes (86 raw
+                        // bytes with escapes). Capture is fixed-size; no value
+                        // strings are allocated by this lexical guard.
+                        let key = serde_json::from_slice::<String>(
+                            &self.header_key[..self.header_key_len],
+                        );
+                        self.control_value =
+                            matches!(key.as_deref(), Ok("schema_version" | "generation"));
+                    }
                 }
             } else {
                 match byte {
@@ -1294,6 +1360,19 @@ impl<R: Read> Read for KeyGuard<R> {
                             .last()
                             .is_some_and(|(object, key)| *object && *key);
                         self.key_bytes = 0;
+                        if self.key && self.stack.len() == 1 {
+                            self.header_key[0] = b'"';
+                            self.header_key_len = 1;
+                        } else if self.headers
+                            && (self.stack.is_empty()
+                                || (self.stack.len() == 1
+                                    && (self.control_value
+                                        || (!self.stack[0].0 && self.array_position < 2))))
+                        {
+                            // Headers are integers. Refuse a string BEFORE
+                            // serde can allocate its invalid-type diagnostic.
+                            return Err(io::Error::other("scan_index_header_type"));
+                        }
                     }
                     b'{' | b'[' => {
                         if self.stack.len() >= 256 {
@@ -1310,6 +1389,9 @@ impl<R: Read> Read for KeyGuard<R> {
                         }
                     }
                     b',' => {
+                        if self.stack.len() == 1 && !self.stack[0].0 {
+                            self.array_position = self.array_position.saturating_add(1);
+                        }
                         if let Some(state) = self.stack.last_mut() {
                             state.1 = state.0;
                         }
