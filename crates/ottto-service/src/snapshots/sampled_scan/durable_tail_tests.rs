@@ -3063,12 +3063,12 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
                 sampled_audit::debt_for_key(&missing, &key, now),
                 Some(rearmed)
             );
-            assert_eq!(
-                ReadPlan::prepare(&mut held, None, &scope, Some(rearmed), now)
-                    .unwrap()
-                    .mode(),
-                ReadMode::Full(FullReason::AuditDue)
-            );
+            // Carrier custody re-arms scheduling debt, independently of the
+            // read cause: without a checkpoint the reader is StateMissing.
+            let plan = ReadPlan::prepare(&mut held, None, &scope, Some(rearmed), now).unwrap();
+            assert_eq!(plan.mode(), ReadMode::Full(FullReason::StateMissing));
+            assert_eq!(rearmed.due_unix_seconds, now);
+            assert_eq!(plan.metrics().audit_due, Some(rearmed.due_unix_seconds));
             missing.save(&index_path).unwrap();
             let loaded = ScanIndex::load(&index_path).unwrap();
             let mut disk = DurableTailStore::new(dir.clone(), source);

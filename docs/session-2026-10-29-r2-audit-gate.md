@@ -253,3 +253,15 @@ The new platform/held-new/missing-intermediate controls remain unexecuted until
 E1's exact-head Linux and supported-layout macOS contracts. Local Clippy compiles
 all targets but does not execute them. No version/field, money, proof, codec,
 allowlist, audit-cap value or Full admission rule changes in this round.
+
+
+Round14 repairs the two remaining Linux fixture expectations without changing
+production. A reset carrier still re-arms current-index scheduling debt before
+restoration, while a missing checkpoint selects StateMissing independently of
+that debt; the fixture now asserts both the read reason and the exact carried
+deadline, retaining its real clean-record replacement checks. Account-hold
+pruning now uses the same rooted-filesystem premises as the shared hardened
+absence helper: no proof root or a still-present file retains the hold, and
+actual deletion beneath a readable configured root permits release. Existing
+persistence, resolving-parse, partial-page and population-bound assertions stay.
+Local all-target Clippy is required; runtime qualification remains CI-only.
