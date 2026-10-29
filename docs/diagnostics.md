@@ -332,6 +332,14 @@ no age exemption. All three are drained like
 `retained_bytes`, the bytes charged to the sync owner's process-retained bound
 (absent where the requested layout is unsupported). A refused charge drops the
 memo with the other retained graphs. Omitted while the memo is empty.
+`counts.withheld_held_tokens` is a gauge of the withheld tokens across recorded
+holds (each key's tokens at its last parse), and `counts.withheld_held_age` counts
+those held keys by time since this process first recorded them held: `le_30d`,
+`31_90d` and `gt_90d`. Both are counts only and RAM only, and omitted while
+nothing is held. First-seen resets on a restart or a refused retained charge,
+so ages are a lower bound; after a restart each held key re-enters on its one
+`start` re-parse. A released key (resolved, deleted, or dropped from the hold
+map) leaves both. The map is charged with the memo.
 
 ## Context Footprint Discovery
 

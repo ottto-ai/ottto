@@ -47476,6 +47476,7 @@ impl ScanIndex {
             {
                 self.claude_account_deferred_holds
                     .insert(index_key.to_string(), source_file_fingerprint.to_string());
+                withheld_account::hold_tokens(index_key, tokens);
             } else {
                 // Past the cap: withheld and progress-blocking, but unrecorded
                 // (no age exemption), so its withheld tokens are disclosed.
@@ -47485,6 +47486,7 @@ impl ScanIndex {
             }
             self.note_withheld_account_parse(index_key, source_file_fingerprint, was_held);
         }
+        withheld_account::retain_held(&self.claude_account_deferred_holds);
         recorded
     }
 
