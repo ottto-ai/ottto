@@ -385,6 +385,23 @@ impl Uploader {
                     .saturating_sub(crate::snapshots::BACKFILL_WINDOW_DAYS * 86_400),
             }),
         );
+        // Match the service's post-prepare retry views before recording holds.
+        index.activate_terminal_contract_retries(
+            self.progress
+                .active_quarantine_retries
+                .iter()
+                .filter(|fp| {
+                    self.progress
+                        .quarantined_fingerprints
+                        .get(*fp)
+                        .is_some_and(|record| record.contract_retry_claims.is_some())
+                })
+                .cloned()
+                .collect(),
+        );
+        index.activate_reason_reoffer_retries(self.progress.active_reason_reoffers.clone());
+        index.activate_reason_reoffer_cooldowns(self.progress.reason_reoffer_cooldowns(now));
+        index.count_mixed_file_context_holds();
     }
     pub(crate) fn send(
         &mut self,

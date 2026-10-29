@@ -172,8 +172,13 @@ impl ScanIndex {
                     .insert(key.clone(), binding);
             }
         }
-        // These are parked at preparation even when no candidate is opened.
-        // Counting only candidate skips would miss the quiet no-walk path.
+    }
+
+    // Call only after this cycle's terminal leases, reason reoffers and
+    // cooldowns are active. The early ACK view alone cannot decide whether
+    // retained conflict debt is parked or selected for retry this cycle.
+    pub(crate) fn count_mixed_file_context_holds(&mut self) {
+        // Count even when the quiet path opens no candidate.
         self.mixed_context_view.held_files = self
             .mixed_context_view
             .bindings

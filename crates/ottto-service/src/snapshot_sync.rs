@@ -6431,6 +6431,7 @@ fn prepare_sync_source_inner(
         upload_progress.reason_reoffer_cooldowns(reoffer_now)
     });
     upload_progress.reselect_pending_cache_heads(&mut index, cache_observations_enabled);
+    index.count_mixed_file_context_holds();
     let mut watcher_hints = crate::snapshot_watcher::take_pending_snapshot_paths(source);
     // Leased unchanged files join the same bounded, revalidated hint queue.
     watcher_hints.paths.extend(reoffer_paths);
@@ -6891,6 +6892,7 @@ fn prepare_continuation_source(
     debug_assert!(leased_paths.is_empty());
     index.activate_reason_reoffer_cooldowns(upload_progress.reason_reoffer_cooldowns(reoffer_now));
     upload_progress.reselect_pending_cache_heads(&mut index, inputs.cache_observations_enabled);
+    index.count_mixed_file_context_holds();
     let roots = crate::snapshot_roots::scan_roots(
         source,
         home,

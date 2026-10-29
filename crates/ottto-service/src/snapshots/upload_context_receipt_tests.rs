@@ -2109,3 +2109,45 @@ fn c1_missing_current_stamp_or_cleared_source_never_holds_a_context_move() {
         "no overwritten clear debt"
     );
 }
+
+#[test]
+fn c1_hold_count_uses_prepared_cooldown_and_lease_views() {
+    let (mut f, refused) = c1_retained_mixed_file();
+    let entity = refused.snapshot_fingerprint.clone();
+    let record = f
+        .index
+        .quarantined_snapshot_fingerprints
+        .get_mut(&entity)
+        .unwrap();
+    record.retry_after_unix_seconds = 0;
+    let body = record.upload_body_witness.clone().unwrap();
+    f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
+    assert_eq!(
+        f.index.mixed_context_view.held_files, 0,
+        "not counted at early activation"
+    );
+    f.index.activate_reason_reoffer_retries(BTreeMap::new());
+    f.index.activate_reason_reoffer_cooldowns(BTreeMap::new());
+    assert!(
+        !f.index.file_upload_context_waits_for_retry(&f.key()),
+        "ordinary timer due"
+    );
+    let exact = BTreeMap::from([(entity, body)]);
+    f.index.activate_reason_reoffer_cooldowns(exact.clone());
+    f.index.count_mixed_file_context_holds();
+    assert_eq!(
+        f.index.mixed_context_view.held_files, 1,
+        "prepared cooldown parks the exact body"
+    );
+    f.index.activate_reason_reoffer_retries(exact);
+    f.index.count_mixed_file_context_holds();
+    assert_eq!(
+        f.index.mixed_context_view.held_files, 0,
+        "prepared lease makes it runnable"
+    );
+    assert!(f.uploader.retains_quarantine(&refused.snapshot_fingerprint));
+    assert!(
+        f.entry().upload_context_receipt.is_none(),
+        "no credit from a gauge"
+    );
+}
