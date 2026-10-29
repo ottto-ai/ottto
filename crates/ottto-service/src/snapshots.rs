@@ -6,6 +6,7 @@ use crate::codex_scan_diagnostics::{
 use crate::local_resource_diagnostics::claude_absence::Parent;
 use crate::local_resource_diagnostics::claude_contract;
 use crate::local_resource_diagnostics::claude_reread::IgnoredVeto;
+use crate::local_resource_diagnostics::rearm_cause;
 use crate::local_resource_diagnostics::{line_delivery_unselected, UnselectedReason};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
@@ -6346,6 +6347,7 @@ pub(crate) fn claude_stale_family_carry_refund_uncarries_for_test() -> usize {
 /// its members. Returns false when the walk had passed one, so the caller
 /// starts the traversal again and the uncarry precedes every pass.
 fn refund_claude_stale_family_carry(index: &mut ScanIndex) -> bool {
+    rearm_cause::retain(index);
     let carry = &index.claude_stale_family_carry;
     if carry.roots.is_empty() && carry.capped_roots.is_empty() {
         return true;
@@ -6391,7 +6393,7 @@ fn refund_claude_stale_family_carry(index: &mut ScanIndex) -> bool {
             .is_some_and(|member| carry.contains(member.root))
             && !entry.source_file_fingerprint.is_empty()
         {
-            entry.source_file_fingerprint.clear();
+            rearm_cause::clear(index_key, entry, rearm_cause::Cause::CarryInvalidation);
             rearmed += 1;
         }
     }
@@ -6646,6 +6648,7 @@ fn replay_and_rearm_claude_family(
     page: &VecDeque<CandidateFile>,
     rearm_parsed: bool,
 ) -> (usize, usize) {
+    rearm_cause::retain(index);
     let in_family = |index_key: &str| {
         claude_index_path_member_ref(Path::new(index_key))
             .is_some_and(|member| member.root == root_session_id)
@@ -6681,7 +6684,7 @@ fn replay_and_rearm_claude_family(
             && in_family(index_key)
             && !entry.source_file_fingerprint.is_empty()
         {
-            entry.source_file_fingerprint.clear();
+            rearm_cause::clear(index_key, entry, rearm_cause::Cause::CarryInvalidation);
             rearmed += 1;
         }
     }
@@ -28224,6 +28227,11 @@ impl OwnedSourceScan {
                 if let Some(context) = sampling.as_mut().filter(|_| active.side_origin.is_none()) {
                     if let Some(plan) = active.parser.reader.acquisition.as_ref() {
                         context.record_input(plan.metrics());
+                        resource_probe.rearm_full_completed(
+                            &local_index_key(&active.candidate.path),
+                            plan.mode(),
+                            plan.metrics().native_bytes,
+                        );
                     }
                 }
                 if active.sampling.as_ref().is_some_and(|acquisition| {
@@ -31107,6 +31115,9 @@ impl OwnedSourceScan {
                         },
                     ),
                 };
+                if source == SnapshotSource::ClaudeCode {
+                    rearm_cause::retain(index);
+                }
                 let sampled_acquisition = sampling.as_ref().map(|context| {
                     let audit_now = sampled_scan::now_seconds();
                     let pending = index
@@ -31134,6 +31145,7 @@ impl OwnedSourceScan {
                         completed_guard_bytes: context.sample_bytes,
                         acquisition_admission: context.admission,
                         page_events: crate::local_resource_diagnostics::PageEvents {
+                            full_cause: resource_probe.rearm_fulls(),
                             full_reasons: crate::local_resource_diagnostics::FullReasons(
                                 context.full_reasons,
                             ),
@@ -32611,6 +32623,7 @@ impl OwnedSourceScan {
             }
             if let Some((context, (mode, audit_due))) = sampling.as_mut().zip(planned_mode) {
                 context.record_mode(mode, audit_due);
+                resource_probe.rearm_full_selected(&local_index_key(&active.candidate.path), mode);
             }
             if let Some(delivery) = line_delivery.as_mut() {
                 delivery.arm();
@@ -32835,6 +32848,7 @@ fn append_codex_state_only_snapshots(
     index: &mut ScanIndex,
     blocked_session_ids: &BTreeSet<String>,
 ) -> (usize, usize) {
+    let snapshots_before = snapshots.len();
     let blocked_session_ids = blocked_session_ids
         .union(&index.codex_state_only_blocked_session_ids)
         .map(|session_id| resolve_codex_identity(session_id.as_str()))
@@ -32931,6 +32945,11 @@ fn append_codex_state_only_snapshots(
         // durable state and semantic no-op suppression.
         snapshots.push(snapshot);
     }
+    crate::local_resource_diagnostics::codex_state_only(
+        scanned_session_count,
+        snapshots.len().saturating_sub(snapshots_before),
+        0, // Semantic no-op suppression remains in finalize_scan_after_policy.
+    );
     (scanned_session_count, 0)
 }
 
@@ -40842,6 +40861,9 @@ fn ensure_bounded_traversal(
     collected_at: &str,
     backfill_window_days: u64,
 ) -> TraversalProgress {
+    if source == SnapshotSource::ClaudeCode {
+        rearm_cause::retain(index);
+    }
     let context_fingerprint =
         scan_traversal_context_fingerprint(source, roots, index, backfill_window_days);
     let context_observation = (source == SnapshotSource::ClaudeCode).then(|| {
@@ -40929,12 +40951,16 @@ fn ensure_bounded_traversal(
                     retained.roots.contains(member.root)
                         || retained.capped_roots.contains(member.root)
                 }) {
-                    entry.source_file_fingerprint.clear();
+                    rearm_cause::clear(key, entry, rearm_cause::Cause::CarryInvalidation);
                 }
             }
             for candidate in &retained.replay {
                 if let Some(entry) = index.files.get_mut(&local_index_key(&candidate.path)) {
-                    entry.source_file_fingerprint.clear();
+                    rearm_cause::clear(
+                        &local_index_key(&candidate.path),
+                        entry,
+                        rearm_cause::Cause::CarryInvalidation,
+                    );
                 }
             }
             index.traversal = None;
@@ -41350,7 +41376,7 @@ fn ensure_bounded_traversal(
             } else if capped_roots.contains(&root) {
                 capped_file_count += 1;
             } else {
-                entry.source_file_fingerprint.clear();
+                rearm_cause::clear(index_key, entry, transition.rearm_cause());
                 rearmed_file_count += 1;
                 if full_rearm_window_roots.contains(&root) {
                     window_rearmed_file_count += 1;
@@ -49097,6 +49123,7 @@ impl ScanIndex {
 
     fn migrate(&mut self, candidate: CandidateFile) {
         let key = local_index_key(&candidate.path);
+        rearm_cause::reproven(&key);
         let last_snapshot_fingerprint = self
             .files
             .get(&key)
@@ -49150,6 +49177,7 @@ impl ScanIndex {
         parse_outcome: ScanParseOutcome,
     ) {
         let key = local_index_key(&candidate.path);
+        rearm_cause::reproven(&key);
         let last_upload_body_witness = self
             .files
             .get(&key)
@@ -59292,7 +59320,10 @@ mod tests {
                     1,
                     "the other, unowned state row still falls back"
                 );
-                assert!(rows.is_empty(), "a committed owner supplies coverage");
+                assert!(
+                    rows.iter().all(|row| row["stage"] == "codex_state_only"),
+                    "a committed owner supplies coverage"
+                );
                 // Model an already-uploaded exclusive body and apply the new batch.
                 let witness = snapshot_upload_body_witness(&native);
                 let mut uploaded = BTreeMap::from([(owner.to_string(), native.clone())]);
@@ -59406,7 +59437,10 @@ mod tests {
             2,
             "no produced body means both state rows retain main's fallback"
         );
-        assert!(rows.is_empty(), "no replacement risk without a fingerprint");
+        assert!(
+            rows.iter().all(|row| row["stage"] == "codex_state_only"),
+            "no replacement risk without a fingerprint"
+        );
     }
 
     #[test]
@@ -59456,7 +59490,7 @@ mod tests {
                     assert_eq!(replacements[0].source_session_id, owner);
                     assert_eq!(replacements[0].unattributed_total_tokens, 900);
                 }
-                assert!(rows.is_empty());
+                assert!(rows.iter().all(|row| row["stage"] == "codex_state_only"));
             }
         }
     }
@@ -59519,7 +59553,7 @@ mod tests {
                     items.is_empty(),
                     "header and unique filename identities both retain coverage"
                 );
-                assert!(rows.is_empty());
+                assert!(rows.iter().all(|row| row["stage"] == "codex_state_only"));
             }
         }
     }
@@ -59576,7 +59610,7 @@ mod tests {
             )
         });
         assert!(
-            rows.is_empty(),
+            rows.iter().all(|row| row["stage"] == "codex_state_only"),
             "zero supported candidates are not ambiguity observations"
         );
         assert_eq!(items.len(), 1);
@@ -59619,6 +59653,74 @@ mod tests {
             assert!(replacements.iter().any(
                 |item| item.source_session_id == owner && item.unattributed_total_tokens == 900
             ));
+        }
+    }
+
+    #[test]
+    fn codex_state_only_terminal_diagnostic_counts_uncovered_entities() {
+        for n in [0, 1, 3] {
+            let dir = temp_dir("codex-state-only-terminal-counts");
+            let sessions = dir.join("sessions");
+            fs::create_dir_all(&sessions).unwrap();
+            let connection = Connection::open(dir.join("state_5.sqlite")).unwrap();
+            connection.execute(CODEX_THREADS_DDL, []).unwrap();
+            for i in 0..=n {
+                connection
+                    .execute(
+                        CODEX_THREADS_INSERT,
+                        (
+                            format!("019e253c-bbbb-7000-9000-{i:012x}"),
+                            "Synthetic State Thread",
+                            if i < n { 59_i64 } else { 0 },
+                            0_i64,
+                            1_777_777_000_i64,
+                            1_777_777_100_i64,
+                            1_777_777_000_000_i64,
+                            1_777_777_100_000_i64,
+                            "fixture-model",
+                        ),
+                    )
+                    .unwrap();
+            }
+            drop(connection);
+            let mut index = ScanIndex::default();
+            let (scan, rows) = crate::local_resource_diagnostics::capture(|| {
+                scan_source_roots(
+                    SnapshotSource::Codex,
+                    &[sessions],
+                    &mut index,
+                    "2026-05-14T10:04:00Z",
+                    BACKFILL_WINDOW_DAYS,
+                )
+                .unwrap()
+            });
+            assert!(scan.census_complete, "the real terminal append call ran");
+            assert_eq!(scan.snapshots.len(), n);
+            assert_eq!(scan.scanned_session_count, n);
+            assert_eq!(scan.semantic_noop_count, 0);
+            let observations = rows
+                .iter()
+                .filter(|row| row["stage"] == "codex_state_only")
+                .collect::<Vec<_>>();
+            if n == 0 {
+                assert!(observations.is_empty(), "all-zero diagnostic is omitted");
+            } else {
+                assert_eq!(observations.len(), 1, "one record per terminal call");
+                assert_eq!(observations[0]["source"], "codex");
+                assert_eq!(
+                    observations[0]["counts"],
+                    json!({"codex_state_only": {
+                        "scanned": n, "emitted": n, "noops": 0,
+                    }})
+                );
+            }
+            assert!(!serde_json::to_string(&scan.snapshots)
+                .unwrap()
+                .contains("codex_state_only"));
+            assert!(!serde_json::to_string(&index)
+                .unwrap()
+                .contains("\"codex_state_only\":"));
+            fs::remove_dir_all(dir).unwrap();
         }
     }
 
