@@ -3420,8 +3420,10 @@ fn q11_overflow_never_forgets_a_spent_key_and_pread_charges_actual_bytes() {
     file.seek(SeekFrom::Start(3)).unwrap();
     assert_eq!(failed.read(&mut file, &mut [0; 128]).unwrap(), 3);
     assert_eq!(retail_reads(), vec![(3, 3, 3)]);
-    let mut summary = Counters::default();
-    summary.retail_keys = 1;
+    let summary = Counters {
+        retail_keys: 1,
+        ..Counters::default()
+    };
     let line = summary.summary(SnapshotSource::ClaudeCode, &store::StoreCounters::default());
     assert!(line.contains("retail_keys=1"));
     assert!(line.contains("budget_refused_retail_old_bytes="));
@@ -6034,7 +6036,7 @@ fn a0h_native_exhaustion_growth_pacing_reselection_and_restart_body() {
                 std::time::Instant::now(),
             )
             .unwrap();
-        drop(idle);
+        idle.finish();
         let ((_, _, idle_modes), idle_io) =
             a0h_observe(|| a0h_scan(&idle_owner, &roots, &root, prior.clone()));
         assert_eq!(idle_modes.0, 0);
@@ -6097,7 +6099,7 @@ fn a0h_native_exhaustion_growth_pacing_reselection_and_restart_body() {
                     )
                     .unwrap();
                 // P2 terminal-drop aftermath: destroy the unread guard, never refund it.
-                drop(guard);
+                guard.finish();
                 assert_eq!(
                     owner.cache.durable().unwrap().retail_spent
                         [&store::key_digest(DurableSource::ClaudeCode, &key)]

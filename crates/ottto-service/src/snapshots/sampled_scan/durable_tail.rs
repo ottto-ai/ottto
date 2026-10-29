@@ -870,7 +870,7 @@ impl SharedCache {
         accepted_end: u64,
         now: std::time::Instant,
     ) -> Result<RetailAttempt, RetailHold> {
-        if custody_node_bytes().is_none_or(|n| n > 1024) {
+        if custody_node_bytes().map_or(true, |n| n > 1024) {
             return Err(RetailHold::AccountingLost);
         }
         let c = checkpoint
@@ -973,7 +973,7 @@ impl SharedCache {
         let interval = std::time::Duration::from_secs(PACE_SECS);
         stores.retail_full_at.retain(|_, at| {
             now.checked_duration_since(*at)
-                .is_none_or(|age| age < interval)
+                .map_or(true, |age| age < interval)
         });
         let key = store::key_digest(DurableSource::ClaudeCode, key);
         if stores.retail_full_at.contains_key(&key) {

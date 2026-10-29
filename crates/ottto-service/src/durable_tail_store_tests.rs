@@ -2777,7 +2777,7 @@ fn batch_ack_has_a_fixed_allocation_at_the_dirty_batch_limit() {
     let acks = receipt.committed.as_ref().expect("real durable writes");
     assert_eq!(acks.iter().flatten().count(), MAX_BATCH);
     assert_eq!(std::mem::size_of_val(acks.as_ref()), BATCH_ACK_BYTES);
-    assert!(BATCH_ACK_BYTES <= MAX_BATCH * 80);
+    const { assert!(BATCH_ACK_BYTES <= MAX_BATCH * 80) };
     assert!(store.counters().peak_codec_bytes >= BATCH_ACK_BYTES as u64);
     assert!(acks
         .iter()
