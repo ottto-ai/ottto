@@ -2141,3 +2141,105 @@ fn unoffered_started_rebuild_survives_save_until_its_replacement_is_offered() {
     assert!(store.rebuilt.is_empty());
     assert_eq!(store.counters().t14_rebuild_full_started, 1);
 }
+
+/// R2-U: only an undecodable or unbindable record's growth reads: one grant
+/// per key until its Full starts, then none inside `U_GROWTH_PACE` (counted;
+/// a RAM copy still tails). Idle, newer/unknown and T14 are unchanged, the
+/// pace is RAM-only, the grants are bounded and no record is touched.
+#[test]
+fn u_growth_grant_is_paced_per_key_and_never_touches_the_record() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let transcript = scratch.transcript("t.jsonl", b"{}\n");
+    let mut store = scratch.store();
+    let b = binding("acct", "scope", ("fp", None));
+    store
+        .write_after_save(
+            &lock,
+            1,
+            vec![pending(b.clone(), certificate(&transcript), 1)],
+        )
+        .unwrap();
+    let valid = fs::read(record_file(&store, &b.key)).unwrap();
+    let mut newer = valid.clone();
+    set_version(&mut newer, 2);
+    let mut unknown = valid.clone();
+    unknown[10] ^= 1;
+    let keys: [Digest32; 4] = [[1; 32], [2; 32], [3; 32], [4; 32]];
+    let reasons = [
+        Refusal::Undecodable,
+        Refusal::Unbindable,
+        Refusal::NewerFormat,
+        Refusal::Unknown,
+    ];
+    let records = [b"bad".to_vec(), valid.clone(), newer, unknown];
+    for (key, bytes) in keys.iter().zip(&records) {
+        put_record(&record_file(&store, key), bytes);
+    }
+    let grown = Growth::Grown { ram: false };
+    let mut cold = scratch.store();
+    for ((key, reason), read) in keys.iter().zip(reasons).zip([true, true, false, false]) {
+        let unread = (!read).then_some(reason);
+        assert_eq!(
+            cold.hold_with(key, Growth::Idle),
+            Some(reason),
+            "{reason:?}"
+        );
+        assert_eq!(cold.hold(key), Some(reason));
+        assert_eq!(cold.hold_with(key, grown), unread, "{reason:?}: growth");
+        // The grant serves the restore recheck and the Full's start.
+        assert_eq!(cold.hold(key), unread);
+        assert_eq!(cold.full_hold(key, true), unread);
+        // Started: growth inside the pace holds; a RAM copy still tails.
+        assert_eq!(
+            cold.hold_with(key, grown),
+            Some(reason),
+            "{reason:?}: paced"
+        );
+        assert_eq!(cold.hold_with(key, Growth::Grown { ram: true }), unread);
+        assert_eq!(cold.hold(key), Some(reason));
+    }
+    assert_eq!(cold.counters().u_growth, [1, 1, 2]);
+    // Past the pace: one more grant. Idle clears a grant whose Full never started.
+    cold.advance_clock(U_GROWTH_PACE);
+    assert_eq!(cold.hold_with(&keys[0], grown), None);
+    assert_eq!(
+        cold.hold_with(&keys[0], Growth::Idle),
+        Some(Refusal::Undecodable)
+    );
+    assert_eq!(cold.hold(&keys[0]), Some(Refusal::Undecodable));
+    assert_eq!(cold.counters().u_growth, [2, 1, 2]);
+    // The pace is RAM-only: a restart grants again.
+    let mut restarted = scratch.store();
+    assert_eq!(restarted.hold_with(&keys[1], grown), None);
+    // T14 is unchanged by growth: one rebuild, no grant.
+    let mut corrupt = valid.clone();
+    let end = corrupt.len() - 1;
+    corrupt[end] ^= 1;
+    put_record(&record_file(&store, &b.key), &corrupt);
+    let mut t14 = scratch.store();
+    assert_eq!(t14.hold_with(&b.key, grown), None);
+    assert_eq!(t14.counters().t14_rebuild, 1);
+    assert_eq!(t14.counters().u_growth, [0; 3]);
+    // Bound: past `U_GROWTH_BOUND` unspent grants a new key waits (counted)
+    // until a started grant is paced out.
+    let mut bounded = scratch.store();
+    let many = (10..=10 + U_GROWTH_BOUND as u8)
+        .map(|n| [n; 32])
+        .collect::<Vec<_>>();
+    for key in &many {
+        put_record(&record_file(&store, key), b"bad");
+    }
+    for key in &many[..U_GROWTH_BOUND] {
+        assert_eq!(bounded.hold_with(key, grown), None);
+    }
+    let last = &many[U_GROWTH_BOUND];
+    assert_eq!(bounded.hold_with(last, grown), Some(Refusal::Undecodable));
+    assert_eq!(bounded.counters().u_growth[2], 1);
+    assert_eq!(bounded.full_hold(&many[0], true), None);
+    bounded.advance_clock(U_GROWTH_PACE);
+    assert_eq!(bounded.hold_with(last, grown), None);
+    for (key, bytes) in keys.iter().zip(&records) {
+        assert_eq!(&fs::read(record_file(&store, key)).unwrap(), bytes);
+    }
+}

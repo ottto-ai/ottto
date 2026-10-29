@@ -27665,15 +27665,21 @@ impl OwnedSourceScan {
                         pending!();
                     }
                     // Grouped members bypass the per-candidate guard: one held member holds the group.
+                    // Growth of any member reads the whole group.
                     #[cfg(unix)]
                     if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
+                        let grown = group.members.iter().any(|member| {
+                            let key = local_index_key(&member.path);
+                            member.size_bytes
+                                > index.files.get(&key).map_or(0, |entry| entry.size_bytes)
+                        });
                         if let Some((member, reason)) = group.members.iter().find_map(|member| {
                             Some((
                                 member,
-                                cache.durable_full_hold(
+                                cache.durable_group_hold(
                                     source,
                                     &local_index_key(&member.path),
-                                    false,
+                                    grown,
                                 )?,
                             ))
                         }) {
@@ -31215,9 +31221,12 @@ impl OwnedSourceScan {
             #[cfg(unix)]
             if side_plan.is_none() {
                 if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
-                    if let Some(reason) =
-                        cache.durable_hold(source, &local_index_key(&candidate.path))
-                    {
+                    let key = local_index_key(&candidate.path);
+                    let committed = index.files.get(&key).map_or(0, |entry| entry.size_bytes);
+                    let grown = opened_file
+                        .metadata()
+                        .is_ok_and(|metadata| metadata.len() > committed);
+                    if let Some(reason) = cache.durable_hold(source, &key, grown) {
                         cache.durable_hold_exit(source, reason, index, &candidate, &mut census);
                         pending!();
                     }

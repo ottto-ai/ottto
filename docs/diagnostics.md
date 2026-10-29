@@ -174,6 +174,15 @@ retryable (red) for the whole hold, so census close, retirement and
 account-family proof wait for that source; a held key is not yet terminal
 disclosed residue.
 
+An undecodable or unbindable record (one no binary can read) holds its file
+only while the file is idle. When the held file grows past its committed index
+end, the file takes the ordinary counted read: a RAM copy tails, otherwise one
+Full, whose restore miss is `refused_record.undecodable` or
+`refused_record.unbindable`. That Full is paced to at most one per key per 6 h
+in this process. The record is never rewritten or collected. The `durable_tail`
+line counts these as `u_growth[undecodable,unbindable,paced]`. Newer-format and
+unknown records still hold under the downgrade exception.
+
 ## Credential File Cap Refusals
 
 Schema 2 adds `credential_file_cap_refusal` point records on the same

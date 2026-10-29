@@ -17,7 +17,9 @@
 //!   only when its generation is at or below the loaded index's committed
 //!   generation and the index entry it was written for is still the
 //!   committed one. Anything else is Full; nothing is partially applied.
-//! - Unknown representations hold acquisition and survive every mutation. A
+//! - Unknown representations hold acquisition and survive every mutation. An
+//!   undecodable or unbindable record (no binary can read it) still lets its
+//!   file's growth read, paced per key (`U_GROWTH_PACE`). A
 //!   known corrupt record (T14) permits one rebuild Full and its post-save
 //!   rename-over replacement. If no replacement lands, RAM alone serves
 //!   the key, or it is held without affecting the source census. More than
@@ -39,6 +41,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// Envelope format. Bump on any envelope or certificate layout change.
 pub(crate) const FORMAT_VERSION: u16 = 1;
@@ -369,6 +372,9 @@ pub(crate) struct StoreCounters {
     /// Writes skipped: predecessor unknown, or a new key while record files
     /// exceed `INVENTORY_BOUND` (offered again after the next save).
     pub(crate) store_write_skipped: [u64; 2],
+    /// U-held growth: reads granted [undecodable, unbindable], and growth
+    /// left held by the pace or the grant bound.
+    pub(crate) u_growth: [u64; 3],
     /// T14 rebuild authorizations (RAM may already hold the file), and mode repairs.
     pub(crate) t14_rebuild: u64,
     /// First admitted rebuild Full starts in this process, not persisted repetition history.
@@ -418,6 +424,22 @@ pub(crate) struct DurableTailStore {
     pass: [u64; 2],
     /// Process-lifetime attempts, removed only after a successful replacement.
     rebuilt: BTreeMap<Digest32, Rebuild>,
+    /// U-held growth grants: `None` until the granted read's Full starts,
+    /// then that start. RAM only; a restart grants again.
+    u_growth: BTreeMap<Digest32, Option<Instant>>,
+    #[cfg(test)]
+    clock: Duration,
+}
+
+/// What the caller knows about the held file against its committed index end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Growth {
+    Unknown,
+    Idle,
+    /// Held-FD length past the committed end; `ram`: a RAM copy can Tail it.
+    Grown {
+        ram: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -436,6 +458,11 @@ pub(crate) const INVENTORY_BOUND: usize = 2 * MAX_RECORDS;
 /// `max(T14_BREAKER, 2% of the records loaded)`.
 pub(crate) const T14_BREAKER: u64 = 20;
 const REBUILT_BOUND: usize = 64;
+/// At most one U-held growth Full per key per this long. Below the smallest
+/// discovery window (one day), so growth is read before it ages out.
+pub(crate) const U_GROWTH_PACE: Duration = Duration::from_secs(6 * 60 * 60);
+const _: () = assert!(U_GROWTH_PACE.as_secs() < 24 * 60 * 60);
+const U_GROWTH_BOUND: usize = REBUILT_BOUND;
 // A memo entry stays within the 128 bytes per record `STORES_RESIDENT_BOUND` charges.
 const _: () = assert!(std::mem::size_of::<(Digest32, (Option<Digest32>, Stamp))>() <= 128);
 
@@ -450,6 +477,9 @@ impl DurableTailStore {
             checked: false,
             pass: [0; 2],
             rebuilt: BTreeMap::new(),
+            u_growth: BTreeMap::new(),
+            #[cfg(test)]
+            clock: Duration::ZERO,
         }
     }
 
@@ -650,6 +680,11 @@ impl DurableTailStore {
 
     /// U holds. T14 permits one rebuild; the adapter checks RAM before holding.
     pub(crate) fn hold(&mut self, key: &Digest32) -> Option<Refusal> {
+        self.hold_with(key, Growth::Unknown)
+    }
+
+    /// `hold`, where an undecodable or unbindable record's growth reads.
+    pub(crate) fn hold_with(&mut self, key: &Digest32, growth: Growth) -> Option<Refusal> {
         let result = self.classify(key, "guard");
         self.pass[0] += u64::from(!matches!(result, Ok(None)));
         match result {
@@ -667,8 +702,59 @@ impl DurableTailStore {
             }
             Err(Refusal::Corrupt) if self.rebuilt[key] == Rebuild::Authorized => None,
             Ok(_) => None,
+            Err(reason @ (Refusal::Undecodable | Refusal::Unbindable))
+                if self.u_growth_reads(key, reason, growth) =>
+            {
+                None
+            }
             Err(reason) => Some(reason),
         }
+    }
+
+    /// The record stays as it is (writes skip U); only this RAM grant changes.
+    fn u_growth_reads(&mut self, key: &Digest32, reason: Refusal, growth: Growth) -> bool {
+        let now = self.now();
+        let paced = |at: Instant| now.saturating_duration_since(at) < U_GROWTH_PACE;
+        match (growth, self.u_growth.get(key).copied()) {
+            (Growth::Idle, Some(None)) => {
+                self.u_growth.remove(key);
+                false
+            }
+            (Growth::Idle, _) => false,
+            (_, Some(None)) => true,
+            (Growth::Unknown, _) => false,
+            (Growth::Grown { ram }, Some(Some(at))) if paced(at) => {
+                self.counters.u_growth[2] += u64::from(!ram);
+                ram
+            }
+            (Growth::Grown { .. }, _) => {
+                if self.u_growth.len() >= U_GROWTH_BOUND && !self.u_growth.contains_key(key) {
+                    self.u_growth.retain(|_, at| at.map_or(true, paced));
+                    if self.u_growth.len() >= U_GROWTH_BOUND {
+                        self.counters.u_growth[2] += 1;
+                        return false;
+                    }
+                }
+                self.u_growth.insert(*key, None);
+                self.counters.u_growth[usize::from(reason == Refusal::Unbindable)] += 1;
+                true
+            }
+        }
+    }
+
+    #[cfg(not(test))]
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    #[cfg(test)]
+    fn now(&self) -> Instant {
+        Instant::now() + self.clock
+    }
+
+    #[cfg(test)]
+    pub(crate) fn advance_clock(&mut self, by: Duration) {
+        self.clock += by;
     }
 
     pub(crate) fn full_hold(&mut self, key: &Digest32, start: bool) -> Option<Refusal> {
@@ -680,6 +766,10 @@ impl DurableTailStore {
         {
             self.rebuilt.insert(*key, Rebuild::Started);
             self.counters.t14_rebuild_full_started += 1;
+        }
+        if start && held.is_none() && self.u_growth.get(key) == Some(&None) {
+            let now = self.now();
+            self.u_growth.insert(*key, Some(now));
         }
         held
     }

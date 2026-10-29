@@ -110,6 +110,7 @@ impl Counters {
              bytes_read={} format_hold[newer,unknown,undecodable,unbindable,known_corrupt]={:?} durable_held={:?} held_census[kept,invalidated]={:?} \
              guard_header_bytes={} guard_verify_bytes={} delete_verify_bytes={} overwrite_verify_bytes={} \
              uninventoried_records={} store_write_skipped[unknown,inventory_overflow]={:?} \
+             u_growth[undecodable,unbindable,paced]={:?} \
              gc_records_deleted={} gc_records_read={} gc_bytes_read={} gc_keep_peak={} \
              records_invalidated={} peak_codec_bytes={} t14_rebuild_full_started={}",
             source.api_slug(),
@@ -136,6 +137,7 @@ impl Counters {
             store.overwrite_verify_bytes,
             store.uninventoried_records,
             store.store_write_skipped,
+            store.u_growth,
             store.gc_records_deleted,
             store.gc_records_read,
             store.gc_bytes_read,
@@ -488,28 +490,36 @@ impl SharedCache {
         }
     }
 
+    /// `grown`: the held FD is longer than the committed index entry.
     pub(crate) fn durable_hold(
         &self,
         snapshot_source: SnapshotSource,
         key: &str,
+        grown: bool,
     ) -> Option<store::Refusal> {
-        self.durable_guard(snapshot_source, key, false)
+        self.durable_guard(snapshot_source, key, Some(grown))
     }
 
+    /// `grown`: `None` is the restore recheck.
     fn durable_guard(
         &self,
         snapshot_source: SnapshotSource,
         key: &str,
-        restore_recheck: bool,
+        grown: Option<bool>,
     ) -> Option<store::Refusal> {
-        let ram = !restore_recheck && self.retained().is_ok_and(|ram| ram.peek(key).is_some());
+        let ram = grown.is_some() && self.retained().is_ok_and(|ram| ram.peek(key).is_some());
+        let growth = match grown {
+            None => store::Growth::Unknown,
+            Some(false) => store::Growth::Idle,
+            Some(true) => store::Growth::Grown { ram },
+        };
         let source = durable_source(snapshot_source)?;
         let held = self
             .durable()?
             .slot(source)
             .as_mut()?
             .store
-            .hold(&store::key_digest(source, key));
+            .hold_with(&store::key_digest(source, key), growth);
         if held == Some(store::Refusal::Corrupt) && ram {
             Counters::bump(
                 &mut self.durable()?.counters.not_persisted,
@@ -518,6 +528,34 @@ impl SharedCache {
             return None;
         }
         held
+    }
+
+    /// A grouped member's hold; `grown`: some member is past its committed end.
+    pub(crate) fn durable_group_hold(
+        &self,
+        source: SnapshotSource,
+        key: &str,
+        grown: bool,
+    ) -> Option<store::Refusal> {
+        let growth = if grown {
+            store::Growth::Grown { ram: false }
+        } else {
+            store::Growth::Idle
+        };
+        let source = durable_source(source)?;
+        self.durable()?
+            .slot(source)
+            .as_mut()?
+            .store
+            .hold_with(&store::key_digest(source, key), growth)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn durable_advance_clock(&self, source: SnapshotSource, by: std::time::Duration) {
+        let source = durable_source(source).unwrap();
+        if let Some(slot) = self.durable().unwrap().slot(source).as_mut() {
+            slot.store.advance_clock(by);
+        }
     }
 
     pub(crate) fn durable_full_hold(
@@ -599,7 +637,7 @@ impl SharedCache {
         ) {
             Ok(taken) => RestoreOutcome::Restored(Box::new(taken)),
             Err(class) => self
-                .durable_guard(snapshot_source, key, true)
+                .durable_guard(snapshot_source, key, None)
                 .map_or(RestoreOutcome::Miss(class), RestoreOutcome::Held),
         }
     }

@@ -804,6 +804,9 @@ impl RestoreTestOutcome for sampled_scan::durable_tail::RestoreOutcome {
 /// C1: `known_corrupt` (T14) is not held: one counted rebuild, acquired like
 /// the control, record untouched before the save. C2: the pass's held keys and
 /// rebuilds reach the `local_resources` alarm for this source.
+/// R2-U: the indexed entry is idle (committed end = file length), so every U
+/// kind holds; a fresh index has no committed end, so an undecodable or
+/// unbindable record's file is growth and reads, record untouched.
 #[test]
 fn common_hold_precedes_outer_gates_and_full_acquisition() {
     use sha2::{Digest, Sha256};
@@ -932,7 +935,8 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                 } else {
                     cache.durable_begin_pass(source, &index_path, &namespace, false);
                     let fingerprint = if bypass == "cleared" { "" } else { "fp" };
-                    let entry: ScanIndexEntry = serde_json::from_value(serde_json::json!({"size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":fingerprint,"last_snapshot_fingerprint":"accepted-body"})).unwrap();
+                    let size = std::fs::metadata(&path).unwrap().len();
+                    let entry: ScanIndexEntry = serde_json::from_value(serde_json::json!({"size_bytes":size,"modified_unix_seconds":1,"source_file_fingerprint":fingerprint,"last_snapshot_fingerprint":"accepted-body"})).unwrap();
                     index.files.insert(key.clone(), entry);
                     if bypass == "owed" {
                         index.activate_effective_upload_body_witness_revision(2);
@@ -1008,7 +1012,8 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                     )
                     .is_none());
                 }
-                let held = kind != "none" && !corrupt;
+                let grows = bypass == "fresh_index" && matches!(kind, "undecodable" | "unbindable");
+                let held = kind != "none" && !corrupt && !grows;
                 let mut completed = false;
                 let mut acquired = false;
                 let mut header_dropped = false;
@@ -1090,7 +1095,16 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                 );
                 let ((), alarms) =
                     crate::local_resource_diagnostics::capture(|| cache.durable_alarm(source));
-                let alarmed = reachable && kind != "none";
+                assert_eq!(
+                    store_counts.u_growth,
+                    [
+                        u64::from(grows && kind == "undecodable"),
+                        u64::from(grows && kind == "unbindable"),
+                        0
+                    ],
+                    "{source:?}/{kind}/{bypass}"
+                );
+                let alarmed = reachable && kind != "none" && !grows;
                 assert_eq!(
                     alarms.len(),
                     usize::from(alarmed),
@@ -1117,7 +1131,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                 if let Some(class) = class {
                     assert_eq!(
                         counts.durable_held[class],
-                        u64::from(reachable && !corrupt),
+                        u64::from(reachable && held),
                         "{source:?}/{corrupt}/{bypass}"
                     );
                     assert_eq!(std::fs::read(&record_path).unwrap(), bytes);
@@ -1125,6 +1139,225 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                     assert_eq!(counts.durable_held, [0; 5]);
                 }
                 assert_eq!(counts.restored, 0);
+                let _ = std::fs::remove_dir_all(root);
+            }
+        }
+    }
+}
+
+/// One more usage line for the `native_fixture` or `codex_budget_fixture` file.
+fn grow_fixture(path: &Path, source: SnapshotSource, n: u64) {
+    use std::io::Write;
+    let line = if source == SnapshotSource::Codex {
+        let usage = |input: u64, output: u64| {
+            serde_json::json!({"input_tokens":input,"cached_input_tokens":0,
+                "output_tokens":output,"reasoning_output_tokens":0})
+        };
+        let total = crate::snapshots::session_start::WINDOW_REQUESTS as u64 + n;
+        serde_json::json!({"type":"event_msg","timestamp":"2026-10-07T10:00:02Z",
+            "payload":{"type":"token_count","info":{
+                "total_token_usage":usage(100 * total, 10 * total),
+                "last_token_usage":usage(100, 10),"model":"gpt-5.2"}}})
+    } else {
+        serde_json::json!({"type":"assistant","sessionId":"11111111-2222-4333-8444-555555555555",
+            "timestamp":"2026-10-07T10:00:02Z","requestId":format!("req-dt-u-{n}"),
+            "message":{"id":format!("msg-dt-u-{n}"),"model":"fixture-model",
+                "usage":{"input_tokens":100,"output_tokens":10}}})
+    };
+    let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+    writeln!(file, "{line}").unwrap();
+}
+
+/// R2-U (E1 hold-drop audit #1): an undecodable or unbindable record, which
+/// no binary can read. Idle: held, zero reads. Growth past the committed end:
+/// one counted Full whose body is a cold Full's of the same bytes, and the
+/// record is never touched (the post-save write skips it). More growth inside
+/// `U_GROWTH_PACE` with no RAM copy: held, counted as paced, zero reads. Quiet
+/// past the pace, or a restart: one counted Full with the exact final body (no
+/// duplicated prefix). Idle again: held, zero reads.
+#[test]
+fn u_record_growth_reads_one_paced_counted_full_and_keeps_the_record() {
+    use std::os::unix::fs::PermissionsExt;
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        for kind in ["undecodable", "unbindable"] {
+            for exit in ["quiet", "restart"] {
+                let root = crate::test_scratch::private_dir("ottto-dt-u-growth");
+                let lock = test_locks::hold(&root);
+                let sessions = root.join("sessions");
+                std::fs::create_dir(&sessions).unwrap();
+                let path = sessions.join("0199f7a0-0000-7000-8000-0000000d7a11.jsonl");
+                if source == SnapshotSource::Codex {
+                    codex_budget_fixture(&path, "0199f7a0-0000-7000-8000-0000000d7a11", None);
+                } else {
+                    native_fixture(&path);
+                }
+                let key = local_index_key(&path);
+                let index_path = root.join("index.json");
+                let namespace = Scope("u-growth".into());
+                let len = || std::fs::metadata(&path).unwrap().len();
+                // One scan: (index, emitted body, native bytes, Full files).
+                // `committed`: the indexed entry's end, under the store; `None`
+                // is the cold oracle (no index entry, no store).
+                let run = |cache: &Arc<SharedCache>, committed: Option<u64>| {
+                    let mut index = ScanIndex::default();
+                    if let Some(size) = committed {
+                        cache.durable_begin_pass(source, &index_path, &namespace, false);
+                        index.files.insert(key.clone(), serde_json::from_value(serde_json::json!({"size_bytes":size,"modified_unix_seconds":1,"source_file_fingerprint":"fp"})).unwrap());
+                    }
+                    let mut scan = OwnedSourceScan::new(
+                        source,
+                        std::slice::from_ref(&sessions),
+                        index,
+                        "2026-10-20T12:00:00Z",
+                        365,
+                        100,
+                        false,
+                        None,
+                        &[],
+                        false,
+                        true,
+                    )
+                    .with_sampled_acquisition(cache.clone(), namespace.clone());
+                    let mut read = (0, 0);
+                    for _ in 0..10_000 {
+                        match scan.step(None) {
+                            OwnedSourceScanStep::Pending(next) => {
+                                if let Some(c) = next.sampling.as_ref() {
+                                    read = (c.native_bytes, c.full_files);
+                                }
+                                scan = next;
+                            }
+                            OwnedSourceScanStep::Complete {
+                                index,
+                                scan: mut result,
+                                ..
+                            } => {
+                                apply_upload_policy(
+                                    source,
+                                    &mut result.snapshots,
+                                    SnapshotUploadPolicy::default(),
+                                );
+                                let body = serde_json::to_value(result.snapshots).unwrap();
+                                return (index, body, read.0, read.1);
+                            }
+                        }
+                    }
+                    panic!("scan did not finish");
+                };
+                let cold = || run(&Arc::new(SharedCache::default()), None).1;
+                let ds = durable_source(source).unwrap();
+                let digest = store::key_digest(ds, &key);
+                let mut disk = DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+                disk.write_after_save(
+                    lock,
+                    1,
+                    vec![PendingRecord {
+                        binding: Binding {
+                            source: ds,
+                            key: digest,
+                            context: [0; 32],
+                            scope: [0; 32],
+                            entry: [0; 32],
+                        },
+                        certificate: certificate(&path, &namespace),
+                        body: crate::snapshots::durable_store_fixture_body(source, 0, 0),
+                        allowlist: codec::allowlist_digest(source),
+                    }],
+                )
+                .unwrap();
+                let record = disk.dir().join(format!(
+                    "{}.rec",
+                    digest
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>()
+                ));
+                drop(disk);
+                let mut bytes = std::fs::read(&record).unwrap();
+                if kind == "undecodable" {
+                    bytes.truncate(5);
+                } else {
+                    bytes[43] ^= 1;
+                }
+                std::fs::write(&record, &bytes).unwrap();
+                std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o600)).unwrap();
+                let class = usize::from(kind == "unbindable");
+                let held_body = serde_json::json!([]);
+
+                // Idle: the selection parses (fingerprint differs), no growth.
+                let cache = Arc::new(SharedCache::default());
+                let (_, body, native, full) = run(&cache, Some(len()));
+                assert_eq!(
+                    (body, native, full),
+                    (held_body.clone(), 0, 0),
+                    "{source:?}/{kind}: idle"
+                );
+                let (counts, stats) = cache.durable_counters(source).unwrap();
+                assert_eq!(counts.durable_held[2 + class], 1);
+                assert_eq!(stats.u_growth, [0; 3]);
+
+                // Growth: one counted Full, the cold body; the record is untouched.
+                let first = len();
+                grow_fixture(&path, source, 1);
+                let grown = len();
+                let (index, body, native, full) = run(&cache, Some(first));
+                let first_body = cold();
+                assert_ne!(first_body, held_body);
+                assert_eq!(
+                    (body, native, full),
+                    (first_body.clone(), grown, 1),
+                    "{source:?}/{kind}: growth"
+                );
+                crate::snapshots::durable_after_save(&cache, &root, source, &index);
+                let (_, stats) = cache.durable_counters(source).unwrap();
+                assert_eq!(stats.u_growth[class], 1);
+                assert_eq!(stats.records_written, 0);
+                assert_eq!(std::fs::read(&record).unwrap(), bytes);
+
+                // More growth inside the pace, no RAM copy: held and counted.
+                let _ = cache.take(&key);
+                grow_fixture(&path, source, 2);
+                let (_, body, native, full) = run(&cache, Some(grown));
+                assert_eq!(
+                    (body, native, full),
+                    (held_body.clone(), 0, 0),
+                    "{source:?}/{kind}: paced"
+                );
+                let (counts, stats) = cache.durable_counters(source).unwrap();
+                assert_eq!(stats.u_growth[2], 1);
+                assert_eq!(counts.durable_held[2 + class], 2);
+
+                // Quiet past the pace (discovery keeps it: the pace is below
+                // one day), or a restart: one counted Full, exact final body.
+                let cache = if exit == "restart" {
+                    Arc::new(SharedCache::default())
+                } else {
+                    cache.durable_advance_clock(source, store::U_GROWTH_PACE);
+                    cache
+                };
+                let (_, body, native, full) = run(&cache, Some(grown));
+                let final_body = cold();
+                assert_ne!(final_body, first_body, "the later growth is in the body");
+                assert_eq!(
+                    (body, native, full),
+                    (final_body, len(), 1),
+                    "{source:?}/{kind}/{exit}"
+                );
+
+                // Idle again: held, zero reads.
+                let (_, body, native, full) = run(&cache, Some(len()));
+                assert_eq!(
+                    (body, native, full),
+                    (held_body.clone(), 0, 0),
+                    "{source:?}/{kind}/{exit}: idle"
+                );
+                let (_, stats) = cache.durable_counters(source).unwrap();
+                let mut reads = [0; 3];
+                reads[class] = if exit == "restart" { 1 } else { 2 };
+                reads[2] = u64::from(exit == "quiet");
+                assert_eq!(stats.u_growth, reads, "{source:?}/{kind}/{exit}");
+                assert_eq!(stats.records_written, 0);
+                assert_eq!(std::fs::read(&record).unwrap(), bytes);
                 let _ = std::fs::remove_dir_all(root);
             }
         }
@@ -1177,7 +1410,7 @@ fn foreign_owned_store_alarms_once_and_holds_nothing() {
     let cache = SharedCache::default();
     cache.durable_begin_pass(source, &index_path, &namespace, false);
     assert!(
-        cache.durable_hold(source, key).is_some(),
+        cache.durable_hold(source, key, false).is_some(),
         "control: U holds"
     );
     let _own = OwnUid;
@@ -1187,7 +1420,7 @@ fn foreign_owned_store_alarms_once_and_holds_nothing() {
     let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
         for _ in 0..2 {
             fresh.durable_begin_pass(source, &index_path, &namespace, false);
-            assert_eq!(fresh.durable_hold(source, key), None);
+            assert_eq!(fresh.durable_hold(source, key, false), None);
             fresh.durable_alarm(source);
         }
     });
@@ -1333,7 +1566,7 @@ fn store_io_failures_emit_cold_production_body_without_holds() {
             let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
                 crate::snapshots::durable_after_save(&cache, &root, source, &index);
                 cache.durable_begin_pass(source, &index_path, &namespace, false);
-                assert_eq!(cache.durable_hold(source, &key), None);
+                assert_eq!(cache.durable_hold(source, &key, false), None);
                 cache.durable_alarm(source);
             });
             assert_eq!(alarms.len(), 1);
@@ -1430,7 +1663,7 @@ fn t14_without_retention_or_encodable_reduction_holds_on_later_passes() {
         std::fs::write(&record, &before).unwrap();
         let cache = SharedCache::default();
         cache.durable_begin_pass(source, &index_path, &namespace, false);
-        assert_eq!(cache.durable_hold(source, &key), None);
+        assert_eq!(cache.durable_hold(source, &key, false), None);
         assert_eq!(cache.durable_full_hold(source, &key, true), None);
         let admitted = cache.insert_admitted(
             key.clone(),
@@ -1463,7 +1696,7 @@ fn t14_without_retention_or_encodable_reduction_holds_on_later_passes() {
         for n in 1..=3 {
             cache.durable_begin_pass(source, &index_path, &namespace, false);
             assert_eq!(
-                cache.durable_hold(source, &key),
+                cache.durable_hold(source, &key, false),
                 (arm == "retention").then_some(store::Refusal::Corrupt)
             );
             let (counts, stats) = cache.durable_counters(source).unwrap();
@@ -1666,7 +1899,7 @@ fn known_corrupt_replacement_case(fail_replacement: bool) {
     assert_eq!(rebuilt.unreadable_path_count, 0);
     assert!(cache.retained().unwrap().peek(&key).is_some());
     assert_eq!(
-        cache.durable_hold(source, &key),
+        cache.durable_hold(source, &key, false),
         None,
         "fresh RAM in the SAME pass wins"
     );
@@ -1696,7 +1929,7 @@ fn known_corrupt_replacement_case(fail_replacement: bool) {
         ));
         cache.retained().unwrap().remove(&key);
         assert_eq!(
-            cache.durable_hold(source, &key),
+            cache.durable_hold(source, &key, false),
             None,
             "repaired record never holds"
         );
