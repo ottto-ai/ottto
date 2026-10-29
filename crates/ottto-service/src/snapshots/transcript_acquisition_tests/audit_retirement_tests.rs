@@ -564,6 +564,173 @@ fn partial_saves_cannot_reuse_quiet_slots_before_retirement_commits() {
     assert_eq!(modes, (0, 0, 0));
 }
 
+#[test]
+fn cap_delayed_growth_survives_age_and_replacement_traversal() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _clock = Clock::at(START);
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        sampled_scan::set_test_now(Some(START));
+        let fixture = ScanFixture::new(source);
+        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let namespace = "cap-delay-age-reset";
+        let (mut index, _, modes) = production_scan(
+            &fixture,
+            source,
+            ScanIndex::default(),
+            Some(cache.clone()),
+            namespace,
+        );
+        assert_eq!(modes, (1, 0, 0));
+        let key = local_index_key(&fixture.file.0);
+        fill_unavailable_audits(
+            &mut index,
+            &key,
+            crate::transcript_cache::CACHE_ENTRIES,
+            START,
+        );
+        let markers = index
+            .files
+            .iter()
+            .filter(|(_, entry)| entry.has_unverified_source())
+            .map(|(key, entry)| (key.clone(), entry.scan_identity_version.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let assert_cap_counts = |rows: &[Value], full: u64, delay: u64| {
+            let page = rows
+                .iter()
+                .find(|row| row["stage"] == "native_collection_page")
+                .unwrap();
+            assert_eq!(
+                page["counts"]["sampled_acquisition"]["index_state_at_page_end"]["audit_cap_full"],
+                full
+            );
+            let delays = rows
+                .iter()
+                .filter(|row| row["stage"] == "sampled_audit_cap_delay")
+                .collect::<Vec<_>>();
+            assert_eq!(delays.len() as u64, delay);
+            if delay > 0 {
+                assert_eq!(delays[0]["counts"]["audit_cap_delay"], delay);
+            }
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row["stage"] == "sampled_audit_cap_alarm")
+                    .count() as u64,
+                full
+            );
+        };
+        fixture.file.append(&usage(source, 130, 1, "fixture-model"));
+        let ((committed, _, modes), diagnostics) =
+            crate::local_resource_diagnostics::capture(|| {
+                production_scan(&fixture, source, index, Some(cache.clone()), namespace)
+            });
+        assert_eq!(modes, (1, 0, 0), "first cap Full enrolls the key");
+        assert_cap_counts(&diagnostics, 1, 0);
+        assert!(!committed.files[&key].has_unverified_source());
+        assert!(!committed.files[&key].source_file_fingerprint.is_empty());
+        let committed_size = committed.files[&key].size_bytes;
+        fixture.file.append(&usage(source, 160, 2, "fixture-model"));
+        let actual_size = fs::metadata(&fixture.file.0).unwrap().len();
+        assert!(actual_size > committed_size, "real unpaid growth");
+        sampled_scan::set_test_now(Some(START + 60));
+        let ((delayed, raw, modes), diagnostics) =
+            crate::local_resource_diagnostics::capture(|| {
+                production_scan(
+                    &fixture,
+                    source,
+                    committed.clone(),
+                    Some(cache.clone()),
+                    namespace,
+                )
+            });
+        assert_eq!(modes, (0, 0, 0), "paced delay starts no acquisition");
+        assert!(raw.snapshots.is_empty(), "the append has not published");
+        assert_cap_counts(&diagnostics, 0, 1);
+        assert_eq!(delayed.files[&key].size_bytes, committed_size);
+        assert!(delayed.files[&key].source_file_fingerprint.is_empty());
+        let old_context = delayed
+            .traversal
+            .as_ref()
+            .unwrap()
+            .context_fingerprint
+            .clone();
+        let mut selected =
+            delayed.committable_subset(&committed, &BTreeSet::new(), &BTreeMap::new());
+        assert_eq!(selected.files[&key].size_bytes, committed_size);
+        assert!(selected.files[&key].source_file_fingerprint.is_empty());
+        let index_path = fixture.dir.join("cap-delay-index.json");
+        selected.save(&index_path).unwrap();
+        let loaded = ScanIndex::load(&index_path).unwrap();
+        assert!(sampled_audit::path_requires_verification(
+            &loaded.files,
+            &fixture.file.0
+        ));
+        let modified =
+            unix_seconds(fs::metadata(&fixture.file.0).unwrap().modified().unwrap()).unwrap();
+        let future = modified + (BACKFILL_WINDOW_DAYS + 2) * 86_400;
+        assert!(!is_recent_enough_at(modified, future, BACKFILL_WINDOW_DAYS));
+        let collected = OffsetDateTime::from_unix_timestamp(future as i64)
+            .unwrap()
+            .format(&Rfc3339)
+            .unwrap();
+        sampled_scan::set_test_now(Some(future)); // expired/sanity-bound pace admits
+        let extra_root = fixture.dir.join("extra-root");
+        fs::create_dir(&extra_root).unwrap();
+        let roots = [fixture.root.clone(), extra_root];
+        let make_scan = |index| {
+            OwnedSourceScan::new(
+                source,
+                &roots,
+                index,
+                &collected,
+                BACKFILL_WINDOW_DAYS,
+                10,
+                false,
+                None,
+                &[],
+                false,
+                true,
+            )
+        };
+        let scan =
+            make_scan(loaded.clone()).with_sampled_acquisition(cache, Scope(namespace.into()));
+        let walk = scan.index.traversal.as_ref().unwrap();
+        assert_ne!(
+            walk.context_fingerprint, old_context,
+            "actual context replacement"
+        );
+        assert_eq!(walk.scan_roots.as_slice(), roots.as_slice());
+        assert_eq!(scan.sampling.as_ref().unwrap().audit_slots, 0);
+        let ((mut serviced, raw, _, modes, _), diagnostics) =
+            crate::local_resource_diagnostics::capture(|| {
+                finish_production_scan_page(scan, source)
+            });
+        assert_eq!(modes, (1, 0, 0), "counted catch-up after the age cutoff");
+        assert_cap_counts(&diagnostics, 1, 0);
+        assert!(
+            !raw.snapshots.is_empty(),
+            "catch-up emits the unpaid append"
+        );
+        assert_eq!(raw.disappeared_file_count, 0);
+        assert_eq!(serviced.files.len(), loaded.files.len(), "nothing pruned");
+        assert_eq!(serviced.files[&key].size_bytes, actual_size);
+        assert!(!serviced.files[&key].source_file_fingerprint.is_empty());
+        assert!(!serviced.files[&key].has_unverified_source());
+        for (marked, version) in &markers {
+            assert_eq!(&serviced.files[marked].scan_identity_version, version);
+        }
+        let (_, cold, _, _, _) = finish_production_scan_page(make_scan(loaded), source);
+        assert!(!cold.snapshots.is_empty());
+        assert_eq!(production_body(source, raw), production_body(source, cold));
+        serviced.save(&index_path).unwrap();
+        let loaded = ScanIndex::load(&index_path).unwrap();
+        assert_eq!(loaded.files[&key].size_bytes, actual_size);
+        assert!(!loaded.files[&key].source_file_fingerprint.is_empty());
+    }
+}
+
 fn fill_unavailable_audits(index: &mut ScanIndex, template_key: &str, count: usize, due: u64) {
     for n in 0..count {
         let key = format!("/synthetic-held-unavailable/{n}.jsonl");

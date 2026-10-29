@@ -265,3 +265,27 @@ absence helper: no proof root or a still-present file retains the hold, and
 actual deletion beneath a readable configured root permits release. Existing
 persistence, resolving-parse, partial-page and population-bound assertions stay.
 Local all-target Clippy is required; runtime qualification remains CI-only.
+
+Round15 gives cap delays durable custody through the existing empty source
+fingerprint witness. Both paced and unfunded completions preserve committed
+size and stay age-exempt even when a changed root configuration replaces the
+watcher queue. The production-scanner regression delays real growth, commits a
+partial subset, saves/reloads, advances beyond the activity window, adds a root
+and verifies counted catch-up with no lost entry or marker and cold Full body
+parity. A separate control serializes the retry without any traversal present.
+
+The hardened absence predicate matches the shared account-hold implementation;
+its diagnostic carriers do not. Both audit retirement and deleted-account-hold
+release currently emit temporary traversal-point counts. Integration with the
+shared diagnostics must preserve both carve-outs and replace those emitters
+without duplicate counts. No new persisted field or cap increase is introduced.
+
+Round16 pins the accepted temporary diagnostic contract through the actual
+deleted-account-hold scan: audit_retired_absent{events} and
+withheld_hold_released{deleted} each emit once, with the shared source/schema
+and count meaning, and neither emits on the next generation. Counting all
+records makes duplicate carriers fail the fixture. The temporary audit count
+now uses the same events object as the integrated diagnostics. Deleted-hold
+tokens remain unreported until shared withheld-account bookkeeping lands.
+Whichever implementation integrates second must unify onto one emitter per
+count and retain the exactly-once fixture; both retirement paths stay present.

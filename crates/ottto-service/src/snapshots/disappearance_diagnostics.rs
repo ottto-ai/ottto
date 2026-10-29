@@ -773,14 +773,29 @@ mod tests {
             });
             let (((pages, events), sites), vanished) = result;
             let retired = u64::from(at == NOW);
-            assert_eq!(
-                rows.iter()
-                    .filter(|row| row["stage"] == "withheld_hold_released"
-                        && row["counts"]["withheld_hold_released"]["deleted"] == 1)
-                    .count(),
-                retired as usize,
-                "proven account-hold release is counted exactly once"
-            );
+            // Pin the shared #799 keys and meanings independently of the
+            // temporary stage/carrier, including zero on the next generation.
+            // Count across ALL records so a second emitter cannot hide behind
+            // a different stage when these paths compose with #876.
+            for (key, expected) in [
+                ("audit_retired_absent", serde_json::json!({"events": 1})),
+                ("withheld_hold_released", serde_json::json!({"deleted": 1})),
+            ] {
+                let emissions = rows
+                    .iter()
+                    .filter(|row| row["counts"].get(key).is_some())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    emissions.len(),
+                    retired as usize,
+                    "{key}: exactly one emission, never duplicate carriers"
+                );
+                for row in emissions {
+                    assert_eq!(row["schema_version"], 2);
+                    assert_eq!(row["source"], "claude_code");
+                    assert_eq!(row["counts"][key], expected, "{key}: shared count meaning");
+                }
+            }
             let mut expected_sites = [[[0; OUTCOMES]; SITES]; 3];
             expected_sites[1][Site::CandidateForcedIndex.index()] = [0, retired];
             assert_eq!(sites, expected_sites, "{at}: retired once");

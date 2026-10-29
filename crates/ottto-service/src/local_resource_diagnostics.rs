@@ -180,7 +180,7 @@ pub(crate) fn audit_retired_absent(source: &str) {
     traversal_point(
         "audit_retired_absent",
         source,
-        &serde_json::json!({"audit_retired_absent": 1}),
+        &serde_json::json!({"audit_retired_absent": {"events": 1}}),
     );
 }
 
