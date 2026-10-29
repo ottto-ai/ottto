@@ -1,5 +1,8 @@
 # Claude upkeep completion status
 
+The worker described here has since been retired; current upkeep decisions use
+the live local credential read and the native refresher.
+
 ## Symptom
 
 Live QA on macOS `0.1.130` completed Claude's official browser authorization
@@ -11,7 +14,7 @@ hidden even after the background upkeep worker had finished.
 
 The foreground status path enqueued upkeep and always returned `InProgress`.
 The worker's durable post-claim results were not read back. More importantly,
-missing or expired refresh grants return `NeedsLogin` before `claim_attempt`, so
+missing or expired refresh grants returned `NeedsLogin` before claiming an attempt, so
 the most common reconnect outcome had no durable witness at all.
 
 ## Fix
