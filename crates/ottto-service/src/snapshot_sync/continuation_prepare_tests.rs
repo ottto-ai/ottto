@@ -885,7 +885,7 @@ fn ordinary_durable_continuation_to_eof(
     crate::snapshots::with_test_limits_for_test(2048, 1024, 64, || {
         let mut ordinary = OwnedSourceScan::new(
             SnapshotSource::Codex,
-            &[root.clone()],
+            std::slice::from_ref(&root),
             index,
             &at,
             30,
@@ -951,7 +951,7 @@ fn ordinary_durable_continuation_to_eof(
                     // pass may finalize, save and run the durable-after-save hook.
                     let mut eof = OwnedSourceScan::new(
                         SnapshotSource::Codex,
-                        &[root.clone()],
+                        std::slice::from_ref(&root),
                         index,
                         &at,
                         30,
