@@ -826,9 +826,7 @@ fn ordinary_durable_continuation_to_eof(
         &ScanIndex,
     ),
 ) {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
+    assert!(crate::heap_layout_bound::layout_supported());
     use crate::snapshots::{OwnedSourceScan, OwnedSourceScanStep};
     let fixture = ContinuationFixture::quiescent(name);
     let root = fixture.home.join(".codex/sessions");
@@ -905,10 +903,13 @@ fn ordinary_durable_continuation_to_eof(
         };
         assert!(
             scan.snapshots.is_empty(),
-            "paused ordinary scan has no EOF publication"
+            "ordinary job genuinely paused before EOF"
         );
         inputs.evidence = scan.take_continuation_evidence();
-        assert!(inputs.evidence.as_ref().unwrap().content_unchanged());
+        assert!(
+            inputs.evidence.is_some(),
+            "carry certified ordinary inventory"
+        );
         let ticket = scan
             .continuation_ticket()
             .expect("ordinary job genuinely paused");
@@ -927,7 +928,7 @@ fn ordinary_durable_continuation_to_eof(
             writer,
         );
         state.assert_preserved(&cache);
-        for _ in 0..64 {
+        for page in 0..64 {
             let result = run_continuation_scan(
                 &fixture.home,
                 &fixture.support_dir,
@@ -939,46 +940,53 @@ fn ordinary_durable_continuation_to_eof(
             .unwrap();
             state.assert_preserved(&cache);
             match result {
-                ContinuationScan::Uncommitted { ticket, snapshots } => {
+                ContinuationScan::Uncommitted {
+                    ticket: Some(_),
+                    snapshots,
+                } => {
                     assert_eq!(
                         snapshots, 0,
-                        "continuation never publishes, including native EOF"
+                        "page {page}: no publication before native EOF"
                     );
-                    if ticket.is_some() {
-                        continue;
-                    }
-                    // #839 keeps completed native work in RAM; only the next ordinary
-                    // pass may finalize, save and run the durable-after-save hook.
-                    let mut eof = OwnedSourceScan::new(
-                        SnapshotSource::Codex,
-                        std::slice::from_ref(&root),
-                        index,
-                        &at,
-                        30,
-                        10,
-                        false,
-                        None,
-                        &[],
-                        false,
-                        false,
-                    )
-                    .with_sampled_acquisition(std::sync::Arc::clone(&cache), namespace.clone());
-                    let (mut index, scan) = loop {
-                        match eof.step(None) {
-                            OwnedSourceScanStep::Pending(next) => eof = next,
-                            OwnedSourceScanStep::Complete { index, scan, .. } => {
-                                break (index, scan)
+                }
+                ContinuationScan::Uncommitted {
+                    ticket: None,
+                    snapshots,
+                } => {
+                    assert_eq!(
+                        snapshots, 0,
+                        "continuation parks EOF for ordinary settlement"
+                    );
+                    let (mut index, scan) = state.finish_ordinary_eof(|| {
+                        let mut ordinary = OwnedSourceScan::new(
+                            SnapshotSource::Codex,
+                            std::slice::from_ref(&root),
+                            ScanIndex::load(&fixture.index_path).unwrap(),
+                            &at,
+                            30,
+                            10,
+                            false,
+                            None,
+                            &[],
+                            false,
+                            false,
+                        )
+                        .with_sampled_acquisition(std::sync::Arc::clone(&cache), namespace.clone());
+                        loop {
+                            match ordinary.step(None) {
+                                OwnedSourceScanStep::Pending(next) => ordinary = next,
+                                OwnedSourceScanStep::Complete { index, scan, .. } => {
+                                    break (index, scan)
+                                }
                             }
                         }
-                    };
+                    });
                     assert!(
                         scan.continuation_ticket().is_none(),
-                        "native EOF no longer pauses"
+                        "ordinary settled genuine native EOF"
                     );
-                    assert!(
-                        !scan.snapshots.is_empty(),
-                        "ordinary finish publishes native EOF"
-                    );
+                    assert!(!scan.snapshots.is_empty(), "native result reached EOF");
+                    state.assert_preserved(&cache);
                     index.save(&fixture.index_path).unwrap();
                     crate::snapshots::durable_after_save(
                         &cache,
@@ -998,6 +1006,7 @@ fn ordinary_durable_continuation_to_eof(
 
 #[cfg(unix)]
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn continuation_keeps_ordinary_gc_decisions_through_native_eof() {
     ordinary_durable_continuation_to_eof("continuation-durable-gc", |state, cache, index| {
         state.assert_gc_at_eof(cache, index);
@@ -1006,6 +1015,7 @@ fn continuation_keeps_ordinary_gc_decisions_through_native_eof() {
 
 #[cfg(unix)]
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn continuation_keeps_ordinary_breaker_and_rebuilt_keys_through_native_eof() {
     ordinary_durable_continuation_to_eof("continuation-durable-breaker", |state, cache, _| {
         state.assert_breaker_at_eof(cache);

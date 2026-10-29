@@ -3392,10 +3392,9 @@ fn grouped_missing_carriers_mark_each_unpaged_member_until_verified() {
 
 #[cfg(unix)]
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn grouped_missing_carriers_mark_each_paged_member_until_verified() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
+    assert!(crate::heap_layout_bound::layout_supported());
     grouped_missing_carriers_mark_each_member_until_verified(true);
 }
 
@@ -3480,10 +3479,9 @@ fn grouped_missing_carrier_requires_live_context_and_clamps_future_debt() {
 /// guard), so this group fixture covers the shared path.
 #[cfg(unix)]
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn parked_group_across_fresh_index_reprobes_member_debt_on_resume() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
+    assert!(crate::heap_layout_bound::layout_supported());
     let source = SnapshotSource::Codex;
     let root = paged_corpus("missing-carrier-r1");
     fs::write(root.join("session_index.jsonl"), "{not valid json}\n").unwrap();

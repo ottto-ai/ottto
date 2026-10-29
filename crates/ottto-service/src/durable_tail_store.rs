@@ -1281,6 +1281,9 @@ impl DurableTailStore {
                     Ok(true) => {}
                     Ok(false) => {
                         on_disk.remove(&key);
+                        // Retirement did not write the offered successor. Keep its
+                        // existing retry provenance until a real write can ACK it.
+                        receipt.deferred_keys.push(key);
                         continue;
                     }
                     Err(_) => {
