@@ -3046,6 +3046,54 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
     // carriers re-arm an immediate current-index audit before any source read.
     // A completed Full whose durable replacement failed has the same state.
     let saved = ScanIndex::load(&index_path).unwrap();
+    // A missing entry must still reach same-context carrier classification.
+    // No entry-derived binding or transcript read is available in either arm.
+    // A foreign namespace supplies no scheduling authority and stays NoEntry.
+    for matching_context in [true, false] {
+        let mut absent = saved.clone();
+        absent.files.remove(&key);
+        let namespace = if matching_context {
+            scope.clone()
+        } else {
+            Scope("foreign-debt-survival".into())
+        };
+        let cache = SharedCache::default();
+        cache.durable_begin_pass(SnapshotSource::ClaudeCode, &index_path, &namespace, true);
+        let interpretation =
+            Interpretation::of(SnapshotSource::ClaudeCode, &key, &absent, true, &namespace);
+        let mut held = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let record_path = dir.join(format!(
+            "{}.rec",
+            record_key
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        ));
+        let before = std::fs::read(&record_path).unwrap();
+        let outcome = cache.durable_restore(
+            SnapshotSource::ClaudeCode,
+            &key,
+            &path,
+            &scope,
+            &mut held,
+            &absent,
+            &interpretation,
+        );
+        assert!(if matching_context {
+            matches!(outcome, RestoreOutcome::Miss(MissClass::AuditCarrier))
+        } else {
+            matches!(outcome, RestoreOutcome::Miss(MissClass::NoEntry))
+        });
+        assert!(!absent.files.contains_key(&key), "no invented membership");
+        assert_eq!(std::fs::read(&record_path).unwrap(), before);
+        let (counts, _) = cache.durable_counters(SnapshotSource::ClaudeCode).unwrap();
+        assert_eq!(
+            counts.ineligible.get("audit_carrier"),
+            matching_context.then_some(&1)
+        );
+        assert_eq!(counts.durable_held, [0; 6]);
+        assert_eq!(counts.restored, 0);
+    }
     for reset in [false, true] {
         let mut missing = saved.clone();
         if reset {
@@ -8821,7 +8869,6 @@ fn o3_generation_ahead_survivor_reads_growth_without_mutation_authority() {
 }
 
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 #[ignore = "requires landed E3 generic growth discovery (#876)"]
 fn o3_paced_growth_survives_idle_past_window_until_real_native_catchup() {
     let _gate = claude_request_money::e2::GateForTest::set(true);
