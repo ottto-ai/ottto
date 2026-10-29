@@ -26829,6 +26829,11 @@ impl OwnedSourceScan {
         }
         let retry_service_end = pending_paths.len();
         if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
+            terminal_off_replay_before_fifo(
+                &mut index.claude_stale_family_carry.replay,
+                &mut pending_paths,
+                selection_limit,
+            );
             // This traversal can outlive a completed walk indefinitely. Keep
             // recovery/due-retry ownership above, then service its retained
             // queue in FIFO order: a repeatedly due audit must not starve an

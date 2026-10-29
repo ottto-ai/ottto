@@ -875,3 +875,14 @@ mod retention_alarm_tests {
         );
     }
 }
+
+// A cancellation replay is already funded/owned. Its obligations must receive
+// their existing page allowance before repeatedly requeued ordinary work.
+fn terminal_off_replay_before_fifo(
+    replay: &mut Vec<ScanTraversalPath>,
+    selected: &mut Vec<ScanTraversalPath>,
+    limit: usize,
+) {
+    let count = limit.saturating_sub(selected.len()).min(replay.len());
+    selected.extend(replay.drain(..count));
+}

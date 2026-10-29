@@ -871,3 +871,42 @@ fn terminal_off_pending_behind_old_witness_is_still_counted_and_unproven() {
     assert!(!claude_terminal_authority(&index, true, W2));
     assert_eq!(serde_json::to_value(&index).unwrap(), before);
 }
+
+#[test]
+fn terminal_off_cancellation_replay_precedes_repeated_held_fifo_on_one_file_pages() {
+    let path = |name: &str| ScanTraversalPath {
+        scan_root: PathBuf::from("synthetic"),
+        path: PathBuf::from(name),
+        census_member: true,
+        watcher_hint: false,
+    };
+    let mut replay = vec![path("cancel-A"), path("cancel-B")];
+    let mut queue = std::collections::VecDeque::from([path("held")]);
+    let mut served = Vec::new();
+    for _ in 0..3 {
+        let mut selected = Vec::new();
+        terminal_off_replay_before_fifo(&mut replay, &mut selected, 1);
+        while selected.len() < 1 {
+            selected.push(queue.pop_front().unwrap());
+        }
+        assert_eq!(selected.len(), 1, "unchanged one-file budget");
+        let chosen = selected.pop().unwrap();
+        if chosen.path == Path::new("held") {
+            queue.push_back(chosen.clone());
+        }
+        served.push(chosen.path);
+    }
+    assert_eq!(
+        served,
+        [
+            PathBuf::from("cancel-A"),
+            PathBuf::from("cancel-B"),
+            PathBuf::from("held")
+        ]
+    );
+    assert!(
+        replay.is_empty(),
+        "funded cancellation obligations drain, allowing G1 retries"
+    );
+    assert_eq!(queue.len(), 1, "held custody remains queued, never settled");
+}
