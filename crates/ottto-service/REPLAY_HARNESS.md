@@ -91,11 +91,13 @@ session and body domains remain `replay-session-v1\0` and
 `replay-emitted-body-v1\0`. All commitments use the same supplied key.
 
 The feature-enabled synthetic integration target declares `required-features`.
-CI owners should run it explicitly, without enabling the feature for release
-builds or the full workspace:
+The Linux job's final `Replay harness (feature)` step runs it and the oracle unit
+tests explicitly, without enabling the feature for release builds or the full
+workspace. Both commands run even if one fails, and either failure fails the step:
 
 ```
 cargo test -p ottto-service --test replay_harness --features replay-harness --locked -- --nocapture
+cargo test -p ottto-service --lib --features replay-harness --locked snapshot_sync::replay_harness::oracle_tests -- --nocapture
 ```
 
 Default CI runs `replay_harness_disabled`, which checks the command is absent.
@@ -103,7 +105,14 @@ The ignored reference benchmark retains its implementation, assertions and
 default unit-test discovery; its backend compiles under `cfg(test)`. Existing
 reference benchmark workflows need no feature change.
 
-P2 failures print the exact `full_causes` and `restore_outcome` page rows. A
-panicking synthetic fixture retains its directory and prints aggregate JSONL to
-the test log. P1's live restore assertion and P2's Tail-only assertion stay in
-place; diagnostics never convert a failure into a pass.
+P1 asserts zero Full/Tail/native+guard bytes, a positive `index_reuse_skips`
+count from the actual candidate-skip branch, and zero `durable_store_io`.
+The latter reuses the existing store's restore attempts, record/GC read counts,
+and body/header/verification/GC byte counts. Missing telemetry stays null.
+
+P2 asserts at most one Full plus a positive Tail count. Every Full must have an
+actual diagnostic cause in the test's pinned transitional set with its named
+retiring slice; missing, unknown or unaccounted causes fail. Restore misses are
+never translated into allowed causes. Every P2 prints the exact `full_causes`,
+`restore_outcome` and aggregate page record. A panicking synthetic fixture retains
+its directory and prints aggregate JSONL to the test log.

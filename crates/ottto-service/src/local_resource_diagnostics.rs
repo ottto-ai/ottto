@@ -363,6 +363,8 @@ pub(crate) struct Probe {
     pub(crate) page_events: claude_reread::Counts,
     pub(crate) full_causes: FullCauses,
     pub(crate) line_delivery: Option<(&'static str, LineDeliveryCounts)>,
+    #[cfg(feature = "replay-harness")]
+    index_reuse_skips: std::cell::Cell<u64>,
 }
 impl Probe {
     pub(crate) fn start() -> Self {
@@ -372,7 +374,14 @@ impl Probe {
             page_events: Default::default(),
             full_causes: Default::default(),
             line_delivery: None,
+            #[cfg(feature = "replay-harness")]
+            index_reuse_skips: std::cell::Cell::new(0),
         }
+    }
+    #[cfg(feature = "replay-harness")]
+    pub(crate) fn index_reuse_skip(&self) {
+        self.index_reuse_skips
+            .set(self.index_reuse_skips.get().saturating_add(1));
     }
     fn observation(&self) -> Observation {
         Observation::between(
@@ -395,6 +404,8 @@ impl Probe {
         struct Counts {
             #[serde(flatten)]
             collection: CollectionCounts,
+            #[cfg(feature = "replay-harness")]
+            index_reuse_skips: u64,
             #[serde(flatten)]
             pending: Option<ClaudeAccountRetainedPending>,
             #[serde(flatten)]
@@ -412,6 +423,8 @@ impl Probe {
         }
         let claude = source == "claude_code";
         let counts = Counts {
+            #[cfg(feature = "replay-harness")]
+            index_reuse_skips: self.index_reuse_skips.replace(0),
             line_delivery: self
                 .line_delivery
                 .filter(|(_, counts)| *counts != LineDeliveryCounts::default())

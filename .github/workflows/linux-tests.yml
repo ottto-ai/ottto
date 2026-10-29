@@ -94,3 +94,11 @@ jobs:
 
       - name: Connector package tests
         run: cargo test --manifest-path crates/Cargo.toml --locked -p ottto-connector-testkit --test first_party_sources
+
+      - name: Replay harness (feature)
+        if: ${{ !cancelled() }}
+        run: |
+          replay_status=0
+          cargo test -p ottto-service --test replay_harness --features replay-harness --locked -- --nocapture || replay_status=$?
+          cargo test -p ottto-service --lib --features replay-harness --locked snapshot_sync::replay_harness::oracle_tests -- --nocapture || replay_status=$?
+          exit "$replay_status"

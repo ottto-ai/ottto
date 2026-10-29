@@ -790,7 +790,7 @@ fn execute(args: &Args, isolation: Isolation) -> Result<()> {
         &mut *output.lock().map_err(|_| anyhow!("output poisoned"))?,
         &serde_json::json!({"kind":"pass_started", "pass":args.pass, "held_files":isolation.held_files}),
     )?;
-    for source in sources {
+    for &source in &sources {
         loop {
             // The CLI explicitly requests already-due pages, without sleeping
             // for serve's cadence between pages. No receipt/index state resets.
@@ -858,10 +858,12 @@ fn execute(args: &Args, isolation: Isolation) -> Result<()> {
             }
         }
     }
+    let durable_store_io = durable_store_io(&daemon.transcript_cache, &sources);
     write_record(
         &mut *output.lock().map_err(|_| anyhow!("output poisoned"))?,
         &serde_json::json!({"kind":"pass_totals", "pass":args.pass, "pages":pages,
         "full_reads":(!totals.unknown).then_some(totals.full), "tail_reads":(!totals.unknown).then_some(totals.tail), "restored":totals.restored, "bytes_read":(!totals.unknown).then_some(totals.bytes),
+        "index_reuse_skips":totals.index_reuse_skips, "durable_store_io":durable_store_io,
         "emitted_entities":backend.stats.items.load(std::sync::atomic::Ordering::Relaxed),
         "read_units":"sampled acquisition selections; completed native + guard bytes", "advisory_only":true}),
     )?;
@@ -875,6 +877,7 @@ struct Totals {
     tail: u64,
     restored: u64,
     bytes: u64,
+    index_reuse_skips: u64,
 }
 impl Totals {
     fn observe(&mut self, row: &serde_json::Value) {
@@ -882,6 +885,7 @@ impl Totals {
             return;
         }
         let counts = &row["counts"];
+        self.index_reuse_skips += counts["index_reuse_skips"].as_u64().unwrap_or(0);
         let reads = &counts["sampled_acquisition"];
         self.unknown |= !reads.is_object();
         self.full += reads["full_selections"].as_u64().unwrap_or(0);
@@ -892,4 +896,35 @@ impl Totals {
             .as_u64()
             .unwrap_or(0);
     }
+}
+
+#[derive(Default, Serialize)]
+struct DurableStoreIo {
+    restore_attempts: u64,
+    records_read: u64,
+    bytes_read: u64,
+}
+
+/// Existing process-lifetime store evidence, read without opening any files.
+/// Missing/unsupported telemetry stays unavailable; it is never an idle zero.
+fn durable_store_io(
+    cache: &crate::snapshots::sampled_scan::SharedCache,
+    sources: &[SnapshotSource],
+) -> Option<DurableStoreIo> {
+    let mut io = DurableStoreIo::default();
+    let mut observed = false;
+    for &source in sources {
+        let (counts, store) = cache.durable_counters(source)?;
+        observed = true;
+        // Every source view repeats the same global restore count.
+        io.restore_attempts = io.restore_attempts.max(counts.restore_attempts);
+        io.records_read += store.records_read + store.gc_records_read;
+        io.bytes_read += store.bytes_read
+            + store.guard_header_bytes
+            + store.guard_verify_bytes
+            + store.delete_verify_bytes
+            + store.overwrite_verify_bytes
+            + store.gc_bytes_read;
+    }
+    observed.then_some(io)
 }
