@@ -561,7 +561,7 @@ fn shared_transition_crash_edges_reach_sigkill_and_keep_a_valid_survivor() {
         );
         let outcome = store.read(
             inventory.iter().next().unwrap(),
-            &crate::durable_tail_codec::allowlist_digest(SOURCE),
+            &fixture::allowlist_digest(SOURCE),
         );
         assert!(
             matches!(outcome, crate::durable_tail_store::ReadOutcome::Found(_)),

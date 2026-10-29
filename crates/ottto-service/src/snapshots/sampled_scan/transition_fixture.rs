@@ -37,6 +37,11 @@ pub(crate) fn seed_old_writer(
     super::durable_tail::transition_seed::seed_pinned_v1(cache, source, key, index, pin)
 }
 
+/// The production body allowlist, without exposing the private codec module.
+pub(crate) fn allowlist_digest(source: SnapshotSource) -> [u8; 32] {
+    super::super::sampled_jsonl::durable::allowlist_digest(source)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Mode {
     ColdFull,
@@ -133,8 +138,8 @@ impl CrashPoint {
     }
 }
 
-/// A child acknowledges the exact edge durably, then actually dies. Only the
-/// isolated child test sets these variables. Parent checks SIGKILL and marker.
+// A child acknowledges the exact edge durably, then actually dies. Only the
+// isolated child test sets these variables. Parent checks SIGKILL and marker.
 thread_local! { static CRASH_ARMED: Cell<bool> = const { Cell::new(false) }; }
 pub(crate) fn arm_crashes() {
     CRASH_ARMED.with(|armed| armed.set(true));
@@ -159,9 +164,9 @@ pub(crate) fn reach(point: CrashPoint) {
     panic!("SIGKILL unexpectedly returned");
 }
 
-/// Consumed bytes at the real BoundedJsonlReader::consume boundary, including
-/// skipped lines and codec re-derivation readers. This is not an OS read counter:
-/// prefetch, raw head reads and certificate samples are reported separately.
+// Consumed bytes at the real BoundedJsonlReader::consume boundary, including
+// skipped lines and codec re-derivation readers. This is not an OS read counter:
+// prefetch, raw head reads and certificate samples are reported separately.
 thread_local! { static CONSUMED: Cell<Option<u64>> = const { Cell::new(None) }; }
 pub(crate) fn record_consumed(bytes: u64) {
     CONSUMED.with(|c| {
@@ -610,7 +615,7 @@ pub(crate) fn fail_store_at(point: CrashPoint, nth: usize) -> StoreFailure {
             | CrashPoint::BeforeRetireSync
             | CrashPoint::RetiredSynced
     ));
-    let hits = std::rc::Rc::new(Cell::new(0));
+    let hits = std::rc::Rc::new(Cell::new(0_usize));
     let count = std::rc::Rc::clone(&hits);
     let previous = crate::durable_tail_store::test_hooks::replace_transition_hook(Some(Box::new(
         move |reached, _| {
