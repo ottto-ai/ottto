@@ -271,19 +271,30 @@ impl ScanIndex {
                     && old.last_snapshot_fingerprint == working.last_snapshot_fingerprint
                     && old.last_upload_body_witness == working.last_upload_body_witness
             }) { continue; }
-            let path = Path::new(key);
-            let Some(root) = traversal.scan_roots.iter().filter(|root| path.starts_with(root))
-                .max_by_key(|root| root.components().count()) else { continue; };
-            if !traversal.pending_candidates.iter().any(|candidate| candidate.path == path) {
-                // A partial save restored this changed/current-page file. With
-                // a parked terminal there is no next fresh walk to rediscover
-                // it: keep retry demand in the EXISTING traversal queue. No
-                // source fingerprint clear, replay grant or new durable field.
-                traversal.pending_candidates.push_back(ScanTraversalPath {
-                    scan_root: root.clone(), path: path.to_path_buf(),
-                    census_member: true, watcher_hint: false,
-                });
-            }
+            enqueue_parked_claude_retry(traversal, key);
+
         }
+    }
+}
+
+fn enqueue_parked_claude_retry(traversal: &mut ScanTraversalCheckpoint, key: &str) {
+    let path = Path::new(key);
+    if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") { return; }
+    let Some(root) = traversal.scan_roots.iter().filter(|root| path.starts_with(root))
+        .max_by_key(|root| root.components().count()) else { return; };
+    if !traversal.pending_candidates.iter().any(|candidate| candidate.path == path) {
+        // Existing queue demand only. The scanner still revalidates the file;
+        // no fingerprint clear, replay/ownership grant or durable field.
+        traversal.pending_candidates.push_back(ScanTraversalPath {
+            scan_root: root.clone(), path: path.to_path_buf(), census_member: true, watcher_hint: false,
+        });
+    }
+}
+
+impl ScanIndex {
+    fn retain_deferred_local_hold_retries(&mut self, held_keys: &BTreeSet<String>) {
+        if self.claude_terminal_fold_deferred().is_none() { return; }
+        let Some(traversal) = self.traversal.as_mut() else { return; };
+        for key in held_keys { enqueue_parked_claude_retry(traversal, key); }
     }
 }

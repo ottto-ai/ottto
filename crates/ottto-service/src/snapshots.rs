@@ -47831,6 +47831,7 @@ impl ScanIndex {
         let placeholders =
             self.claude_terminal_member_placeholder_keys(previous, &held_keys, reparse_held);
         let mut result = self.clone();
+        result.retain_deferred_local_hold_retries(&held_keys);
         result
             .claude_money_birth_store
             .preserve_missing_from(&previous.claude_money_birth_store);
@@ -47956,6 +47957,9 @@ impl ScanIndex {
             .preserve_missing_from(&previous.claude_money_birth_store);
         let empty_advances = self.claude_empty_map_advances(previous);
         let held_keys = self.locally_held_keys(held);
+        // A completed transport can still revert nonblocking local holds.
+        // A parked terminal must retain their ordinary retry demand too.
+        self.retain_deferred_local_hold_retries(&held_keys);
         self.note_claude_history_not_accepted(previous, &held_keys);
         let placeholders =
             self.claude_terminal_member_placeholder_keys(previous, &held_keys, reparse_held);

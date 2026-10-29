@@ -288,5 +288,14 @@ fn partial_deferred_page_keeps_unsettled_file_in_existing_traversal_queue() {
     assert!(!working.files[&key].source_file_fingerprint.is_empty(), "retry scheduling never clears the source witness");
     let accepted = working.committable_subset(&previous, &BTreeSet::from(["owed-body".into()]), &BTreeMap::new());
     assert!(accepted.traversal.as_ref().unwrap().pending_candidates.is_empty(), "settled files are not queued again");
+    let held = BTreeSet::from(["owed-body".into()]);
+    let borrowed = working.with_locally_held_keys_reverted(&previous, &held, &held);
+    let moved = working.clone().into_locally_held_keys_reverted(&previous, &held, &held);
+    for restored in [borrowed, moved] {
+        assert!(!restored.files.contains_key(&key), "held output cannot commit its file");
+        let pending = &restored.traversal.as_ref().unwrap().pending_candidates;
+        assert_eq!(pending.len(), 1, "completed transport must keep held-file retry demand");
+        assert_eq!(pending[0].path, Path::new(&key));
+    }
     let _ = fs::remove_dir_all(root);
 }
