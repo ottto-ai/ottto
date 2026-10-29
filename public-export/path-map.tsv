@@ -5,6 +5,7 @@
 .github/workflows/linux-tests.yml	.github/workflows	Public repository root file is already in export shape.
 .github/workflows/macos-stable-release.yml	.github/workflows	Public repository root file is already in export shape.
 .github/workflows/merge-queue-cleanup.yml	.github/workflows	Public repository root file is already in export shape.
+.github/workflows/replay-harness.yml	.github/workflows	Public repository root file is already in export shape.
 AGENTS.md	.	Public repository root file is already in export shape.
 CLAUDE.md	.	Public repository root file is already in export shape.
 CODE_OF_CONDUCT.md	.	Public repository root file is already in export shape.

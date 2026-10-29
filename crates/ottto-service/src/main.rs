@@ -23,6 +23,9 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[cfg(feature = "replay-harness")]
+    #[command(hide = true)]
+    ReplayHarness(ottto_service::snapshot_sync::replay_harness::Args),
     #[command(hide = true)]
     ContextCompositionWorker,
     #[command(hide = true)]
@@ -176,15 +179,22 @@ enum ServiceCommand {
 }
 
 fn main() -> Result<()> {
+    let cli = Cli::parse();
+    // Replay exits before even the normal daemon's Keychain/UI setup.
+    #[cfg(feature = "replay-harness")]
+    if let Some(Command::ReplayHarness(args)) = cli.command {
+        std::process::exit(ottto_service::snapshot_sync::replay_harness::run(args));
+    }
+
     // This is a background service: it must never block on an interactive
     // keychain modal (e.g. "Keychain Not Found"). Disable Security UI for the
     // whole process up front so a transient keychain failure logs and retries
     // instead of stalling behind a dialog no user is present to answer.
     ottto_core::disable_keychain_user_interaction();
 
-    let cli = Cli::parse();
-
     match cli.command.unwrap_or(Command::Status { json: true }) {
+        #[cfg(feature = "replay-harness")]
+        Command::ReplayHarness(_) => unreachable!("replay handled before service startup"),
         Command::ContextCompositionWorker => {
             ottto_service::context_composition::run_context_composition_worker()?;
         }
