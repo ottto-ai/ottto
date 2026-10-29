@@ -251,6 +251,10 @@ impl OwnedJsonlParser {
             Ok(())
         })();
         if let Err(error) = checked {
+            crate::local_resource_diagnostics::durable_tail_alarm(
+                self.source.api_slug(),
+                &serde_json::json!({"prepare_invariant": 1}),
+            );
             return Err(PrepareRejected {
                 error,
                 taken,
@@ -323,9 +327,15 @@ impl OwnedJsonlParser {
             Err(error) => {
                 return Err(PrepareRejected {
                     error: error.into(),
-                    refusal: PreparationRefusal::Transient,
+                    // An old checkpoint's metadata/sample/seek failure may
+                    // persist. Returning it must allow MAIN's zero-based Full.
+                    refusal: if old.is_some() {
+                        PreparationRefusal::NonTransient("prepare_io")
+                    } else {
+                        PreparationRefusal::Transient
+                    },
                     taken,
-                })
+                });
             }
         };
         let mode = plan.mode();
