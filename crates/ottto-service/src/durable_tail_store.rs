@@ -498,9 +498,16 @@ impl DurableTailStore {
         ) {
             return false;
         }
-        if self.disabled.is_some() || self.rebuilt.len() >= REBUILT_BOUND {
+        self.pass[0] += 1;
+        if self.pass[1] >= T14_BREAKER.max(self.pass[0] / 50) {
+            self.disable("t14_breaker");
+        } else if self.rebuilt.len() >= REBUILT_BOUND {
+            self.disable("t14_rebuilt_overflow");
+        }
+        if self.disabled.is_some() {
             return false;
         }
+        self.pass[1] += 1;
         self.rebuilt.insert(*key, Rebuild::Started);
         self.counters.t14_rebuild += 1;
         self.counters.t14_rebuild_full_started += 1;
@@ -670,6 +677,23 @@ impl DurableTailStore {
                 self.counters.guard_header_bytes += n as u64;
             }
             let binding = decode_header_with_row(&header, key, self.source, self.codec_row)?;
+            // A row's version prefix must precede body admission too. A newer
+            // graph can exceed this reader's cap and still is not ours to fix.
+            let mut prefix = Vec::new();
+            if let Some(row) = self.codec_row {
+                Read::by_ref(&mut file)
+                    .take(3)
+                    .read_to_end(&mut prefix)
+                    .map_err(|e| self.read_failure(e, Refusal::Undecodable))?;
+                match work {
+                    "delete" => self.counters.delete_verify_bytes += prefix.len() as u64,
+                    "overwrite" => self.counters.overwrite_verify_bytes += prefix.len() as u64,
+                    _ => self.counters.guard_verify_bytes += prefix.len() as u64,
+                }
+                if (row.newer)(&prefix) {
+                    return Err(Refusal::NewerFormat);
+                }
+            }
             // After any repair: its ctime moved.
             let Some(metadata) = self.inspect_file(&file) else {
                 return Ok(None);
@@ -687,10 +711,11 @@ impl DurableTailStore {
             test_hooks::before_access(&path, "body")
                 .map_err(|e| self.read_failure(e, Refusal::Corrupt))?;
             let mut bytes = header;
+            bytes.extend_from_slice(&prefix);
             file.take((RECORD_BYTES + TRAILER_BYTES + 1) as u64)
                 .read_to_end(&mut bytes)
                 .map_err(|e| self.read_failure(e, Refusal::Corrupt))?;
-            let read = bytes.len().saturating_sub(n) as u64;
+            let read = bytes.len().saturating_sub(n + prefix.len()) as u64;
             match work {
                 "delete" => self.counters.delete_verify_bytes += read,
                 "overwrite" => self.counters.overwrite_verify_bytes += read,

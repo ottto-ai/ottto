@@ -637,7 +637,7 @@ fn durable_sidecar_money_newer_format_waits_without_downgrade_then_reupgrade_equ
         // A never-accepted dependent also waits: Unknown cannot become $0 or
         // a sidecar-less estimate merely because the reader is downgraded.
         c.agent(0, &line(ROOT, "new-agent", AT, 30));
-        let mut older = slots.restart(&c).as_older_reader();
+        let mut older = slots.restart(&c).into_older_reader();
         let mut held_index = accepted;
         for _ in 0..3 {
             older.begin_pass();

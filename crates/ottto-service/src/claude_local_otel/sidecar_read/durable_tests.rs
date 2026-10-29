@@ -798,7 +798,7 @@ fn sparse_resource_carrier_contains_counts_and_persistent_failure_alarm_only() {
 
 #[test]
 fn unknown_representation_keeps_owner_pending_and_never_reacquires_or_overwrites() {
-    for mutation in ["allowlist", "kind", "envelope", "parser"] {
+    for mutation in ["allowlist", "kind", "envelope", "parser", "large_parser"] {
         let mut fixture = Fixture::new("sidecar-unknown-protection");
         let (api, trace) = bytes("first");
         fixture.write("scope", &api, &trace);
@@ -811,6 +811,9 @@ fn unknown_representation_keeps_owner_pending_and_never_reacquires_or_overwrites
             "kind" => unknown[42] = 77,
             "envelope" => unknown[8..10].copy_from_slice(&2_u16.to_le_bytes()),
             _ => unknown[store::HEADER_BYTES] = 2,
+        }
+        if mutation == "large_parser" {
+            unknown.resize(store::RECORD_BYTES + store::HEADER_BYTES + 33, 0);
         }
         // Deliberately leave the trailer stale. Newer representations are
         // opaque before checksum/continuation validation, never a repair grant.
@@ -1080,13 +1083,20 @@ fn malformed_growth_full_has_own_six_hour_pacing_and_keeps_owner_selected() {
         f.append(Kind::Api, &suffix);
         api.extend(&suffix);
         r.begin_pass();
+        r.growth_pace = (0..PACE_BOUND)
+            .map(|n| (format!("other-{n}"), n as u64))
+            .collect();
+        assert_eq!(r.growth_pace.len(), PACE_BOUND);
         fail_open();
         let (mut r, _) = load(r, &f.dir);
         let count = match reason {
             RestoreFailure::Unbindable => "sidecar_u_growth_full_unbindable",
             _ => "sidecar_u_growth_full_undecodable",
         };
-        assert_eq!(take_counts()[count], 1);
+        let counts = take_counts();
+        assert_eq!(counts[count], 1);
+        assert_eq!(counts["sidecar_pace_evicted"], 1);
+        assert_eq!(counts["sidecar_pace_alarm"], 1);
         assert!(r.pending_sessions().contains("scope"));
         fs::rename(&parked, &source).unwrap();
         let (suffix, _) = bytes("later");
@@ -1119,7 +1129,7 @@ fn newer_parser_holds_untouched_for_passes_and_reupgrade_resumes_without_old_byt
     let path = record_path(&r, "scope");
     let original = fs::read(&path).unwrap();
     drop(r);
-    let mut older = f.restart().as_older_reader();
+    let mut older = f.restart().into_older_reader();
     for _ in 0..4 {
         older.begin_pass();
         let (next, reports) = load(older, &f.dir);
@@ -1173,4 +1183,27 @@ fn v0_1_201_whole_file_reader_ignores_new_durable_kind() {
         ReadOutcome::Refused(store::Refusal::Unknown)
     );
     assert_eq!(fs::read(path).unwrap(), original);
+}
+
+#[test]
+fn s2_hold_age_keeps_unselected_entities_and_clears_only_healthy_selected_entities() {
+    let f = Fixture::new("sidecar-hold-age-pages");
+    let a = BTreeSet::from(["a".into()]);
+    let b = BTreeSet::from(["b".into()]);
+    let mut r = f.reader();
+    r.set_time(100);
+    let (mut r, ()) = with_reader(r, || record_holds(&a, &a));
+    assert_eq!(take_counts()["sidecar_s2_hold_entities"], 1);
+    r.set_time(200);
+    let (mut r, ()) = with_reader(r, || record_holds(&b, &b));
+    let counts = take_counts();
+    assert_eq!(counts["sidecar_s2_hold_entities"], 2);
+    assert_eq!(counts["sidecar_s2_hold_oldest_age"], 100);
+    r.set_time(220);
+    let (r, ()) = with_reader(r, || record_holds(&BTreeSet::new(), &b));
+    let counts = take_counts();
+    assert_eq!(counts["sidecar_s2_hold_entities"], 1);
+    assert_eq!(counts["sidecar_s2_hold_oldest_age"], 120);
+    let (_, ()) = with_reader(r, || record_holds(&BTreeSet::new(), &a));
+    assert!(take_counts().is_empty(), "recovery clears the gauges");
 }

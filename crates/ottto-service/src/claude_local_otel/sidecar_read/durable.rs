@@ -104,6 +104,7 @@ pub(crate) struct Reader {
     growth_pace: BTreeMap<String, u64>,
     hold_since: BTreeMap<String, u64>,
     now: u64,
+    simulated_clock: bool,
     pub(super) counts: [Counts; 2],
 }
 
@@ -132,6 +133,7 @@ impl Reader {
             write_cursor: None,
             sync_owed: false,
             restored_records: 0,
+            simulated_clock: false,
             newer: BTreeSet::new(),
             newer_counted: BTreeSet::new(),
             repairs: BTreeMap::new(),
@@ -146,7 +148,7 @@ impl Reader {
     }
     /// Synthetic downgrade: current parser-1 bytes are newer than parser 0.
     /// Re-upgrade uses the unchanged production codec and record, no migration.
-    pub(crate) fn as_older_reader(mut self) -> Self {
+    pub(crate) fn into_older_reader(mut self) -> Self {
         assert!(self.entries.is_empty(), "downgrade starts from disk");
         self.store = DurableTailStore::new(self.store.dir().into(), DurableSource::ClaudeCode)
             .with_codec_row(CodecRow {
@@ -158,6 +160,12 @@ impl Reader {
         self
     }
     pub(crate) fn begin_pass(&mut self) {
+        if !self.simulated_clock {
+            self.now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+        }
         self.bootstrap_left = BOOTSTRAP_PASS_BYTES;
         self.restored_records = 0;
         self.counts = [Counts::default(); 2];
@@ -237,6 +245,7 @@ impl Reader {
     }
     pub(crate) fn set_time(&mut self, now: u64) {
         self.now = now;
+        self.simulated_clock = true;
     }
     fn lengths(&self, session: &str) -> [Option<u64>; 2] {
         [Kind::Api, Kind::Trace].map(|kind| {
@@ -1059,13 +1068,20 @@ pub(in crate::claude_local_otel) fn unavailable_families() -> BTreeSet<String> {
             .unwrap_or_default()
     })
 }
-pub(in crate::claude_local_otel) fn record_holds(held: &BTreeSet<String>) {
+pub(in crate::claude_local_otel) fn record_holds(
+    held: &BTreeSet<String>,
+    selected: &BTreeSet<String>,
+) {
     ACTIVE.with(|active| {
         let mut active = active.borrow_mut();
         let Some(reader) = active.as_mut() else {
             return;
         };
-        reader.hold_since.retain(|id, _| held.contains(id));
+        // A page only resolves the entities it actually reconsidered. An
+        // unrelated selected family must not erase an older ongoing hold.
+        reader
+            .hold_since
+            .retain(|id, _| !selected.contains(id) || held.contains(id));
         for id in held {
             reader.hold_since.entry(id.clone()).or_insert(reader.now);
         }
@@ -1075,7 +1091,7 @@ pub(in crate::claude_local_otel) fn record_holds(held: &BTreeSet<String>) {
             .map(|start| reader.now.saturating_sub(*start))
             .max()
             .unwrap_or(0);
-        super::counts::record_holds(held.len() as u64, age);
+        super::counts::record_holds(reader.hold_since.len() as u64, age);
     });
 }
 

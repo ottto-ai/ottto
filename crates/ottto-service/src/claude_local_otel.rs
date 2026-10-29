@@ -82,7 +82,11 @@ pub(crate) fn durable_sidecar_held_entities(
             }
         })
         .collect();
-    sidecar_read::durable::record_holds(&held);
+    let selected = items
+        .iter()
+        .map(|item| item.source_session_id.clone())
+        .collect();
+    sidecar_read::durable::record_holds(&held, &selected);
     held
 }
 
