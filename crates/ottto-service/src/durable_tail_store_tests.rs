@@ -2496,14 +2496,7 @@ fn claude_mutations_require_exact_strict_proof_and_a_current_stamp() {
                         "{seam} {arm}"
                     );
                 }
-                _ => cold
-                    .gc(
-                        &lock,
-                        &b.context,
-                        &placeholder_allowlist(),
-                        &BTreeMap::new(),
-                    )
-                    .unwrap(),
+                _ => cold.gc(&lock, &b.context, &BTreeMap::new()).unwrap(),
             }
             if arm == "eligible" {
                 if seam == "overwrite" {
@@ -2804,14 +2797,7 @@ fn claude_mutation_proof_expires_at_pass_boundary_and_unmemoized_records_survive
     let disk = record_file(&store, &b.key);
     let before = fs::read(&disk).unwrap();
     store.begin_pass();
-    store
-        .gc(
-            &lock,
-            &b.context,
-            &placeholder_allowlist(),
-            &BTreeMap::new(),
-        )
-        .unwrap();
+    store.gc(&lock, &b.context, &BTreeMap::new()).unwrap();
     assert_eq!(
         fs::read(&disk).unwrap(),
         before,

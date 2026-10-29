@@ -678,6 +678,7 @@ pub(crate) struct DurableCustody {
     upgrade: Option<UpgradeRead>,
 }
 impl DurableCustody {
+    #[cfg(test)]
     pub(crate) fn take_retail(&mut self) -> Option<RetailAttempt> {
         self.retail.take()
     }
@@ -800,6 +801,7 @@ impl RetailAttempt {
         self.range(file, at)?;
         self.accounted(file).read(bytes)
     }
+    #[cfg(test)]
     pub(crate) fn read_at(
         &mut self,
         file: &File,

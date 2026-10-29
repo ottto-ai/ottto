@@ -7423,3 +7423,122 @@ fn a1t_no_match_shared_pacing_ram_tail_eviction_release_restart_and_no_rebind() 
     assert_eq!(std::fs::read(&disk_path).unwrap(), survivor);
     let _ = std::fs::remove_dir_all(root);
 }
+
+// P2 component skeleton: accepted v1 -> process loss -> restored Tail ->
+// acknowledged successor -> second process loss. Move this row to the shared
+// transition fixture when #882 lands; retain these production scanner/wire calls.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
+fn p2_restart_restore_tail_persists_successor_and_restarts_again() {
+    use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
+    use std::io::Write;
+    let _gate = claude_request_money::e2::GateForTest::set(true);
+    let root = crate::test_scratch::private_dir("ottto-p2-restart");
+    let lock = test_locks::hold(&root);
+    let projects = root.join("projects");
+    std::fs::create_dir_all(&projects).unwrap();
+    let path = projects.join("1338a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl");
+    let roots = vec![projects];
+    let index_path = root.join("index.json");
+    let source = SnapshotSource::ClaudeCode;
+    let key = local_index_key(&path);
+    std::fs::write(&path, a1a_row("accepted", 100)).unwrap();
+    let warm = E2ScanFixture::default();
+    warm.begin_durable(source, &root, &index_path);
+    let (mut index, mut scan, modes) = a1a_scan_at(
+        &warm,
+        &roots,
+        &root,
+        ScanIndex::default(),
+        "2026-08-02T08:00:00Z",
+    );
+    assert_eq!(modes, (1, 0, 0));
+    assert_eq!(scan.snapshots.len(), 1);
+    a1a_wire(&root, &mut index, &mut scan);
+    index.record_accepted_snapshot_fingerprints(
+        &scan
+            .snapshots
+            .iter()
+            .map(|s| s.snapshot_fingerprint.clone())
+            .collect(),
+    );
+    index.save(&index_path).unwrap();
+    assert_eq!(
+        warm.cache
+            .durable_write_after_save(lock, source, &index)
+            .unwrap()
+            .written,
+        1
+    );
+    drop(warm);
+
+    for (id, tokens, total, requests) in
+        [("restart-one", 200, 300, 2), ("restart-two", 400, 700, 3)]
+    {
+        let prior = ScanIndex::load(&index_path).unwrap();
+        let accepted = prior.files[&key].size_bytes;
+        assert!(prior.files[&key].last_upload_body_witness.is_some());
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(a1a_row(id, tokens).as_bytes())
+            .unwrap();
+        let length = std::fs::metadata(&path).unwrap().len();
+        assert!(length > accepted);
+        let restarted = E2ScanFixture::default();
+        restarted.begin_durable(source, &root, &index_path);
+        assert!(restarted.cache.retained_checkpoint(&key).is_none());
+        let ((mut index, mut scan, modes), consumed) = observe_consumed(|| {
+            a1a_scan_at(
+                &restarted,
+                &roots,
+                &root,
+                prior.clone(),
+                "2026-08-02T08:01:00Z",
+            )
+        });
+        assert_eq!(modes, (0, 1, 0));
+        assert_eq!(consumed, length - accepted);
+        assert_eq!(
+            restarted.cache.durable_counters(source).unwrap().0.restored,
+            1
+        );
+        assert_eq!(scan.snapshots.len(), 1);
+        assert_eq!(
+            (
+                scan.snapshots[0].input_tokens,
+                scan.snapshots[0].request_count
+            ),
+            (total, requests)
+        );
+        let actual = a1a_wire(&root, &mut index, &mut scan);
+        let cold = E2ScanFixture::default();
+        let (mut ci, mut cs, cold_modes) =
+            a1a_scan_at(&cold, &roots, &root, prior, "2026-08-02T08:01:00Z");
+        assert_eq!(cold_modes, (1, 0, 0));
+        assert_eq!(actual, a1a_wire(&root, &mut ci, &mut cs));
+        index.record_accepted_snapshot_fingerprints(
+            &scan
+                .snapshots
+                .iter()
+                .map(|s| s.snapshot_fingerprint.clone())
+                .collect(),
+        );
+        index.save(&index_path).unwrap();
+        assert_eq!(
+            restarted
+                .cache
+                .durable_write_after_save(lock, source, &index)
+                .unwrap()
+                .written,
+            1
+        );
+        restarted.cache.durable_gc(lock, source, &index).unwrap();
+        assert_eq!(
+            ScanIndex::load(&index_path).unwrap().files[&key].size_bytes,
+            length
+        );
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
