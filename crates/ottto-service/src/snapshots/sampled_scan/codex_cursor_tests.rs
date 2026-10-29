@@ -788,6 +788,7 @@ fn strict_debt_is_never_settleable_residue_and_held_debt_is() {
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
+        withheld_content_stamp: None,
     };
     let disclose = |disclosure: &Disclosure| {
         let mut index = ScanIndex::default();
@@ -2894,6 +2895,7 @@ fn unchanged_candidate(fixture: &ScanRoot, index: &ScanIndex) -> CandidateFile {
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
+        withheld_content_stamp: None,
     }
 }
 
@@ -4935,6 +4937,7 @@ fn memo_wakes_on_the_conflicted_identity_set() {
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
+        withheld_content_stamp: None,
     };
     let digest = |codex: &CodexTitleMetadata| {
         memo_digest(
@@ -5951,6 +5954,7 @@ fn one_writer_attributes_and_replays_held_totals() {
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
+        withheld_content_stamp: None,
     };
     let key = local_index_key(&candidate.path);
     let mut index = ScanIndex::default();
@@ -7428,6 +7432,7 @@ fn memo_digest_fences_receipt_contents_context_census_flags_and_members() {
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
+        withheld_content_stamp: None,
     };
     let receipt = |tier: &str| -> AppliedTierReceipt {
         serde_json::from_value(json!({"version": 1, "derivation": "fixture",
@@ -7825,6 +7830,7 @@ fn join_member(path: PathBuf) -> CandidateFile {
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
+        withheld_content_stamp: None,
     }
 }
 
@@ -14013,6 +14019,7 @@ fn ownership_disclosure_replays_preserve_cause_and_group_strict_uses_group_bucke
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
+        withheld_content_stamp: None,
     };
     for cause in [ownership::CREATED, ownership::PARENT, ownership::PARSER] {
         let mut index = ScanIndex::default();

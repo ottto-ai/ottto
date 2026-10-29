@@ -314,11 +314,24 @@ after the existing decision, are drained by that source's next completed page,
 and count repeated decisions, not distinct files or bytes. They are recorded
 whether or not an observer is registered.
 
-On Claude pages, `counts.withheld_hold_released` counts released holds: `deleted`
+On Claude pages, `counts.withheld_reparse` counts re-parses of keys withheld for
+an unresolved account: `start` (first in this process), `evidence` (same size,
+but the sampled content, the file object, its api/trace sidecar stamps or the
+request identity contract changed) and `growth` (the size changed). A withheld
+key whose content and evidence are unchanged is skipped and not counted; an
+mtime, ctime or xattr change alone reads zero bytes once the key has been
+re-checked unchanged after its last parse. A past-due sampled audit on such a
+key is deferred to its next counted re-parse (it cannot settle while held). The
+memo behind that skip is RAM only. `counts.withheld_hold_released` counts released holds: `deleted`
 (the held file was proved absent) and `resolved` (a parse bound the account).
 `counts.withheld_hold_unrecorded` counts withheld keys past the 4,096-hold cap
 that could not be recorded (`events`) and their withheld `tokens`; such a key has
-no age exemption. Both are drained like `line_delivery_unselected`.
+no age exemption. All three are drained like
+`line_delivery_unselected`.
+`counts.withheld_memo` is a gauge of that memo: `entries` (at most 4,096) and
+`retained_bytes`, the bytes charged to the sync owner's process-retained bound
+(absent where the requested layout is unsupported). A refused charge drops the
+memo with the other retained graphs. Omitted while the memo is empty.
 
 ## Context Footprint Discovery
 

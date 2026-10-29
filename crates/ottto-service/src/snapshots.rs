@@ -165,7 +165,7 @@ mod stale_carry_diagnostics;
 #[cfg(test)]
 mod transcript_acquisition_tests;
 mod traversal_transition;
-mod withheld_account;
+pub(crate) mod withheld_account;
 use stale_carry_diagnostics::{
     Counts as StaleCarryRejectionCounts, Rejection as StaleCarryRejection,
 };
@@ -5046,7 +5046,8 @@ impl ClaudeUsageAuthorityDisposition {
     ///   retry is due; the held key keeps its committed revision;
     /// - an account deferral, whose verdict depends on the body and the local
     ///   request evidence rather than on traversal completeness. Its key keeps
-    ///   the committed revision and is reparsed by every later generation.
+    ///   the committed revision and is reparsed once per process and when its
+    ///   content or account evidence changes (`withheld_account`).
     ///
     /// Everything else stays progress-blocking. Without a durable disclosure
     /// for every account deferral (`account_holds_recorded == false`), account
@@ -21826,6 +21827,7 @@ fn codex_parent_candidate_match(
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
+        withheld_content_stamp: None,
     };
     Ok(candidate)
 }
@@ -21954,6 +21956,7 @@ fn codex_parent_locate(
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
+        withheld_content_stamp: None,
     };
     let file = open_candidate_beneath_root(&candidate).map_err(|_| Absent)?;
     let opened = file.metadata().map_err(|_| Absent)?;
@@ -27600,6 +27603,7 @@ impl OwnedSourceScan {
                             SnapshotSource::Codex,
                             &mut live.clone(),
                             Some(&context.cache),
+                            false,
                         )
                         .ok()
                         .map(|(file, _)| file)
@@ -30474,7 +30478,7 @@ impl OwnedSourceScan {
                             index.remove_file_entry_unless_held(index_key, vanished);
                             if held && !index.claude_account_deferred_holds.contains_key(index_key)
                             {
-                                withheld_account::released_deleted();
+                                withheld_account::released_deleted(index_key);
                             }
                         }
                         if census_record && index.claude_request_census.get(index_key).is_none() {
@@ -38493,6 +38497,9 @@ struct CandidateFile {
     fingerprint_changed_nanos: u64,
     /// The live file birth (unix nanos) of that open; zero if unavailable.
     fingerprint_birth_nanos: u64,
+    /// A withheld-account held key's re-read stamp: content and account
+    /// evidence only, never mtime or ctime (`withheld_account.rs`).
+    withheld_content_stamp: Option<String>,
 }
 
 /// The object inputs of one opened-object identity (unix device, inode and
@@ -42217,6 +42224,7 @@ fn candidate_from_traversal_path_at(
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
+        withheld_content_stamp: None,
     })
 }
 
@@ -42273,7 +42281,7 @@ fn reconcile_missing_index_entries_with_side(
             index.confirmed_empty_files.remove(key);
             index.file_snapshot_fingerprints.remove(key);
             if index.claude_account_deferred_holds.remove(key).is_some() {
-                withheld_account::released_deleted();
+                withheld_account::released_deleted(key);
             }
             index.drop_codex_proof_items(key, codex_side_drop);
         }
@@ -42412,6 +42420,7 @@ fn collect_recent_jsonl_files(
             opened_object_identity: String::new(),
             fingerprint_changed_nanos: 0,
             fingerprint_birth_nanos: 0,
+            withheld_content_stamp: None,
         });
     }
 }
@@ -42601,7 +42610,7 @@ fn open_candidate_file_stat(
     source: SnapshotSource,
     candidate: &mut CandidateFile,
 ) -> std::io::Result<(File, Option<OpenedObjectStat>)> {
-    open_candidate_file_stat_retained(source, candidate, None)
+    open_candidate_file_stat_retained(source, candidate, None, false)
 }
 
 fn physical_identity(metadata: &fs::Metadata) -> Option<[u64; 2]> {
@@ -42620,6 +42629,7 @@ fn open_candidate_file_stat_retained(
     source: SnapshotSource,
     candidate: &mut CandidateFile,
     cache: Option<&sampled_scan::SharedCache>,
+    held: bool,
 ) -> std::io::Result<(File, Option<OpenedObjectStat>)> {
     #[cfg(test)]
     ALL_TRANSCRIPT_OPENS_FOR_TEST.with(|count| count.set(count.get() + 1));
@@ -42629,8 +42639,10 @@ fn open_candidate_file_stat_retained(
     let retained = cache
         .filter(|_| source == SnapshotSource::Codex)
         .map(|cache| (cache, candidate.path.as_path()));
-    let (identity, stat) = opened_object_identity_and_stat_retained(source, &mut file, retained)?;
+    let (identity, stat, content) =
+        opened_object_identity_and_stat_retained(source, &mut file, retained, held)?;
     candidate.opened_object_identity = identity;
+    candidate.withheld_content_stamp = content;
     let tracked =
         stat.filter(|_| matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex));
     candidate.fingerprint_changed_nanos = tracked.map_or(0, |stat| stat.changed_unix_nanos());
@@ -42683,8 +42695,11 @@ fn open_and_identify_scan_candidate_with_rescue(
     verification_rescue: bool,
     cache: Option<&sampled_scan::SharedCache>,
 ) -> Option<(CandidateFile, File)> {
+    let held = retention
+        .account_holds
+        .contains_key(&local_index_key(&candidate.path));
     let (mut opened_file, live) =
-        match open_candidate_file_stat_retained(source, &mut candidate, cache) {
+        match open_candidate_file_stat_retained(source, &mut candidate, cache, held) {
             Ok(opened) => opened,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 if claude_absence_is_removal(source, &candidate.path).is_removal(&candidate.path) {
@@ -42758,6 +42773,15 @@ fn open_and_identify_scan_candidate_with_rescue(
         return None;
     };
     let session_sidecar_fingerprint = std::mem::take(&mut candidate.source_file_fingerprint);
+    // SOURCE condition 1: the sampled content plus the sidecars the account
+    // resolver reads; a metadata-only touch leaves it unchanged.
+    candidate.withheld_content_stamp = candidate.withheld_content_stamp.take().map(|content| {
+        sha256_hex(&[
+            "claude_withheld_content:v1",
+            &content,
+            &session_sidecar_fingerprint,
+        ])
+    });
     candidate.source_file_fingerprint = scan_file_fingerprint_with_opened_identity(
         &candidate.path,
         candidate.size_bytes,
@@ -42939,14 +42963,18 @@ fn opened_object_identity_and_stat(
     source: SnapshotSource,
     file: &mut File,
 ) -> std::io::Result<(String, Option<OpenedObjectStat>)> {
-    opened_object_identity_and_stat_retained(source, file, None)
+    opened_object_identity_and_stat_retained(source, file, None, false)
+        .map(|(identity, stat, _)| (identity, stat))
 }
 
+/// With `content_only`, also the identity of the same samples with ctime
+/// zeroed: the withheld-account content stamp, at no extra read.
 fn opened_object_identity_and_stat_retained(
     source: SnapshotSource,
     file: &mut File,
     retained: Option<(&sampled_scan::SharedCache, &Path)>,
-) -> std::io::Result<(String, Option<OpenedObjectStat>)> {
+    content_only: bool,
+) -> std::io::Result<(String, Option<OpenedObjectStat>, Option<String>)> {
     file.seek(SeekFrom::Start(0))?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
@@ -42975,11 +43003,15 @@ fn opened_object_identity_and_stat_retained(
     #[cfg(not(unix))]
     let stat = None;
     let identity = opened_object_identity_from(len, stat.as_ref(), &samples);
+    let content = content_only.then(|| {
+        let object = stat.map(|stat| stat.with_changed_unix_nanos(0));
+        opened_object_identity_from(len, object.as_ref(), &samples)
+    });
     if let Some((cache, path)) = retained {
         cache.retained_sampled(path, file, &metadata, &samples);
     }
     file.seek(SeekFrom::Start(0))?;
-    Ok((identity, stat))
+    Ok((identity, stat, content))
 }
 
 /// Ron's re-read rule: only content (size, mtime, sampled bytes) or
@@ -47424,6 +47456,7 @@ impl ScanIndex {
         use crate::local_resource_diagnostics::{withheld_event, WithheldEvent};
         let mut recorded = true;
         for (index_key, source_file_fingerprint) in completed_parses {
+            let was_held = self.claude_account_deferred_holds.contains_key(index_key);
             let (held, tokens) = (self.file_snapshot_fingerprints.get(index_key).into_iter())
                 .flatten()
                 .filter_map(|fingerprint| account_deferred_tokens.get(fingerprint))
@@ -47450,6 +47483,7 @@ impl ScanIndex {
                 withheld_event(WithheldEvent::UnrecordedEvents, 1);
                 withheld_event(WithheldEvent::UnrecordedTokens, tokens);
             }
+            self.note_withheld_account_parse(index_key, source_file_fingerprint, was_held);
         }
         recorded
     }
@@ -47465,7 +47499,7 @@ impl ScanIndex {
         self.claude_account_deferred_holds.retain(|index_key, _| {
             let present = files.contains_key(index_key) || observed.contains(index_key);
             if !present {
-                withheld_account::released_deleted();
+                withheld_account::released_deleted(index_key);
             }
             present
         });
@@ -48760,6 +48794,9 @@ impl ScanIndex {
             if self.claude_retired_family_member(&candidate.path) {
                 return self.claude_returning_member_decision(candidate);
             }
+            if self.withheld_account_unchanged(&key, candidate) {
+                return (CandidateDecision::Skip, None);
+            }
             return (
                 CandidateDecision::Parse,
                 Some(CandidateParseReason::NewFile),
@@ -48787,8 +48824,13 @@ impl ScanIndex {
                 return (CandidateDecision::Skip, None);
             }
         }
-        if entry.audit_requires_full(now) || sampled_audit::progress_debt(self, &key, now).is_some()
-        {
+        // A withheld key's audit debt (carried onto its reverted entry) cannot
+        // settle while held; an unchanged one defers it to its next counted
+        // re-parse, usually the binding read, instead of a Full every pass.
+        let audit = entry.audit_requires_full(now)
+            && (entry.source_file_fingerprint.is_empty()
+                || !self.withheld_account_unchanged(&key, candidate));
+        if audit || sampled_audit::progress_debt(self, &key, now).is_some() {
             return (CandidateDecision::Parse, Some(CandidateParseReason::Audit));
         }
         // A locally held Claude family above keeps its existing bounded retry
@@ -48825,6 +48867,13 @@ impl ScanIndex {
                 CandidateDecision::Parse,
                 Some(CandidateParseReason::ActivityOrQuarantineRetry),
             );
+        }
+        // A withheld key keeps its old committed revision; unless re-armed it
+        // re-parses only once per process or on a stamp/evidence change.
+        if !entry.source_file_fingerprint.is_empty()
+            && self.withheld_account_unchanged(&key, candidate)
+        {
+            return (CandidateDecision::Skip, None);
         }
         let transcript_changed = entry.size_bytes != candidate.size_bytes
             || entry.modified_unix_seconds != candidate.modified_unix_seconds
@@ -53136,6 +53185,7 @@ mod tests {
             opened_object_identity: String::new(),
             fingerprint_changed_nanos: 0,
             fingerprint_birth_nanos: 0,
+            withheld_content_stamp: None,
         }
     }
 
@@ -53647,6 +53697,7 @@ mod tests {
             opened_object_identity: "opened".to_string(),
             fingerprint_changed_nanos: 0,
             fingerprint_birth_nanos: 0,
+            withheld_content_stamp: None,
         };
         let mut stale_witness = snapshot_quarantine_witness(SnapshotSource::Codex);
         stale_witness.collector_version.push_str("-old");
@@ -54265,6 +54316,7 @@ mod tests {
             opened_object_identity: "opened".to_string(),
             fingerprint_changed_nanos: 0,
             fingerprint_birth_nanos: 0,
+            withheld_content_stamp: None,
         };
         let index = ScanIndex {
             files: BTreeMap::from([(
@@ -54319,6 +54371,7 @@ mod tests {
             opened_object_identity: "opened".to_string(),
             fingerprint_changed_nanos: 0,
             fingerprint_birth_nanos: 0,
+            withheld_content_stamp: None,
         };
         let index = ScanIndex {
             files: BTreeMap::from([(
@@ -54370,6 +54423,7 @@ mod tests {
             opened_object_identity: "opened".to_string(),
             fingerprint_changed_nanos: 0,
             fingerprint_birth_nanos: 0,
+            withheld_content_stamp: None,
         };
         let index = ScanIndex {
             files: BTreeMap::from([(
@@ -89595,7 +89649,7 @@ crate::durable_tail_codec::durable_struct!(BucketRowAccumulator {
     N usage: UsageTotals,
     U reasoning_effort: Option<String>,
 });
-crate::heap_layout_bound::fields!(CandidateFile; physical_identity, scan_root, path, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, legacy_source_file_fingerprint, legacy_config_reconciliation_required, opened_object_identity, fingerprint_changed_nanos, fingerprint_birth_nanos);
+crate::heap_layout_bound::fields!(CandidateFile; physical_identity, scan_root, path, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, legacy_source_file_fingerprint, legacy_config_reconciliation_required, opened_object_identity, fingerprint_changed_nanos, fingerprint_birth_nanos, withheld_content_stamp);
 crate::heap_layout_bound::fields!(ClaudeAccountFamilyPending; current, previous_windows, confirmed_absent_members);
 crate::heap_layout_bound::fields!(ClaudeAccountFamilyPendingWindow; version, census_window_end, account_identifier_hash, evidence_request_count, census_complete, members, member_requests, invalid);
 crate::heap_layout_bound::fields!(ClaudeAccountRequestSet; prefixes, fingerprint, identity_revision);
