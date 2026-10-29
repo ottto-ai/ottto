@@ -124,7 +124,6 @@ fn durable_round_trip(s: &Scratch, index: &ScanIndex, generation: u64) {
         .collect::<Vec<_>>()
         .try_into()
         .unwrap();
-<<<<<<< HEAD
     let logical = serde_json::to_value(index).unwrap();
     let entry = index.files.get("synthetic-file").unwrap();
     let context = logical["upload_context_fingerprint"].as_str();
@@ -141,17 +140,6 @@ fn durable_round_trip(s: &Scratch, index: &ScanIndex, generation: u64) {
             entry.effective_upload_body_witness_revision,
             0,
         ),
-=======
-    let logical=serde_json::to_value(index).unwrap();
-    let entry=index.files.get("synthetic-file").unwrap();
-    let context=logical["upload_context_fingerprint"].as_str();
-    let binding = durable::Binding {
-        source,
-        key: durable::key_digest(source, "synthetic-file"),
-        context: durable::context_digest(&"a".repeat(64),context),
-        scope: durable::scope_digest("synthetic-scope", &allowlist, "identity:v1", "legacy"),
-        entry: durable::replay_entry_digest(&durable::entry_digest(&entry.source_file_fingerprint,entry.last_upload_body_witness.as_deref()),entry.effective_upload_body_witness_revision,0),
->>>>>>> e1/scanindex-reader
     };
     let record = durable::PendingRecord {
         binding: binding.clone(),
@@ -184,7 +172,6 @@ fn durable_round_trip(s: &Scratch, index: &ScanIndex, generation: u64) {
     assert_eq!(restored.index_generation, generation);
     assert_eq!(restored.record, record);
     // The actual #865 admission seam checks entry/context/scope AND generation.
-<<<<<<< HEAD
     let expected = durable::Expected {
         binding: binding.clone(),
         committed_generation: root["generation"].as_u64().unwrap(),
@@ -202,12 +189,6 @@ fn durable_round_trip(s: &Scratch, index: &ScanIndex, generation: u64) {
             committed_generation: generation + 1
         })
         .is_ok());
-=======
-    let expected=durable::Expected{binding:binding.clone(),committed_generation:root["generation"].as_u64().unwrap()};
-    assert!(restored.eligible(&expected).is_ok());
-    assert!(restored.eligible(&durable::Expected{binding:binding.clone(),committed_generation:generation-1}).is_err());
-    assert!(restored.eligible(&durable::Expected{binding,committed_generation:generation+1}).is_ok());
->>>>>>> e1/scanindex-reader
     assert!(restored.index_generation <= root["generation"].as_u64().unwrap());
     assert!(crate::snapshots::verify_durable_body(
         &restored.record.body,
@@ -225,7 +206,6 @@ fn reader_loads_frozen_writer_bytes_and_preserves_logical2_and_durable_generatio
     assert_eq!(root.generation(), Some(7));
     durable_round_trip(&s, &actual, root.generation().unwrap());
 }
-<<<<<<< HEAD
 struct RealFragments {
     logical: Value,
     metadata: Value,
@@ -340,5 +320,3 @@ fn actual_sharded_save_keeps_every_other_field_in_metadata_and_binds_durable_gen
     assert_eq!(loaded.generation(), Some(8));
     durable_round_trip(&s, &actual, loaded.generation().unwrap());
 }
-=======
->>>>>>> e1/scanindex-reader

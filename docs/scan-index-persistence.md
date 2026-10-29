@@ -164,7 +164,6 @@ no power-loss claim. Full typed production round-trip, hold/positional coverage,
 resource accounting, 12k/100k measurements and P1–P4/E4 emitted-money equivalence
 remain integration gates. This component changes no live daemon or state.
 
-<<<<<<< HEAD
 ## Writer publication and collection
 
 The three dominant maps use 256 hash buckets each. A borrowed, charged key index
@@ -207,8 +206,6 @@ may resume. Prior-root markers, quarantine/legacy siblings, or any unknown objec
 refuse cleanup. No prior state is discarded. GC continuation binds exact root
 identity and restarts its sweep after any root change.
 
-=======
->>>>>>> e1/scanindex-reader
 ## SOURCE and money conditions: scoped unknown state
 
 Outer schema 3 / storage 1 / logical 2, naming and digest domains are approved.
