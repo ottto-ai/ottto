@@ -331,7 +331,9 @@ impl codex_file_join::HeaderInventory {
             || self
                 .headers
                 .binary_search_by(|h| h.candidate.path.as_os_str().cmp(path.as_os_str()))
-                .is_ok_and(|at| self.headers[at].custody_cause.is_some() || self.headers[at].plain_twin)
+                .is_ok_and(|at| {
+                    self.headers[at].custody_cause.is_some() || self.headers[at].plain_twin
+                })
     }
 }
 
