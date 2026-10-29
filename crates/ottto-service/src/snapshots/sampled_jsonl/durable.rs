@@ -207,6 +207,7 @@ pub(crate) struct Decoded {
     rederive: Rederive,
 }
 
+#[cfg(test)]
 pub(crate) fn decode(body: &[u8], source: SnapshotSource) -> Result<Decoded, Corrupt> {
     let mut d = Dec::new(body);
     let reduction = CachedJsonlReduction::take(&mut d)?;
@@ -219,6 +220,36 @@ pub(crate) fn decode(body: &[u8], source: SnapshotSource) -> Result<Decoded, Cor
         reduction,
         rederive,
     })
+}
+
+/// Funds typed decode only; re-derivation is a separate allocation boundary.
+#[cfg(unix)]
+pub(crate) fn decode_bounded(
+    body: &[u8],
+    source: SnapshotSource,
+    lease: &mut crate::durable_tail_store::ActiveLease,
+) -> Result<Decoded, crate::durable_tail_codec::DecodeFailure> {
+    use crate::durable_tail_codec::DecodeFailure;
+    if !crate::heap_layout_bound::layout_supported() {
+        return Err(DecodeFailure::Budget);
+    }
+    lease
+        .charge(std::mem::size_of::<Decoded>() as u64)
+        .map_err(|_| DecodeFailure::Budget)?;
+    let mut reserve = |bytes| lease.charge(bytes).is_ok();
+    let mut d = Dec::bounded(body, &mut reserve);
+    let result = (|| {
+        let reduction = CachedJsonlReduction::take(&mut d)?;
+        let rederive = Rederive::take(&mut d)?;
+        if d.remaining() != 0 || reduction.accumulator.source != source {
+            return Err(Corrupt);
+        }
+        Ok(Decoded {
+            reduction,
+            rederive,
+        })
+    })();
+    d.outcome(result)
 }
 
 /// Re-derivation I/O, for the per-pass receipt.

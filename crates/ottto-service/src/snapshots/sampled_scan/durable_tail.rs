@@ -719,7 +719,13 @@ impl SharedCache {
             snapshot_source,
             (4 * store::RECORD_BYTES + WRITE_PASS_BYTES) as u64,
         ) else {
-            return self.durable_hold(snapshot_source, key);
+            // Recheck disabled/debt after the wait; never fall into classifier I/O
+            // without funding if another worker reconciled or disabled the slot.
+            return self.durable().and_then(|mut stores| {
+                let slot = stores.slot(source).as_ref()?;
+                (slot.store.disabled().is_none() && slot.store.receipt_pending(&digest))
+                    .then_some(store::Refusal::ReceiptPending)
+            });
         };
         let result = self.hold_active(snapshot_source, key);
         lease.release();
@@ -754,13 +760,38 @@ impl SharedCache {
         source: SnapshotSource,
         candidate: &CandidateFile,
         index: &mut ScanIndex,
-    ) -> Option<store::Refusal> {
-        self.reconcile_pending_key(source, &local_index_key(&candidate.path))
-            .or_else(|| self.durable_hold(source, &local_index_key(&candidate.path)))
-            .or_else(|| {
-                self.durable_upgrade_missing(source, candidate, index)
-                    .then_some(store::Refusal::UpgradeMissing)
-            })
+    ) -> Result<Option<store::Refusal>, store::ActiveOverBudget> {
+        let Some(ds) = durable_source(source) else {
+            return Ok(None);
+        };
+        {
+            let Some(mut stores) = self.durable() else {
+                return Err(store::ActiveOverBudget);
+            };
+            if stores
+                .slot(ds)
+                .as_ref()
+                .is_none_or(|slot| slot.store.disabled().is_some())
+            {
+                return Ok(None); // Disabled stores never hold native acquisition.
+            }
+        }
+        let key = local_index_key(&candidate.path);
+        if let Some(reason) = self.reconcile_pending_key(source, &key) {
+            return Ok(Some(reason));
+        }
+        // Guard classification also allocates an envelope: fund it outside Stores.
+        let store::LeaseWait::Granted(lease) =
+            self.acquire_active(source, store::RESTORE_INPUT_BYTES)
+        else {
+            return Err(store::ActiveOverBudget);
+        };
+        let result = self.durable_hold(source, &key).or_else(|| {
+            self.durable_upgrade_missing(source, candidate, index)
+                .then_some(store::Refusal::UpgradeMissing)
+        });
+        lease.release();
+        Ok(result)
     }
 
     pub(in crate::snapshots) fn durable_upgrade_missing(
@@ -872,7 +903,7 @@ impl SharedCache {
     }
 
     /// Restores `key` from the durable store into the RAM cache and takes it,
-    /// or `None` (the read is then Full, with nothing left behind). `held` is
+    /// or a typed pending/integrity/missing outcome. `held` is
     /// the parser's opened FD for `path`, not yet read; a duplicate of it
     /// serves the bounded re-derivation, and the read plan repositions it.
     #[allow(clippy::too_many_arguments)]
@@ -895,8 +926,14 @@ impl SharedCache {
         if let Some(reason) = self.reconcile_pending_key(snapshot_source, key) {
             return RestoreOutcome::Held(reason);
         }
-        // The common guard held U/T14 before acquisition; this sees class changes since.
-        match self.restore_known(
+        let store::LeaseWait::Granted(mut lease) = self.acquire_active(
+            snapshot_source,
+            (store::RECORD_BYTES + super::AUDIT_AND_SCRATCH_BYTES) as u64,
+        ) else {
+            return RestoreOutcome::Pending;
+        };
+        // Reconcile completed before this owner; never reacquire it at cache take.
+        let result = match self.restore_known(
             snapshot_source,
             key,
             path,
@@ -904,21 +941,24 @@ impl SharedCache {
             held,
             index,
             interpretation,
+            &mut lease,
         ) {
-            Some(()) => match self.take_prepared(snapshot_source, key) {
-                Ok(Some((taken, lease))) => {
+            Some(Ok(())) => match self.take(key) {
+                Some(taken) => {
                     if let Some(mut stores) = self.durable() {
                         stores.counters.restored += 1;
                     }
-                    RestoreOutcome::Restored(Box::new(taken), lease)
+                    return RestoreOutcome::Restored(Box::new(taken), lease);
                 }
-                Ok(None) => RestoreOutcome::Pending,
-                Err(()) => RestoreOutcome::Pending,
+                None => RestoreOutcome::Pending,
             },
+            Some(Err(store::ActiveOverBudget)) => RestoreOutcome::Pending,
             None => self
                 .durable_hold(snapshot_source, key)
                 .map_or(RestoreOutcome::Miss, RestoreOutcome::Held),
-        }
+        };
+        lease.release();
+        result
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -931,12 +971,15 @@ impl SharedCache {
         held: &mut File,
         index: &ScanIndex,
         interpretation: &Interpretation<'_>,
-    ) -> Option<()> {
+        lease: &mut store::ActiveLease,
+    ) -> Option<Result<(), store::ActiveOverBudget>> {
         let source = durable_source(snapshot_source)?;
         let store_key = store::key_digest(source, key);
         let allowlist = codec::allowlist_digest(snapshot_source);
         let record = {
-            let mut stores = self.durable()?;
+            let Some(mut stores) = self.durable() else {
+                return Some(Err(store::ActiveOverBudget));
+            };
             stores.counters.restore_attempts += 1;
             // A cleared fingerprint is reparse debt (a held or reverted
             // selection): it always reads Full.
@@ -956,7 +999,13 @@ impl SharedCache {
                 return None;
             }
             let outcome = match stores.slot(source).as_mut() {
-                Some(slot) => slot.store.read(&store_key, &allowlist),
+                Some(slot) => match slot.store.read_bounded(&store_key, &allowlist, lease) {
+                    Ok(outcome) => outcome,
+                    Err(refusal) => {
+                        stores.counters.budget_refused += 1;
+                        return Some(Err(refusal));
+                    }
+                },
                 None => return None,
             };
             match outcome {
@@ -988,8 +1037,11 @@ impl SharedCache {
             scope,
             held,
             interpretation,
+            lease,
         );
-        let mut stores = self.durable()?;
+        let Some(mut stores) = self.durable() else {
+            return Some(Err(store::ActiveOverBudget));
+        };
         let (checkpoint, reduction, receipt) = match restored {
             Ok(restored) => restored,
             Err(class) => {
@@ -1000,6 +1052,10 @@ impl SharedCache {
                     }
                     Failure::Certificate(reason) => {
                         Counters::bump(&mut counters.certificate_refused, full_reason_class(reason))
+                    }
+                    Failure::Budget => {
+                        counters.budget_refused += 1;
+                        return Some(Err(store::ActiveOverBudget));
                     }
                     Failure::Corrupt => counters.corrupt_body += 1,
                     Failure::NotRederived(refuse) => {
@@ -1018,7 +1074,7 @@ impl SharedCache {
         stores.counters.rederive_line_bytes += receipt.line_bytes;
         drop(stores);
         // The restored copy is charged to the RAM cache exactly as a retained
-        // copy is admitted; a refused charge leaves the read Full.
+        // copy is admitted; a refused charge keeps acquisition Pending.
         let admitted = self.insert_admitted(
             key.to_string(),
             sampled_jsonl::CompletedNativeAcquisition {
@@ -1030,13 +1086,15 @@ impl SharedCache {
             },
             0,
         );
-        let mut stores = self.durable()?;
+        let Some(mut stores) = self.durable() else {
+            return Some(Err(store::ActiveOverBudget));
+        };
         if !admitted {
             stores.counters.budget_refused += 1;
-            return None;
+            return Some(Err(store::ActiveOverBudget));
         }
         drop(stores);
-        Some(())
+        Some(Ok(()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1049,6 +1107,7 @@ impl SharedCache {
         scope: &Scope,
         held: &mut File,
         interpretation: &Interpretation<'_>,
+        lease: &mut store::ActiveLease,
     ) -> Result<(Checkpoint, CachedJsonlReduction, codec::RederiveReceipt), Failure> {
         if source == SnapshotSource::Codex {
             refuse_compressed_codex(Some(path), None, CodexZstCause::DurableTailUnsupported)
@@ -1060,7 +1119,12 @@ impl SharedCache {
             .certificate
             .restore(held, scope.clone())
             .map_err(Failure::Certificate)?;
-        let decoded = codec::decode(&record.record.body, source).map_err(|_| Failure::Corrupt)?;
+        let decoded = codec::decode_bounded(&record.record.body, source, lease).map_err(
+            |reason| match reason {
+                crate::durable_tail_codec::DecodeFailure::Budget => Failure::Budget,
+                crate::durable_tail_codec::DecodeFailure::Integrity => Failure::Corrupt,
+            },
+        )?;
         let counting = decoded.counting();
         let cutover = interpretation
             .counting_view
@@ -1553,7 +1617,54 @@ pub(crate) enum RestoreOutcome {
     Held(store::Refusal),
 }
 
+#[cfg(test)]
+mod restore_test {
+    use super::*;
+    // Direct-test callers keep the same credit until their graph is dropped or
+    // explicitly transferred. Production continues to use Restored(Taken, lease).
+    pub(in crate::snapshots) struct RestoredForTest {
+        taken: Option<Box<Taken<CachedJsonlReduction>>>,
+        lease: Option<store::ActiveLease>,
+    }
+    impl std::ops::Deref for RestoredForTest {
+        type Target = Taken<CachedJsonlReduction>;
+        fn deref(&self) -> &Self::Target {
+            self.taken.as_deref().unwrap()
+        }
+    }
+    impl RestoredForTest {
+        pub(in crate::snapshots) fn into_parts(
+            mut self,
+        ) -> (Taken<CachedJsonlReduction>, store::ActiveLease) {
+            (*self.taken.take().unwrap(), self.lease.take().unwrap())
+        }
+    }
+    impl Drop for RestoredForTest {
+        fn drop(&mut self) {
+            drop(self.taken.take());
+            if let Some(lease) = self.lease.take() {
+                lease.release();
+            }
+        }
+    }
+    impl RestoreOutcome {
+        pub(in crate::snapshots) fn into_test_option(self) -> Option<RestoredForTest> {
+            match self {
+                Self::Restored(taken, lease) => Some(RestoredForTest {
+                    taken: Some(taken),
+                    lease: Some(lease),
+                }),
+                Self::Miss => None,
+                Self::Pending if !crate::heap_layout_bound::layout_supported() => None,
+                Self::Pending => panic!("ordinary restore unexpectedly Pending"),
+                Self::Held(reason) => panic!("ordinary restore unexpectedly Held: {reason:?}"),
+            }
+        }
+    }
+}
+
 enum Failure {
+    Budget,
     Ineligible(store::Ineligible),
     Certificate(FullReason),
     Corrupt,

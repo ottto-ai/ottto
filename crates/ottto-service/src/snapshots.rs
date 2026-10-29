@@ -27653,9 +27653,27 @@ impl OwnedSourceScan {
                     #[cfg(unix)]
                     if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
                         if let Some((member, reason)) = group.members.iter().find_map(|member| {
-                            Some((member, cache.durable_guard(source, member, index)?))
+                            match cache.durable_guard(source, member, index) {
+                                Ok(None) => None,
+                                result => Some((member, result)),
+                            }
                         }) {
-                            cache.durable_hold_exit(source, reason, index, member, &mut census);
+                            match reason {
+                                Ok(Some(reason)) => cache.durable_hold_exit(
+                                    source,
+                                    reason,
+                                    index,
+                                    member,
+                                    &mut census,
+                                ),
+                                Err(_) => cache.durable_custody_hold(
+                                    source,
+                                    "active_input_pending",
+                                    index,
+                                    member,
+                                ),
+                                Ok(None) => unreachable!(),
+                            }
                             pending!();
                         }
                     }
@@ -31214,9 +31232,21 @@ impl OwnedSourceScan {
             #[cfg(unix)]
             if side_plan.is_none() {
                 if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
-                    if let Some(reason) = cache.durable_guard(source, &candidate, index) {
-                        cache.durable_hold_exit(source, reason, index, &candidate, &mut census);
-                        pending!();
+                    match cache.durable_guard(source, &candidate, index) {
+                        Ok(None) => {}
+                        Ok(Some(reason)) => {
+                            cache.durable_hold_exit(source, reason, index, &candidate, &mut census);
+                            pending!();
+                        }
+                        Err(_) => {
+                            cache.durable_custody_hold(
+                                source,
+                                "active_input_pending",
+                                index,
+                                &candidate,
+                            );
+                            pending!();
+                        }
                     }
                 }
             }
@@ -31867,7 +31897,7 @@ impl OwnedSourceScan {
                         );
                         // M1: on a RAM miss, a durable record may restore
                         // the copy (charged to the RAM cache, then taken as
-                        // a retained copy); any refusal leaves the read Full.
+                        // a retained copy); resource refusal keeps it Pending.
                         // #814's E2 held-new flag is RAM-only in M1: a miss
                         // carries it false, and a restore needs the
                         // committed index entry, so it never widens reuse.

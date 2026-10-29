@@ -20,6 +20,55 @@ pub(super) fn placeholder_body(count: u64, sum: u64) -> Vec<u8> {
     )
 }
 
+#[test]
+fn cold_read_reserves_before_classifier_input_or_body_allocation() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            active::set_active_budget_for_test(None);
+        }
+    }
+    let _reset = Reset;
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let path = scratch.transcript("source.jsonl", b"{}\n");
+    let b = binding("account", "scope", ("fp-a", None));
+    let mut store = scratch.store();
+    assert_eq!(
+        store
+            .write_after_save(&lock, 1, 0, vec![pending(b.clone(), certificate(&path), 1)])
+            .unwrap()
+            .written,
+        1
+    );
+    let before = store.counters();
+    active::set_active_budget_for_test(Some(RESTORE_INPUT_BYTES - 1));
+    let LeaseWait::Granted(mut lease) = ActiveLease::acquire("claude_code") else {
+        panic!("lease unavailable")
+    };
+    assert!(store
+        .read_bounded(&b.key, &placeholder_allowlist(), &mut lease)
+        .is_err());
+    lease.release();
+    let after = store.counters();
+    assert_eq!(after.guard_header_bytes, before.guard_header_bytes);
+    assert_eq!(after.guard_verify_bytes, before.guard_verify_bytes);
+    assert_eq!(after.records_read, before.records_read);
+    assert_eq!(after.format_hold, before.format_hold);
+    active::set_active_budget_for_test(None);
+    let LeaseWait::Granted(mut lease) = ActiveLease::acquire("claude_code") else {
+        panic!("lease unavailable")
+    };
+    assert!(matches!(
+        store.read_bounded(&b.key, &placeholder_allowlist(), &mut lease),
+        Ok(ReadOutcome::Found(_))
+    ));
+    lease.release();
+}
+
 /// #801's real lock: `StateDirLock` on the scratch state directory.
 use crate::locked_state_dir::LockedStateDir;
 use crate::state_dir_lock::StateDirLockError;

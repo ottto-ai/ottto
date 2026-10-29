@@ -3922,14 +3922,21 @@ fn pending_singleton_capture_keeps_its_existing_admission_after_restart() {
     let cache = sampled_scan::SharedCache::default();
     cache.durable_begin_pass(source, &index_path, &namespace, false);
     assert!(!store::store_dir_for_index(&index_path).exists());
-    assert_eq!(cache.durable_guard(source, &candidate, &mut loaded), None);
+    assert_eq!(
+        cache
+            .durable_guard(source, &candidate, &mut loaded)
+            .unwrap(),
+        None
+    );
     // Without pending capture or joined custody the same absence still holds.
     let entry = loaded.files.get_mut(&key).unwrap();
     entry.codex_captured_uncommitted = false;
     entry.codex_captured_tier_receipt = None;
     entry.codex_captured_tier_receipt_required = false;
     assert_eq!(
-        cache.durable_guard(source, &candidate, &mut loaded),
+        cache
+            .durable_guard(source, &candidate, &mut loaded)
+            .unwrap(),
         Some(store::Refusal::UpgradeMissing)
     );
     // Pending capture cannot bypass a protected record's earlier hold.
@@ -3950,7 +3957,9 @@ fn pending_singleton_capture_keeps_its_existing_admission_after_restart() {
     )
     .unwrap();
     assert_eq!(
-        cache.durable_guard(source, &candidate, &mut loaded),
+        cache
+            .durable_guard(source, &candidate, &mut loaded)
+            .unwrap(),
         Some(store::Refusal::NewerFormat)
     );
 }

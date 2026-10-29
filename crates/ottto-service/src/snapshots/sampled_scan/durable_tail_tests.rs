@@ -228,6 +228,192 @@ fn direct_completed_absence_and_heap_refusal_return_checkpoint_and_custody() {
     }
 }
 
+struct ResetActiveBudget;
+impl Drop for ResetActiveBudget {
+    fn drop(&mut self) {
+        store::active::set_active_budget_for_test(None);
+    }
+}
+
+// Actual OwnedSourceScan cold caller: guard and decoded-result refusals are
+// pending, preserve the predecessor, never spend Q11 or read native Tail.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "validated native admission layout")]
+fn production_cold_input_and_decode_budget_refusals_keep_five_passes_pending() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    assert!(crate::heap_layout_bound::layout_supported());
+    let _gate = claude_request_money::e2::GateForTest::set(true);
+    let _reset = ResetActiveBudget;
+    let source = SnapshotSource::ClaudeCode;
+    for limit in [
+        0,
+        store::RESTORE_INPUT_BYTES
+            + (store::RECORD_BYTES + super::super::AUDIT_AND_SCRATCH_BYTES) as u64,
+    ] {
+        let root = crate::test_scratch::ScratchDir::new("cold-decode-budget");
+        let lock = test_locks::hold(&root);
+        let sessions = root.join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let path = sessions.join("11111111-2222-4333-8444-555555555555.jsonl");
+        native_fixture(&path);
+        let key = local_index_key(&path);
+        let index_path = root.join("index.json");
+        let namespace = Scope("bounded-decode".into());
+        let cache = Arc::new(SharedCache::default());
+        cache.durable_begin_pass(source, &index_path, &namespace, true);
+        let start = |index| {
+            OwnedSourceScan::new_with_identity_capture(
+                source,
+                std::slice::from_ref(&sessions),
+                index,
+                "2026-10-20T12:00:00Z",
+                365,
+                100,
+                false,
+                None,
+                &[],
+                false,
+                true,
+                true,
+            )
+            .with_sampled_acquisition(cache.clone(), namespace.clone())
+        };
+        let finish = |mut scan: OwnedSourceScan| {
+            let mut modes = (0, 0, 0);
+            for _ in 0..10_000 {
+                if let Some(context) = scan.sampling.as_ref() {
+                    modes = (context.full_files, context.tail_files, context.native_bytes);
+                }
+                match scan.step(None) {
+                    OwnedSourceScanStep::Pending(next) => scan = next,
+                    OwnedSourceScanStep::Complete { index, scan, .. } => {
+                        return (index, scan, modes)
+                    }
+                }
+            }
+            panic!("scan did not complete");
+        };
+        let (mut index, first, _) = finish(start(ScanIndex::default()));
+        assert_eq!(first.snapshots.len(), 1);
+        assert_eq!(first.snapshots[0].input_tokens, 100);
+        assert!(cache.retained().unwrap().peek(&key).is_some());
+        index.save(&index_path).unwrap();
+        assert_eq!(
+            cache
+                .durable_write_after_save(lock, source, &index)
+                .unwrap()
+                .written,
+            1
+        );
+        cache.retained().unwrap().clear();
+        let entry = serde_json::to_value(&index.files[&key]).unwrap();
+        use std::io::Write;
+        let suffix = serde_json::json!({"type":"assistant","sessionId":"11111111-2222-4333-8444-555555555555",
+            "timestamp":"2026-10-07T10:01:00Z","requestId":"req-budget-tail",
+            "message":{"id":"msg-budget-tail","model":"fixture-model","usage":{"input_tokens":25,"output_tokens":3}}}).to_string()+"\n";
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(suffix.as_bytes())
+            .unwrap();
+        let before = cache.durable_counters(source).unwrap();
+        let old_bytes = (retail_bytes(source, 0), retail_bytes(source, 1));
+        store::active::set_active_budget_for_test(Some(limit));
+        for _ in 0..5 {
+            let (next, result, modes) = finish(start(index));
+            assert!(result.snapshots.is_empty());
+            assert_eq!(result.unreadable_path_count, 0);
+            assert_eq!(modes, (0, 0, 0), "no Full, Tail or native body bytes");
+            assert_eq!(serde_json::to_value(&next.files[&key]).unwrap(), entry);
+            assert!(cache.retained().unwrap().peek(&key).is_none());
+            assert_eq!(
+                (retail_bytes(source, 0), retail_bytes(source, 1)),
+                old_bytes
+            );
+            assert!(cache.durable().unwrap().retail_spent.is_empty());
+            index = next;
+        }
+        let after = cache.durable_counters(source).unwrap();
+        assert_eq!(after.0.corrupt_body, before.0.corrupt_body);
+        assert_eq!(after.1.format_hold, before.1.format_hold);
+        assert_eq!(after.1.t14_rebuild, before.1.t14_rebuild);
+        if limit == 0 {
+            assert_eq!(after.1.guard_header_bytes, before.1.guard_header_bytes);
+            assert_eq!(after.1.records_read, before.1.records_read);
+        } else {
+            assert_eq!(
+                after.1.records_read - before.1.records_read,
+                5,
+                "actual cold decode reached"
+            );
+        }
+        store::active::set_active_budget_for_test(None);
+        let (_, result, modes) = finish(start(index));
+        assert_eq!(result.snapshots.len(), 1);
+        assert_eq!(result.snapshots[0].input_tokens, 125);
+        assert_eq!((modes.0, modes.1), (0, 1));
+        assert_eq!(retail_bytes(source, 0) - old_bytes.0, suffix.len() as u64);
+        assert_eq!(retail_bytes(source, 1) - old_bytes.1, 0);
+        let store::LeaseWait::Granted(lease) = cache.acquire_active(source, store::ACTIVE_BYTES)
+        else {
+            panic!("budget exit leaked lease")
+        };
+        lease.release();
+    }
+}
+
+// Direct bounded snapshot API, with real encoded native Claude and Codex graphs.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "validated native decode layout")]
+fn bounded_snapshot_result_refuses_before_graph_allocation_and_then_decodes_both_sources() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    assert!(crate::heap_layout_bound::layout_supported());
+    let _reset = ResetActiveBudget;
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let root = crate::test_scratch::ScratchDir::new("bounded-snapshot-result");
+        let path = root.join("source.jsonl");
+        let taken = owned_fixture(source, &path, &Scope("snapshot-budget".into()));
+        let body = codec::encode(
+            &taken.retained.state,
+            store::BODY_BYTES,
+            jsonl_line_cap() as u64,
+        )
+        .unwrap();
+        store::active::set_active_budget_for_test(Some(0));
+        let store::LeaseWait::Granted(mut lease) = store::ActiveLease::acquire(source.api_slug())
+        else {
+            panic!("lease unavailable")
+        };
+        assert!(matches!(
+            codec::decode_bounded(&body, source, &mut lease),
+            Err(crate::durable_tail_codec::DecodeFailure::Budget)
+        ));
+        lease.release();
+        store::active::set_active_budget_for_test(None);
+        let store::LeaseWait::Granted(mut lease) = store::ActiveLease::acquire(source.api_slug())
+        else {
+            panic!("lease unavailable")
+        };
+        let decoded = codec::decode_bounded(&body, source, &mut lease).unwrap();
+        assert_eq!(decoded.counting(), taken.retained.state.durable_counting());
+        assert_eq!(
+            decoded.head_end().unwrap(),
+            codec::decode(&body, source).unwrap().head_end().unwrap()
+        );
+        drop(decoded);
+        assert!(matches!(
+            codec::decode_bounded(&[], source, &mut lease),
+            Err(crate::durable_tail_codec::DecodeFailure::Integrity)
+        ));
+        lease.release();
+    }
+}
+
 // Actual production caller, not the direct API fixtures above. The accepted
 // frontier is the record's frontier: this fixture's exact old-byte overlap is0;
 // its positive Tail and physical guarded bytes discriminate the lost-guard bug.
@@ -939,7 +1125,10 @@ fn receipt_pending_guard_keeps_accepted_witness_and_census_without_unreadable() 
         store::test_hooks::set_before_rename(None);
         assert!(slot.store.has_pending());
     }
-    let reason = cache.durable_guard(source, &candidate, &mut index).unwrap();
+    let reason = cache
+        .durable_guard(source, &candidate, &mut index)
+        .unwrap()
+        .unwrap();
     store::test_hooks::set_before_unlink(None);
     assert_eq!(reason, store::Refusal::ReceiptPending);
     cache.durable_hold_exit(source, reason, &mut index, &candidate, &mut census);
@@ -2235,23 +2424,6 @@ fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
     }
 }
 
-trait RestoreTestOutcome {
-    fn into_test_option(
-        self,
-    ) -> Option<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>>;
-}
-impl RestoreTestOutcome for sampled_scan::durable_tail::RestoreOutcome {
-    fn into_test_option(
-        self,
-    ) -> Option<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>> {
-        match self {
-            Self::Restored(taken) => Some(*taken),
-            Self::Miss => None,
-            Self::Held(reason) => panic!("ordinary restore unexpectedly Held: {reason:?}"),
-        }
-    }
-}
-
 /// L23/F1: the production guard dominates all sampling, trust and dependency
 /// fallbacks. Kind `none` is the non-held control: the same fixture with no
 /// record reaches acquisition, and the arm's later gate observes its false value.
@@ -2850,7 +3022,8 @@ fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites(
                     .unwrap(),
                     pending.body
                 );
-                // A failed format-only write leaves v1 authoritative even after GC.
+                drop(taken); // End the direct restore before another active owner.
+                             // A failed format-only write leaves v1 authoritative even after GC.
                 store::test_hooks::set_before_rename(Some(Box::new(|_, _| {
                     Err(std::io::Error::other("injected"))
                 })));
@@ -3043,6 +3216,7 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
                 .into_test_option()
                 .expect("v1 maps without content acquisition");
             assert_eq!(restored.retained.state.durable_counting(), Some(fact));
+            let (restored, lease) = restored.into_parts();
             cache.insert(
                 key.clone(),
                 sampled_jsonl::CompletedNativeAcquisition {
@@ -3054,6 +3228,7 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
                 },
                 0,
             );
+            lease.release(); // The admitted cache now owns this graph.
             cache.durable_note_selection(&key, &index.files[&key].source_file_fingerprint);
             index.save(&index_path).unwrap();
             assert_eq!(
@@ -3164,6 +3339,9 @@ fn compressed_record_refuses_before_certificate_restore_or_body_decode() {
         index_generation: 1,
     };
     let mut held = File::open(&plain).unwrap();
+    let store::LeaseWait::Granted(mut lease) = store::ActiveLease::acquire("codex") else {
+        panic!("test lease unavailable")
+    };
     codex_zst_refusal_tests::assert_refused(CodexZstCause::DurableTailUnsupported, || {
         assert!(matches!(
             SharedCache::default().durable_restore_record(
@@ -3173,11 +3351,13 @@ fn compressed_record_refuses_before_certificate_restore_or_body_decode() {
                 &compressed,
                 &scope,
                 &mut held,
-                &contract
+                &contract,
+                &mut lease,
             ),
             Err(Failure::NotRederived(_))
         ));
     });
+    lease.release();
     // #830's wrapper rechecks holds on a restore miss. The compressed
     // refusal must precede that record IO too, not just restore_known.
     let lock = test_locks::hold(&root);
@@ -3492,6 +3672,7 @@ fn q11_strict_restore_real_plain_reader_tail_then_retry_holds() {
         )
         .into_test_option()
         .expect("strict record restores");
+    let (taken, lease) = taken.into_parts();
     let attempt = cache
         .begin_retail(
             source,
@@ -3509,6 +3690,7 @@ fn q11_strict_restore_real_plain_reader_tail_then_retry_holds() {
         crate::transcript_acquisition::ReadMode::Tail
     );
     parser.reader.reader.put_retail(attempt);
+    lease.release(); // Actual native parser now owns the acquisition.
     retail_reads();
     while !parser.step().unwrap() {}
     assert_eq!(retail_reads(), vec![(accepted_end, 3, 0)]);

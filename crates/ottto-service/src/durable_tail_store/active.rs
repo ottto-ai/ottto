@@ -3,6 +3,21 @@ use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 pub(crate) const ACTIVE_BYTES: u64 = 64 * 1024 * 1024;
+#[cfg(test)]
+thread_local! {
+    static TEST_BUDGET: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+#[cfg(test)]
+pub(crate) fn set_active_budget_for_test(bytes: Option<u64>) {
+    TEST_BUDGET.with(|budget| budget.set(bytes));
+}
+fn active_budget() -> u64 {
+    #[cfg(test)]
+    if let Some(bytes) = TEST_BUDGET.with(|budget| budget.get()) {
+        return bytes.min(ACTIVE_BYTES);
+    }
+    ACTIVE_BYTES
+}
 const WAIT: Duration = Duration::from_secs(20);
 // Fixed FIFO slots: waiting never allocates or holds another scan lock.
 static OWNER: Mutex<Owner> = Mutex::new(Owner {
@@ -81,8 +96,11 @@ impl ActiveLease {
         let total = self
             .bytes
             .checked_add(bytes)
-            .filter(|n| *n <= ACTIVE_BYTES)
-            .ok_or(ActiveOverBudget)?;
+            .filter(|n| *n <= active_budget())
+            .ok_or_else(|| {
+                event(self.source, "active_budget_refused", 1);
+                ActiveOverBudget
+            })?;
         self.bytes = total;
         event(self.source, "active_current_bytes", total);
         Ok(())
@@ -148,6 +166,38 @@ mod tests {
                 sender.send(ticket).unwrap();
             }
         });
+    }
+
+    #[test]
+    fn tiny_budget_is_thread_local_checked_and_cannot_raise_the_production_cap() {
+        if !crate::test_isolation::run_here() {
+            return;
+        }
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                set_active_budget_for_test(None);
+            }
+        }
+        let _reset = Reset;
+        set_active_budget_for_test(Some(7));
+        assert_eq!(active_budget(), 7);
+        assert_eq!(
+            std::thread::spawn(active_budget).join().unwrap(),
+            ACTIVE_BYTES
+        );
+        let mut lease = granted();
+        lease.charge(7).unwrap();
+        assert!(lease.charge(1).is_err());
+        assert_eq!(lease.bytes, 7);
+        assert!(lease.charge(u64::MAX).is_err());
+        lease.release();
+        set_active_budget_for_test(Some(u64::MAX));
+        assert_eq!(active_budget(), ACTIVE_BYTES);
+        set_active_budget_for_test(None);
+        let mut lease = granted();
+        lease.charge(ACTIVE_BYTES).unwrap();
+        lease.release();
     }
 
     fn granted() -> ActiveLease {

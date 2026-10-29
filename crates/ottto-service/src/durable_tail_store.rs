@@ -39,7 +39,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-mod active;
+pub(crate) mod active;
 pub(crate) use active::{ActiveLease, ActiveOverBudget, LeaseWait, ACTIVE_BYTES};
 
 /// Envelope format. Bump on any envelope or certificate layout change.
@@ -74,6 +74,11 @@ const CERTIFICATE_BYTES: usize = 8 * 3 // device, inode, length
     + 1 // debt flag
     + 8; // debt
 const TRAILER_BYTES: usize = 32;
+// Classifier reallocation (old header + envelope), then input + copied body.
+// Conservative cumulative reservation; no credit is refunded between phases.
+const INPUT_ENVELOPE: usize = RECORD_BYTES + HEADER_BYTES + TRAILER_BYTES + 1;
+pub(crate) const RESTORE_INPUT_BYTES: u64 =
+    (3 * INPUT_ENVELOPE + std::mem::size_of::<DurableRecord>()) as u64;
 pub(crate) const BODY_BYTES: usize = RECORD_BYTES - HEADER_BYTES - TRAILER_BYTES;
 
 /// Every 32-byte digest in the envelope (outside the codec body), as
@@ -653,7 +658,8 @@ impl DurableTailStore {
                 }
             }
             let mut bytes = header;
-            file.take((RECORD_BYTES + TRAILER_BYTES + 1) as u64)
+            bytes.reserve_exact(INPUT_ENVELOPE - bytes.len());
+            file.take((INPUT_ENVELOPE - n) as u64)
                 .read_to_end(&mut bytes)
                 .map_err(|_| Refusal::Corrupt)?;
             let read = bytes.len().saturating_sub(n) as u64;
@@ -708,6 +714,17 @@ impl DurableTailStore {
             Err(Refusal::Corrupt) | Ok(_) => None,
             Err(reason) => Some(reason),
         }
+    }
+
+    /// Cold caller owns the process-wide lease before taking Stores.
+    pub(crate) fn read_bounded(
+        &mut self,
+        key: &Digest32,
+        allowlist: &Digest32,
+        lease: &mut ActiveLease,
+    ) -> Result<ReadOutcome, ActiveOverBudget> {
+        lease.charge(RESTORE_INPUT_BYTES)?;
+        Ok(self.read(key, allowlist))
     }
 
     pub(crate) fn read(&mut self, key: &Digest32, allowlist: &Digest32) -> ReadOutcome {
