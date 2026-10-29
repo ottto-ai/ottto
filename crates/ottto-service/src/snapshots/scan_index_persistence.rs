@@ -1876,7 +1876,9 @@ fn collect_directory(
         }
         counts.scanned += 1;
         let Ok(text) = name.to_str() else { continue };
-        if reachable.contains(text) || !owned(text) {
+        // Future repair controls are opaque, even if an ownership predicate
+        // is broadened later. Never open or unlink them as payload objects.
+        if reserved_repair_filename(text) || reachable.contains(text) || !owned(text) {
             continue;
         }
         let file = open_at(dir, name, libc::O_RDONLY)?;
@@ -1901,6 +1903,9 @@ fn collect_directory(
 }
 
 fn owned_filename(text: &str) -> bool {
+    if reserved_repair_filename(text) {
+        return false;
+    }
     if let Some(suffix) = text.strip_prefix(".tmp-") {
         return suffix.len() == 32 && suffix.bytes().all(|b| b.is_ascii_hexdigit());
     }

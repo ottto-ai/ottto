@@ -1258,3 +1258,109 @@ fn gc_cursor_restarts_payload_sweep_after_root_change() {
 
 #[path = "support/scan_index_r3.rs"]
 mod r3;
+
+#[test]
+fn gc_preserves_future_repair_controls_but_does_not_pin_prior_only_payloads() {
+    let scratch = Scratch::new();
+    let store = scratch.store();
+    let first = store
+        .commit(&missing(&store), 1, &Fixture::new(1, 3).plan())
+        .unwrap();
+    let prior_bytes = fs::read(scratch.root()).unwrap();
+    let fixture = Fixture::new(2, 3);
+    let next = store.commit(&first.root, 2, &fixture.plan()).unwrap();
+    let current_bytes = fs::read(scratch.root()).unwrap();
+    let dir = scratch.0.join("scan-index.json.shards");
+    let controls = [
+        (
+            format!("prior-root-00000000000000000001-{}.json", "a".repeat(64)),
+            prior_bytes,
+        ),
+        (
+            format!("prior-root-00000000000000000002-{}.json", "b".repeat(64)),
+            current_bytes.clone(),
+        ),
+        (
+            "verified-complete.json".into(),
+            serde_json::to_vec(&json!({"generation":2,"digest":"b".repeat(64)})).unwrap(),
+        ),
+    ];
+    for (name, bytes) in &controls {
+        fs::write(dir.join(name), bytes).unwrap();
+        // These are never object inputs, including when their mode would
+        // fail the immutable-object validator.
+        fs::set_permissions(dir.join(name), fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    assert_eq!(load(&store).0, fixture.logical(2));
+    let mut cursor = GcCursor::default();
+    let mut removed = 0;
+    let mut complete = false;
+    for _ in 0..first.stats.written_objects * 4 + 60 {
+        let counts = store
+            .collect(
+                &next.root,
+                GcBudget {
+                    entries: 1,
+                    bytes: u64::MAX,
+                },
+                &mut cursor,
+            )
+            .unwrap();
+        assert!(counts.scanned <= 1);
+        removed += counts.removed;
+        if !counts.incomplete {
+            complete = true;
+            break;
+        }
+    }
+    assert!(complete);
+    assert_eq!(
+        removed, first.stats.written_objects,
+        "N GC may lose the prior-only restore option"
+    );
+    assert_eq!(fs::read(scratch.root()).unwrap(), current_bytes);
+    assert_eq!(load(&store).0, fixture.logical(2));
+    for (name, bytes) in &controls {
+        assert_eq!(fs::read(dir.join(name)).unwrap(), *bytes);
+        assert_eq!(
+            fs::metadata(dir.join(name)).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+    }
+    let root: Value = serde_json::from_slice(&current_bytes).unwrap();
+    let object = root["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["slot"]["kind"] == "bucket")
+        .unwrap();
+    let tag = match object["slot"]["field"].as_str().unwrap() {
+        "account_pending" => "account",
+        "usage_pending" => "usage",
+        "request_census" => "census",
+        _ => unreachable!(),
+    };
+    let payload = format!(
+        "{}-{:02x}-{}.json",
+        tag,
+        object["slot"]["bucket"].as_u64().unwrap(),
+        object["digest"].as_str().unwrap()
+    );
+    fs::write(dir.join(payload), b"{damaged}").unwrap();
+    let Opened::Partial(_, unknown) = store.open().unwrap() else {
+        panic!("UNKNOWN required");
+    };
+    assert!(store
+        .collect(
+            &unknown,
+            GcBudget {
+                entries: 100,
+                bytes: u64::MAX
+            },
+            &mut GcCursor::default()
+        )
+        .is_err());
+    for (name, bytes) in &controls {
+        assert_eq!(fs::read(dir.join(name)).unwrap(), *bytes);
+    }
+}
