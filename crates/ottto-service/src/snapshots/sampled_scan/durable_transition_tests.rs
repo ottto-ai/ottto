@@ -787,8 +787,17 @@ impl TransitionDriver for Codex24b {
             self.disk.owner(source)
         };
         scanner.versions = Some(feed.clone());
+        let mut prior = self.prior.clone();
+        if mode == Mode::Restart {
+            // Existing 24b native tests use this re-emission obligation too:
+            // missing activity selects an unchanged file without changing the
+            // record's replay binding. A truly quiet unselected file has no EOF.
+            assert!(!prior.file_snapshot_fingerprints.is_empty());
+            assert!(!prior.snapshot_activity_at.is_empty());
+            prior.snapshot_activity_at.clear();
+        }
         let ((index, scan, modes), consumed) =
-            fixture::observe_consumed(|| other_page(&self.c, &scanner, source, self.prior.clone()));
+            fixture::observe_consumed(|| other_page(&self.c, &scanner, source, prior));
         let (sample, observed, rejected) = feed.snapshot();
         let sample = sample.expect("production EOF observes restored SessionStartState");
         assert_eq!(sample.version(), Some("0.148.9"));
