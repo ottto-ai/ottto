@@ -485,6 +485,13 @@ impl DurableTailStore {
         }
     }
 
+    /// Read-only codec dispatch for every selected sidecar family, including
+    /// those a permissive cohort error would otherwise skip. No T14 grant.
+    #[cfg(all(test, unix))]
+    pub(crate) fn sidecar_refusal(&mut self, key: &Digest32) -> Option<Refusal> {
+        self.classify(key, "guard").err()
+    }
+
     /// Dark sidecar adapter: reuse T14 custody for a known malformed row.
     /// Unknown/newer representations can never grant a replacement.
     #[cfg(all(test, unix))]

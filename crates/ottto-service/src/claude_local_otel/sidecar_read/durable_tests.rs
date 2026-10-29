@@ -1237,3 +1237,49 @@ fn state_fix_can_span_bootstrap_passes_without_renewing_grant() {
     assert_eq!(r.body_bytes(), [0, 0]);
     assert_eq!(report, frozen(&api, &trace));
 }
+
+#[test]
+fn malformed_state_fix_fatal_api_vetoes_entire_permissive_cohort() {
+    for directory in [true, false] {
+        let mut f = Fixture::new("sidecar-repair-fatal-cohort");
+        let (api, trace) = bytes("first");
+        f.write("scope", &api, &trace);
+        let mut a = api_row("healthy");
+        a.session_id = "z-good".into();
+        sign_api(&mut a);
+        let mut t = trace_row("healthy");
+        t.session_id = "z-good".into();
+        sign_trace(&mut t);
+        f.write("z-good", &line(&a), &line(&t));
+        let mut r = f.reader();
+        r.load("scope").unwrap();
+        r.load("z-good").unwrap();
+        f.save(&mut r);
+        let path = record_path(&r, "scope");
+        let mut bad = fs::read(&path).unwrap();
+        *bad.last_mut().unwrap() ^= 1;
+        fs::write(path, bad).unwrap();
+        drop(r);
+        if directory {
+            let path = evidence_path(&f.dir, "scope");
+            fs::remove_file(&path).unwrap();
+            fs::create_dir(path).unwrap();
+        } else {
+            API_BEFORE_OPEN.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(|path| {
+                    fs::rename(path, path.with_extension("refused")).unwrap();
+                }))
+            });
+        }
+        let (r, result) = with_reader(f.restart(), || {
+            ClaudeApiEvidenceRead::load(&f.dir, ["scope".into(), "z-good".into()])
+        });
+        assert!(
+            result.is_err(),
+            "repair eviction must retain the fatal API error"
+        );
+        assert!(!r.entries.contains_key("scope"));
+        assert!(r.pending_sessions().contains("scope"));
+        assert_eq!(take_counts()["sidecar_state_fix_rebuilds"], 1);
+    }
+}

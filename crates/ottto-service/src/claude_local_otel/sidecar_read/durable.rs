@@ -100,6 +100,7 @@ pub(crate) struct Reader {
     restored_records: u64,
     newer: BTreeSet<String>,
     newer_counted: BTreeSet<String>,
+    probed: BTreeSet<String>,
     repairs: BTreeMap<String, Repair>,
     growth_pace: BTreeMap<String, u64>,
     hold_since: BTreeMap<String, u64>,
@@ -136,6 +137,7 @@ impl Reader {
             simulated_clock: false,
             newer: BTreeSet::new(),
             newer_counted: BTreeSet::new(),
+            probed: BTreeSet::new(),
             repairs: BTreeMap::new(),
             growth_pace: BTreeMap::new(),
             hold_since: BTreeMap::new(),
@@ -170,6 +172,7 @@ impl Reader {
         self.restored_records = 0;
         self.counts = [Counts::default(); 2];
         self.newer_counted.clear();
+        self.probed.clear();
         self.store.begin_pass();
     }
     pub(crate) fn restored_records(&self) -> u64 {
@@ -277,6 +280,23 @@ impl Reader {
             io::ErrorKind::WouldBlock,
             "sidecar unavailable; dependents held",
         )
+    }
+    fn classify_selected(&mut self, sessions: &BTreeSet<String>) {
+        let before = self.counts;
+        for session in sessions {
+            if self.newer.contains(session) {
+                let _ = self.failed_restore(session, RestoreFailure::NewerFormat);
+            } else if !self.entries.contains_key(session)
+                && self.probed.insert(session.clone())
+                && matches!(
+                    self.store.sidecar_refusal(&self.binding(session).key),
+                    Some(store::Refusal::Unknown | store::Refusal::NewerFormat)
+                )
+            {
+                let _ = self.failed_restore(session, RestoreFailure::NewerFormat);
+            }
+        }
+        publish_counts(before, self.counts);
     }
     fn repair_pair(&mut self, session: &str, reason: RestoreFailure) -> Option<Pair> {
         let lengths = self.lengths(session);
@@ -439,8 +459,16 @@ impl Reader {
         if self.repairs.contains_key(session) && cursorless_failure {
             // A failed physical acquisition has spent this repair attempt.
             // A paced slot has not: retain its sibling and continue next pass.
+            let fatal = entry.api_fatal;
             self.entries.remove(session);
             self.protected.entry(session.into()).or_default();
+            if let Some(kind) = fatal {
+                publish_counts(before_counts, self.counts);
+                return Err(io::Error::new(
+                    kind,
+                    "fatal sidecar API state-fix acquisition",
+                ));
+            }
         }
         publish_counts(before_counts, self.counts);
         Ok(reports)
@@ -1064,13 +1092,17 @@ pub(in crate::claude_local_otel) fn prepared_fixture(check: impl FnOnce(&Path, &
     tests::prepared_fixture(check);
 }
 
-pub(in crate::claude_local_otel) fn unavailable_families() -> BTreeSet<String> {
+pub(in crate::claude_local_otel) fn unavailable_families(
+    support: &Path,
+    sessions: &BTreeSet<String>,
+) -> BTreeSet<String> {
     ACTIVE.with(|active| {
-        active
-            .borrow()
-            .as_ref()
-            .map(|r| r.newer.clone())
-            .unwrap_or_default()
+        let mut active = active.borrow_mut();
+        let Some(reader) = active.as_mut().filter(|reader| reader.support == support) else {
+            return BTreeSet::new();
+        };
+        reader.classify_selected(sessions);
+        reader.newer.clone()
     })
 }
 pub(in crate::claude_local_otel) fn record_holds(

@@ -47,6 +47,14 @@ pub(crate) fn durable_sidecar_prepared_fixture(
     sidecar_read::durable::prepared_fixture(check);
 }
 
+#[cfg(all(test, unix))]
+pub(crate) fn durable_sidecar_unavailable_families(
+    support: &Path,
+    sessions: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    sidecar_read::durable::unavailable_families(support, sessions)
+}
+
 /// Consumer S2 guard, active only in the synthetic durable-route harness.
 /// Native accepted ledger + witness remain the authority; no money in slots.
 #[cfg(all(test, unix))]
@@ -61,7 +69,14 @@ pub(crate) fn durable_sidecar_held_entities(
     }
     // TODO P2 follow-up: estimate-only accepted body may grow during failure.
     // Until the accepted-body floor lands, protect every accepted tuple.
-    let unavailable = sidecar_read::durable::unavailable_families();
+    let roots = items
+        .iter()
+        .filter_map(|item| {
+            crate::snapshots::claude_request_money::request_owned_family_root(item)
+                .map(str::to_owned)
+        })
+        .collect();
+    let unavailable = durable_sidecar_unavailable_families(support, &roots);
     let held: BTreeSet<_> = items
         .iter()
         .filter_map(|item| {
@@ -1532,6 +1547,13 @@ pub(crate) fn claude_trace_ownership_evidence_dir(support_dir: &Path) -> PathBuf
 /// True only when neither paired sidecar exists. Oversized, non-file or
 /// unreadable sidecars are failures, not absence.
 pub(crate) fn claude_sidecars_absent(support_dir: &Path, session_id: &str) -> bool {
+    #[cfg(all(test, unix))]
+    if sidecar_read::durable::active_for(support_dir)
+        && durable_sidecar_unavailable_families(support_dir, &BTreeSet::from([session_id.into()]))
+            .contains(session_id)
+    {
+        return false; // NewerFormat is unavailable, never an absence fact.
+    }
     [
         evidence_path(support_dir, session_id),
         trace_evidence_path(support_dir, session_id),

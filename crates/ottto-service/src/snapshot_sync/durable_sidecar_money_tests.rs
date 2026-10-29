@@ -229,7 +229,7 @@ fn durable_sidecar_money_accepted_refusal_holds_then_recovers() {
             held.snapshots.is_empty(),
             "S2 forbids an estimate replacement"
         );
-        let held_index = settle_route(&c, &accepted, held_page, &mut progress, held_holds);
+        let mut held_index = settle_route(&c, &accepted, held_page, &mut progress, held_holds);
         assert_eq!(stored_bodies(&held_index), before);
         // Carry the real accepted body only after proving its native tuple
         // survived the production hold and settlement. No acquisition credit.
@@ -246,6 +246,7 @@ fn durable_sidecar_money_accepted_refusal_holds_then_recovers() {
             reader = next;
             let aged_index = settle_route(&c, &held_index, page, &mut progress, holds);
             assert_eq!(stored_bodies(&aged_index), before);
+            held_index = aged_index;
             aged.accepted = prior.accepted.clone();
             money_oracle::assert_held(ROOT, &prior, &aged, &expected);
             let counts = crate::claude_local_otel::take_sidecar_read_counts();
@@ -691,5 +692,41 @@ fn durable_sidecar_money_newer_format_waits_without_downgrade_then_reupgrade_equ
         );
         money_oracle::assert_equivalent(&expected, &recovered);
         assert_reported(&recovered, 2);
+    });
+}
+
+#[test]
+fn durable_sidecar_money_newer_cohort_cannot_hide_an_absent_selected_pair() {
+    with_e2(|| {
+        const FIRST: &str = "0338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+        let mut c = Corpus::new("sidecar-money-newer-cohort");
+        c.root(FIRST, &line(FIRST, "first", AT, 10));
+        c.root(ROOT, &line(ROOT, "second", AT, 20));
+        c.evidence_for(FIRST, &[], &[]);
+        c.evidence(&[], &[]);
+        let mut slots = Slots::new(&c);
+        let (mut r, _) = with_durable_sidecar_reader(slots.reader(&c), || {
+            render(&c, ScanIndex::default(), Mode::Ram)
+        });
+        slots.save(&mut r);
+        drop(r);
+        for trace in [false, true] { std::fs::remove_file(sidecar_path(&c, trace)).unwrap(); }
+        assert!(crate::claude_local_otel::claude_sidecars_absent(&c.support, ROOT));
+        let older = slots.restart(&c).into_older_reader();
+        let (r, (page, route, holds)) = with_durable_sidecar_reader(older, || {
+            // The first refusal aborts the permissive cohort. The later
+            // physically absent family still has a newer persisted record.
+            assert!(crate::claude_local_otel::ClaudeApiEvidenceRead::load(
+                &c.support, [FIRST.into(), ROOT.into()]).is_err());
+            let result = render(&c, ScanIndex::default(), Mode::Ram);
+            assert!(!crate::claude_local_otel::claude_sidecars_absent(&c.support, ROOT));
+            result
+        });
+        assert_eq!(r.body_bytes(), [0, 0]);
+        assert!(route.batches.is_empty());
+        assert!(route.snapshots.is_empty(), "neither unavailable family may emit an estimate");
+        assert_eq!(holds.held_entity_count, 2);
+        assert!(page.scan.snapshots.is_empty());
+        assert_eq!(crate::claude_local_otel::take_sidecar_read_counts()["sidecar_hold_newer_format"], 2);
     });
 }

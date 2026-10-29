@@ -8869,6 +8869,11 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         requested_session_count: session_ids.len(),
         ..Default::default()
     };
+    // Classify every family before any sidecar-dependent decision. A cohort
+    // acquisition error or a physically absent pair cannot hide a newer row.
+    #[cfg(all(test, unix))]
+    let _ =
+        crate::claude_local_otel::durable_sidecar_unavailable_families(support_dir, &session_ids);
     // E2: every held copy skip is decided (or the session held) before
     // telemetry attaches, so a copy that counts after all can be matched.
     crate::snapshots::claude_request_money::e2::decide_page_copies(
