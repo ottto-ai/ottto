@@ -5,6 +5,8 @@ mod loopback_backend;
 #[cfg(feature = "replay-harness")]
 pub mod replay_harness;
 #[cfg(test)]
+use crate::snapshots::snapshot_quarantine_witness;
+#[cfg(test)]
 pub(crate) mod upload_context_receipt_tests;
 use crate::adaptive_collector::{CadenceConfig, SourceCadence};
 use crate::agent_status::AgentStatusCollection;
@@ -32,13 +34,13 @@ use crate::snapshot_client::{
 use crate::snapshots::{
     apply_upload_policy, collector_version, context_curve_derivation_revision,
     finalize_scan_after_policy_with_body_witness, prepare_codex_recovery_diagnostics,
-    snapshot_quarantine_deadline_is_bounded, snapshot_quarantine_witness,
-    snapshot_upload_body_witness, validate_snapshot_batch_request, ScanIndex, SnapshotBatchRequest,
-    SnapshotItem, SnapshotQuarantineDisposition, SnapshotQuarantineRecord,
-    SnapshotQuarantineWitness, SnapshotSource, SnapshotSourceManifest, SnapshotUploadPolicy,
-    SourceScanResult, UnsettledUploadCause, CONTEXT_CURVE_CONTRACT_VERSION,
-    MAX_BACKFILL_FILES_PER_SOURCE, MAX_SNAPSHOT_RECONSTRUCTION_FAILURES,
-    SNAPSHOT_QUARANTINE_RETRY_SECONDS, SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
+    snapshot_quarantine_deadline_is_bounded, snapshot_upload_body_witness,
+    validate_snapshot_batch_request, ScanIndex, SnapshotBatchRequest, SnapshotItem,
+    SnapshotQuarantineDisposition, SnapshotQuarantineRecord, SnapshotQuarantineWitness,
+    SnapshotSource, SnapshotSourceManifest, SnapshotUploadPolicy, SourceScanResult,
+    UnsettledUploadCause, CONTEXT_CURVE_CONTRACT_VERSION, MAX_BACKFILL_FILES_PER_SOURCE,
+    MAX_SNAPSHOT_RECONSTRUCTION_FAILURES, SNAPSHOT_QUARANTINE_RETRY_SECONDS,
+    SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
 };
 use crate::LocalDaemon;
 use crate::LocalHealthUploadFailureKind;
@@ -1246,6 +1248,8 @@ struct SnapshotUploadProgress {
     fresh_context_body_acks: BTreeMap<String, String>,
     #[serde(skip)]
     context_rearm_entities: BTreeSet<String>,
+    #[serde(skip)]
+    context_receipt_candidates: Vec<crate::snapshots::UploadContextReceiptCandidate>,
 }
 
 impl SnapshotUploadProgress {
@@ -1289,6 +1293,7 @@ impl SnapshotUploadProgress {
             terminal_contract_retry_pending_save: false,
             fresh_context_body_acks: BTreeMap::new(),
             context_rearm_entities: BTreeSet::new(),
+            context_receipt_candidates: Vec::new(),
         }
     }
 
@@ -1917,6 +1922,28 @@ impl SnapshotUploadProgress {
         for fingerprint in fingerprints {
             self.record_body(fingerprint, fingerprint);
         }
+    }
+
+    fn note_reprojected_context_refusals(&mut self, items: &[SnapshotItem]) -> bool {
+        let Some(active) = self.active_quarantine_witness.as_ref() else {
+            return false;
+        };
+        let mut changed = false;
+        for item in items {
+            if let Some(record) = self
+                .quarantined_fingerprints
+                .get_mut(&item.snapshot_fingerprint)
+            {
+                if record.witness != *active
+                    && record.upload_body_witness.as_deref()
+                        == Some(snapshot_upload_body_witness(item).as_str())
+                {
+                    record.witness = active.clone();
+                    changed = true;
+                }
+            }
+        }
+        changed
     }
 
     fn record_body(&mut self, fingerprint: &str, body_witness: &str) {
@@ -2909,6 +2936,9 @@ fn checkpoint_partial_snapshot_index_with_comparison(
     durable.reason_reoffer_counts = progress.reason_reoffer_counts;
     durable.ack_capacity = progress.ack_capacity;
     durable.retained_stale_ack_count = progress.retained_stale_ack_count;
+    durable.fresh_context_body_acks = progress.fresh_context_body_acks.clone();
+    durable.context_rearm_entities = progress.context_rearm_entities.clone();
+    durable.context_receipt_candidates = progress.context_receipt_candidates.clone();
     if durable != *progress || durable.schema_version != SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION {
         return Err(anyhow!(
             "snapshot progress changed before partial checkpoint"
@@ -2982,11 +3012,18 @@ fn checkpoint_partial_snapshot_index_with_comparison(
         locally_held,
         &census_absent,
     )?;
+    let context_rearms = committable.accept_file_upload_context_acks(
+        &progress.context_receipt_candidates,
+        &progress.fresh_context_body_acks,
+    );
     validate_destination()?;
     if let Some(cap) = read_limit {
         committable.save_with_read_limit(index_path, cap)?;
     } else {
         committable.save(index_path)?;
+    }
+    if let Some(scan) = correction_scan {
+        context_rearms.emit(scan.source);
     }
     Ok(committable)
 }
@@ -5956,6 +5993,11 @@ fn prepare_sync_source_inner(
     let checkpoint_namespace = attribution_context
         .as_ref()
         .map(SessionAttributionContext::checkpoint_namespace);
+    let upload_context = cycle_upload_context(
+        upload_policy,
+        checkpoint_namespace.as_deref(),
+        cache_observations_enabled,
+    );
     let legacy_policy_index_path = legacy_policy_scoped_snapshot_index_path(
         support_dir,
         source,
@@ -6003,7 +6045,7 @@ fn prepare_sync_source_inner(
     let mut upload_progress = SnapshotUploadProgress::load(
         &upload_progress_path,
         &upload_destination_namespace,
-        snapshot_quarantine_witness(source),
+        crate::snapshots::snapshot_quarantine_witness_for_context(source, &upload_context),
     )?;
     let (mut index, load_origin) =
         ScanIndex::load_for_snapshot_source_with_origin(&index_path, source, support_dir)?;
@@ -6034,11 +6076,6 @@ fn prepare_sync_source_inner(
             cache_observations_enabled,
         );
     }
-    let upload_context = cycle_upload_context(
-        upload_policy,
-        checkpoint_namespace.as_deref(),
-        cache_observations_enabled,
-    );
     continuation::observe(source, &upload_context, upload_policy);
     index.activate_file_upload_context(source, upload_context);
     if !context_curve_enabled {
@@ -6546,10 +6583,19 @@ fn prepare_continuation_source(
     let scan_started_at = replay_harness::collection_timestamp().unwrap_or_else(current_rfc3339);
     #[cfg(not(feature = "replay-harness"))]
     let scan_started_at = current_rfc3339();
+    let checkpoint_namespace = inputs
+        .attribution_context
+        .as_ref()
+        .map(SessionAttributionContext::checkpoint_namespace);
+    let upload_context = cycle_upload_context(
+        inputs.upload_policy,
+        checkpoint_namespace.as_deref(),
+        inputs.cache_observations_enabled,
+    );
     let mut upload_progress = SnapshotUploadProgress::load(
         &inputs.upload_progress_path,
         &inputs.upload_destination_namespace,
-        snapshot_quarantine_witness(source),
+        crate::snapshots::snapshot_quarantine_witness_for_context(source, &upload_context),
     )?;
     let (mut index, _) =
         ScanIndex::load_for_snapshot_source_with_origin(&inputs.index_path, source, support_dir)?;
@@ -6599,18 +6645,7 @@ fn prepare_continuation_source(
     // except that the outage gate is read, never reset (C-1).
     let codex_side_pass =
         crate::snapshots::begin_codex_continuation_side_pass(cache, &inputs.index_path, &mut index);
-    let checkpoint_namespace = inputs
-        .attribution_context
-        .as_ref()
-        .map(SessionAttributionContext::checkpoint_namespace);
-    index.activate_file_upload_context(
-        SnapshotSource::Codex,
-        cycle_upload_context(
-            inputs.upload_policy,
-            checkpoint_namespace.as_deref(),
-            inputs.cache_observations_enabled,
-        ),
-    );
+    index.activate_file_upload_context(source, upload_context);
     // The ordinary selection's in-memory effects, on this page's own copy;
     // the probe above found no claim, so there is nothing to save.
     let claimed = prepare_upload_progress_for_cycle_with_reoffer(
@@ -7301,9 +7336,15 @@ fn finish_sync_source(
     // No absent ACK or unrelated entity borrows those slots.
     let ack_admission_limited =
         upload_progress.admit_upload_input(&mut scan_result.snapshots, &index);
-    let context_receipt_candidates =
+    if matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex)
+        && upload_progress.note_reprojected_context_refusals(&scan_result.snapshots)
+    {
+        upload_progress.save(&upload_progress_path)?;
+    }
+    upload_progress.context_receipt_candidates =
         index.file_upload_context_ack_candidates(&scan_result.snapshots);
-    upload_progress.context_rearm_entities = context_receipt_candidates
+    upload_progress.context_rearm_entities = upload_progress
+        .context_receipt_candidates
         .iter()
         .flat_map(|candidate| candidate.entity_fingerprints().cloned())
         .collect();
@@ -7953,7 +7994,7 @@ fn finish_sync_source(
     // correction later in this finish. Retire only that Claude prior index
     // before the full disk-index CAS decode; keep every possible receipt path.
     let context_rearm_counts = index.accept_file_upload_context_acks(
-        &context_receipt_candidates,
+        &upload_progress.context_receipt_candidates,
         &upload_progress.fresh_context_body_acks,
     );
     let retire_prior_index = source == SnapshotSource::ClaudeCode && !comparison_current;
@@ -24120,7 +24161,7 @@ mod tests {
 
 crate::heap_layout_bound::fields!(SourcePreparation; native_comparison_reservation, native_comparison_lease, prepared_claude_evidence, terminal_native_traversal, native_comparison_controller, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
 
-crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save, fresh_context_body_acks, context_rearm_entities);
+crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save, fresh_context_body_acks, context_rearm_entities, context_receipt_candidates);
 
 crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint, group_fingerprint, entities, reselected_heads, settled_entities);
 

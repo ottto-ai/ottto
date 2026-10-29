@@ -17,8 +17,16 @@ has a fresh exact entity ACK for its admitted post-policy body in this cycle.
 Restored ACK ledgers, count-only responses, parser completion, finalization,
 quarantine, unstored unchanged responses and prior-context ACKs grant no receipt.
 Partial file groups and restored held revisions cannot borrow sibling ACKs.
+Shed/error partial checkpoints normalize runtime leases only for comparison;
+they persist a receipt only for a complete selected file with fresh exact ACKs.
+Reloaded ACK ledgers cannot mint one.
 Byte-identical old bodies bypass no-op suppression only for this per-file debt;
-permanent refusals and current quarantine retain their backoff. Empty or
+permanent refusals and current quarantine retain their backoff. The existing
+quarantine contract witness is bound to the upload-context H, so a policy change
+can reconstruct a previously refused body. An identical re-projected refused
+entity/body keeps its existing disposition, deadline and failure budget under
+the new witness, without gaining acceptance. This adds 80 bytes to each retained
+quarantine contract string; it adds no field or identifier. Empty or
 policy-suppressed files have no body to acknowledge and gain no receipt.
 
 The change grants no census completion, absence, retirement, tombstone drain,

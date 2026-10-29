@@ -38,6 +38,7 @@ pub(crate) mod cache_overcap_tests;
 mod cache_policy_tests;
 mod claude_context_file_birth;
 mod upload_context_receipt;
+pub(crate) use upload_context_receipt::Candidate as UploadContextReceiptCandidate;
 #[cfg(test)]
 mod upload_context_receipt_tests;
 pub use claude_context_file_birth::{ClaudeContextBasisCounts, ClaudeContextFileBirthCounts};
@@ -4266,6 +4267,20 @@ pub fn snapshot_quarantine_witness(source: SnapshotSource) -> SnapshotQuarantine
     }
 }
 
+/// Reuse the existing refusal witness to distinguish an assessed body under
+/// a changed upload policy. This is refusal/backoff evidence, never acceptance.
+pub(crate) fn snapshot_quarantine_witness_for_context(
+    source: SnapshotSource,
+    context: &str,
+) -> SnapshotQuarantineWitness {
+    let mut witness = snapshot_quarantine_witness(source);
+    if matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex) {
+        witness.contract.push_str(":upload_context:");
+        witness.contract.push_str(context);
+    }
+    witness
+}
+
 pub fn snapshot_quarantine_record(source: SnapshotSource) -> SnapshotQuarantineRecord {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -8106,8 +8121,8 @@ pub fn finalize_scan_after_policy_with_body_witness(
         // again when a history hold is released, even without an old body tuple.
         // Legacy/unknown incidence stays funded and protects only its original
         // ACKs even when no file association can be recovered.
-        let context_rearm_required =
-            index.file_upload_context_requires_adoption(&pending.index_key);
+        let context_rearm_required = index.file_upload_context_enabled
+            && index.file_upload_context_requires_adoption(&pending.index_key);
         if let Some(unknown) = index.accepted_rebuild_incidence.get("") {
             carried_noop_entities.extend(
                 unknown
@@ -8149,7 +8164,7 @@ pub fn finalize_scan_after_policy_with_body_witness(
             // Use the pre-replay fact: record() writes provisional new entries.
             && !pending.codex_pending_recovery
             && !quarantine_retry_required
-            && !index.file_upload_context_requires_adoption(&pending.index_key)
+            && !context_rearm_required
         {
             noop_source_files.insert(pending.source_file_fingerprint.clone());
             result.semantic_noop_count = result
@@ -46411,7 +46426,15 @@ impl ScanIndex {
     }
 
     fn activate_quarantine_witness(&mut self, source: SnapshotSource) {
-        self.active_quarantine_witness = Some(snapshot_quarantine_witness(source));
+        self.active_quarantine_witness = Some(
+            self.active_upload_context_fingerprint
+                .as_deref()
+                .filter(|_| self.file_upload_context_enabled)
+                .map_or_else(
+                    || snapshot_quarantine_witness(source),
+                    |context| snapshot_quarantine_witness_for_context(source, context),
+                ),
+        );
     }
 
     #[cfg(test)]

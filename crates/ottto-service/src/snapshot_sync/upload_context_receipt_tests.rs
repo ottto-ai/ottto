@@ -126,3 +126,72 @@ fn upload_context_receipt_count_only_ack_refused() {
     assert_eq!(progress.accepted_fingerprints.len(), 1);
     assert!(progress.fresh_context_body_acks.is_empty());
 }
+
+pub(crate) fn partial_context_checkpoint(
+    source: SnapshotSource,
+    index: &ScanIndex,
+    previous: &ScanIndex,
+    items: &[SnapshotItem],
+    fresh: bool,
+) -> ScanIndex {
+    let scratch = crate::test_scratch::ScratchDir::new("context-partial-checkpoint");
+    let mut progress = SnapshotUploadProgress::new(
+        "a".repeat(64),
+        crate::snapshots::snapshot_quarantine_witness_for_context(source, &"d".repeat(64)),
+    );
+    progress.context_receipt_candidates = index.file_upload_context_ack_candidates(items);
+    progress.context_rearm_entities = progress
+        .context_receipt_candidates
+        .iter()
+        .flat_map(|candidate| candidate.entity_fingerprints().cloned())
+        .collect();
+    let exact = exact_acks(source, items);
+    for (entity, body) in &exact {
+        progress.record_body(entity, body);
+    }
+    if fresh {
+        progress.fresh_context_body_acks = exact;
+    }
+    let progress_path = scratch.join("progress.json");
+    let index_path = scratch.join("index.json");
+    progress.save(&progress_path).unwrap();
+    let restored: SnapshotUploadProgress =
+        serde_json::from_slice(&std::fs::read(&progress_path).unwrap()).unwrap();
+    assert!(restored.context_receipt_candidates.is_empty());
+    assert!(restored.fresh_context_body_acks.is_empty());
+    let selected = checkpoint_partial_snapshot_index(
+        index,
+        previous,
+        &progress,
+        items,
+        None,
+        &BTreeSet::new(),
+        &index_path,
+        &progress_path,
+        || Ok(()),
+    )
+    .unwrap();
+    let loaded = ScanIndex::load(&index_path).unwrap();
+    assert_eq!(
+        serde_json::to_value(&selected.files).unwrap(),
+        serde_json::to_value(&loaded.files).unwrap()
+    );
+    selected
+}
+
+pub(crate) fn reproject_context_refusal(
+    source: SnapshotSource,
+    context: &str,
+    quarantine: BTreeMap<String, SnapshotQuarantineRecord>,
+    items: &[SnapshotItem],
+) -> BTreeMap<String, SnapshotQuarantineRecord> {
+    let mut progress = SnapshotUploadProgress::new(
+        "a".repeat(64),
+        crate::snapshots::snapshot_quarantine_witness_for_context(source, context),
+    );
+    progress.quarantined_fingerprints = quarantine;
+    assert!(progress.note_reprojected_context_refusals(items));
+    assert!(progress.fresh_context_body_acks.is_empty());
+    assert!(progress.accepted_fingerprints.is_empty());
+    progress.quarantined_fingerprints
+}

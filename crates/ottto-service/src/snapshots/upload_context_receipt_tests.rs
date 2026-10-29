@@ -274,8 +274,8 @@ fn upload_context_receipt_partial_entity_ack_refused() {
 fn codex_refused_body_backoff_reads_zero_bytes_over_three_relists() {
     let mut f = Fixture::new(SnapshotSource::Codex);
     let (_, items) = f.pending();
-    f.index.active_quarantine_witness = Some(snapshot_quarantine_witness(f.source));
     let mut refusal = snapshot_quarantine_record(f.source);
+    refusal.witness = f.index.active_quarantine_witness.clone().unwrap();
     refusal.upload_body_witness = Some(snapshot_upload_body_witness(&items[0]));
     f.index
         .quarantined_snapshot_fingerprints
@@ -442,4 +442,83 @@ fn upload_context_receipt_destination_policy_precedes_admission() {
             .files,
         1
     );
+}
+
+#[test]
+fn upload_context_receipt_partial_checkpoint_accepts_runtime_fields_and_persists_receipt() {
+    let mut f = Fixture::new(SnapshotSource::Codex);
+    let previous = f.index.clone();
+    let (_, items) = f.pending();
+    f.index = crate::snapshot_sync::upload_context_receipt_tests::partial_context_checkpoint(
+        f.source, &f.index, &previous, &items, true,
+    );
+    assert!(f.entry().upload_context_receipt.is_some());
+    f.assert_quiet();
+}
+#[test]
+fn upload_context_receipt_partial_checkpoint_old_ack_refused() {
+    let mut f = Fixture::new(SnapshotSource::Codex);
+    let previous = f.index.clone();
+    let (_, items) = f.pending();
+    f.index = crate::snapshot_sync::upload_context_receipt_tests::partial_context_checkpoint(
+        f.source, &f.index, &previous, &items, false,
+    );
+    assert!(f.entry().upload_context_receipt.is_none());
+}
+#[test]
+fn upload_context_legacy_activation_preserves_identical_body_noop() {
+    let mut f = Fixture::new(SnapshotSource::Codex);
+    f.adopt();
+    // The legacy/Pi activation path does not enable file receipts.
+    f.index.file_upload_context_enabled = false;
+    f.index.activate_upload_context("e".repeat(64));
+    let (scan, _) = f.walk(true);
+    assert_eq!(scan.scanned_file_count, 1);
+    assert!(scan.snapshots.is_empty());
+    assert!(scan.semantic_noop_count > 0);
+}
+#[test]
+fn upload_context_policy_change_reprojects_old_refusal_then_keeps_backoff() {
+    let mut f = Fixture::new(SnapshotSource::Codex);
+    f.index
+        .activate_file_upload_context(f.source, "c".repeat(64));
+    let (_, items) = f.pending();
+    let mut refusal = snapshot_quarantine_record(f.source);
+    refusal.witness = f.index.active_quarantine_witness.clone().unwrap();
+    refusal.upload_body_witness = Some(snapshot_upload_body_witness(&items[0]));
+    refusal.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
+    refusal.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
+    refusal.retry_after_unix_seconds = 0;
+    f.index
+        .quarantined_snapshot_fingerprints
+        .insert(items[0].snapshot_fingerprint.clone(), refusal);
+    let original = f.index.quarantined_snapshot_fingerprints.clone();
+    f.index
+        .activate_file_upload_context(f.source, "d".repeat(64));
+    let (scan, _) = f.walk(true);
+    assert_eq!(
+        scan.scanned_file_count, 1,
+        "changed policy can repair a refusal"
+    );
+    assert!(!scan.snapshots.is_empty());
+    let rebound = crate::snapshot_sync::upload_context_receipt_tests::reproject_context_refusal(
+        f.source,
+        &"d".repeat(64),
+        original.clone(),
+        &scan.snapshots,
+    );
+    for (entity, record) in &rebound {
+        assert_eq!(record.disposition, original[entity].disposition);
+        assert_eq!(
+            record.failed_reconstruction_count,
+            original[entity].failed_reconstruction_count
+        );
+        assert_eq!(
+            record.retry_after_unix_seconds,
+            original[entity].retry_after_unix_seconds
+        );
+    }
+    f.index.quarantined_snapshot_fingerprints = rebound;
+    f.assert_quiet();
+    assert!(f.entry().upload_context_receipt.is_none());
 }

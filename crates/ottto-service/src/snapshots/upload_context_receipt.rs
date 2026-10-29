@@ -13,6 +13,7 @@ pub(crate) struct Receipt {
 
 /// Captured from the final admitted bodies under their own context, before POST.
 /// Never serialized; restored ACK ledgers cannot create these acknowledgements.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Candidate {
     key: String,
     receipt: Receipt,
@@ -47,6 +48,7 @@ impl ScanIndex {
         self.activate_upload_context(context);
         self.file_upload_context_enabled =
             matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex);
+        self.activate_quarantine_witness(source);
     }
 
     fn receipt_matches(&self, entry: &ScanIndexEntry) -> bool {
@@ -217,3 +219,5 @@ impl ScanIndex {
     }
 }
 crate::heap_layout_bound::fields!(Receipt; context_fingerprint, replay_generation, source_witness, body_witness);
+
+crate::heap_layout_bound::fields!(Candidate; key, receipt, historical_replay_generation, bodies);
