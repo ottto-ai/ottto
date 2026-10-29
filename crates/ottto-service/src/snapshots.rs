@@ -27624,6 +27624,10 @@ impl OwnedSourceScan {
                         if let Some(traversal) = index.traversal.as_ref() {
                             index.archive_pass.prep_after = inventory
                                 .retain_cached_archives(index, &traversal.codex_rollout_paths);
+                            // Cached-feed preparation cannot certify a directory
+                            // walk that activation (or ordinary discovery) still owes.
+                            inventory.complete &= traversal.pending_directories.is_empty();
+                            inventory.bounded_out |= !traversal.pending_directories.is_empty();
                         }
                         inventory.feed_prepared = true;
                         pending!();
@@ -43255,6 +43259,26 @@ fn release_codex_inventory_hold(source: SnapshotSource, traversal: &mut ScanTrav
         .take()
         .expect("hold checked above");
     if archive_debt != 0 {
+        // The old walk admitted only plain paths. Its unchanged directory
+        // witnesses cannot certify archive membership in another directory.
+        // Reuse the bounded directory queue for a fresh metadata census, once;
+        // keep accepted entries, fingerprints, custody and paid-read evidence.
+        traversal.codex_join_directory_census = Some(codex_file_join::DirectoryCensus::new());
+        traversal
+            .pending_directories
+            .extend(
+                traversal
+                    .scan_roots
+                    .iter()
+                    .cloned()
+                    .map(|root| ScanTraversalPath {
+                        order_modified: None,
+                        scan_root: root.clone(),
+                        path: root,
+                        census_member: true,
+                        watcher_hint: false,
+                    }),
+            );
         // Queueing is not an acquisition grant: plain work sorts first, F3
         // preparation is bounded, and archive admission uses the carried pass
         // gates before any prefix/body decoder can be constructed.

@@ -110,6 +110,11 @@ impl ScanIndex {
             );
             return Ok(Admission::Held);
         }
+        // A partial/old intake census is negative scope only. New archive
+        // acquisition waits until every configured root has been inventoried.
+        if inventory.is_some_and(|inventory| !inventory.complete) {
+            return Ok(Admission::Deferred);
+        }
         if !self
             .archive_pass
             .ready(budget.singleton_remaining(sampled_scan::codex_cursor::Limits::current()))

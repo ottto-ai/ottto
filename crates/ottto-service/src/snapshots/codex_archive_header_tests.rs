@@ -2582,7 +2582,9 @@ fn denied_archive_inventory_debt_releases_once_and_paces_without_plain_body_rere
     let archive = root.join(f.0.file_name().unwrap());
     fs::rename(&f.0, &archive).unwrap();
     f.0 = archive;
-    let roots = [root.clone()];
+    let other = state.join("other/sessions");
+    fs::create_dir_all(&other).unwrap();
+    let roots = [root.clone(), other.clone()];
     let plain = root.join("rollout-stable-plain.jsonl");
     fs::write(
         &plain,
@@ -2600,6 +2602,17 @@ fn denied_archive_inventory_debt_releases_once_and_paces_without_plain_body_rere
         fs::write(&path, zstd::stream::encode_all(body.as_bytes(), 1).unwrap()).unwrap();
         archives.insert(local_index_key(&path));
     }
+    let owed = archives.clone();
+    let hidden = other.join("rollout-unlisted-archive.jsonl.zst");
+    let body = String::from_utf8(synthetic_rollout())
+        .unwrap()
+        .replace("compressed-fixture", "unlisted-archive");
+    fs::write(
+        &hidden,
+        zstd::stream::encode_all(body.as_bytes(), 1).unwrap(),
+    )
+    .unwrap();
+    archives.insert(local_index_key(&hidden));
     let cache = Arc::new(sampled_scan::SharedCache::default());
     let ((mut index, baseline), baseline_reads) =
         terminal_contract_retry::source_acquisitions(|| {
@@ -2653,10 +2666,12 @@ fn denied_archive_inventory_debt_releases_once_and_paces_without_plain_body_rere
             .extend(archives.iter().cloned());
         traversal.observed_index_keys.insert(plain_key.clone());
         let mut dirs = codex_file_join::DirectoryCensus::new();
-        dirs.observe(&root, &fs::metadata(&root).unwrap());
+        for directory in &roots {
+            dirs.observe(directory, &fs::metadata(directory).unwrap());
+        }
         traversal.codex_join_directory_census = Some(dirs);
         traversal.residue.codex_inventory_hold = Some(CodexInventoryHold {
-            owed: archives.clone(),
+            owed: owed.clone(),
             refused_headers: BTreeMap::from([(
                 local_index_key(&f.0),
                 codex_file_join::path_witness(&f.0),
@@ -2706,7 +2721,7 @@ fn denied_archive_inventory_debt_releases_once_and_paces_without_plain_body_rere
                     .codex_inventory_hold
                     .is_none());
                 assert!(
-                    archives.iter().all(|key| scan
+                    owed.iter().all(|key| scan
                         .index
                         .traversal
                         .as_ref()
@@ -2714,6 +2729,16 @@ fn denied_archive_inventory_debt_releases_once_and_paces_without_plain_body_rere
                         .codex_rollout_paths
                         .contains(key)),
                     "scoped activation relist includes every sibling"
+                );
+                assert!(
+                    !scan
+                        .index
+                        .traversal
+                        .as_ref()
+                        .unwrap()
+                        .pending_directories
+                        .is_empty(),
+                    "full metadata census is still owed before any archive decode"
                 );
                 scan.index.archive_pass.power = false;
                 scan.index.archive_pass.cpu = 30_000_000;
@@ -2836,4 +2861,32 @@ fn activation_does_not_release_unchanged_nonregular_archive_inventory_witness() 
         assert_eq!(traversal.residue.codex_inventory_hold.as_ref(), Some(&hold));
         assert!(traversal.pending_candidates.is_empty());
     }
+}
+
+#[test]
+fn incomplete_archive_inventory_defers_before_frame_or_header_io() {
+    let f = ArchiveFixture::new(b"no read permission from incomplete membership");
+    let mut index = ScanIndex::default();
+    index.archive_pass.power = true;
+    let inventory = codex_file_join::HeaderInventory::new(&[], &BTreeSet::new(), None);
+    let (admission, rows) = crate::local_resource_diagnostics::capture(|| {
+        index
+            .classify_archive(
+                &f.candidate(),
+                &File::open(&f.0).unwrap(),
+                Some(&inventory),
+                None,
+                &mut sampled_scan::codex_cursor::PageBudget::default(),
+            )
+            .unwrap()
+    });
+    assert!(matches!(
+        admission,
+        codex_archive_catchup::Admission::Deferred
+    ));
+    assert!(index.files.is_empty());
+    assert_eq!(decoded_archive_bytes(&rows), 0);
+    assert!(!rows
+        .iter()
+        .any(|row| row["stage"] == "codex_zst_frame_header"));
 }
