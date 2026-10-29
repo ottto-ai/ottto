@@ -31649,12 +31649,10 @@ impl OwnedSourceScan {
                 &claude_title_metadata,
                 claude_effort_support_dir_ref,
             );
-            let verification_rescue = sampled_audit::progress_debt(
-                index,
-                &local_index_key(&candidate.path),
-                sampled_scan::now_seconds(),
-            )
-            .is_some();
+            let rescue_key = local_index_key(&candidate.path);
+            let verification_rescue =
+                sampled_audit::progress_debt(index, &rescue_key, sampled_scan::now_seconds())
+                    .is_some();
             let Some((mut candidate, opened_file)) = open_and_identify_scan_candidate_with_rescue(
                 source,
                 candidate,
@@ -31665,8 +31663,14 @@ impl OwnedSourceScan {
                 verification_rescue,
                 sampling.as_ref().map(|context| context.cache.as_ref()),
             ) else {
+                if verification_rescue {
+                    sampled_audit::progress_open_failed(index, &rescue_key);
+                }
                 pending!();
             };
+            if verification_rescue {
+                sampled_audit::progress_opened(index, &rescue_key);
+            }
             if preflight_source_file_fingerprint
                 .as_ref()
                 .is_some_and(|fingerprint| fingerprint != &candidate.source_file_fingerprint)

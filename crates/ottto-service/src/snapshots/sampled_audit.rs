@@ -259,7 +259,9 @@ pub(super) fn awaits_hold_deadline_restoration(index: &ScanIndex, key: &str) -> 
 /// persisted census hold: one interval out, as a Tail stages it, and tagged
 /// `p` because plain v2 cannot prove the lost tag was `c`. Each restored
 /// entry owes one Full; the deadline only delays it. Restorations take free
-/// audit slots and always leave one, so sampling stays supported.
+/// audit slots and always leave one, so sampling stays supported. A key
+/// whose unattempted progress slot already owes an earlier due keeps it:
+/// converting the obligation re-arms debt, never moves it later (#865).
 pub(super) fn restore_held_audit_deadlines(index: &mut ScanIndex, now: u64) -> usize {
     let pending = index
         .files
@@ -281,7 +283,16 @@ pub(super) fn restore_held_audit_deadlines(index: &mut ScanIndex, now: u64) -> u
         .take(budget)
         .cloned()
         .collect::<Vec<_>>();
+    let owed = index
+        .held_audit_progress
+        .as_ref()
+        .filter(|slot| !slot.attempted && slot.due > 0)
+        .map(|slot| (slot.key.clone(), slot.due));
     for key in &keys {
+        let due = owed
+            .as_ref()
+            .filter(|(owed, _)| owed == key)
+            .map_or(due, |(_, owed)| due.min(*owed));
         if let Some(entry) = index.files.get_mut(key) {
             entry.scan_identity_version = Some(provenance_marker(due, true));
         }
@@ -298,8 +309,10 @@ pub(super) fn restore_held_audit_deadlines(index: &mut ScanIndex, now: u64) -> u
 /// unrelated unavailable/oversized file forever. One durable rotating slot
 /// schedules a native Full after a fresh interval, without allocating a
 /// sampled marker or taking the last sampled slot. It grants no authority.
-/// Failed attempts rotate too; their census holds stay eligible for the next
-/// round. The fixed population therefore cannot starve a readable member.
+/// `attempted` is set only once the secure open succeeds. A failed open
+/// rotates too but keeps the owed due, so debt never moves later; census
+/// holds stay eligible for the next round. The fixed population therefore
+/// cannot starve a readable member.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct HeldAuditProgress {
     pub(super) key: String,
@@ -325,6 +338,60 @@ pub(super) fn debt_for_key(index: &ScanIndex, key: &str, now: u64) -> Option<Aud
         .or_else(|| progress_debt(index, key, now))
 }
 
+/// A held key the slot may serve: bounded, still awaiting restoration, and
+/// owned by a scan root, so its Full can be queued.
+fn progress_eligible(index: &ScanIndex, key: &str) -> bool {
+    key.len() <= 4096
+        && awaits_hold_deadline_restoration(index, key)
+        && index
+            .traversal
+            .as_ref()
+            .is_some_and(|traversal| traversal.first_matching_scan_root(Path::new(key)).is_some())
+}
+
+/// BTreeMap order plus a persisted cursor gives every held path a turn,
+/// including when a prior turn failed its secure open/cap.
+fn next_progress_key(index: &ScanIndex, after: Option<&str>) -> Option<String> {
+    let eligible = |key: &&String| progress_eligible(index, key.as_str());
+    let records = || index.claude_request_census.records().map(|(key, _)| key);
+    records()
+        .filter(eligible)
+        .find(|key| after.map_or(true, |after| key.as_str() > after))
+        .or_else(|| records().find(eligible))
+        .cloned()
+}
+
+/// The queued progress Full for `key` passed its secure open: the slot's
+/// turn is spent, so the next preparation rotates to a fresh interval.
+pub(super) fn progress_opened(index: &mut ScanIndex, key: &str) {
+    if let Some(slot) = index
+        .held_audit_progress
+        .as_mut()
+        .filter(|slot| slot.key == key)
+    {
+        slot.attempted = true;
+    }
+}
+
+/// The queued progress Full for `key` failed its secure open. Rotate the
+/// turn (wrapping to `key` itself when it is the only eligible member) but
+/// keep the owed due: a failed open never re-arms a later deadline.
+pub(super) fn progress_open_failed(index: &mut ScanIndex, key: &str) {
+    let Some(due) = index
+        .held_audit_progress
+        .as_ref()
+        .filter(|slot| slot.key == key && !slot.attempted)
+        .map(|slot| slot.due)
+    else {
+        return;
+    };
+    index.held_audit_progress = next_progress_key(index, Some(key)).map(|key| HeldAuditProgress {
+        key,
+        due,
+        attempted: false,
+    });
+}
+
 impl OwnedSourceScan {
     /// At most one additional Full attempt per page. The queue contains only
     /// a bounded path and deadline; entry/census identity is never rewritten.
@@ -333,42 +400,16 @@ impl OwnedSourceScan {
             return;
         }
         let previous = self.index.held_audit_progress.as_ref();
-        // A held key the slot may serve: bounded, still awaiting restoration,
-        // and owned by a scan root, so the Full below can be queued.
-        let eligible = |key: &str| {
-            key.len() <= 4096
-                && awaits_hold_deadline_restoration(&self.index, key)
-                && self.index.traversal.as_ref().is_some_and(|traversal| {
-                    traversal.first_matching_scan_root(Path::new(key)).is_some()
-                })
-        };
         let keep = previous.is_some_and(|slot| {
             !slot.attempted
                 && slot.due > 0
                 && now
                     .checked_add(AUDIT_INTERVAL_SECONDS)
                     .is_some_and(|latest| slot.due <= latest)
-                && eligible(slot.key.as_str())
+                && progress_eligible(&self.index, slot.key.as_str())
         });
         if !keep {
-            let after = previous.map(|slot| slot.key.as_str());
-            // BTreeMap order plus a persisted cursor gives every held path a
-            // turn, including when a prior turn failed its secure open/cap.
-            let key = self
-                .index
-                .claude_request_census
-                .records()
-                .map(|(key, _)| key)
-                .filter(|key| eligible(key.as_str()))
-                .find(|key| after.map_or(true, |after| key.as_str() > after))
-                .or_else(|| {
-                    self.index
-                        .claude_request_census
-                        .records()
-                        .map(|(key, _)| key)
-                        .find(|key| eligible(key.as_str()))
-                })
-                .cloned();
+            let key = next_progress_key(&self.index, previous.map(|slot| slot.key.as_str()));
             self.index.held_audit_progress =
                 key.zip(now.checked_add(AUDIT_INTERVAL_SECONDS))
                     .map(|(key, due)| HeldAuditProgress {
@@ -432,7 +473,6 @@ impl OwnedSourceScan {
                 });
             }
         }
-        self.index.held_audit_progress.as_mut().unwrap().attempted = true;
         super::claude_request_census::note_identity_incomplete_hold_deadlines_restored(1);
     }
 }
