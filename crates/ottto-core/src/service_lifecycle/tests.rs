@@ -1,5 +1,5 @@
 use super::*;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -126,21 +126,43 @@ fn symlink_lock_is_refused_without_touching_target() {
     assert_eq!(fs::read(target).unwrap(), b"keep");
 }
 
-// This harness entry is invoked only in a separate process by the test below.
-// Acquiring and spawning in Rust avoids shell redirection machinery reusing
-// arbitrary inherited descriptor numbers before the fake command starts.
+// Exact harness entries used only by the subprocess test below. Filesystem
+// gates keep readiness independent of shell stdin and libtest output handling.
+#[test]
+fn bootstrap_child_fixture() {
+    let Some(directory) = std::env::var_os("OTTTO_BOOTSTRAP_TEST_CHILD_DIR") else {
+        return;
+    };
+    let directory = PathBuf::from(directory);
+    fs::write(directory.join("child-ready"), b"ready").unwrap();
+    let start = Instant::now();
+    while !directory.join("release-child").exists() && start.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(POLL);
+    }
+    assert!(
+        directory.join("release-child").exists(),
+        "child gate was not released"
+    );
+    fs::write(directory.join("child-finished"), b"finished").unwrap();
+}
+
 #[test]
 fn bootstrap_owner_fixture() {
     let Some(directory) = std::env::var_os("OTTTO_BOOTSTRAP_TEST_OWNER_DIR") else {
         return;
     };
-    let lock =
-        ServiceLifecycleTransaction::acquire(&PathBuf::from(directory), Duration::from_secs(1))
-            .unwrap();
-    let mut command = Command::new("/bin/sh");
-    command.args(["-c", "printf 'ottto-child-ready\\n'; read release"]);
+    let directory = PathBuf::from(directory);
+    let lock = ServiceLifecycleTransaction::acquire(&directory, Duration::from_secs(1)).unwrap();
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "service_lifecycle::tests::bootstrap_child_fixture",
+            "--nocapture",
+        ])
+        .env("OTTTO_BOOTSTRAP_TEST_CHILD_DIR", &directory);
     let mut child = lock.spawn(&mut command).unwrap();
-    child.wait().unwrap();
+    assert!(child.wait().unwrap().success());
 }
 
 #[test]
@@ -154,29 +176,29 @@ fn abrupt_helper_death_leaves_child_owning_transaction() {
             "--nocapture",
         ])
         .env("OTTTO_BOOTSTRAP_TEST_OWNER_DIR", &fixture.0)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped());
+        .stdin(Stdio::null())
+        .stdout(Stdio::null());
     let mut owner = Reap(command.spawn().unwrap());
-    let mut output = BufReader::new(owner.0.stdout.take().unwrap());
-    loop {
-        let mut line = String::new();
+    let start = Instant::now();
+    while !fixture.0.join("child-ready").exists() && start.elapsed() < Duration::from_secs(5) {
         assert!(
-            output.read_line(&mut line).unwrap() > 0,
+            owner.0.try_wait().unwrap().is_none(),
             "helper exited before child readiness"
         );
-        if line.contains("ottto-child-ready") {
-            break;
-        }
+        std::thread::sleep(POLL);
     }
+    assert!(
+        fixture.0.join("child-ready").exists(),
+        "child did not start"
+    );
+    assert!(
+        owner.0.try_wait().unwrap().is_none(),
+        "helper did not wait for its gated child"
+    );
     owner.0.kill().unwrap();
     owner.0.wait().unwrap();
     assert!(ServiceLifecycleTransaction::acquire(&fixture.0, Duration::from_millis(50)).is_err());
-    owner
-        .0
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(b"release\n")
-        .unwrap();
+    fs::write(fixture.0.join("release-child"), b"release").unwrap();
     drop(fixture.lock());
+    assert!(fixture.0.join("child-finished").exists());
 }
