@@ -7,7 +7,9 @@ use std::io::{self, BufRead, BufReader, Read};
 use std::mem::size_of;
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
-use zstd::zstd_safe::{DCtx, DParameter, InBuffer, OutBuffer};
+#[path = "codex_decoder_allocation.rs"]
+mod decoder_allocation;
+use decoder_allocation::Context as DecoderContext;
 
 /// One predicate for a candidate's encoding or the already-opened input kind.
 /// A suffix is only a refusal signal, never ownership or decode authority.
@@ -456,7 +458,7 @@ impl ArchiveEvidence {
 pub(super) struct BoundedDecoder<R: Read> {
     input: BufReader<io::Take<R>>,
     physical_limit: u64,
-    context: DCtx<'static>,
+    context: DecoderContext,
     reserved: usize,
     remaining: u64,
     frame_complete: bool,
@@ -471,10 +473,10 @@ impl<R: Read> BoundedDecoder<R> {
         #[cfg(test)]
         super::codex_zst_refusal_tests::decoder_constructed();
         let reserved = decoder_reservation()?;
-        let mut context = DCtx::try_create()
+        let mut context = DecoderContext::new(reserved.saturating_sub(BUFFER_BYTES))
             .ok_or_else(|| io::Error::other("compressed rollout decoder allocation failed"))?;
         context
-            .set_parameter(DParameter::WindowLogMax(WINDOW_LOG))
+            .set_window_log(WINDOW_LOG)
             .map_err(|_| invalid("cannot bound compressed rollout window"))?;
         Ok(Self {
             input: BufReader::with_capacity(BUFFER_BYTES, input.take(u64::MAX)),
@@ -501,7 +503,6 @@ impl<R: Read> BoundedDecoder<R> {
             if input_ended && self.frame_complete {
                 return Ok(0);
             }
-            let mut input = InBuffer::around(bytes);
             // At the limit, probe one byte: a Take-style artificial EOF would
             // incorrectly turn over-limit content into a complete JSONL body.
             let mut probe = [0u8; 1];
@@ -509,17 +510,15 @@ impl<R: Read> BoundedDecoder<R> {
             let capacity = output
                 .len()
                 .min(self.remaining.min(usize::MAX as u64) as usize);
-            let mut out = if at_limit {
-                OutBuffer::around(&mut probe[..])
+            let out = if at_limit {
+                &mut probe[..]
             } else {
-                OutBuffer::around(&mut output[..capacity])
+                &mut output[..capacity]
             };
-            let hint = self
+            let (hint, consumed, produced) = self
                 .context
-                .decompress_stream(&mut out, &mut input)
+                .decompress(bytes, out)
                 .map_err(|_| invalid(CodexZstCause::DecodeFailed))?;
-            let consumed = input.pos;
-            let produced = out.pos();
             self.compressed_bytes = self.compressed_bytes.saturating_add(consumed as u64);
             self.decoded_bytes = self.decoded_bytes.saturating_add(produced as u64);
             self.input.consume(consumed);
@@ -2369,6 +2368,9 @@ pub(in crate::snapshots) mod tests {
                 .unwrap()
                 .contains("compressed_admission_yields"));
             index = ScanIndex::load(&saved_index).unwrap();
+            // Each yield is a new retry generation. A retained generation keeps
+            // its earlier RU counts even after this archive becomes residue.
+            index.traversal = None;
             let (next, result, rows, _) = archive_pass(&f, index, false, None);
             assert!(next.files.is_empty());
             assert_eq!(decodes(&rows), 0);
@@ -2683,8 +2685,8 @@ pub(in crate::snapshots) mod tests {
                     assert!(pending.is_empty());
                 }
                 if modern {
-                    // Existing plain-file edge case: both legal filename grammars
-                    // have state support. Keep this separate bug visible to owners.
+                    // Main now withholds both supported ambiguous filename owners
+                    // after a prior body, for plain files as well as archives.
                     metadata.state_threads.insert(
                         format!("2026-10-07T12-00-00-{id}"),
                         metadata.state_threads[id].clone(),
@@ -2697,12 +2699,10 @@ pub(in crate::snapshots) mod tests {
                         &mut index,
                         &BTreeSet::new(),
                     );
-                    let replacement = ambiguous.iter().find(|s| s.source_session_id == id);
-                    assert_eq!(replacement.is_some(), !archive);
-                    if let Some(replacement) = replacement {
-                        assert_eq!(replacement.unattributed_total_tokens, 440);
-                        assert_ne!(replacement.model_usage, native.model_usage);
-                    }
+                    assert!(
+                        ambiguous.iter().all(|s| s.source_session_id != id),
+                        "archive={archive}: ambiguous filename cannot replace native money"
+                    );
                 }
             }
         }
@@ -2898,7 +2898,28 @@ pub(in crate::snapshots) mod tests {
         assert!(codex_file_join::receipt_state(index.files.get(&key))
             .0
             .is_some());
-        let mut saved = checkpoint(&index);
+        let mut committed: ScanIndex = serde_json::from_slice(
+            &fs::read(f.0.parent().unwrap().join("reservation.json")).unwrap(),
+        )
+        .unwrap();
+        let (mut captured, changed, held) =
+            index.stage_codex_recovery_capture(&committed, &first.snapshots);
+        assert_eq!(changed, BTreeSet::from(["compressed-fixture".into()]));
+        assert!(held.is_empty());
+        captured
+            .save(&f.0.parent().unwrap().join("reservation.json"))
+            .unwrap();
+        committed = captured;
+        let mut saved = index.committable_subset_with_local_holds(
+            &committed,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
+        assert!(codex_file_join::receipt_state(saved.files.get(&key))
+            .0
+            .is_some());
+        saved = serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
         retry_due(&mut saved, &key);
         let (_, recovered, rows, _) = archive_pass(&f, saved, true, None); // traces expired
         assert_eq!(decodes(&rows), 1);
@@ -2915,8 +2936,12 @@ pub(in crate::snapshots) mod tests {
         let _lock = ARCHIVE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let f =
-            ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+        let bytes = String::from_utf8(synthetic_rollout()).unwrap().replacen(
+            "\"id\":\"compressed-fixture\"",
+            &format!("\"id\":\"compressed-fixture\",\"timestamp\":\"{NOW}\""),
+            1,
+        );
+        let f = ArchiveFixture::new(&zstd::stream::encode_all(bytes.as_bytes(), 1).unwrap());
         let key = local_index_key(&f.0);
         for v2 in [false, true] {
             let mut prior = ScanIndex::default();
@@ -3041,6 +3066,9 @@ pub(in crate::snapshots) mod tests {
             .iter()
             .any(|s| s.source_session_id == "compressed-fixture"));
         retry_due(&mut saved, &key);
+        // Six hours also passes the traversal's at-most-one-hour retry. The
+        // old red generation cannot certify the parent's current census.
+        saved.traversal = None;
         let (after, result, rows, _) = archive_pass_with(&f, saved, true, None, &roots, |_| {});
         assert_eq!(decodes(&rows), 1);
         assert_pending(&after, &f.0, 2);
