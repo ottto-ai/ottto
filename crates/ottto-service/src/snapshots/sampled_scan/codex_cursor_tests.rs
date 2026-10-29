@@ -15266,7 +15266,7 @@ fn deferred_group_preserves_accepted_extent_and_releases_through_existing_ends()
     }
     for end in ["complete", "cancel", "drop", "evict", "unavailable"] {
         with_test_limits(2048, 1024, 64, || {
-            let (fixture, mut index, cache, held) = deferred_group_fixture_with_loss(true, true);
+            let (fixture, mut index, cache, held, _) = deferred_group_fixture_with_loss(true, true);
             let members = cache.paused_members_for_test().unwrap();
             let paths = members.clone();
             let mut dirs = codex_file_join::DirectoryCensus::new();
