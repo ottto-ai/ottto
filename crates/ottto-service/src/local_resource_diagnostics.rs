@@ -465,6 +465,8 @@ impl Probe {
             withheld_hold_unrecorded: BTreeMap<&'static str, u64>,
             #[serde(skip_serializing_if = "Option::is_none")]
             withheld_memo: Option<crate::snapshots::withheld_account::Census>,
+            #[serde(flatten)]
+            withheld_held: Option<crate::snapshots::withheld_account::HeldGauge>,
         }
         let claude = source == "claude_code";
         let counts = Counts {
@@ -481,6 +483,9 @@ impl Probe {
             withheld_hold_unrecorded: drain(source, &WITHHELD_UNRECORDED),
             withheld_memo: claude
                 .then(crate::snapshots::withheld_account::census)
+                .flatten(),
+            withheld_held: claude
+                .then(crate::snapshots::withheld_account::held_gauge)
                 .flatten(),
             reread: if claude {
                 self.page_events.with_current().without_terminal_rearm()
