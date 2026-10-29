@@ -5023,3 +5023,5 @@ fn transcript_path_current_account_is_the_newest_parsed_request() {
     }
     let _ = fs::remove_dir_all(dir);
 }
+
+include!("claude_request_identity_window_tests.rs");

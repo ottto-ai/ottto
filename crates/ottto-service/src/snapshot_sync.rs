@@ -56,6 +56,8 @@ use zeroize::Zeroize;
 
 mod account_hash_changes;
 mod continuation;
+#[cfg(test)]
+mod identity_bucket_progress_tests;
 mod reason_reoffer;
 mod rejection_log;
 
@@ -1218,6 +1220,12 @@ struct SnapshotUploadProgress {
     retained_stale_ack_count: usize,
     #[serde(default)]
     accepted_cache_states: BTreeMap<String, serde_json::Value>,
+    /// Class L bucket-start priority hints, written only for stored-body ACKs.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::snapshots::claude_request_identity::AcceptedBuckets::is_empty"
+    )]
+    accepted_identity_buckets: crate::snapshots::claude_request_identity::AcceptedBuckets,
     #[serde(default)]
     accepted_cache_heads: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -1278,6 +1286,7 @@ impl SnapshotUploadProgress {
             ack_capacity: ack_retention::default_ack_capacity(),
             retained_stale_ack_count: 0,
             accepted_cache_states: BTreeMap::new(),
+            accepted_identity_buckets: Default::default(),
             accepted_cache_heads: BTreeMap::new(),
             pending_cache_heads: BTreeMap::new(),
             quarantined_fingerprints: BTreeMap::new(),
@@ -1943,6 +1952,7 @@ impl SnapshotUploadProgress {
             return Ok(());
         };
         self.accepted_account_hashes.record(&value);
+        self.accepted_identity_buckets.record(&value);
         let key = cache_session_key(session);
         // Count-only legacy ACKs cannot distinguish changed from unchanged.
         // Recover authority through the same bootstrap rather than retaining
@@ -2479,6 +2489,7 @@ impl SnapshotUploadProgress {
             && self.accepted_cache_heads.is_empty()
             && self.pending_cache_heads.is_empty()
             && self.accepted_account_hashes.is_empty()
+            && self.accepted_identity_buckets.is_empty()
         {
             return self.clear(path);
         }
@@ -6942,6 +6953,7 @@ fn finish_sync_source(
             comparison_completion.as_mut(),
             native_comparison_lease.as_ref(),
             Some((&daemon.transcript_cache, &committed_index)),
+            Some(&upload_progress.accepted_identity_buckets),
         );
         let (disposition, census_withheld, stats) = match applied {
             Ok(applied) => applied,
@@ -8823,6 +8835,7 @@ fn apply_claude_local_evidence_to_scan_with_comparison(
         comparison,
         lease,
         None,
+        None,
     )
     .expect("ordinary or logical comparison evidence fixture has no resource refusal")
 }
@@ -8844,6 +8857,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     mut comparison: Option<&mut crate::snapshots::claude_native_comparison::Completion>,
     lease: Option<&crate::snapshots::claude_native_comparison::lifecycle::Lease>,
     retained: Option<(&crate::snapshots::sampled_scan::SharedCache, &ScanIndex)>,
+    accepted_identity_buckets: Option<&crate::snapshots::claude_request_identity::AcceptedBuckets>,
 ) -> std::result::Result<
     (
         crate::snapshots::ClaudeUsageAuthorityDisposition,
@@ -9101,6 +9115,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         )
         .with_status_coverage(crate::claude_status_coverage::snapshot())
         .with_native_originals(&originals)
+        .with_accepted_buckets(accepted_identity_buckets)
     });
     if !full_rearm_evidence_complete {
         index.note_claude_full_rearm_evidence_gap(&scan_result.census_window_end);
@@ -11649,6 +11664,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let owner = std::sync::Arc::new(lifecycle::Lifecycle::default());
@@ -11665,6 +11681,7 @@ mod tests {
                 None,
                 completion.as_mut(),
                 Some(&lease),
+                None,
                 None,
             )
             .unwrap()
@@ -24162,7 +24179,7 @@ mod tests {
 
 crate::heap_layout_bound::fields!(SourcePreparation; native_comparison_reservation, native_comparison_lease, prepared_claude_evidence, terminal_native_traversal, native_comparison_controller, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
 
-crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_account_hashes, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save);
+crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_account_hashes, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_identity_buckets, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save);
 
 crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint, group_fingerprint, entities, reselected_heads, settled_entities);
 

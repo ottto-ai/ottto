@@ -36,6 +36,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
+mod accepted;
+mod budget;
+pub(crate) use accepted::AcceptedBuckets;
+pub(crate) use budget::Measurement as CapMeasurement;
+
 pub(crate) const COLLECTOR: &str = "claude_code_jsonl:own_request_identity_rows:v1";
 pub(crate) const E2_GROUPING: &str =
     "claude_code_jsonl:own_request_identity_rows:v1/e2_grouping:v1";
@@ -384,13 +389,15 @@ struct RowGroup {
     total: Amounts,
     by_key: BTreeMap<Option<AuthorityKey>, Amounts>,
     refused: bool,
+    truncated: bool,
 }
 
 /// Per-item aggregation at today's (bucket, row key) x authority-key grain,
 /// fed one request at a time so nothing grows with the request count. Groups
 /// are capped by the rows the item can carry (more could never reproduce), and
-/// each group by `MAX_AUTHORITY_KEYS` plus the untagged entry: keys past the
-/// cap fold into untagged as they arrive, before any encoding.
+/// each group by `MAX_AUTHORITY_KEYS` plus the untagged entry. A truncated
+/// row never qualifies for the sticky budget; independent later rows can
+/// still retain their proof. The emitted item keeps the global key cap.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Grouping {
     groups: BTreeMap<String, BTreeMap<RowKey, RowGroup>>,
@@ -588,18 +595,29 @@ impl Grouping {
                 group.refused = true;
                 None
             }
-            IdentityRef::Tagged(key) if !self.keys_over_cap => {
-                // At most `MAX_AUTHORITY_KEYS` keys: scan before copying one.
-                if !self.keys.iter().any(|known| key.matches(known)) {
+            IdentityRef::Tagged(key) => {
+                if !self.keys_over_cap && !self.keys.iter().any(|known| key.matches(known)) {
                     if self.keys.len() == MAX_AUTHORITY_KEYS {
                         self.keys_over_cap = true;
                     } else {
                         self.keys.insert(key.to_key());
                     }
                 }
-                (!self.keys_over_cap).then_some(key)
+                // Bound construction per row, so an old global key does not
+                // prevent a later bucket's independent proof from surviving.
+                let known = group
+                    .by_key
+                    .keys()
+                    .flatten()
+                    .any(|known| key.matches(known));
+                if known || group.by_key.keys().flatten().count() < MAX_AUTHORITY_KEYS {
+                    Some(key)
+                } else {
+                    group.truncated = true;
+                    group.refused = true;
+                    None
+                }
             }
-            IdentityRef::Tagged(_) => None,
             IdentityRef::Missing => None,
             IdentityRef::Refused(_) => {
                 group.refused = true;
@@ -718,6 +736,26 @@ pub(crate) fn apply(
     apply_grouped(item, grouping)
 }
 
+#[cfg(test)]
+pub(crate) fn apply_with_accepted_for_test(
+    item: &mut SnapshotItem,
+    contributions: &[Contribution],
+    accepted: &AcceptedBuckets,
+) -> Result<Tagged, Ineligible> {
+    let mut grouping = Grouping::new(bucket_row_count(item));
+    for c in contributions {
+        grouping.add_at(
+            &c.bucket_start,
+            &c.row_key,
+            &c.usage,
+            c.identity.as_ref(),
+            Some(&c.bucket_start),
+        );
+    }
+    let known = accepted.get(&item.source_session_id);
+    apply_grouped_with_accepted(item, grouping, known)
+}
+
 /// `apply` with each request's own transcript time (`None`: auxiliary),
 /// withdrawing transcript tags first exactly as `tag_item` does.
 #[cfg(test)]
@@ -742,9 +780,18 @@ pub(crate) fn apply_timed(
 /// Tag `item` from its aggregated requests. Returns `Err` when the item must
 /// stay on today's path (it is left unchanged). On success the item carries the
 /// new collector, the tagged or fallback shape, and a fresh fingerprint.
+#[cfg(test)]
 pub(crate) fn apply_grouped(
     item: &mut SnapshotItem,
+    grouping: Grouping,
+) -> Result<Tagged, Ineligible> {
+    apply_grouped_with_accepted(item, grouping, None)
+}
+
+fn apply_grouped_with_accepted(
+    item: &mut SnapshotItem,
     mut grouping: Grouping,
+    accepted: Option<&[i64]>,
 ) -> Result<Tagged, Ineligible> {
     if let Some(ineligible) = grouping.failed {
         return Err(ineligible);
@@ -785,6 +832,7 @@ pub(crate) fn apply_grouped(
         )?;
     }
 
+    refuse_unproved_accepted(&mut grouping, accepted);
     let prior_refusals = item.request_identity_refusals;
     let mut refusals = prior_refusals;
     let mut over_cap = BTreeSet::new();
@@ -884,11 +932,24 @@ pub(crate) fn apply_grouped(
         over_cap.insert(OverCap::Rows);
     }
 
-    let lost = bucket_identities
+    let lost = item
+        .usage_buckets
         .iter()
-        .flatten()
-        .filter(|identity| !matches!(identity, RowIdentity::Untagged))
-        .count() as u64;
+        .zip(&bucket_identities)
+        .map(|(bucket, identities)| {
+            bucket
+                .model_usage
+                .iter()
+                .zip(identities)
+                .filter(|(row, identity)| {
+                    !matches!(identity, RowIdentity::Untagged)
+                        || grouping
+                            .get(&bucket.bucket_start, &row_key_from_model_usage(row))
+                            .is_some_and(|group| group.refused)
+                })
+                .count() as u64
+        })
+        .sum::<u64>();
     // Measure the attempted tagged body even when another cap failed. Only
     // byte counts and closed reason labels enter local diagnostics; the same
     // full strip below still owns every over-cap wire body and its display.
@@ -898,11 +959,59 @@ pub(crate) fn apply_grouped(
         over_cap.insert(OverCap::Bytes);
     }
     if over_cap.is_empty() {
+        budget::record(&cap_counts(item, accepted, None));
         item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
         item.claude_account_display = display(grouping.unowned_request);
         return Ok(Tagged::Sent { refusals });
     }
     crate::local_resource_diagnostics::claude_identity_over_cap(&over_cap, attempted_bytes);
+    let attempted_counts = cap_counts(item, accepted, None);
+    if let Some((kept, measurement)) = budget::select(item, &grouping, prior_refusals, accepted) {
+        budget::record(&cap_counts(item, accepted, Some(&measurement)));
+        let mut visible = grouping;
+        for (bucket, keep) in item.usage_buckets.iter().zip(&kept) {
+            if !keep {
+                for group in visible
+                    .groups
+                    .get_mut(&bucket.bucket_start)
+                    .into_iter()
+                    .flat_map(BTreeMap::values_mut)
+                {
+                    group.by_key = BTreeMap::from([(None, group.total.clone())]);
+                }
+            }
+        }
+        let latest_kept = visible.latest.ties.iter().all(|(bucket, row, key)| {
+            key.as_ref().is_some_and(|key| {
+                visible
+                    .get(bucket, row)
+                    .is_some_and(|group| group.by_key.contains_key(&Some(key.clone())))
+            })
+        });
+        item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
+        item.claude_account_display = Some(Box::new(account_display(
+            &visible,
+            visible.unowned_request || !latest_kept,
+        )));
+        return Ok(Tagged::Sent {
+            refusals: item.request_identity_refusals,
+        });
+    }
+    let mut counts = attempted_counts;
+    counts.accepted_overflow.differs = counts.retained_buckets;
+    counts.retained_buckets = 0;
+    counts.refused_new_buckets = grouping
+        .groups
+        .iter()
+        .filter(|(bucket, rows)| {
+            !accepted::bucket_key(bucket)
+                .is_some_and(|key| accepted.is_some_and(|known| known.binary_search(&key).is_ok()))
+                && rows
+                    .values()
+                    .any(|group| group.by_key.keys().any(Option::is_some))
+        })
+        .count() as u64;
+    budget::record(&counts);
     let refusals = lost.max(1).saturating_add(prior_refusals);
     strip(item);
     item.provenance.collector = COLLECTOR.to_string();
@@ -918,6 +1027,171 @@ pub(crate) fn apply_grouped(
         over_cap: over_cap.into_iter().collect(),
         refusals,
     })
+}
+
+fn refuse_unproved_accepted(grouping: &mut Grouping, accepted: Option<&[i64]>) {
+    for (bucket, rows) in &mut grouping.groups {
+        let remembered = accepted::bucket_key(bucket)
+            .is_some_and(|key| accepted.is_some_and(|known| known.binary_search(&key).is_ok()));
+        // A bucket-level hint cannot turn a legitimately missing sibling row
+        // into a refusal. Refuse restoration only when the whole remembered
+        // bucket has lost its currently provable identity.
+        let proved = rows.values().any(|group| {
+            group
+                .by_key
+                .iter()
+                .any(|(key, amounts)| key.is_some() && amounts.counts != [0; 8])
+        });
+        if remembered && !proved {
+            for group in rows.values_mut() {
+                group.refused = true;
+            }
+        }
+    }
+}
+
+fn cap_counts(
+    item: &SnapshotItem,
+    accepted: Option<&[i64]>,
+    measurement: Option<&CapMeasurement>,
+) -> budget::Counts {
+    let retained = item
+        .usage_buckets
+        .iter()
+        .filter(|bucket| {
+            accepted::bucket_key(&bucket.bucket_start)
+                .is_some_and(|key| accepted.is_some_and(|known| known.binary_search(&key).is_ok()))
+                && bucket.model_usage.iter().any(|row| {
+                    row.evidence_ref.is_some()
+                        || row.identity_parts.as_ref().is_some_and(|parts| {
+                            parts.iter().any(|part| part.evidence_ref.is_some())
+                        })
+                })
+        })
+        .count() as u64;
+    budget::Counts {
+        retained_buckets: measurement.map_or(retained, |m| m.accepted_retained),
+        refused_new_buckets: measurement.map_or(0, |m| m.refused_recent_buckets),
+        accepted_state_unknown: u64::from(accepted.is_none()),
+        accepted_overflow: measurement
+            .map_or_else(Default::default, |m| m.accepted_overflow.clone()),
+    }
+}
+
+/// Pure measurement over a request-owned item's currently held native proof.
+/// It never reads accounts/transcripts, emits diagnostics or uploads a body.
+#[allow(dead_code)] // Side-run/debug hook; deliberately not a runtime decision input.
+pub(crate) fn measure_identity_cap(
+    item: &SnapshotItem,
+    accepted: &AcceptedBuckets,
+) -> Option<CapMeasurement> {
+    let mut grouping = request_owned_grouping(item, None).or_else(|| wire_grouping(item))?;
+    let mut output = item.clone();
+    let known = accepted.get(&item.source_session_id);
+    refuse_unproved_accepted(&mut grouping, known);
+    if let Some((_, measured)) = budget::select(
+        &mut output,
+        &grouping,
+        item.request_identity_refusals,
+        known,
+    ) {
+        return Some(measured);
+    }
+    let mut measured = CapMeasurement::default();
+    let mut refused_rows = 0u64;
+    for bucket in &item.usage_buckets {
+        let remembered = accepted::bucket_key(&bucket.bucket_start)
+            .is_some_and(|key| known.is_some_and(|set| set.binary_search(&key).is_ok()));
+        let mut tagged = false;
+        for row in &bucket.model_usage {
+            let group = grouping.get(&bucket.bucket_start, &row_key_from_model_usage(row))?;
+            let proved = group.by_key.keys().any(Option::is_some);
+            tagged |= proved;
+            refused_rows += u64::from(proved || group.refused || remembered);
+        }
+        if tagged {
+            if remembered {
+                measured.accepted_overflow.differs += 1;
+            } else {
+                measured.refused_recent_buckets += 1;
+            }
+        }
+    }
+    strip(&mut output);
+    output.request_identity_refusals = item
+        .request_identity_refusals
+        .saturating_add(refused_rows.max(1));
+    measured.item_bytes = item_bytes(&output);
+    Some(measured)
+}
+
+// A side-run may have a tagged item without the native fold. Use only its
+// explicit current shares, never reconstruct lost proof from an account hint.
+fn wire_grouping(item: &SnapshotItem) -> Option<Grouping> {
+    let mut grouping = Grouping::new(bucket_row_count(item));
+    for bucket in &item.usage_buckets {
+        for row in &bucket.model_usage {
+            let mut add =
+                |login: Option<&str>, reference: Option<u16>, usage: UsageTotals| -> Option<()> {
+                    let identity = match reference {
+                        None => IdentityRef::Missing,
+                        Some(reference) => {
+                            let evidence = item.request_evidence.get(usize::from(reference))?;
+                            let basis = match evidence.identity_basis.as_str() {
+                                TELEMETRY => TELEMETRY,
+                                TELEMETRY_LOGIN => TELEMETRY_LOGIN,
+                                TRANSCRIPT_ORG => TRANSCRIPT_ORG,
+                                TRANSCRIPT_SOLE_LOGIN => TRANSCRIPT_SOLE_LOGIN,
+                                _ => return None,
+                            };
+                            IdentityRef::Tagged(KeyRef {
+                                login,
+                                org: evidence.provider_workspace_hash.as_deref(),
+                                basis,
+                            })
+                        }
+                    };
+                    grouping.add_at(
+                        &bucket.bucket_start,
+                        &row_key_from_model_usage(row),
+                        &usage,
+                        identity,
+                        None,
+                    );
+                    Some(())
+                };
+            if let Some(parts) = &row.identity_parts {
+                for part in parts {
+                    let mut share = row.clone();
+                    share.input_tokens = part.input_tokens;
+                    share.output_tokens = part.output_tokens;
+                    share.cache_read_tokens = part.cache_read_tokens;
+                    share.cache_creation_5m_tokens = part.cache_creation_5m_tokens;
+                    share.cache_creation_1h_tokens = part.cache_creation_1h_tokens;
+                    share.reasoning_output_tokens = part.reasoning_output_tokens;
+                    share.unattributed_total_tokens = part.unattributed_total_tokens;
+                    share.request_count = part.request_count;
+                    share.cost_usd = part.cost_usd.clone();
+                    share.input_cost_usd = part.input_cost_usd.clone();
+                    share.output_cost_usd = part.output_cost_usd.clone();
+                    share.cache_read_cost_usd = part.cache_read_cost_usd.clone();
+                    share.cache_creation_cost_usd = part.cache_creation_cost_usd.clone();
+                    add(
+                        part.account_identifier_hash.as_deref(),
+                        part.evidence_ref,
+                        super::usage_totals_from_model_usage(&share),
+                    )?;
+                }
+            } else {
+                add(
+                    row.account_identifier_hash.as_deref(),
+                    row.evidence_ref,
+                    super::usage_totals_from_model_usage(row),
+                )?;
+            }
+        }
+    }
+    Some(grouping)
 }
 
 fn withdrawn(key: AuthorityKey) -> Option<AuthorityKey> {
@@ -1088,6 +1362,7 @@ fn reproduces(row: &SnapshotModelUsage, amounts: &Amounts) -> Result<(), Ineligi
     Ok(())
 }
 
+#[derive(Clone)]
 enum RowIdentity {
     Untagged,
     Single(AuthorityKey),
@@ -2356,6 +2631,8 @@ pub(crate) fn record_listed_legacy_counts(families: u64, files: u64) {
 }
 #[derive(Default, serde::Serialize)]
 pub(crate) struct IdentityCounts {
+    #[serde(skip_serializing_if = "budget::Counts::is_empty")]
+    identity_cap: budget::Counts,
     #[serde(skip_serializing_if = "is_zero")]
     claude_mixed_login_sessions: u64,
     #[serde(skip_serializing_if = "is_zero")]
@@ -2375,6 +2652,7 @@ pub(crate) fn take_identity_counts() -> IdentityCounts {
         .each_ref()
         .map(|counter| counter.swap(0, std::sync::atomic::Ordering::Relaxed));
     IdentityCounts {
+        identity_cap: budget::take_counts(),
         claude_mixed_login_sessions: mixed,
         claude_inherited_org_requests: inherited,
         claude_identity_conflict_fallbacks: conflicts,
@@ -2491,6 +2769,7 @@ pub(crate) struct ScanEvidence<'a> {
     /// telemetry may veto its original org for billing without changing the
     /// unambiguous native account used by local Desktop activity.
     native_originals: Option<&'a BTreeMap<String, super::SessionAccountEvidence>>,
+    accepted_buckets: Option<&'a AcceptedBuckets>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -2552,6 +2831,11 @@ impl<'a> ScanEvidence<'a> {
             }
         }
         evidence
+    }
+
+    pub(crate) fn with_accepted_buckets(mut self, accepted: Option<&'a AcceptedBuckets>) -> Self {
+        self.accepted_buckets = accepted;
+        self
     }
 
     pub(crate) fn with_native_originals(
@@ -3762,6 +4046,9 @@ fn tag_item(
     reported: &mut BTreeMap<String, Grouping>,
     ownership: &TranscriptOwnership<'_>,
 ) -> Option<Result<Tagged, Ineligible>> {
+    let accepted = evidence
+        .accepted_buckets
+        .and_then(|state| state.get(&item.source_session_id));
     if super::claude_request_money::e2::enabled()
         && super::claude_history_upgrade::is_request_owned_literal(item)
     {
@@ -3790,7 +4077,7 @@ fn tag_item(
         );
         let prior_refusals = item.request_identity_refusals;
         normalize_activity(item);
-        let tagged = apply_grouped(item, grouping);
+        let tagged = apply_grouped_with_accepted(item, grouping, accepted);
         if tagged.is_err() {
             (
                 item.source_started_at,
@@ -3799,7 +4086,7 @@ fn tag_item(
             ) = lifecycle;
             return Some(tagged);
         }
-        if matches!(tagged, Ok(Tagged::Sent { .. })) {
+        if matches!(tagged, Ok(Tagged::Sent { .. })) || evidence.accepted_buckets.is_some() {
             return Some(tagged);
         }
         let fallback = item
@@ -3811,7 +4098,7 @@ fn tag_item(
             .clone();
         let grouping = request_owned_grouping(item, Some(&fallback))?;
         item.request_identity_refusals = prior_refusals;
-        let tagged = apply_grouped(item, grouping);
+        let tagged = apply_grouped_with_accepted(item, grouping, accepted);
         if tagged.is_err() {
             (
                 item.source_started_at,
@@ -3871,7 +4158,7 @@ fn tag_item(
     normalize_activity(item);
     let desktop_recent = std::mem::take(&mut grouping.desktop_recent);
     let owned = !grouping.unowned_request;
-    let tagged = apply_grouped(item, grouping);
+    let tagged = apply_grouped_with_accepted(item, grouping, accepted);
     if tagged.is_ok() && owned {
         crate::desktop_recent::publish(desktop_recent);
     }
