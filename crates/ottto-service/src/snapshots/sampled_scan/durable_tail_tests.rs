@@ -3966,7 +3966,7 @@ fn a0h_scan(
 }
 
 #[test]
-fn a0h_pacing_is_funded_nonrenewing_and_overflow_reads() {
+fn a0h_pacing_is_funded_nonrenewing_and_evicts_oldest() {
     let root = crate::test_scratch::private_dir("a0h-pace");
     let path = root.join("t.jsonl");
     std::fs::write(&path, b"{}\n{}\n").unwrap();
@@ -3983,7 +3983,7 @@ fn a0h_pacing_is_funded_nonrenewing_and_overflow_reads() {
     }
     assert!(!cache.retail_full("k", &file, 3, now - std::time::Duration::from_secs(1)));
     assert!(cache.retail_full("k", &file, 3, now + std::time::Duration::from_secs(21600)));
-    let later = now + std::time::Duration::from_secs(21600);
+    let later = now + std::time::Duration::from_secs(21601);
     for n in 1..2 * store::MAX_RECORDS {
         assert!(cache.retail_full(&format!("k{n}"), &file, 3, later));
     }
@@ -3996,10 +3996,20 @@ fn a0h_pacing_is_funded_nonrenewing_and_overflow_reads() {
         "full pace map reads safely"
     );
     assert!(
-        cache.retail_full("overflow", &file, 3, later),
-        "explicit unpaced overflow exception"
+        !cache.retail_full("overflow", &file, 3, later),
+        "the newly admitted key is tracked and paced"
     );
-    assert_eq!(cache.durable().unwrap().counters.retail_full[2], 2);
+    let stores = cache.durable().unwrap();
+    assert_eq!(stores.counters.retail_full[2], 1);
+    assert_eq!(stores.retail_full_at.len(), 2 * store::MAX_RECORDS);
+    assert!(!stores
+        .retail_full_at
+        .contains_key(&store::key_digest(DurableSource::ClaudeCode, "k")));
+    assert_eq!(
+        stores.retail_full_at[&store::key_digest(DurableSource::ClaudeCode, "overflow")],
+        later
+    );
+    drop(stores);
     assert!(
         SharedCache::default().retail_full("k", &file, 3, later),
         "RAM pacing resets on restart"
@@ -4338,7 +4348,7 @@ fn a0h_native_exhaustion_growth_pacing_reselection_and_restart_body() {
 }
 
 #[test]
-fn a0h_pacing_overflow_alone_emits_one_alarm_without_a_full_delta() {
+fn a0h_pace_evicted_alone_emits_one_alarm_without_a_full_delta() {
     let root = crate::test_scratch::private_dir("a0h-overflow-alarm");
     let cache = SharedCache::default();
     let source = SnapshotSource::ClaudeCode;
@@ -4363,7 +4373,7 @@ fn a0h_pacing_overflow_alone_emits_one_alarm_without_a_full_delta() {
     assert_eq!(alarms.len(), 1);
     assert_eq!(alarms[0]["stage"], "durable_tail_alarm");
     assert_eq!(
-        alarms[0]["counts"]["retail_pacing_overflow"],
+        alarms[0]["counts"]["pace_evicted"],
         serde_json::json!([1, 1])
     );
     assert_eq!(
@@ -4550,6 +4560,49 @@ fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
         let ((_, _, mode), io) = a0h_observe(|| a0h_scan(&owner, &roots, &root, prior.clone()));
         assert_eq!(mode.0, 0);
         assert_eq!(io, (0, 0));
+        // Real metadata-only selection. Certificate SameSizeEdit precedes codec decoding.
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(mtime + std::time::Duration::from_secs(2))
+            .unwrap();
+        let metadata_owner = E2ScanFixture::default();
+        metadata_owner.begin_durable(source, &root, &index_path);
+        let ((mut mi, mut ms, mm), mio) =
+            a0h_observe(|| a0h_scan(&metadata_owner, &roots, &root, prior.clone()));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), accepted);
+        assert_eq!(
+            metadata_owner
+                .cache
+                .durable_counters(source)
+                .unwrap()
+                .0
+                .stale_full,
+            [0; 3]
+        );
+        if reason == "restore_semantics" {
+            assert_eq!(mm, (1, 0, 0), "pre-existing certificate Full");
+            assert_eq!(mio.1, accepted);
+            let cold = E2ScanFixture::default();
+            let (mut ci, mut cs, _) = a0h_scan(&cold, &roots, &root, prior.clone());
+            assert_eq!(
+                a0h_wire(&root, &mut mi, &mut ms),
+                a0h_wire(&root, &mut ci, &mut cs)
+            );
+        } else {
+            assert_eq!(mm.0, 0, "{reason}: never reaches certificate fallback");
+            assert_eq!(mio, (0, 0));
+            assert_eq!(mi.files[&key].size_bytes, accepted);
+            assert_eq!(mi.files[&key].last_upload_body_witness, witness);
+        }
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
         std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
@@ -4872,4 +4925,65 @@ fn b1g_absent_growth_twice_overflow_closed_restart_exact_body_and_idle() {
         );
         let _ = std::fs::remove_dir_all(root);
     }
+}
+
+#[test]
+fn stale_full_evicts_oldest_shared_stamp_and_paces_the_new_key() {
+    let root = crate::test_scratch::private_dir("stale-eviction");
+    let path = root.join("t.jsonl");
+    std::fs::write(&path, b"{}\n{}\n").unwrap();
+    let file = File::open(&path).unwrap();
+    let cache = SharedCache::default();
+    let source = SnapshotSource::ClaudeCode;
+    cache.durable_begin_pass(
+        source,
+        &root.join("index.json"),
+        &Scope("evict".into()),
+        false,
+    );
+    let now = std::time::Instant::now();
+    for n in 0..2 * store::MAX_RECORDS {
+        assert!(cache.retail_full(
+            &format!("k{n}"),
+            &file,
+            3,
+            now + std::time::Duration::from_secs(u64::from(n != 0))
+        ));
+    }
+    let _ = crate::local_resource_diagnostics::capture(|| cache.durable_alarm(source));
+    cache.durable().unwrap().retail_full_now = Some(now + std::time::Duration::from_secs(2));
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        "new".into(),
+        serde_json::from_value(serde_json::json!({
+            "size_bytes":3,"source_file_fingerprint":"accepted",
+            "effective_upload_body_witness_revision":effective_revision(source)
+        }))
+        .unwrap(),
+    );
+    let floor = AcceptedFloor::of(&index, "new").unwrap();
+    assert!(cache.stale_full("new", &file, Some(floor), "context"));
+    {
+        let stores = cache.durable().unwrap();
+        assert_eq!(stores.counters.stale_full, [1, 0, 0]);
+        assert_eq!(stores.counters.retail_full[2], 1);
+        assert_eq!(stores.retail_full_at.len(), 2 * store::MAX_RECORDS);
+        assert!(!stores
+            .retail_full_at
+            .contains_key(&store::key_digest(DurableSource::ClaudeCode, "k0")));
+        assert!(stores
+            .retail_full_at
+            .contains_key(&store::key_digest(DurableSource::ClaudeCode, "new")));
+    }
+    let ((), alarms) = crate::local_resource_diagnostics::capture(|| cache.durable_alarm(source));
+    assert_eq!(alarms.len(), 1);
+    assert_eq!(
+        alarms[0]["counts"]["pace_evicted"],
+        serde_json::json!([1, 1])
+    );
+    assert_eq!(alarms[0]["counts"]["context"], serde_json::json!([1, 1]));
+    assert!(!cache.stale_full("new", &file, Some(floor), "restore_semantics"));
+    assert!(!cache.retail_full("new", &file, 3, now + std::time::Duration::from_secs(2)));
+    assert_eq!(cache.durable().unwrap().counters.retail_full[2], 1);
+    let _ = std::fs::remove_dir_all(root);
 }
