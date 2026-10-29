@@ -413,7 +413,9 @@ impl HeaderInventory {
             }) {
                 let current = open_candidate_beneath_root(&candidate)?.metadata()?;
                 let stamp = crate::transcript_acquisition::FileStamp::capture(current.clone())?;
-                if cached.stamp.same_content(&stamp) {
+                // Non-Unix stamps have no object identity; length alone
+                // cannot authorize reuse of owning-header facts.
+                if cached.stamp.same_object(&stamp) && cached.stamp.same_content(&stamp) {
                     self.reuse_hits += 1;
                     self.bytes_avoided = self.bytes_avoided.saturating_add(cached.read_bytes);
                     return Ok(HeaderWitness {
