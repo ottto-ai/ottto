@@ -382,7 +382,7 @@ fn replacement_truncation_head_and_boundary_edits_rebuild_without_predecessor_ro
     for mutation in ["replace", "truncate", "head", "boundary"] {
         let mut fixture = Fixture::new("sidecar-proved-mutation");
         let mut api = Vec::new();
-        for ordinal in 0..20 {
+        for ordinal in 0..64 {
             api.extend(line(&api_row(&format!("before-{ordinal}"))));
         }
         let trace = bytes("trace").1;

@@ -58,21 +58,45 @@ fn sidecar_path(corpus: &Corpus, trace: bool) -> PathBuf {
         })
         .join(format!("{:x}.jsonl", Sha256::digest(ROOT.as_bytes())))
 }
-fn route(page: &mut Page, mode: Mode) -> RouteResult {
-    page.finish();
+fn finish_route(page: &mut Page, mode: Mode) -> (RouteResult, LocalHoldSettlement) {
+    // Classification consumes held items. Carry its actual result through
+    // upload/settlement; never classify an already-filtered page a second time.
+    let holds = page.finish();
     let (result, batches, _) = upload(&page.scan.snapshots, &mut e2_progress(), ack);
     assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
-    RouteResult::emitted(
-        mode,
-        SnapshotSource::ClaudeCode,
-        batches,
-        &page.scan.snapshots,
+    (
+        RouteResult::emitted(
+            mode,
+            SnapshotSource::ClaudeCode,
+            batches,
+            &page.scan.snapshots,
+        ),
+        holds,
     )
 }
-fn render(corpus: &Corpus, index: ScanIndex, mode: Mode) -> (Page, RouteResult) {
+fn route(page: &mut Page, mode: Mode) -> RouteResult {
+    finish_route(page, mode).0
+}
+fn render(
+    corpus: &Corpus,
+    index: ScanIndex,
+    mode: Mode,
+) -> (Page, RouteResult, LocalHoldSettlement) {
     let mut page = ready(corpus, &E2ScanFixture::default(), index, 100, false);
-    let output = route(&mut page, mode);
-    (page, output)
+    let (output, holds) = finish_route(&mut page, mode);
+    (page, output, holds)
+}
+fn settle_route(
+    corpus: &Corpus,
+    committed: &ScanIndex,
+    page: Page,
+    progress: &mut SnapshotUploadProgress,
+    holds: LocalHoldSettlement,
+) -> ScanIndex {
+    upload(&page.scan.snapshots, progress, ack).0.unwrap();
+    let mut settled = settle_completed_upload(page.index, committed, progress, &holds);
+    settle_index_after_upload(&mut settled.index, committed, progress);
+    corpus.reload(&mut settled.index)
 }
 fn cold(corpus: &Corpus) -> RouteResult {
     render(corpus, ScanIndex::default(), Mode::ColdFull).1
@@ -94,7 +118,7 @@ fn durable_sidecar_money_full_ram_disk_tail_late_latest_wins() {
         let expected = cold(&c);
         assert_reported(&expected, 1);
         let mut slots = Slots::new(&c);
-        let (mut reader, (first_page, first)) =
+        let (mut reader, (first_page, first, first_holds)) =
             with_durable_sidecar_reader(slots.reader(&c), || {
                 render(&c, ScanIndex::default(), Mode::Ram)
             });
@@ -103,7 +127,13 @@ fn durable_sidecar_money_full_ram_disk_tail_late_latest_wins() {
         slots.save(&mut reader);
         // Real ACK + Completed settlement supplies the accepted-body premise.
         let mut progress = e2_progress();
-        let accepted_index = settle(&c, &ScanIndex::default(), first_page, &mut progress);
+        let accepted_index = settle_route(
+            &c,
+            &ScanIndex::default(),
+            first_page,
+            &mut progress,
+            first_holds,
+        );
         assert!(!accepted_index.current_snapshot_fingerprints().is_empty());
         let native_before = std::fs::metadata(&native).unwrap();
         let trace_row = serde_json::to_string(&trace("r2", "")).unwrap() + "\n";
@@ -121,7 +151,7 @@ fn durable_sidecar_money_full_ram_disk_tail_late_latest_wins() {
         let expected = cold(&c);
         assert_reported(&expected, 2);
         reader.begin_pass();
-        let (reader, (_, ram)) =
+        let (reader, (_, ram, _)) =
             with_durable_sidecar_reader(reader, || render(&c, accepted_index.clone(), Mode::Ram));
         assert_eq!(
             reader.body_bytes(),
@@ -131,27 +161,27 @@ fn durable_sidecar_money_full_ram_disk_tail_late_latest_wins() {
         money_oracle::assert_no_smaller_reemit(ROOT, &first, &ram, &expected, false);
         // Do not save this suffix: restore the prior offset and replay it.
         drop(reader);
-        let (mut reader, (_, disk)) = with_durable_sidecar_reader(slots.restart(&c), || {
+        let (mut reader, (_, mut disk, _)) = with_durable_sidecar_reader(slots.restart(&c), || {
             render(&c, accepted_index, Mode::DiskRestore)
         });
         assert_eq!(
             reader.body_bytes(),
             [row.len() as u64, trace_row.len() as u64]
         );
+        disk.restored = reader.restored_records();
+        assert_eq!(disk.restored, 1, "real paired record restored before Tail");
         money_oracle::assert_equivalent(&expected, &disk);
         slots.save(&mut reader);
         // Independent projections after two process-owned reader/lock resets.
         drop(reader);
         for mode in [Mode::Restart, Mode::EvictRetry] {
-            let (mut reader, (_, restored)) =
+            let (mut reader, (_, mut restored, _)) =
                 with_durable_sidecar_reader(slots.restart(&c), || {
                     render(&c, ScanIndex::default(), mode)
                 });
             money_oracle::assert_equivalent(&expected, &restored);
-            assert_eq!(
-                restored.restored, 0,
-                "E1 restore telemetry is not wired in this adapter"
-            );
+            restored.restored = reader.restored_records();
+            assert_eq!(restored.restored, 1, "real paired record restored");
             assert_eq!(reader.body_bytes(), [0, 0]);
             slots.save(&mut reader);
         }
@@ -167,9 +197,10 @@ fn durable_sidecar_money_accepted_refusal_holds_then_recovers() {
         c.evidence(&[api("r1", 10, 100)], &[]);
         let expected = cold(&c);
         let mut slots = Slots::new(&c);
-        let (mut reader, (page, mut prior)) = with_durable_sidecar_reader(slots.reader(&c), || {
-            render(&c, ScanIndex::default(), Mode::Ram)
-        });
+        let (mut reader, (page, mut prior, prior_holds)) =
+            with_durable_sidecar_reader(slots.reader(&c), || {
+                render(&c, ScanIndex::default(), Mode::Ram)
+            });
         assert_reported(&prior, 1);
         let witness = snapshot_upload_body_witness(&page.scan.snapshots[0]);
         prior.accepted.insert(
@@ -180,7 +211,7 @@ fn durable_sidecar_money_accepted_refusal_holds_then_recovers() {
             },
         );
         let mut progress = e2_progress();
-        let accepted = settle(&c, &ScanIndex::default(), page, &mut progress);
+        let accepted = settle_route(&c, &ScanIndex::default(), page, &mut progress, prior_holds);
         let before = stored_bodies(&accepted);
         slots.save(&mut reader);
         append(&native, &line(ROOT, "r2", "2026-08-02T07:01:00Z", 20));
@@ -188,13 +219,13 @@ fn durable_sidecar_money_accepted_refusal_holds_then_recovers() {
         let saved = path.with_extension("held");
         std::fs::rename(&path, &saved).unwrap();
         reader.begin_pass();
-        let (mut reader, (held_page, mut held)) =
+        let (mut reader, (held_page, mut held, held_holds)) =
             with_durable_sidecar_reader(reader, || render(&c, accepted.clone(), Mode::Ram));
         assert!(
             held.snapshots.is_empty(),
             "S2 forbids an estimate replacement"
         );
-        let held_index = settle(&c, &accepted, held_page, &mut progress);
+        let held_index = settle_route(&c, &accepted, held_page, &mut progress, held_holds);
         assert_eq!(stored_bodies(&held_index), before);
         // Carry the real accepted body only after proving its native tuple
         // survived the production hold and settlement. No acquisition credit.
@@ -210,7 +241,7 @@ fn durable_sidecar_money_accepted_refusal_holds_then_recovers() {
         );
         let expected = cold(&c);
         reader.begin_pass();
-        let (_, (_, recovery)) =
+        let (_, (_, recovery, _)) =
             with_durable_sidecar_reader(reader, || render(&c, held_index, Mode::Ram));
         money_oracle::assert_equivalent(&expected, &recovery);
         assert_reported(&recovery, 2);
@@ -235,7 +266,7 @@ fn durable_sidecar_money_rotation_rebuild_is_one_whole_body() {
         .unwrap();
         let expected = cold(&c);
         reader.begin_pass();
-        let (mut reader, (_, actual)) =
+        let (mut reader, (_, actual, _)) =
             with_durable_sidecar_reader(reader, || render(&c, ScanIndex::default(), Mode::Ram));
         assert_eq!(reader.rebuilds(), [1, 0]);
         money_oracle::assert_equivalent(&expected, &actual);
@@ -267,11 +298,12 @@ fn durable_sidecar_money_prepared_and_paid_routes_equal_whole_file() {
                     "evidence_fingerprint": "synthetic-prepared-selection",
                     "member_request_id_fingerprints": {}, "assigned_request_id_fingerprints": {}
                 });
-                page.index = serde_json::from_value(value).unwrap();
+                // Selection-only E-empty witness; the native money fold below
+                // keeps its original index, with no fabricated census proof.
+                let selection: ScanIndex = serde_json::from_value(value).unwrap();
                 assert!(
                     crate::snapshots::claude_native_comparison::early_root_is_eligible(
-                        &page.index,
-                        ROOT
+                        &selection, ROOT
                     )
                 );
                 let prepared = if paid_route {
@@ -283,14 +315,14 @@ fn durable_sidecar_money_prepared_and_paid_routes_equal_whole_file() {
                     .unwrap();
                     PreparedClaudeLocalEvidence::load_paid_eligible(
                         &c.support,
-                        &page.index,
+                        &selection,
                         [ROOT].into_iter(),
                         &mut paid,
                         0,
                     )
                     .unwrap()
                 } else {
-                    PreparedClaudeLocalEvidence::load(&c.support, &page.scan.snapshots, &page.index)
+                    PreparedClaudeLocalEvidence::load(&c.support, &page.scan.snapshots, &selection)
                 };
                 assert!(
                     prepared.frozen_roots_are_current(&c.support, &BTreeSet::from([ROOT.into()]))
@@ -319,7 +351,7 @@ fn durable_sidecar_money_quiet_restart_shared_oracle() {
         let (mut reader, _) = with_durable_sidecar_reader(slots.reader(&c), || cold(&c));
         slots.save(&mut reader);
         drop(reader);
-        let (reader, (_, mut quiet)) = with_durable_sidecar_reader(slots.restart(&c), || {
+        let (reader, (_, mut quiet, _)) = with_durable_sidecar_reader(slots.restart(&c), || {
             render(&c, ScanIndex::default(), Mode::Restart)
         });
         quiet.io.consumed = reader.body_bytes().into_iter().sum();

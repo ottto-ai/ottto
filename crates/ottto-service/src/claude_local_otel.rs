@@ -63,9 +63,13 @@ pub(crate) fn durable_sidecar_held_roots(
         .iter()
         .filter_map(|item| {
             let root = crate::snapshots::claude_request_money::request_owned_family_root(item)?;
-            (!healthy.contains(root)
-                && crate::snapshots::durable_sidecar_has_accepted_body(index, root))
-            .then(|| root.to_owned())
+            if healthy.contains(root)
+                || !crate::snapshots::durable_sidecar_has_accepted_body(index, root)
+            {
+                None
+            } else {
+                Some(root.to_owned())
+            }
         })
         .collect();
     sidecar_read::record_holds(held.len() as u64);

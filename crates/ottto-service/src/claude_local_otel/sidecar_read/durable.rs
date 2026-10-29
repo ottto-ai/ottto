@@ -83,6 +83,7 @@ pub(crate) struct Reader {
     bootstrap_left: u64,
     write_cursor: Option<String>,
     sync_owed: bool,
+    restored_records: u64,
     pub(super) counts: [Counts; 2],
 }
 
@@ -109,13 +110,18 @@ impl Reader {
             bootstrap_left: BOOTSTRAP_PASS_BYTES,
             write_cursor: None,
             sync_owed: false,
+            restored_records: 0,
             counts: [Counts::default(); 2],
         }
     }
     pub(crate) fn begin_pass(&mut self) {
         self.bootstrap_left = BOOTSTRAP_PASS_BYTES;
+        self.restored_records = 0;
         self.counts = [Counts::default(); 2];
         self.store.begin_pass();
+    }
+    pub(crate) fn restored_records(&self) -> u64 {
+        self.restored_records
     }
     pub(crate) fn body_bytes(&self) -> [u64; 2] {
         self.counts.map(|counts| counts.bytes_read)
@@ -170,6 +176,7 @@ impl Reader {
                         "sidecar owner held",
                     ));
                 }
+                self.restored_records += 1;
                 Ok(pair)
             }
             _ => Err(io::Error::new(
