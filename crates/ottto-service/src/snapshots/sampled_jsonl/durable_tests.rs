@@ -1263,6 +1263,7 @@ fn fallback_classes_over_the_synthetic_corpus() {
             ) => field,
             Err(Refuse::TooLarge) => "record_bytes",
             Err(Refuse::UnknownLabel) => "static_label",
+            Err(Refuse::WriteFailed) => "encode_io",
         };
         *tally.entry(class).or_default() += 1;
     }

@@ -39,6 +39,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 pub(crate) mod active;
 pub(crate) use active::{ActiveLease, ActiveOverBudget, LeaseWait, ACTIVE_BYTES};
@@ -385,6 +389,66 @@ fn migration_binding(original: &Digest32, current: &Expected) -> Digest32 {
     )
 }
 
+/// Exact encoded candidate, including the original trailer (not a re-encoding
+/// of decoded fields, which may discard retired positional values).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RecordIdentity {
+    key: Digest32,
+    allowlist: Digest32,
+    format: u16,
+    generation: u64,
+    encoded_len: u64,
+    trailer: Digest32,
+}
+impl RecordIdentity {
+    /// Only called with our encoded bytes or a fully verified decoded record.
+    fn verified(record: &DurableRecord, bytes: &[u8]) -> Self {
+        Self {
+            key: record.record.binding.key,
+            allowlist: record.record.allowlist,
+            format: record.format,
+            generation: record.index_generation,
+            encoded_len: bytes.len() as u64,
+            trailer: bytes[bytes.len() - TRAILER_BYTES..]
+                .try_into()
+                .expect("verified trailer"),
+        }
+    }
+}
+
+struct VerifiedRecord {
+    record: Box<DurableRecord>,
+    identity: RecordIdentity,
+}
+#[derive(Clone, Copy)]
+struct PendingWrite {
+    prior: Option<Stamp>,
+    candidate: RecordIdentity,
+    content: Digest32,
+    completed: Option<Stamp>,
+    failures: u8,
+}
+// Existing per-source pending reservation allows 4096 bytes per tree node.
+const _: () = assert!(std::mem::size_of::<(Digest32, PendingWrite)>() <= 320);
+
+/// Acquisition durability only; never accepted-money or replacement ACK credit.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ReceiptProof {
+    identity: RecordIdentity,
+    stamp: Stamp,
+    content: Digest32,
+}
+const _: () = assert!(std::mem::size_of::<ReceiptProof>() <= 256);
+/// Verified absence (including ordinary retirement), after directory sync.
+pub(crate) struct RetirementProof {
+    candidate: RecordIdentity,
+}
+pub(crate) enum ReconcileOutcome {
+    NoPending,
+    Receipted(ReceiptProof),
+    Retired(RetirementProof),
+}
+
 /// Preservation classes: unknown representations (U) precede known corruption (T14).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Refusal {
@@ -487,6 +551,12 @@ pub(crate) struct StoreCounters {
     pub(crate) receipt_pending_held: u64,
     pub(crate) receipt_pending_records: u64,
     pub(crate) durable_write_failed_published: u64,
+    /// Owned temps verified absent after directory sync, counted once.
+    pub(crate) temp_discard_verified: u64,
+    /// Failed explicit/fallback temp cleanup attempts, per pass.
+    pub(crate) temp_discard_failed: u64,
+    /// Temp cleanup reached through unwinding or a missed explicit exit.
+    pub(crate) temp_drop_fallback: u64,
     /// Failed physical attempt boundaries: setup, inventory, statvfs.
     pub(crate) store_write_failed: [u64; 3],
     /// Per-pass read I/O.
@@ -525,7 +595,7 @@ type BatchAcks = [Option<(Digest32, Digest32, Stamp)>; MAX_BATCH];
 const BATCH_ACK_BYTES: usize = std::mem::size_of::<BatchAcks>();
 
 /// What one post-save batch did.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct BatchReceipt {
     pub(crate) written: usize,
     pub(crate) clean: usize,
@@ -537,6 +607,8 @@ pub(crate) struct BatchReceipt {
     pub(crate) bytes_written: u64,
     /// Fixed allocation; no acknowledgement escapes a failed directory sync.
     committed: Option<Box<BatchAcks>>,
+    /// Actual exact completions only; ordinary clean retries carry none.
+    pub(crate) completed: Vec<ReceiptProof>,
 }
 
 /// One store directory. The in-RAM map of last durable content digests
@@ -546,6 +618,7 @@ pub(crate) struct DurableTailStore {
     source: DurableSource,
     durable: BTreeMap<Digest32, (Option<Digest32>, Stamp, bool)>,
     counters: StoreCounters,
+    cleanup: Arc<TempCleanupCounts>,
     /// The store-level fault that made this store memory-only for the process.
     disabled: Option<&'static str>,
     /// This pass: directory checked and [records loaded, T14 rebuilds].
@@ -554,7 +627,7 @@ pub(crate) struct DurableTailStore {
     /// Process-lifetime attempts, removed only after a successful replacement.
     rebuilt: BTreeMap<Digest32, Rebuild>,
     startup_synced: bool,
-    pending: BTreeMap<Digest32, (Option<Stamp>, u64, Digest32, u8)>,
+    pending: BTreeMap<Digest32, PendingWrite>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -585,6 +658,7 @@ impl DurableTailStore {
             durable: BTreeMap::new(),
             source,
             counters: StoreCounters::default(),
+            cleanup: Arc::new(TempCleanupCounts::default()),
             disabled: None,
             checked: false,
             pass: [0; 2],
@@ -685,6 +759,9 @@ impl DurableTailStore {
     pub(crate) fn counters(&self) -> StoreCounters {
         StoreCounters {
             receipt_pending_records: self.pending.len() as u64,
+            temp_discard_verified: self.cleanup.verified.load(Ordering::Relaxed),
+            temp_discard_failed: self.cleanup.failed.load(Ordering::Relaxed),
+            temp_drop_fallback: self.cleanup.fallback.load(Ordering::Relaxed),
             ..self.counters
         }
     }
@@ -693,7 +770,10 @@ impl DurableTailStore {
     /// are a level, not a flow, and are kept.
     #[cfg(test)]
     pub(crate) fn take_pass(&mut self) -> StoreCounters {
-        let pass = self.counters();
+        let mut pass = self.counters();
+        pass.temp_discard_verified = self.cleanup.verified.swap(0, Ordering::Relaxed);
+        pass.temp_discard_failed = self.cleanup.failed.swap(0, Ordering::Relaxed);
+        pass.temp_drop_fallback = self.cleanup.fallback.swap(0, Ordering::Relaxed);
         self.counters = StoreCounters {
             disk_records: pass.disk_records,
             disk_bytes: pass.disk_bytes,
@@ -867,7 +947,7 @@ impl DurableTailStore {
         if self.disabled.is_some() {
             return Ok(None); // D-DISABLED: keep debt, publish valid RAM under native fences.
         }
-        if self.pending.contains_key(key) {
+        if self.receipt_pending(key) {
             return Err(Refusal::ReceiptPending);
         }
         let result = self.classify(key, "guard", None);
@@ -942,28 +1022,36 @@ impl DurableTailStore {
         if self.disabled.is_some() {
             return ReadOutcome::Missing; // Never reuse ambiguous disabled-store bytes.
         }
-        if self.pending.contains_key(key) {
+        if self.receipt_pending(key) {
             return ReadOutcome::Refused(Refusal::ReceiptPending);
         }
-        self.read_known(key, None)
+        match self.read_known(key, None) {
+            Ok(Some(verified)) => ReadOutcome::Found(verified.record),
+            Ok(None) => ReadOutcome::Missing,
+            Err(reason) => ReadOutcome::Refused(reason),
+        }
     }
-    fn read_known(&mut self, key: &Digest32, writer: Option<&dyn SingleWriter>) -> ReadOutcome {
+    fn read_known(
+        &mut self,
+        key: &Digest32,
+        writer: Option<&dyn SingleWriter>,
+    ) -> Result<Option<VerifiedRecord>, Refusal> {
         match self.classify(key, "guard", writer) {
-            Err(reason) => return ReadOutcome::Refused(reason),
+            Err(reason) => return Err(reason),
             Ok(None) => {
                 self.counters.missing += 1;
-                return ReadOutcome::Missing;
+                return Ok(None);
             }
             Ok(Some(_)) => {}
         }
         let bytes = match read_private(&self.record_path(key)) {
             Ok(Some(bytes)) => bytes,
-            Ok(None) => return ReadOutcome::Missing,
+            Ok(None) => return Ok(None),
             Err(e) if e.kind() != io::ErrorKind::InvalidData => {
                 self.disable("record_access");
-                return ReadOutcome::Missing;
+                return Ok(None);
             }
-            _ => return ReadOutcome::Refused(Refusal::Corrupt),
+            _ => return Err(Refusal::Corrupt),
         };
         self.counters.records_read += 1;
         self.counters.bytes_read += bytes.len() as u64;
@@ -975,9 +1063,13 @@ impl DurableTailStore {
                 if let Some((content, _, _)) = self.durable.get_mut(key) {
                     *content = Some(stored_digest(&bytes));
                 }
-                ReadOutcome::Found(Box::new(record))
+                let identity = RecordIdentity::verified(&record, &bytes);
+                Ok(Some(VerifiedRecord {
+                    record: Box::new(record),
+                    identity,
+                }))
             }
-            Err(reason) => ReadOutcome::Refused(reason),
+            Err(reason) => Err(reason),
         }
     }
 
@@ -985,14 +1077,75 @@ impl DurableTailStore {
         !self.pending.is_empty()
     }
     pub(crate) fn receipt_pending(&self, key: &Digest32) -> bool {
-        self.pending.contains_key(key)
+        self.pending.get(key).is_some_and(|pending| {
+            pending
+                .completed
+                .is_none_or(|stamp| stamp_at(&self.record_path(key)).ok() != Some(Some(stamp)))
+        })
+    }
+
+    /// Retain a real reconciliation completion in the existing bounded owner.
+    /// It remains available until a successful batch delivers the exact proof.
+    pub(crate) fn retain_receipt(&mut self, proof: ReceiptProof) -> io::Result<()> {
+        if stamp_at(&self.record_path(&proof.identity.key))? != Some(proof.stamp) {
+            return Err(io::Error::other("completion changed"));
+        }
+        let pending = self
+            .pending
+            .get_mut(&proof.identity.key)
+            .filter(|pending| {
+                pending.candidate == proof.identity && pending.content == proof.content
+            })
+            .ok_or_else(|| io::Error::other("completion candidate changed"))?;
+        pending.completed = Some(proof.stamp);
+        Ok(())
+    }
+
+    /// Validate the entire delivery before releasing any completion custody.
+    fn finish_batch(&mut self, mut receipt: BatchReceipt) -> io::Result<BatchReceipt> {
+        for proof in &receipt.completed {
+            if stamp_at(&self.record_path(&proof.identity.key))? != Some(proof.stamp)
+                || !self
+                    .pending
+                    .get(&proof.identity.key)
+                    .is_some_and(|pending| {
+                        pending.candidate == proof.identity
+                            && pending.content == proof.content
+                            && pending.completed == Some(proof.stamp)
+                    })
+            {
+                return Err(io::Error::other("batch completion changed"));
+            }
+        }
+        if self.source == DurableSource::ClaudeCode && !receipt.completed.is_empty() {
+            let acks = receipt.committed.get_or_insert_with(|| Box::new([None; MAX_BATCH]));
+            for (i, proof) in receipt.completed.iter().enumerate() {
+                acks[i] = Some((proof.identity.key, proof.content, proof.stamp));
+            }
+        }
+        for proof in &receipt.completed {
+            let key = proof.identity.key;
+            self.rebuilt.remove(&key);
+            if self.durable.len() < MAX_RECORDS || self.durable.contains_key(&key) {
+                self.durable
+                    .insert(key, (Some(proof.content), proof.stamp, true));
+            }
+            self.pending.remove(&key);
+            self.counters.max_record_bytes = self
+                .counters
+                .max_record_bytes
+                .max(proof.identity.encoded_len);
+        }
+        self.counters.records_written += receipt.written as u64;
+        self.counters.bytes_written += receipt.bytes_written;
+        Ok(receipt)
     }
 
     pub(crate) fn reconcile_pending(
         &mut self,
         writer: &dyn SingleWriter,
         key: &Digest32,
-    ) -> io::Result<bool> {
+    ) -> io::Result<ReconcileOutcome> {
         self.check_writer(writer)?;
         if self.disabled.is_some() {
             return Err(io::Error::other("store disabled"));
@@ -1000,8 +1153,8 @@ impl DurableTailStore {
         let result = self.reconcile_pending_inner(writer, key);
         if result.is_err() {
             if let Some(pending) = self.pending.get_mut(key) {
-                pending.3 = pending.3.saturating_add(1);
-                if pending.3 >= RECEIPT_RECONCILE_FAILURES {
+                pending.failures = pending.failures.saturating_add(1);
+                if pending.failures >= RECEIPT_RECONCILE_FAILURES {
                     self.disable("receipt_unreconciled");
                 }
             }
@@ -1013,20 +1166,37 @@ impl DurableTailStore {
         &mut self,
         writer: &dyn SingleWriter,
         key: &Digest32,
-    ) -> io::Result<bool> {
+    ) -> io::Result<ReconcileOutcome> {
         if !self.usable(Some(writer)) {
             return Err(io::Error::other("store disabled"));
         }
-        let Some((prior, generation, content, _)) = self.pending.get(key).copied() else {
-            return Ok(true);
+        let Some(PendingWrite {
+            prior,
+            candidate,
+            content,
+            completed,
+            ..
+        }) = self.pending.get(key).copied()
+        else {
+            return Ok(ReconcileOutcome::NoPending);
         };
         let path = self.record_path(key);
-        let stamp = || fs::symlink_metadata(&path).ok().map(|m| Stamp::of(&m));
-        let before = stamp();
-        self.durable.remove(key); // Reconcile must fully verify, even a memo hit.
+        let before = stamp_at(&path)?;
+        if let Some(stamp) = completed {
+            return if before == Some(stamp) {
+                Ok(ReconcileOutcome::Receipted(ReceiptProof {
+                    identity: candidate,
+                    stamp,
+                    content,
+                }))
+            } else {
+                Err(io::Error::other("retained completion changed"))
+            };
+        }
+        self.durable.remove(key); // Reconcile fully verifies, even a memo hit.
         let receipted = match self.read_known(key, Some(writer)) {
-            ReadOutcome::Found(record) if before == stamp() => {
-                if record.index_generation == generation && record_digest(&record) == content {
+            Ok(Some(verified)) if before == stamp_at(&path)? => {
+                if verified.identity == candidate {
                     let file = OpenOptions::new()
                         .read(true)
                         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -1036,8 +1206,11 @@ impl DurableTailStore {
                     }
                     file.sync_all()?;
                     true
-                } else if prior.is_some() && before == prior && record.format == FORMAT_VERSION {
-                    if stamp() != before {
+                } else if prior.is_some()
+                    && before == prior
+                    && verified.record.format == FORMAT_VERSION
+                {
+                    if stamp_at(&path)? != before {
                         return Err(io::Error::other("predecessor changed"));
                     }
                     remove_if_present(&path)?;
@@ -1046,27 +1219,31 @@ impl DurableTailStore {
                     return Err(io::Error::other("unadjudicated survivor"));
                 }
             }
-            ReadOutcome::Missing if before.is_none() && self.disabled.is_none() => false,
+            Ok(None) if before.is_none() && self.disabled.is_none() => false,
             _ => return Err(io::Error::other("unverified survivor")),
         };
         self.sync_store()?;
-        if (receipted && stamp() != before)
-            || (!receipted
-                && !fs::symlink_metadata(&path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound))
-        {
+        let after = stamp_at(&path)?;
+        if (receipted && after != before) || (!receipted && after.is_some()) {
             return Err(io::Error::other("survivor changed"));
         }
-        self.pending.remove(key);
         if receipted {
             // This is the exact positive receipt boundary, including a later
             // reconciliation outside the original write batch. Negative or
             // unresolved outcomes must never regrant a failed T14 rebuild.
             self.rebuilt.remove(key);
             self.counters.receipt_reconciled += 1;
+            Ok(ReconcileOutcome::Receipted(ReceiptProof {
+                identity: candidate,
+                stamp: after.expect("verified survivor"),
+                content,
+            }))
         } else {
+            self.pending.remove(key);
+            self.durable.remove(key);
             self.counters.durable_write_failed_published += 1;
+            Ok(ReconcileOutcome::Retired(RetirementProof { candidate }))
         }
-        Ok(receipted)
     }
 
     pub(crate) fn revoke(&mut self, key: &Digest32) {
@@ -1311,7 +1488,13 @@ impl DurableTailStore {
             .iter()
             .map(|record| record.body.len())
             .sum::<usize>();
-        for record in pending {
+        // Deduplicate in the already-funded input allocation. First offer wins;
+        // no extra key map survives beside the pending/candidate owner.
+        let mut pending = pending;
+        pending.reverse();
+        while let Some(record) = pending.pop() {
+            let key = record.binding.key;
+            pending.retain(|other| other.binding.key != key);
             if record.binding.source != self.source
                 || header_len(record.format(), self.source, &record.allowlist).is_err()
                 || record.acquisition.is_some() && record.binding.entry != [0; 32]
@@ -1325,27 +1508,58 @@ impl DurableTailStore {
             ) {
                 continue;
             }
-            if self.pending.contains_key(&record.binding.key)
-                && self.reconcile_pending(writer, &record.binding.key).is_err()
+            if receipt.completed.iter().any(|proof| proof.identity.key == key) { continue; }
+            if self.receipt_pending(&key) && self.reconcile_pending(writer, &key).is_err()
             {
-                let stamp = fs::symlink_metadata(self.record_path(&record.binding.key))
-                    .ok()
-                    .map(|m| Stamp::of(&m));
-                let same = self
-                    .pending
-                    .get(&record.binding.key)
-                    .is_some_and(|(prior, ..)| prior.is_some() && *prior == stamp);
+                continue;
+            }
+            let content = content_digest(&record);
+            let reconciliation = if self.pending.contains_key(&key) {
+                match self.reconcile_pending(writer, &key) {
+                    Ok(ReconcileOutcome::Receipted(proof)) => self.retain_receipt(proof),
+                    Ok(_) => Ok(()),
+                    Err(error) => Err(error),
+                }
+            } else {
+                Ok(())
+            };
+            if reconciliation.is_err() {
+                let stamp = stamp_at(&self.record_path(&key))?;
+                let same = self.pending.get(&key).is_some_and(|pending| {
+                    pending.completed.is_none() && pending.prior.is_some() && pending.prior == stamp
+                });
                 if !(same
                     && matches!(
-                        self.classify(&record.binding.key, "overwrite", Some(writer)),
+                        self.classify(&key, "overwrite", Some(writer)),
                         Err(Refusal::Corrupt)
                     ))
                 {
-                    receipt.deferred_keys.push(record.binding.key);
+                    receipt.deferred_keys.push(key);
                     continue;
                 }
             }
-            // A rebuild may replace its corrupt predecessor once, after save.
+            let content = content_digest(&record);
+            if let Some(PendingWrite {
+                candidate,
+                content: completed_content,
+                completed: Some(stamp),
+                ..
+            }) = self.pending.get(&key).copied()
+            {
+                if completed_content != content || receipt.completed.len() >= MAX_BATCH {
+                    receipt.deferred_keys.push(key);
+                    continue;
+                }
+                receipt.written += 1;
+                receipt.bytes_written += candidate.encoded_len;
+                receipt.completed.push(ReceiptProof {
+                    identity: candidate,
+                    stamp,
+                    content,
+                });
+                continue; // Exact completed B, before stale-A authorization or clean handling.
+            }
+            // A T14 predecessor is the rebuild's to replace.
             let (prior, previous_content) =
                 match self.classify(&record.binding.key, "overwrite", Some(writer)) {
                     Err(Refusal::Corrupt) => (
@@ -1363,7 +1577,6 @@ impl DurableTailStore {
                     Ok(Some(old)) => (old.stamp, old.content),
                     Ok(None) => (None, None),
                 };
-            let content = content_digest(&record);
             if previous_content == Some(content) {
                 receipt.clean += 1;
             } else {
@@ -1375,17 +1588,17 @@ impl DurableTailStore {
         }
         if dirty.is_empty() {
             self.counters.records_clean += receipt.clean as u64;
-            return Ok(receipt);
+            return self.finish_batch(receipt);
         }
         ensure_private_dir(&self.dir).inspect_err(|_| self.counters.store_write_failed[0] += 1)?;
         self.checked = false;
         if !self.usable(Some(writer)) {
-            return Ok(receipt);
+            return Ok(BatchReceipt::default()); // Keep completion custody; no unchecked delivery.
         }
         let (mut on_disk, mut unlisted) = self
             .scan_disk()
             .inspect_err(|_| self.counters.store_write_failed[1] += 1)?;
-        let mut attempted = 0;
+        let mut attempted = receipt.completed.len();
         for (record, content, prior) in dirty {
             if attempted >= MAX_BATCH {
                 receipt.deferred += 1;
@@ -1452,51 +1665,67 @@ impl DurableTailStore {
                     .get_or_insert_with(|| Box::new([None; MAX_BATCH]));
             }
             attempted += 1;
-            self.pending
-                .insert(key, (prior, committed_generation, content, 0));
-            if write_atomic(&self.dir, &path, &bytes, prior)
-                .and_then(|_| self.sync_store())
-                .is_err()
-            {
-                match self.reconcile_pending(writer, &key) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        on_disk.remove(&key);
-                        // Retirement did not write the offered successor. Keep its
-                        // existing retry provenance until a real write can ACK it.
-                        receipt.deferred_keys.push(key);
-                        continue;
-                    }
-                    Err(_) => {
-                        self.counters.receipt_pending_held += 1;
-                        receipt.deferred_keys.push(key);
-                        continue;
-                    }
+            let candidate = RecordIdentity::verified(&stored, &bytes);
+            self.pending.insert(
+                key,
+                PendingWrite {
+                    prior,
+                    candidate,
+                    content,
+                    completed: None,
+                    failures: 0,
+                },
+            );
+            let attempt = write_atomic(
+                writer,
+                &self.dir,
+                &path,
+                &bytes,
+                prior,
+                Arc::clone(&self.cleanup),
+            )
+            .and_then(|stamp| {
+                self.sync_store()?;
+                if stamp_at(&path)? != Some(stamp) {
+                    return Err(io::Error::other("committed survivor changed"));
                 }
-            } else {
-                self.pending.remove(&key);
-            }
-            self.rebuilt.remove(&key);
-            on_disk.insert(key, bytes.len() as u64);
-            let stamp = Stamp::of(&fs::symlink_metadata(&path)?);
-            if self.durable.len() < MAX_RECORDS || self.durable.contains_key(&key) {
-                self.durable.insert(key, (Some(content), stamp, true));
-            }
-            if let Some(acks) = receipt.committed.as_mut() {
-                acks[receipt.written] = Some((key, content, stamp));
-            }
+                Ok(ReconcileOutcome::Receipted(ReceiptProof {
+                    identity: candidate,
+                    stamp,
+                    content,
+                }))
+            });
+            let outcome = attempt.or_else(|_| self.reconcile_pending(writer, &key));
+            let proof = match outcome {
+                Ok(ReconcileOutcome::Receipted(proof)) if proof.identity == candidate => proof,
+                Ok(ReconcileOutcome::Retired(proof)) if proof.candidate == candidate => {
+                    on_disk.remove(&key);
+                    continue;
+                }
+                _ => {
+                    self.counters.receipt_pending_held += 1;
+                    receipt.deferred_keys.push(key);
+                    continue;
+                }
+            };
+            let encoded_len = proof.identity.encoded_len;
+            self.retain_receipt(proof)?;
+            let pending = self.pending.get(&key).expect("retained completion");
+            receipt.completed.push(ReceiptProof {
+                identity: pending.candidate,
+                stamp: pending.completed.expect("completed stamp"),
+                content: pending.content,
+            });
+            on_disk.insert(key, encoded_len);
             receipt.written += 1;
-            receipt.bytes_written += bytes.len() as u64;
-            self.counters.max_record_bytes = self.counters.max_record_bytes.max(bytes.len() as u64);
+            receipt.bytes_written += encoded_len;
         }
         self.counters.batches += 1;
-        self.counters.records_written += receipt.written as u64;
         self.counters.records_clean += receipt.clean as u64;
         self.counters.records_deferred += receipt.deferred as u64;
         self.counters.budget_refused += receipt.budget_refused as u64;
-        self.counters.bytes_written += receipt.bytes_written;
         self.set_disk_level(&on_disk, unlisted);
-        Ok(receipt)
+        self.finish_batch(receipt)
     }
 
     /// Garbage collection after a successful save: delete stale temp files,
@@ -1896,6 +2125,14 @@ impl Stamp {
     }
 }
 
+fn stamp_at(path: &Path) -> io::Result<Option<Stamp>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(Stamp::of(&metadata))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 fn our_uid() -> u32 {
     #[cfg(test)]
     if let Some(uid) = test_hooks::uid() {
@@ -1909,16 +2146,25 @@ fn dead_temp(name: &str) -> bool {
     let name = name
         .strip_prefix('.')
         .and_then(|n| n.strip_suffix(TEMP_SUFFIX));
-    let Some((record, pid)) = name.and_then(|n| n.rsplit_once('.')) else {
+    let Some((prefix, last)) = name.and_then(|n| n.rsplit_once('.')) else {
         return false;
+    };
+    let (record, pid, staged) = if let Some((record, pid)) = prefix.rsplit_once('.') {
+        if record.ends_with(RECORD_SUFFIX) && last.parse::<u64>().is_ok() {
+            (record, pid, true)
+        } else {
+            (prefix, last, false)
+        }
+    } else {
+        (prefix, last, false)
     };
     let pid = pid.parse::<i32>().ok().filter(|pid| *pid > 0);
     let named = record
         .strip_suffix(RECORD_SUFFIX)
         .and_then(parse_hex_digest);
-    // This process's temps are orphans too: GC holds the store exclusively.
-    let ours = pid.is_some_and(|pid| pid.unsigned_abs() == std::process::id());
-    // SAFETY: signal zero only probes the process; it sends no signal.
+    // Owned stages can outlive Stores; a live process's stage is never a GC orphan.
+    let ours = !staged && pid.is_some_and(|pid| pid.unsigned_abs() == std::process::id());
+    // SAFETY: signal zero probes only, without sending a signal.
     named.is_some()
         && (ours
             || pid.is_some_and(|pid| unsafe { libc::kill(pid, 0) } == -1)
@@ -2064,27 +2310,95 @@ fn remove_if_present(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Temp file (create-new, 0600), write, fsync, rename. The caller syncs the
-/// directory and its parent before issuing a receipt.
-fn write_atomic(dir: &Path, path: &Path, bytes: &[u8], prior: Option<Stamp>) -> io::Result<()> {
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "record name"))?;
-    let temp = dir.join(format!(".{name}.{}{TEMP_SUFFIX}", std::process::id()));
-    remove_if_present(&temp)?;
-    let result = (|| {
-        let mut file = OpenOptions::new()
+/// Private ownership of a create-new temp. A temp is never record authority.
+/// Keep its descriptor until commit/discard so pathname reuse cannot authorize
+/// removing or promoting another inode.
+#[derive(Default)]
+struct TempCleanupCounts {
+    verified: AtomicU64,
+    failed: AtomicU64,
+    fallback: AtomicU64,
+}
+// Includes Arc's two reference counts and alignment within the existing slot reserve.
+const _: () =
+    assert!(std::mem::size_of::<TempCleanupCounts>() + 2 * std::mem::size_of::<usize>() <= 64);
+
+struct OwnedTemp {
+    path: PathBuf,
+    file: Option<File>,
+    cleanup: Arc<TempCleanupCounts>,
+}
+
+impl OwnedTemp {
+    fn prepare(dir: &Path, path: &Path, cleanup: Arc<TempCleanupCounts>) -> io::Result<Self> {
+        static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+        Self::create(
+            dir,
+            path,
+            cleanup,
+            Some(NEXT_TEMP.fetch_add(1, Ordering::Relaxed)),
+        )
+    }
+    fn prepare_atomic(
+        dir: &Path,
+        path: &Path,
+        cleanup: Arc<TempCleanupCounts>,
+    ) -> io::Result<Self> {
+        // This owner never leaves Stores. GC can retry abandoned same-process
+        // M1 temps after a failed explicit and unwind cleanup.
+        Self::create(dir, path, cleanup, None)
+    }
+    fn create(
+        dir: &Path,
+        path: &Path,
+        cleanup: Arc<TempCleanupCounts>,
+        serial: Option<u64>,
+    ) -> io::Result<Self> {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "record name"))?;
+        let temp = dir.join(match serial {
+            Some(serial) => format!(".{name}.{}.{}{TEMP_SUFFIX}", std::process::id(), serial),
+            None => format!(".{name}.{}{TEMP_SUFFIX}", std::process::id()),
+        });
+        let file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&temp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
+        Ok(Self {
+            path: temp,
+            file: Some(file),
+            cleanup,
+        })
+    }
+
+    fn sync(&self) -> io::Result<()> {
+        self.file
+            .as_ref()
+            .ok_or_else(|| io::Error::other("disarmed temp"))?
+            .sync_all()
+    }
+
+    fn verify(&self) -> io::Result<()> {
+        let held = self
+            .file
+            .as_ref()
+            .ok_or_else(|| io::Error::other("disarmed temp"))?
+            .metadata()?;
+        let actual = fs::symlink_metadata(&self.path)?;
+        if Stamp::of(&held) != Stamp::of(&actual) {
+            return Err(io::Error::other("temp changed"));
+        }
+        Ok(())
+    }
+
+    fn commit(&mut self, path: &Path, prior: Option<Stamp>) -> io::Result<Stamp> {
         #[cfg(test)]
-        test_hooks::before_rename(&temp, path)?;
+        test_hooks::before_rename(&self.path, path)?;
+        self.verify()?;
         let actual = match fs::symlink_metadata(path) {
             Ok(metadata) => Some(Stamp::of(&metadata)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
@@ -2093,10 +2407,156 @@ fn write_atomic(dir: &Path, path: &Path, bytes: &[u8], prior: Option<Stamp>) -> 
         if actual != prior {
             return Err(io::Error::other("predecessor changed"));
         }
-        fs::rename(&temp, path)
+        fs::rename(&self.path, path)?;
+        // Disarm immediately after rename, including failure of the following fstat.
+        // The canonical candidate now belongs to pending custody, never temp cleanup.
+        let file = self.file.take().expect("owned temp");
+        Ok(Stamp::of(&file.metadata()?))
+    }
+
+    fn discard(&mut self) -> io::Result<()> {
+        if self.file.is_none() {
+            return Ok(());
+        }
+        let result = (|| {
+            match self.verify() {
+                Ok(()) => remove_if_present(&self.path)?,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            sync_dir(self.path.parent().expect("temp directory"))?;
+            if !fs::symlink_metadata(&self.path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+            {
+                return Err(io::Error::other("temp cleanup unverified"));
+            }
+            self.cleanup.verified.fetch_add(1, Ordering::Relaxed);
+            self.file.take();
+            Ok(())
+        })();
+        if result.is_err() {
+            self.cleanup.failed.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+}
+
+impl Write for OwnedTemp {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| io::Error::other("disarmed temp"))?
+            .write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| io::Error::other("disarmed temp"))?
+            .flush()
+    }
+}
+impl Drop for OwnedTemp {
+    fn drop(&mut self) {
+        if self.file.is_some() {
+            self.cleanup.fallback.fetch_add(1, Ordering::Relaxed);
+            if crate::locked_state_dir::held_for(&self.path).is_some() {
+                let _ = self.discard();
+            } else {
+                self.cleanup.failed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+// Compatibility adapter for the inherited leaf tests; exercises the same owner.
+#[cfg(test)]
+struct TempRecord<'a> {
+    inner: OwnedTemp,
+    counters: &'a mut StoreCounters,
+}
+#[cfg(test)]
+impl<'a> TempRecord<'a> {
+    fn prepare(dir: &Path, path: &Path, counters: &'a mut StoreCounters) -> io::Result<Self> {
+        Ok(Self {
+            inner: OwnedTemp::prepare(dir, path, Arc::default())?,
+            counters,
+        })
+    }
+    fn discard(&mut self) -> io::Result<()> {
+        let result = self.inner.discard();
+        self.update();
+        result
+    }
+    fn update(&mut self) {
+        self.counters.temp_discard_verified = self.inner.cleanup.verified.load(Ordering::Relaxed);
+        self.counters.temp_discard_failed = self.inner.cleanup.failed.load(Ordering::Relaxed);
+        self.counters.temp_drop_fallback = self.inner.cleanup.fallback.load(Ordering::Relaxed);
+    }
+}
+#[cfg(test)]
+impl std::ops::Deref for TempRecord<'_> {
+    type Target = OwnedTemp;
+    fn deref(&self) -> &OwnedTemp {
+        &self.inner
+    }
+}
+#[cfg(test)]
+impl std::ops::DerefMut for TempRecord<'_> {
+    fn deref_mut(&mut self) -> &mut OwnedTemp {
+        &mut self.inner
+    }
+}
+#[cfg(test)]
+impl Drop for TempRecord<'_> {
+    fn drop(&mut self) {
+        if self.inner.file.is_some() {
+            self.inner.cleanup.fallback.fetch_add(1, Ordering::Relaxed);
+            let _ = self.inner.discard();
+            // Avoid a second fallback when a replaced pathname cannot be removed.
+            self.inner.file.take();
+        }
+        self.update();
+    }
+}
+
+/// The M1 caller shares the owned leaf engine and its source-slot counters.
+fn write_atomic<W: SingleWriter>(
+    writer: &W,
+    dir: &Path,
+    path: &Path,
+    bytes: &[u8],
+    prior: Option<Stamp>,
+    cleanup: Arc<TempCleanupCounts>,
+) -> io::Result<Stamp> {
+    // M1's stack-bound writer can unwind before returning. It remains a real
+    // proof for this short scope; the native stage uses the unborrowed owner.
+    struct Attempt<'a, W: SingleWriter> {
+        temp: OwnedTemp,
+        writer: &'a W,
+    }
+    impl<W: SingleWriter> Drop for Attempt<'_, W> {
+        fn drop(&mut self) {
+            if self.temp.file.is_some() {
+                self.temp.cleanup.fallback.fetch_add(1, Ordering::Relaxed);
+                if self.temp.path.starts_with(self.writer.state_dir()) {
+                    let _ = self.temp.discard();
+                } else {
+                    self.temp.cleanup.failed.fetch_add(1, Ordering::Relaxed);
+                }
+                self.temp.file.take();
+            }
+        }
+    }
+    let mut attempt = Attempt {
+        temp: OwnedTemp::prepare_atomic(dir, path, cleanup)?,
+        writer,
+    };
+    let result = (|| {
+        attempt.temp.write_all(bytes)?;
+        attempt.temp.sync()?;
+        attempt.temp.commit(path, prior)
     })();
     if result.is_err() {
-        let _ = fs::remove_file(&temp);
+        let _ = attempt.temp.discard();
     }
     result
 }

@@ -1803,6 +1803,82 @@ fn store_snapshot(dir: &Path) -> BTreeMap<PathBuf, (Vec<u8>, Vec<i128>)> {
         .collect()
 }
 
+#[test]
+fn hold_active_retains_exact_completion_for_one_later_batch_receipt() {
+    let root = crate::test_scratch::ScratchDir::new("dt-hold-completion");
+    let lock = test_locks::hold(&root);
+    let _clear = ClearWriteFaults;
+    let source = SnapshotSource::ClaudeCode;
+    let ds = DurableSource::ClaudeCode;
+    let cache = SharedCache::default();
+    cache.durable_begin_pass(
+        source,
+        &root.join("index.json"),
+        &Scope("completion".into()),
+        false,
+    );
+    let path = root.join("source.jsonl");
+    std::fs::write(&path, b"{}\n").unwrap();
+    let key = local_index_key(&path);
+    let mut binding = store::tests::binding("account", "scope", ("fp", None));
+    binding.key = store::key_digest(ds, &key);
+    let next = store::tests::pending(binding.clone(), store::tests::certificate(&path), 2);
+    {
+        let mut stores = cache.durable().unwrap();
+        let slot = stores.slot(ds).as_mut().unwrap();
+        slot.store
+            .write_after_save(
+                lock,
+                1,
+                0,
+                vec![store::tests::pending(
+                    binding.clone(),
+                    store::tests::certificate(&path),
+                    1,
+                )],
+            )
+            .unwrap();
+        store::test_hooks::set_before_dir_sync(Some(Box::new(|_| {
+            Err(std::io::Error::other("sync EIO"))
+        })));
+        let failed = slot
+            .store
+            .write_after_save(lock, 2, 0, vec![next.clone()])
+            .unwrap();
+        store::test_hooks::set_before_dir_sync(None);
+        assert_eq!(failed.written, 0);
+        assert!(failed.completed.is_empty());
+        assert!(slot.store.receipt_pending(&binding.key));
+    }
+    assert_eq!(cache.hold_active(source, &key), None); // Actual pre-writer consumer.
+    {
+        let mut stores = cache.durable().unwrap();
+        let slot = stores.slot(ds).as_mut().unwrap();
+        assert!(!slot.store.receipt_pending(&binding.key));
+        assert!(
+            slot.store.has_pending(),
+            "retain delivery custody without holding native completion"
+        );
+        assert_eq!(slot.store.counters().receipt_reconciled, 1);
+        store::test_hooks::set_before_rename(Some(Box::new(|_, _| {
+            panic!("completed candidate must not rewrite")
+        })));
+        let delivered = slot
+            .store
+            .write_after_save(lock, 3, 0, vec![next.clone()])
+            .unwrap();
+        store::test_hooks::set_before_rename(None);
+        assert_eq!(delivered.written, 1);
+        assert_eq!(delivered.completed.len(), 1);
+        assert!(!slot.store.has_pending());
+        let clean = slot.store.write_after_save(lock, 4, 0, vec![next]).unwrap();
+        assert_eq!(clean.clean, 1);
+        assert_eq!(clean.written, 0);
+        assert!(clean.completed.is_empty());
+        assert_eq!(slot.store.counters().receipt_reconciled, 1);
+    }
+}
+
 struct ClearWriteFaults;
 impl Drop for ClearWriteFaults {
     fn drop(&mut self) {

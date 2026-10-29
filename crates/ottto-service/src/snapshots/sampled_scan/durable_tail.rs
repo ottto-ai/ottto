@@ -815,6 +815,7 @@ fn refuse_class(refuse: Refuse) -> &'static str {
         Refuse::NonEmpty(field) | Refuse::NotRederivable(field) | Refuse::NotDigest(field) => field,
         Refuse::UnknownLabel => "static_label",
         Refuse::TooLarge => "record_bytes",
+        Refuse::WriteFailed => "encode_io",
     }
 }
 
@@ -1707,8 +1708,14 @@ impl SharedCache {
         let key = store::key_digest(source, key);
         let mut stores = self.durable()?;
         let slot = stores.slot(source).as_mut()?;
-        if let Some(writer) = crate::locked_state_dir::held_for(&slot.dir) {
-            let _ = slot.store.reconcile_pending(writer, &key);
+        if let Some(writer) = crate::locked_state_dir::held_for(slot.store.dir()) {
+            if let Ok(store::ReconcileOutcome::Receipted(proof)) =
+                slot.store.reconcile_pending(writer, &key)
+            {
+                if slot.store.retain_receipt(proof).is_err() {
+                    return Some(store::Refusal::ReceiptPending);
+                }
+            }
         }
         // Only a still-pending receipt holds here; the caller's guard classifies
         // a reconciled key, and a store disabled by reconcile publishes (D-DISABLED).

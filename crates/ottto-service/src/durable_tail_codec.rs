@@ -30,6 +30,7 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::io::Write;
 
 use sha2::{Digest, Sha256};
 
@@ -42,6 +43,8 @@ pub(crate) enum Refuse {
     UnknownLabel,
     /// The encoded body outgrew the record cap.
     TooLarge,
+    /// The output sink could not accept the encoded bytes.
+    WriteFailed,
     /// An `X` field cannot be re-derived from the file under the bound.
     NotRederivable(&'static str),
     /// An `H` text field that is not exactly 64 lower-case hex (a 32-byte
@@ -60,25 +63,68 @@ pub(crate) enum DecodeFailure {
     Budget,
 }
 
-enum Sink {
-    Bytes { out: Vec<u8>, limit: usize },
-    Count { len: usize, limit: usize },
+enum Sink<'a> {
+    Write {
+        out: &'a mut dyn Write,
+        len: usize,
+        limit: usize,
+    },
+    Bytes {
+        out: Vec<u8>,
+        limit: usize,
+    },
+    Count {
+        len: usize,
+        limit: usize,
+    },
     Hash(Box<Sha256>),
 }
 
 /// Encoder. In hash mode it also feeds `X` fields, so a re-derived value can
 /// be checked against the digest without storing it.
-pub(crate) struct Enc {
-    sink: Sink,
+pub(crate) struct Enc<'a> {
+    sink: Sink<'a>,
 }
 
-impl Enc {
+impl<'a> Enc<'a> {
     pub(crate) fn bytes(limit: usize) -> Self {
         Self {
             sink: Sink::Bytes {
                 out: Vec::with_capacity(limit),
                 limit,
             },
+        }
+    }
+    /// Count and emit through the same field walk. The body allocation is
+    /// exact and only happens after every admission/size check succeeds.
+    pub(crate) fn count_write(
+        limit: usize,
+        put: impl Fn(&mut Enc<'_>) -> Result<(), Refuse>,
+    ) -> Result<Vec<u8>, Refuse> {
+        let mut count = Enc::count(limit);
+        put(&mut count)?;
+        let len = count.counted();
+        let mut out = Vec::with_capacity(len);
+        let mut writer = Enc::writer(&mut out, len);
+        put(&mut writer)?;
+        writer.finish_written()?;
+        Ok(out)
+    }
+    /// Borrow a sink after counting. Both overrun and underrun refuse the record.
+    pub(crate) fn writer(out: &'a mut dyn Write, exact_len: usize) -> Self {
+        Self {
+            sink: Sink::Write {
+                out,
+                len: 0,
+                limit: exact_len,
+            },
+        }
+    }
+    pub(crate) fn finish_written(self) -> Result<usize, Refuse> {
+        match self.sink {
+            Sink::Write { len, limit, .. } if len == limit => Ok(len),
+            Sink::Write { .. } => Err(Refuse::WriteFailed),
+            _ => unreachable!("only a writer has an emitted length"),
         }
     }
     pub(crate) fn count(limit: usize) -> Self {
@@ -108,11 +154,20 @@ impl Enc {
     pub(crate) fn position(&self) -> Option<usize> {
         match &self.sink {
             Sink::Bytes { out, .. } => Some(out.len()),
+            Sink::Write { len, .. } => Some(*len),
             Sink::Hash(_) | Sink::Count { .. } => None,
         }
     }
     pub(crate) fn raw(&mut self, bytes: &[u8]) -> Result<(), Refuse> {
         match &mut self.sink {
+            Sink::Write { out, len, limit } => {
+                let end = len.checked_add(bytes.len()).ok_or(Refuse::TooLarge)?;
+                if end > *limit {
+                    return Err(Refuse::TooLarge);
+                }
+                out.write_all(bytes).map_err(|_| Refuse::WriteFailed)?;
+                *len = end;
+            }
             Sink::Bytes { out, limit } => {
                 if out.len().saturating_add(bytes.len()) > *limit {
                     return Err(Refuse::TooLarge);
@@ -153,7 +208,7 @@ impl Enc {
     pub(crate) fn into_bytes(self) -> Vec<u8> {
         match self.sink {
             Sink::Bytes { out, .. } => out,
-            Sink::Hash(_) | Sink::Count { .. } => Vec::new(),
+            Sink::Hash(_) | Sink::Count { .. } | Sink::Write { .. } => Vec::new(),
         }
     }
     /// Hash mode: the digest.
@@ -161,7 +216,7 @@ impl Enc {
         match self.sink {
             Sink::Hash(hasher) => hasher.finalize().into(),
             Sink::Bytes { out, .. } => Sha256::digest(out).into(),
-            Sink::Count { .. } => unreachable!("counting is not hashing"),
+            Sink::Count { .. } | Sink::Write { .. } => unreachable!("sink is not hashing"),
         }
     }
 }
@@ -1550,6 +1605,68 @@ pub(crate) fn trace_verify(f: impl FnOnce()) -> (Vec<(usize, bool)>, usize) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn count_write_matches_bytes_and_refuses_before_output() {
+        let put = |e: &mut Enc<'_>| {
+            e.varint(300)?;
+            e.len_prefixed(b"synthetic")
+        };
+        let mut legacy = Enc::bytes(64);
+        put(&mut legacy).unwrap();
+        let expected = legacy.into_bytes();
+        let actual = Enc::count_write(expected.len(), put).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(actual.capacity(), actual.len());
+        let calls = std::cell::Cell::new(0);
+        assert_eq!(
+            Enc::count_write(expected.len() - 1, |e| {
+                calls.set(calls.get() + 1);
+                put(e)
+            }),
+            Err(Refuse::TooLarge)
+        );
+        assert_eq!(calls.get(), 1, "count refusal never starts the output pass");
+    }
+
+    #[test]
+    fn write_sink_handles_short_writes_limits_and_io_errors() {
+        struct Short(Vec<u8>);
+        impl std::io::Write for Short {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let n = bytes.len().min(1);
+                self.0.extend_from_slice(&bytes[..n]);
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut out = Short(Vec::new());
+        {
+            let mut e = Enc {
+                sink: Sink::Write {
+                    out: &mut out,
+                    len: 0,
+                    limit: 3,
+                },
+            };
+            e.raw(b"abc").unwrap();
+            assert_eq!(e.position(), Some(3));
+            assert_eq!(e.raw(b"d"), Err(Refuse::TooLarge));
+        }
+        assert_eq!(out.0, b"abc");
+        let mut empty = &mut [][..];
+        let mut e = Enc {
+            sink: Sink::Write {
+                out: &mut empty,
+                len: 0,
+                limit: 1,
+            },
+        };
+        assert_eq!(e.raw(b"x"), Err(Refuse::WriteFailed));
+        assert_eq!(e.position(), Some(0));
+    }
     use super::*;
 
     // Direct codec fixtures: the actual allocator proves the first refused

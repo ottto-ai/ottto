@@ -120,7 +120,17 @@ impl Drop for Scratch {
 /// Exact in-memory custody oracle; no new production representation/hash.
 pub(crate) fn pending_snapshot(store: &DurableTailStore) -> Vec<u8> {
     let mut out = Vec::new();
-    for (key, (prior, generation, content, failures)) in &store.pending {
+    for (
+        key,
+        PendingWrite {
+            prior,
+            candidate,
+            content,
+            completed,
+            failures,
+        },
+    ) in &store.pending
+    {
         out.extend_from_slice(key);
         out.push(u8::from(prior.is_some()));
         if let Some(stamp) = prior {
@@ -131,9 +141,23 @@ pub(crate) fn pending_snapshot(store: &DurableTailStore) -> Vec<u8> {
                 out.extend_from_slice(&word.to_le_bytes());
             }
         }
-        out.extend_from_slice(&generation.to_le_bytes());
+        out.extend_from_slice(&candidate.generation.to_le_bytes());
+        out.extend_from_slice(&candidate.format.to_le_bytes());
+        out.extend_from_slice(&candidate.encoded_len.to_le_bytes());
+        out.extend_from_slice(&candidate.key);
+        out.extend_from_slice(&candidate.trailer);
+        out.extend_from_slice(&candidate.allowlist);
         out.extend_from_slice(content);
         out.push(*failures);
+        out.push(u8::from(completed.is_some()));
+        if let Some(stamp) = completed {
+            for word in stamp.0 {
+                out.extend_from_slice(&word.to_le_bytes());
+            }
+            for word in stamp.1 {
+                out.extend_from_slice(&word.to_le_bytes());
+            }
+        }
     }
     out
 }
@@ -239,7 +263,13 @@ fn failed_unlink_holds_across_memo_clear_then_reconciles_no_record() {
                 0
             );
             assert_eq!(fs::read(record_file(&store, &b.key)).unwrap(), original);
-            assert!(!store.reconcile_pending(&lock, &b.key).unwrap());
+            let candidate = store.pending[&b.key].candidate;
+            let ReconcileOutcome::Retired(proof) = store.reconcile_pending(&lock, &b.key).unwrap()
+            else {
+                panic!("verified retirement must return its exact candidate");
+            };
+            assert_eq!(proof.candidate, candidate);
+            assert!(stamp_at(&record_file(&store, &b.key)).unwrap().is_none());
         }
         assert!(!record_file(&store, &b.key).exists());
         assert!(!store.receipt_pending(&b.key));
@@ -293,10 +323,169 @@ fn equal_generation_impostor_never_elects_receipt_and_unknown_swap_is_protected(
                 format: FORMAT_VERSION,
             }),
         );
-        assert!(store.reconcile_pending(&lock, &b.key).unwrap());
+        let ReconcileOutcome::Receipted(proof) = store.reconcile_pending(&lock, &b.key).unwrap()
+        else {
+            panic!("exact completion");
+        };
+        store.retain_receipt(proof).unwrap();
         assert_eq!(store.counters().receipt_reconciled, 1);
         assert_eq!(store.counters().durable_write_failed_published, 0);
     }
+}
+
+#[test]
+fn exact_survivor_uses_original_trailer_not_canonicalized_retired_fields() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let path = scratch.transcript("source.jsonl", b"{}\n");
+    let b = binding("account", "scope", ("fp-a", None));
+    let mut store = scratch.store();
+    store
+        .write_after_save(&lock, 1, 0, vec![pending(b.clone(), certificate(&path), 1)])
+        .unwrap();
+    test_hooks::set_before_dir_sync(Some(Box::new(|_| Err(io::Error::other("sync EIO")))));
+    let receipt = store
+        .write_after_save(&lock, 2, 0, vec![pending(b.clone(), certificate(&path), 2)])
+        .unwrap();
+    test_hooks::set_before_dir_sync(None);
+    assert_eq!(receipt.written, 0);
+    assert!(store.receipt_pending(&b.key));
+    let disk = record_file(&store, &b.key);
+    let original = fs::read(&disk).unwrap();
+    let mut altered = original.clone();
+    // The typed decoder deliberately drops these retired bytes. A reconstructed
+    // header/content digest would therefore call these two records identical.
+    altered[HEADER_BYTES - 13] = 1;
+    altered[HEADER_BYTES - 12..HEADER_BYTES - 4].copy_from_slice(&123_u64.to_le_bytes());
+    set_version(&mut altered, FORMAT_VERSION); // Refresh the existing trailer.
+    assert_eq!(
+        decode(&altered, &placeholder_allowlist()).unwrap(),
+        decode(&original, &placeholder_allowlist()).unwrap()
+    );
+    assert_ne!(altered, original);
+    put_record(&disk, &altered);
+    let debt = pending_snapshot(&store);
+    assert!(store.reconcile_pending(&lock, &b.key).is_err());
+    assert_eq!(pending_snapshot(&store), debt);
+    assert_eq!(fs::read(&disk).unwrap(), altered);
+    assert_eq!(store.counters().receipt_reconciled, 0);
+    put_record(&disk, &original);
+    let ReconcileOutcome::Receipted(proof) = store.reconcile_pending(&lock, &b.key).unwrap() else {
+        panic!("original bytes alone discharge this candidate");
+    };
+    assert_eq!(
+        proof.identity.trailer.as_slice(),
+        &original[original.len() - TRAILER_BYTES..]
+    );
+    assert_eq!(proof.identity.encoded_len, original.len() as u64);
+    assert!(Some(proof.stamp) == stamp_at(&disk).unwrap());
+    store.retain_receipt(proof).unwrap();
+}
+
+#[test]
+fn replacement_during_successful_directory_sync_cannot_receipt_an_impostor() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let path = scratch.transcript("source.jsonl", b"{}\n");
+    let b = binding("account", "scope", ("fp-a", None));
+    let mut store = scratch.store();
+    store
+        .write_after_save(&lock, 1, 0, vec![pending(b.clone(), certificate(&path), 1)])
+        .unwrap();
+    let disk = record_file(&store, &b.key);
+    let impostor = encode(&DurableRecord {
+        record: pending(b.clone(), certificate(&path), 3),
+        index_generation: 2,
+        format: FORMAT_VERSION,
+    });
+    let target = disk.clone();
+    let swapped = impostor.clone();
+    let reached = std::rc::Rc::new(std::cell::Cell::new(false));
+    let hit = reached.clone();
+    test_hooks::set_before_dir_sync(Some(Box::new(move |_| {
+        if !hit.replace(true) {
+            put_record(&target, &swapped);
+        }
+        Ok(())
+    })));
+    let receipt = store
+        .write_after_save(&lock, 2, 0, vec![pending(b.clone(), certificate(&path), 2)])
+        .unwrap();
+    test_hooks::set_before_dir_sync(None);
+    assert!(reached.get());
+    assert_eq!(receipt.written, 0);
+    assert_eq!(receipt.deferred_keys, vec![b.key]);
+    assert!(store.receipt_pending(&b.key));
+    assert_eq!(fs::read(&disk).unwrap(), impostor);
+    assert_eq!(store.hold(&b.key), Some(Refusal::ReceiptPending));
+}
+
+#[test]
+fn retained_completion_rejects_wrong_candidate_and_final_path_swap() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let path = scratch.transcript("source.jsonl", b"{}\n");
+    let b = binding("account", "scope", ("fp-a", None));
+    let mut store = scratch.store();
+    let a = pending(b.clone(), certificate(&path), 1);
+    let next = pending(b.clone(), certificate(&path), 2);
+    let mut other = a.clone();
+    other.binding.key = key_digest(DurableSource::ClaudeCode, "other");
+    store
+        .write_after_save(&lock, 1, 0, vec![a, other.clone()])
+        .unwrap();
+    test_hooks::set_before_dir_sync(Some(Box::new(|_| Err(io::Error::other("sync EIO")))));
+    let failed = store
+        .write_after_save(&lock, 2, 0, vec![next.clone()])
+        .unwrap();
+    test_hooks::set_before_dir_sync(None);
+    assert!(failed.completed.is_empty());
+    let ReconcileOutcome::Receipted(proof) = store.reconcile_pending(&lock, &b.key).unwrap() else {
+        panic!("exact survivor");
+    };
+    store.retain_receipt(proof).unwrap();
+    let debt = pending_snapshot(&store);
+    let wrong_key = store.write_after_save(&lock, 3, 0, vec![other]).unwrap();
+    assert_eq!(wrong_key.clean, 1);
+    assert!(wrong_key.completed.is_empty());
+    assert_eq!(pending_snapshot(&store), debt);
+    let wrong = pending(b.clone(), certificate(&path), 3);
+    let wrong_candidate = store
+        .write_after_save(&lock, 3, 0, vec![wrong.clone()])
+        .unwrap();
+    assert!(wrong_candidate.completed.is_empty());
+    assert_eq!(wrong_candidate.deferred_keys, vec![b.key]);
+    assert_eq!(pending_snapshot(&store), debt);
+    let ReconcileOutcome::Receipted(proof) = store.reconcile_pending(&lock, &b.key).unwrap() else {
+        panic!("retained completion");
+    };
+    let receipt = BatchReceipt {
+        written: 1,
+        bytes_written: proof.identity.encoded_len,
+        completed: vec![proof],
+        ..Default::default()
+    };
+    put_record(
+        &record_file(&store, &b.key),
+        &encode(&DurableRecord {
+            record: wrong,
+            index_generation: 2,
+            format: FORMAT_VERSION,
+        }),
+    );
+    assert!(store.finish_batch(receipt).is_err());
+    assert_eq!(
+        pending_snapshot(&store),
+        debt,
+        "failed delivery retains exact custody"
+    );
+    assert!(store.receipt_pending(&b.key));
+    assert!(store.reconcile_pending(&lock, &b.key).is_err());
+}
+
+#[test]
+fn exact_pending_identity_fits_existing_node_reservation() {
+    assert!(crate::heap_layout_bound::tree_node_bytes::<Digest32, PendingWrite>().unwrap() <= 4096);
 }
 
 #[test]
@@ -489,19 +678,54 @@ fn post_rename_sync_failure_keeps_b_pending_until_its_exact_receipt() {
         test_hooks::set_before_dir_sync(None);
         assert_eq!(reached.get(), 2, "write then reconcile both reached fsync");
         assert_eq!(receipt.written, 0);
+        assert!(receipt.completed.is_empty());
         assert_eq!(receipt.deferred_keys, vec![b.key]);
         assert_eq!(store.hold(&b.key), Some(Refusal::ReceiptPending));
         assert_eq!(
             fs::read(record_file(&store, &b.key)).unwrap(),
             encode(&DurableRecord {
                 envelope_audit_debt: None,
-                record: replacement,
+                record: replacement.clone(),
                 index_generation: 2,
                 format: FORMAT_VERSION
             })
         );
         assert_eq!(store.counters().t14_rebuild, 0);
-        assert!(store.reconcile_pending(&lock, &b.key).unwrap());
+        let candidate = store.pending[&b.key].candidate;
+        let expected_stamp = stamp_at(&record_file(&store, &b.key)).unwrap();
+        if parent {
+            let ReconcileOutcome::Receipted(proof) =
+                store.reconcile_pending(&lock, &b.key).unwrap()
+            else {
+                panic!("exact survivor");
+            };
+            assert_eq!(proof.identity, candidate);
+            assert!(Some(proof.stamp) == expected_stamp);
+            store.retain_receipt(proof).unwrap();
+            assert!(!store.receipt_pending(&b.key));
+            assert!(
+                store.has_pending(),
+                "delivery custody survives reconciliation"
+            );
+        } // Otherwise the next batch's initial scan performs the full reconciliation.
+        let delivered = store
+            .write_after_save(&lock, 3, 0, vec![replacement.clone(), replacement.clone()])
+            .unwrap();
+        assert_eq!(delivered.written, 1);
+        assert_eq!(delivered.completed.len(), 1);
+        assert_eq!(delivered.completed[0].identity, candidate);
+        assert!(Some(delivered.completed[0].stamp) == expected_stamp);
+        let clean = store
+            .write_after_save(&lock, 4, 0, vec![replacement])
+            .unwrap();
+        assert_eq!(clean.clean, 1);
+        assert_eq!(clean.written, 0);
+        assert!(clean.completed.is_empty());
+        assert!(matches!(
+            store.reconcile_pending(&lock, &b.key).unwrap(),
+            ReconcileOutcome::NoPending
+        ));
+
         assert_eq!(store.counters().receipt_reconciled, 1);
         assert_eq!(store.counters().durable_write_failed_published, 0);
         assert_eq!(found(store.read(&b.key)).index_generation, 2);
@@ -967,10 +1191,101 @@ fn every_binding_mismatch_refuses() {
     assert_eq!(codex.eligible(&want), Err(Ineligible::EntryChanged));
 }
 
-/// A crash after the temp file is written and synced but before the rename
-/// leaves the old record readable and a temp that GC removes.
 #[test]
-fn interrupted_replacement_temp_present_keeps_the_old_record() {
+fn private_temp_explicit_cleanup_counts_once_after_verified_absence() {
+    let scratch = Scratch::new();
+    let path = scratch.root.join("stage.rec");
+    let mut counters = StoreCounters::default();
+    let mut temp = TempRecord::prepare(&scratch.root, &path, &mut counters).unwrap();
+    let temp_path = temp.path.clone();
+    assert!(temp_path.exists());
+    assert_eq!(temp.counters.temp_discard_verified, 0);
+    temp.discard().unwrap();
+    assert!(!temp_path.exists());
+    assert!(temp.file.is_none());
+    assert_eq!(temp.counters.temp_discard_verified, 1);
+    temp.discard().unwrap();
+    assert_eq!(temp.counters.temp_discard_verified, 1);
+    drop(temp);
+    assert_eq!(counters.temp_discard_verified, 1);
+    assert_eq!(counters.temp_discard_failed, 0);
+    assert_eq!(counters.temp_drop_fallback, 0);
+}
+
+#[test]
+fn private_temp_commit_and_discard_never_grant_a_receipt() {
+    let scratch = Scratch::new();
+    let path = scratch.root.join("stage.rec");
+    let mut counters = StoreCounters::default();
+    let mut temp = TempRecord::prepare(&scratch.root, &path, &mut counters).unwrap();
+    temp.file.as_mut().unwrap().write_all(b"synthetic").unwrap();
+    temp.sync().unwrap();
+    let temp_path = temp.path.clone();
+    assert!(temp_path.exists());
+    assert!(!path.exists());
+    temp.commit(&path, None).unwrap();
+    temp.discard().unwrap(); // No unlink after a successful rename.
+    drop(temp);
+    assert_eq!(fs::read(&path).unwrap(), b"synthetic");
+    assert!(!temp_path.exists());
+    assert_eq!(counters.temp_discard_verified, 0);
+    assert_eq!(counters.temp_drop_fallback, 0);
+    assert_eq!(counters.temp_discard_failed, 0);
+    assert_eq!(counters.records_written, 0, "only the store can receipt");
+}
+
+#[test]
+fn private_temp_replacement_cannot_be_committed_or_discarded() {
+    let scratch = Scratch::new();
+    let path = scratch.root.join("stage.rec");
+    let mut counters = StoreCounters::default();
+    let mut temp = TempRecord::prepare(&scratch.root, &path, &mut counters).unwrap();
+    temp.file.as_mut().unwrap().write_all(b"owned").unwrap();
+    temp.sync().unwrap();
+    let temp_path = temp.path.clone();
+    fs::rename(&temp_path, scratch.root.join("held-original")).unwrap();
+    fs::write(&temp_path, b"replacement").unwrap();
+    assert!(temp.commit(&path, None).is_err());
+    assert!(temp.discard().is_err());
+    assert!(!path.exists());
+    drop(temp);
+    assert_eq!(fs::read(&temp_path).unwrap(), b"replacement");
+    assert_eq!(counters.temp_discard_verified, 0);
+    assert_eq!(counters.temp_discard_failed, 2);
+    assert_eq!(counters.temp_drop_fallback, 1);
+}
+
+#[test]
+fn private_temp_discard_retries_directory_sync_without_unlinking_records() {
+    let scratch = Scratch::new();
+    let path = scratch.root.join("stage.rec");
+    fs::write(&path, b"predecessor").unwrap();
+    let mut counters = StoreCounters::default();
+    let mut temp = TempRecord::prepare(&scratch.root, &path, &mut counters).unwrap();
+    let temp_path = temp.path.clone();
+    test_hooks::set_before_dir_sync(Some(Box::new(|_| Err(io::Error::other("sync EIO")))));
+    let failed = temp.discard();
+    test_hooks::set_before_dir_sync(None);
+    assert!(failed.is_err());
+    assert!(!temp_path.exists());
+    assert!(temp.file.is_some(), "unverified cleanup remains owned");
+    assert_eq!(temp.counters.temp_discard_verified, 0);
+    temp.discard().unwrap();
+    assert!(temp.file.is_none());
+    assert_eq!(temp.counters.temp_discard_verified, 1);
+    temp.discard().unwrap();
+    assert_eq!(temp.counters.temp_discard_verified, 1);
+    drop(temp);
+    assert_eq!(fs::read(&path).unwrap(), b"predecessor");
+    assert_eq!(counters.temp_discard_verified, 1);
+    assert_eq!(counters.temp_discard_failed, 1);
+    assert_eq!(counters.temp_drop_fallback, 0);
+}
+
+/// Unwinding after temp sync keeps the old record and exercises counted Drop
+/// cleanup. Real SIGKILL edges (which cannot run Drop) remain in the crash matrix.
+#[test]
+fn interrupted_replacement_unwind_discards_temp_and_keeps_the_old_record() {
     let scratch = Scratch::new();
     let lock = LockedStateDir::acquire(&scratch.root).unwrap();
     let transcript = scratch.transcript("t.jsonl", b"{}\n");
@@ -1003,7 +1318,9 @@ fn interrupted_replacement_temp_present_keeps_the_old_record() {
         .filter_map(Result::ok)
         .filter(|entry| entry.file_name().to_string_lossy().ends_with(TEMP_SUFFIX))
         .count();
-    assert_eq!(temps, 1, "the synced temp is left behind");
+    assert_eq!(temps, 0, "unwinding discards only the owned temp");
+    assert_eq!(store.counters().temp_drop_fallback, 1);
+    assert_eq!(store.counters().temp_discard_failed, 0);
     assert_eq!(
         store.read(&old.key),
         ReadOutcome::Refused(Refusal::ReceiptPending)
@@ -1015,7 +1332,7 @@ fn interrupted_replacement_temp_present_keeps_the_old_record() {
     let mut keep = BTreeMap::new();
     keep.insert(old.key, Some(old.scope));
     store.gc(&lock, &old.context, &keep).unwrap();
-    assert_eq!(store.counters().gc_temps_deleted, 1);
+    assert_eq!(store.counters().gc_temps_deleted, 0);
     assert!(store.receipt_pending(&old.key));
     assert_eq!(found(restarted.read(&old.key)).record.binding, old);
 }
