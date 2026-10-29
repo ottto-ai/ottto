@@ -274,6 +274,8 @@ fn truncate_then_regrow_past_committed_extent_rebuilds_from_zero() {
 /// Portable certificate/selector seam: the cursor's retained-prefix completion
 /// is reproduced from a real ReadPlan seal, without a supported-layout override.
 /// The subsequent aged discovery and catch-up are ordinary production scans.
+/// Covers the in-memory seam, not the ordinary index-reload boundary: retaining
+/// the fragment witness across source preparations is a separate follow-up.
 #[test]
 fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
     use crate::transcript_acquisition::{AuditDebt, ReadPlan, Scope};

@@ -393,6 +393,11 @@ the existing sampled fingerprint to match, after independent audit/context gates
 Real extra bytes, termination, replacement or missing binding use the ordinary
 counted catch-up path; a length difference alone never proves a known fragment.
 
+The fragment-only Codex exclusion holds within a source preparation; the witness
+isn't retained across index reloads yet, so an aged, unchanged unterminated-fragment
+Codex file may be counted grown and Tail-read once per preparation past the window
+(bounded; never Full). Follow-up: cache-retained witness.
+
 On Claude pages, `counts.withheld_reparse` counts re-parses of keys withheld for
 an unresolved account: `start` (first in this process), `evidence` (same size,
 but the sampled content, the file object, its api/trace sidecar stamps or the
