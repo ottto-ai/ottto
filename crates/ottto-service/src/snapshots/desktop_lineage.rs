@@ -138,6 +138,7 @@ impl ClaudeTitleMetadata {
 }
 
 // Compact JSON upper bound, including escaped path keys, before insert/clone.
+// The root serializer keeps this value compact even in held/pretty output.
 fn file_edges_bytes(edges: &BTreeMap<String, String>) -> usize {
     2 + edges
         .keys()

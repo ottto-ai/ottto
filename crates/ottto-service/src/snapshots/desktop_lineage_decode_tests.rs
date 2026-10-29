@@ -333,6 +333,117 @@ fn selector_drops(rows: &[Value]) -> u64 {
 }
 
 #[test]
+fn desktop_lineage_nested_optional_damage_preserves_load_cas_and_identity_custody() {
+    let fields = [
+        "claude_desktop_completed_lineage",
+        "claude_desktop_lineage_file_edges",
+    ];
+    let mut original = seed();
+    original
+        .accepted_snapshot_fingerprints
+        .insert("a".repeat(64));
+    original.file_snapshot_fingerprints.insert(
+        "/synthetic/child.jsonl".into(),
+        BTreeSet::from(["a".repeat(64)]),
+    );
+    original.session_account_bindings.insert(
+        "sibling-session".into(),
+        SessionAccountBinding {
+            account_identifier_hash: "a".repeat(64),
+            workspace_identifier_hash: Some("b".repeat(64)),
+        },
+    );
+    let owner = codex_protected_owner("synthetic-owner");
+    original
+        .files
+        .get_mut("/synthetic/child.jsonl")
+        .unwrap()
+        .codex_protected_owner = Some(owner.clone());
+    let scratch = crate::test_scratch::ScratchDir::new("desktop-lineage-depth");
+    let path = scratch.join("index.json");
+    // 65 also exercises wrong-shape normalization BEFORE bounded_shape's
+    // depth-64 gate; 257 is valid JSON above the optional resource depth cap.
+    for depth in [65, 257] {
+        let nested = format!("{}null{}", "[".repeat(depth), "]".repeat(depth));
+        for damaged in [&fields[..1], &fields[1..], &fields[..]] {
+            let mut value = serde_json::to_value(&original).unwrap();
+            for field in damaged {
+                value.as_object_mut().unwrap().remove(*field);
+            }
+            let mut bytes = serde_json::to_vec(&value).unwrap();
+            assert_eq!(bytes.pop(), Some(b'}'));
+            for field in damaged {
+                bytes.extend_from_slice(format!(",\"{field}\":{nested}").as_bytes());
+            }
+            bytes.push(b'}');
+            fs::write(&path, &bytes).unwrap();
+            for mode in ["load", "streaming_cas", "bounded_cas", "identity"] {
+                let (loaded, rows) = crate::local_resource_diagnostics::capture(|| match mode {
+                    "load" => ScanIndex::load(&path).unwrap(),
+                    "streaming_cas" => {
+                        read_file(File::open(&path).unwrap(), "cas", "claude_code").unwrap()
+                    }
+                    "bounded_cas" => read_bounded(&bytes).unwrap(),
+                    _ => read_identity_carry(File::open(&path).unwrap(), "claude_code").unwrap(),
+                });
+                assert_eq!(
+                    selector_drops(&rows),
+                    damaged.len() as u64,
+                    "{mode}/{depth}"
+                );
+                assert_eq!(
+                    loaded.session_account_bindings,
+                    original.session_account_bindings
+                );
+                assert_eq!(
+                    loaded.accepted_snapshot_fingerprints,
+                    original.accepted_snapshot_fingerprints
+                );
+                assert_eq!(
+                    loaded.file_snapshot_fingerprints,
+                    original.file_snapshot_fingerprints
+                );
+                assert!(loaded.decode_holds.is_empty());
+                if mode == "identity" {
+                    // Identity capture intentionally skips file records; it
+                    // retains ACK/owner bindings and never rewrites the source.
+                    assert!(loaded.files.is_empty());
+                } else {
+                    assert_eq!(loaded.files.len(), original.files.len());
+                    assert_eq!(
+                        loaded.files["/synthetic/child.jsonl"].codex_protected_owner,
+                        Some(owner.clone())
+                    );
+                    for (key, file) in &original.files {
+                        assert_eq!(
+                            loaded.files[key].source_file_fingerprint,
+                            file.source_file_fingerprint
+                        );
+                    }
+                }
+                assert_eq!(
+                    loaded.claude_desktop_completed_lineage,
+                    if damaged.contains(&fields[0]) {
+                        None
+                    } else {
+                        original.claude_desktop_completed_lineage.clone()
+                    }
+                );
+                assert_eq!(
+                    loaded.claude_desktop_lineage_file_edges,
+                    if damaged.contains(&fields[1]) {
+                        BTreeMap::new()
+                    } else {
+                        original.claude_desktop_lineage_file_edges.clone()
+                    }
+                );
+                assert_eq!(fs::read(&path).unwrap(), bytes);
+            }
+        }
+    }
+}
+
+#[test]
 fn desktop_lineage_full_record_budget_refuses_only_new_baseline_on_existing_diagnostic_line() {
     let mut index = seed();
     index.claude_desktop_lineage_file_edges.clear();
@@ -424,4 +535,77 @@ fn desktop_lineage_file_byte_budget_roundtrips_and_refuses_one_more_without_evic
         loaded.claude_desktop_completed_lineage,
         index.claude_desktop_completed_lineage
     );
+    assert_compact_to_held_transition_keeps_admitted_baselines();
+}
+
+fn assert_compact_to_held_transition_keeps_admitted_baselines() {
+    let mut index = seed();
+    index.claude_desktop_lineage_file_edges.clear();
+    let entry = index.files["/synthetic/child.jsonl"].clone();
+    let edge = desktop_lineage::edge_fingerprint(Some(PARENT));
+    // Reproduce a previously admitted compact map: these medium keys fit the
+    // compact cap, but root-level pretty indentation takes it above 1 MiB.
+    let keys: Vec<_> = (0..desktop_lineage::MAX_EDGES)
+        .map(|n| format!("/synthetic/{n:04}/{}", "k".repeat(169)))
+        .collect();
+    for key in &keys {
+        assert_eq!(key.len(), 185);
+        index.files.insert(key.clone(), entry.clone());
+        if key != keys.last().unwrap() {
+            index
+                .claude_desktop_lineage_file_edges
+                .insert(key.clone(), edge.clone());
+        }
+    }
+    // Exercise actual admission of the final pair, rather than only seeding
+    // a map whose size the writer might never have allowed.
+    let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+        index.record_desktop_lineage_file_edge(keys.last().unwrap(), edge)
+    });
+    assert_eq!(selector_drops(&rows), 0);
+    assert_eq!(
+        index.claude_desktop_lineage_file_edges.len(),
+        desktop_lineage::MAX_EDGES
+    );
+    let expected = index.claude_desktop_lineage_file_edges.clone();
+    let compact = serde_json::to_vec(&expected).unwrap();
+    assert_eq!(compact.len(), 1_044_481);
+    let scratch = crate::test_scratch::ScratchDir::new("desktop-lineage-held-byte-budget");
+    let path = scratch.join("index.json");
+    index.save(&path).unwrap();
+    let mut value = serde_json::to_value(ScanIndex::load(&path).unwrap()).unwrap();
+    value["files"]["opaque-held"] =
+        json!({"size_bytes":[], "codex_protected_owner":codex_protected_owner("held-owner")});
+    // Prove this fixture discriminates ordinary recursive pretty formatting.
+    let recursively_pretty = serde_json::to_vec_pretty(&value).unwrap();
+    let root: BTreeMap<String, &RawValue> = serde_json::from_slice(&recursively_pretty).unwrap();
+    assert_eq!(
+        root["claude_desktop_lineage_file_edges"].get().len(),
+        1_069_060
+    );
+    assert!(
+        root["claude_desktop_lineage_file_edges"].get().len() as u64
+            > desktop_lineage::MAX_DECODE_BYTES
+    );
+    fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    let mut held = ScanIndex::load(&path).unwrap();
+    assert!(!held.decode_holds.is_empty());
+    assert_eq!(held.claude_desktop_lineage_file_edges, expected);
+    held.save(&path).unwrap();
+    let written = fs::read(&path).unwrap();
+    let root: BTreeMap<String, &RawValue> = serde_json::from_slice(&written).unwrap();
+    assert_eq!(
+        root["claude_desktop_lineage_file_edges"].get().as_bytes(),
+        compact
+    );
+    let (reloaded, rows) =
+        crate::local_resource_diagnostics::capture(|| ScanIndex::load(&path).unwrap());
+    assert_eq!(selector_drops(&rows), 0);
+    assert_eq!(reloaded.claude_desktop_lineage_file_edges, expected);
+    assert_eq!(
+        reloaded.claude_desktop_completed_lineage,
+        held.claude_desktop_completed_lineage
+    );
+    assert!(reloaded.decode_holds.same_as(&held.decode_holds));
+    assert!(reloaded.decode_holds_file("opaque-held"));
 }
