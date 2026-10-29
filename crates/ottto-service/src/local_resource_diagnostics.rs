@@ -41,8 +41,12 @@ pub(crate) enum CodexZstCause {
     CompatibilityUnfunded,
     #[serde(rename = "CompressedAdmissionRefused")]
     AdmissionRefused,
+    // Subset of decoder refusals: the unchanged free-only floor would fit
+    // without optional header entries. Attempts, not files or lost usage.
+    #[serde(rename = "decoder_refused_header_occupancy")]
+    DecoderRefusedHeaderOccupancy,
 }
-const CODEX_ZST_CAUSES: usize = CodexZstCause::AdmissionRefused as usize + 1;
+const CODEX_ZST_CAUSES: usize = CodexZstCause::DecoderRefusedHeaderOccupancy as usize + 1;
 static CODEX_ZST_REFUSED: [AtomicU64; CODEX_ZST_CAUSES] =
     [const { AtomicU64::new(0) }; CODEX_ZST_CAUSES];
 
@@ -1386,8 +1390,13 @@ mod tests {
             HeaderUnfunded,
             CompatibilityUnfunded,
             AdmissionRefused,
+            DecoderRefusedHeaderOccupancy,
         ];
         assert_eq!(ALL.len(), super::CODEX_ZST_CAUSES);
+        assert_eq!(
+            serde_json::to_value(DecoderRefusedHeaderOccupancy).unwrap(),
+            "decoder_refused_header_occupancy"
+        );
         for (index, cause) in ALL.iter().enumerate() {
             assert_eq!(*cause as usize, index);
         }
