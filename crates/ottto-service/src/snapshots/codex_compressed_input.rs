@@ -937,6 +937,8 @@ pub(in crate::snapshots) mod tests {
     include!("codex_archive_header_tests.rs");
     include!("codex_archive_correction_tests.rs");
     include!("codex_archive_ru_tests.rs");
+    include!("codex_archive_released_entry_tests.rs");
+    include!("codex_archive_downgrade_tests.rs");
     use super::super::*;
     use super::*;
     use crate::transcript_acquisition::Scope;
