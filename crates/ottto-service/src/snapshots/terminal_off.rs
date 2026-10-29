@@ -508,30 +508,29 @@ fn resume_claude_retry_admission(index: &mut ScanIndex, at: &str) {
 
 fn enqueue_terminal_off_retry(
     traversal: &mut ScanTraversalCheckpoint,
-    key: &str,
+    admitted: &ScanTraversalPath,
     census_member: bool,
 ) {
-    let path = Path::new(key);
-    if claude_index_path_member_ref(path).is_none()
-        || path.extension().and_then(|v| v.to_str()) != Some("jsonl")
+    // Scope includes the acquisition root. Reconstructing the deepest root
+    // here can invent ScopeChanged on unchanged bytes under overlapping roots.
+    // A real configured-root change still invalidates this scheduling owner.
+    if !traversal.scan_roots.contains(&admitted.scan_root)
+        || !admitted.path.starts_with(&admitted.scan_root)
+        || claude_index_path_member_ref(&admitted.path).is_none()
+        || admitted.path.extension().and_then(|v| v.to_str()) != Some("jsonl")
     {
         return;
     }
-    let Some(root) = traversal
-        .scan_roots
-        .iter()
-        .filter(|r| path.starts_with(r))
-        .max_by_key(|r| r.components().count())
-    else {
-        return;
-    };
-    if !traversal.pending_candidates.iter().any(|p| p.path == path) {
-        traversal.pending_candidates.push_back(ScanTraversalPath {
-            scan_root: root.clone(),
-            path: path.to_path_buf(),
-            census_member,
-            watcher_hint: false,
-        });
+    if let Some(queued) = traversal
+        .pending_candidates
+        .iter_mut()
+        .find(|p| p.path == admitted.path)
+    {
+        queued.scan_root.clone_from(&admitted.scan_root);
+    } else {
+        let mut retry = admitted.clone();
+        retry.census_member = census_member;
+        traversal.pending_candidates.push_back(retry);
     }
 }
 
@@ -549,7 +548,14 @@ impl ScanIndex {
             for key in keys {
                 // Already observed held custody is a reread, not new discovery.
                 // G1 lets real-loss/floor retries restart despite rereads.
-                enqueue_terminal_off_retry(traversal, key, false);
+                if let Some(admitted) = self
+                    .claude_full_rearm_progress
+                    .terminal_off_admitted
+                    .iter()
+                    .find(|p| local_index_key(&p.path) == *key)
+                {
+                    enqueue_terminal_off_retry(traversal, admitted, false);
+                }
             }
         }
     }
@@ -577,7 +583,14 @@ impl ScanIndex {
             }) {
                 continue;
             }
-            enqueue_terminal_off_retry(traversal, key, true);
+            if let Some(admitted) = self
+                .claude_full_rearm_progress
+                .terminal_off_admitted
+                .iter()
+                .find(|p| local_index_key(&p.path) == *key)
+            {
+                enqueue_terminal_off_retry(traversal, admitted, true);
+            }
         }
     }
 }

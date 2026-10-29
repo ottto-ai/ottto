@@ -452,7 +452,16 @@ fn terminal_off_delete_defers_all_raw_effects_and_full_rearm() {
     let before = index.files[&key].source_file_fingerprint.clone();
     fs::remove_file(&path).unwrap();
     if let Some(t) = index.traversal.as_mut() {
-        enqueue_terminal_off_retry(t, &key, true);
+        enqueue_terminal_off_retry(
+            t,
+            &ScanTraversalPath {
+                scan_root: scratch.to_path_buf(),
+                path: path.clone(),
+                census_member: true,
+                watcher_hint: false,
+            },
+            true,
+        );
     }
     let page = off_scan(&mut index, &scratch, W2, 10);
     assert!(

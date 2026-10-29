@@ -4711,3 +4711,105 @@ fn rearm_full_cause_counts_native_bytes_without_changing_selection_or_uploads() 
             .is_none());
     }
 }
+
+#[test]
+fn terminal_off_overlapping_root_retry_preserves_native_scope_and_reads_no_full() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::ClaudeCode;
+    let scratch = crate::test_scratch::ScratchDir::new("terminal-off-retry-scope");
+    let nested = scratch.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    let fixture = Fixture(nested.join("a1111111-1111-4111-8111-111111111111.jsonl"));
+    fixture.append(&usage(source, 100, 0, "fixture-model"));
+    let roots = vec![scratch.to_path_buf(), nested.clone()];
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let scan = OwnedSourceScan::new(
+        source,
+        &roots,
+        ScanIndex::default(),
+        NOW,
+        183,
+        10,
+        false,
+        None,
+        &[],
+        false,
+        false,
+    )
+    .with_sampled_acquisition(cache, Scope("terminal-off-overlap".into()));
+    let mut candidate = scan.identified_candidates.front().unwrap().clone();
+    // A retry-due/held-progress admission can select the first matching root,
+    // whereas ordinary directory discovery selects the deepest root.
+    candidate.scan_root = roots[0].clone();
+    let context = scan.sampling.as_ref().unwrap();
+    let scope = context.file_scope(source, &candidate, "", false, false, &scan.index);
+    let (retained, mode, _, _) = acquire_with(
+        &fixture,
+        source,
+        &CodexTitleMetadata::default(),
+        &scope,
+        None,
+        100,
+        true,
+    );
+    assert!(matches!(mode, ReadMode::Full(_)));
+    let mut index = scan.index.clone();
+    let key = local_index_key(&candidate.path);
+    index.claude_full_rearm_progress.terminal_off_admitted = vec![ScanTraversalPath {
+        scan_root: candidate.scan_root.clone(),
+        path: candidate.path.clone(),
+        census_member: false,
+        watcher_hint: true,
+    }];
+    index.traversal.as_mut().unwrap().pending_candidates.clear();
+    index.retain_terminal_off_held_retries(&BTreeSet::from([key]));
+    // Selected custody survives the real old decoder shape, not only RAM.
+    index = serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
+    let retry = index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .pending_candidates
+        .front()
+        .unwrap();
+    assert_eq!(retry.scan_root, roots[0]);
+    assert!(!retry.census_member);
+    assert!(retry.watcher_hint);
+    candidate.scan_root = retry.scan_root.clone();
+    let retry_scope = context.file_scope(source, &candidate, "", false, false, &scan.index);
+    assert_eq!(retry_scope, scope);
+    let (retained, retry_mode, _, _) = acquire_with(
+        &fixture,
+        source,
+        &CodexTitleMetadata::default(),
+        &retry_scope,
+        retained,
+        101,
+        true,
+    );
+    assert_eq!(
+        retry_mode,
+        ReadMode::Unchanged,
+        "zero Full/parse bytes on unchanged retry"
+    );
+    // Discriminator: the former deepest-root reconstruction really does
+    // invent an otherwise-unjustified native ScopeChanged Full.
+    candidate.scan_root = nested;
+    let wrong_scope = context.file_scope(source, &candidate, "", false, false, &scan.index);
+    let (_, wrong_mode, _, _) = acquire_with(
+        &fixture,
+        source,
+        &CodexTitleMetadata::default(),
+        &wrong_scope,
+        retained,
+        102,
+        true,
+    );
+    assert_eq!(
+        wrong_mode,
+        ReadMode::Full(crate::transcript_acquisition::FullReason::ScopeChanged)
+    );
+    assert!(index.accepted_snapshot_fingerprints.is_empty());
+}
