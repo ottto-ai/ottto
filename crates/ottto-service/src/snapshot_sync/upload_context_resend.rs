@@ -55,6 +55,10 @@ impl Cycle {
     pub(super) fn is_catchup(&self, entity: &str) -> bool {
         self.resends.get(entity) == Some(&true)
     }
+    #[cfg(test)]
+    pub(super) fn is_resend(&self, entity: &str) -> bool {
+        self.resends.contains_key(entity)
+    }
     pub(super) fn reserve_ordinary_bytes(&mut self, bytes: usize) {
         self.remaining_bytes = self.remaining_bytes.saturating_sub(bytes);
         // Selection admits at most one oversized logical unit. Its complete

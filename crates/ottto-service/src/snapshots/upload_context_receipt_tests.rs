@@ -151,6 +151,39 @@ impl Fixture {
         }
     }
 
+    fn send_ordering_page(&mut self, previous: &ScanIndex, scan: &SourceScanResult) -> (u64, u64) {
+        self.uploader.activate(
+            self.source,
+            self.index
+                .active_upload_context_fingerprint
+                .clone()
+                .unwrap(),
+            &mut self.index,
+        );
+        let before = (
+            self.uploader.received_item_bytes,
+            self.uploader.received_catchup_bytes,
+            self.uploader.received_resend_bytes,
+        );
+        let counts = self
+            .uploader
+            .send(self.source, &mut self.index, previous, &scan.snapshots)
+            .unwrap();
+        let catchup = self.uploader.received_catchup_bytes - before.1;
+        let ordinary = self.uploader.received_item_bytes - before.0 - catchup;
+        // These small ordering fixtures need no oversized wire/native exception.
+        assert!(
+            catchup
+                <= (crate::snapshot_sync::SNAPSHOT_BATCH_MAX_BYTES as u64).saturating_sub(ordinary)
+        );
+        assert_eq!(
+            self.uploader.counts().1,
+            self.uploader.received_resend_bytes - before.2,
+            "resend counter equals actual received item bytes, including changed revisions"
+        );
+        counts
+    }
+
     fn assert_quiet(&mut self) {
         // Freeze the ceiling before any quiet walk can enlarge the index.
         let settled_group_members = self
@@ -1409,13 +1442,7 @@ fn real_scan_ordinary_codex_group_precedes_context_group_under_read_cap() {
     let (scan, _) = f.walk(true);
     assert_eq!(scan.scanned_file_count, 4);
     f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
-    assert_eq!(
-        f.uploader
-            .send(f.source, &mut f.index, &previous, &scan.snapshots)
-            .unwrap()
-            .0,
-        4
-    );
+    assert_eq!(f.send_ordering_page(&previous, &scan).0, 4);
     let path = f.root.join("d.jsonl");
     let mut changed = fs::read_to_string(&path).unwrap();
     changed.push(' '); // physical growth forces the joined unit's ordinary read
@@ -1441,14 +1468,7 @@ fn real_scan_ordinary_codex_group_precedes_context_group_under_read_cap() {
         "changed group goes before lexically earlier context-only group"
     );
     assert_eq!(scan.scanned_file_count, 2);
-    f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
-    assert_eq!(
-        f.uploader
-            .send(f.source, &mut f.index, &previous, &scan.snapshots)
-            .unwrap()
-            .0,
-        2
-    );
+    assert_eq!(f.send_ordering_page(&previous, &scan).0, 2);
     f.cache = Arc::default();
     let previous = f.index.clone();
     let (scan, _) = f.walk(true);
@@ -1456,14 +1476,7 @@ fn real_scan_ordinary_codex_group_precedes_context_group_under_read_cap() {
         scan.scanned_file_count, 2,
         "deferred context group continues next pass"
     );
-    f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
-    assert_eq!(
-        f.uploader
-            .send(f.source, &mut f.index, &previous, &scan.snapshots)
-            .unwrap()
-            .0,
-        2
-    );
+    assert_eq!(f.send_ordering_page(&previous, &scan).0, 2);
     f.assert_quiet();
 }
 
@@ -1487,10 +1500,32 @@ fn ordinary_singleton_precedes_context_group(same_size_rewrite: bool) {
             vec!["a", "b", "c"]
         };
         for name in &names {
-            let original_name = if *name == "c" { "a" } else { name };
-            let body =
-                fs::read_to_string(root.join("sessions").join(format!("{original_name}.jsonl")))
-                    .unwrap();
+            let body = if *name == "c" {
+                // A genuine continuation after b's 300, never a copied candidate.
+                let mut rows = codex_file_join::tests::member(
+                    "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+                    "r-c",
+                    100,
+                    400,
+                );
+                let created = rows[0]["timestamp"].clone();
+                rows[0]["payload"]["timestamp"] = created.clone();
+                rows[1]["timestamp"] = json!("2026-10-01T10:03:01Z");
+                rows[1]["payload"]["turn_id"] = json!("turn-c");
+                rows.insert(
+                    1,
+                    json!({"type":"event_msg","timestamp":created,
+                        "payload":{"type":"task_started","turn_id":"turn-c"}}),
+                );
+                let finished = rows.last().unwrap()["timestamp"].clone();
+                rows.push(json!({"type":"event_msg","timestamp":finished,
+                    "payload":{"type":"task_complete","turn_id":"turn-c"}}));
+                rows.into_iter()
+                    .map(|row| format!("{row}\n"))
+                    .collect::<String>()
+            } else {
+                fs::read_to_string(root.join("sessions").join(format!("{name}.jsonl"))).unwrap()
+            };
             fs::write(
                 f.root.join(format!("{name}.jsonl")),
                 body.replace("2026-10-01", "2026-10-29"),
@@ -1502,10 +1537,7 @@ fn ordinary_singleton_precedes_context_group(same_size_rewrite: bool) {
         let (scan, _) = f.walk(true);
         f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
         assert_eq!(
-            f.uploader
-                .send(f.source, &mut f.index, &previous, &scan.snapshots)
-                .unwrap()
-                .0,
+            f.send_ordering_page(&previous, &scan).0,
             members + u64::from(same_size_rewrite)
         );
         let prior_modified =
@@ -1565,8 +1597,11 @@ fn ordinary_singleton_precedes_context_group(same_size_rewrite: bool) {
         assert_eq!(traversal.pending_candidates[1].path, singleton);
         f.cache = Arc::default();
         let previous = f.index.clone();
-        let ((scan, _), reads) =
-            terminal_contract_retry::source_acquisitions(|| f.walk_with_file_limit(true, 2));
+        let (((scan, native), reads), group_native) =
+            terminal_contract_retry::group_body_bytes(|| {
+                terminal_contract_retry::source_acquisitions(|| f.walk_with_file_limit(true, 2))
+            });
+        assert!(native + group_native <= sampled_scan::codex_cursor::Limits::current().singleton());
         assert_eq!(
             scan.scanned_file_count, 1,
             "ordinary singleton owns its slot"
@@ -1576,6 +1611,7 @@ fn ordinary_singleton_precedes_context_group(same_size_rewrite: bool) {
             BTreeMap::from([(singleton.clone(), 1)]),
             "context group stays unparsed"
         );
+        assert_eq!(group_native, 0);
         for name in &names {
             let key = local_index_key(&f.root.join(format!("{name}.jsonl")));
             assert!(
@@ -1591,26 +1627,32 @@ fn ordinary_singleton_precedes_context_group(same_size_rewrite: bool) {
                 .iter()
                 .any(|pending| local_index_key(&pending.path) == key));
         }
-        f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
         let first = f.uploader.posts.len();
-        assert_eq!(
-            f.uploader
-                .send(f.source, &mut f.index, &previous, &scan.snapshots)
-                .unwrap()
-                .0,
-            1
-        );
+        assert_eq!(f.send_ordering_page(&previous, &scan).0, 1);
         assert!(f.uploader.posts[first..]
             .iter()
             .flatten()
             .all(|item| item["source_session_id"] == SESSION));
         f.cache = Arc::default();
         let previous = f.index.clone();
-        let ((scan, _), reads) =
-            terminal_contract_retry::source_acquisitions(|| f.walk_with_file_limit(true, 2));
+        let (((scan, native), reads), group_native) =
+            terminal_contract_retry::group_body_bytes(|| {
+                terminal_contract_retry::source_acquisitions(|| f.walk_with_file_limit(true, 2))
+            });
+        assert!(native + group_native <= sampled_scan::codex_cursor::Limits::current().singleton());
         assert_eq!(
             scan.scanned_file_count as u64, members,
             "context group runs on its later page"
+        );
+        assert_eq!(
+            group_native,
+            names
+                .iter()
+                .map(|name| fs::metadata(f.root.join(format!("{name}.jsonl")))
+                    .unwrap()
+                    .len())
+                .sum::<u64>(),
+            "every context member is physically read once"
         );
         // A joined job constructs one SourceFileParser at its canonical live
         // member; the job's tier reader covers the physical aliases.
@@ -1619,14 +1661,7 @@ fn ordinary_singleton_precedes_context_group(same_size_rewrite: bool) {
             && names
                 .iter()
                 .any(|name| *path == f.root.join(format!("{name}.jsonl")))));
-        f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
-        assert_eq!(
-            f.uploader
-                .send(f.source, &mut f.index, &previous, &scan.snapshots)
-                .unwrap()
-                .0,
-            members
-        );
+        assert_eq!(f.send_ordering_page(&previous, &scan).0, members);
         for name in &names {
             let key = local_index_key(&f.root.join(format!("{name}.jsonl")));
             let receipt = f.index.files[&key]
@@ -1735,74 +1770,148 @@ fn real_scan_settled_alias_cannot_evict_an_ordinary_singleton_beside_ordinary_gr
                 _ => 3,
             },
         );
-    f.cache = Arc::default();
-    let previous = f.index.clone();
-    let ((scan, _), reads) =
-        terminal_contract_retry::source_acquisitions(|| f.walk_with_file_limit(true, 3));
-    assert_eq!(scan.scanned_file_count, 3);
-    assert_eq!(
-        reads,
-        // The settled group keeps its baseline metadata-witness slots; the
-        // other ordinary group waits. Those slots still cannot evict z.
-        BTreeMap::from([(singleton.clone(), 1)])
-    );
-    for name in ["c", "d"] {
-        let key = local_index_key(&f.root.join(format!("{name}.jsonl")));
-        let pending = f
-            .index
-            .traversal
-            .as_ref()
-            .unwrap()
-            .pending_candidates
-            .iter()
-            .find(|pending| local_index_key(&pending.path) == key)
-            .expect("the waiting ordinary group is still owed in traversal");
-        assert!(pending.census_member);
-        assert_eq!(
-            f.index.files[&key].source_file_fingerprint,
-            previous.files[&key].source_file_fingerprint
-        );
-        assert_eq!(
-            f.index.files[&key].last_upload_body_witness,
-            previous.files[&key].last_upload_body_witness
-        );
-        assert_eq!(
-            f.index.files[&key].upload_context_receipt, previous.files[&key].upload_context_receipt,
-            "deferred group receives no new receipt/credit on page one"
-        );
-    }
-    f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
-    let first = f.uploader.posts.len();
-    f.uploader
-        .send(f.source, &mut f.index, &previous, &scan.snapshots)
-        .unwrap();
-    assert!(!f.uploader.posts[first..].is_empty());
-    assert!(f.uploader.posts[first..]
+    let ordinary_group = [f.root.join("c.jsonl"), f.root.join("d.jsonl")];
+    let group_bytes = ordinary_group
         .iter()
-        .flatten()
-        .all(|item| item["source_session_id"] == SESSION));
-    let mut waiting_group_parsed = false;
-    for _ in 0..2 {
+        .map(|path| fs::metadata(path).unwrap().len())
+        .sum::<u64>();
+    let expected_modified = fs::metadata(&ordinary_group[1])
+        .unwrap()
+        .modified()
+        .unwrap();
+    let mut singleton_parses = 0;
+    let mut group_parses = 0;
+    let mut total_group_bytes = 0;
+    // Ordinary B and z may share a page or run on separate pages. Observe the
+    // bounded service window, not a filename/hash-dependent ordinary schedule.
+    for _ in 0..3 {
         f.cache = Arc::default();
         let previous = f.index.clone();
-        let ((scan, _), reads) =
-            terminal_contract_retry::source_acquisitions(|| f.walk_with_file_limit(true, 3));
-        waiting_group_parsed |= reads.iter().any(|(path, count)| {
-            *count == 1
-                && ["c", "d"]
-                    .iter()
-                    .any(|name| *path == f.root.join(format!("{name}.jsonl")))
-        });
-        f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
-        f.uploader
-            .send(f.source, &mut f.index, &previous, &scan.snapshots)
-            .unwrap();
-        if waiting_group_parsed {
-            break;
+        let (((scan, native), reads), physical_group_bytes) =
+            terminal_contract_retry::group_body_bytes(|| {
+                terminal_contract_retry::source_acquisitions(|| f.walk_with_file_limit(true, 3))
+            });
+        assert!(scan.scanned_file_count <= 3);
+        assert!(
+            native + physical_group_bytes
+                <= sampled_scan::codex_cursor::Limits::current().singleton()
+        );
+        assert!(
+            reads.iter().all(|(path, count)| {
+                *count == 1 && (path == &singleton || ordinary_group.contains(path))
+            }),
+            "settled a/b never acquire a body parser"
+        );
+        let representatives = reads
+            .iter()
+            .filter(|(path, _)| ordinary_group.contains(path))
+            .count();
+        assert!(representatives <= 1, "B uses one joined canonical parser");
+        let group_admitted = representatives == 1;
+        singleton_parses += reads.get(&singleton).copied().unwrap_or(0);
+        group_parses += representatives;
+        assert!(
+            singleton_parses <= 1 && group_parses <= 1,
+            "STOP for Lead A: an ordinary item was parsed twice without another change"
+        );
+        total_group_bytes += physical_group_bytes;
+        if group_admitted {
+            // All group-body I/O belongs to c/d, once each; a/b contribute none.
+            assert_eq!(physical_group_bytes, group_bytes);
+            let changed = &f.index.files[&local_index_key(&ordinary_group[1])];
+            assert_eq!(
+                changed.modified_unix_nanos,
+                expected_modified
+                    .duration_since(UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_nanos() as u64)
+            );
+            assert_ne!(
+                changed.source_file_fingerprint,
+                previous.files[&local_index_key(&ordinary_group[1])].source_file_fingerprint
+            );
+            assert!(changed.codex_joined_member_set.is_some());
+        } else {
+            assert_eq!(physical_group_bytes, 0, "no hidden settled-group body read");
+            if group_parses == 0 {
+                for path in &ordinary_group {
+                    let key = local_index_key(path);
+                    let pending = f
+                        .index
+                        .traversal
+                        .as_ref()
+                        .unwrap()
+                        .pending_candidates
+                        .iter()
+                        .find(|pending| local_index_key(&pending.path) == key)
+                        .expect("deferred ordinary group remains owed in traversal");
+                    assert!(pending.census_member);
+                    assert_eq!(
+                        f.index.files[&key].source_file_fingerprint,
+                        previous.files[&key].source_file_fingerprint
+                    );
+                    assert_eq!(
+                        f.index.files[&key].last_upload_body_witness,
+                        previous.files[&key].last_upload_body_witness
+                    );
+                    assert_eq!(
+                        f.index.files[&key].upload_context_receipt,
+                        previous.files[&key].upload_context_receipt,
+                        "deferred B receives no credit"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            f.index.context_read_counts.local_bytes, 0,
+            "this page has ordinary work and settled metadata, no context catch-up"
+        );
+        let first = f.uploader.posts.len();
+        f.send_ordering_page(&previous, &scan);
+        let posted = f.uploader.posts[first..]
+            .iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        assert!(posted
+            .iter()
+            .all(|item| item["source_session_id"] == SESSION
+                || item["source_session_id"] == "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee"));
+        if reads.contains_key(&singleton) {
+            assert!(posted
+                .iter()
+                .any(|item| item["source_session_id"] == SESSION));
+        }
+        let group_posted = posted
+            .iter()
+            .any(|item| item["source_session_id"] == "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee");
+        assert!(!group_posted || group_admitted, "unadmitted B cannot POST");
+        if group_posted {
+            for path in &ordinary_group {
+                let entry = &f.index.files[&local_index_key(path)];
+                let receipt = entry
+                    .upload_context_receipt
+                    .as_ref()
+                    .expect("normal accepted B response earns its receipt");
+                assert_eq!(receipt.context_fingerprint, "d".repeat(64));
+                assert_eq!(receipt.source_witness, entry.source_file_fingerprint);
+                assert_eq!(
+                    Some(&receipt.body_witness),
+                    entry.last_upload_body_witness.as_ref()
+                );
+            }
         }
     }
-    assert!(
-        waiting_group_parsed,
-        "waiting ordinary group is parsed within the next two pages"
+    assert_eq!(
+        singleton_parses, 1,
+        "ordinary z is served exactly once within three pages"
     );
+    assert_eq!(
+        group_parses, 1,
+        "ordinary B is served exactly once within three pages"
+    );
+    assert_eq!(
+        total_group_bytes, group_bytes,
+        "physical group body bytes are exactly one c/d replay, with no a/b read"
+    );
+    f.assert_quiet();
 }

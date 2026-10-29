@@ -329,6 +329,7 @@ pub(crate) struct Uploader {
     // Bytes observed at the receiving boundary, excluding the request envelope.
     pub received_item_bytes: u64,
     pub received_catchup_bytes: u64,
+    pub received_resend_bytes: u64,
     pub not_stored: bool,
     pub refuse: bool,
     pub fail_after: Option<usize>,
@@ -344,6 +345,7 @@ impl Uploader {
             posts: Vec::new(),
             received_item_bytes: 0,
             received_catchup_bytes: 0,
+            received_resend_bytes: 0,
             not_stored: false,
             refuse: false,
             fail_after: None,
@@ -401,9 +403,19 @@ impl Uploader {
             })
             .map(|item| item.snapshot_fingerprint.clone())
             .collect::<BTreeSet<_>>();
+        let resends = items
+            .iter()
+            .filter(|item| {
+                self.progress
+                    .context_resend
+                    .is_resend(&item.snapshot_fingerprint)
+            })
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect::<BTreeSet<_>>();
         let posts = &mut self.posts;
         let received_item_bytes = &mut self.received_item_bytes;
         let received_catchup_bytes = &mut self.received_catchup_bytes;
+        let received_resend_bytes = &mut self.received_resend_bytes;
         let fail_after = self.fail_after;
         let not_stored = self.not_stored;
         let refuse = self.refuse;
@@ -423,6 +435,9 @@ impl Uploader {
                     *received_item_bytes += bytes;
                     if catchup.contains(&item.snapshot_fingerprint) {
                         *received_catchup_bytes += bytes;
+                    }
+                    if resends.contains(&item.snapshot_fingerprint) {
+                        *received_resend_bytes += bytes;
                     }
                 }
                 posts.push(
