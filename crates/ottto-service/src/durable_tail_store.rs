@@ -10,8 +10,8 @@
 //! - Records are written only after a successful index save, stamped with
 //!   that save's committed generation, and only when their content changed
 //!   since the last durable write (dirty), at most `MAX_BATCH` per save.
-//! - Each write is temp file (0600, create-new), fsync, rename, then one
-//!   directory and parent fsync per record. A torn, truncated or flipped record fails its
+//! - Each write is a flushed temp file (0600, create-new), then rename, with
+//!   one directory and parent fsync per bounded batch/pass. A torn or flipped record fails its
 //!   SHA-256 trailer and is refused as `Corrupt`.
 //! - A record restores only under its own source, key, context and scope, and
 //!   only when its generation is at or below the loaded index's committed
@@ -45,7 +45,13 @@ use std::sync::{
 };
 
 pub(crate) mod active;
+mod stream;
 pub(crate) use active::{ActiveLease, ActiveOverBudget, LeaseWait, ACTIVE_BYTES};
+pub(crate) use stream::{
+    FailureDisposition, PassFlush, PendingCommit, PrepareStoreFailure, PreparedHeader,
+    PreparedRecord, ReceiptProof, RecordIdentity, ResolvePreparation, StreamCommit,
+    StreamPreparation, StreamResolution,
+};
 
 /// Envelope format. Bump on any envelope or certificate layout change.
 pub(crate) const FORMAT_V1: u16 = 1;
@@ -394,7 +400,7 @@ fn migration_binding(original: &Digest32, current: &Expected) -> Digest32 {
 /// Exact encoded candidate, including the original trailer (not a re-encoding
 /// of decoded fields, which may discard retired positional values).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct RecordIdentity {
+struct WireRecordIdentity {
     key: Digest32,
     allowlist: Digest32,
     format: u16,
@@ -402,7 +408,7 @@ struct RecordIdentity {
     encoded_len: u64,
     trailer: Digest32,
 }
-impl RecordIdentity {
+impl WireRecordIdentity {
     /// Only called with our encoded bytes or a fully verified decoded record.
     fn verified(record: &DurableRecord, bytes: &[u8]) -> Self {
         Self {
@@ -420,12 +426,12 @@ impl RecordIdentity {
 
 struct VerifiedRecord {
     record: Box<DurableRecord>,
-    identity: RecordIdentity,
+    identity: WireRecordIdentity,
 }
 #[derive(Clone, Copy)]
 struct PendingWrite {
     prior: Option<Stamp>,
-    candidate: RecordIdentity,
+    candidate: WireRecordIdentity,
     content: Digest32,
     completed: Option<Stamp>,
     failures: u8,
@@ -435,19 +441,19 @@ const _: () = assert!(std::mem::size_of::<(Digest32, PendingWrite)>() <= 320);
 
 /// Acquisition durability only; never accepted-money or replacement ACK credit.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct ReceiptProof {
-    identity: RecordIdentity,
+pub(crate) struct WireReceiptProof {
+    identity: WireRecordIdentity,
     stamp: Stamp,
     content: Digest32,
 }
-const _: () = assert!(std::mem::size_of::<ReceiptProof>() <= 256);
+const _: () = assert!(std::mem::size_of::<WireReceiptProof>() <= 256);
 /// Verified absence (including ordinary retirement), after directory sync.
 pub(crate) struct RetirementProof {
-    candidate: RecordIdentity,
+    candidate: WireRecordIdentity,
 }
 pub(crate) enum ReconcileOutcome {
     NoPending,
-    Receipted(ReceiptProof),
+    Receipted(WireReceiptProof),
     Retired(RetirementProof),
 }
 
@@ -556,6 +562,12 @@ pub(crate) struct StoreCounters {
     /// A write failed and neither the explicit nor fallback temp cleanup
     /// established absence. Separate from integrity and receipt mismatch.
     pub(crate) store_write_cleanup_failed: u64,
+    pub(crate) store_faults: u64,
+    pub(crate) stale_record_refused: u64,
+    pub(crate) resource_paused_seconds: u64,
+    pub(crate) resource_pause_checks: u64,
+    pub(crate) resource_pause_skipped: u64,
+    pub(crate) native_flushes: u64,
     /// Owned temps verified absent after directory sync, counted once.
     pub(crate) temp_discard_verified: u64,
     /// Failed explicit/fallback temp cleanup attempts, per pass.
@@ -613,7 +625,7 @@ pub(crate) struct BatchReceipt {
     /// Fixed allocation; no acknowledgement escapes a failed directory sync.
     committed: Option<Box<BatchAcks>>,
     /// Actual exact completions only; ordinary clean retries carry none.
-    pub(crate) completed: Vec<ReceiptProof>,
+    pub(crate) completed: Vec<WireReceiptProof>,
 }
 
 /// One store directory. The in-RAM map of last durable content digests
@@ -634,6 +646,11 @@ pub(crate) struct DurableTailStore {
     startup_synced: bool,
     gc_after: Option<Digest32>,
     pending: BTreeMap<Digest32, PendingWrite>,
+    resource_pause: Option<stream::ResourcePause>,
+    stream_dirty: Arc<AtomicU64>,
+    stream_flush_taken: bool,
+    resource_checked: bool,
+    resource_granted: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -674,11 +691,19 @@ impl DurableTailStore {
             startup_synced: false,
             gc_after: None,
             pending: BTreeMap::new(),
+            resource_pause: None,
+            stream_dirty: Arc::default(),
+            stream_flush_taken: false,
+            resource_checked: false,
+            resource_granted: false,
         }
     }
 
     /// A new pass: the directory is checked again and the T14 breaker resets.
     pub(crate) fn begin_pass(&mut self) {
+        self.stream_flush_taken = false;
+        self.resource_checked = false;
+        self.resource_granted = false;
         self.checked = false;
         for (_, _, allowed) in self.durable.values_mut() {
             *allowed = false;
@@ -768,6 +793,12 @@ impl DurableTailStore {
     pub(crate) fn counters(&self) -> StoreCounters {
         StoreCounters {
             receipt_pending_records: self.pending.len() as u64,
+            resource_paused_seconds: self.counters.resource_paused_seconds.saturating_add(
+                self.resource_pause
+                    .as_ref()
+                    .and_then(|p| std::time::SystemTime::now().duration_since(p.since).ok())
+                    .map_or(0, |age| age.as_secs()),
+            ),
             temp_discard_verified: self.cleanup.verified.load(Ordering::Relaxed),
             temp_discard_failed: self.cleanup.failed.load(Ordering::Relaxed),
             temp_drop_fallback: self.cleanup.fallback.load(Ordering::Relaxed),
@@ -1078,7 +1109,7 @@ impl DurableTailStore {
                 if let Some((content, _, _)) = self.durable.get_mut(key) {
                     *content = Some(stored_digest(&bytes));
                 }
-                let identity = RecordIdentity::verified(&record, &bytes);
+                let identity = WireRecordIdentity::verified(&record, &bytes);
                 Ok(Some(VerifiedRecord {
                     record: Box::new(record),
                     identity,
@@ -1101,7 +1132,7 @@ impl DurableTailStore {
 
     /// Retain a real reconciliation completion in the existing bounded owner.
     /// It remains available until a successful batch delivers the exact proof.
-    pub(crate) fn retain_receipt(&mut self, proof: ReceiptProof) -> io::Result<()> {
+    pub(crate) fn retain_receipt(&mut self, proof: WireReceiptProof) -> io::Result<()> {
         if stamp_at(&self.record_path(&proof.identity.key))? != Some(proof.stamp) {
             return Err(io::Error::other("completion changed"));
         }
@@ -1201,7 +1232,7 @@ impl DurableTailStore {
         let before = stamp_at(&path)?;
         if let Some(stamp) = completed {
             return if before == Some(stamp) {
-                Ok(ReconcileOutcome::Receipted(ReceiptProof {
+                Ok(ReconcileOutcome::Receipted(WireReceiptProof {
                     identity: candidate,
                     stamp,
                     content,
@@ -1250,7 +1281,7 @@ impl DurableTailStore {
             // unresolved outcomes must never regrant a failed T14 rebuild.
             self.rebuilt.remove(key);
             self.counters.receipt_reconciled += 1;
-            Ok(ReconcileOutcome::Receipted(ReceiptProof {
+            Ok(ReconcileOutcome::Receipted(WireReceiptProof {
                 identity: candidate,
                 stamp: after.expect("verified survivor"),
                 content,
@@ -1460,7 +1491,7 @@ impl DurableTailStore {
     /// that save's committed generation and only entries that save kept.
     /// Clean records (same content as the last durable write) are skipped;
     /// at most `MAX_BATCH` dirty records are written, the rest are deferred.
-    /// Each record syncs the store and parent; ambiguous outcomes stay pending.
+    /// The bounded batch syncs the store and parent once; ambiguous outcomes stay pending.
     pub(crate) fn write_after_save<W: SingleWriter>(
         &mut self,
         writer: &W,
@@ -1498,6 +1529,13 @@ impl DurableTailStore {
         let mut receipt = BatchReceipt::default();
         let mut dirty = Vec::new();
         if !self.usable(Some(writer)) {
+            return Ok(receipt);
+        }
+        if !self.check_resources(writer, index_length) {
+            receipt
+                .deferred_keys
+                .extend(pending.iter().map(|record| record.binding.key));
+            receipt.deferred = receipt.deferred_keys.len();
             return Ok(receipt);
         }
         // The caller's bodies stay live for the whole batch.
@@ -1576,7 +1614,7 @@ impl DurableTailStore {
                 }
                 receipt.written += 1;
                 receipt.bytes_written += candidate.encoded_len;
-                receipt.completed.push(ReceiptProof {
+                receipt.completed.push(WireReceiptProof {
                     identity: candidate,
                     stamp,
                     content: completed_content,
@@ -1685,7 +1723,7 @@ impl DurableTailStore {
                     .get_or_insert_with(|| Box::new([None; MAX_BATCH]));
             }
             attempted += 1;
-            let candidate = RecordIdentity::verified(&stored, &bytes);
+            let candidate = WireRecordIdentity::verified(&stored, &bytes);
             self.pending.insert(
                 key,
                 PendingWrite {
@@ -1705,11 +1743,10 @@ impl DurableTailStore {
                 Arc::clone(&self.cleanup),
             )
             .and_then(|stamp| {
-                self.sync_store()?;
                 if stamp_at(&path)? != Some(stamp) {
                     return Err(io::Error::other("committed survivor changed"));
                 }
-                Ok(ReconcileOutcome::Receipted(ReceiptProof {
+                Ok(ReconcileOutcome::Receipted(WireReceiptProof {
                     identity: candidate,
                     stamp,
                     content,
@@ -1717,6 +1754,16 @@ impl DurableTailStore {
             });
             if attempt.as_ref().is_err_and(write_cleanup_failed) {
                 self.counters.store_write_cleanup_failed += 1;
+            }
+            if attempt.as_ref().is_err_and(stream::no_space) {
+                // A capacity failure never authorizes predecessor retirement.
+                // Drop only failed RAM authority and let the native owner retain
+                // its key hold; the next successful write may replace A.
+                self.pause_resources();
+                self.pending.remove(&key);
+                receipt.deferred += 1;
+                receipt.deferred_keys.push(key);
+                continue;
             }
             let outcome = attempt.or_else(|_| self.reconcile_pending(writer, &key));
             let proof = match outcome {
@@ -1736,7 +1783,7 @@ impl DurableTailStore {
             let encoded_len = proof.identity.encoded_len;
             self.retain_receipt(proof)?;
             let pending = self.pending.get(&key).expect("retained completion");
-            receipt.completed.push(ReceiptProof {
+            receipt.completed.push(WireReceiptProof {
                 identity: pending.candidate,
                 stamp: pending.completed.expect("completed stamp"),
                 content: pending.content,
@@ -1750,6 +1797,11 @@ impl DurableTailStore {
         self.counters.records_deferred += receipt.deferred as u64;
         self.counters.budget_refused += receipt.budget_refused as u64;
         self.set_disk_level(&on_disk, unlisted);
+        if !receipt.completed.is_empty() {
+            // One flush for the whole bounded batch. Receipt delivery follows
+            // this boundary; there is no file/directory fsync per record.
+            self.sync_store()?;
+        }
         self.finish_batch(receipt)
     }
 
@@ -2556,7 +2608,7 @@ fn write_atomic<W: SingleWriter>(
     };
     let result = (|| {
         attempt.temp.write_all(bytes)?;
-        attempt.temp.sync()?;
+        attempt.temp.flush()?;
         attempt.temp.commit(path, prior)
     })();
     if let Err(write) = result {
@@ -2634,53 +2686,82 @@ fn encode(record: &DurableRecord) -> Vec<u8> {
 
 /// Everything before the body, ending with the body length: exactly
 /// the selected representation header length.
+struct HeaderParts<'a> {
+    binding: &'a Binding,
+    certificate: &'a DurableCertificate,
+    allowlist: &'a Digest32,
+    acquisition: Option<AcquisitionFields>,
+    format: u16,
+    generation: u64,
+    body_len: usize,
+}
 fn encode_header(out: &mut Vec<u8>, record: &PendingRecord, format: u16, generation: u64) {
-    let binding = &record.binding;
-    let certificate = &record.certificate;
-    out.extend_from_slice(&MAGIC);
-    out.extend_from_slice(&format.to_le_bytes());
-    out.extend_from_slice(&record.allowlist);
-    out.push(binding.source.tag());
+    write_header(
+        out,
+        HeaderParts {
+            binding: &record.binding,
+            certificate: &record.certificate,
+            allowlist: &record.allowlist,
+            acquisition: record.acquisition,
+            format,
+            generation,
+            body_len: record.body.len(),
+        },
+    )
+    .expect("Vec header write");
+}
+fn write_header(out: &mut dyn Write, fields: HeaderParts<'_>) -> io::Result<()> {
+    let HeaderParts {
+        binding,
+        certificate,
+        allowlist,
+        acquisition,
+        format,
+        generation,
+        body_len,
+    } = fields;
+    out.write_all(&MAGIC)?;
+    out.write_all(&format.to_le_bytes())?;
+    out.write_all(allowlist)?;
+    out.write_all(&[binding.source.tag()])?;
     for part in [
         &binding.key,
         &binding.context,
         &binding.scope,
         &binding.entry,
     ] {
-        out.extend_from_slice(part);
+        out.write_all(part)?;
     }
-    out.extend_from_slice(&generation.to_le_bytes());
+    out.write_all(&generation.to_le_bytes())?;
     if format == FORMAT_V3 {
-        let acquisition = record
-            .acquisition
-            .expect("v3 requires captured acquisition provenance");
-        out.extend_from_slice(&acquisition.acquired_revision.to_le_bytes());
-        out.push(match acquisition.protocol {
+        let acquisition = acquisition.expect("v3 requires captured acquisition provenance");
+        out.write_all(&acquisition.acquired_revision.to_le_bytes())?;
+        out.write_all(&[match acquisition.protocol {
             crate::snapshots::AcquisitionProtocol::Legacy => 0,
             crate::snapshots::AcquisitionProtocol::WriteAhead => 1,
-        });
+        }])?;
     }
     for value in [certificate.device, certificate.inode, certificate.length] {
-        out.extend_from_slice(&value.to_le_bytes());
+        out.write_all(&value.to_le_bytes())?;
     }
-    out.extend_from_slice(&certificate.modified.0.to_le_bytes());
-    out.extend_from_slice(&certificate.modified.1.to_le_bytes());
-    out.extend_from_slice(&certificate.birth_nanos.to_le_bytes());
-    out.extend_from_slice(&certificate.sealed_offset.to_le_bytes());
-    out.extend_from_slice(&certificate.sample_len.to_le_bytes());
-    out.extend_from_slice(&certificate.head_sha256);
-    out.extend_from_slice(&certificate.boundary_sha256);
-    out.extend_from_slice(&certificate.verified_unix_seconds.to_le_bytes());
-    out.push(u8::from(certificate.audit_debt_unix_seconds.is_some()));
-    out.extend_from_slice(
+    out.write_all(&certificate.modified.0.to_le_bytes())?;
+    out.write_all(&certificate.modified.1.to_le_bytes())?;
+    out.write_all(&certificate.birth_nanos.to_le_bytes())?;
+    out.write_all(&certificate.sealed_offset.to_le_bytes())?;
+    out.write_all(&certificate.sample_len.to_le_bytes())?;
+    out.write_all(&certificate.head_sha256)?;
+    out.write_all(&certificate.boundary_sha256)?;
+    out.write_all(&certificate.verified_unix_seconds.to_le_bytes())?;
+    out.write_all(&[u8::from(certificate.audit_debt_unix_seconds.is_some())])?;
+    out.write_all(
         &certificate
             .audit_debt_unix_seconds
             .unwrap_or(0)
             .to_le_bytes(),
-    );
-    out.extend_from_slice(&(record.body.len() as u32).to_le_bytes());
+    )?;
+    out.write_all(&(body_len as u32).to_le_bytes())?;
+    Ok(())
 }
-
 struct Cursor<'a>(&'a [u8]);
 impl<'a> Cursor<'a> {
     fn take(&mut self, n: usize) -> Option<&'a [u8]> {
