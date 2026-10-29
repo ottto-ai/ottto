@@ -41,6 +41,18 @@ impl Restarted {
     fn counts(&self) -> Counters {
         self.cache.durable_counters(SOURCE).unwrap().0
     }
+
+    /// A new process over the same store and committed index.
+    fn restart(self) -> Self {
+        let cache = SharedCache::default();
+        cache.durable_begin_pass(
+            SOURCE,
+            &self.root.join("index.json"),
+            &self.namespace,
+            false,
+        );
+        Self { cache, ..self }
+    }
 }
 
 /// A new process over a store whose record for `key` was written for
@@ -164,6 +176,7 @@ fn fault_free_restart_leaves_the_counters_at_zero() {
         assert_eq!(counts.store_write_failed_restart_full, [0, 0], "{name}");
         assert_eq!(counts.store_write_after_save_failed, 0, "{name}");
         let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
+            run.cache.durable_alarm_at(SOURCE, Instant::now());
             run.cache
                 .durable_alarm_at(SOURCE, Instant::now() + 3 * RESTART_FULL_ALARM_WINDOW)
         });
@@ -177,44 +190,69 @@ fn fault_free_restart_leaves_the_counters_at_zero() {
     }
 }
 
-/// The alarm fires once after `files > 0` has persisted more than 24 h, not
-/// before, then at most once per further 24 h window.
+/// The alarm fires on this process's first refused-predecessor Full, with no
+/// wait; a second one in the same process counts but does not alarm again
+/// within 24 h; a new process alarms again on its own first occurrence.
 #[test]
-fn restart_full_alarm_fires_once_per_window_after_24_hours() {
+fn restart_full_alarm_fires_on_the_first_file_once_per_process() {
     let run = restart_over("ottto-dt-restart-alarm", Some(true));
     let t0 = Instant::now();
-    let alarms_at = |at: Instant| {
+    let second = Duration::from_secs(1);
+    let window = RESTART_FULL_ALARM_WINDOW;
+    let alarms_at = |cache: &SharedCache, at: Instant| {
         let ((), lines) =
-            crate::local_resource_diagnostics::capture(|| run.cache.durable_alarm_at(SOURCE, at));
+            crate::local_resource_diagnostics::capture(|| cache.durable_alarm_at(SOURCE, at));
         lines
             .into_iter()
             .filter(|line| line["stage"] == "durable_tail_restart_full_alarm")
             .collect::<Vec<_>>()
     };
-    // Nothing to report yet: the clock does not start.
-    assert!(alarms_at(t0).is_empty());
-    assert_eq!(run.restore_label(), "ineligible.entry_changed");
-    run.cache
-        .durable_acquisition_completed(&run.key, ReadMode::Full(FullReason::StateMissing), 64);
-    let window = RESTART_FULL_ALARM_WINDOW;
-    let second = Duration::from_secs(1);
-    assert!(alarms_at(t0).is_empty(), "first count starts the clock");
-    assert!(
-        alarms_at(t0 + window).is_empty(),
-        "24 h is not more than 24 h"
-    );
-    let fired = alarms_at(t0 + window + second);
-    assert_eq!(fired.len(), 1);
+    let refused_full = |run: &Restarted, bytes: u64| {
+        assert_eq!(run.restore_label(), "ineligible.entry_changed");
+        run.cache.durable_acquisition_completed(
+            &run.key,
+            ReadMode::Full(FullReason::StateMissing),
+            bytes,
+        );
+    };
+    assert!(alarms_at(&run.cache, t0).is_empty(), "nothing counted yet");
+    refused_full(&run, 64);
+    assert_eq!(run.counts().store_write_failed_restart_full, [1, 64]);
+    let fired = alarms_at(&run.cache, t0);
+    assert_eq!(fired.len(), 1, "first file alarms with no 24 h wait");
     assert_eq!(fired[0]["source"], SOURCE.api_slug());
     assert_eq!(
         fired[0]["counts"]["store_write_failed_restart_full"],
         serde_json::json!([1, 64])
     );
     assert_eq!(fired[0]["counts"]["store_write_after_save_failed"], 0);
-    assert_eq!(fired[0]["counts"]["pending_seconds"], window.as_secs() + 1);
-    assert!(alarms_at(t0 + window + 2 * second).is_empty());
-    assert!(alarms_at(t0 + 2 * window).is_empty(), "same window");
-    assert_eq!(alarms_at(t0 + 2 * window + second).len(), 1, "next window");
+    assert!(fired[0]["counts"].get("pending_seconds").is_none());
+    assert!(alarms_at(&run.cache, t0 + second).is_empty(), "once");
+    // A second occurrence in the same process: counted, not alarmed again.
+    refused_full(&run, 80);
+    assert_eq!(run.counts().store_write_failed_restart_full, [2, 144]);
+    assert!(alarms_at(&run.cache, t0 + 2 * second).is_empty());
+    assert!(alarms_at(&run.cache, t0 + window - second).is_empty());
+    assert_eq!(
+        alarms_at(&run.cache, t0 + window).len(),
+        1,
+        "a process running 24 h later may alarm again"
+    );
+    // A new process over the same stale predecessor alarms on its own first.
+    let run = run.restart();
+    assert_eq!(run.counts().store_write_failed_restart_full, [0, 0]);
+    assert!(
+        alarms_at(&run.cache, t0).is_empty(),
+        "new process, nothing yet"
+    );
+    refused_full(&run, 64);
+    assert_eq!(run.counts().store_write_failed_restart_full, [1, 64]);
+    let fired = alarms_at(&run.cache, t0);
+    assert_eq!(fired.len(), 1, "restart re-arms the alarm");
+    assert_eq!(
+        fired[0]["counts"]["store_write_failed_restart_full"],
+        serde_json::json!([1, 64])
+    );
     let _ = std::fs::remove_dir_all(&run.root);
 }
 

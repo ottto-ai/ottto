@@ -89,10 +89,11 @@ pub(crate) struct Counters {
     /// Records offered to a post-save batch that returned an error. The
     /// store keeps each one's predecessor until a later write replaces it.
     pub(crate) store_write_after_save_failed: u64,
-    /// [files, bytes]: Fulls whose restore refused the record as behind the
-    /// committed entry (`entry_changed`), and the native bytes those Fulls
-    /// read. The closest existing refusal to a predecessor left by a failed
-    /// write; it also counts a record never offered (deferred or evicted).
+    /// [files, bytes], an UPPER BOUND: Fulls whose restore refused the
+    /// record as behind the committed entry (`entry_changed`), and the native
+    /// bytes those Fulls read. It reuses that refusal with no persisted
+    /// marker of a failed write, so it also counts a record never offered
+    /// (deferred or evicted).
     pub(crate) store_write_failed_restart_full: [u64; 2],
 }
 
@@ -160,8 +161,7 @@ impl Counters {
     }
 }
 
-/// How long `store_write_failed_restart_full.files > 0` must persist before
-/// its alarm, and the spacing between alarms.
+/// The least spacing between two restart-Full alarms in one process.
 pub(crate) const RESTART_FULL_ALARM_WINDOW: std::time::Duration =
     std::time::Duration::from_secs(24 * 60 * 60);
 
@@ -195,9 +195,7 @@ pub(crate) struct Stores {
     /// Keys whose restore refused the record as `entry_changed`, until their
     /// next acquisition completes. Process-local, never persisted.
     stale_predecessor: BTreeSet<String>,
-    /// When `store_write_failed_restart_full` first counted a file in this
-    /// process, and when its alarm last fired.
-    restart_full_since: Option<std::time::Instant>,
+    /// When this process last emitted the restart-Full alarm.
     restart_full_alarmed: Option<std::time::Instant>,
     counters: Counters,
 }
@@ -1340,17 +1338,16 @@ impl SharedCache {
         }
     }
 
-    /// One alarm per `RESTART_FULL_ALARM_WINDOW` once
-    /// `store_write_failed_restart_full.files > 0` has persisted longer than
-    /// it: the pending-since and once-per-24 h throttle of the accepted
-    /// rebuild alarm (`load_containment.rs`), kept process-local here so no
-    /// persisted field is added. Counts only; the line is process-wide.
+    /// One alarm at this process's first `store_write_failed_restart_full`
+    /// file, then at most one per `RESTART_FULL_ALARM_WINDOW`: the once-per-
+    /// 24 h throttle of the accepted rebuild alarm (`load_containment.rs`),
+    /// kept process-local so no persisted field is added. The counter on the
+    /// `durable_tail` line stays the persistent signal. Counts only.
     fn durable_restart_full_alarm(&self, snapshot_source: SnapshotSource, at: std::time::Instant) {
         #[derive(serde::Serialize)]
         struct Alarm {
             store_write_failed_restart_full: [u64; 2],
             store_write_after_save_failed: u64,
-            pending_seconds: u64,
         }
         let Some(mut stores) = self.durable() else {
             return;
@@ -1358,20 +1355,16 @@ impl SharedCache {
         if stores.counters.store_write_failed_restart_full[0] == 0 {
             return;
         }
-        let since = *stores.restart_full_since.get_or_insert(at);
-        let pending = at.saturating_duration_since(since);
-        let due = pending > RESTART_FULL_ALARM_WINDOW
-            && stores.restart_full_alarmed.map_or(true, |last| {
-                at.saturating_duration_since(last) >= RESTART_FULL_ALARM_WINDOW
-            });
-        if !due {
+        if stores
+            .restart_full_alarmed
+            .is_some_and(|last| at.saturating_duration_since(last) < RESTART_FULL_ALARM_WINDOW)
+        {
             return;
         }
         stores.restart_full_alarmed = Some(at);
         let alarm = Alarm {
             store_write_failed_restart_full: stores.counters.store_write_failed_restart_full,
             store_write_after_save_failed: stores.counters.store_write_after_save_failed,
-            pending_seconds: pending.as_secs(),
         };
         drop(stores);
         crate::local_resource_diagnostics::durable_tail_restart_full_alarm(
