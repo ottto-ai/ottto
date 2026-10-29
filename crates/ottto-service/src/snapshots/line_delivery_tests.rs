@@ -2774,14 +2774,23 @@ fn withheld_removed_project_releases_account_and_audit_debt() {
     for hinted in [false, true] {
         let root = Root::new("ld-removed-project-held");
         let project = root.projects().join("project");
-        let parent = project.join("session/subagents");
+        // A normal Claude root session under projects/<p>. An arbitrary
+        // session/subagents/<uuid> path is not a valid subagent identity.
+        let parent = project.clone();
         fs::create_dir_all(&parent).unwrap();
         let path = parent.join(format!("{SESSION}.jsonl"));
         let key = local_index_key(&path);
         append(&path, &assistant_line("u1"));
-        let (previous, _, _) = finish(new_scan(&root.projects(), ScanIndex::default()));
+        let (previous, initial, _) = finish(new_scan(&root.projects(), ScanIndex::default()));
+        assert_eq!(initial.scanned_file_count, 1);
+        assert!(previous.files.contains_key(&key));
         append(&path, &assistant_line("u2"));
         let (mut parsed, scan, _) = finish(new_scan(&root.projects(), previous.clone()));
+        assert_eq!(scan.scanned_file_count, 1);
+        assert!(
+            !scan.snapshots.is_empty(),
+            "growth produces an account-held body"
+        );
         // `finish` normally simulates accepted upload for reader tests. This
         // page instead enters account classification BEFORE upload, so only
         // the baseline's real ACKs exist at this production seam.
