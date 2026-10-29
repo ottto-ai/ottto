@@ -33,3 +33,23 @@ Validation: changed-file formatting and diff checks; package-scoped macOS clippy
 with all targets, locked dependencies and warnings denied. No local tests or
 macOS/money workflow dispatches are part of this repair. Native runtime
 qualification remains with the PR owner.
+
+The follow-up sibling audit searched the complete Rust tree for durable-pass
+setup, restore, post-save writes and pinned-v1 serializers. Two more recovery
+fixtures had the same Codex capture mismatch:
+`missing_index_debt_carrier_recovers_by_full_in_one_pass_for_both_sources` and
+`missing_index_terminal_loss_carries_recovered_debt_until_verified_full_for_both_sources`.
+Their original assertions ended at quiet restart or envelope inspection, which
+never proved that the replacement could restore. Both now bind capture to the
+scanner and append after restart, requiring exactly one disk restore, Tail
+without Full, and body equality with a cold Full for each source. Existing
+Full/debt/GC/idle checks remain unchanged.
+
+Checked sibling restart, inventory-overflow, parent-ledger, MCP-version,
+sidecar-reduction and E2-pipeline fixtures already align capture. No-record,
+foreign-context, opaque-hold and grouped-debt fixtures deliberately avoid
+compatible retained-record restoration. Pinned-v1 failed-rewrite tests use a
+fresh store without a read-populated content memo; store dirty-batch and
+read-memo tests already distinguish unchanged records from real debt changes.
+No additional clean-record write assumption was found. Production's shared
+capture flag and all persisted/runtime contracts remain unchanged.
