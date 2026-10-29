@@ -32375,6 +32375,12 @@ impl OwnedSourceScan {
                         &active.candidate,
                         index,
                         mode,
+                        active
+                            .parser
+                            .reader
+                            .acquisition
+                            .as_ref()
+                            .map_or(active.candidate.size_bytes, |plan| plan.frozen_length()),
                     );
                 }
             }

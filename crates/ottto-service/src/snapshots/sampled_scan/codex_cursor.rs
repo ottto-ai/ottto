@@ -4568,6 +4568,7 @@ impl SharedCache {
         candidate: &CandidateFile,
         index: &ScanIndex,
         mode: crate::transcript_acquisition::ReadMode,
+        frozen_bytes: u64,
     ) {
         let key = local_index_key(&candidate.path);
         let bytes = self
@@ -4583,7 +4584,7 @@ impl SharedCache {
         if first {
             crate::local_resource_diagnostics::custody_group_recovery("first_read", bytes);
         } else if matches!(mode, crate::transcript_acquisition::ReadMode::Full(_)) {
-            crate::local_resource_diagnostics::custody_group_restart_full(candidate.size_bytes);
+            crate::local_resource_diagnostics::custody_group_restart_full(frozen_bytes);
         } else {
             crate::local_resource_diagnostics::custody_group_recovery("tail", bytes);
         }

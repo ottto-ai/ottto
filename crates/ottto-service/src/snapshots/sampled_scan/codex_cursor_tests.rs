@@ -14542,7 +14542,13 @@ fn custody_recovery_classifies_actual_first_read_and_named_non_reusable_full() {
                 crate::transcript_acquisition::ReadMode::Full(_)
             ));
             let (_, rows) = crate::local_resource_diagnostics::capture(|| {
-                cache.cursor_custody_recovery(&namespace, &candidate, &index, mode);
+                cache.cursor_custody_recovery(
+                    &namespace,
+                    &candidate,
+                    &index,
+                    mode,
+                    candidate.size_bytes,
+                );
                 while !parser.step().unwrap() {}
             });
             if prior {
@@ -14584,7 +14590,13 @@ fn custody_recovery_classifies_actual_first_read_and_named_non_reusable_full() {
             for _ in 0..5 {
                 let (_, rows) = crate::local_resource_diagnostics::capture(|| {
                     assert!(!cache.cursor_end_custody(&namespace, &index, None));
-                    cache.cursor_custody_recovery(&namespace, &candidate, &index, mode);
+                    cache.cursor_custody_recovery(
+                        &namespace,
+                        &candidate,
+                        &index,
+                        mode,
+                        candidate.size_bytes,
+                    );
                 });
                 assert!(rows.is_empty(), "receipt consumed once");
             }
