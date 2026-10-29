@@ -340,3 +340,134 @@ fn terminal_admission_counts_sparse_sidecar_metadata_without_decoding() {
     assert!(deferred.est_bytes > CLAUDE_TERMINAL_MAX_EST_DECODED_BYTES);
     let _ = fs::remove_dir_all(support);
 }
+
+#[test]
+#[cfg(unix)]
+fn scoped_debt_dispatch_uses_resolved_configured_root() {
+    let (root, _, _) = claude_account_family_fixture();
+    let alias = root.with_extension("configured-link");
+    std::os::unix::fs::symlink(&root, &alias).unwrap();
+    let canonical = fs::canonicalize(&root).unwrap();
+    let key = local_index_key(&canonical.join("1338a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl"));
+    let mut index = ScanIndex::default();
+    let mut entry = manifest_index_entry(Some("prior-body"));
+    let mut debt: ClaudeScopedRearmDebt = entry.source_file_fingerprint.clone().into();
+    debt.armed = true;
+    entry.source_file_fingerprint.clear();
+    index.files.insert(key.clone(), entry);
+    index
+        .claude_full_rearm_progress
+        .scoped_rearm_pending
+        .insert(key, debt);
+    let scan = scan_source_roots_with_test_limit(
+        SnapshotSource::ClaudeCode,
+        std::slice::from_ref(&alias),
+        &mut index,
+        "2026-08-02T07:20:00Z",
+        BACKFILL_WINDOW_DAYS,
+        100,
+        true,
+    )
+    .unwrap();
+    assert!(index
+        .claude_full_rearm_progress
+        .scoped_rearm_pending
+        .is_empty());
+    assert!(
+        scan.census_complete,
+        "a configured symlink cannot strand armed debt"
+    );
+    let _ = fs::remove_file(alias);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn selected_checkpoint_recovers_only_uncommitted_scoped_clears() {
+    let key = "/opaque/family.jsonl".to_owned();
+    let mut previous = ScanIndex::default();
+    previous
+        .files
+        .insert(key.clone(), manifest_index_entry(Some("prior")));
+    let expected = previous.files[&key].source_file_fingerprint.clone();
+    let mut working = previous.clone();
+    working
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .last_snapshot_fingerprint = Some("corrected".into());
+    working
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .last_upload_body_witness = Some("corrected-body".into());
+    working
+        .claude_full_rearm_progress
+        .scoped_rearm_cleared
+        .insert(key.clone(), expected);
+    let accepted = BTreeSet::from(["corrected".to_owned()]);
+    let selected = working.committable_subset_with_local_holds(
+        &previous,
+        &accepted,
+        &BTreeMap::new(),
+        &BTreeSet::new(),
+    );
+    assert!(
+        selected
+            .claude_full_rearm_progress
+            .scoped_rearm_pending
+            .is_empty(),
+        "an accepted correction must not be cleared again on partial save"
+    );
+    let held = BTreeSet::from(["corrected".to_owned()]);
+    let restored =
+        working.committable_subset_with_local_holds(&previous, &accepted, &BTreeMap::new(), &held);
+    assert_eq!(
+        restored.files[&key].last_snapshot_fingerprint.as_deref(),
+        Some("prior")
+    );
+    assert!(
+        !restored.claude_full_rearm_progress.scoped_rearm_pending[&key].armed,
+        "a restored prior revision retains its owed, uncommitted clear"
+    );
+}
+
+#[test]
+fn owned_start_proof_corrections_share_the_scoped_allowance() {
+    let mut index = ScanIndex::default();
+    for n in 0..40 {
+        let root = format!("owned-{n:03}");
+        index.files.insert(
+            format!("/opaque/{root}.jsonl"),
+            manifest_index_entry(Some("prior")),
+        );
+        index.claude_owned_start_census.insert(
+            root,
+            ClaudeOwnedStartCensusWitness {
+                marker_source_file_fingerprint: "marker".into(),
+                verified_source_file_fingerprint: Some("verified".into()),
+                emitted_source_file_fingerprint: None,
+            },
+        );
+    }
+    apply_claude_reported_usage_with_index_and_limits(
+        &mut [],
+        &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+        &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+        &mut index,
+        false,
+        "2026-08-02T07:20:00Z",
+        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+        MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+        None,
+    );
+    assert_eq!(index.claude_scoped_rearm_counts().files, 32);
+    assert_eq!(index.claude_scoped_rearm_counts().deferred, 8);
+    assert_eq!(
+        index
+            .files
+            .values()
+            .filter(|e| e.source_file_fingerprint.is_empty())
+            .count(),
+        32
+    );
+}

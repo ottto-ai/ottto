@@ -533,16 +533,14 @@ fn first_proof_hold_vetoes_the_skip_until_a_full_rearm() {
     let held = rearm.terminal(&mut index, &rearm.items);
     assert!(held.counts.rearm_full_suppressed == 1, "{held:?}");
     assert!(
-        !index
+        index
             .claude_full_rearm_progress
             .first_proof_hold_since_full_rearm
     );
-    assert!(
-        rearm
-            .terminal(&mut index, &rearm.items)
-            .suppression
-            .full_rearm_suppressed
-    );
+    let still_held = rearm.terminal(&mut index, &rearm.items);
+    assert_eq!(still_held.counts.rearm_full_suppressed, 1);
+    assert!(!still_held.suppression.full_rearm_suppressed);
+    assert_eq!(still_held.rearmed_files, 0);
 }
 
 /// A malformed persisted progress value decodes as no progress: the index
@@ -1590,7 +1588,7 @@ fn a_withheld_account_rearms_the_same_before_and_after_the_cutover() {
             assert_eq!(
                 runs[1],
                 vec![(true, false, 0), (false, true, 0), (false, true, 0)],
-                "pay once for the baseline; attribution explanations never re-arm it"
+                "suppress the baseline replay; attribution explanations never re-arm it"
             );
         },
     );

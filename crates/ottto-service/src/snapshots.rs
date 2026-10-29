@@ -9589,10 +9589,18 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                     crate::local_resource_diagnostics::claude_reread::ClearSite::OwnedStart,
                     !entry.source_file_fingerprint.is_empty(),
                 );
-                entry.source_file_fingerprint.clear();
+                if !entry.source_file_fingerprint.is_empty() {
+                    index
+                        .claude_full_rearm_progress
+                        .scoped_rearm_pending
+                        .entry(index_key.clone())
+                        .or_insert_with(|| entry.source_file_fingerprint.clone().into());
+                }
             }
         }
     }
+
+    index.drain_claude_scoped_rearms();
 
     let mut disposition = ClaudeUsageAuthorityDisposition {
         request_groupings,
@@ -26290,7 +26298,8 @@ impl OwnedSourceScan {
                         return true;
                     }
                     let path = Path::new(key);
-                    let Some(root) = roots
+                    let Some(root) = traversal
+                        .scan_roots
                         .iter()
                         .filter(|root| path.starts_with(root))
                         .max_by_key(|root| root.components().count())
@@ -48336,9 +48345,10 @@ impl ScanIndex {
         );
         let mut rearm_progress = self.claude_full_rearm_progress.clone();
         for (key, expected) in &rearm_progress.scoped_rearm_cleared {
-            if files
-                .get(key)
-                .is_some_and(|entry| &entry.source_file_fingerprint == expected)
+            if !safe_keys.contains(key)
+                && files
+                    .get(key)
+                    .is_some_and(|entry| &entry.source_file_fingerprint == expected)
             {
                 rearm_progress
                     .scoped_rearm_pending
@@ -65757,7 +65767,7 @@ mod tests {
                 fence_before: true,
                 pending_occurrence_count: 5,
                 coverage_complete: true,
-                full_rearm: true,
+                rearm_full_suppressed: 1,
                 ..Default::default()
             }
         );
