@@ -9,6 +9,7 @@ pub(crate) fn scan_roots(
     home: &Path,
     codex_homes: &[PathBuf],
 ) -> Result<Vec<PathBuf>> {
+    #[cfg(feature = "replay-harness")]
     if let Some(roots) = crate::snapshot_sync::replay_harness::registered_roots(source) {
         return Ok(roots);
     }
@@ -102,6 +103,7 @@ pub(crate) fn watcher_roots(home: &Path) -> Result<Vec<(SnapshotSource, PathBuf)
 }
 
 pub(crate) fn validate_claude_roots(home: &Path, expected: &[PathBuf]) -> Result<()> {
+    #[cfg(feature = "replay-harness")]
     if let Some(roots) =
         crate::snapshot_sync::replay_harness::registered_roots(SnapshotSource::ClaudeCode)
     {

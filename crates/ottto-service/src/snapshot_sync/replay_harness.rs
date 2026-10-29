@@ -1,6 +1,7 @@
 //! Advisory replay of cloned transcripts through the real snapshot page owner.
 //! The manifest's private containing directory is the clone boundary. Nothing
 //! here starts serve, provider status, relays, MCP, login recovery or launchd.
+#![cfg(feature = "replay-harness")]
 use super::loopback_backend::{synthetic_device, Backend, EnvVarGuard};
 use super::*;
 use crate::source_rotation::{Owner, Step};
@@ -27,6 +28,12 @@ pub struct Args {
     /// Aggregate JSONL file inside the scratch support directory.
     #[arg(long)]
     pub out: PathBuf,
+    /// Read-only private 32-byte key shared by the chain and independent COLD.
+    #[arg(long)]
+    pub blinding_key_file: PathBuf,
+    /// Frozen RFC3339 collection clock, identical for the chain and COLD.
+    #[arg(long)]
+    pub collected_at: String,
     /// Optional {"files": [clone-relative paths]} inventory, prepared by the driver.
     /// The driver truncates/appends copies; the harness never edits transcripts.
     #[arg(long)]
@@ -45,6 +52,9 @@ pub enum Pass {
     P2,
     #[value(name = "P3")]
     P3,
+    #[value(name = "COLD")]
+    #[serde(rename = "COLD")]
+    Cold,
 }
 
 #[derive(Clone, Deserialize)]
@@ -88,6 +98,7 @@ struct Isolation {
     roots: Roots,
     out: PathBuf,
     held_files: usize,
+    key: Vec<u8>,
 }
 
 fn private_dir(path: &Path) -> Result<PathBuf> {
@@ -163,6 +174,10 @@ fn isolated_tree(path: &Path, boundary: &Path) -> Result<()> {
 
 impl Isolation {
     fn validate(args: &Args) -> Result<Self> {
+        OffsetDateTime::parse(
+            &args.collected_at,
+            &time::format_description::well_known::Rfc3339,
+        )?;
         let support = private_dir(&args.support_dir)?;
         // The account database still identifies live provider/support roots
         // when the driver has already replaced HOME with a scratch directory.
@@ -187,6 +202,7 @@ impl Isolation {
         // An empty directory is admitted once. Subsequent passes must carry our
         // marker; an existing daemon state cannot accidentally become scratch.
         if support.join(MARKER).exists() {
+            anyhow::ensure!(args.pass != Pass::Cold, "COLD requires fresh scratch");
             anyhow::ensure!(
                 read_fixed(&support.join(MARKER), MARKER_BYTES.len())? == MARKER_BYTES,
                 "scratch marker invalid"
@@ -345,12 +361,14 @@ impl Isolation {
         } else {
             0
         };
+        let key = blinding_key(&args.blinding_key_file)?;
         Ok(Self {
             support,
             secrets,
             roots,
             out,
             held_files,
+            key,
         })
     }
 }
@@ -387,22 +405,23 @@ fn write_record(out: &mut File, value: &serde_json::Value) -> std::io::Result<()
     out.write_all(b"\n")?;
     out.sync_data()
 }
-fn blinding_key(support: &Path) -> Result<Vec<u8>> {
-    let path = support.join("replay-blinding-key");
-    if !path.exists() {
-        let mut key = [0; 32];
-        getrandom::fill(&mut key).map_err(|_| anyhow!("random key unavailable"))?;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)?;
-        file.write_all(&key)?;
-        file.sync_all()?;
-        File::open(support)?.sync_all()?;
-    }
-    let key = read_fixed(&path, 32)?;
+fn blinding_key(path: &Path) -> Result<Vec<u8>> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let meta = file.metadata()?;
+    // SAFETY: geteuid has no preconditions. Validate the open FD before reading.
+    anyhow::ensure!(
+        meta.is_file()
+            && meta.nlink() == 1
+            && meta.len() == 32
+            && meta.uid() == unsafe { libc::geteuid() }
+            && meta.mode() & 0o077 == 0,
+        "private 32-byte blinding key required"
+    );
+    let mut key = Vec::with_capacity(32);
+    file.take(33).read_to_end(&mut key)?;
     anyhow::ensure!(key.len() == 32, "invalid blinding key");
     Ok(key)
 }
@@ -412,61 +431,195 @@ fn blinded(key: &[u8], domain: &[u8], value: &[u8]) -> String {
     mac.update(value);
     format!("{:x}", mac.finalize().into_bytes())
 }
+// Exact wire-field equality for all 15 fields in the shared money oracle.
+// Structured/string values may contain provider labels or account selectors:
+// commit to their complete value AND presence, never export them verbatim.
+const MONEY_FIELDS: [&str; 15] = [
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_creation_5m_tokens",
+    "cache_creation_1h_tokens",
+    "reasoning_output_tokens",
+    "unattributed_total_tokens",
+    "request_count",
+    "cost",
+    "usage_buckets",
+    "model_usage",
+    "removed_usage",
+    "removed_request_count",
+    "usage_accounting_contract",
+    "telemetry_owned_complete",
+];
+
+struct EmissionSink {
+    out: Arc<Mutex<File>>,
+    key: Vec<u8>,
+    pass: Pass,
+    collected_at: String,
+}
+thread_local! {
+    static EMISSION_SINK: RefCell<Option<EmissionSink>> = const { RefCell::new(None) };
+}
+struct EmissionGuard;
+impl Drop for EmissionGuard {
+    fn drop(&mut self) {
+        EMISSION_SINK.with(|slot| slot.borrow_mut().take());
+    }
+}
+
+/// Only the real scan's collection input clock is overridden. Keep the emitted
+/// clock bytes in the digest; no wall-clock normalization is permitted.
+pub(crate) fn collection_timestamp() -> Option<String> {
+    EMISSION_SINK.with(|slot| slot.borrow().as_ref().map(|sink| sink.collected_at.clone()))
+}
+
+/// Feature-only observation after the HTTP exchange succeeds. No sink is
+/// installed by serve. The typed request is required to reuse the existing
+/// sentinel/envelope computation; the body is the exact pre-compression wire.
+pub(crate) fn observe_emitted_batch(request: &SnapshotBatchRequest, body: &[u8]) -> Result<()> {
+    EMISSION_SINK.with(|slot| {
+        let sink = slot.borrow();
+        let Some(sink) = sink.as_ref() else {
+            return Ok(());
+        };
+        let wire: serde_json::Value = serde_json::from_slice(body)?;
+        let mut out = sink.out.lock().map_err(|_| anyhow!("output poisoned"))?;
+        observe_batch(&mut out, &sink.key, sink.pass, request, &wire)
+    })
+}
+
 fn observe_batch(
     out: &mut File,
     key: &[u8],
     pass: Pass,
+    request: &SnapshotBatchRequest,
     batch: &serde_json::Value,
-) -> std::io::Result<()> {
-    let source = match batch["source"].as_str() {
-        Some("claude_code") => "claude_code",
-        Some("codex") => "codex",
-        Some("pi") => "pi",
-        _ => return Err(std::io::Error::other("unknown synthetic batch source")),
+) -> Result<()> {
+    let source = match request.source.as_str() {
+        "claude_code" => SnapshotSource::ClaudeCode,
+        "codex" => SnapshotSource::Codex,
+        "pi" => SnapshotSource::Pi,
+        _ => return Err(anyhow!("unknown synthetic batch source")),
     };
-    for item in batch["snapshots"]
+    let items = batch["snapshots"]
         .as_array()
-        .ok_or_else(|| std::io::Error::other("missing snapshots"))?
-    {
-        let id = item["source_session_id"]
-            .as_str()
-            .ok_or_else(|| std::io::Error::other("missing session identity"))?;
+        .ok_or_else(|| anyhow!("missing snapshots"))?;
+    anyhow::ensure!(
+        items.len() == request.snapshots.len(),
+        "wire item count mismatch"
+    );
+    for (item, typed) in items.iter().zip(&request.snapshots) {
+        let mut body = item.clone();
+        let envelope = body
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("wire item missing"))?
+            .remove("semantic_envelope")
+            .ok_or_else(|| anyhow!("wire envelope missing"))?;
+        anyhow::ensure!(body == serde_json::to_value(typed)?, "wire item mismatch");
+        anyhow::ensure!(
+            envelope
+                == serde_json::to_value(crate::snapshots::snapshot_semantic_envelope(
+                    source,
+                    typed,
+                    request.upload_policy
+                ))?,
+            "wire envelope mismatch"
+        );
+
+        // Same sentinel and production hash computation as money_equivalence.
+        // Never normalize money, labels, policies, identities or body evidence.
+        let mut normalized = typed.clone();
+        normalized.source_file_fingerprint = Some("physical-identity:excluded".into());
+        body["source_file_fingerprint"] = serde_json::json!(normalized.source_file_fingerprint);
+        let normalized_envelope =
+            serde_json::to_value(crate::snapshots::snapshot_semantic_envelope(
+                source,
+                &normalized,
+                request.upload_policy,
+            ))?;
+        // Fail closed if physical identity ever starts changing another field.
+        let mut before = envelope;
+        for name in ["revision_hash", "revision_v2_hash"] {
+            before[name] = normalized_envelope[name].clone();
+        }
+        anyhow::ensure!(
+            before == normalized_envelope,
+            "sentinel changed semantic content"
+        );
+        body["semantic_envelope"] = normalized_envelope;
+        let bytes = crate::canonical_json::canonicalize(&body)?;
         let mut totals = serde_json::Map::new();
-        for name in [
-            "input_tokens",
-            "output_tokens",
-            "cache_read_tokens",
-            "cache_creation_5m_tokens",
-            "cache_creation_1h_tokens",
-            "reasoning_output_tokens",
-            "unattributed_total_tokens",
-        ] {
-            // The wire contract omits this one field precisely when zero.
+        for &name in &MONEY_FIELDS[..7] {
             let value = if name == "unattributed_total_tokens" && item.get(name).is_none() {
                 0
             } else {
                 item[name]
                     .as_u64()
-                    .ok_or_else(|| std::io::Error::other("missing numeric token total"))?
+                    .ok_or_else(|| anyhow!("missing numeric token total"))?
             };
             totals.insert(name.into(), serde_json::Value::from(value));
         }
-        // Digest the actual emitted entity, excluding only its collection clock.
-        // No normalization of money, identity, accounting contracts or tool rows.
-        let mut body = item.clone();
-        if let Some(body) = body.as_object_mut() {
-            body.remove("collected_at");
-        }
-        let bytes = crate::canonical_json::canonicalize(&body).map_err(std::io::Error::other)?;
+        let money = money_commitments(key, item)?;
         write_record(
             out,
             &serde_json::json!({"kind":"session", "pass":pass,
-            "blinded_session_hash":blinded(key, b"replay-session-v1\0", format!("{source}\0{id}").as_bytes()),
-            "source":source, "token_totals":totals, "entity_count":1,
+            "blinded_session_hash":blinded(key, b"replay-session-v1\0", format!("{}\0{}",source.api_slug(),typed.source_session_id).as_bytes()),
+            "source":source.api_slug(), "token_totals":totals, "entity_count":1,
+            "money_oracle":money, "money_oracle_encoding":"keyed-field-digests-v1",
             "emitted_body_digest":blinded(key, b"replay-emitted-body-v1\0", &bytes)}),
         )?;
     }
     Ok(())
+}
+
+fn money_commitments(key: &[u8], item: &serde_json::Value) -> Result<serde_json::Value> {
+    let mut money = serde_json::Map::new();
+    for name in MONEY_FIELDS {
+        // Presence is significant (absent != explicit null). Every field is
+        // committed independently; no arbitrary input keys leave this module.
+        let value = serde_json::json!([item.get(name).is_some(), item.get(name)]);
+        let bytes = crate::canonical_json::canonicalize(&value)?;
+        let domain = format!("replay-money-field-v1\0{name}\0");
+        money.insert(
+            name.into(),
+            serde_json::Value::String(blinded(key, domain.as_bytes(), &bytes)),
+        );
+    }
+    Ok(serde_json::Value::Object(money))
+}
+
+#[cfg(test)]
+mod oracle_tests {
+    use super::*;
+
+    #[test]
+    fn every_money_field_and_its_presence_are_bound_without_exporting_content() {
+        let key = [11; 32];
+        let baseline = money_commitments(&key, &serde_json::json!({})).unwrap();
+        for field in MONEY_FIELDS {
+            let null = serde_json::json!({field: null});
+            let value =
+                serde_json::json!({field: {"private-selector-canary": "private-path-canary"}});
+            let null = money_commitments(&key, &null).unwrap();
+            let changed = money_commitments(&key, &value).unwrap();
+            assert_ne!(baseline[field], null[field], "presence lost: {field}");
+            assert_ne!(null[field], changed[field], "value lost: {field}");
+            for sibling in MONEY_FIELDS {
+                if sibling != field {
+                    assert_eq!(baseline[sibling], changed[sibling]);
+                }
+            }
+            let text = changed.to_string();
+            assert!(!text.contains("private-selector-canary"));
+            assert!(!text.contains("private-path-canary"));
+        }
+        assert_ne!(baseline["cost"], baseline["removed_usage"]);
+        assert_ne!(
+            baseline,
+            money_commitments(&[12; 32], &serde_json::json!({})).unwrap()
+        );
+    }
 }
 
 fn fake_collection(source: SnapshotSource) -> AgentStatusCollection {
@@ -565,22 +718,16 @@ fn execute(args: &Args, isolation: Isolation) -> Result<()> {
     let locked = crate::locked_state_dir::LockedStateDir::acquire(&isolation.support)?;
     crate::locked_state_dir::hold_for_process(locked);
     let output = Arc::new(Mutex::new(open_private(&isolation.out)?));
-    let key = blinding_key(&isolation.support)?;
-    let pass = args.pass;
-    let sink = Arc::clone(&output);
-    let backend = Backend::with_listener(
-        listener,
-        Some(Arc::new(move |batch| {
-            observe_batch(
-                &mut *sink
-                    .lock()
-                    .map_err(|_| std::io::Error::other("output poisoned"))?,
-                &key,
-                pass,
-                batch,
-            )
-        })),
-    )?;
+    let backend = Backend::with_listener(listener, None)?;
+    EMISSION_SINK.with(|slot| {
+        *slot.borrow_mut() = Some(EmissionSink {
+            out: Arc::clone(&output),
+            key: isolation.key,
+            pass: args.pass,
+            collected_at: args.collected_at.clone(),
+        });
+    });
+    let _emissions = EmissionGuard;
     fs::write(isolation.support.join(MARKER), MARKER_BYTES)?;
     let home = isolation.support.join("home");
     fs::create_dir_all(&home)?;

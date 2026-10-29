@@ -1240,6 +1240,7 @@ struct Record<T: Serialize> {
 }
 fn emit(record: &impl Serialize) {
     if let Ok(json) = serde_json::to_string(record) {
+        #[cfg(any(test, feature = "replay-harness"))]
         if TEST_OUTPUT.with(|output| {
             if let Some(output) = output.borrow_mut().as_mut() {
                 output.push(json.clone());
@@ -1259,9 +1260,11 @@ fn write_line(json: &str, writer: &mut impl Write) {
     let _ = writeln!(writer, "ottto-service: local_resources {json}");
 }
 
+#[cfg(any(test, feature = "replay-harness"))]
 thread_local! {
     static TEST_OUTPUT: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
 }
+#[cfg(any(test, feature = "replay-harness"))]
 pub(crate) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<serde_json::Value>) {
     struct Reset;
     impl Drop for Reset {

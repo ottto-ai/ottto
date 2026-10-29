@@ -1,64 +1,109 @@
-# Isolated replay harness
+# Advisory replay harness
 
-`ottto-service replay-harness` is a hidden, advisory debugging command. It is
-never a release gate. It runs production snapshot pages and their real entity
-ACK/recovery pipeline against an in-process IPv4 loopback sink. It does not start
-the service, provider status workers, relays, MCP, login recovery or launchd.
+This synthetic development tool is advisory only, never a release gate. It is
+absent from default and installed builds. Build it explicitly with
+`--features replay-harness`; release packaging must never enable that feature.
+The feature gates the command, root and status overrides, diagnostic capture,
+emitted-body observer, and synthetic loopback backend. Existing unit-test
+status/diagnostic overrides and benchmark backend access remain available under
+`cfg(test)` only, preserving benchmark discovery without enabling a runtime feature.
 
-```text
-ottto-service replay-harness --support-dir <scratch> --roots-manifest <json> \
-  --pass <P0|P1|P2|P3> --out <scratch/output.jsonl> \
-  [--hold-back <json>] [--kill-after-pages N]
+It runs real snapshot pages and the entity ACK/recovery pipeline against an
+in-process IPv4 loopback sink. It never starts serve, relays, MCP, provider
+status workers, login recovery or launchd.
+
+```
+ottto-service replay-harness --support-dir <scratch> --roots-manifest <manifest> \
+  --pass <P0|P1|P2|P3|COLD> --out <scratch/output.jsonl> \
+  --blinding-key-file <private-key> --collected-at <frozen-RFC3339> \
+  [--hold-back <inventory>] [--kill-after-pages N]
 ```
 
-The driver must prepare separate user-owned 0700 clone and scratch directories.
-The roots manifest's containing directory defines the clone boundary. Its shape
-is `{"claude": [paths], "codex": [paths], "pi": [paths]}`; paths can be absolute
-or relative to that boundary. Every effective transcript root comes exclusively
-from this in-memory registry. Default provider roots and registered real slots
-are excluded. Symlinks, hard links, special files and paths outside the clone
-are refused. The driver must not modify the private clone during a pass.
+The key input is an existing owner-only regular file of exactly 32 bytes. It is
+read-only and shared between the chain and COLD; the tool never generates a
+substitute key. Symlinked, hard-linked, missing, public and oversized key files
+are refused before output or scratch mutation. Keep the key outside the clone
+and scratch directories so separate invocations can share it.
 
-Set `OTTTO_LOCAL_PLATFORM_SUPPORT_DIR` to exactly the scratch directory and
-`OTTTO_SERVICE_SECRET_FALLBACK_DIR` to scratch or a private child directory.
-Leave `OTTTO_API_BASE_URL` unset: the command binds its own ephemeral loopback
-listener and installs that exact address. An inherited API value must match
-that listener exactly; unrelated loopback addresses also fail. Saved connection
-bindings are refused. The scratch directory must initially be empty (or contain
-only the empty secret directory); subsequent passes require the harness marker.
-Real support/provider directories are refused. A scratch HOME and provider-home
-variables are installed before daemon construction; proxy variables are removed.
-File secrets are mandatory, so the harness cannot fall back to Keychain.
+The driver must create two physically independent copies of the same frozen
+corpus before running the chain and COLD. The manifest's private containing
+directory is each copy's boundary. COLD starts in a separate process with a fresh
+empty private scratch directory (or an empty private secrets child). It refuses
+a scratch marker from any earlier pass. No index, durable store, process RAM or
+provider collection is shared. File hard links, symlinks and roots outside the
+clone are refused. Independence and identical frozen input bytes are driver
+preconditions; the command cannot attest the copying history of an input tree.
 
-The command acquires the real state-directory lock and holds it until process
-exit. P0, P1 and P2 label cold, quiet restart and growth respectively; they do not
-change scanner policy or suppress unexpected reads. The driver owns truncation
-and appending. `--hold-back` accepts `{"files": [clone-relative paths]}` and
-validates the inventory, reporting only its count. `--kill-after-pages N` is
-valid only for P3 with positive N and sends SIGKILL after the Nth successfully
-finished source page. The page marker and emitted aggregates are synced first.
-If N is greater than the completed pass's pages, the pass finishes normally;
-a driver expecting a crash must reject that run.
+Set `OTTTO_LOCAL_PLATFORM_SUPPORT_DIR` to exactly scratch and
+`OTTTO_SERVICE_SECRET_FALLBACK_DIR` to scratch or a private child. Leave
+`OTTTO_API_BASE_URL` unset: the command binds an ephemeral loopback listener and
+installs that address. Any inherited API value must match its own listener
+exactly. Real support/provider directories and saved connections are refused.
+Scratch HOME/provider homes and file secrets prevent access to live provider
+slots or Keychain; proxy variables are removed. The real state-directory lock
+is held for process lifetime. Never edit the private clone during a pass.
 
-JSONL contains `pass_started`, `local_resources`, `session`, `page_finished` and
-one final `pass_totals` record. Interrupted passes have no totals. Session rows
-record each actual emitted entity, including retries; they are cumulative
-session revisions, so a consumer carries the latest revision across quiet
-passes rather than summing tokens. Rows include source, seven numeric token
-totals, entity count, a blinded session ID and a blinded canonical emitted-body
-digest. Only the top-level collection timestamp is excluded from that digest.
-No raw paths, identities or content are written. The random 0600 blinding key in
-scratch is stable across restarts, and emission records are synced before ACK.
-The caller must preserve the interrupted pass's output when restarting.
+The roots manifest is `{"claude": [paths], "codex": [paths], "pi": [paths]}`,
+with absolute paths or paths relative to its containing directory. The optional
+hold-back inventory is `{"files": [clone-relative paths]}`; the driver owns
+truncation and appending. `--kill-after-pages` accepts a positive page count only
+for P3 and kills after a successfully completed real source page, with records
+already synced. A count beyond the final page does not cause a kill.
 
-Pass totals reuse existing diagnostics: full/tail counts are sampled acquisition
-selections and bytes are completed native plus guard bytes. These exclude
-failed acquisitions, discovery, joins and sidecars; they are not total file I/O.
-Unavailable acquisition counters are null, never invented zeroes. Restore counts
-are successful durable restore outcomes. `local_resources` records carry the
-existing schema unchanged for an external extractor.
+All passes emit the same session record, including `token_totals`,
+`entity_count`, `emitted_body_digest`, and `money_oracle`. The last session record
+for each blinded session is the latest emitted body; quiet pages emit no fake
+zero or empty replacement. Consumers fold records in emission order, including
+completed records before a P3 kill. Counts and unavailable values in page
+diagnostics retain their existing meanings.
 
-Exit codes are 0 (completed), 2 (isolation refused), and 3 (failed). Deliberate
-P3 termination is SIGKILL. Synthetic integration tests run in CI only. Equality
-with the independent `snapshot-audit` oracle requires a shared key, identity,
-policy and digest contract; this command alone does not establish that oracle.
+Pass totals are sampled acquisition selections and completed native plus guard
+bytes, excluding discovery, joins, sidecars and failed acquisitions. They are
+not total filesystem I/O. Unavailable values remain null. `local_resources`
+carries the existing schema unchanged. Exit codes are 0 completed, 2 isolation
+refused, 3 failed; deliberate termination is SIGKILL.
+
+`money_oracle_encoding` is `keyed-field-digests-v1`. `money_oracle` contains
+exactly these 15 named fields, each a domain-separated HMAC-SHA256 of the
+canonical `[present, value]` pair from the actual emitted entity:
+
+- `input_tokens`, `output_tokens`, `cache_read_tokens`
+- `cache_creation_5m_tokens`, `cache_creation_1h_tokens`
+- `reasoning_output_tokens`, `unattributed_total_tokens`, `request_count`
+- `cost`, `usage_buckets`, `model_usage`
+- `removed_usage`, `removed_request_count`
+- `usage_accounting_contract`, `telemetry_owned_complete`
+
+The domain is `replay-money-field-v1\0<field>\0`. This compares every field
+independently, including absence versus null, without exporting labels,
+selectors, identifiers or arbitrary object keys. The seven numeric token totals
+remain available for aggregate comparisons. Field commitments detect monetary
+inequality; a commitment alone does not reveal the direction of a cost change.
+
+The body digest uses the exact emitted item, checked against the typed request.
+The driver supplies the same frozen RFC3339 `--collected-at` input to the real
+scan on every chain/COLD invocation. Collection timestamp bytes remain in the
+digest. Only the existing money-equivalence sentinel is normalized:
+`source_file_fingerprint = "physical-identity:excluded"`, with revision hashes
+recomputed by the production semantic-envelope function. Normalization fails
+closed if any other envelope field changes. No money field is normalized. The
+session and body domains remain `replay-session-v1\0` and
+`replay-emitted-body-v1\0`. All commitments use the same supplied key.
+
+The feature-enabled synthetic integration target declares `required-features`.
+CI owners should run it explicitly, without enabling the feature for release
+builds or the full workspace:
+
+```
+cargo test -p ottto-service --test replay_harness --features replay-harness --locked -- --nocapture
+```
+
+Default CI runs `replay_harness_disabled`, which checks the command is absent.
+The ignored reference benchmark retains its implementation, assertions and
+default unit-test discovery; its backend compiles under `cfg(test)`. Existing
+reference benchmark workflows need no feature change.
+
+P2 failures print the exact `full_causes` and `restore_outcome` page rows. A
+panicking synthetic fixture retains its directory and prints aggregate JSONL to
+the test log. P1's live restore assertion and P2's Tail-only assertion stay in
+place; diagnostics never convert a failure into a pass.

@@ -1,5 +1,5 @@
 //! Synthetic child-process checks. Never reads provider state or starts serve.
-#![cfg(unix)]
+#![cfg(all(unix, feature = "replay-harness"))]
 use serde_json::{json, Value};
 use std::fs;
 use std::io::Write;
@@ -15,6 +15,8 @@ struct Fixture {
     clone: PathBuf,
     support: PathBuf,
     root: PathBuf,
+    key: PathBuf,
+    collected_at: String,
 }
 impl Fixture {
     fn new() -> Self {
@@ -26,15 +28,23 @@ impl Fixture {
         let clone = base.join("clone");
         let support = base.join("scratch");
         let root = clone.join("claude/project");
+        let key = base.join("shared-key");
         for dir in [&base, &clone, &support, &root] {
             fs::create_dir_all(dir).unwrap();
             fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
         }
+        fs::write(&key, [42; 32]).unwrap();
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+        let collected_at = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
         let fixture = Self {
             base,
             clone,
             support,
             root,
+            key,
+            collected_at,
         };
         fixture.manifest(json!({"claude":[fixture.clone.join("claude")], "codex":[], "pi":[]}));
         fixture.append(1, 10);
@@ -44,9 +54,7 @@ impl Fixture {
         fs::write(self.clone.join("roots.json"), value.to_string()).unwrap();
     }
     fn append(&self, n: u64, tokens: u64) {
-        let now = time::OffsetDateTime::now_utc()
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap();
+        let now = &self.collected_at;
         let row = json!({"type":"assistant", "sessionId":SESSION, "uuid":format!("u{n}"), "requestId":format!("req{n}"), "timestamp":now,
             "cwd":self.base.join(CANARY), "message":{"id":format!("msg{n}"), "model":"claude-sonnet-4-6", "role":"assistant", "content":[{"type":"text","text":CANARY}], "usage":{"input_tokens":tokens,"output_tokens":2}}});
         let mut file = fs::OpenOptions::new()
@@ -65,6 +73,10 @@ impl Fixture {
             .arg(self.clone.join("roots.json"))
             .args(["--pass", pass, "--out"])
             .arg(self.support.join(format!("{pass}.jsonl")))
+            .arg("--blinding-key-file")
+            .arg(&self.key)
+            .arg("--collected-at")
+            .arg(&self.collected_at)
             .env("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &self.support)
             .env("OTTTO_SERVICE_SECRET_FALLBACK_DIR", &self.support)
             .env_remove("OTTTO_API_BASE_URL");
@@ -114,6 +126,21 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            // Retain synthetic scratch and print its aggregate-only records.
+            // In CI the filesystem disappears with the runner; the log remains.
+            eprintln!("retaining failed synthetic replay fixture; aggregate diagnostics follow");
+            if let Ok(entries) = fs::read_dir(&self.support) {
+                for entry in entries.flatten() {
+                    if entry.path().extension().is_some_and(|ext| ext == "jsonl") {
+                        if let Ok(text) = fs::read_to_string(entry.path()) {
+                            eprintln!("replay aggregate diagnostics:\n{text}");
+                        }
+                    }
+                }
+            }
+            return;
+        }
         fs::remove_dir_all(&self.base).unwrap();
     }
 }
@@ -127,6 +154,163 @@ fn session(rows: &[Value]) -> &Value {
         .rev()
         .find(|row| row["kind"] == "session")
         .expect("emitted session")
+}
+
+#[test]
+fn independent_cold_uses_the_same_key_and_all_fifteen_money_fields() {
+    // Separate processes, physical files and empty scratch directories. Copy
+    // frozen bytes, including their transcript clock and workspace, verbatim.
+    let chain = Fixture::new();
+    let mut cold = Fixture::new();
+    cold.key = chain.key.clone();
+    cold.collected_at = chain.collected_at.clone();
+    let chain_path = chain.root.join(format!("{SESSION}.jsonl"));
+    let cold_path = cold.root.join(format!("{SESSION}.jsonl"));
+    fs::copy(&chain_path, &cold_path).unwrap();
+    use std::os::unix::fs::MetadataExt;
+    assert_ne!(
+        fs::metadata(chain_path).unwrap().ino(),
+        fs::metadata(cold_path).unwrap().ino()
+    );
+    assert_eq!(fs::read_dir(&cold.support).unwrap().count(), 0);
+    let before = chain.run("P0");
+    let independent = cold.run("COLD");
+    assert_eq!(totals(&independent)["pass"], "COLD");
+    assert!(totals(&independent)["full_reads"].as_u64().unwrap() > 0);
+    let before = session(&before);
+    let independent = session(&independent);
+    for field in [
+        "blinded_session_hash",
+        "source",
+        "token_totals",
+        "entity_count",
+        "money_oracle",
+        "money_oracle_encoding",
+        "emitted_body_digest",
+    ] {
+        assert_eq!(before[field], independent[field], "COLD mismatch: {field}");
+    }
+    let fields = [
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_creation_5m_tokens",
+        "cache_creation_1h_tokens",
+        "reasoning_output_tokens",
+        "unattributed_total_tokens",
+        "request_count",
+        "cost",
+        "usage_buckets",
+        "model_usage",
+        "removed_usage",
+        "removed_request_count",
+        "usage_accounting_contract",
+        "telemetry_owned_complete",
+    ];
+    assert_eq!(
+        independent["money_oracle"].as_object().unwrap().len(),
+        fields.len()
+    );
+    for field in fields {
+        assert_eq!(
+            independent["money_oracle"][field].as_str().unwrap().len(),
+            64,
+            "missing {field}"
+        );
+    }
+}
+
+#[test]
+fn cold_refuses_reused_scratch_without_mutating_it() {
+    let f = Fixture::new();
+    f.run("P0");
+    let index = fs::read(f.support.join("P0.jsonl")).unwrap();
+    let output = f.command("COLD").output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(!f.support.join("COLD.jsonl").exists());
+    assert_eq!(fs::read(f.support.join("P0.jsonl")).unwrap(), index);
+}
+
+#[test]
+fn supplied_key_controls_session_body_and_money_commitments() {
+    let first = Fixture::new();
+    let mut second = Fixture::new();
+    second.collected_at = first.collected_at.clone();
+    fs::copy(
+        first.root.join(format!("{SESSION}.jsonl")),
+        second.root.join(format!("{SESSION}.jsonl")),
+    )
+    .unwrap();
+    fs::write(&second.key, [43; 32]).unwrap();
+    let first = first.run("P0");
+    let second = second.run("COLD");
+    let first = session(&first);
+    let second = session(&second);
+    assert_eq!(first["token_totals"], second["token_totals"]);
+    assert_ne!(
+        first["blinded_session_hash"],
+        second["blinded_session_hash"]
+    );
+    assert_ne!(first["emitted_body_digest"], second["emitted_body_digest"]);
+    for (field, value) in first["money_oracle"].as_object().unwrap() {
+        assert_ne!(
+            value, &second["money_oracle"][field],
+            "key ignored: {field}"
+        );
+    }
+}
+
+#[test]
+fn emitted_collection_clock_remains_in_body_digest() {
+    let first = Fixture::new();
+    let mut second = Fixture::new();
+    fs::copy(
+        first.root.join(format!("{SESSION}.jsonl")),
+        second.root.join(format!("{SESSION}.jsonl")),
+    )
+    .unwrap();
+    second.key = first.key.clone();
+    second.collected_at = (time::OffsetDateTime::parse(
+        &first.collected_at,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap()
+        + time::Duration::seconds(1))
+    .format(&time::format_description::well_known::Rfc3339)
+    .unwrap();
+    let first = first.run("P0");
+    let second = second.run("COLD");
+    let first = session(&first);
+    let second = session(&second);
+    assert_eq!(
+        first["blinded_session_hash"],
+        second["blinded_session_hash"]
+    );
+    assert_eq!(first["money_oracle"], second["money_oracle"]);
+    assert_ne!(first["emitted_body_digest"], second["emitted_body_digest"]);
+}
+
+#[test]
+fn refuses_invalid_collection_clock_before_scratch_mutation() {
+    let mut f = Fixture::new();
+    f.collected_at = CANARY.into();
+    f.refused(f.command("COLD"));
+}
+
+#[test]
+fn refuses_missing_public_and_symlinked_blinding_keys() {
+    let f = Fixture::new();
+    let original = fs::read(&f.key).unwrap();
+    fs::remove_file(&f.key).unwrap();
+    f.refused(f.command("P0"));
+    fs::write(&f.key, original).unwrap();
+    fs::set_permissions(&f.key, fs::Permissions::from_mode(0o644)).unwrap();
+    f.refused(f.command("P0"));
+    let target = f.base.join("key-target");
+    fs::rename(&f.key, &target).unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+    symlink(target, &f.key).unwrap();
+    f.refused(f.command("P0"));
 }
 
 #[test]
@@ -199,6 +383,17 @@ fn synthetic_cold_quiet_growth_kill_and_restart() {
     assert!(!quiet.iter().any(|row| row["kind"] == "session"));
     f.append(2, 20);
     let growth = f.run("P2");
+    if totals(&growth)["full_reads"] != 0 {
+        for row in &growth {
+            if row["record"]["stage"] == "native_collection_page" {
+                let causes = &row["record"]["counts"]["full_causes"];
+                eprintln!(
+                    "P2 full_causes={causes} restore_outcome={}",
+                    causes["restore_outcome"]
+                );
+            }
+        }
+    }
     assert_eq!(totals(&growth)["full_reads"], 0);
     assert!(totals(&growth)["tail_reads"].as_u64().unwrap() > 0);
     assert_eq!(
@@ -233,16 +428,26 @@ fn synthetic_cold_quiet_growth_kill_and_restart() {
     assert!(restart.iter().any(|row| row["kind"] == "local_resources"));
     // Independent fresh scratch uses the same production cycle over the final
     // synthetic transcript; cumulative money must equal the restarted chain.
-    let fresh = Fixture::new();
+    let mut fresh = Fixture::new();
+    fresh.key = f.key.clone();
+    fresh.collected_at = f.collected_at.clone();
     fs::copy(
         f.root.join(format!("{SESSION}.jsonl")),
         fresh.root.join(format!("{SESSION}.jsonl")),
     )
     .unwrap();
-    let oracle = fresh.run("P0");
+    let oracle = fresh.run("COLD");
     assert_eq!(
         session(&before_restart)["token_totals"],
         session(&oracle)["token_totals"]
+    );
+    assert_eq!(
+        session(&before_restart)["money_oracle"],
+        session(&oracle)["money_oracle"]
+    );
+    assert_eq!(
+        session(&before_restart)["emitted_body_digest"],
+        session(&oracle)["emitted_body_digest"]
     );
     // Keep the quiet-restore acceptance criterion, but let the growth/crash
     // assertions run first so CI exposes their outcomes independently of it.
@@ -278,6 +483,10 @@ fn refuses_live_support_even_with_matching_environment() {
         .arg(f.clone.join("roots.json"))
         .args(["--pass", "P0", "--out"])
         .arg(live.join("P0.jsonl"))
+        .arg("--blinding-key-file")
+        .arg(&f.key)
+        .arg("--collected-at")
+        .arg(&f.collected_at)
         .env("HOME", &home)
         .env("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &live)
         .env("OTTTO_SERVICE_SECRET_FALLBACK_DIR", &live)
@@ -375,11 +584,15 @@ fn refuses_oversized_marker_and_blinding_key_without_allocating_them() {
             b"ottto isolated replay v1\n",
         )
         .unwrap();
-        let file = fs::File::create(f.support.join(name)).unwrap();
+        let path = if name == "replay-blinding-key" {
+            f.key.clone()
+        } else {
+            f.support.join(name)
+        };
+        let file = fs::File::create(path).unwrap();
         file.set_len(64 * 1024 * 1024).unwrap();
         let output = f.command("P0").output().unwrap();
-        let expected = if name == ".replay-harness" { 2 } else { 3 };
-        assert_eq!(output.status.code(), Some(expected));
+        assert_eq!(output.status.code(), Some(2));
         f.assert_private(&output);
     }
 }

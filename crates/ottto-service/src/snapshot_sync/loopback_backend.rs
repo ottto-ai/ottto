@@ -1,4 +1,5 @@
 //! Reusable synthetic entity-ACK sink. Binds only IPv4 loopback; no outbound I/O.
+#![cfg(any(test, feature = "replay-harness"))]
 use super::current_rfc3339;
 use ottto_core::{
     FileDeviceStore, LocalDeviceBinding, OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
@@ -253,6 +254,7 @@ pub(super) struct EnvVarGuard {
     previous: Option<std::ffi::OsString>,
 }
 impl EnvVarGuard {
+    #[cfg(feature = "replay-harness")]
     pub(super) fn remove(key: &'static str) -> Self {
         let previous = std::env::var_os(key);
         std::env::remove_var(key);
