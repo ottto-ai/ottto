@@ -65,6 +65,10 @@ impl ReceiptOwed {
         &self.chain
     }
 
+    pub(in crate::snapshots) fn chain_mut(&mut self) -> &mut AcquiredChain {
+        &mut self.chain
+    }
+
     pub(crate) fn checkpoint(&self) -> &Checkpoint {
         &self.checkpoint
     }
@@ -77,7 +81,7 @@ impl ReceiptOwed {
     /// and exact final-stamp verification. NoPending, retained A and retirement
     /// are not receipts. The parent must revalidate a delayed proof at delivery.
     pub(crate) fn matches(&self, receipt: &ReceiptProof) -> bool {
-        self.candidate.as_ref() == Some(receipt.identity())
+        self.candidate() == Some(receipt.identity())
             && receipt.identity().binding() == self.chain.binding()
     }
 
@@ -113,6 +117,7 @@ pub(crate) enum OwedAdmission {
     Admitted,
     Refused(Box<Taken<CachedJsonlReduction>>),
 }
+#[allow(clippy::large_enum_variant)] // Returns the already-funded frame; refusal may not allocate a new box.
 pub(in crate::snapshots) enum OwedCompletionAdmission {
     Admitted,
     Refused(sampled_jsonl::CompletedNativeAcquisition),
@@ -273,7 +278,7 @@ impl SharedCache {
             )
         };
         let custody = acquisition.custody_mut();
-        if let Some(mut owed) = custody.take_owed() {
+        if let Some(owed) = custody.take_owed() {
             let bound = match candidate {
                 Some(candidate) if owed.candidate.as_ref() != Some(candidate) => {
                     Err(HeldCause::Incompatible)
@@ -392,7 +397,7 @@ impl SharedCache {
     ) -> Result<(), HeldCause> {
         let birth = owed.chain.object().2;
         let old = owed
-            .checkpoint
+            .checkpoint()
             .durable_certificate(birth)
             .ok_or(HeldCause::Incompatible)?;
         let new = checkpoint

@@ -34,14 +34,12 @@ mod owed;
 pub(in crate::snapshots) use owed::OwedCompletionAdmission;
 pub(crate) use owed::{OwedAdmission, OwedQuery, ReceiptOwed};
 mod write_ahead;
-pub(crate) use crate::durable_tail_store::ActiveLease;
 pub(in crate::snapshots) use write_ahead::{
     CommitFences, FinishAcquisition, LiveFinishView, NativeFinishAttempt,
 };
 pub(crate) use write_ahead::{
-    Degraded, DegradedCause, HeldCause, NotPersisted, PrepareOutcome, PrepareStoreFailure,
-    PreparedRecord, ReceiptProof, ReconcileOutcome, RecordIdentity, Unprepared,
-    UnpreparedDisposition, WriteOutcome,
+    Degraded, DegradedCause, HeldCause, NotPersisted, PrepareOutcome, PreparedRecord, ReceiptProof,
+    ReconcileOutcome, RecordIdentity, Unprepared, UnpreparedDisposition, WriteOutcome,
 };
 
 use super::super::*;
@@ -61,7 +59,7 @@ use sampled_jsonl::CachedJsonlReduction;
 
 /// Encoded bytes one post-save write may produce, so encoding under the
 /// retained lock stays bounded. Entries past it are deferred to a later save.
-pub(crate) const WRITE_PASS_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const WRITE_PASS_BYTES: usize = store::WRITE_PASS_BYTES;
 
 /// Upper bound of both stores' resident maps (two sources), ONE canonical value:
 /// - memo 2*256*256 = 131,072 bytes;
@@ -858,13 +856,26 @@ fn replay_scope_for(
     let body_revision = replay.filter(|row| row.kind == ObligationKind::BodyWitness);
     let money_rule = replay.filter(|row| row.kind == ObligationKind::MoneyRule);
     store::replay_scope_digest(
-        &store::scope_digest_for(
-            format,
-            &scope.0,
-            &allowlist,
-            &interpretation.identity_contract,
-            &interpretation.counting_view,
-        ),
+        &if format == store::FORMAT_V3 {
+            // Claude is explicitly absent. Codex's body-derived C is checked
+            // by v3_replay_scope after decode, before content input or reuse.
+            let absent =
+                acquired::ImmutableCounting::canonical(source, None).expect("admitted source");
+            store::scope_digest_v3(
+                &scope.0,
+                &allowlist,
+                &interpretation.identity_contract,
+                absent.bytes(),
+            )
+        } else {
+            store::scope_digest_for(
+                format,
+                &scope.0,
+                &allowlist,
+                &interpretation.identity_contract,
+                &interpretation.counting_view,
+            )
+        },
         body_revision.map_or(revision, |row| row.revision),
         body_revision.map_or(index.active_effective_upload_body_witness_revision, |row| {
             row.revision
@@ -878,6 +889,44 @@ fn replay_scope_for(
         },
         source == SnapshotSource::ClaudeCode && claude_request_money::e2::enabled(),
     )
+}
+
+/// Format-3 scope uses immutable counting from the actual acquisition/body.
+/// Mutable ACK evidence remains in the existing CV/CUO checks.
+fn v3_replay_scope(
+    source: SnapshotSource,
+    scope: &Scope,
+    index: &ScanIndex,
+    interpretation: &Interpretation<'_>,
+    revision: u64,
+    counting: &acquired::ImmutableCounting,
+) -> store::Digest32 {
+    let allowlist = durable_source(source)
+        .expect("admitted source")
+        .properties()
+        .allowlist();
+    store::replay_scope_digest(
+        &store::scope_digest_v3(
+            &scope.0,
+            &allowlist,
+            &interpretation.identity_contract,
+            counting.bytes(),
+        ),
+        revision,
+        index.active_effective_upload_body_witness_revision,
+        if source == SnapshotSource::ClaudeCode {
+            index.claude_money_birth_store.money_rule_version()
+        } else {
+            0
+        },
+        source == SnapshotSource::ClaudeCode && claude_request_money::e2::enabled(),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct V3RestoreScope<'a> {
+    index: &'a ScanIndex,
+    interpretation: &'a Interpretation<'a>,
 }
 
 fn unregistered_scope(
@@ -3266,7 +3315,19 @@ impl SharedCache {
             expected = original;
             adapter_revision = Some(revision);
         }
-        let restored = self.durable_restore_record(
+        if record.format == store::FORMAT_V3 {
+            let acquisition = record.record.acquisition.ok_or(MissClass::NoEntry)?;
+            let current = effective_revision(snapshot_source);
+            if acquisition.acquired_revision != current {
+                return Err(self.stale(if acquisition.acquired_revision > current {
+                    "revision_downgrade"
+                } else {
+                    "revision_adoption_required"
+                }));
+            }
+            expected.binding.scope = record.record.binding.scope;
+        }
+        let restored = self.durable_restore_record_scoped(
             snapshot_source,
             &record,
             &expected,
@@ -3274,6 +3335,10 @@ impl SharedCache {
             scope,
             held,
             lease,
+            Some(V3RestoreScope {
+                index,
+                interpretation,
+            }),
         );
         // Registry probes include allowlist hashing; keep them outside Stores.
         let owed = if matches!(restored, Err(Failure::Ineligible(store::Ineligible::Scope))) {
@@ -3350,7 +3415,11 @@ impl SharedCache {
         if let Some(slot) = stores.slot(source).as_mut() {
             slot.store.authorize(&record, &expected);
         }
-        if source == DurableSource::ClaudeCode && stores.fund_key(store_key) {
+        let needs_original = record.format == store::FORMAT_V1
+            || interpretation
+                .accepted
+                .is_some_and(|floor| floor.end > record.record.certificate.sealed_offset);
+        if source == DurableSource::ClaudeCode && needs_original && stores.fund_key(store_key) {
             let proof = stores
                 .slot(source)
                 .as_ref()
@@ -3387,6 +3456,9 @@ impl SharedCache {
             held,
             index,
             lease,
+            acquired::ImmutableCounting::from_reduction(&reduction)
+                .ok()
+                .as_ref(),
         ) {
             durable
                 .put_chain(chain)
@@ -3416,6 +3488,7 @@ impl SharedCache {
         held: &mut File,
         index: &ScanIndex,
         lease: &mut store::ActiveLease,
+        counting: Option<&acquired::ImmutableCounting>,
     ) -> Option<AcquiredChain> {
         use std::io::{Seek, SeekFrom};
         let ds = durable_source(snapshot_source)?;
@@ -3423,7 +3496,50 @@ impl SharedCache {
             (store::FORMAT_V3, Some(acquisition)) => {
                 (acquisition.acquired_revision, acquisition.protocol)
             }
-            (store::FORMAT_V1, None) => (adapter_revision?, AcquisitionProtocol::Legacy),
+            (store::FORMAT_V1, None) => {
+                let revision = match adapter_revision {
+                    Some(revision) => revision,
+                    None if snapshot_source == SnapshotSource::Codex => {
+                        let mut stores = self.durable()?;
+                        let slot = stores.slot(ds).as_ref()?;
+                        let interpretation = Interpretation::of(
+                            snapshot_source,
+                            key,
+                            index,
+                            slot.identity_capture,
+                            &slot.namespace,
+                        );
+                        let entry = index.files.get(key)?;
+                        let candidates = std::collections::BTreeSet::from([
+                            entry.effective_upload_body_witness_revision,
+                            effective_revision(snapshot_source),
+                            index.active_effective_upload_body_witness_revision,
+                        ]);
+                        let mut matched = None;
+                        for revision in candidates {
+                            let expected = expected(
+                                ds,
+                                snapshot_source,
+                                key,
+                                checkpoint.scope(),
+                                index,
+                                &interpretation,
+                                Some((store::FORMAT_V1, record.record.allowlist, revision)),
+                            )?;
+                            if record.eligible(&expected).is_ok() {
+                                if matched.is_some() {
+                                    return None;
+                                }
+                                matched = Some(revision);
+                            }
+                        }
+                        matched
+                            .filter(|revision| *revision == effective_revision(snapshot_source))?
+                    }
+                    None => return None,
+                };
+                (revision, AcquisitionProtocol::Legacy)
+            }
             _ => return None,
         };
         let binding = self.live_binding(
@@ -3433,6 +3549,8 @@ impl SharedCache {
             checkpoint.scope(),
             index,
             revision,
+            counting?,
+            lease,
         )?;
         // Two bounded content samples plus the digest text, funded before input.
         lease
@@ -3460,6 +3578,7 @@ impl SharedCache {
         .ok()
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn durable_restore_record(
         &self,
@@ -3470,6 +3589,21 @@ impl SharedCache {
         scope: &Scope,
         held: &mut File,
         lease: &mut store::ActiveLease,
+    ) -> Result<(Checkpoint, CachedJsonlReduction, codec::RederiveReceipt), Failure> {
+        self.durable_restore_record_scoped(source, record, expected, path, scope, held, lease, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn durable_restore_record_scoped(
+        &self,
+        source: SnapshotSource,
+        record: &store::DurableRecord,
+        expected: &Expected,
+        path: &Path,
+        scope: &Scope,
+        held: &mut File,
+        lease: &mut store::ActiveLease,
+        v3: Option<V3RestoreScope<'_>>,
     ) -> Result<(Checkpoint, CachedJsonlReduction, codec::RederiveReceipt), Failure> {
         if source == SnapshotSource::Codex {
             refuse_compressed_codex(Some(path), None, CodexZstCause::DurableTailUnsupported)
@@ -3500,6 +3634,27 @@ impl SharedCache {
                 crate::durable_tail_codec::DecodeFailure::Integrity => Failure::Corrupt,
             },
         )?;
+        if record.format == store::FORMAT_V3 {
+            let inputs = v3.ok_or(Failure::Ineligible(store::Ineligible::Scope))?;
+            let counting = decoded.immutable_counting().map_err(|_| Failure::Corrupt)?;
+            let acquired = record
+                .record
+                .acquisition
+                .ok_or(Failure::Corrupt)?
+                .acquired_revision;
+            if record.record.binding.scope
+                != v3_replay_scope(
+                    source,
+                    scope,
+                    inputs.index,
+                    inputs.interpretation,
+                    acquired,
+                    &counting,
+                )
+            {
+                return Err(Failure::Ineligible(store::Ineligible::Scope));
+            }
+        }
         if decoded
             .cutover()
             .is_some_and(|stored| stored != codex_counting_version::cutover_unix_ms())
@@ -3524,6 +3679,16 @@ impl SharedCache {
         let (reduction, receipt) = decoded
             .rederive_content(held)
             .map_err(Failure::NotRederived)?;
+        if source == SnapshotSource::Codex
+            && v3.is_some_and(|inputs| {
+                !codex_counting_version::reusable_under_view(
+                    reduction.finish_view().0,
+                    &inputs.interpretation.counting_view,
+                )
+            })
+        {
+            return Err(Failure::Ineligible(store::Ineligible::Scope));
+        }
         let after =
             crate::transcript_acquisition::FileStamp::capture(held.metadata().map_err(|_| {
                 Failure::Certificate(CertificateRefusal::Changed(FullReason::Replaced))
@@ -3964,6 +4129,9 @@ impl SharedCache {
                         return Some(original.binding.scope);
                     }
                     let (format, allowlist) = slot.store.representation(&digest)?;
+                    if format == store::FORMAT_V3 {
+                        return None;
+                    }
                     expected(
                         source,
                         snapshot_source,

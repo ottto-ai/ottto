@@ -199,6 +199,18 @@ pub(in crate::snapshots) struct CommitFences<'a> {
     chain: &'a AcquiredChain,
     committed_index: &'a ScanIndex,
 }
+fn named_object_is_held(path: &Path, held: &File) -> bool {
+    std::fs::symlink_metadata(path)
+        .ok()
+        .zip(held.metadata().ok())
+        .is_some_and(|(named, held)| {
+            named.is_file()
+                && !named.file_type().is_symlink()
+                && (named.dev(), named.ino(), birth_unix_nanos(&named))
+                    == (held.dev(), held.ino(), birth_unix_nanos(&held))
+        })
+}
+
 impl<'a> CommitFences<'a> {
     pub(in crate::snapshots) fn new(
         held: &'a mut File,
@@ -208,7 +220,7 @@ impl<'a> CommitFences<'a> {
         chain: &'a AcquiredChain,
         committed_index: &'a ScanIndex,
     ) -> Result<Self, HeldCause> {
-        if Path::new(chain.key()) != path {
+        if Path::new(chain.key()) != path || !named_object_is_held(path, held) {
             return Err(HeldCause::Incompatible);
         }
         // O: the object this pass opened is the one the chain acquired.
@@ -253,7 +265,7 @@ impl<'a> CommitFences<'a> {
     /// The prepared candidate is exactly this chain's next record.
     fn admit(&mut self, identity: &RecordIdentity) -> Result<(), HeldCause> {
         let checkpoint = self.checkpoint.ok_or(HeldCause::Fence)?;
-        if Path::new(self.chain.key()) != self.path {
+        if Path::new(self.chain.key()) != self.path || !named_object_is_held(self.path, self.held) {
             return Err(HeldCause::Incompatible);
         }
         if identity.binding() != self.chain.binding()
@@ -352,12 +364,22 @@ impl SharedCache {
         checkpoint: &Checkpoint,
         index: &ScanIndex,
         write_ahead_eligible: bool,
+        counting: &acquired::ImmutableCounting,
     ) -> Result<AcquiredChain, HeldCause> {
         let ds = durable_source(source).ok_or(HeldCause::Incompatible)?;
         let m = held.metadata().map_err(|_| HeldCause::Fence)?;
         let revision = effective_revision(source);
         let binding = self
-            .live_binding(ds, source, key, checkpoint.scope(), index, revision)
+            .live_binding(
+                ds,
+                source,
+                key,
+                checkpoint.scope(),
+                index,
+                revision,
+                counting,
+                lease,
+            )
             .ok_or(HeldCause::Incompatible)?;
         self.authorize_predecessor(lease, source, key, index, &binding, checkpoint, &m)?;
         acquired::capture_chain(
@@ -380,6 +402,7 @@ impl SharedCache {
 
     /// A later pass reuses a retained or restored chain: r_a, protocol and
     /// eligibility are inherited, never restamped; O/binding/generation move.
+    #[allow(clippy::too_many_arguments)] // Each argument is a frozen native proof input; ownership stays with the caller.
     pub(in crate::snapshots) fn durable_rebind_chain(
         &self,
         lease: &mut store::ActiveLease,
@@ -388,6 +411,7 @@ impl SharedCache {
         held: &File,
         checkpoint: &Checkpoint,
         index: &ScanIndex,
+        counting: &acquired::ImmutableCounting,
     ) -> Result<(), HeldCause> {
         let ds = durable_source(chain.source()).ok_or(HeldCause::Incompatible)?;
         if chain.acquired_revision() != effective_revision(chain.source()) {
@@ -402,6 +426,8 @@ impl SharedCache {
                 checkpoint.scope(),
                 index,
                 chain.acquired_revision(),
+                counting,
+                lease,
             )
             .ok_or(HeldCause::Incompatible)?;
         self.authorize_predecessor(
@@ -436,8 +462,57 @@ impl SharedCache {
         checkpoint: &Checkpoint,
         held: &std::fs::Metadata,
     ) -> Result<(), HeldCause> {
-        if source != SnapshotSource::ClaudeCode {
-            return Ok(()); // Codex v1 needs no memo; Codex native v3 is P5.
+        let ds = durable_source(source).ok_or(HeldCause::Incompatible)?;
+        let digest = binding.key;
+        if self.durable().is_some_and(|mut stores| {
+            stores
+                .slot(ds)
+                .as_ref()
+                .is_some_and(|slot| slot.store.absent(&digest))
+        }) {
+            return Ok(());
+        }
+        if self.durable().is_some_and(|mut stores| {
+            stores.slot(ds).as_mut().is_some_and(|slot| {
+                slot.store
+                    .authorize_native(binding, effective_revision(source))
+            })
+        }) {
+            return Ok(());
+        }
+        // A cold v3 predecessor is read once, then every warm mutation uses
+        // the saved stamp. It owes no v1 old-byte witness/custody slot.
+        let native = self
+            .durable()
+            .and_then(|mut stores| {
+                stores
+                    .slot(ds)
+                    .as_mut()
+                    .and_then(|slot| slot.store.representation(&digest))
+            })
+            .is_some_and(|(format, _)| format == store::FORMAT_V3);
+        if source == SnapshotSource::Codex || native {
+            lease
+                .charge(store::RESTORE_INPUT_BYTES)
+                .map_err(|_| HeldCause::CustodyBound)?;
+            let mut stores = self.durable().ok_or(HeldCause::Fence)?;
+            let slot = stores.slot(ds).as_mut().ok_or(HeldCause::Fence)?;
+            match slot
+                .store
+                .read_bounded(&digest, lease)
+                .map_err(|_| HeldCause::CustodyBound)?
+            {
+                ReadOutcome::Found(record) if record.format == store::FORMAT_V3 => {
+                    let expected = Expected {
+                        binding: binding.clone(),
+                        committed_generation: index.generation,
+                    };
+                    slot.store.authorize(&record, &expected);
+                }
+                ReadOutcome::Refused(reason) => return Err(HeldCause::Protected(reason)),
+                _ => {}
+            }
+            return Ok(());
         }
         let certificate = checkpoint
             .durable_certificate(birth_unix_nanos(held))
@@ -458,11 +533,13 @@ impl SharedCache {
             return Err(HeldCause::Fence);
         };
         authorize_strict(slot, source, key, index, custody, binding, &certificate);
+        stores.release_idle_custody(&digest);
         Ok(())
     }
 
     /// The v3 binding the existing reader expects: the current pass's context
     /// and scope formula with format 3 and r_a; the entry digest is reserved.
+    #[allow(clippy::too_many_arguments)] // Frozen binding inputs, including body-derived immutable C.
     pub(super) fn live_binding(
         &self,
         ds: DurableSource,
@@ -471,10 +548,25 @@ impl SharedCache {
         scope: &Scope,
         index: &ScanIndex,
         revision: u64,
+        counting: &acquired::ImmutableCounting,
+        lease: &mut store::ActiveLease,
     ) -> Option<Binding> {
         let (namespace, identity_capture) = {
             let mut stores = self.durable()?;
             let slot = stores.slot(ds).as_ref()?;
+            let strings = slot
+                .namespace
+                .0
+                .len()
+                .checked_add(key.len().checked_mul(2)?)?
+                .checked_add(
+                    index
+                        .claude_request_identity_contract
+                        .as_ref()
+                        .map_or(0, String::len),
+                )?
+                .checked_add(512)?;
+            lease.charge(strings as u64).ok()?;
             (slot.namespace.clone(), slot.identity_capture)
         };
         let interpretation = Interpretation::of(source, key, index, identity_capture, &namespace);
@@ -485,14 +577,7 @@ impl SharedCache {
                 &namespace.0,
                 index.active_upload_context_fingerprint.as_deref(),
             ),
-            scope: replay_scope_for(
-                source,
-                scope,
-                index,
-                &interpretation,
-                None,
-                Some((store::FORMAT_V3, ds.properties().allowlist(), revision)),
-            ),
+            scope: v3_replay_scope(source, scope, index, &interpretation, revision, counting),
             entry: [0; 32],
         })
     }
@@ -580,7 +665,9 @@ impl SharedCache {
             let Some(writer) = held_for(&slot.dir) else {
                 return PrepareOutcome::Degraded(Degraded::NoLock);
             };
-            if !slot.store.check_resources(writer, 0) {
+            let index_len =
+                std::fs::metadata(&slot.index_path).map_or(0, |metadata| metadata.len());
+            if !slot.store.check_resources(writer, index_len) {
                 return PrepareOutcome::Degraded(Degraded::Paused);
             }
             match slot.store.prepare_stream(writer, header) {
@@ -799,12 +886,7 @@ impl SharedCache {
                 debug_assert!(!cause.is_empty());
                 // Cleanup proved the predecessor absent: degraded publish.
                 // Publication without a record leaves no receipt to owe.
-                if stores
-                    .retail_spent
-                    .get(&digest)
-                    .is_some_and(|custody| custody.hold.is_some())
-                    && !stores.hold_content_changed(digest)
-                {
+                if stores.hold(&digest).is_some() && !stores.hold_content_changed(digest) {
                     return WriteOutcome::FailedHeld(HeldCause::StaleSurvivor);
                 }
                 stores.clear_owed(digest);
@@ -813,10 +895,7 @@ impl SharedCache {
             }
             store::FailureDisposition::Hold { cause } if source == DurableSource::ClaudeCode => {
                 debug_assert!(!cause.is_empty());
-                let held = stores
-                    .retail_spent
-                    .get(&digest)
-                    .is_some_and(|custody| custody.hold.is_some());
+                let held = stores.hold(&digest).is_some();
                 if stores.hold_content_changed(digest)
                     || (held && !stores.observe_hold(digest, observed))
                 {
@@ -885,10 +964,7 @@ impl SharedCache {
             }
         };
         if source == DurableSource::ClaudeCode
-            && stores
-                .retail_spent
-                .get(&digest)
-                .is_some_and(|custody| custody.hold.is_some())
+            && stores.hold(&digest).is_some()
             && !stores.hold_content_changed(digest)
         {
             return UnpreparedDisposition::Hold(HeldCause::StaleSurvivor);
@@ -913,12 +989,7 @@ impl SharedCache {
                 if fault {
                     note_degraded(stores);
                 }
-                if stores
-                    .retail_spent
-                    .get(&digest)
-                    .is_some_and(|custody| custody.hold.is_some())
-                    && !stores.hold_content_changed(digest)
-                {
+                if stores.hold(&digest).is_some() && !stores.hold_content_changed(digest) {
                     return UnpreparedDisposition::Hold(HeldCause::StaleSurvivor);
                 }
                 UnpreparedDisposition::PublishWithoutRecord { cause: reason }
@@ -927,10 +998,7 @@ impl SharedCache {
             // predecessor: hold only this Claude key; keys without a stale
             // survivor (and every Codex key, whose v1 entry refuses) publish.
             PriorRecord::Retained { .. } if fault && source == DurableSource::ClaudeCode => {
-                let held = stores
-                    .retail_spent
-                    .get(&digest)
-                    .is_some_and(|custody| custody.hold.is_some());
+                let held = stores.hold(&digest).is_some();
                 if stores.hold_content_changed(digest)
                     || (held && !stores.observe_hold(digest, observed))
                 {
@@ -1020,7 +1088,8 @@ impl SharedCache {
         let Some(writer) = held_for(&slot.dir) else {
             return true;
         };
-        !slot.store.check_resources(writer, 0)
+        let index_len = std::fs::metadata(&slot.index_path).map_or(0, |metadata| metadata.len());
+        !slot.store.check_resources(writer, index_len)
     }
 
     /// Native discovery/publication query for a held Claude key; counts growth
@@ -1044,17 +1113,13 @@ impl SharedCache {
         };
         let metadata = held.metadata().ok();
         let edited = metadata.as_ref().is_some_and(|m| {
-            stores
-                .retail_spent
-                .get(&digest)
-                .and_then(|custody| custody.hold)
-                .is_some_and(|hold| {
-                    m.len() < hold.length
-                        || (m.len() == hold.length
-                            && hold
-                                .modified
-                                .is_some_and(|old| old != (m.mtime(), m.mtime_nsec())))
-                })
+            stores.hold(&digest).copied().is_some_and(|hold| {
+                m.len() < hold.length
+                    || (m.len() == hold.length
+                        && hold
+                            .modified
+                            .is_some_and(|old| old != (m.mtime(), m.mtime_nsec())))
+            })
         });
         if edited {
             stores.release_hold(digest, HoldRelease::Content);
@@ -1122,6 +1187,7 @@ fn unprepared_write(disposition: UnpreparedDisposition) -> WriteOutcome {
 fn receipted_locked(stores: &mut Stores, source: DurableSource, key: &str, receipt: &ReceiptProof) {
     let digest = store::key_digest(source, key);
     stores.release_hold(digest, HoldRelease::Write);
+    stores.release_restore_pending(&digest, receipt.identity().certificate().length);
     if source != DurableSource::ClaudeCode {
         return;
     }
@@ -1143,6 +1209,7 @@ fn receipted_locked(stores: &mut Stores, source: DurableSource, key: &str, recei
             custody.original = None;
         }
     }
+    stores.release_idle_custody(&digest);
 }
 
 // Process-lifetime D3 hold counts on the existing #799 diagnostics line. Store
@@ -1179,12 +1246,7 @@ pub(super) struct D3State {
 
 impl Stores {
     fn capture_hold_metadata(&mut self, digest: store::Digest32, file: &File) {
-        if let (Some(hold), Ok(metadata)) = (
-            self.retail_spent
-                .get_mut(&digest)
-                .and_then(|c| c.hold.as_mut()),
-            file.metadata(),
-        ) {
+        if let (Some(hold), Ok(metadata)) = (self.hold_mut(&digest), file.metadata()) {
             hold.modified = Some((metadata.mtime(), metadata.mtime_nsec()));
         }
     }
@@ -1195,55 +1257,43 @@ impl Stores {
         digest: store::Digest32,
         observed: Option<((u64, u64, u64), u64)>,
     ) {
-        if !self.fund_key(digest) {
-            // The attempt still holds; only the cross-pass marker is unfunded.
+        if self.hold(&digest).is_some() {
+            return;
+        }
+        let (object, length) = observed.unwrap_or(((0, 0, 0), 0));
+        let hold = ClaudeHold {
+            since: std::time::SystemTime::now(),
+            object,
+            length,
+            content_changed: false,
+            modified: None,
+        };
+        if !self.place_hold(digest, hold) {
             self.counters.d3[D3_HOLD_UNFUNDED] += 1;
             return;
         }
-        let Some(custody) = self.retail_spent.get_mut(&digest) else {
-            return;
-        };
-        if custody.hold.is_none() {
-            let (object, length) = observed.unwrap_or(((0, 0, 0), 0));
-            custody.hold = Some(ClaudeHold {
-                since: std::time::SystemTime::now(),
-                object,
-                length,
-                content_changed: false,
-                modified: None,
-            });
-            if !self.d3.hold_alarmed {
-                self.d3.hold_alarmed = true;
-                self.d3.hold_alarm_due = true;
-            }
+        if !self.d3.hold_alarmed {
+            self.d3.hold_alarmed = true;
+            self.d3.hold_alarm_due = true;
         }
     }
 
     pub(super) fn release_hold(&mut self, digest: store::Digest32, why: HoldRelease) {
-        if let Some(custody) = self.retail_spent.get_mut(&digest) {
-            if custody.hold.take().is_some() {
-                self.counters.d3[if why == HoldRelease::Write {
-                    D3_RELEASED_WRITE
-                } else {
-                    D3_RELEASED_CONTENT
-                }] += 1;
-            }
+        if self.take_hold(&digest).is_some() {
+            self.counters.d3[if why == HoldRelease::Write {
+                D3_RELEASED_WRITE
+            } else {
+                D3_RELEASED_CONTENT
+            }] += 1;
         }
     }
 
     pub(super) fn hold_content_changed(&self, digest: store::Digest32) -> bool {
-        self.retail_spent
-            .get(&digest)
-            .and_then(|custody| custody.hold)
-            .is_some_and(|hold| hold.content_changed)
+        self.hold(&digest).is_some_and(|hold| hold.content_changed)
     }
 
     pub(super) fn mark_hold_content_changed(&mut self, digest: store::Digest32) {
-        if let Some(hold) = self
-            .retail_spent
-            .get_mut(&digest)
-            .and_then(|custody| custody.hold.as_mut())
-        {
+        if let Some(hold) = self.hold_mut(&digest) {
             hold.content_changed = true;
         }
     }
@@ -1256,11 +1306,7 @@ impl Stores {
         digest: store::Digest32,
         observed: Option<((u64, u64, u64), u64)>,
     ) -> bool {
-        let Some(hold) = self
-            .retail_spent
-            .get_mut(&digest)
-            .and_then(|custody| custody.hold.as_mut())
-        else {
+        let Some(hold) = self.hold_mut(&digest) else {
             return false;
         };
         let Some((object, length)) = observed else {
@@ -1270,10 +1316,11 @@ impl Stores {
             self.release_hold(digest, HoldRelease::Content);
             return false;
         }
-        if length > hold.length {
-            self.counters.d3[D3_HOLD_GROWTH_BYTES] += length - hold.length;
+        let grown = length.saturating_sub(hold.length);
+        if grown > 0 {
             hold.length = length;
         }
+        self.counters.d3[D3_HOLD_GROWTH_BYTES] += grown;
         true
     }
 
@@ -1281,11 +1328,7 @@ impl Stores {
     pub(super) fn claude_holds(&self) -> [u64; 2] {
         let mut keys = 0;
         let mut oldest = 0;
-        for hold in self
-            .retail_spent
-            .values()
-            .filter_map(|custody| custody.hold)
-        {
+        for hold in self.holds() {
             keys += 1;
             oldest = oldest.max(hold.since.elapsed().map_or(0, |age| age.as_secs()));
         }

@@ -837,7 +837,10 @@ fn m3_d3_codex_strict_rebind_survives_save_and_load_and_refuses_a_with_one_full(
     assert_eq!(refused.tail(), 0);
     assert!(!refused.disabled());
     let (counts, stats) = rig.counters();
-    assert_eq!(counts.ineligible.get("selection_cleared"), Some(&1));
+    assert_eq!(
+        counts.ineligible.get("selection_cleared.stale_record"),
+        Some(&1)
+    );
     assert_eq!(counts.restored, 0);
     assert_eq!(stats.stale_record_refused, 1, "stale-A refusal is reported");
     assert!(!rig.index.files[&key].source_file_fingerprint.is_empty());
@@ -993,4 +996,70 @@ fn m3_d3_sigkill_at_native_order_points_recovers_exactly_once() {
             "{point:?}: published exactly once"
         );
     }
+}
+
+/// The real Codex native fault reaches the PRE barrier before any upload is
+/// authorized. The barrier saves retained facts, never the newly parsed end.
+#[test]
+fn m3_codex_native_double_fault_commits_only_pre_binding_before_publish() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    let _clear = ClearFaults;
+    let mut rig = Rig::new(SnapshotSource::Codex, "m3-codex-pre-ack");
+    rig.create(CODEX_SESSION, 3);
+    assert_eq!(rig.pass().published(CODEX_SESSION), 1);
+    rig.assert_native_record(CODEX_SESSION);
+    let key = rig.key(CODEX_SESSION);
+    let mut committed = rig.index.clone();
+    let pre = serde_json::to_value(&committed.files[&key]).unwrap();
+    let membership = committed.file_snapshot_fingerprints[&key].clone();
+    let a = fs::read(rig.record(CODEX_SESSION)).unwrap();
+    rig.append(CODEX_SESSION, 1);
+    fail_rename(rig.record(CODEX_SESSION), libc::EIO);
+    fail_cleanup(Cleanup::NativeStage, rig.record(CODEX_SESSION));
+    rig.cache
+        .durable_begin_pass(rig.source, &rig.index_path, &rig.namespace, true);
+    let (mut working, publications) = scan(
+        rig.source,
+        &rig.sessions,
+        std::mem::take(&mut rig.index),
+        rig.cache.clone(),
+        &rig.namespace,
+    );
+    assert_eq!(publications.len(), 1, "Codex degrades instead of holding");
+    assert!(rig.cache.durable_store_faulted(rig.source));
+    assert_eq!(rig.counters().1.receipt_pending_records, 0);
+    assert_eq!(fs::read(rig.record(CODEX_SESSION)).unwrap(), a);
+    assert!(working.files[&key].source_file_fingerprint.is_empty());
+    assert_eq!(
+        serde_json::to_value(&ScanIndex::load(&rig.index_path).unwrap().files[&key]).unwrap(),
+        pre,
+        "no post-upload save is being counted as this barrier"
+    );
+    assert!(commit_store_fault_barrier(
+        &rig.cache,
+        rig.source,
+        &mut working,
+        &mut committed,
+        &rig.index_path
+    )
+    .unwrap());
+    let disk = ScanIndex::load(&rig.index_path).unwrap();
+    assert!(disk.files[&key].source_file_fingerprint.is_empty());
+    let mut rebound = serde_json::to_value(&disk.files[&key]).unwrap();
+    rebound["source_file_fingerprint"] = pre["source_file_fingerprint"].clone();
+    assert_eq!(
+        rebound, pre,
+        "real PRE revision, extent, witness and debt are retained"
+    );
+    assert_eq!(disk.file_snapshot_fingerprints[&key], membership);
+    assert_eq!(
+        working.generation, disk.generation,
+        "subsequent saves CAS against the barrier"
+    );
+    assert!(
+        !rig.cache.owes_discovery(rig.source, &key),
+        "disabled store drops owed claims"
+    );
 }

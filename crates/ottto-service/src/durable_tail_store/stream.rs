@@ -489,6 +489,54 @@ impl PassFlush {
 }
 
 impl DurableTailStore {
+    /// Re-arm a fully verified native predecessor using only its exact saved
+    /// stamp and bounded header. A memo without a verified content digest is
+    /// not authority. Never enumerate or re-read its body on a warm write.
+    pub(crate) fn authorize_native(&mut self, binding: &Binding, revision: u64) -> bool {
+        let Some((Some(_), stamp, _)) = self.durable.get(&binding.key).copied() else {
+            return false;
+        };
+        let path = self.record_path(&binding.key);
+        let checked = (|| -> io::Result<bool> {
+            if stamp_at(&path)? != Some(stamp) {
+                return Ok(false);
+            }
+            let mut file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&path)?;
+            let metadata = file.metadata()?;
+            if !metadata.is_file()
+                || metadata.uid() != our_uid()
+                || metadata.mode() & 0o777 != 0o600
+                || Stamp::of(&metadata) != stamp
+            {
+                return Ok(false);
+            }
+            let mut bytes = [0; HEADER_V3_BYTES];
+            file.read_exact(&mut bytes)?;
+            self.counters.guard_header_bytes += HEADER_V3_BYTES as u64;
+            let header = decode_header(&bytes, &binding.key, binding.source)
+                .map_err(|_| io::Error::other("native predecessor header"))?;
+            Ok(header.format == FORMAT_V3
+                && header.record.binding == *binding
+                && header
+                    .record
+                    .acquisition
+                    .is_some_and(|acquisition| acquisition.acquired_revision == revision)
+                && metadata.len() == (HEADER_V3_BYTES + header.body_len + TRAILER_BYTES) as u64
+                && Stamp::of(&file.metadata()?) == stamp
+                && stamp_at(&path)? == Some(stamp))
+        })()
+        .unwrap_or(false);
+        if checked {
+            if let Some((_, _, allowed)) = self.durable.get_mut(&binding.key) {
+                *allowed = true;
+            }
+        }
+        checked
+    }
+
     pub(crate) fn prepare_stream(
         &mut self,
         writer: &dyn SingleWriter,
@@ -530,6 +578,17 @@ impl DurableTailStore {
             {
                 return Err(io::Error::other("invalid native header"));
             }
+            let encoded_len = size + header.body_len + TRAILER_BYTES;
+            if self.stream_records >= MAX_BATCH
+                || self
+                    .stream_bytes
+                    .checked_add(encoded_len)
+                    .map_or(true, |bytes| bytes > WRITE_PASS_BYTES)
+            {
+                self.counters.records_deferred += 1;
+                protected = Some(Refusal::ReceiptPending);
+                return Err(io::Error::other("native pass allowance exhausted"));
+            }
             if self.pending.contains_key(&key) || self.pending.len() >= MAX_BATCH {
                 protected = Some(Refusal::ReceiptPending);
                 return Err(io::Error::other("pending bound"));
@@ -568,6 +627,8 @@ impl DurableTailStore {
                 }
             }
             attempt.prior_known = true;
+            self.stream_records += 1;
+            self.stream_bytes += encoded_len;
             Ok(())
         })();
         match result {
@@ -873,8 +934,7 @@ impl DurableTailStore {
             self.dir.parent().unwrap_or(&self.dir)
         };
         // One statvfs reserves a whole bounded pass, not one syscall per record.
-        let enough =
-            above_floor(dir, (MAX_BATCH * RECORD_BYTES) as u64, index_len).unwrap_or(false);
+        let enough = above_floor(dir, WRITE_PASS_BYTES as u64, index_len).unwrap_or(false);
         self.resource_checked = true;
         self.resource_granted = enough;
         if !enough {

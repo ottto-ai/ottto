@@ -1,6 +1,5 @@
 //! Acquisition provenance travels with the existing checkpoint custody owner.
 //! These fields never become index membership, replay permission or money ACKs.
-#[cfg(test)]
 use super::SnapshotAccumulator;
 use super::{store, CachedJsonlReduction, HeldCause, SnapshotSource};
 use crate::transcript_acquisition as ta;
@@ -21,13 +20,12 @@ impl ImmutableCounting {
     pub(crate) fn from_reduction(reduction: &CachedJsonlReduction) -> Result<Self, store::Refusal> {
         Self::canonical(reduction.source(), reduction.durable_counting())
     }
-    #[cfg(test)]
     pub(in crate::snapshots) fn from_accumulator(
         accumulator: &SnapshotAccumulator,
     ) -> Result<Self, store::Refusal> {
         Self::canonical(accumulator.source, accumulator.durable_counting())
     }
-    fn canonical(
+    pub(super) fn canonical(
         source: SnapshotSource,
         contract: Option<(Option<i64>, u8, u8)>,
     ) -> Result<Self, store::Refusal> {
@@ -49,8 +47,6 @@ impl ImmutableCounting {
         }
         Ok(Self { bytes })
     }
-    // Inspection helper for the scope-contract controls until native v3 activation.
-    #[cfg(test)]
     pub(crate) fn bytes(&self) -> &[u8; 13] {
         &self.bytes
     }

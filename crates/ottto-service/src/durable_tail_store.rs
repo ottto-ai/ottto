@@ -65,6 +65,8 @@ pub(crate) const RECORD_BYTES: usize = crate::transcript_cache::ENTRY_BYTES;
 pub(crate) const MAX_RECORDS: usize = crate::transcript_cache::CACHE_ENTRIES;
 /// Dirty records written per index save; the rest stay dirty for the next.
 pub(crate) const MAX_BATCH: usize = 32;
+/// Encoded native/batch write allowance for one source pass.
+pub(crate) const WRITE_PASS_BYTES: usize = 8 * 1024 * 1024;
 const RECORD_SUFFIX: &str = ".rec";
 const TEMP_SUFFIX: &str = ".tmp";
 
@@ -649,6 +651,8 @@ pub(crate) struct DurableTailStore {
     resource_pause: Option<stream::ResourcePause>,
     stream_dirty: Arc<AtomicU64>,
     stream_flush_taken: bool,
+    stream_records: usize,
+    stream_bytes: usize,
     resource_checked: bool,
     resource_granted: bool,
 }
@@ -694,6 +698,8 @@ impl DurableTailStore {
             resource_pause: None,
             stream_dirty: Arc::default(),
             stream_flush_taken: false,
+            stream_records: 0,
+            stream_bytes: 0,
             resource_checked: false,
             resource_granted: false,
         }
@@ -702,6 +708,8 @@ impl DurableTailStore {
     /// A new pass: the directory is checked again and the T14 breaker resets.
     pub(crate) fn begin_pass(&mut self) {
         self.stream_flush_taken = false;
+        self.stream_records = 0;
+        self.stream_bytes = 0;
         self.resource_checked = false;
         self.resource_granted = false;
         self.checked = false;

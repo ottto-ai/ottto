@@ -6123,9 +6123,10 @@ fn q11_complete_map_is_paid_before_the_first_key() {
     let pace_nodes =
         crate::heap_layout_bound::tree_node_bytes::<store::Digest32, FullPace>().unwrap();
     assert!((2 * store::MAX_RECORDS + 1) * (nodes + pace_nodes) <= reserve);
-    assert_eq!(STORES_RESIDENT_BOUND, 1_452_032);
+    assert_eq!(STORES_RESIDENT_BOUND, 1_978_368);
     assert_eq!(
         super::super::STATE_BYTES
+            + super::super::KEY_RESERVE_BYTES
             + reserve
             + crate::source_rotation::OVERLAP_BUDGET
             + super::super::AUDIT_AND_SCRATCH_BYTES,

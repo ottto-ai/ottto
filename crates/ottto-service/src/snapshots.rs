@@ -29357,6 +29357,9 @@ impl OwnedSourceScan {
                             && !comparison_target
                             && side_origin.is_none()
                             && aliases.is_empty()
+                            && applied_receipts.values().all(Option::is_none)
+                            && (source != SnapshotSource::Codex
+                                || sampled_scan::compatible_reduction(&parser.accumulator))
                     })
                     .and_then(|(context, active)| {
                         let held = parser.reader.reader.get_ref().try_clone().ok()?;
@@ -29372,6 +29375,11 @@ impl OwnedSourceScan {
                             mode: active.mode,
                             held: &held,
                             index,
+                            counting:
+                                sampled_scan::durable_tail::ImmutableCounting::from_accumulator(
+                                    &parser.accumulator,
+                                )
+                                .ok(),
                         };
                         if let Some(completed) = completed_acquisition.as_mut() {
                             bind_native_chain(&context.cache, completed, &request);
@@ -30734,6 +30742,22 @@ impl OwnedSourceScan {
                     // Exact watcher remove/rename hints must amend the same durable
                     // observation set used by directory census reconciliation. Apply
                     // removals first so a valid observation later in this page wins.
+                    #[cfg(unix)]
+                    if let Some(context) = sampling.as_ref() {
+                        for key in census
+                            .removed_index_keys
+                            .iter()
+                            .filter(|key| context.cache.owes_discovery(source, key))
+                        {
+                            census.observed_index_keys.insert(key.clone());
+                        }
+                        census
+                            .removed_index_keys
+                            .retain(|key| !context.cache.owes_discovery(source, key));
+                        census
+                            .claude_vanished_index_keys
+                            .retain(|key| !context.cache.owes_discovery(source, key));
+                    }
                     for index_key in &census.removed_index_keys {
                         traversal.observed_index_keys.remove(index_key);
                     }
@@ -30999,7 +31023,13 @@ impl OwnedSourceScan {
                     && state_census_complete
                     && sidecar_census_complete
                 {
-                    reconcile_missing_index_entries_bounded(index, codex_side_drop)
+                    reconcile_missing_index_entries_bounded(
+                        index,
+                        codex_side_drop,
+                        sampling
+                            .as_ref()
+                            .map(|context| (source, context.cache.as_ref())),
+                    )
                 } else {
                     false
                 };
@@ -35297,6 +35327,7 @@ struct NativeChainRequest<'a> {
     key: &'a str,
     opened_object_identity: &'a str,
     mode: crate::transcript_acquisition::ReadMode,
+    counting: Option<sampled_scan::durable_tail::ImmutableCounting>,
     held: &'a File,
     index: &'a ScanIndex,
 }
@@ -35316,6 +35347,9 @@ fn bind_native_chain(
     request: &NativeChainRequest<'_>,
 ) {
     use crate::transcript_acquisition::{FullReason, ReadMode};
+    let Some(counting) = request.counting.as_ref() else {
+        return;
+    };
     let real_edit = matches!(
         request.mode,
         ReadMode::Full(
@@ -35331,12 +35365,19 @@ fn bind_native_chain(
     }
     let custody = &mut completed.durable;
     if let Some(mut owed) = custody.owed.take() {
-        // A later Tail invalidates the old candidate, never its acquisition.
-        let _ = cache.advance_owed(&mut owed, &completed.checkpoint);
-        custody.owed = Some(owed);
-        if custody.ensure_active(cache, request.source, 0).is_err() {
-            return;
+        if custody.ensure_active(cache, request.source, 0).is_ok() {
+            let _ = cache.advance_owed(&mut owed, &completed.checkpoint);
+            let _ = cache.durable_rebind_chain(
+                custody.active.as_mut().expect("lease"),
+                owed.chain_mut(),
+                request.opened_object_identity,
+                request.held,
+                &completed.checkpoint,
+                request.index,
+                counting,
+            );
         }
+        custody.owed = Some(owed);
         return;
     }
     if !custody.has_active() {
@@ -35357,6 +35398,7 @@ fn bind_native_chain(
                 request.held,
                 &completed.checkpoint,
                 request.index,
+                counting,
             )
             .is_err()
         {
@@ -35379,6 +35421,7 @@ fn bind_native_chain(
         &completed.checkpoint,
         request.index,
         first_read || real_edit,
+        counting,
     ) {
         custody.chain = Some(chain);
     }
@@ -43705,6 +43748,21 @@ fn release_codex_inventory_hold(source: SnapshotSource, traversal: &mut ScanTrav
     }
 }
 
+fn owed_discovery(
+    _cache: Option<&sampled_scan::SharedCache>,
+    _source: SnapshotSource,
+    _key: &str,
+) -> bool {
+    #[cfg(unix)]
+    {
+        _cache.is_some_and(|cache| cache.owes_discovery(_source, _key))
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 #[derive(Clone, Copy)]
 struct DiscoveryRecovery<'a> {
     files: &'a BTreeMap<String, ScanIndexEntry>,
@@ -44102,19 +44160,26 @@ fn candidate_from_traversal_path_at<'a>(
 fn reconcile_missing_index_entries_bounded(
     index: &mut ScanIndex,
     codex_side_drop: Option<(&sampled_scan::SharedCache, u128)>,
+    durable: Option<(SnapshotSource, &sampled_scan::SharedCache)>,
 ) -> bool {
-    reconcile_missing_index_entries_with_side(index, MAX_BACKFILL_FILES_PER_SOURCE, codex_side_drop)
+    reconcile_missing_index_entries_with_side(
+        index,
+        MAX_BACKFILL_FILES_PER_SOURCE,
+        codex_side_drop,
+        durable,
+    )
 }
 
 #[cfg(test)]
 fn reconcile_missing_index_entries_with_limit(index: &mut ScanIndex, limit: usize) -> bool {
-    reconcile_missing_index_entries_with_side(index, limit, None)
+    reconcile_missing_index_entries_with_side(index, limit, None, None)
 }
 
 fn reconcile_missing_index_entries_with_side(
     index: &mut ScanIndex,
     limit: usize,
     codex_side_drop: Option<(&sampled_scan::SharedCache, u128)>,
+    durable: Option<(SnapshotSource, &sampled_scan::SharedCache)>,
 ) -> bool {
     let Some(snapshot) = index.traversal.as_ref() else {
         return false;
@@ -44139,6 +44204,7 @@ fn reconcile_missing_index_entries_with_side(
             .as_ref()
             .is_some_and(|traversal| traversal.observed_index_keys.contains(key));
         if !observed
+            && !durable.is_some_and(|(source, cache)| owed_discovery(Some(cache), source, key))
             && !index.decode_holds_file(key)
             && !index
                 .files
