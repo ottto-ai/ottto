@@ -365,6 +365,14 @@ fn plain_retained_output_and_charge_are_unchanged_beside_archive_pressure() {
             index.files[&local_index_key(&plain)]
                 .last_upload_body_witness
                 .clone(),
+            cache
+                .retained()
+                .unwrap()
+                .victims()
+                .into_iter()
+                .find(|(resident, _, _)| resident == &local_index_key(&plain))
+                .unwrap()
+                .2,
         ));
     }
     assert_eq!(observations[0], observations[1]);
@@ -621,7 +629,7 @@ fn compressed_retained_save_never_writes_a_durable_record() {
     // Force selection/touch as a hostile caller: the actual writer must fence
     // this even though normal archive admission never marks it for persistence.
     cache.durable_note_selection(&key, &index.files[&key].source_file_fingerprint);
-    cache.durable_touch(&key);
+    cache.durable_touch_for_test(&key);
     index.save(&index_path).unwrap();
     cache.durable_write_after_save(writer, SnapshotSource::Codex, &index);
     cache
@@ -694,4 +702,120 @@ fn plain_prepare_cannot_take_or_reuse_a_compressed_retained_entry() {
         crate::transcript_acquisition::ReadMode::Full(_)
     ));
     assert!(cache.retained_checkpoint(&key).is_some());
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "funded decoder needs validated heap layout"
+)]
+fn claude_retained_reuse_is_unchanged_beside_archive_pressure() {
+    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+    let plain =
+        f.0.with_file_name("11111111-2222-4333-8444-555555555555.jsonl");
+    fs::write(
+        &plain,
+        serde_json::to_string(&json!({
+            "type":"assistant", "sessionId":"11111111-2222-4333-8444-555555555555",
+            "timestamp":NOW,"requestId":"synthetic-mixed-request",
+            "message":{"id":"synthetic-mixed-message","model":"fixture-model",
+            "usage":{"input_tokens":100,"output_tokens":10}}
+        }))
+        .unwrap()
+            + "\n",
+    )
+    .unwrap();
+    let key = local_index_key(&plain);
+    let mut member = super::super::codex_zst_refusal_tests::candidate(&plain);
+    member.size_bytes = fs::metadata(&plain).unwrap().len();
+    let mut observations = Vec::new();
+    for with_archive in [false, true] {
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        if with_archive {
+            let (_, archive) = finish_selector(retained_archive_scan(
+                &f,
+                ScanIndex::default(),
+                cache.clone(),
+            ));
+            assert_eq!(archive.snapshots.len(), 1);
+            assert!(cache.retained_checkpoint(&local_index_key(&f.0)).is_some());
+        }
+        let pressure = OpenedInput::funded(File::open(&f.0).unwrap(), &cache)
+            .unwrap()
+            .unwrap();
+        let mut index = ScanIndex::default();
+        let mut bodies = Vec::new();
+        for pass in 0..2 {
+            let mut scan = OwnedSourceScan::new(
+                SnapshotSource::ClaudeCode,
+                &[],
+                index,
+                NOW,
+                BACKFILL_WINDOW_DAYS,
+                10,
+                false,
+                None,
+                &[],
+                false,
+                true,
+            )
+            .with_sampled_acquisition(cache.clone(), Scope("mixed-claude".into()));
+            scan.identified_candidates = VecDeque::from([member.clone()]);
+            scan.census.observed_index_keys.insert(key.clone());
+            scan.census_unix_seconds = None;
+            let ((next_index, result), events) =
+                crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
+                    for _ in 0..1000 {
+                        match scan.step(None) {
+                            OwnedSourceScanStep::Pending(next) => scan = next,
+                            OwnedSourceScanStep::Complete {
+                                mut index,
+                                mut scan,
+                                ..
+                            } => {
+                                apply_upload_policy(
+                                    SnapshotSource::ClaudeCode,
+                                    &mut scan.snapshots,
+                                    SnapshotUploadPolicy::default(),
+                                );
+                                finalize_scan_after_policy(
+                                    SnapshotSource::ClaudeCode,
+                                    &mut scan,
+                                    &mut index,
+                                );
+                                return (index, scan);
+                            }
+                        }
+                    }
+                    panic!("plain Claude scan did not complete");
+                });
+            index = next_index;
+            assert_eq!(result.snapshots.len(), 1);
+            bodies.push(snapshot_upload_body_witness(&result.snapshots[0]));
+            if pass == 1 {
+                assert_eq!(events.take_hit, 1);
+            }
+        }
+        assert_eq!(bodies[0], bodies[1]);
+        let checkpoint = cache
+            .retained_checkpoint(&key)
+            .expect("Claude remains retained");
+        assert!(!checkpoint.is_compressed());
+        // Compare the plain entry's own frozen charge, excluding the distinct
+        // archive resident and live decoder claim.
+        let own_charge = cache
+            .retained()
+            .unwrap()
+            .victims()
+            .into_iter()
+            .find(|(resident, _, _)| resident == &key)
+            .unwrap()
+            .2;
+        observations.push((bodies, checkpoint.sealed_offset(), own_charge));
+        assert!(own_charge > 0);
+        pressure.close();
+        assert_eq!(cache.cursor_reserved(), 0);
+    }
+    assert_eq!(observations[0], observations[1]);
 }

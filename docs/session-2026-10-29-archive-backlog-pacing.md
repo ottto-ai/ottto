@@ -20,14 +20,16 @@ consumer qualification and runtime validation before activation can ship.
 Native power uses the continuation platform seam. Pending archive resends use
 retained reductions; synthetic fixtures are present but unexecuted.
 
-
 Completed archive reductions may enter the existing process cache under its
 normal accounting and admission rules. An unchanged pending archive can resend
 that reduction through native finalization and exact body ACK settlement without
 creating a decoder. `codex_zst_retained_resend` counts these hits. Losing the
 retained copy still permits the existing paced, bounded
-`codex_zst_first_read_retry` exception; release approval for this residual is
-pending. Archives remain replace-only and excluded from durable restoration.
+`codex_zst_first_read_retry` exception, including admission-refused copies.
+The in-process retry consumes 0 decode bytes; re-decode after restart/eviction
+remains a named bounded exception; exit = P5 candidate: durable archive restore
+(needs SOURCE representation). Archives remain replace-only and excluded from
+durable restoration and post-save durable writes.
 The cache's archive witness grants no physical prefix or side-ledger seal.
 
 Queued archive scheduling metadata is RAM-only and charged with its existing
@@ -35,3 +37,9 @@ queue owner. Within the complete header-inventory population it orders archives
 newest first before page selection, preserves plain FIFO, and reuses the metadata
 on later pages. The preparation bound stays at the existing header population;
 an oversized population keeps the existing inventory/custody limitations.
+
+Archive checkpoints carry a heap-accounted RAM domain marker. Only pending
+archive re-emission can take them; plain acquisition and physical-prefix plans
+reject them. Header-bound evidence is valid only for the same content/object
+stamp. Missing or malformed flags load false, allowing at most one bounded
+64 KiB header decode; older decoders drop the evidence.

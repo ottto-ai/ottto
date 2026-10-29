@@ -344,6 +344,10 @@ impl SharedCache {
         });
     }
     #[cfg(test)]
+    pub(super) fn durable_touch_for_test(&self, key: &str) {
+        self.durable_touch(key);
+    }
+    #[cfg(test)]
     pub(super) fn retained_checkpoint(
         &self,
         key: &str,
