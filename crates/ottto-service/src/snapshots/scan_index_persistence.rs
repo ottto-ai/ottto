@@ -361,6 +361,7 @@ impl PartialIndex {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ReadStats {
     pub scanindex_orphan_init_discarded: u64,
+    pub root_missing_reserved_only: u64,
     /// index_shard_unavailable{map,cause}, fixed low-cardinality axes only.
     pub index_shard_unavailable: [[u64; 6]; 3],
 }
@@ -795,14 +796,14 @@ impl LockedStore {
                 file
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                if self.authorized_legacy_replacement.get() {
-                    return Ok((None, Root::Missing));
-                }
                 match self.directory() {
-                    Ok(dir) => ensure!(
-                        repair_only_directory(&dir)?,
-                        "scan_index_root_missing_with_shards"
-                    ),
+                    Ok(dir) => {
+                        self.refuse_reserved_without_root(&dir)?;
+                        ensure!(
+                            self.authorized_legacy_replacement.get(),
+                            "scan_index_root_missing_with_shards"
+                        );
+                    }
                     Err(e)
                         if e.downcast_ref::<io::Error>()
                             .is_some_and(|e| e.kind() == io::ErrorKind::NotFound) => {}
@@ -1176,13 +1177,6 @@ impl LockedStore {
                     || text == format!("{stem}.lock")
                 {
                     Stamp::capture(&open_at(&self.parent, name, libc::O_RDONLY)?, false)?;
-                } else if text == self.objects_name.to_str()? {
-                    // Recovery may retain N+1's opaque class-L repair files.
-                    // They are not prior-root authority for a fresh legacy save.
-                    ensure!(
-                        repair_only_directory(&self.payload_directory()?)?,
-                        "scan_index_prior_state_requires_repair"
-                    );
                 } else if text.strip_prefix(&temp_prefix).is_some_and(|suffix| {
                     suffix.len() == 32 && suffix.bytes().all(|b| b.is_ascii_hexdigit())
                 }) {
@@ -1842,20 +1836,6 @@ fn reserved_repair_filename(name: &str) -> bool {
     generation.len() == 20 && generation.bytes().all(|b| b.is_ascii_digit()) && valid_digest(digest)
 }
 
-/// Name-only exception for a nonempty directory containing only reserved
-/// repair files. Empty/mixed directories retain their existing missing-root
-/// refusal; prior-root witnesses are still checked by recovery and CAS.
-fn repair_only_directory(dir: &File) -> Result<bool> {
-    let mut any = false;
-    let mut only_reserved = true;
-    visit_storage_directory(dir, |name| {
-        any = true;
-        only_reserved &= name.to_str().is_ok_and(reserved_repair_filename);
-        Ok(())
-    })?;
-    Ok(any && only_reserved)
-}
-
 fn orphan_slot(name: &str) -> Option<(Slot, &str)> {
     let stem = name.strip_suffix(".json")?;
     let (label, digest) = stem.rsplit_once('-')?;
@@ -1921,11 +1901,38 @@ impl LockedStore {
         self.parent.sync_all()?;
         Ok(())
     }
+    /// Opaque repair controls are evidence of possible history, never freshness.
+    /// Check names only, before validating or deleting any orphan payload.
+    fn refuse_reserved_without_root(&self, dir: &File) -> Result<()> {
+        visit_storage_directory(dir, |name| {
+            if name.to_str().is_ok_and(reserved_repair_filename) {
+                let mut stats = self.read_stats.get();
+                stats.root_missing_reserved_only =
+                    stats.root_missing_reserved_only.saturating_add(1);
+                self.read_stats.set(stats);
+                bail!("scan_index_root_missing_with_shards");
+            }
+            Ok(())
+        })
+    }
     fn recover_fresh_init(&self) -> Result<()> {
         match open_at(&self.parent, &self.root_name, libc::O_RDONLY) {
             Ok(_) => return Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
+        }
+        let dir = match self.payload_directory() {
+            Ok(dir) => Some(dir),
+            Err(e)
+                if e.downcast_ref::<io::Error>()
+                    .is_some_and(|e| e.kind() == io::ErrorKind::NotFound) =>
+            {
+                None
+            }
+            Err(e) => return Err(e),
+        };
+        if let Some(dir) = &dir {
+            self.refuse_reserved_without_root(dir)?;
         }
         let root = self
             .root_name
@@ -1963,26 +1970,14 @@ impl LockedStore {
             !self.prior_root_seen.get(),
             "scan_index_prior_state_requires_repair"
         );
-        let dir = match self.payload_directory() {
-            Ok(dir) => Some(dir),
-            Err(e)
-                if e.downcast_ref::<io::Error>()
-                    .is_some_and(|e| e.kind() == io::ErrorKind::NotFound) =>
-            {
-                None
-            }
-            Err(e) => return Err(e),
-        };
-        let mut repair_files = false;
-        let mut orphans = false;
         if let Some(dir) = &dir {
             visit_storage_directory(dir, |name| {
                 let text = name
                     .to_str()
                     .map_err(|_| anyhow::anyhow!("scan_index_orphan_unknown"))?;
                 if reserved_repair_filename(text) {
-                    repair_files = true;
-                    return Ok(());
+                    // A control appearing after the first pass must also stall.
+                    self.refuse_reserved_without_root(dir)?;
                 }
                 let file = open_at(dir, name, libc::O_RDONLY)?;
                 let stamp = Stamp::capture(&file, true)?;
@@ -1999,13 +1994,8 @@ impl LockedStore {
                 } else {
                     ensure!(owned_payload_temp(text), "scan_index_orphan_unknown");
                 }
-                orphans = true;
                 Ok(())
             })?;
-        }
-        // Opaque repair files alone authorize no deletion and are not a discard.
-        if repair_files && !orphans && !temps {
-            return Ok(());
         }
         // Existing checkpoint flock excludes concurrent index publication.
         if let Some(dir) = dir {
@@ -2018,18 +2008,16 @@ impl LockedStore {
                 Ok(())
             })?;
             dir.sync_all()?;
-            if !repair_files {
-                ensure!(
-                    unsafe {
-                        libc::unlinkat(
-                            self.parent.as_raw_fd(),
-                            self.objects_name.as_ptr(),
-                            libc::AT_REMOVEDIR,
-                        )
-                    } == 0,
-                    "scan_index_orphan_directory"
-                );
-            }
+            ensure!(
+                unsafe {
+                    libc::unlinkat(
+                        self.parent.as_raw_fd(),
+                        self.objects_name.as_ptr(),
+                        libc::AT_REMOVEDIR,
+                    )
+                } == 0,
+                "scan_index_orphan_directory"
+            );
         } else if !temps {
             return Ok(());
         }
