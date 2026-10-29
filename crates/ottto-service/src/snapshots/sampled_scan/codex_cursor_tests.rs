@@ -10792,6 +10792,20 @@ fn header_facts_never_shrink_the_main_copy_budget_and_yield_before_allocation() 
         .unwrap());
     let refreshed = codex_file_join::header_cache_tests::page(&root, &paths, &cache);
     assert_eq!((refreshed.reuse_misses, refreshed.reuse_evictions), (2, 2));
+    let job = proof_job("header-proof", "/idx/header-proof.json", "inc-1", 4096);
+    assert!(suspend(&cache, job));
+    cache.retire_headers_over_room(bytes);
+    assert!(cache
+        .with_cursor(|cursor| cursor.headers.is_empty())
+        .unwrap());
+    assert!(
+        cache.proof_suspended_for_test().is_some(),
+        "header pressure must preserve proof authority"
+    );
+    cache.retire_proof_over_room(0);
+    assert!(cache.proof_suspended_for_test().is_none());
+    let refreshed = codex_file_join::header_cache_tests::page(&root, &paths, &cache);
+    assert_eq!(refreshed.reuse_evictions, 2);
     let context = main_context(&cache);
     let (budget, step) = super::super::copy_budget_step(Some(&context), None, true);
     assert!(budget > 0 && budget < super::super::ENTRY_BYTES);

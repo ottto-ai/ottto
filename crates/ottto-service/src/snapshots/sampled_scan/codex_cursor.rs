@@ -4115,6 +4115,13 @@ fn reclaim_headers(
     fits
 }
 
+fn optional_bytes(cursor: &CursorState) -> Option<usize> {
+    cursor
+        .headers
+        .optional_bytes()?
+        .checked_add(cursor.proof.charge())
+}
+
 // Header facts are only scalar/string graphs. Use the shared field walker
 // and budget on portable builds too; native cursor admission keeps its existing
 // layout-supported gate. Opaque or over-visit resident graphs refuse caching.
@@ -4295,7 +4302,7 @@ impl SharedCache {
             return;
         };
         self.with_cursor(|cursor| {
-            let bytes = cursor.headers.optional_bytes();
+            let bytes = optional_bytes(cursor);
             if bytes.map_or(true, |bytes| bytes > room) {
                 cursor.headers.clear();
             }
@@ -4314,11 +4321,7 @@ impl SharedCache {
     /// under the locks, never skipped.
     pub(in crate::snapshots) fn retire_proof_over_room(&self, room: usize) {
         let over = match self.cursor.try_lock() {
-            Ok(cursor) => cursor
-                .headers
-                .optional_bytes()
-                .and_then(|bytes| bytes.checked_add(cursor.proof.charge()))
-                .map_or(true, |bytes| bytes > room),
+            Ok(cursor) => optional_bytes(&cursor).map_or(true, |bytes| bytes > room),
             Err(std::sync::TryLockError::WouldBlock) => true,
             Err(std::sync::TryLockError::Poisoned(_)) => false,
         };
@@ -4329,12 +4332,7 @@ impl SharedCache {
             return;
         };
         self.with_cursor(|cursor| {
-            if cursor
-                .headers
-                .optional_bytes()
-                .and_then(|bytes| bytes.checked_add(cursor.proof.charge()))
-                .map_or(true, |bytes| bytes > room)
-            {
+            if optional_bytes(cursor).map_or(true, |bytes| bytes > room) {
                 cursor.headers.clear();
             }
             if cursor.proof.charge() > room {
