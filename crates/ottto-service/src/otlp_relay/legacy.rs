@@ -1,5 +1,6 @@
 //! Bounded compatibility ingress for exporters that retain their startup port.
 use super::*;
+use crate::agent_configs::claude_managed_settings;
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::path::PathBuf;
@@ -9,6 +10,8 @@ use std::sync::{mpsc, Arc, LazyLock, OnceLock};
 const IDLE_SECONDS: u64 = 24 * 60 * 60;
 const REQUEST_FLUSH_SECONDS: u64 = 10 * 60;
 const RETRY_SECONDS: u64 = 60;
+// Match the default config backup retention; read no more even with a larger override.
+const MAX_SEED_BACKUPS: usize = 10;
 pub(crate) const STALE_EXPORTER_CODE: &str = "claude_stale_exporter_port";
 
 #[derive(Default)]
@@ -16,7 +19,7 @@ struct Counters {
     open: AtomicUsize,
     requests: AtomicU64,
     bind_skipped: AtomicU64,
-    closed_idle: AtomicU64,
+    closed: AtomicU64,
     last_request: AtomicU64,
 }
 
@@ -26,10 +29,10 @@ static RELEASE: OnceLock<mpsc::Sender<Release>> = OnceLock::new();
 
 pub(super) fn counts() -> serde_json::Value {
     json!({
-        "legacy_relay_listeners_open": COUNTERS.open.load(Ordering::Relaxed),
-        "legacy_relay_requests": COUNTERS.requests.load(Ordering::Relaxed),
-        "legacy_relay_bind_skipped": COUNTERS.bind_skipped.load(Ordering::Relaxed),
-        "legacy_relay_closed_idle": COUNTERS.closed_idle.load(Ordering::Relaxed),
+        "otlp_legacy_listener_bound": COUNTERS.open.load(Ordering::Relaxed),
+        "otlp_legacy_listener_requests": COUNTERS.requests.load(Ordering::Relaxed),
+        "otlp_legacy_listener_busy": COUNTERS.bind_skipped.load(Ordering::Relaxed),
+        "otlp_legacy_listener_closed": COUNTERS.closed.load(Ordering::Relaxed),
     })
 }
 
@@ -84,38 +87,134 @@ impl Activity {
     }
 }
 
-#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+/// Only retained, Ottto-shaped backup files can supply historical approval.
+fn seed_from_backups(
+    directory: &Path,
+    approved: Option<u16>,
+    candidates: &[u16],
+    retired: &[u16],
+) -> Result<Vec<u16>> {
+    match std::fs::symlink_metadata(directory) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => return Ok(Vec::new()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    // Keep only the newest retained names in RAM; contents use the existing
+    // 1 MiB no-follow owner-controlled reader, one file at a time.
+    let mut newest = BTreeMap::new();
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(stamp) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("claude_code_config_"))
+            .and_then(|tail| tail.strip_suffix(".json"))
+            .and_then(|stamp| stamp.parse::<u128>().ok())
+        else {
+            continue;
+        };
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        newest.insert((stamp, name), entry.path());
+        if newest.len() > MAX_SEED_BACKUPS {
+            newest.pop_first();
+        }
+    }
+    let mut ports = Vec::new();
+    for path in newest.into_values().rev() {
+        let Ok(Some(body)) = claude_managed_settings::read_settings_backup(&path) else {
+            continue;
+        };
+        let Some(port) = claude_managed_settings::approved_relay_port(&body) else {
+            continue;
+        };
+        if candidates.contains(&port)
+            && Some(port) != approved
+            && !retired.contains(&port)
+            && !ports.contains(&port)
+        {
+            ports.push(port);
+            if ports.len() == 2 {
+                break;
+            }
+        }
+    }
+    Ok(ports)
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
 struct Record {
     version: u8,
     seeded: bool,
     last_approved: Option<u16>,
     ports: Vec<Port>, // oldest first
+    retired: Vec<u16>,
 }
 
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+impl Default for Record {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            seeded: false,
+            last_approved: None,
+            ports: Vec::new(),
+            retired: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
 struct Port {
     port: u16,
     idle_since: Option<u64>,
 }
 
 impl Record {
-    fn observe(&mut self, approved: Option<u16>, candidates: &[u16], seed: u16) {
+    fn observe(&mut self, approved: Option<u16>, candidates: &[u16], seed: &[u16]) {
         let approved = approved.filter(|port| candidates.contains(port));
-        self.ports.retain(|entry| candidates.contains(&entry.port));
-        if !self.seeded {
-            self.seeded = true;
-            if candidates.contains(&seed) && Some(seed) != approved {
-                self.push(seed);
-            }
-        }
+        self.retired.retain(|port| candidates.contains(port));
+        self.retired.sort_unstable();
+        self.retired.dedup();
+        self.ports.retain(|entry| {
+            candidates.contains(&entry.port) && !self.retired.contains(&entry.port)
+        });
         if let Some(approved) = approved {
+            // Only an actual new approval can authorize this port again. It
+            // remains excluded from legacy ingress until superseded later.
+            self.retired.retain(|port| *port != approved);
+            if !self.seeded {
+                self.seeded = true;
+                // Seed is newest first; the record is oldest first.
+                for port in seed.iter().rev().copied() {
+                    if candidates.contains(&port)
+                        && port != approved
+                        && !self.retired.contains(&port)
+                    {
+                        self.push(port);
+                    }
+                }
+            }
             if self.last_approved != Some(approved) {
-                if let Some(old) = self.last_approved.filter(|old| candidates.contains(old)) {
+                if let Some(old) = self
+                    .last_approved
+                    .filter(|old| candidates.contains(old) && !self.retired.contains(old))
+                {
                     self.push(old);
                 }
                 self.last_approved = Some(approved);
             }
             self.ports.retain(|entry| entry.port != approved);
+        } else {
+            let revoked = std::mem::take(&mut self.ports);
+            for entry in revoked {
+                self.retire(entry.port);
+            }
+            // A later approval must not carry authority across revocation.
+            self.last_approved = None;
         }
         // Also sanitize a restored record, without renewing any idle clock.
         let mut seen = std::collections::BTreeSet::new();
@@ -123,7 +222,12 @@ impl Record {
         self.ports.retain(|entry| seen.insert(entry.port));
         self.ports.truncate(2);
         self.ports.reverse();
-        self.last_approved = self.last_approved.filter(|port| candidates.contains(port));
+    }
+
+    fn retire(&mut self, port: u16) {
+        if !self.retired.contains(&port) {
+            self.retired.push(port);
+        }
     }
 
     fn push(&mut self, port: u16) {
@@ -185,16 +289,17 @@ impl Supervisor {
                 if bytes.len() > 4096 {
                     return Err(anyhow!("legacy relay record exceeds its size bound"));
                 }
-                let record: Record = serde_json::from_slice(&bytes)?;
+                let record: Record = if bytes.iter().all(u8::is_ascii_whitespace) {
+                    Record::default()
+                } else {
+                    serde_json::from_slice(&bytes)?
+                };
                 if record.version != 1 {
                     return Err(anyhow!("unsupported legacy relay record version"));
                 }
                 record
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Record {
-                version: 1,
-                ..Record::default()
-            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Record::default(),
             Err(error) => return Err(error.into()),
         };
         Ok(Self {
@@ -212,7 +317,10 @@ impl Supervisor {
     }
 
     fn remove(&mut self, port: u16) -> Result<()> {
-        self.open.remove(&port); // close before acknowledging primary recovery
+        // Close before acknowledging primary recovery.
+        if self.open.remove(&port).is_some() {
+            self.counters.closed.fetch_add(1, Ordering::Relaxed);
+        }
         let before = self.record.ports.len();
         self.record.ports.retain(|entry| entry.port != port);
         if self.record.ports.len() != before {
@@ -227,13 +335,19 @@ impl Supervisor {
         approved: Option<u16>,
         primary: u16,
         candidates: &[u16],
-        seed: u16,
+        seed: &[u16],
     ) -> Result<()> {
         let before = serde_json::to_vec(&self.record)?;
         self.record.observe(approved, candidates, seed);
         self.open.retain(|port, _| {
-            self.record.ports.iter().any(|entry| entry.port == *port) && *port != primary
+            let keep =
+                self.record.ports.iter().any(|entry| entry.port == *port) && *port != primary;
+            if !keep {
+                self.counters.closed.fetch_add(1, Ordering::Relaxed);
+            }
+            keep
         });
+        let mut expired = Vec::new();
         self.record.ports.retain_mut(|entry| {
             let last = self
                 .open
@@ -242,12 +356,16 @@ impl Supervisor {
             let idle = entry.idle_since.map(|idle| idle.max(last.unwrap_or(0)));
             if idle.is_some_and(|idle| now.saturating_sub(idle) >= IDLE_SECONDS) {
                 self.open.remove(&entry.port);
-                self.counters.closed_idle.fetch_add(1, Ordering::Relaxed);
+                self.counters.closed.fetch_add(1, Ordering::Relaxed);
+                expired.push(entry.port);
                 false
             } else {
                 true
             }
         });
+        for port in expired {
+            self.record.retire(port);
+        }
         for entry in &mut self.record.ports {
             if entry.port == primary || self.open.contains_key(&entry.port) {
                 continue;
@@ -321,8 +439,9 @@ pub(super) fn spawn(daemon: LocalDaemon, source: SnapshotSource, primary: Arc<At
         .name("ottto-legacy-otlp".into())
         .spawn(move || {
             let run = || -> Result<()> {
+                let support_dir = ottto_core::default_support_dir();
                 let mut supervisor = Supervisor::load(
-                    ottto_core::default_support_dir().join("legacy-relay-ports.json"),
+                    support_dir.join("legacy-relay-ports.json"),
                     COUNTERS.clone(),
                     now_seconds(),
                 )?;
@@ -332,12 +451,23 @@ pub(super) fn spawn(daemon: LocalDaemon, source: SnapshotSource, primary: Arc<At
                 loop {
                     let now = now_seconds();
                     if now >= next_tick {
+                        let approved = approved_candidate_relay_port();
+                        let seed = if !supervisor.record.seeded && approved.is_some() {
+                            seed_from_backups(
+                                &support_dir.join("config-backups/claude_code"),
+                                approved,
+                                &candidates,
+                                &supervisor.record.retired,
+                            )?
+                        } else {
+                            Vec::new()
+                        };
                         supervisor.reconcile(
                             now,
-                            approved_candidate_relay_port(),
+                            approved,
                             primary.load(Ordering::Relaxed),
                             &candidates,
-                            fallback_relay_port_for_uid(uid),
+                            &seed,
                         )?;
                         next_tick = now.saturating_add(RETRY_SECONDS);
                     }

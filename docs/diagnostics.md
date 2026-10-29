@@ -620,19 +620,31 @@ Claude Code keeps its telemetry endpoint for the life of a session. Ottto can
 serve up to two older approved candidate ports on loopback, accepting only
 `POST /v1/logs`, `/v1/metrics` and `/v1/traces` through the same local export
 handler. Control and health routes return 404 on these listeners. A private,
-versioned port record retains the newest two previous approvals and seeds the
-first per-user fallback once. Busy ports are skipped and retried every 60 seconds.
-A port becomes ineligible as soon as it is observed as the current approval.
-Primary recovery releases that legacy socket before attempting its bind.
+versioned port record retains the newest two previous approvals. On first
+approval it seeds once from retained Ottto-owned Claude settings backups,
+reading at most the newest ten JSON backups with the existing size and
+no-symlink checks. Ports must be in the current user's relay candidate list;
+seed discovery does not guess ports or connect to them. Busy ports are skipped
+and retried every 60 seconds. A port observed as the current approval is removed from legacy
+ingress; primary recovery releases that legacy socket before attempting its bind.
+
+If Claude telemetry consent or endpoint approval is absent, disabled or revoked,
+the next periodic tick closes all legacy listeners and retires their ports.
+Idle expiry also retires a port. Retirement survives restarts and prevents
+re-seeding or reopening until that port is explicitly approved again and then
+superseded. The primary listener continues its existing behavior for all sources.
+The optional record is separate from existing daemon formats: older daemons
+ignore it, and missing fields or unknown extra fields decode without error.
 
 A listener closes after 24 hours without an accepted OTLP request. First-open
 time and request activity persist across daemon restarts; activity writes are
 limited to once per 10 minutes, so a crash can lose up to that much recent
 activity and shorten retention. No request content or identity is in the port
 record. The primary relay's `/healthz` response includes process-local counts
-under `legacy_relay`: `legacy_relay_listeners_open` (current gauge),
-`legacy_relay_requests`, `legacy_relay_bind_skipped` and
-`legacy_relay_closed_idle` (cumulative counts since process start).
+under `legacy_relay`: `otlp_legacy_listener_bound` (current gauge),
+`otlp_legacy_listener_requests`, `otlp_legacy_listener_busy` and
+`otlp_legacy_listener_closed` (cumulative counts since process start). The closed
+count covers idle expiry, revocation, approval/history removal and primary handoff.
 
 Canonical health reports `claude_stale_exporter_port` as a `Warning` owned by
 `source`, with runtime authority, while a legacy listener has accepted OTLP
