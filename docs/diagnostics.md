@@ -614,6 +614,33 @@ finding above. Without an approved candidate, the fallback chain applies immedia
 Startup retains its existing behavior of falling back if the approved port is
 busy.
 
+## Claude Stale Exporter Port
+
+Claude Code keeps its telemetry endpoint for the life of a session. Ottto can
+serve up to two older approved candidate ports on loopback, accepting only
+`POST /v1/logs`, `/v1/metrics` and `/v1/traces` through the same local export
+handler. Control and health routes return 404 on these listeners. A private,
+versioned port record retains the newest two previous approvals and seeds the
+first per-user fallback once. Busy ports are skipped and retried every 60 seconds.
+A port becomes ineligible as soon as it is observed as the current approval.
+Primary recovery releases that legacy socket before attempting its bind.
+
+A listener closes after 24 hours without an accepted OTLP request. First-open
+time and request activity persist across daemon restarts; activity writes are
+limited to once per 10 minutes, so a crash can lose up to that much recent
+activity and shorten retention. No request content or identity is in the port
+record. The primary relay's `/healthz` response includes process-local counts
+under `legacy_relay`: `legacy_relay_listeners_open` (current gauge),
+`legacy_relay_requests`, `legacy_relay_bind_skipped` and
+`legacy_relay_closed_idle` (cumulative counts since process start).
+
+Canonical health reports `claude_stale_exporter_port` as a `Warning` owned by
+`source`, with runtime authority, while a legacy listener has accepted OTLP
+within the last hour in this process. Restart those Claude Code sessions to
+reload the current telemetry endpoint. The uploaded warning contains no port
+number. This restores future local evidence; it cannot recover dropped batches
+and does not change consent, account attribution or money calculations.
+
 ## Common Diagnostics Flow
 
 ```bash
