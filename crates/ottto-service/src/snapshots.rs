@@ -26922,6 +26922,11 @@ impl OwnedSourceScan {
                     let inventoried = inventory
                         .headers
                         .iter()
+                        // Excluded archives cannot carry protected replay evidence.
+                        .filter(|h| {
+                            !is_compressed_codex_rollout(Some(&h.candidate.path), None)
+                                || !inventory.member_held(&h.candidate.path)
+                        })
                         .map(|header| local_index_key(&header.candidate.path))
                         .collect::<BTreeSet<_>>();
                     inventory.complete &= selected.is_subset(&inventoried);

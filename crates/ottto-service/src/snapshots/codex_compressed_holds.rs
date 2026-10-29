@@ -230,8 +230,9 @@ impl codex_file_join::HeaderInventory {
             }
         }
         for header in &mut self.headers[first..last] {
-            if cause != CodexZstCause::FamilyUnproven
-                || is_compressed_codex_rollout(Some(&header.candidate.path), None)
+            if header.custody_cause != Some(CodexZstCause::ParentLedgerUnbound)
+                && (cause != CodexZstCause::FamilyUnproven
+                    || is_compressed_codex_rollout(Some(&header.candidate.path), None))
             {
                 header.custody_cause = Some(cause);
             }

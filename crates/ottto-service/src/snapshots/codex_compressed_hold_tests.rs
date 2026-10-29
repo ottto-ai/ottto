@@ -1767,7 +1767,7 @@ fn prepared(inv: &mut codex_file_join::HeaderInventory, index: &mut ScanIndex) -
     let mut steps = 0;
     while !inv.prepare_custody(index) {
         steps += 1;
-        assert!(steps <= index.codex_state_only_blocked_by_file.len() + 2);
+        assert!(steps <= index.files.len() + 2);
     }
     inv.hold_custodied_siblings(index);
     steps
@@ -1855,7 +1855,11 @@ fn mixed_family_plain_money_matches_plain_reader_and_only_archive_is_sticky() {
         seed_archive(&mut index, &archive, OWNER);
         let decodes = codex_zst_refusal_tests::activity().0;
         for pass in 0..3 {
-            let inv = no_open(&archive, || home_inventory(&roots, &paths, &mut index));
+            let inv = if pass == 0 {
+                home_inventory(&roots, &paths, &mut index)
+            } else {
+                no_open(&archive, || home_inventory(&roots, &paths, &mut index))
+            };
             let mut scan = staged(&root, index, &paths);
             scan.codex_join_inventory = Some(inv);
             let ((mut next, result), rows) = capture(|| no_open(&archive, || run(scan)));
@@ -2011,5 +2015,117 @@ fn present_family_archive_keeps_legacy_tombstone_across_two_censuses() {
         next.save(&saved).unwrap();
         index = ScanIndex::load(&saved).unwrap();
     }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn excluded_archive_priority_receipts_cannot_be_bypassed_by_plain_replacement() {
+    for twin in [false, true] {
+        for captured in [false, true] {
+            let root = crate::test_scratch::private_dir("family-protected-replacement");
+            let plain = member(&root, "left/sessions", OWNER, false);
+            let original = member(&root, "right/sessions", OWNER, true);
+            let archive = if twin {
+                original
+            } else {
+                let path = original
+                    .with_file_name(format!("rollout-2026-10-01T10-00-00-{OWNER}.jsonl.zst"));
+                fs::rename(original, &path).unwrap();
+                path
+            };
+            let mut index = accepted(&root, &archive);
+            seed_archive(&mut index, &archive, OWNER);
+            let mut replay = codex_file_join::TierReplay::new(None, false, "scope".into());
+            for row in codex_file_join::tests::member(OWNER, "response", 100, 100) {
+                replay.observe(&row);
+            }
+            replay.admitted(Some(("a".repeat(64), "derived_from_logs_2".into())));
+            let receipt = replay.finish().unwrap().unwrap();
+            let key = local_index_key(&archive);
+            let entry = index.files.get_mut(&key).unwrap();
+            entry.codex_protected_owner = Some(codex_protected_owner(OWNER));
+            if captured {
+                entry.codex_captured_tier_receipt = Some(receipt);
+                entry.codex_captured_tier_receipt_required = true;
+            } else {
+                entry.codex_applied_tier_receipt = Some(receipt);
+                entry.codex_applied_tier_receipt_required = true;
+            }
+            let before = index.files[&key].clone();
+            let incidence = index.file_snapshot_fingerprints.clone();
+            let decodes = codex_zst_refusal_tests::activity().0;
+            let saved = root.join("index.json");
+            for _ in 0..2 {
+                let paths = [plain.clone(), archive.clone()];
+                // An unheld twin may validate its cached stamp, without decoding.
+                let inv = home_inventory(
+                    &[root.join("left/sessions"), root.join("right/sessions")],
+                    &paths,
+                    &mut index,
+                );
+                let mut scan = staged(&root, index, &paths);
+                scan.codex_join_inventory = Some(inv);
+                assert!(scan.codex_turn_traces.is_none(), "live traces expired");
+                let (mut next, result) = no_open(&archive, || run(scan));
+                assert!(
+                    result.snapshots.is_empty(),
+                    "cannot reprice protected money"
+                );
+                assert!(result.ownership_incomplete_file_count > 0);
+                assert!(!result.census_complete);
+                assert_eq!(codex_zst_refusal_tests::activity().0, decodes);
+                let retained = &next.files[&key];
+                assert_eq!(
+                    retained.last_snapshot_fingerprint,
+                    before.last_snapshot_fingerprint
+                );
+                assert_eq!(
+                    retained.last_upload_body_witness,
+                    before.last_upload_body_witness
+                );
+                assert_eq!(
+                    retained.codex_applied_tier_receipt,
+                    before.codex_applied_tier_receipt
+                );
+                assert_eq!(
+                    retained.codex_captured_tier_receipt,
+                    before.codex_captured_tier_receipt
+                );
+                assert_eq!(next.file_snapshot_fingerprints, incidence);
+                assert!(!next
+                    .files
+                    .get(&local_index_key(&plain))
+                    .is_some_and(|entry| entry.codex_compressed_hold.is_some()));
+                next.save(&saved).unwrap();
+                index = ScanIndex::load(&saved).unwrap();
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+}
+
+#[test]
+fn historical_family_cannot_weaken_new_member_parent_custody() {
+    let root = crate::test_scratch::private_dir("family-parent-precedence");
+    let archive = member(&root, "sessions", OWNER, true);
+    let mut index = ScanIndex::default();
+    seed_archive(&mut index, &archive, OWNER);
+    for (name, cause) in [
+        ("a-parent", CodexZstCause::ParentLedgerUnbound),
+        ("z-family", CodexZstCause::FamilyUnproven),
+    ] {
+        index.hold_compressed(&root.join(name), BTreeSet::from([OWNER.into()]), cause);
+    }
+    let mut inv = inventory(&root, std::slice::from_ref(&archive), &mut index);
+    while !inv.prepare_custody(&index) {}
+    assert_eq!(
+        inv.headers[0].custody_cause,
+        Some(CodexZstCause::ParentLedgerUnbound)
+    );
+    inv.hold_custodied_siblings(&mut index);
+    assert_eq!(
+        index.files[&local_index_key(&archive)].codex_compressed_hold,
+        Some(CodexZstCause::ParentLedgerUnbound)
+    );
     fs::remove_dir_all(root).unwrap();
 }
