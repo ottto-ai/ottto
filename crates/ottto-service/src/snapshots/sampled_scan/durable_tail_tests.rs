@@ -2984,7 +2984,7 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
     }
     // A current clean index clears stale RAM debt on write, never the reverse.
     let mut held = File::open(&path).unwrap();
-    let mut stale = certificate(&path, &scope);
+    let mut stale = self::certificate(&path, &scope);
     stale.audit_debt_unix_seconds = Some(due);
     let (checkpoint, _) = stale.restore(&mut held, scope.clone()).unwrap();
     assert_eq!(checkpoint.audit_debt().unwrap().due_unix_seconds, due);
