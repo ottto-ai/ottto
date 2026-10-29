@@ -30,6 +30,7 @@ pub(crate) mod support_health;
 mod bounded_read;
 #[cfg(test)]
 mod decoder_tests;
+mod sidecar_read;
 
 pub(crate) const STORE_DIR: &str = "local-otel/claude-code-effort";
 const TRACE_STORE_DIR: &str = "local-otel/claude-code-trace-ownership";
@@ -840,7 +841,7 @@ impl ClaudeApiEvidenceRead {
                         },
                     )
                 } else {
-                    bounded_read::api(&path, root, paid, fixed.checked_add(retained_rows)?)?
+                    sidecar_read::paid_api(&path, root, paid, fixed.checked_add(retained_rows)?)?
                 };
             let mut row_storage = heap_layout_bound::Counter::new(usize::MAX);
             rows.completed_heap_bound(&mut row_storage)?;
@@ -1011,7 +1012,7 @@ pub(crate) fn load_claude_trace_paid(
         return None;
     }
     let path = trace_evidence_path(support_dir, root);
-    let result = bounded_read::trace(&path, root, paid, occupied_with_path)?;
+    let result = sidecar_read::paid_trace(&path, root, paid, occupied_with_path)?;
     let current = fs::metadata(&path)
         .ok()
         .and_then(|metadata| api_file_generation(&metadata));
@@ -1064,6 +1065,13 @@ pub fn load_claude_api_request_evidence_report(
 }
 
 fn decode_api_sidecar(
+    support_dir: &Path,
+    session_id: &str,
+) -> Result<(Vec<ClaudeLocalOtelEvidence>, ApiReadWitness)> {
+    sidecar_read::api(support_dir, session_id)
+}
+
+fn decode_api_sidecar_whole_file(
     support_dir: &Path,
     session_id: &str,
 ) -> Result<(Vec<ClaudeLocalOtelEvidence>, ApiReadWitness)> {
@@ -1237,6 +1245,13 @@ pub fn load_claude_trace_ownership_evidence(
     support_dir: &Path,
     session_ids: impl IntoIterator<Item = String>,
 ) -> ClaudeTraceOwnershipLoadReport {
+    sidecar_read::trace(support_dir, session_ids)
+}
+
+fn load_trace_whole_file(
+    support_dir: &Path,
+    session_ids: impl IntoIterator<Item = String>,
+) -> ClaudeTraceOwnershipLoadReport {
     let mut report = ClaudeTraceOwnershipLoadReport::default();
     for session_id in BTreeSet::from_iter(session_ids) {
         let path = trace_evidence_path(support_dir, &session_id);
@@ -1265,6 +1280,8 @@ pub fn load_claude_trace_ownership_evidence(
         };
         #[cfg(test)]
         TRACE_READ_RECEIPT.with(|count| count.set(count.get() + 1));
+        #[cfg(all(test, unix))]
+        let file = sidecar_read::durable::CountedTrace(file);
         let mut decoder = TraceSidecarDecoder::new(&session_id, Vec::new());
         decoder.report = report;
         for line in BufReader::new(file).lines() {

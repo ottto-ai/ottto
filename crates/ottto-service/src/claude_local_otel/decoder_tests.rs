@@ -1,7 +1,7 @@
 //! Frozen a0e3e222 whole-file decisions, deliberately independent of decoder methods.
 use super::*;
 
-fn baseline_api(bytes: &[u8]) -> ApiSidecarDecoder<'static> {
+pub(super) fn baseline_api(bytes: &[u8]) -> ApiSidecarDecoder<'static> {
     let mut state = ApiSidecarDecoder::new("scope", Vec::new());
     let mut reader = BufReader::new(bytes);
     let mut line = Vec::new();
@@ -22,7 +22,7 @@ fn baseline_api(bytes: &[u8]) -> ApiSidecarDecoder<'static> {
     state
 }
 
-fn baseline_trace(bytes: &[u8]) -> TraceSidecarDecoder<'static> {
+pub(super) fn baseline_trace(bytes: &[u8]) -> TraceSidecarDecoder<'static> {
     let mut state = TraceSidecarDecoder::new("scope", Vec::new());
     for line in BufReader::new(bytes).lines() {
         match line {
