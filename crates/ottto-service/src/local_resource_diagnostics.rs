@@ -490,6 +490,8 @@ pub(crate) struct ClaudeAccountRetainedPending {
     pub(crate) claude_account_retained_pending_families: usize,
     /// Pretty JSON bytes of the retained field, including its field wrapper.
     pub(crate) claude_account_retained_pending_bytes: u64,
+    #[serde(flatten)]
+    pub(crate) retention: crate::snapshots::account_pending_retention::Counts,
 }
 impl crate::heap_layout_bound::HeapLayoutBound for Probe {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
