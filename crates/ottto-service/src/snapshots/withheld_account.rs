@@ -9,6 +9,8 @@ use crate::local_resource_diagnostics::{withheld_event, WithheldEvent};
 pub(super) struct Seen {
     size_bytes: u64,
     evidence: [u8; 32],
+    // Device, inode, birth: only CONTENT carries a usable generation.
+    object: [u64; 3],
 }
 impl crate::heap_layout_bound::HeapLayoutBound for Seen {
     const INLINE_ONLY: bool = true;
@@ -17,6 +19,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for Seen {
         let Self {
             size_bytes: _,
             evidence: _,
+            object: _,
         } = self;
         c.add(0)
     }
@@ -25,11 +28,11 @@ impl crate::heap_layout_bound::HeapLayoutBound for Seen {
 const PARSED: &str = "claude_withheld_account_evidence:v1";
 const CONTENT: &str = "claude_withheld_account_content:v1";
 
-/// A single fixed-size value owns no heap and keeps the memo and W2 gauge in
-/// the same bounded population. `None` tokens mean unknown, never zero owed.
-#[derive(Clone, Copy, Debug)]
+/// One bounded entry keeps the boxed completion witness and W2 gauge in
+/// the same capped population. `None` tokens mean unknown, never zero owed.
+#[derive(Clone, Debug)]
 struct Entry {
-    seen: Option<Seen>,
+    seen: Option<Box<Seen>>,
     tokens: Option<u64>,
     first_seen: u64,
 }
@@ -109,7 +112,8 @@ fn memo_key(index_key: &str) -> [u8; 32] {
 }
 
 /// Reuse the already-read samples, with a known object-generation witness.
-/// A reused device/inode with another birth must never inherit a Skip. No
+/// Generation is checked separately by Seen; this digest binds the same
+/// device/inode and bounded samples across metadata-only birth clamps. No
 /// stat or birth (including platforms without them) means no memo witness.
 pub(super) fn content_stamp(
     len: u64,
@@ -117,13 +121,22 @@ pub(super) fn content_stamp(
     samples: &OpenedContentSamples,
 ) -> Option<String> {
     let stat = stat?;
-    let birth = stat.birth_nanos?;
+    stat.birth_nanos?;
     let object = opened_object_identity_from(len, Some(&stat.with_changed_unix_nanos(0)), samples);
     let mut hash = Sha256::new();
-    update_length_prefixed(&mut hash, b"claude_withheld_object_generation:v1");
+    update_length_prefixed(&mut hash, b"claude_withheld_object_content:v2");
     update_length_prefixed(&mut hash, object.as_bytes());
-    update_length_prefixed(&mut hash, &birth.to_be_bytes());
     Some(format!("{:x}", hash.finalize()))
+}
+
+// Platform-neutral: compare the timestamps already normalized to unix nanos.
+// Linux normally keeps birth constant; no platform-specific weaker fence.
+fn birth_clamp_continues(before: Seen, after: Seen, modified: u64) -> bool {
+    before.object[..2] == after.object[..2]
+        && before.size_bytes == after.size_bytes
+        && before.evidence == after.evidence
+        && after.object[2] < before.object[2]
+        && after.object[2] == modified
 }
 
 impl ScanIndex {
@@ -134,12 +147,18 @@ impl ScanIndex {
         Seen {
             size_bytes,
             evidence,
+            object: [0; 3],
         }
     }
 
     /// Capture at validated parse completion, even before its first hold is
     /// recorded. The completion owner carries this RAM-only value to classify.
     pub(super) fn withheld_completed_seen(&self, candidate: &CandidateFile) -> Option<Seen> {
+        let [device, inode] = candidate.physical_identity?;
+        let birth = candidate.fingerprint_birth_nanos;
+        if birth == 0 {
+            return None;
+        }
         candidate.withheld_content_stamp.as_deref().map(|stamp| {
             // Restored body/activity debt may be deferred only under the
             // authority that completed this parse. A revision or context
@@ -158,6 +177,7 @@ impl ScanIndex {
             hash.update(seen.evidence);
             hash.update(authority);
             seen.evidence = hash.finalize().into();
+            seen.object = [device, inode, birth];
             seen
         })
     }
@@ -167,7 +187,7 @@ impl ScanIndex {
         if self.claude_account_deferred_holds.contains_key(key) {
             with_state(|state| {
                 if let Some(entry) = state.entry(memo_key(key)) {
-                    entry.seen = Some(seen);
+                    entry.seen = Some(Box::new(seen));
                 }
             });
         }
@@ -196,15 +216,35 @@ impl ScanIndex {
             self.forget_withheld_content(key);
             return false;
         };
-        with_state(|state| {
-            !state.refused
-                && state
-                    .entries
-                    .get(&memo_key(key))
-                    .and_then(|entry| entry.seen)
-                    == Some(content)
+        let (unchanged, clamped) = with_state(|state| {
+            if state.refused {
+                return (false, false);
+            }
+            let Some(before) = state
+                .entries
+                .get_mut(&memo_key(key))
+                .and_then(|entry| entry.seen.as_deref_mut())
+            else {
+                return (false, false);
+            };
+            if *before == content {
+                return (true, false);
+            }
+            // Exact same object, sampled bytes, extent and resolver/output
+            // evidence; only a backwards birth==mtime clamp may continue it.
+            let clamped = birth_clamp_continues(*before, content, candidate.modified_unix_nanos);
+            if clamped {
+                // Adopt the clamp once. Identical later lookups neither loop
+                // nor count it again; a further clamp must reprove every gate.
+                *before = content;
+            }
+            (clamped, clamped)
         })
-        .unwrap_or(false)
+        .unwrap_or((false, false));
+        if clamped {
+            withheld_event(WithheldEvent::BirthClampAccepted, 1);
+        }
+        unchanged
     }
 
     /// Count EVERY completed reparse, even an identical PARSED digest. The
@@ -224,7 +264,12 @@ impl ScanIndex {
         let key = memo_key(key);
         let trigger = with_state(|state| {
             let previous = (!state.refused)
-                .then(|| state.entries.get(&key).and_then(|entry| entry.seen))
+                .then(|| {
+                    state
+                        .entries
+                        .get(&key)
+                        .and_then(|entry| entry.seen.as_deref().copied())
+                })
                 .flatten();
             let trigger = match (previous, parsed) {
                 (None, _) => WithheldEvent::ReparseStart,
@@ -234,7 +279,7 @@ impl ScanIndex {
                 _ => WithheldEvent::ReparseEvidence,
             };
             if let Some(entry) = state.entry(key) {
-                entry.seen = parsed;
+                entry.seen = parsed.map(Box::new);
             }
             trigger
         })
@@ -300,8 +345,8 @@ pub(super) fn retain_held(holds: &BTreeMap<String, String>) {
     });
 }
 
-/// Portable conservative allowance for a full B-tree node per entry plus a
-/// root. Fixed-size keys/values own no additional heap. This exceeds the
+/// Portable conservative allowance for a full B-tree node plus one boxed Seen
+/// per entry, and a root. Keys and the remaining value fields own no heap. This exceeds the
 /// validated native tree_node_bytes layout; charging never gates on the
 /// generic graph walk's layout_supported toolchain/platform whitelist.
 const NODE_UPPER_BYTES: usize = 1536;
@@ -447,6 +492,7 @@ mod tests {
         let seen = Seen {
             size_bytes: 1,
             evidence: [7; 32],
+            object: [1, 2, 3],
         };
         let mut counter = Counter::new(0);
         seen.heap_bound(&mut counter).unwrap();
@@ -618,6 +664,101 @@ mod tests {
     }
 
     #[test]
+    fn backward_birth_clamp_after_content_memo_skips_without_reparse() {
+        reset();
+        let key = "/opaque/clamp.jsonl";
+        let mut index = ScanIndex::default();
+        parsed(&mut index, key, 5);
+        index
+            .claude_account_deferred_holds
+            .insert(key.into(), "parsed".into());
+        let mut file = candidate(key, 5, Some("sample-and-account-evidence"));
+        file.fingerprint_birth_nanos = 100;
+        file.modified_unix_nanos = 200;
+        let seen = index.withheld_completed_seen(&file).unwrap();
+        index.remember_withheld_content(key, seen);
+        file.fingerprint_birth_nanos = 50;
+        file.modified_unix_nanos = 50;
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            for pass in 0..5 {
+                assert_eq!(
+                    index.candidate_decision_at(&file, 300),
+                    CandidateDecision::Skip,
+                    "post-memo backward clamp pass {pass} must not select a transcript read"
+                );
+            }
+            crate::local_resource_diagnostics::Probe::start().collection(
+                "claude_code",
+                crate::local_resource_diagnostics::CollectionCounts {
+                    scanned_files: 0,
+                    semantic_noops: 0,
+                    sampled_acquisition: None,
+                    full_causes: Default::default(),
+                },
+            );
+        });
+        assert_eq!(
+            rows[0]["counts"]["withheld_birth_clamp_accepted"],
+            json!({"events":1})
+        );
+        assert!(rows[0]["counts"]["withheld_reparse"].is_null());
+        assert_eq!(
+            with_state(|s| s.entries[&memo_key(key)].seen.as_deref().unwrap().object[2]),
+            Some(50)
+        );
+    }
+
+    #[test]
+    fn birth_clamp_rejects_replacement_changed_samples_evidence_and_unknown_identity() {
+        for cause in [
+            "inode",
+            "device",
+            "sample",
+            "evidence",
+            "length",
+            "forward",
+            "not_mtime",
+            "no_identity",
+            "no_birth",
+        ] {
+            reset();
+            let key = "/opaque/clamp-negative.jsonl";
+            let mut index = ScanIndex::default();
+            parsed(&mut index, key, 5);
+            index
+                .claude_account_deferred_holds
+                .insert(key.into(), "parsed".into());
+            let mut file = candidate(key, 5, Some("same-samples"));
+            file.fingerprint_birth_nanos = 100;
+            index.remember_withheld_content(key, index.withheld_completed_seen(&file).unwrap());
+            file.fingerprint_birth_nanos = 50;
+            file.modified_unix_nanos = 50;
+            match cause {
+                "inode" => file.physical_identity = Some([1, 3]),
+                "device" => file.physical_identity = Some([2, 2]),
+                "sample" => file.withheld_content_stamp = Some("changed-sample".into()),
+                "evidence" => {
+                    index.claude_request_identity_contract = Some("changed-account".into())
+                }
+                "length" => file.size_bytes += 1,
+                "forward" => {
+                    file.fingerprint_birth_nanos = 150;
+                    file.modified_unix_nanos = 150;
+                }
+                "not_mtime" => file.modified_unix_nanos = 51,
+                "no_identity" => file.physical_identity = None,
+                "no_birth" => file.fingerprint_birth_nanos = 0,
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                index.candidate_decision_at(&file, 300),
+                CandidateDecision::Parse,
+                "{cause}"
+            );
+        }
+    }
+
+    #[test]
     fn every_completed_reparse_is_counted_even_with_equal_parsed_evidence() {
         reset();
         let key = "/opaque/reparses.jsonl";
@@ -671,9 +812,15 @@ mod tests {
             birth_nanos: Some(50),
             ..stat
         };
+        let mut file = candidate("/opaque/generation", 100_000, Some(&original));
+        file.fingerprint_birth_nanos = stat.birth_nanos.unwrap();
+        let index = ScanIndex::default();
+        let original_seen = index.withheld_completed_seen(&file).unwrap();
+        file.fingerprint_birth_nanos = recreated.birth_nanos.unwrap();
         assert_ne!(
-            content_stamp(100_000, Some(&recreated), &samples).as_deref(),
-            Some(original.as_str())
+            index.withheld_completed_seen(&file),
+            Some(original_seen),
+            "a reused inode with a different birth cannot inherit the memo"
         );
         assert!(
             content_stamp(100_000, None, &samples).is_none(),
@@ -736,13 +883,14 @@ mod tests {
         let seen = Seen {
             size_bytes: u64::MAX,
             evidence: [0xff; 32],
+            object: [1, 2, 3],
         };
         let full: Entries = (0..MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS)
             .map(|slot| {
                 (
                     memo_key(&format!("/opaque/{slot}.jsonl")),
                     Entry {
-                        seen: Some(seen),
+                        seen: Some(Box::new(seen)),
                         tokens: Some(1),
                         first_seen: 0,
                     },
@@ -760,7 +908,10 @@ mod tests {
         );
         // Assert even on Linux or an unvalidated compiler. The real charge
         // has no layout gate, and its native comparison remains an extra check.
-        assert!(tree_node_bytes::<[u8; 32], Entry>().unwrap() <= NODE_UPPER_BYTES);
+        assert!(
+            tree_node_bytes::<[u8; 32], Entry>().unwrap() + std::mem::size_of::<Seen>()
+                <= NODE_UPPER_BYTES
+        );
         assert_eq!(retained_bound(usize::MAX), Some(expected));
         if crate::heap_layout_bound::layout_supported() {
             let native = crate::heap_layout_bound::completed_bound(&full, usize::MAX).unwrap();

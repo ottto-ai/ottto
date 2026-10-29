@@ -520,6 +520,25 @@ adoption/activity repair, including after one counted restart/discard recovery.
 A newly activated revision/context, actual quarantine retry, family correction
 or genuine external rearm still selects independently. W2 token/age disclosure
 remains available while the memo is admitted. The memo behind that skip is RAM only.
+`counts.withheld_birth_clamp_accepted.events` counts an accepted backwards
+birth/mtime clamp, emitted on the Claude page and drained per page (numeric
+only, not unique keys). A completed RAM CONTENT memo may continue only with the
+same device/inode, length, bounded samples and account/output evidence, a
+strictly earlier known birth, and birth exactly equal to mtime in the platform's
+normalized nanoseconds. Acceptance updates the memo birth to that clamp once;
+identical later passes neither re-parse nor recount it. This is platform-neutral
+code: Linux normally retains birth unchanged. Forward birth, unequal birth and
+mtime, changed identity/content/evidence or unavailable identity keep the
+existing fences and counted acquisition paths. This avoids parse/line delivery;
+existing bounded identity samples remain. No new persisted state or read occurs.
+
+Virtual N1 audit delay applies only to an aged grown key admitted solely by the
+grown-since-committed retention arm. A recent grown key keeps main's immediate
+TranscriptChanged selection. At its retained due time, the aged key takes the
+existing Audit cause. Inherited limitation (also on main): virtual-deadline to
+sampled-marker conversion can derive a later deadline when capacity opens;
+failed turns can schedule a fresh interval. E1 owns that separate follow-up.
+
 `counts.withheld_hold_released` counts released holds: `deleted` (the held file
 was proved absent), `deleted_tokens` (its last-known withheld tokens, when
 available), and `resolved` (a parse bound the account). A held audit obligation
@@ -544,7 +563,8 @@ Unknown; no $0 is invented. All three are drained like
 `line_delivery_unselected`. `counts.withheld_memo` is a gauge of that memo:
 `entries` (at most 4,096) and `retained_bytes`, the bytes charged to the sync
 owner's process-retained bound using a conservative layout-independent allowance
-(1,536 bytes per possible B-tree node per entry, plus a root and state header).
+(1,536 bytes per entry for a possible B-tree node and boxed witness, plus a
+root and state header).
 Codex-version, native-comparison and continuation graphs are admitted first;
 this memo is charged only from the remainder. Its own refusal drops only the
 memo details and cannot discard those admitted sibling graphs or BASE-exit
@@ -552,8 +572,9 @@ native comparison. An unsupported sibling alone does not discard a memo that
 fits the available allowance. Persistently refused memo details remain unknown
 and require the existing counted recovery path until they can be retained.
 An empty memo releases its B-tree root and charges no heap bytes. The completed
-content witness is fixed inline data; its accounting needs one visit and no
-heap allocation. `counts.withheld_held_tokens` is a gauge of the withheld
+content witness is a fixed 64-byte value: one heap-accounting visit for the
+value itself, boxed in the memo. A compact map entry and its box fit the same
+existing per-entry allowance; pending completion owns its value inline. `counts.withheld_held_tokens` is a gauge of the withheld
 tokens across recorded holds (each key's tokens at its last parse), and
 `counts.withheld_held_age` counts those held keys by wall-clock estimates since
 this process first recorded them held: `le_30d`, `31_90d` and `gt_90d`. Both are

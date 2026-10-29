@@ -170,7 +170,7 @@ pub(crate) enum UnselectedReason {
     WithheldOversized,
 }
 /// Three reasons, seven withheld events, growth, deleted tokens and audit retirement.
-const UNSELECTED_REASONS: usize = 15;
+const UNSELECTED_REASONS: usize = 16;
 /// Claude, Codex, Pi x reason, drained by that source's page line.
 #[cfg(not(test))]
 static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
@@ -215,6 +215,7 @@ pub(crate) enum WithheldEvent {
     UnrecordedEvents,
     UnrecordedTokens,
     ReleasedDeletedTokens = 11,
+    BirthClampAccepted = 15,
 }
 /// Recorded after the decision; never a gate input.
 pub(crate) fn withheld_event(event: WithheldEvent, amount: u64) {
@@ -558,6 +559,8 @@ impl Probe {
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             withheld_reparse: BTreeMap<&'static str, u64>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            withheld_birth_clamp_accepted: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             withheld_hold_unrecorded: BTreeMap<&'static str, u64>,
             #[serde(skip_serializing_if = "Option::is_none")]
             withheld_memo: Option<crate::snapshots::withheld_account::Census>,
@@ -581,6 +584,7 @@ impl Probe {
             codex_fragment_tail_repeat: drain(source, &[("files", 13), ("bytes", 14)]),
             withheld_hold_released: drain(source, &WITHHELD_RELEASED),
             withheld_reparse: drain(source, &WITHHELD_REPARSE),
+            withheld_birth_clamp_accepted: drain(source, &[("events", 15)]),
             withheld_hold_unrecorded: drain(source, &WITHHELD_UNRECORDED),
             withheld_memo: claude
                 .then(crate::snapshots::withheld_account::census)

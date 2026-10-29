@@ -1894,9 +1894,11 @@ fn withheld_account_reparses_only_on_start_evidence_or_growth() {
     let path = root.file(SESSION);
     let key = local_index_key(&path);
     let today = days_from_now(0);
+    let clamp_events = std::cell::Cell::new(0_u64);
+    let last_page = RefCell::new(Value::Null);
     let page = |index: ScanIndex, cache: &Arc<sampled_scan::SharedCache>| {
         let recorder = Recorder::default();
-        let ((index, result, _), _) = capture(|| {
+        let ((index, result, _), rows) = capture(|| {
             finish(
                 OwnedSourceScan::new(
                     SnapshotSource::ClaudeCode,
@@ -1918,6 +1920,17 @@ fn withheld_account_reparses_only_on_start_evidence_or_growth() {
                 .with_line_observer("test", Box::new(recorder.clone())),
             )
         });
+        for row in &rows {
+            clamp_events.set(
+                clamp_events.get()
+                    + row["counts"]["withheld_birth_clamp_accepted"]["events"]
+                        .as_u64()
+                        .unwrap_or(0),
+            );
+            if row["stage"] == "native_collection_page" {
+                *last_page.borrow_mut() = row.clone();
+            }
+        }
         let reads = recorder
             .events()
             .into_iter()
@@ -1953,10 +1966,10 @@ fn withheld_account_reparses_only_on_start_evidence_or_growth() {
     let cache = Arc::new(sampled_scan::SharedCache::default());
     append(&path, &assistant_line("u1"));
     // macOS setattrlist(2): backdating mtime before creation also backdates
-    // creation. Establish the oldest touch BEFORE recording object generation;
+    // creation. Establish an unchanged-birth control BEFORE recording generation;
     // later touches then change only mtime/ctime on APFS as well as Linux.
     let file = File::options().write(true).open(&path).unwrap();
-    file.set_modified(UNIX_EPOCH + std::time::Duration::from_secs(1))
+    file.set_modified(UNIX_EPOCH + std::time::Duration::from_secs(100))
         .unwrap();
     file.set_modified(SystemTime::now()).unwrap();
     let original_birth = file.metadata().unwrap().created().ok();
@@ -2034,7 +2047,7 @@ fn withheld_account_reparses_only_on_start_evidence_or_growth() {
             .unwrap();
     };
     let hour_ago = SystemTime::now() - std::time::Duration::from_secs(3_600);
-    for modified in [UNIX_EPOCH + std::time::Duration::from_secs(1), hour_ago] {
+    for modified in [UNIX_EPOCH + std::time::Duration::from_secs(100), hour_ago] {
         touch(modified);
         assert_eq!(
             fs::metadata(&path).unwrap().created().ok(),
@@ -2044,6 +2057,63 @@ fn withheld_account_reparses_only_on_start_evidence_or_growth() {
         assert_eq!(page(committed.clone(), &cache).2, Vec::new(), "a touch");
     }
     assert_eq!(reparses(), BTreeMap::new(), "a touch is no re-parse");
+
+    // The original r24 failure: move mtime BELOW birth AFTER CONTENT exists.
+    // On APFS this also clamps birth; Linux retains its original birth.
+    let before = fs::metadata(&path).unwrap();
+    let backward = UNIX_EPOCH + std::time::Duration::from_secs(50);
+    touch(backward);
+    #[cfg(target_os = "macos")]
+    {
+        assert!(before.created().unwrap() > backward);
+        assert_eq!(fs::metadata(&path).unwrap().created().unwrap(), backward);
+    }
+    #[cfg(not(target_os = "macos"))]
+    assert_eq!(
+        fs::metadata(&path).unwrap().created().ok(),
+        before.created().ok()
+    );
+    for pass in 0..3 {
+        assert_eq!(
+            page(committed.clone(), &cache).2,
+            Vec::new(),
+            "post-memo backward touch {pass}"
+        );
+    }
+    assert_eq!(
+        clamp_events.get(),
+        u64::from(cfg!(target_os = "macos")),
+        "one clamp acceptance, never per-pass"
+    );
+    assert_eq!(reparses(), BTreeMap::new());
+
+    // Equal length plus a changed sampled byte must still read Full. Keep the
+    // same object and repeat the clamp signature; samples must veto acceptance.
+    let bytes = fs::read(&path).unwrap();
+    let offset = bytes.windows(2).position(|w| w == b"u1").unwrap();
+    let mut file = File::options().write(true).open(&path).unwrap();
+    file.seek(SeekFrom::Start(offset as u64)).unwrap();
+    file.write_all(b"v").unwrap();
+    touch(UNIX_EPOCH + std::time::Duration::from_secs(25));
+    assert_eq!(fs::metadata(&path).unwrap().len(), bytes.len() as u64);
+    let (parsed, result, reads) = page(committed.clone(), &cache);
+    assert_eq!(
+        reads,
+        vec![DeliveryMode::Full],
+        "changed sampled byte never inherits clamp Skip"
+    );
+    let reason = if crate::heap_layout_bound::layout_supported() {
+        "same_size_edit"
+    } else {
+        "state_missing"
+    };
+    assert_eq!(
+        last_page.borrow()["counts"]["sampled_acquisition"]["page_events"]["full_reasons"][reason],
+        1
+    );
+    assert_eq!(clamp_events.get(), u64::from(cfg!(target_os = "macos")));
+    withhold(&mut committed, parsed, &result);
+    assert_eq!(reparses(), BTreeMap::from([("evidence", 1)]));
 
     // SOURCE condition 2: the account binds on new evidence; that parse is
     // the one read, and later generations read nothing.

@@ -31511,7 +31511,12 @@ impl OwnedSourceScan {
                         CandidateDecision::Parse,
                         Some(CandidateParseReason::ForcedFamily),
                     ),
-                    None => index.candidate_decision_with_reason(&candidate),
+                    None => index.candidate_decision_in_window(
+                        &candidate,
+                        unix_seconds(SystemTime::now()).unwrap_or_default(),
+                        census_unix_seconds,
+                        backfill_window_days,
+                    ),
                 };
             let target_match = native_comparison
                 .as_ref()
@@ -49228,6 +49233,23 @@ impl ScanIndex {
         self.candidate_decision_with_reason_at(candidate, now)
     }
 
+    fn candidate_decision_in_window(
+        &self,
+        candidate: &CandidateFile,
+        audit_now: u64,
+        census_now: Option<u64>,
+        window: u64,
+    ) -> (CandidateDecision, Option<CandidateParseReason>) {
+        let growth_only = census_now
+            .is_some_and(|now| !is_recent_enough_at(candidate.modified_unix_seconds, now, window))
+            && !discovery_retention!(self).owes(&candidate.path)
+            && self
+                .files
+                .get(&local_index_key(&candidate.path))
+                .is_some_and(|entry| candidate.size_bytes > entry.size_bytes);
+        self.candidate_decision_with_reason_gated(candidate, audit_now, true, growth_only)
+    }
+
     #[cfg(test)]
     fn candidate_decision_at(&self, candidate: &CandidateFile, now: u64) -> CandidateDecision {
         self.candidate_decision_with_reason_at(candidate, now).0
@@ -49238,7 +49260,7 @@ impl ScanIndex {
         candidate: &CandidateFile,
         now: u64,
     ) -> (CandidateDecision, Option<CandidateParseReason>) {
-        self.candidate_decision_with_reason_gated(candidate, now, true)
+        self.candidate_decision_with_reason_gated(candidate, now, true, false)
     }
 
     /// True when the local list names this Claude file's family root or the
@@ -49261,7 +49283,7 @@ impl ScanIndex {
         self.effective_upload_body_witness_revision_requires_adoption(&local_index_key(
             &candidate.path,
         )) && self
-            .candidate_decision_with_reason_gated(candidate, now, false)
+            .candidate_decision_with_reason_gated(candidate, now, false, false)
             .0
             == CandidateDecision::Skip
     }
@@ -49309,6 +49331,7 @@ impl ScanIndex {
         candidate: &CandidateFile,
         now: u64,
         body_witness_adoption: bool,
+        growth_only: bool,
     ) -> (CandidateDecision, Option<CandidateParseReason>) {
         let key = local_index_key(&candidate.path);
         if self.decode_holds_file(&key) {
@@ -49432,7 +49455,8 @@ impl ScanIndex {
         // The virtual N1 recovery slot schedules its own one permitted Full.
         // Grown retention keeps the key observed, but cannot bypass that due
         // time after a marker-erasing reload (there may be no reusable copy).
-        if !entry.source_file_fingerprint.is_empty()
+        if growth_only
+            && !entry.source_file_fingerprint.is_empty()
             && sampled_audit::awaits_hold_deadline_restoration(self, &key)
             && self
                 .held_audit_progress

@@ -126,3 +126,21 @@ On macOS, setting mtime before creation time also moves creation time backward
 (`setattrlist(2)`); that operation changed the fixture's object generation. Later
 touches explicitly assert the established birth identity is unchanged. The
 production birth fence and all original no-acquisition assertions remain.
+
+
+## Round25 clamp continuation and aged-only audit deferral
+
+The completed RAM witness records device/inode/birth separately from the
+existing bounded content and account/output digest. A strictly backwards birth
+with exactly equal mtime may continue only the same device/inode, extent and
+evidence. Acceptance updates the stored birth once and emits
+`withheld_birth_clamp_accepted{events}`; all other generation changes keep their
+existing fence. No persisted field or extra read. The boxed 64-byte witness and
+compact memo entry remain inside the existing 1,536-byte per-entry allowance.
+
+Future virtual-audit Skip is restricted to aged positive growth admitted only
+through grown retention. Recent growth preserves main's immediate selection;
+due Audit and genuine rearm controls remain. The inherited virtual-to-marker
+deadline conversion remains E1's follow-up, with no stronger due guarantee.
+Native post-memo backward-touch and changed-sample controls accompany portable
+selector/counter and replacement/identity/evidence controls.

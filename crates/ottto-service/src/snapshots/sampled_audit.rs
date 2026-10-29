@@ -489,9 +489,11 @@ mod tests {
         index
             .claude_request_census_mut_for_test()
             .insert_for_test(&key, record);
+        let now = 10 * 86_400;
+        let due = now + 100;
         index.held_audit_progress = Some(HeldAuditProgress {
             key: key.clone(),
-            due: 100,
+            due,
             attempted: false,
         });
         candidate.size_bytes += 1;
@@ -505,13 +507,26 @@ mod tests {
             ),
             "growth stays discoverable, never dropped"
         );
+        let decide = |index: &ScanIndex, candidate: &CandidateFile, at| {
+            index.candidate_decision_in_window(candidate, at, Some(at), 7)
+        };
+        let mut recent = candidate.clone();
+        recent.modified_unix_seconds = now;
         assert_eq!(
-            index.candidate_decision_at(&candidate, 99),
+            decide(&index, &recent, now),
+            (
+                CandidateDecision::Parse,
+                Some(CandidateParseReason::TranscriptChanged)
+            ),
+            "recent growth preserves main's immediate selection"
+        );
+        assert_eq!(
+            decide(&index, &candidate, due - 1).0,
             CandidateDecision::Skip,
             "scheduling future virtual debt cannot acquire the grown file"
         );
         assert_eq!(
-            index.candidate_decision_with_reason_at(&candidate, 100),
+            decide(&index, &candidate, due),
             (CandidateDecision::Parse, Some(CandidateParseReason::Audit)),
             "due read retains its counted audit cause"
         );
@@ -522,7 +537,7 @@ mod tests {
             .source_file_fingerprint
             .clear();
         assert_eq!(
-            index.candidate_decision_at(&candidate, 99),
+            decide(&index, &candidate, due - 1).0,
             CandidateDecision::Parse,
             "genuine external rearm is not hidden by the virtual delay"
         );
