@@ -2790,7 +2790,7 @@ fn a1a_strict_writer_preserves_cleared_and_reverted_predecessors_after_restore_p
 }
 
 #[test]
-fn a1a_supported_unprovable_migration_holds_on_growth_without_o3() {
+fn a1a_supported_unprovable_migration_classifies_stale_on_growth_without_o3() {
     use std::io::Write;
     let root = crate::test_scratch::private_dir("ottto-a1a-unprovable");
     let lock = test_locks::hold(&root);
@@ -3602,9 +3602,84 @@ fn a1t_no_match_growth_full_restart_recounts_without_dropping_or_adding_the_pref
         .unwrap();
     let length = std::fs::metadata(&path).unwrap().len();
     assert!(length > prior.files[&key].size_bytes);
+    // A higher selector reason must not mask growth into a hold. A due audit
+    // reaches the no-match restore and takes the counted Full; owed adoption
+    // is refused before the record is read ("history_owed"), so it takes the
+    // ordinary uncounted Miss Full. Neither drops the appended usage.
+    for arm in ["audit", "adoption"] {
+        let mut selected = ScanIndex::load(&index_path).unwrap();
+        let entry = selected.files.get_mut(&key).unwrap();
+        if arm == "audit" {
+            entry.set_unverified_deadline(1);
+            assert!(
+                entry.audit_requires_full(2),
+                "audit outranks TranscriptChanged"
+            );
+        } else {
+            // The cycle activates the current revision before the scan.
+            entry.effective_upload_body_witness_revision = effective_revision(source) - 1;
+            selected.activate_effective_upload_body_witness_revision(effective_revision(source));
+            selected.adopt_effective_upload_body_witness_revision_monotonically();
+            assert!(selected.effective_upload_body_witness_revision_requires_adoption(&key));
+        }
+        let owner = E2ScanFixture::default();
+        owner.begin_durable(source, &root, &index_path);
+        let ((page, body), samples) = crate::transcript_acquisition::capture_sample_reads(|| {
+            observe_consumed(|| {
+                a1a_scan_at(
+                    &owner,
+                    &roots,
+                    &root,
+                    selected.clone(),
+                    "2026-08-02T08:01:30Z",
+                )
+            })
+        });
+        let (mut index, mut scan, modes) = page;
+        assert_eq!(modes, (1, 0, 0), "{arm}: growth is read once, never held");
+        assert_eq!(body, length, "{arm}");
+        assert!(samples.is_empty(), "{arm}");
+        assert_eq!(scan.unreadable_path_count, 0, "{arm}");
+        let counts = owner.cache.durable_counters(source).unwrap().0;
+        let transitional = if arm == "audit" {
+            assert_eq!(counts.ineligible.get("old_binding_no_match"), Some(&1));
+            1
+        } else {
+            assert_eq!(counts.ineligible.get("history_owed"), Some(&1));
+            0
+        };
+        let ((), alarms) =
+            crate::local_resource_diagnostics::capture(|| owner.cache.durable_alarm(source));
+        assert_eq!(
+            alarms
+                .first()
+                .map(|a| a["counts"]["old_binding_no_match"].clone()),
+            (transitional == 1).then(|| serde_json::json!([1, 1])),
+            "{arm}"
+        );
+        assert!(alarms
+            .iter()
+            .all(|a| a["counts"]["held_keys"] == serde_json::json!([0, 0])));
+        if arm == "audit" {
+            let emitted = a1a_wire(&root, &mut index, &mut scan);
+            assert_eq!(
+                (
+                    scan.snapshots[0].input_tokens,
+                    scan.snapshots[0].output_tokens,
+                    scan.snapshots[0].request_count
+                ),
+                (300, 20, 2)
+            );
+            let cold = E2ScanFixture::default();
+            let (mut cold_index, mut cold_scan, _) =
+                a1a_scan_at(&cold, &roots, &root, selected, "2026-08-02T08:01:30Z");
+            assert_eq!(emitted, a1a_wire(&root, &mut cold_index, &mut cold_scan));
+        }
+        assert_eq!(std::fs::read(&disk_path).unwrap(), survivor, "{arm}");
+    }
     for restart in 0..2 {
         // First run deliberately restarts BEFORE ACK/index save. The same still
-        // TranscriptChanged row is allowed again, as the transitional contract says.
+        // growing row is allowed again, as the transitional contract says.
         let selected = ScanIndex::load(&index_path).unwrap();
         assert_eq!(
             selected.files[&key].size_bytes,
