@@ -98,6 +98,31 @@ pub(crate) fn custody_group_progress_dropped(bytes: u64) {
     );
 }
 
+/// Per-member recovery admissions; the acquisition reason itself is unchanged.
+pub(crate) fn custody_group_recovery(kind: &str, bytes: u64) {
+    traversal_point(
+        "custody_group_recovery",
+        "codex",
+        &serde_json::json!({
+            "custody_group_progress_dropped": {(kind): {"events": 1, "bytes": bytes}}
+        }),
+    );
+}
+pub(crate) fn custody_group_restart_full(bytes: u64) {
+    durable_tail_alarm(
+        "codex",
+        &serde_json::json!({
+            "custody_group_restart_full": {"events": 1, "bytes": bytes}
+        }),
+    );
+}
+pub(crate) fn custody_overflow() {
+    durable_tail_alarm(
+        "codex",
+        &serde_json::json!({"custody_overflow": {"events": 1}}),
+    );
+}
+
 pub(crate) fn codex_zst_refused(cause: CodexZstCause) {
     let counter = &CODEX_ZST_REFUSED[cause as usize];
     let previous = counter

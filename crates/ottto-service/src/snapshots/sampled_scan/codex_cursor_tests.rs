@@ -14389,3 +14389,209 @@ fn mixed_custody_drop_is_counted_once_then_reacquires_only_a_durable_tail() {
         }
     });
 }
+
+// Genuine group acquisition with either no previous P or a real record under
+// a different native scope. No manually fabricated checkpoint or accepted body.
+fn group_custody_recovery_case(
+    prior: bool,
+) -> (
+    ScanRoot,
+    ScanIndex,
+    Arc<SharedCache>,
+    PathBuf,
+    CandidateFile,
+    u64,
+) {
+    use crate::snapshots::codex_file_join::tests::usage;
+    fn chain(created: &str, start: u64, count: u64) -> Vec<u8> {
+        let mut bytes = codex_line(json!({"type":"session_meta", "timestamp":created,
+            "payload":{"id":SESSION,"timestamp":created}}));
+        for n in 1..=count {
+            bytes.extend(codex_line(
+                json!({"type":"token_usage_record", "timestamp":NOW,
+                "payload":{"thread_id":SESSION,"response_id":format!("{start}-{n}"),
+                "usage":usage(10),"thread_token_usage":usage(start+n*10)}}),
+            ));
+            bytes.extend(codex_line(json!({"type":"event_msg","timestamp":NOW,
+                "payload":{"type":"token_count","info":{"last_token_usage":usage(10),
+                "total_token_usage":usage(start+n*10)}}})));
+        }
+        bytes
+    }
+    let fixture = ScanRoot::new(0);
+    let path = fixture.file(SESSION);
+    let key = local_index_key(&path);
+    let cache = Arc::new(SharedCache::default());
+    let mut index = ScanIndex::default();
+    if prior {
+        fs::write(&path, chain("2026-10-07T10:00:00Z", 0, 1)).unwrap();
+        let (next, seed, _) = page_selections(
+            &fixture,
+            index,
+            Some(Arc::clone(&cache)),
+            "prior-incompatible-scope",
+            NOW,
+            |_| {},
+            usize::MAX,
+        );
+        index = next;
+        assert!(!seed.snapshots.is_empty());
+        assert!(index.files[&key].last_snapshot_fingerprint.is_some());
+        assert!(cache.retained_checkpoint(&key).is_some());
+    }
+    fs::write(&path, chain("2026-10-07T10:00:00Z", 0, 30)).unwrap();
+    let held = fixture.root.join("later.jsonl");
+    fs::write(&held, chain("2026-10-07T10:30:00Z", 300, 30)).unwrap();
+    for _ in 0..8 {
+        index.traversal = None;
+        index = page(&fixture, index, Some(Arc::clone(&cache))).0;
+        if cache.paused_members_for_test().is_some() {
+            break;
+        }
+    }
+    let (candidate, consumed) = cache
+        .with_cursor(|cursor| {
+            let Slot::Paused(job) = &cursor.slot else {
+                panic!("paused GROUP");
+            };
+            let group = job.group.as_ref().expect("real group");
+            assert_eq!(group.current, 0);
+            assert_eq!(job.candidate.path, path);
+            (job.candidate.clone(), job.parser.reader.consumed_bytes())
+        })
+        .unwrap();
+    assert!(consumed > 0);
+    assert_eq!(
+        index
+            .files
+            .get(&key)
+            .is_some_and(|e| e.last_snapshot_fingerprint.is_some()),
+        prior
+    );
+    if prior {
+        assert!(
+            cache.retained_checkpoint(&key).is_some(),
+            "non-reusable record PRESENT"
+        );
+    } else {
+        assert!(!index.files.contains_key(&key));
+    }
+    index
+        .files
+        .entry(local_index_key(&held))
+        .or_default()
+        .codex_compressed_hold = Some(CodexZstCause::ParentLedgerUnbound);
+    index.codex_state_only_blocked_by_file.clear();
+    let saved = fixture._dir.0.join("reload.json");
+    index.save(&saved).unwrap();
+    index = ScanIndex::load(&saved).unwrap();
+    (fixture, index, cache, held, candidate, consumed)
+}
+
+#[test]
+fn custody_recovery_classifies_actual_first_read_and_named_non_reusable_full() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let clock = TestClock;
+    clock.set(1_900_000_000);
+    with_test_limits(2048, 1024, 64, || {
+        for prior in [false, true] {
+            let (fixture, index, cache, held, candidate, consumed) =
+                group_custody_recovery_case(prior);
+            let namespace = Scope("cursor-fixture".into());
+            let key = local_index_key(&candidate.path);
+            let (_, drops) = crate::local_resource_diagnostics::capture(|| {
+                codex_compressed_hold_tests::no_open(&held, || {
+                    assert!(!cache.cursor_end_custody(&namespace, &index, None));
+                });
+            });
+            assert!(cache.cursor_slot_free());
+            assert_eq!(
+                drops
+                    .iter()
+                    .filter(|r| r["stage"] == "custody_group_progress_dropped")
+                    .count(),
+                1
+            );
+            let file = File::open(&candidate.path).unwrap();
+            let mut parser = OwnedJsonlParser::new(
+                file,
+                &candidate.path,
+                SnapshotSource::Codex,
+                apply_codex_line,
+                None,
+                None,
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+            let old = cache.take(&key).map(|t| t.retained);
+            assert_eq!(old.is_some(), prior);
+            let mode = parser
+                .prepare_acquisition(
+                    old,
+                    &Scope("different-current-scope".into()),
+                    None,
+                    1_900_000_000,
+                )
+                .unwrap();
+            assert!(matches!(
+                mode,
+                crate::transcript_acquisition::ReadMode::Full(_)
+            ));
+            let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+                cache.cursor_custody_recovery(&namespace, &candidate, &index, mode);
+                while !parser.step().unwrap() {}
+            });
+            if prior {
+                let full = rows
+                    .iter()
+                    .find(|r| r["counts"]["custody_group_restart_full"]["events"] == 1)
+                    .expect("named exception");
+                assert_eq!(full["stage"], "durable_tail_alarm");
+                assert_eq!(
+                    full["counts"]["custody_group_restart_full"]["bytes"],
+                    candidate.size_bytes
+                );
+                assert!(rows
+                    .iter()
+                    .all(
+                        |r| r["counts"]["custody_group_progress_dropped"]["first_read"].is_null()
+                    ));
+            } else {
+                assert_eq!(
+                    rows.iter()
+                        .filter(
+                            |r| r["counts"]["custody_group_progress_dropped"]["first_read"]
+                                ["events"]
+                                == 1
+                        )
+                        .count(),
+                    1
+                );
+                assert!(rows
+                    .iter()
+                    .any(
+                        |r| r["counts"]["custody_group_progress_dropped"]["first_read"]["bytes"]
+                            == consumed
+                    ));
+                assert!(rows
+                    .iter()
+                    .all(|r| r["counts"]["custody_group_restart_full"].is_null()));
+            }
+            for _ in 0..5 {
+                let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+                    assert!(!cache.cursor_end_custody(&namespace, &index, None));
+                    cache.cursor_custody_recovery(&namespace, &candidate, &index, mode);
+                });
+                assert!(rows.is_empty(), "receipt consumed once");
+            }
+            assert!(index.files[&local_index_key(&held)]
+                .codex_compressed_hold
+                .is_some());
+            drop(fixture);
+        }
+    });
+}

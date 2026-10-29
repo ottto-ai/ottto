@@ -27665,15 +27665,15 @@ impl OwnedSourceScan {
                 // that selected no candidates (no header inventory: no
                 // evidence for the job this page). A deferred job therefore
                 // never spins within a page.
-                if let Some(context) = sampling.as_ref() {
+                let custody_pending = sampling.as_ref().is_some_and(|context| {
                     context.cache.cursor_end_custody(
                         &context.namespace,
                         index,
                         codex_join_inventory.as_ref(),
-                    );
-                }
+                    )
+                });
                 if let Some(context) = sampling.as_ref().filter(|_| {
-                    !codex_page.cursor_exhausted(sampled_scan::codex_cursor::Limits::current())
+                    !custody_pending && !codex_page.cursor_exhausted(sampled_scan::codex_cursor::Limits::current())
                         // Custody cleanup above is namespace-scoped; foreign
                         // jobs must reach cursor_resume's stale-job retirement.
                         && codex_join_inventory.is_some()
@@ -32369,6 +32369,14 @@ impl OwnedSourceScan {
             }
             if let Some((context, (mode, audit_due))) = sampling.as_mut().zip(planned_mode) {
                 context.record_mode(mode, audit_due);
+                if source == SnapshotSource::Codex {
+                    context.cache.cursor_custody_recovery(
+                        &context.namespace,
+                        &active.candidate,
+                        index,
+                        mode,
+                    );
+                }
             }
             if let Some(delivery) = line_delivery.as_mut() {
                 delivery.arm();

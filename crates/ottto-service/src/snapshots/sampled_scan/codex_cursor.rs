@@ -2276,6 +2276,8 @@ pub(in crate::snapshots) struct CursorState {
     memo: SingletonMemo,
     wake: WakeIdentities,
     invalidations: BTreeMap<String, (u32, u64)>,
+    // RAM-only recovery accounting in this cache; never persisted or a read grant.
+    custody_restarts: BTreeMap<String, u64>,
     parked: BTreeMap<String, Parked>,
     rotation: Rotation,
     counters: Counters,
@@ -2315,6 +2317,7 @@ impl Default for CursorState {
             memo: SingletonMemo::default(),
             wake: WakeIdentities::default(),
             invalidations: BTreeMap::new(),
+            custody_restarts: BTreeMap::new(),
             parked: BTreeMap::new(),
             rotation: Rotation::default(),
             counters: Counters::default(),
@@ -2345,6 +2348,7 @@ impl HeapLayoutBound for CursorState {
             memo,
             wake,
             invalidations,
+            custody_restarts,
             parked,
             rotation,
             counters,
@@ -2377,6 +2381,7 @@ impl HeapLayoutBound for CursorState {
         memo.heap_bound(c)?;
         wake.heap_bound(c)?;
         invalidations.heap_bound(c)?;
+        custody_restarts.heap_bound(c)?;
         parked.heap_bound(c)?;
         rotation.heap_bound(c)?;
         counters.heap_bound(c)?;
@@ -4429,13 +4434,15 @@ impl SharedCache {
             .unwrap_or(false)
     }
 
-    /// Retire this namespace's held attempt without reading; disk custody stays owed.
+    /// Returns true only when charged recovery bookkeeping cannot fit: keep
+    /// the paused job and never resume its held members. No read permission.
     pub(in crate::snapshots) fn cursor_end_custody(
         &self,
         namespace: &Scope,
         index: &ScanIndex,
         inventory: Option<&codex_file_join::HeaderInventory>,
-    ) {
+    ) -> bool {
+        let mut retained = false;
         let dropped = self.with_cursor(|cursor| {
             let Slot::Paused(job) = &cursor.slot else {
                 return None;
@@ -4454,27 +4461,91 @@ impl SharedCache {
             {
                 return None;
             }
-            let bytes = job.group.as_ref().map_or(0, |group| {
-                group
-                    .members
-                    .iter()
-                    .zip(&group.stamps)
-                    .enumerate()
-                    .take(group.current + 1)
-                    .filter(|(_, (member, _))| !held(&local_index_key(&member.path)))
-                    .fold(0_u64, |bytes, (at, (_, stamp))| {
-                        bytes.saturating_add(if at == group.current {
+            let mut bytes = 0_u64;
+            if let Some(group) = &job.group {
+                // Prepay the moved vectors plus ALL new receipt nodes/temporary
+                // keys against the charge freed by this job, before allocation.
+                let mut cost = Counter::new(cursor.slot_charge);
+                let funded = (|| {
+                    group.members.heap_bound(&mut cost)?;
+                    group.stamps.heap_bound(&mut cost)?;
+                    cost.add(meta.namespace.capacity())?;
+                    if cursor
+                        .custody_restarts
+                        .len()
+                        .checked_add(group.members.len())?
+                        > codex_file_join::MAX_HEADER_FILES
+                    {
+                        return None;
+                    }
+                    for (at, (member, stamp)) in group
+                        .members
+                        .iter()
+                        .zip(&group.stamps)
+                        .enumerate()
+                        .take(group.current + 1)
+                    {
+                        let consumed = if at == group.current {
                             job.parser.reader.consumed_bytes()
                         } else {
                             stamp.extent
-                        })
-                    })
-            });
-            // Saved pace is not a parser checkpoint: disclose unheld progress lost.
+                        };
+                        if consumed == 0 || held(&local_index_key(&member.path)) {
+                            continue;
+                        }
+                        bytes = bytes.saturating_add(consumed);
+                        cost.add(crate::heap_layout_bound::tree_node_bytes::<String, u64>()?)?;
+                        cost.add(
+                            member
+                                .path
+                                .as_os_str()
+                                .len()
+                                .checked_mul(6)?
+                                .checked_add(meta.namespace.len() * 2 + 32)?,
+                        )?;
+                    }
+                    Some(())
+                })();
+                if funded.is_none() {
+                    retained = true;
+                    crate::local_resource_diagnostics::custody_overflow();
+                    return None;
+                }
+            }
             cursor.rotation.waiting.retain(|key, _| {
                 key.split_once('\0') != Some((meta.namespace.as_str(), meta.key.as_str()))
             });
-            cursor.slot = Slot::Empty;
+            let Slot::Paused(mut job) = std::mem::replace(&mut cursor.slot, Slot::Empty) else {
+                unreachable!()
+            };
+            if let Some(mut group) = job.group.take() {
+                let namespace = job.cursor.take().expect("checked cursor").namespace;
+                let members = std::mem::take(&mut group.members);
+                let stamps = std::mem::take(&mut group.stamps);
+                let current = group.current;
+                let consumed = job.parser.reader.consumed_bytes();
+                // Free the parser/proof BEFORE allocating prepaid receipts.
+                drop(group);
+                drop(job);
+                for (at, (member, stamp)) in members
+                    .into_iter()
+                    .zip(stamps)
+                    .enumerate()
+                    .take(current + 1)
+                {
+                    let bytes = if at == current {
+                        consumed
+                    } else {
+                        stamp.extent
+                    };
+                    if bytes != 0 && !held(&local_index_key(&member.path)) {
+                        cursor.custody_restarts.insert(
+                            memo_key(&Scope(namespace.clone()), &local_index_key(&member.path)),
+                            bytes,
+                        );
+                    }
+                }
+            }
             cursor.slot_key = None;
             cursor.slot_members.clear();
             cursor.slot_charge = 0;
@@ -4483,6 +4554,36 @@ impl SharedCache {
         });
         if let Some(bytes) = dropped.flatten() {
             crate::local_resource_diagnostics::custody_group_progress_dropped(bytes);
+        }
+        retained || dropped.is_none()
+    }
+
+    /// Consume once at the ordinary native acquisition boundary. The existing
+    /// acquisition decides Full/Tail; this receipt never changes its reason.
+    pub(in crate::snapshots) fn cursor_custody_recovery(
+        &self,
+        namespace: &Scope,
+        candidate: &CandidateFile,
+        index: &ScanIndex,
+        mode: crate::transcript_acquisition::ReadMode,
+    ) {
+        let key = local_index_key(&candidate.path);
+        let bytes = self
+            .with_cursor(|cursor| cursor.custody_restarts.remove(&memo_key(namespace, &key)))
+            .flatten();
+        let Some(bytes) = bytes else {
+            return;
+        };
+        let first = !index
+            .files
+            .get(&key)
+            .is_some_and(|e| e.last_snapshot_fingerprint.is_some());
+        if first {
+            crate::local_resource_diagnostics::custody_group_recovery("first_read", bytes);
+        } else if matches!(mode, crate::transcript_acquisition::ReadMode::Full(_)) {
+            crate::local_resource_diagnostics::custody_group_restart_full(candidate.size_bytes);
+        } else {
+            crate::local_resource_diagnostics::custody_group_recovery("tail", bytes);
         }
     }
 

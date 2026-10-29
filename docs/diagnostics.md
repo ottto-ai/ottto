@@ -877,8 +877,29 @@ totals; no paths or ids are emitted. Emission occurs after releasing the cursor
 lock. Sum records for the observed process interval; absence means zero observed
 drops, not evidence about a previous process.
 
-Accepted residual: at most one Tail re-read of an unheld group member's paused
-suffix per custody latch, bounded by the cursor page budget; Tail only. The held
-member remains excluded from later group formation. Exit: custody-aware group
-continuation retaining unheld parser offsets independently of held-member
-authority. This count grants no new Full, custody release or publication credit.
+Acquisition classification is reported when the ordinary native acquisition is
+admitted, under stage `custody_group_recovery` and
+`counts.custody_group_progress_dropped.{tail,first_read}.{events,bytes}`. These
+are per-member recovery admissions and discarded consumed bytes; the original
+per-drop totals above remain one event per cleanup. FirstRead is derived from
+absence of a committed entry/accepted fingerprint, never merely from cleanup;
+existing acquisition reasons elsewhere are unchanged. A reusable record takes
+Tail. A committed accepted member without a reusable record takes the named
+`custody_group_restart_full` transitional exception: at most one Full per member
+per custody latch, bounded by that file's size. Its admitted events and planned
+file bytes emit a nonzero `durable_tail_alarm` on the same carrier (expected
+approximately zero); it is distinct from discarded-byte and growth counts.
+RAM-only recovery receipts are charged inside the existing cursor cache and
+consumed once. They are not persisted, proof or an additional read permission.
+If receipt admission cannot fit the retiring job's charge, keep that job and
+alarm `custody_overflow.events`; never silently discard its accounting.
+
+Residual: first-read restart after group custody drop, ≤1/latch, bounded by the
+page budget, exit 11c. Reusable accepted state has at most one Tail suffix
+re-read per latch; accepted non-reusable state has the named bounded Full
+exception above. H stays sticky and is excluded from subsequent groups. If
+post-release Full counts are not rare, progress-preserving continuation is
+required. Exit = 11c custody-aware group continuation; 11c must keep independent
+unheld offsets without relying on held-member authority. No custody release or
+publication credit is granted here. Counters reset with process observation;
+sum their deltas, not repeated growth observations.
