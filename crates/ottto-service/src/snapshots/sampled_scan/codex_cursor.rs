@@ -4508,7 +4508,6 @@ impl SharedCache {
                 })();
                 if funded.is_none() {
                     retained = true;
-                    crate::local_resource_diagnostics::custody_overflow();
                     return None;
                 }
             }
@@ -4554,6 +4553,9 @@ impl SharedCache {
         });
         if let Some(bytes) = dropped.flatten() {
             crate::local_resource_diagnostics::custody_group_progress_dropped(bytes);
+        }
+        if retained {
+            crate::local_resource_diagnostics::custody_overflow();
         }
         retained || dropped.is_none()
     }
