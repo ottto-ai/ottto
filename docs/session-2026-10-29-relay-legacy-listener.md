@@ -18,11 +18,20 @@ workers. Busy ports are skipped and retried on a 60-second tick. A port observed
 as currently approved is removed immediately during reconciliation; primary
 recovery also requests a synchronous socket release before binding it.
 Compatibility startup or persistence failure closes only compatibility sockets.
-When Claude telemetry consent or endpoint approval is absent or disabled, the
-next tick closes all legacy sockets and retires their ports. Idle expiry also
+Legacy requests recheck current approval and their live listener generation
+before capture; refused requests return 403 without evidence or request activity.
+Claude disable/removal hooks invalidate workers synchronously and request
+persisted retirement/socket closure with a two-second acknowledgement bound.
+Previously accepted connections are fenced, and already-admitted exports drain
+before a successful acknowledgement. Periodic revocation remains a fallback. Idle expiry also
 retires ports. Retirement persists across restarts and re-seeding; only a fresh
 approval followed by supersession permits reopening. Primary listener behavior
 for all sources is unchanged. No process enumeration is used for early closure.
+Retirement precommits a separate private tombstone and updates the main record
+before dropping sockets. Write failure still closes sockets and attempts to
+unlink stale state; loading the tombstone masks replayed old allowlists.
+If both state and tombstone persistence fail, supervision exits and logs the
+residual risk of losing retirement across restart.
 
 Idle listeners close after 24 hours. First-open time is durable before serving;
 last-request time is flushed at most once per ten minutes and survives restart.

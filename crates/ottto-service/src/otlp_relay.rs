@@ -755,10 +755,26 @@ pub(crate) fn serve_test_connection(stream: TcpStream, daemon: LocalDaemon) {
 }
 
 fn handle_client(
+    stream: TcpStream,
+    source: SnapshotSource,
+    daemon: LocalDaemon,
+    legacy_activity: Option<legacy::Activity>,
+) -> Result<()> {
+    handle_client_at(
+        stream,
+        source,
+        daemon,
+        legacy_activity,
+        &ottto_core::default_support_dir(),
+    )
+}
+
+fn handle_client_at(
     mut stream: TcpStream,
     source: SnapshotSource,
     daemon: LocalDaemon,
     legacy_activity: Option<legacy::Activity>,
+    support_dir: &Path,
 ) -> Result<()> {
     let request = match read_http_request(&mut stream) {
         Ok(request) => request,
@@ -802,8 +818,19 @@ fn handle_client(
     }
 
     let request_source = source_from_request(&request).unwrap_or(source);
-    let response =
-        local_otlp_export_response(request_source, &request, &ottto_core::default_support_dir());
+    let export = || local_otlp_export_response(request_source, &request, support_dir);
+    let response = if let Some(activity) = legacy_activity.as_ref() {
+        let Some(response) = activity.export_if_approved(export) else {
+            return write_json_response(
+                &mut stream,
+                403,
+                json!({"error":"legacy_relay_approval_revoked"}),
+            );
+        };
+        response
+    } else {
+        export()
+    };
     // Only a successful export keeps a legacy port alive or raises its note.
     if let Some(activity) = legacy_activity.filter(|_| (200..300).contains(&response.status)) {
         activity.accepted();
@@ -2489,7 +2516,7 @@ mod tests {
         );
     }
 
-    const CLAUDE_API_REQUEST_LOG: &[u8] = br#"{"resourceLogs":[{"resource":{"attributes":[{"key":"session.id","value":{"stringValue":"retired-forward-session"}}]},"scopeLogs":[{"logRecords":[{"timeUnixNano":"1783728000000000000","body":{"stringValue":"claude_code.api_request"},"attributes":[{"key":"request_id","value":{"stringValue":"req-retired-forward"}},{"key":"model","value":{"stringValue":"claude-opus-4-7"}},{"key":"effort","value":{"stringValue":"high"}},{"key":"input_tokens","value":{"intValue":"12"}},{"key":"output_tokens","value":{"intValue":"3"}},{"key":"prompt","value":{"stringValue":"must-not-persist"}}]}]}]}]}"#;
+    pub(super) const CLAUDE_API_REQUEST_LOG: &[u8] = br#"{"resourceLogs":[{"resource":{"attributes":[{"key":"session.id","value":{"stringValue":"retired-forward-session"}}]},"scopeLogs":[{"logRecords":[{"timeUnixNano":"1783728000000000000","body":{"stringValue":"claude_code.api_request"},"attributes":[{"key":"request_id","value":{"stringValue":"req-retired-forward"}},{"key":"model","value":{"stringValue":"claude-opus-4-7"}},{"key":"effort","value":{"stringValue":"high"}},{"key":"input_tokens","value":{"intValue":"12"}},{"key":"output_tokens","value":{"intValue":"3"}},{"key":"prompt","value":{"stringValue":"must-not-persist"}}]}]}]}]}"#;
     const CLAUDE_LLM_REQUEST_TRACE: &[u8] = br#"{"resourceSpans":[{"resource":{"attributes":[{"key":"session.id","value":{"stringValue":"retired-forward-session"}}]},"scopeSpans":[{"spans":[{"name":"claude_code.llm_request","startTimeUnixNano":"1783728000000000000","attributes":[{"key":"request_id","value":{"stringValue":"req-retired-forward"}},{"key":"client_request_id","value":{"stringValue":"client-req-retired-forward"}},{"key":"prompt","value":{"stringValue":"must-not-persist"}}]}]}]}]}"#;
 
     fn otlp_post(path: &str, content_type: &str, body: &[u8]) -> HttpRequest {

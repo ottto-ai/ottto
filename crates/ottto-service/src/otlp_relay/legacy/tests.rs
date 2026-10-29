@@ -273,13 +273,15 @@ fn restricted_handler_rejects_control_health_and_non_otlp_and_shares_export_resp
         write!(client, "{method} {path} HTTP/1.1\r\nHost: localhost\r\nX-Ottto-Local-Relay: codex\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}").unwrap();
         let stream = open.accept().unwrap();
         apply_relay_io_timeouts(&stream);
-        handle_client(
-            stream,
-            SnapshotSource::ClaudeCode,
-            super::super::tests::test_daemon(),
-            Some(open.activity.clone()),
-        )
-        .unwrap();
+        with_request_approval(Some(APPROVED), || {
+            handle_client(
+                stream,
+                SnapshotSource::ClaudeCode,
+                super::super::tests::test_daemon(),
+                Some(open.activity.clone()),
+            )
+            .unwrap();
+        });
         let mut response = String::new();
         client.read_to_string(&mut response).unwrap();
         response
@@ -323,10 +325,13 @@ fn restricted_handler_rejects_control_health_and_non_otlp_and_shares_export_resp
 #[test]
 fn recent_request_window_expires_at_one_hour() {
     let counters = Arc::new(Counters::default());
-    let activity = Activity {
-        last: Arc::new(AtomicU64::new(100)),
-        counters: counters.clone(),
-    };
+    let activity = Activity::new(
+        2,
+        APPROVED,
+        100,
+        counters.clone(),
+        Arc::new(Admission::default()),
+    );
     assert!(!recent_at(0, 100));
     activity.accepted_at(1000);
     let last = counters.last_request.load(Ordering::Relaxed);
@@ -571,4 +576,229 @@ fn idle_retirement_is_durable_and_cannot_be_reseeded() {
         .unwrap();
     assert!(restarted.open.is_empty());
     assert!(restarted.record.ports.is_empty());
+}
+
+fn with_request_approval<T>(approved: Option<u16>, run: impl FnOnce() -> T) -> T {
+    struct Reset(Option<Option<u16>>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_APPROVAL.with(|value| value.set(self.0));
+        }
+    }
+    let _reset = Reset(TEST_APPROVAL.with(|value| value.replace(Some(approved))));
+    run()
+}
+
+fn with_endpoint<T>(endpoint: Endpoint, run: impl FnOnce() -> T) -> T {
+    struct Reset(Option<Endpoint>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_ENDPOINT.with(|value| *value.borrow_mut() = self.0.take());
+        }
+    }
+    let _reset = Reset(TEST_ENDPOINT.with(|value| value.replace(Some(endpoint))));
+    run()
+}
+
+fn hook_supervisor(mut supervisor: Supervisor) -> (Endpoint, thread::JoinHandle<Supervisor>) {
+    let (sender, receiver) = mpsc::channel();
+    let endpoint = Endpoint {
+        sender,
+        admission: supervisor.admission.clone(),
+    };
+    let worker = thread::spawn(move || {
+        let command = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        supervisor.handle_command(command).unwrap();
+        supervisor
+    });
+    (endpoint, worker)
+}
+
+#[test]
+fn synchronous_hook_retires_without_tick_and_fences_disable_reenable() {
+    let (_dir, mut supervisor) = scratch();
+    let port = spare_port();
+    let candidates = [APPROVED, port];
+    supervisor
+        .reconcile(100, Some(APPROVED), 0, &candidates, &[port])
+        .unwrap();
+    let accepted_before_revoke = supervisor.open[&port].activity.clone();
+    let (endpoint, worker) = hook_supervisor(supervisor);
+    with_endpoint(endpoint, revoke_now);
+    let mut supervisor = worker.join().unwrap();
+    assert!(supervisor.open.is_empty());
+    assert!(supervisor.record.retired.contains(&port));
+    assert_eq!(supervisor.counters.open.load(Ordering::Relaxed), 0);
+    let disk: Record = load_private_record(&supervisor.path).unwrap();
+    assert!(disk.retired.contains(&port));
+    let released = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+    drop(released);
+    // Consent returns to exactly the same approval before a periodic tick.
+    supervisor
+        .reconcile(101, Some(APPROVED), 0, &candidates, &[port])
+        .unwrap();
+    assert!(supervisor.open.is_empty());
+    with_request_approval(Some(APPROVED), || {
+        assert!(accepted_before_revoke
+            .export_if_approved(|| panic!("retired worker exported"))
+            .is_none());
+    });
+    supervisor
+        .reconcile(102, Some(port), APPROVED, &candidates, &[])
+        .unwrap();
+    supervisor
+        .reconcile(103, Some(APPROVED), APPROVED, &candidates, &[])
+        .unwrap();
+    assert!(supervisor.open.contains_key(&port));
+    with_request_approval(Some(APPROVED), || {
+        assert!(accepted_before_revoke
+            .export_if_approved(|| panic!("old generation exported"))
+            .is_none());
+        let admission = supervisor.admission.clone();
+        assert_eq!(
+            supervisor.open[&port].activity.export_if_approved(|| {
+                assert!(
+                    admission.exports.try_write().is_err(),
+                    "export fence is held through capture"
+                );
+                7
+            }),
+            Some(7)
+        );
+    });
+}
+
+#[test]
+fn revoked_approval_refuses_preaccepted_request_before_tick_without_capture_or_activity() {
+    let (_dir, mut supervisor) = scratch();
+    let port = spare_port();
+    supervisor
+        .reconcile(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
+        .unwrap();
+    let open = &supervisor.open[&port];
+    let mut client = TcpStream::connect(open.listener.local_addr().unwrap()).unwrap();
+    apply_relay_io_timeouts(&client);
+    let stream = open.accept().unwrap();
+    apply_relay_io_timeouts(&stream);
+    let activity = open.activity.clone();
+    let capture_dir = ScratchDir::new("legacy-revoked-capture");
+    let positive_dir = ScratchDir::new("legacy-approved-capture");
+    let body = super::super::tests::CLAUDE_API_REQUEST_LOG;
+    let positive = HttpRequest {
+        method: "POST".into(),
+        path: "/v1/logs".into(),
+        headers: BTreeMap::from([("content-type".into(), "application/json".into())]),
+        body: body.to_vec(),
+    };
+    assert_eq!(
+        local_otlp_export_response(SnapshotSource::ClaudeCode, &positive, &positive_dir).status,
+        200
+    );
+    let evidence = crate::claude_local_otel::load_claude_effort_evidence(
+        &positive_dir,
+        ["retired-forward-session".to_string()],
+    )
+    .unwrap();
+    assert_eq!(
+        evidence["retired-forward-session"].len(),
+        1,
+        "payload really stores evidence when admitted"
+    );
+    // Accepted while approved; finish the request only after revocation.
+    write!(client, "POST /v1/logs HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n", body.len()).unwrap();
+    client.write_all(body).unwrap();
+    let (endpoint, worker) = hook_supervisor(supervisor);
+    with_endpoint(endpoint, || {
+        with_request_approval(None, || {
+            let capture_called = std::cell::Cell::new(false);
+            // The real HTTP handler must refuse; this seam independently proves
+            // the capture closure cannot run, even with a valid parsed request.
+            handle_client_at(
+                stream,
+                SnapshotSource::ClaudeCode,
+                super::super::tests::test_daemon(),
+                Some(activity.clone()),
+                &capture_dir,
+            )
+            .unwrap();
+            assert!(activity
+                .export_if_approved(|| capture_called.set(true))
+                .is_none());
+            assert!(!capture_called.get());
+        })
+    });
+    let supervisor = worker.join().unwrap();
+    let mut response = String::new();
+    client.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 403"));
+    assert_eq!(
+        std::fs::read_dir(&capture_dir).unwrap().count(),
+        0,
+        "refused request stored nothing"
+    );
+    assert_eq!(supervisor.counters.requests.load(Ordering::Relaxed), 0);
+    assert_eq!(supervisor.counters.last_request.load(Ordering::Relaxed), 0);
+    assert_eq!(activity.last.load(Ordering::Relaxed), 100);
+    assert!(supervisor.open.is_empty());
+    assert!(supervisor.record.retired.contains(&port));
+}
+
+#[test]
+fn failed_revoke_save_closes_and_tombstone_blocks_replayed_old_allowlist() {
+    let (_dir, mut supervisor) = scratch();
+    let port = spare_port();
+    let candidates = [APPROVED, port];
+    supervisor
+        .reconcile(100, Some(APPROVED), 0, &candidates, &[port])
+        .unwrap();
+    let old_disk = std::fs::read(&supervisor.path).unwrap();
+    supervisor.fail_save.set(true);
+    assert!(supervisor.revoke().is_err());
+    assert!(supervisor.open.is_empty());
+    assert!(supervisor.record.retired.contains(&port));
+    assert!(
+        !supervisor.path.exists(),
+        "stale allowlist unlink attempted"
+    );
+    let tombstone: Retired =
+        load_private_record(&supervisor.path.with_file_name("legacy-relay-retired.json")).unwrap();
+    assert!(tombstone.ports.contains(&port));
+    // Restore the exact old disk bytes, also modeling an unlink failure.
+    std::fs::write(&supervisor.path, old_disk).unwrap();
+    let mut restarted =
+        Supervisor::load(supervisor.path.clone(), supervisor.counters.clone(), 101).unwrap();
+    restarted
+        .reconcile(101, Some(APPROVED), 0, &candidates, &[port])
+        .unwrap();
+    assert!(restarted.open.is_empty());
+    assert!(restarted.record.retired.contains(&port));
+    let _not_bound_by_legacy = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+}
+
+#[test]
+fn failed_idle_save_also_retires_before_fail_closed_cleanup() {
+    let (_dir, mut supervisor) = scratch();
+    let port = spare_port();
+    let candidates = [APPROVED, port];
+    supervisor
+        .reconcile(100, Some(APPROVED), 0, &candidates, &[port])
+        .unwrap();
+    let old_disk = std::fs::read(&supervisor.path).unwrap();
+    supervisor.fail_save.set(true);
+    assert!(supervisor
+        .reconcile(100 + IDLE_SECONDS, Some(APPROVED), 0, &candidates, &[])
+        .is_err());
+    assert!(supervisor.open.is_empty());
+    std::fs::write(&supervisor.path, old_disk).unwrap();
+    let mut restarted = Supervisor::load(
+        supervisor.path.clone(),
+        supervisor.counters.clone(),
+        100 + IDLE_SECONDS,
+    )
+    .unwrap();
+    restarted
+        .reconcile(100 + IDLE_SECONDS, Some(APPROVED), 0, &candidates, &[port])
+        .unwrap();
+    assert!(restarted.open.is_empty());
+    assert!(restarted.record.retired.contains(&port));
 }

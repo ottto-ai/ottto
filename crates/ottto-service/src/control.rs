@@ -1821,6 +1821,7 @@ fn validate_managed_claude_settings_root(config_dir: &str) -> Result<(), LocalAp
 }
 
 fn disable_managed_claude_relay_settings() -> Result<bool, LocalApiError> {
+    crate::otlp_relay::legacy::revoke_now();
     let _settings_guard = lock_managed_claude_settings();
     use crate::agent_configs::claude_managed_settings::{disable_settings, Outcome};
     let default_root = home_path(".claude");
@@ -2089,6 +2090,7 @@ pub(crate) fn remove_claude_registration_with_relay_cleanup(
             .and_then(|slot| slot.config_dir.as_deref())
         {
             validate_managed_claude_settings_root(root)?;
+            crate::otlp_relay::legacy::revoke_now();
             crate::agent_configs::claude_managed_settings::disable_settings(Path::new(root), false)
                 .map_err(|_| LocalApiError::LocalOperationFailed("managed Claude relay settings must be safely cleared before removing registration".into()))?;
         }
@@ -9559,6 +9561,9 @@ fn setup_answer(
         }
     };
     let detail = save_setup_answer(&api_base_url, &mut credentials, &source, &answer_type)?;
+    if source == SourceKind::ClaudeCode {
+        crate::otlp_relay::legacy::revoke_now();
+    }
     setup_result_from_detail(&credentials.connection, detail, false, Vec::new())
 }
 

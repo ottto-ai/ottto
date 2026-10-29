@@ -628,13 +628,23 @@ seed discovery does not guess ports or connect to them. Busy ports are skipped
 and retried every 60 seconds. A port observed as the current approval is removed from legacy
 ingress; primary recovery releases that legacy socket before attempting its bind.
 
-If Claude telemetry consent or endpoint approval is absent, disabled or revoked,
-the next periodic tick closes all legacy listeners and retires their ports.
+Every legacy export rechecks Claude endpoint approval and the listener's live
+approval generation immediately before capture. Refused exports return 403 and
+store no evidence or successful-request activity. Claude disable/removal operations
+invalidate that generation synchronously and wait up to two seconds for the
+supervisor to persist retirement and close sockets. A refused request also
+signals revocation; periodic checks remain a fallback for external settings edits.
 Idle expiry also retires a port. Retirement survives restarts and prevents
 re-seeding or reopening until that port is explicitly approved again and then
 superseded. The primary listener continues its existing behavior for all sources.
 The optional record is separate from existing daemon formats: older daemons
 ignore it, and missing fields or unknown extra fields decode without error.
+Retirement is persisted before socket closure, with a separate owner-only
+`legacy-relay-retired.json` tombstone protecting against replay of a stale main
+record after a failed write. A write failure closes legacy listeners and attempts
+to remove the stale main record. If both state and tombstone writes fail,
+compatibility supervision stops and logs the failure; retirement may be unknown
+after restart. Existing atomic-file durability guarantees apply.
 
 A listener closes after 24 hours without an accepted OTLP request. First-open
 time and request activity persist across daemon restarts; activity writes are
