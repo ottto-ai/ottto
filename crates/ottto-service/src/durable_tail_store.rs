@@ -48,9 +48,8 @@ pub(crate) mod active;
 mod stream;
 pub(crate) use active::{ActiveLease, ActiveOverBudget, LeaseWait, ACTIVE_BYTES};
 pub(crate) use stream::{
-    FailureDisposition, PassFlush, PendingCommit, PrepareStoreFailure, PreparedHeader,
-    PreparedRecord, ReceiptProof, RecordIdentity, ResolvePreparation, StreamCommit,
-    StreamPreparation, StreamResolution,
+    FailureDisposition, PrepareStoreFailure, PreparedHeader, PreparedRecord, ReceiptProof,
+    RecordIdentity,
 };
 
 /// Envelope format. Bump on any envelope or certificate layout change.

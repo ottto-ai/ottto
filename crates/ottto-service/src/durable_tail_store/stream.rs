@@ -71,7 +71,7 @@ impl RecordIdentity {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ReceiptProof {
-    identity: RecordIdentity,
+    identity: Box<RecordIdentity>,
     stamp: Stamp,
     content: Digest32,
 }
@@ -121,7 +121,7 @@ struct Attempt {
 impl Attempt {
     fn failure(self, stage: &'static str, error: io::Error) -> PrepareStoreFailure {
         PrepareStoreFailure {
-            attempt: self,
+            attempt: Box::new(self),
             stage,
             error,
             protected: None,
@@ -141,7 +141,7 @@ impl Attempt {
 }
 
 pub(crate) struct PrepareStoreFailure {
-    attempt: Attempt,
+    attempt: Box<Attempt>,
     stage: &'static str,
     error: io::Error,
     protected: Option<Refusal>,
@@ -160,7 +160,7 @@ impl PrepareStoreFailure {
         self.protected
     }
     pub(crate) fn is_enospc(&self) -> bool {
-        matches!(self.error.raw_os_error(), Some(libc::ENOSPC | libc::EDQUOT))
+        no_space(&self.error)
     }
     pub(crate) fn discard(&mut self) -> io::Result<()> {
         self.attempt.writer()?;
@@ -378,11 +378,8 @@ impl ResolvePreparation {
             let attempt = &self.failure.attempt;
             let current = stamp_at(&attempt.path)?;
             if let Some(identity) = attempt.identity.as_ref() {
-                if current.is_some() && verify_stream_candidate(&attempt.path, identity, &mut read)?
-                {
-                    return Ok(Resolution::Receipted(
-                        stamp_at(&attempt.path)?.expect("verified path"),
-                    ));
+                if let Some(stamp) = verify_stream_candidate(&attempt.path, identity, &mut read)? {
+                    return Ok(Resolution::Receipted(stamp));
                 }
             }
             let Some(stamp) = current else {
@@ -431,7 +428,7 @@ fn verify_stream_candidate(
     path: &Path,
     expected: &RecordIdentity,
     read: &mut u64,
-) -> io::Result<bool> {
+) -> io::Result<Option<Stamp>> {
     let before = stamp_at(path)?;
     let mut file = OpenOptions::new()
         .read(true)
@@ -444,7 +441,7 @@ fn verify_stream_candidate(
         || Some(Stamp::of(&metadata)) != before
         || metadata.len() != expected.encoded_len
     {
-        return Ok(false);
+        return Ok(None);
     }
     let mut remaining = expected.encoded_len - TRAILER_BYTES as u64;
     let mut hash = Sha256::new();
@@ -460,10 +457,12 @@ fn verify_stream_candidate(
     file.read_exact(&mut trailer)?;
     *read += TRAILER_BYTES as u64;
     let digest: Digest32 = hash.finalize().into();
-    Ok(digest == expected.trailer
+    Ok((digest == expected.trailer
         && trailer == expected.trailer
         && Some(Stamp::of(&file.metadata()?)) == before
         && stamp_at(path)? == before)
+        .then_some(before)
+        .flatten())
 }
 
 pub(crate) struct PassFlush {
@@ -527,7 +526,7 @@ impl DurableTailStore {
                 || size
                     .checked_add(header.body_len)
                     .and_then(|n| n.checked_add(TRAILER_BYTES))
-                    .is_none_or(|n| n > RECORD_BYTES)
+                    .map_or(true, |n| n > RECORD_BYTES)
             {
                 return Err(io::Error::other("invalid native header"));
             }
@@ -654,7 +653,7 @@ impl DurableTailStore {
         })();
         match result {
             Ok(()) => Ok(ReceiptProof {
-                identity: attempt.identity.expect("receipt identity"),
+                identity: Box::new(attempt.identity.expect("receipt identity")),
                 stamp,
                 content: attempt.content,
             }),
@@ -683,7 +682,7 @@ impl DurableTailStore {
         self.counters.guard_header_bytes += read;
         if let Resolution::Receipted(stamp) = result {
             return match self.finish_stream(StreamCommit {
-                attempt: failure.attempt,
+                attempt: *failure.attempt,
                 stamp,
             }) {
                 Ok(receipt) => FailureDisposition::Receipted(receipt),
@@ -721,6 +720,74 @@ impl DurableTailStore {
                 cause: "stale_survivor",
             }
         }
+    }
+    /// Only a registered exact native candidate can produce this proof.
+    /// None is not absence and never discharges a candidate-less owed mark.
+    pub(crate) fn reconcile_stream(
+        &mut self,
+        writer: &dyn SingleWriter,
+        key: &Digest32,
+    ) -> Result<Option<ReceiptProof>, Refusal> {
+        self.check_writer(writer).map_err(|_| Refusal::Unbindable)?;
+        if self.disabled.is_some() {
+            return Ok(None);
+        }
+        let Some(pending) = self.pending.get(key).copied() else {
+            return Ok(None);
+        };
+        if pending.candidate.format != FORMAT_V3 {
+            return Err(Refusal::ReceiptPending);
+        }
+        let path = self.record_path(key);
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&path)
+            .map_err(|_| Refusal::ReceiptPending)?;
+        let header_stamp = Stamp::of(&file.metadata().map_err(|_| Refusal::ReceiptPending)?);
+        let mut bytes = [0; HEADER_V3_BYTES];
+        file.read_exact(&mut bytes)
+            .map_err(|_| Refusal::ReceiptPending)?;
+        self.counters.guard_header_bytes += HEADER_V3_BYTES as u64;
+        let header = decode_header(&bytes, key, self.source)?;
+        let Some(acquisition) = header.record.acquisition else {
+            return Err(Refusal::ReceiptPending);
+        };
+        let identity = RecordIdentity {
+            binding: header.record.binding,
+            certificate: header.record.certificate,
+            format: header.format,
+            allowlist: header.record.allowlist,
+            acquisition,
+            generation: header.generation,
+            encoded_len: (HEADER_V3_BYTES + header.body_len + TRAILER_BYTES) as u64,
+            trailer: pending.candidate.trailer,
+        };
+        if identity.wire() != pending.candidate {
+            return Err(Refusal::ReceiptPending);
+        }
+        let mut read = 0;
+        let verified = verify_stream_candidate(&path, &identity, &mut read)
+            .ok()
+            .flatten();
+        self.counters.guard_verify_bytes += read;
+        let stamp = verified
+            .filter(|stamp| *stamp == header_stamp)
+            .ok_or(Refusal::ReceiptPending)?;
+        let attempt = Attempt {
+            dir: self.dir.clone(),
+            path,
+            key: *key,
+            prior: pending.prior,
+            prior_known: true,
+            cleanup: self.cleanup.clone(),
+            temp: None,
+            identity: Some(identity),
+            content: pending.content,
+        };
+        self.finish_stream(StreamCommit { attempt, stamp })
+            .map(Some)
+            .map_err(|_| Refusal::ReceiptPending)
     }
     pub(crate) fn receipt_current(&self, receipt: &ReceiptProof) -> bool {
         stamp_at(&self.record_path(&receipt.identity.binding.key))
@@ -843,6 +910,15 @@ impl std::fmt::Display for PrepareStoreFailure {
     }
 }
 impl std::error::Error for PrepareStoreFailure {}
+
+/// Preserve the original errno even when both write and cleanup failed.
+pub(super) fn no_space(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::ENOSPC | libc::EDQUOT))
+        || error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<WriteCleanupFailure>())
+            .is_some_and(|failure| no_space(&failure.write))
+}
 
 #[cfg(test)]
 mod tests {
@@ -1066,13 +1142,4 @@ mod tests {
         assert_eq!(store.counters().durable_write_failed_published, 1);
         assert_eq!(store.counters().stale_record_refused, 1);
     }
-}
-
-/// Preserve the original errno even when both write and cleanup failed.
-pub(super) fn no_space(error: &io::Error) -> bool {
-    matches!(error.raw_os_error(), Some(libc::ENOSPC | libc::EDQUOT))
-        || error
-            .get_ref()
-            .and_then(|source| source.downcast_ref::<WriteCleanupFailure>())
-            .is_some_and(|failure| no_space(&failure.write))
 }
