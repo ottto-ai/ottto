@@ -16,6 +16,7 @@ struct ParkedDirectoryReader {
     offset: u64,
     next_due: Option<std::time::Instant>,
     identity: Option<[u64; 2]>,
+    checkpoint_generation: u64,
 }
 
 fn parked_rewalk_position(traversal: &ScanTraversalCheckpoint) -> (u64, Option<String>) {
@@ -51,6 +52,7 @@ fn parked_rewalk_active(traversal: &ScanTraversalCheckpoint) -> bool {
 fn recover_parked_claude_metadata(index: &mut ScanIndex, overflowed: bool) {
     use std::sync::OnceLock;
     static READERS: OnceLock<Mutex<BTreeMap<String, ParkedDirectoryReader>>> = OnceLock::new();
+    let checkpoint_generation = index.generation;
     let Some(traversal) = index.traversal.as_mut() else { return; };
     let active = parked_rewalk_active(traversal);
     if !active && (!traversal.pending_directories.is_empty()
@@ -79,6 +81,15 @@ fn recover_parked_claude_metadata(index: &mut ScanIndex, overflowed: bool) {
         state.reader = None;
         traversal.watcher_hint_seen = false; // this sweep covers the triggering loss
     }
+    if active && checkpoint_generation <= state.checkpoint_generation {
+        // Existing durable generation is the acknowledgement of the previous
+        // metadata checkpoint. No advance means replay/identity debt was not
+        // accepted; never use a merely learned identity to skip old demand.
+        state.reader = None;
+        state.identity = None;
+        state.path = PathBuf::new();
+    }
+    state.checkpoint_generation = checkpoint_generation;
     if active && state.path.as_os_str().is_empty() {
         // After process restart/eviction no saved directory identity exists.
         // Replay this directory's metadata, then one full metadata sweep before
@@ -101,6 +112,7 @@ fn recover_parked_claude_metadata(index: &mut ScanIndex, overflowed: bool) {
                 // no traversal restart or reuse of an old inode's iterator.
                 offset = 0;
                 parked_rewalk_set_position(traversal, 0, &reconciliation_after);
+                traversal.watcher_hint_seen = true;
                 state.reader = None;
             } else if state.offset != offset {
                 // A rejected save/CAS may leave process state ahead of durable

@@ -126,3 +126,9 @@ Directory identity is rechecked even after an iterator was discarded for error
 retry. A replacement restarts that directory's metadata at zero rather than
 applying the removed directory's offset to unknown files. Test-only restart epochs
 are thread-isolated and page-limit overrides unwind safely.
+
+The existing durable index generation acknowledges cached metadata progress. If
+it has not advanced since the prior metadata page, cached directory identity and
+iterator progress are discarded and replay debt is re-established. A rejected
+checkpoint cannot turn newly learned identity into permission to skip an older
+cursor. No persisted acknowledgement or generation field is added.

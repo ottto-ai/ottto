@@ -511,3 +511,35 @@ fn directory_replacement_after_metadata_refusal_discovers_new_file_without_a_hin
     }
     assert_settled(&home, &server, TARGET);
 }
+
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn rejected_restart_replay_keeps_full_metadata_sweep_debt() {
+    let server = AckScriptedServer::new();
+    let mut home = AckFinishHome::new(&server);
+    seed_deferred(&home, true);
+    let (p, i, s) = prepare(&mut home);
+    home.finish(p, i, s).unwrap();
+    for n in 0..2050 { std::fs::write(project(&home).join(format!("restart-debt-{n:04}.txt")), "").unwrap(); }
+    for _ in 0..2 {
+        let (p, i, s) = prepare(&mut home);
+        home.finish(p, i, s).unwrap();
+    }
+    let value = serde_json::to_value(saved(&home)).unwrap();
+    let cursor = value["traversal"]["reconciliation_after"].as_str().unwrap().strip_prefix("\0parked_rewalk:").unwrap();
+    let (old_offset, _): (u64, Option<String>) = serde_json::from_str(cursor).unwrap();
+    assert!(old_offset > 512);
+    assert_eq!(value["traversal"]["watcher_hint_seen"], false);
+    crate::snapshots::forget_parked_rewalk_process_for_test();
+    let (p, i, s) = prepare(&mut home);
+    assert_eq!(serde_json::to_value(&i).unwrap()["traversal"]["watcher_hint_seen"], true);
+    drop((p, i, s)); // replay learned identity, but its checkpoint was rejected
+    let (p, i, s) = prepare(&mut home);
+    let value = serde_json::to_value(&i).unwrap();
+    assert_eq!(value["traversal"]["watcher_hint_seen"], true, "rejected replay never spends full-sweep debt");
+    let cursor = value["traversal"]["reconciliation_after"].as_str().unwrap().strip_prefix("\0parked_rewalk:").unwrap();
+    let (offset, _): (u64, Option<String>) = serde_json::from_str(cursor).unwrap();
+    assert!(offset <= 512 && offset < old_offset, "replay again, never skip the unacknowledged replacement prefix");
+    home.finish(p, i, s).unwrap();
+}
