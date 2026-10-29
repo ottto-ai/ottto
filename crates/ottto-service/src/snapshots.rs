@@ -32709,7 +32709,21 @@ fn append_codex_state_only_snapshots(
         .iter()
         .map(|snapshot| resolve_codex_identity(snapshot.source_session_id.as_str()))
         .collect();
-    // Cover accepted header owners as well as main's uniquely resolved filenames.
+    // Sessions whose rollout was parsed into a snapshot in a PRIOR scan run.
+    // The incremental scan skips unchanged rollout files, so they are absent
+    // from this run's `snapshots`, but their split snapshot already reached the
+    // backend — re-emitting a state-only total would overwrite it with an
+    // unattributed "Other". We recover those session ids from the persisted
+    // scan index, and also cover accepted header owners when the filename is
+    // ambiguous. Two correctness points:
+    //   * Only entries that actually produced a snapshot count
+    //     (`last_snapshot_fingerprint` is set). `index.record` runs for every
+    //     scanned file, including a rollout that parsed to zero usage rows; such
+    //     a session has no split snapshot, so it MUST still fall through to a
+    //     state-only total or its tokens would be dropped entirely.
+    //   * Session ids are derived from the rollout filename, so coverage does
+    //     not depend on the state DB `rollout_path` matching the scan path
+    //     byte-for-byte (home symlinks, relative paths, case differences).
     let mut covered_in_prior_runs = BTreeSet::new();
     let mut ambiguous_observations = 0_u64;
     let mut ambiguous_tokens = 0_u64;
