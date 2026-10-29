@@ -827,12 +827,6 @@ fn transition_row(rows: &[serde_json::Value], event: &str) -> Option<serde_json:
         .cloned()
 }
 
-fn cause_names(value: &serde_json::Value) -> Vec<&str> {
-    value
-        .as_array()
-        .map(|names| names.iter().filter_map(serde_json::Value::as_str).collect())
-        .unwrap_or_default()
-}
 
 /// Diagnostics only: the page that leaves a Claude sweep unsettled names its
 /// path; the terminal's retiring line names it beside the withheld census;
