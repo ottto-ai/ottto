@@ -1293,7 +1293,7 @@ fn budget_bounds_hold() {
     // Beside the cache, outside its state budget: both stores' digest maps.
     assert_eq!(
         crate::snapshots::sampled_scan::durable_tail::STORES_RESIDENT_BOUND,
-        64 * 1024 + 513 * 1024
+        64 * 1024 + 2 * 513 * 1024
     );
     // Per write pass: at most MAX_BATCH records of at most RECORD_BYTES.
     assert_eq!(MAX_BATCH, 32);
@@ -1344,7 +1344,7 @@ fn structurally_decodes(body: &[u8]) -> bool {
         SnapshotSource::Pi,
     ]
     .into_iter()
-    .any(|source| decode(body, source).is_ok())
+    .any(|source| decode_body(body, source).is_ok())
 }
 
 fn verified_without_allocation(body: &[u8]) -> Result<(), Corrupt> {

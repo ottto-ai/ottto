@@ -32236,7 +32236,12 @@ impl OwnedSourceScan {
                         let mut restored_claude = false;
                         #[cfg(unix)]
                         let (retained, taken_admission, debt) = match retained {
-                            None if allow_sample && !parser.reader.reader.is_compressed() => {
+                            None if allow_sample
+                                && !parser.reader.reader.is_compressed()
+                                // Existing index-owned due Full is independent of
+                                // reuse. A stale cache record cannot hold it idle.
+                                && !debt.is_some_and(|owed| sampled_scan::now_seconds() >= owed.due_unix_seconds) =>
+                            {
                                 let mut interpretation =
                                     sampled_scan::durable_tail::Interpretation::of(
                                         source,

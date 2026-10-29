@@ -511,7 +511,8 @@ fn attribution_capture_toggle_refuses_the_previous_claude_record() {
             .into_test_option()
             .is_none());
         let (counts, disk) = cache.durable_counters(source).unwrap();
-        assert_eq!(counts.ineligible.get("scope"), Some(&1));
+        // #865's finite original-binding classifier owns Claude scope misses.
+        assert_eq!(counts.ineligible.get("old_binding_no_match"), Some(&1));
         assert_eq!(counts.restored, 0);
         assert_eq!(disk.records_read, 1);
     }
@@ -950,7 +951,9 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                         &namespace,
                         false,
                     );
-                    assert!(!absent_path.exists(), "fresh cleanup ran");
+                    // #865/B1 requires a proved original before Claude deletion.
+                    assert_eq!(absent_path.exists(), source == SnapshotSource::ClaudeCode,
+                        "fresh cleanup preserves unproved Claude predecessor; Codex cleanup unchanged");
                 } else {
                     cache.durable_begin_pass(source, &index_path, &namespace, false);
                     let fingerprint = if bypass == "cleared" { "" } else { "fp" };
@@ -2512,7 +2515,8 @@ fn restore_reports_each_early_exit_without_changing_old_totals() {
         .unwrap()
         .source_file_fingerprint
         .clear();
-    assert_eq!(label(attempt(&index)), "ineligible.selection_cleared");
+    // #865 removed the Claude selection-clear veto: absence is a counted Miss.
+    assert_eq!(label(attempt(&index)), "missing");
     index.files.get_mut(&key).unwrap().source_file_fingerprint = "fp".into();
     index
         .files
@@ -2521,8 +2525,8 @@ fn restore_reports_each_early_exit_without_changing_old_totals() {
         .effective_upload_body_witness_revision = 2;
     assert_eq!(label(attempt(&index)), "ineligible.history_owed");
     let (old, disk) = cache.durable_counters(source).unwrap();
-    assert_eq!((old.restore_attempts, old.missing, old.restored), (4, 1, 0));
-    assert_eq!(old.ineligible["selection_cleared"], 1);
+    assert_eq!((old.restore_attempts, old.missing, old.restored), (4, 2, 0));
+    assert!(!old.ineligible.contains_key("selection_cleared"));
     assert_eq!(old.ineligible["history_owed"], 1);
     assert_eq!(old.durable_held, [0; 6]);
     let text = old.summary(source, &disk);
@@ -2958,9 +2962,26 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
         let mut rewritten = record.record.clone();
         rewritten.certificate = current;
         let old_wire = store::tests::pinned_v1_bytes(&rewritten, index.generation);
-        DurableTailStore::new(dir.clone(), source)
-            .write_after_save(lock, index.generation, vec![rewritten])
-            .unwrap();
+        let mut writer = DurableTailStore::new(dir.clone(), source);
+        let original = match writer.read(&record_key) {
+            ReadOutcome::Found(original) => original,
+            other => panic!("verified debt predecessor: {other:?}"),
+        };
+        writer.authorize(
+            &original,
+            &Expected {
+                binding: original.record.binding.clone(),
+                committed_generation: index.generation,
+            },
+        );
+        assert_eq!(
+            writer
+                .write_after_save(lock, index.generation, vec![rewritten])
+                .unwrap()
+                .written,
+            1
+        );
+
         let record_path = dir.join(format!(
             "{}.rec",
             record_key
@@ -4463,7 +4484,16 @@ fn a1a_supported_unprovable_migration_classifies_stale_on_growth_without_o3() {
             RestoreOutcome::Stale("old_binding_no_match")
         ));
         assert_eq!(body_bytes, 0);
-        assert!(samples.is_empty());
+        // Round5 edgeF1 requires independent bounded A2 probes on growth;
+        // unchanged idle metadata takes no probe and append-only samples match.
+        if pass < 2 {
+            assert!(samples.is_empty());
+        } else {
+            assert_eq!(samples.len(), 2);
+            assert!(samples
+                .iter()
+                .all(|sample| sample.requested <= 4096 && sample.result.is_ok()));
+        }
         assert_eq!(
             loaded.files[&key].size_bytes, index.files[&key].size_bytes,
             "restore does not advance accepted state"
@@ -5838,7 +5868,7 @@ fn a1t_transitional_full_requires_known_current_floor_and_strict_growth() {
     index.files.insert(
         key.clone(),
         serde_json::from_value(serde_json::json!({
-            "size_bytes":3,"source_file_fingerprint":"accepted",
+            "size_bytes":3,"modified_unix_seconds":1,"source_file_fingerprint":"accepted",
             "effective_upload_body_witness_revision":effective_revision(source)
         }))
         .unwrap(),
@@ -6411,7 +6441,7 @@ fn stale_growth_gate_keeps_transient_and_future_floors_held_and_shares_pacing() 
     index.files.insert(
         "k".into(),
         serde_json::from_value(serde_json::json!({
-            "size_bytes":3,"source_file_fingerprint":"accepted",
+            "size_bytes":3,"modified_unix_seconds":1,"source_file_fingerprint":"accepted",
             "effective_upload_body_witness_revision":effective_revision(SnapshotSource::ClaudeCode)
         }))
         .unwrap(),
@@ -7033,7 +7063,7 @@ fn stale_full_evicts_oldest_shared_stamp_and_paces_the_new_key() {
     index.files.insert(
         "new".into(),
         serde_json::from_value(serde_json::json!({
-            "size_bytes":3,"source_file_fingerprint":"accepted",
+            "size_bytes":3,"modified_unix_seconds":1,"source_file_fingerprint":"accepted",
             "effective_upload_body_witness_revision":effective_revision(source)
         }))
         .unwrap(),
@@ -7761,7 +7791,7 @@ fn absent_upgrade_growth_is_a_counted_miss_and_shares_the_full_pace() {
     index.files.insert(
         "k".into(),
         serde_json::from_value(serde_json::json!({
-            "size_bytes":3,"source_file_fingerprint":"accepted",
+            "size_bytes":3,"modified_unix_seconds":1,"source_file_fingerprint":"accepted",
             "effective_upload_body_witness_revision":effective_revision(source)
         }))
         .unwrap(),
@@ -9129,4 +9159,13 @@ fn pace_clock_anomaly_is_separate_from_overflow_and_never_refunds_q11() {
     );
     assert_eq!(cache.durable().unwrap().retail_spent[&key].spent, spent);
     let _ = std::fs::remove_dir_all(root);
+}
+
+/// Advance only the shared Full clock; never clear a spend or restore grant.
+pub(crate) fn expire_full_pace(cache: &SharedCache, key: &str) {
+    let mut stores = cache.durable().unwrap();
+    let digest = store::key_digest(DurableSource::ClaudeCode, key);
+    if let Some(at) = stores.retail_full_at.get(&digest).copied() {
+        stores.retail_full_now = Some(at + std::time::Duration::from_secs(PACE_SECS));
+    }
 }

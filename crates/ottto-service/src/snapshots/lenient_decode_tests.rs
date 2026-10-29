@@ -4762,7 +4762,7 @@ fn o3_ambiguous_negative_evidence_refuses_through_every_reader() {
         ),
     ];
     for fields in forms {
-        let bytes = format!("{{{fields}}}").into_bytes();
+        let bytes = format!("{{\"files\":{{}},{fields}}}").into_bytes();
         let native = claude_request_census::decode_index(bytes.as_slice()).unwrap();
         let bounded = lenient_decode::read_bounded(&bytes).unwrap();
         let streaming =
