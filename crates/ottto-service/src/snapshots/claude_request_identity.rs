@@ -951,8 +951,8 @@ fn apply_grouped_with_accepted(
         })
         .sum::<u64>();
     // Measure the attempted tagged body even when another cap failed. Only
-    // byte counts and closed reason labels enter local diagnostics; the same
-    // full strip below still owns every over-cap wire body and its display.
+    // byte counts and closed reason labels enter local diagnostics. Recovery
+    // below must satisfy the same wire bounds and reconciliation rules.
     install(item, &evidence, top_identities, bucket_identities, refusals);
     let attempted_bytes = item_bytes(item);
     if attempted_bytes > MAX_ITEM_BYTES {

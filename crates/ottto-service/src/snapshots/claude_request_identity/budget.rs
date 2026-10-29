@@ -173,6 +173,7 @@ fn subtract_amounts(total: &mut Amounts, part: &Amounts) -> Option<()> {
 struct Selection {
     top: Vec<BTreeMap<Option<AuthorityKey>, Amounts>>,
     top_metrics: Vec<Metrics>,
+    residual_missing: Vec<[usize; 5]>,
     metrics: Metrics,
     keys: BTreeSet<AuthorityKey>,
     refused_rows: u64,
@@ -236,6 +237,7 @@ pub(super) fn select(
     let mut selection = Selection {
         top: vec![BTreeMap::new(); item.model_usage.len()],
         top_metrics: vec![Metrics::default(); item.model_usage.len()],
+        residual_missing: vec![[0; 5]; item.model_usage.len()],
         metrics: Metrics::default(),
         keys: BTreeSet::new(),
         refused_rows: 0,
@@ -254,6 +256,13 @@ pub(super) fn select(
                 .iter()
                 .any(|(key, amount)| key.is_some() && amount.counts != [0; 8]);
             selection.refused_rows += u64::from(group.refused || has_tag);
+            let top = row_index[&row_key_from_model_usage(row)];
+            for (count, cost) in selection.residual_missing[top]
+                .iter_mut()
+                .zip(row_costs(row))
+            {
+                *count += usize::from(cost.is_none());
+            }
         }
     }
     strip(item);
@@ -290,10 +299,38 @@ pub(super) fn select(
                 valid = false;
                 break;
             }
-            let top = &mut next.top[row_index[&key]];
-            subtract_amounts(top.get_mut(&None)?, &group.total)?;
+            let top_index = row_index[&key];
+            let untagged = group
+                .by_key
+                .get(&None)
+                .is_some_and(|amount| amount.counts != [0; 8]);
+            let absent = row_costs(row).map(Option::is_none);
+            for (count, absent) in next.residual_missing[top_index].iter_mut().zip(absent) {
+                if absent && !untagged {
+                    *count -= 1;
+                }
+            }
+            let top = &mut next.top[top_index];
+            let residual = top.get_mut(&None)?;
+            subtract_amounts(residual, &group.total)?;
+            for (poisoned, count) in residual
+                .poisoned
+                .iter_mut()
+                .zip(next.residual_missing[top_index])
+            {
+                *poisoned = count > 0;
+            }
             for (key, amount) in &group.by_key {
-                top.entry(key.clone()).or_default().merge(amount)?;
+                let mut wire_amount = amount.clone();
+                // Missing bucket money is missing on every emitted part,
+                // even when the request regrouping held a partial amount.
+                for (field, absent) in absent.into_iter().enumerate() {
+                    if absent {
+                        wire_amount.costs[field] = None;
+                        wire_amount.poisoned[field] = true;
+                    }
+                }
+                top.entry(key.clone()).or_default().merge(&wire_amount)?;
             }
             next.keys.extend(
                 group
@@ -334,6 +371,22 @@ pub(super) fn select(
         }
         let zero_index = evidence.iter().map(|key| (key.clone(), 0)).collect();
         for top in changed {
+            // A parent row with absent money cannot carry a known amount on
+            // just one part. Refuse an unrepresentable partial body rather
+            // than violate receiver per-authority money reconciliation.
+            if next.top[top]
+                .values()
+                .filter(|amount| amount.counts != [0; 8])
+                .any(|amount| {
+                    row_costs(&item.model_usage[top])
+                        .iter()
+                        .enumerate()
+                        .any(|(field, cost)| cost.is_none() && amount.wire(field).is_some())
+                })
+            {
+                valid = false;
+                break;
+            }
             next.metrics.subtract(&next.top_metrics[top]);
             let identity =
                 row_identity(&item.model_usage[top], &next.top[top], &zero_index).ok()?;

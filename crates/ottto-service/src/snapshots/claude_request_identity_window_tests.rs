@@ -425,3 +425,35 @@ fn sticky_partial_body_displays_only_the_kept_newest_own_account() {
     );
     sticky_assert_reconciled(&item);
 }
+
+#[test]
+fn sticky_partial_money_absence_cannot_emit_unreconciled_known_cost_shares() {
+    let (mut item, mut proof) = sticky_session(576);
+    for (hour, bucket) in item.usage_buckets.iter_mut().enumerate() {
+        let reported = ![0, 24, 48, 72].contains(&hour);
+        bucket.model_usage[0].cost_usd = reported.then(|| "0.000003".into());
+        if reported {
+            for c in &mut proof[hour * 3..hour * 3 + 3] {
+                c.usage.costs = UsageCosts {
+                    observed: true,
+                    reported: true,
+                    total: Some(1_000_000),
+                    ..Default::default()
+                };
+            }
+        }
+    }
+    item.model_usage[0].cost_usd = None;
+    let result = identity::apply_with_accepted_for_test(
+        &mut item,
+        &proof,
+        &identity::AcceptedBuckets::default(),
+    )
+    .unwrap();
+    assert!(
+        matches!(result, Tagged::Fallback { .. }),
+        "no recent prefix can carry known per-key money under an unreported top row"
+    );
+    assert_eq!(item.request_identity_refusals, 576);
+    sticky_assert_reconciled(&item);
+}
