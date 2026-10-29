@@ -97,21 +97,10 @@ fn kickstart_with(
     let plist = launch_agent_path_from_home(home);
     run_launchctl(&mut run, &["enable", &target])?;
     ensure_launch_agent_loaded(&mut run, &plist, &domain, &target)?;
-    match run_launchctl(&mut run, &["kickstart", "-k", &target]) {
-        Ok(()) => Ok(()),
-        // A conclusive nonzero exit retains the existing explicit recovery
-        // path. Timeout/spawn/I/O errors are indeterminate and fail closed.
-        Err(error) if error.downcast_ref::<LaunchctlExitFailure>().is_some() => {
-            rebootstrap_launch_agent(&mut run, &plist, &domain, &target).map_err(
-                |rebootstrap_error| {
-                    error
-                        .context(format!(
-                    "rebootstrap after kickstart failure also failed: {rebootstrap_error:#}"))
-                },
-            )
-        }
-        Err(error) => Err(error),
-    }
+    // A connected listener may still be starting after bootstrap released the
+    // transaction. Ensure it runs without killing the newly loaded instance.
+    // A failed automatic start never escalates to bootout/replacement.
+    run_launchctl(&mut run, &["kickstart", &target])
 }
 
 #[cfg(unix)]
@@ -152,26 +141,6 @@ fn bootstrap_launch_agent(
             )
         }),
     }
-}
-
-#[cfg(unix)]
-fn rebootstrap_launch_agent(
-    run: &mut impl FnMut(&[&str]) -> Result<ExitStatus>,
-    plist_path: &Path,
-    domain: &str,
-    target: &str,
-) -> Result<()> {
-    anyhow::ensure!(
-        plist_path.exists(),
-        "LaunchAgent plist is missing at {}",
-        plist_path.display()
-    );
-    let status = run(&["bootout", target])?;
-    anyhow::ensure!(
-        status.success() || matches!(status.code(), Some(libc::ESRCH | 113)),
-        "launchctl bootout failed with {status}; autostart state may be partial"
-    );
-    bootstrap_launch_agent(run, plist_path, domain, target)
 }
 
 #[cfg(unix)]
@@ -354,10 +323,7 @@ mod autostart_tests {
             ["enable", "print", "kickstart"]
         );
         assert_eq!(commands[0][1], macos_launch_agent_target());
-        assert_eq!(
-            commands[2],
-            ["kickstart", "-k", &macos_launch_agent_target()]
-        );
+        assert_eq!(commands[2], ["kickstart", &macos_launch_agent_target()]);
         assert_eq!(
             fs::read(launch_agent_path_from_home(&fixture.0)).unwrap(),
             original
@@ -421,33 +387,63 @@ mod autostart_tests {
     }
 
     #[test]
-    fn cli_conclusive_kickstart_failure_keeps_owned_rebootstrap_recovery() {
+    fn serialized_cli_requests_keep_the_just_bootstrapped_generation_while_listener_starts() {
         let fixture = Fixture::new();
+        // The helper has loaded generation 1 and returned, releasing its lock.
+        // No listener is ready yet, so multiple CLI requests enter autostart.
+        let helper = ServiceLifecycleTransaction::acquire(&fixture.0, Duration::ZERO).unwrap();
+        let mut generation = 1;
+        let mut loaded = true;
+        let listener_ready = false;
+        drop(helper);
         let mut seen = Vec::new();
-        kickstart_with(&fixture.0, |_, args| {
-            seen.push(args[0].to_owned());
-            Ok(status(if args[0] == "kickstart" { 7 } else { 0 }))
-        })
-        .unwrap();
-        assert_eq!(
-            seen,
-            ["enable", "print", "kickstart", "bootout", "bootstrap"]
-        );
+        for _ in 0..3 {
+            assert!(!listener_ready);
+            kickstart_with(&fixture.0, |_, args| {
+                seen.push(args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>());
+                match args[0] {
+                    "print" => return Ok(status(if loaded { 0 } else { 113 })),
+                    "bootout" => loaded = false,
+                    "bootstrap" => {
+                        loaded = true;
+                        generation += 1;
+                    }
+                    "kickstart" if args.contains(&"-k") => generation += 1,
+                    _ => {}
+                }
+                Ok(status(0))
+            })
+            .unwrap();
+        }
+        assert!(loaded);
+        assert_eq!(generation, 1, "CLI replaced the helper's starting daemon");
+        assert!(seen.iter().all(|args| !args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "-k" | "bootout" | "bootstrap"))));
+        assert_eq!(seen.iter().filter(|args| args[0] == "kickstart").count(), 3);
     }
 
     #[test]
-    fn cli_failed_bootout_does_not_continue_to_bootstrap() {
-        let fixture = Fixture::new();
-        let mut seen = Vec::new();
-        assert!(kickstart_with(&fixture.0, |_, args| {
-            seen.push(args[0].to_owned());
-            Ok(status(if matches!(args[0], "kickstart" | "bootout") {
-                7
-            } else {
-                0
-            }))
-        })
-        .is_err());
-        assert_eq!(seen, ["enable", "print", "kickstart", "bootout"]);
+    fn failed_automatic_kickstart_never_destroys_a_loaded_starting_job() {
+        for kickoff_status in [7, 113] {
+            let fixture = Fixture::new();
+            let mut seen = Vec::new();
+            assert!(kickstart_with(&fixture.0, |_, args| {
+                seen.push(args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>());
+                Ok(status(if args[0] == "kickstart" {
+                    kickoff_status
+                } else {
+                    0
+                }))
+            })
+            .is_err());
+            assert_eq!(
+                seen.iter().map(|args| args[0].as_str()).collect::<Vec<_>>(),
+                ["enable", "print", "kickstart"]
+            );
+            assert!(seen.iter().all(|args| !args
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "-k" | "bootout" | "bootstrap"))));
+        }
     }
 }

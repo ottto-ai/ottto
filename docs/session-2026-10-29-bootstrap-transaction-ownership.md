@@ -20,9 +20,11 @@ once and, if busy, issues no launchctl commands and returns to the CLI's
 existing bounded socket retry. Participating launchctl commands use a fixed
 executable path, a ten-second polling deadline, a one MiB output cap, and
 kill/wait cleanup. CLI command work also has a thirty-second budget. Its
-existing finite loaded-job reconciliation is retained; indeterminate command
-errors stop recovery. A failed bootout cannot proceed to bootstrap unless its
-status specifically means that the job is already absent.
+existing finite loaded-job reconciliation is retained. Automatic kickstart
+uses no `-k` and never escalates to bootout/rebootstrap, even on a nonzero exit.
+Socket refusal after a just-completed bootstrap must not kill the new daemon
+while its listener is still starting. Explicit coordinated service bootstrap
+remains the repair/replacement path.
 
 The helper's ownership probe runs under the lock and refuses unknown results.
 It reuses the existing ownership decision and shared refusal-message builder,
@@ -45,14 +47,18 @@ mutation never becomes retryable merely because an underlying error is busy.
 An independent source review of `b19b46f33` returned NO-GO: CLI autostart bypassed
 the lock, all errors were mislabeled as owner conflicts, and refusal messages
 lost the current owner and repair hint. All three findings were accepted and
-addressed here. That initial verdict is preserved; no subsequent Claude GO is
+addressed here. A further accepted ordering finding was that serialized CLI
+autostart could still kill a just-loaded daemon before its listener was ready;
+non-destructive automatic start and no replacement fallback address that gap.
+That initial verdict is preserved; no subsequent Claude GO is
 claimed. Final verification uses the same task identity and one focused,
 sensitive AutoReview pass after relevant CI.
 
 Regression tests use temporary files, injected command results and synthetic
 subprocesses, never live launchd. They cover timeout kill/reap, inheritance
 after owner close and Rust helper death, competing acquisition, CLI contention
-without mutation, indeterminate CLI recovery refusal, conclusive recovery,
+without mutation, indeterminate/nonzero CLI start refusal, repeated CLI starts during the
+post-bootstrap listener gap without generation replacement,
 failed-stage short-circuiting, actual JSON decision mapping, owner hints,
 explicit migration, external plist preservation and symlink-lock refusal.
 
@@ -71,3 +77,11 @@ to fail closed. Legacy-label cleanup remains separate behavior and runs after
 lock acquisition, before current-label inspection/writes; its own process and
 SMAppService timing is unchanged. No persistent transaction journal, atomic
 plist replacement or rollback protocol is introduced.
+
+Contention can still surface an early registration error in a consumer that
+treats every nonzero helper exit alike: a CLI transaction can use thirty
+seconds, whereas the helper waits five seconds for its lock. A consumer with
+only one immediate retry can exhaust that grace before legitimate CLI work
+ends. The busy JSON classification enables safe bounded contention retry; it
+does not itself implement that consumer policy. Raising the helper grace must
+account for subsequent command work and the caller's overall process deadline.
