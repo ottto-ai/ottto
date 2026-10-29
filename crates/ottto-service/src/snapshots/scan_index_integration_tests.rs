@@ -558,6 +558,14 @@ fn recovery_emission_boundaries(
     BTreeSet<String>,
 ) {
     use claude_request_money::e2;
+    // Mirror ordinary preparation before the evidence/finalization seam. A
+    // loaded index starts with active revision 0; S-726-1 intentionally vetoes
+    // E2's request-owned literal there, even for an undamaged control. This
+    // activation is also done by snapshot_sync before any production scan.
+    let revision =
+        crate::snapshot_sync::effective_upload_body_witness_revision(SnapshotSource::ClaudeCode);
+    index.activate_effective_upload_body_witness_revision(revision);
+    index.adopt_effective_upload_body_witness_revision_monotonically();
     e2::decide_page_copies(&mut items, index);
     e2::attach_page(&mut items, evidence);
     let unresolved = e2::side_calls_page(
@@ -570,6 +578,27 @@ fn recovery_emission_boundaries(
         index,
     );
     let held = e2::finish_page(&mut items, index, e2::TelemetryRead::Loaded);
+    if index.persistence_available() {
+        assert_eq!(items.len(), 1, "positive E2 body before finalization");
+        assert!(matches!(
+            index.claude_literal_guard(&items),
+            claude_history_upgrade::LiteralGuard::Open
+        ));
+        // Frozen reproduction of round 9's bad control setup: turning off
+        // the active revision rejects this same literal without any damage.
+        let mut inactive = index.clone();
+        inactive.active_effective_upload_body_witness_revision = 0;
+        assert!(matches!(
+            inactive.claude_literal_guard(&items),
+            claude_history_upgrade::LiteralGuard::DenyAll
+        ));
+        let mut vetoed = items.clone();
+        assert_eq!(
+            inactive.veto_claude_history_emission(SnapshotSource::ClaudeCode, &mut vetoed),
+            1
+        );
+        assert!(vetoed.is_empty());
+    }
     if !index.persistence_available() {
         assert_eq!(unresolved, held);
     }
@@ -586,7 +615,7 @@ fn recovery_emission_boundaries(
         parse_complete: true,
         diagnostic_reason: FileReason::Complete,
         parsed_snapshot_count: 1,
-        effective_upload_body_witness_revision: 0,
+        effective_upload_body_witness_revision: revision,
     });
     index.activate_upload_context("r9-complete-context".into());
     finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, index);
