@@ -14382,6 +14382,7 @@ fn mixed_custody_drop_is_counted_once_then_reacquires_only_a_durable_tail() {
         cache.clear();
         cache.durable_begin_pass(SnapshotSource::Codex, &index_path, &namespace, capture);
         let mut tails = 0;
+        let mut recovery_tails = 0;
         let mut completed = false;
         let mut events = 1;
         for _ in 0..64 {
@@ -14403,6 +14404,17 @@ fn mixed_custody_drop_is_counted_once_then_reacquires_only_a_durable_tail() {
             index = next;
             assert_eq!(selections.modes.0, 0, "ZERO Full on reacquisition");
             tails += selections.modes.1;
+            recovery_tails += rows
+                .iter()
+                .map(|r| {
+                    r["counts"]["custody_group_progress_dropped"]["tail"]["events"]
+                        .as_u64()
+                        .unwrap_or(0)
+                })
+                .sum::<u64>();
+            assert!(rows
+                .iter()
+                .all(|r| r["counts"]["custody_group_restart_full"].is_null()));
             events += rows
                 .iter()
                 .filter(|r| r["stage"] == "custody_group_progress_dropped")
@@ -14425,6 +14437,7 @@ fn mixed_custody_drop_is_counted_once_then_reacquires_only_a_durable_tail() {
             }
         }
         assert!(completed && tails > 0, "P served by Tail within64 pages");
+        assert_eq!(recovery_tails, 1, "one classified Tail recovery");
         assert!(
             cache
                 .durable_counters(SnapshotSource::Codex)
