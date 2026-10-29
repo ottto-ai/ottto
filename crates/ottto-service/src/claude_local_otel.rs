@@ -30,6 +30,9 @@ pub(crate) mod support_health;
 mod bounded_read;
 #[cfg(test)]
 mod decoder_tests;
+pub(crate) mod strict_budget;
+#[cfg(test)]
+mod strict_budget_tests;
 
 pub(crate) const STORE_DIR: &str = "local-otel/claude-code-effort";
 const TRACE_STORE_DIR: &str = "local-otel/claude-code-trace-ownership";
@@ -1093,7 +1096,7 @@ fn decode_api_sidecar(
     if !metadata.is_file() {
         anyhow::bail!("Claude effort evidence is not a regular file");
     }
-    if metadata.len() >= MAX_EVIDENCE_FILE_BYTES {
+    if metadata.len() >= strict_budget::allowance() {
         health.oversized_files += 1;
         return Ok(empty(health));
     }
@@ -1124,21 +1127,24 @@ fn decode_api_sidecar(
     if !opened.is_file() {
         anyhow::bail!("opened Claude effort evidence is not a regular file");
     }
-    if opened.len() >= MAX_EVIDENCE_FILE_BYTES {
+    if opened.len() >= strict_budget::allowance() {
         health.oversized_files += 1;
         return Ok(empty(health));
     }
     let before_opened = api_file_generation(&opened);
     // A concurrent writer must not defeat the existing per-file read bound.
-    let mut reader = BufReader::new((&file).take(MAX_EVIDENCE_FILE_BYTES));
-    let (rows, bytes) = decode_api_rows(&mut reader, session_id, &mut health);
+    let limit = strict_budget::allowance().min(opened.len().saturating_add(1));
+    let mut reader = BufReader::new((&file).take(limit));
+    let (rows, _) = decode_api_rows(&mut reader, session_id, &mut health);
+    let bytes = limit - reader.get_ref().limit();
+    strict_budget::consumed(bytes);
     #[cfg(test)]
     API_AFTER_READ.with(|hook| {
         if let Some(hook) = hook.borrow_mut().take() {
             hook(&path);
         }
     });
-    if bytes >= MAX_EVIDENCE_FILE_BYTES {
+    if bytes >= limit {
         health.oversized_files += 1;
         return Ok(empty(health));
     }
@@ -1233,6 +1239,20 @@ impl ApiSidecarDecoder<'_> {
     }
 }
 
+/// Metadata-only pre-I/O charge, including an EOF/growth sentinel per file.
+pub(crate) fn strict_cohort_bytes(support_dir: &Path, root: &str) -> u64 {
+    [
+        evidence_path(support_dir, root),
+        trace_evidence_path(support_dir, root),
+    ]
+    .iter()
+    .fold(0u64, |sum, path| {
+        sum.saturating_add(
+            fs::metadata(path).map_or(MAX_EVIDENCE_FILE_BYTES, |m| m.len().saturating_add(1)),
+        )
+    })
+}
+
 pub fn load_claude_trace_ownership_evidence(
     support_dir: &Path,
     session_ids: impl IntoIterator<Item = String>,
@@ -1255,19 +1275,42 @@ pub fn load_claude_trace_ownership_evidence(
             report.unreadable_lines += 1;
             continue;
         }
-        if metadata.len() >= MAX_EVIDENCE_FILE_BYTES {
+        if metadata.len() >= strict_budget::allowance() {
             report.oversized_files += 1;
             continue;
         }
-        let Ok(file) = File::open(&path) else {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NONBLOCK);
+        }
+        let Ok(file) = options.open(&path) else {
             report.unreadable_lines += 1;
             continue;
         };
         #[cfg(test)]
         TRACE_READ_RECEIPT.with(|count| count.set(count.get() + 1));
+        let Ok(opened) = file.metadata() else {
+            report.unreadable_lines += 1;
+            continue;
+        };
+        if !opened.is_file() || opened.len() >= strict_budget::allowance() {
+            report.oversized_files += 1;
+            continue;
+        }
+        let limit = strict_budget::allowance().min(opened.len().saturating_add(1));
+        #[cfg(test)]
+        TRACE_BEFORE_READ.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook(&path);
+            }
+        });
+        let mut reader = BufReader::new((&file).take(limit));
         let mut decoder = TraceSidecarDecoder::new(&session_id, Vec::new());
         decoder.report = report;
-        for line in BufReader::new(file).lines() {
+        for line in reader.by_ref().lines() {
             let line = match line {
                 Ok(line) => line,
                 Err(_) => {
@@ -1276,6 +1319,20 @@ pub fn load_claude_trace_ownership_evidence(
                 }
             };
             decoder.push_line(line.as_bytes());
+        }
+        let bytes = limit - reader.get_ref().limit();
+        strict_budget::consumed(bytes);
+        #[cfg(test)]
+        TRACE_BYTES_FOR_TEST.with(|count| count.set(count.get() + bytes));
+        let unchanged = file.metadata().ok().and_then(|m| api_file_generation(&m))
+            == api_file_generation(&opened)
+            && fs::metadata(&path)
+                .ok()
+                .and_then(|m| api_file_generation(&m))
+                == api_file_generation(&opened);
+        if bytes >= limit || !unchanged {
+            decoder.rows.clear();
+            decoder.report.oversized_files += 1;
         }
         decoder.finish_eof(None);
         let (rows, decoded_report) = decoder.into_output();
@@ -1358,7 +1415,10 @@ impl<'a> TraceSidecarDecoder<'a> {
 }
 
 #[cfg(test)]
-thread_local! { static TRACE_READ_RECEIPT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+thread_local! {
+static TRACE_BYTES_FOR_TEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+static TRACE_BEFORE_READ: std::cell::RefCell<Option<Box<dyn FnOnce(&Path)>>> = const { std::cell::RefCell::new(None) };
+static TRACE_READ_RECEIPT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
 #[cfg(test)]
 pub(crate) fn reset_evidence_read_counts_for_test() {

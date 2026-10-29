@@ -5,11 +5,38 @@ const OFF_CHILD: &str = "agent-a4d1585d310070d0f";
 const W1: &str = "2026-08-20T10:02:00Z";
 const W2: &str = "2026-08-20T10:12:00Z";
 
+fn off_index() -> ScanIndex {
+    ScanIndex {
+        claude_request_identity_contract: Some(
+            claude_request_identity::cycle_contract(true).into(),
+        ),
+        historical_replay_generation: Some("terminal-off-generation".into()),
+        upload_context_fingerprint: Some("settled-destination".into()),
+        active_upload_context_fingerprint: Some("settled-destination".into()),
+        ..Default::default()
+    }
+}
+fn off_suppression_preconditions(index: &ScanIndex) {
+    assert_eq!(
+        index.claude_request_identity_contract.as_deref(),
+        Some(claude_request_identity::cycle_contract(true))
+    );
+    assert!(!index.claude_request_identity_contract_changed);
+    assert!(claude_redundant_stale_clear_suppressed(index));
+}
 fn off_line(member: &str, request: &str) -> String {
-    format!("{{\"timestamp\":\"2026-08-20T10:01:00Z\",\"sessionId\":\"{member}\",\"type\":\"assistant\",\"forkedFrom\":{{\"sessionId\":\"prior\",\"messageUuid\":\"prior-message\"}},\"requestId\":\"{request}\",\"message\":{{\"id\":\"msg-{request}\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":2}}}}}}\n")
+    // A copied prefix establishes a real owned-start marker; X itself is an
+    // ordinary OWNED occurrence. The old fixture made X inherited and empty.
+    let prefix = serde_json::json!({"timestamp":"2026-08-20T10:00:00Z","sessionId":member,"type":"assistant","forkedFrom":{"sessionId":"prior","messageUuid":"prior-message"},"requestId":"inherited","message":{"id":"inherited-message","model":"claude-opus-4-8","usage":{"input_tokens":900,"output_tokens":2}}});
+    let owned = serde_json::json!({"timestamp":"2026-08-20T10:01:00Z","sessionId":member,"type":"assistant","requestId":request,"message":{"id":format!("msg-{request}"),"model":"claude-opus-4-8","usage":{"input_tokens":10,"output_tokens":2}}});
+    format!("{prefix}\n{owned}\n")
 }
 
 fn off_scan(index: &mut ScanIndex, root: &Path, at: &str, limit: usize) -> SourceScanResult {
+    // The production prepare activates context after every reload.
+    if index.active_upload_context_fingerprint.is_none() {
+        index.activate_upload_context("settled-destination".into());
+    }
     let mut result = scan_source_roots_with_limit(
         SnapshotSource::ClaudeCode,
         &[root.to_owned()],
@@ -61,7 +88,7 @@ fn terminal_off_w1_w2_open_fence_skipped_duplicate_never_verifies() {
         .unwrap();
         let mut index = ScanIndex {
             claude_duplicate_request_witness_overflowed: initially_closed,
-            ..Default::default()
+            ..off_index()
         };
         // W1 is multi-page; selected save/reload retains the earlier page.
         for _ in 0..2 {
@@ -81,10 +108,19 @@ fn terminal_off_w1_w2_open_fence_skipped_duplicate_never_verifies() {
             .clone();
         let pending_w1 = index.claude_usage_family_pending.clone();
         assert!(pending_w1.contains_key(OFF_ROOT));
+        let w1 = &pending_w1[OFF_ROOT];
+        assert_eq!(w1.member_request_id_hashes.len(), 2);
+        assert!(w1
+            .member_request_id_hashes
+            .values()
+            .all(|ids| !ids.is_empty()));
+        assert!(w1.member_occurrences.values().all(|rows| !rows.is_empty()));
+        assert!(index.claude_owned_start_census.contains_key(OFF_ROOT));
         // Exact counterexample: only root changes; child still contains X.
         let mut text = fs::read_to_string(&root_path).unwrap();
         text.push_str("{\"type\":\"user\",\"message\":{\"content\":\"metadata only\"}}\n");
         fs::write(&root_path, text).unwrap();
+        off_suppression_preconditions(&index);
         index.traversal = None;
         index.claude_duplicate_request_witness_overflowed = initially_closed;
         let page = off_scan(&mut index, &root, W2, 10);
@@ -92,8 +128,48 @@ fn terminal_off_w1_w2_open_fence_skipped_duplicate_never_verifies() {
             page.scanned_file_count, 1,
             "unchanged duplicate sibling skipped"
         );
+        // The exact historical eligibility predicate, without the terminal
+        // guard, sees X only in changed R's replacement pending. It WOULD mint
+        // R's verification despite unchanged C still containing owned X.
+        let eligible = claude_owned_start_eligible(
+            &index,
+            &complete_claude_family_members(&index),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &page.census_window_end,
+        );
+        assert!(eligible.iter().any(|(member, _)| member == OFF_ROOT));
+        for offered_terminal in [false, true] {
+            for route in ["direct", "scan", "native-observations"] {
+                let mut guarded = index.clone();
+                let mut guarded_page = page.clone();
+                guarded_page.census_complete = offered_terminal;
+                apply_claude_effort_evidence_with_index(&mut guarded_page.snapshots, &BTreeMap::new(), &mut guarded, offered_terminal, &page.census_window_end);
+                let api = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
+                let trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
+                let verdict = match route {
+                    "direct" => apply_claude_reported_usage_with_index(&mut guarded_page.snapshots, &api, &trace, &mut guarded, offered_terminal, &page.census_window_end),
+                    "scan" => apply_claude_reported_usage_to_scan_with_identity(&mut guarded_page, &api, &trace, &mut guarded, None),
+                    _ => {
+                        let observations = record_claude_native_observations(&guarded_page, &mut guarded);
+                        apply_claude_reported_usage_to_scan_with_observations(&mut guarded_page, &api, &trace, &mut guarded, None, Some(observations))
+                    }
+                };
+                assert!(!verdict.duplicate_census.census_complete, "{route}");
+                assert!(verdict.duplicate_census.fence_after, "{route}");
+                assert!(guarded.claude_usage_family_witnesses.is_empty(), "{route}");
+                assert!(guarded.claude_account_family_witnesses.is_empty(), "{route}");
+                assert!(guarded.claude_owned_start_census.values().all(|w| w.verified_source_file_fingerprint.is_none()), "{route}");
+                assert!(guarded_page.snapshots.iter().all(|item| item.cache_observations.is_none() && item.context_curve.as_ref().is_none_or(|curve| !matches!(curve.coverage.as_str(), "complete" | "sampled"))), "{route}");
+            }
+        }
+
         assert!(!page.census_complete);
-        assert!(index.claude_duplicate_request_witness_overflowed);
+        assert!(claude_effective_duplicate_fence_closed(&index));
+        assert_eq!(
+            index.claude_duplicate_request_witness_overflowed,
+            initially_closed
+        );
         assert_eq!(
             index.files[&local_index_key(&child_path)].source_file_fingerprint,
             child_fingerprint
@@ -126,7 +202,7 @@ fn terminal_off_w1_w2_open_fence_skipped_duplicate_never_verifies() {
 
 #[test]
 fn terminal_off_hard_reenable_requires_reconstruction_even_after_reload() {
-    let mut index = ScanIndex::default();
+    let mut index = off_index();
     assert!(!claude_terminal_reconstructed(&index, W2));
     assert!(!claude_terminal_authority(&index, true, W2));
     index.claude_full_rearm_progress.full_rearm_window_next = true;
@@ -154,7 +230,7 @@ fn terminal_off_fresh_start_zero_parses_and_bounded_identity_samples() {
     let mut index = ScanIndex {
         upload_context_fingerprint: Some("settled-destination".into()),
         active_upload_context_fingerprint: Some("settled-destination".into()),
-        ..Default::default()
+        ..off_index()
     };
     let first = off_scan(&mut index, &scratch, W1, N);
     assert_eq!(first.scanned_file_count, N);
@@ -162,6 +238,7 @@ fn terminal_off_fresh_start_zero_parses_and_bounded_identity_samples() {
     // Process reload + no retained traversal: not a cheap parking-only test.
     index = serde_json::from_value(serde_json::to_value(index).unwrap()).unwrap();
     index.active_upload_context_fingerprint = Some("settled-destination".into());
+    off_suppression_preconditions(&index);
     index.traversal = None;
     let before = START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get);
     let body_before = TERMINAL_OFF_BODY_BYTES_FOR_TEST.with(std::cell::Cell::get);
@@ -195,7 +272,7 @@ fn terminal_off_sample_mismatch_uses_ordinary_changed_file_path() {
     let scratch = crate::test_scratch::ScratchDir::new("terminal-off-mismatch");
     let path = scratch.join(format!("{OFF_ROOT}.jsonl"));
     fs::write(&path, off_line(OFF_ROOT, "X")).unwrap();
-    let mut index = ScanIndex::default();
+    let mut index = off_index();
     let first = off_scan(&mut index, &scratch, W1, 10);
     off_accept(&mut index, &first);
     let old = index.files[&local_index_key(&path)]
@@ -210,6 +287,7 @@ fn terminal_off_sample_mismatch_uses_ordinary_changed_file_path() {
         .unwrap()
         .set_modified(mtime)
         .unwrap();
+    off_suppression_preconditions(&index);
     index.traversal = None;
     let changed = off_scan(&mut index, &scratch, W2, 10);
     assert_eq!(changed.scanned_file_count, 1);
@@ -217,6 +295,9 @@ fn terminal_off_sample_mismatch_uses_ordinary_changed_file_path() {
         index.files[&local_index_key(&path)].source_file_fingerprint,
         old
     );
+    index
+        .claude_full_rearm_progress
+        .terminal_off_rediscovery_after = 0;
     let quiet = off_scan(&mut index, &scratch, W2, 10);
     assert_eq!(quiet.scanned_file_count, 0, "changed file read once");
 }
@@ -229,7 +310,7 @@ fn terminal_off_offline_create_overflow_and_cadence_discover_without_restart() {
         off_line(OFF_ROOT, "X"),
     )
     .unwrap();
-    let mut index = ScanIndex::default();
+    let mut index = off_index();
     let first = off_scan(&mut index, &scratch, W1, 10);
     off_accept(&mut index, &first);
     let window = index.traversal.as_ref().unwrap().census_window_end.clone();
@@ -262,7 +343,7 @@ fn terminal_off_selected_save_requeues_earlier_failed_page_and_keeps_clear_debt(
         off_line(OFF_ROOT, "X"),
     )
     .unwrap();
-    let mut index = ScanIndex::default();
+    let mut index = off_index();
     let previous = index.clone();
     let failed = off_scan(&mut index, &scratch, W1, 1);
     assert_eq!(failed.snapshots.len(), 1);
@@ -307,7 +388,7 @@ fn terminal_off_delete_defers_all_raw_effects_and_full_rearm() {
     let scratch = crate::test_scratch::ScratchDir::new("terminal-off-delete");
     let path = scratch.join(format!("{OFF_ROOT}.jsonl"));
     fs::write(&path, off_line(OFF_ROOT, "X")).unwrap();
-    let mut index = ScanIndex::default();
+    let mut index = off_index();
     let first = off_scan(&mut index, &scratch, W1, 10);
     off_accept(&mut index, &first);
     let key = local_index_key(&path);
@@ -339,7 +420,7 @@ fn terminal_off_context_change_and_contract_debt_still_select() {
     let scratch = crate::test_scratch::ScratchDir::new("terminal-off-context");
     let path = scratch.join(format!("{OFF_ROOT}.jsonl"));
     fs::write(&path, off_line(OFF_ROOT, "X")).unwrap();
-    let mut index = ScanIndex::default();
+    let mut index = off_index();
     let first = off_scan(&mut index, &scratch, W1, 10);
     off_accept(&mut index, &first);
     index.active_upload_context_fingerprint = Some("new-destination".into());
@@ -370,7 +451,7 @@ fn terminal_off_context_change_and_contract_debt_still_select() {
 
 #[test]
 fn terminal_off_process_state_preserves_old_decoder_shape() {
-    let mut index = ScanIndex::default();
+    let mut index = off_index();
     let before = serde_json::to_value(&index.claude_full_rearm_progress).unwrap();
     index
         .claude_full_rearm_progress
@@ -394,7 +475,7 @@ fn terminal_off_held_selected_save_reload_preserves_unaccepted_retry() {
     let scratch = crate::test_scratch::ScratchDir::new("terminal-off-held");
     let path = scratch.join(format!("{OFF_ROOT}.jsonl"));
     fs::write(&path, off_line(OFF_ROOT, "X")).unwrap();
-    let mut index = ScanIndex::default();
+    let mut index = off_index();
     let previous = index.clone();
     let scan = off_scan(&mut index, &scratch, W1, 1);
     let held = scan
@@ -442,7 +523,7 @@ fn terminal_off_rediscovery_reauthorizes_only_current_symlink_target() {
     )
     .unwrap();
     std::os::unix::fs::symlink(&a, &configured).unwrap();
-    let mut index = ScanIndex::default();
+    let mut index = off_index();
     let first = off_scan(&mut index, &configured, W1, 10);
     off_accept(&mut index, &first);
     fs::remove_file(&configured).unwrap();
@@ -489,6 +570,9 @@ fn terminal_off_rediscovery_reauthorizes_only_current_symlink_target() {
 
 #[test]
 fn terminal_off_fresh_context_reselection_is_disclosed_until_adoption() {
+    // TODO R1: provided by the source-general upload-context receipt PR
+    // (e1/upload-context-receipt); consume it here after merge.
+
     let scratch = crate::test_scratch::ScratchDir::new("terminal-off-fresh-context");
     fs::write(
         scratch.join(format!("{OFF_ROOT}.jsonl")),
@@ -512,4 +596,100 @@ fn terminal_off_fresh_context_reselection_is_disclosed_until_adoption() {
     assert!(index.upload_context_fingerprint.is_none());
     assert!(index.active_upload_context_fingerprint.is_some());
     assert!(!second.census_complete);
+}
+
+#[test]
+fn terminal_off_save_preserves_persisted_fence_and_closes_effective_fence() {
+    for closed in [false, true] {
+        let scratch = crate::test_scratch::ScratchDir::new("terminal-off-fence-save");
+        fs::write(scratch.join(format!("{OFF_ROOT}.jsonl")), off_line(OFF_ROOT, "X")).unwrap();
+        let mut index = off_index();
+        index.claude_duplicate_request_witness_overflowed = closed;
+        let page = off_scan(&mut index, &scratch, W1, 1);
+        assert!(!page.census_complete);
+        assert!(claude_effective_duplicate_fence_closed(&index));
+        let encoded = serde_json::to_value(&index).unwrap();
+        assert_eq!(encoded["claude_duplicate_request_witness_overflowed"], closed);
+        let loaded: ScanIndex = serde_json::from_value(encoded).unwrap();
+        assert_eq!(loaded.claude_duplicate_request_witness_overflowed, closed);
+        assert!(claude_effective_duplicate_fence_closed(&loaded));
+    }
+}
+
+#[test]
+fn terminal_off_old_reader_owned_start_correction_quiesces_with_custody() {
+    let scratch = crate::test_scratch::ScratchDir::new("terminal-off-owed-start");
+    let path = scratch.join(format!("{OFF_ROOT}.jsonl"));
+    fs::write(&path, off_line(OFF_ROOT, "X")).unwrap();
+    let key = local_index_key(&path);
+    let mut index = off_index();
+    let first = off_scan(&mut index, &scratch, W1, 1);
+    off_accept(&mut index, &first);
+    let fingerprint = index.files[&key].source_file_fingerprint.clone();
+    assert!(!fingerprint.is_empty());
+    let witness = index.claude_owned_start_census.get_mut(OFF_ROOT).unwrap();
+    witness.verified_source_file_fingerprint = Some(fingerprint.clone());
+    witness.emitted_source_file_fingerprint = None;
+    // The old emitter already owed one defensive re-read. Preserve that debt;
+    // only avoid issuing it again after the ordinary read has discharged it.
+    index.files.get_mut(&key).unwrap().source_file_fingerprint.clear();
+    let old = serde_json::to_value(&index).unwrap();
+    index = serde_json::from_value(old).unwrap();
+    index.active_upload_context_fingerprint = Some("settled-destination".into());
+    let before = TERMINAL_OFF_BODY_BYTES_FOR_TEST.with(std::cell::Cell::get);
+    for pass in 0..4 {
+        index.traversal = None;
+        off_suppression_preconditions(&index);
+        let bytes_before = TERMINAL_OFF_BODY_BYTES_FOR_TEST.with(std::cell::Cell::get);
+        let scan = off_scan(&mut index, &scratch, W2, 1);
+        assert_eq!(scan.scanned_file_count, usize::from(pass == 0));
+        if pass > 0 {
+            assert_eq!(TERMINAL_OFF_BODY_BYTES_FOR_TEST.with(std::cell::Cell::get), bytes_before);
+        }
+        off_accept(&mut index, &scan);
+        let witness = &index.claude_owned_start_census[OFF_ROOT];
+        assert_eq!(witness.verified_source_file_fingerprint.as_ref(), Some(&fingerprint));
+        assert!(witness.emitted_source_file_fingerprint.is_none());
+        assert_eq!(index.files[&key].source_file_fingerprint, fingerprint);
+        assert!(!scan.census_complete);
+        index = serde_json::from_value(serde_json::to_value(index).unwrap()).unwrap();
+        index.active_upload_context_fingerprint = Some("settled-destination".into());
+    }
+    assert!(TERMINAL_OFF_BODY_BYTES_FOR_TEST.with(std::cell::Cell::get) > before);
+}
+
+#[cfg(unix)]
+#[test]
+fn terminal_off_ctime_only_counts_one_file_two_observations_per_walk() {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = crate::test_scratch::ScratchDir::new("terminal-off-ctime");
+    let path = scratch.join(format!("{OFF_ROOT}.jsonl"));
+    // Both head and tail are paid, including the second ctime validation.
+    let mut contents = off_line(OFF_ROOT, "X");
+    contents.push_str(&format!("{{\"type\":\"user\",\"padding\":\"{}\"}}\n", "x".repeat(20_000)));
+    fs::write(&path, contents).unwrap();
+    let mut index = off_index();
+    let first = off_scan(&mut index, &scratch, W1, 1);
+    off_accept(&mut index, &first);
+    let key = local_index_key(&path);
+    assert_ne!(index.files[&key].opened_birth_nanos, 0);
+    let metadata = fs::metadata(&path).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(metadata.permissions().mode() ^ 0o100)).unwrap();
+    let live = fs::metadata(&path).unwrap();
+    let changed = (live.ctime() as u64).saturating_mul(1_000_000_000).saturating_add(live.ctime_nsec() as u64);
+    assert_ne!(changed, index.files[&key].opened_changed_nanos, "fixture must move ctime");
+    off_suppression_preconditions(&index);
+    index.traversal = None;
+    let body_before = TERMINAL_OFF_BODY_BYTES_FOR_TEST.with(std::cell::Cell::get);
+    let quiet = off_scan(&mut index, &scratch, W2, 1);
+    assert_eq!(quiet.scanned_file_count, 0);
+    assert_eq!(TERMINAL_OFF_BODY_BYTES_FOR_TEST.with(std::cell::Cell::get), body_before);
+    START_IDENTITY_SAMPLES.with(|counts| {
+        let counts = counts.borrow();
+        assert_eq!(counts.files.len(), 1);
+        assert_eq!(counts.observations, 2);
+        assert!(counts.bytes <= 4 * FILE_CONTENT_SAMPLE_BYTES as u64);
+    });
+    reset_start_identity_samples();
+    START_IDENTITY_SAMPLES.with(|counts| assert_eq!(counts.borrow().observations, 0));
 }

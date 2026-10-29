@@ -2271,6 +2271,8 @@ impl ClaudeStaleFamilyCarry {
 struct ClaudeFullRearmProgress {
     #[serde(skip)]
     terminal_off_rediscovery_after: u64,
+    #[serde(skip)]
+    terminal_off_strict_after: Option<String>,
     // Process-local proof: every decode drops it. A restart between read and
     // close therefore fails closed, even if persisted scheduling survives.
     #[serde(skip)]
@@ -8729,6 +8731,44 @@ pub(crate) fn apply_claude_reported_usage_to_scan_with_comparison(
     disposition
 }
 
+// Eligibility alone deliberately does not grant authority. The caller must
+// require effective completion and the effective duplicate fence first.
+fn claude_owned_start_eligible(
+    index: &ScanIndex,
+    complete_families: &BTreeMap<String, BTreeSet<String>>,
+    uncertified_roots: &BTreeSet<String>,
+    duplicated_request_hashes: &BTreeSet<String>,
+    census_window_end: &str,
+) -> Vec<(String, String)> {
+    index
+        .claude_owned_start_census
+        .iter()
+        .filter_map(|(source_session_id, witness)| {
+            let (root_session_id, _) = complete_families
+                .iter()
+                .find(|(_, members)| members.contains(source_session_id))?;
+            if uncertified_roots.contains(root_session_id) {
+                return None;
+            }
+            let pending = index.claude_usage_family_pending.get(root_session_id)?;
+            if pending.invalid || pending.census_window_end != census_window_end {
+                return None;
+            }
+            let request_hashes = pending.member_request_id_hashes.get(source_session_id)?;
+            if !request_hashes.is_disjoint(&duplicated_request_hashes) {
+                return None;
+            }
+            let indexed_fingerprint = index.files.iter().find_map(|(index_key, entry)| {
+                claude_index_path_family_member(Path::new(index_key))
+                    .filter(|(_, member)| member == source_session_id)
+                    .map(|_| entry.source_file_fingerprint.clone())
+            })?;
+            (indexed_fingerprint == witness.marker_source_file_fingerprint)
+                .then_some((source_session_id.clone(), indexed_fingerprint))
+        })
+        .collect::<Vec<_>>()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_claude_reported_usage_with_index_limits_and_current_files(
     snapshots: &mut [SnapshotItem],
@@ -8746,11 +8786,6 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     veto_api_rows: &ClaudeVetoApiRows,
 ) -> ClaudeUsageAuthorityDisposition {
     let census_complete = claude_terminal_authority(index, census_complete, census_window_end);
-    if claude_terminal_off() {
-        // Old-reader-compatible negative custody, including an OPEN fence
-        // restored from disk. Skipped members never become uniqueness proof.
-        index.claude_duplicate_request_witness_overflowed = true;
-    }
     let complete_rebuild_read =
         census_complete && take_claude_complete_rebuild_read(index, census_window_end);
     let (negatives, diagnostic) = comparison.map_or((None, None), |view| {
@@ -8780,7 +8815,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     };
     duplicate_census.census_complete = census_complete;
     duplicate_census.rearm_full_suppressed = u64::from(claude_terminal_off());
-    duplicate_census.fence_before = index.claude_duplicate_request_witness_overflowed;
+    duplicate_census.fence_before = claude_effective_duplicate_fence_closed(index);
     let reports_healthy = api_report.health.is_complete() && trace_report.is_complete();
     // The canonical ownership reducer validates semantic evidence too (row
     // fingerprints/revisions/clocks and paired clients), beyond file health.
@@ -9214,35 +9249,15 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     }
     if census_complete
         && !duplicate_census_invalid
-        && !index.claude_duplicate_request_witness_overflowed
+        && !claude_effective_duplicate_fence_closed(index)
     {
-        let verified = index
-            .claude_owned_start_census
-            .iter()
-            .filter_map(|(source_session_id, witness)| {
-                let (root_session_id, _) = complete_families
-                    .iter()
-                    .find(|(_, members)| members.contains(source_session_id))?;
-                if uncertified_roots.contains(root_session_id) {
-                    return None;
-                }
-                let pending = index.claude_usage_family_pending.get(root_session_id)?;
-                if pending.invalid || pending.census_window_end != census_window_end {
-                    return None;
-                }
-                let request_hashes = pending.member_request_id_hashes.get(source_session_id)?;
-                if !request_hashes.is_disjoint(&duplicated_request_hashes) {
-                    return None;
-                }
-                let indexed_fingerprint = index.files.iter().find_map(|(index_key, entry)| {
-                    claude_index_path_family_member(Path::new(index_key))
-                        .filter(|(_, member)| member == source_session_id)
-                        .map(|_| entry.source_file_fingerprint.clone())
-                })?;
-                (indexed_fingerprint == witness.marker_source_file_fingerprint)
-                    .then_some((source_session_id.clone(), indexed_fingerprint))
-            })
-            .collect::<Vec<_>>();
+        let verified = claude_owned_start_eligible(
+            index,
+            &complete_families,
+            &uncertified_roots,
+            &duplicated_request_hashes,
+            census_window_end,
+        );
         for (source_session_id, fingerprint) in verified {
             if let Some(witness) = index.claude_owned_start_census.get_mut(&source_session_id) {
                 witness.verified_source_file_fingerprint = Some(fingerprint);
@@ -9278,7 +9293,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             .cloned()
             .unwrap_or_default();
         let unresolved_duplicate = duplicate_census_invalid
-            || index.claude_duplicate_request_witness_overflowed
+            || claude_effective_duplicate_fence_closed(index)
             || item.claude_usage_request_ids.iter().any(|request_id| {
                 let request_hash = format!("{:x}", Sha256::digest(request_id.as_bytes()));
                 duplicated_request_hashes.contains(&request_hash)
@@ -9564,7 +9579,16 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 .map(|_| source_session_id.clone())
         })
         .collect::<BTreeSet<_>>();
-    if !owned_start_reparse_ids.is_empty() {
+    if claude_terminal_off() && !owned_start_reparse_ids.is_empty() {
+        // Verification and the un-emitted correction remain custody. This
+        // emitter cannot run until paged reconstruction; repeatedly clearing
+        // the file would impose an impossible Full obligation after reload.
+        eprintln!(
+            "ALARM owned_start_correction_deferred families={} custody=UNPROVEN",
+            owned_start_reparse_ids.len()
+        );
+    }
+    if !claude_terminal_off() && !owned_start_reparse_ids.is_empty() {
         for (index_key, entry) in &mut index.files {
             if claude_index_path_family_member(Path::new(index_key)).is_some_and(
                 |(_, source_session_id)| owned_start_reparse_ids.contains(&source_session_id),
@@ -10336,7 +10360,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             });
         }
     }
-    duplicate_census.fence_after = index.claude_duplicate_request_witness_overflowed;
+    duplicate_census.fence_after = claude_effective_duplicate_fence_closed(index);
     disposition.duplicate_census = duplicate_census;
     #[cfg(test)]
     CLAUDE_FIRST_PROOF_HOLD_FOR_TEST.with(|cell| cell.set(disposition.first_proof_hold));
@@ -41150,6 +41174,9 @@ fn ensure_bounded_traversal(
     // Capture only fixed counters before the existing reset/rearm. A missing
     // prior traversal does not explain why it was removed; the retirement
     // record, when available, supplies that independent witness.
+    if source == SnapshotSource::ClaudeCode {
+        reset_start_identity_samples();
+    }
     let mut transition = traversal_transition::Starting::capture(
         source,
         index,
@@ -43183,7 +43210,7 @@ fn opened_object_identity_and_stat_retained(
     }
     let len = metadata.len();
     let samples = read_opened_content_samples(file, len)?;
-    note_start_identity_sample(source, &samples);
+    note_start_identity_sample(source, file, &samples);
     #[cfg(unix)]
     let stat = Some(OpenedObjectStat {
         device: metadata.dev(),
@@ -43256,7 +43283,7 @@ fn opened_identity_at(
     let len = file.metadata()?.len();
     file.seek(SeekFrom::Start(0))?;
     let samples = read_opened_content_samples(file, len)?;
-    note_start_identity_sample(source, &samples);
+    note_start_identity_sample(source, file, &samples);
     file.seek(SeekFrom::Start(0))?;
     Ok(opened_object_identity_from(len, Some(object), &samples))
 }
@@ -44002,6 +44029,10 @@ impl ScanIndex {
         canonicalize_codex_identity_set(&mut self.codex_parent_ownership_refs);
         canonicalize_codex_identity_map(&mut self.codex_state_only_snapshot_fingerprints)
             && canonicalize_codex_identity_map(&mut self.codex_parent_ownership_ledgers)
+    }
+
+    pub(crate) fn claude_strict_cursor(&mut self) -> &mut Option<String> {
+        &mut self.claude_full_rearm_progress.terminal_off_strict_after
     }
 
     pub fn activate_upload_context(&mut self, fingerprint: String) {
@@ -45255,7 +45286,7 @@ impl ScanIndex {
 
     #[cfg(test)]
     pub(crate) fn claude_duplicate_fence_closed_for_test(&self) -> bool {
-        self.claude_duplicate_request_witness_overflowed
+        claude_effective_duplicate_fence_closed(self)
     }
 
     #[cfg(test)]
@@ -57552,7 +57583,7 @@ mod tests {
                 true,
             )
             .expect("traversal completes");
-            assert!(result.census_complete);
+            assert!(!result.census_complete);
             finalize_scan_after_policy(source, &mut result, index);
             result
         };
@@ -57580,23 +57611,28 @@ mod tests {
         );
         assert_eq!(
             index.terminal_jsonl_dispositions.len(),
-            1,
-            "the renamed-away key is pruned, not accumulated"
+            2,
+            "terminal-off retains both old and renamed custody"
         );
         assert!(index
             .terminal_jsonl_dispositions
             .contains_key(&local_index_key(&moved)));
-        assert_eq!(index.files.len(), 1);
+        assert_eq!(index.files.len(), 2);
 
         // Deleted path: nothing indexed corresponds to the disposition at all.
         fs::remove_file(&moved).expect("remove terminal fixture");
         let after_delete = traverse(&mut index, "2026-07-22T08:12:00Z");
         assert_eq!(after_delete.scanned_file_count, 0);
         assert!(
-            index.terminal_jsonl_dispositions.is_empty(),
-            "a deleted file leaves no durable disposition behind"
+            index
+                .terminal_jsonl_dispositions
+                .contains_key(&local_index_key(&original))
+                && index
+                    .terminal_jsonl_dispositions
+                    .contains_key(&local_index_key(&moved)),
+            "absence is unproven while terminal-off"
         );
-        assert!(index.files.is_empty());
+        assert_eq!(index.files.len(), 2);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -65448,175 +65484,15 @@ mod tests {
     #[test]
     fn claude_duplicate_census_counts_separate_complete_invalid_and_owner_bound() {
         let (root, parent, items) = claude_account_family_fixture();
-
-        // The fixture census clock; a fresh closure schedules its next full
-        // re-arm one base backoff later.
-        let next_full_rearm = Some(1_785_654_600 + CLAUDE_DUPLICATE_FENCE_REARM_BASE_SECONDS);
-
-        // Complete valid census: fence stays clear and no cause fires.
-        let (_, _, counts) = claude_census_counts_run_twice(
-            &items,
-            &ScanIndex::default(),
-            true,
-            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
-        );
-        assert_eq!(
-            counts,
-            ClaudeDuplicateCensusCounts {
-                census_complete: true,
-                pending_occurrence_count: 5,
-                coverage_complete: true,
-                ..Default::default()
-            }
-        );
-
-        // Invalid census from a family whose occurrence proof is incomplete.
         let mut invalid_items = items.clone();
         invalid_items[1].claude_usage_occurrences.clear();
-        let (_, invalid_index, counts) = claude_census_counts_run_twice(
-            &invalid_items,
-            &ScanIndex::default(),
-            true,
-            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
-        );
-        assert!(invalid_index.claude_duplicate_request_witness_overflowed);
-        assert!(invalid_index.claude_duplicate_request_owners.is_empty());
-        assert_eq!(
-            counts,
-            ClaudeDuplicateCensusCounts {
-                census_complete: true,
-                fence_after: true,
-                census_invalid: true,
-                invalid_current_window_family_count: 1,
-                page_invalidated_identity_count: 1,
-                coverage_complete: true,
-                full_rearm: true,
-                rearm_attempt: 1,
-                full_rearm_deferred_until: next_full_rearm,
-                ..Default::default()
-            }
-        );
-
-        // The same page before the terminal pass: invalid, but the fence and
-        // the terminal-only family count are untouched.
-        let (_, open_index, counts) = claude_census_counts_run_twice(
-            &invalid_items,
-            &ScanIndex::default(),
-            false,
-            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
-        );
-        assert!(!open_index.claude_duplicate_request_witness_overflowed);
-        assert_eq!(
-            counts,
-            ClaudeDuplicateCensusCounts {
-                census_invalid: true,
-                page_invalidated_identity_count: 1,
-                ..Default::default()
-            }
-        );
-
-        // Invalid census from the pending-occurrence cap.
-        let (_, cap_index, counts) = claude_census_counts_run_twice(
-            &items,
-            &ScanIndex::default(),
-            true,
-            1,
-            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
-        );
-        assert!(cap_index.claude_duplicate_request_witness_overflowed);
-        assert_eq!(
-            counts,
-            ClaudeDuplicateCensusCounts {
-                census_complete: true,
-                fence_after: true,
-                census_invalid: true,
-                invalid_current_window_family_count: 1,
-                page_invalidated_cap_count: 1,
-                coverage_complete: true,
-                full_rearm: true,
-                rearm_attempt: 1,
-                full_rearm_deferred_until: next_full_rearm,
-                ..Default::default()
-            }
-        );
-
-        // Stale, unquarantined pending from an older window whose family has
-        // no indexed file left: a complete census proves it vanished, so it
-        // cannot hide a current request and does not poison the census.
-        let mut stale_index = ScanIndex::default();
-        stale_index.claude_usage_family_pending.insert(
-            "stale-root".to_string(),
+        let mut stale = ScanIndex::default();
+        stale.claude_usage_family_pending.insert(
+            "stale-root".into(),
             ClaudeUsageFamilyPending {
-                census_window_end: "2026-08-01T00:00:00Z".to_string(),
-                member_request_id_hashes: BTreeMap::new(),
-                member_occurrences: BTreeMap::new(),
-                invalid: false,
-                idless_revision: None,
-            },
-        );
-        let (_, stale_after, counts) = claude_census_counts_run_twice(
-            &items,
-            &stale_index,
-            true,
-            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
-        );
-        assert!(!stale_after.claude_duplicate_request_witness_overflowed);
-        assert!(!stale_after
-            .claude_usage_family_pending
-            .contains_key("stale-root"));
-        assert_eq!(
-            counts,
-            ClaudeDuplicateCensusCounts {
-                census_complete: true,
-                pending_occurrence_count: 5,
-                coverage_complete: true,
-                ..Default::default()
-            }
-        );
-
-        // The same stale pending while one of its files is still indexed is
-        // an invalid census: no current-window family is invalid, and the
-        // unobserved member also leaves coverage incomplete.
-        stale_index.files.insert(
-            "/opaque/stale-root.jsonl".to_string(),
-            manifest_index_entry(Some("stale-settled")),
-        );
-        let (_, stale_after, counts) = claude_census_counts_run_twice(
-            &items,
-            &stale_index,
-            true,
-            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
-        );
-        assert!(stale_after.claude_duplicate_request_witness_overflowed);
-        assert_eq!(
-            counts,
-            ClaudeDuplicateCensusCounts {
-                census_complete: true,
-                fence_after: true,
-                census_invalid: true,
-                pending_occurrence_count: 5,
-                coverage_missing_member_count: 1,
-                full_rearm: true,
-                rearm_attempt: 1,
-                full_rearm_deferred_until: next_full_rearm,
-                ..Default::default()
-            }
-        );
-
-        // The same stale member pending, also only in the old window, keeps
-        // it fail closed even without a root file.
-        let mut stale_member_index = ScanIndex::default();
-        stale_member_index.claude_usage_family_pending.insert(
-            "stale-root".to_string(),
-            ClaudeUsageFamilyPending {
-                census_window_end: "2026-08-01T00:00:00Z".to_string(),
+                census_window_end: "2026-08-01T00:00:00Z".into(),
                 member_request_id_hashes: BTreeMap::from([(
-                    "stale-member".to_string(),
+                    "stale-member".into(),
                     BTreeSet::new(),
                 )]),
                 member_occurrences: BTreeMap::new(),
@@ -65624,83 +65500,110 @@ mod tests {
                 idless_revision: None,
             },
         );
-        stale_member_index.files.insert(
-            "/opaque/stale-member.jsonl".to_string(),
-            manifest_index_entry(Some("stale-member-settled")),
+        stale.files.insert(
+            "/opaque/stale-member.jsonl".into(),
+            manifest_index_entry(Some("stale-settled")),
         );
-        let (_, stale_member_after, counts) = claude_census_counts_run_twice(
-            &items,
-            &stale_member_index,
-            true,
-            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
-        );
-        assert!(stale_member_after.claude_duplicate_request_witness_overflowed);
-        assert!(counts.census_invalid);
-
-        // Owner bound: a valid census whose cross-family duplicates exceed
-        // the owner limit sets the fence without any invalid cause.
         let copy_id = "3338a80a-f36e-4cbc-a5bb-50fc66430ba5";
         let mut copy = items[0].clone();
-        copy.source_session_id = copy_id.to_string();
+        copy.source_session_id = copy_id.into();
         for fact in &mut copy.attribution_facts {
             if fact.value == parent {
-                fact.value = copy_id.to_string();
+                fact.value = copy_id.into();
             }
         }
         assert_eq!(claude_snapshot_family_root(&copy), copy_id);
-        let mut bound_items = items.clone();
-        bound_items.push(copy);
-        let (_, bound_index, counts) = claude_census_counts_run_twice(
-            &bound_items,
-            &ScanIndex::default(),
-            true,
-            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-            1,
-        );
-        assert!(bound_index.claude_duplicate_request_witness_overflowed);
-        assert!(bound_index.claude_duplicate_request_owners.is_empty());
-        assert_eq!(
-            counts,
-            ClaudeDuplicateCensusCounts {
-                census_complete: true,
-                fence_after: true,
-                pending_occurrence_count: 9,
-                coverage_complete: true,
-                full_rearm: true,
-                rearm_attempt: 1,
-                full_rearm_deferred_until: next_full_rearm,
-                ..Default::default()
+        let mut bounded = items.clone();
+        bounded.push(copy);
+        for (case, page, input, occurrence_limit, owner_limit) in [
+            (
+                "valid",
+                &items,
+                ScanIndex::default(),
+                MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+                MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+            ),
+            (
+                "invalid-member",
+                &invalid_items,
+                ScanIndex::default(),
+                MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+                MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+            ),
+            (
+                "occurrence-cap",
+                &items,
+                ScanIndex::default(),
+                1,
+                MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+            ),
+            (
+                "stale-indexed-member",
+                &items,
+                stale,
+                MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+                MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+            ),
+            (
+                "owner-bound",
+                &bounded,
+                ScanIndex::default(),
+                MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+                1,
+            ),
+        ] {
+            for offered_terminal in [false, true] {
+                let (_, after, counts) = claude_census_counts_run_twice(
+                    page,
+                    &input,
+                    offered_terminal,
+                    occurrence_limit,
+                    owner_limit,
+                );
+                assert!(!counts.census_complete, "{case}");
+                assert!(
+                    counts.fence_before && counts.fence_after && counts.census_invalid,
+                    "{case}"
+                );
+                assert_eq!(counts.rearm_full_suppressed, 1, "{case}");
+                assert!(!counts.full_rearm && !counts.coverage_complete, "{case}");
+                assert_eq!(counts.rearm_attempt, 0, "{case}");
+                assert_eq!(
+                    after.claude_duplicate_request_witness_overflowed,
+                    input.claude_duplicate_request_witness_overflowed,
+                    "persisted fence: {case}"
+                );
+                assert!(after.claude_usage_family_witnesses.is_empty(), "{case}");
+                assert!(after.claude_duplicate_request_owners.is_empty(), "{case}");
+                if case == "invalid-member" {
+                    assert_eq!(counts.page_invalidated_identity_count, 1);
+                }
+                if case == "occurrence-cap" {
+                    assert!(counts.page_invalidated_cap_count > 0);
+                }
+                for (key, entry) in &input.files {
+                    assert_eq!(
+                        after.files[key].source_file_fingerprint, entry.source_file_fingerprint,
+                        "{case}"
+                    );
+                }
+                // Removing a copied or stale member does not open the effective
+                // fence or schedule a whole-index replay during containment.
+                let (_, recovered, recovery) = claude_census_counts_run_twice(
+                    &items,
+                    &after,
+                    true,
+                    MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+                    owner_limit,
+                );
+                assert!(!recovery.census_complete && !recovery.full_rearm, "{case}");
+                assert!(recovery.fence_after, "{case}");
+                assert_eq!(
+                    recovered.claude_duplicate_request_witness_overflowed,
+                    after.claude_duplicate_request_witness_overflowed
+                );
             }
-        );
-
-        // Once the copy is gone, the next valid, fully covered terminal pass
-        // clears the fence, re-emits posture once, and resets the backoff.
-        let (_, cleared_index, counts) = claude_census_counts_run_twice(
-            &items,
-            &bound_index,
-            true,
-            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-            1,
-        );
-        assert!(!cleared_index.claude_duplicate_request_witness_overflowed);
-        assert_eq!(cleared_index.claude_duplicate_fence_rearm_attempt, 0);
-        assert_eq!(
-            cleared_index.claude_duplicate_fence_next_full_rearm_unix_seconds,
-            None
-        );
-        assert_eq!(
-            counts,
-            ClaudeDuplicateCensusCounts {
-                census_complete: true,
-                fence_before: true,
-                pending_occurrence_count: 5,
-                coverage_complete: true,
-                full_rearm: true,
-                ..Default::default()
-            }
-        );
-
+        }
         let _ = fs::remove_dir_all(root);
     }
 
@@ -78434,7 +78337,10 @@ mod tests {
         )
         .expect("scan one-sided optional title shapes");
         assert!(scan.sidecar_census_complete);
-        assert!(scan.census_complete);
+        assert!(
+            !scan.census_complete,
+            "terminal-off retains incomplete source custody"
+        );
         assert_eq!(index.claude_desktop_title_files.len(), 1);
         assert_eq!(scan.snapshots.len(), 1);
         assert!(scan.snapshots[0].session_display_name.is_none());
@@ -90558,7 +90464,7 @@ crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_mem
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarry; origin, roots, capped_roots, replay);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarryOrigin; context_fingerprint, process, full_rearm_window, admission);
 crate::heap_layout_bound::fields!(ClaudeRetryAdmission; after_root, upper_root, complete, roots_complete, progressed, served_before, due_through, due_after_path, due_upper_path, due_complete, oversized_root, oversized_after_path, storage_deferred);
-crate::heap_layout_bound::fields!(ClaudeFullRearmProgress; terminal_off_rediscovery_after, rebuild_read_full, complete_rebuild_read, observed_window, structural_roots, other_invalidation_observed, ignored_vetoes, structural_rearm_owed, structural_record, traversal_origin, full_rearm_window_next, full_rearm_window, stale_rearm_fence_deadline, stale_rearms_at_deadline, first_proof_hold_since_full_rearm, held_family_roots, contract_cutover);
+crate::heap_layout_bound::fields!(ClaudeFullRearmProgress; terminal_off_rediscovery_after, terminal_off_strict_after, rebuild_read_full, complete_rebuild_read, observed_window, structural_roots, other_invalidation_observed, ignored_vetoes, structural_rearm_owed, structural_record, traversal_origin, full_rearm_window_next, full_rearm_window, stale_rearm_fence_deadline, stale_rearms_at_deadline, first_proof_hold_since_full_rearm, held_family_roots, contract_cutover);
 crate::heap_layout_bound::fields!(ClaudeCompleteRebuildRead; origin, members_digest);
 crate::heap_layout_bound::fields!(ClaudeStructuralInvalidRecord; basis, families, suppressed_since_unix_seconds, skipped_full_rearms);
 crate::heap_layout_bound::fields!(ClaudeFullRearmWindow; context_fingerprint, process, window_ends, member_digests);

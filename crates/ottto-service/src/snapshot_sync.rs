@@ -51,6 +51,7 @@ use zeroize::Zeroize;
 mod continuation;
 mod reason_reoffer;
 mod rejection_log;
+mod strict_cohort;
 
 // Direct API host; the apex `ottto.net/backend` proxy is retired in the marketing cutover.
 const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
@@ -8923,6 +8924,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         .into_iter()
         .collect::<Vec<_>>();
     stats.candidate_root_count = usage_roots.len();
+    let mut strict_cursor = index.claude_strict_cursor().clone();
     let request_owned_enabled = crate::snapshots::claude_request_money::e2::enabled();
     // A family kept on ordinary money (listed) reads its telemetry as gate off.
     let request_owned =
@@ -8965,6 +8967,24 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         })
         .collect::<Vec<_>>();
     stats.paired_sidecar_root_count = usage_roots.len();
+    // Account the actual all-pending strict cohort before its first I/O.
+    // Page-local roots have priority; off-page roots rotate across passes.
+    let page_roots = claude_evidence_root_session_ids(&scan_result.snapshots)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let strict_plan =
+        strict_cohort::plan(support_dir, usage_roots, &page_roots, &mut strict_cursor);
+    let mut deferred_roots = strict_plan.deferred.len();
+    let mut deferred_bytes = strict_plan.deferred_bytes;
+    if deferred_roots > 0 {
+        full_rearm_evidence_complete = false;
+        identity_unhealthy_roots.extend(strict_plan.deferred.iter().cloned());
+    }
+    let usage_roots = strict_plan.roots;
+    let strict_budget = crate::claude_local_otel::strict_budget::StrictReadBudget::new(
+        strict_cohort::BYTES_PER_PASS,
+    );
+
     // Effort has already updated pending-family state. Release all non-paired
     // rows before moving the selected roots into the usage aggregate.
     let paired_roots: BTreeSet<String> = usage_roots.iter().cloned().collect();
@@ -9009,6 +9029,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             stats.trace_incomplete_root_count += 1;
         }
         if !api.health.is_complete() || !trace.is_complete() {
+            deferred_roots += 1;
+            deferred_bytes = deferred_bytes.saturating_add(
+                crate::claude_local_otel::strict_cohort_bytes(support_dir, &root_session_id),
+            );
             full_rearm_evidence_complete = false;
             if let Some(rows) = api.evidence.remove(&root_session_id) {
                 veto_api_rows.insert(root_session_id.clone(), rows);
@@ -9052,6 +9076,16 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             stats.trace_evidence_row_count += rows.len();
             trace_report.evidence.insert(root_session_id, rows);
         }
+    }
+    *index.claude_strict_cursor() = strict_cursor;
+    let strict_bytes = strict_budget.consumed();
+    drop(strict_budget);
+    eprintln!("strict_cohort_deferred roots={deferred_roots} bytes={} consumed_bytes={strict_bytes} allowance_bytes={} custody=UNPROVEN", deferred_bytes, strict_cohort::BYTES_PER_PASS);
+    if deferred_roots > 0 {
+        // Legacy cross-root owner/negative dependencies are not complete.
+        // Do not infer uniqueness/absence from the serviced subset. Contract-5
+        // page-local reads keep their independent per-root health verdicts.
+        api_report.health.unreadable_lines += 1;
     }
     if stats.request_set_mismatch_root_count > 0 {
         index.note_claude_ignored_rearm_veto(

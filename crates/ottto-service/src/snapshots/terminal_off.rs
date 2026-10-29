@@ -5,6 +5,12 @@ pub(crate) fn claude_terminal_off() -> bool {
     true
 }
 
+// The containment veto is process policy, never a persisted fence mutation.
+// In particular an old reader must reload the pre-containment fence value.
+fn claude_effective_duplicate_fence_closed(index: &ScanIndex) -> bool {
+    claude_terminal_off() || index.claude_duplicate_request_witness_overflowed
+}
+
 fn claude_terminal_reconstructed(index: &ScanIndex, window: &str) -> bool {
     index
         .claude_full_rearm_progress
@@ -82,23 +88,38 @@ fn claude_terminal_unproven(index: &ScanIndex, window: &str) {
 
 static CLAUDE_TERMINAL_OFF_OFFERS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
-static CLAUDE_START_IDENTITY_FILES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-static CLAUDE_START_IDENTITY_BYTES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+#[derive(Default)]
+struct StartIdentitySamples {
+    files: BTreeSet<(u64, u64)>,
+    observations: u64,
+    bytes: u64,
+}
+thread_local! {
+    static START_IDENTITY_SAMPLES: std::cell::RefCell<StartIdentitySamples> = std::cell::RefCell::new(StartIdentitySamples::default());
+}
 #[cfg(test)]
 thread_local! {
     static TERMINAL_OFF_BODY_BYTES_FOR_TEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static START_IDENTITY_SAMPLE_FOR_TEST: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
 }
-
-fn note_start_identity_sample(source: SnapshotSource, samples: &OpenedContentSamples) {
+fn reset_start_identity_samples() {
+    START_IDENTITY_SAMPLES.with(|counts| *counts.borrow_mut() = StartIdentitySamples::default());
+}
+fn note_start_identity_sample(source: SnapshotSource, file: &File, samples: &OpenedContentSamples) {
     if source != SnapshotSource::ClaudeCode {
         return;
     }
     let bytes = (samples.head.len() + samples.tail.as_ref().map_or(0, Vec::len)) as u64;
-    CLAUDE_START_IDENTITY_FILES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    CLAUDE_START_IDENTITY_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+    START_IDENTITY_SAMPLES.with(|counts| {
+        let mut counts = counts.borrow_mut();
+        counts.observations += 1;
+        counts.bytes += bytes;
+        if let Ok(metadata) = file.metadata() {
+            if let Some([device, inode]) = physical_identity(&metadata) {
+                counts.files.insert((device, inode));
+            }
+        }
+    });
     #[cfg(test)]
     START_IDENTITY_SAMPLE_FOR_TEST.with(|v| {
         let (f, b) = v.get();
@@ -109,12 +130,18 @@ fn note_start_identity_sample(source: SnapshotSource, samples: &OpenedContentSam
 fn terminal_off_offer(index: &ScanIndex, window: &str) {
     use std::sync::atomic::Ordering::Relaxed;
     let offers = CLAUDE_TERMINAL_OFF_OFFERS.fetch_add(1, Relaxed) + 1;
-    eprintln!("ALARM claude_terminal_off offers={offers} rearm_full_suppressed=1: terminal authority withheld; ordinary page upload/ACK/save continues");
-    eprintln!(
-        "start_identity_sample files={} bytes={} scope=process_total",
-        CLAUDE_START_IDENTITY_FILES.load(Relaxed),
-        CLAUDE_START_IDENTITY_BYTES.load(Relaxed)
-    );
+    static SINCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let since = SINCE.get_or_init(|| unix_seconds(SystemTime::now()).unwrap_or_default());
+    eprintln!("ALARM claude_terminal_off offers={offers} since_unix_seconds={since} rearm_full_suppressed=1: terminal authority withheld; ordinary page upload/ACK/save continues");
+    START_IDENTITY_SAMPLES.with(|counts| {
+        let counts = counts.borrow();
+        eprintln!(
+            "start_identity_sample files={} observations={} bytes={} scope=walk",
+            counts.files.len(),
+            counts.observations,
+            counts.bytes
+        );
+    });
     claude_terminal_unproven(index, window);
 }
 
@@ -182,6 +209,7 @@ fn refresh_terminal_off_discovery(
     if !traversal.pending_directories.is_empty() {
         return;
     }
+    reset_start_identity_samples();
     claude_terminal_rewind(traversal);
     index
         .claude_full_rearm_progress

@@ -183,16 +183,19 @@ impl Rearm {
         }
     }
 
-    /// The first closed terminal re-arms and records the set; the next one
-    /// skips. Returns that skipping terminal.
+    /// Containment never pays a structural baseline with a whole-index read.
+    /// Keep both offers so later scenarios still exercise retained pending.
     fn establish(&self, index: &mut ScanIndex, items: &[SnapshotItem]) -> Terminal {
         let first = self.terminal(index, items);
-        assert!(first.counts.full_rearm, "no record yet: {first:?}");
-        assert!(index.claude_full_rearm_progress.structural_record.is_some());
-        let skipped = self.terminal(index, items);
-        assert!(skipped.suppression.full_rearm_suppressed, "{skipped:?}");
-        assert!(!skipped.counts.full_rearm);
-        skipped
+        assert!(!first.counts.full_rearm, "{first:?}");
+        assert_eq!(first.counts.rearm_full_suppressed, 1);
+        assert_eq!(first.rearmed_files, 0);
+        assert!(index.claude_full_rearm_progress.structural_record.is_none());
+        let second = self.terminal(index, items);
+        assert!(!second.counts.full_rearm);
+        assert_eq!(second.counts.rearm_full_suppressed, 1);
+        assert_eq!(second.rearmed_files, 0);
+        second
     }
 }
 
@@ -217,86 +220,42 @@ fn insert_file(index: &mut ScanIndex, key: &str, source: &str, size_bytes: u64) 
 fn unchanged_structural_set_skips_repeated_full_rearms() {
     const TERMINALS: usize = 5;
     let rearm = Rearm::new();
-    let mut fix = rearm.index();
-    let mut base = rearm.index();
-    let fix_runs = (0..TERMINALS)
-        .map(|_| rearm.terminal(&mut fix, &rearm.items))
-        .collect::<Vec<_>>();
-    let base_runs = (0..TERMINALS)
-        .map(|_| rearm.base_terminal(&mut base, &rearm.items))
-        .collect::<Vec<_>>();
-    let family_bytes = rearm
-        .sources
-        .keys()
-        .map(|key| fix.files[key].size_bytes)
-        .sum::<u64>();
-    // Preconditions on BASE: every due terminal re-arms the whole family.
-    for run in &base_runs {
-        assert!(run.counts.full_rearm && run.counts.fence_after, "{run:?}");
-        assert!(run.counts.census_invalid);
-        assert_eq!(run.counts.page_invalidated_identity_count, 1);
-        assert_eq!(run.rearmed_files, 2);
-        assert_eq!(run.suppression, ClaudeFullRearmSuppressionCounts::default());
+    let mut retained = rearm.index();
+    let mut lost_progress = rearm.index();
+    let original = retained
+        .files
+        .iter()
+        .map(|(k, v)| (k.clone(), v.source_file_fingerprint.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for _ in 0..TERMINALS {
+        for run in [
+            rearm.terminal(&mut retained, &rearm.items),
+            rearm.base_terminal(&mut lost_progress, &rearm.items),
+        ] {
+            assert!(!run.counts.census_complete);
+            assert!(run.counts.census_invalid && run.counts.fence_after);
+            assert_eq!(run.counts.page_invalidated_identity_count, 1);
+            assert!(!run.counts.full_rearm);
+            assert_eq!(run.counts.rearm_full_suppressed, 1);
+            assert_eq!((run.rearmed_files, run.rearmed_bytes), (0, 0));
+        }
+        for index in [&retained, &lost_progress] {
+            assert_eq!(
+                index
+                    .files
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.source_file_fingerprint.clone()))
+                    .collect::<BTreeMap<_, _>>(),
+                original
+            );
+            assert!(index.claude_duplicate_request_witness_overflowed);
+            assert_eq!(index.claude_duplicate_fence_rearm_attempt, 0);
+            assert!(index.claude_usage_family_witnesses.is_empty());
+        }
     }
-    // The first fix terminal has no record yet and re-arms like BASE.
-    assert!(fix_runs[0].counts.full_rearm);
-    assert_eq!(fix_runs[0].rearmed_files, 2);
-    assert!(!fix_runs[0].suppression.full_rearm_suppressed);
-    // FLIPS: every later due terminal skips.
-    for (skipped, run) in fix_runs.iter().enumerate().skip(1) {
-        assert!(!run.counts.full_rearm, "{run:?}");
-        assert!(run.counts.fence_before && run.counts.fence_after);
-        assert!(run.counts.census_invalid, "the census stays invalid");
-        assert_eq!(run.rearmed_files, 0);
-        assert_eq!(
-            run.suppression,
-            ClaudeFullRearmSuppressionCounts {
-                full_rearm_suppressed: true,
-                full_rearm_skipped_invalid_unchanged: skipped as u64,
-                full_rearm_post_rebuild_skipped: 0,
-                structural_invalid_family_count: 1,
-                suppressed_since_unix_seconds: Some(CENSUS_CLOCK),
-            }
-        );
-    }
-    let parses = |runs: &[Terminal]| runs.iter().map(|run| run.rearmed_files).sum::<usize>();
-    let bytes = |runs: &[Terminal]| runs.iter().map(|run| run.rearmed_bytes).sum::<u64>();
-    assert_eq!(parses(&base_runs), 2 * TERMINALS);
-    assert_eq!(parses(&fix_runs), 2);
-    assert_eq!(bytes(&base_runs), family_bytes * TERMINALS as u64);
-    assert_eq!(bytes(&fix_runs), family_bytes);
-    assert_eq!(base.claude_duplicate_fence_rearm_attempt, TERMINALS as u8);
-    assert_eq!(
-        fix.claude_duplicate_fence_rearm_attempt, 1,
-        "no attempt bump"
-    );
-    assert!(fix.claude_duplicate_request_witness_overflowed);
-    assert!(!fix.claude_request_identity_contract_changed);
-
-    // Disclosed beside the duplicate census, and absent while empty.
-    let line = |suppression| {
-        serde_json::to_value(crate::snapshot_sync::ClaudeLocalEvidenceStats {
-            full_rearm_suppression: suppression,
-            ..Default::default()
-        })
-        .unwrap()
-    };
-    let disclosed = line(fix_runs[TERMINALS - 1].suppression);
-    assert_eq!(
-        disclosed["full_rearm_suppression"]["full_rearm_skipped_invalid_unchanged"],
-        (TERMINALS - 1) as u64
-    );
-    assert_eq!(
-        disclosed["full_rearm_suppression"]["structural_invalid_family_count"],
-        1
-    );
-    assert_eq!(
-        disclosed["full_rearm_suppression"]["suppressed_since_unix_seconds"],
-        CENSUS_CLOCK
-    );
-    assert!(line(Default::default())
-        .get("full_rearm_suppression")
-        .is_none());
+    let counts = serde_json::to_value(rearm.terminal(&mut retained, &rearm.items).counts).unwrap();
+    assert_eq!(counts["rearm_full_suppressed"], 1);
+    // Diagnostic bounds remain independent of the disabled recovery policy.
     let encoded = serde_json::to_string(&ClaudeFullRearmSuppressionCounts {
         full_rearm_suppressed: true,
         full_rearm_skipped_invalid_unchanged: u64::MAX,
@@ -305,20 +264,7 @@ fn unchanged_structural_set_skips_repeated_full_rearms() {
         suppressed_since_unix_seconds: Some(u64::MAX),
     })
     .unwrap();
-    assert!(encoded.len() <= 192, "{} bytes", encoded.len());
-
-    // The persisted record is content-free: digests and counts only.
-    let progress = serde_json::to_string(&fix.claude_full_rearm_progress).unwrap();
-    let root = rearm.root.to_string_lossy().to_string();
-    for forbidden in [
-        rearm.parent.as_str(),
-        "a4d1585d",
-        "rev-",
-        "req_",
-        root.as_str(),
-    ] {
-        assert!(!progress.contains(forbidden), "{forbidden}");
-    }
+    assert!(encoded.len() <= 192);
 }
 
 /// An incremental terminal that reads nothing is closed only by coverage, by

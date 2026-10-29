@@ -349,113 +349,65 @@ fn claude_duplicate_fence_reopens_only_after_full_coverage() {
         claude_duplicate_request_witness_overflowed: true,
         ..ScanIndex::default()
     };
-    closed.files.insert(
-        unobserved.to_string(),
-        manifest_index_entry(Some("unobserved")),
-    );
-
-    let (_, after, counts) = claude_census_counts_run_twice(
-        &items,
-        &closed,
-        true,
-        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-        MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
-    );
-    assert!(after.claude_duplicate_request_witness_overflowed);
-    assert_eq!(
-        counts,
-        ClaudeDuplicateCensusCounts {
-            census_complete: true,
-            fence_before: true,
-            fence_after: true,
-            pending_occurrence_count: 5,
-            coverage_missing_member_count: 1,
-            full_rearm: true,
-            rearm_attempt: 1,
-            full_rearm_deferred_until: Some(
-                CENSUS_CLOCK + CLAUDE_DUPLICATE_FENCE_REARM_BASE_SECONDS
-            ),
-            ..Default::default()
-        }
-    );
-    assert!(after.files[unobserved].source_file_fingerprint.is_empty());
-
-    // Inside the backoff the same closed census does not replay again.
-    let mut deferred = after.clone();
-    deferred
+    closed
         .files
-        .get_mut(unobserved)
-        .expect("unobserved entry")
-        .source_file_fingerprint = "source".to_string();
-    let (_, deferred_after, counts) = claude_census_counts_run_twice(
-        &items,
-        &deferred,
-        true,
-        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-        MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
-    );
-    assert!(deferred_after.claude_duplicate_request_witness_overflowed);
-    assert!(!counts.full_rearm);
-    assert_eq!(counts.rearm_attempt, 1);
-    assert_eq!(
-        counts.full_rearm_deferred_until,
-        Some(CENSUS_CLOCK + CLAUDE_DUPLICATE_FENCE_REARM_BASE_SECONDS)
-    );
-    assert_eq!(
-        deferred_after.files[unobserved].source_file_fingerprint,
-        "source"
-    );
-
-    // Losing the scheduling fields replays rather than opening.
-    let mut lost: ScanIndex =
-        serde_json::from_slice(&serde_json::to_vec(&deferred).expect("encode index"))
-            .expect("decode index");
-    lost.claude_duplicate_fence_rearm_attempt = 0;
-    lost.claude_duplicate_fence_next_full_rearm_unix_seconds = None;
-    let (_, lost_after, counts) = claude_census_counts_run_twice(
-        &items,
-        &lost,
-        true,
-        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-        MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
-    );
-    assert!(lost_after.claude_duplicate_request_witness_overflowed);
-    assert!(counts.full_rearm);
-
-    // An open fence is not closed by coverage alone.
-    let mut open = closed.clone();
-    open.claude_duplicate_request_witness_overflowed = false;
-    let (_, open_after, counts) = claude_census_counts_run_twice(
-        &items,
-        &open,
-        true,
-        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-        MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
-    );
-    assert!(!open_after.claude_duplicate_request_witness_overflowed);
-    assert!(!counts.coverage_complete);
-    assert!(!counts.full_rearm);
-
-    // Once the unobserved member is gone, the fence opens and posture is
-    // re-emitted once.
-    let mut covered = deferred.clone();
-    covered.files.remove(unobserved);
-    let (_, covered_after, counts) = claude_census_counts_run_twice(
-        &items,
-        &covered,
-        true,
-        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-        MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
-    );
-    assert!(!covered_after.claude_duplicate_request_witness_overflowed);
-    assert!(counts.coverage_complete);
-    assert!(counts.full_rearm);
-    assert_eq!(covered_after.claude_duplicate_fence_rearm_attempt, 0);
-    assert_eq!(
-        covered_after.claude_duplicate_fence_next_full_rearm_unix_seconds,
-        None
-    );
-
+        .insert(unobserved.into(), manifest_index_entry(Some("unobserved")));
+    let before_source = closed.files[unobserved].source_file_fingerprint.clone();
+    for phase in [
+        "unobserved",
+        "backoff",
+        "lost-scheduling",
+        "restored-open",
+        "coverage-restored",
+    ] {
+        let mut input = closed.clone();
+        match phase {
+            "backoff" => {
+                input.claude_duplicate_fence_next_full_rearm_unix_seconds =
+                    Some(CENSUS_CLOCK + 3600)
+            }
+            "lost-scheduling" => {
+                input = serde_json::from_slice(&serde_json::to_vec(&input).unwrap()).unwrap();
+                input.claude_duplicate_fence_rearm_attempt = 0;
+                input.claude_duplicate_fence_next_full_rearm_unix_seconds = None;
+            }
+            "restored-open" => input.claude_duplicate_request_witness_overflowed = false,
+            "coverage-restored" => {
+                input.files.remove(unobserved);
+            }
+            _ => {}
+        }
+        let persisted = input.claude_duplicate_request_witness_overflowed;
+        let (_, after, counts) = claude_census_counts_run_twice(
+            &items,
+            &input,
+            true,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+        );
+        assert!(!counts.census_complete, "{phase}");
+        assert!(counts.fence_after && counts.census_invalid, "{phase}");
+        assert!(!counts.full_rearm, "{phase}");
+        assert_eq!(counts.rearm_full_suppressed, 1, "{phase}");
+        assert_eq!(
+            after.claude_duplicate_request_witness_overflowed, persisted,
+            "RAM veto only: {phase}"
+        );
+        assert!(
+            after.claude_usage_family_witnesses.is_empty(),
+            "coverage alone cannot mint proof: {phase}"
+        );
+        assert_eq!(
+            after.claude_duplicate_fence_rearm_attempt,
+            input.claude_duplicate_fence_rearm_attempt
+        );
+        if let Some(entry) = after.files.get(unobserved) {
+            assert_eq!(
+                entry.source_file_fingerprint, before_source,
+                "no induced re-read: {phase}"
+            );
+        }
+    }
     let _ = fs::remove_dir_all(root);
 }
 

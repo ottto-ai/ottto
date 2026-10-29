@@ -3,13 +3,16 @@
 This draft alternative withholds Claude terminal authority for every cohort.
 Current-page evidence, upload, exact ACK handling and selected-index saves
 continue. It has no terminal admission, staged raw effects, frozen reader or
-reader allowance. Codex and Pi retain their source policies.
+terminal-reader allowance. The independent strict API/trace cohort has a
+128-root / 16 MiB per-pass allowance, with an actual reader `take()` bound and
+continuation for off-page debt. Codex and Pi retain their source policies.
 
 The gate precedes exact removals, missing-file reconciliation, whole-absent
 family retirement, tombstone draining and terminal proof folds. It also clamps
 direct account/usage folds, native comparison's alternate completion route,
 post-policy finalization and manifest publication. A loaded open duplicate fence
-is closed before the usage fold. Incomplete or skipped member coverage cannot
+is clamped closed only in RAM for the usage fold; its persisted value is
+unchanged. Incomplete or skipped member coverage cannot
 verify an owned start or open the fence.
 
 Stale-start debt does not clear settled selection fingerprints merely to
@@ -35,9 +38,14 @@ selected custody remains with the retained traversal owner.
 
 Diagnostics include `claude_terminal_off` offers, unproven families,
 `carry_admission_stalled` families and oldest age, `start_identity_sample` files
-and bytes, rediscovery, context reselection, and `rearm_full_suppressed`.
-Samples are permitted; the fresh-start fixture requires zero parses and at most
-one head/tail identity sample per unchanged candidate in its settled cohort.
+observations and bytes per walk, rediscovery, context reselection,
+`owned_start_correction_deferred`, `strict_cohort_deferred` roots/bytes and
+`rearm_full_suppressed`. A ctime-only change pays a second head/tail observation:
+the fresh-start bound is 8 KiB per unchanged file with matching ctime, or 16 KiB
+if stored ctime must be adopted. Both cases require zero body/Full bytes and
+zero parses. Files and observations are counted separately. A historical
+verified-but-unemitted owned start retains its correction custody without an
+impossible re-arm while its strict emitter is disabled.
 
 Small cohorts lose terminal proof recovery too: complete-family attribution and
 ownership corrections, fence opening, pending retirement, context adoption,
@@ -48,6 +56,15 @@ ordinary permitted uploads still settle. Required held corrections are delayed,
 potentially indefinitely during containment. No claim of eventual recovery of
 expired/unavailable evidence or measured monetary equivalence is made.
 
+Strict posture, cache and curve outputs pause on all installs (context
+analytics, not money totals). Small-cohort completion corrections retain owed
+custody and wait for paging: delayed, not intentionally dropped.
+
+R1 is provided by the source-general upload-context receipt PR
+(`e1/upload-context-receipt`); this draft consumes it after merge. Until then
+the context-reselection control intentionally retains main's behavior. No receipt
+field or per-file adoption is included here.
+
 The paged reconstruction fold is the dependency for restoring completion.
 Flipping containment alone cannot re-enable authority: the shared hard gate
 also requires a same-process reconstruction certificate bound to current member
@@ -56,6 +73,7 @@ current certificate supports only the conservative complete rebuild; the paged
 fold must implement its bounded equivalent before authority can resume.
 
 No persisted fields or format revision are added. Admission uses the existing
-cursor; cadence is explicitly omitted from serialization and safely resets on
+cursor; rediscovery cadence and the strict-service cursor are explicitly
+omitted from serialization and safely resets on
 restart. Tests use synthetic sources. Local validation is package clippy with
 all targets; tests run in CI, never through local `cargo test`.
