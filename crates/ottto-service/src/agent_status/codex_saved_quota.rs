@@ -808,6 +808,16 @@ fn lock(mutex: &Mutex<()>) -> MutexGuard<'_, ()> {
 }
 
 /// The home's saved reading, for a status read. Never reads the provider.
+/// Launch preflight may inspect the current saved proof, but must never wake
+/// a provider read or perform login/model probes as a side effect.
+pub(super) fn serve_saved_for_launch(
+    home: &Path,
+    home_trust: CodexHomeTrust,
+    now: u64,
+) -> Result<CodexUsageProbe, CodexQuotaFailure> {
+    serve_saved_at(&saved_quota_support_dir(), home, home_trust, now)
+}
+
 pub(super) fn serve_saved(
     home: &Path,
     home_trust: CodexHomeTrust,

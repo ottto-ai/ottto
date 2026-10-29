@@ -178,10 +178,18 @@ static SETUP_RUN_BINDING_LOCK: Mutex<()> = Mutex::new(());
 static IDENTITY_MUTATION_RESERVATION: AtomicU64 = AtomicU64::new(0);
 static NEXT_IDENTITY_MUTATION_RESERVATION: AtomicU64 = AtomicU64::new(1);
 
-fn lock_setup_run_binding() -> MutexGuard<'static, ()> {
+pub(crate) fn lock_setup_run_binding() -> MutexGuard<'static, ()> {
     SETUP_RUN_BINDING_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+pub(crate) fn try_lock_setup_run_binding() -> Option<MutexGuard<'static, ()>> {
+    SETUP_RUN_BINDING_LOCK.try_lock().ok()
+}
+
+pub(crate) fn identity_mutation_in_progress() -> bool {
+    IDENTITY_MUTATION_RESERVATION.load(Ordering::Acquire) != 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -236,6 +244,7 @@ fn reserve_identity_mutation_locked(
         require_cloud_session_cleanup_before_identity_change_without_pause(&grants)?;
     }
     let snapshot = load_local_identity_authority_snapshot()?;
+    crate::account_nicknames::invalidate_locked();
     let id = NEXT_IDENTITY_MUTATION_RESERVATION.fetch_add(1, Ordering::Relaxed);
     if id == 0
         || IDENTITY_MUTATION_RESERVATION
@@ -363,6 +372,7 @@ pub fn handle_request_with_peer(
     let client_install_owner = request
         .client_install_owner
         .unwrap_or(InstallOwner::Unknown);
+    let cli_session_exec = request.client_kind == Some(LocalClientKind::Cli);
     let status_refresh_quota_source =
         status_refresh_quota_source(request.client_kind, request.protocol_version);
     match handle_command(
@@ -371,6 +381,7 @@ pub fn handle_request_with_peer(
         request.command,
         client_install_owner,
         status_refresh_quota_source,
+        cli_session_exec,
     ) {
         Ok(payload) => LocalControlResponse {
             request_id,
@@ -847,14 +858,185 @@ fn status_refresh_quota_source(
         .then_some(SourceKind::Codex)
 }
 
+fn require_session_launch_schema(version: u16) -> Result<(), LocalApiError> {
+    if version != 1 {
+        return Err(LocalApiError::InvalidRequest(
+            "unsupported session launch schema".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn handle_command(
     daemon: &LocalDaemon,
     authorization: RequestAuthorization,
     command: LocalControlCommand,
     client_install_owner: InstallOwner,
     status_refresh_quota_source: Option<SourceKind>,
+    cli_session_exec: bool,
 ) -> Result<serde_json::Value, LocalApiError> {
+    // Invalidate pending handoffs before any explicit account/slot mutation.
+    // Existing mutation handlers retain all of their authorization and order.
+    if matches!(
+        &command,
+        LocalControlCommand::AuthComplete { .. }
+            | LocalControlCommand::AuthCompletePending { .. }
+            | LocalControlCommand::AuthSwitchAccount { .. }
+            | LocalControlCommand::AuthReset { .. }
+            | LocalControlCommand::ClaudeAccountRemove { .. }
+            | LocalControlCommand::ClaudeAccountReconnect { .. }
+            | LocalControlCommand::ClaudeAccountReconnectTarget { .. }
+            | LocalControlCommand::ClaudeAccountStartBrowserReconnect { .. }
+            | LocalControlCommand::CodexAccountRemove { .. }
+            | LocalControlCommand::CodexAccountReconnect { .. }
+    ) {
+        require_authorized_local_client(daemon, &authorization)?;
+        daemon
+            .session_launch
+            .lock()
+            .map_err(|_| LocalApiError::StatePoisoned)?
+            .invalidate();
+    }
     match command {
+        LocalControlCommand::SessionLaunchPrepare {
+            schema_version,
+            provider,
+            slot_id,
+            expected_account_identifier_hash,
+            expected_organization_identifier_hash,
+            folder,
+            ..
+        } => {
+            require_authorized_local_client(daemon, &authorization)?;
+            require_session_launch_schema(schema_version)?;
+            to_value(
+                daemon
+                    .session_launch
+                    .lock()
+                    .map_err(|_| LocalApiError::StatePoisoned)?
+                    .prepare(
+                        provider,
+                        &slot_id,
+                        &expected_account_identifier_hash,
+                        expected_organization_identifier_hash
+                            .as_deref()
+                            .unwrap_or(""),
+                        folder,
+                        preferred_ottto_cli_path(),
+                        &default_support_dir(),
+                    ),
+            )
+        }
+        LocalControlCommand::SessionLaunchConsume {
+            schema_version,
+            launch_id,
+            secret,
+        } => {
+            require_authorized_local_client(daemon, &authorization)?;
+            // Only the token-authenticated CLI owns the exec plan. The trusted
+            // Companion can prepare/poll/cancel, but never consume a handoff.
+            if !cli_session_exec || !matches!(&authorization, RequestAuthorization::Token(_)) {
+                return Err(LocalApiError::Unauthorized);
+            }
+            require_session_launch_schema(schema_version)?;
+            to_value(
+                daemon
+                    .session_launch
+                    .lock()
+                    .map_err(|_| LocalApiError::StatePoisoned)?
+                    .consume(&launch_id, secret.expose_secret()),
+            )
+        }
+        LocalControlCommand::SessionLaunchReport {
+            schema_version,
+            launch_id,
+            attempt_id,
+            reason,
+        } => {
+            require_authorized_local_client(daemon, &authorization)?;
+            if !cli_session_exec || !matches!(&authorization, RequestAuthorization::Token(_)) {
+                return Err(LocalApiError::Unauthorized);
+            }
+            require_session_launch_schema(schema_version)?;
+            to_value(
+                daemon
+                    .session_launch
+                    .lock()
+                    .map_err(|_| LocalApiError::StatePoisoned)?
+                    .report(&launch_id, attempt_id.expose_secret(), reason),
+            )
+        }
+        LocalControlCommand::SessionLaunchStatus {
+            schema_version,
+            launch_id,
+        } => {
+            require_authorized_local_client(daemon, &authorization)?;
+            require_session_launch_schema(schema_version)?;
+            to_value(
+                daemon
+                    .session_launch
+                    .lock()
+                    .map_err(|_| LocalApiError::StatePoisoned)?
+                    .status(&launch_id, false),
+            )
+        }
+        LocalControlCommand::SessionLaunchCancel {
+            schema_version,
+            launch_id,
+        } => {
+            require_authorized_local_client(daemon, &authorization)?;
+            require_session_launch_schema(schema_version)?;
+            to_value(
+                daemon
+                    .session_launch
+                    .lock()
+                    .map_err(|_| LocalApiError::StatePoisoned)?
+                    .status(&launch_id, true),
+            )
+        }
+        LocalControlCommand::SessionLaunchRecentFolders {
+            schema_version,
+            provider,
+            slot_id,
+            limit,
+        } => {
+            require_authorized_local_client(daemon, &authorization)?;
+            require_session_launch_schema(schema_version)?;
+            to_value(
+                daemon
+                    .session_launch
+                    .lock()
+                    .map_err(|_| LocalApiError::StatePoisoned)?
+                    .recent(
+                        provider,
+                        slot_id.as_deref(),
+                        usize::from(limit.unwrap_or(100)),
+                        &default_support_dir(),
+                    ),
+            )
+        }
+        LocalControlCommand::AccountNicknames => {
+            require_authorized_local_client(daemon, &authorization)?;
+            to_value(crate::account_nicknames::read())
+        }
+        LocalControlCommand::AccountNicknameSet {
+            source,
+            account_identifier_hash,
+            organization_identifier_hash,
+            nickname,
+            base_revision,
+        } => {
+            require_authorized_local_client(daemon, &authorization)?;
+            to_value(crate::account_nicknames::set(
+                ottto_protocol::AccountNicknamePairV1 {
+                    source,
+                    account_identifier_hash: Some(account_identifier_hash),
+                    organization_identifier_hash,
+                },
+                nickname,
+                base_revision,
+            ))
+        }
         LocalControlCommand::Status {
             refresh_agent_status,
             retry_relay_authorization,
@@ -17277,6 +17459,79 @@ fn source_display_name(source: &SourceKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_exec_commands_require_cli_kind_and_authorized_token() {
+        let daemon = daemon();
+        for report in [false, true] {
+            let command = || {
+                if report {
+                    LocalControlCommand::SessionLaunchReport {
+                        schema_version: 1,
+                        launch_id: "synthetic".into(),
+                        attempt_id: SecretString::new("synthetic"),
+                        reason: ottto_protocol::SessionLaunchBlockReasonV1::ExecFailed,
+                    }
+                } else {
+                    LocalControlCommand::SessionLaunchConsume {
+                        schema_version: 1,
+                        launch_id: "synthetic".into(),
+                        secret: SecretString::new("synthetic"),
+                    }
+                }
+            };
+            for (kind, token, expected) in [
+                (
+                    Some(LocalClientKind::CompanionApp),
+                    Some("token"),
+                    CliErrorCode::LocalAuthFailed,
+                ),
+                (None, Some("token"), CliErrorCode::LocalAuthFailed),
+                // Without a token or trusted peer, the common authorization
+                // boundary refuses before the CLI-only command check.
+                (
+                    Some(LocalClientKind::Cli),
+                    None,
+                    CliErrorCode::LocalClientNotTrusted,
+                ),
+                (
+                    Some(LocalClientKind::Cli),
+                    Some("wrong-token"),
+                    CliErrorCode::LocalAuthFailed,
+                ),
+            ] {
+                let response = handle_request(
+                    &daemon,
+                    LocalControlRequest {
+                        request_id: "launch-auth".into(),
+                        protocol_version: 28,
+                        token: token.map(str::to_owned),
+                        client_kind: kind,
+                        client_install_owner: None,
+                        command: command(),
+                    },
+                );
+                assert!(!response.ok);
+                assert_eq!(response.error.unwrap().code, expected);
+            }
+            let response = handle_request(
+                &daemon,
+                LocalControlRequest {
+                    request_id: "launch-auth".into(),
+                    protocol_version: 28,
+                    token: Some("token".into()),
+                    client_kind: Some(LocalClientKind::Cli),
+                    client_install_owner: None,
+                    command: command(),
+                },
+            );
+            assert!(response.ok);
+            assert_eq!(
+                response.payload.unwrap()["block"]["reason"],
+                "launch_unknown"
+            );
+        }
+    }
+
     #[test]
     fn codex_status_read_reuses_only_fresh_annotation_of_unchanged_settings() {
         let annotated_at = std::time::Instant::now();
