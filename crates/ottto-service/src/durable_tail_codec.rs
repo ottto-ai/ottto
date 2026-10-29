@@ -98,17 +98,27 @@ impl<'a> Enc<'a> {
         put(&mut count)?;
         let len = count.counted();
         let mut out = Vec::with_capacity(len);
-        {
-            let mut writer = Enc {
-                sink: Sink::Write {
-                    out: &mut out,
-                    len: 0,
-                    limit: len,
-                },
-            };
-            put(&mut writer)?;
-        }
+        let mut writer = Enc::writer(&mut out, len);
+        put(&mut writer)?;
+        writer.finish_written()?;
         Ok(out)
+    }
+    /// Borrow a sink after counting. Both overrun and underrun refuse the record.
+    pub(crate) fn writer(out: &'a mut dyn Write, exact_len: usize) -> Self {
+        Self {
+            sink: Sink::Write {
+                out,
+                len: 0,
+                limit: exact_len,
+            },
+        }
+    }
+    pub(crate) fn finish_written(self) -> Result<usize, Refuse> {
+        match self.sink {
+            Sink::Write { len, limit, .. } if len == limit => Ok(len),
+            Sink::Write { .. } => Err(Refuse::WriteFailed),
+            _ => unreachable!("only a writer has an emitted length"),
+        }
     }
     pub(crate) fn count(limit: usize) -> Self {
         Self {

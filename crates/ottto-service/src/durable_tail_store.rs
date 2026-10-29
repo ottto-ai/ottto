@@ -38,6 +38,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 mod active;
 pub(crate) use active::{ActiveLease, ActiveOverBudget, LeaseWait, ACTIVE_BYTES};
@@ -503,6 +507,7 @@ pub(crate) struct DurableTailStore {
     source: DurableSource,
     durable: BTreeMap<Digest32, (Option<Digest32>, Stamp, bool)>,
     counters: StoreCounters,
+    cleanup: Arc<TempCleanupCounts>,
     /// The store-level fault that made this store memory-only for the process.
     disabled: Option<&'static str>,
     /// This pass: directory checked, [records loaded, T14 rebuilds], and the
@@ -532,6 +537,7 @@ impl DurableTailStore {
             durable: BTreeMap::new(),
             source,
             counters: StoreCounters::default(),
+            cleanup: Arc::new(TempCleanupCounts::default()),
             disabled: None,
             checked: false,
             pass: [0; 2],
@@ -631,6 +637,9 @@ impl DurableTailStore {
     pub(crate) fn counters(&self) -> StoreCounters {
         StoreCounters {
             receipt_pending_records: self.pending.len() as u64,
+            temp_discard_verified: self.cleanup.verified.load(Ordering::Relaxed),
+            temp_discard_failed: self.cleanup.failed.load(Ordering::Relaxed),
+            temp_drop_fallback: self.cleanup.fallback.load(Ordering::Relaxed),
             ..self.counters
         }
     }
@@ -638,7 +647,10 @@ impl DurableTailStore {
     /// The counters since the last call, which resets them. The disk totals
     /// are a level, not a flow, and are kept.
     pub(crate) fn take_pass(&mut self) -> StoreCounters {
-        let pass = self.counters();
+        let mut pass = self.counters();
+        pass.temp_discard_verified = self.cleanup.verified.swap(0, Ordering::Relaxed);
+        pass.temp_discard_failed = self.cleanup.failed.swap(0, Ordering::Relaxed);
+        pass.temp_drop_fallback = self.cleanup.fallback.swap(0, Ordering::Relaxed);
         self.counters = StoreCounters {
             disk_records: pass.disk_records,
             disk_bytes: pass.disk_bytes,
@@ -1014,8 +1026,13 @@ impl DurableTailStore {
             .iter()
             .map(|record| record.body.len())
             .sum::<usize>();
-        for record in pending {
+        // Deduplicate in the already-funded input allocation. First offer wins;
+        // no extra key map survives beside the pending/candidate owner.
+        let mut pending = pending;
+        pending.reverse();
+        while let Some(record) = pending.pop() {
             let key = record.binding.key;
+            pending.retain(|other| other.binding.key != key);
             if receipt
                 .completed
                 .iter()
@@ -1170,18 +1187,25 @@ impl DurableTailStore {
                     completed: None,
                 },
             );
-            let attempt = write_atomic(&self.dir, &path, &bytes, prior, &mut self.counters)
-                .and_then(|stamp| {
-                    self.sync_store()?;
-                    if stamp_at(&path)? != Some(stamp) {
-                        return Err(io::Error::other("committed survivor changed"));
-                    }
-                    Ok(ReconcileOutcome::Receipted(ReceiptProof {
-                        identity: candidate,
-                        stamp,
-                        content,
-                    }))
-                });
+            let attempt = write_atomic(
+                writer,
+                &self.dir,
+                &path,
+                &bytes,
+                prior,
+                Arc::clone(&self.cleanup),
+            )
+            .and_then(|stamp| {
+                self.sync_store()?;
+                if stamp_at(&path)? != Some(stamp) {
+                    return Err(io::Error::other("committed survivor changed"));
+                }
+                Ok(ReconcileOutcome::Receipted(ReceiptProof {
+                    identity: candidate,
+                    stamp,
+                    content,
+                }))
+            });
             let outcome = attempt.or_else(|_| self.reconcile_pending(writer, &key));
             let proof = match outcome {
                 Ok(ReconcileOutcome::Receipted(proof)) if proof.identity == candidate => proof,
@@ -1568,16 +1592,25 @@ fn dead_temp(name: &str) -> bool {
     let name = name
         .strip_prefix('.')
         .and_then(|n| n.strip_suffix(TEMP_SUFFIX));
-    let Some((record, pid)) = name.and_then(|n| n.rsplit_once('.')) else {
+    let Some((prefix, last)) = name.and_then(|n| n.rsplit_once('.')) else {
         return false;
+    };
+    let (record, pid, staged) = if let Some((record, pid)) = prefix.rsplit_once('.') {
+        if record.ends_with(RECORD_SUFFIX) && last.parse::<u64>().is_ok() {
+            (record, pid, true)
+        } else {
+            (prefix, last, false)
+        }
+    } else {
+        (prefix, last, false)
     };
     let pid = pid.parse::<i32>().ok().filter(|pid| *pid > 0);
     let named = record
         .strip_suffix(RECORD_SUFFIX)
         .and_then(parse_hex_digest);
-    // This process's temps are orphans too: GC holds the store exclusively.
-    let ours = pid.is_some_and(|pid| pid.unsigned_abs() == std::process::id());
-    // SAFETY: signal zero only probes the process; it sends no signal.
+    // Owned stages can outlive Stores; a live process's stage is never a GC orphan.
+    let ours = !staged && pid.is_some_and(|pid| pid.unsigned_abs() == std::process::id());
+    // SAFETY: signal zero probes only, without sending a signal.
     named.is_some()
         && (ours
             || pid.is_some_and(|pid| unsafe { libc::kill(pid, 0) } == -1)
@@ -1698,20 +1731,35 @@ fn remove_if_present(path: &Path) -> io::Result<()> {
 /// Private ownership of a create-new temp. A temp is never record authority.
 /// Keep its descriptor until commit/discard so pathname reuse cannot authorize
 /// removing or promoting another inode.
-struct TempRecord<'a> {
+#[derive(Default)]
+struct TempCleanupCounts {
+    verified: AtomicU64,
+    failed: AtomicU64,
+    fallback: AtomicU64,
+}
+// Includes Arc's two reference counts and alignment within the existing slot reserve.
+const _: () =
+    assert!(std::mem::size_of::<TempCleanupCounts>() + 2 * std::mem::size_of::<usize>() <= 64);
+
+struct OwnedTemp {
     path: PathBuf,
     file: Option<File>,
-    counters: &'a mut StoreCounters,
+    cleanup: Arc<TempCleanupCounts>,
 }
 
-impl<'a> TempRecord<'a> {
-    fn prepare(dir: &Path, path: &Path, counters: &'a mut StoreCounters) -> io::Result<Self> {
+impl OwnedTemp {
+    fn prepare(dir: &Path, path: &Path, cleanup: Arc<TempCleanupCounts>) -> io::Result<Self> {
         let name = path
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "record name"))?;
-        let temp = dir.join(format!(".{name}.{}{TEMP_SUFFIX}", std::process::id()));
-        remove_if_present(&temp)?;
+        static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+        let serial = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let temp = dir.join(format!(
+            ".{name}.{}.{}{TEMP_SUFFIX}",
+            std::process::id(),
+            serial
+        ));
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1721,16 +1769,23 @@ impl<'a> TempRecord<'a> {
         Ok(Self {
             path: temp,
             file: Some(file),
-            counters,
+            cleanup,
         })
     }
 
     fn sync(&self) -> io::Result<()> {
-        self.file.as_ref().expect("owned temp").sync_all()
+        self.file
+            .as_ref()
+            .ok_or_else(|| io::Error::other("disarmed temp"))?
+            .sync_all()
     }
 
     fn verify(&self) -> io::Result<()> {
-        let held = self.file.as_ref().expect("owned temp").metadata()?;
+        let held = self
+            .file
+            .as_ref()
+            .ok_or_else(|| io::Error::other("disarmed temp"))?
+            .metadata()?;
         let actual = fs::symlink_metadata(&self.path)?;
         if Stamp::of(&held) != Stamp::of(&actual) {
             return Err(io::Error::other("temp changed"));
@@ -1751,9 +1806,10 @@ impl<'a> TempRecord<'a> {
             return Err(io::Error::other("predecessor changed"));
         }
         fs::rename(&self.path, path)?;
-        let stamp = Stamp::of(&self.file.as_ref().expect("owned temp").metadata()?);
-        self.file.take(); // The caller still owes store/parent sync for a receipt.
-        Ok(stamp)
+        // Disarm immediately after rename, including failure of the following fstat.
+        // The canonical candidate now belongs to pending custody, never temp cleanup.
+        let file = self.file.take().expect("owned temp");
+        Ok(Stamp::of(&file.metadata()?))
     }
 
     fn discard(&mut self) -> io::Result<()> {
@@ -1771,43 +1827,134 @@ impl<'a> TempRecord<'a> {
             {
                 return Err(io::Error::other("temp cleanup unverified"));
             }
-            self.counters.temp_discard_verified += 1;
+            self.cleanup.verified.fetch_add(1, Ordering::Relaxed);
             self.file.take();
             Ok(())
         })();
         if result.is_err() {
-            self.counters.temp_discard_failed += 1;
+            self.cleanup.failed.fetch_add(1, Ordering::Relaxed);
         }
         result
     }
 }
 
-impl Drop for TempRecord<'_> {
+impl Write for OwnedTemp {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| io::Error::other("disarmed temp"))?
+            .write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| io::Error::other("disarmed temp"))?
+            .flush()
+    }
+}
+impl Drop for OwnedTemp {
     fn drop(&mut self) {
         if self.file.is_some() {
-            self.counters.temp_drop_fallback += 1;
-            let _ = self.discard();
+            self.cleanup.fallback.fetch_add(1, Ordering::Relaxed);
+            if crate::locked_state_dir::held_for(&self.path).is_some() {
+                let _ = self.discard();
+            } else {
+                self.cleanup.failed.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
 
-/// Same post-save writer: prepare/write/sync/commit, with explicit discard on
-/// every error. The caller syncs the store and parent before issuing a receipt.
-fn write_atomic(
+// Compatibility adapter for the inherited leaf tests; exercises the same owner.
+#[cfg(test)]
+struct TempRecord<'a> {
+    inner: OwnedTemp,
+    counters: &'a mut StoreCounters,
+}
+#[cfg(test)]
+impl<'a> TempRecord<'a> {
+    fn prepare(dir: &Path, path: &Path, counters: &'a mut StoreCounters) -> io::Result<Self> {
+        Ok(Self {
+            inner: OwnedTemp::prepare(dir, path, Arc::default())?,
+            counters,
+        })
+    }
+    fn discard(&mut self) -> io::Result<()> {
+        let result = self.inner.discard();
+        self.update();
+        result
+    }
+    fn update(&mut self) {
+        self.counters.temp_discard_verified = self.inner.cleanup.verified.load(Ordering::Relaxed);
+        self.counters.temp_discard_failed = self.inner.cleanup.failed.load(Ordering::Relaxed);
+        self.counters.temp_drop_fallback = self.inner.cleanup.fallback.load(Ordering::Relaxed);
+    }
+}
+#[cfg(test)]
+impl std::ops::Deref for TempRecord<'_> {
+    type Target = OwnedTemp;
+    fn deref(&self) -> &OwnedTemp {
+        &self.inner
+    }
+}
+#[cfg(test)]
+impl std::ops::DerefMut for TempRecord<'_> {
+    fn deref_mut(&mut self) -> &mut OwnedTemp {
+        &mut self.inner
+    }
+}
+#[cfg(test)]
+impl Drop for TempRecord<'_> {
+    fn drop(&mut self) {
+        if self.inner.file.is_some() {
+            self.inner.cleanup.fallback.fetch_add(1, Ordering::Relaxed);
+            let _ = self.inner.discard();
+            // Avoid a second fallback when a replaced pathname cannot be removed.
+            self.inner.file.take();
+        }
+        self.update();
+    }
+}
+
+/// The M1 caller shares the owned leaf engine and its source-slot counters.
+fn write_atomic<W: SingleWriter>(
+    writer: &W,
     dir: &Path,
     path: &Path,
     bytes: &[u8],
     prior: Option<Stamp>,
-    counters: &mut StoreCounters,
+    cleanup: Arc<TempCleanupCounts>,
 ) -> io::Result<Stamp> {
-    let mut temp = TempRecord::prepare(dir, path, counters)?;
+    // M1's stack-bound writer can unwind before returning. It remains a real
+    // proof for this short scope; the native stage uses the unborrowed owner.
+    struct Attempt<'a, W: SingleWriter> {
+        temp: OwnedTemp,
+        writer: &'a W,
+    }
+    impl<W: SingleWriter> Drop for Attempt<'_, W> {
+        fn drop(&mut self) {
+            if self.temp.file.is_some() {
+                self.temp.cleanup.fallback.fetch_add(1, Ordering::Relaxed);
+                if self.temp.path.starts_with(self.writer.state_dir()) {
+                    let _ = self.temp.discard();
+                } else {
+                    self.temp.cleanup.failed.fetch_add(1, Ordering::Relaxed);
+                }
+                self.temp.file.take();
+            }
+        }
+    }
+    let mut attempt = Attempt {
+        temp: OwnedTemp::prepare(dir, path, cleanup)?,
+        writer,
+    };
     let result = (|| {
-        temp.file.as_mut().expect("owned temp").write_all(bytes)?;
-        temp.sync()?;
-        temp.commit(path, prior)
+        attempt.temp.write_all(bytes)?;
+        attempt.temp.sync()?;
+        attempt.temp.commit(path, prior)
     })();
     if result.is_err() {
-        let _ = temp.discard();
+        let _ = attempt.temp.discard();
     }
     result
 }

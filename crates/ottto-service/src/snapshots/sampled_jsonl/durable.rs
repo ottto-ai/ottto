@@ -161,7 +161,55 @@ pub(crate) fn encode(
     )
 }
 
-// Same field order as CachedJsonlReduction::put, borrowing native fields.
+/// Borrowed PRE-finalization state. Rederivation is computed once for both walks.
+pub(in crate::snapshots) struct BodyEncoding<'a> {
+    accumulator: &'a SnapshotAccumulator,
+    report: &'a JsonlReadReport,
+    scalars: (usize, usize, bool),
+    rederive: Rederive,
+}
+impl<'a> BodyEncoding<'a> {
+    pub(in crate::snapshots) fn new(
+        accumulator: &'a SnapshotAccumulator,
+        report: &'a JsonlReadReport,
+        scalars: (usize, usize, bool),
+        line_cap: u64,
+    ) -> Result<Self, Refuse> {
+        // Reuse source registration; no additional Claude/Codex dispatch table.
+        super::super::sampled_scan::durable_tail::durable_source(accumulator.source)
+            .ok_or(Refuse::NotRederivable("SnapshotAccumulator.source"))?;
+        Ok(Self {
+            accumulator,
+            report,
+            scalars,
+            rederive: rederive_digests(accumulator, line_cap)?,
+        })
+    }
+    fn put(&self, e: &mut Enc<'_>) -> Result<(), Refuse> {
+        self.accumulator.put(e)?;
+        self.report.put(e)?;
+        self.scalars.0.put(e)?;
+        self.scalars.1.put(e)?;
+        self.scalars.2.put(e)?;
+        self.rederive.put(e)
+    }
+    pub(in crate::snapshots) fn count(&self, limit: usize) -> Result<usize, Refuse> {
+        let mut e = Enc::count(limit);
+        self.put(&mut e)?;
+        Ok(e.counted())
+    }
+    pub(in crate::snapshots) fn write(
+        &self,
+        out: &mut dyn std::io::Write,
+        exact_len: usize,
+    ) -> Result<usize, Refuse> {
+        let mut e = Enc::writer(out, exact_len);
+        self.put(&mut e)?;
+        e.finish_written()
+    }
+}
+
+// Same field order as CachedJsonlReduction::put, for retained and live callers.
 pub(in crate::snapshots) fn encode_parts(
     acc: &SnapshotAccumulator,
     report: &JsonlReadReport,
@@ -169,21 +217,11 @@ pub(in crate::snapshots) fn encode_parts(
     limit: usize,
     line_cap: u64,
 ) -> Result<Vec<u8>, Refuse> {
-    if !matches!(
-        acc.source,
-        SnapshotSource::ClaudeCode | SnapshotSource::Codex
-    ) {
-        return Err(Refuse::NotRederivable("SnapshotAccumulator.source"));
-    }
-    let rederive = rederive_digests(acc, line_cap)?;
-    Enc::count_write(limit, |e| {
-        acc.put(e)?;
-        report.put(e)?;
-        scalars.0.put(e)?;
-        scalars.1.put(e)?;
-        scalars.2.put(e)?;
-        rederive.put(e)
-    })
+    let plan = BodyEncoding::new(acc, report, scalars, line_cap)?;
+    let len = plan.count(limit)?;
+    let mut out = Vec::with_capacity(len);
+    plan.write(&mut out, len)?;
+    Ok(out)
 }
 
 /// Structural body verification only: no reduction, re-derivation or live
