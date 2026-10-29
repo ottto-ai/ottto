@@ -19,6 +19,7 @@ pub(crate) struct Candidate {
     receipt: Receipt,
     historical_replay_generation: Option<String>,
     bodies: BTreeMap<String, String>,
+    wire_bytes: u64,
 }
 
 impl Candidate {
@@ -63,10 +64,11 @@ impl Candidate {
 pub(crate) struct RearmCounts {
     pub files: u64,
     pub bytes: u64,
+    pub local_bytes: u64,
 }
 impl RearmCounts {
     pub(crate) fn emit(&self, source: SnapshotSource) {
-        if self.files > 0 {
+        if self.files > 0 || self.local_bytes > 0 {
             crate::local_resource_diagnostics::traversal_point(
                 "upload_context_rearm",
                 source.api_slug(),
@@ -160,8 +162,18 @@ impl ScanIndex {
             return Vec::new();
         };
         let mut by_source: BTreeMap<&str, BTreeMap<String, String>> = BTreeMap::new();
+        let mut by_source_bytes = BTreeMap::<&str, u64>::new();
         for item in items {
             if let Some(source) = item.source_file_fingerprint.as_deref() {
+                if !by_source
+                    .get(source)
+                    .is_some_and(|bodies| bodies.contains_key(&item.snapshot_fingerprint))
+                {
+                    let bytes = crate::snapshot_sync::snapshot_packing_json_length(item)
+                        .unwrap_or(0) as u64;
+                    let total = by_source_bytes.entry(source).or_default();
+                    *total = total.saturating_add(bytes);
+                }
                 by_source.entry(source).or_default().insert(
                     item.snapshot_fingerprint.clone(),
                     snapshot_upload_body_witness(item),
@@ -201,6 +213,10 @@ impl ScanIndex {
                     },
                     historical_replay_generation: self.historical_replay_generation.clone(),
                     bodies: bodies.clone(),
+                    wire_bytes: by_source_bytes
+                        .get(entry.source_file_fingerprint.as_str())
+                        .copied()
+                        .unwrap_or(0),
                 })
             })
             .collect()
@@ -213,7 +229,10 @@ impl ScanIndex {
         candidates: &[Candidate],
         fresh_acks: &BTreeMap<String, String>,
     ) -> RearmCounts {
-        let mut counts = RearmCounts::default();
+        let mut counts = RearmCounts {
+            local_bytes: self.context_read_counts.local_bytes,
+            ..RearmCounts::default()
+        };
         for candidate in candidates {
             if self.active_upload_context_fingerprint.as_ref()
                 != Some(&candidate.receipt.context_fingerprint)
@@ -256,7 +275,7 @@ impl ScanIndex {
             entry.upload_context_receipt = Some(candidate.receipt.clone());
             if rearmed {
                 counts.files += 1;
-                counts.bytes = counts.bytes.saturating_add(entry.size_bytes);
+                counts.bytes = counts.bytes.saturating_add(candidate.wire_bytes);
             }
         }
         counts
@@ -264,4 +283,4 @@ impl ScanIndex {
 }
 crate::heap_layout_bound::fields!(Receipt; context_fingerprint, replay_generation, source_witness, body_witness);
 
-crate::heap_layout_bound::fields!(Candidate; key, receipt, historical_replay_generation, bodies);
+crate::heap_layout_bound::fields!(Candidate; key, receipt, historical_replay_generation, bodies, wire_bytes);

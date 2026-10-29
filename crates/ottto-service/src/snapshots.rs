@@ -37,6 +37,7 @@ pub(crate) mod cache_overcap_tests;
 #[cfg(test)]
 mod cache_policy_tests;
 mod claude_context_file_birth;
+mod upload_context_read;
 mod upload_context_receipt;
 pub(crate) use upload_context_receipt::Candidate as UploadContextReceiptCandidate;
 #[cfg(test)]
@@ -3779,6 +3780,8 @@ pub struct ScanIndex {
     active_upload_context_fingerprint: Option<String>,
     #[serde(skip)]
     file_upload_context_enabled: bool,
+    #[serde(skip)]
+    pub(crate) context_read_counts: upload_context_read::LocalCounts,
     /// Runtime-only revision of the effective additive upload projection.
     /// Adoption is recorded per complete, settled file rather than per census.
     #[serde(skip)]
@@ -4176,6 +4179,7 @@ impl Default for ScanIndex {
             active_quarantine_witness: None,
             active_upload_context_fingerprint: None,
             file_upload_context_enabled: false,
+            context_read_counts: Default::default(),
             active_effective_upload_body_witness_revision: 0,
             active_effective_upload_body_witness_revision_monotone: false,
             effective_upload_body_witness_revision_excluded_source_files: BTreeSet::new(),
@@ -25931,6 +25935,7 @@ pub(crate) struct OwnedSourceScan {
     semantic_noop_count: usize,
     /// This page's history-upgrade budget and count-only gate diagnostics.
     history_upgrade: HistoryPage,
+    context_read_budget: upload_context_read::Budget,
     codex_state_only_blocked_session_ids: BTreeSet<String>,
     codex_parent_resolution_retry_required: bool,
     residue_index_keys: BTreeSet<String>,
@@ -26426,7 +26431,7 @@ impl OwnedSourceScan {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_continuation(
         roots: &[PathBuf],
-        owned_index: ScanIndex,
+        mut owned_index: ScanIndex,
         collected_at: &str,
         requested_backfill_window_days: u64,
         file_limit: usize,
@@ -26435,6 +26440,7 @@ impl OwnedSourceScan {
         ordinary_equivalent: Option<std::time::Duration>,
         mut evidence: Option<CodexContinuationEvidence>,
     ) -> Self {
+        owned_index.context_read_counts = Default::default();
         let codex_title_metadata = evidence
             .as_mut()
             .map(|e| std::mem::take(&mut e.codex))
@@ -26478,6 +26484,7 @@ impl OwnedSourceScan {
             scanned_session_count: 0,
             semantic_noop_count: 0,
             history_upgrade: HistoryPage::with_twin_groups(Default::default()),
+            context_read_budget: upload_context_read::Budget::new(SnapshotSource::Codex),
             codex_state_only_blocked_session_ids: Default::default(),
             codex_parent_resolution_retry_required: false,
             residue_index_keys: Default::default(),
@@ -26533,6 +26540,7 @@ impl OwnedSourceScan {
         );
         let mut resource_probe = crate::local_resource_diagnostics::Probe::start();
         let index = &mut owned_index;
+        index.context_read_counts = Default::default();
         index.activate_quarantine_witness(source);
         let backfill_window_days = effective_backfill_window_days(requested_backfill_window_days);
         let codex_title_metadata = if source == SnapshotSource::Codex {
@@ -27136,6 +27144,9 @@ impl OwnedSourceScan {
             }
         }
 
+        // Only pure context debt moves behind ordinary work. Preserve relative
+        // order of all authority, recovery, new and changed family members.
+        identified_candidates.sort_by_cached_key(|candidate| index.context_only_read(candidate));
         let codex_join_inventory =
             (source == SnapshotSource::Codex && !identified_candidates.is_empty()).then(|| {
                 let traversal = index
@@ -27182,6 +27193,7 @@ impl OwnedSourceScan {
             scanned_session_count,
             semantic_noop_count,
             history_upgrade: HistoryPage::with_twin_groups(claude_twin_groups),
+            context_read_budget: upload_context_read::Budget::new(source),
             codex_state_only_blocked_session_ids,
             codex_parent_resolution_retry_required,
             residue_index_keys,
@@ -27371,6 +27383,7 @@ impl OwnedSourceScan {
             mut scanned_session_count,
             mut semantic_noop_count,
             mut history_upgrade,
+            mut context_read_budget,
             mut codex_state_only_blocked_session_ids,
             mut codex_parent_resolution_retry_required,
             mut residue_index_keys,
@@ -28231,6 +28244,12 @@ impl OwnedSourceScan {
                     !codex_page.cursor_exhausted(sampled_scan::codex_cursor::Limits::current())
                         && codex_join_inventory.is_some()
                         && (!codex_page.continuation() || codex_parent_identities.census_valid())
+                        && (!index.file_upload_context_enabled
+                            || !identified_candidates.iter().any(|candidate| {
+                                !index.context_only_read(candidate)
+                                    && index.candidate_decision_with_reason(candidate).0
+                                        == CandidateDecision::Parse
+                            }))
                         && codex_page.claim_resume()
                 }) {
                     // Continuing the paused job is the highest scheduling class.
@@ -28262,6 +28281,9 @@ impl OwnedSourceScan {
                         },
                     ) {
                         sampled_scan::codex_cursor::Resumed::Active(job, lease) => {
+                            if index.context_only_read(&job.candidate) {
+                                context_read_budget.charge_cursor_ordinary(&mut codex_page);
+                            }
                             codex_cursor_lease = Some(lease);
                             active_file = Some(job);
                             pending!();
@@ -28311,8 +28333,36 @@ impl OwnedSourceScan {
                     )
                 })
             };
-            if active_file.is_none() && !rereads_wait() {
+            let context_group_waits = index.file_upload_context_enabled
+                && codex_join_groups.front().is_some_and(|group| {
+                    group
+                        .members
+                        .iter()
+                        .all(|candidate| index.context_only_read(candidate))
+                })
+                && identified_candidates.iter().any(|candidate| {
+                    !index.context_only_read(candidate)
+                        && index.candidate_decision_with_reason(candidate).0
+                            == CandidateDecision::Parse
+                });
+            if active_file.is_none() && !rereads_wait() && !context_group_waits {
                 if let Some(group) = codex_join_groups.pop_front() {
+                    if index.file_upload_context_enabled
+                        && group
+                            .members
+                            .iter()
+                            .all(|candidate| index.context_only_read(candidate))
+                        && group.members.iter().any(|candidate| {
+                            !context_read_budget.admit(source, index, candidate, &snapshots)
+                        })
+                    {
+                        sampled_scan::codex_cursor::requeue_members(
+                            index,
+                            &codex_selected_flags,
+                            &group.members,
+                        );
+                        pending!();
+                    }
                     if group
                         .members
                         .iter()
@@ -28409,6 +28459,15 @@ impl OwnedSourceScan {
                 } else {
                     active.parser.step()
                 };
+                context_read_budget.record(
+                    index,
+                    &active.candidate,
+                    active
+                        .parser
+                        .reader
+                        .consumed_bytes()
+                        .saturating_sub(before_body_read),
+                );
                 if source == SnapshotSource::ClaudeCode
                     && before_body_read == 0
                     && active.parser.reader.consumed_bytes() > 0
@@ -31643,6 +31702,14 @@ impl OwnedSourceScan {
                     terminal_native_traversal,
                 });
             };
+            // Reject budget debt before opening/constructing any body parser.
+            // Requeue the original census membership; absence/completion stays owed.
+            if index.context_only_read(&candidate)
+                && !context_read_budget.admit(source, index, &candidate, &snapshots)
+            {
+                sampled_scan::codex_cursor::requeue(index, &codex_selected_flags, &candidate);
+                pending!();
+            }
             if let Some(context) = sampling
                 .as_ref()
                 .filter(|_| source == SnapshotSource::Codex)
@@ -32322,6 +32389,9 @@ impl OwnedSourceScan {
                     && expected > sampled_scan::codex_cursor::Limits::current().singleton()
                 {
                     pending!();
+                }
+                if index.context_only_read(&candidate) {
+                    context_read_budget.charge_cursor_ordinary(&mut codex_page);
                 }
                 match context.cache.cursor_plan_paced(
                     &mut codex_page,
@@ -33129,6 +33199,7 @@ impl OwnedSourceScan {
             scanned_session_count,
             semantic_noop_count,
             history_upgrade,
+            context_read_budget,
             codex_state_only_blocked_session_ids,
             codex_parent_resolution_retry_required,
             residue_index_keys,
@@ -48821,6 +48892,7 @@ impl ScanIndex {
             active_quarantine_witness: self.active_quarantine_witness.clone(),
             active_upload_context_fingerprint: self.active_upload_context_fingerprint.clone(),
             file_upload_context_enabled: self.file_upload_context_enabled,
+            context_read_counts: self.context_read_counts,
             active_effective_upload_body_witness_revision: self
                 .active_effective_upload_body_witness_revision,
             active_effective_upload_body_witness_revision_monotone: self
@@ -91679,7 +91751,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, recovered_audit_due, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
-crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery; shared codex_versions);
+crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, context_read_budget, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery; shared codex_versions);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
@@ -91697,7 +91769,7 @@ crate::durable_tail_codec::durable_struct!(key RowKey {
     U subscription_product: Option<String>,
 });
 crate::heap_layout_bound::fields!(ScanCensus; causes, oversized_discovery, #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, parse_reasons, codex_selections, codex_counting_v2, claude_compaction_unlinked_parent_count);
-crate::heap_layout_bound::fields!(ScanIndex; decode_holds, claude_account_window_retention, schema_version, generation, upload_ack_retirement_handoff, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_retired_family_tombstones, claude_retired_family_tombstones_initialized, claude_retired_family_tombstones_uncertain, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_full_rearm_progress, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, codex_counting_moved_evidence, codex_counting_tombstones, codex_counting_evicted_legacy, codex_counting_evictions, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, file_upload_context_enabled, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_move_not_full, claude_history_move_released, accepted_incidence_pending_census, accepted_rebuild_incidence, accepted_rebuild_pending_since_unix_seconds, accepted_rebuild_last_alarm_unix_seconds, claude_no_list_policy, claude_history_emission, reason_reoffer_retries, terminal_contract_retries, claude_history_unverified_in_process, claude_rebuild_read_load_eligible, reason_reoffer_cooldowns, retired_reread_guard, held_audit_progress, claude_money_birth_store, claude_desktop_store_inventory);
+crate::heap_layout_bound::fields!(ScanIndex; decode_holds, claude_account_window_retention, schema_version, generation, upload_ack_retirement_handoff, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_retired_family_tombstones, claude_retired_family_tombstones_initialized, claude_retired_family_tombstones_uncertain, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_full_rearm_progress, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, codex_counting_moved_evidence, codex_counting_tombstones, codex_counting_evicted_legacy, codex_counting_evictions, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, file_upload_context_enabled, context_read_counts, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_move_not_full, claude_history_move_released, accepted_incidence_pending_census, accepted_rebuild_incidence, accepted_rebuild_pending_since_unix_seconds, accepted_rebuild_last_alarm_unix_seconds, claude_no_list_policy, claude_history_emission, reason_reoffer_retries, terminal_contract_retries, claude_history_unverified_in_process, claude_rebuild_read_load_eligible, reason_reoffer_cooldowns, retired_reread_guard, held_audit_progress, claude_money_birth_store, claude_desktop_store_inventory);
 crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos, upload_context_receipt);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);

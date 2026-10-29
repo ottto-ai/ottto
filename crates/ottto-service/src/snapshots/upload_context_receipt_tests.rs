@@ -137,7 +137,11 @@ impl Fixture {
             .uploader
             .send(self.source, &mut self.index, &committed, &items)
             .unwrap();
-        RearmCounts { files, bytes }
+        RearmCounts {
+            files,
+            bytes,
+            local_bytes: self.index.context_read_counts.local_bytes,
+        }
     }
 
     fn assert_quiet(&mut self) {
@@ -366,13 +370,20 @@ fn claude_held_family_backoff_reads_zero_bytes_over_three_relists() {
 fn upload_context_receipt_restart_and_generation_rearm_once() {
     let mut f = Fixture::new(SnapshotSource::Codex);
     let size = fs::metadata(&f.path).unwrap().len();
+    let counts = f.adopt();
+    assert_eq!(counts.files, 1);
     assert_eq!(
-        f.adopt(),
-        RearmCounts {
-            files: 1,
-            bytes: size
-        }
+        counts.bytes,
+        f.uploader
+            .posts
+            .last()
+            .unwrap()
+            .iter()
+            .map(|item| serde_json::to_vec(item).unwrap().len() as u64)
+            .sum::<u64>(),
+        "wire item bytes, not native file length"
     );
+    assert!(counts.local_bytes <= size);
     let saved_path = f._scratch.join("restart-index.json");
     f.index.save(&saved_path).unwrap();
     f.index = ScanIndex::load(&saved_path).unwrap();
@@ -382,13 +393,20 @@ fn upload_context_receipt_restart_and_generation_rearm_once() {
     f.index.context_curve_replay_epoch += 1;
     // The real prepare resets both index and upload progress for a new replay.
     f.uploader.replay("synthetic-curve-epoch-1");
+    let counts = f.adopt();
+    assert_eq!(counts.files, 1);
     assert_eq!(
-        f.adopt(),
-        RearmCounts {
-            files: 1,
-            bytes: size
-        }
+        counts.bytes,
+        f.uploader
+            .posts
+            .last()
+            .unwrap()
+            .iter()
+            .map(|item| serde_json::to_vec(item).unwrap().len() as u64)
+            .sum::<u64>(),
+        "wire item bytes, not native file length"
     );
+    assert!(counts.local_bytes <= size);
     f.assert_quiet();
 }
 #[test]
@@ -986,5 +1004,151 @@ fn real_uploader_context_catchup_spends_only_budget_left_after_new_usage() {
             .iter()
             .all(|item| !reacked.contains(&item["snapshot_fingerprint"])));
         assert_eq!(f.uploader.counts().2, 2);
+    }
+}
+
+/// Cold acquisition on every page makes repeated Full reads observable. Each
+/// file must get its real ACK/receipt in the same page as its sole body parse.
+#[test]
+fn real_scan_context_catchup_reads_each_file_once_across_many_passes() {
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let mut f = Fixture::new(source);
+        let template = fs::read_to_string(&f.path).unwrap();
+        let mut paths = vec![f.path.clone()];
+        for n in 1..8 {
+            let session = format!("019fa111-2222-7333-8444-{n:012}");
+            let name = match source {
+                SnapshotSource::Codex => format!("rollout-2026-10-29T10-00-00-{session}.jsonl"),
+                _ => format!("{session}.jsonl"),
+            };
+            let path = f.root.join(name);
+            fs::write(&path, template.replace(SESSION, &session)).unwrap();
+            paths.push(path);
+        }
+        // Populate the actual index/ACK ledger, without direct receipt writes.
+        for _ in 0..8 {
+            let previous = f.index.clone();
+            let (scan, _) = f.walk(true);
+            f.uploader.activate(source, "d".repeat(64), &mut f.index);
+            f.uploader
+                .send(source, &mut f.index, &previous, &scan.snapshots)
+                .unwrap();
+            if paths.iter().all(|path| {
+                f.index
+                    .files
+                    .get(&local_index_key(path))
+                    .is_some_and(|entry| entry.upload_context_receipt.is_some())
+            }) {
+                break;
+            }
+        }
+        assert!(paths
+            .iter()
+            .all(|path| f.index.files[&local_index_key(path)]
+                .upload_context_receipt
+                .is_some()));
+        // Change the last (not FIFO-first) file. It must read before history.
+        let changed = paths.last().unwrap().clone();
+        let mut body = fs::read_to_string(&changed).unwrap();
+        let changed_session = "019fa111-2222-7333-8444-000000000007";
+        let growth = match source {
+            SnapshotSource::Codex => {
+                json!({"timestamp":"2026-10-29T10:02:01Z","type":"event_msg","payload":{"type":"token_count","info":{"model":"gpt-5.5","total_token_usage":{"input_tokens":24,"output_tokens":8}}}})
+            }
+            _ => {
+                json!({"type":"assistant","sessionId":changed_session,"timestamp":"2026-10-29T10:02:01Z","requestId":"changed-request","message":{"id":"changed-message","model":"claude-sonnet-4-6","usage":{"input_tokens":24,"output_tokens":8}}})
+            }
+        };
+        body.push_str(&format!("{growth}\n"));
+        fs::write(&changed, body).unwrap();
+        let native_total: u64 = paths
+            .iter()
+            .map(|path| fs::metadata(path).unwrap().len())
+            .sum();
+        let changed_bytes = fs::metadata(&changed).unwrap().len();
+        let max_other = paths
+            .iter()
+            .filter(|path| **path != changed)
+            .map(|path| fs::metadata(path).unwrap().len())
+            .max()
+            .unwrap();
+        let read_limit = changed_bytes + max_other;
+        f.index.activate_file_upload_context(source, "e".repeat(64));
+        let mut parses = BTreeMap::<PathBuf, usize>::new();
+        let mut passes = 0;
+        let mut local_bytes = 0;
+        let mut all_read_bytes = 0;
+        for _ in 0..40 {
+            f.cache = Arc::default(); // force cold Full, not a retained-cache shortcut
+            let previous = f.index.clone();
+            let (((scan, _), per_file), order) =
+                upload_context_read::with_read_limit(read_limit, || {
+                    terminal_contract_retry::source_acquisitions(|| f.walk(true))
+                });
+            let read_bytes: u64 = per_file
+                .keys()
+                .map(|path| fs::metadata(path).unwrap().len())
+                .sum();
+            assert!(
+                read_bytes <= read_limit,
+                "native read budget is hard for every selected page"
+            );
+            if passes == 0 {
+                assert_eq!(
+                    order.first(),
+                    Some(&changed),
+                    "ordinary changed file reads first"
+                );
+                assert!(
+                    order.len() >= 2,
+                    "catch-up uses the remaining native allowance in that same pass"
+                );
+            }
+            all_read_bytes += read_bytes;
+            local_bytes += f.index.context_read_counts.local_bytes;
+            for (path, count) in per_file {
+                *parses.entry(path).or_default() += count;
+            }
+            f.uploader.activate(source, "e".repeat(64), &mut f.index);
+            let before = f.uploader.posts.len();
+            let emitted = f
+                .uploader
+                .send(source, &mut f.index, &previous, &scan.snapshots)
+                .unwrap();
+            assert_eq!(
+                emitted.0 as usize,
+                order.len(),
+                "every parsed file earns its receipt this pass"
+            );
+            assert_eq!(
+                f.uploader.posts[before..]
+                    .iter()
+                    .map(Vec::len)
+                    .sum::<usize>(),
+                order.len()
+            );
+            passes += 1;
+            if paths.iter().all(|path| {
+                f.index.files[&local_index_key(path)]
+                    .upload_context_receipt
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.context_fingerprint == "e".repeat(64))
+            }) {
+                break;
+            }
+        }
+        assert!(passes > 3);
+        assert_eq!(parses.len(), paths.len());
+        assert!(
+            parses.values().all(|count| *count == 1),
+            "a wire-deferred tail must never be re-parsed"
+        );
+        assert_eq!(all_read_bytes, native_total);
+        assert_eq!(
+            local_bytes,
+            native_total - changed_bytes,
+            "local_bytes counts actual context body acquisition only"
+        );
+        f.assert_quiet();
     }
 }

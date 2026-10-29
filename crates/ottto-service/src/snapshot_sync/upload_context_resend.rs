@@ -5,6 +5,8 @@ use super::*;
 pub(super) struct ResendCounts {
     pub entities: u64,
     pub bytes: u64,
+    pub files: u64,
+    pub local_bytes: u64,
     pub identical: u64,
     pub changed: u64,
 }
@@ -115,7 +117,7 @@ impl Cycle {
             .iter()
             .filter(|(entities, _)| !entities.is_disjoint(&self.not_stored))
             .collect();
-        if self.counts.entities > 0 || !held.is_empty() {
+        if self.counts.entities > 0 || self.counts.local_bytes > 0 || !held.is_empty() {
             crate::local_resource_diagnostics::traversal_point(
                 "upload_context",
                 source,
@@ -134,6 +136,8 @@ impl SnapshotUploadProgress {
         previous: &ScanIndex,
         items: &[SnapshotItem],
     ) {
+        self.context_resend.counts.files = index.context_read_counts.files;
+        self.context_resend.counts.local_bytes = index.context_read_counts.local_bytes;
         self.context_receipt_candidates = index.file_upload_context_ack_candidates(items);
         self.context_resend
             .retain_candidates(&self.context_receipt_candidates);
@@ -179,7 +183,7 @@ impl SnapshotUploadProgress {
             .collect();
     }
 }
-crate::heap_layout_bound::fields!(ResendCounts; entities, bytes, identical, changed);
+crate::heap_layout_bound::fields!(ResendCounts; entities, bytes, files, local_bytes, identical, changed);
 crate::heap_layout_bound::fields!(Cycle; active, source_matches, candidates, resends, attempted, files, not_stored, counts, remaining_bytes, ordinary_pending, deferred, bootstrap_blocks_catchup);
 
 #[cfg(test)]

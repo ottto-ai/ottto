@@ -157,3 +157,32 @@ Cache-head bootstrap cannot send catch-up probes before ordinary full bodies.
 Paced-out probes wait for a later pass without inventing a head token or
 blocking ordinary siblings. No persisted field, timer or daemon operation is
 added by these round-7 repairs. Validation runs no local Cargo tests.
+
+Round 8 paces native context-only acquisition before parser construction.
+At the previous head the file cap and Codex cursor budgets still applied,
+but Claude context-only Full reads had no general native-byte cap and transport
+could defer already-parsed bodies. Repeating that Full parse on later passes
+invalidated the intended one-time read exposure.
+
+Only pure context debt moves behind ordinary new/changed/recovery/authority
+work; relative family order in that ordinary prefix is preserved. A deferred
+context file returns to the same durable traversal with its census membership,
+without constructing its body parser. Admission reserves both native bytes
+and wire capacity: entity count times the maximum641KiB legal item, times
+three for the possible two head-bootstrap POSTs plus final POST, with separator
+reserves. Ordinary bodies reserve their built serialized sizes first. The
+native allowance reuses Codex's64MiB singleton/cursor and Claude's1GiB history
+allowance after ordinary body acquisition. A legal Claude file fits that
+allowance; larger Codex singletons continue through their existing cursor.
+A conservatively oversized wire group may be admitted alone; actual sends
+still obey the transport backstop. No new durable size field is required.
+
+Actual native body-reader deltas populate `local_bytes` on the existing context
+resend/rearm diagnostic lines. `bytes` now consistently means serialized item
+wire bytes, excluding request envelopes, rather than indexed native length;
+resend also discloses files read. Zero-byte cache reuse is zero local bytes.
+Counters and scheduling state are runtime-only. The portable real scan/uploader
+fixture forces cold acquisition, spans more than three pages, puts a changed
+file first under a tight native limit, checks every file parses exactly once,
+requires a receipt for every parsed file in that same page and checks actual
+local bytes against the source lengths. No macOS-gated fixture is modified.

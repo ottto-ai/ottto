@@ -94,7 +94,7 @@ const SNAPSHOT_BATCH_LIMIT: usize = 50;
 // semantic envelopes and bounded request metadata. The exact request serializer
 // is still checked immediately before network I/O by
 // `validate_snapshot_batch_request`.
-const SNAPSHOT_BATCH_MAX_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const SNAPSHOT_BATCH_MAX_BYTES: usize = 2 * 1024 * 1024;
 // A 50-item page needs at most six binary splits to isolate one poison item.
 // Cap there so broad schema drift cannot turn one five-minute cycle into dozens
 // of doomed backend calls.
@@ -10073,7 +10073,9 @@ impl std::io::Write for SnapshotPackingLength {
         Ok(())
     }
 }
-fn snapshot_packing_json_length<T: Serialize + ?Sized>(item: &T) -> serde_json::Result<usize> {
+pub(crate) fn snapshot_packing_json_length<T: Serialize + ?Sized>(
+    item: &T,
+) -> serde_json::Result<usize> {
     let mut length = SnapshotPackingLength { bytes: 0 };
     serde_json::to_writer(&mut length, item)?;
     Ok(length.bytes)
