@@ -224,7 +224,7 @@ fn direct_completed_absence_and_heap_refusal_return_checkpoint_and_custody() {
             sampled_jsonl::preparation_tests::refuse_heap(true);
         }
         let mut returned = cache
-            .insert_with_custody("key".into(), original, 23, true, false)
+            .insert_with_custody("key".into(), original, 23, true, false, false)
             .err()
             .expect("no destructive refusal");
         assert_eq!(format!("{:?}", returned.checkpoint), checkpoint);
@@ -239,6 +239,40 @@ fn direct_completed_absence_and_heap_refusal_return_checkpoint_and_custody() {
     }
 }
 
+// Direct legacy codec oracle, not a production cold restore or read grant.
+fn legacy_rederive_oracle(
+    path: &Path,
+    body: &[u8],
+    source: SnapshotSource,
+) -> CachedJsonlReduction {
+    let decoded = codec::decode(body, source).unwrap();
+    let parser = codec::rederive_parser(File::open(path).unwrap(), path, &decoded).unwrap();
+    decoded
+        .rederive(
+            parser,
+            &mut File::open(path).unwrap(),
+            jsonl_line_cap() as u64,
+        )
+        .unwrap()
+        .0
+}
+fn assert_rederive_pending(
+    outcome: RestoreOutcome,
+    cache: &SharedCache,
+    source: SnapshotSource,
+    key: &str,
+) {
+    assert!(matches!(outcome, RestoreOutcome::Pending));
+    assert!(cache.retained().unwrap().peek(key).is_none());
+    assert!(cache
+        .durable_counters(source)
+        .unwrap()
+        .0
+        .ineligible
+        .get("rederive_unfunded")
+        .is_some_and(|n| *n > 0));
+}
+
 struct ResetActiveBudget;
 impl Drop for ResetActiveBudget {
     fn drop(&mut self) {
@@ -250,26 +284,48 @@ impl Drop for ResetActiveBudget {
 // pending, preserve the predecessor, never spend Q11 or read native Tail.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "validated native admission layout")]
-fn production_cold_input_and_decode_budget_refusals_keep_five_passes_pending() {
+fn production_cold_resources_hold_five_passes_without_native_reads() {
     if !crate::test_isolation::run_here() {
         return;
     }
     assert!(crate::heap_layout_bound::layout_supported());
     let _gate = claude_request_money::e2::GateForTest::set(true);
     let _reset = ResetActiveBudget;
+    let _clear = ClearPreparationFault;
     let source = SnapshotSource::ClaudeCode;
-    for limit in [
-        0,
-        store::RESTORE_INPUT_BYTES
-            + (store::RECORD_BYTES + super::super::AUDIT_AND_SCRATCH_BYTES) as u64,
-    ] {
+    for phase in ["guard", "decode", "rederive", "cache"] {
+        let limit = match phase {
+            "guard" => 0,
+            "decode" => {
+                store::RESTORE_INPUT_BYTES
+                    + (store::RECORD_BYTES + super::super::AUDIT_AND_SCRATCH_BYTES) as u64
+            }
+            _ => store::ACTIVE_BYTES,
+        };
         let root = crate::test_scratch::ScratchDir::new("cold-decode-budget");
         let lock = test_locks::hold(&root);
         let sessions = root.join("sessions");
         std::fs::create_dir(&sessions).unwrap();
         let path = sessions.join("11111111-2222-4333-8444-555555555555.jsonl");
         native_fixture(&path);
+        if phase == "rederive" {
+            use std::io::Write;
+            let prompt = serde_json::json!({"type":"user","sessionId":"11111111-2222-4333-8444-555555555555",
+                "timestamp":"2026-10-07T10:00:01Z","uuid":"prompt-budget","cwd":"/tmp/synthetic-budget",
+                "message":{"role":"user","content":"synthetic prompt requiring rederive"}}).to_string()+"\n";
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(prompt.as_bytes())
+                .unwrap();
+        }
         let key = local_index_key(&path);
+        let limit = if phase == "decode" {
+            limit + 4 * key.len() as u64
+        } else {
+            limit
+        };
         let index_path = root.join("index.json");
         let namespace = Scope("bounded-decode".into());
         let cache = Arc::new(SharedCache::default());
@@ -333,6 +389,7 @@ fn production_cold_input_and_decode_budget_refusals_keep_five_passes_pending() {
         let before = cache.durable_counters(source).unwrap();
         let old_bytes = (retail_bytes(source, 0), retail_bytes(source, 1));
         store::active::set_active_budget_for_test(Some(limit));
+        sampled_jsonl::preparation_tests::refuse_heap(phase == "cache");
         for _ in 0..5 {
             let (next, result, modes) = finish(start(index));
             assert!(result.snapshots.is_empty());
@@ -362,6 +419,33 @@ fn production_cold_input_and_decode_budget_refusals_keep_five_passes_pending() {
             );
         }
         store::active::set_active_budget_for_test(None);
+        sampled_jsonl::preparation_tests::refuse_heap(false);
+        if phase == "cache" {
+            assert_eq!(after.0.ineligible.get("cache_transit"), Some(&5));
+        }
+        if phase == "rederive" {
+            assert_eq!(after.0.ineligible.get("rederive_unfunded"), Some(&5));
+            assert_eq!(
+                (after.0.rederive_head_bytes, after.0.rederive_line_bytes),
+                (0, 0)
+            );
+            let (next, held, modes) = finish(start(index));
+            assert!(held.snapshots.is_empty());
+            assert_eq!(held.unreadable_path_count, 0);
+            assert_eq!(modes, (0, 0, 0));
+            assert_eq!(serde_json::to_value(&next.files[&key]).unwrap(), entry);
+            assert_eq!(
+                (retail_bytes(source, 0), retail_bytes(source, 1)),
+                old_bytes
+            );
+            let store::LeaseWait::Granted(lease) =
+                cache.acquire_active(source, store::ACTIVE_BYTES)
+            else {
+                panic!("rederive refusal leaked credit")
+            };
+            lease.release();
+            continue;
+        }
         let (_, result, modes) = finish(start(index));
         assert_eq!(result.snapshots.len(), 1);
         assert_eq!(result.snapshots[0].input_tokens, 125);
@@ -373,6 +457,259 @@ fn production_cold_input_and_decode_budget_refusals_keep_five_passes_pending() {
             panic!("budget exit leaked lease")
         };
         lease.release();
+    }
+}
+
+// Direct production factory. A write-only FD discriminates any certificate,
+// head or named-line read before the typed resource refusal.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "validated native decode layout")]
+fn rederive_refusal_precedes_certificate_io_and_keeps_integrity_separate() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    assert!(crate::heap_layout_bound::layout_supported());
+    use std::io::Seek;
+    let root = crate::test_scratch::ScratchDir::new("unfunded-rederive-no-read");
+    let path = root.join("source.jsonl");
+    let source = SnapshotSource::ClaudeCode;
+    let scope = Scope("pre-read-budget".into());
+    native_fixture(&path);
+    use std::io::Write;
+    let prompt =
+        serde_json::json!({"type":"user","sessionId":"11111111-2222-4333-8444-555555555555",
+        "timestamp":"2026-10-07T10:00:01Z","cwd":"/tmp/synthetic",
+        "message":{"role":"user","content":"native prompt"}})
+        .to_string()
+            + "\n";
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(prompt.as_bytes())
+        .unwrap();
+    let body = codec::encode(
+        &native_record(&path, &scope).0,
+        store::BODY_BYTES,
+        jsonl_line_cap() as u64,
+    )
+    .unwrap();
+    assert!(codec::decode(&body, source)
+        .unwrap()
+        .without_rederive()
+        .is_err());
+    let binding = store::tests::binding("account", "scope", ("fp-a", None));
+    let expected = Expected {
+        binding: binding.clone(),
+        committed_generation: 1,
+    };
+    let mut record = store::DurableRecord {
+        format: store::FORMAT_VERSION,
+        index_generation: 1,
+        record: PendingRecord {
+            binding,
+            certificate: certificate(&path, &scope),
+            body,
+            allowlist: codec::allowlist_digest(source),
+        },
+    };
+    let index = ScanIndex::default();
+    let interpretation = Interpretation::of(source, "key", &index, false, &scope);
+    let cache = SharedCache::default();
+    let store::LeaseWait::Granted(mut lease) = cache.acquire_prepared_transfer(source) else {
+        panic!("lease unavailable")
+    };
+    let mut held = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    assert!(matches!(
+        cache.durable_restore_record(
+            source,
+            &record,
+            &expected,
+            &path,
+            &scope,
+            &mut held,
+            &interpretation,
+            &mut lease
+        ),
+        Err(Failure::Resource("rederive_unfunded"))
+    ));
+    assert_eq!(held.stream_position().unwrap(), 0);
+    record.record.body.clear();
+    assert!(matches!(
+        cache.durable_restore_record(
+            source,
+            &record,
+            &expected,
+            &path,
+            &scope,
+            &mut held,
+            &interpretation,
+            &mut lease
+        ),
+        Err(Failure::Corrupt)
+    ));
+    lease.release();
+    // Empty obligations are a positive decode, but never bypass certificate IO.
+    native_fixture(&path);
+    record.record.body = codec::encode(
+        &native_record(&path, &scope).0,
+        store::BODY_BYTES,
+        jsonl_line_cap() as u64,
+    )
+    .unwrap();
+    record.record.certificate = certificate(&path, &scope);
+    assert!(codec::decode(&record.record.body, source)
+        .unwrap()
+        .without_rederive()
+        .is_ok());
+    assert_eq!(record.eligible(&expected), Ok(()));
+    let store::LeaseWait::Granted(mut lease) = cache.acquire_prepared_transfer(source) else {
+        panic!("lease unavailable")
+    };
+    assert!(matches!(
+        cache.durable_restore_record(
+            source,
+            &record,
+            &expected,
+            &path,
+            &scope,
+            &mut held,
+            &interpretation,
+            &mut lease
+        ),
+        Err(Failure::Certificate(_))
+    ));
+    let restored = cache.durable_restore_record(
+        source,
+        &record,
+        &expected,
+        &path,
+        &scope,
+        &mut File::open(&path).unwrap(),
+        &interpretation,
+        &mut lease,
+    );
+    assert!(restored.is_ok());
+    drop(restored);
+    lease.release();
+    let store::LeaseWait::Granted(lease) = cache.acquire_active(source, store::ACTIVE_BYTES) else {
+        panic!("error left active credit")
+    };
+    lease.release();
+}
+
+// Direct ordinary admission primitive with take-back enabled. The original
+// graph, rank, guard and flags survive refusal; success has no RAM residue.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "validated native cache layout")]
+fn atomic_cache_transit_returns_same_graph_and_custody_or_retains_original_refusal() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    assert!(crate::heap_layout_bound::layout_supported());
+    let _clear = ClearPreparationFault;
+    for arm in ["accept", "heap", "capacity", "poison", "absent"] {
+        let root = crate::test_scratch::ScratchDir::new("atomic-cache-transit");
+        let path = root.join("source.jsonl");
+        let source = SnapshotSource::ClaudeCode;
+        let cache = SharedCache::default();
+        let mut taken = *owned_fixture(source, &path, &Scope("transit".into()));
+        let body = codec::encode(
+            &taken.retained.state,
+            store::BODY_BYTES,
+            jsonl_line_cap() as u64,
+        )
+        .unwrap();
+        let guard = cache
+            .begin_retail(
+                source,
+                "key",
+                &taken.retained.checkpoint,
+                &File::open(&path).unwrap(),
+                taken.retained.checkpoint.sealed_offset(),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        let facts = (guard.object, guard.next, guard.end, guard.old_end);
+        taken.durable.put_retail(guard);
+        let checkpoint = format!("{:?}", taken.retained.checkpoint);
+        let mut completed = sampled_jsonl::CompletedNativeAcquisition {
+            durable: taken.durable,
+            checkpoint: taken.retained.checkpoint,
+            reduction: Some(taken.retained.state),
+            released: Some((17, 19)),
+            unsealed: false,
+        };
+        match arm {
+            "heap" => sampled_jsonl::preparation_tests::refuse_heap(true),
+            "capacity" => {
+                *cache.retained().unwrap() =
+                    crate::transcript_cache::TranscriptCache::with_byte_limit(0)
+            }
+            "poison" => cache.poison_retained(),
+            "absent" => {
+                drop(completed.reduction.take());
+            }
+            _ => {}
+        }
+        let store::LeaseWait::Granted(lease) = cache.acquire_prepared_transfer(source) else {
+            panic!("lease unavailable")
+        };
+        let result = cache.insert_with_custody("key".into(), completed, 23, true, false, true);
+        let mut durable = if arm == "accept" {
+            let mut returned = match result {
+                Ok(Some(taken)) => taken,
+                _ => panic!("expected actual admission and take"),
+            };
+            assert!(cache.retained().unwrap().peek("key").is_none());
+            assert_eq!(format!("{:?}", returned.retained.checkpoint), checkpoint);
+            assert_eq!(
+                codec::encode(
+                    &returned.retained.state,
+                    store::BODY_BYTES,
+                    jsonl_line_cap() as u64
+                )
+                .unwrap(),
+                body
+            );
+            assert_eq!(
+                (
+                    returned.modified_hint,
+                    returned.finalization_charge,
+                    returned.e2_held_new_file
+                ),
+                ((17, 19), 23, true)
+            );
+            std::mem::take(&mut returned.durable)
+        } else {
+            let original = match result {
+                Err(original) => original,
+                _ => panic!("refusal lost original"),
+            };
+            assert_eq!(format!("{:?}", original.checkpoint), checkpoint);
+            assert_eq!(original.released, Some((17, 19)));
+            assert!(!original.unsealed);
+            if arm == "absent" {
+                assert!(original.reduction.is_none());
+            } else {
+                assert_eq!(
+                    codec::encode(
+                        original.reduction.as_ref().unwrap(),
+                        store::BODY_BYTES,
+                        jsonl_line_cap() as u64
+                    )
+                    .unwrap(),
+                    body
+                );
+            }
+            original.durable
+        };
+        let guard = durable.take_retail().expect("one original guard");
+        assert_eq!((guard.object, guard.next, guard.end, guard.old_end), facts);
+        guard.finish();
+        drop(durable);
+        lease.release();
+        sampled_jsonl::preparation_tests::refuse_heap(false);
     }
 }
 
@@ -2370,8 +2707,8 @@ fn open_call(call_id_bytes: usize) -> serde_json::Value {
 /// (`WRITE_PASS_BYTES`) keeps its acquired selection provenance. Its next
 /// save, with no rescan or admission of the key in between, writes its
 /// record: no selection refusal, no invalidation of the key's existing
-/// record (intact while its replacement waits), and a restart restores the
-/// replacement. Arm `spent`: the first two bodies use the allowance exactly
+/// record (intact while its replacement waits). The restart preserves the
+/// content-bearing replacement under the explicit pre-read resource hold. Arm `spent`: the first two bodies use the allowance exactly
 /// (`budget == 0`); arm `too_large`: the third body exceeds the remainder.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
@@ -2557,37 +2894,34 @@ fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
         }
         drop(cache);
 
-        // Restart: all three restore from the committed index.
+        // Restart: all three content-bearing records hold before native input.
         let loaded = ScanIndex::load(&index_path).unwrap();
         let restart = SharedCache::default();
         restart.durable_begin_pass(source, &index_path, &namespace, false);
         for (path, body) in [(&a, &body_a), (&b, &body_b), (&c, &body_c)] {
             let key = local_index_key(path);
             let interpretation = Interpretation::of(source, &key, &loaded, false, &namespace);
-            let taken = restart
-                .durable_restore(
-                    source,
-                    &key,
-                    path,
-                    &scope,
-                    &mut File::open(path).unwrap(),
-                    &loaded,
-                    &interpretation,
-                )
-                .into_test_option()
-                .unwrap_or_else(|| {
-                    let (counts, disk) = restart.durable_counters(source).unwrap();
-                    panic!("{arm}: restore: {}", counts.summary(source, &disk))
-                });
+            let outcome = restart.durable_restore(
+                source,
+                &key,
+                path,
+                &scope,
+                &mut File::open(path).unwrap(),
+                &loaded,
+                &interpretation,
+            );
+            assert_rederive_pending(outcome, &restart, source, &key);
+            let direct = legacy_rederive_oracle(path, body, source);
             assert_eq!(
-                codec::encode(&taken.retained.state, store::RECORD_BYTES, cap).unwrap(),
+                codec::encode(&direct, store::RECORD_BYTES, cap).unwrap(),
                 *body,
                 "{arm}"
             );
         }
         let (counts, disk) = restart.durable_counters(source).unwrap();
         println!("dt_budget {arm} restart: {}", counts.summary(source, &disk));
-        assert_eq!(counts.restored, 3, "{arm}");
+        assert_eq!(counts.restored, 0, "{arm}: resource holds grant no restore");
+        assert_eq!(counts.ineligible.get("rederive_unfunded"), Some(&3));
         let _ = std::fs::remove_dir_all(root);
     }
 }
@@ -3163,35 +3497,54 @@ fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites(
             }
             let cache = SharedCache::default();
             cache.durable_begin_pass(source, &index_path, &changed_namespace, false);
-            let result = cache
-                .durable_restore(
-                    source,
-                    &key,
-                    &path,
-                    &changed_scope,
-                    &mut File::open(&path).unwrap(),
-                    &index,
-                    &changed,
-                )
-                .into_test_option();
-            assert_eq!(result.is_some(), arm == "equal", "{source:?} {arm}");
+            let outcome = cache.durable_restore(
+                source,
+                &key,
+                &path,
+                &changed_scope,
+                &mut File::open(&path).unwrap(),
+                &index,
+                &changed,
+            );
+            let content_hold = source == SnapshotSource::Codex && arm == "equal";
+            let result = if content_hold {
+                assert_rederive_pending(outcome, &cache, source, &key);
+                None
+            } else {
+                outcome.into_test_option()
+            };
+            assert_eq!(
+                result.is_some(),
+                arm == "equal" && !content_hold,
+                "{source:?} {arm}"
+            );
             assert_eq!(
                 std::fs::read(&disk).unwrap(),
                 bytes,
                 "bootstrap never eagerly replaces"
             );
-            if let Some(taken) = result {
-                assert_eq!(
-                    codec::encode(
-                        &taken.retained.state,
-                        store::RECORD_BYTES,
-                        jsonl_line_cap() as u64
-                    )
-                    .unwrap(),
-                    pending.body
-                );
-                drop(taken); // End the direct restore before another active owner.
-                             // A failed format-only write leaves v1 authoritative even after GC.
+            if arm == "equal" {
+                if content_hold {
+                    let direct = legacy_rederive_oracle(&path, &pending.body, source);
+                    assert_eq!(
+                        codec::encode(&direct, store::RECORD_BYTES, jsonl_line_cap() as u64)
+                            .unwrap(),
+                        pending.body
+                    );
+                } else {
+                    let taken = result.expect("no-input record actually restored");
+                    assert_eq!(
+                        codec::encode(
+                            &taken.retained.state,
+                            store::RECORD_BYTES,
+                            jsonl_line_cap() as u64
+                        )
+                        .unwrap(),
+                        pending.body
+                    );
+                    drop(taken);
+                }
+                // A failed format-only write leaves v1 authoritative even after GC.
                 store::test_hooks::set_before_rename(Some(Box::new(|_, _| {
                     Err(std::io::Error::other("injected"))
                 })));
@@ -3245,18 +3598,20 @@ fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites(
                 assert_eq!(std::fs::read(&disk).unwrap(), bytes);
                 let restart = SharedCache::default();
                 restart.durable_begin_pass(source, &index_path, &namespace, false);
-                assert!(restart
-                    .durable_restore(
-                        source,
-                        &key,
-                        &path,
-                        &scope,
-                        &mut File::open(&path).unwrap(),
-                        &index,
-                        &interp
-                    )
-                    .into_test_option()
-                    .is_some());
+                let outcome = restart.durable_restore(
+                    source,
+                    &key,
+                    &path,
+                    &scope,
+                    &mut File::open(&path).unwrap(),
+                    &index,
+                    &interp,
+                );
+                if content_hold {
+                    assert_rederive_pending(outcome, &restart, source, &key);
+                } else {
+                    assert!(outcome.into_test_option().is_some());
+                }
             } else {
                 let (counts, _) = cache.durable_counters(source).unwrap();
                 assert_eq!(
@@ -3371,32 +3726,41 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
         if crate::heap_layout_bound::layout_supported() {
             let cache = SharedCache::default();
             cache.durable_begin_pass(source, &index_path, &namespace, false);
-            let restored = cache
-                .durable_restore(
-                    source,
-                    &key,
-                    &path,
-                    &scope,
-                    &mut File::open(&path).unwrap(),
-                    &index,
-                    &interpretation,
-                )
-                .into_test_option()
-                .expect("v1 maps without content acquisition");
-            assert_eq!(restored.retained.state.durable_counting(), Some(fact));
-            let (restored, lease) = restored.into_parts();
+            let outcome = cache.durable_restore(
+                source,
+                &key,
+                &path,
+                &scope,
+                &mut File::open(&path).unwrap(),
+                &index,
+                &interpretation,
+            );
+            assert_rederive_pending(outcome, &cache, source, &key);
+            assert_eq!(
+                std::fs::read(&disk).unwrap(),
+                bytes,
+                "resource hold preserves old representation"
+            );
+            // Separate direct native writer control; no cold restore claimed.
+            assert_eq!(reduction.durable_counting(), Some(fact));
+            let checkpoint = match parser
+                .certify_without_retention(&scope, 1_800_000_000)
+                .unwrap()
+            {
+                sampled_jsonl::SideCertificate::Certified { completed, .. } => completed.checkpoint,
+                _ => panic!("native counting control certified"),
+            };
             cache.insert(
                 key.clone(),
                 sampled_jsonl::CompletedNativeAcquisition {
                     durable: Default::default(),
-                    checkpoint: restored.retained.checkpoint,
-                    reduction: Some(restored.retained.state),
+                    checkpoint,
+                    reduction: Some(reduction),
                     released: None,
                     unsealed: false,
                 },
                 0,
             );
-            lease.release(); // The admitted cache now owns this graph.
             cache.durable_note_selection(&key, &index.files[&key].source_file_fingerprint);
             index.save(&index_path).unwrap();
             assert_eq!(
@@ -3413,19 +3777,20 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
             assert_eq!(next.format, store::FORMAT_VERSION);
             let restart = SharedCache::default();
             restart.durable_begin_pass(source, &index_path, &namespace, false);
-            let second = restart
-                .durable_restore(
-                    source,
-                    &key,
-                    &path,
-                    &scope,
-                    &mut File::open(&path).unwrap(),
-                    &index,
-                    &interpretation,
-                )
-                .into_test_option()
-                .expect("second restart");
-            assert_eq!(second.retained.state.durable_counting(), Some(fact));
+            let second = restart.durable_restore(
+                source,
+                &key,
+                &path,
+                &scope,
+                &mut File::open(&path).unwrap(),
+                &index,
+                &interpretation,
+            );
+            assert_rederive_pending(second, &restart, source, &key);
+            assert_eq!(
+                codec::decode(&next.record.body, source).unwrap().counting(),
+                Some(fact)
+            );
             // A record whose old pinned binding proves the configured cutover
             // but whose own decoded cutover disagrees is R29, never mapped.
             let _new_cutover = TestCutover::set(1);

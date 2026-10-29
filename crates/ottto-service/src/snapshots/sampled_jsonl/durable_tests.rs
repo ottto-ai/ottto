@@ -1591,3 +1591,50 @@ fn compressed_rederive_refuses_before_seek_or_jsonl_parse() {
         );
     });
 }
+
+#[test]
+fn no_input_completion_requires_every_rederive_digest_absent() {
+    for field in 0..5 {
+        let mut obligation = Rederive::default();
+        let slot = match field {
+            0 => &mut obligation.first_prompt,
+            1 => &mut obligation.workspace,
+            2 => &mut obligation.agent_label,
+            3 => &mut obligation.session_start,
+            _ => &mut obligation.title,
+        };
+        *slot = Some([1; 32]);
+        let decoded = Decoded {
+            reduction: CachedJsonlReduction {
+                accumulator: SnapshotAccumulator::new(SnapshotSource::ClaudeCode),
+                report: JsonlReadReport::default(),
+                recognized_usage_drop_count: 0,
+                positive_recognized_usage_count: 0,
+                positive_usage_evidence: false,
+            },
+            rederive: obligation,
+        };
+        let (result, stats) =
+            crate::retry_allocation_probe::measure_caller_thread(|| decoded.without_rederive());
+        assert!(
+            result.is_err(),
+            "obligation{field} cannot use a zero/missing head mark as absence"
+        );
+        assert_eq!(stats.allocations, 0);
+    }
+    let decoded = Decoded {
+        reduction: CachedJsonlReduction {
+            accumulator: SnapshotAccumulator::new(SnapshotSource::ClaudeCode),
+            report: JsonlReadReport::default(),
+            recognized_usage_drop_count: 0,
+            positive_recognized_usage_count: 0,
+            positive_usage_evidence: false,
+        },
+        rederive: Rederive::default(),
+    };
+    let (result, stats) =
+        crate::retry_allocation_probe::measure_caller_thread(|| decoded.without_rederive());
+    let (_, receipt) = result.unwrap();
+    assert_eq!(receipt, RederiveReceipt::default());
+    assert_eq!(stats.allocations, 0);
+}

@@ -5,7 +5,8 @@
 //!   record must bind to the loaded, committed index (generation, entry,
 //!   context, scope with format, allowlist, identity contract and counting
 //!   view), its certificate must admit on the held FD, its body must decode
-//!   and its content fields must re-derive. The copy is then charged through
+//!   and any unfunded content re-derivation holds before input. A record
+//!   without content obligations is then charged through
 //!   the ordinary cache admission and taken like any retained copy, so the
 //!   existing `prepare_acquisition` decides Unchanged, Tail or Full. Any
 //!   resource refusal is Pending with no reusable guardless RAM entry.
@@ -929,14 +930,22 @@ impl SharedCache {
         }
         #[cfg(test)]
         tests::before_cold_transfer();
-        let store::LeaseWait::Granted(mut lease) = self.acquire_active(
-            snapshot_source,
-            (store::RECORD_BYTES + super::AUDIT_AND_SCRATCH_BYTES) as u64,
-        ) else {
-            return RestoreOutcome::Pending;
+        let store::LeaseWait::Granted(mut lease) = self.acquire_prepared_transfer(snapshot_source)
+        else {
+            return self.restore_resource_pending(snapshot_source, "active_wait");
         };
-        // Reconcile completed before this owner; never reacquire it at cache take.
-        let result = match self.restore_known(
+        // Incoming key, admission scratch/stored key and dirty-candidate key.
+        // The initial transfer reserve separately covers one <=8MiB victim key.
+        if key
+            .len()
+            .checked_mul(4)
+            .and_then(|n| u64::try_from(n).ok())
+            .is_none_or(|bytes| lease.charge(bytes).is_err())
+        {
+            lease.release();
+            return self.restore_resource_pending(snapshot_source, "cache_key");
+        }
+        let result = self.restore_known(
             snapshot_source,
             key,
             path,
@@ -945,33 +954,52 @@ impl SharedCache {
             index,
             interpretation,
             &mut lease,
-        ) {
+        );
+        match result {
             Some(Ok(completed)) => {
-                // The cold owner is already funded before any RAM visibility.
-                if !self.insert_admitted(key.to_string(), completed, 0) {
-                    if let Some(mut stores) = self.durable() {
-                        stores.counters.budget_refused += 1;
-                    }
-                    lease.release();
-                    return RestoreOutcome::Pending;
-                }
-                match self.take(key) {
-                    Some(taken) => {
+                // Admission and take share one retained lock and this paid owner.
+                match self.insert_with_custody(key.to_string(), completed, 0, false, true, true) {
+                    Ok(Some(taken)) => {
                         if let Some(mut stores) = self.durable() {
                             stores.counters.restored += 1;
                         }
-                        return RestoreOutcome::Restored(Box::new(taken), lease);
+                        RestoreOutcome::Restored(Box::new(taken), lease)
                     }
-                    None => RestoreOutcome::Pending,
+                    refused => {
+                        drop(refused); // Original graph/temporary custody before its credit.
+                        lease.release();
+                        self.restore_resource_pending(snapshot_source, "cache_transit")
+                    }
                 }
             }
-            Some(Err(store::ActiveOverBudget)) => RestoreOutcome::Pending,
-            None => self
-                .durable_hold(snapshot_source, key)
-                .map_or(RestoreOutcome::Miss, RestoreOutcome::Held),
-        };
-        lease.release();
-        result
+            Some(Err(phase)) => {
+                lease.release();
+                self.restore_resource_pending(snapshot_source, phase)
+            }
+            None => {
+                let result = self
+                    .durable_hold(snapshot_source, key)
+                    .map_or(RestoreOutcome::Miss, RestoreOutcome::Held);
+                lease.release();
+                result
+            }
+        }
+    }
+
+    fn restore_resource_pending(
+        &self,
+        source: SnapshotSource,
+        phase: &'static str,
+    ) -> RestoreOutcome {
+        if let Some(mut stores) = self.durable() {
+            stores.counters.budget_refused += 1;
+            Counters::bump(&mut stores.counters.ineligible, phase);
+        }
+        crate::local_resource_diagnostics::durable_tail_alarm(
+            source.api_slug(),
+            &serde_json::json!({"restore_resource_pending":{(phase):1}}),
+        );
+        RestoreOutcome::Pending
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -985,13 +1013,13 @@ impl SharedCache {
         index: &ScanIndex,
         interpretation: &Interpretation<'_>,
         lease: &mut store::ActiveLease,
-    ) -> Option<Result<sampled_jsonl::CompletedNativeAcquisition, store::ActiveOverBudget>> {
+    ) -> Option<Result<sampled_jsonl::CompletedNativeAcquisition, &'static str>> {
         let source = durable_source(snapshot_source)?;
         let store_key = store::key_digest(source, key);
         let allowlist = codec::allowlist_digest(snapshot_source);
         let record = {
             let Some(mut stores) = self.durable() else {
-                return Some(Err(store::ActiveOverBudget));
+                return Some(Err("stores_unavailable"));
             };
             stores.counters.restore_attempts += 1;
             // A cleared fingerprint is reparse debt (a held or reverted
@@ -1014,10 +1042,7 @@ impl SharedCache {
             let outcome = match stores.slot(source).as_mut() {
                 Some(slot) => match slot.store.read_bounded(&store_key, &allowlist, lease) {
                     Ok(outcome) => outcome,
-                    Err(refusal) => {
-                        stores.counters.budget_refused += 1;
-                        return Some(Err(refusal));
-                    }
+                    Err(store::ActiveOverBudget) => return Some(Err("input")),
                 },
                 None => return None,
             };
@@ -1053,7 +1078,7 @@ impl SharedCache {
             lease,
         );
         let Some(mut stores) = self.durable() else {
-            return Some(Err(store::ActiveOverBudget));
+            return Some(Err("stores_unavailable"));
         };
         let (checkpoint, reduction, receipt) = match restored {
             Ok(restored) => restored,
@@ -1066,10 +1091,7 @@ impl SharedCache {
                     Failure::Certificate(reason) => {
                         Counters::bump(&mut counters.certificate_refused, full_reason_class(reason))
                     }
-                    Failure::Budget => {
-                        counters.budget_refused += 1;
-                        return Some(Err(store::ActiveOverBudget));
-                    }
+                    Failure::Resource(phase) => return Some(Err(phase)),
                     Failure::Corrupt => counters.corrupt_body += 1,
                     Failure::NotRederived(refuse) => {
                         Counters::bump(&mut counters.not_rederived, refuse_class(refuse))
@@ -1112,14 +1134,9 @@ impl SharedCache {
                 .map_err(|_| Failure::NotRederived(Refuse::NotRederivable("compressed")))?;
         }
         record.eligible(expected).map_err(Failure::Ineligible)?;
-        let (checkpoint, _) = record
-            .record
-            .certificate
-            .restore(held, scope.clone())
-            .map_err(Failure::Certificate)?;
         let decoded = codec::decode_bounded(&record.record.body, source, lease).map_err(
             |reason| match reason {
-                crate::durable_tail_codec::DecodeFailure::Budget => Failure::Budget,
+                crate::durable_tail_codec::DecodeFailure::Budget => Failure::Resource("decode"),
                 crate::durable_tail_codec::DecodeFailure::Integrity => Failure::Corrupt,
             },
         )?;
@@ -1132,20 +1149,19 @@ impl SharedCache {
         if counting.is_some_and(|c| c.0 != cutover) {
             return Err(Failure::Ineligible(store::Ineligible::Scope));
         }
-        let mut rederive = held
-            .try_clone()
-            .map_err(|_| Failure::NotRederived(Refuse::NotRederivable("descriptor")))?;
-        let parser = codec::rederive_parser(
-            rederive
-                .try_clone()
-                .map_err(|_| Failure::NotRederived(Refuse::NotRederivable("descriptor")))?,
-            path,
-            &decoded,
-        )
-        .map_err(|_| Failure::NotRederived(Refuse::NotRederivable("parser")))?;
+        // No certificate sample, descriptor clone, native parser or JSON value
+        // may allocate/read for an obligation without proved pre-growth funding.
         let (reduction, receipt) = decoded
-            .rederive(parser, &mut rederive, jsonl_line_cap() as u64)
-            .map_err(Failure::NotRederived)?;
+            .without_rederive()
+            .map_err(|_| Failure::Resource("rederive_unfunded"))?;
+        lease
+            .charge(scope.0.len() as u64)
+            .map_err(|_| Failure::Resource("certificate_scope"))?;
+        let (checkpoint, _) = record
+            .record
+            .certificate
+            .restore(held, scope.clone())
+            .map_err(Failure::Certificate)?;
         Ok((checkpoint, reduction, receipt))
     }
 
@@ -1666,7 +1682,7 @@ mod restore_test {
 }
 
 enum Failure {
-    Budget,
+    Resource(&'static str),
     Ineligible(store::Ineligible),
     Certificate(FullReason),
     Corrupt,

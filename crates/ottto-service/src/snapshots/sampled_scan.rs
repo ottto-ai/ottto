@@ -343,7 +343,7 @@ impl SharedCache {
         completed: sampled_jsonl::CompletedNativeAcquisition,
         live_bytes: usize,
     ) -> bool {
-        self.insert_with_custody(key, completed, live_bytes, false, true)
+        self.insert_with_custody(key, completed, live_bytes, false, true, false)
             .is_ok()
     }
     pub(super) fn return_prepared_taken(
@@ -351,14 +351,15 @@ impl SharedCache {
         key: String,
         taken: Box<crate::transcript_cache::Taken<CachedJsonlReduction>>,
     ) -> Result<(), Box<crate::transcript_cache::Taken<CachedJsonlReduction>>> {
-        self.insert_taken(key, taken, false)
+        self.insert_taken(key, taken, false, false).map(|_| ())
     }
     fn insert_taken<I: crate::transcript_cache::Incoming<CachedJsonlReduction>>(
         &self,
         key: String,
         incoming: I,
         _write_candidate: bool,
-    ) -> Result<(), I> {
+        take_back: bool,
+    ) -> Result<Option<crate::transcript_cache::Taken<CachedJsonlReduction>>, I> {
         let taken: &crate::transcript_cache::Taken<CachedJsonlReduction> = incoming.borrow();
         let fits = taken.durable.heap_bound(&mut Counter::new(0)).is_some();
         #[cfg(test)]
@@ -375,7 +376,6 @@ impl SharedCache {
         let reserved = live_bytes
             .saturating_add(self.cursor_resident_for_main())
             .saturating_add(side_ledger::SIDE_LEDGER_BYTES);
-        #[cfg(unix)]
         let touched = key.clone();
         let result = cache.insert_taken_reserving(key, incoming, reserved);
         self.drop_suspended_proof_if_over(&cache, live_bytes);
@@ -383,7 +383,15 @@ impl SharedCache {
         if result.is_ok() && _write_candidate {
             self.durable_touch(&touched);
         }
-        result
+        // No cold copy is observable between admission and take: both happen
+        // under this retained guard, with ordinary cursor/side reservations.
+        result.map(|()| {
+            if take_back {
+                cache.take(&touched)
+            } else {
+                None
+            }
+        })
     }
     fn insert_with_custody(
         &self,
@@ -392,7 +400,11 @@ impl SharedCache {
         live_bytes: usize,
         held_new: bool,
         write_candidate: bool,
-    ) -> Result<(), sampled_jsonl::CompletedNativeAcquisition> {
+        take_back: bool,
+    ) -> Result<
+        Option<crate::transcript_cache::Taken<CachedJsonlReduction>>,
+        sampled_jsonl::CompletedNativeAcquisition,
+    > {
         let Some(state) = completed.reduction.take() else {
             return Err(completed);
         };
@@ -412,8 +424,8 @@ impl SharedCache {
             finalization_charge: live_bytes,
             e2_held_new_file: held_new,
         };
-        match self.insert_taken(key, taken, write_candidate) {
-            Ok(()) => Ok(()),
+        match self.insert_taken(key, taken, write_candidate, take_back) {
+            Ok(taken) => Ok(taken),
             Err(taken) => Err(sampled_jsonl::CompletedNativeAcquisition {
                 checkpoint: taken.retained.checkpoint,
                 reduction: Some(taken.retained.state),
