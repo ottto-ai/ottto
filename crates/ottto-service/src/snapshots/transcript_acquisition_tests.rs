@@ -1162,6 +1162,15 @@ fn production_scan_page_at_with_setup(
         scan = scan.with_sampled_acquisition(cache, Scope(namespace.into()));
     }
     setup(&mut scan);
+    finish_production_scan_page(scan, source)
+}
+
+// Also drive scans constructed with multiple roots through the same native
+// finalization and acceptance path as the ordinary single-root fixtures.
+fn finish_production_scan_page(
+    mut scan: OwnedSourceScan,
+    source: SnapshotSource,
+) -> ProductionScanPage {
     let mut modes = (0, 0, 0);
     let mut metrics = (0, 0);
     loop {

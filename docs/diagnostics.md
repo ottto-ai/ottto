@@ -109,7 +109,10 @@ SystemTime clock expires on backwards time or jumps beyond 30 days. A restart
 allows at most one extra cap Full per key. Existing marked Tails stay enabled.
 A positive Full count emits `sampled_audit_cap_alarm` immediately (`> 0`);
 positive `pace_evicted` emits its own `sampled_audit_pace_alarm` immediately.
-Delayed paths keep their committed size and persisted age-bypassing retry.
+Delayed paths keep their committed size and clear the existing source
+fingerprint as a durable reparse witness. It remains age-exempt across partial
+saves, restarts and context-changing traversal replacements; the watcher queue
+alone is not its custody.
 
 Complete-c quiet retirement requires both samples, stable EOF/stamp and native
 completion/RAM admission. With an active durable store the scheduling marker
@@ -131,6 +134,10 @@ dangling links, unreadable/missing roots and other errors keep it owed. Codex-pr
 remains retained; this counter grants no Full or source/census credit. Account
 removal also emits `withheld_hold_released{deleted}`. Ordinary unavailable audit
 markers are never evicted.
+The absence predicate is shared with the hardened account-hold proof. The
+`audit_retired_absent` and deleted-hold counts currently use temporary traversal
+point carriers; integration must replace them with the shared account/absence
+diagnostics, preserving both retirement paths without double counting.
 Both objects are absent when sampling is null.
 
 Additive version 2 Claude counts on the existing page/check-in carrier classify

@@ -265,3 +265,17 @@ absence helper: no proof root or a still-present file retains the hold, and
 actual deletion beneath a readable configured root permits release. Existing
 persistence, resolving-parse, partial-page and population-bound assertions stay.
 Local all-target Clippy is required; runtime qualification remains CI-only.
+
+Round15 gives cap delays durable custody through the existing empty source
+fingerprint witness. Both paced and unfunded completions preserve committed
+size and stay age-exempt even when a changed root configuration replaces the
+watcher queue. The production-scanner regression delays real growth, commits a
+partial subset, saves/reloads, advances beyond the activity window, adds a root
+and verifies counted catch-up with no lost entry or marker and cold Full body
+parity. A separate control serializes the retry without any traversal present.
+
+The hardened absence predicate matches the shared account-hold implementation;
+its diagnostic carriers do not. Both audit retirement and deleted-account-hold
+release currently emit temporary traversal-point counts. Integration with the
+shared diagnostics must preserve both carve-outs and replace those emitters
+without duplicate counts. No new persisted field or cap increase is introduced.

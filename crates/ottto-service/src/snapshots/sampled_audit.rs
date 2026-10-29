@@ -608,6 +608,25 @@ mod tests {
         index
     }
     #[test]
+    fn cap_retry_keeps_durable_custody_without_a_traversal_or_marker() {
+        let mut index = index();
+        let candidate = candidate();
+        let key = local_index_key(&candidate.path);
+        assert!(index.traversal.is_none());
+        assert!(!path_requires_verification(&index.files, &candidate.path));
+        queue_cap_retry(&mut index, &candidate);
+        let mut loaded: ScanIndex =
+            serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
+        assert!(loaded.traversal.is_none());
+        assert!(path_requires_verification(&loaded.files, &candidate.path));
+        assert!(!loaded.files[&key].has_unverified_source());
+        assert_eq!(loaded.files[&key].size_bytes, 1);
+        loaded.files.remove(&key);
+        queue_cap_retry(&mut loaded, &candidate);
+        assert!(!loaded.files.contains_key(&key), "no invented membership");
+    }
+
+    #[test]
     fn marked_population_admission_and_quiet_retirement_share_the_cap() {
         let mut index = index();
         for n in 0..CACHE_ENTRIES {
@@ -1097,6 +1116,12 @@ mod provenance_tests {
 /// A cap delay is still owed: persist an age-bypassing retry without advancing
 /// the committed file size or claiming source/census completion.
 pub(super) fn queue_cap_retry(index: &mut ScanIndex, candidate: &CandidateFile) {
+    // The queue can disappear on a context-changing traversal replacement.
+    // Reuse the existing durable reparse witness at every age/open gate and
+    // in partial saves; keep the committed size and marker population intact.
+    if let Some(entry) = index.files.get_mut(&local_index_key(&candidate.path)) {
+        entry.source_file_fingerprint.clear();
+    }
     if let Some(traversal) = index.traversal.as_mut() {
         if !traversal
             .pending_candidates
