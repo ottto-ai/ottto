@@ -1662,6 +1662,7 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
     impl Drop for ResetClock {
         fn drop(&mut self) {
             sampled_scan::set_test_now(None);
+            sampled_scan::test_hooks::clear();
         }
     }
     let _clock = ResetClock;
@@ -1677,6 +1678,7 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
             ("due_quiet", 0),
             ("slots_256", 256),
             ("slots_300", 300),
+            ("slots_1024", 1024),
             ("clock_append", 0),
             ("real_edit", 0),
         ] {
@@ -1803,6 +1805,7 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
                 // admission refuses it: exercise DT's budget-refused Miss.
                 *second.retained().unwrap() = TranscriptCache::with_byte_limit(0);
             }
+            sampled_scan::test_hooks::clear();
             let (((warm, result, modes, bytes), diagnostics), sample_reads) =
                 crate::transcript_acquisition::capture_sample_reads(|| {
                     crate::local_resource_diagnostics::capture(|| {
@@ -1818,7 +1821,7 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
                                 if pending > 0 {
                                     assert_eq!(context.audit_slots, 0);
                                     assert_eq!(context.audit_metadata_supported, pending <= 256);
-                                    let (budget, _) = sampled_scan::copy_budget_step(
+                                    let (budget, step) = sampled_scan::copy_budget_step(
                                         scan.sampling.as_ref(),
                                         None,
                                         false,
@@ -1827,11 +1830,19 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
                                         budget > 0,
                                         "audit population cannot zero the bounded copy budget"
                                     );
+                                    let resident = step.resident.expect("measured residents");
+                                    assert!(resident > 0);
+                                    assert!(
+                                        resident + 2 * budget
+                                            <= crate::transcript_cache::CACHE_BYTES,
+                                        "residents plus both copy shares stay within the cache cap"
+                                    );
                                 }
                             },
                         )
                     })
                 });
+            let copy_decisions = sampled_scan::test_hooks::decisions();
             let pages = diagnostics
                 .iter()
                 .filter(|record| record["stage"] == "native_collection_page")
@@ -1926,6 +1937,42 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
                 !full,
                 "only an actual native Full verifies the source"
             );
+            if pending > 0 {
+                // E3 C2: index debt population is not resident-cache capacity.
+                // Inspect the actual retained copy and the real retention
+                // call's allowance; no fabricated budget or copy is injected.
+                use sampled_scan::test_hooks::Decision;
+                let cache = second.retained().unwrap();
+                let resident = cache.resident_bound().expect("cache admission bound");
+                assert!(resident > 0 && resident <= crate::transcript_cache::CACHE_BYTES);
+                assert!(cache.victims().len() <= crate::transcript_cache::CACHE_ENTRIES);
+                let copy = cache.peek(&key).expect("restored Tail copy was retained");
+                let budget = match copy_decisions.as_slice() {
+                    [Decision::Granted {
+                        budget,
+                        resident_measured: true,
+                        active_measured: true,
+                    }] => *budget,
+                    [Decision::Deferred { budget_after, .. }] => *budget_after,
+                    other => panic!("one measured retention allowance: {other:?}"),
+                };
+                assert!(budget > 0);
+                let bytes = crate::heap_layout_bound::bound(
+                    copy,
+                    budget.min(crate::transcript_cache::ENTRY_BYTES),
+                )
+                .expect("actual copy fits both its allowance and per-entry bound");
+                assert!(bytes > 0 && bytes <= budget);
+                drop(cache);
+                assert!(
+                    crate::heap_layout_bound::bound(
+                        second.as_ref(),
+                        crate::transcript_cache::CACHE_BYTES,
+                    )
+                    .is_some(),
+                    "all shared resident state remains bounded"
+                );
+            }
         }
     }
 }
