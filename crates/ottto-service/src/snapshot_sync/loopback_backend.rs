@@ -59,6 +59,9 @@ fn entity_ack(item: &serde_json::Value) -> serde_json::Value {
     let mut payload = serde_json::Map::new();
     for key in [
         "session_account_evidence",
+        // Creator-bearing ACKs also witness the optional curve; the resumable
+        // uploader refuses a creator-only digest for that larger body.
+        "context_curve",
         "tool_usage",
         "tool_usage_truncated",
     ] {
