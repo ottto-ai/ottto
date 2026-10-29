@@ -27672,20 +27672,11 @@ impl OwnedSourceScan {
                         codex_join_inventory.as_ref(),
                     );
                 }
-                if let Some(context) = sampling.as_ref().filter(|context| {
+                if let Some(context) = sampling.as_ref().filter(|_| {
                     !codex_page.cursor_exhausted(sampled_scan::codex_cursor::Limits::current())
-                        && !index.files.iter().any(|(key, entry)| {
-                            entry.codex_compressed_hold.is_some()
-                                && context.cache.cursor_job_owns(key)
-                        })
-                        && codex_join_inventory.as_ref().is_some_and(|inv| {
-                            !inv.headers.iter().any(|h| {
-                                inv.member_held(&h.candidate.path)
-                                    && context
-                                        .cache
-                                        .cursor_job_owns(&local_index_key(&h.candidate.path))
-                            })
-                        })
+                        // Custody cleanup above is namespace-scoped; foreign
+                        // jobs must reach cursor_resume's stale-job retirement.
+                        && codex_join_inventory.is_some()
                         && codex_page.claim_resume()
                 }) {
                     // Continuing the paused job is the highest scheduling class.

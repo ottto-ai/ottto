@@ -12087,11 +12087,19 @@ fn continuation_never_evicts_a_foreign_job() {
     let fixture = ScanRoot::new(40);
     let cache = Arc::new(SharedCache::default());
     with_test_limits(2048, 1024, 64, || {
-        paused_singleton(&fixture, &cache);
+        let (mut index, _) = paused_singleton(&fixture, &cache);
+        index
+            .files
+            .entry(local_index_key(&fixture.file(SESSION)))
+            .or_default()
+            .codex_compressed_hold = Some(CodexZstCause::ParentLedgerUnbound);
         // Stale: its namespace has not paged for `NAMESPACE_STALE_PAGES`.
         cache
             .with_cursor(|cursor| cursor.rotation.page += NAMESPACE_STALE_PAGES)
             .unwrap();
+        codex_compressed_hold_tests::no_open(&fixture.file(SESSION), || {
+            cache.cursor_end_custody(&Scope("other".into()), &index, None);
+        });
         assert!(cache.cursor_resume(&Scope("other".into()), true).is_none());
         assert_eq!(counter(&cache, |c| c.jobs_lost), 0);
         assert!(!cache.cursor_slot_free());
