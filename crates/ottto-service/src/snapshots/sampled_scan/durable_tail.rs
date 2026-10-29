@@ -252,6 +252,31 @@ impl Slot {
         &mut self,
         key: &str,
         index: &ScanIndex,
+        lease: &mut store::ActiveLease,
+    ) -> Result<(Box<store::DurableRecord>, Expected), &'static str> {
+        let digest = store::key_digest(DurableSource::ClaudeCode, key);
+        let record = match self
+            .store
+            .read_bounded(&digest, lease)
+            .map_err(|_| "o3.input_pending")?
+        {
+            ReadOutcome::Found(record) => record,
+            ReadOutcome::Refused(
+                store::Refusal::NewerFormat
+                | store::Refusal::Unknown
+                | store::Refusal::Undecodable
+                | store::Refusal::Unbindable,
+            ) => return Err("o3.protected_record"),
+            _ => return Err("o3.record"),
+        };
+        self.migration_expected(key, index, record)
+    }
+
+    fn migration_expected(
+        &self,
+        key: &str,
+        index: &ScanIndex,
+        record: Box<store::DurableRecord>,
     ) -> Result<(Box<store::DurableRecord>, Expected), &'static str> {
         if index.effective_upload_body_witness_revision_requires_adoption(key)
             || index.files.get(key).is_some_and(|e| {
@@ -263,17 +288,6 @@ impl Slot {
         {
             return Err("o3.replay");
         }
-        let digest = store::key_digest(DurableSource::ClaudeCode, key);
-        let record = match self.store.read(&digest) {
-            ReadOutcome::Found(record) => record,
-            ReadOutcome::Refused(
-                store::Refusal::NewerFormat
-                | store::Refusal::Unknown
-                | store::Refusal::Undecodable
-                | store::Refusal::Unbindable,
-            ) => return Err("o3.protected_record"),
-            _ => return Err("o3.record"),
-        };
         if record.record.binding.context
             != store::context_digest(
                 &self.namespace.0,
@@ -1063,9 +1077,10 @@ fn authorize_strict(
         .as_ref()
         .is_some_and(|s| s.load(Ordering::Relaxed))
     {
-        if let (Some(proof), Ok((record, current))) =
-            (custody.original.as_ref(), slot.migration_record(key, index))
-        {
+        if let (Some(proof), Ok((record, current))) = (
+            custody.original.as_ref(),
+            slot.migration_expected(key, index, record),
+        ) {
             if replacement.binding == current.binding {
                 slot.store
                     .authorize_migration(&record, &current, &replacement.certificate, proof);
@@ -1580,7 +1595,7 @@ impl SharedCache {
         recovered_audit_due: &mut Option<u64>,
     ) -> Result<Option<store::Refusal>, store::ActiveOverBudget> {
         self.durable_funded_guard(source, key, |cache| {
-            cache.durable_member_hold_active(source, key, index, recovered_audit_due)
+            cache.durable_member_hold_active(source, key, true, index, recovered_audit_due)
         })
     }
 
@@ -1588,6 +1603,7 @@ impl SharedCache {
         &self,
         snapshot_source: SnapshotSource,
         key: &str,
+        start: bool,
         index: &ScanIndex,
         recovered_audit_due: &mut Option<u64>,
     ) -> Option<store::Refusal> {
@@ -1600,7 +1616,7 @@ impl SharedCache {
         );
         match slot.store.full_guard(
             &store::key_digest(source, key),
-            true,
+            start,
             index.files.contains_key(key),
             &live_context,
         ) {
@@ -1852,11 +1868,15 @@ impl SharedCache {
                 return Err("o3.ram");
             }
             let digest = store::key_digest(DurableSource::ClaudeCode, key);
+            let mut lease = match self.acquire_active(SnapshotSource::ClaudeCode, 0) {
+                store::LeaseWait::Granted(lease) => lease,
+                _ => return Err("o3.input_pending"),
+            };
             let mut stores = self.durable().ok_or("o3.custody")?;
             let (record, current) = stores.slots[DurableSource::ClaudeCode.slot()]
                 .as_mut()
                 .ok_or("o3.store")?
-                .migration_record(key, index)?;
+                .migration_record(key, index, &mut lease)?;
             let r = &record.record.certificate;
             if record.index_generation > a.generation {
                 return Err("o3.generation");
@@ -1918,7 +1938,12 @@ impl SharedCache {
         if let Err(reason) = result {
             if !matches!(
                 reason,
-                "o3.idle" | "o3.revision" | "o3.replay" | "o3.context" | "o3.protected_record"
+                "o3.idle"
+                    | "o3.revision"
+                    | "o3.replay"
+                    | "o3.context"
+                    | "o3.protected_record"
+                    | "o3.input_pending"
             ) && self.no_match_full(key, file, accepted).is_some()
             {
                 return Ok(MigrationStart::Fallback);
@@ -1967,6 +1992,21 @@ impl SharedCache {
     ) -> Result<Option<UpgradeRead>, RetailHold> {
         let key = name;
         let key = store::key_digest(DurableSource::ClaudeCode, key);
+        let needs_input = index.is_some()
+            && self.durable().is_some_and(|s| {
+                s.retail_spent.get(&key).is_some_and(|c| {
+                    c.upgrade_started.is_some()
+                        && c.original.as_ref().is_some_and(|p| p.is_migration())
+                })
+            });
+        let mut input_lease = if needs_input {
+            match self.acquire_active(SnapshotSource::ClaudeCode, 0) {
+                store::LeaseWait::Granted(lease) => Some(lease),
+                _ => return Err(RetailHold::AccountingLost),
+            }
+        } else {
+            None
+        };
         let mut stores = self.durable().ok_or(RetailHold::AccountingLost)?;
         if !stores.slots[DurableSource::ClaudeCode.slot()]
             .as_ref()
@@ -1995,7 +2035,11 @@ impl SharedCache {
                 .as_mut()
                 .ok_or(RetailHold::Ineligible)?;
             let (record, current) = slot
-                .migration_record(name, index)
+                .migration_record(
+                    name,
+                    index,
+                    input_lease.as_mut().ok_or(RetailHold::AccountingLost)?,
+                )
                 .map_err(|_| RetailHold::Ineligible)?;
             if !migration_object(
                 &record.record.certificate,
@@ -2361,23 +2405,39 @@ impl SharedCache {
         index: &ScanIndex,
     ) -> RestoreOutcome {
         let full = phase != "active_wait"
-            && self.paced_growth_full(
-                source,
-                key,
-                held,
-                index.files.get(key).map_or(0, |entry| entry.size_bytes),
-                SystemTime::now(),
-                "resource_full_granted",
-            );
-        if let Some(mut stores) = self.durable() {
-            if full {
-                Counters::bump(&mut stores.counters.resource_full, phase);
+            && if source == SnapshotSource::Codex {
+                grown(held, index, key)
+                    && held.metadata().is_ok_and(|m| {
+                        self.paced_admission(
+                            source,
+                            key,
+                            SystemTime::now(),
+                            false,
+                            near_source_cap(source, m.len()),
+                            false,
+                        )
+                    })
             } else {
+                self.paced_growth_full(
+                    source,
+                    key,
+                    held,
+                    index.files.get(key).map_or(0, |entry| entry.size_bytes),
+                    SystemTime::now(),
+                    "resource_full_granted",
+                )
+            };
+        if let Some(mut stores) = self.durable() {
+            if full && source != SnapshotSource::Codex {
+                Counters::bump(&mut stores.counters.resource_full, phase);
+            } else if !full {
                 stores.counters.budget_refused += 1;
                 Counters::bump(&mut stores.counters.ineligible, phase);
             }
         }
-        let event = if full {
+        let event = if full && source == SnapshotSource::Codex {
+            "restore_resource_eligible"
+        } else if full {
             "restore_resource_full"
         } else {
             "restore_resource_pending"
@@ -2391,6 +2451,27 @@ impl SharedCache {
         } else {
             RestoreOutcome::Pending
         }
+    }
+
+    pub(in crate::snapshots) fn start_resource_full(
+        &self,
+        source: SnapshotSource,
+        key: &str,
+        file: &File,
+        accepted_end: u64,
+        phase: &'static str,
+    ) -> bool {
+        if !self.paced_growth_full(source, key, file, accepted_end, SystemTime::now(), phase) {
+            return false;
+        }
+        if let Some(mut stores) = self.durable() {
+            Counters::bump(&mut stores.counters.resource_full, phase);
+        }
+        crate::local_resource_diagnostics::durable_tail_alarm(
+            source.api_slug(),
+            &serde_json::json!({"restore_resource_full":{(phase):1}}),
+        );
+        true
     }
 
     #[allow(clippy::too_many_arguments)]

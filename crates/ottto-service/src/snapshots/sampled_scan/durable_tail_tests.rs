@@ -6871,7 +6871,7 @@ fn q8_strict_v1_bridge_keeps_unknown_same_and_inode_reuse_conservative() {
         generation: 9,
         entry: record.record.binding.entry,
         strict: true,
-        verified_extent: None,
+        verified_extent: true,
     };
     let (dev, ino, birth) = (r.device, r.inode, r.birth_nanos);
     assert_eq!(
@@ -9229,7 +9229,17 @@ fn a0h_native_exhaustion_growth_pacing_reselection_and_restart_body() {
         assert!(
             matches!(owner.cache.begin_retail(source, &key, &checkpoint, &file, accepted, now), Err(r) if r == expected_hold)
         );
-        let spent_before = owner.cache.durable().unwrap().retail_spent.clone();
+        let spent_snapshot = || {
+            owner
+                .cache
+                .durable()
+                .unwrap()
+                .retail_spent
+                .iter()
+                .map(|(key, custody)| (*key, custody.spent))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let spent_before = spent_snapshot();
         let wall_now = std::time::SystemTime::now();
         owner.cache.durable().unwrap().retail_full_now = Some(wall_now);
         let ((mut index, mut scan, modes), io) =
@@ -9249,7 +9259,7 @@ fn a0h_native_exhaustion_growth_pacing_reselection_and_restart_body() {
         let (mut cold_index, mut cold_scan, modes) = a0h_scan(&cold, &roots, &root, prior.clone());
         assert_eq!(modes.0, 1);
         assert_eq!(actual, a0h_wire(&root, &mut cold_index, &mut cold_scan));
-        assert_eq!(owner.cache.durable().unwrap().retail_spent, spent_before);
+        assert_eq!(spent_snapshot(), spent_before);
         assert_eq!(
             file.metadata().unwrap().len(),
             high,
@@ -9270,7 +9280,7 @@ fn a0h_native_exhaustion_growth_pacing_reselection_and_restart_body() {
         assert_eq!(idle_modes.0, 0);
         assert_eq!(idle_io, (0, 0));
         assert_eq!(quiet.files[&key].size_bytes, high);
-        assert_eq!(owner.cache.durable().unwrap().retail_spent, spent_before);
+        assert_eq!(spent_snapshot(), spent_before);
         // Remaining pace rows deliberately keep the unacknowledged prefix C.
 
         assert_eq!(
@@ -9389,7 +9399,7 @@ fn a0h_native_exhaustion_growth_pacing_reselection_and_restart_body() {
                 let (mut cold_index, mut cold_output, _) =
                     a0h_scan(&cold, &roots, &root, prior.clone());
                 assert_eq!(actual, a0h_wire(&root, &mut cold_index, &mut cold_output));
-                assert_eq!(owner.cache.durable().unwrap().retail_spent, spent_before);
+                assert_eq!(spent_snapshot(), spent_before);
                 assert_eq!(
                     owner.cache.durable_counters(source).unwrap().0.retail_full,
                     before_pace,
@@ -14299,4 +14309,95 @@ fn b4_warm_busy_keeps_aged_census_through_terminal_then_catches_up() {
         caught.files[&key].size_bytes,
         std::fs::metadata(&path).unwrap().len()
     );
+}
+
+#[test]
+fn migration_input_refusal_has_no_classifier_claim_or_pace_side_effects() {
+    let _reset = ResetActiveBudget;
+    let root = crate::test_scratch::ScratchDir::new("integration-migration-funding");
+    let path = root.join("t.jsonl");
+    std::fs::write(&path, b"{}\n{}\n").unwrap();
+    let key = local_index_key(&path);
+    let source = SnapshotSource::ClaudeCode;
+    let cache = SharedCache::default();
+    cache.durable_begin_pass(
+        source,
+        &root.join("index.json"),
+        &Scope("migration".into()),
+        false,
+    );
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        key.clone(),
+        serde_json::from_value(serde_json::json!({
+            "size_bytes": 3, "source_file_fingerprint": "accepted",
+            "effective_upload_body_witness_revision": effective_revision(source)
+        }))
+        .unwrap(),
+    );
+    let floor = AcceptedFloor::of(&index, &key);
+    let before = cache.durable_counters(source).unwrap().1;
+    let before_index = serde_json::to_value(&index).unwrap();
+    store::active::set_active_budget_for_test(Some(0));
+    assert_eq!(
+        cache
+            .migration_start(&key, &File::open(&path).unwrap(), &mut index, floor)
+            .err(),
+        Some("o3.input_pending")
+    );
+    assert_eq!(cache.durable_counters(source).unwrap().1, before);
+    assert_eq!(serde_json::to_value(&index).unwrap(), before_index);
+    let stores = cache.durable().unwrap();
+    assert!(stores.retail_full_at.is_empty());
+    assert!(stores.retail_spent.is_empty());
+    assert_eq!(stores.counters.migration[2], 0);
+}
+
+#[test]
+fn codex_resource_probe_deferral_does_not_spend_recovery_pace() {
+    let root = crate::test_scratch::ScratchDir::new("integration-resource-start");
+    let path = root.join("t.jsonl");
+    std::fs::write(&path, b"{}\n{}\n").unwrap();
+    let file = File::open(&path).unwrap();
+    let key = local_index_key(&path);
+    let source = SnapshotSource::Codex;
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        key.clone(),
+        serde_json::from_value(serde_json::json!({
+            "size_bytes": 3, "source_file_fingerprint": "accepted"
+        }))
+        .unwrap(),
+    );
+    let cache = SharedCache::default();
+    cache.durable_begin_pass(
+        source,
+        &root.join("index.json"),
+        &Scope("resource".into()),
+        false,
+    );
+    // A page can decline an eligible acquisition and retry it on the next page.
+    for _ in 0..2 {
+        assert!(matches!(
+            cache.restore_resource_pending(source, "rederive_unfunded", &key, &file, &index),
+            RestoreOutcome::Miss(MissClass::Resource("rederive_unfunded"))
+        ));
+        let stores = cache.durable().unwrap();
+        assert!(stores.retail_full_at.is_empty());
+        assert!(stores.counters.resource_full.is_empty());
+        assert_eq!(stores.counters.retail_full, [0; 3]);
+    }
+    assert!(cache.start_resource_full(source, &key, &file, 3, "rederive_unfunded"));
+    assert!(matches!(
+        cache.restore_resource_pending(source, "rederive_unfunded", &key, &file, &index),
+        RestoreOutcome::Pending
+    ));
+    assert!(!cache.start_resource_full(source, &key, &file, 3, "rederive_unfunded"));
+    let stores = cache.durable().unwrap();
+    assert_eq!(stores.retail_full_at.len(), 1);
+    assert_eq!(
+        stores.counters.resource_full.get("rederive_unfunded"),
+        Some(&1)
+    );
+    assert!(stores.retail_spent.is_empty());
 }

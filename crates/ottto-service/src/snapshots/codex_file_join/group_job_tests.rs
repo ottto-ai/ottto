@@ -3566,3 +3566,49 @@ fn parked_group_across_fresh_index_reprobes_member_debt_on_resume() {
     );
     fs::remove_dir_all(root).unwrap();
 }
+
+#[cfg(unix)]
+#[test]
+fn protected_group_peer_does_not_spend_corruption_rebuild_before_input() {
+    let (root, _) = fixture();
+    let writer = crate::locked_state_dir::test_locks::hold(&root);
+    let records = seed_member_debts(&root, writer, &[("a", 1, None), ("b", 1, None)]);
+    let newer = [
+        b"ottto-dt".as_slice(),
+        &(crate::durable_tail_store::FORMAT_VERSION + 1).to_le_bytes(),
+        &[7_u8; 64],
+    ]
+    .concat();
+    fs::write(&records[0].1, &newer).unwrap();
+    let mut corrupt = fs::read(&records[1].1).unwrap();
+    *corrupt.last_mut().unwrap() ^= 1;
+    fs::write(&records[1].1, &corrupt).unwrap();
+    let cache = Arc::new(SharedCache::default());
+    let source = SnapshotSource::Codex;
+    let (index, held) = sampled(&root, ScanIndex::default(), 10, &cache);
+    assert!(held.snapshots.is_empty());
+    assert_eq!(
+        cache
+            .durable_counters(source)
+            .unwrap()
+            .1
+            .t14_rebuild_full_started,
+        0,
+        "a held peer must leave the corrupt member's native attempt unspent"
+    );
+    assert_eq!(fs::read(&records[0].1).unwrap(), newer);
+    assert_eq!(fs::read(&records[1].1).unwrap(), corrupt);
+    fs::remove_file(&records[0].1).unwrap();
+    let (_, recovered) = next_generation(&root, index, &cache, 1);
+    assert!(!recovered.snapshots.is_empty());
+    assert_eq!(
+        cache
+            .durable_counters(source)
+            .unwrap()
+            .1
+            .t14_rebuild_full_started,
+        1,
+        "same-process recovery retains the one native rebuild attempt"
+    );
+    fs::remove_dir_all(root).unwrap();
+}

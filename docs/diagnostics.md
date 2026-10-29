@@ -1130,7 +1130,7 @@ is allowed. A busy FIFO lease remains `active_wait_busy`, a transient delay.
 These are RAM-only counters and stamps; restart can admit one extra growth
 Full. Structural Full publishes without a replacement retained/durable record.
 The pace uses `SystemTime`: backwards time or an elapsed interval beyond the
-one-day sanity maximum expires toward reading. Codex page/cursor deferral
+seven-day sanity maximum expires toward reading. Codex page/cursor deferral
 consumes no structural allowance; the stamp is enrolled at acquisition start.
 Growth at 90% or more of the source file cap bypasses pacing immediately, under
 the same cause with a `near_cap` annotation. Source caps predate this path:

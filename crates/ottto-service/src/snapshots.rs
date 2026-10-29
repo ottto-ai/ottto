@@ -27833,8 +27833,8 @@ impl OwnedSourceScan {
                         for member in &group_members {
                             let mut due = None;
                             let key = local_index_key(&member.path);
-                            let held =
-                                cache.durable_member_hold_active(source, &key, index, &mut due);
+                            let held = cache
+                                .durable_member_hold_active(source, &key, false, index, &mut due);
                             if let Some(at) =
                                 group.members.iter().position(|m| m.path == member.path)
                             {
@@ -27843,6 +27843,23 @@ impl OwnedSourceScan {
                             if let Some(reason) = held {
                                 refused = true;
                                 cache.durable_hold_exit(source, reason, index, member, &mut census);
+                            }
+                        }
+                        if !refused {
+                            for member in &group_members {
+                                let key = local_index_key(&member.path);
+                                if let Some(reason) = cache.durable_member_hold_active(
+                                    source, &key, true, index, &mut None,
+                                ) {
+                                    refused = true;
+                                    cache.durable_hold_exit(
+                                        source,
+                                        reason,
+                                        index,
+                                        member,
+                                        &mut census,
+                                    );
+                                }
                             }
                         }
                         refused
@@ -32231,6 +32248,7 @@ impl OwnedSourceScan {
             let mut paced_full_granted = false;
             let mut migration_floor = None;
             let mut active_bound_degraded = false;
+            let mut resource_full_pending = None;
             // U1a-2a G7: a side read's acquisition is a fresh `Full` read
             // under the side scope: no retained take, no admission observes
             // or counters, no debt. Failures are its charged attempt.
@@ -32649,6 +32667,11 @@ impl OwnedSourceScan {
                                         }
                                     }
                                     sampled_scan::durable_tail::RestoreOutcome::Miss(class) => {
+                                        if source == SnapshotSource::Codex {
+                                            if let sampled_scan::durable_tail::MissClass::Resource(phase) = class {
+                                                resource_full_pending = Some(phase);
+                                            }
+                                        }
                                         if matches!(
                                             class,
                                             sampled_scan::durable_tail::MissClass::RealEdit(_)
@@ -33252,6 +33275,20 @@ impl OwnedSourceScan {
                             pending!();
                         }
                     }
+                }
+            }
+            if let (Some(phase), Some(context)) = (resource_full_pending, sampling.as_ref()) {
+                let key = local_index_key(&active.candidate.path);
+                if !context.cache.start_resource_full(
+                    source,
+                    &key,
+                    active.parser.reader.reader.get_ref(),
+                    index.files.get(&key).map_or(0, |entry| entry.size_bytes),
+                    phase,
+                ) {
+                    residue_index_keys.insert(key);
+                    drop(codex_cursor_lease.take());
+                    pending!();
                 }
             }
             if active_bound_degraded {
