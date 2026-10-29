@@ -490,6 +490,8 @@ pub(crate) struct ClaudeAccountRetainedPending {
     pub(crate) claude_account_retained_pending_families: usize,
     /// Pretty JSON bytes of the retained field, including its field wrapper.
     pub(crate) claude_account_retained_pending_bytes: u64,
+    #[serde(flatten)]
+    pub(crate) retention: crate::snapshots::account_pending_retention::Counts,
 }
 impl crate::heap_layout_bound::HeapLayoutBound for Probe {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
@@ -744,6 +746,17 @@ pub(crate) fn claude_reemission_stop_latched(reminder: bool, counts: &impl Seria
 /// disabled store, as [since last, total] counts. No path, id or wire event.
 pub(crate) fn durable_tail_alarm(source: &str, counts: &impl Serialize) {
     traversal_point("durable_tail_alarm", source, counts);
+}
+pub(crate) fn codex_continuation(held: Option<&'static str>) {
+    let counts = serde_json::json!({
+        "continuation_pages_run": u8::from(held.is_none()),
+        "continuation_held": held.map(|reason| BTreeMap::from([(reason, 1u8)])).unwrap_or_default(),
+    });
+    traversal_point("codex_continuation", "codex", &counts);
+}
+pub(crate) fn codex_continuation_mint(outcome: &'static str) {
+    let counts = serde_json::json!({"continuation_mint": BTreeMap::from([(outcome, 1u8)])});
+    traversal_point("codex_continuation_mint", "codex", &counts);
 }
 pub(crate) fn traversal_point(stage: &'static str, source: &str, counts: &impl Serialize) {
     emit(&Record {
@@ -2361,6 +2374,70 @@ mod tests {
             assert!(!text.contains("secret/path"));
             assert!(!text.contains("cycle_peak"));
             assert_eq!(record["schema_version"], SCHEMA_VERSION);
+        }
+    }
+}
+#[cfg(test)]
+mod continuation_tests {
+    #[test]
+    fn continuation_mint_counts_have_closed_fixed_keys() {
+        let outcomes = [
+            "minted",
+            "inventory_incomplete",
+            "groups_completed",
+            "no_remaining",
+            "over_bound",
+        ];
+        let (_, rows) = super::capture(|| {
+            for outcome in outcomes {
+                super::codex_continuation_mint(outcome);
+            }
+        });
+        assert_eq!(rows.len(), outcomes.len());
+        for (row, outcome) in rows.iter().zip(outcomes) {
+            assert_eq!(row["stage"], "codex_continuation_mint");
+            assert_eq!(row["schema_version"], 2);
+            assert_eq!(row["source"], "codex");
+            assert_eq!(
+                row["counts"],
+                serde_json::json!({"continuation_mint":{outcome:1}})
+            );
+        }
+    }
+
+    #[test]
+    fn continuation_counts_use_fixed_point_schema() {
+        let (_, rows) = super::capture(|| {
+            super::codex_continuation(None);
+            for cause in [
+                "roster_changed",
+                "context_changed",
+                "policy_changed",
+                "group_job",
+                "other",
+            ] {
+                super::codex_continuation(Some(cause));
+            }
+        });
+        assert_eq!(rows.len(), 6);
+        assert_eq!(rows[0]["counts"]["continuation_pages_run"], 1);
+        assert_eq!(
+            rows[0]["counts"]["continuation_held"],
+            serde_json::json!({})
+        );
+        for row in rows {
+            assert_eq!(row["schema_version"], 2);
+            assert_eq!(row["source"], "codex");
+            assert_eq!(row["stage"], "codex_continuation");
+            assert!(row["observation"]["shared_process_cpu_delta_us"].is_null());
+            assert_eq!(row["counts"].as_object().unwrap().len(), 2);
+            assert!(
+                row["counts"]["continuation_held"]
+                    .as_object()
+                    .unwrap()
+                    .len()
+                    <= 1
+            );
         }
     }
 }

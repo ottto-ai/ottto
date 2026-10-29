@@ -449,7 +449,9 @@ impl SessionAttributionContext {
                         normalized_template: normalized_template.as_deref(),
                         repository_hash: input.repository_hash,
                         source_started_at: input.source_started_at,
+                        #[cfg(any(target_os = "macos", test))]
                         source_session_id: input.source_session_id,
+                        #[cfg(any(target_os = "macos", test))]
                         transcript_path: input.transcript_path,
                     },
                 )

@@ -11,6 +11,7 @@ pub const CODEX_TELEMETRY_KEY_SERVICE: &str = "ottto-telemetry-key-codex";
 pub const CLAUDE_CODE_TELEMETRY_KEY_SERVICE: &str = "ottto-telemetry-key-claude_code";
 pub const LEGACY_TELEMETRY_DEVICE_SECRET_SERVICE: &str = "ottto.telemetry.device-secret";
 pub const TELEMETRY_KEY_FILE_STORE_ENV: &str = "OTTTO_TELEMETRY_KEY_STORE_DIR";
+#[cfg(target_os = "macos")]
 const KEYCHAIN_SERVICE_SWEEP_LIMIT: usize = 256;
 
 fn is_directory_not_empty(error: &io::Error) -> bool {
