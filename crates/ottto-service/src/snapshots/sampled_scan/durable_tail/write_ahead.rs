@@ -16,9 +16,6 @@ pub(crate) use crate::durable_tail_store::{
     PrepareStoreFailure, PreparedRecord, ReceiptProof, RecordIdentity,
 };
 
-/// The one funded64KiB stream buffer the store's writer owns while streaming.
-const STREAM_SCRATCH_BYTES: u64 = 64 * 1024;
-
 /// Borrowed PRE-finalization native state; never a copy of the graph.
 pub(in crate::snapshots) struct LiveFinishView<'a> {
     pub(in crate::snapshots) accumulator: &'a SnapshotAccumulator,
@@ -166,17 +163,26 @@ pub(crate) enum PriorRecord {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UnpreparedDisposition {
-    PublishRetainingPrior { format: u16, cause: Unprepared },
-    PublishWithoutRecord { cause: Unprepared },
-    PublishStoreUntouched { cause: Degraded },
+    /// Same durable PRE barrier as a write+cleanup double failure.
+    PublishStrictRebind,
+    PublishRetainingPrior {
+        format: u16,
+        cause: Unprepared,
+    },
+    PublishWithoutRecord {
+        cause: Unprepared,
+    },
+    PublishStoreUntouched {
+        cause: Degraded,
+    },
     Hold(HeldCause),
 }
 /// The store's public receipt exists only at synchronous stream finish; a
 /// later reconciliation reports the class, and debt discharges on that receipt.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum ReconcileOutcome {
-    /// A pending completion was verified and retained in the store.
-    Receipted,
+    /// Only an actual exact registered candidate produces a receipt.
+    Receipted(ReceiptProof),
     /// No pending; a record survives under its existing authority.
     Retained,
     Absent,
@@ -286,6 +292,41 @@ impl<'a> CommitFences<'a> {
 }
 
 impl SharedCache {
+    pub(crate) fn durable_store_faulted(&self, source: SnapshotSource) -> bool {
+        let Some(ds) = durable_source(source) else {
+            return false;
+        };
+        self.durable().is_some_and(|mut stores| {
+            stores.slot(ds).as_ref().is_some_and(|slot| {
+                slot.store.disabled() == Some("write_cleanup_failed")
+                    || slot.store.resource_paused()
+            })
+        })
+    }
+
+    /// The plain pass flush is owned so no filesystem write runs under Stores.
+    pub(crate) fn durable_flush_pass(&self, source: SnapshotSource) -> std::io::Result<()> {
+        let Some(ds) = durable_source(source) else {
+            return Ok(());
+        };
+        let flush = {
+            let Some(mut stores) = self.durable() else {
+                return Ok(());
+            };
+            let Some(slot) = stores.slot(ds).as_mut() else {
+                return Ok(());
+            };
+            let Some(writer) = held_for(&slot.dir) else {
+                return Ok(());
+            };
+            slot.store.flush_pass(writer)?
+        };
+        match flush {
+            Some(flush) => flush.flush(),
+            None => Ok(()),
+        }
+    }
+
     /// Native capture of a fresh acquisition chain. The caller proved the real
     /// held O and, for `write_ahead_eligible`, a byte-zero native origin.
     #[allow(clippy::too_many_arguments)] // Every input is one proved native fact.
@@ -425,17 +466,23 @@ impl SharedCache {
             (slot.namespace.clone(), slot.identity_capture)
         };
         let interpretation = Interpretation::of(source, key, index, identity_capture, &namespace);
-        let mut expected = expected(
-            ds,
-            source,
-            key,
-            scope,
-            index,
-            &interpretation,
-            Some((store::FORMAT_V3, ds.properties().allowlist(), revision)),
-        )?;
-        expected.binding.entry = [0; 32];
-        Some(expected.binding)
+        Some(Binding {
+            source: ds,
+            key: store::key_digest(ds, key),
+            context: store::context_digest(
+                &namespace.0,
+                index.active_upload_context_fingerprint.as_deref(),
+            ),
+            scope: replay_scope_for(
+                source,
+                scope,
+                index,
+                &interpretation,
+                None,
+                Some((store::FORMAT_V3, ds.properties().allowlist(), revision)),
+            ),
+            entry: [0; 32],
+        })
     }
 
     pub(in crate::snapshots) fn prepare_live(
@@ -483,7 +530,13 @@ impl SharedCache {
             Err(Refuse::TooLarge) => return PrepareOutcome::NotPersisted(NotPersisted::EntryCap),
             Err(_) => return PrepareOutcome::NotPersisted(NotPersisted::Codec),
         };
-        if lease.charge(STREAM_SCRATCH_BYTES).is_err() {
+        let scratch = self.durable().and_then(|mut stores| {
+            stores
+                .slot(source)
+                .as_ref()
+                .and_then(|slot| slot.store.stream_reserve_bytes())
+        });
+        if scratch.map_or(true, |bytes| lease.charge(bytes).is_err()) {
             return PrepareOutcome::NotPersisted(NotPersisted::ActiveBound);
         }
         let header = store::PreparedHeader {
@@ -508,12 +561,12 @@ impl SharedCache {
             if slot.store.disabled().is_some() {
                 return PrepareOutcome::Degraded(Degraded::Disabled);
             }
-            if slot.store.resource_paused() {
-                return PrepareOutcome::Degraded(Degraded::Paused);
-            }
             let Some(writer) = held_for(&slot.dir) else {
                 return PrepareOutcome::Degraded(Degraded::NoLock);
             };
+            if !slot.store.check_resources(writer, 0) {
+                return PrepareOutcome::Degraded(Degraded::Paused);
+            }
             match slot.store.prepare_stream(writer, header) {
                 Ok(preparation) => preparation,
                 Err(failure) => return PrepareOutcome::StoreFailed(failure),
@@ -717,23 +770,33 @@ impl SharedCache {
             }
             store::FailureDisposition::PublishDegraded {
                 strict_rebind: true,
-                ..
+                cause,
             } => {
+                debug_assert_eq!(cause, "write_cleanup_failed");
                 // Codex double failure: the store disabled itself and dropped
                 // its in-RAM pending set; no debt marker may outlive it.
                 stores.clear_source_owed(source);
                 note_degraded(stores);
                 WriteOutcome::FailedPublishedWithoutRecord(DegradedCause::StrictRebind)
             }
-            store::FailureDisposition::PublishDegraded { .. } => {
+            store::FailureDisposition::PublishDegraded { cause, .. } => {
+                debug_assert!(!cause.is_empty());
                 // Cleanup proved the predecessor absent: degraded publish.
                 // Publication without a record leaves no receipt to owe.
-                stores.release_hold(digest, HoldRelease::Absent);
+                if stores
+                    .retail_spent
+                    .get(&digest)
+                    .is_some_and(|custody| custody.hold.is_some())
+                    && !stores.hold_content_changed(digest)
+                {
+                    return WriteOutcome::FailedHeld(HeldCause::StaleSurvivor);
+                }
                 stores.clear_owed(digest);
                 note_degraded(stores);
                 WriteOutcome::FailedPublishedWithoutRecord(DegradedCause::WriteFailedRetired)
             }
-            store::FailureDisposition::Hold { .. } if source == DurableSource::ClaudeCode => {
+            store::FailureDisposition::Hold { cause } if source == DurableSource::ClaudeCode => {
+                debug_assert!(!cause.is_empty());
                 let held = stores
                     .retail_spent
                     .get(&digest)
@@ -748,6 +811,7 @@ impl SharedCache {
                     WriteOutcome::FailedPublishedWithoutRecord(DegradedCause::PriorUnbindable)
                 } else {
                     stores.hold_key(digest, observed);
+                    stores.capture_hold_metadata(digest, fences.held);
                     WriteOutcome::FailedHeld(HeldCause::StaleSurvivor)
                 }
             }
@@ -768,6 +832,10 @@ impl SharedCache {
         };
         let digest = store::key_digest(source, fences.key());
         let observed = fences.observed();
+        if source == DurableSource::Codex && self.durable_store_faulted(fences.chain.source()) {
+            return UnpreparedDisposition::PublishStrictRebind;
+        }
+
         let Some(mut guard) = self.durable() else {
             return UnpreparedDisposition::PublishStoreUntouched {
                 cause: Degraded::Disabled,
@@ -781,7 +849,7 @@ impl SharedCache {
             }
             Some(slot) if slot.store.absent(&digest) => PriorRecord::Absent,
             // Header-only classification of the survivor, never its body.
-            Some(slot) => match slot.store.hold(&digest) {
+            Some(slot) => match slot.store.guard_with_carrier(&digest, true, &[0; 32]).err() {
                 Some(refusal) => PriorRecord::Protected(refusal),
                 None => slot
                     .store
@@ -820,7 +888,14 @@ impl SharedCache {
                 if fault {
                     note_degraded(stores);
                 }
-                stores.release_hold(digest, HoldRelease::Absent);
+                if stores
+                    .retail_spent
+                    .get(&digest)
+                    .is_some_and(|custody| custody.hold.is_some())
+                    && !stores.hold_content_changed(digest)
+                {
+                    return UnpreparedDisposition::Hold(HeldCause::StaleSurvivor);
+                }
                 UnpreparedDisposition::PublishWithoutRecord { cause: reason }
             }
             // A store fault or resource pause never retires a valid
@@ -841,6 +916,7 @@ impl SharedCache {
                     }
                 } else {
                     stores.hold_key(digest, observed);
+                    stores.capture_hold_metadata(digest, fences.held);
                     UnpreparedDisposition::Hold(HeldCause::StaleSurvivor)
                 }
             }
@@ -864,37 +940,62 @@ impl SharedCache {
             return ReconcileOutcome::Absent;
         };
         let digest = store::key_digest(ds, key);
-        let had_pending = self.durable().is_some_and(|mut stores| {
-            stores.slot(ds).as_ref().is_some_and(|slot| {
-                slot.store.disabled().is_none() && slot.store.receipt_pending(&digest)
-            })
-        });
-        match self.reconcile_pending_key(source, key) {
-            Some(store::Refusal::ReceiptPending) => {
-                return ReconcileOutcome::Held(HeldCause::ReceiptPending)
+        let mut lease = match self.acquire_active(source, 64 * 1024 + 4096) {
+            store::LeaseWait::Granted(lease) => lease,
+            store::LeaseWait::Busy | store::LeaseWait::OverBudget => {
+                return ReconcileOutcome::Held(HeldCause::CustodyBound)
             }
-            Some(refusal) => return ReconcileOutcome::Held(HeldCause::Protected(refusal)),
-            None => {}
+        };
+        // A bounded stream verifier, never an opaque body Vec. Keep its lease
+        // through delivery; no old record is deleted by reconciliation.
+        if lease.charge(4096).is_err() {
+            return ReconcileOutcome::Held(HeldCause::CustodyBound);
         }
-        let Some(mut guard) = self.durable() else {
+        let Some(mut stores) = self.durable() else {
             return ReconcileOutcome::Held(HeldCause::ReceiptPending);
         };
-        let stores = &mut *guard;
-        let (disabled, absent) = match stores.slots[ds.slot()].as_ref() {
-            None => return ReconcileOutcome::Absent,
-            Some(slot) => (slot.store.disabled().is_some(), slot.store.absent(&digest)),
+        let Some(slot) = stores.slot(ds).as_mut() else {
+            return ReconcileOutcome::Absent;
         };
-        if disabled {
-            // A disabled store dropped its pending set and serves nothing.
+        if slot.store.disabled().is_some() {
             stores.clear_source_owed(ds);
-            ReconcileOutcome::Absent
-        } else if absent {
-            ReconcileOutcome::Absent
-        } else if had_pending {
-            ReconcileOutcome::Receipted
-        } else {
-            ReconcileOutcome::Retained
+            return ReconcileOutcome::Absent;
         }
+        let Some(writer) = held_for(&slot.dir) else {
+            return ReconcileOutcome::Held(HeldCause::ReceiptPending);
+        };
+        match slot.store.reconcile_stream(writer, &digest) {
+            Ok(Some(receipt)) => ReconcileOutcome::Receipted(receipt),
+            Ok(None) if slot.store.absent(&digest) => ReconcileOutcome::Absent,
+            Ok(None) => ReconcileOutcome::Retained,
+            Err(refusal) => ReconcileOutcome::Held(HeldCause::Protected(refusal)),
+        }
+    }
+
+    /// A paused key does no transcript acquisition. Probing the store is
+    /// source-level and bounded; other keys remain publishable.
+    pub(in crate::snapshots) fn durable_held_paused(
+        &self,
+        source: SnapshotSource,
+        key: &str,
+        file: &File,
+    ) -> bool {
+        if !self.durable_claude_hold(source, key, file) {
+            return false;
+        }
+        let Some(ds) = durable_source(source) else {
+            return false;
+        };
+        let Some(mut stores) = self.durable() else {
+            return true;
+        };
+        let Some(slot) = stores.slot(ds).as_mut() else {
+            return true;
+        };
+        let Some(writer) = held_for(&slot.dir) else {
+            return true;
+        };
+        !slot.store.check_resources(writer, 0)
     }
 
     /// Native discovery/publication query for a held Claude key; counts growth
@@ -916,7 +1017,30 @@ impl SharedCache {
         let Some(mut stores) = self.durable() else {
             return false;
         };
-        stores.observe_hold(digest, observed)
+        let metadata = held.metadata().ok();
+        let edited = metadata.as_ref().is_some_and(|m| {
+            stores
+                .retail_spent
+                .get(&digest)
+                .and_then(|custody| custody.hold)
+                .is_some_and(|hold| {
+                    m.len() < hold.length
+                        || (m.len() == hold.length
+                            && hold
+                                .modified
+                                .is_some_and(|old| old != (m.mtime(), m.mtime_nsec())))
+                })
+        });
+        if edited {
+            stores.release_hold(digest, HoldRelease::Content);
+            stores.clear_owed(digest);
+            return false;
+        }
+        let held_now = stores.observe_hold(digest, observed);
+        if held_now {
+            stores.capture_hold_metadata(digest, held);
+        }
+        held_now
     }
 
     /// The native classifier proved a genuine content change (real edit or
@@ -926,7 +1050,10 @@ impl SharedCache {
             return;
         };
         if let Some(mut stores) = self.durable() {
-            stores.mark_hold_content_changed(store::key_digest(ds, key));
+            let digest = store::key_digest(ds, key);
+            stores.mark_hold_content_changed(digest);
+            stores.release_hold(digest, HoldRelease::Content);
+            stores.clear_owed(digest);
         }
     }
 
@@ -951,6 +1078,9 @@ impl SharedCache {
 /// prior-record adjudication as an unprepared write, as a write outcome.
 fn unprepared_write(disposition: UnpreparedDisposition) -> WriteOutcome {
     match disposition {
+        UnpreparedDisposition::PublishStrictRebind => {
+            WriteOutcome::FailedPublishedWithoutRecord(DegradedCause::StrictRebind)
+        }
         UnpreparedDisposition::Hold(cause) => WriteOutcome::FailedHeld(cause),
         UnpreparedDisposition::PublishWithoutRecord { .. } => {
             WriteOutcome::FailedPublishedWithoutRecord(DegradedCause::WriteFailedRetired)
@@ -1002,10 +1132,11 @@ pub(super) const D3_COUNTS: usize = 4;
 /// witness or debt copy. RAM only: a restart re-derives it from the survivor.
 #[derive(Clone, Copy)]
 pub(super) struct ClaudeHold {
-    since: std::time::Instant,
+    since: std::time::SystemTime,
     object: (u64, u64, u64),
     length: u64,
     content_changed: bool,
+    modified: Option<(i64, i64)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1023,6 +1154,17 @@ pub(super) struct D3State {
 }
 
 impl Stores {
+    fn capture_hold_metadata(&mut self, digest: store::Digest32, file: &File) {
+        if let (Some(hold), Ok(metadata)) = (
+            self.retail_spent
+                .get_mut(&digest)
+                .and_then(|c| c.hold.as_mut()),
+            file.metadata(),
+        ) {
+            hold.modified = Some((metadata.mtime(), metadata.mtime_nsec()));
+        }
+    }
+
     /// Hold only this key; the source and every other key keep publishing.
     pub(super) fn hold_key(
         &mut self,
@@ -1040,10 +1182,11 @@ impl Stores {
         if custody.hold.is_none() {
             let (object, length) = observed.unwrap_or(((0, 0, 0), 0));
             custody.hold = Some(ClaudeHold {
-                since: std::time::Instant::now(),
+                since: std::time::SystemTime::now(),
                 object,
                 length,
                 content_changed: false,
+                modified: None,
             });
             if !self.d3.hold_alarmed {
                 self.d3.hold_alarmed = true;
@@ -1120,7 +1263,7 @@ impl Stores {
             .filter_map(|custody| custody.hold)
         {
             keys += 1;
-            oldest = oldest.max(hold.since.elapsed().as_secs());
+            oldest = oldest.max(hold.since.elapsed().map_or(0, |age| age.as_secs()));
         }
         [keys, oldest]
     }

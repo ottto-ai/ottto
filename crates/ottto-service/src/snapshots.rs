@@ -3213,6 +3213,7 @@ pub(crate) fn durable_after_save(
         }
         None => cache.durable_note_unlocked(source),
     }
+    let _ = cache.durable_flush_pass(source);
     if let Some((counters, store)) = cache.durable_counters(source) {
         eprintln!("{}", counters.summary(source, &store));
     }
@@ -29292,9 +29293,10 @@ impl OwnedSourceScan {
                         twins: history_upgrade.twin_groups(),
                     }),
                 };
-                // M3 G1: only an ordinary Claude plain singleton activates.
-                // Group/member, proof, side, comparison and Codex (M1 until
-                // P5) keep the legacy finish. The held descriptor is
+                // M3 G1 and D3: ordinary plain singleton completions stage
+                // before publication for both durable sources. Codex must
+                // observe a store failure before ACK to enforce strict rebind.
+                // Group/member, proof, side and comparison keep their owners. The held descriptor is
                 // duplicated, never read, before the parser is consumed: the
                 // commit fences check it after a native Ok.
                 #[cfg(unix)]
@@ -29302,7 +29304,7 @@ impl OwnedSourceScan {
                     .as_ref()
                     .zip(file_sampling.as_ref())
                     .filter(|_| {
-                        source == SnapshotSource::ClaudeCode
+                        matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex)
                             && !comparison_target
                             && side_origin.is_none()
                             && aliases.is_empty()
@@ -31766,6 +31768,36 @@ impl OwnedSourceScan {
                     HistoryDecision::NotOwed => {}
                 }
             }
+            #[cfg(unix)]
+            if let Some(context) = sampling.as_ref() {
+                let key = local_index_key(&candidate.path);
+                if native_edit_proven {
+                    context.cache.durable_release_hold(source, &key);
+                }
+                match context.cache.owed_before_skip(source, &key) {
+                    sampled_scan::durable_tail::OwedQuery::None => {}
+                    sampled_scan::durable_tail::OwedQuery::Owed => {
+                        if decision == CandidateDecision::Skip {
+                            decision = CandidateDecision::Parse;
+                        }
+                    }
+                    sampled_scan::durable_tail::OwedQuery::Hold(cause) => {
+                        if source == SnapshotSource::ClaudeCode
+                            && cause == sampled_scan::durable_tail::HeldCause::StaleSurvivor
+                            && !native_edit_proven
+                            && context
+                                .cache
+                                .durable_held_paused(source, &key, &opened_file)
+                        {
+                            context.cache.retain_owed_discovery(source, &key);
+                            pending!();
+                        }
+                        if decision == CandidateDecision::Skip {
+                            decision = CandidateDecision::Parse;
+                        }
+                    }
+                }
+            }
             if source == SnapshotSource::ClaudeCode && decision == CandidateDecision::Parse {
                 if let Some(reason) = parse_reason {
                     let count = &mut census.parse_reasons[reason as usize];
@@ -32415,21 +32447,56 @@ impl OwnedSourceScan {
             } else if let Some(context) = sampling.as_mut() {
                 let key = local_index_key(&candidate.path);
                 #[cfg(unix)]
-                let (taken, mut preparation_lease) = match context.cache.take_prepared(source, &key)
-                {
-                    Ok(Some((taken, lease))) => (Some(taken), Some(lease)),
-                    Ok(None) => (None, None),
-                    Err(()) => {
-                        residue_index_keys.insert(key.clone());
-                        context.cache.durable_custody_hold(
-                            source,
-                            "prepared_funding_pending",
-                            index,
-                            &candidate,
-                        );
-                        pending!();
+                let receipt = if matches!(
+                    context.cache.owed_before_skip(source, &key),
+                    sampled_scan::durable_tail::OwedQuery::Owed
+                ) {
+                    match context.cache.reconcile_receipt(source, &key) {
+                        sampled_scan::durable_tail::ReconcileOutcome::Receipted(receipt) => {
+                            Some(receipt)
+                        }
+                        sampled_scan::durable_tail::ReconcileOutcome::Held(cause) => {
+                            context.cache.retain_owed_discovery(source, &key);
+                            if cause == sampled_scan::durable_tail::HeldCause::ReceiptPending {
+                                pending!();
+                            }
+                            None
+                        }
+                        sampled_scan::durable_tail::ReconcileOutcome::Retained
+                        | sampled_scan::durable_tail::ReconcileOutcome::Absent => None,
                     }
+                } else {
+                    None
                 };
+                #[cfg(unix)]
+                let (mut taken, mut preparation_lease) =
+                    match context.cache.take_prepared(source, &key) {
+                        Ok(Some((taken, lease))) => (Some(taken), Some(lease)),
+                        Ok(None) => (None, None),
+                        Err(()) => {
+                            residue_index_keys.insert(key.clone());
+                            context.cache.durable_custody_hold(
+                                source,
+                                "prepared_funding_pending",
+                                index,
+                                &candidate,
+                            );
+                            pending!();
+                        }
+                    };
+                #[cfg(unix)]
+                if let Some((taken, receipt)) = taken.as_mut().zip(receipt.as_ref()) {
+                    if let Some(owed) = taken.durable.take_owed() {
+                        match context.cache.discharge_owed(owed, receipt) {
+                            Ok(chain) => {
+                                let _ = taken.durable.put_chain(chain);
+                            }
+                            Err(owed) => {
+                                let _ = taken.durable.put_owed(owed);
+                            }
+                        }
+                    }
+                }
                 #[cfg(not(unix))]
                 let taken = context.cache.take(&key);
                 #[cfg(unix)]
@@ -32449,7 +32516,22 @@ impl OwnedSourceScan {
                 macro_rules! return_original {
                     ($taken:expr, $reason:expr) => {{
                         let reason: Option<&'static str> = $reason;
-                        match context.cache.return_prepared_taken(key.clone(), $taken) {
+                        let taken = $taken;
+                        let returned = if taken.durable.owed().is_some() {
+                            let live_bytes = taken.finalization_charge;
+                            match context
+                                .cache
+                                .return_owed_taken(key.clone(), taken, live_bytes)
+                            {
+                                sampled_scan::durable_tail::OwedAdmission::Admitted => Ok(()),
+                                sampled_scan::durable_tail::OwedAdmission::Refused(taken) => {
+                                    Err(taken)
+                                }
+                            }
+                        } else {
+                            context.cache.return_prepared_taken(key.clone(), taken)
+                        };
+                        match returned {
                             Ok(()) =>
                             {
                                 #[cfg(unix)]
@@ -35199,8 +35281,13 @@ fn bind_native_chain(
         cache.durable_release_hold(request.source, request.key);
     }
     let custody = &mut completed.durable;
-    if custody.owed.is_some() {
-        // Debt owns its chain; `advance_owed` moves it under the facade.
+    if let Some(mut owed) = custody.owed.take() {
+        // A later Tail invalidates the old candidate, never its acquisition.
+        let _ = cache.advance_owed(&mut owed, &completed.checkpoint);
+        custody.owed = Some(owed);
+        if custody.ensure_active(cache, request.source, 0).is_err() {
+            return;
+        }
         return;
     }
     if custody.ensure_active(cache, request.source, 0).is_err() {
@@ -35210,6 +35297,7 @@ fn bind_native_chain(
     if let Some(chain) = custody.chain.as_mut() {
         if cache
             .durable_rebind_chain(
+                custody.active.as_mut().expect("ensured active lease"),
                 chain,
                 request.opened_object_identity,
                 request.held,
@@ -35317,6 +35405,22 @@ fn settle_native_attempt(
                 PrepareOutcome::StoreFailed(failure) => failure.identity().cloned(),
                 PrepareOutcome::NotPersisted(_) | PrepareOutcome::Degraded(_) => None,
             };
+            if let PrepareOutcome::Prepared(prepared) = &staged {
+                if acquisition.custody().owed().is_some()
+                    && cache
+                        .bind_owed_prepared(&mut acquisition, prepared)
+                        .is_err()
+                {
+                    discard_staging(cache, staged);
+                    cache.retain_owed_discovery(fence.source, fence.key);
+                    return NativeSettlement {
+                        native,
+                        completed: None,
+                        disposition: NativeDisposition::Hold,
+                        staged: true,
+                    };
+                }
+            }
             let fences = match custody_chain(acquisition.custody()) {
                 Some(chain) => CommitFences::new(
                     &mut held,
@@ -35370,9 +35474,7 @@ fn settle_native_attempt(
         disposition
     };
     // The process-wide lease ends before any cache admission or effect.
-    if let Some(lease) = acquisition.custody_mut().active.take() {
-        lease.release();
-    }
+    acquisition.custody_mut().release_active();
     let completed = match acquisition {
         FinishAcquisition::Certified(completed) if disposition == NativeDisposition::Hold => {
             // Funded owed retention, or the debt survives through the
@@ -35435,10 +35537,14 @@ fn write_disposition(
             owe_receipt(cache, acquisition, candidate)
         }
         WriteOutcome::FailedPublishedWithoutRecord(DegradedCause::StrictRebind) => {
+            acquisition.custody_mut().take_owed();
             NativeDisposition::PublishStrictRebind
         }
         // Verified retirement or an untouched store: degraded, no record.
-        WriteOutcome::FailedPublishedWithoutRecord(_) => NativeDisposition::Publish,
+        WriteOutcome::FailedPublishedWithoutRecord(_) => {
+            acquisition.custody_mut().take_owed();
+            NativeDisposition::Publish
+        }
     }
 }
 
@@ -35450,10 +35556,46 @@ fn unprepared_disposition(
 ) -> NativeDisposition {
     use sampled_scan::durable_tail::UnpreparedDisposition;
     match disposition {
-        UnpreparedDisposition::PublishRetainingPrior { .. }
-        | UnpreparedDisposition::PublishWithoutRecord { .. }
-        | UnpreparedDisposition::PublishStoreUntouched { .. } => NativeDisposition::Publish,
-        UnpreparedDisposition::Hold(_) => owe_receipt(cache, acquisition, None),
+        UnpreparedDisposition::PublishStrictRebind => NativeDisposition::PublishStrictRebind,
+        UnpreparedDisposition::PublishRetainingPrior { format, cause } => {
+            debug_assert!(matches!(format, 1 | 3));
+            debug_assert!(matches!(
+                cause,
+                sampled_scan::durable_tail::Unprepared::NotPersisted(_)
+                    | sampled_scan::durable_tail::Unprepared::Degraded(_)
+            ));
+            NativeDisposition::Publish
+        }
+        UnpreparedDisposition::PublishWithoutRecord { cause } => {
+            debug_assert!(matches!(
+                cause,
+                sampled_scan::durable_tail::Unprepared::NotPersisted(_)
+                    | sampled_scan::durable_tail::Unprepared::Degraded(_)
+            ));
+            NativeDisposition::Publish
+        }
+        UnpreparedDisposition::PublishStoreUntouched { cause } => {
+            debug_assert!(matches!(
+                cause,
+                sampled_scan::durable_tail::Degraded::Disabled
+                    | sampled_scan::durable_tail::Degraded::NoLock
+                    | sampled_scan::durable_tail::Degraded::Paused
+                    | sampled_scan::durable_tail::Degraded::Refused
+            ));
+            NativeDisposition::Publish
+        }
+        UnpreparedDisposition::Hold(cause) => {
+            debug_assert!(matches!(
+                cause,
+                sampled_scan::durable_tail::HeldCause::Fence
+                    | sampled_scan::durable_tail::HeldCause::Protected(_)
+                    | sampled_scan::durable_tail::HeldCause::ReceiptPending
+                    | sampled_scan::durable_tail::HeldCause::CustodyBound
+                    | sampled_scan::durable_tail::HeldCause::Incompatible
+                    | sampled_scan::durable_tail::HeldCause::StaleSurvivor
+            ));
+            owe_receipt(cache, acquisition, None)
+        }
     }
 }
 
@@ -35481,6 +35623,46 @@ fn codex_strict_rebind(index: &mut ScanIndex, source: SnapshotSource, key: &str)
         }
         None => false,
     }
+}
+
+/// D3's crash boundary is before the upload request can be acknowledged.
+/// Persist the binding change on the previously committed PRE entry, never on
+/// a newly parsed body/revision/extent. Carry #865 only toward more audit debt.
+#[cfg(unix)]
+pub(crate) fn commit_store_fault_barrier(
+    cache: &sampled_scan::SharedCache,
+    source: SnapshotSource,
+    working: &mut ScanIndex,
+    committed: &mut ScanIndex,
+    index_path: &Path,
+) -> Result<bool> {
+    if source != SnapshotSource::Codex || !cache.durable_store_faulted(source) {
+        return Ok(false);
+    }
+    let mut changed = false;
+    for (key, entry) in &mut committed.files {
+        if working
+            .files
+            .get(key)
+            .is_some_and(|current| current.source_file_fingerprint.is_empty())
+            && !entry.source_file_fingerprint.is_empty()
+        {
+            entry.carry_sampled_audit(&working.files[key]);
+            entry.source_file_fingerprint.clear();
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(false);
+    }
+    #[cfg(test)]
+    sampled_scan::test_hooks::fire(sampled_scan::test_hooks::Point::BeforeFaultBarrier);
+    committed.save(index_path)?;
+    // Subsequent selected saves CAS against this actual durable generation.
+    working.generation = committed.generation;
+    #[cfg(test)]
+    sampled_scan::test_hooks::fire(sampled_scan::test_hooks::Point::AfterFaultBarrier);
+    Ok(true)
 }
 
 /// `created()` of an opened file with its device and inode, or None when the

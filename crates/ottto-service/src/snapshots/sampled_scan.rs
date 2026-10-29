@@ -1820,6 +1820,10 @@ pub(super) mod test_hooks {
         /// M3 E12: the completion is settled (receipt, owed hold or degraded
         /// disposition), before cursor publication, birth or any effect.
         BeforeNativeEffects,
+        /// Before the retained PRE binding changes on disk; no POST is allowed.
+        BeforeFaultBarrier,
+        /// The retained PRE rebind is durable; the uploader may now proceed.
+        AfterFaultBarrier,
     }
 
     /// What `tail_completion_budget` measured on its last call.

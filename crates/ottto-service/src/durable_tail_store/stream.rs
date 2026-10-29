@@ -177,7 +177,7 @@ pub(crate) struct StreamPreparation {
     header: PreparedHeader,
 }
 pub(crate) struct PreparedRecord {
-    attempt: Attempt,
+    attempt: Box<Attempt>,
 }
 impl PreparedRecord {
     pub(crate) fn identity(&self) -> &RecordIdentity {
@@ -309,7 +309,7 @@ impl StreamPreparation {
         })();
         match result {
             Ok(()) => Ok(PreparedRecord {
-                attempt: self.attempt,
+                attempt: Box::new(self.attempt),
             }),
             Err(error) => Err(self.attempt.failure("stream_write", error)),
         }
@@ -584,7 +584,7 @@ impl DurableTailStore {
         writer: &dyn SingleWriter,
         prepared: PreparedRecord,
     ) -> Result<PendingCommit, PrepareStoreFailure> {
-        let attempt = prepared.attempt;
+        let attempt = *prepared.attempt;
         let result = (|| {
             self.check_writer(writer)?;
             if self.disabled.is_some()
@@ -836,6 +836,13 @@ impl DurableTailStore {
                 next_probe: now + PAUSE_RECHECK,
             });
         }
+    }
+    #[cfg(test)]
+    pub(crate) fn expire_resource_pause_for_test(&mut self) {
+        if let Some(pause) = self.resource_pause.as_mut() {
+            pause.next_probe = SystemTime::UNIX_EPOCH;
+        }
+        self.resource_checked = false;
     }
     pub(crate) fn resource_paused(&self) -> bool {
         self.resource_pause.is_some()
