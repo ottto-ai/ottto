@@ -300,10 +300,15 @@ jobs:
           (ref / rel).write_text(head + "use reference_hook as e2_hook;" + tail)
           sync = ref / "crates/ottto-service/src/snapshot_sync.rs"
           source = sync.read_text()
+          backend = "crates/ottto-service/src/snapshot_sync/loopback_backend.rs"
+          (ref / backend).write_text((cand / backend).read_text())
+          if "mod loopback_backend;" not in source:
+              source = "mod loopback_backend;\n" + source
           if "snapshot_sync/money_e2_bench_tests.rs" not in source:
               anchor = '    include!("snapshot_sync/request_identity_pipeline_tests.rs");\n'
               assert source.count(anchor) == 1, "reference include anchor"
-              sync.write_text(source.replace(anchor, anchor + '    mod money_e2_bench_tests {\n        include!("snapshot_sync/money_e2_bench_tests.rs");\n    }\n'))
+              source = source.replace(anchor, anchor + '    mod money_e2_bench_tests {\n        include!("snapshot_sync/money_e2_bench_tests.rs");\n    }\n')
+          sync.write_text(source)
           PY
           cd "$RUNNER_TEMP/reference"
           export CARGO_TARGET_DIR="$RUNNER_TEMP/target"

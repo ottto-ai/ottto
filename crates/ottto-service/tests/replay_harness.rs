@@ -196,7 +196,6 @@ fn synthetic_cold_quiet_growth_kill_and_restart() {
     let quiet = f.run("P1");
     assert_eq!(totals(&quiet)["full_reads"], 0);
     assert_eq!(totals(&quiet)["tail_reads"], 0);
-    assert!(totals(&quiet)["restored"].as_u64().unwrap() > 0);
     assert!(!quiet.iter().any(|row| row["kind"] == "session"));
     f.append(2, 20);
     let growth = f.run("P2");
@@ -244,6 +243,13 @@ fn synthetic_cold_quiet_growth_kill_and_restart() {
     assert_eq!(
         session(&before_restart)["token_totals"],
         session(&oracle)["token_totals"]
+    );
+    // Keep the quiet-restore acceptance criterion, but let the growth/crash
+    // assertions run first so CI exposes their outcomes independently of it.
+    assert!(
+        totals(&quiet)["restored"].as_u64().unwrap() > 0,
+        "quiet restore target unmet: {}",
+        totals(&quiet)
     );
 }
 #[test]
