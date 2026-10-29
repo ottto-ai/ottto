@@ -1038,13 +1038,13 @@ fn the_ordinary_equivalent_is_the_ordinary_interval_with_no_historical_estimate(
     // historical estimate. It is a per-page lower bound of what ordinary
     // scheduling took (the delayed scan above took longer, as disclosed);
     // coverage stays the guard's.
-    let clock = format!("{:?}", cadence);
+    let clock = format!("{cadence:?}");
     assert_eq!(
         ordinary_equivalent(&cadence, false),
         Some(Duration::from_secs(600))
     );
     assert!(ordinary_equivalent(&cadence, false) < Some(historical_estimate));
-    assert_eq!(format!("{:?}", cadence), clock, "a read");
+    assert_eq!(format!("{cadence:?}"), clock, "a read");
 }
 
 #[test]
@@ -1093,13 +1093,13 @@ fn the_ordinary_equivalent_is_unknown_while_failing_disabled_or_in_backoff() {
         change(&world);
         let cadence = world.cadence.borrow();
         let expected = expected.unwrap_or(Some(cadence.ordinary_interval()));
-        let clock = format!("{:?}", cadence);
+        let clock = format!("{cadence:?}");
         assert_eq!(
             ordinary_equivalent(&cadence, world.backoff.get()),
             expected,
             "{name}"
         );
-        assert_eq!(format!("{:?}", cadence), clock, "{name}: a read");
+        assert_eq!(format!("{cadence:?}"), clock, "{name}: a read");
         drop(cadence);
         assert!(world.held(), "{name}: reading it consumes no ticket");
     }
