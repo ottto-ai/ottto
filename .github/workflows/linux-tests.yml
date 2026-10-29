@@ -1,8 +1,8 @@
 name: Linux tests
 
-# Early, free signal for the portable test surface. macOS "Rust contracts" in
-# ci.yml stays the authority: it owns clippy, layout coverage, and native
-# behavior. A green Linux run is never merge evidence on its own.
+# Early, free signal for portable tests and clippy. macOS "Rust contracts" in
+# ci.yml stays authoritative for macOS-only cfg code, layout coverage, and
+# native behavior. A green Linux run is never merge evidence on its own.
 
 on:
   pull_request:
@@ -68,7 +68,7 @@ jobs:
           echo "TMPDIR=$RUNNER_TEMP/tmp" >> "$GITHUB_ENV"
 
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component clippy
 
       - name: Compiler receipt
         run: rustc -Vv && cargo -V
@@ -83,6 +83,12 @@ jobs:
             . -> target
             crates -> crates/target
           save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+
+      - name: Runtime clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Connector clippy
+        run: cargo clippy --manifest-path crates/Cargo.toml --workspace --all-targets --locked -- -D warnings
 
       - name: Runtime tests
         # Print a failing assertion when it happens, not only after the suite.
