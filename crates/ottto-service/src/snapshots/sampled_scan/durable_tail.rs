@@ -116,7 +116,7 @@ impl Counters {
         };
         format!(
             "ottto-service: durable_tail source={} restore_attempts={} restored={} original_v1_mapped={} durable_restore_after_selection_clear={} objects[same,unknown,changed]={:?} s2_skipped_object_changed={} missing={} \
-             retail_attempts={} retail_keys={} retail_exhausted[full,paced,overflow]={:?} tail_read_bytes={} budget_refused_retail_old_bytes={} repeated_physical_old_bytes={} refused_record={} upgrade_state_missing={} upgrade_claimed={} upgrade_count_basis={} ineligible={{{}}} certificate_refused={{{}}} corrupt_body={} \
+             retail_attempts={} retail_keys={} retail_exhausted[full,paced,pace_evicted]={:?} tail_read_bytes={} budget_refused_retail_old_bytes={} repeated_physical_old_bytes={} refused_record={} upgrade_state_missing={} upgrade_claimed={} upgrade_count_basis={} ineligible={{{}}} certificate_refused={{{}}} corrupt_body={} \
              not_rederived={{{}}} budget_refused={} rederive_head_bytes={} \
              rederive_named_lines={} rederive_line_bytes={} not_persisted={{{}}} \
              write_deferred={} write_unlocked={} peak_body_bytes={} disk_records={} disk_bytes={} \
@@ -882,21 +882,18 @@ impl SharedCache {
             }
             return false;
         }
-        if stores.retail_full_at.len() < 2 * store::MAX_RECORDS
-            && crate::heap_layout_bound::tree_node_bytes::<store::Digest32, std::time::Instant>()
-                .is_some_and(|n| n <= 1024)
-        {
-            stores.retail_full_at.insert(key, now);
-        } else {
-            if cause.is_none() {
+        if stores.retail_full_at.len() >= 2 * store::MAX_RECORDS {
+            let oldest = stores
+                .retail_full_at
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(key, _)| *key);
+            if let Some(oldest) = oldest {
+                stores.retail_full_at.remove(&oldest);
                 stores.counters.retail_full[2] += 1;
-            } else {
-                Counters::bump(
-                    &mut stores.counters.ineligible,
-                    "stale_full.pacing_overflow",
-                );
             }
         }
+        stores.retail_full_at.insert(key, now);
         if let Some(cause) = cause {
             stores.counters.stale_full[cause] += 1;
         } else {
@@ -976,6 +973,16 @@ impl SharedCache {
     ) -> Option<store::Refusal> {
         self.durable_hold(source, &local_index_key(&candidate.path))
             .or_else(|| {
+                if source == SnapshotSource::ClaudeCode
+                    && index
+                        .files
+                        .get(&local_index_key(&candidate.path))
+                        .is_some_and(|e| {
+                            e.effective_upload_body_witness_revision > effective_revision(source)
+                        })
+                {
+                    return Some(store::Refusal::BehindAccepted);
+                }
                 self.durable_upgrade_missing(source, candidate, index, consume)
                     .then_some(store::Refusal::UpgradeMissing)
             })
@@ -1026,7 +1033,9 @@ impl SharedCache {
             return false;
         }
         if source == SnapshotSource::ClaudeCode {
-            if candidate.size_bytes <= entry.size_bytes {
+            if candidate.size_bytes <= entry.size_bytes
+                || entry.effective_upload_body_witness_revision > effective_revision(source)
+            {
                 return true;
             }
             let claimed = index.reread_guard.upgrade_growth(&key, candidate, consume);
@@ -1070,7 +1079,17 @@ impl SharedCache {
             return Ok(None);
         }
         let funded = stores.fund_key(key);
-        let m = file.metadata().map_err(|_| RetailHold::Ineligible)?;
+        let metadata = file.metadata();
+        #[cfg(test)]
+        let metadata = if tests::b1_metadata_fails() {
+            Err(std::io::Error::other("injected observer fstat failure"))
+        } else {
+            metadata
+        };
+        let m = metadata.map_err(|_| {
+            Counters::bump(&mut stores.counters.ineligible, "metadata");
+            RetailHold::Ineligible
+        })?;
         let started = if funded {
             Some(
                 stores
@@ -1830,7 +1849,7 @@ impl SharedCache {
             revision_adoption_required: [u64; 2],
             retail_exhausted: [u64; 2],
             retail_exhausted_paced: [u64; 2],
-            retail_pacing_overflow: [u64; 2],
+            pace_evicted: [u64; 2],
             upgrade_state_missing: [u64; 2],
             upgrade_count_basis: &'static str,
             t14_rebuild: [u64; 2],
@@ -1891,7 +1910,7 @@ impl SharedCache {
                     revision_adoption_required: pair(11),
                     retail_exhausted: pair(6),
                     retail_exhausted_paced: pair(7),
-                    retail_pacing_overflow: pair(8),
+                    pace_evicted: pair(8),
                     upgrade_state_missing: pair(4),
                     upgrade_count_basis: if source == DurableSource::ClaudeCode {
                         "native_read"
