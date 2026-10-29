@@ -213,6 +213,9 @@ impl Isolation {
         );
         let mut protected = Vec::new();
         for home in &homes {
+            if home != &homes[0] && home.starts_with(&support) {
+                continue; // A driver may already have installed a scratch HOME.
+            }
             for provider in [
                 ".claude",
                 ".codex",
@@ -224,7 +227,15 @@ impl Isolation {
         }
         for variable in ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "PI_CODING_AGENT_DIR"] {
             if let Some(path) = std::env::var_os(variable) {
-                protected.push(path.into());
+                let path = PathBuf::from(path);
+                let effective = match fs::canonicalize(&path) {
+                    Ok(path) => path,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => path.clone(),
+                    Err(error) => return Err(error.into()),
+                };
+                if !effective.starts_with(&support) {
+                    protected.push(path);
+                }
             }
         }
         for path in protected {

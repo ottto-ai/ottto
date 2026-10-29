@@ -377,3 +377,27 @@ fn refuses_oversized_marker_and_blinding_key_without_allocating_them() {
         f.assert_private(&output);
     }
 }
+
+#[test]
+fn accepts_driver_supplied_home_and_provider_paths_inside_scratch() {
+    let f = Fixture::new();
+    // Establish the scratch marker first, so fixture directories can be added
+    // without weakening admission of an unrelated nonempty support directory.
+    f.run("P0");
+    let home = f.support.join("driver-home");
+    fs::create_dir(&home).unwrap();
+    let output = f
+        .command("P1")
+        .env("HOME", &home)
+        .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+        .env("CODEX_HOME", home.join(".codex"))
+        .env("PI_CODING_AGENT_DIR", home.join(".pi/agent"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(totals(&f.rows("P1"))["full_reads"], 0);
+}
