@@ -63340,11 +63340,7 @@ mod tests {
     }
 
     fn claude_account_family_fixture() -> (PathBuf, String, Vec<SnapshotItem>) {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let root = temp_dir(&format!(
-            "claude-account-family-{}",
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
+        let root = crate::test_scratch::private_dir("claude-account-family");
         let parent = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5".to_string();
         let parent_path = root.join(format!("{parent}.jsonl"));
         fs::write(
