@@ -177,7 +177,7 @@ no identifiers, paths, values, prompts or telemetry bodies.
 | `fragments`, `fragment_reread_bytes` | Incomplete EOF disclosures per decision, and prior unsealed bytes replayed on growth. EOF rows are held until LF; quiet fragments read no body bytes. |
 | `failures`, `persistent_failures` | Refused source acquisitions or paired-store writes; a paired failure can count for both kinds. Persistent means at least three consecutive failures of that operation in the retained process owner. |
 
-`sidecar_accepted_body_holds` counts distinct entities whose durable-route consumer
+`sidecar_s2_hold_entities` counts distinct entities whose durable-route consumer
 retains an accepted native body and witness on incomplete telemetry (S2).
 It grants no acquisition, settlement or ACK credit. This guard is currently
 active only with the synthetic durable reader, alongside the other counters.
@@ -1131,3 +1131,20 @@ values.
 A later complete native parse still emits its exclusive body for a session with
 an earlier state-only row. An emitted total alone does not prove a server-side
 overwrite; backend authority rules independently govern successor acceptance.
+
+The dark durable-sidecar harness also reports `sidecar_s2_hold_oldest_age` in
+seconds and `sidecar_s2_hold_alarm` when that age exceeds 24 hours. These are
+current levels, cleared on recovery. Until the accepted-body floor is available,
+accepted estimates also wait during failure; never-accepted entities may use the
+existing token estimate contract except when their sidecar is NewerFormat.
+`sidecar_hold_newer_format` is the single flattened `sidecar_hold{newer_format}`
+counter (also called `sidecar_newer_format_held`); it counts owning sessions per
+pass. A held representation is unavailable, grants no dependent decision or
+replacement body, and stays byte-identical. Only source metadata is consulted;
+source body bytes remain zero. Re-upgrade resumes the untouched continuation.
+`sidecar_state_fix_rebuilds` counts the one-time repair of malformed state.
+`sidecar_u_growth_full_undecodable` and `sidecar_u_growth_full_unbindable` count
+separate growth-driven Full grants, paced per key over six hours. Overflow of
+that pacing map evicts its oldest stamp toward reading and emits
+`sidecar_pace_evicted` with `sidecar_pace_alarm`. Source failures and store refusal
+with a valid continuation keep suffix custody and never grant these rebuilds.

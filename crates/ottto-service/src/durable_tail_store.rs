@@ -129,7 +129,8 @@ pub(crate) type Digest32 = [u8; 32];
 pub(crate) struct CodecRow {
     pub(crate) source: DurableSource,
     pub(crate) allowlist: Digest32,
-    pub(crate) verify: fn(&[u8]) -> bool,
+    pub(crate) verify: fn(&[u8]) -> Result<(), Refusal>,
+    pub(crate) newer: fn(&[u8]) -> bool,
 }
 
 fn digest(domain: &str, parts: &[&[u8]]) -> Digest32 {
@@ -482,6 +483,28 @@ impl DurableTailStore {
             pass: [0; 2],
             rebuilt: BTreeMap::new(),
         }
+    }
+
+    /// Dark sidecar adapter: reuse T14 custody for a known malformed row.
+    /// Unknown/newer representations can never grant a replacement.
+    #[cfg(all(test, unix))]
+    pub(crate) fn sidecar_state_fix(&mut self, key: &Digest32) -> bool {
+        if self.codec_row.is_none() || self.disabled.is_some() || self.rebuilt.contains_key(key) {
+            return false;
+        }
+        if matches!(
+            self.classify(key, "guard"),
+            Err(Refusal::Unknown | Refusal::NewerFormat)
+        ) {
+            return false;
+        }
+        if self.disabled.is_some() || self.rebuilt.len() >= REBUILT_BOUND {
+            return false;
+        }
+        self.rebuilt.insert(*key, Rebuild::Started);
+        self.counters.t14_rebuild += 1;
+        self.counters.t14_rebuild_full_started += 1;
+        true
     }
 
     pub(crate) fn with_codec_row(mut self, row: CodecRow) -> Self {
@@ -879,6 +902,9 @@ impl DurableTailStore {
             // A rebuild may replace its corrupt predecessor once, after save.
             match self.classify(&record.binding.key, "overwrite") {
                 Err(Refusal::Corrupt) | Ok(_) => {}
+                Err(Refusal::Undecodable | Refusal::Unbindable)
+                    if self.codec_row.is_some()
+                        && self.rebuilt.get(&record.binding.key) == Some(&Rebuild::Offered) => {}
                 Err(_) => {
                     self.counters.store_write_skipped[0] += 1;
                     continue;
@@ -1427,6 +1453,12 @@ fn verify_with_row(
 ) -> Result<(), Refusal> {
     let bad = Refusal::Corrupt;
     let end = bytes.len().checked_sub(TRAILER_BYTES).ok_or(bad)?;
+    // Row-level version dispatch has the same downgrade protection as the
+    // envelope version. Probe only its bounded scalar prefix before checksum;
+    // all structural verification still follows the integrity fence.
+    if row.is_some_and(|row| bytes.get(HEADER_BYTES..end).is_some_and(row.newer)) {
+        return Err(Refusal::NewerFormat);
+    }
     if bytes[end..] != Sha256::digest(&bytes[..end])[..] {
         return Err(bad);
     }
@@ -1439,12 +1471,13 @@ fn verify_with_row(
     if end.checked_sub(start) != Some(h.body_len) {
         return Err(bad);
     }
-    let valid = match row {
+    match row {
         Some(row) if row.source == source => (row.verify)(&bytes[start..end]),
-        Some(_) => false,
-        None => crate::snapshots::verify_durable_body(&bytes[start..end], source),
-    };
-    valid.then_some(()).ok_or(bad)
+        Some(_) => Err(bad),
+        None => crate::snapshots::verify_durable_body(&bytes[start..end], source)
+            .then_some(())
+            .ok_or(bad),
+    }
 }
 
 fn remove_if_present(path: &Path) -> io::Result<()> {

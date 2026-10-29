@@ -23,6 +23,20 @@ type TraceOutput = (ClaudeTraceOwnershipLoadReport, ClaudeTraceReadGeneration);
 // permission for a second bootstrap. Production source caps remain unchanged.
 const BOOTSTRAP_PASS_BYTES: u64 = MAX_EVIDENCE_FILE_BYTES;
 const RETRY_ALARM: u32 = 3;
+const GROWTH_PACE_SECONDS: u64 = 6 * 60 * 60;
+const PACE_BOUND: usize = store::INVENTORY_BOUND;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestoreFailure {
+    NewerFormat,
+    Undecodable,
+    Unbindable,
+    Unavailable,
+}
+struct Repair {
+    lengths: [Option<u64>; 2],
+    reason: RestoreFailure,
+}
 
 #[derive(Clone, Copy)]
 pub(super) enum Kind {
@@ -84,6 +98,12 @@ pub(crate) struct Reader {
     write_cursor: Option<String>,
     sync_owed: bool,
     restored_records: u64,
+    newer: BTreeSet<String>,
+    newer_counted: BTreeSet<String>,
+    repairs: BTreeMap<String, Repair>,
+    growth_pace: BTreeMap<String, u64>,
+    hold_since: BTreeMap<String, u64>,
+    now: u64,
     pub(super) counts: [Counts; 2],
 }
 
@@ -95,6 +115,7 @@ impl Reader {
             source: DurableSource::ClaudeCode,
             allowlist: codec::allowlist(),
             verify: codec::verify,
+            newer: codec::newer,
         };
         Self {
             support: support.into(),
@@ -111,13 +132,36 @@ impl Reader {
             write_cursor: None,
             sync_owed: false,
             restored_records: 0,
+            newer: BTreeSet::new(),
+            newer_counted: BTreeSet::new(),
+            repairs: BTreeMap::new(),
+            growth_pace: BTreeMap::new(),
+            hold_since: BTreeMap::new(),
+            now: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
             counts: [Counts::default(); 2],
         }
+    }
+    /// Synthetic downgrade: current parser-1 bytes are newer than parser 0.
+    /// Re-upgrade uses the unchanged production codec and record, no migration.
+    pub(crate) fn as_older_reader(mut self) -> Self {
+        assert!(self.entries.is_empty(), "downgrade starts from disk");
+        self.store = DurableTailStore::new(self.store.dir().into(), DurableSource::ClaudeCode)
+            .with_codec_row(CodecRow {
+                source: DurableSource::ClaudeCode,
+                allowlist: codec::allowlist(),
+                verify: codec::verify_older,
+                newer: codec::newer_than_older,
+            });
+        self
     }
     pub(crate) fn begin_pass(&mut self) {
         self.bootstrap_left = BOOTSTRAP_PASS_BYTES;
         self.restored_records = 0;
         self.counts = [Counts::default(); 2];
+        self.newer_counted.clear();
         self.store.begin_pass();
     }
     pub(crate) fn restored_records(&self) -> u64 {
@@ -148,63 +192,158 @@ impl Reader {
             entry: store::entry_digest(session, None),
         }
     }
-    fn restore(&mut self, session: &str) -> io::Result<Pair> {
+    fn empty_pair(session: &str) -> Pair {
+        Pair {
+            parser: codec::PARSER,
+            session: session.into(),
+            api: ApiSlot::default(),
+            trace: TraceSlot::default(),
+            pending: false,
+        }
+    }
+    fn restore(&mut self, session: &str) -> Result<Pair, RestoreFailure> {
+        use store::Refusal;
         let binding = self.binding(session);
         match self.store.read(&binding.key) {
-            ReadOutcome::Missing if self.store.disabled().is_none() => Ok(Pair {
-                parser: codec::PARSER,
-                session: session.into(),
-                api: ApiSlot::default(),
-                trace: TraceSlot::default(),
-                pending: false,
-            }),
+            ReadOutcome::Missing if self.store.disabled().is_none() => {
+                Ok(Self::empty_pair(session))
+            }
             ReadOutcome::Found(record) => {
                 record
                     .eligible(&store::Expected {
                         binding,
                         committed_generation: self.generation,
                     })
-                    .map_err(|_| {
-                        io::Error::new(io::ErrorKind::InvalidData, "sidecar binding held")
-                    })?;
-                let pair = codec::decode(&record.record.body).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "sidecar continuation held")
-                })?;
+                    .map_err(|_| RestoreFailure::Unbindable)?;
+                let pair =
+                    codec::decode(&record.record.body).map_err(|_| RestoreFailure::Undecodable)?;
                 if pair.session != session {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "sidecar owner held",
-                    ));
+                    return Err(RestoreFailure::Unbindable);
                 }
                 self.restored_records += 1;
                 Ok(pair)
             }
-            _ => Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "sidecar representation held",
-            )),
+            ReadOutcome::Refused(Refusal::Unknown | Refusal::NewerFormat) => {
+                Err(RestoreFailure::NewerFormat)
+            }
+            ReadOutcome::Refused(Refusal::Unbindable) => Err(RestoreFailure::Unbindable),
+            ReadOutcome::Refused(Refusal::Corrupt | Refusal::Undecodable)
+                if self.store.disabled().is_none() =>
+            {
+                Err(RestoreFailure::Undecodable)
+            }
+            _ => Err(RestoreFailure::Unavailable),
         }
+    }
+    pub(crate) fn set_time(&mut self, now: u64) {
+        self.now = now;
+    }
+    fn lengths(&self, session: &str) -> [Option<u64>; 2] {
+        [Kind::Api, Kind::Trace].map(|kind| {
+            fs::metadata(kind.path(&self.support, session))
+                .ok()
+                .map(|m| m.len())
+        })
+    }
+    fn failed_restore(&mut self, session: &str, reason: RestoreFailure) -> io::Error {
+        // NewerFormat is UNAVAILABLE. Only stat source paths; no body open,
+        // parser fallback, store rewrite, retirement or dependent decision.
+        if reason == RestoreFailure::NewerFormat {
+            self.newer.insert(session.into());
+            if self.newer_counted.insert(session.into()) {
+                let _ = self.lengths(session);
+                super::counts::extra("sidecar_hold_newer_format", 1);
+            }
+        }
+        let failures = self.protected.entry(session.into()).or_default();
+        *failures = failures.saturating_add(1);
+        for counts in &mut self.counts {
+            counts.selected += 1;
+            counts.failures += 1;
+            if *failures >= RETRY_ALARM {
+                counts.persistent_failures += 1;
+            }
+        }
+        io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "sidecar unavailable; dependents held",
+        )
+    }
+    fn repair_pair(&mut self, session: &str, reason: RestoreFailure) -> Option<Pair> {
+        let lengths = self.lengths(session);
+        if lengths.into_iter().flatten().sum::<u64>() > self.bootstrap_left {
+            return None;
+        }
+        if let Some(previous) = self.repairs.get(session) {
+            let growth = lengths
+                .into_iter()
+                .zip(previous.lengths)
+                .any(|(now, old)| now.is_some_and(|n| n > old.unwrap_or(0)));
+            if !growth {
+                return None;
+            }
+            if self
+                .growth_pace
+                .get(session)
+                .is_some_and(|last| self.now >= *last && self.now - last < GROWTH_PACE_SECONDS)
+            {
+                return None;
+            }
+            if self.growth_pace.len() >= PACE_BOUND && !self.growth_pace.contains_key(session) {
+                if let Some(oldest) = self
+                    .growth_pace
+                    .iter()
+                    .min_by_key(|(_, time)| **time)
+                    .map(|(key, _)| key.clone())
+                {
+                    self.growth_pace.remove(&oldest);
+                    super::counts::extra("sidecar_pace_evicted", 1);
+                }
+            }
+            self.growth_pace.insert(session.into(), self.now);
+            let key = match previous.reason {
+                RestoreFailure::Unbindable => "sidecar_u_growth_full_unbindable",
+                _ => "sidecar_u_growth_full_undecodable",
+            };
+            super::counts::extra(key, 1);
+        } else {
+            if !self.store.sidecar_state_fix(&self.binding(session).key) {
+                return None;
+            }
+            super::counts::extra("sidecar_state_fix_rebuilds", 1);
+        }
+        self.repairs
+            .insert(session.into(), Repair { lengths, reason });
+        Some(Self::empty_pair(session))
     }
     pub(super) fn load(&mut self, session: &str) -> io::Result<Reports> {
         let before_counts = self.counts;
+        if self.newer.contains(session) {
+            let error = self.failed_restore(session, RestoreFailure::NewerFormat);
+            publish_counts(before_counts, self.counts);
+            return Err(error);
+        }
         if !self.entries.contains_key(session) {
             let pair = match self.restore(session) {
                 Ok(pair) => pair,
-                Err(error) => {
-                    let failures = self.protected.entry(session.into()).or_default();
-                    *failures = failures.saturating_add(1);
-                    for counts in &mut self.counts {
-                        counts.selected += 1;
-                        counts.failures += 1;
-                        if *failures >= RETRY_ALARM {
-                            counts.persistent_failures += 1;
+                Err(reason) => {
+                    let repaired = match reason {
+                        RestoreFailure::Undecodable | RestoreFailure::Unbindable => {
+                            self.repair_pair(session, reason)
                         }
+                        _ => None,
+                    };
+                    if let Some(pair) = repaired {
+                        pair
+                    } else {
+                        let error = self.failed_restore(session, reason);
+                        publish_counts(before_counts, self.counts);
+                        return Err(error);
                     }
-                    publish_counts(before_counts, self.counts);
-                    return Err(error);
                 }
             };
             self.protected.remove(session);
+            self.newer.remove(session);
             self.entries.insert(
                 session.into(),
                 Entry {
@@ -281,6 +420,13 @@ impl Reader {
                 },
                 ..Default::default()
             };
+        }
+        if failed
+            && self.repairs.contains_key(session)
+            && (entry.pair.api.certificate.is_none() || entry.pair.trace.certificate.is_none())
+        {
+            self.entries.remove(session);
+            self.protected.entry(session.into()).or_default();
         }
         publish_counts(before_counts, self.counts);
         Ok(reports)
@@ -904,16 +1050,52 @@ pub(in crate::claude_local_otel) fn prepared_fixture(check: impl FnOnce(&Path, &
     tests::prepared_fixture(check);
 }
 
+pub(in crate::claude_local_otel) fn unavailable_families() -> BTreeSet<String> {
+    ACTIVE.with(|active| {
+        active
+            .borrow()
+            .as_ref()
+            .map(|r| r.newer.clone())
+            .unwrap_or_default()
+    })
+}
+pub(in crate::claude_local_otel) fn record_holds(held: &BTreeSet<String>) {
+    ACTIVE.with(|active| {
+        let mut active = active.borrow_mut();
+        let Some(reader) = active.as_mut() else {
+            return;
+        };
+        reader.hold_since.retain(|id, _| held.contains(id));
+        for id in held {
+            reader.hold_since.entry(id.clone()).or_insert(reader.now);
+        }
+        let age = reader
+            .hold_since
+            .values()
+            .map(|start| reader.now.saturating_sub(*start))
+            .max()
+            .unwrap_or(0);
+        super::counts::record_holds(held.len() as u64, age);
+    });
+}
+
 pub(super) fn active_api(support: &Path, session: &str) -> Option<io::Result<ApiOutput>> {
     ACTIVE.with(|active| {
         let mut active = active.borrow_mut();
         let reader = active.as_mut().filter(|reader| reader.support == support)?;
         Some(reader.load(session).and_then(|(mut api, _)| {
-            if let Some(kind) = reader.entries[session].api_fatal {
+            if let Some(kind) = reader
+                .entries
+                .get(session)
+                .and_then(|entry| entry.api_fatal)
+            {
                 return Err(io::Error::new(kind, "fatal sidecar API acquisition"));
             }
             let generation = if api.health.is_complete() {
-                reader.entries[session].api_generation.clone()
+                reader
+                    .entries
+                    .get(session)
+                    .and_then(|entry| entry.api_generation.clone())
             } else {
                 None
             };
@@ -933,9 +1115,10 @@ pub(super) fn active_paid_trace(support: &Path, session: &str) -> Option<io::Res
         let mut active = active.borrow_mut();
         let reader = active.as_mut().filter(|reader| reader.support == support)?;
         Some(reader.load(session).and_then(|(_, report)| {
-            let opened = reader.entries[session]
-                .trace_generation
-                .clone()
+            let opened = reader
+                .entries
+                .get(session)
+                .and_then(|entry| entry.trace_generation.clone())
                 .ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidData, "trace generation unavailable")
                 })?;

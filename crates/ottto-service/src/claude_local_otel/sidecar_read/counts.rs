@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 #[cfg(not(test))]
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-const KEYS: [&str; 27] = [
+const KEYS: [&str; 35] = [
     "sidecar_api_selected",
     "sidecar_api_opened",
     "sidecar_api_bytes_read",
@@ -30,13 +30,21 @@ const KEYS: [&str; 27] = [
     "sidecar_trace_fragment_reread_bytes",
     "sidecar_trace_failures",
     "sidecar_trace_persistent_failures",
-    "sidecar_accepted_body_holds",
+    "sidecar_s2_hold_entities",
+    "sidecar_s2_hold_oldest_age",
+    "sidecar_hold_newer_format",
+    "sidecar_state_fix_rebuilds",
+    "sidecar_u_growth_full_undecodable",
+    "sidecar_u_growth_full_unbindable",
+    "sidecar_pace_evicted",
+    "sidecar_s2_hold_alarm",
+    "sidecar_pace_alarm",
 ];
 #[cfg(not(test))]
-static COUNTS: [AtomicU64; 27] = [const { AtomicU64::new(0) }; 27];
+static COUNTS: [AtomicU64; 35] = [const { AtomicU64::new(0) }; 35];
 #[cfg(test)]
 thread_local! {
-    static COUNTS: std::cell::RefCell<[u64; 27]> = const { std::cell::RefCell::new([0; 27]) };
+    static COUNTS: std::cell::RefCell<[u64; 35]> = const { std::cell::RefCell::new([0; 35]) };
 }
 #[cfg(all(test, unix))]
 pub(super) fn record(kind: usize, fields: [u64; 13]) {
@@ -50,17 +58,33 @@ pub(super) fn record(kind: usize, fields: [u64; 13]) {
     });
 }
 #[cfg(all(test, unix))]
-pub(super) fn record_holds(count: u64) {
+pub(super) fn record_holds(count: u64, age: u64) {
     COUNTS.with(|counts| {
         let mut counts = counts.borrow_mut();
-        counts[26] = counts[26].saturating_add(count);
+        counts[26] = count;
+        counts[27] = age;
+        counts[33] = u64::from(age > 24 * 60 * 60);
+    });
+}
+#[cfg(all(test, unix))]
+pub(super) fn extra(key: &'static str, value: u64) {
+    let index = KEYS
+        .iter()
+        .position(|name| *name == key)
+        .expect("registered count");
+    COUNTS.with(|counts| {
+        let mut counts = counts.borrow_mut();
+        counts[index] = counts[index].saturating_add(value);
+        if key == "sidecar_pace_evicted" {
+            counts[34] = 1;
+        }
     });
 }
 pub(super) fn take() -> BTreeMap<&'static str, u64> {
     #[cfg(not(test))]
-    let values: [u64; 27] = std::array::from_fn(|index| COUNTS[index].swap(0, Relaxed));
+    let values: [u64; 35] = std::array::from_fn(|index| COUNTS[index].swap(0, Relaxed));
     #[cfg(test)]
-    let values = COUNTS.with(|counts| std::mem::take(&mut *counts.borrow_mut()));
+    let values = COUNTS.with(|counts| std::mem::replace(&mut *counts.borrow_mut(), [0; 35]));
     let mut counts: BTreeMap<_, _> = KEYS
         .into_iter()
         .zip(values)

@@ -59,6 +59,9 @@ pub(crate) fn durable_sidecar_held_entities(
     if !sidecar_read::durable::active_for(support) {
         return BTreeSet::new();
     }
+    // TODO P2 follow-up: estimate-only accepted body may grow during failure.
+    // Until the accepted-body floor lands, protect every accepted tuple.
+    let unavailable = sidecar_read::durable::unavailable_families();
     let held: BTreeSet<_> = items
         .iter()
         .filter_map(|item| {
@@ -66,11 +69,12 @@ pub(crate) fn durable_sidecar_held_entities(
             // A cohort refusal can leave strict reads healthy while the
             // finalizer still discloses an incomplete candidate body.
             let complete = healthy.contains(root) && item.telemetry_owned_complete == Some(true);
-            if complete
-                || !crate::snapshots::durable_sidecar_has_accepted_body(
-                    index,
-                    &item.source_session_id,
-                )
+            if !unavailable.contains(root)
+                && (complete
+                    || !crate::snapshots::durable_sidecar_has_accepted_body(
+                        index,
+                        &item.source_session_id,
+                    ))
             {
                 None
             } else {
@@ -78,7 +82,7 @@ pub(crate) fn durable_sidecar_held_entities(
             }
         })
         .collect();
-    sidecar_read::record_holds(held.len() as u64);
+    sidecar_read::durable::record_holds(&held);
     held
 }
 

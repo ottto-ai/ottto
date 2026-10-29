@@ -579,7 +579,6 @@ fn codec_views_protect_each_others_records_from_gc_and_overwrite() {
         .gc(
             fixture.writer.as_ref().unwrap(),
             &reader.context,
-            &codec::allowlist(),
             &BTreeMap::new(),
         )
         .unwrap();
@@ -633,12 +632,7 @@ fn codec_views_protect_each_others_records_from_gc_and_overwrite() {
     let keep = BTreeMap::from([(key, Some(reader.binding("scope").scope))]);
     reader
         .store
-        .gc(
-            fixture.writer.as_ref().unwrap(),
-            &reader.context,
-            &codec::allowlist(),
-            &keep,
-        )
+        .gc(fixture.writer.as_ref().unwrap(), &reader.context, &keep)
         .unwrap();
     assert_eq!(
         reader.store.inventory().unwrap(),
@@ -661,7 +655,7 @@ fn codec_has_no_raw_fragment_or_runtime_fingerprint_memo() {
     assert!(!encoded
         .windows(b"RAW_FRAGMENT_CANARY".len())
         .any(|bytes| bytes == b"RAW_FRAGMENT_CANARY"));
-    assert!(codec::verify(&encoded));
+    assert!(codec::verify(&encoded).is_ok());
     let restored = codec::decode(&encoded).unwrap();
     assert!(
         !restored.api.state.rows[0]
@@ -804,27 +798,37 @@ fn sparse_resource_carrier_contains_counts_and_persistent_failure_alarm_only() {
 
 #[test]
 fn unknown_representation_keeps_owner_pending_and_never_reacquires_or_overwrites() {
-    let mut fixture = Fixture::new("sidecar-unknown-protection");
-    let (api, trace) = bytes("first");
-    fixture.write("scope", &api, &trace);
-    let (mut reader, _) = load(fixture.reader(), &fixture.dir);
-    fixture.save(&mut reader);
-    let key = reader.binding("scope").key;
-    let name: String = key.iter().map(|byte| format!("{byte:02x}")).collect();
-    let path = reader.store.dir().join(format!("{name}.rec"));
-    let mut unknown = fs::read(&path).unwrap();
-    unknown[10] ^= 0xff; // header before trailer: unknown allowlist stays U.
-    fs::write(&path, &unknown).unwrap();
-    drop(reader);
-    let mut reader = fixture.restart();
-    for _ in 0..3 {
-        assert!(reader.load("scope").is_err());
+    for mutation in ["allowlist", "kind", "envelope", "parser"] {
+        let mut fixture = Fixture::new("sidecar-unknown-protection");
+        let (api, trace) = bytes("first");
+        fixture.write("scope", &api, &trace);
+        let (mut reader, _) = load(fixture.reader(), &fixture.dir);
+        fixture.save(&mut reader);
+        let path = record_path(&reader, "scope");
+        let mut unknown = fs::read(&path).unwrap();
+        match mutation {
+            "allowlist" => unknown[10] ^= 0xff,
+            "kind" => unknown[42] = 77,
+            "envelope" => unknown[8..10].copy_from_slice(&2_u16.to_le_bytes()),
+            _ => unknown[store::HEADER_BYTES] = 2,
+        }
+        // Deliberately leave the trailer stale. Newer representations are
+        // opaque before checksum/continuation validation, never a repair grant.
+        fs::write(&path, &unknown).unwrap();
+        drop(reader);
+        let mut reader = fixture.restart();
+        for _ in 0..3 {
+            reader.begin_pass();
+            assert!(reader.load("scope").is_err());
+            assert_eq!(body_bytes(&reader), (0, 0));
+            assert_eq!(reader.counts.map(|c| c.opened), [0, 0]);
+            assert_eq!(take_counts()["sidecar_hold_newer_format"], 1);
+            fixture.save(&mut reader);
+            assert_eq!(fs::read(&path).unwrap(), unknown);
+        }
+        assert_eq!(reader.pending_sessions(), BTreeSet::from(["scope".into()]));
+        assert!(reader.counts[0].persistent_failures > 0);
     }
-    assert_eq!(body_bytes(&reader), (0, 0));
-    assert_eq!(reader.pending_sessions(), BTreeSet::from(["scope".into()]));
-    assert!(reader.counts[0].persistent_failures > 0);
-    fixture.save(&mut reader);
-    assert_eq!(fs::read(path).unwrap(), unknown);
 }
 
 #[test]
@@ -972,4 +976,201 @@ fn crash_after_suffix_decode_before_save_replays_each_fingerprint_once() {
     let (reader, actual) = load(fixture.restart(), &fixture.dir);
     assert_eq!(actual, frozen(&api, &trace));
     assert_eq!(body_bytes(&reader), (0, 0));
+}
+
+fn record_path(reader: &Reader, session: &str) -> PathBuf {
+    let name: String = reader
+        .binding(session)
+        .key
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    reader.store.dir().join(format!("{name}.rec"))
+}
+
+#[test]
+fn malformed_undecodable_and_unbindable_each_get_one_state_fix_then_tail() {
+    for reason in [RestoreFailure::Undecodable, RestoreFailure::Unbindable] {
+        for broken_magic in [false, true] {
+            let mut f = Fixture::new("sidecar-state-fix");
+            let (mut api, trace) = bytes("first");
+            f.write("scope", &api, &trace);
+            let (mut r, _) = load(f.reader(), &f.dir);
+            f.save(&mut r);
+            let path = record_path(&r, "scope");
+            let mut bad = fs::read(&path).unwrap();
+            match reason {
+                RestoreFailure::Unbindable => {
+                    bad[75] ^= 1; // valid envelope, different context
+                    let end = bad.len() - 32;
+                    let hash = Sha256::digest(&bad[..end]);
+                    bad[end..].copy_from_slice(&hash);
+                }
+                _ if broken_magic => bad[0] ^= 1,
+                _ => *bad.last_mut().unwrap() ^= 1,
+            }
+            fs::write(&path, &bad).unwrap();
+            drop(r);
+            let (mut r, report) = load(f.restart(), &f.dir);
+            assert_eq!(report, frozen(&api, &trace));
+            assert_eq!(r.body_bytes(), [api.len() as u64, trace.len() as u64]);
+            assert_eq!(take_counts()["sidecar_state_fix_rebuilds"], 1);
+            let (suffix, _) = bytes("late");
+            f.append(Kind::Api, &suffix);
+            api.extend(&suffix);
+            r.begin_pass();
+            let (mut r, report) = load(r, &f.dir);
+            assert_eq!(report, frozen(&api, &trace));
+            assert_eq!(r.body_bytes(), [suffix.len() as u64, 0]);
+            assert!(!take_counts().contains_key("sidecar_state_fix_rebuilds"));
+            f.save(&mut r);
+            assert_ne!(fs::read(&path).unwrap(), bad);
+            let (r, report) = load(f.restart(), &f.dir);
+            assert_eq!(report, frozen(&api, &trace));
+            assert_eq!(r.body_bytes(), [0, 0]);
+        }
+    }
+}
+
+#[test]
+fn malformed_growth_full_has_own_six_hour_pacing_and_keeps_owner_selected() {
+    for reason in [RestoreFailure::Undecodable, RestoreFailure::Unbindable] {
+        let mut f = Fixture::new("sidecar-u-growth-pace");
+        let (mut api, trace) = bytes("first");
+        f.write("scope", &api, &trace);
+        let (mut r, _) = load(f.reader(), &f.dir);
+        f.save(&mut r);
+        let path = record_path(&r, "scope");
+        let mut bad = fs::read(&path).unwrap();
+        if reason == RestoreFailure::Unbindable {
+            bad[75] ^= 1;
+            let end = bad.len() - 32;
+            let hash = Sha256::digest(&bad[..end]);
+            bad[end..].copy_from_slice(&hash);
+        } else {
+            *bad.last_mut().unwrap() ^= 1;
+        }
+        fs::write(&path, &bad).unwrap();
+        drop(r);
+        let mut r = f.restart();
+        r.set_time(100);
+        let source = Kind::Api.path(&f.dir, "scope");
+        let parked = source.with_extension("failed");
+        let fail_open = || {
+            API_BEFORE_OPEN.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(|path| {
+                    fs::rename(path, path.with_extension("failed")).unwrap();
+                }))
+            });
+        };
+        fail_open();
+        let (mut r, _) = load(r, &f.dir);
+        assert!(r.entries.is_empty(), "no complete repaired cursor survived");
+        assert!(r.pending_sessions().contains("scope"));
+        assert_eq!(take_counts()["sidecar_state_fix_rebuilds"], 1);
+        r.begin_pass();
+        let (mut r, _) = load(r, &f.dir);
+        assert_eq!(
+            r.body_bytes(),
+            [0, 0],
+            "same unusable record cannot re-arm A5"
+        );
+        fs::rename(&parked, &source).unwrap();
+        let (suffix, _) = bytes("late");
+        f.append(Kind::Api, &suffix);
+        api.extend(&suffix);
+        r.begin_pass();
+        fail_open();
+        let (mut r, _) = load(r, &f.dir);
+        let count = match reason {
+            RestoreFailure::Unbindable => "sidecar_u_growth_full_unbindable",
+            _ => "sidecar_u_growth_full_undecodable",
+        };
+        assert_eq!(take_counts()[count], 1);
+        assert!(r.pending_sessions().contains("scope"));
+        fs::rename(&parked, &source).unwrap();
+        let (suffix, _) = bytes("later");
+        f.append(Kind::Api, &suffix);
+        api.extend(&suffix);
+        r.begin_pass();
+        r.set_time(100 + GROWTH_PACE_SECONDS - 1);
+        let (mut r, _) = load(r, &f.dir);
+        assert_eq!(r.body_bytes(), [0, 0]);
+        assert!(r.pending_sessions().contains("scope"));
+        r.begin_pass();
+        r.set_time(100 + GROWTH_PACE_SECONDS);
+        let (r, report) = load(r, &f.dir);
+        assert_eq!(r.body_bytes(), [api.len() as u64, trace.len() as u64]);
+        assert_eq!(report, frozen(&api, &trace));
+        let counts = take_counts();
+        assert_eq!(counts[count], 1);
+        assert!(!counts.contains_key("sidecar_state_fix_rebuilds"));
+        assert_eq!(fs::read(path).unwrap(), bad, "no invented save/receipt");
+    }
+}
+
+#[test]
+fn newer_parser_holds_untouched_for_passes_and_reupgrade_resumes_without_old_bytes() {
+    let mut f = Fixture::new("sidecar-downgrade");
+    let (api, trace) = bytes("first");
+    f.write("scope", &api, &trace);
+    let (mut r, _) = load(f.reader(), &f.dir);
+    f.save(&mut r);
+    let path = record_path(&r, "scope");
+    let original = fs::read(&path).unwrap();
+    drop(r);
+    let mut older = f.restart().as_older_reader();
+    for _ in 0..4 {
+        older.begin_pass();
+        let (next, reports) = load(older, &f.dir);
+        older = next;
+        assert!(!reports.0.health.is_complete());
+        assert!(reports.0.evidence.is_empty());
+        assert!(reports.1.evidence.is_empty());
+        assert_eq!(older.body_bytes(), [0, 0]);
+        assert_eq!(older.counts.map(|c| c.opened), [0, 0]);
+        assert_eq!(take_counts()["sidecar_hold_newer_format"], 1);
+        f.save(&mut older);
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+    drop(older);
+    let (r, report) = load(f.restart(), &f.dir);
+    assert_eq!(r.restored_records(), 1);
+    assert_eq!(r.body_bytes(), [0, 0]);
+    assert_eq!(report, frozen(&api, &trace));
+    assert_eq!(fs::read(path).unwrap(), original);
+}
+
+#[test]
+fn newer_parser_dispatch_precedes_unknown_continuation_shape() {
+    // A future parser may have a completely different tail, so do not judge it.
+    assert_eq!(
+        codec::verify(&[2, 255, 255]),
+        Err(store::Refusal::NewerFormat)
+    );
+    assert_eq!(codec::verify(&[1, 255, 255]), Err(store::Refusal::Corrupt));
+}
+
+#[test]
+fn v0_1_201_whole_file_reader_ignores_new_durable_kind() {
+    // Legacy whole-file contract: only canonical JSONL sidecars are consulted;
+    // the new kind is in the shared store, never injected into their JSONL.
+    let mut f = Fixture::new("sidecar-legacy-kind");
+    let (api, trace) = bytes("first");
+    f.write("scope", &api, &trace);
+    let (mut r, _) = load(f.reader(), &f.dir);
+    f.save(&mut r);
+    let path = record_path(&r, "scope");
+    let original = fs::read(&path).unwrap();
+    let (rows, witness) = decode_api_sidecar_whole_file(&f.dir, "scope").unwrap();
+    let expected = frozen(&api, &trace);
+    assert_eq!(rows, expected.0.evidence["scope"]);
+    assert_eq!(witness.health, expected.0.health);
+    assert_eq!(load_trace_whole_file(&f.dir, ["scope".into()]), expected.1);
+    let mut legacy = DurableTailStore::new(r.store.dir().into(), DurableSource::ClaudeCode);
+    assert_eq!(
+        legacy.read(&r.binding("scope").key),
+        ReadOutcome::Refused(store::Refusal::Unknown)
+    );
+    assert_eq!(fs::read(path).unwrap(), original);
 }

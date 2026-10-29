@@ -276,9 +276,31 @@ pub(super) fn encode(pair: &Pair) -> Result<Vec<u8>, Refuse> {
     pair.put(&mut e)?;
     Ok(e.into_bytes())
 }
-pub(super) fn verify(bytes: &[u8]) -> bool {
+pub(super) fn newer(bytes: &[u8]) -> bool {
     let mut d = Dec::new(bytes);
-    Pair::verify(&mut d).and_then(|()| d.finish()).is_ok()
+    u16::take(&mut d).is_ok_and(|parser| parser > PARSER)
+}
+pub(super) fn newer_than_older(bytes: &[u8]) -> bool {
+    let mut d = Dec::new(bytes);
+    u16::take(&mut d).is_ok_and(|parser| parser > 0)
+}
+pub(super) fn verify(bytes: &[u8]) -> Result<(), crate::durable_tail_store::Refusal> {
+    verify_parser(bytes, PARSER)
+}
+pub(super) fn verify_older(bytes: &[u8]) -> Result<(), crate::durable_tail_store::Refusal> {
+    verify_parser(bytes, 0)
+}
+fn verify_parser(bytes: &[u8], supported: u16) -> Result<(), crate::durable_tail_store::Refusal> {
+    use crate::durable_tail_store::Refusal;
+    let mut d = Dec::new(bytes);
+    // Dispatch before interpreting the rest of a newer decoder's graph.
+    if u16::take(&mut d).map_err(|_| Refusal::Corrupt)? > supported {
+        return Err(Refusal::NewerFormat);
+    }
+    let mut d = Dec::new(bytes);
+    Pair::verify(&mut d)
+        .and_then(|()| d.finish())
+        .map_err(|_| Refusal::Corrupt)
 }
 pub(super) fn decode(bytes: &[u8]) -> Result<Pair, Corrupt> {
     let mut d = Dec::new(bytes);

@@ -222,6 +222,7 @@ fn durable_sidecar_money_accepted_refusal_holds_then_recovers() {
         let saved = path.with_extension("held");
         std::fs::rename(&path, &saved).unwrap();
         reader.begin_pass();
+        reader.set_time(100);
         let (mut reader, (held_page, mut held, held_holds)) =
             with_durable_sidecar_reader(reader, || render(&c, accepted.clone(), Mode::Ram));
         assert!(
@@ -235,8 +236,26 @@ fn durable_sidecar_money_accepted_refusal_holds_then_recovers() {
         held.accepted = prior.accepted.clone();
         money_oracle::assert_held(ROOT, &prior, &held, &expected);
         assert!(
-            crate::claude_local_otel::take_sidecar_read_counts()["sidecar_accepted_body_holds"] > 0
+            crate::claude_local_otel::take_sidecar_read_counts()["sidecar_s2_hold_entities"] > 0
         );
+        for (age, alarm) in [(24 * 60 * 60 - 60, false), (24 * 60 * 60 + 1, true)] {
+            reader.begin_pass();
+            reader.set_time(100 + age);
+            let (next, (page, mut aged, holds)) =
+                with_durable_sidecar_reader(reader, || render(&c, held_index.clone(), Mode::Ram));
+            reader = next;
+            let aged_index = settle_route(&c, &held_index, page, &mut progress, holds);
+            assert_eq!(stored_bodies(&aged_index), before);
+            aged.accepted = prior.accepted.clone();
+            money_oracle::assert_held(ROOT, &prior, &aged, &expected);
+            let counts = crate::claude_local_otel::take_sidecar_read_counts();
+            assert_eq!(counts["sidecar_s2_hold_entities"], 1);
+            assert_eq!(counts["sidecar_s2_hold_oldest_age"], age);
+            assert_eq!(
+                counts.get("sidecar_s2_hold_alarm").copied().unwrap_or(0),
+                u64::from(alarm)
+            );
+        }
         std::fs::rename(saved, &path).unwrap();
         append(
             &path,
@@ -585,5 +604,82 @@ fn durable_sidecar_money_new_agent_estimate_survives_accepted_root_hold() {
         money_oracle::assert_held(ROOT, &prior, &held, &expected);
         // The sibling estimate is a real new ACK; ROOT's body stays unchanged.
         assert_eq!(progress.accepted_fingerprints.len(), 2);
+    });
+}
+
+#[test]
+fn durable_sidecar_money_newer_format_waits_without_downgrade_then_reupgrade_equals_full() {
+    with_e2(|| {
+        crate::claude_local_otel::take_sidecar_read_counts();
+        let mut c = Corpus::new("sidecar-money-newer-hold");
+        let native = c.root(ROOT, &line(ROOT, "r1", AT, 10));
+        c.evidence(&[api("r1", 10, 100)], &[]);
+        let expected = cold(&c);
+        let mut slots = Slots::new(&c);
+        let (mut reader, (page, mut prior, holds)) =
+            with_durable_sidecar_reader(slots.reader(&c), || {
+                render(&c, ScanIndex::default(), Mode::Ram)
+            });
+        assert_reported(&prior, 1);
+        prior.accepted.insert(
+            ROOT.into(),
+            Accepted {
+                body: prior.snapshots[ROOT].clone(),
+                witness: snapshot_upload_body_witness(&page.scan.snapshots[0]),
+            },
+        );
+        let mut progress = e2_progress();
+        let accepted = settle_route(&c, &ScanIndex::default(), page, &mut progress, holds);
+        let before = stored_bodies(&accepted);
+        slots.save(&mut reader);
+        drop(reader);
+        append(&native, &line(ROOT, "r2", "2026-08-02T07:01:00Z", 20));
+        // A never-accepted dependent also waits: Unknown cannot become $0 or
+        // a sidecar-less estimate merely because the reader is downgraded.
+        c.agent(0, &line(ROOT, "new-agent", AT, 30));
+        let mut older = slots.restart(&c).as_older_reader();
+        let mut held_index = accepted;
+        for _ in 0..3 {
+            older.begin_pass();
+            let (next, (page, mut held, holds)) =
+                with_durable_sidecar_reader(older, || render(&c, held_index.clone(), Mode::Ram));
+            older = next;
+            assert_eq!(older.body_bytes(), [0, 0]);
+            assert!(held.batches.is_empty());
+            assert!(held.snapshots.is_empty());
+            assert_eq!(holds.held_entity_count, 2);
+            let settled = settle_route(&c, &held_index, page, &mut progress, holds);
+            assert_eq!(
+                stored_bodies(&settled),
+                before,
+                "accepted tokens/cost/witness stay exact"
+            );
+            held.accepted = prior.accepted.clone();
+            money_oracle::assert_held(ROOT, &prior, &held, &expected);
+            held_index = settled;
+            assert_eq!(
+                crate::claude_local_otel::take_sidecar_read_counts()["sidecar_hold_newer_format"],
+                1
+            );
+        }
+        drop(older);
+        // The current reader resumes the untouched record and only the suffix.
+        for row in [api("r2", 20, 200), api("new-agent", 30, 300)] {
+            append(
+                &sidecar_path(&c, false),
+                &(serde_json::to_string(&row).unwrap() + "\n"),
+            );
+        }
+        append(
+            &sidecar_path(&c, true),
+            &(serde_json::to_string(&trace("new-agent", "agent-000")).unwrap() + "\n"),
+        );
+        let expected = cold(&c);
+        let (reader, (_, recovered, _)) = with_durable_sidecar_reader(slots.restart(&c), || {
+            render(&c, held_index, Mode::DiskRestore)
+        });
+        assert_eq!(reader.restored_records(), 1);
+        money_oracle::assert_equivalent(&expected, &recovered);
+        assert_reported(&recovered, 2);
     });
 }

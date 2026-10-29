@@ -4,10 +4,6 @@
 use super::*;
 use crate::source_rotation::PaidReservation;
 mod counts;
-#[cfg(all(test, unix))]
-pub(super) fn record_holds(count: u64) {
-    counts::record_holds(count);
-}
 
 pub(super) fn take_counts() -> BTreeMap<&'static str, u64> {
     counts::take()
