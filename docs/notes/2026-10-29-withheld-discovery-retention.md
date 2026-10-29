@@ -54,3 +54,12 @@ unknown timestamps and observation overflow remain explicit. These snapshots
 are not an exact whole-index population gauge or an ACK. Real refusal fixtures
 retain the old committed extent across two quiet subsequent pages; rewrite
 fixtures keep the existing counted Full-from-zero identity/anchor behavior.
+
+Round 18 restricts newly carried sampled debt in Completed restoration to
+account-held keys. Existing audit debt on a committed authority/family-held
+entry still survives its ordinary restore; the account slice adds no new audit
+retention for those other holds. E1's independent composition remains separate.
+Held-key absence retirement also counts request-census removal, through the same
+wrapper as deletion/audit counters. Oversized growth repeats grown/size counts
+on each pass; Codex fragment-only suffixes retain the existing cached Tail retry
+behavior past the activity window. Both costs are explicit in diagnostics.

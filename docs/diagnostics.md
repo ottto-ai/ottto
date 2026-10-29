@@ -380,6 +380,16 @@ They retain counted rebuilds for observed rewrites/shrink/sample mismatches;
 length-only retention grants no Tail authority. Existing sampled acquisition's
 accepted unsampled-interior-edit limitations still apply.
 
+Two retention costs are intentional and count attempts, not unique files. An
+over-cap grown file cannot commit the unread suffix: it stays observed and is
+counted in both grown retention and size refusal on every eligible pass,
+indefinitely until its state changes. Counting has no once-per-process cap.
+Codex fragment-only growth is also retained: a cached reduction whose committed
+extent is `fragment.offset` can Tail-read the same unterminated trailing record
+on subsequent passes, including past the activity window. This extends the
+existing in-window fragment handling until completion, cache eviction or restart;
+it does not create a new Full-read cause.
+
 On Claude pages, `counts.withheld_reparse` counts re-parses of keys withheld for
 an unresolved account: `start` (first in this process), `evidence` (same size,
 but the sampled content, the file object, its api/trace sidecar stamps or the
