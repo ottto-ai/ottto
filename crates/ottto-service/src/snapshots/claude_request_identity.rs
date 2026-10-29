@@ -1560,12 +1560,34 @@ fn strip(item: &mut SnapshotItem) {
     }
 }
 
-/// Sorted compact JSON bytes, the receiver's item-size measure.
+/// Complete compact wire bytes, including the largest policy framing and a
+/// possible cache predecessor. Hash values have fixed width as tags change.
 pub(crate) fn item_bytes(item: &SnapshotItem) -> usize {
-    serde_json::to_value(item)
-        .ok()
-        .and_then(|value| serde_json::to_vec(&value).ok())
-        .map_or(usize::MAX, |bytes| bytes.len())
+    let policy = super::SnapshotUploadPolicy {
+        session_titles_enabled: false,
+        workspace_labels_enabled: false,
+        session_artifacts_enabled: false,
+        session_attribution_enabled: false,
+        session_attribution_labels_enabled: false,
+    };
+    let mut envelope = super::snapshot_semantic_envelope(SnapshotSource::ClaudeCode, item, policy);
+    if envelope.base_head_etag.is_none()
+        && (item.cache_observations.is_some()
+            || item.cache_observations_state.is_some()
+            || !item.cache_requests.is_empty())
+    {
+        envelope.base_head_etag = Some("0".repeat(64));
+    }
+    if serde_json::to_vec(&envelope).map_or(true, |bytes| {
+        bytes.len() > super::MAX_SEMANTIC_ENVELOPE_BYTES
+    }) {
+        return usize::MAX;
+    }
+    serde_json::to_vec(&super::SnapshotItemWire {
+        snapshot: item,
+        semantic_envelope: envelope,
+    })
+    .map_or(usize::MAX, |bytes| bytes.len())
 }
 
 // --- Canonical hash leaf (W0 `session_identity_leaf:v3`) ---------------------

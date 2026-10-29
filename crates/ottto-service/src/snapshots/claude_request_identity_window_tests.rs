@@ -172,6 +172,21 @@ fn sticky_assert_reconciled(item: &SnapshotItem) {
         (0..item.request_evidence.len() as u16).collect()
     );
     assert!(identity::item_bytes(item) <= identity::MAX_ITEM_BYTES);
+    // Exercise the real upload wrapper, including semantic_envelope. A bare
+    // SnapshotItem at 640 KiB is not an uploadable wire item.
+    let mut request = valid_v6_batch_request();
+    request.source = "claude_code".into();
+    request.upload_policy = SnapshotUploadPolicy {
+        session_titles_enabled: false,
+        workspace_labels_enabled: false,
+        session_artifacts_enabled: false,
+        session_attribution_enabled: false,
+        session_attribution_labels_enabled: false,
+    };
+    request.snapshots = vec![item.clone()];
+    let wire = serde_json::to_value(&request).unwrap();
+    assert!(wire["snapshots"][0]["semantic_envelope"].is_object());
+    assert!(serde_json::to_vec(&wire["snapshots"][0]).unwrap().len() <= identity::MAX_ITEM_BYTES);
 }
 #[test]
 fn sticky_budget_preserves_accepted_old_bucket_and_refuses_new_when_full() {
@@ -645,6 +660,11 @@ fn sticky_pad_to_bytes(clean: &SnapshotItem, target: usize) -> (SnapshotItem, Ve
     filler.model = "claude-filler".into();
     filler.input_tokens = 1;
     filler.request_count = 1;
+    filler.cost_usd = None;
+    filler.input_cost_usd = None;
+    filler.output_cost_usd = None;
+    filler.cache_read_cost_usd = None;
+    filler.cache_creation_cost_usd = None;
     let start = OffsetDateTime::parse("2026-01-01T00:00:00Z", &Rfc3339).unwrap();
     let with_fillers = |count: usize| {
         let mut candidate = clean.clone();
@@ -1032,4 +1052,79 @@ fn sticky_unreconcilable_newer_accepted_money_does_not_erase_an_older_joint_pair
     assert!(!sticky_tagged(&padded.usage_buckets[2].model_usage[0]));
     assert_eq!(padded.request_identity_refusals, 1);
     sticky_assert_reconciled(&padded);
+}
+
+fn sticky_assert_money_companions_survive_eviction(reported_current: bool) {
+    let requests = [
+        display_request(Some("max"), HOUR_10, 1, login_key(OWNER_A), Some(HOUR_10)),
+        display_request(Some("pro"), HOUR_11, 1, login_key(D64), Some(HOUR_11)),
+        display_request(
+            Some("max"),
+            "2026-09-01T12:00:00Z",
+            1,
+            login_key(OWNER_A),
+            Some("2026-09-01T12:00:00Z"),
+        ),
+    ];
+    let (mut item, timed) = display_item(&requests);
+    item.collected_at = "2026-09-01T12:05:00Z".into();
+    item.session_display_name = Some("x".into());
+    item.workspace_display_label = Some("x".into());
+    item.repository_label = Some("x".into());
+    let mut proof = timed.into_iter().map(|(c, _)| c).collect::<Vec<_>>();
+    if reported_current {
+        item.usage_buckets[2].model_usage[0].cost_usd = Some("0.000001".into());
+        proof[2].usage.costs = UsageCosts {
+            observed: true,
+            reported: true,
+            total: Some(1_000_000),
+            ..Default::default()
+        };
+        proof[0].usage.costs = UsageCosts {
+            observed: true,
+            reported: false,
+            ..Default::default()
+        };
+    }
+    let mut accepted = identity::AcceptedBuckets::default();
+    identity::apply_with_accepted_for_test(&mut item, &proof, &accepted).unwrap();
+    accepted.record(&serde_json::to_value(&item).unwrap());
+    let mut clean = stripped(&item);
+    clean.provenance.collector = identity::COLLECTOR.into();
+    let extra = |pair: bool| {
+        let mut candidate = clean.clone();
+        let mut shares = proof.clone();
+        for (index, share) in shares.iter_mut().enumerate() {
+            if (index == 1) == pair {
+                share.identity = RequestIdentity::Missing;
+            }
+        }
+        identity::apply_with_accepted_for_test(
+            &mut candidate,
+            &shares,
+            &identity::AcceptedBuckets::default(),
+        )
+        .unwrap();
+        candidate.request_identity_refusals = if pair { 1 } else { 2 };
+        identity::item_bytes(&candidate) - identity::item_bytes(&clean)
+    };
+    let headroom = extra(true).max(extra(false)) + 1;
+    assert!(identity::item_bytes(&item) - identity::item_bytes(&clean) > headroom);
+    let (mut padded, filler_proof) =
+        sticky_pad_to_bytes(&clean, identity::MAX_ITEM_BYTES - headroom);
+    proof.extend(filler_proof);
+    identity::apply_with_accepted_for_test(&mut padded, &proof, &accepted).unwrap();
+    assert!(sticky_tagged(&padded.usage_buckets[0].model_usage[0]));
+    assert!(!sticky_tagged(&padded.usage_buckets[1].model_usage[0]));
+    assert!(sticky_tagged(&padded.usage_buckets[2].model_usage[0]));
+    assert_eq!(padded.request_identity_refusals, 1);
+    sticky_assert_reconciled(&padded);
+}
+#[test]
+fn sticky_protected_current_money_keeps_its_old_unpriced_companion_over_a_middle_bucket() {
+    sticky_assert_money_companions_survive_eviction(true);
+}
+#[test]
+fn sticky_re_admission_completes_top_rows_atomically_when_single_buckets_cannot_fit() {
+    sticky_assert_money_companions_survive_eviction(false);
 }

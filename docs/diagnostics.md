@@ -78,7 +78,7 @@ accepting version 1 binaries; there is no version negotiation.
 
 | Stage | Local fields | Meaning |
 | --- | --- | --- |
-| `claude_request_identity_over_cap` | `counts.claude_request_identity_over_cap`: `evidence_entries`, `authority_keys`, `parts_per_row`, `parts_per_item`, `rows`, `bytes`; `counts.claude_request_identity_last_over_cap_item_bytes` | Cumulative, saturating process counters per cap reason, plus the attempted tagged item's last measured compact JSON byte size. One attempt can increment several reasons; retries count separately. Recorded before budget recovery or full-strip fallback. Labels are append-only. No row content or identity is logged or uploaded. |
+| `claude_request_identity_over_cap` | `counts.claude_request_identity_over_cap`: `evidence_entries`, `authority_keys`, `parts_per_row`, `parts_per_item`, `rows`, `bytes`; `counts.claude_request_identity_last_over_cap_item_bytes` | Cumulative, saturating process counters per cap reason, plus the attempted tagged item's last budgeted compact wire byte size, including semantic framing. One attempt can increment several reasons; retries count separately. Recorded before budget recovery or full-strip fallback. Labels are append-only. No row content or identity is logged or uploaded. |
 
 Each completed `native_collection_page` records existing scanned-file and
 semantic-no-op counts. `sampled_acquisition` is `null` when unavailable. Its
@@ -1168,6 +1168,13 @@ residual cannot supply that witness. Missing witnesses propagate through the
 candidate set, with each bucket and dependency removed at most once. This
 prevents an independently impossible bucket from discarding other accepted
 buckets that reconcile only together.
+
+Re-admission tries a bucket with its required money witnesses atomically, and
+can complete a shared top row when doing so shrinks the representation. Failed
+row completions are cached until selection changes. The byte budget includes
+the existing semantic envelope, the largest policy flag encoding, and a
+possible cache predecessor when the item carries cache material. The complete
+wire size is checked again after allocation; the 640 KiB wire cap is unchanged.
 
 The destination-scoped upload progress stores class L priority hints only:
 hashed session keys and sorted bucket-start timestamps, with no identities.

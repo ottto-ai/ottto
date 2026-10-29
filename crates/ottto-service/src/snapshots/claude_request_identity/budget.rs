@@ -321,6 +321,37 @@ fn intrinsically_fits(
     })
 }
 
+struct MoneyPlan {
+    possible: Vec<bool>,
+    required: Vec<Vec<usize>>,
+    supplied: Vec<Vec<usize>>,
+    suppliers: Vec<Vec<usize>>,
+}
+impl MoneyPlan {
+    fn closure(&self, seeds: impl IntoIterator<Item = usize>, kept: &[bool]) -> Option<Vec<usize>> {
+        let mut pending = seeds.into_iter().collect::<Vec<_>>();
+        let mut included = BTreeSet::new();
+        let mut supplied = BTreeSet::new();
+        while let Some(bucket) = pending.pop() {
+            if kept[bucket] || !included.insert(bucket) {
+                continue;
+            }
+            if !self.possible[bucket] {
+                return None;
+            }
+            supplied.extend(self.supplied[bucket].iter().copied());
+            for &node in &self.required[bucket] {
+                if supplied.contains(&node) || self.suppliers[node].iter().any(|&index| kept[index])
+                {
+                    continue;
+                }
+                pending.push(*self.suppliers[node].first()?);
+            }
+        }
+        Some(included.into_iter().collect())
+    }
+}
+
 // A known tagged cost under an unreported top row needs an unpriced share
 // of that same row and authority to reconcile. Untagged money cannot provide
 // that witness. Remove impossible candidates before ordered cap eviction;
@@ -330,7 +361,8 @@ fn money_candidates(
     grouping: &Grouping,
     row_index: &BTreeMap<RowKey, usize>,
     mut possible: Vec<bool>,
-) -> Option<Vec<bool>> {
+    rank: &[usize],
+) -> Option<MoneyPlan> {
     #[derive(Default)]
     struct Node {
         witnesses: usize,
@@ -339,6 +371,8 @@ fn money_candidates(
     let mut indexes = BTreeMap::new();
     let mut nodes: Vec<Node> = Vec::new();
     let mut witnesses = vec![Vec::new(); possible.len()];
+    let mut requirements = vec![Vec::new(); possible.len()];
+    let mut suppliers = Vec::<Vec<usize>>::new();
     for (index, bucket) in item.usage_buckets.iter().enumerate() {
         if !possible[index] {
             continue;
@@ -359,6 +393,7 @@ fn money_candidates(
                     }
                     let node = *indexes.entry((top, key, field)).or_insert_with(|| {
                         nodes.push(Node::default());
+                        suppliers.push(Vec::new());
                         nodes.len() - 1
                     });
                     if row_costs(row)[field].is_some() && amount.wire(field).is_some() {
@@ -371,9 +406,11 @@ fn money_candidates(
         }
         for node in required {
             nodes[node].dependents.push(index);
+            requirements[index].push(node);
         }
         for node in supplied {
             nodes[node].witnesses += 1;
+            suppliers[node].push(index);
             witnesses[index].push(node);
         }
     }
@@ -398,7 +435,16 @@ fn money_candidates(
             }
         }
     }
-    Some(possible)
+    for suppliers in &mut suppliers {
+        suppliers.retain(|&index| possible[index]);
+        suppliers.sort_by_key(|&index| rank[index]);
+    }
+    Some(MoneyPlan {
+        possible,
+        required: requirements,
+        supplied: witnesses,
+        suppliers,
+    })
 }
 
 fn change_bucket(
@@ -654,7 +700,11 @@ pub(super) fn select(
         .copied()
         .filter(|&index| is_accepted[index])
         .collect::<Vec<_>>();
-    let possible = money_candidates(
+    let mut rank = vec![usize::MAX; item.usage_buckets.len()];
+    for (priority, &index) in order.iter().enumerate() {
+        rank[index] = priority;
+    }
+    let plan = money_candidates(
         item,
         grouping,
         &row_index,
@@ -671,9 +721,10 @@ pub(super) fn select(
                     )
             })
             .collect(),
+        &rank,
     )?;
     for &index in &accepted_order {
-        if !possible[index] {
+        if !plan.possible[index] {
             continue;
         }
         let Some((next, rows)) =
@@ -697,22 +748,76 @@ pub(super) fn select(
         kept[index] = false;
         bucket_identities[index].fill(RowIdentity::Untagged);
     }
-    // One unencodable candidate cannot discard independent accepted proof.
-    for index in order {
-        if kept[index] || !possible[index] {
+    let mut row_buckets = vec![Vec::new(); item.model_usage.len()];
+    for &index in &order {
+        if plan.possible[index] {
+            for row in &item.usage_buckets[index].model_usage {
+                row_buckets[row_index[&row_key_from_model_usage(row)]].push(index);
+            }
+        }
+    }
+    // Re-admit required money companions atomically. A top-row completion can
+    // also collapse Parts to Single; cache failed completions until selection
+    // changes, so one shared long row is not retried for every bucket.
+    let mut failed_completions = BTreeSet::new();
+    for &index in &order {
+        if kept[index] || !plan.possible[index] {
             continue;
         }
-        let Some((next, identities)) =
-            change_bucket(item, grouping, &selection, &row_index, index, false)
-        else {
-            continue;
-        };
-        if fits(item, &next, base_bytes, prior_refusals).is_none() {
-            continue;
+        let mut own_rows = item.usage_buckets[index]
+            .model_usage
+            .iter()
+            .map(|row| row_index[&row_key_from_model_usage(row)])
+            .collect::<Vec<_>>();
+        own_rows.sort_unstable();
+        own_rows.dedup();
+        let mut choices = vec![vec![index]];
+        if let Some(companions) = plan.closure([index], &kept) {
+            if companions.len() > 1 {
+                choices.push(companions);
+            }
         }
-        selection = next;
-        kept[index] = true;
-        bucket_identities[index] = identities;
+        if !failed_completions.contains(&own_rows) {
+            let seeds = own_rows
+                .iter()
+                .flat_map(|&row| row_buckets[row].iter().copied());
+            if let Some(completion) = plan.closure(seeds, &kept) {
+                if completion.len() > 1 {
+                    choices.push(completion);
+                }
+            }
+        }
+        let mut admitted = false;
+        for mut members in choices {
+            members.sort_by_key(|&member| rank[member]);
+            let mut trial = selection.clone();
+            let mut added = Vec::new();
+            let mut valid = true;
+            for member in members {
+                let Some((next, identities)) =
+                    change_bucket(item, grouping, &trial, &row_index, member, false)
+                else {
+                    valid = false;
+                    break;
+                };
+                trial = next;
+                added.push((member, identities));
+            }
+            if !valid || fits(item, &trial, base_bytes, prior_refusals).is_none() {
+                continue;
+            }
+            selection = trial;
+            for (member, identities) in added {
+                kept[member] = true;
+                bucket_identities[member] = identities;
+            }
+            admitted = true;
+            failed_completions.clear();
+            break;
+        }
+        if !admitted {
+            failed_completions.insert(own_rows);
+        }
     }
     if !kept.iter().any(|keep| *keep) {
         return None;
