@@ -292,10 +292,29 @@ pub(crate) struct DurableRecord {
 /// Exact verified predecessor; no caller can manufacture or clone its authority.
 pub(crate) struct MutationWitness {
     key: Digest32,
-    content: Digest32,
+    original: Digest32,
     stamp: Stamp,
-    format: u16,
-    generation: u64,
+    migration: Option<MigrationBinding>,
+}
+struct MigrationBinding {
+    current: Digest32,
+    floor: std::num::NonZeroU64,
+}
+fn original_digest(record: &DurableRecord, content: &Digest32) -> Digest32 {
+    digest(
+        "ottto-dt-original:v1",
+        &[
+            content,
+            &record.format.to_le_bytes(),
+            &record.index_generation.to_le_bytes(),
+        ],
+    )
+}
+fn migration_binding(current: &Expected) -> Digest32 {
+    digest(
+        "ottto-dt-migration:v1",
+        &[&current.binding.context, &current.binding.scope],
+    )
 }
 
 /// Preservation classes: unknown representations (U) precede known corruption (T14).
@@ -734,10 +753,9 @@ impl DurableTailStore {
         };
         let proof = MutationWitness {
             key,
-            content: digest,
+            original: original_digest(record, &digest),
             stamp: *stamp,
-            format: record.format,
-            generation: record.index_generation,
+            migration: None,
         };
         (*content == digest && self.witness_current(&proof)).then_some(proof)
     }
@@ -755,7 +773,7 @@ impl DurableTailStore {
         receipt.committed.as_ref().is_some_and(|acks| {
             acks.iter().flatten().any(|(key, content, stamp)| {
                 *key == proof.key
-                    && *content != proof.content
+                    && *stamp != proof.stamp
                     && self.durable.get(key).is_some_and(|(have, current, _)| {
                         *have == Some(*content) && current == stamp
                     })
@@ -771,13 +789,12 @@ impl DurableTailStore {
         proof: &MutationWitness,
     ) {
         self.revoke(&record.record.binding.key);
+        let content = content_digest(&record.record);
         if record.eligible(expected).is_err()
             || record.record.binding.entry != expected.binding.entry
             || record.index_generation > expected.committed_generation
             || proof.key != record.record.binding.key
-            || proof.format != record.format
-            || proof.generation != record.index_generation
-            || proof.content != content_digest(&record.record)
+            || proof.original != original_digest(record, &content)
             || !self.witness_current(proof)
         {
             return;
@@ -793,7 +810,75 @@ impl DurableTailStore {
             self.durable.remove(&key); // Never evict a current mutation permission.
         }
         self.durable
-            .insert(proof.key, (Some(proof.content), proof.stamp, true));
+            .insert(proof.key, (Some(content), proof.stamp, true));
+    }
+    /// Only the supported no-match acquisition classifier calls this, BEFORE O3 reserve.
+    pub(crate) fn migration_witness(
+        &self,
+        record: &DurableRecord,
+        current: &Expected,
+        floor: u64,
+    ) -> Option<MutationWitness> {
+        if self.source != DurableSource::ClaudeCode
+            || record.format != 1
+            || record.record.binding.source != self.source
+            || record.record.binding.key != current.binding.key
+            || record.record.binding.context != current.binding.context
+        {
+            return None;
+        }
+        let mut original = current.clone();
+        original.binding.scope = record.record.binding.scope;
+        original.binding.entry = record.record.binding.entry;
+        let mut proof = self.mutation_witness(record, &original)?;
+        proof.migration = Some(MigrationBinding {
+            current: migration_binding(current),
+            floor: std::num::NonZeroU64::new(floor)?,
+        });
+        Some(proof)
+    }
+    pub(crate) fn migration_matches(
+        &self,
+        proof: &MutationWitness,
+        record: &DurableRecord,
+        current: &Expected,
+    ) -> bool {
+        proof.key == current.binding.key
+            && record.record.binding.key == proof.key
+            && record.record.binding.context == current.binding.context
+            && proof
+                .migration
+                .as_ref()
+                .is_some_and(|m| m.current == migration_binding(current))
+            && proof.original == original_digest(record, &content_digest(&record.record))
+            && self.witness_current(proof)
+    }
+    /// The caller supplies a completed native checkpoint and strict saved selection.
+    pub(crate) fn authorize_migration(
+        &mut self,
+        record: &DurableRecord,
+        current: &Expected,
+        replacement: &DurableCertificate,
+        proof: &MutationWitness,
+    ) {
+        self.revoke(&record.record.binding.key);
+        let old = &record.record.certificate;
+        if !self.migration_matches(proof, record, current)
+            || (old.device, old.inode) != (replacement.device, replacement.inode)
+            || (old.birth_nanos != 0
+                && replacement.birth_nanos != 0
+                && old.birth_nanos != replacement.birth_nanos)
+            || !proof
+                .migration
+                .as_ref()
+                .is_some_and(|m| replacement.sealed_offset >= m.floor.get())
+        {
+            return;
+        }
+        let mut original = current.clone();
+        original.binding.scope = record.record.binding.scope;
+        original.binding.entry = record.record.binding.entry;
+        self.authorize_witness(record, &original, proof);
     }
     fn authorized(&mut self, key: &Digest32) -> bool {
         let allowed = self.source != DurableSource::ClaudeCode
@@ -1151,6 +1236,17 @@ impl DurableTailStore {
 
     fn note_codec(&mut self, bytes: usize) {
         self.counters.peak_codec_bytes = self.counters.peak_codec_bytes.max(bytes as u64);
+    }
+}
+
+impl MutationWitness {
+    pub(crate) fn migration_floor(&mut self, end: u64) -> Option<u64> {
+        let m = self.migration.as_mut()?;
+        m.floor = std::num::NonZeroU64::new(m.floor.get().max(end))?;
+        Some(m.floor.get())
+    }
+    pub(crate) fn is_migration(&self) -> bool {
+        self.migration.is_some()
     }
 }
 

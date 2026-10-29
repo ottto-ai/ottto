@@ -26755,6 +26755,18 @@ impl OwnedSourceScan {
                     break 'scan_step
                 };
             }
+            macro_rules! migration_failure {
+                ($candidate:expr) => {
+                    #[cfg(unix)]
+                    if source == SnapshotSource::ClaudeCode
+                        && sampling
+                            .as_ref()
+                            .is_some_and(|c| c.cache.migration_failure(index, $candidate))
+                    {
+                        pending!();
+                    }
+                };
+            }
             if source == SnapshotSource::Codex && !codex_join_prepared {
                 if let Some(inventory) = codex_join_inventory.as_mut() {
                     if !inventory.step(&codex_title_metadata) {
@@ -27819,6 +27831,7 @@ impl OwnedSourceScan {
                         pending!();
                     }
                     Err(error) => {
+                        migration_failure!(&active.candidate);
                         // U1a-2a G14a: a side read error is its charged
                         // attempt; no census line, no dequeue.
                         if let Some(side) = active.side_origin.take() {
@@ -28578,6 +28591,7 @@ impl OwnedSourceScan {
                                     == candidate.opened_object_identity)
                             },
                         ) {
+                            migration_failure!(&candidate);
                             if source == SnapshotSource::ClaudeCode {
                                 claude_request_census::invalidate_claude_request_census(
                                     index,
@@ -28659,6 +28673,7 @@ impl OwnedSourceScan {
                         ) {
                             Ok(completed) => completed,
                             Err(_) => {
+                                migration_failure!(&candidate);
                                 if source == SnapshotSource::ClaudeCode {
                                     claude_request_census::invalidate_claude_request_census(
                                         index,
@@ -28837,6 +28852,7 @@ impl OwnedSourceScan {
                         pending!();
                     }
                     Err(_error) => {
+                        migration_failure!(&candidate);
                         #[cfg(test)]
                         sampled_scan::test_hooks::record_finish_error(&_error);
                         if source == SnapshotSource::ClaudeCode {
@@ -31822,6 +31838,8 @@ impl OwnedSourceScan {
                         #[cfg(unix)]
                         let mut retail_attempt = None;
                         #[cfg(unix)]
+                        let mut migration_floor = None;
+                        #[cfg(unix)]
                         let (retained, taken_admission) = match retained {
                             None if allow_sample && !parser.reader.reader.is_compressed() => {
                                 let mut interpretation =
@@ -31886,20 +31904,6 @@ impl OwnedSourceScan {
                                         );
                                         (Some(taken.retained), Some(admission))
                                     }
-                                    sampled_scan::durable_tail::RestoreOutcome::Stale(
-                                        "old_binding_no_match",
-                                    ) if source == SnapshotSource::ClaudeCode
-                                        && context
-                                            .cache
-                                            .no_match_full(
-                                                &key,
-                                                parser.reader.reader.get_ref(),
-                                                durable_accepted,
-                                            )
-                                            .is_some() =>
-                                    {
-                                        (None, taken_admission)
-                                    }
                                     sampled_scan::durable_tail::RestoreOutcome::Stale(reason)
                                         if source == SnapshotSource::ClaudeCode
                                             && context.cache.stale_full(&key,
@@ -31907,9 +31911,34 @@ impl OwnedSourceScan {
                                     {
                                         (None, taken_admission)
                                     }
-                                    sampled_scan::durable_tail::RestoreOutcome::Stale(_) => {
-                                        context.cache.durable_stale_hold(source, index, &candidate);
-                                        pending!();
+                                    sampled_scan::durable_tail::RestoreOutcome::Stale(reason) => {
+                                        use sampled_scan::durable_tail::MigrationStart;
+                                        let grant = (source == SnapshotSource::ClaudeCode
+                                            && reason == "old_binding_no_match")
+                                            .then(|| {
+                                                context.cache.migration_start(
+                                                    &key,
+                                                    parser.reader.reader.get_ref(),
+                                                    index,
+                                                    durable_accepted,
+                                                )
+                                            });
+                                        match grant {
+                                            Some(Ok(MigrationStart::Full(end))) => {
+                                                migration_floor = Some(end);
+                                                (None, taken_admission)
+                                            }
+                                            Some(Ok(MigrationStart::AwaitSave)) => {
+                                                identified_candidates.push_front(candidate);
+                                                pending!();
+                                            }
+                                            _ => {
+                                                context
+                                                    .cache
+                                                    .durable_stale_hold(source, index, &candidate);
+                                                pending!();
+                                            }
+                                        }
                                     }
                                     sampled_scan::durable_tail::RestoreOutcome::Miss => {
                                         (None, taken_admission)
@@ -31941,6 +31970,7 @@ impl OwnedSourceScan {
                             Err(_) => {
                                 context.admission.prepare_failed =
                                     context.admission.prepare_failed.saturating_add(1);
+                                migration_failure!(&candidate);
                                 if source == SnapshotSource::ClaudeCode {
                                     claude_request_census::invalidate_claude_request_census(
                                         index,
@@ -31953,13 +31983,15 @@ impl OwnedSourceScan {
                         };
                         #[cfg(unix)]
                         if source == SnapshotSource::ClaudeCode
-                            && !matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
+                            && (migration_floor.is_some()
+                                || !matches!(
+                                    mode,
+                                    crate::transcript_acquisition::ReadMode::Full(_)
+                                ))
                             && durable_accepted.is_some_and(|a| {
-                                parser
-                                    .reader
-                                    .acquisition
-                                    .as_ref()
-                                    .map_or(true, |p| p.frozen_length() < a.end)
+                                parser.reader.acquisition.as_ref().map_or(true, |p| {
+                                    p.frozen_length() < a.end.max(migration_floor.unwrap_or(0))
+                                })
                             })
                         {
                             context.cache.durable_hold_exit(
@@ -32296,15 +32328,20 @@ impl OwnedSourceScan {
                             .is_some_and(|e| !e.source_file_fingerprint.is_empty()
                                 && active.candidate.size_bytes > e.size_bytes))
                 {
-                    match context.cache.upgrade_read(
+                    match context.cache.migration_read(
                         &local_index_key(&active.candidate.path),
                         active.parser.reader.reader.get_ref(),
+                        index,
                     ) {
                         Ok(Some(read)) => active.parser.reader.reader.put_upgrade(read),
                         Ok(None) => {}
-                        // No observer/retained state was attached on failure. Keep the
-                        // existing fresh Full; fstat failure is counted as `metadata`.
-                        Err(_) => {}
+                        // Retained migrations require their exact native observer.
+                        // Absent-record metadata failures retain the baseline Full.
+                        Err(_) => {
+                            if context.cache.migration_failure(index, &active.candidate) {
+                                pending!();
+                            }
+                        }
                     }
                 }
                 if let Some((mode, audit_due)) = planned_mode {

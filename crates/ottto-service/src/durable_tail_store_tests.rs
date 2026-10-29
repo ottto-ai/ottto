@@ -2139,3 +2139,114 @@ fn claude_mutation_proof_expires_at_pass_boundary_and_unmemoized_records_survive
     );
     assert_eq!(fs::read(&disk).unwrap(), before);
 }
+
+#[test]
+fn o3_conditional_replacement_binds_original_current_object_and_real_floor() {
+    for arm in [
+        "complete",
+        "context",
+        "scope",
+        "generation",
+        "format",
+        "object",
+        "floor",
+        "stamp",
+    ] {
+        let scratch = Scratch::new();
+        let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+        let path = scratch.transcript("t.jsonl", b"{}\n");
+        let mut store = scratch.store();
+        let old = binding("acct", "unprovable-old-scope", ("old", None));
+        store
+            .write_after_save(&lock, 1, vec![pending(old.clone(), certificate(&path), 1)])
+            .unwrap();
+        let record = found(store.read(&old.key, &placeholder_allowlist()));
+        let disk = record_file(&store, &old.key);
+        let survivor = fs::read(&disk).unwrap();
+        let current = Expected {
+            binding: binding("acct", "current-scope", ("new", None)),
+            committed_generation: 2,
+        };
+        assert!(
+            record.eligible(&current).is_err(),
+            "ordinary strict mutation remains refused"
+        );
+        fs::write(&path, b"{}\n{}\n").unwrap();
+        let mut proof = store
+            .migration_witness(&record, &current, 6)
+            .expect("exact old envelope/current context");
+        assert_eq!(proof.migration_floor(3), Some(6), "floor never lowers");
+        let mut candidate = record.clone();
+        let mut now = current.clone();
+        let mut replacement = certificate(&path);
+        match arm {
+            "context" => now.binding.context = [3; 32],
+            "scope" => now.binding.scope = [3; 32],
+            "generation" => candidate.index_generation += 1,
+            "format" => candidate.format += 1,
+            "object" => replacement.inode += 1,
+            "floor" => replacement.sealed_offset = 3,
+            "stamp" => {
+                let alternate = disk.with_extension("other");
+                put_record(&alternate, &survivor);
+                fs::rename(alternate, &disk).unwrap();
+            }
+            _ => {}
+        }
+        store.authorize_migration(&candidate, &now, &replacement, &proof);
+        let receipt = store
+            .write_after_save(
+                &lock,
+                2,
+                vec![pending(current.binding.clone(), replacement, 2)],
+            )
+            .unwrap();
+        assert_eq!(receipt.written, usize::from(arm == "complete"), "{arm}");
+        assert_eq!(
+            store.replacement_committed(&proof, &receipt),
+            arm == "complete",
+            "{arm}"
+        );
+        if arm != "complete" {
+            assert_eq!(fs::read(&disk).unwrap(), survivor, "{arm}");
+        }
+    }
+}
+
+#[test]
+fn o3_witness_rejects_unclassified_source_context_format_and_future_record() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let path = scratch.transcript("t.jsonl", b"{}\n");
+    let mut store = scratch.store();
+    let old = binding("acct", "old-scope", ("old", None));
+    store
+        .write_after_save(&lock, 2, vec![pending(old.clone(), certificate(&path), 1)])
+        .unwrap();
+    let record = found(store.read(&old.key, &placeholder_allowlist()));
+    for arm in ["source", "context", "key", "format", "future", "zero-floor"] {
+        let mut candidate = record.clone();
+        let mut current = Expected {
+            binding: old.clone(),
+            committed_generation: 2,
+        };
+        match arm {
+            "source" => candidate.record.binding.source = DurableSource::Codex,
+            "context" => current.binding.context = [2; 32],
+            "key" => current.binding.key = [2; 32],
+            "format" => candidate.format = 2,
+            "future" => current.committed_generation = 1,
+            _ => {}
+        }
+        assert!(
+            store
+                .migration_witness(
+                    &candidate,
+                    &current,
+                    if arm == "zero-floor" { 0 } else { 3 }
+                )
+                .is_none(),
+            "{arm}"
+        );
+    }
+}
