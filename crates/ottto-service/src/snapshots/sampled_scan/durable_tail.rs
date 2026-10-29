@@ -2179,11 +2179,6 @@ impl SharedCache {
             }
         }
         let slot = stores.slot(source).as_mut()?;
-        if source == DurableSource::ClaudeCode {
-            for key in offered.values() {
-                authorize_strict(slot, snapshot_source, key, index);
-            }
-        }
         if !invalidate.is_empty() {
             let _ = slot.store.remove_keys(writer, &invalidate);
         }
@@ -2707,7 +2702,7 @@ mod restore_test {
                     taken: Some(taken),
                     lease: Some(lease),
                 }),
-                Self::Miss(_) => None,
+                Self::Miss(_) | Self::Stale(_) | Self::Held(store::Refusal::BehindAccepted) => None,
                 Self::Pending if !crate::heap_layout_bound::layout_supported() => None,
                 Self::Pending => panic!("ordinary restore unexpectedly Pending"),
                 Self::Held(reason) => panic!("ordinary restore unexpectedly Held: {reason:?}"),

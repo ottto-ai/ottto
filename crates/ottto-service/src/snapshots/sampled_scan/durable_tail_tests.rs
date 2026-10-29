@@ -7231,7 +7231,8 @@ fn a1a_frozen_floor_holds_before_certificate_even_after_working_entry_clear() {
     );
     disk.write_after_save(
         lock,
-        index.generation, 0,
+        index.generation,
+        0,
         vec![PendingRecord {
             binding,
             certificate: certificate(&path, &scope),
@@ -7335,7 +7336,8 @@ fn a1a_strict_writer_preserves_cleared_and_reverted_predecessors_after_restore_p
         );
         disk.write_after_save(
             lock,
-            index.generation, 0,
+            index.generation,
+            0,
             vec![PendingRecord {
                 binding,
                 certificate: certificate(&path, &scope),
@@ -7443,7 +7445,8 @@ fn a1a_supported_unprovable_migration_classifies_stale_on_growth_without_o3() {
     );
     disk.write_after_save(
         lock,
-        index.generation, 0,
+        index.generation,
+        0,
         vec![PendingRecord {
             binding,
             certificate: certificate(&path, &scope),
@@ -10411,4 +10414,258 @@ fn p2_restart_restore_tail_persists_successor_and_restarts_again() {
         );
     }
     let _ = std::fs::remove_dir_all(root);
+}
+
+thread_local! {
+    static CONSUMED: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+pub(super) fn record_consumed(bytes: u64) {
+    CONSUMED.with(|total| {
+        if let Some(n) = total.get() {
+            total.set(Some(n + bytes));
+        }
+    });
+}
+fn observe_consumed<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            CONSUMED.with(|n| n.set(None));
+        }
+    }
+    CONSUMED.with(|n| assert!(n.replace(Some(0)).is_none()));
+    let _reset = Reset;
+    let value = f();
+    (value, CONSUMED.with(|n| n.get().unwrap()))
+}
+
+thread_local! { static UPGRADE_OBSERVED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+pub(super) fn observe_upgrade_read() {
+    UPGRADE_OBSERVED.with(|n| n.set(n.get() + 1));
+}
+
+/// Ordinary-pass state that must survive the production continuation builder and EOF.
+pub(crate) struct ContinuationDurableState {
+    key: String,
+    digest: store::Digest32,
+    scope: Scope,
+    namespace: Scope,
+    dir: PathBuf,
+    corrupt: Vec<store::Digest32>,
+    initial: store::tests::ContinuationPassState,
+    guard_header_bytes: u64,
+}
+
+impl ContinuationDurableState {
+    pub(crate) fn seed(
+        cache: &SharedCache,
+        index: &mut ScanIndex,
+        index_path: &Path,
+        namespace: &Scope,
+        writer: &crate::locked_state_dir::LockedStateDir,
+    ) -> Self {
+        let source = SnapshotSource::Codex;
+        let ds = DurableSource::Codex;
+        let key = index_path.parent().unwrap().join("ordinary-only.jsonl");
+        std::fs::write(&key, b"{}\n").unwrap();
+        let key = local_index_key(&key);
+        index.files.insert(
+            key.clone(),
+            serde_json::from_value(serde_json::json!({
+                "size_bytes":3, "modified_unix_seconds":1, "source_file_fingerprint":"ordinary-fp"
+            }))
+            .unwrap(),
+        );
+        index.save(index_path).unwrap();
+        let scope = Scope("ordinary-decided-scope".into());
+        let old_scope = Scope("obsolete-stored-scope".into());
+        let interpretation = Interpretation::of(source, &key, index, false, namespace);
+        let binding = expected(ds, source, &key, &old_scope, index, &interpretation, None)
+            .unwrap()
+            .binding;
+        let current = expected(ds, source, &key, &scope, index, &interpretation, None).unwrap();
+        assert_ne!(
+            binding.scope, current.binding.scope,
+            "ordinary GC has a real obsolete-scope decision"
+        );
+        let digest = binding.key;
+        let allowlist = ds.properties().allowlist();
+        let record = PendingRecord {
+            binding,
+            certificate: certificate(Path::new(&key), &old_scope),
+            body: crate::snapshots::durable_store_fixture_body(source, 0, 0),
+            allowlist,
+        };
+        let corrupt: Vec<_> = (0..=store::T14_BREAKER)
+            .map(|n| store::key_digest(ds, &format!("corrupt-{n}")))
+            .collect();
+        let mut pending = vec![record.clone()];
+        for key in &corrupt {
+            let mut record = record.clone();
+            record.binding.key = *key;
+            pending.push(record);
+        }
+        cache.durable_note_scope(source, &key, &scope);
+        let mut stores = cache.durable().unwrap();
+        let slot = stores.slot(ds).as_mut().unwrap();
+        let receipt = slot
+            .store
+            .write_after_save(writer, index.generation, 0, pending)
+            .unwrap();
+        assert_eq!(receipt.written, corrupt.len() + 1);
+        let record = match slot.store.read(&digest) {
+            ReadOutcome::Found(record) => record,
+            other => panic!("seeded ordinary record: {other:?}"),
+        };
+        slot.store.authorize(
+            &record,
+            &Expected {
+                binding: record.record.binding.clone(),
+                committed_generation: index.generation,
+            },
+        );
+        for key in &corrupt {
+            let name = key.iter().map(|b| format!("{b:02x}")).collect::<String>();
+            let path = slot.dir.join(format!("{name}.rec"));
+            let mut bytes = std::fs::read(&path).unwrap();
+            *bytes.last_mut().unwrap() ^= 1;
+            std::fs::write(&path, bytes).unwrap();
+        }
+        for key in corrupt.iter().take(store::T14_BREAKER as usize - 1) {
+            assert_eq!(slot.store.hold(key), None);
+        }
+        let initial = store::tests::continuation_pass_state(&slot.store);
+        assert!(initial.checked);
+        assert_eq!(initial.counts, [store::T14_BREAKER - 1; 2]);
+        assert_eq!(initial.rebuilt.len() as u64, store::T14_BREAKER - 1);
+        assert!(initial.authorized.contains(&digest));
+        assert_eq!(slot.store.disabled(), None);
+        Self {
+            key,
+            digest,
+            scope,
+            namespace: namespace.clone(),
+            dir: slot.dir.clone(),
+            corrupt,
+            initial,
+            guard_header_bytes: slot.store.counters().guard_header_bytes,
+        }
+    }
+
+    pub(crate) fn assert_preserved(&self, cache: &SharedCache) {
+        let mut stores = cache.durable().unwrap();
+        let slot = stores.slot(DurableSource::Codex).as_mut().unwrap();
+        assert_eq!(slot.dir, self.dir, "ordinary directory binding");
+        assert_eq!(slot.namespace, self.namespace, "ordinary namespace binding");
+        assert!(!slot.identity_capture);
+        assert_eq!(
+            slot.decided.get(&self.key),
+            Some(&self.scope),
+            "ordinary GC decision survives continuation"
+        );
+        assert_eq!(
+            store::tests::continuation_pass_state(&slot.store),
+            self.initial,
+            "continuation cannot reset checks, breaker, rebuilt keys or authority"
+        );
+        assert_eq!(
+            slot.store.counters().guard_header_bytes - self.guard_header_bytes,
+            0,
+            "continuation adds zero guard header bytes to the ordinary pass"
+        );
+    }
+
+    pub(crate) fn assert_gc_at_eof(&self, cache: &SharedCache, index: &ScanIndex) {
+        assert!(
+            index.files.contains_key(&self.key),
+            "ordinary key remains indexed"
+        );
+        let name = self
+            .digest
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        assert!(
+            !self.dir.join(format!("{name}.rec")).exists(),
+            "retained ordinary decision rejects obsolete scope at EOF GC"
+        );
+        let (_, stats) = cache.durable_counters(SnapshotSource::Codex).unwrap();
+        assert_eq!(stats.gc_records_deleted, 1);
+    }
+
+    pub(crate) fn assert_breaker_at_eof(&self, cache: &SharedCache) {
+        let mut stores = cache.durable().unwrap();
+        let slot = stores.slot(DurableSource::Codex).as_mut().unwrap();
+        let before = store::tests::continuation_pass_state(&slot.store);
+        assert!(before.checked);
+        assert_eq!(before.counts, self.initial.counts);
+        assert_eq!(before.rebuilt, self.initial.rebuilt);
+        assert_eq!(slot.store.hold(&self.corrupt[0]), None);
+        assert_eq!(
+            slot.store.counters().t14_rebuild,
+            store::T14_BREAKER - 1,
+            "repeat rebuilt key is not recounted"
+        );
+        assert_eq!(
+            slot.store
+                .hold(&self.corrupt[store::T14_BREAKER as usize - 1]),
+            None
+        );
+        assert_eq!(slot.store.counters().t14_rebuild, store::T14_BREAKER);
+        assert_eq!(slot.store.disabled(), None);
+        assert_eq!(
+            slot.store.hold(&self.corrupt[store::T14_BREAKER as usize]),
+            None
+        );
+        assert_eq!(
+            slot.store.disabled(),
+            Some("t14_breaker"),
+            "ordinary and continuation share one breaker budget"
+        );
+        assert_eq!(slot.store.counters().t14_rebuild, store::T14_BREAKER);
+    }
+}
+
+thread_local! {
+    static A0H_READS: std::cell::Cell<Option<(usize, u64)>> = const { std::cell::Cell::new(None) };
+}
+pub(crate) fn a0h_record_read(read: &std::io::Result<usize>) {
+    A0H_READS.with(|v| {
+        if let Some((calls, bytes)) = v.get() {
+            v.set(Some((
+                calls + 1,
+                bytes + read.as_ref().copied().unwrap_or(0) as u64,
+            )));
+        }
+    });
+}
+fn a0h_observe<T>(f: impl FnOnce() -> T) -> (T, (usize, u64)) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            A0H_READS.with(|v| v.set(None));
+        }
+    }
+    A0H_READS.with(|v| assert!(v.replace(Some((0, 0))).is_none()));
+    let _reset = Reset;
+    let result = f();
+    (result, A0H_READS.with(|v| v.get().unwrap()))
+}
+
+thread_local! {
+    static B1_METADATA_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+pub(super) fn b1_metadata_fails() -> bool {
+    B1_METADATA_FAIL.with(|v| v.get())
+}
+fn b1_with_metadata_failure<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            B1_METADATA_FAIL.with(|v| v.set(false));
+        }
+    }
+    B1_METADATA_FAIL.with(|v| v.set(true));
+    let _reset = Reset;
+    f()
 }

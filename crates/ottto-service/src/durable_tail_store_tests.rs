@@ -3084,7 +3084,12 @@ fn claude_mutations_require_exact_strict_proof_and_a_current_stamp() {
             match seam {
                 "overwrite" => {
                     let receipt = cold
-                        .write_after_save(&lock, 2, 0, vec![pending(b.clone(), certificate(&path), 2)])
+                        .write_after_save(
+                            &lock,
+                            2,
+                            0,
+                            vec![pending(b.clone(), certificate(&path), 2)],
+                        )
                         .unwrap();
                     assert_eq!(
                         receipt.written,
@@ -3135,7 +3140,10 @@ fn original_witness_survives_memo_turnover_but_never_a_different_record() {
         let old = pending(b.clone(), certificate(&path), 1);
         let mut store = scratch.store();
         assert_eq!(
-            store.write_after_save(&lock, 1, 0, vec![old]).unwrap().written,
+            store
+                .write_after_save(&lock, 1, 0, vec![old])
+                .unwrap()
+                .written,
             1
         );
         let mut decoded = found(store.read(&b.key));
@@ -3215,7 +3223,8 @@ fn batch_ack_is_key_specific_and_bound_to_the_written_target_stamp() {
     let initial = store
         .write_after_save(
             &lock,
-            1, 0,
+            1,
+            0,
             vec![
                 pending(first.clone(), certificate(&path), 1),
                 pending(other.clone(), certificate(&path), 1),
@@ -3240,7 +3249,8 @@ fn batch_ack_is_key_specific_and_bound_to_the_written_target_stamp() {
     let receipt = store
         .write_after_save(
             &lock,
-            2, 0,
+            2,
+            0,
             vec![pending(first.clone(), certificate(&path), 2)],
         )
         .unwrap();
@@ -3258,7 +3268,8 @@ fn batch_ack_is_key_specific_and_bound_to_the_written_target_stamp() {
     let clean = store
         .write_after_save(
             &lock,
-            3, 0,
+            3,
+            0,
             vec![pending(first.clone(), certificate(&path), 2)],
         )
         .unwrap();
@@ -3346,7 +3357,8 @@ fn batch_ack_never_escapes_failed_or_ambiguous_writes_or_a_clean_retry() {
             let retry = store
                 .write_after_save(
                     &lock,
-                    3, 0,
+                    3,
+                    0,
                     vec![
                         pending(b.clone(), certificate(&path), 2),
                         pending(other, certificate(&path), 1),
