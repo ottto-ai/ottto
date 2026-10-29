@@ -49,7 +49,6 @@ impl CachedJsonlReduction {
         self.accumulator.usage_witness()
     }
     /// The copy's source (M1: a durable record is written per source).
-    #[cfg(unix)]
     pub(super) fn source(&self) -> SnapshotSource {
         self.accumulator.source
     }
@@ -122,6 +121,30 @@ impl OwnedJsonlParser {
         self.accumulator.codex_parent_ownership_ledgers = inputs.parents;
     }
 
+    /// Plan against a bounded borrowed certificate before cache take. Full refusal leaves
+    /// the checkpoint, native reduction, rank and audit debt in their owner.
+    /// The exact plan is reused by prepare_acquisition, without a second guard read.
+    pub(super) fn prepare_continuation_only(
+        &mut self,
+        checkpoint: Option<&crate::transcript_acquisition::Checkpoint>,
+        scope: &Scope,
+        debt: Option<AuditDebt>,
+        now: u64,
+    ) -> Result<bool> {
+        if self.source != SnapshotSource::ClaudeCode
+            || self.reader.reader.is_compressed()
+            || checkpoint.is_none()
+        {
+            return Ok(false);
+        }
+        let plan = ReadPlan::prepare(self.reader.reader.get_mut(), checkpoint, scope, debt, now)?;
+        if matches!(plan.mode(), ReadMode::Full(_)) {
+            return Ok(false);
+        }
+        self.reader.acquisition = Some(plan);
+        Ok(true)
+    }
+
     /// Invoked on a fresh safely-opened parser before any fill/read. Scope and
     /// durable debt must be supplied by the existing source/index authority.
     pub(super) fn prepare_acquisition(
@@ -174,13 +197,16 @@ impl OwnedJsonlParser {
                             })
                         }))
         });
-        let plan = ReadPlan::prepare(
-            self.reader.reader.get_mut(),
-            old.as_ref().map(|old| &old.checkpoint),
-            scope,
-            debt,
-            now,
-        )?;
+        let plan = match self.reader.acquisition.take() {
+            Some(plan) => plan,
+            None => ReadPlan::prepare(
+                self.reader.reader.get_mut(),
+                old.as_ref().map(|old| &old.checkpoint),
+                scope,
+                debt,
+                now,
+            )?,
+        };
         let mode = plan.mode();
         if matches!(mode, ReadMode::Full(_)) && self.source == SnapshotSource::Codex {
             self.accumulator.codex_observed_priority_turns = Some(BTreeMap::new());

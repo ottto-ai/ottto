@@ -248,6 +248,38 @@ impl SharedCache {
             }
         }
     }
+    /// Bounded certificate copy only; native state stays resident. No source
+    /// I/O under the retained lock. Fits the existing acquisition scratch reserve.
+    pub(super) fn claude_checkpoint(
+        &self,
+        key: &str,
+    ) -> Result<Option<crate::transcript_acquisition::Checkpoint>, ()> {
+        let cache = self.retained().map_err(|_| ())?;
+        let Some(old) = cache.peek(key) else {
+            return Ok(None);
+        };
+        if old.state.source() != SnapshotSource::ClaudeCode
+            || crate::heap_layout_bound::bound(&old.checkpoint, 64 * 1024).is_none()
+        {
+            return Err(());
+        }
+        Ok(Some(old.checkpoint.clone()))
+    }
+    /// Consume only the exact certificate preflight validated outside the lock.
+    /// A concurrent eviction/replacement refuses without disturbing its owner.
+    pub(super) fn take_claude_checkpoint(
+        &self,
+        key: &str,
+        checkpoint: &crate::transcript_acquisition::Checkpoint,
+    ) -> Result<Option<crate::transcript_cache::Taken<CachedJsonlReduction>>, ()> {
+        let mut cache = self.retained().map_err(|_| ())?;
+        if !cache.peek(key).is_some_and(|old| {
+            old.state.source() == SnapshotSource::ClaudeCode && old.checkpoint == *checkpoint
+        }) {
+            return Err(());
+        }
+        Ok(cache.take(key))
+    }
     /// Capture after E2 finish_page, before identity/policy changes fingerprints.
     /// The committed index is the pre-scan authority: new held keys remain
     /// absent there and in settlement. Each flag shares its reduction's scope

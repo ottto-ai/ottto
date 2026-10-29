@@ -1001,6 +1001,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                         None,
                         365,
                         &BTreeMap::new(),
+                        None,
                     )
                     .unwrap();
                     assert!(sampled_scan::reduction_dependencies(
@@ -1864,6 +1865,7 @@ fn known_corrupt_replacement_case(fail_replacement: bool) {
         None,
         365,
         &BTreeMap::new(),
+        None,
     )
     .unwrap();
     cache.durable_hold_exit(

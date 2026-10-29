@@ -206,6 +206,9 @@ fn claude_retry_singleton_storage_only_scoped(
     root: &str,
     debt_scope: Option<&BTreeSet<String>>,
 ) -> bool {
+    if index.usage_guard_reason(root).is_some() {
+        return true; // scoped custody only; never oversized re-arm service
+    }
     let Some(pending) = index.claude_usage_family_pending.get(root) else {
         return false;
     };
@@ -532,11 +535,11 @@ fn claude_retry_note_offered(
     if oversized_after.is_some() {
         for path in paths {
             let key = local_index_key(&path.path);
-            if claude_index_path_member_ref(&path.path)
-                .is_some_and(|m| oversized.as_deref() == Some(m.root))
-                && previous
-                    .as_deref()
-                    .map_or(true, |after| key.as_str() > after)
+            if claude_index_path_member_ref(&path.path).is_some_and(|m| {
+                oversized.as_deref() == Some(m.root) && !index.usage_guard_holds.holds(m.root)
+            }) && previous
+                .as_deref()
+                .map_or(true, |after| key.as_str() > after)
                 && oversized_after
                     .as_deref()
                     .is_some_and(|after| key.as_str() <= after)

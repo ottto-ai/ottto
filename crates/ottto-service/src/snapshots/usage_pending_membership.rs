@@ -21,6 +21,7 @@ impl<'a> Hashes<'a> {
     pub(super) fn len(self) -> usize {
         self.explicit.map_or(0, BTreeSet::len) + self.occurrences.map_or(0, BTreeMap::len)
     }
+    #[cfg(test)]
     pub(super) fn is_empty(self) -> bool {
         self.len() == 0
     }

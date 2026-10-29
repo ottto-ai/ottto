@@ -67,7 +67,9 @@ fn carry_family(index: &mut ScanIndex, root: &str, subagents: &[Option<&str>], w
         census_window_end: CARRY_FAILED.to_string(),
         member_request_id_hashes: BTreeMap::new(),
         member_occurrences: BTreeMap::new(),
-        invalid: false,
+        // Legacy refusal/capping controls need an observed negative fact.
+        // Missing-witness Unknown is exercised in usage_guard_phase1_tests.
+        invalid: !witnessed,
         idless_revision: None,
     };
     let mut witness = ClaudeUsageFamilyWitness {
@@ -197,11 +199,11 @@ fn carry_arms(
 }
 
 /// T1, positive: a same-context red retry with the fence already closed keeps
-/// the witnessed family's committed revisions, compacts its old-window
-/// pending to member keys only, and re-arms the unwitnessed family exactly as
+/// the witnessed family's committed revisions and old-window proof detail,
+/// and re-arms the observed-invalid family exactly as
 /// BASE does. The row stays count-only.
 #[test]
-fn c1b_unchanged_witnessed_family_is_carried_and_compacted_at_red_retry() {
+fn c1b_unchanged_witnessed_family_is_carried_with_retained_detail_at_red_retry() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -238,19 +240,10 @@ fn c1b_unchanged_witnessed_family_is_carried_and_compacted_at_red_retry() {
     let pending = &fix.claude_usage_family_pending[CARRY_ROOT];
     assert_eq!(pending.census_window_end, CARRY_FAILED, "the old window");
     assert!(!pending.invalid);
-    assert!(pending.member_occurrences.is_empty());
     assert_eq!(
-        pending
-            .member_request_id_hashes
-            .keys()
-            .cloned()
-            .collect::<BTreeSet<_>>(),
-        carry_family_members()
+        pending, &before.claude_usage_family_pending[CARRY_ROOT],
+        "phase 1 retains exact detail"
     );
-    assert!(pending
-        .member_request_id_hashes
-        .values()
-        .all(BTreeSet::is_empty));
     assert_eq!(
         fix.claude_usage_family_witnesses,
         before.claude_usage_family_witnesses
@@ -266,10 +259,10 @@ fn c1b_unchanged_witnessed_family_is_carried_and_compacted_at_red_retry() {
     }
 }
 
-/// T2, red chain: the compacted entry is carried again at the next red retry
-/// (the tripwire is vacuous on it) with no re-arm of its family.
+/// T2, red chain: the retained detailed entry is verified again at the next
+/// red retry with no re-arm of its family.
 #[test]
-fn c1b_compacted_family_is_carried_again_across_a_red_chain() {
+fn c1b_detailed_family_is_carried_again_across_a_red_chain() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -307,10 +300,9 @@ fn c1b_compacted_family_is_carried_again_across_a_red_chain() {
     assert_eq!(index.claude_usage_family_pending[CARRY_ROOT], compacted);
 }
 
-/// T3, cap budget: compacted carried entries hold no occurrences, so the
-/// shared pending budget counts only the re-armed family's.
+/// Phase 1 keeps all token detail and prices every retained occurrence.
 #[test]
-fn c1b_compaction_releases_the_pending_occurrence_budget() {
+fn phase1_retry_preserves_the_pending_occurrence_budget() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -325,8 +317,7 @@ fn c1b_compaction_releases_the_pending_occurrence_budget() {
         .pending_occurrence_count
     };
     assert_eq!(budget(&mut base), 3, "BASE keeps every stale occurrence");
-    // FLIPS: BASE keeps the witnessed family's two occurrences.
-    assert_eq!(budget(&mut fix), 1);
+    assert_eq!(budget(&mut fix), 3, "phase 1 keeps detailed proof on disk");
 }
 
 /// Q3 residual: every indexed member is stale, so today's re-arm reaches all
@@ -421,6 +412,11 @@ fn carry_controls() -> Vec<CarryControl> {
         }),
         carry_control("full_retry_could_reopen", |index| {
             index.files.remove(&carry_key(CARRY_OTHER, None));
+            index
+                .claude_usage_family_pending
+                .get_mut(CARRY_UNWITNESSED)
+                .unwrap()
+                .invalid = false;
         }),
         carry_control("no_witness", |index| {
             index.claude_usage_family_witnesses.remove(CARRY_ROOT);
@@ -658,8 +654,9 @@ fn c1b_negative_controls_rearm_exactly_like_base() {
         for key in carry_family_keys() {
             if let Some(entry) = fix.files.get(&key) {
                 assert!(
-                    entry.source_file_fingerprint.is_empty(),
-                    "{}: {key} re-arms",
+                    entry.source_file_fingerprint.is_empty()
+                        != fix.usage_guard_holds.holds_path(Path::new(&key)),
+                    "{}: {key} re-arms only with known evidence",
                     control.name
                 );
             }
@@ -1428,16 +1425,11 @@ fn window_indexed_ids(index: &ScanIndex) -> BTreeSet<String> {
         .collect()
 }
 
-/// Carried and capped pending is compacted to member keys: it credits
-/// nothing and keeps the next complete census invalid.
-fn assert_compacted_and_invalid(index: &ScanIndex, root: &str) {
+/// Retained old-window pending credits no current census evidence.
+fn assert_retained_and_census_invalid(index: &ScanIndex, root: &str) {
     let pending = &index.claude_usage_family_pending[root];
-    assert!(pending.member_occurrences.is_empty(), "{root}");
-    assert!(!pending.member_request_id_hashes.is_empty(), "{root}");
-    assert!(pending
-        .member_request_id_hashes
-        .values()
-        .all(BTreeSet::is_empty));
+    assert!(!pending.member_occurrences.is_empty(), "{root}");
+    assert!(!pending.membership().is_empty(), "{root}");
     assert!(claude_stale_pending_keeps_census_invalid(
         index,
         root,
@@ -1497,7 +1489,7 @@ fn fix2_clean_followup_carries_window_families_and_caps_stale_rearms() {
     }
     let unwitnessed = carry_key(CARRY_UNWITNESSED, None);
     assert!(fix.files[&unwitnessed].source_file_fingerprint.is_empty());
-    assert_compacted_and_invalid(&fix, CARRY_ROOT);
+    assert_retained_and_census_invalid(&fix, CARRY_ROOT);
     assert_eq!(
         fix.claude_usage_family_witnesses,
         before.claude_usage_family_witnesses
@@ -1533,7 +1525,7 @@ fn fix2_clean_followup_carries_window_families_and_caps_stale_rearms() {
         before.files[&unwitnessed].source_file_fingerprint
     );
     for root in [CARRY_ROOT, CARRY_UNWITNESSED] {
-        assert_compacted_and_invalid(&fix, root);
+        assert_retained_and_census_invalid(&fix, root);
     }
     assert_eq!(fix.claude_full_rearm_progress.stale_rearms_at_deadline, 1);
     let serialized = row.to_string();
@@ -1681,7 +1673,7 @@ fn fix2_capped_family_member_change_cancels_and_requeues_passed_member() {
     let ready = index.clone();
     let second = carry_start(&mut index, CARRY_SECOND_RETRY, BACKFILL_WINDOW_DAYS);
     assert_eq!(second["stale_rearm_capped_files"], 2);
-    assert_compacted_and_invalid(&index, CARRY_UNWITNESSED);
+    assert_retained_and_census_invalid(&index, CARRY_UNWITNESSED);
     let child = carry_key(CARRY_UNWITNESSED, Some(agent));
     let root = carry_key(CARRY_UNWITNESSED, None);
     let traversal = index.traversal.as_mut().unwrap();
@@ -1784,7 +1776,7 @@ fn fix2_unhealthy_retry_also_honors_the_same_deadline_cap() {
     assert_eq!(second["carried_pending_families"], 1);
     assert_eq!(second["stale_rearm_capped_files"], 1);
     assert_eq!(second["rearmed_index_files"], 0);
-    assert_compacted_and_invalid(&index, CARRY_UNWITNESSED);
+    assert_retained_and_census_invalid(&index, CARRY_UNWITNESSED);
     assert_eq!(index.claude_full_rearm_progress.stale_rearms_at_deadline, 1);
 }
 
@@ -2458,7 +2450,7 @@ fn scoped_unhealthy_retry_reads_zero_of_32_healthy_files_and_keeps_evidence() {
         assert!(saved.claude_duplicate_request_witness_overflowed);
         assert_eq!(saved.claude_usage_authority_pending_count(), 9);
         for root in fixture.roots.iter().skip(9) {
-            assert_compacted_and_invalid(&saved, root);
+            assert_retained_and_census_invalid(&saved, root);
         }
         eprintln!("SCOPED_UNHEALTHY_RETRY held=9 healthy=32 unrelated={unrelated} base_full=32 healthy_full=0");
     }
@@ -2728,7 +2720,7 @@ fn scoped_unhealthy_retry_restart_recomputes_terminal_carry_from_durable_state()
                 );
             }
             for root in fixture.roots.iter().skip(9) {
-                assert_compacted_and_invalid(&fixture.index, root);
+                assert_retained_and_census_invalid(&fixture.index, root);
             }
         } else {
             assert_eq!(row["carried_pending_families"], 0, "{case}");
@@ -2935,7 +2927,7 @@ fn scoped_unhealthy_retry_refuses_missing_mismatched_or_incomplete_family_eviden
 }
 
 #[test]
-fn accepted_retry_carries_without_otel_census_or_fence_deadline() {
+fn accepted_retry_holds_missing_witness_without_otel_census_or_fence_deadline() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -2949,7 +2941,8 @@ fn accepted_retry_carries_without_otel_census_or_fence_deadline() {
             .claude_duplicate_fence_next_full_rearm_unix_seconds = deadline;
         let before = serde_json::to_value(&fixture.index).unwrap();
         let row = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
-        assert_eq!(row["carried_pending_families"], 1);
+        assert_eq!(row["carried_pending_families"], 0);
+        assert!(fixture.index.usage_guard_holds.holds(&fixture.roots[0]));
         assert_eq!(row["rearmed_index_files"], 0);
         assert_eq!(
             scoped_retry_full_reads(&fixture.index, &fixture.candidates),
@@ -3614,10 +3607,29 @@ fn accepted_carry_streams_when_request_graph_refuses_even_a_small_family_set() {
         .claude_usage_family_pending
         .get_mut(&root)
         .unwrap();
-    pending.member_occurrences.clear();
+    let hashes = (0..12000)
+        .map(|n| format!("{n:064x}"))
+        .collect::<BTreeSet<_>>();
+    let occurrences = hashes
+        .iter()
+        .map(|hash| (hash.clone(), carry_occurrence(0, 10)))
+        .collect();
     pending
         .member_request_id_hashes
-        .insert(root, (0..12000).map(|n| format!("{n:064x}")).collect());
+        .insert(root.clone(), hashes.clone());
+    pending.member_occurrences.insert(root.clone(), occurrences);
+    let witness = fixture
+        .index
+        .claude_usage_family_witnesses
+        .get_mut(&root)
+        .unwrap();
+    witness
+        .member_request_id_fingerprints
+        .insert(root.clone(), claude_request_id_set_fingerprint(&hashes));
+    witness.member_occurrence_fingerprints.insert(
+        root.clone(),
+        claude_occurrence_map_fingerprint(&pending.member_occurrences[&root]),
+    );
     let stale = fixture
         .index
         .claude_usage_family_pending
@@ -3885,11 +3897,11 @@ fn contract_debt_defers_exact_acks_on_ordinary_streaming_and_batch_routes() {
         assert!(fixture.index.claude_duplicate_request_witness_overflowed);
         for pending in fixture.index.claude_usage_family_pending.values() {
             assert_eq!(pending.census_window_end, CARRY_FAILED);
-            assert!(pending.member_occurrences.is_empty());
+            assert!(!pending.member_occurrences.is_empty());
             assert!(pending
-                .member_request_id_hashes
+                .membership()
                 .values()
-                .all(BTreeSet::is_empty));
+                .all(|hashes| !hashes.is_empty()));
         }
         let previous = fixture.index.clone();
         let partial =
