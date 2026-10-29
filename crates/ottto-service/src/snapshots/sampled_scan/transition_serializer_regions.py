@@ -6,7 +6,8 @@ extractor, not a Rust compiler or an interprocedural resolver:
 * comments/whitespace are ignored; literal bytes and token boundaries are kept;
 * all durable_struct!/durable_enum! invocations and handwritten Durable,
   HDigest, key and empty trait impls in each catalog unit are balanced regions;
-* referenced same-unit const/static definitions and bare helper calls are
+* referenced same-unit const/static definitions (including simple named format
+  captures) and bare helper calls are
   followed to a fixed point (qualified external/method calls are not resolved);
 * explicit roots cover the body encode/allowlist functions, session-start
   re-derivation helpers, source slug and owned-container Deref implementations;
@@ -137,6 +138,8 @@ def regions(path, source):
         identifiers, calls = set(), set()
         for a, b in chosen:
             identifiers.update(t[a:b])
+            for token in t[a:b]:
+                identifiers.update(re.findall(r'(?<!\{)\{([A-Za-z_][A-Za-z_0-9]*)(?=[:}])', token))
             for i in range(a, b - 1):
                 # Local bare calls only: no guessed resolution of .method/::name.
                 if t[i + 1] == "(" and (i == a or t[i - 1] not in (".", ":", "fn")):

@@ -120,7 +120,7 @@ const PINNED_SOURCES: &[SourcePin] = &[
     SourcePin {
         path: "snapshots/sampled_jsonl/durable.rs",
         text: include_str!("../sampled_jsonl/durable.rs"),
-        sha256: "2d35c65818faadc48fd3cdbbb7782eed7ad3e2228b12a1b86859360fbbde19e3",
+        sha256: "27b26458253274b54befb92b8d914789bbc1f88cbd9b14c24379d4327ea0ed3a",
     },
     SourcePin {
         path: "snapshots/sampled_jsonl.rs",
@@ -265,6 +265,11 @@ fn pinned_v1_refuses_encoding_constant_and_local_helper_drift() {
         "snapshots/sampled_jsonl/durable.rs",
         "pub(crate) const HEAD_BOUND: u64 = 1024 * 1024;",
         "pub(crate) const HEAD_BOUND: u64 = 2 * 1024 * 1024;",
+    );
+    assert_source_drift_refused(
+        "snapshots/sampled_jsonl/durable.rs",
+        "pub(crate) const NAMED_LINES: usize = 4;",
+        "pub(crate) const NAMED_LINES: usize = 5;",
     );
     assert_source_drift_refused(
         "snapshots/sampled_jsonl/durable.rs",
