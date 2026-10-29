@@ -441,11 +441,12 @@ fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
         "accept",
         "capacity",
         "poison",
+        "persistent_capacity",
         "spent",
         "funding",
         "funding_spent",
     ] {
-        let refuse_return = matches!(return_mode, "capacity" | "poison");
+        let refuse_return = matches!(return_mode, "capacity" | "poison" | "persistent_capacity");
         let root = crate::test_scratch::ScratchDir::new("cold-prepare-return-tail");
         let lock = test_locks::hold(&root);
         let sessions = root.join("sessions");
@@ -665,6 +666,8 @@ fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
             lease.release();
             continue;
         }
+        let other_restore = other_source_restore_after_return_release(&root, lock);
+        let original_record = store_snapshot(&store::store_dir_for_index(&index_path));
         let granted = Arc::new(Mutex::new(None));
         let observation = granted.clone();
         let pressure = cache.clone();
@@ -721,8 +724,8 @@ fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
         assert_eq!(cache.durable().unwrap().counters.retail_attempts, 1);
         assert_eq!(scan.sampling.as_ref().unwrap().full_files, 0);
         assert_eq!(scan.sampling.as_ref().unwrap().native_bytes, 0);
-        if return_mode == "poison" {
-            let active = scan.active_file.as_ref().expect("funded poison hold");
+        if matches!(return_mode, "poison" | "persistent_capacity") {
+            let active = scan.active_file.as_ref().expect("funded persistent hold");
             assert!(active
                 .parser
                 .pending_taken
@@ -732,16 +735,52 @@ fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
                 .retail
                 .is_some());
             assert!(active.parser.pending_funding.is_some());
-            assert!(cache.lock_poisoned_for_test(super::super::TestLock::Retained));
-            let (_, events) = crate::local_resource_diagnostics::capture(|| drop(scan));
+            assert_eq!(
+                cache.lock_poisoned_for_test(super::super::TestLock::Retained),
+                return_mode == "poison"
+            );
+            store::ActiveLease::timeout_next_acquire_for_test(std::time::Duration::from_millis(5));
+            assert!(matches!(
+                cache.acquire_active(SnapshotSource::Codex, 0),
+                store::LeaseWait::Busy
+            ));
+            let (scan, events) = crate::local_resource_diagnostics::capture(|| {
+                for attempt in 2..=RETURN_ADMISSION_ATTEMPTS {
+                    scan = match scan.step(None) {
+                        OwnedSourceScanStep::Pending(next) => next,
+                        _ => panic!("return retries must remain cooperative"),
+                    };
+                    assert_eq!(
+                        scan.active_file.is_some(),
+                        attempt < RETURN_ADMISSION_ATTEMPTS
+                    );
+                }
+                scan
+            });
             assert_eq!(
                 events
                     .iter()
-                    .filter(|event| event["counts"]["active_drop_release"] == 1)
+                    .filter(|event| event["counts"]["prepared_return_dropped"] == 1)
                     .count(),
-                1,
-                "cancelled owner uses the counted release net"
+                1
             );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| event["counts"]["active_drop_release"] == 1),
+                "terminal release is explicit"
+            );
+            assert!(scan.active_file.is_none());
+            assert_eq!(scan.sampling.as_ref().unwrap().native_bytes, 0);
+            assert_eq!(scan.sampling.as_ref().unwrap().full_files, 0);
+            drop(scan);
+            sampled_jsonl::preparation_tests::set(None);
+            other_restore(); // Real other-source cold restore now acquires the owner.
+            assert_eq!(
+                store_snapshot(&store::store_dir_for_index(&index_path)),
+                original_record
+            );
+
             let store::LeaseWait::Granted(lease) =
                 cache.acquire_active(source, store::ACTIVE_BYTES)
             else {
@@ -4154,4 +4193,84 @@ fn receipt_retry_bound_reads_growth_after_quiet_window_and_restart_is_idle() {
         .files
         .get(&key)
         .is_some_and(ScanIndexEntry::has_unverified_source));
+}
+
+/// Seeds an actual no-content Codex record before the Claude owner is parked.
+/// The returned action drives the ordinary cold caller after bounded release.
+fn other_source_restore_after_return_release(
+    root: &Path,
+    lock: &crate::locked_state_dir::LockedStateDir,
+) -> impl FnOnce() {
+    let source = SnapshotSource::Codex;
+    let ds = DurableSource::Codex;
+    let path = root.join("019fa111-2222-7333-8444-555555555555.jsonl");
+    std::fs::write(&path, b"{}\n").unwrap();
+    let key = local_index_key(&path);
+    let namespace = Scope("other-owner".into());
+    let scope = Scope("other-file".into());
+    let index_path = root.join("other-index.json");
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        key.clone(),
+        serde_json::from_value(serde_json::json!({
+            "size_bytes": 3, "modified_unix_seconds": 1, "source_file_fingerprint": "other-fp"
+        }))
+        .unwrap(),
+    );
+    index.save(&index_path).unwrap();
+    let cache = SharedCache::default();
+    cache.durable_begin_pass(source, &index_path, &namespace, false);
+    let interp = Interpretation::of(source, &key, &index, false, &namespace);
+    let binding = expected(ds, source, &key, &scope, &index, &interp, None)
+        .unwrap()
+        .binding;
+    let (reduction, _) = native_record_of(&path, &scope, source);
+    let body = codec::encode(&reduction, store::BODY_BYTES, jsonl_line_cap() as u64).unwrap();
+    let mut disk = DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+    assert_eq!(
+        disk.write_after_save(
+            lock,
+            index.generation,
+            0,
+            vec![PendingRecord {
+                binding,
+                certificate: certificate(&path, &scope),
+                body: body.clone(),
+                allowlist: codec::allowlist_digest(source)
+            }]
+        )
+        .unwrap()
+        .written,
+        1
+    );
+    move || {
+        let interp = Interpretation::of(source, &key, &index, false, &namespace);
+        let restored = cache
+            .durable_restore(
+                source,
+                &key,
+                &path,
+                &scope,
+                &mut File::open(&path).unwrap(),
+                &index,
+                &interp,
+            )
+            .into_test_option()
+            .expect("other-source actual cold restore after terminal release");
+        assert_eq!(
+            codec::encode(
+                &restored.retained.state,
+                store::BODY_BYTES,
+                jsonl_line_cap() as u64
+            )
+            .unwrap(),
+            body
+        );
+        drop(restored);
+        let store::LeaseWait::Granted(lease) = cache.acquire_active(source, store::ACTIVE_BYTES)
+        else {
+            panic!("other restore leaked the released owner")
+        };
+        lease.release();
+    }
 }
