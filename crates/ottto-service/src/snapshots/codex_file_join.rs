@@ -2899,12 +2899,8 @@ pub(super) mod tests {
             "the held file was not rewritten"
         );
         assert_eq!(retry_deadline(&index), deadline, "no re-walk was forced");
-        assert!(inventory_hold(&index).is_none());
-        let (_, again) = retained_page(&root, index, &[]);
-        assert_eq!(
-            again.scanned_file_count, 0,
-            "a recovered file is not re-read"
-        );
+        // A recovered file is not re-read; the page releases it as accepted.
+        released_once_accepted(&root, index);
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -2980,8 +2976,20 @@ pub(super) mod tests {
             "the held file was not rewritten"
         );
         assert_eq!(retry_deadline(&index), deadline, "no re-walk was forced");
-        assert!(inventory_hold(&index).is_none());
+        released_once_accepted(&root, index);
         fs::remove_dir_all(root).unwrap();
+    }
+    /// G2: the catch-up page leaves its keys owed; the next page start finds
+    /// their committed sizes matching the files and releases them, reading
+    /// nothing.
+    fn released_once_accepted(root: &Path, index: ScanIndex) {
+        assert!(inventory_hold(&index).is_some_and(|hold| !hold.owed.is_empty()));
+        let (index, page) = retained_page(root, index, &[]);
+        assert_eq!(
+            page.scanned_file_count, 0,
+            "acceptance is checked, not re-read"
+        );
+        assert!(inventory_hold(&index).is_none());
     }
     /// RFC 3339 for the real clock plus `days`: fixture files carry real
     /// mtimes, so this is when they have idled `days` days.
@@ -3000,7 +3008,9 @@ pub(super) mod tests {
         // Hold rule (E3 Codex owed keys): a candidate an incomplete inventory
         // held grows while held, then idles past the 7-day window. The
         // bounded retry's fresh walk still selects it, once its blocker is
-        // gone, and its whole usage is emitted exactly once.
+        // gone, and its whole usage is emitted. G2: a failed upload of that
+        // complete parse leaves it owed and retried, still past the window;
+        // only the committed, accepted size releases it.
         let (root, held_index, unreadable, new, _) = held_behind_unreadable_header();
         let key = local_index_key(&new);
         crate::local_resource_diagnostics::take_codex_owed_for_test();
@@ -3014,21 +3024,56 @@ pub(super) mod tests {
         // retry due; the retry walks 8 days later, with `new` aged out.
         fs::remove_file(&unreadable).unwrap();
         held_index.mark_bounded_sweep_unsettled();
+        let committed = held_index.clone();
         let (index, page) = retained_page_at(&root, held_index, &[], &days_from_now(8));
-        // Before this slice the retry's fresh traversal dropped the hold and
-        // its walk aged `new` out: nothing was emitted, ever.
-        assert_eq!(
+        let emitted = |page: &SourceScanResult| {
             page.snapshots
                 .iter()
                 .filter(|item| item.source_session_id == UNRELATED)
                 .map(|item| item.input_tokens)
-                .collect::<Vec<_>>(),
+                .collect::<Vec<_>>()
+        };
+        // Before this slice the retry's fresh traversal dropped the hold and
+        // its walk aged `new` out: nothing was emitted, ever.
+        assert_eq!(
+            emitted(&page),
             vec![160],
-            "the held growth is emitted once, whole"
+            "the held growth is emitted, whole"
         );
         assert_eq!(page.scanned_file_count, 1, "only the owed key is read");
+        let owes =
+            |index: &ScanIndex| inventory_hold(index).is_some_and(|hold| hold.owed.contains(&key));
+        // Before G2 the complete parse released the key at page end.
+        assert!(owes(&index), "a parse is not an accepted catch-up");
+        // The upload fails: nothing is accepted, so the committed index has
+        // no entry at the parsed size.
+        let failed = index.committable_subset(&committed, &BTreeSet::new(), &BTreeMap::new());
+        assert!(owes(&failed));
+        assert_ne!(
+            failed.files.get(&key).map(|entry| entry.size_bytes),
+            Some(fs::metadata(&new).unwrap().len())
+        );
+        let (retried_index, retried) =
+            retained_page_at(&root, failed.clone(), &[], &days_from_now(9));
+        assert_eq!(
+            emitted(&retried),
+            vec![160],
+            "the failed upload is retried, past the window"
+        );
+        assert!(owes(&retried_index));
+        let accepted = retried
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect();
+        let accepted_index = retried_index.committable_subset(&failed, &accepted, &BTreeMap::new());
+        let (index, quiet) = retained_page_at(&root, accepted_index, &[], &days_from_now(9));
+        assert_eq!(
+            quiet.scanned_file_count, 0,
+            "acceptance is checked, not re-read"
+        );
+        assert!(!owes(&index), "the accepted size releases it");
         assert!(index.files.contains_key(&key));
-        assert!(inventory_hold(&index).map_or(true, |hold| !hold.owed.contains(&key)));
         let (_, released) = crate::local_resource_diagnostics::take_codex_owed_for_test();
         assert_eq!(released.get("caught_up"), Some(&1));
         fs::remove_dir_all(root).unwrap();

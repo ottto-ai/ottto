@@ -2731,8 +2731,8 @@ const MAX_CODEX_INVENTORY_HOLD_KEYS: usize = MAX_BACKFILL_FILES_PER_SOURCE;
 /// `release_codex_inventory_hold`), and pass the unchanged inventory and
 /// ownership gates like any other candidate. While the evidence stays put
 /// and no retry is due nothing is re-read. `owed` is a `DiscoveryRetention`
-/// source: it outlives the walk that recorded it and leaves only by catch-up
-/// or proven removal.
+/// source: it outlives the walk that recorded it and leaves only by an
+/// accepted catch-up (the committed size matches the file) or proven removal.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 struct CodexInventoryHold {
@@ -26108,6 +26108,7 @@ impl OwnedSourceScan {
             index.record_started_claude_request_identity_contract(claude_request_identity_capture);
         }
         let next_generation_hints;
+        let codex_owed_woken;
         {
             let traversal = index.traversal.as_mut().expect("traversal initialized");
             // The walk borrows the owed Codex keys beside the traversal it
@@ -26126,7 +26127,8 @@ impl OwnedSourceScan {
                 );
             }
             traversal.residue.codex_inventory_hold = codex_hold;
-            release_codex_inventory_hold(source, traversal, collected_at);
+            codex_owed_woken =
+                release_codex_inventory_hold(source, traversal, &index.files, collected_at) > 0;
         }
         if source == SnapshotSource::Codex {
             // L-SB: an index from before blocked-set attribution moves its
@@ -26403,6 +26405,7 @@ impl OwnedSourceScan {
         index.resume_census_window_end = Some(census_window_end.clone());
         let mut census = ScanCensus {
             causes,
+            codex_owed_woken,
             ..ScanCensus::default()
         };
         let codex_selected_flags = if source == SnapshotSource::Codex {
@@ -30177,11 +30180,14 @@ impl OwnedSourceScan {
                     ) {
                         traversal.residue.index_keys.remove(index_key);
                     }
-                    release_settled_codex_owed(
-                        traversal,
-                        &settled_residue_index_keys,
-                        &census.removed_index_keys,
-                    );
+                    release_removed_codex_owed(traversal, &census.removed_index_keys);
+                    if let Some(inventory) = codex_join_inventory
+                        .as_ref()
+                        .filter(|_| census.codex_owed_woken)
+                    {
+                        let bytes = inventory.read_bytes as u64;
+                        codex_owed_event(CodexOwedEvent::WakeInventoryBytes, bytes);
+                    }
                     if let Some(inventory) = codex_join_inventory
                         .as_ref()
                         .filter(|inventory| !inventory.complete)
@@ -30524,13 +30530,16 @@ impl OwnedSourceScan {
                             );
                     }
                 }
+                // Owed Codex keys keep the generation open until the
+                // committed index proves their catch-up (`release_codex_inventory_hold`).
                 let raw_census_complete = traversal_discovery_done
                     && traversal_healthy
                     && clean_frozen_generation
                     && state_census_complete
                     && sidecar_census_complete
                     && reconciliation_complete
-                    && !parent_resolution_restart;
+                    && !parent_resolution_restart
+                    && traversal_snapshot.residue.codex_inventory_hold.is_none();
                 let needs_clean_followup =
                     raw_census_complete && index.bounded_sweep_had_unsettled_upload;
                 // Path-(a) bridge: a raw-complete census first retires every
@@ -30724,8 +30733,7 @@ impl OwnedSourceScan {
                                 .map(|candidate| candidate.path.clone())
                                 .collect::<Vec<_>>()
                         });
-                    carried_codex_owed =
-                        close_codex_owed(index.traversal.as_mut(), traversal_healthy);
+                    carried_codex_owed = close_codex_owed(index.traversal.as_mut());
                     index.traversal = None;
                     index.resume_after_path = None;
                     index.resume_upper_bound_path = None;
@@ -38399,6 +38407,8 @@ struct ScanCensus {
     causes: ownership::Counts,
     #[cfg(test)]
     discovered_file_count: usize,
+    /// A passed retry deadline queued owed Codex keys on this page.
+    codex_owed_woken: bool,
     directory_entry_cap_exceeded_count: usize,
     symlink_rejected_count: usize,
     unreadable_path_count: usize,
@@ -41685,27 +41695,17 @@ fn owe_codex_keys<'k>(hold: &mut CodexInventoryHold, keys: impl IntoIterator<Ite
     }
 }
 
-/// Release the owed keys this page settled: a parse to completion is the
-/// validated catch-up (a Tail from the retained prefix where one exists),
-/// and an exact absence (`removed_index_keys`) a proven removal.
-fn release_settled_codex_owed(
-    traversal: &mut ScanTraversalCheckpoint,
-    caught_up: &BTreeSet<String>,
-    removed: &BTreeSet<String>,
-) {
+/// Release the owed keys this page proved removed (`removed_index_keys`;
+/// owed keys never take its age path).
+fn release_removed_codex_owed(traversal: &mut ScanTraversalCheckpoint, removed: &BTreeSet<String>) {
     let Some(hold) = traversal.residue.codex_inventory_hold.as_mut() else {
         return;
     };
-    for (keys, event) in [
-        (caught_up, CodexOwedEvent::CaughtUp),
-        (removed, CodexOwedEvent::Removed),
-    ] {
-        for key in keys {
-            if hold.owed.remove(key) {
-                hold.refused_headers.remove(key);
-                hold.outside_roster.remove(key);
-                codex_owed_event(event, 1);
-            }
+    for key in removed {
+        if hold.owed.remove(key) {
+            hold.refused_headers.remove(key);
+            hold.outside_roster.remove(key);
+            codex_owed_event(CodexOwedEvent::Removed, 1);
         }
     }
     if hold.owed.is_empty() {
@@ -41713,19 +41713,10 @@ fn release_settled_codex_owed(
     }
 }
 
-/// The owed keys of a closing generation. A healthy close finished
-/// discovery with no census member pending and nothing refused, so each
-/// remaining key was observed and read, or unchanged: caught up. A red close
-/// (a parent-resolution restart) hands them to the next walk.
-fn close_codex_owed(
-    traversal: Option<&mut ScanTraversalCheckpoint>,
-    healthy: bool,
-) -> Option<CodexInventoryHold> {
+/// The owed keys of a closing generation (only a restart closes with keys
+/// still owed: they keep a census open) go to the next walk.
+fn close_codex_owed(traversal: Option<&mut ScanTraversalCheckpoint>) -> Option<CodexInventoryHold> {
     let hold = traversal?.residue.codex_inventory_hold.take()?;
-    if healthy {
-        codex_owed_event(CodexOwedEvent::CaughtUp, hold.owed.len() as u64);
-        return None;
-    }
     Some(CodexInventoryHold {
         owed: hold.owed,
         ..CodexInventoryHold::default()
@@ -41744,19 +41735,22 @@ fn close_codex_owed(
 /// are queued, at the back, after any watcher hints, and they meet the same
 /// inventory, ownership, capture, send and checkpoint gates as any
 /// candidate. If the evidence still does not prove the page, it is held and
-/// recorded again. Queued keys stay owed until their catch-up settles
-/// (`release_settled_codex_owed`); one the finished walk did not list and
-/// that is gone is released as removed.
+/// recorded again. A key stays owed until the committed index entry's size
+/// matches the file, so after upload acceptance, not after its parse; a
+/// healthy traversal queues an unmatched key again (a failed upload's
+/// retry). One the finished walk did not list and that is gone is released
+/// as removed. Returns the keys a passed deadline queued.
 fn release_codex_inventory_hold(
     source: SnapshotSource,
     traversal: &mut ScanTraversalCheckpoint,
+    files: &BTreeMap<String, ScanIndexEntry>,
     collected_at: &str,
-) {
+) -> u64 {
     if source != SnapshotSource::Codex || !traversal.pending_directories.is_empty() {
-        return;
+        return 0;
     }
     let Some(mut hold) = traversal.residue.codex_inventory_hold.take() else {
-        return;
+        return 0;
     };
     let moved = |key: &String, witness: &Option<String>| {
         codex_file_join::path_witness(Path::new(key)) != *witness
@@ -41785,7 +41779,16 @@ fn release_codex_inventory_hold(
         !gone
     });
     codex_owed_event(CodexOwedEvent::Removed, removed);
-    if released {
+    let mut caught_up = 0;
+    hold.owed.retain(|key| {
+        let on_disk = fs::symlink_metadata(key).map(|metadata| metadata.len());
+        let accepted = on_disk.is_ok_and(|len| files.get(key).is_some_and(|e| e.size_bytes == len));
+        caught_up += u64::from(accepted);
+        !accepted
+    });
+    codex_owed_event(CodexOwedEvent::CaughtUp, caught_up);
+    let mut woken = 0;
+    if released || !traversal.counts.has_errors() {
         if retry_due {
             // The page re-arms the next, longer, retry deadline.
             traversal.unhealthy_retry_not_before_unix_seconds = None;
@@ -41816,7 +41819,9 @@ fn release_codex_inventory_hold(
                 census_member: true,
                 watcher_hint: false,
             });
+            woken += u64::from(retry_due);
         }
+        codex_owed_event(CodexOwedEvent::WakeEvents, woken);
         // The spent evidence goes; the keys stay owed.
         hold = CodexInventoryHold {
             owed: hold.owed,
@@ -41827,6 +41832,7 @@ fn release_codex_inventory_hold(
     if !hold.owed.is_empty() {
         traversal.residue.codex_inventory_hold = Some(hold);
     }
+    woken
 }
 
 fn advance_bounded_directory_traversal(
@@ -89696,7 +89702,7 @@ crate::durable_tail_codec::durable_struct!(key RowKey {
     U model_provider: Option<String>,
     U subscription_product: Option<String>,
 });
-crate::heap_layout_bound::fields!(ScanCensus; causes, oversized_discovery, #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, parse_reasons, codex_selections, codex_counting_v2, claude_compaction_unlinked_parent_count);
+crate::heap_layout_bound::fields!(ScanCensus; causes, oversized_discovery, #[cfg(test)] discovered_file_count, codex_owed_woken, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, parse_reasons, codex_selections, codex_counting_v2, claude_compaction_unlinked_parent_count);
 crate::heap_layout_bound::fields!(ScanIndex; decode_holds, schema_version, generation, upload_ack_retirement_handoff, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_retired_family_tombstones, claude_retired_family_tombstones_initialized, claude_retired_family_tombstones_uncertain, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_full_rearm_progress, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, codex_counting_moved_evidence, codex_counting_tombstones, codex_counting_evicted_legacy, codex_counting_evictions, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_move_not_full, claude_history_move_released, accepted_incidence_pending_census, accepted_rebuild_incidence, accepted_rebuild_pending_since_unix_seconds, accepted_rebuild_last_alarm_unix_seconds, claude_no_list_policy, claude_history_emission, reason_reoffer_retries, terminal_contract_retries, claude_history_unverified_in_process, claude_rebuild_read_load_eligible, reason_reoffer_cooldowns, retired_reread_guard, held_audit_progress, claude_money_birth_store);
 crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);

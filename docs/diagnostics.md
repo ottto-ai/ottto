@@ -268,16 +268,21 @@ hold) registers as one field plus its lines in `discovery_retention!`,
 
 Codex owed keys are candidates held by an incomplete header inventory or
 refused at a cursor start for want of reduction inputs (`Reduction`
-unreadable). They stay owed across the bounded retry and restarts until a
-parse to completion settles them, a clean close proves them caught up, or
-their absence is proved. While owed, unmoved evidence re-reads nothing until
-the traversal's bounded retry deadline, when they are queued once and the
-deadline re-arms. On Codex pages, `counts.codex_owed` counts `held` (keys that
+unreadable). They stay owed across the bounded retry and restarts until the
+committed index entry's size matches the file (checked at page start, so
+after upload acceptance, never at parse completion) or their absence is
+proved, and they keep the generation's census open. A healthy traversal
+queues an unmatched key again, so a failed upload is retried. While owed,
+unmoved evidence re-reads nothing until the traversal's bounded retry
+deadline, when they are queued once and the deadline re-arms;
+`counts.codex_owed_wake` counts those wakes' cheap checks: `events` (keys a
+passed deadline queued) and `inventory_bytes` (header inventory bytes read on
+those pages). On Codex pages, `counts.codex_owed` counts `held` (keys that
 became owed), `overflow` (past the 10,000-key bound a new key keeps only the
 window), `oversized` (an owed key over the size cap, kept observed and unread)
 and `dropped` (owed keys lost when a red restart closes a partially settled
 sweep; an open gap that should stay zero), and
-`counts.codex_owed_released` counts `caught_up` and `removed`. Both are
+`counts.codex_owed_released` counts `caught_up` and `removed`. All three are
 drained like `line_delivery_unselected`.
 
 `counts.line_delivery_unselected` counts discovery skip decisions for the

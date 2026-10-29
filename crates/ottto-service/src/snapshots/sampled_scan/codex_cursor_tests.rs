@@ -13875,9 +13875,11 @@ fn owed_page(
 /// Hold rule, N1 variant. A committed large rollout grows while its
 /// reduction inputs are unavailable: each cursor start is refused and the key
 /// is owed. Unmoved evidence before the retry deadline reads nothing. It
-/// idles past the 7-day window and the bounded retry walks it anyway. Once
-/// the inputs return it is caught up by exactly one Tail from the retained
-/// prefix (zero Full), emitted once and equal to a cold Full.
+/// idles past the 7-day window and the bounded retry walks it anyway. A
+/// passed deadline with the inputs still missing wakes one counted cheap
+/// check and reads no body. Once the inputs return it is caught up by exactly
+/// one Tail from the retained prefix (zero Full), emitted once and equal to a
+/// cold Full, and released by the next page that finds it accepted.
 #[test]
 fn reduction_refused_growth_stays_owed_and_catches_up_by_one_tail() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -13970,10 +13972,20 @@ fn reduction_refused_growth_stays_owed_and_catches_up_by_one_tail() {
         assert!(held.snapshots.is_empty());
         assert!(owed(&index));
         assert!(index.files.contains_key(&key), "its entry is kept");
+        // D2: past the re-armed deadline, still missing: one cheap, counted
+        // check, no body read.
+        crate::local_resource_diagnostics::take_codex_owed_wake_for_test();
+        let (index, woken, modes) = page(index, 9, 8 * day + 7_200);
+        assert_eq!(deferred(), 4, "the deadline queued it once");
+        assert_eq!((modes, woken.snapshots.len()), ((0, 0), 0), "no body read");
+        assert!(owed(&index));
+        let wake = crate::local_resource_diagnostics::take_codex_owed_wake_for_test();
+        assert_eq!(wake.get("events"), Some(&1));
+        assert!(wake.get("inventory_bytes").copied().unwrap_or(0) <= 65_537);
         // The inputs return while the file idles: the bounded retry queues it
         // once and it is caught up by one Tail.
         refuse.set(false);
-        let (index, tail, modes) = page(index, 9, 9 * day);
+        let (index, tail, modes) = page(index, 10, 9 * day);
         assert_eq!(modes, (0, 1), "one Tail, zero Full");
         assert_eq!(counter(&cache, |c| c.jobs_started), 1, "no new cursor job");
         assert_eq!(
@@ -13984,7 +13996,12 @@ fn reduction_refused_growth_stays_owed_and_catches_up_by_one_tail() {
             1,
             "emitted once"
         );
-        assert!(!owed(&index), "released by the catch-up");
+        // G2: a parse is not acceptance; the next page start finds the
+        // committed size matching the file and releases it, reading nothing.
+        assert!(owed(&index), "owed until accepted");
+        let (index, accepted, modes) = page(index, 11, 10 * day);
+        assert_eq!((modes, accepted.snapshots.len()), ((0, 0), 0));
+        assert!(!owed(&index), "released once accepted");
         assert_eq!(
             crate::local_resource_diagnostics::take_codex_owed_for_test(),
             (
@@ -13995,7 +14012,7 @@ fn reduction_refused_growth_stays_owed_and_catches_up_by_one_tail() {
         (tail, index)
     });
     // Nothing is read again, and the catch-up equals a cold Full.
-    let (_, again, modes) = with_test_limits(2048, 1024, 64, || page(tail_index, 10, 10 * day));
+    let (_, again, modes) = with_test_limits(2048, 1024, 64, || page(tail_index, 12, 11 * day));
     assert_eq!((modes, again.snapshots.len()), ((0, 0), 0));
     let (_, full) = page_fixture_full(&fixture);
     assert_eq!(fingerprints(&tail), fingerprints(&full));

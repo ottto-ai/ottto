@@ -136,9 +136,9 @@ pub(crate) enum UnselectedReason {
     /// The subset of size skips whose key holds a withheld-account revision.
     WithheldOversized,
 }
-/// The three reasons, the four `WithheldEvent` slots, then the six
+/// The three reasons, the four `WithheldEvent` slots, then the eight
 /// `CodexOwedEvent` slots.
-const UNSELECTED_REASONS: usize = 13;
+const UNSELECTED_REASONS: usize = 15;
 /// Claude, Codex, Pi x reason, drained by that source's page line.
 #[cfg(not(test))]
 static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
@@ -206,6 +206,10 @@ pub(crate) enum CodexOwedEvent {
     Removed,
     /// Lost by a red restart of a partially settled sweep (an open gap).
     Dropped,
+    /// Owed keys a passed retry deadline queued (a cheap header check each),
+    /// and the header inventory bytes read on the pages that did it.
+    WakeEvents,
+    WakeInventoryBytes,
 }
 /// Recorded after the decision; never a gate input.
 pub(crate) fn codex_owed_event(event: CodexOwedEvent, count: u64) {
@@ -220,6 +224,7 @@ const CODEX_OWED: [(&str, usize); 4] = [
     ("dropped", 12),
 ];
 const CODEX_OWED_RELEASED: [(&str, usize); 2] = [("caught_up", 10), ("removed", 11)];
+const CODEX_OWED_WAKE: [(&str, usize); 2] = [("events", 13), ("inventory_bytes", 14)];
 #[cfg(test)]
 pub(crate) fn take_codex_owed_for_test(
 ) -> (BTreeMap<&'static str, u64>, BTreeMap<&'static str, u64>) {
@@ -227,6 +232,10 @@ pub(crate) fn take_codex_owed_for_test(
         drain("codex", &CODEX_OWED),
         drain("codex", &CODEX_OWED_RELEASED),
     )
+}
+#[cfg(test)]
+pub(crate) fn take_codex_owed_wake_for_test() -> BTreeMap<&'static str, u64> {
+    drain("codex", &CODEX_OWED_WAKE)
 }
 const WITHHELD_RELEASED: [(&str, usize); 1] = [("deleted", 3)];
 const WITHHELD_REPARSE: [(&str, usize); 3] = [("start", 4), ("evidence", 5), ("growth", 6)];
@@ -499,6 +508,8 @@ impl Probe {
             codex_owed: BTreeMap<&'static str, u64>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             codex_owed_released: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            codex_owed_wake: BTreeMap<&'static str, u64>,
         }
         let claude = source == "claude_code";
         let counts = Counts {
@@ -517,6 +528,7 @@ impl Probe {
                 .flatten(),
             codex_owed: drain(source, &CODEX_OWED),
             codex_owed_released: drain(source, &CODEX_OWED_RELEASED),
+            codex_owed_wake: drain(source, &CODEX_OWED_WAKE),
             reread: if claude {
                 self.page_events.with_current().without_terminal_rearm()
             } else {
