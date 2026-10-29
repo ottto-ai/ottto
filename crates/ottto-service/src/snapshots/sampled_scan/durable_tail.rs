@@ -159,9 +159,10 @@ struct Slot {
     namespace: Scope,
     identity_capture: bool,
     /// Keys held (U) by this source, and the totals the last alarm reported:
-    /// [held, t14_rebuild, mode_repaired, disabled, rebuild_full, u_growth_full].
+    /// [held, t14_rebuild, mode_repaired, disabled, rebuild_full, u_growth_full,
+    /// pace_evicted].
     held: u64,
-    reported: [u64; 6],
+    reported: [u64; 7],
 }
 
 /// Process-lifetime durable state beside the RAM cache.
@@ -485,7 +486,7 @@ impl SharedCache {
                 namespace: namespace.clone(),
                 identity_capture,
                 held: 0,
-                reported: [0; 6],
+                reported: [0; 7],
             });
         }
     }
@@ -1114,6 +1115,8 @@ impl SharedCache {
             t14_rebuild_full_started: u64,
             mode_repaired: [u64; 2],
             u_growth_full: [u64; 2],
+            /// A pacing-map overflow, never folded into `u_growth_full`.
+            pace_evicted: [u64; 2],
             #[serde(skip_serializing_if = "Option::is_none")]
             store_disabled: Option<&'static str>,
         }
@@ -1134,6 +1137,7 @@ impl SharedCache {
             u64::from(disabled.is_some()),
             store.t14_rebuild_full_started,
             store.u_growth[0] + store.u_growth[1],
+            store.u_growth[3],
         ];
         let last = std::mem::replace(&mut slot.reported, now);
         drop(stores);
@@ -1147,6 +1151,7 @@ impl SharedCache {
                     t14_rebuild_full_started: store.t14_rebuild_full_started,
                     mode_repaired: pair(2),
                     u_growth_full: pair(5),
+                    pace_evicted: pair(6),
                     store_disabled: disabled.filter(|_| last[3] == 0),
                 },
             );

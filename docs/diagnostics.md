@@ -166,8 +166,10 @@ whose durable-store counts for that source changed. Each count is
 `[since the last alarm, process total]`: `held_keys` (files held because their
 record has an unknown or newer format), `t14_rebuild` (known corrupt records
 read Full once and replaced after the save), `mode_repaired` (store
-directory or records restored to owner-only) and `u_growth_full` (Fulls of
-undecodable or unbindable records' growth started, below). `store_disabled` appears once,
+directory or records restored to owner-only), `u_growth_full` (Fulls of
+undecodable or unbindable records' growth started, below) and `pace_evicted`
+(paces forgotten because the pacing map was full). `pace_evicted` is a separate
+count so that a pacing-map overflow is never read as normal U growth. `store_disabled` appears once,
 with `foreign_owner`, `not_directory`, `mode_unrepairable` or `t14_breaker`
 (more than max(20, 2%) corrupt records in one pass), when the store becomes
 memory-only for the process. While a key is held, its source's census stays
@@ -184,7 +186,8 @@ is paced to at most one per file, or per group, per 6 h in this process. It is
 counted when it starts, never when a guard passes, with one count per U
 member's reason. That count raises this alarm as `u_growth_full`. A Full held
 by the pace is a counted hold. If more paces are fresh than the bound allows,
-the oldest pace is forgotten and counted, so a read is never refused. The
+the oldest pace is forgotten and counted (`pace_evicted`, its own alarm field),
+so a read is never refused. The
 record is never rewritten or collected. The `durable_tail` line reports
 `u_growth[full_undecodable,full_unbindable,paced,pace_evicted]`. Newer-format
 and unknown records still hold under the downgrade exception.

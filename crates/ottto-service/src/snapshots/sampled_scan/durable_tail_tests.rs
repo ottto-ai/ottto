@@ -1120,6 +1120,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                     assert_eq!(alarm["counts"]["held_keys"], pair(held));
                     assert_eq!(alarm["counts"]["t14_rebuild"], pair(corrupt));
                     assert_eq!(alarm["counts"]["u_growth_full"], pair(grows));
+                    assert_eq!(alarm["counts"]["pace_evicted"], pair(false));
                     assert!(alarm["counts"].get("store_disabled").is_none());
                 }
                 let class = [
@@ -1398,6 +1399,10 @@ fn u_record_growth_reads_one_paced_counted_full_and_keeps_the_record() {
                     alarms[0]["counts"]["u_growth_full"],
                     serde_json::json!([1, 1])
                 );
+                assert_eq!(
+                    alarms[0]["counts"]["pace_evicted"],
+                    serde_json::json!([0, 0])
+                );
                 let (_, stats) = cache.durable_counters(source).unwrap();
                 assert_eq!(stats.records_written, 0);
                 assert_eq!(std::fs::read(&record).unwrap(), bytes);
@@ -1443,6 +1448,63 @@ fn u_record_growth_reads_one_paced_counted_full_and_keeps_the_record() {
             }
         }
     }
+}
+
+/// R2-U (Lead A): a pacing-map overflow raises the durable_tail alarm with
+/// its own `pace_evicted` delta, never folded into `u_growth_full`; idle,
+/// admitted and paced Full starts never move it.
+#[test]
+fn pace_eviction_alarms_apart_from_u_growth() {
+    let source = SnapshotSource::ClaudeCode;
+    let file = UFile::new(source);
+    let (record, bytes) = file.u_record("undecodable");
+    let cache = Arc::new(SharedCache::default());
+    cache.durable_begin_pass(source, &file.index_path, &file.namespace, false);
+    let alarms = || {
+        let ((), alarms) =
+            crate::local_resource_diagnostics::capture(|| cache.durable_alarm(source));
+        alarms
+    };
+    let keys = std::slice::from_ref(&file.key);
+    let held = Some((0, store::Refusal::Undecodable));
+    let pair = |since: u64, total: u64| serde_json::json!([since, total]);
+    // Idle: held, nothing counted, no alarm.
+    assert_eq!(
+        cache.durable_full_start(source, keys, &file.key, false),
+        held
+    );
+    assert!(alarms().is_empty());
+    // Admitted: U growth alarms, no eviction.
+    assert_eq!(
+        cache.durable_full_start(source, keys, &file.key, true),
+        None
+    );
+    let admitted = alarms();
+    assert_eq!(admitted.len(), 1);
+    assert_eq!(admitted[0]["counts"]["u_growth_full"], pair(1, 1));
+    assert_eq!(admitted[0]["counts"]["pace_evicted"], pair(0, 0));
+    // Paced, then idle: no alarm, so no `pace_evicted`.
+    assert_eq!(
+        cache.durable_full_start(source, keys, &file.key, true),
+        held
+    );
+    assert_eq!(
+        cache.durable_full_start(source, keys, &file.key, false),
+        held
+    );
+    assert!(alarms().is_empty());
+    // Overflow: a new pace past a full map of fresh paces evicts the oldest.
+    cache.durable_test_store(source, |disk| disk.fill_paces());
+    assert_eq!(
+        cache.durable_full_start(source, keys, "another-pace", true),
+        None
+    );
+    let evicted = alarms();
+    assert_eq!(evicted.len(), 1);
+    assert_eq!(evicted[0]["counts"]["pace_evicted"], pair(1, 1));
+    assert_eq!(evicted[0]["counts"]["u_growth_full"], pair(1, 2));
+    assert_eq!(file.u_growth(&cache), [2, 0, 1, 1]);
+    assert_eq!(std::fs::read(&record).unwrap(), bytes);
 }
 
 /// R2-U: an unsampled read (no restore attempt) of U-held growth is the same
