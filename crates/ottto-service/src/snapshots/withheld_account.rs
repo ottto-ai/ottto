@@ -133,6 +133,44 @@ pub(super) fn released_deleted(key: &str) {
     withheld_event(WithheldEvent::ReleasedDeleted);
 }
 
+/// The memo's charge in the sync owner's process-retained bound
+/// (`snapshot_sync.rs`, `Owner::retained_bound`). Entries own no heap, so one
+/// `tree_nodes` charge prices the map as `completed_bound` does, without a
+/// per-entry walk past the 4,096-visit cap. Unsupported layout: only an empty
+/// memo is known.
+pub(crate) fn retained_bound(limit: usize) -> Option<usize> {
+    let len = with_memo(|memo| memo.len())?;
+    if !crate::heap_layout_bound::layout_supported() {
+        return (len == 0).then_some(0);
+    }
+    let mut c = crate::heap_layout_bound::Counter::new(limit);
+    c.add(std::mem::size_of::<Memo>())?;
+    crate::heap_layout_bound::tree_nodes::<[u8; 32], Seen>(len, &mut c)?;
+    Some(c.bytes)
+}
+
+/// The rotation refused the charge: drop the memo; each held key then
+/// re-parses once, counted `start`.
+pub(crate) fn discard_retained() {
+    with_memo(|memo| memo.clear());
+}
+
+/// #799 resource census gauge on the Claude page line; `None` while empty.
+#[derive(Debug, Serialize)]
+pub(crate) struct Census {
+    entries: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retained_bytes: Option<usize>,
+}
+pub(crate) fn census() -> Option<Census> {
+    let entries = with_memo(|memo| memo.len()).filter(|entries| *entries > 0)?;
+    let retained_bytes = retained_bound(usize::MAX);
+    Some(Census {
+        entries,
+        retained_bytes,
+    })
+}
+
 /// A process restart, for one key: its next selection re-parses once.
 #[cfg(test)]
 pub(super) fn restart_for_test(key: &str) {
@@ -144,10 +182,11 @@ mod tests {
     use super::*;
     use crate::heap_layout_bound::{completed_bound, tree_node_bytes};
 
-    /// Priced at the hold cap: one modeled B-tree node per entry plus a root,
-    /// independent of path length (keys are digests).
+    /// At the hold cap the memo is charged to the owner's retained bound
+    /// and reported on the #799 census line, with the bytes the generic
+    /// completed walk prices (keys are digests, so path length is irrelevant).
     #[test]
-    fn memo_at_the_hold_cap_is_priced_by_the_layout_bound() {
+    fn memo_at_the_hold_cap_is_charged_and_reported() {
         let seen = Seen {
             size_bytes: u64::MAX,
             modified_unix_nanos: u64::MAX,
@@ -156,9 +195,29 @@ mod tests {
         let full: Memo = (0..MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS)
             .map(|slot| (memo_key(&format!("/opaque/{slot}.jsonl")), seen))
             .collect();
-        let node = tree_node_bytes::<[u8; 32], Seen>().unwrap();
-        let expected = std::mem::size_of::<Memo>() + (MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS + 1) * node;
-        assert_eq!(completed_bound(&full, usize::MAX), Some(expected));
-        assert!(expected < 6 << 20, "{expected} bytes at the cap");
+        with_memo(|memo| *memo = full.clone());
+        let charged = retained_bound(usize::MAX);
+        // None on both sides where the requested layout is unsupported.
+        assert_eq!(charged, completed_bound(&full, usize::MAX));
+        if crate::heap_layout_bound::layout_supported() {
+            let node = tree_node_bytes::<[u8; 32], Seen>().unwrap();
+            let expected =
+                std::mem::size_of::<Memo>() + (MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS + 1) * node;
+            assert_eq!(charged, Some(expected));
+            assert!(expected < 6 << 20, "{expected} bytes at the cap");
+            assert_eq!(
+                retained_bound(expected - 1),
+                None,
+                "over the limit is refused"
+            );
+        }
+        let line = serde_json::to_value(census()).unwrap();
+        assert_eq!(line["entries"], MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS);
+        assert_eq!(
+            line.get("retained_bytes").and_then(Value::as_u64),
+            charged.map(|bytes| bytes as u64)
+        );
+        discard_retained();
+        assert!(census().is_none(), "an empty memo is omitted");
     }
 }

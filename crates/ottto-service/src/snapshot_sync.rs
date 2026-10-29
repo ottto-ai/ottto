@@ -4714,13 +4714,18 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
         };
         // Stage 1 (K2): a held continuation ticket's inputs; zero while inert.
         let continuation = continuation::retained_bound(limit.checked_sub(native)?)?;
-        native.checked_add(continuation)
+        let charged = native.checked_add(continuation)?;
+        // E3: the withheld-account re-parse memo (RAM only, <= 4,096 entries).
+        let withheld =
+            crate::snapshots::withheld_account::retained_bound(limit.checked_sub(charged)?)?;
+        charged.checked_add(withheld)
     }
     fn discard_retained(&mut self) {
         if crate::snapshots::claude_native_comparison::enabled() {
             self.daemon.native_comparison.discard_retained();
         }
         continuation::discard_retained();
+        crate::snapshots::withheld_account::discard_retained();
     }
     fn boundary(&mut self, busy: impl Iterator<Item = SnapshotSource>) {
         self.retry

@@ -455,6 +455,8 @@ impl Probe {
             withheld_hold_released: BTreeMap<&'static str, u64>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             withheld_reparse: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            withheld_memo: Option<crate::snapshots::withheld_account::Census>,
         }
         let claude = source == "claude_code";
         let counts = Counts {
@@ -468,6 +470,9 @@ impl Probe {
             ),
             withheld_hold_released: drain(source, &WITHHELD_RELEASED),
             withheld_reparse: drain(source, &WITHHELD_REPARSE),
+            withheld_memo: claude
+                .then(crate::snapshots::withheld_account::census)
+                .flatten(),
             reread: if claude {
                 self.page_events.with_current().without_terminal_rearm()
             } else {
