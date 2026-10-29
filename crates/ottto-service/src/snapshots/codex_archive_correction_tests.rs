@@ -817,6 +817,8 @@ fn correction_ack_debt_survives_restart_without_regranting_full() {
     assert_eq!(archive_evidence(&deferred, &f).terminal_failures, 0);
     // No response/ACK callback at all: persist Pending and expire its deadline on restart.
     let path = f.0.parent().unwrap().join("correction-debt.json");
+    // Move the saved generation too; CAS must not create a missing nonzero-generation index.
+    fs::rename(f.0.parent().unwrap().join("reservation.json"), &path).unwrap();
     index.save(&path).unwrap();
     let mut restored = ScanIndex::load(&path).unwrap();
     retry_due(&mut restored, &key);
@@ -875,6 +877,8 @@ fn correction_crash_after_reservation_spends_grant_before_any_byte() {
     index.settle_archive_outcome(&ack_bodies(&first), true, None);
     index.activate_archive_user_context(user_context("B"));
     let path = f.0.parent().unwrap().join("a3-reservation.json");
+    // Move the saved generation too; CAS must not create a missing nonzero-generation index.
+    fs::rename(f.0.parent().unwrap().join("reservation.json"), &path).unwrap();
     index.save(&path).unwrap();
     let mut scan = staged_archive_with(
         &f,

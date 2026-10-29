@@ -14469,16 +14469,29 @@ fn decoder_production_budget_admits_seven_mib_without_eviction_or_yields() {
             }
         }
         let copy = cache.take(&key).expect("real retained reduction").retained;
-        let warm_key = "a".repeat(7 * 1024 * 1024 / 2);
-        let peer_key = "b".repeat(7 * 1024 * 1024 / 2);
-        for key in [&warm_key, &peer_key, &key] {
+        // Charge the actual retained graph first: main can add state without
+        // changing the seven-MiB admission premise or widening its assertion.
+        for key in ["a", "b", key.as_str()] {
             assert!(cache.retained().unwrap().insert(
-                key.clone(),
+                key.to_owned(),
                 crate::transcript_cache::Retained {
                     checkpoint: copy.checkpoint.clone(),
                     state: copy.state.clone(),
                 }
             ));
+        }
+        let target = 7 * 1024 * 1024 + 128 * 1024;
+        let baseline = retained_floor(&cache);
+        assert!(
+            baseline < target,
+            "fixture state fits below the warm target"
+        );
+        let padding = (target - baseline) / 2;
+        let warm_key = "a".repeat(1 + padding);
+        let peer_key = "b".repeat(1 + padding);
+        for (old, key) in [("a", &warm_key), ("b", &peer_key)] {
+            let retained = cache.take(old).unwrap().retained;
+            assert!(cache.retained().unwrap().insert(key.clone(), retained));
         }
         let warm = retained_floor(&cache);
         assert!((7 * 1024 * 1024..7 * 1024 * 1024 + 256 * 1024).contains(&warm));
@@ -14814,7 +14827,7 @@ fn parked_singleton_across_fresh_index_reprobes_record_debt() {
 fn inventory_decoder_releases_without_waiting_for_stores_bounded_join() {
     let _lock = crate::snapshots::codex_compressed_input::tests::ARCHIVE_TEST_LOCK
         .lock()
-        .unwrap();
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let root = crate::test_scratch::private_dir("header-lock-order");
     let path = root.join("rollout-synthetic.jsonl.zst");
     std::fs::write(
@@ -14880,7 +14893,7 @@ fn inventory_decoder_releases_without_waiting_for_stores_bounded_join() {
 fn invalid_archive_owner_holds_paused_singleton_without_more_reads() {
     let _lock = crate::snapshots::codex_compressed_input::tests::ARCHIVE_TEST_LOCK
         .lock()
-        .unwrap();
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let fixture = ScanRoot::new(80);
     let cache = Arc::new(SharedCache::default());
     with_test_limits(2048, 1024, 64, || {

@@ -7,7 +7,9 @@ use std::io::{self, BufRead, BufReader, Read};
 use std::mem::size_of;
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
-use zstd::zstd_safe::{DCtx, DParameter, InBuffer, OutBuffer};
+#[path = "codex_decoder_allocation.rs"]
+mod decoder_allocation;
+use decoder_allocation::Context as DecoderContext;
 
 /// One predicate for a candidate's encoding or the already-opened input kind.
 /// A suffix is only a refusal signal, never ownership or decode authority.
@@ -46,10 +48,15 @@ fn invalid(message: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-// Bundled zstd 1.5.7, WindowLogMax(23), 514 MiB synthetic concatenated
-// archive: CI run 40774588149 measured 8,894,448 bytes peak (native heap +
-// buffers + box, including resize overlap). Add 10%, round up to 64 KiB.
-// Paid inside STATE_BYTES; the fixed primary Tail floor remains unchanged.
+// Darwin receipt: zstd 1.5.7, WindowLogMax(23), 514 MiB decoded fixture,
+// Mac CI run 40942402563 log's decoder_allocation_receipt: actual-size peak
+// 13,009,088 bytes, plus 10%, rounded up to 64 KiB = 14,352,384 bytes.
+// Paid inside unchanged STATE_BYTES; admission preserves the primary Tail floor.
+#[cfg(target_os = "macos")]
+const COMPRESSED_INPUT_CREDIT: usize = 14_352_384;
+// Other platforms retain CI run 40774588149's 8,894,448-byte requested peak
+// plus 10%, rounded up to 64 KiB. No non-Darwin credit change.
+#[cfg(not(target_os = "macos"))]
 const COMPRESSED_INPUT_CREDIT: usize = 9_830_400;
 
 /// Decoder portion of the measured whole-input credit, including input buffer.
@@ -95,6 +102,16 @@ pub(super) fn admission_streak(key: &str, yielded: bool) -> u8 {
     let count = previous.saturating_add(1).min(13);
     slots.insert(hash, count);
     count
+}
+/// Shared body-refusal/header-claim signal; header deferral gates are not claims.
+pub(super) fn record_admission_yield(key: &str) {
+    if admission_streak(key, true) == 12 {
+        crate::local_resource_diagnostics::traversal_point(
+            "codex_zst_admission_alarm",
+            "codex",
+            &serde_json::json!({"consecutive_yields": 12, "admission_starved_count": admission_starved_count(None)}),
+        );
+    }
 }
 /// Count starved tracked keys, optionally scoped to one physical archive.
 pub(super) fn admission_starved_count(key: Option<&str>) -> usize {
@@ -479,7 +496,7 @@ impl ArchiveEvidence {
 pub(super) struct BoundedDecoder<R: Read> {
     input: BufReader<io::Take<R>>,
     physical_limit: u64,
-    context: DCtx<'static>,
+    context: DecoderContext,
     reserved: usize,
     remaining: u64,
     frame_complete: bool,
@@ -494,10 +511,10 @@ impl<R: Read> BoundedDecoder<R> {
         #[cfg(test)]
         super::codex_zst_refusal_tests::decoder_constructed();
         let reserved = decoder_reservation()?;
-        let mut context = DCtx::try_create()
+        let mut context = DecoderContext::new(reserved.saturating_sub(BUFFER_BYTES))
             .ok_or_else(|| io::Error::other("compressed rollout decoder allocation failed"))?;
         context
-            .set_parameter(DParameter::WindowLogMax(WINDOW_LOG))
+            .set_window_log(WINDOW_LOG)
             .map_err(|_| invalid("cannot bound compressed rollout window"))?;
         Ok(Self {
             input: BufReader::with_capacity(BUFFER_BYTES, input.take(u64::MAX)),
@@ -524,7 +541,6 @@ impl<R: Read> BoundedDecoder<R> {
             if input_ended && self.frame_complete {
                 return Ok(0);
             }
-            let mut input = InBuffer::around(bytes);
             // At the limit, probe one byte: a Take-style artificial EOF would
             // incorrectly turn over-limit content into a complete JSONL body.
             let mut probe = [0u8; 1];
@@ -532,17 +548,15 @@ impl<R: Read> BoundedDecoder<R> {
             let capacity = output
                 .len()
                 .min(self.remaining.min(usize::MAX as u64) as usize);
-            let mut out = if at_limit {
-                OutBuffer::around(&mut probe[..])
+            let out = if at_limit {
+                &mut probe[..]
             } else {
-                OutBuffer::around(&mut output[..capacity])
+                &mut output[..capacity]
             };
-            let hint = self
+            let (hint, consumed, produced) = self
                 .context
-                .decompress_stream(&mut out, &mut input)
+                .decompress(bytes, out)
                 .map_err(|_| invalid(CodexZstCause::DecodeFailed))?;
-            let consumed = input.pos;
-            let produced = out.pos();
             self.compressed_bytes = self.compressed_bytes.saturating_add(consumed as u64);
             self.decoded_bytes = self.decoded_bytes.saturating_add(produced as u64);
             self.input.consume(consumed);
@@ -606,6 +620,14 @@ impl<R: Read> Drop for BoundedDecoder<R> {
                 ("codex_zst_compressed_consumed_bytes", self.compressed_bytes),
                 ("codex_zst_decoded_bytes", self.decoded_bytes),
                 ("codex_zst_cpu_micros", self.cpu_micros),
+                (
+                    "codex_zst_decoder_native_peak_bytes",
+                    self.context.peak_bytes() as u64,
+                ),
+                (
+                    "codex_zst_decoder_allocation_refusals",
+                    self.context.allocation_refusals(),
+                ),
             ]),
         );
     }
@@ -1007,13 +1029,19 @@ impl super::ScanIndex {
         let mut evidence = ArchiveEvidence::begin(&file, &candidate.path, previous)?;
         evidence.disposition = ArchiveDisposition::HeaderValidated;
         evidence.decode_attempts = 0;
-        let input = match cache {
-            Some(cache) => OpenedInput::funded_inner(file, cache, false)?,
-            None => None,
-        };
-        let mut input = match input {
-            Some(input) => input.header_only(),
-            None => return Ok(HeaderRead::Deferred),
+        let mut input = match cache.map(|cache| OpenedInput::funded(file, cache)) {
+            Some(Ok(Some(input))) => {
+                admission_streak(&key, false);
+                input.header_only()
+            }
+            Some(Ok(None)) => {
+                record_admission_yield(&key);
+                return Ok(HeaderRead::Deferred);
+            }
+            _ => {
+                codex_zst_refused(CodexZstCause::AdmissionRefused);
+                return Ok(HeaderRead::Deferred);
+            }
         };
         evidence.header_attempted = true;
         self.files.entry(key.clone()).or_default().archive = Some(Box::new(evidence));
@@ -1060,6 +1088,14 @@ impl super::ScanIndex {
                 "codex_zst_inventory_physical_bytes": physical,
                 "codex_zst_inventory_compressed_consumed_bytes": compressed,
                 "codex_zst_inventory_cpu_micros": cpu,
+                "codex_zst_decoder_native_peak_bytes": match &input {
+                    OpenedInput::Compressed(r, _) => r.get_ref().context.peak_bytes(),
+                    _ => 0,
+                },
+                "codex_zst_decoder_allocation_refusals": match &input {
+                    OpenedInput::Compressed(r, _) => r.get_ref().context.allocation_refusals(),
+                    _ => 0,
+                },
             }),
         );
         input.close();
@@ -1164,6 +1200,64 @@ pub(in crate::snapshots) mod tests {
         result
     }
 
+    fn decoder_process_peak_rss_bytes() -> Option<u64> {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        // SAFETY: getrusage initializes the entire struct on success.
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        let usage = unsafe { usage.assume_init() };
+        let peak = u64::try_from(usage.ru_maxrss).ok()?;
+        if cfg!(target_os = "macos") {
+            Some(peak)
+        } else {
+            peak.checked_mul(1024)
+        }
+    }
+
+    #[test]
+    fn decoder_credit_preserves_the_platform_receipt_and_margin() {
+        #[cfg(target_os = "macos")]
+        {
+            let measured_peak = 13_009_088_usize; // Mac run 40942402563, zstd 1.5.7.
+            assert!(
+                compressed_input_credit().unwrap() >= measured_peak + measured_peak.div_ceil(10)
+            );
+            assert_eq!(compressed_input_credit().unwrap(), 14_352_384);
+        }
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(compressed_input_credit().unwrap(), 9_830_400);
+        // The live large-window measurement below independently fails if an
+        // upgraded decoder no longer fits its platform credit plus 10%.
+    }
+
+    #[test]
+    fn decoder_native_peak_is_visible_on_the_existing_input_carrier() {
+        let f = fixture(
+            &zstd::stream::encode_all(&b"synthetic\n"[..], 1).unwrap(),
+            ".jsonl.zst",
+        );
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            let mut input = OpenedInput::compressed(
+                File::open(&f.0).unwrap(),
+                64,
+                compressed_input_credit().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(std::io::copy(&mut input, &mut std::io::sink()).unwrap(), 10);
+            input.close();
+        });
+        let counts = &rows
+            .iter()
+            .find(|r| r["stage"] == "codex_zst_input")
+            .unwrap()["counts"];
+        let peak = counts["codex_zst_decoder_native_peak_bytes"]
+            .as_u64()
+            .unwrap();
+        assert!(peak > 0 && peak <= compressed_input_credit().unwrap() as u64);
+        assert_eq!(counts["codex_zst_decoder_allocation_refusals"], 0);
+    }
+
     #[test]
     fn decoder_production_window_peak_allocation() {
         // Streaming, unknown content size prevents the encoder shrinking the
@@ -1207,6 +1301,7 @@ pub(in crate::snapshots) mod tests {
         assert_eq!(prefix[5], ((WINDOW_LOG - 10) * 8) as u8);
         file.seek(SeekFrom::Start(0)).unwrap();
         let credit = compressed_input_credit().unwrap();
+        let rss_before = decoder_process_peak_rss_bytes();
         let (_, allocation) = crate::retry_allocation_probe::measure(|| {
             let mut input = OpenedInput::compressed(file, 2 * 1024 * 1024 * 1024, credit).unwrap();
             let mut output = [0; BUFFER_BYTES];
@@ -1221,6 +1316,8 @@ pub(in crate::snapshots) mod tests {
             assert_eq!(total, 514 * 1024 * 1024);
             input.close();
         });
+        let rss_after = decoder_process_peak_rss_bytes();
+        eprintln!("decoder_process_rss_receipt before_bytes={rss_before:?} after_bytes={rss_after:?} scope=whole_process_lifetime_high_water not_a_delta_or_gate=true");
         let peak = allocation
             .requested_peak_with_overlap
             .max(allocation.usable_peak_with_overlap);
@@ -2461,6 +2558,9 @@ pub(in crate::snapshots) mod tests {
                 .unwrap()
                 .contains("compressed_admission_yields"));
             index = ScanIndex::load(&saved_index).unwrap();
+            // Each yield is a new retry generation. A retained generation keeps
+            // its earlier RU counts even after this archive becomes residue.
+            index.traversal = None;
             let (next, result, rows, _) = archive_pass(&f, index, false, None);
             assert!(next.files.is_empty());
             assert_eq!(decodes(&rows), 0);
@@ -2778,8 +2878,8 @@ pub(in crate::snapshots) mod tests {
                     assert!(pending.is_empty());
                 }
                 if modern {
-                    // Existing plain-file edge case: both legal filename grammars
-                    // have state support. Keep this separate bug visible to owners.
+                    // Main now withholds both supported ambiguous filename owners
+                    // after a prior body, for plain files as well as archives.
                     metadata.state_threads.insert(
                         format!("2026-10-07T12-00-00-{id}"),
                         metadata.state_threads[id].clone(),
@@ -2793,12 +2893,10 @@ pub(in crate::snapshots) mod tests {
                         &BTreeSet::new(),
                     )
                     .expect("funded state-only exclusion");
-                    let replacement = ambiguous.iter().find(|s| s.source_session_id == id);
-                    assert_eq!(replacement.is_some(), !archive);
-                    if let Some(replacement) = replacement {
-                        assert_eq!(replacement.unattributed_total_tokens, 440);
-                        assert_ne!(replacement.model_usage, native.model_usage);
-                    }
+                    assert!(
+                        ambiguous.iter().all(|s| s.source_session_id != id),
+                        "archive={archive}: ambiguous filename cannot replace native money"
+                    );
                 }
             }
         }
@@ -2994,7 +3092,28 @@ pub(in crate::snapshots) mod tests {
         assert!(codex_file_join::receipt_state(index.files.get(&key))
             .0
             .is_some());
-        let mut saved = checkpoint(&index);
+        let mut committed: ScanIndex = serde_json::from_slice(
+            &fs::read(f.0.parent().unwrap().join("reservation.json")).unwrap(),
+        )
+        .unwrap();
+        let (mut captured, changed, held) =
+            index.stage_codex_recovery_capture(&committed, &first.snapshots);
+        assert_eq!(changed, BTreeSet::from(["compressed-fixture".into()]));
+        assert!(held.is_empty());
+        captured
+            .save(&f.0.parent().unwrap().join("reservation.json"))
+            .unwrap();
+        committed = captured;
+        let mut saved = index.committable_subset_with_local_holds(
+            &committed,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
+        assert!(codex_file_join::receipt_state(saved.files.get(&key))
+            .0
+            .is_some());
+        saved = serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
         retry_due(&mut saved, &key);
         let (_, recovered, rows, _) = archive_pass(&f, saved, true, None); // traces expired
         assert_eq!(decodes(&rows), 1);
@@ -3011,8 +3130,12 @@ pub(in crate::snapshots) mod tests {
         let _lock = ARCHIVE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let f =
-            ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+        let bytes = String::from_utf8(synthetic_rollout()).unwrap().replacen(
+            "\"id\":\"compressed-fixture\"",
+            &format!("\"id\":\"compressed-fixture\",\"timestamp\":\"{NOW}\""),
+            1,
+        );
+        let f = ArchiveFixture::new(&zstd::stream::encode_all(bytes.as_bytes(), 1).unwrap());
         let key = local_index_key(&f.0);
         for v2 in [false, true] {
             let mut prior = ScanIndex::default();
@@ -3137,6 +3260,9 @@ pub(in crate::snapshots) mod tests {
             .iter()
             .any(|s| s.source_session_id == "compressed-fixture"));
         retry_due(&mut saved, &key);
+        // Six hours also passes the traversal's at-most-one-hour retry. The
+        // old red generation cannot certify the parent's current census.
+        saved.traversal = None;
         let (after, result, rows, _) = archive_pass_with(&f, saved, true, None, &roots, |_| {});
         assert_eq!(decodes(&rows), 1);
         assert_pending(&after, &f.0, 2);

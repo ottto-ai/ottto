@@ -2163,10 +2163,7 @@ pub(super) fn new_source_parser_with_archive_scope(
             }
         };
         let Some(input) = input else {
-            if codex_compressed_input::admission_streak(&key, true) == 12 {
-                let counts = serde_json::json!({"consecutive_yields": 12, "admission_starved_count": codex_compressed_input::admission_starved_count(None)});
-                traversal_point("codex_zst_admission_alarm", "codex", &counts);
-            }
+            codex_compressed_input::record_admission_yield(&key);
             anyhow::bail!(codex_compressed_input::ArchiveAdmissionYield);
         };
         codex_compressed_input::admission_streak(&key, false);

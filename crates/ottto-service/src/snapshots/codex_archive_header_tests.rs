@@ -112,7 +112,9 @@ fn header_inventory(
     ignore = "funded decoder needs validated heap layout"
 )]
 fn inventory_header_once_then_full_once_with_physical_accounting() {
-    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     let mut value: Value =
         serde_json::from_slice(synthetic_rollout().split(|b| *b == b'\n').next().unwrap()).unwrap();
     value["payload"]["cli_version"] = json!("0.77.0");
@@ -247,7 +249,9 @@ fn inventory_header_once_then_full_once_with_physical_accounting() {
     ignore = "funded decoder needs validated heap layout"
 )]
 fn header_read_never_checks_archive_completion_and_failed_full_keeps_projection() {
-    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     let first = b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"compressed-fixture\"}}\n";
     let mut encoded = zstd::stream::encode_all(&first[..], 1).unwrap();
     // A separately truncated later frame does not invalidate first-record evidence.
@@ -278,7 +282,9 @@ fn header_read_never_checks_archive_completion_and_failed_full_keeps_projection(
     ignore = "funded decoder needs validated heap layout"
 )]
 fn header_limits_and_failures_do_not_redecode_same_stamp() {
-    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     let cache = Arc::new(sampled_scan::SharedCache::default());
     let mut skippable = vec![0x50, 0x2a, 0x4d, 0x18];
     skippable.extend_from_slice(&(256_u32 * 1024).to_le_bytes());
@@ -326,32 +332,75 @@ fn header_limits_and_failures_do_not_redecode_same_stamp() {
     ignore = "funded decoder needs validated heap layout"
 )]
 fn refused_header_admission_does_not_spend_a_decode_attempt() {
-    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
     let cache = Arc::new(sampled_scan::SharedCache::default());
     let occupied = OpenedInput::funded(File::open(&f.0).unwrap(), &cache)
         .unwrap()
         .unwrap();
     let mut state = ScanIndex::default();
-    let (_, rows) = crate::local_resource_diagnostics::capture(|| {
-        assert!(matches!(
-            state
-                .inventory_archive_header(&f.candidate(), Some(&cache), &mut funded_header_work())
-                .unwrap(),
-            HeaderRead::Deferred
-        ));
-    });
-    assert_eq!(decodes(&rows), 0);
-    assert_eq!(
-        rows.iter()
-            .filter_map(|r| r["counts"]["codex_zst_refused"]["CompressedAdmissionRefused"].as_u64())
-            .count(),
-        1
-    );
-    assert!(!rows.iter().any(|r| r["stage"] == "codex_zst_inventory"));
-    assert!(!state.files.contains_key(&local_index_key(&f.0)));
+    let key = local_index_key(&f.0);
+    admission_streak(&key, false);
+    for attempt in 1..=14 {
+        let mut work = funded_header_work();
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            assert!(matches!(
+                state
+                    .inventory_archive_header(&f.candidate(), Some(&cache), &mut work)
+                    .unwrap(),
+                HeaderRead::Deferred
+            ));
+        });
+        assert_eq!(decodes(&rows), 0);
+        assert_eq!(
+            rows.iter()
+                .filter_map(
+                    |r| r["counts"]["codex_zst_refused"]["CompressedAdmissionRefused"].as_u64()
+                )
+                .count(),
+            1
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r["stage"] == "codex_zst_admission_alarm")
+                .count(),
+            usize::from(attempt == 12)
+        );
+        assert_eq!(
+            admission_starved_count(Some(&key)),
+            usize::from(attempt >= 12)
+        );
+        assert!(!rows.iter().any(|r| r["stage"] == "codex_zst_inventory"));
+        assert!(!state.files.contains_key(&key));
+        assert_eq!((work.physical_bytes, work.decoded_bytes), (0, 0));
+    }
     occupied.close();
-    assert_eq!(decodes(&header_inventory(&f, &mut state, &cache)), 1);
+    let rows = header_inventory(&f, &mut state, &cache);
+    assert_eq!(decodes(&rows), 1);
+    let counts = &rows
+        .iter()
+        .find(|r| r["stage"] == "codex_zst_inventory")
+        .unwrap()["counts"];
+    assert!(
+        counts["codex_zst_decoder_native_peak_bytes"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(counts["codex_zst_decoder_allocation_refusals"], 0);
+    assert_eq!(admission_starved_count(Some(&key)), 0);
+    assert_eq!(
+        admission_streak(&key, true),
+        1,
+        "funded header reset the streak to zero"
+    );
+    admission_streak(&key, false);
+    assert_eq!(
+        state.files[&key].archive.as_ref().unwrap().decode_attempts,
+        0
+    );
 }
 
 #[test]
@@ -360,7 +409,9 @@ fn refused_header_admission_does_not_spend_a_decode_attempt() {
     ignore = "funded decoder needs validated heap layout"
 )]
 fn invalid_archive_does_not_hold_live_plain_on_next_pass() {
-    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     let mut f = ArchiveFixture::new(b"corrupt");
     let bad = f.0.with_file_name("rollout-bad.jsonl.zst");
     fs::rename(&f.0, &bad).unwrap();
@@ -440,7 +491,9 @@ fn invalid_archive_does_not_hold_live_plain_on_next_pass() {
     ignore = "funded decoder needs validated heap layout"
 )]
 fn full_read_accepts_seventy_kib_header_and_settles_once() {
-    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     let mut bytes = serde_json::to_vec(&json!({"type":"session_meta", "payload": {
         "id":"compressed-fixture", "instructions":"x".repeat(70 * 1024), "cli_version":"v-large"
     }}))
@@ -511,7 +564,9 @@ fn full_read_accepts_seventy_kib_header_and_settles_once() {
     ignore = "funded decoder needs validated heap layout"
 )]
 fn real_full_admission_refusal_preserves_header_without_redecode() {
-    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
     let cache = Arc::new(sampled_scan::SharedCache::default());
     let mut state = ScanIndex::default();
@@ -554,7 +609,9 @@ fn real_full_admission_refusal_preserves_header_without_redecode() {
     ignore = "funded decoder needs validated heap layout"
 )]
 fn header_permission_and_cpu_gate_spend_no_transcript_bytes_or_attempt() {
-    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
     let cache = Arc::new(sampled_scan::SharedCache::default());
     let mut state = ScanIndex::default();
@@ -614,7 +671,9 @@ fn header_permission_and_cpu_gate_spend_no_transcript_bytes_or_attempt() {
     ignore = "funded decoder needs validated heap layout"
 )]
 fn double_uuid_archive_has_named_owner_hold_no_replacement_or_redecode() {
-    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     let owner = "019fa111-2222-7333-8444-555555555555";
     let other = "019fa111-aaaa-7333-8444-555555555555";
     let mut lines: Vec<Value> = synthetic_rollout()
@@ -681,7 +740,9 @@ fn double_uuid_archive_has_named_owner_hold_no_replacement_or_redecode() {
     ignore = "funded decoder needs validated heap layout"
 )]
 fn inventory_step_charges_decoded_bytes_to_page_and_keeps_physical_inventory_accounting() {
-    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
     let root = f.0.parent().unwrap().to_owned();
     let mut dirs = codex_file_join::DirectoryCensus::new();
@@ -740,7 +801,9 @@ fn inventory_step_charges_decoded_bytes_to_page_and_keeps_physical_inventory_acc
     ignore = "funded decoder needs validated heap layout"
 )]
 fn unreadable_segment_holds_its_filename_owner_but_not_unrelated_plain() {
-    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     let f = ArchiveFixture::new(b"corrupt archive segment");
     let root = f.0.parent().unwrap().to_owned();
     let related = root.join("rollout-compressed-fixture.jsonl");
@@ -2889,4 +2952,58 @@ fn incomplete_archive_inventory_defers_before_frame_or_header_io() {
     assert!(!rows
         .iter()
         .any(|row| row["stage"] == "codex_zst_frame_header"));
+}
+
+#[test]
+fn header_deferred_gates_and_absent_cache_do_not_increment_admission_streak() {
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+    let key = local_index_key(&f.0);
+    admission_streak(&key, false);
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let mut state = ScanIndex::default();
+    let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+        for _ in 0..12 {
+            for mut work in [
+                HeaderWork::default(),
+                HeaderWork {
+                    allowed: true,
+                    cpu_micros: 30_000_000,
+                    ..HeaderWork::default()
+                },
+            ] {
+                assert!(matches!(
+                    state
+                        .inventory_archive_header(&f.candidate(), Some(&cache), &mut work)
+                        .unwrap(),
+                    HeaderRead::Deferred
+                ));
+                assert_eq!((work.physical_bytes, work.decoded_bytes), (0, 0));
+            }
+            assert!(matches!(
+                state
+                    .inventory_archive_header(&f.candidate(), None, &mut funded_header_work())
+                    .unwrap(),
+                HeaderRead::Deferred
+            ));
+            let mut outside_scope = f.candidate();
+            outside_scope.scan_root = f.0.parent().unwrap().join("different-root");
+            assert!(state
+                .inventory_archive_header(&outside_scope, Some(&cache), &mut funded_header_work())
+                .is_err());
+        }
+    });
+    assert_eq!(decodes(&rows), 0);
+    assert!(state.files.is_empty());
+    assert!(!rows
+        .iter()
+        .any(|r| r["stage"] == "codex_zst_admission_alarm"));
+    assert_eq!(
+        admission_streak(&key, true),
+        1,
+        "no actual claim was refused"
+    );
+    admission_streak(&key, false);
 }

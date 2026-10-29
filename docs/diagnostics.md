@@ -1119,13 +1119,23 @@ A3 user-setting corrections use separate once-only grants, described below.
 Quiet settled/empty/held/refused stamps decode zero bytes.
 
 Decoder admission keeps fixed headroom of one 8 MiB primary entry plus side-ledger
-bytes; the resident cache is charged once. Each admission yield increments the
-cumulative `codex_zst_refused` counter once per attempted archive per pass. After
+bytes; the resident cache is charged once. The Darwin decoder credit is
+14,352,384 bytes (zstd 1.5.7, window log 23, native 514 MiB fixture peak
+13,009,088 plus 10%, rounded to 64 KiB); other platforms keep 9,830,400 bytes.
+The checked sum is `R + C + D + F + 2*S <= 31 MiB`, where R and C are the
+whole retained/cursor bounds, D is decoder credit, F is the 8 MiB primary floor
+and S is the 125,840-byte fixed side reservation. This leaves F+S free and raises
+the STATE ceiling by zero. Larger D can yield more under warm/cursor pressure;
+the 12-yield alarm is the signal. No resident is evicted by decoder admission. Each admission yield increments
+the cumulative `codex_zst_refused` counter once per attempted archive per pass. After
 12 consecutive yields for an archive, `codex_zst_admission_alarm` discloses the
 starvation once, with `consecutive_yields: 12`. RAM-only process streaks survive
 index reloads, reset on admission or process restart, and are cleared when a key
 is retired. A bounded process map holds at most 256 SHA-256
-identities and byte counters; at capacity, a new identity evicts the lowest hash. No streak is serialized or changes archive
+identities and byte counters; at capacity, a new identity evicts the lowest hash.
+Actual header-inventory decoder-claim refusals share this per-key streak with
+body admission; successful funding resets it. Header power/QoS/CPU/scope
+deferrals and an absent header cache never increment it. No streak is serialized or changes archive
 evidence. Decoder input and leaked-release fields are per-event counts.
 Archive inventory uses a stamp-bound `header_validated` projection with no
 acquisition, money, checkpoint or ACK authority. One paid attempt per stamp emits
@@ -1134,6 +1144,17 @@ only `codex_zst_inventory`, never `codex_zst_input`. Its counters include
 (physical File input including read-ahead), `codex_zst_inventory_physical_bytes`,
 `codex_zst_inventory_compressed_consumed_bytes` (successful decoder steps),
 `codex_zst_inventory_decoded_bytes` and `codex_zst_inventory_cpu_micros`.
+Both existing stages (`codex_zst_input` and `codex_zst_inventory`) append
+`codex_zst_decoder_native_peak_bytes`, a per-decoder high-water gauge of native
+allocations including allocator headers, tracker and live resize overlap.
+Darwin charges actual `malloc_size`; other platforms charge requested bytes.
+This gauge excludes the two separately prepaid 8 KiB I/O buffers and boxed
+reader; it is not whole-process RSS. Do not sum it as a byte counter.
+`codex_zst_decoder_allocation_refusals` is the per-input saturating count of
+native allocation callback refusals, including size-class preflight and actual
+charge-limit checks. These are backstop failures after funding, not admission
+yields. Both labels are counts/bytes only on the existing local carrier; neither
+adds persisted authority. No logging or allocation is added inside the callback.
 
 Inventory uses an 8 KiB output buffer, retains only the first newline-terminated
 record in a Vec capped at 64 KiB, and caps physical input at 128 KiB. Read-ahead
