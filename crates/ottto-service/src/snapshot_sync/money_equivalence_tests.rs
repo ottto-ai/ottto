@@ -103,31 +103,11 @@ impl ReceiptBody {
                     .iter()
                     .find(|item| snapshot["snapshot_fingerprint"] == item.snapshot_fingerprint)
                     .expect("wire snapshot must have its emitted production item");
-                let raw = snapshot.clone();
-                let mut raw_item = raw.as_object().unwrap().clone();
-                raw_item.remove("semantic_envelope").unwrap();
-                assert_eq!(Value::Object(raw_item), serde_json::to_value(item).unwrap());
-                // These fixtures upload with this exact policy. Check the wire
-                // before using it rather than silently assuming a default.
-                let policy = SnapshotUploadPolicy::default();
-                assert_eq!(
-                    raw["semantic_envelope"],
-                    serde_json::to_value(crate::snapshots::snapshot_semantic_envelope(
-                        self.source,
-                        item,
-                        policy,
-                    ))
-                    .unwrap(),
+                crate::snapshots::sampled_scan::transition_fixture::normalize_sentinel(
+                    self.source,
+                    item,
+                    snapshot,
                 );
-                let mut cross_item = item.clone();
-                cross_item.source_file_fingerprint = Some("physical-identity:excluded".into());
-                snapshot["source_file_fingerprint"] = json!(cross_item.source_file_fingerprint);
-                // Calls the same revision v1/v2 functions as real wire emission.
-                snapshot["semantic_envelope"] = serde_json::to_value(
-                    crate::snapshots::snapshot_semantic_envelope(self.source, &cross_item, policy),
-                )
-                .unwrap();
-                assert_cross_build_scope(&raw, snapshot);
             }
             canonical(&wire)
         };
@@ -144,26 +124,6 @@ impl ReceiptBody {
             envelope(&self.raw)
         }
     }
-}
-
-fn assert_cross_build_scope(raw: &Value, cross: &Value) {
-    let mut restored = cross.clone();
-    // Assert existing paths: normalization must never add/delete fields or
-    // permit any other component, content hash, money or ordering drift.
-    for path in [
-        "/source_file_fingerprint",
-        "/semantic_envelope/revision_hash",
-        "/semantic_envelope/revision_v2_hash",
-    ] {
-        *restored
-            .pointer_mut(path)
-            .expect("existing cross-build path") =
-            raw.pointer(path).expect("existing raw path").clone();
-    }
-    assert_eq!(
-        &restored, raw,
-        "cross-build body changed outside identity paths"
-    );
 }
 
 fn receipt(name: &str, bodies: &[ReceiptBody]) {

@@ -3,8 +3,7 @@
 // second implementation of evidence, finalization, batching or ACK settlement.
 use super::*;
 use crate::snapshots::sampled_scan::transition_fixture::{
-    self as fixture, money_oracle, Accepted, CrashPoint, IoBytes, Mode, RouteResult,
-    TransitionDriver,
+    self as fixture, money_oracle, CrashPoint, IoBytes, Mode, RouteResult, TransitionDriver,
 };
 
 const SOURCE: SnapshotSource = SnapshotSource::ClaudeCode;
@@ -16,7 +15,6 @@ struct M1 {
     path: PathBuf,
     ram: E2ScanFixture,
     prior: ScanIndex,
-    accepted: BTreeMap<String, Accepted>,
     pages: BTreeMap<Mode, Page>,
     old_bytes: BTreeMap<PathBuf, Vec<u8>>,
     restarts: usize,
@@ -45,24 +43,8 @@ impl M1 {
         warm.enrich(&c);
         warm.finish();
         literal(&warm);
-        let (status, bodies, _) = upload(&warm.scan.snapshots, &mut e2_progress(), ack);
+        let (status, _bodies, _) = upload(&warm.scan.snapshots, &mut e2_progress(), ack);
         assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
-        let result = RouteResult::emitted(Mode::ColdFull, SOURCE, bodies, &warm.scan.snapshots);
-        let accepted = warm
-            .scan
-            .snapshots
-            .iter()
-            .map(|item| {
-                assert!(item.request_count > 0);
-                (
-                    item.source_session_id.clone(),
-                    Accepted {
-                        body: result.snapshots[&item.source_session_id].clone(),
-                        witness: snapshot_upload_body_witness(item),
-                    },
-                )
-            })
-            .collect();
         warm.index.record_accepted_snapshot_fingerprints(
             &warm
                 .scan
@@ -88,7 +70,6 @@ impl M1 {
             path,
             ram,
             prior,
-            accepted,
             pages: BTreeMap::new(),
             old_bytes,
             restarts: 0,
@@ -165,7 +146,19 @@ impl TransitionDriver for M1 {
         };
         fixture::reach(CrashPoint::AfterAck);
         let mut result = RouteResult::emitted(mode, SOURCE, bodies, &page.scan.snapshots);
-        result.accepted = self.accepted.clone();
+        result.accepted.insert(
+            ROOT.into(),
+            fixture::accepted_record(
+                if mode == Mode::ColdFull {
+                    &self.prior
+                } else {
+                    &page.index
+                },
+                SOURCE,
+                &self.path,
+                &self.disk.index,
+            ),
+        );
         // The actual parser consumption is measured; raw head rederive is an
         // independent receipt. Cheap certificate/probe I/O is NOT measured yet.
         result.io = IoBytes {
@@ -202,27 +195,6 @@ impl TransitionDriver for M1 {
         fixture::reach(CrashPoint::SaveGc);
         assert_eq!(self.disk.records(), 1);
         self.prior = ScanIndex::load(&self.disk.index).unwrap();
-        for item in &page.scan.snapshots {
-            self.accepted.insert(
-                item.source_session_id.clone(),
-                Accepted {
-                    body: {
-                        let mut s = item.clone();
-                        s.source_file_fingerprint = Some("physical-identity:excluded".into());
-                        let mut v = serde_json::to_value(&s).unwrap();
-                        v["semantic_envelope"] =
-                            serde_json::to_value(crate::snapshots::snapshot_semantic_envelope(
-                                SOURCE,
-                                &s,
-                                SnapshotUploadPolicy::default(),
-                            ))
-                            .unwrap();
-                        v
-                    },
-                    witness: snapshot_upload_body_witness(item),
-                },
-            );
-        }
     }
 
     fn restart(&mut self) {
@@ -443,13 +415,50 @@ fn shared_unknown_record_holds_last_accepted_body_and_survives_gc() {
         assert_eq!(sibling_item.request_count, sibling_requests + 1);
         unknown[8..10].copy_from_slice(&u16::MAX.to_le_bytes());
         std::fs::write(&path, &unknown).unwrap();
+        let mut prior = cold.clone();
+        prior.accepted.insert(
+            ROOT.into(),
+            fixture::accepted_record(&f.prior, SOURCE, &f.path, &f.disk.index),
+        );
         for _ in 0..5 {
             let held = f.emit_bodies(Mode::DiskRestore);
             assert_eq!(held.modes, (0, 1, 0));
             assert_eq!(held.restored, 1);
             assert_eq!(held.snapshots[SIBLING], cold.snapshots[SIBLING]);
-            money_oracle::assert_held(ROOT, &cold, &held, &cold);
-            money_oracle::assert_no_smaller_reemit(ROOT, &cold, &held, &cold, true);
+            money_oracle::assert_held(ROOT, &prior, &held, &cold);
+            let mut changed = held.clone();
+            changed
+                .accepted
+                .get_mut(ROOT)
+                .unwrap()
+                .witness
+                .push_str("changed");
+            assert!(
+                std::panic::catch_unwind(|| money_oracle::assert_held(
+                    ROOT, &prior, &changed, &cold
+                ))
+                .is_err(),
+                "native witness drift must fail"
+            );
+            let mut changed = held.clone();
+            changed.accepted.get_mut(ROOT).unwrap().record_bytes.push(0);
+            assert!(
+                std::panic::catch_unwind(|| money_oracle::assert_held(
+                    ROOT, &prior, &changed, &cold
+                ))
+                .is_err(),
+                "native record bytes drift must fail"
+            );
+            let mut changed = held.clone();
+            changed.snapshots.get_mut(SIBLING).unwrap()["request_count"] = json!(999);
+            assert!(
+                std::panic::catch_unwind(|| money_oracle::assert_held(
+                    ROOT, &prior, &changed, &cold
+                ))
+                .is_err(),
+                "held sibling must still match cold Full"
+            );
+            money_oracle::assert_no_smaller_reemit(ROOT, &prior, &held, &cold, true);
             let page = &f.pages[&Mode::DiskRestore];
             assert_eq!(
                 stored_bodies(&page.index)[&fixture::local_key(&f.path)],
@@ -461,7 +470,7 @@ fn shared_unknown_record_holds_last_accepted_body_and_survives_gc() {
         }
         f.restart();
         let held = f.emit_bodies(Mode::Restart);
-        money_oracle::assert_held(ROOT, &cold, &held, &cold);
+        money_oracle::assert_held(ROOT, &prior, &held, &cold);
         assert_eq!(std::fs::read(path).unwrap(), unknown);
     });
 }
@@ -691,16 +700,6 @@ fn shared_codex_dated_legacy_and_v2_receipts_survive_two_restarts() {
                 other_page(&c, &owner, SnapshotSource::Codex, prior.clone());
             assert_eq!(modes, (0, 1, 0));
             assert_eq!(durable_restores(&owner.cache, SnapshotSource::Codex).1, 1);
-            let evidence = |index: &ScanIndex, scan: &SourceScanResult| {
-                json!({
-                "TierReplay": index.files.iter().map(|(k, e)| (k.clone(), json!({
-                    "applied":e.codex_applied_tier_receipt, "required":e.codex_applied_tier_receipt_required,
-                    "captured":e.codex_captured_tier_receipt, "owner":e.codex_protected_owner,
-                    "v2":e.codex_counting_v2 }))).collect::<BTreeMap<_,_>>(),
-                "token_count": scan.snapshots.iter().map(|s| (s.source_session_id.clone(),
-                    json!([s.input_tokens, s.output_tokens, s.cache_read_tokens,
-                        s.reasoning_output_tokens, s.request_count]))).collect::<BTreeMap<_,_>>() })
-            };
             let mut cold = RouteResult::emitted(
                 Mode::ColdFull,
                 SnapshotSource::Codex,
@@ -713,8 +712,8 @@ fn shared_codex_dated_legacy_and_v2_receipts_survive_two_restarts() {
                 vec![other_wire(SnapshotSource::Codex, &disk_scan)],
                 &disk_scan.snapshots,
             );
-            cold.codex_evidence = evidence(&cold_index, &cold_scan);
-            restored.codex_evidence = evidence(&next, &disk_scan);
+            cold.codex_evidence = fixture::codex_evidence(&cold_index, &cold_scan);
+            restored.codex_evidence = fixture::codex_evidence(&next, &disk_scan);
             money_oracle::assert_equivalent(&cold, &restored);
             assert!(next.files.values().all(|e| e.codex_counting_v2 != legacy));
             prior = disk.commit(&owner.cache, SnapshotSource::Codex, &mut next);
@@ -734,6 +733,8 @@ fn shared_money_oracle_reports_each_field_and_rejects_false_holds() {
     with_e2(|| {
         let mut f = M1::old_writer("transition-oracle-controls", WRITERS[0]);
         f.grow("r4", 40);
+        let smaller = f.emit_bodies(Mode::ColdFull);
+        f.grow("r5", 50);
         let cold = f.emit_bodies(Mode::ColdFull);
         for field in [
             "input_tokens",
@@ -751,6 +752,7 @@ fn shared_money_oracle_reports_each_field_and_rejects_false_holds() {
             "removed_request_count",
             "usage_accounting_contract",
             "telemetry_owned_complete",
+            "resolver_conflict_count",
         ] {
             let mut changed = cold.clone();
             changed.snapshots.get_mut(ROOT).unwrap()[field] = json!("changed");
@@ -771,6 +773,30 @@ fn shared_money_oracle_reports_each_field_and_rejects_false_holds() {
                     .is_err()
             );
         }
+        // A real smaller native emitted body must fail the behind-accepted
+        // guard. This is a helper negative, not C4's behind-accepted Tail row.
+        assert!(
+            smaller.snapshots[ROOT]["request_count"].as_u64().unwrap()
+                < cold.snapshots[ROOT]["request_count"].as_u64().unwrap()
+        );
+        assert!(
+            std::panic::catch_unwind(|| money_oracle::assert_no_smaller_reemit(
+                ROOT, &cold, &smaller, &cold, true
+            ))
+            .is_err()
+        );
+        money_oracle::assert_equivalent(&cold, &cold);
+        let mut byte_only = cold.clone();
+        byte_only.normalized[0]["snapshots"][0]["collected_at"] = json!("byte-only-change");
+        assert!(
+            money_oracle::money_differences(&cold, &byte_only).is_empty(),
+            "byte-only change stays money-equal"
+        );
+        assert!(
+            std::panic::catch_unwind(|| money_oracle::assert_equivalent(&cold, &byte_only))
+                .is_err(),
+            "normalized bytes must independently reject drift"
+        );
         let mut changed = cold.clone();
         changed.codex_evidence = json!({"TierReplay":"changed", "token_count":7});
         assert!(
@@ -842,17 +868,7 @@ impl TransitionDriver for Codex24b {
             result.io.rederive_head = counters.rederive_head_bytes;
             result.io.rederive_named = counters.rederive_line_bytes;
         }
-        result.codex_evidence = json!({
-            "TierReplay": index.files.iter().map(|(k,e)| (k.clone(), json!({
-                "applied":e.codex_applied_tier_receipt,
-                "required":e.codex_applied_tier_receipt_required,
-                "captured":e.codex_captured_tier_receipt,
-                "owner":e.codex_protected_owner, "v2":e.codex_counting_v2
-            }))).collect::<BTreeMap<_,_>>(),
-            "token_count": scan.snapshots.iter().map(|s| (s.source_session_id.clone(),
-                json!([s.input_tokens,s.output_tokens,s.request_count])))
-                .collect::<BTreeMap<_,_>>()
-        });
+        result.codex_evidence = fixture::codex_evidence(&index, &scan);
         self.pages.insert(mode, (scanner, index));
         result
     }

@@ -42971,6 +42971,12 @@ fn read_opened_content_samples(file: &mut File, len: u64) -> std::io::Result<Ope
     } else {
         None
     };
+    #[cfg(all(test, unix))]
+    sampled_scan::transition_fixture::record_identity_samples(
+        len,
+        head.len(),
+        tail.as_ref().map_or(0, Vec::len),
+    );
     Ok(OpenedContentSamples { head, tail })
 }
 

@@ -20,7 +20,7 @@ use crate::snapshots::{
     snapshot_semantic_envelope, SnapshotItem, SnapshotSource, SnapshotUploadPolicy,
 };
 use serde_json::{json, Value};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -190,6 +190,68 @@ pub(crate) fn observe_consumed<T>(f: impl FnOnce() -> T) -> (T, u64) {
     (result, bytes)
 }
 
+/// Opaque receipt from the real opened-object identity sampler. A single-file
+/// quiet step may sample at open and finish, at most twice. The expected bytes
+/// come from each native invocation's file extent, never a caller allowance.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct AnchorWindow {
+    expected: u64,
+    observed: u64,
+    invocations: usize,
+}
+impl AnchorWindow {
+    const MAX_INVOCATIONS: usize = 2;
+    fn assert_bounded(&self) {
+        assert!(
+            self.invocations <= Self::MAX_INVOCATIONS,
+            "too many identity sample invocations"
+        );
+        assert_eq!(
+            self.observed, self.expected,
+            "native identity sample short/excess read"
+        );
+    }
+}
+thread_local! {
+    static ANCHORS: RefCell<Option<AnchorWindow>> = const { RefCell::new(None) };
+}
+/// Called only at the real head/tail read site; extent and read return values
+/// remain separate so a short read cannot set its own expected allowance.
+pub(crate) fn record_identity_samples(extent: u64, head: usize, tail: usize) {
+    ANCHORS.with(|slot| {
+        if let Some(window) = slot.borrow_mut().as_mut() {
+            let sample = super::super::FILE_CONTENT_SAMPLE_BYTES as u64;
+            assert!(head as u64 <= sample && tail as u64 <= sample);
+            window.invocations += 1;
+            assert!(
+                window.invocations <= AnchorWindow::MAX_INVOCATIONS,
+                "too many identity sample invocations"
+            );
+            window.expected += extent.min(sample) + if extent > sample { sample } else { 0 };
+            window.observed += (head + tail) as u64;
+        }
+    });
+}
+pub(crate) fn observe_identity_samples<T>(run: impl FnOnce() -> T) -> (T, AnchorWindow) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ANCHORS.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+    ANCHORS.with(|slot| {
+        assert!(
+            slot.borrow_mut().replace(AnchorWindow::default()).is_none(),
+            "nested anchor observer"
+        )
+    });
+    let _reset = Reset;
+    let result = run();
+    let window = ANCHORS.with(|slot| slot.borrow().as_ref().unwrap().clone());
+    window.assert_bounded();
+    (result, window)
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct IoBytes {
     pub(crate) consumed: u64,
@@ -200,15 +262,123 @@ pub(crate) struct IoBytes {
     pub(crate) cheap_checks: Option<u64>,
     /// Head/boundary identity hashes detect mtime-restored replacement. These
     /// are separate from body/fragment re-derivation and other cheap/raw reads;
-    /// None is unmeasured, not zero. Quiet callers must supply the exact window.
+    /// None is unmeasured, not zero. Scoped quiet checks use a native receipt.
     pub(crate) anchor_reads: Option<u64>,
     pub(crate) other_reads: Option<u64>,
 }
 
+/// Independent held-state observation: the index's accepted witnesses and the
+/// exact native reduction file, including framing/generation. Never populated
+/// from a driver's emitted-item cache.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Accepted {
-    pub(crate) body: Value,
+    pub(crate) record_bytes: Vec<u8>,
+    pub(crate) snapshot_fingerprint: String,
     pub(crate) witness: String,
+}
+
+pub(crate) fn accepted_record(
+    index: &super::super::ScanIndex,
+    source: SnapshotSource,
+    transcript: &Path,
+    index_path: &Path,
+) -> Accepted {
+    use crate::durable_tail_store::{key_digest, store_dir_for_index, DurableSource};
+    let key = local_key(transcript);
+    let entry = &index.files[&key];
+    let source = match source {
+        SnapshotSource::ClaudeCode => DurableSource::ClaudeCode,
+        SnapshotSource::Codex => DurableSource::Codex,
+        _ => panic!("source has no durable transcript store"),
+    };
+    let name = key_digest(source, &key)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
+        + ".rec";
+    Accepted {
+        record_bytes: std::fs::read(store_dir_for_index(index_path).join(name)).unwrap(),
+        snapshot_fingerprint: entry
+            .last_snapshot_fingerprint
+            .clone()
+            .expect("native accepted fingerprint"),
+        witness: entry
+            .last_upload_body_witness
+            .clone()
+            .expect("native accepted body witness"),
+    }
+}
+
+/// The one cross-build sentinel, shared with money_equivalence_tests. Rebuild
+/// revisions with production types and prove precisely three paths changed.
+pub(crate) fn normalize_sentinel(
+    source: SnapshotSource,
+    item: &SnapshotItem,
+    snapshot: &mut Value,
+) {
+    let raw = snapshot.clone();
+    let mut fields = raw.as_object().unwrap().clone();
+    fields
+        .remove("semantic_envelope")
+        .expect("production envelope");
+    assert_eq!(Value::Object(fields), serde_json::to_value(item).unwrap());
+    let policy = SnapshotUploadPolicy::default();
+    assert_eq!(
+        raw["semantic_envelope"],
+        serde_json::to_value(snapshot_semantic_envelope(source, item, policy)).unwrap()
+    );
+    let mut neutral = item.clone();
+    neutral.source_file_fingerprint = Some("physical-identity:excluded".into());
+    snapshot["source_file_fingerprint"] = json!(neutral.source_file_fingerprint);
+    snapshot["semantic_envelope"] =
+        serde_json::to_value(snapshot_semantic_envelope(source, &neutral, policy)).unwrap();
+    let mut restored = snapshot.clone();
+    for path in [
+        "/source_file_fingerprint",
+        "/semantic_envelope/revision_hash",
+        "/semantic_envelope/revision_v2_hash",
+    ] {
+        *restored.pointer_mut(path).expect("existing sentinel path") =
+            raw.pointer(path).expect("existing raw path").clone();
+    }
+    assert_eq!(restored, raw, "normalization escaped sentinel scope");
+}
+
+/// One collector for both Codex drivers. Preserve empty native values too;
+/// receipts, counting, parent ownership and proof state are separate evidence.
+pub(crate) fn codex_evidence(
+    index: &super::super::ScanIndex,
+    scan: &super::super::SourceScanResult,
+) -> Value {
+    json!({
+        "TierReplay": index.files.iter().map(|(k,e)| (k.clone(), json!({
+            "applied": e.codex_applied_tier_receipt,
+            "required": e.codex_applied_tier_receipt_required,
+            "captured": e.codex_captured_tier_receipt,
+            "captured_required": e.codex_captured_tier_receipt_required,
+            "captured_uncommitted": e.codex_captured_uncommitted,
+            "owner": e.codex_protected_owner,
+            "joined_members": e.codex_joined_member_set,
+            "captured_members": e.codex_captured_joined_member_set,
+            "counting_owner": e.codex_counting_owner,
+            "v2": e.codex_counting_v2
+        }))).collect::<BTreeMap<_,_>>(),
+        "token_count": scan.snapshots.iter().map(|s| (s.source_session_id.clone(), json!([
+            s.input_tokens, s.output_tokens, s.cache_read_tokens, s.reasoning_output_tokens,
+            s.unattributed_total_tokens, s.request_count
+        ]))).collect::<BTreeMap<_,_>>(),
+        "parent_ledgers": index.codex_parent_ownership_ledgers,
+        "parent_refs": index.codex_parent_ownership_refs,
+        "proofs": index.codex_parent_prefix_proofs,
+        "proof_seq": index.codex_parent_proof_seq,
+        "proof_wrap_epoch": index.codex_parent_proof_wrap_epoch,
+        "proof_parents_live": index.codex_parent_proof_parents_live,
+        "proof_cursor": index.codex_parent_proof_cursor,
+        "side_cursor": index.codex_parent_side_cursor,
+        "side": index.codex_parent_side,
+        "side_generation": index.codex_parent_side_generation,
+        "side_requests": index.codex_parent_side_requests,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -252,34 +422,7 @@ impl RouteResult {
                         seen.insert(item.snapshot_fingerprint.clone()),
                         "duplicate emission"
                     );
-                    let raw = snapshot.clone();
-                    let mut fields = raw.as_object().unwrap().clone();
-                    fields
-                        .remove("semantic_envelope")
-                        .expect("production envelope");
-                    assert_eq!(Value::Object(fields), serde_json::to_value(item).unwrap());
-                    let policy = SnapshotUploadPolicy::default();
-                    assert_eq!(
-                        raw["semantic_envelope"],
-                        serde_json::to_value(snapshot_semantic_envelope(source, item, policy))
-                            .unwrap()
-                    );
-                    let mut neutral = item.clone();
-                    neutral.source_file_fingerprint = Some("physical-identity:excluded".into());
-                    snapshot["source_file_fingerprint"] = json!(neutral.source_file_fingerprint);
-                    snapshot["semantic_envelope"] =
-                        serde_json::to_value(snapshot_semantic_envelope(source, &neutral, policy))
-                            .unwrap();
-                    let mut restored = snapshot.clone();
-                    for path in [
-                        "/source_file_fingerprint",
-                        "/semantic_envelope/revision_hash",
-                        "/semantic_envelope/revision_v2_hash",
-                    ] {
-                        *restored.pointer_mut(path).expect("existing sentinel path") =
-                            raw.pointer(path).expect("existing raw path").clone();
-                    }
-                    assert_eq!(restored, raw, "normalization escaped sentinel scope");
+                    normalize_sentinel(source, item, snapshot);
                     assert!(
                         snapshots
                             .insert(item.source_session_id.clone(), snapshot.clone())
@@ -346,6 +489,7 @@ pub(crate) mod money_oracle {
         "removed_request_count",
         "usage_accounting_contract",
         "telemetry_owned_complete",
+        "resolver_conflict_count",
     ];
 
     /// Structural, per-field diagnostics even when the final bytes differ.
@@ -375,24 +519,8 @@ pub(crate) mod money_oracle {
             _ => out.push(format!("{path}: expected {a}, got {b}")),
         }
     }
-    pub(crate) fn assert_equivalent(cold: &RouteResult, other: &RouteResult) {
-        assert_eq!(cold.source, other.source);
-        assert!(
-            !cold.snapshots.is_empty(),
-            "empty cold Full is no money proof"
-        );
+    pub(crate) fn money_differences(cold: &RouteResult, other: &RouteResult) -> Vec<String> {
         let mut differences = Vec::new();
-        if cold.source == SnapshotSource::Codex {
-            for route in [cold, other] {
-                for field in ["TierReplay", "token_count"] {
-                    assert!(
-                        route.codex_evidence.get(field).is_some(),
-                        "{:?}: Codex evidence/{field} not collected",
-                        route.mode
-                    );
-                }
-            }
-        }
         for entity in cold
             .snapshots
             .keys()
@@ -414,6 +542,28 @@ pub(crate) mod money_oracle {
                 _ => differences.push(format!("entity/{entity}: missing/extra emitted entity")),
             }
         }
+        differences
+    }
+
+    pub(crate) fn assert_equivalent(cold: &RouteResult, other: &RouteResult) {
+        assert_eq!(cold.source, other.source);
+        assert!(
+            !cold.snapshots.is_empty(),
+            "empty cold Full is no money proof"
+        );
+        let mut differences = Vec::new();
+        if cold.source == SnapshotSource::Codex {
+            for route in [cold, other] {
+                for field in ["TierReplay", "token_count"] {
+                    assert!(
+                        route.codex_evidence.get(field).is_some(),
+                        "{:?}: Codex evidence/{field} not collected",
+                        route.mode
+                    );
+                }
+            }
+        }
+        differences.extend(money_differences(cold, other));
         diff(
             "codex/TierReplay_receipts_ownership_token_count",
             &cold.codex_evidence,
@@ -456,11 +606,16 @@ pub(crate) mod money_oracle {
             .get(entity)
             .expect("prior accepted body + witness");
         assert!(
-            before.body["request_count"].as_u64().unwrap_or(0) > 0,
+            prior.snapshots[entity]["request_count"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0,
             "fixture must start with nonempty accepted money"
         );
         assert!(
-            !before.witness.is_empty(),
+            !before.witness.is_empty()
+                && !before.snapshot_fingerprint.is_empty()
+                && !before.record_bytes.is_empty(),
             "fixture must have accepted witness"
         );
         assert_eq!(
@@ -510,17 +665,18 @@ pub(crate) mod money_oracle {
     }
 
     pub(crate) fn assert_quiet_restart_zero_bytes(result: &RouteResult) {
-        assert_quiet_restart_with_anchor_window(result, 0);
+        assert_quiet_restart_with_anchor_window(result, &AnchorWindow::default());
     }
 
     /// Identity head/boundary hashes are required to detect mtime-restored
-    /// replacement, not a body/fragment read leak. Permit exactly the caller's
-    /// computed anchor window for this assertion only; all body/other bytes
-    /// remain forbidden. The default zero-byte assertion passes a zero window.
+    /// replacement. Permit only the native sampler receipt's independently
+    /// extent-derived bounded window; body/other bytes remain forbidden.
+    /// This does not turn a scan's unmeasured cheap/other I/O into zero.
     pub(crate) fn assert_quiet_restart_with_anchor_window(
         result: &RouteResult,
-        anchor_window: u64,
+        anchor_window: &AnchorWindow,
     ) {
+        anchor_window.assert_bounded();
         assert!(matches!(
             result.mode,
             Mode::DiskRestore | Mode::Restart | Mode::EvictRetry
@@ -539,7 +695,7 @@ pub(crate) mod money_oracle {
         );
         assert_eq!(
             result.io.anchor_reads,
-            Some(anchor_window),
+            Some(anchor_window.expected),
             "identity anchor I/O unmeasured or outside exact window"
         );
         assert_eq!(
@@ -557,9 +713,25 @@ pub(crate) mod money_oracle {
     mod quiet_tests {
         use super::*;
 
-        // Synthetic measured I/O premises exercise the shared assertion; these
-        // unit controls do not claim that a native scan measured these bytes.
-        const ANCHOR_WINDOW: u64 = 8192;
+        // Unix unlinks the scratch file immediately; the open native handle is
+        // cleaned on success, panic and failed assertions without a new crate.
+        fn scratch_file() -> std::fs::File {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "ottto-oracle-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap();
+            std::fs::remove_file(path).unwrap();
+            file
+        }
 
         fn quiet_result(anchor_reads: u64) -> RouteResult {
             let mut result =
@@ -573,6 +745,38 @@ pub(crate) mod money_oracle {
             result
         }
 
+        // These portable controls exercise native file sampling/JSONL reads,
+        // not a full acquisition scan. Full-scan cheap/other probes remain
+        // explicitly unmeasured in the M1 driver.
+        fn sampled(len: usize, invocations: usize, body: bool) -> (RouteResult, AnchorWindow) {
+            use std::io::{BufReader, Seek, SeekFrom, Write};
+            let mut file = scratch_file();
+            file.write_all(&vec![b'\n'; len]).unwrap();
+            let (((), consumed), window) = observe_identity_samples(|| {
+                observe_consumed(|| {
+                    for _ in 0..invocations {
+                        file.seek(SeekFrom::Start(0)).unwrap();
+                        super::super::super::super::read_opened_content_samples(
+                            &mut file, len as u64,
+                        )
+                        .unwrap();
+                    }
+                    if body {
+                        file.seek(SeekFrom::Start(0)).unwrap();
+                        let mut reader = super::super::super::super::BoundedJsonlReader::new(
+                            BufReader::new(&mut file),
+                            1024,
+                            false,
+                        );
+                        reader.step(|_| {}).unwrap();
+                    }
+                })
+            });
+            let mut result = quiet_result(window.observed);
+            result.io.consumed = consumed;
+            (result, window)
+        }
+
         #[test]
         fn quiet_default_accepts_zero_anchor_reads() {
             assert_quiet_restart_zero_bytes(&quiet_result(0));
@@ -581,40 +785,59 @@ pub(crate) mod money_oracle {
         #[test]
         #[should_panic(expected = "identity anchor I/O unmeasured or outside exact window")]
         fn quiet_default_rejects_anchor_reads() {
-            assert_quiet_restart_zero_bytes(&quiet_result(ANCHOR_WINDOW));
+            let (result, _) = sampled(1, 1, false);
+            assert_quiet_restart_zero_bytes(&result);
         }
 
         #[test]
-        fn quiet_anchor_window_accepts_exact_count() {
-            assert_quiet_restart_with_anchor_window(&quiet_result(ANCHOR_WINDOW), ANCHOR_WINDOW);
+        fn quiet_anchor_window_accepts_native_head_tail_counts() {
+            let sample = super::super::super::super::FILE_CONTENT_SAMPLE_BYTES;
+            for len in [0, 1, sample, sample + 1, sample * 3] {
+                let (result, window) = sampled(len, 2, false);
+                assert_eq!(window.invocations, 2);
+                assert!(window.expected <= (4 * sample) as u64);
+                assert_quiet_restart_with_anchor_window(&result, &window);
+            }
         }
 
         #[test]
-        #[should_panic(expected = "identity anchor I/O unmeasured or outside exact window")]
-        fn quiet_anchor_window_rejects_short_count() {
-            assert_quiet_restart_with_anchor_window(
-                &quiet_result(ANCHOR_WINDOW - 1),
-                ANCHOR_WINDOW,
+        #[should_panic(expected = "too many identity sample invocations")]
+        fn quiet_anchor_window_rejects_unbounded_invocations() {
+            sampled(1, AnchorWindow::MAX_INVOCATIONS + 1, false);
+        }
+
+        #[test]
+        fn quiet_anchor_window_rejects_short_and_excess_count() {
+            let (baseline, window) = sampled(32, 1, false);
+            for bytes in [window.observed - 1, window.observed + 1] {
+                let mut changed = baseline.clone();
+                changed.io.anchor_reads = Some(bytes);
+                assert!(
+                    std::panic::catch_unwind(|| assert_quiet_restart_with_anchor_window(
+                        &changed, &window
+                    ))
+                    .is_err()
+                );
+            }
+        }
+
+        #[test]
+        fn quiet_anchor_window_rejects_measured_body_bytes() {
+            let (baseline, window) = sampled(32, 1, false);
+            assert_quiet_restart_with_anchor_window(&baseline, &window);
+            let (changed, window) = sampled(32, 1, true);
+            assert_eq!(
+                changed.io.consumed, 1,
+                "native JSONL reader consumed one newline"
             );
-        }
-
-        #[test]
-        #[should_panic(expected = "identity anchor I/O unmeasured or outside exact window")]
-        fn quiet_anchor_window_rejects_excess_count() {
-            assert_quiet_restart_with_anchor_window(
-                &quiet_result(ANCHOR_WINDOW + 1),
-                ANCHOR_WINDOW,
+            assert!(
+                std::panic::catch_unwind(|| assert_quiet_restart_with_anchor_window(
+                    &changed, &window
+                ))
+                .is_err()
             );
-        }
-
-        #[test]
-        fn quiet_anchor_window_rejects_body_bytes() {
-            let baseline = quiet_result(ANCHOR_WINDOW);
+            // No anchor exemption for the other two native rederive counters.
             for io in [
-                IoBytes {
-                    consumed: 1,
-                    ..baseline.io.clone()
-                },
                 IoBytes {
                     rederive_head: 1,
                     ..baseline.io.clone()
@@ -626,27 +849,33 @@ pub(crate) mod money_oracle {
             ] {
                 let mut changed = baseline.clone();
                 changed.io = io;
-                assert!(std::panic::catch_unwind(|| {
-                    assert_quiet_restart_with_anchor_window(&changed, ANCHOR_WINDOW);
-                })
-                .is_err());
+                assert!(
+                    std::panic::catch_unwind(|| assert_quiet_restart_with_anchor_window(
+                        &changed, &window
+                    ))
+                    .is_err()
+                );
             }
         }
 
         #[test]
         #[should_panic(expected = "other I/O unmeasured/nonzero")]
-        fn quiet_anchor_window_rejects_other_reads() {
-            let mut result = quiet_result(ANCHOR_WINDOW);
-            result.io.other_reads = Some(1);
-            assert_quiet_restart_with_anchor_window(&result, ANCHOR_WINDOW);
+        fn quiet_anchor_window_rejects_measured_other_reads() {
+            use std::io::{Read, Seek, SeekFrom, Write};
+            let (mut result, window) = sampled(32, 1, false);
+            let mut other = scratch_file();
+            other.write_all(b"x").unwrap();
+            other.seek(SeekFrom::Start(0)).unwrap();
+            result.io.other_reads = Some(other.read(&mut [0_u8; 1]).unwrap() as u64);
+            assert_quiet_restart_with_anchor_window(&result, &window);
         }
 
         #[test]
         #[should_panic(expected = "identity anchor I/O unmeasured or outside exact window")]
         fn quiet_anchor_window_rejects_unmeasured_anchors() {
-            let mut result = quiet_result(ANCHOR_WINDOW);
+            let (mut result, window) = sampled(32, 1, false);
             result.io.anchor_reads = None;
-            assert_quiet_restart_with_anchor_window(&result, ANCHOR_WINDOW);
+            assert_quiet_restart_with_anchor_window(&result, &window);
         }
     }
 }
