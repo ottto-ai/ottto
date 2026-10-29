@@ -198,13 +198,18 @@ pub(crate) struct LineDeliveryCounts {
 pub(crate) enum UnselectedReason {
     Age,
     Size,
+    /// The subset of size skips whose key holds a withheld-account revision.
+    WithheldOversized,
 }
-/// Claude, Codex, Pi x (age, size), drained by that source's page line.
+const UNSELECTED_REASONS: usize = 3;
+/// Claude, Codex, Pi x reason, drained by that source's page line.
 #[cfg(not(test))]
-static LINE_UNSELECTED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
+    [const { AtomicU64::new(0) }; 3 * UNSELECTED_REASONS];
 #[cfg(test)]
 thread_local! {
-    static LINE_UNSELECTED: [AtomicU64; 6] = const { [const { AtomicU64::new(0) }; 6] };
+    static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
+        const { [const { AtomicU64::new(0) }; 3 * UNSELECTED_REASONS] };
 }
 fn line_unselected(source: &str, reason: usize, f: impl FnOnce(&AtomicU64) -> u64) -> u64 {
     let sources = ["claude_code", "codex", "pi"];
@@ -213,11 +218,11 @@ fn line_unselected(source: &str, reason: usize, f: impl FnOnce(&AtomicU64) -> u6
     };
     #[cfg(test)]
     {
-        LINE_UNSELECTED.with(|slots| f(&slots[2 * slot + reason]))
+        LINE_UNSELECTED.with(|slots| f(&slots[UNSELECTED_REASONS * slot + reason]))
     }
     #[cfg(not(test))]
     {
-        f(&LINE_UNSELECTED[2 * slot + reason])
+        f(&LINE_UNSELECTED[UNSELECTED_REASONS * slot + reason])
     }
 }
 /// One skip decision, recorded after the gate decided; never a gate input.
@@ -517,7 +522,7 @@ impl Probe {
                 .line_delivery
                 .filter(|(_, counts)| *counts != LineDeliveryCounts::default())
                 .map(|(observer, counts)| BTreeMap::from([(observer, counts)])),
-            line_delivery_unselected: [("age", 0), ("size", 1)]
+            line_delivery_unselected: [("age", 0), ("size", 1), ("withheld_oversized", 2)]
                 .into_iter()
                 .map(|(key, reason)| (key, line_unselected(source, reason, |n| n.swap(0, Relaxed))))
                 .filter(|(_, count)| *count > 0)

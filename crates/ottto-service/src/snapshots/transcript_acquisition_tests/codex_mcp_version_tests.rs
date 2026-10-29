@@ -39,7 +39,7 @@ fn current_candidate(f: &ScanFixture, index: &ScanIndex) -> CandidateFile {
         &mut census,
         None,
         BACKFILL_WINDOW_DAYS,
-        &index.files,
+        discovery_retention!(index),
     )
     .unwrap();
     prepare_owned_scan_candidate(
@@ -55,7 +55,7 @@ fn current_candidate(f: &ScanFixture, index: &ScanIndex) -> CandidateFile {
         &mut census,
         None,
         BACKFILL_WINDOW_DAYS,
-        &index.files,
+        discovery_retention!(index),
     )
     .unwrap()
     .0

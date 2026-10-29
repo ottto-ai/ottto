@@ -15,7 +15,7 @@ fn archive_open(f: &ArchiveFixture, index: &ScanIndex, census: &mut ScanCensus) 
         census,
         None,
         365,
-        &index.files,
+        discovery_retention!(index),
     )
     .is_some()
 }
@@ -280,7 +280,7 @@ fn terminal_archive_residue_skips_only_affected_session_and_pending_still_reduce
             &mut census,
             None,
             365,
-            &index.files
+            discovery_retention!(index)
         )
         .is_some());
     }
