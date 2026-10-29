@@ -3573,7 +3573,7 @@ impl ScanIndex {
                     serde_json::json!({
                         "invalid": pending.invalid,
                         "window": pending.census_window_end,
-                        "members": pending.member_request_id_hashes,
+                        "members": pending.membership(),
                     }),
                 )
             })

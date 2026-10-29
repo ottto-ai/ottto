@@ -307,8 +307,15 @@ impl NativeBodyBudget<'_> {
                 BTreeMap<String, ClaudeTranscriptUsageOccurrenceWitness>,
             >(members.checked_add(1).ok_or(refusal)?, 1, &mut retained)
             .ok_or(refusal)?;
+            // Runtime derivation markers own one member name, including empty members.
+            restore_tree_insert_peak::<String, ()>(
+                members.checked_add(1).ok_or(refusal)?,
+                1,
+                &mut retained,
+            )
+            .ok_or(refusal)?;
             retained
-                .add(item.source_session_id.len().checked_mul(2).ok_or(refusal)?)
+                .add(item.source_session_id.len().checked_mul(3).ok_or(refusal)?)
                 .ok_or(refusal)?;
             // The unchanged canonical code keeps local maps while cloning its
             // installed maps. Its equality check creates one more temporary

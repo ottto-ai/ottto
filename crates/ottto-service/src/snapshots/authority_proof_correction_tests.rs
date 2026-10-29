@@ -103,6 +103,7 @@ fn apc_terminal_fixture() -> ScanIndex {
     index.claude_usage_family_pending.insert(
         APC_ROOT.to_string(),
         ClaudeUsageFamilyPending {
+            derived_request_members: std::collections::BTreeSet::new(),
             census_window_end: APC_WINDOW.to_string(),
             member_request_id_hashes: BTreeMap::new(),
             member_occurrences: BTreeMap::new(),

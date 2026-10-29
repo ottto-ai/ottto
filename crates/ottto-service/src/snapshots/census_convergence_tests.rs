@@ -37,6 +37,7 @@ fn occurrences(
 
 fn current_pending(member: &str, request: &str) -> ClaudeUsageFamilyPending {
     ClaudeUsageFamilyPending {
+        derived_request_members: std::collections::BTreeSet::new(),
         census_window_end: WINDOW.to_string(),
         member_request_id_hashes: BTreeMap::from([(
             member.to_string(),
@@ -613,6 +614,7 @@ fn retry_pending_root_is_never_an_unchanged_proof_root() {
     held.claude_usage_family_pending.insert(
         root.clone(),
         ClaudeUsageFamilyPending {
+            derived_request_members: std::collections::BTreeSet::new(),
             census_window_end: WINDOW.to_string(),
             member_request_id_hashes: BTreeMap::from([(
                 root.clone(),

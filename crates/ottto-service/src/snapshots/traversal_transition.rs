@@ -410,6 +410,7 @@ mod tests {
         index.claude_usage_family_pending.insert(
             "private-session".into(),
             super::super::ClaudeUsageFamilyPending {
+                derived_request_members: std::collections::BTreeSet::new(),
                 census_window_end: T0.into(),
                 member_request_id_hashes: Default::default(),
                 member_occurrences: Default::default(),
@@ -785,6 +786,7 @@ mod tests {
             plain.claude_usage_family_pending.insert(
                 "private-session".into(),
                 super::super::ClaudeUsageFamilyPending {
+                    derived_request_members: std::collections::BTreeSet::new(),
                     census_window_end: T0.into(),
                     member_request_id_hashes: Default::default(),
                     member_occurrences: Default::default(),

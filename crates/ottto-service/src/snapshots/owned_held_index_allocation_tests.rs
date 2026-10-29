@@ -41,6 +41,7 @@ fn synthetic_index(roots: usize) -> ScanIndex {
     };
     for root in 0..roots {
         let mut pending = ClaudeUsageFamilyPending {
+            derived_request_members: std::collections::BTreeSet::new(),
             census_window_end: WINDOW.to_string(),
             member_request_id_hashes: BTreeMap::new(),
             member_occurrences: BTreeMap::new(),
