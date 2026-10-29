@@ -144,3 +144,14 @@ due Audit and genuine rearm controls remain. The inherited virtual-to-marker
 deadline conversion remains E1's follow-up, with no stronger due guarantee.
 Native post-memo backward-touch and changed-sample controls accompany portable
 selector/counter and replacement/identity/evidence controls.
+
+
+## Round27 accepted birth-clamp identity boundary
+
+APFS birth-clamp continuation accepts an object with an identical [device,inode], length, bounded samples and evidence whose birth moved down to its mtime. A reused-inode replacement crafted to match all of these (unsampled interior differing) would inherit the withheld memo until binding or real change. APFS does not reuse inode numbers in normal operation; Linux cannot produce the signature. Counted by withheld_birth_clamp_accepted.
+The effect is a withheld memo Skip until binding or a real change, never a wrong upload; no unprivileged continuity witness is available (`st_gen` needs root). No ACK, census or money credit is granted.
+
+The generation control compares a forward birth change; it does not prove an
+unconditional reused-inode fence across the accepted backwards-clamp signature.
+This disclosure follows the approved observable conjunction; production logic and
+all test assertions are unchanged.

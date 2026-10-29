@@ -130,7 +130,8 @@ pub(super) fn content_stamp(
 }
 
 // Platform-neutral: compare the timestamps already normalized to unix nanos.
-// Linux normally keeps birth constant; no platform-specific weaker fence.
+// Linux keeps birth constant; the conjunction is platform-neutral. Reused
+// object ids with every accepted clamp input matching remain indistinguishable.
 fn birth_clamp_continues(before: Seen, after: Seen, modified: u64) -> bool {
     before.object[..2] == after.object[..2]
         && before.size_bytes == after.size_bytes
@@ -806,8 +807,12 @@ mod tests {
             content_stamp(100_000, Some(&touch), &samples).as_deref(),
             Some(original.as_str())
         );
-        // Simulated delete/recreate: all sampled inputs and object id reused,
-        // only the generation differs. No filesystem inode-allocation luck.
+        // Simulated delete/recreate with FORWARD birth movement (5 -> 50):
+        // equal samples/object id still produce different Seen values. This
+        // comparison is not a universal reused-inode fence: the selector accepts
+        // a backwards birth==mtime clamp when device/inode, length, bounded
+        // samples and evidence all match, even for an indistinguishable reused
+        // object id. This control does not exercise that accepted exception.
         let recreated = OpenedObjectStat {
             birth_nanos: Some(50),
             ..stat

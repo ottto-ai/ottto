@@ -532,6 +532,9 @@ mtime, changed identity/content/evidence or unavailable identity keep the
 existing fences and counted acquisition paths. This avoids parse/line delivery;
 existing bounded identity samples remain. No new persisted state or read occurs.
 
+Known gap: APFS birth-clamp continuation accepts an object with an identical [device,inode], length, bounded samples and evidence whose birth moved down to its mtime. A reused-inode replacement crafted to match all of these (unsampled interior differing) would inherit the withheld memo until binding or real change. APFS does not reuse inode numbers in normal operation; Linux cannot produce the signature. Counted by withheld_birth_clamp_accepted.
+The effect is a withheld memo Skip until binding or a real change, never a wrong upload; no unprivileged continuity witness is available (`st_gen` needs root). No ACK, census or money credit is granted.
+
 Virtual N1 audit delay applies only to an aged grown key admitted solely by the
 grown-since-committed retention arm. A recent grown key keeps main's immediate
 TranscriptChanged selection. At its retained due time, the aged key takes the
