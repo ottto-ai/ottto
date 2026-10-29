@@ -72,6 +72,18 @@ const CODEX_ZST_CAUSES: usize = CodexZstCause::__Count as usize;
 static CODEX_ZST_REFUSED: [AtomicU64; CODEX_ZST_CAUSES] =
     [const { AtomicU64::new(0) }; CODEX_ZST_CAUSES];
 
+pub(crate) fn codex_held_growth(bytes: u64, over_cap: u64) {
+    traversal_point(
+        "codex_held_growth",
+        "codex",
+        &BTreeMap::from([
+            ("held_growth_bytes", bytes),
+            ("held_growth_files", u64::from(bytes != 0)),
+            ("held_over_cap", over_cap),
+        ]),
+    );
+}
+
 pub(crate) fn codex_zst_refused(cause: CodexZstCause) {
     let counter = &CODEX_ZST_REFUSED[cause as usize];
     let previous = counter

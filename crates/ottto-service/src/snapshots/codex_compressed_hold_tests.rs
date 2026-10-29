@@ -14,7 +14,7 @@ pub(super) fn opening(path: &Path) {
         )
     });
 }
-fn no_open<T>(path: &Path, run: impl FnOnce() -> T) -> T {
+pub(super) fn no_open<T>(path: &Path, run: impl FnOnce() -> T) -> T {
     struct Reset;
     impl Drop for Reset {
         fn drop(&mut self) {
@@ -23,6 +23,20 @@ fn no_open<T>(path: &Path, run: impl FnOnce() -> T) -> T {
     }
     DENY_OPEN.with(|s| s.replace(Some(path.to_owned())));
     let _reset = Reset;
+    run()
+}
+thread_local! { static FILE_CAP: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) }; }
+pub(super) fn file_cap() -> Option<u64> {
+    FILE_CAP.with(std::cell::Cell::get)
+}
+pub(super) fn with_file_cap<T>(cap: Option<u64>, run: impl FnOnce() -> T) -> T {
+    struct Reset(Option<u64>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FILE_CAP.with(|slot| slot.set(self.0));
+        }
+    }
+    let _reset = Reset(FILE_CAP.with(|slot| slot.replace(cap)));
     run()
 }
 const PARENT: &str = "ffffffff-bbbb-4ccc-8ddd-eeeeeeeeeeee";

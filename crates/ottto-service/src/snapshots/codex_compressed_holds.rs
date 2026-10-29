@@ -1,6 +1,28 @@
 //! Dedicated non-red custody; no acquisition or ACK authority.
 use super::*;
 
+/// Called with existing walk metadata; repeated observations are not unique bytes.
+pub(super) fn observe_growth(
+    source: SnapshotSource,
+    files: &BTreeMap<String, ScanIndexEntry>,
+    path: &Path,
+    length: u64,
+) {
+    let Some(entry) = files
+        .get(&local_index_key(path))
+        .filter(|entry| source == SnapshotSource::Codex && entry.codex_compressed_hold.is_some())
+    else {
+        return;
+    };
+    if !is_compressed_codex_rollout(Some(path), None) {
+        let bytes = length.saturating_sub(entry.size_bytes);
+        let over_cap = u64::from(length > max_jsonl_file_bytes(source));
+        if bytes != 0 || over_cap != 0 {
+            crate::local_resource_diagnostics::codex_held_growth(bytes, over_cap);
+        }
+    }
+}
+
 pub(super) fn deserialize_hold<'de, D: serde::Deserializer<'de>>(
     de: D,
 ) -> Result<Option<CodexZstCause>, D::Error> {

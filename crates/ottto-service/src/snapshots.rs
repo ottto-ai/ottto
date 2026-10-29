@@ -26851,26 +26851,6 @@ impl OwnedSourceScan {
                     if !done {
                         pending!();
                     }
-                    if inventory.custody_incomplete
-                        || index
-                            .files
-                            .values()
-                            .any(|entry| entry.codex_compressed_hold.is_some())
-                    {
-                        inventory.complete = false;
-                        if let Some(traversal) = index.traversal.as_mut() {
-                            for candidate in identified_candidates.drain(..) {
-                                traversal.pending_candidates.push_back(ScanTraversalPath {
-                                    scan_root: candidate.scan_root,
-                                    path: candidate.path,
-                                    census_member: true,
-                                    watcher_hint: false,
-                                });
-                            }
-                        }
-                        codex_join_prepared = true;
-                        pending!();
-                    }
                     let unresolved = &inventory.held_owners;
                     residue_blocked_session_ids.extend(unresolved.iter().cloned());
                     codex_state_only_blocked_session_ids.extend(unresolved.iter().cloned());
@@ -41513,6 +41493,7 @@ fn refresh_retained_codex_roster(
                 .ok()
                 .and_then(unix_seconds)
                 .unwrap_or_default();
+            codex_compressed_holds::observe_growth(source, retention.files, &path, metadata.len());
             if !retention.owes(&path)
                 && census_unix_seconds.is_some_and(|now| {
                     !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
@@ -41848,6 +41829,7 @@ fn advance_bounded_directory_traversal_with_budget(
                 .ok()
                 .and_then(unix_seconds)
                 .unwrap_or_default();
+            codex_compressed_holds::observe_growth(source, retention.files, &path, metadata.len());
             if !retention.owes(&path)
                 && census_unix_seconds.is_some_and(|now| {
                     !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
@@ -41942,6 +41924,7 @@ fn candidate_from_traversal_path_at(
     backfill_window_days: u64,
     retention: DiscoveryRetention<'_>,
 ) -> Option<CandidateFile> {
+    let files = retention.files;
     if source == SnapshotSource::Codex
         && files
             .get(&local_index_key(&pending.path))
@@ -42275,6 +42258,8 @@ fn is_recent_enough_at(
 /// its age while owed, so reconciliation never prunes it; its growth takes the
 /// counted Tail path; only a validated catch-up or a proven, counted removal
 /// releases it; it is never a Full cause. File-size caps still apply.
+/// This view bypasses age/window rejection only: no audit, sample or Full grant.
+/// E2 custody observes growth stat-only until its owner validates Tail catch-up.
 /// Source-agnostic (the Claude walk, candidate and open gates, the Codex roster
 /// and `codex_parent_outside_window`). Register a source with its field, its
 /// line in `discovery_retention!` and `unverified`, and its line in `owes`.
@@ -42291,6 +42276,8 @@ impl<'a> DiscoveryRetention<'a> {
     fn owes(&self, path: &Path) -> bool {
         sampled_audit::path_requires_verification(self.files, path)
             || self.account_holds.contains_key(&local_index_key(path))
+            // E2: correctness custody owes stat-only growth until counted release.
+            || self.files.get(&local_index_key(path)).is_some_and(|entry| entry.codex_compressed_hold.is_some())
     }
 
     /// An oversized withheld-account key stays observed, never opened; its
@@ -42348,6 +42335,10 @@ fn effective_backfill_window_days(requested_backfill_window_days: u64) -> u64 {
 }
 
 fn max_jsonl_file_bytes(source: SnapshotSource) -> u64 {
+    #[cfg(test)]
+    if let (SnapshotSource::Codex, Some(cap)) = (source, codex_compressed_hold_tests::file_cap()) {
+        return cap;
+    }
     match source {
         SnapshotSource::Codex => MAX_CODEX_JSONL_FILE_BYTES,
         SnapshotSource::ClaudeCode | SnapshotSource::Pi => MAX_JSONL_FILE_BYTES,
@@ -42505,6 +42496,7 @@ fn open_and_identify_scan_candidate_with_rescue(
     verification_rescue: bool,
     cache: Option<&sampled_scan::SharedCache>,
 ) -> Option<(CandidateFile, File)> {
+    let files = retention.files;
     if source == SnapshotSource::Codex
         && files
             .get(&local_index_key(&candidate.path))
