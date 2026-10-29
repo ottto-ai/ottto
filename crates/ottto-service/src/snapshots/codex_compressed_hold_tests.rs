@@ -786,7 +786,7 @@ fn shared_history_is_paged_with_inline_current_owner_flags_and_bound_plus_one() 
     assert_eq!(steps, 2049);
     assert_eq!(inv.headers.len(), 1);
     assert!(inv.headers[0].custody_cause.is_none());
-    assert_eq!(inv.custody_peak, 16384);
+    assert_eq!(inv.custody_peak, codex_compressed_holds::OWNER_LOOKUP_SLACK);
     let sample = inv.headers[0].clone();
     inv.headers
         .resize(codex_file_join::MAX_HEADER_FILES + 1, sample);
@@ -1095,7 +1095,7 @@ fn unattributed_hold_lookup_pages_unheld_retained_entries_too() {
     );
     assert!(inv.member_held(&plain.with_extension("jsonl.zst")));
     assert!(inv.complete_for(Some(&PARENT.to_owned())));
-    assert_eq!(inv.custody_peak, 16384);
+    assert_eq!(inv.custody_peak, codex_compressed_holds::OWNER_LOOKUP_SLACK);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -1269,6 +1269,7 @@ fn unattributed_opaque_filename_uses_retained_counting_binding_as_negative_scope
         assert!(witness.is_some());
         latch(&mut index, &held);
         index.codex_state_only_blocked_by_file.clear();
+        assert!(index.codex_state_only_blocked_session_ids.is_empty());
         let smaller = held.with_file_name("b.jsonl");
         fs::write(
             &smaller,
@@ -1283,14 +1284,50 @@ fn unattributed_opaque_filename_uses_retained_counting_binding_as_negative_scope
             fs::remove_file(&held).unwrap();
         }
         let saved = root.join("index.json");
-        for _ in 0..2 {
+        for pass in 0..2 {
             index.traversal = None;
-            let (mut next, result) = no_open(&held, || normal(&root, index, &[]));
+            let mut scan = OwnedSourceScan::new(
+                SnapshotSource::Codex,
+                &[root.join("sessions")],
+                index,
+                "2026-10-06T23:00:00Z",
+                7,
+                10,
+                false,
+                None,
+                &[],
+                false,
+                false,
+            );
+            scan.state_census_complete = true;
+            scan.sidecar_census_complete = true;
+            for id in [OWNER, "cccccccc-dddd-4eee-8fff-aaaaaaaaaaaa"] {
+                scan.codex_title_metadata.state_threads.insert(
+                    id.to_owned(),
+                    CodexStateThread {
+                        tokens_used: 1000,
+                        updated_at: Some("2026-10-06T00:00:00Z".into()),
+                        ..Default::default()
+                    },
+                );
+            }
+            let (mut next, result) = no_open(&held, || run(scan));
             assert_eq!(result.unreadable_path_count, 0);
             assert!(result
                 .snapshots
                 .iter()
-                .all(|s| s.source_session_id == PARENT));
+                .all(|s| s.source_session_id != OWNER));
+            assert!(result
+                .snapshots
+                .iter()
+                .any(|s| s.source_session_id == "cccccccc-dddd-4eee-8fff-aaaaaaaaaaaa"));
+            if pass == 0 {
+                assert!(result
+                    .snapshots
+                    .iter()
+                    .any(|s| s.source_session_id == PARENT));
+                fs::remove_file(&smaller).unwrap();
+            }
             assert!(next.files[&local_index_key(&unrelated)]
                 .last_snapshot_fingerprint
                 .is_some());

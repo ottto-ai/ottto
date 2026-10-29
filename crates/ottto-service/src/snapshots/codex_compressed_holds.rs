@@ -1,6 +1,8 @@
 //! Dedicated non-red custody; no acquisition or ACK authority.
 use super::*;
 
+pub(super) const OWNER_LOOKUP_SLACK: usize = 16384 + 2 * codex_file_join::MAX_HEADER_BYTES;
+
 /// Called with existing walk metadata; repeated observations are not unique bytes.
 pub(super) fn observe_growth(
     source: SnapshotSource,
@@ -112,7 +114,7 @@ impl codex_file_join::HeaderInventory {
             // Fixed cursor/temporary slack: no historical population allocation.
             let mut cost =
                 crate::heap_layout_bound::Counter::new(crate::source_rotation::PARKED_BUDGET);
-            if cost.add(16384).is_none() {
+            if cost.add(OWNER_LOOKUP_SLACK).is_none() {
                 self.refuse_custody();
             }
             self.custody_peak = cost.bytes;
@@ -123,10 +125,10 @@ impl codex_file_join::HeaderInventory {
                 let owners = index.codex_state_only_blocked_by_file.get(key);
                 if let Some(binding) = entry.codex_counting_owner.as_deref().filter(|binding| {
                     valid_codex_protected_owner(binding)
-                        && !owners
-                            .into_iter()
-                            .flatten()
-                            .any(|owner| codex_protected_owner(owner) == *binding)
+                        && !owners.into_iter().flatten().any(|owner| {
+                            owner.len() <= codex_file_join::MAX_HEADER_BYTES
+                                && codex_protected_owner(owner) == *binding
+                        })
                 }) {
                     // Negative accepted-owner scope, one current owner per step;
                     // no retained-roster rescan, new map or fresh proof/ACK.

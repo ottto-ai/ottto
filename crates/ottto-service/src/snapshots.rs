@@ -32650,20 +32650,60 @@ fn append_codex_state_only_snapshots(
         })
         .collect();
     let mut scanned_session_count = 0;
+    // This collection only vetoes state totals, never grants history proof.
+    let negative_scope = |entry: &ScanIndexEntry| {
+        entry.codex_history_is_protected()
+            || (entry.codex_compressed_hold.is_some() && entry.codex_counting_owner.is_some())
+    };
+    if index
+        .files
+        .values()
+        .any(|entry| entry.codex_compressed_hold.is_some() && entry.codex_counting_owner.is_some())
+    {
+        use crate::heap_layout_bound::HeapLayoutBound;
+        let count = index
+            .files
+            .values()
+            .filter(|entry| negative_scope(entry))
+            .count();
+        let mut peak =
+            crate::heap_layout_bound::Counter::new(crate::source_rotation::PARKED_BUDGET);
+        let funded = (|| {
+            // Include the sets already resident while adding the borrowed refs.
+            blocked_session_ids.heap_bound(&mut peak)?;
+            covered_session_ids.heap_bound(&mut peak)?;
+            covered_in_prior_runs.heap_bound(&mut peak)?;
+            crate::heap_layout_bound::tree_nodes::<&String, ()>(count, &mut peak)?;
+            peak.add(count.saturating_mul(4 * std::mem::size_of::<&ScanIndexEntry>()))
+        })();
+        if funded.is_none() {
+            crate::local_resource_diagnostics::codex_zst_held(CodexZstCause::AdmissionRefused);
+            return (0, 0);
+        }
+    }
     let protected = index
         .files
         .values()
-        .filter(|entry| entry.codex_history_is_protected())
+        .filter(|entry| negative_scope(entry))
         .collect::<Vec<_>>();
-    let unknown_protected_owner = protected.iter().any(|entry| {
-        entry
-            .codex_protected_owner
-            .as_ref()
-            .map_or(true, |owner| !valid_codex_protected_owner(owner))
-    });
+    let unknown_protected_owner = protected
+        .iter()
+        .filter(|entry| entry.codex_history_is_protected())
+        .any(|entry| {
+            entry
+                .codex_protected_owner
+                .as_ref()
+                .map_or(true, |owner| !valid_codex_protected_owner(owner))
+        });
     let protected_owners = protected
         .iter()
-        .filter_map(|entry| entry.codex_protected_owner.as_ref())
+        .filter_map(|entry| {
+            if entry.codex_history_is_protected() {
+                entry.codex_protected_owner.as_ref()
+            } else {
+                entry.codex_counting_owner.as_ref()
+            }
+        })
         .collect::<BTreeSet<_>>();
     for (source_session_id, thread) in &metadata.state_threads {
         if thread.tokens_used == 0
