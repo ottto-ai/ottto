@@ -2901,7 +2901,7 @@ fn withheld_new_completed_checkpoint_requires_positive_absence() {
         append(&path, &assistant_line("held-new"));
         let previous = ScanIndex::default();
         let (parsed, scan, _) = finish(new_scan(&root.projects(), previous.clone()));
-        let held = crate::snapshot_sync::settle_withheld_for_test(&previous, parsed, scan);
+        let mut held = crate::snapshot_sync::settle_withheld_for_test(&previous, parsed, scan);
         assert!(!held.files.contains_key(&key));
         assert!(held.claude_account_deferred_holds.contains_key(&key));
         let checkpoint = root.0.join("hold-only.json");

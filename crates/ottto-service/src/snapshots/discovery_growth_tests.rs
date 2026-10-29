@@ -101,7 +101,8 @@ impl Fixture {
     }
     fn save_and_report(&self, index: &ScanIndex, scan: &SourceScanResult) -> Value {
         let path = self.root.join("index.json");
-        index.save(&path).unwrap();
+        let mut checkpoint = index.clone();
+        checkpoint.save(&path).unwrap();
         let saved = ScanIndex::load(&path).unwrap();
         let (_, rows) = capture(|| scan.report_discovery_growth_after_save(&saved));
         assert_eq!(rows.len(), 1, "one saved-page observation row");
