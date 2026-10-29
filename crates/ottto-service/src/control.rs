@@ -32024,13 +32024,38 @@ X-API-Key = "otel_redacted"
         let addr = listener.local_addr().unwrap();
         assert_eq!(addr.port(), old, "old port precedes the free default port");
         let daemon = daemon().with_account(connected_account());
+        let connected = ottto_protocol::RelayState {
+            state: ottto_protocol::RelayRuntimeState::Connected,
+            endpoint: Some(format!("http://{addr}")),
+            last_connected_at: None,
+            last_error: None,
+        };
+        daemon
+            .set_relay_state_for_trusted_client(connected.clone())
+            .unwrap();
+        // A listener failure between sightings ends the streak: recovery to the
+        // same mismatch needs two fresh sightings again.
+        assert!(daemon
+            .status_for_trusted_client()
+            .unwrap()
+            .relay
+            .last_error
+            .is_none());
         daemon
             .set_relay_state_for_trusted_client(ottto_protocol::RelayState {
-                state: ottto_protocol::RelayRuntimeState::Connected,
+                state: ottto_protocol::RelayRuntimeState::Failed,
                 endpoint: Some(format!("http://{addr}")),
                 last_connected_at: None,
-                last_error: None,
+                last_error: Some(StableMessage {
+                    code: "relay_listener_failed".into(),
+                    text: "listener failed".into(),
+                }),
             })
+            .unwrap();
+        let failed = daemon.status_for_trusted_client().unwrap().relay;
+        assert_eq!(failed.last_error.unwrap().code, "relay_listener_failed");
+        daemon
+            .set_relay_state_for_trusted_client(connected)
             .unwrap();
         let first = daemon.status_for_trusted_client().unwrap().relay;
         assert!(first.last_error.is_none(), "one sighting is not reported");

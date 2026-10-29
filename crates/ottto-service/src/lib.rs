@@ -645,11 +645,11 @@ impl LocalDaemon {
             // Keep it only for the relay this status reports. It enters the one
             // canonical projection, so a set or cleared blocker gets the same
             // revision and an upload can never clear with a lower one.
-            let finding = if state.relay == relay && state.relay.last_error.is_none() {
-                self.relay_mismatch.observe(observed)
-            } else {
-                None
-            };
+            // A relay error or a relay change between the locks also ends the
+            // streak, so a recovered listener starts a fresh one.
+            let finding = self.relay_mismatch.observe(
+                observed.filter(|_| state.relay == relay && state.relay.last_error.is_none()),
+            );
             status_from_state_with_relay_finding(&state, finding)
         };
         if snapshots::claude_native_comparison::enabled() {
