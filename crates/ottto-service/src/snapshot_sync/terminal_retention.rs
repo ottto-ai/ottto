@@ -6,6 +6,7 @@ const ACK_AGE_MEMO_MAX: usize = 65_536;
 struct AckAges {
     // Hash of destination, entity and exact body; never raw identifiers/logs.
     first: BTreeMap<[u8; 32], u64>,
+    order: VecDeque<[u8; 32]>,
 }
 fn key(destination: &str, entity: &str, body: &str) -> [u8; 32] {
     use sha2::Digest;
@@ -18,11 +19,19 @@ fn key(destination: &str, entity: &str, body: &str) -> [u8; 32] {
 }
 impl AckAges {
     fn accept(&mut self, key: [u8; 32], now: u64) {
-        if self.first.len() < ACK_AGE_MEMO_MAX || self.first.contains_key(&key) {
-            self.first.entry(key).or_insert(now);
+        if self.first.contains_key(&key) {
+            return;
         }
-        // Beyond the bounded diagnostic memo, age remains explicitly unknown.
-        // The accepted ledger itself is unchanged and never evicted here.
+        if self.first.len() == ACK_AGE_MEMO_MAX {
+            if let Some(oldest) = self.order.pop_front() {
+                self.first.remove(&oldest);
+            }
+        }
+        self.first.insert(key, now);
+        self.order.push_back(key);
+        // A newly ACKed exact body always gets its real acceptance time.
+        // Eviction makes an older diagnostic age unknown; it never evicts an
+        // accepted ledger entry, settles debt or drives an age-based decision.
     }
     fn gauge(&self, keys: impl Iterator<Item = [u8; 32]>, now: u64) -> (Option<u64>, usize) {
         let (mut oldest, mut unknown) = (None, 0usize);
@@ -95,5 +104,15 @@ mod tests {
         assert_eq!(AckAges::default().gauge([new].into_iter(), 140), (None, 1));
         assert_ne!(new, key("C", "new", "body"));
         assert_ne!(new, key("D", "new", "changed"));
+        for number in 0..ACK_AGE_MEMO_MAX {
+            let mut next = [0; 32];
+            next[..8].copy_from_slice(&(number as u64).to_le_bytes());
+            memo.accept(next, 200);
+        }
+        let newest = key("D", "after-cap", "body");
+        memo.accept(newest, 300);
+        assert_eq!(memo.first.len(), ACK_AGE_MEMO_MAX);
+        assert_eq!(memo.order.len(), ACK_AGE_MEMO_MAX);
+        assert_eq!(memo.gauge([newest, new].into_iter(), 310), (Some(10), 1));
     }
 }
