@@ -29037,6 +29037,9 @@ impl OwnedSourceScan {
                 };
                 if source == SnapshotSource::Codex
                     && side_origin.is_none()
+                    && parsed_file.codex_parent_ledger_consulted
+                    && (parsed_file.codex_parent_resolution_pending
+                        || parsed_file.codex_parent_unresolvable.is_some())
                     && parsed_file
                         .codex_parent_session_ref
                         .as_deref()
@@ -29068,9 +29071,12 @@ impl OwnedSourceScan {
                         for owner in &owners {
                             inventory.mark_custody_owner(owner, CodexZstCause::ParentLedgerUnbound);
                         }
-                        inventory
-                            .headers
-                            .sort_unstable_by(|a, b| a.candidate.path.cmp(&b.candidate.path));
+                        inventory.headers.sort_unstable_by(|a, b| {
+                            a.candidate
+                                .path
+                                .as_os_str()
+                                .cmp(b.candidate.path.as_os_str())
+                        });
                         inventory.hold_custodied_siblings(index);
                     }
                     codex_state_only_blocked_session_ids.extend(owners);

@@ -1686,3 +1686,47 @@ fn missing_held_path_still_blocks_new_same_owner_member() {
         .is_some());
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn proven_local_fork_boundaries_publish_without_parent_custody() {
+    for ordinal in [false, true] {
+        let root = crate::test_scratch::private_dir("custody-local-boundary");
+        let child = member(&root, "sessions", OWNER, false);
+        let parent = member(&root, "sessions", PARENT, true);
+        let mut rows = codex_file_join::tests::member(OWNER, "local", 100, 100);
+        rows[0]["payload"]["forked_from_id"] = json!(PARENT);
+        if ordinal {
+            rows[0]["payload"]["subagent_history_start_ordinal"] = json!(1);
+            for (n, row) in rows.iter_mut().enumerate() {
+                row["ordinal"] = json!(n);
+            }
+        } else {
+            rows[0]["payload"]["history_base"] = json!({"cursor":"external"});
+        }
+        fs::write(
+            &child,
+            rows.iter()
+                .map(|v| v.to_string() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+        let mut index = ScanIndex::default();
+        seed_archive(&mut index, &parent, PARENT);
+        let inv = inventory(&root, &[child.clone(), parent.clone()], &mut index);
+        let mut scan = staged(&root, index, std::slice::from_ref(&child));
+        scan.index
+            .traversal
+            .as_mut()
+            .unwrap()
+            .codex_rollout_paths
+            .insert(local_index_key(&parent));
+        scan.codex_join_inventory = Some(inv);
+        let (index, result) = run(scan);
+        assert_eq!(result.snapshots.len(), 1);
+        assert!(result.snapshots[0].input_tokens > 0);
+        assert!(index.files[&local_index_key(&child)]
+            .codex_compressed_hold
+            .is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+}
