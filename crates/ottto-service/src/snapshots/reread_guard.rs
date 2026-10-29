@@ -328,6 +328,13 @@ impl State {
     pub(super) fn needs_save(&self) -> bool {
         self.reservations.values().any(|r| !r.saved)
     }
+    pub(super) fn upgrade_claimed(&self, key: &str) -> bool {
+        !self.closed
+            && self
+                .reservations
+                .get(&KeyHash::of(key))
+                .is_some_and(|r| r.upgrade && r.saved && r.claimed)
+    }
     fn saved(&mut self) {
         for r in self.reservations.values_mut() {
             r.saved = true;

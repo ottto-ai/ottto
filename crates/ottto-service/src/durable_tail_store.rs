@@ -289,6 +289,13 @@ pub(crate) struct DurableRecord {
     pub(crate) format: u16,
 }
 
+/// Exact verified predecessor; no caller can manufacture or clone its authority.
+pub(crate) struct MutationWitness {
+    key: Digest32,
+    content: Digest32,
+    stamp: Stamp,
+}
+
 /// Preservation classes: unknown representations (U) precede known corruption (T14).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Refusal {
@@ -696,19 +703,66 @@ impl DurableTailStore {
 
     /// Only a fully verified original binding may authorize a Claude mutation.
     pub(crate) fn authorize(&mut self, record: &DurableRecord, expected: &Expected) {
+        self.revoke(&record.record.binding.key);
+        if let Some(proof) = self.mutation_witness(record, expected) {
+            self.authorize_witness(record, expected, &proof);
+        }
+    }
+    pub(crate) fn mutation_witness(
+        &self,
+        record: &DurableRecord,
+        expected: &Expected,
+    ) -> Option<MutationWitness> {
         if record.eligible(expected).is_err()
             || record.record.binding.entry != expected.binding.entry
             || record.index_generation > expected.committed_generation
         {
-            return;
+            return None;
         }
         let key = record.record.binding.key;
         let digest = content_digest(&record.record);
-        let path = self.record_path(&key);
-        if let Some((Some(content), stamp, allowed)) = self.durable.get_mut(&key) {
-            *allowed = *content == digest
-                && fs::symlink_metadata(path).is_ok_and(|m| Stamp::of(&m) == *stamp);
+        let (Some(content), stamp, _) = self.durable.get(&key)? else {
+            return None;
+        };
+        let proof = MutationWitness {
+            key,
+            content: digest,
+            stamp: *stamp,
+        };
+        (*content == digest && self.witness_current(&proof)).then_some(proof)
+    }
+    pub(crate) fn witness_current(&self, proof: &MutationWitness) -> bool {
+        fs::symlink_metadata(self.record_path(&proof.key))
+            .is_ok_and(|m| Stamp::of(&m) == proof.stamp)
+    }
+    pub(crate) fn authorize_witness(
+        &mut self,
+        record: &DurableRecord,
+        expected: &Expected,
+        proof: &MutationWitness,
+    ) {
+        self.revoke(&record.record.binding.key);
+        if record.eligible(expected).is_err()
+            || record.record.binding.entry != expected.binding.entry
+            || record.index_generation > expected.committed_generation
+            || proof.key != record.record.binding.key
+            || proof.content != content_digest(&record.record)
+            || !self.witness_current(proof)
+        {
+            return;
         }
+        if self.durable.len() >= MAX_RECORDS && !self.durable.contains_key(&proof.key) {
+            let Some(key) = self
+                .durable
+                .iter()
+                .find_map(|(k, (_, _, allowed))| (!allowed).then_some(*k))
+            else {
+                return;
+            };
+            self.durable.remove(&key); // Never evict a current mutation permission.
+        }
+        self.durable
+            .insert(proof.key, (Some(proof.content), proof.stamp, true));
     }
     fn authorized(&mut self, key: &Digest32) -> bool {
         let allowed = self.source != DurableSource::ClaudeCode

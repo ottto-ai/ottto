@@ -32251,6 +32251,27 @@ impl OwnedSourceScan {
                 }
             }
             if let Some((context, (mode, audit_due))) = sampling.as_mut().zip(planned_mode) {
+                #[cfg(unix)]
+                if source == SnapshotSource::ClaudeCode
+                    && matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
+                    && index
+                        .reread_guard
+                        .upgrade_claimed(&local_index_key(&active.candidate.path))
+                {
+                    match context.cache.upgrade_read(
+                        &local_index_key(&active.candidate.path),
+                        active.parser.reader.reader.get_ref(),
+                    ) {
+                        Ok(Some(read)) => active.parser.reader.reader.put_upgrade(read),
+                        Ok(None) => {}
+                        Err(_) => {
+                            context
+                                .cache
+                                .durable_stale_hold(source, index, &active.candidate);
+                            pending!();
+                        }
+                    }
+                }
                 context.record_mode(mode, audit_due);
             }
             if let Some(delivery) = line_delivery.as_mut() {

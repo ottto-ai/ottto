@@ -74,6 +74,7 @@ pub(crate) struct Counters {
     pub(crate) retail_keys: u64,
     pub(crate) missing: u64,
     pub(crate) upgrade_state_missing: u64,
+    pub(crate) upgrade_claimed: u64,
     pub(crate) refused_record: u64,
     pub(crate) durable_held: [u64; 7],
     pub(crate) held_census: [u64; 2],
@@ -113,7 +114,7 @@ impl Counters {
         };
         format!(
             "ottto-service: durable_tail source={} restore_attempts={} restored={} original_v1_mapped={} durable_restore_after_selection_clear={} objects[same,unknown,changed]={:?} s2_skipped_object_changed={} missing={} \
-             retail_attempts={} retail_keys={} tail_read_bytes={} budget_refused_retail_old_bytes={} repeated_physical_old_bytes={} refused_record={} upgrade_state_missing={} ineligible={{{}}} certificate_refused={{{}}} corrupt_body={} \
+             retail_attempts={} retail_keys={} tail_read_bytes={} budget_refused_retail_old_bytes={} repeated_physical_old_bytes={} refused_record={} upgrade_state_missing={} upgrade_claimed={} upgrade_count_basis={} ineligible={{{}}} certificate_refused={{{}}} corrupt_body={} \
              not_rederived={{{}}} budget_refused={} rederive_head_bytes={} \
              rederive_named_lines={} rederive_line_bytes={} not_persisted={{{}}} \
              write_deferred={} write_unlocked={} peak_body_bytes={} disk_records={} disk_bytes={} \
@@ -138,6 +139,8 @@ impl Counters {
             retail_bytes(source, 1),
             self.refused_record,
             self.upgrade_state_missing,
+            self.upgrade_claimed,
+            if source == SnapshotSource::ClaudeCode { "native_read" } else { "legacy_claim" },
             classes(&self.ineligible),
             classes(&self.certificate_refused),
             self.corrupt_body,
@@ -206,10 +209,34 @@ pub(crate) struct Stores {
     selected: BTreeMap<String, String>,
     counters: Counters,
     // Source+key only: never clear on passes, scope changes or cache eviction.
-    retail_spent: BTreeMap<store::Digest32, (u64, std::time::Instant)>,
+    retail_spent: BTreeMap<store::Digest32, Box<KeyCustody>>,
+    upgrade_reads: std::sync::Arc<AtomicU64>,
+}
+
+#[derive(Default)]
+struct KeyCustody {
+    spent: Option<(u64, std::time::Instant)>,
+    original: Option<store::MutationWitness>,
+    upgrade_started: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+fn custody_node_bytes() -> Option<usize> {
+    crate::heap_layout_bound::tree_node_bytes::<store::Digest32, Box<KeyCustody>>()?
+        .checked_add(std::mem::size_of::<KeyCustody>() + std::mem::align_of::<KeyCustody>())?
+        .checked_add(64) // Both Arc payloads/headers/alignment, conservatively per node.
 }
 
 impl Stores {
+    fn fund_key(&mut self, key: store::Digest32) -> bool {
+        if custody_node_bytes().map_or(true, |n| n > 1024)
+            || (!self.retail_spent.contains_key(&key)
+                && self.retail_spent.len() >= store::MAX_RECORDS * 2)
+        {
+            Counters::bump(&mut self.counters.ineligible, "custody_unfunded");
+            return false;
+        }
+        self.retail_spent.entry(key).or_default();
+        true
+    }
     fn slot(&mut self, source: DurableSource) -> &mut Option<Slot> {
         match source {
             DurableSource::ClaudeCode => &mut self.claude,
@@ -543,6 +570,7 @@ fn retail_bytes(source: SnapshotSource, metric: usize) -> u64 {
 #[derive(Default)]
 pub(crate) struct DurableCustody {
     retail: Option<RetailAttempt>,
+    upgrade: Option<UpgradeRead>,
 }
 impl DurableCustody {
     pub(crate) fn take_retail(&mut self) -> Option<RetailAttempt> {
@@ -554,6 +582,44 @@ impl DurableCustody {
     }
     pub(crate) fn retail_mut(&mut self) -> Option<&mut RetailAttempt> {
         self.retail.as_mut()
+    }
+    pub(crate) fn put_upgrade(&mut self, read: UpgradeRead) {
+        assert!(
+            self.retail.is_none() && self.upgrade.is_none(),
+            "upgrade custody already attached"
+        );
+        self.upgrade = Some(read);
+    }
+    pub(crate) fn upgrade_mut(&mut self) -> Option<&mut UpgradeRead> {
+        self.upgrade.as_mut()
+    }
+}
+
+pub(crate) struct UpgradeRead {
+    object: (u64, u64, u64),
+    started: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    total: std::sync::Arc<AtomicU64>,
+}
+impl UpgradeRead {
+    pub(crate) fn read(&mut self, file: &mut File, bytes: &mut [u8]) -> std::io::Result<usize> {
+        use std::io::Read;
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        let m = file.metadata()?;
+        if (m.dev(), m.ino(), birth_unix_nanos(&m)) != self.object {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "upgrade object",
+            ));
+        }
+        let result = file.read(bytes);
+        if !self.started.swap(true, Ordering::Relaxed) {
+            self.total.fetch_add(1, Ordering::Relaxed);
+            #[cfg(test)]
+            tests::observe_upgrade_read();
+        }
+        result
     }
 }
 
@@ -644,6 +710,7 @@ fn authorize_strict(
     snapshot_source: SnapshotSource,
     key: &str,
     index: &ScanIndex,
+    prior: &mut Option<store::MutationWitness>,
 ) {
     slot.store
         .revoke(&store::key_digest(DurableSource::ClaudeCode, key));
@@ -666,7 +733,12 @@ fn authorize_strict(
         &slot.namespace,
     );
     if let Ok((expected, _)) = claude_expected(key, scope, index, &interpretation, &record) {
-        slot.store.authorize(&record, &expected);
+        if prior.is_none() {
+            *prior = slot.store.mutation_witness(&record, &expected);
+        }
+        if let Some(proof) = prior.as_ref() {
+            slot.store.authorize_witness(&record, &expected, proof);
+        }
     }
 }
 
@@ -682,9 +754,7 @@ impl SharedCache {
         accepted_end: u64,
         now: std::time::Instant,
     ) -> Result<RetailAttempt, RetailHold> {
-        if crate::heap_layout_bound::tree_node_bytes::<store::Digest32, (u64, std::time::Instant)>()
-            .is_none_or(|n| n > 1024)
-        {
+        if custody_node_bytes().is_none_or(|n| n > 1024) {
             return Err(RetailHold::AccountingLost);
         }
         let c = checkpoint
@@ -696,7 +766,7 @@ impl SharedCache {
         let source = durable_source(source).ok_or(RetailHold::Ineligible)?;
         let key = store::key_digest(source, key);
         let mut stores = self.durable().ok_or(RetailHold::AccountingLost)?;
-        if let Some((high, spent)) = stores.retail_spent.get(&key) {
+        if let Some((high, spent)) = stores.retail_spent.get(&key).and_then(|c| c.spent.as_ref()) {
             if now < *spent {
                 Counters::bump(&mut stores.counters.ineligible, "retail_clock_rollback");
                 return Err(RetailHold::AccountingLost);
@@ -708,7 +778,9 @@ impl SharedCache {
                 );
                 return Err(RetailHold::Exhausted);
             }
-        } else if stores.retail_spent.len() >= store::MAX_RECORDS * 2 {
+        } else if !stores.retail_spent.contains_key(&key)
+            && stores.retail_spent.len() >= store::MAX_RECORDS * 2
+        {
             Counters::bump(
                 &mut stores.counters.ineligible,
                 "retail_accounting_overflow",
@@ -719,10 +791,13 @@ impl SharedCache {
             Counters::bump(&mut stores.counters.ineligible, "retail_range_ineligible");
             return Err(RetailHold::Ineligible);
         }
-        let first = !stores.retail_spent.contains_key(&key);
+        if !stores.fund_key(key) {
+            return Err(RetailHold::AccountingLost);
+        }
+        let first = stores.retail_spent[&key].spent.is_none();
         stores.counters.retail_keys += u64::from(first);
         stores.counters.retail_attempts += 1;
-        stores.retail_spent.insert(key, (end, now));
+        stores.retail_spent.get_mut(&key).expect("funded").spent = Some((end, now));
         Ok(RetailAttempt {
             source,
             object: (c.device, c.inode, c.birth_nanos),
@@ -845,8 +920,39 @@ impl SharedCache {
         {
             return true;
         }
-        stores.counters.upgrade_state_missing += u64::from(consume);
+        stores.counters.upgrade_claimed += u64::from(consume);
+        // Codex retains its existing claim-based observation until its owned slice.
+        stores.counters.upgrade_state_missing +=
+            u64::from(consume && source == SnapshotSource::Codex);
         false
+    }
+
+    pub(in crate::snapshots) fn upgrade_read(
+        &self,
+        key: &str,
+        file: &File,
+    ) -> Result<Option<UpgradeRead>, RetailHold> {
+        let key = store::key_digest(DurableSource::ClaudeCode, key);
+        let mut stores = self.durable().ok_or(RetailHold::AccountingLost)?;
+        if !stores.claude.as_ref().is_some_and(|s| s.store.absent(&key)) {
+            return Ok(None);
+        }
+        if !stores.fund_key(key) {
+            return Err(RetailHold::AccountingLost);
+        }
+        let m = file.metadata().map_err(|_| RetailHold::Ineligible)?;
+        let started = stores
+            .retail_spent
+            .get_mut(&key)
+            .expect("funded")
+            .upgrade_started
+            .get_or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+            .clone();
+        Ok(Some(UpgradeRead {
+            object: (m.dev(), m.ino(), birth_unix_nanos(&m)),
+            started,
+            total: stores.upgrade_reads.clone(),
+        }))
     }
 
     /// Q11 capacity/exhaustion is disclosed stale custody, never an integrity failure.
@@ -1096,6 +1202,17 @@ impl SharedCache {
         };
         if let Some(slot) = stores.slot(source).as_mut() {
             slot.store.authorize(&record, &expected);
+        }
+        if source == DurableSource::ClaudeCode && stores.fund_key(store_key) {
+            let proof = stores
+                .claude
+                .as_ref()?
+                .store
+                .mutation_witness(&record, &expected);
+            let custody = stores.retail_spent.get_mut(&store_key)?;
+            if custody.original.is_none() {
+                custody.original = proof;
+            }
         }
         stores.counters.rederive_head_bytes += receipt.head_bytes;
         REDERIVE_HEAD_BYTES[source as usize].fetch_add(receipt.head_bytes, Ordering::Relaxed);
@@ -1351,19 +1468,64 @@ impl SharedCache {
         for class in not_persisted {
             Counters::bump(&mut counters.not_persisted, class);
         }
-        let slot = stores.slot(source).as_mut()?;
         if source == DurableSource::ClaudeCode {
             for key in offered.values() {
-                authorize_strict(slot, snapshot_source, key, index);
+                let digest = store::key_digest(source, key);
+                if !stores.fund_key(digest) {
+                    stores.claude.as_mut()?.store.revoke(&digest);
+                    continue;
+                }
+                let stores = &mut *stores;
+                authorize_strict(
+                    stores.claude.as_mut()?,
+                    snapshot_source,
+                    key,
+                    index,
+                    &mut stores.retail_spent.get_mut(&digest)?.original,
+                );
             }
         }
+        let slot = stores.slot(source).as_mut()?;
         if !invalidate.is_empty() {
             let _ = slot.store.remove_keys(writer, &invalidate);
         }
-        let receipt = slot
+        let receipt = match slot
             .store
             .write_after_save(writer, index.generation, pending)
-            .ok()?;
+        {
+            Ok(receipt) => receipt,
+            Err(_) => {
+                for key in offered
+                    .values()
+                    .filter(|_| source == DurableSource::ClaudeCode)
+                {
+                    if let Some(entry) = index.files.get(key) {
+                        stores
+                            .selected
+                            .insert(key.clone(), entry.source_file_fingerprint.clone());
+                        stores.touched.insert(key.clone());
+                    }
+                }
+                return None;
+            }
+        };
+        if source == DurableSource::ClaudeCode {
+            let stores = &mut *stores;
+            for digest in offered.keys() {
+                if let Some(c) = stores.retail_spent.get_mut(digest) {
+                    if c.original.as_ref().is_some_and(|p| {
+                        !stores
+                            .claude
+                            .as_ref()
+                            .expect("slot")
+                            .store
+                            .witness_current(p)
+                    }) {
+                        c.original = None;
+                    }
+                }
+            }
+        }
         // Records past the batch limit are offered again after the next save.
         for key in &receipt.deferred_keys {
             if let Some(key) = offered.remove(key) {
@@ -1516,6 +1678,7 @@ impl SharedCache {
         struct Alarm {
             held_keys: [u64; 2],
             upgrade_state_missing: [u64; 2],
+            upgrade_count_basis: &'static str,
             t14_rebuild: [u64; 2],
             mode_repaired: [u64; 2],
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -1527,7 +1690,11 @@ impl SharedCache {
         let Some(mut stores) = self.durable() else {
             return;
         };
-        let upgrade = stores.counters.upgrade_state_missing;
+        let upgrade = if source == DurableSource::ClaudeCode {
+            stores.upgrade_reads.load(Ordering::Relaxed)
+        } else {
+            stores.counters.upgrade_state_missing
+        };
         let Some(slot) = stores.slot(source).as_mut() else {
             return;
         };
@@ -1548,6 +1715,11 @@ impl SharedCache {
                 &Alarm {
                     held_keys: pair(0),
                     upgrade_state_missing: pair(4),
+                    upgrade_count_basis: if source == DurableSource::ClaudeCode {
+                        "native_read"
+                    } else {
+                        "legacy_claim"
+                    },
                     t14_rebuild: pair(1),
                     mode_repaired: pair(2),
                     store_disabled: disabled.filter(|_| last[3] == 0),
@@ -1563,7 +1735,10 @@ impl SharedCache {
     ) -> Option<(Counters, store::StoreCounters)> {
         let source = durable_source(snapshot_source)?;
         let mut stores = self.durable()?;
-        let counters = stores.counters.clone();
+        let mut counters = stores.counters.clone();
+        if source == DurableSource::ClaudeCode {
+            counters.upgrade_state_missing = stores.upgrade_reads.load(Ordering::Relaxed);
+        }
         let store = stores.slot(source).as_ref()?.store.counters();
         Some((counters, store))
     }

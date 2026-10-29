@@ -1993,9 +1993,7 @@ fn q11_strict_restore_real_plain_reader_tail_then_retry_holds() {
 
 #[test]
 fn q11_complete_map_is_paid_before_the_first_key() {
-    let nodes =
-        crate::heap_layout_bound::tree_node_bytes::<store::Digest32, (u64, std::time::Instant)>()
-            .unwrap();
+    let nodes = custody_node_bytes().unwrap();
     let reserve = super::super::RETAIL_RESERVE_BYTES;
     assert!((2 * store::MAX_RECORDS + 1) * nodes <= reserve);
     assert_eq!(
@@ -2899,5 +2897,423 @@ fn a1a_supported_unprovable_migration_holds_on_growth_without_o3() {
         assert_eq!(std::fs::read(&disk_path).unwrap(), before);
         loaded.save(&index_path).unwrap();
     }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+thread_local! { static UPGRADE_OBSERVED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+pub(super) fn observe_upgrade_read() {
+    UPGRADE_OBSERVED.with(|n| n.set(n.get() + 1));
+}
+
+#[test]
+fn b1_native_upgrade_observation_is_once_and_below_buffering() {
+    use crate::snapshots::codex_compressed_input::OpenedInput;
+    use std::io::{BufRead, Seek};
+    let root = crate::test_scratch::private_dir("ottto-b1-observer");
+    let path = root.join("body.jsonl");
+    std::fs::write(&path, b"one\ntwo\n").unwrap();
+    let key = local_index_key(&path);
+    let cache = SharedCache::default();
+    cache.durable_begin_pass(
+        SnapshotSource::ClaudeCode,
+        &root.join("index.json"),
+        &Scope("b1".into()),
+        false,
+    );
+    let file = File::open(&path).unwrap();
+    let cancelled = cache.upgrade_read(&key, &file).unwrap().unwrap();
+    drop(cancelled);
+    assert_eq!(
+        cache
+            .durable_counters(SnapshotSource::ClaudeCode)
+            .unwrap()
+            .0
+            .upgrade_state_missing,
+        0
+    );
+    let mut input = OpenedInput::plain(file);
+    input.put_upgrade(cache.upgrade_read(&key, input.get_ref()).unwrap().unwrap());
+    let before = UPGRADE_OBSERVED.with(|n| n.get());
+    assert_eq!(input.fill_buf().unwrap(), b"one\ntwo\n", "actual prefetch");
+    assert_eq!(UPGRADE_OBSERVED.with(|n| n.get()), before + 1);
+    input.consume(1);
+    assert_eq!(input.fill_buf().unwrap(), b"ne\ntwo\n");
+    let remaining = input.fill_buf().unwrap().len();
+    input.consume(remaining);
+    input.get_mut().seek(std::io::SeekFrom::Start(0)).unwrap();
+    assert_eq!(input.fill_buf().unwrap(), b"one\ntwo\n");
+    assert_eq!(
+        cache
+            .durable_counters(SnapshotSource::ClaudeCode)
+            .unwrap()
+            .0
+            .upgrade_state_missing,
+        1
+    );
+    cache.clear();
+    cache.durable_begin_pass(
+        SnapshotSource::ClaudeCode,
+        &root.join("index.json"),
+        &Scope("changed".into()),
+        false,
+    );
+    let mut second = OpenedInput::plain(File::open(&path).unwrap());
+    second.put_upgrade(cache.upgrade_read(&key, second.get_ref()).unwrap().unwrap());
+    assert!(!second.fill_buf().unwrap().is_empty());
+    assert_eq!(
+        UPGRADE_OBSERVED.with(|n| n.get()),
+        before + 1,
+        "no duplicate observer credit; no read permission is supplied by this observer"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn b1_native_upgrade_counts_an_actual_failed_read_but_not_a_changed_fd() {
+    let root = crate::test_scratch::private_dir("ottto-b1-read-error");
+    let path = root.join("body.jsonl");
+    std::fs::write(&path, b"{}\n").unwrap();
+    let cache = SharedCache::default();
+    cache.durable_begin_pass(
+        SnapshotSource::ClaudeCode,
+        &root.join("index.json"),
+        &Scope("b1".into()),
+        false,
+    );
+    let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    let mut tag = cache.upgrade_read("write-only", &file).unwrap().unwrap();
+    assert!(
+        tag.read(&mut file, &mut [0; 1]).is_err(),
+        "write-only FD reaches real failed File::read"
+    );
+    assert_eq!(
+        cache
+            .durable_counters(SnapshotSource::ClaudeCode)
+            .unwrap()
+            .0
+            .upgrade_state_missing,
+        1
+    );
+    let mut tag = cache
+        .upgrade_read("other", &File::open(&path).unwrap())
+        .unwrap()
+        .unwrap();
+    let other = root.join("other.jsonl");
+    std::fs::write(&other, b"{}\n").unwrap();
+    assert!(tag
+        .read(&mut File::open(other).unwrap(), &mut [0; 1])
+        .is_err());
+    assert_eq!(
+        cache
+            .durable_counters(SnapshotSource::ClaudeCode)
+            .unwrap()
+            .0
+            .upgrade_state_missing,
+        1,
+        "wrong O never reached native read"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn b1_funded_custody_does_not_evict_or_reset_spent_keys_at_overflow() {
+    let cache = SharedCache::default();
+    let mut stores = cache.durable().unwrap();
+    let now = std::time::Instant::now();
+    for n in 0..2 * store::MAX_RECORDS {
+        let key = store::key_digest(DurableSource::ClaudeCode, &n.to_string());
+        assert!(stores.fund_key(key));
+        stores.retail_spent.get_mut(&key).unwrap().spent = Some((n as u64 + 10, now));
+    }
+    assert!(custody_node_bytes().unwrap() <= 1024);
+    assert!(!stores.fund_key([255; 32]));
+    assert_eq!(stores.retail_spent.len(), 2 * store::MAX_RECORDS);
+    for n in 0..2 * store::MAX_RECORDS {
+        let key = store::key_digest(DurableSource::ClaudeCode, &n.to_string());
+        assert!(stores.fund_key(key), "existing funded node still available");
+        assert_eq!(stores.retail_spent[&key].spent, Some((n as u64 + 10, now)));
+    }
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "native retained layout")]
+fn b1_absent_o3_saves_before_read_counts_native_start_then_writes_and_restores() {
+    use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
+    use std::io::Write;
+    let _gate = claude_request_money::e2::GateForTest::set(true);
+    let root = crate::test_scratch::private_dir("ottto-b1-absent");
+    let lock = test_locks::hold(&root);
+    let projects = root.join("projects");
+    std::fs::create_dir_all(&projects).unwrap();
+    let path = projects.join("1338a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl");
+    let key = local_index_key(&path);
+    let source = SnapshotSource::ClaudeCode;
+    let index_path = root.join("index.json");
+    let roots = vec![projects];
+    std::fs::write(&path, a1a_row("first", 100)).unwrap();
+    let warm = E2ScanFixture::default();
+    warm.begin_durable(source, &root, &index_path);
+    let (mut committed, mut first, _) = a1a_scan_at(
+        &warm,
+        &roots,
+        &root,
+        ScanIndex::default(),
+        "2026-08-02T08:00:00Z",
+    );
+    a1a_wire(&root, &mut committed, &mut first);
+    committed.record_accepted_snapshot_fingerprints(
+        &first
+            .snapshots
+            .iter()
+            .map(|s| s.snapshot_fingerprint.clone())
+            .collect(),
+    );
+    committed.save(&index_path).unwrap();
+    assert!(!committed.files[&key].source_file_fingerprint.is_empty());
+    drop(warm); // Deliberately no record: exercise the EXISTING absent-state O3 path.
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(a1a_row("second", 200).as_bytes())
+        .unwrap();
+    let prior = committed.clone();
+    let owner = E2ScanFixture::default();
+    owner.begin_durable(source, &root, &index_path);
+    let mut owned = OwnedSourceScan::new_with_identity_capture(
+        source,
+        &roots,
+        committed.clone(),
+        "2026-08-02T08:01:00Z",
+        183,
+        100,
+        false,
+        Some(&root),
+        &[],
+        false,
+        true,
+        false,
+    )
+    .with_sampled_acquisition(owner.cache.clone(), Scope("e2-pipeline".into()));
+    let before = UPGRADE_OBSERVED.with(|n| n.get());
+    let mut failed_save = false;
+    let mut saw_claim_before_read = false;
+    let mut turns = 0;
+    let (mut index, mut scan) = loop {
+        turns += 1;
+        assert!(turns < 100_000, "O3 native scan must terminate");
+        match owned.step(None) {
+            OwnedSourceScanStep::Pending(mut next) => {
+                if next.index.reread_guard.needs_save() && !failed_save {
+                    assert!(next
+                        .persist_reread_reservations(&mut committed, &path.join("refused-index"))
+                        .is_err());
+                    failed_save = true;
+                    assert_eq!(UPGRADE_OBSERVED.with(|n| n.get()), before);
+                    assert!(!next.index.reread_guard.upgrade_claimed(&key));
+                }
+                next.persist_reread_reservations(&mut committed, &index_path)
+                    .unwrap();
+                if next.index.reread_guard.upgrade_claimed(&key)
+                    && UPGRADE_OBSERVED.with(|n| n.get()) == before
+                {
+                    saw_claim_before_read = true;
+                    assert_eq!(
+                        owner
+                            .cache
+                            .durable_counters(source)
+                            .unwrap()
+                            .0
+                            .upgrade_state_missing,
+                        0
+                    );
+                }
+                owned = next;
+            }
+            OwnedSourceScanStep::Complete { index, scan, .. } => break (index, scan),
+        }
+    };
+    assert!(failed_save && saw_claim_before_read);
+    assert_eq!(UPGRADE_OBSERVED.with(|n| n.get()), before + 1);
+    let counts = owner.cache.durable_counters(source).unwrap().0;
+    assert_eq!(
+        (counts.upgrade_claimed, counts.upgrade_state_missing),
+        (1, 1)
+    );
+    let cold = E2ScanFixture::default();
+    let (mut cold_index, mut cold_scan, _) =
+        a1a_scan_at(&cold, &roots, &root, prior, "2026-08-02T08:01:00Z");
+    assert_eq!(
+        a1a_wire(&root, &mut index, &mut scan),
+        a1a_wire(&root, &mut cold_index, &mut cold_scan)
+    );
+    index.record_accepted_snapshot_fingerprints(
+        &scan
+            .snapshots
+            .iter()
+            .map(|s| s.snapshot_fingerprint.clone())
+            .collect(),
+    );
+    index.save(&index_path).unwrap();
+    assert_eq!(
+        owner
+            .cache
+            .durable_write_after_save(lock, source, &index)
+            .unwrap()
+            .written,
+        1
+    );
+    for _ in 0..2 {
+        let mut prior = ScanIndex::load(&index_path).unwrap();
+        assert!(!prior.reread_guard.upgrade_missing(&key, true));
+        prior
+            .files
+            .get_mut(&key)
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+        let quiet = E2ScanFixture::default();
+        quiet.begin_durable(source, &root, &index_path);
+        let ((_, _, modes), samples) = crate::transcript_acquisition::capture_sample_reads(|| {
+            a1a_scan_at(&quiet, &roots, &root, prior, "2026-08-02T08:02:00Z")
+        });
+        assert_eq!(modes, (0, 0, 1));
+        let counts = quiet.cache.durable_counters(source).unwrap().0;
+        assert_eq!((counts.restored, counts.upgrade_state_missing), (1, 0));
+        assert_eq!(
+            samples
+                .iter()
+                .map(|r| r.result.unwrap() as u64)
+                .sum::<u64>(),
+            2 * std::fs::metadata(&path).unwrap().len().min(4096)
+        );
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "native retained layout")]
+fn b1_strict_tail_writer_retries_with_the_original_witness_after_memo_loss() {
+    use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
+    use std::io::Write;
+    let _gate = claude_request_money::e2::GateForTest::set(true);
+    let root = crate::test_scratch::private_dir("ottto-b1-witness-retry");
+    let lock = test_locks::hold(&root);
+    let projects = root.join("projects");
+    std::fs::create_dir_all(&projects).unwrap();
+    let path = projects.join("1338a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl");
+    let roots = vec![projects];
+    let key = local_index_key(&path);
+    let digest = store::key_digest(DurableSource::ClaudeCode, &key);
+    let source = SnapshotSource::ClaudeCode;
+    let index_path = root.join("index.json");
+    std::fs::write(&path, a1a_row("first", 100)).unwrap();
+    let warm = E2ScanFixture::default();
+    warm.begin_durable(source, &root, &index_path);
+    let (mut index, mut scan, modes) = a1a_scan_at(
+        &warm,
+        &roots,
+        &root,
+        ScanIndex::default(),
+        "2026-08-02T08:00:00Z",
+    );
+    assert_eq!(modes.0, 1);
+    a1a_wire(&root, &mut index, &mut scan);
+    index.record_accepted_snapshot_fingerprints(
+        &scan
+            .snapshots
+            .iter()
+            .map(|s| s.snapshot_fingerprint.clone())
+            .collect(),
+    );
+    index.save(&index_path).unwrap();
+    assert_eq!(
+        warm.cache
+            .durable_write_after_save(lock, source, &index)
+            .unwrap()
+            .written,
+        1
+    );
+    let dir = store::store_dir_for_index(&index_path);
+    let disk = std::fs::read_dir(&dir)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let original = std::fs::read(&disk).unwrap();
+    drop(warm);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(a1a_row("second", 200).as_bytes())
+        .unwrap();
+    index
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .source_file_fingerprint
+        .clear();
+    let owner = E2ScanFixture::default();
+    owner.begin_durable(source, &root, &index_path);
+    let (mut index, mut scan, modes) =
+        a1a_scan_at(&owner, &roots, &root, index, "2026-08-02T08:01:00Z");
+    assert_eq!(modes, (0, 1, 0));
+    assert_eq!(owner.cache.durable_counters(source).unwrap().0.restored, 1);
+    a1a_wire(&root, &mut index, &mut scan);
+    index.record_accepted_snapshot_fingerprints(
+        &scan
+            .snapshots
+            .iter()
+            .map(|s| s.snapshot_fingerprint.clone())
+            .collect(),
+    );
+    index.save(&index_path).unwrap();
+    let spent = {
+        let mut stores = owner.cache.durable().unwrap();
+        let custody = &stores.retail_spent[&digest];
+        assert!(custody.original.is_some());
+        let spent = custody.spent.expect("retail high water retained");
+        stores.claude.as_mut().unwrap().store =
+            DurableTailStore::new(dir.clone(), DurableSource::ClaudeCode);
+        spent
+    };
+    store::test_hooks::set_before_rename(Some(Box::new(|_, _| {
+        Err(std::io::Error::other("b1 injected rename"))
+    })));
+    let receipt = owner.cache.durable_write_after_save(lock, source, &index);
+    store::test_hooks::set_before_rename(None);
+    assert!(
+        receipt.is_none(),
+        "actual dirty Tail replacement reached failure seam"
+    );
+    assert_eq!(std::fs::read(&disk).unwrap(), original);
+    {
+        let stores = owner.cache.durable().unwrap();
+        assert!(stores.retail_spent[&digest].original.is_some());
+        assert_eq!(stores.retail_spent[&digest].spent, Some(spent));
+        assert!(stores.touched.contains(&key));
+        assert_eq!(
+            stores.selected.get(&key),
+            Some(&index.files[&key].source_file_fingerprint)
+        );
+    }
+    assert_eq!(
+        owner
+            .cache
+            .durable_write_after_save(lock, source, &index)
+            .unwrap()
+            .written,
+        1
+    );
+    assert_ne!(std::fs::read(&disk).unwrap(), original);
+    let stores = owner.cache.durable().unwrap();
+    assert!(
+        stores.retail_spent[&digest].original.is_none(),
+        "successful replacement retires only original witness"
+    );
+    assert_eq!(stores.retail_spent[&digest].spent, Some(spent));
+    drop(stores);
     let _ = std::fs::remove_dir_all(root);
 }

@@ -1826,6 +1826,87 @@ fn claude_mutations_require_exact_strict_proof_and_a_current_stamp() {
 }
 
 #[test]
+fn original_witness_survives_memo_turnover_but_never_a_different_record() {
+    for arm in [
+        "turnover",
+        "budget",
+        "entry",
+        "generation",
+        "context",
+        "scope",
+        "replacement",
+        "body",
+    ] {
+        let scratch = Scratch::new();
+        let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+        let path = scratch.transcript("t.jsonl", b"{}\n");
+        let b = binding("acct", "scope", ("fp", None));
+        let old = pending(b.clone(), certificate(&path), 1);
+        let mut store = scratch.store();
+        assert_eq!(
+            store.write_after_save(&lock, 1, vec![old]).unwrap().written,
+            1
+        );
+        let decoded = found(store.read(&b.key, &placeholder_allowlist()));
+        let mut expected = Expected {
+            binding: b.clone(),
+            committed_generation: 1,
+        };
+        let witness = store
+            .mutation_witness(&decoded, &expected)
+            .expect("strict original proof");
+        let disk = record_file(&store, &b.key);
+        store.begin_pass();
+        store.durable.clear(); // The witness is independent of the verification optimization.
+        match arm {
+            "entry" => expected.binding.entry = entry_digest("changed", None),
+            "generation" => expected.committed_generation = 0,
+            "context" => expected.binding.context = [11; 32],
+            "scope" => expected.binding.scope = [12; 32],
+            "replacement" => {
+                let replacement = disk.with_extension("replacement");
+                put_record(&replacement, &fs::read(&disk).unwrap());
+                fs::rename(replacement, &disk).unwrap();
+            }
+            "body" => {
+                let replacement = DurableRecord {
+                    record: pending(b.clone(), certificate(&path), 3),
+                    index_generation: 1,
+                    format: 1,
+                };
+                put_record(&disk, &encode(&replacement));
+            }
+            _ => {}
+        }
+        let before = fs::read(&disk).unwrap();
+        store.authorize_witness(&decoded, &expected, &witness);
+        let allowed = matches!(arm, "turnover" | "budget");
+        assert_eq!(store.authorized(&b.key), allowed, "{arm}");
+        if arm == "budget" {
+            let mut oversized = pending(b.clone(), certificate(&path), 2);
+            oversized.body.resize(RECORD_BYTES, 0);
+            assert_eq!(
+                store
+                    .write_after_save(&lock, 2, vec![oversized])
+                    .unwrap()
+                    .budget_refused,
+                1
+            );
+            assert_eq!(fs::read(&disk).unwrap(), before);
+            store.authorize_witness(&decoded, &expected, &witness);
+            assert!(store.authorized(&b.key));
+        }
+        let receipt = store
+            .write_after_save(&lock, 2, vec![pending(b.clone(), certificate(&path), 2)])
+            .unwrap();
+        assert_eq!(receipt.written, usize::from(allowed), "{arm}");
+        if !allowed {
+            assert_eq!(fs::read(&disk).unwrap(), before, "{arm}");
+        }
+    }
+}
+
+#[test]
 fn claude_mutation_proof_expires_at_pass_boundary_and_unmemoized_records_survive() {
     let scratch = Scratch::new();
     let lock = LockedStateDir::acquire(&scratch.root).unwrap();
