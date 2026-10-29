@@ -60,6 +60,9 @@ pub(crate) fn rederive_head_bytes_total(source: SnapshotSource) -> u64 {
     })
 }
 
+const PACE_SECS: u64 = 6 * 3600;
+const _: () = assert!(PACE_SECS < 86_400);
+
 /// Content-free outcome counts, by class. Field paths are static names; no
 /// id, path or value is ever counted.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -788,7 +791,7 @@ impl SharedCache {
         };
         #[cfg(test)]
         let now = stores.retail_full_now.unwrap_or(now);
-        let interval = std::time::Duration::from_secs(6 * 3600);
+        let interval = std::time::Duration::from_secs(PACE_SECS);
         stores.retail_full_at.retain(|_, at| {
             now.checked_duration_since(*at)
                 .is_none_or(|age| age < interval)
