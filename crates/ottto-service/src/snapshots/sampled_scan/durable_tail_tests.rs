@@ -1504,6 +1504,21 @@ fn pace_eviction_alarms_apart_from_u_growth() {
     assert_eq!(evicted[0]["counts"]["pace_evicted"], pair(1, 1));
     assert_eq!(evicted[0]["counts"]["u_growth_full"], pair(1, 2));
     assert_eq!(file.u_growth(&cache), [2, 0, 1, 1]);
+    // Eviction alone: only the `pace_evicted` coordinate moves, and that alone
+    // raises the alarm (a trigger over the other six coordinates emits none).
+    cache.durable_test_store(source, |disk| disk.count_pace_eviction());
+    let only = alarms();
+    assert_eq!(only.len(), 1, "an eviction-only change alarms");
+    let counts = &only[0]["counts"];
+    assert_eq!(counts["pace_evicted"], pair(1, 2));
+    assert_eq!(counts["u_growth_full"], pair(0, 2));
+    assert_eq!(counts["held_keys"], pair(0, 0));
+    assert_eq!(counts["t14_rebuild"], pair(0, 0));
+    assert_eq!(counts["mode_repaired"], pair(0, 0));
+    assert_eq!(counts["t14_rebuild_full_started"], 0);
+    assert!(counts.get("store_disabled").is_none());
+    assert!(alarms().is_empty(), "no change, no alarm");
+    assert_eq!(file.u_growth(&cache), [2, 0, 1, 2]);
     assert_eq!(std::fs::read(&record).unwrap(), bytes);
 }
 

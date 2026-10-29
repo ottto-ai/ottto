@@ -800,6 +800,12 @@ impl DurableTailStore {
         }
     }
 
+    /// Counts one pace eviction and nothing else (the alarm's eviction-only change).
+    #[cfg(test)]
+    pub(crate) fn count_pace_eviction(&mut self) {
+        self.counters.u_growth[3] += 1;
+    }
+
     pub(crate) fn read(&mut self, key: &Digest32, allowlist: &Digest32) -> ReadOutcome {
         match self.classify(key, "guard") {
             Err(reason) => return ReadOutcome::Refused(reason),
