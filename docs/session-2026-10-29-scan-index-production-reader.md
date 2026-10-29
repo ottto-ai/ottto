@@ -17,3 +17,11 @@ shared parked budget and is included in heap/Arc/Clone accounting. ScanIndexEntr
 is unchanged; native layout remains pinned at 480 bytes. No local tests were run;
 all-target compilation and Linux runtime/native contract jobs supply validation.
 See scan-index-persistence.md for representation, downgrade and release gates.
+
+Round 9 adds direct manifest refusal/counting, per-source UNKNOWN health and an
+alarm once per unavailable episode. Each map has a damaged/held/restored E2,
+finalization, context and manifest fixture comparing the retained page against
+an undamaged nonzero-money control with zero transcript reads. Projection
+fixtures cover repeated loads, recovery, captured state, sibling sources and
+set/clear events between status reads. Proposed label/hover strings are constants
+pending wording approval; companion/web presentation remains separate.

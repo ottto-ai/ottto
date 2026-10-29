@@ -47794,6 +47794,10 @@ impl ScanIndex {
         window_start: &str,
         window_end: &str,
     ) -> Result<SnapshotSourceManifest> {
+        if !self.persistence_available() {
+            crate::local_resource_diagnostics::scan_index_manifest_refused(source.api_slug());
+            return Err(anyhow::anyhow!("scan_index_map_unavailable"));
+        }
         let window_start_at = OffsetDateTime::parse(window_start, &Rfc3339)
             .context("parse snapshot manifest window start")?;
         let window_end_at = OffsetDateTime::parse(window_end, &Rfc3339)

@@ -283,7 +283,7 @@ struct DaemonState {
     /// `SourceHealth.reconciliation_enabled`. In-memory only (cleared on reset
     /// and restart), which the Companion tolerates as "managed by workspace".
     source_reconciliation: BTreeMap<String, bool>,
-    scan_index_health_revisions: [u64; 3],
+    scan_index_health_revisions: [[u64; 3]; 2],
     /// Directory for the persisted per-source state files. `None` keeps
     /// source state purely in-memory (tests); production sets it via
     /// `with_source_state_dir(default_sources_dir())`.
@@ -494,7 +494,7 @@ impl LocalDaemon {
                 sources: Vec::new(),
                 source_first_seen: BTreeMap::new(),
                 source_reconciliation: BTreeMap::new(),
-                scan_index_health_revisions: [0; 3],
+                scan_index_health_revisions: [[0; 3]; 2],
                 source_state_dir: None,
                 local_health_events: Vec::new(),
                 command_ledger: Vec::new(),
@@ -2186,61 +2186,68 @@ fn observe_scan_index_health_changes(state: &mut DaemonState) {
     // One atomic capture: a concurrent load cannot change the state belonging
     // to these counters. Projection below reads only the resulting events.
     let observations = health::observations();
-    for (i, source) in [
-        SnapshotSource::ClaudeCode,
-        SnapshotSource::Codex,
-        SnapshotSource::Pi,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let (since, transitions) = &observations[i];
-        let prior = state.scan_index_health_revisions[i];
-        if prior == *transitions {
-            continue;
-        }
-        for transition in prior.saturating_add(1)..=*transitions {
-            // Real set/clear transitions alternate. Preserve BOTH when a good
-            // load follows a refusal before a client asks for status.
-            let blocked = since.is_some() ^ ((*transitions - transition) % 2 != 0);
-            push_local_health_event(
-                state,
-                "ScanIndexCollectionChanged",
-                "scan_index_collection_changed",
-                LocalHealthAuthority::Runtime,
-                serde_json::json!({
-                    "source": source.api_slug(), "reason": health::CODE,
-                    "blocked_sources": u8::from(blocked), "transitions": transition,
-                }),
-            );
-            if transition == *transitions {
-                if let Some(since) = since {
-                    state
-                        .local_health_events
-                        .last_mut()
-                        .expect("just pushed event")
-                        .observed_at = since.clone();
+    for (reason_index, observations) in observations.iter().enumerate() {
+        let reason = health::REASONS[reason_index];
+        for (i, source) in [
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Codex,
+            SnapshotSource::Pi,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (since, transitions) = &observations[i];
+            let prior = state.scan_index_health_revisions[reason_index][i];
+            if prior == *transitions {
+                continue;
+            }
+            for transition in prior.saturating_add(1)..=*transitions {
+                // Real set/clear transitions alternate. Preserve BOTH when a good
+                // load follows a refusal before a client asks for status.
+                let blocked = since.is_some() ^ ((*transitions - transition) % 2 != 0);
+                push_local_health_event(
+                    state,
+                    "ScanIndexCollectionChanged",
+                    "scan_index_collection_changed",
+                    LocalHealthAuthority::Runtime,
+                    serde_json::json!({
+                        "source": source.api_slug(), "reason": reason.code(),
+                        "blocked_sources": u8::from(blocked), "transitions": transition,
+                    }),
+                );
+                if transition == *transitions {
+                    if let Some(since) = since {
+                        state
+                            .local_health_events
+                            .last_mut()
+                            .expect("just pushed event")
+                            .observed_at = since.clone();
+                    }
                 }
             }
+            state.scan_index_health_revisions[reason_index][i] = *transitions;
         }
-        state.scan_index_health_revisions[i] = *transitions;
     }
 }
 
 fn projected_scan_index_refusal(
     events: &[LocalHealthEventV1],
     source: snapshots::SnapshotSource,
-) -> Option<&str> {
-    events
-        .iter()
-        .rev()
-        .find(|event| {
-            event.event_type == "ScanIndexCollectionChanged"
-                && event.payload["source"] == source.api_slug()
-                && event.payload["reason"] == snapshots::scan_index_health::CODE
+) -> Option<(snapshots::scan_index_health::Reason, &str)> {
+    snapshots::scan_index_health::REASONS
+        .into_iter()
+        .find_map(|reason| {
+            events
+                .iter()
+                .rev()
+                .find(|event| {
+                    event.event_type == "ScanIndexCollectionChanged"
+                        && event.payload["source"] == source.api_slug()
+                        && event.payload["reason"] == reason.code()
+                })
+                .filter(|event| event.payload["blocked_sources"] == 1)
+                .map(|event| (reason, event.observed_at.as_str()))
         })
-        .filter(|event| event.payload["blocked_sources"] == 1)
-        .map(|event| event.observed_at.as_str())
 }
 
 fn status_from_state_with_relay_finding(
@@ -2417,8 +2424,15 @@ pub fn refresh_canonical_local_health_with_started_at(status: &mut DaemonStatus,
         (SourceKind::Pi, snapshots::SnapshotSource::Pi),
     ] {
         if !sources.iter().any(|row| row.app == app) {
-            if let Some(since) = projected_scan_index_refusal(&status.local_health_events, source) {
-                sources.push(scan_index_refused_source(&app, projection_revision, since));
+            if let Some((reason, since)) =
+                projected_scan_index_refusal(&status.local_health_events, source)
+            {
+                sources.push(scan_index_refused_source(
+                    &app,
+                    projection_revision,
+                    since,
+                    reason,
+                ));
             }
         }
     }
@@ -2866,6 +2880,7 @@ fn scan_index_refused_source(
     source: &SourceKind,
     projection_revision: u64,
     since: &str,
+    reason: snapshots::scan_index_health::Reason,
 ) -> LocalHealthSourceV1 {
     LocalHealthSourceV1 {
         source_id: format!("src_{}", source_slug(source)),
@@ -2874,9 +2889,9 @@ fn scan_index_refused_source(
         authority: LocalHealthAuthority::Runtime,
         authority_at: since.into(),
         projection_revision: projection_revision.saturating_sub(1),
-        blocking_reason: Some(snapshots::scan_index_health::CODE.into()),
-        next_action: Some("update_ottto".into()),
-        clear_condition: Some(snapshots::scan_index_health::DETAIL.into()),
+        blocking_reason: Some(reason.code().into()),
+        next_action: Some(reason.action().into()),
+        clear_condition: Some(reason.detail().into()),
     }
 }
 
@@ -2890,8 +2905,8 @@ fn local_health_source_for_status(
         SourceKind::Codex => snapshots::SnapshotSource::Codex,
         SourceKind::Pi => snapshots::SnapshotSource::Pi,
     };
-    if let Some(since) = projected_scan_index_refusal(events, snapshot_source) {
-        return scan_index_refused_source(&source.source, projection_revision, since);
+    if let Some((reason, since)) = projected_scan_index_refusal(events, snapshot_source) {
+        return scan_index_refused_source(&source.source, projection_revision, since, reason);
     }
     if snapshots::scan_index_rebuild_paused(snapshot_source) {
         return LocalHealthSourceV1 {
@@ -3227,14 +3242,18 @@ fn local_health_blockers_for_status(
         ));
     }
     for source in sources {
-        if source.blocking_reason.as_deref() == Some(snapshots::scan_index_health::CODE) {
+        if let Some(reason) = source
+            .blocking_reason
+            .as_deref()
+            .and_then(snapshots::scan_index_health::Reason::from_code)
+        {
             blockers.push(LocalHealthBlockerV1 {
-                code: snapshots::scan_index_health::CODE.into(),
+                code: reason.code().into(),
                 severity: LocalHealthSeverity::Warning,
                 owner: "source".into(),
                 source: source_slug(&source.app).into(),
                 since: source.authority_at.clone(),
-                clear_condition: snapshots::scan_index_health::DETAIL.into(),
+                clear_condition: reason.detail().into(),
             });
             continue;
         }
