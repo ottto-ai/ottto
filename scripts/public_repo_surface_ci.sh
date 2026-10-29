@@ -253,6 +253,7 @@ run_step B "test macOS release gate" bash scripts/test_macos_release_gate.sh
 run_step P "test macOS installer channel policy" bash scripts/test_macos_installer_channel_policy.sh
 run_step B "test macOS package URL scheme policy" bash scripts/test_macos_package_url_scheme_policy.sh
 run_step M "test macOS package root resolution" bash scripts/test_macos_package_root_resolution.sh
+run_step M "test macOS Companion entitlement policy" bash scripts/test_macos_companion_entitlements.sh
 run_step M "test macOS Sparkle bundle version and launch policy" bash scripts/test_macos_sparkle_bundle_version.sh
 run_step M "test macOS launch smoke" bash scripts/test_macos_launch_smoke.sh
 run_step P "test macOS stable release workflow policy" bash scripts/test_macos_stable_release_workflow.sh
