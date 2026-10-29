@@ -1416,10 +1416,26 @@ impl LockedStore {
             object.generation = generation;
             let unchanged = matches!(&*expected.0, Root::Sharded { manifest, .. }
                 if manifest.objects.iter().any(|old|old.same_payload(&object)));
-            if !unchanged {
-                required += u128::from(object.bytes);
-            }
-            planned.push(object);
+            let orphan = if unchanged {
+                None
+            } else {
+                match open_at(
+                    &dir,
+                    &cstring(object.filename().as_bytes())?,
+                    libc::O_RDONLY,
+                ) {
+                    // Content-addressed leftovers may already occupy all the
+                    // required payload space. Verify them BEFORE admission,
+                    // retaining their stamp for the publication pass.
+                    Ok(_) => Some(self.validate_object(&dir, &object)?),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        required += u128::from(object.bytes);
+                        None
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            };
+            planned.push((object, orphan));
         }
         let mut space = std::mem::MaybeUninit::<libc::statvfs>::uninit();
         ensure!(
@@ -1428,11 +1444,13 @@ impl LockedStore {
         );
         let space = unsafe { space.assume_init() };
         let available = u128::from(space.f_bavail) * u128::from(space.f_frsize);
+        #[cfg(test)]
+        let available = TEST_AVAILABLE_SPACE.with(|limit| available.min(limit.get()));
         ensure!(required <= available, "scan_index_insufficient_space");
         let mut objects = Vec::with_capacity(planned.len());
         let mut stamps = Vec::with_capacity(planned.len());
         let mut stats = WriteStats::default();
-        for object in planned {
+        for (object, orphan) in planned {
             let old = match &*expected.0 {
                 Root::Sharded {
                     manifest, stamps, ..
@@ -1443,7 +1461,7 @@ impl LockedStore {
                     .map(|i| &stamps[i]),
                 _ => None,
             };
-            let stamp = if let Some(old) = old {
+            let stamp = if let Some(old) = orphan.as_ref().or(old) {
                 let file = open_at(
                     &dir,
                     &cstring(object.filename().as_bytes())?,
@@ -2600,4 +2618,22 @@ impl LockedStore {
         self.read_stats.set(stats);
         Ok(())
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_AVAILABLE_SPACE: std::cell::Cell<u128> = const { std::cell::Cell::new(u128::MAX) };
+}
+/// Restricts the REAL fstatvfs result for a single test-thread operation.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn with_available_space_for_test<T>(limit: u128, operation: impl FnOnce() -> T) -> T {
+    struct Restore(u128);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_AVAILABLE_SPACE.with(|limit| limit.set(self.0));
+        }
+    }
+    let _restore = Restore(TEST_AVAILABLE_SPACE.with(|value| value.replace(limit)));
+    operation()
 }

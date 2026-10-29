@@ -994,7 +994,13 @@ fn compatibility_sentinel_is_not_logical_files_and_orphan_reuse_is_not_a_write()
         .unwrap();
     assert!(error.downcast_ref::<CommitPublished>().is_none());
     assert_eq!(load(&store).0, fixture.logical(1));
-    let recovered = store.commit(&first.root, 2, &changed.plan()).unwrap();
+    // A failed payload-first attempt has already consumed the payload disk
+    // space. A retry with only the root reserve left MUST reuse that verified
+    // orphan; charging it again would permanently stall under disk pressure.
+    let recovered = with_available_space_for_test(MAX_ROOT_BYTES as u128, || {
+        store.commit(&first.root, 2, &changed.plan())
+    })
+    .unwrap();
     assert_eq!(recovered.stats.written_objects, 0);
     assert_eq!(recovered.stats.written_bytes, 0);
     assert_eq!(recovered.stats.unchanged_objects, 1);
