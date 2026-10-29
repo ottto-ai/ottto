@@ -886,7 +886,7 @@ fn terminal_off_cancellation_replay_precedes_repeated_held_fifo_on_one_file_page
     for _ in 0..3 {
         let mut selected = Vec::new();
         terminal_off_replay_before_fifo(&mut replay, &mut selected, 1);
-        while selected.len() < 1 {
+        while selected.is_empty() {
             selected.push(queue.pop_front().unwrap());
         }
         assert_eq!(selected.len(), 1, "unchanged one-file budget");
