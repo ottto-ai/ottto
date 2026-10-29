@@ -353,3 +353,17 @@ impl ScanIndex {
         for key in keys { enqueue_parked_claude_retry(traversal, key); }
     }
 }
+
+#[cfg(test)]
+impl ScanIndex {
+    pub(crate) fn seed_terminal_retained_pending_for_test(&mut self, root: &str) -> serde_json::Value {
+        let pending = ClaudeUsageFamilyPending {
+            census_window_end: "2026-01-01T00:00:00Z".into(),
+            member_request_id_hashes: BTreeMap::new(), member_occurrences: BTreeMap::new(),
+            invalid: false, idless_revision: None,
+        };
+        let value = serde_json::to_value(&pending).unwrap();
+        self.claude_usage_family_pending.insert(root.to_owned(), pending);
+        value
+    }
+}

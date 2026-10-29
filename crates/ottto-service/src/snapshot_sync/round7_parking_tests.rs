@@ -265,13 +265,12 @@ fn off_page_open_error_keeps_incomplete_page_history_upload_and_settlement() {
     std::fs::write(home.support.join("snapshots/claude_code-reemission-exclusions.txt"), "# synthetic\n").unwrap();
     let before = server.offered.lock().unwrap().len();
     let mut value = serde_json::to_value(saved(&home)).unwrap();
-    value["claude_usage_family_pending"][off] = serde_json::json!({"census_window_end":"2026-01-01T00:00:00Z",
-        "member_request_id_hashes":{},"member_occurrences":{},"invalid":false});
+    value["claude_usage_family_pending"].as_object_mut().unwrap().remove(off);
     let mut index: ScanIndex = serde_json::from_value(value).unwrap();
     index.save(&index_path(&home)).unwrap();
     write_pair(&home, IDENTITY_PIPELINE_ROOT);
     let (api, _) = crate::claude_local_otel::terminal_sidecar_paths_for_test(&home.support, off);
-    let off_pending = serde_json::to_value(saved(&home)).unwrap()["claude_usage_family_pending"][off].clone();
+    let mut off_pending = serde_json::Value::Null;
     crate::snapshots::with_max_gated_claude_revision(3, || {
         crate::snapshots::claude_request_money::e2::with_enabled(|| {
             crate::snapshots::with_staged_births_for_test(
@@ -281,6 +280,10 @@ fn off_page_open_error_keeps_incomplete_page_history_upload_and_settlement() {
                     assert!(i.claude_terminal_fold_deferred().is_none());
                     assert!(!s.snapshots.is_empty());
                     assert!(s.snapshots.iter().all(|body| body.source_session_id != off), "failed family is truly off-page");
+                    // Retained scheduling demand arrives after this page was
+                    // selected, so it cannot trigger the unrelated BASE
+                    // traversal-start stale-family re-arm in this fixture.
+                    off_pending = i.seed_terminal_retained_pending_for_test(off);
                     i.mark_bounded_sweep_unsettled();
                     s.census_complete = false; // legitimate earlier-page settlement veto
                     let _hook = crate::claude_local_otel::terminal_off_page_open_failure_for_test(api);
