@@ -413,6 +413,11 @@ impl ScanIndex {
             self.refresh_usage_guard_holds();
         }
     }
+    pub(super) fn refresh_usage_guard_holds_if_stale(&mut self) {
+        if !self.usage_guard_holds.fresh() {
+            self.refresh_usage_guard_holds();
+        }
+    }
     pub(super) fn usage_guard_reason(&self, root: &str) -> Option<Unknown> {
         #[cfg(test)]
         if REPLAY_OLD.with(std::cell::Cell::get) {

@@ -6565,7 +6565,8 @@ fn cancel_claude_family_carry_for_member_parse(
     page_snapshots: &[SnapshotItem],
     page: &VecDeque<CandidateFile>,
 ) {
-    index.refresh_usage_guard_holds();
+    // Selection already rebuilt a projection dirtied by native completion.
+    index.refresh_usage_guard_holds_if_stale();
     if !index.persistence_available() {
         return;
     }
@@ -10302,12 +10303,16 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             diagnostic.update(|d| d.terminal_rearm = Some(rearm));
         }
 
+        // B3 phase 1: Unknown-held stale proof is neither carried nor re-read,
+        // so a complete census cannot retire it; it stays the reconstructible hold.
+        index.refresh_usage_guard_holds_at(Some(census_window_end));
         index
             .claude_usage_family_pending
             .retain(|root_session_id, _| {
                 index
                     .claude_usage_authority_quarantine
                     .contains_key(root_session_id)
+                    || index.usage_guard_holds.holds(root_session_id)
             });
         let progress = &mut index.claude_full_rearm_progress;
         progress.observed_window = None;
@@ -30934,15 +30939,6 @@ impl OwnedSourceScan {
                 index.refresh_usage_guard_after_native_completion();
             }
             let Some(mut candidate) = identified_candidates.pop_front() else {
-                if source == SnapshotSource::ClaudeCode {
-                    census
-                        .removed_index_keys
-                        .retain(|key| !index.usage_guard_holds.retains_path(Path::new(key)));
-                    census
-                        .claude_vanished_index_keys
-                        .retain(|key| !index.usage_guard_holds.retains_path(Path::new(key)));
-                }
-
                 if codex_page.continuation() {
                     let continuation_evidence = codex_join_inventory.map(|inventory| {
                         Arc::new(Mutex::new(Some(CodexContinuationEvidence {
@@ -43223,7 +43219,6 @@ fn reconcile_missing_index_entries_with_side(
             .as_ref()
             .is_some_and(|traversal| traversal.observed_index_keys.contains(key));
         if !observed
-            && !index.usage_guard_holds.retains_path(Path::new(key))
             && !index.decode_holds_file(key)
             && !index
                 .files
