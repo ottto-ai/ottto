@@ -1114,3 +1114,37 @@ and drops the split on save; re-upgrade preserves S as all-unattributed, without
 backfill. Existing old-object/old-array decoding stays supported. No format,
 parser or scan-identity bump, new reader, hold, selection, admission or upload
 behavior is introduced.
+
+## Codex state-only identity coverage
+
+Prior coverage retains both the uniquely resolved filename identity and the
+existing committed header/counting or protected owner hash, including a header
+outside both filename candidates. Accepted-owner coverage requires nonempty
+exact file incidence whose entities are accepted, not quarantined or decode-held;
+a permanent refusal or local wire-size rejection grants no new coverage.
+
+Checkpoint retention and expiry follow the existing rules; local retention
+changes are deferred. The backend downgrade fence
+(`usage_accounting_authority_downgrade`) protects attributed usage floors against
+an uncontracted state-only successor. Local coverage reduces redundant emission;
+it does not replace that backend money protection.
+
+With a prior snapshot fingerprint, exactly two evidence-supported filename
+identities, and no committed owner coverage, both candidates are withheld from
+state-only output. No fingerprint preserves ordinary fallback; zero supported
+candidates are not counted. The existing `local_resources` carrier emits at most
+one `codex_state_only_ambiguous_identity` line per state-only pass, whose
+`counts.codex_state_only_ambiguous_identity` is the number of ambiguous entry
+observations in that pass. Repeated passes observe the same entries again: this
+is NOT a distinct-entry/file/session count, and sums must not be reported as
+files. Alongside the count, `counts.codex_state_only_ambiguous_identity_tokens`
+is the saturating sum of the supported state threads' `tokens_used` per observed
+ambiguous entry in that pass (units: tokens). The token sum is an UPPER BOUND on
+possibly withheld state-only usage: repeated candidates and already-covered
+usage can contribute again. A zero-token observation reports zero tokens. Only
+aggregate counts and token sums are logged, with no paths, ids or per-session
+values.
+
+A later complete native parse still emits its exclusive body for a session with
+an earlier state-only row. An emitted total alone does not prove a server-side
+overwrite; backend authority rules independently govern successor acceptance.

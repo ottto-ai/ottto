@@ -545,6 +545,100 @@ pub(in crate::snapshots) mod tests {
     }
 
     #[test]
+    fn compressed_exclusive_body_supersedes_an_earlier_state_only_emission() {
+        let plain = synthetic_rollout();
+        let archive = fixture(
+            &zstd::stream::encode_all(&plain[..], 1).unwrap(),
+            ".jsonl.zst",
+        );
+        let owner = "compressed-fixture";
+        let mut metadata = CodexTitleMetadata::default();
+        metadata.state_threads.insert(
+            owner.into(),
+            CodexStateThread {
+                tokens_used: 825,
+                model: Some("gpt-synthetic".into()),
+                ..Default::default()
+            },
+        );
+        let mut index = ScanIndex::default();
+        let mut earlier = Vec::new();
+        append_codex_state_only_snapshots(
+            &mut earlier,
+            &metadata,
+            NOW,
+            &mut index,
+            &BTreeSet::new(),
+        );
+        assert_eq!(earlier.len(), 1);
+        assert_eq!(earlier[0].unattributed_total_tokens, 825);
+        assert!(earlier[0].usage_accounting_contract.is_none());
+        index
+            .codex_state_only_snapshot_fingerprints
+            .insert(owner.into(), earlier[0].snapshot_fingerprint.clone());
+
+        // Exercise the existing decoder + native parser seam directly. This
+        // simulates future archive admission without activating discovery.
+        let mut file = File::open(&archive.0).unwrap();
+        let expected = opened_object_identity(SnapshotSource::Codex, &mut file).unwrap();
+        let input =
+            OpenedInput::compressed(file, plain.len() as u64, compressed_input_credit().unwrap())
+                .unwrap();
+        let mut parser = codex_parser(input, &archive.0);
+        while !parser.step().unwrap() {}
+        let mut parsed = parser
+            .finish(
+                &expected,
+                &archive.0,
+                NOW,
+                "compressed-input-fixture".into(),
+                Some(&metadata),
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(parsed.complete());
+        assert_eq!(parsed.snapshots.len(), 1);
+        let native = parsed.snapshots[0].clone();
+        assert_eq!(native.source_session_id, owner);
+        assert_eq!(
+            native.usage_accounting_contract.as_deref(),
+            Some("session_exclusive_reported_usage:v1")
+        );
+        assert_eq!(native.unattributed_total_tokens, 0);
+        // The shared fixture reports last-token deltas 100 + 250 + 400.
+        assert_eq!(native.input_tokens, 750);
+        assert_eq!(native.cache_read_tokens, 375);
+        assert_eq!(native.output_tokens, 75);
+        assert_eq!(native.model_usage[0].model, "gpt-synthetic");
+        append_codex_state_only_snapshots(
+            &mut parsed.snapshots,
+            &metadata,
+            NOW,
+            &mut index,
+            &BTreeSet::new(),
+        );
+        assert_eq!(
+            parsed.snapshots.len(),
+            1,
+            "old state-only evidence must not suppress the real parsed body or append a total"
+        );
+
+        // Daemon-side ordering oracle: the later contracted body is emitted
+        // under the same session key, replacing the prior total. Actual backend
+        // authority ranking remains the backend's independently enforced rule.
+        let mut uploaded = BTreeMap::from([(owner.to_string(), earlier.remove(0))]);
+        for item in parsed.snapshots {
+            uploaded.insert(item.source_session_id.clone(), item);
+        }
+        assert_eq!(
+            snapshot_upload_body_witness(&uploaded[owner]),
+            snapshot_upload_body_witness(&native)
+        );
+        assert_eq!(uploaded[owner].model_usage, native.model_usage);
+    }
+
+    #[test]
     fn compressed_rollout_over_its_decoded_limit_never_finalizes() {
         let plain = synthetic_rollout();
         let encoded = zstd::stream::encode_all(&plain[..], 3).unwrap();

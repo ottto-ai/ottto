@@ -60,6 +60,20 @@ pub(crate) fn codex_zst_refused(cause: CodexZstCause) {
     );
 }
 
+/// Per-pass observations, not distinct entries/files or a lifetime counter.
+pub(crate) fn codex_state_only_ambiguous_identity(observations: u64, tokens: u64) {
+    if observations > 0 {
+        traversal_point(
+            "codex_state_only_ambiguous_identity",
+            "codex",
+            &BTreeMap::from([
+                ("codex_state_only_ambiguous_identity", observations),
+                ("codex_state_only_ambiguous_identity_tokens", tokens),
+            ]),
+        );
+    }
+}
+
 /// Nonzero-only counters on the existing native_collection_page line.
 #[derive(Default, Serialize)]
 struct ClaudeRecordCaps {
@@ -490,6 +504,8 @@ pub(crate) struct ClaudeAccountRetainedPending {
     pub(crate) claude_account_retained_pending_families: usize,
     /// Pretty JSON bytes of the retained field, including its field wrapper.
     pub(crate) claude_account_retained_pending_bytes: u64,
+    #[serde(flatten)]
+    pub(crate) retention: crate::snapshots::account_pending_retention::Counts,
 }
 impl crate::heap_layout_bound::HeapLayoutBound for Probe {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
