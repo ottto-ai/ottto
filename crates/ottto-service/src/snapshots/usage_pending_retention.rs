@@ -14,10 +14,12 @@ pub(super) enum Refusal {
     DuplicateOwner,
     HistoryOrReplay,
     AuditOrCorrection,
+    AccountDebt,
     Unaccepted,
     UsageProof,
     ReceiptB1,
     RetryCarryB3,
+    CarrierS4,
 }
 
 pub(super) enum Settlement<'a> {
@@ -30,10 +32,14 @@ struct MemberFile<'a> {
     key: &'a str,
     entry: &'a ScanIndexEntry,
     duplicate: bool,
-    history_hold: bool,
 }
 type Members<'a> = BTreeMap<ClaudeIndexPathMemberRef<'a>, MemberFile<'a>>;
-type Inventory<'a> = BTreeMap<&'a str, Members<'a>>;
+#[derive(Default)]
+struct FamilyFiles<'a> {
+    members: Members<'a>,
+    held: bool,
+}
+type Inventory<'a> = BTreeMap<&'a str, FamilyFiles<'a>>;
 
 // One borrowed node per indexed file, plus at most one node per file's root.
 // Refuse before allocation if the optional diagnostic scratch is not bounded.
@@ -43,8 +49,14 @@ fn inventory(index: &ScanIndex) -> Option<Inventory<'_>> {
         return None;
     }
     let mut cost = Counter::new(crate::source_rotation::PARKED_BUDGET);
-    tree_nodes::<&str, Members<'_>>(index.files.len(), &mut cost)?;
+    tree_nodes::<&str, FamilyFiles<'_>>(index.claude_usage_family_pending.len(), &mut cost)?;
     tree_nodes::<ClaudeIndexPathMemberRef<'_>, MemberFile<'_>>(index.files.len(), &mut cost)?;
+    Some(build_inventory(index))
+}
+
+// The production caller admits this borrowed graph before allocation. Small
+// synthetic fixtures can exercise family semantics on non-native CI layouts.
+fn build_inventory(index: &ScanIndex) -> Inventory<'_> {
     let mut inventory: Inventory<'_> = BTreeMap::new();
     for (key, entry) in &index.files {
         let Some(member) = claude_index_path_member_ref(Path::new(key)) else {
@@ -56,38 +68,44 @@ fn inventory(index: &ScanIndex) -> Option<Inventory<'_>> {
         inventory
             .entry(member.root)
             .or_default()
+            .members
             .entry(member)
             .and_modify(|file| file.duplicate = true)
             .or_insert(MemberFile {
                 key,
                 entry,
                 duplicate: false,
-                history_hold: false,
             });
     }
-    for held in index
-        .claude_history_emission
-        .files
-        .values()
-        .filter(|held| held.held.is_some() || held.literal_denied)
+    // Holds may name a sibling omitted from the selected files map. They
+    // still hold the entire family; absence here cannot erase that debt.
+    for key in index
+        .claude_account_deferred_holds
+        .keys()
+        .map(String::as_str)
+        .chain(
+            index
+                .claude_history_emission
+                .files
+                .values()
+                .filter(|held| held.held.is_some() || held.literal_denied)
+                .map(|held| held.index_key.as_str()),
+        )
     {
-        if let Some(member) = claude_index_path_member_ref(Path::new(&held.index_key)) {
-            if let Some(file) = inventory
-                .get_mut(member.root)
-                .and_then(|files| files.get_mut(&member))
-            {
-                file.history_hold = true;
+        if let Some(member) = claude_index_path_member_ref(Path::new(key)) {
+            if index.claude_usage_family_pending.contains_key(member.root) {
+                inventory.entry(member.root).or_default().held = true;
             }
         }
     }
-    Some(inventory)
+    inventory
 }
 
 fn known_refusal(
     index: &ScanIndex,
     root: &str,
     pending: &ClaudeUsageFamilyPending,
-    files: Option<&Members<'_>>,
+    files: Option<&FamilyFiles<'_>>,
 ) -> Option<Refusal> {
     if pending.invalid {
         return Some(Refusal::Invalid);
@@ -98,6 +116,12 @@ fn known_refusal(
     if index.claude_usage_authority_quarantine.contains_key(root) {
         return Some(Refusal::Quarantine);
     }
+    if index.claude_account_family_pending.contains_key(root) {
+        return Some(Refusal::AccountDebt);
+    }
+    if files.is_some_and(|family| family.held) {
+        return Some(Refusal::HeldMember);
+    }
     if index.claude_request_identity_contract_changed
         || index.claude_request_identity_contract.is_none()
         || index.upload_context_fingerprint.is_none()
@@ -106,9 +130,10 @@ fn known_refusal(
     {
         return Some(Refusal::IdentityOrContext);
     }
-    let Some(files) = files else {
+    let Some(family) = files else {
         return Some(Refusal::Membership);
     };
+    let files = &family.members;
     if pending.membership().is_empty()
         || files.len() != pending.membership().keys().count()
         || !files.contains_key(&ClaudeIndexPathMemberRef {
@@ -143,7 +168,6 @@ fn known_refusal(
         || files.values().any(|file| {
             index.claude_family_listed(file.key)
                 || index.effective_upload_body_witness_revision_requires_adoption(file.key)
-                || file.history_hold
                 || index
                     .claude_reemission_exclusions
                     .holds_without_list_before(
@@ -231,7 +255,7 @@ fn settlement<'a>(
     index: &'a ScanIndex,
     root: &str,
     pending: &ClaudeUsageFamilyPending,
-    files: Option<&Members<'_>>,
+    files: Option<&FamilyFiles<'_>>,
 ) -> Settlement<'a> {
     if let Some(reason) = known_refusal(index, root, pending, files) {
         return Settlement::Refused(reason);
@@ -243,6 +267,17 @@ fn settlement<'a>(
         Ok(commitment) => Settlement::Settled(commitment),
         Err(reason) => Settlement::Refused(reason),
     }
+}
+
+fn negative_scheduling_carrier_durable(_index: &ScanIndex, _root: &str) -> bool {
+    // TODO(E7 S4-carrier): Where is the durable L carrier preserving this
+    // family's negative scheduling fence and overlap/debt effects after removal?
+    // A usage/body digest (H) and first-seen status (N) cannot replace it.
+    false
+}
+
+fn may_retire(index: &ScanIndex, root: &str, result: &Settlement<'_>) -> bool {
+    matches!(result, Settlement::Settled(_)) && negative_scheduling_carrier_durable(index, root)
 }
 
 #[derive(Default, Serialize)]
@@ -267,6 +302,8 @@ pub(super) struct Counts {
     pub(super) byte_measurement_failed: u64,
     pub(super) compacted: Weight,
     pub(super) compaction_scratch_refused: Weight,
+    pub(super) retirement_carrier_refused: Weight,
+    pub(super) retired: Weight,
 }
 
 fn pending_bytes(pending: &ClaudeUsageFamilyPending) -> Option<u64> {
@@ -292,7 +329,7 @@ fn pending_bytes(pending: &ClaudeUsageFamilyPending) -> Option<u64> {
 // cumulative count, successful-save receipt or frozen-copy measurement.
 fn classify_index(
     index: &ScanIndex,
-    mut settled: impl FnMut(&str, &ClaudeUsageFamilyWitness, u64),
+    mut settled: impl FnMut(&str, &ClaudeUsageFamilyWitness, u64, bool),
 ) -> Counts {
     let mut counts = Counts::default();
     if index.claude_usage_family_pending.is_empty() {
@@ -311,15 +348,26 @@ fn classify_index(
         if let Err(reason) = retry_carry_replacement(index, root) {
             counts.owner_gates.entry(reason).or_default().add(bytes);
         }
+        if !negative_scheduling_carrier_durable(index, root) {
+            counts
+                .owner_gates
+                .entry(Refusal::CarrierS4)
+                .or_default()
+                .add(bytes);
+        }
         let result = match &inventory {
             Some(inventory) => settlement(index, root, pending, inventory.get(root.as_str())),
             None => Settlement::Refused(Refusal::Scratch),
         };
+        let retire = may_retire(index, root, &result);
         match result {
             Settlement::Settled(commitment) => {
                 // H commitment exists only when the exact receipt gate earns it.
-                settled(root, commitment, bytes);
+                settled(root, commitment, bytes, retire);
                 counts.settled.add(bytes);
+                if !retire {
+                    counts.retirement_carrier_refused.add(bytes);
+                }
             }
             Settlement::Refused(reason) => counts.refused.entry(reason).or_default().add(bytes),
         }
@@ -333,7 +381,16 @@ pub(super) struct Prepared {
     previous: Vec<(String, ClaudeUsageFamilyPending)>,
 }
 impl Prepared {
-    fn compact(&mut self, index: &mut ScanIndex, root: String) -> u64 {
+    fn compact(&mut self, index: &mut ScanIndex, root: String, retire: bool) -> u64 {
+        if retire {
+            let previous = index
+                .claude_usage_family_pending
+                .remove(&root)
+                .expect("classified root");
+            let bytes = pending_bytes(&previous).unwrap_or(0);
+            self.previous.push((root, previous));
+            return bytes;
+        }
         let pending = index
             .claude_usage_family_pending
             .get_mut(&root)
@@ -396,14 +453,14 @@ impl ScanIndex {
         let mut scratch_refused = Weight::default();
         let mut cost =
             crate::heap_layout_bound::Counter::new(crate::source_rotation::PARKED_BUDGET);
-        let mut counts = classify_index(self, |root, _commitment, bytes| {
+        let mut counts = classify_index(self, |root, _commitment, bytes, retire| {
             let pending = &self.claude_usage_family_pending[root];
             if price_compaction(root, pending, &mut cost).is_none()
                 || candidates.try_reserve(1).is_err()
             {
                 scratch_refused.add(bytes);
             } else {
-                candidates.push(root.to_owned());
+                candidates.push((root.to_owned(), retire));
             }
         });
         counts.compaction_scratch_refused = scratch_refused;
@@ -416,11 +473,16 @@ impl ScanIndex {
             .try_reserve_exact(candidates.len())
             .is_ok()
         {
-            for root in candidates {
-                counts.compacted.add(prepared.compact(self, root));
+            for (root, retire) in candidates {
+                let bytes = prepared.compact(self, root, retire);
+                if retire {
+                    counts.retired.add(bytes);
+                } else {
+                    counts.compacted.add(bytes);
+                }
             }
         } else {
-            for root in candidates {
+            for (root, _) in candidates {
                 counts
                     .compaction_scratch_refused
                     .add(pending_bytes(&self.claude_usage_family_pending[&root]).unwrap_or(0));
@@ -429,7 +491,7 @@ impl ScanIndex {
         if counts.considered.families != 0 {
             crate::local_resource_diagnostics::traversal_point(
                 "claude_usage_pending_settlement_attempt",
-                "claude",
+                SnapshotSource::ClaudeCode.api_slug(),
                 &counts,
             );
         }
@@ -500,7 +562,7 @@ mod tests {
                 derived_request_members: BTreeSet::new(),
             },
         );
-        let entities = BTreeSet::from(["entity-1".into(), "entity-2".into()]);
+        let entities = BTreeSet::from(["1".repeat(64), "2".repeat(64)]);
         let mut entry = crate::snapshots::tests::manifest_index_entry(Some(&codex_digest_hex(
             &snapshot_file_entity_set_digest(&entities),
         )));
@@ -524,14 +586,17 @@ mod tests {
                 key: KEY,
                 entry: &index.files[KEY],
                 duplicate: false,
-                history_hold: false,
             },
         )]);
+        let family = FamilyFiles {
+            members: files,
+            held: false,
+        };
         settlement(
             index,
             ROOT,
             &index.claude_usage_family_pending[ROOT],
-            Some(&files),
+            Some(&family),
         )
     }
     fn refused(index: &ScanIndex, expected: Refusal) {
@@ -549,7 +614,14 @@ mod tests {
             &index.files[KEY]
         ));
         refused(&index, Refusal::ReceiptB1);
-        for accepted in [BTreeSet::from(["entity-1".into()]), BTreeSet::new()] {
+        assert!(!negative_scheduling_carrier_durable(&index, ROOT));
+        assert!(!may_retire(&index, ROOT, &decision(&index)));
+        assert!(!may_retire(
+            &index,
+            ROOT,
+            &Settlement::Settled(&index.claude_usage_family_witnesses[ROOT])
+        ));
+        for accepted in [BTreeSet::from(["1".repeat(64)]), BTreeSet::new()] {
             let mut changed = index.clone();
             changed.accepted_snapshot_fingerprints = accepted;
             refused(&changed, Refusal::Unaccepted);
@@ -609,7 +681,7 @@ mod tests {
     #[test]
     fn byte_counter_uses_existing_wire_bytes_and_both_gates_are_visible() {
         let index = fixture();
-        let counts = classify_index(&index, |_, _, _| {});
+        let counts = classify_index(&index, |_, _, _, _| {});
         let bytes = serde_json::to_vec(&index.claude_usage_family_pending[ROOT])
             .unwrap()
             .len() as u64;
@@ -632,6 +704,11 @@ mod tests {
             counts.owner_gates[&Refusal::RetryCarryB3].pending_value_bytes,
             bytes
         );
+        assert_eq!(
+            counts.owner_gates[&Refusal::CarrierS4].pending_value_bytes,
+            bytes
+        );
+        assert_eq!(counts.retired.families, 0);
         assert_eq!(counts.byte_measurement_failed, 0);
     }
     #[test]
@@ -642,7 +719,7 @@ mod tests {
         let mut prepared = Prepared {
             previous: Vec::with_capacity(1),
         };
-        prepared.compact(&mut index, ROOT.into());
+        prepared.compact(&mut index, ROOT.into(), false);
         let compacted = &index.claude_usage_family_pending[ROOT];
         assert!(compacted.member_occurrences.is_empty());
         assert_eq!(
@@ -656,7 +733,7 @@ mod tests {
         let mut committed = Prepared {
             previous: Vec::with_capacity(1),
         };
-        committed.compact(&mut index, ROOT.into());
+        committed.compact(&mut index, ROOT.into(), false);
         committed.finish(&mut index, true);
         let mut skeleton = index.claude_usage_family_pending[ROOT].clone();
         for _ in 0..2 {
@@ -690,5 +767,124 @@ mod tests {
                 .claude_usage_family_pending
                 .insert(ROOT.into(), restored);
         }
+    }
+    #[test]
+    fn carrier_crash_before_publication_preserves_pending_on_disk() {
+        const CHILD_DIR: &str = "OTTTO_E7_USAGE_CRASH_FIXTURE_DIR";
+        if let Some(directory) = std::env::var_os(CHILD_DIR) {
+            let directory = PathBuf::from(directory);
+            let mut index = ScanIndex::load(&directory.join("index.json")).unwrap();
+            assert!(index.claude_usage_family_pending.contains_key(ROOT));
+            let prepared = index.prepare_claude_usage_pending_settlement();
+            assert!(
+                prepared.previous.is_empty(),
+                "closed gates preserve the predecessor"
+            );
+            assert!(!negative_scheduling_carrier_durable(&index, ROOT));
+            fs::write(directory.join("reached-before-publication"), b"reached").unwrap();
+            // Abrupt process death skips Prepared::finish and all destructors.
+            std::process::exit(73);
+        }
+        struct FixtureDir(PathBuf);
+        impl Drop for FixtureDir {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let directory = FixtureDir(std::env::temp_dir().join(format!(
+                "ottto-usage-carrier-crash-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            )));
+        fs::create_dir_all(&directory.0).unwrap();
+        let path = directory.0.join("index.json");
+        let mut index = fixture();
+        index.save(&path).unwrap();
+        let before = fs::read(&path).unwrap();
+        let original = index.claude_usage_family_pending[ROOT].clone();
+        let accepted = index.accepted_snapshot_fingerprints.clone();
+        let file_heads = serde_json::to_value(&index.files).unwrap();
+        let test_name = format!(
+            "{}::carrier_crash_before_publication_preserves_pending_on_disk",
+            module_path!().split_once("::").unwrap().1
+        );
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test_name, "--nocapture"])
+            .env(CHILD_DIR, &directory.0)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(73),
+            "child did not reach crash edge: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(directory.0.join("reached-before-publication").exists());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        for _ in 0..2 {
+            let restored = ScanIndex::load(&path).unwrap();
+            assert!(restored.persistence_available());
+            assert_eq!(restored.claude_usage_family_pending[ROOT], original);
+            assert_eq!(restored.accepted_snapshot_fingerprints, accepted);
+            assert_eq!(serde_json::to_value(&restored.files).unwrap(), file_heads);
+            assert!(!negative_scheduling_carrier_durable(&restored, ROOT));
+        }
+    }
+    #[test]
+    fn remaining_account_debt_and_omitted_held_siblings_refuse_settlement() {
+        let mut index = fixture();
+        index.claude_account_family_pending.insert(ROOT.into(), serde_json::from_value(json!({
+            "census_window_end":"2026-10-01T00:00:00Z", "account_identifier_hash":"account", "evidence_request_count":1, "invalid":false
+        })).unwrap());
+        refused(&index, Refusal::AccountDebt);
+        for kind in ["deferred", "history"] {
+            let mut index = fixture();
+            let child = format!("/synthetic/{ROOT}/subagents/agent-hidden.jsonl");
+            assert!(!index.files.contains_key(&child));
+            if kind == "deferred" {
+                index
+                    .claude_account_deferred_holds
+                    .insert(child, "hold".into());
+            } else {
+                index.claude_history_emission.files.insert(
+                    "held-revision".into(),
+                    claude_history_upgrade::GatedHistory {
+                        index_key: child,
+                        held: Some(claude_history_upgrade::HistoryHold::TelemetryUnread),
+                        ..Default::default()
+                    },
+                );
+            }
+            let inventory = build_inventory(&index);
+            assert!(inventory[ROOT].held);
+            assert!(matches!(
+                settlement(
+                    &index,
+                    ROOT,
+                    &index.claude_usage_family_pending[ROOT],
+                    inventory.get(ROOT)
+                ),
+                Settlement::Refused(Refusal::HeldMember)
+            ));
+        }
+    }
+
+    #[test]
+    fn production_measurement_emits_claude_code_source_and_attempt_counts() {
+        let mut index = fixture();
+        let (prepared, records) = crate::local_resource_diagnostics::capture(|| {
+            index.prepare_claude_usage_pending_settlement()
+        });
+        prepared.finish(&mut index, true);
+        let records = records
+            .iter()
+            .filter(|record| record["stage"] == "claude_usage_pending_settlement_attempt")
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["source"], "claude_code");
     }
 }

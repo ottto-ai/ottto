@@ -4622,7 +4622,7 @@ impl ClaudeAccountRequestSet {
         }
         Some(Self {
             prefixes: base64::engine::general_purpose::STANDARD_NO_PAD.encode(packed),
-            fingerprint: claude_request_hashes_fingerprint(hashes.iter()),
+            fingerprint: claude_request_id_set_fingerprint(hashes),
             identity_revision: None,
         })
     }
@@ -4825,7 +4825,6 @@ struct ClaudeUsageFamilyWitness {
 
 #[derive(Debug, Clone)]
 struct ClaudeUsageFamilyPending {
-    derived_request_members: std::collections::BTreeSet::new(),
     census_window_end: String,
     // Empty placeholders for derived members; explicit sets for all others.
     member_request_id_hashes: BTreeMap<String, BTreeSet<String>>,
