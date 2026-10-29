@@ -4538,10 +4538,12 @@ impl SharedCache {
                         stamp.extent
                     };
                     if bytes != 0 && !held(&local_index_key(&member.path)) {
-                        cursor.custody_restarts.insert(
-                            memo_key(&Scope(namespace.clone()), &local_index_key(&member.path)),
-                            bytes,
-                        );
+                        let file_key = local_index_key(&member.path);
+                        let mut key = String::with_capacity(namespace.len() + file_key.len() + 1);
+                        key.push_str(&namespace);
+                        key.push('\0');
+                        key.push_str(&file_key);
+                        cursor.custody_restarts.insert(key, bytes);
                     }
                 }
             }
