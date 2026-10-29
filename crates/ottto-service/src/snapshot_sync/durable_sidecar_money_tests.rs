@@ -530,3 +530,60 @@ fn durable_sidecar_money_refusal_holds_accepted_root_and_agent_entities() {
         );
     });
 }
+
+#[test]
+fn durable_sidecar_money_new_agent_estimate_survives_accepted_root_hold() {
+    with_e2(|| {
+        let agent_session = format!("{ROOT}_agent-000");
+        let mut c = Corpus::new("sidecar-money-new-agent-estimate");
+        let native = c.root(ROOT, &line(ROOT, "r1", AT, 10));
+        c.evidence(&[api("r1", 10, 100)], &[]);
+        let mut slots = Slots::new(&c);
+        let (mut reader, (page, mut prior, holds)) =
+            with_durable_sidecar_reader(slots.reader(&c), || {
+                render(&c, ScanIndex::default(), Mode::Ram)
+            });
+        assert_reported(&prior, 1);
+        prior.accepted.insert(
+            ROOT.into(),
+            Accepted {
+                body: prior.snapshots[ROOT].clone(),
+                witness: snapshot_upload_body_witness(&page.scan.snapshots[0]),
+            },
+        );
+        let mut progress = e2_progress();
+        let accepted = settle_route(&c, &ScanIndex::default(), page, &mut progress, holds);
+        let before = stored_bodies(&accepted);
+        assert_eq!(before.len(), 1, "only ROOT has any accepted body");
+        slots.save(&mut reader);
+        append(&native, &line(ROOT, "r2", "2026-08-02T07:01:00Z", 30));
+        c.agent(0, &line(ROOT, "new-agent", AT, 20));
+        let path = sidecar_path(&c, false);
+        let parked = path.with_extension("unavailable");
+        std::fs::rename(&path, &parked).unwrap();
+        let expected = cold(&c);
+        reader.begin_pass();
+        let (_, (page, mut held, holds)) =
+            with_durable_sidecar_reader(reader, || render(&c, accepted.clone(), Mode::Ram));
+        assert_eq!(
+            holds.held_entity_count, 1,
+            "the new agent has no accepted-money floor"
+        );
+        assert!(!held.snapshots.contains_key(ROOT));
+        assert_eq!(held.snapshots[&agent_session]["request_count"], 1);
+        assert_eq!(
+            held.snapshots[&agent_session]["telemetry_owned_complete"],
+            false
+        );
+        assert!(held.snapshots[&agent_session]["cost"].is_null());
+        let held_index = settle_route(&c, &accepted, page, &mut progress, holds);
+        let after = stored_bodies(&held_index);
+        for (key, tuple) in &before {
+            assert_eq!(after.get(key), Some(tuple));
+        }
+        held.accepted = prior.accepted.clone();
+        money_oracle::assert_held(ROOT, &prior, &held, &expected);
+        // The sibling estimate is a real new ACK; ROOT's body stays unchanged.
+        assert_eq!(progress.accepted_fingerprints.len(), 2);
+    });
+}

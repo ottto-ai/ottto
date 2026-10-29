@@ -9151,12 +9151,20 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     // an estimate. Keep the native body/witness and retry the whole join.
     // Activation stays dark; wire this same consumer guard with the reader.
     #[cfg(all(test, unix))]
-    disposition.hold_request_owned(crate::claude_local_otel::durable_sidecar_held_entities(
-        support_dir,
-        index,
-        &scan_result.snapshots,
-        &strict_healthy_roots,
-    ));
+    {
+        // Acceptance belongs to the prior committed head. A working fold's
+        // candidate or money marks cannot weaken an accepted-body floor.
+        let accepted_index: &ScanIndex = match retained {
+            Some((_, committed)) => committed,
+            None => index,
+        };
+        disposition.hold_request_owned(crate::claude_local_otel::durable_sidecar_held_entities(
+            support_dir,
+            accepted_index,
+            &scan_result.snapshots,
+            &strict_healthy_roots,
+        ));
+    }
     if request_owned_enabled {
         for item in &mut scan_result.snapshots {
             if let Some(root) =

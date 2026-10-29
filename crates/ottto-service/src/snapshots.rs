@@ -5256,9 +5256,10 @@ fn claude_index_file_body_accepted(
 /// native body is protected on a telemetry refusal, including older estimates;
 /// the acquisition record itself grants no accepted-money authority.
 #[cfg(all(test, unix))]
-pub(crate) fn durable_sidecar_has_accepted_body(index: &ScanIndex, root: &str) -> bool {
+pub(crate) fn durable_sidecar_has_accepted_body(index: &ScanIndex, entity: &str) -> bool {
     index.files.iter().any(|(key, entry)| {
-        claude_index_path_member_ref(Path::new(key)).is_some_and(|member| member.root == root)
+        claude_index_path_member_ref(Path::new(key))
+            .is_some_and(|member| member.matches_member(entity))
             && entry
                 .last_upload_body_witness
                 .as_ref()

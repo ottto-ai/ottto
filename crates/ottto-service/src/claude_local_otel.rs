@@ -66,7 +66,12 @@ pub(crate) fn durable_sidecar_held_entities(
             // A cohort refusal can leave strict reads healthy while the
             // finalizer still discloses an incomplete candidate body.
             let complete = healthy.contains(root) && item.telemetry_owned_complete == Some(true);
-            if complete || !crate::snapshots::durable_sidecar_has_accepted_body(index, root) {
+            if complete
+                || !crate::snapshots::durable_sidecar_has_accepted_body(
+                    index,
+                    &item.source_session_id,
+                )
+            {
                 None
             } else {
                 Some(item.source_session_id.clone())
