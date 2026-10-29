@@ -104,3 +104,25 @@ not per process/day. Cache loss, unsupported layouts and due audits retain their
 separate existing Full causes. Cache-retained fragment witness remains a
 follow-up. The complete-body fixture now injects the same collection timestamp
 into its cold scan, preserving every compared field and assertion.
+
+
+## Round24 native regression repair
+
+The fragment pointer's eight inline bytes are recovered by storing the existing
+immutable Codex counting-owner hash as `Box<str>` instead of `String`; its JSON
+string/None representation and validator stay the same. The native index-entry
+contract remains 480 bytes. Completed account content witnesses own no heap and
+now consume one accounting visit, rather than walking all 32 digest bytes.
+An empty withheld memo releases any empty B-tree root and reserves no heap.
+Existing frame, owner, traversal and layout-admission limits are unchanged.
+
+Grown retention keeps virtual N1 recovery debt observed, but a scheduled future
+audit slot cannot select an ordinary transcript-changed read before its due
+time. Independent correction, context, retry and genuine rearm causes retain
+priority. The portable control checks future Skip, due Audit and external rearm.
+
+The touch fixture now establishes its historical mtime before its first scan.
+On macOS, setting mtime before creation time also moves creation time backward
+(`setattrlist(2)`); that operation changed the fixture's object generation. Later
+touches explicitly assert the established birth identity is unchanged. The
+production birth fence and all original no-acquisition assertions remain.
