@@ -299,3 +299,25 @@ audit debt must reach native planning but cannot select an idle file before D.
 Both the selector and metadata wake retain the due-time check. The existing
 oldest-deadline selector control remains unchanged, and the new idle-cadence
 control additionally requires no rewalk for a future marker.
+
+### Round 21: blocked debt preserves idle discovery cadence
+
+Owed discovery now checks the existing per-key secure-open backoff/stat gate
+before forcing a walk, including exact terminal retry owners. Parked or backing
+off debt keeps D and custody without causing healthy neighbours to pay samples
+on every preparation. A changed stat makes that key eligible again; readable due
+work retains prompt service. Context/adoption debt retains its existing selector
+and same-release receipt dependency.
+
+A real multi-preparation control covers both parked and backing-off K beside an
+unchanged neighbour: save/load, no repeated identity samples or body bytes before
+cadence, unchanged failure count and D, then stat change and readable recovery.
+A separate production-cadence fixture appends without hints or memo expiry,
+requires quietness through the299th second and discovery at300seconds.
+
+The constructor/progress root fixture now derives the actual production
+reduction dependencies, asserts equality with active_file.sampling.scope, and
+acquires separately through each held/failed reloaded retry Scope. Both must
+remain Unchanged, with no ScopeChanged Full. No new persisted state, authority,
+body-read cause or budget is introduced. Native Scope execution remains a
+branch-Mac obligation.

@@ -4897,24 +4897,6 @@ fn terminal_off_constructor_progress_replacement_survives_held_and_failed_reload
         !scan.index.files[&key].has_unverified_source(),
         "capacity kept K plain v2"
     );
-    let scope_index = scan.index.clone();
-    let scope = scan.sampling.as_ref().unwrap().file_scope(
-        source,
-        &admitted,
-        "",
-        false,
-        false,
-        &scope_index,
-    );
-    let (retained, _, _, _) = acquire_with(
-        &fixture,
-        source,
-        &CodexTitleMetadata::default(),
-        &scope,
-        None,
-        100,
-        true,
-    );
     // Run the actual final candidate boundary, without editing any candidate
     // root or admitted inventory. The active parser yields after selection.
     for _ in 0..100 {
@@ -4929,6 +4911,32 @@ fn terminal_off_constructor_progress_replacement_survives_held_and_failed_reload
         };
     }
     assert!(scan.active_file.is_some());
+    let active = scan.active_file.as_ref().unwrap();
+    let dependencies = sampled_scan::reduction_dependencies(
+        source,
+        &active.candidate,
+        &scan.codex_title_metadata,
+        &scan.claude_title_metadata,
+        scan.claude_effort_support_dir.as_deref(),
+    )
+    .unwrap();
+    assert!(
+        !dependencies.is_empty(),
+        "real Claude reduction dependencies"
+    );
+    let scope = scan.sampling.as_ref().unwrap().file_scope(
+        source,
+        &active.candidate,
+        &dependencies,
+        source != SnapshotSource::ClaudeCode || scan.artifacts_enabled,
+        scan.context_curve_enabled,
+        &scan.index,
+    );
+    assert_eq!(
+        active.sampling.as_ref().expect("native acquisition").scope,
+        scope,
+        "reference must equal the production active Scope"
+    );
     let actual = &scan.index.claude_full_rearm_progress.terminal_off_admitted[0];
     assert_eq!(actual.path, fixture.0);
     assert_eq!(
@@ -4977,29 +4985,51 @@ fn terminal_off_constructor_progress_replacement_survives_held_and_failed_reload
             &index.files,
         )
         .unwrap();
+        let retry_dependencies = sampled_scan::reduction_dependencies(
+            source,
+            &retry,
+            &scan.codex_title_metadata,
+            &scan.claude_title_metadata,
+            scan.claude_effort_support_dir.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(retry_dependencies, dependencies);
         let retry_scope = scan.sampling.as_ref().unwrap().file_scope(
             source,
             &retry,
-            "",
-            false,
-            false,
-            &scope_index,
+            &retry_dependencies,
+            source != SnapshotSource::ClaudeCode || scan.artifacts_enabled,
+            scan.context_curve_enabled,
+            &index,
         );
         assert_eq!(
             scope, retry_scope,
-            "held/failed selected reload preserves actual Scope"
+            "held/failed selected reload preserves the actual active Scope"
+        );
+        let (retained, _, _, _) = acquire_with(
+            &fixture,
+            source,
+            &CodexTitleMetadata::default(),
+            &scope,
+            None,
+            100,
+            true,
+        );
+        let (_, mode, _, _) = acquire_with(
+            &fixture,
+            source,
+            &CodexTitleMetadata::default(),
+            &retry_scope,
+            retained,
+            101,
+            true,
+        );
+        assert_eq!(
+            mode,
+            ReadMode::Unchanged,
+            "each reloaded Scope incurs zero ScopeChanged Full bytes"
         );
     }
-    let (retained, mode, _, _) = acquire_with(
-        &fixture,
-        source,
-        &CodexTitleMetadata::default(),
-        &scope,
-        retained,
-        101,
-        true,
-    );
-    assert_eq!(mode, ReadMode::Unchanged, "zero ScopeChanged Full bytes");
     // Removing the actual configured root remains invalidation: a retry
     // cannot silently rebound to the other, still configured overlapping root.
     let mut changed = scan.index.clone();
@@ -5017,5 +5047,4 @@ fn terminal_off_constructor_progress_replacement_survives_held_and_failed_reload
         .unwrap()
         .pending_candidates
         .is_empty());
-    drop(retained);
 }
