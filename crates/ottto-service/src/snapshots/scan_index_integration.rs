@@ -207,9 +207,13 @@ pub(super) fn publish(
     index: &ScanIndex,
 ) -> Result<scan_index_persistence::LoadedRoot> {
     index.require_persistence_available()?;
-    let result = store.write_legacy(expected, index.generation, |out| {
-        lenient_decode::write_index(out, index).map_err(Into::into)
-    });
+    let result = if scan_index_writer::ENABLED {
+        scan_index_writer::publish(store, expected, index)
+    } else {
+        store.write_legacy(expected, index.generation, |out| {
+            lenient_decode::write_index(out, index).map_err(Into::into)
+        })
+    };
     drain_stats(store, "unattributed");
     result
 }

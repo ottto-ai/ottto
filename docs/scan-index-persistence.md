@@ -336,3 +336,22 @@ Clone/subset/recovery, no retirement/release/fence/re-read/export, fresh orphans
 error-path stats draining, legacy rewrite/generation and admission/heap custody.
 Runtime and macOS layout results are CI evidence, not inferred from compilation.
 The N+1 release pairing and actual downgrade-stall release notes remain required.
+
+## N+1 activation and scratch admission
+
+The writer's production publication branch is compiled but `ENABLED` remains
+false until the release owner provides N publication, M4 installation and one
+successful-save proof. Reader N always writes legacy. After that gate is
+satisfied, activating N+1 selects the existing immutable shard commit boundary;
+it does not change semantic CAS, save cadence or generation meaning.
+
+The shard plan borrows existing values and uses the shared 8 MiB parked budget,
+reserving 4 MiB for descriptors, buffers, root encoding and GC workspace before
+charging every bucket pointer allocation. No `usize::MAX` scratch allowance is
+used. Existing opaque legacy map debt stays in legacy form until its map can
+validate completely; migration never launders raw holds into proven maps.
+Each successful sharded save runs one GC pass bounded to 2,048 entries and
+16 GiB of unlinked payloads. Incomplete/error cleanup remains incomplete and
+never supplies free-space credit: commit uses actual filesystem availability.
+Unknown maps cannot call commit or GC. Post-publication commit errors retain
+`CommitPublished`; cleanup failures do not roll back a published generation.

@@ -3862,3 +3862,13 @@ pub(super) fn decode_persistence_census<R: std::io::Read>(
     anyhow::ensure!(dropped == 0, "census records unavailable");
     Ok(census)
 }
+
+impl ClaudeRequestCensus {
+    pub(super) fn persistence_entries(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (&str, &ClaudeRequestCensusRecord)> {
+        self.records
+            .iter()
+            .map(|(key, value)| (key.as_str(), value))
+    }
+}

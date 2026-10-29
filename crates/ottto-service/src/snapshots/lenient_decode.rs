@@ -202,24 +202,54 @@ impl<T: Serialize> Serialize for WireMap<'_, T> {
 
 impl Serialize for ScanIndex {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        if !self.persistence_available() {
+        IndexWire {
+            index: self,
+            metadata_only: false,
+        }
+        .serialize(serializer)
+    }
+}
+struct IndexWire<'a> {
+    index: &'a ScanIndex,
+    metadata_only: bool,
+}
+impl Serialize for IndexWire<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let index = self.index;
+        let include = |field: &str| {
+            !self.metadata_only
+                || !matches!(
+                    field,
+                    "schema_version"
+                        | "generation"
+                        | "claude_account_family_pending"
+                        | "claude_usage_family_pending"
+                        | "claude_request_census"
+                )
+        };
+        if !index.persistence_available() {
             return Err(serde::ser::Error::custom("scan_index_map_unavailable"));
         }
         let mut map = serializer.serialize_map(None)?;
         macro_rules! field {
             ($name:ident) => {
-                map.serialize_entry(stringify!($name), &self.$name)?
+                if include(stringify!($name)) {
+                    map.serialize_entry(stringify!($name), &index.$name)?;
+                }
             };
             ($name:ident, $skip:path) => {
-                if !$skip(&self.$name) {
+                if !$skip(&index.$name) {
                     field!($name);
                 }
             };
             (held $name:ident) => {
-                if !self.$name.is_empty() || self.decode_holds.0.contains_key(stringify!($name)) {
+                if include(stringify!($name))
+                    && (!index.$name.is_empty()
+                        || index.decode_holds.0.contains_key(stringify!($name)))
+                {
                     map.serialize_entry(
                         stringify!($name),
-                        &WireMap(&self.$name, self.decode_holds.0.get(stringify!($name))),
+                        &WireMap(&index.$name, index.decode_holds.0.get(stringify!($name))),
                     )?;
                 }
             };
@@ -229,7 +259,7 @@ impl Serialize for ScanIndex {
         field!(upload_context_fingerprint, Option::is_none);
         map.serialize_entry(
             "files",
-            &WireMap(&self.files, self.decode_holds.0.get("files")),
+            &WireMap(&index.files, index.decode_holds.0.get("files")),
         )?;
         field!(session_account_bindings, BTreeMap::is_empty);
         field!(terminal_jsonl_dispositions, BTreeMap::is_empty);
@@ -2762,4 +2792,57 @@ pub(super) fn retain_persistence_claims(index: &mut ScanIndex) {
             &controls.claims,
         );
     }
+}
+
+pub(super) fn write_persistence_metadata(
+    out: &mut dyn Write,
+    index: &ScanIndex,
+) -> anyhow::Result<()> {
+    let wire = IndexWire {
+        index,
+        metadata_only: true,
+    };
+    if index.decode_holds.is_empty() {
+        serde_json::to_writer(out, &wire)?;
+    } else {
+        serde_json::to_writer_pretty(out, &wire)?;
+    }
+    Ok(())
+}
+pub(super) enum PersistenceValue<'a, T> {
+    Typed(&'a T),
+    Raw(&'a RawValue),
+}
+impl<T: Serialize> Serialize for PersistenceValue<'_, T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            Self::Typed(value) => value.serialize(serializer),
+            Self::Raw(value) => value.serialize(serializer),
+        }
+    }
+}
+pub(super) fn persistence_buckets<'a, T: Serialize>(
+    typed: &'a BTreeMap<String, T>,
+    index: &'a ScanIndex,
+    field: &'static str,
+    budget: &mut usize,
+) -> anyhow::Result<scan_index_persistence::BucketMap<'a, PersistenceValue<'a, T>>> {
+    let held = index.decode_holds.0.get(field);
+    let count = typed
+        .len()
+        .checked_add(held.map_or(0, BTreeMap::len))
+        .ok_or_else(|| anyhow::anyhow!("scan_index_writer_admission"))?;
+    scan_index_persistence::BucketMap::new_bounded(
+        typed
+            .iter()
+            .filter(move |(key, _)| !held.is_some_and(|h| h.contains_key(*key)))
+            .map(|(key, value)| (key.as_str(), PersistenceValue::Typed(value)))
+            .chain(
+                held.into_iter()
+                    .flat_map(|h| h.iter())
+                    .map(|(key, raw)| (key.as_str(), PersistenceValue::Raw(raw.0.as_ref()))),
+            ),
+        count,
+        budget,
+    )
 }

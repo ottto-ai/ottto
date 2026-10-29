@@ -67,6 +67,7 @@ pub(crate) mod claude_request_identity;
 pub(crate) mod claude_request_money;
 mod scan_index_integration;
 pub(crate) mod scan_index_persistence;
+mod scan_index_writer;
 use scan_index_integration::read_scan_index_representation;
 mod idless_retry_marker;
 mod oversized_discovery;
