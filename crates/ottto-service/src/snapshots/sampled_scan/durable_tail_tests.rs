@@ -804,6 +804,10 @@ impl RestoreTestOutcome for sampled_scan::durable_tail::RestoreOutcome {
 /// C1: `known_corrupt` (T14) is not held: one counted rebuild, acquired like
 /// the control, record untouched before the save. C2: the pass's held keys and
 /// rebuilds reach the `local_resources` alarm for this source.
+/// R2-U: the indexed entry is idle (committed end = file length), so every U
+/// kind holds; a fresh index has no committed end, so an undecodable or
+/// unbindable record's file is growth: one Full, counted by reason at its
+/// start and alarmed, record untouched.
 #[test]
 fn common_hold_precedes_outer_gates_and_full_acquisition() {
     use sha2::{Digest, Sha256};
@@ -932,7 +936,8 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                 } else {
                     cache.durable_begin_pass(source, &index_path, &namespace, false);
                     let fingerprint = if bypass == "cleared" { "" } else { "fp" };
-                    let entry: ScanIndexEntry = serde_json::from_value(serde_json::json!({"size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":fingerprint,"last_snapshot_fingerprint":"accepted-body"})).unwrap();
+                    let size = std::fs::metadata(&path).unwrap().len();
+                    let entry: ScanIndexEntry = serde_json::from_value(serde_json::json!({"size_bytes":size,"modified_unix_seconds":1,"source_file_fingerprint":fingerprint,"last_snapshot_fingerprint":"accepted-body"})).unwrap();
                     index.files.insert(key.clone(), entry);
                     if bypass == "owed" {
                         index.activate_effective_upload_body_witness_revision(2);
@@ -1008,7 +1013,8 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                     )
                     .is_none());
                 }
-                let held = kind != "none" && !corrupt;
+                let grows = bypass == "fresh_index" && matches!(kind, "undecodable" | "unbindable");
+                let held = kind != "none" && !corrupt && !grows;
                 let mut completed = false;
                 let mut acquired = false;
                 let mut header_dropped = false;
@@ -1090,6 +1096,16 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                 );
                 let ((), alarms) =
                     crate::local_resource_diagnostics::capture(|| cache.durable_alarm(source));
+                assert_eq!(
+                    store_counts.u_growth,
+                    [
+                        u64::from(grows && kind == "undecodable"),
+                        u64::from(grows && kind == "unbindable"),
+                        0,
+                        0
+                    ],
+                    "{source:?}/{kind}/{bypass}"
+                );
                 let alarmed = reachable && kind != "none";
                 assert_eq!(
                     alarms.len(),
@@ -1103,6 +1119,8 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                     let pair = |on: bool| serde_json::json!([u64::from(on), u64::from(on)]);
                     assert_eq!(alarm["counts"]["held_keys"], pair(held));
                     assert_eq!(alarm["counts"]["t14_rebuild"], pair(corrupt));
+                    assert_eq!(alarm["counts"]["u_growth_full"], pair(grows));
+                    assert_eq!(alarm["counts"]["pace_evicted"], pair(false));
                     assert!(alarm["counts"].get("store_disabled").is_none());
                 }
                 let class = [
@@ -1117,7 +1135,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                 if let Some(class) = class {
                     assert_eq!(
                         counts.durable_held[class],
-                        u64::from(reachable && !corrupt),
+                        u64::from(reachable && held),
                         "{source:?}/{corrupt}/{bypass}"
                     );
                     assert_eq!(std::fs::read(&record_path).unwrap(), bytes);
@@ -1127,6 +1145,461 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                 assert_eq!(counts.restored, 0);
                 let _ = std::fs::remove_dir_all(root);
             }
+        }
+    }
+}
+
+/// One more usage line for the `native_fixture` or `codex_budget_fixture` file.
+fn grow_fixture(path: &Path, source: SnapshotSource, n: u64) {
+    use std::io::Write;
+    let line = if source == SnapshotSource::Codex {
+        let usage = |input: u64, output: u64| {
+            serde_json::json!({"input_tokens":input,"cached_input_tokens":0,
+                "output_tokens":output,"reasoning_output_tokens":0})
+        };
+        let total = crate::snapshots::session_start::WINDOW_REQUESTS as u64 + n;
+        serde_json::json!({"type":"event_msg","timestamp":"2026-10-07T10:00:02Z",
+            "payload":{"type":"token_count","info":{
+                "total_token_usage":usage(100 * total, 10 * total),
+                "last_token_usage":usage(100, 10),"model":"gpt-5.2"}}})
+    } else {
+        serde_json::json!({"type":"assistant","sessionId":"11111111-2222-4333-8444-555555555555",
+            "timestamp":"2026-10-07T10:00:02Z","requestId":format!("req-dt-u-{n}"),
+            "message":{"id":format!("msg-dt-u-{n}"),"model":"fixture-model",
+                "usage":{"input_tokens":100,"output_tokens":10}}})
+    };
+    let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+    writeln!(file, "{line}").unwrap();
+}
+
+/// An R2-U single-file fixture: one transcript, its key and its store.
+struct UFile {
+    source: SnapshotSource,
+    root: PathBuf,
+    lock: &'static crate::locked_state_dir::LockedStateDir,
+    sessions: PathBuf,
+    path: PathBuf,
+    key: String,
+    index_path: PathBuf,
+    namespace: Scope,
+}
+
+/// One scan: the emitted body, native bytes, Full and Tail files.
+#[derive(Debug, PartialEq)]
+struct UPass {
+    body: serde_json::Value,
+    native: u64,
+    full: usize,
+    tail: usize,
+}
+
+impl UPass {
+    fn held() -> Self {
+        Self {
+            body: serde_json::json!([]),
+            native: 0,
+            full: 0,
+            tail: 0,
+        }
+    }
+}
+
+impl UFile {
+    fn new(source: SnapshotSource) -> Self {
+        let root = crate::test_scratch::private_dir("ottto-dt-u-growth");
+        let lock = test_locks::hold(&root);
+        let sessions = root.join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let path = sessions.join("0199f7a0-0000-7000-8000-0000000d7a11.jsonl");
+        if source == SnapshotSource::Codex {
+            codex_budget_fixture(&path, "0199f7a0-0000-7000-8000-0000000d7a11", None);
+        } else {
+            native_fixture(&path);
+        }
+        Self {
+            source,
+            key: local_index_key(&path),
+            index_path: root.join("index.json"),
+            namespace: Scope("u-growth".into()),
+            root,
+            lock,
+            sessions,
+            path,
+        }
+    }
+
+    fn len(&self) -> u64 {
+        std::fs::metadata(&self.path).unwrap().len()
+    }
+
+    /// Writes this key's record, then breaks it as `kind`: its path and bytes.
+    fn u_record(&self, kind: &str) -> (PathBuf, Vec<u8>) {
+        use std::os::unix::fs::PermissionsExt;
+        let ds = durable_source(self.source).unwrap();
+        let digest = store::key_digest(ds, &self.key);
+        let mut disk = DurableTailStore::new(store::store_dir_for_index(&self.index_path), ds);
+        disk.write_after_save(
+            self.lock,
+            1,
+            vec![PendingRecord {
+                binding: Binding {
+                    source: ds,
+                    key: digest,
+                    context: [0; 32],
+                    scope: [0; 32],
+                    entry: [0; 32],
+                },
+                certificate: certificate(&self.path, &self.namespace),
+                body: crate::snapshots::durable_store_fixture_body(self.source, 0, 0),
+                allowlist: codec::allowlist_digest(self.source),
+            }],
+        )
+        .unwrap();
+        let record = disk.dir().join(format!(
+            "{}.rec",
+            digest
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        ));
+        let mut bytes = std::fs::read(&record).unwrap();
+        if kind == "undecodable" {
+            bytes.truncate(5);
+        } else {
+            bytes[43] ^= 1;
+        }
+        std::fs::write(&record, &bytes).unwrap();
+        std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o600)).unwrap();
+        (record, bytes)
+    }
+
+    /// One scan with `cache`. `committed`: the indexed entry's end, under the
+    /// store (`None`: no entry and no store, the cold oracle); `sampled`:
+    /// false clears the sampled acquisition (no restore attempt).
+    fn scan(
+        &self,
+        cache: &Arc<SharedCache>,
+        committed: Option<u64>,
+        sampled: bool,
+    ) -> (ScanIndex, UPass) {
+        let mut index = ScanIndex::default();
+        if let Some(size) = committed {
+            cache.durable_begin_pass(self.source, &self.index_path, &self.namespace, false);
+            index.files.insert(self.key.clone(), serde_json::from_value(serde_json::json!({"size_bytes":size,"modified_unix_seconds":1,"source_file_fingerprint":"fp"})).unwrap());
+        }
+        let mut scan = OwnedSourceScan::new(
+            self.source,
+            std::slice::from_ref(&self.sessions),
+            index,
+            "2026-10-20T12:00:00Z",
+            365,
+            100,
+            false,
+            None,
+            &[],
+            false,
+            true,
+        )
+        .with_sampled_acquisition(cache.clone(), self.namespace.clone());
+        if !sampled {
+            scan.sampling = None;
+        }
+        let mut pass = UPass::held();
+        for _ in 0..10_000 {
+            match scan.step(None) {
+                OwnedSourceScanStep::Pending(next) => {
+                    if let Some(c) = next.sampling.as_ref() {
+                        (pass.native, pass.full, pass.tail) =
+                            (c.native_bytes, c.full_files, c.tail_files);
+                    }
+                    scan = next;
+                }
+                OwnedSourceScanStep::Complete {
+                    index,
+                    scan: mut result,
+                    ..
+                } => {
+                    apply_upload_policy(
+                        self.source,
+                        &mut result.snapshots,
+                        SnapshotUploadPolicy::default(),
+                    );
+                    pass.body = serde_json::to_value(result.snapshots).unwrap();
+                    return (index, pass);
+                }
+            }
+        }
+        panic!("scan did not finish");
+    }
+
+    /// A cold Full of the current bytes.
+    fn cold(&self, sampled: bool) -> serde_json::Value {
+        let cache = Arc::new(SharedCache::default());
+        self.scan(&cache, None, sampled).1.body
+    }
+
+    fn u_growth(&self, cache: &SharedCache) -> [u64; 4] {
+        cache.durable_counters(self.source).unwrap().1.u_growth
+    }
+}
+
+impl Drop for UFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+/// R2-U (E1 hold-drop audit #1): an undecodable or unbindable record, which
+/// no binary can read. Idle: held, zero reads. Growth past the committed end:
+/// one Full whose body is a cold Full's of the same bytes, counted by reason
+/// at its start and alarmed; the post-save write leaves the record untouched.
+/// More growth inside `U_GROWTH_PACE` with no RAM copy: held, counted paced,
+/// zero reads. Quiet past the pace, or a restart: one counted Full with the
+/// exact final body (no duplicated prefix). Idle again: held, zero reads.
+#[test]
+fn u_record_growth_reads_one_paced_counted_full_and_keeps_the_record() {
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        for kind in ["undecodable", "unbindable"] {
+            for exit in ["quiet", "restart"] {
+                let file = UFile::new(source);
+                let (record, bytes) = file.u_record(kind);
+                let class = usize::from(kind == "unbindable");
+                let mut full = [0; 4];
+
+                // Idle: the selection parses (fingerprint differs), no growth.
+                let cache = Arc::new(SharedCache::default());
+                let (_, pass) = file.scan(&cache, Some(file.len()), true);
+                assert_eq!(pass, UPass::held(), "{source:?}/{kind}: idle");
+                let (counts, _) = cache.durable_counters(source).unwrap();
+                assert_eq!(counts.durable_held[2 + class], 1);
+                assert_eq!(file.u_growth(&cache), full);
+
+                // Growth: one Full, the cold body, counted at its start.
+                let first = file.len();
+                grow_fixture(&file.path, source, 1);
+                let grown = file.len();
+                let (index, pass) = file.scan(&cache, Some(first), true);
+                let first_body = file.cold(true);
+                assert_ne!(first_body, UPass::held().body);
+                let expected = UPass {
+                    body: first_body.clone(),
+                    native: grown,
+                    full: 1,
+                    tail: 0,
+                };
+                assert_eq!(pass, expected, "{source:?}/{kind}: growth");
+                full[class] = 1;
+                assert_eq!(file.u_growth(&cache), full);
+                let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
+                    crate::snapshots::durable_after_save(&cache, &file.root, source, &index);
+                    cache.durable_alarm(source);
+                });
+                assert_eq!(alarms.len(), 1);
+                assert_eq!(
+                    alarms[0]["counts"]["u_growth_full"],
+                    serde_json::json!([1, 1])
+                );
+                assert_eq!(
+                    alarms[0]["counts"]["pace_evicted"],
+                    serde_json::json!([0, 0])
+                );
+                let (_, stats) = cache.durable_counters(source).unwrap();
+                assert_eq!(stats.records_written, 0);
+                assert_eq!(std::fs::read(&record).unwrap(), bytes);
+
+                // More growth inside the pace, no RAM copy: held and counted.
+                let _ = cache.take(&file.key);
+                grow_fixture(&file.path, source, 2);
+                let (_, pass) = file.scan(&cache, Some(grown), true);
+                assert_eq!(pass, UPass::held(), "{source:?}/{kind}: paced");
+                full[2] = 1;
+                assert_eq!(file.u_growth(&cache), full);
+                let (counts, _) = cache.durable_counters(source).unwrap();
+                assert_eq!(counts.durable_held[2 + class], 2);
+
+                // Quiet past the pace (discovery keeps it: the pace is below
+                // one day), or a restart: one counted Full, exact final body.
+                let cache = if exit == "restart" {
+                    full = [0; 4];
+                    Arc::new(SharedCache::default())
+                } else {
+                    cache.durable_test_store(source, |disk| {
+                        disk.advance_clock(store::U_GROWTH_PACE)
+                    });
+                    cache
+                };
+                let (_, pass) = file.scan(&cache, Some(grown), true);
+                let final_body = file.cold(true);
+                assert_ne!(final_body, first_body, "the later growth is in the body");
+                let expected = UPass {
+                    body: final_body,
+                    native: file.len(),
+                    full: 1,
+                    tail: 0,
+                };
+                assert_eq!(pass, expected, "{source:?}/{kind}/{exit}");
+                full[class] += 1;
+
+                // Idle again: held, zero reads.
+                let (_, pass) = file.scan(&cache, Some(file.len()), true);
+                assert_eq!(pass, UPass::held(), "{source:?}/{kind}/{exit}: idle");
+                assert_eq!(file.u_growth(&cache), full, "{source:?}/{kind}/{exit}");
+                assert_eq!(std::fs::read(&record).unwrap(), bytes);
+            }
+        }
+    }
+}
+
+/// R2-U (Lead A): a pacing-map overflow raises the durable_tail alarm with
+/// its own `pace_evicted` delta, never folded into `u_growth_full`; idle,
+/// admitted and paced Full starts never move it.
+#[test]
+fn pace_eviction_alarms_apart_from_u_growth() {
+    let source = SnapshotSource::ClaudeCode;
+    let file = UFile::new(source);
+    let (record, bytes) = file.u_record("undecodable");
+    let cache = Arc::new(SharedCache::default());
+    cache.durable_begin_pass(source, &file.index_path, &file.namespace, false);
+    let alarms = || {
+        let ((), alarms) =
+            crate::local_resource_diagnostics::capture(|| cache.durable_alarm(source));
+        alarms
+    };
+    let keys = std::slice::from_ref(&file.key);
+    let held = Some((0, store::Refusal::Undecodable));
+    let pair = |since: u64, total: u64| serde_json::json!([since, total]);
+    // Idle: held, nothing counted, no alarm.
+    assert_eq!(
+        cache.durable_full_start(source, keys, &file.key, false),
+        held
+    );
+    assert!(alarms().is_empty());
+    // Admitted: U growth alarms, no eviction.
+    assert_eq!(
+        cache.durable_full_start(source, keys, &file.key, true),
+        None
+    );
+    let admitted = alarms();
+    assert_eq!(admitted.len(), 1);
+    assert_eq!(admitted[0]["counts"]["u_growth_full"], pair(1, 1));
+    assert_eq!(admitted[0]["counts"]["pace_evicted"], pair(0, 0));
+    // Paced, then idle: no alarm, so no `pace_evicted`.
+    assert_eq!(
+        cache.durable_full_start(source, keys, &file.key, true),
+        held
+    );
+    assert_eq!(
+        cache.durable_full_start(source, keys, &file.key, false),
+        held
+    );
+    assert!(alarms().is_empty());
+    // Overflow: a new pace past a full map of fresh paces evicts the oldest.
+    cache.durable_test_store(source, |disk| disk.fill_paces());
+    assert_eq!(
+        cache.durable_full_start(source, keys, "another-pace", true),
+        None
+    );
+    let evicted = alarms();
+    assert_eq!(evicted.len(), 1);
+    assert_eq!(evicted[0]["counts"]["pace_evicted"], pair(1, 1));
+    assert_eq!(evicted[0]["counts"]["u_growth_full"], pair(1, 2));
+    assert_eq!(file.u_growth(&cache), [2, 0, 1, 1]);
+    // Eviction alone: only the `pace_evicted` coordinate moves, and that alone
+    // raises the alarm (a trigger over the other six coordinates emits none).
+    cache.durable_test_store(source, |disk| disk.count_pace_eviction());
+    let only = alarms();
+    assert_eq!(only.len(), 1, "an eviction-only change alarms");
+    let counts = &only[0]["counts"];
+    assert_eq!(counts["pace_evicted"], pair(1, 2));
+    assert_eq!(counts["u_growth_full"], pair(0, 2));
+    assert_eq!(counts["held_keys"], pair(0, 0));
+    assert_eq!(counts["t14_rebuild"], pair(0, 0));
+    assert_eq!(counts["mode_repaired"], pair(0, 0));
+    assert_eq!(counts["t14_rebuild_full_started"], 0);
+    assert!(counts.get("store_disabled").is_none());
+    assert!(alarms().is_empty(), "no change, no alarm");
+    assert_eq!(file.u_growth(&cache), [2, 0, 1, 2]);
+    assert_eq!(std::fs::read(&record).unwrap(), bytes);
+}
+
+/// R2-U: an unsampled read (no restore attempt) of U-held growth is the same
+/// Full, counted by reason at its start; idle stays held.
+#[test]
+fn u_record_unsampled_growth_counts_the_full_at_its_start() {
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        for kind in ["undecodable", "unbindable"] {
+            let file = UFile::new(source);
+            let (record, bytes) = file.u_record(kind);
+            let cache = Arc::new(SharedCache::default());
+            let (_, idle) = file.scan(&cache, Some(file.len()), false);
+            assert_eq!(idle.body, UPass::held().body, "{source:?}/{kind}: idle");
+            let first = file.len();
+            grow_fixture(&file.path, source, 1);
+            let (_, pass) = file.scan(&cache, Some(first), false);
+            assert_ne!(pass.body, UPass::held().body);
+            assert_eq!(pass.body, file.cold(false), "{source:?}/{kind}");
+            let (counts, _) = cache.durable_counters(source).unwrap();
+            assert_eq!(counts.restore_attempts, 0, "no restore attempt");
+            assert_eq!(
+                file.u_growth(&cache),
+                [
+                    u64::from(kind == "undecodable"),
+                    u64::from(kind == "unbindable"),
+                    0,
+                    0
+                ]
+            );
+            assert_eq!(std::fs::read(&record).unwrap(), bytes);
+        }
+    }
+}
+
+/// R2-U: a warm RAM copy Tails U-held growth with no Full pace taken or
+/// counted, before the first U Full, inside and after its pace, and with the
+/// pace map at its bound: suffix-only reads, the cold body.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn u_record_ram_tail_growth_takes_no_full_pace() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        for kind in ["undecodable", "unbindable"] {
+            let file = UFile::new(source);
+            let cache = Arc::new(SharedCache::default());
+            // Warm RAM from an ordinary first read, before the record broke.
+            let (_, warm) = file.scan(&cache, Some(0), true);
+            assert_eq!(warm.full, 1);
+            let (record, bytes) = file.u_record(kind);
+            let tail = |n: u64, when: &str| {
+                let before = file.len();
+                grow_fixture(&file.path, source, n);
+                let paces = file.u_growth(&cache);
+                let (_, pass) = file.scan(&cache, Some(before), true);
+                let expected = UPass {
+                    body: file.cold(true),
+                    native: file.len() - before,
+                    full: 0,
+                    tail: 1,
+                };
+                assert_eq!(pass, expected, "{source:?}/{kind}: {when}");
+                assert_eq!(file.u_growth(&cache), paces, "{source:?}/{kind}: {when}");
+            };
+            tail(1, "before the first U Full");
+            // One U Full with RAM evicted sets the pace; RAM is warm after it.
+            let before = file.len();
+            let _ = cache.take(&file.key);
+            grow_fixture(&file.path, source, 2);
+            assert_eq!(file.scan(&cache, Some(before), true).1.full, 1);
+            tail(3, "inside the pace");
+            cache.durable_test_store(source, |disk| disk.advance_clock(store::U_GROWTH_PACE));
+            tail(4, "after the pace");
+            cache.durable_test_store(source, |disk| disk.fill_paces());
+            tail(5, "at the bound");
+            let mut full = [0; 4];
+            full[usize::from(kind == "unbindable")] = 1;
+            assert_eq!(file.u_growth(&cache), full);
+            assert_eq!(std::fs::read(&record).unwrap(), bytes);
         }
     }
 }
@@ -1177,7 +1650,7 @@ fn foreign_owned_store_alarms_once_and_holds_nothing() {
     let cache = SharedCache::default();
     cache.durable_begin_pass(source, &index_path, &namespace, false);
     assert!(
-        cache.durable_hold(source, key).is_some(),
+        cache.durable_hold(source, key, false).is_some(),
         "control: U holds"
     );
     let _own = OwnUid;
@@ -1187,7 +1660,7 @@ fn foreign_owned_store_alarms_once_and_holds_nothing() {
     let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
         for _ in 0..2 {
             fresh.durable_begin_pass(source, &index_path, &namespace, false);
-            assert_eq!(fresh.durable_hold(source, key), None);
+            assert_eq!(fresh.durable_hold(source, key, false), None);
             fresh.durable_alarm(source);
         }
     });
@@ -1333,7 +1806,7 @@ fn store_io_failures_emit_cold_production_body_without_holds() {
             let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
                 crate::snapshots::durable_after_save(&cache, &root, source, &index);
                 cache.durable_begin_pass(source, &index_path, &namespace, false);
-                assert_eq!(cache.durable_hold(source, &key), None);
+                assert_eq!(cache.durable_hold(source, &key, false), None);
                 cache.durable_alarm(source);
             });
             assert_eq!(alarms.len(), 1);
@@ -1430,7 +1903,7 @@ fn t14_without_retention_or_encodable_reduction_holds_on_later_passes() {
         std::fs::write(&record, &before).unwrap();
         let cache = SharedCache::default();
         cache.durable_begin_pass(source, &index_path, &namespace, false);
-        assert_eq!(cache.durable_hold(source, &key), None);
+        assert_eq!(cache.durable_hold(source, &key, false), None);
         assert_eq!(cache.durable_full_hold(source, &key, true), None);
         let admitted = cache.insert_admitted(
             key.clone(),
@@ -1463,7 +1936,7 @@ fn t14_without_retention_or_encodable_reduction_holds_on_later_passes() {
         for n in 1..=3 {
             cache.durable_begin_pass(source, &index_path, &namespace, false);
             assert_eq!(
-                cache.durable_hold(source, &key),
+                cache.durable_hold(source, &key, false),
                 (arm == "retention").then_some(store::Refusal::Corrupt)
             );
             let (counts, stats) = cache.durable_counters(source).unwrap();
@@ -1666,7 +2139,7 @@ fn known_corrupt_replacement_case(fail_replacement: bool) {
     assert_eq!(rebuilt.unreadable_path_count, 0);
     assert!(cache.retained().unwrap().peek(&key).is_some());
     assert_eq!(
-        cache.durable_hold(source, &key),
+        cache.durable_hold(source, &key, false),
         None,
         "fresh RAM in the SAME pass wins"
     );
@@ -1696,7 +2169,7 @@ fn known_corrupt_replacement_case(fail_replacement: bool) {
         ));
         cache.retained().unwrap().remove(&key);
         assert_eq!(
-            cache.durable_hold(source, &key),
+            cache.durable_hold(source, &key, false),
             None,
             "repaired record never holds"
         );

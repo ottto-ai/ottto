@@ -17,7 +17,9 @@
 //!   only when its generation is at or below the loaded index's committed
 //!   generation and the index entry it was written for is still the
 //!   committed one. Anything else is Full; nothing is partially applied.
-//! - Unknown representations hold acquisition and survive every mutation. A
+//! - Unknown representations hold acquisition and survive every mutation. An
+//!   undecodable or unbindable record (no binary can read it) still lets its
+//!   file's growth read: a Tail freely, a Full paced (`U_GROWTH_PACE`). A
 //!   known corrupt record (T14) permits one rebuild Full and its post-save
 //!   rename-over replacement. If no replacement lands, RAM alone serves
 //!   the key, or it is held without affecting the source census. More than
@@ -39,6 +41,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 /// Envelope format. Bump on any envelope or certificate layout change.
 pub(crate) const FORMAT_VERSION: u16 = 1;
@@ -369,6 +372,9 @@ pub(crate) struct StoreCounters {
     /// Writes skipped: predecessor unknown, or a new key while record files
     /// exceed `INVENTORY_BOUND` (offered again after the next save).
     pub(crate) store_write_skipped: [u64; 2],
+    /// U-held growth Fulls started, by member reason [undecodable,
+    /// unbindable]; Fulls held by the pace; paces forgotten at the bound.
+    pub(crate) u_growth: [u64; 4],
     /// T14 rebuild authorizations (RAM may already hold the file), and mode repairs.
     pub(crate) t14_rebuild: u64,
     /// First admitted rebuild Full starts in this process, not persisted repetition history.
@@ -418,6 +424,18 @@ pub(crate) struct DurableTailStore {
     pass: [u64; 2],
     /// Process-lifetime attempts, removed only after a successful replacement.
     rebuilt: BTreeMap<Digest32, Rebuild>,
+    /// The last U-held growth Full start, by pace key (a file, or a group).
+    /// RAM only; a restart forgets it.
+    u_full: BTreeMap<Digest32, SystemTime>,
+    #[cfg(test)]
+    clock: SystemTime,
+}
+
+impl Refusal {
+    /// No binary can read it, so growth must not wait for one.
+    fn reads_growth(self) -> bool {
+        matches!(self, Self::Undecodable | Self::Unbindable)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -436,6 +454,13 @@ pub(crate) const INVENTORY_BOUND: usize = 2 * MAX_RECORDS;
 /// `max(T14_BREAKER, 2% of the records loaded)`.
 pub(crate) const T14_BREAKER: u64 = 20;
 const REBUILT_BOUND: usize = 64;
+/// At most one U-held growth Full per pace key per this long. Below the
+/// smallest discovery window (one day), so growth is read before it ages out.
+pub(crate) const U_GROWTH_PACE: Duration = Duration::from_secs(6 * 60 * 60);
+const _: () = assert!(U_GROWTH_PACE.as_secs() < 24 * 60 * 60);
+/// Treat implausible wall-clock changes as expiry, favoring a read.
+const U_GROWTH_MAX_ELAPSED: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const U_GROWTH_BOUND: usize = REBUILT_BOUND;
 // A memo entry stays within the 128 bytes per record `STORES_RESIDENT_BOUND` charges.
 const _: () = assert!(std::mem::size_of::<(Digest32, (Option<Digest32>, Stamp))>() <= 128);
 
@@ -450,6 +475,9 @@ impl DurableTailStore {
             checked: false,
             pass: [0; 2],
             rebuilt: BTreeMap::new(),
+            u_full: BTreeMap::new(),
+            #[cfg(test)]
+            clock: SystemTime::now(),
         }
     }
 
@@ -650,6 +678,17 @@ impl DurableTailStore {
 
     /// U holds. T14 permits one rebuild; the adapter checks RAM before holding.
     pub(crate) fn hold(&mut self, key: &Digest32) -> Option<Refusal> {
+        self.hold_with(key, false)
+    }
+
+    /// `hold`, except that an undecodable or unbindable record lets a file
+    /// that `grown` past its committed end read (`full_start` paces a Full).
+    pub(crate) fn hold_with(&mut self, key: &Digest32, grown: bool) -> Option<Refusal> {
+        self.held(key)
+            .filter(|reason| !(grown && reason.reads_growth()))
+    }
+
+    fn held(&mut self, key: &Digest32) -> Option<Refusal> {
         let result = self.classify(key, "guard");
         self.pass[0] += u64::from(!matches!(result, Ok(None)));
         match result {
@@ -673,15 +712,105 @@ impl DurableTailStore {
 
     pub(crate) fn full_hold(&mut self, key: &Digest32, start: bool) -> Option<Refusal> {
         let held = self.hold(key);
-        if start
-            && held.is_none()
-            && self.disabled.is_none()
-            && self.rebuilt.get(key) == Some(&Rebuild::Authorized)
-        {
+        if start && held.is_none() {
+            self.start_rebuild(key);
+        }
+        held
+    }
+
+    fn start_rebuild(&mut self, key: &Digest32) {
+        if self.disabled.is_none() && self.rebuilt.get(key) == Some(&Rebuild::Authorized) {
             self.rebuilt.insert(*key, Rebuild::Started);
             self.counters.t14_rebuild_full_started += 1;
         }
-        held
+    }
+
+    /// The start of one Full of `keys` (a file, or a whole group): the held
+    /// member's position and reason, or `None` and every member started.
+    /// Grown undecodable or unbindable members admit it at most once per
+    /// `U_GROWTH_PACE` per `pace` key, counted by reason here, at the start.
+    /// At the bound the oldest pace is forgotten, so a read is never refused.
+    pub(crate) fn full_start(
+        &mut self,
+        keys: &[Digest32],
+        pace: &Digest32,
+        grown: bool,
+    ) -> Option<(usize, Refusal)> {
+        let (mut first, mut reads) = (None, [0; 2]);
+        for (n, key) in keys.iter().enumerate() {
+            match self.held(key) {
+                Some(reason) if grown && reason.reads_growth() => {
+                    first.get_or_insert((n, reason));
+                    reads[usize::from(reason == Refusal::Unbindable)] += 1;
+                }
+                Some(reason) => return Some((n, reason)),
+                None => {}
+            }
+        }
+        if first.is_some() {
+            let now = self.now();
+            // Wall time includes macOS sleep. Backwards or implausibly large
+            // jumps expire the pace instead of holding a growth read.
+            let fresh = |at: &SystemTime| {
+                now.duration_since(*at)
+                    .is_ok_and(|elapsed| elapsed <= U_GROWTH_MAX_ELAPSED && elapsed < U_GROWTH_PACE)
+            };
+            if self.u_full.get(pace).is_some_and(fresh) {
+                self.counters.u_growth[2] += 1;
+                return first;
+            }
+            if self.u_full.len() >= U_GROWTH_BOUND && !self.u_full.contains_key(pace) {
+                self.u_full.retain(|_, at| fresh(&*at));
+                let oldest = self
+                    .u_full
+                    .iter()
+                    .min_by_key(|(_, at)| **at)
+                    .map(|(k, _)| *k);
+                if let Some(oldest) = oldest.filter(|_| self.u_full.len() >= U_GROWTH_BOUND) {
+                    self.u_full.remove(&oldest);
+                    self.counters.u_growth[3] += 1;
+                }
+            }
+            self.u_full.insert(*pace, now);
+            self.counters.u_growth[0] += reads[0];
+            self.counters.u_growth[1] += reads[1];
+        }
+        for key in keys {
+            self.start_rebuild(key);
+        }
+        None
+    }
+
+    #[cfg(not(test))]
+    fn now(&self) -> SystemTime {
+        SystemTime::now()
+    }
+
+    #[cfg(test)]
+    fn now(&self) -> SystemTime {
+        self.clock
+    }
+
+    #[cfg(test)]
+    pub(crate) fn advance_clock(&mut self, by: Duration) {
+        self.clock += by;
+    }
+
+    /// Fills the pace map to its bound with fresh synthetic paces.
+    #[cfg(test)]
+    pub(crate) fn fill_paces(&mut self) {
+        let now = self.now();
+        for k in 0..U_GROWTH_BOUND {
+            let mut pace = [0xEE; 32];
+            pace[..8].copy_from_slice(&(k as u64).to_le_bytes());
+            self.u_full.insert(pace, now);
+        }
+    }
+
+    /// Counts one pace eviction and nothing else (the alarm's eviction-only change).
+    #[cfg(test)]
+    pub(crate) fn count_pace_eviction(&mut self) {
+        self.counters.u_growth[3] += 1;
     }
 
     pub(crate) fn read(&mut self, key: &Digest32, allowlist: &Digest32) -> ReadOutcome {

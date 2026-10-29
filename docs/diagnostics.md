@@ -202,14 +202,34 @@ A `durable_tail_alarm` record (schema 2 additive) follows a post-save pass
 whose durable-store counts for that source changed. Each count is
 `[since the last alarm, process total]`: `held_keys` (files held because their
 record has an unknown or newer format), `t14_rebuild` (known corrupt records
-read Full once and replaced after the save) and `mode_repaired` (store
-directory or records restored to owner-only). `store_disabled` appears once,
+read Full once and replaced after the save), `mode_repaired` (store
+directory or records restored to owner-only), `u_growth_full` (Fulls of
+undecodable or unbindable records' growth started, below) and `pace_evicted`
+(paces forgotten because the pacing map was full). `pace_evicted` is a separate
+count so that a pacing-map overflow is never read as normal U growth. `store_disabled` appears once,
 with `foreign_owner`, `not_directory`, `mode_unrepairable` or `t14_breaker`
 (more than max(20, 2%) corrupt records in one pass), when the store becomes
 memory-only for the process. While a key is held, its source's census stays
 retryable (red) for the whole hold, so census close, retirement and
 account-family proof wait for that source; a held key is not yet terminal
 disclosed residue.
+
+An undecodable or unbindable record (one no binary can read) holds its file
+only while the file is idle. Once the opened file is longer than its committed
+index end, it takes the ordinary read. A RAM copy tails it, unpaced and
+uncounted here. Otherwise the file gets one Full. A Codex group gets one Full
+of the whole group, admitted only when no member has any other hold. The Full
+is paced to at most one per file, or per group, per 6 h in this process. The
+pace uses wall time, including system sleep; backwards or greater-than-seven-day
+clock jumps expire it so growth can read. It is
+counted when it starts, never when a guard passes, with one count per U
+member's reason. That count raises this alarm as `u_growth_full`. A Full held
+by the pace is a counted hold. If more paces are fresh than the bound allows,
+the oldest pace is forgotten and counted (`pace_evicted`, its own alarm field),
+so a read is never refused. The
+record is never rewritten or collected. The `durable_tail` line reports
+`u_growth[full_undecodable,full_unbindable,paced,pace_evicted]`. Newer-format
+and unknown records still hold under the downgrade exception.
 
 ## Credential File Cap Refusals
 

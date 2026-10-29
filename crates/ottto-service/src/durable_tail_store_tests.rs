@@ -2141,3 +2141,174 @@ fn unoffered_started_rebuild_survives_save_until_its_replacement_is_offered() {
     assert!(store.rebuilt.is_empty());
     assert_eq!(store.counters().t14_rebuild_full_started, 1);
 }
+
+/// R2-U: growth lets an undecodable or unbindable record's file pass the
+/// guard with no state (a Tail or a refused group keeps nothing).
+/// `full_start` admits one Full per pace key per `U_GROWTH_PACE`, counted at
+/// the start by member reason, a whole group at once. Newer/unknown and T14
+/// are unchanged; at the bound the oldest pace is forgotten and the read is
+/// never refused; no record is touched.
+#[test]
+fn u_growth_full_start_is_paced_per_key_and_never_refused() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let transcript = scratch.transcript("t.jsonl", b"{}\n");
+    let mut store = scratch.store();
+    let b = binding("acct", "scope", ("fp", None));
+    store
+        .write_after_save(
+            &lock,
+            1,
+            vec![pending(b.clone(), certificate(&transcript), 1)],
+        )
+        .unwrap();
+    let valid = fs::read(record_file(&store, &b.key)).unwrap();
+    let mut newer = valid.clone();
+    set_version(&mut newer, 2);
+    let mut unknown = valid.clone();
+    unknown[10] ^= 1;
+    let keys: [Digest32; 4] = [[1; 32], [2; 32], [3; 32], [4; 32]];
+    let reasons = [
+        Refusal::Undecodable,
+        Refusal::Unbindable,
+        Refusal::NewerFormat,
+        Refusal::Unknown,
+    ];
+    let records = [b"bad".to_vec(), valid.clone(), newer, unknown];
+    for (key, bytes) in keys.iter().zip(&records) {
+        put_record(&record_file(&store, key), bytes);
+    }
+    let mut cold = scratch.store();
+    for ((key, reason), reads) in keys.iter().zip(reasons).zip([true, true, false, false]) {
+        let unread = (!reads).then_some(reason);
+        assert_eq!(cold.hold_with(key, false), Some(reason), "{reason:?}");
+        assert_eq!(cold.hold(key), Some(reason));
+        for _ in 0..3 {
+            assert_eq!(cold.hold_with(key, true), unread, "{reason:?}: growth");
+        }
+        assert_eq!(cold.full_start(&[*key], key, false), Some((0, reason)));
+        assert_eq!(
+            cold.full_start(&[*key], key, true),
+            unread.map(|reason| (0, reason)),
+            "{reason:?}: admitted"
+        );
+        assert_eq!(cold.full_start(&[*key], key, true), Some((0, reason)));
+        assert_eq!(
+            cold.hold_with(key, true),
+            unread,
+            "{reason:?}: a Tail is not paced"
+        );
+    }
+    assert_eq!(cold.counters().u_growth, [1, 1, 2, 0]);
+    cold.advance_clock(U_GROWTH_PACE);
+    assert_eq!(cold.full_start(&[keys[0]], &keys[0], true), None);
+    assert_eq!(cold.counters().u_growth, [2, 1, 2, 0]);
+    // The pace is RAM-only: a restart admits again.
+    assert_eq!(scratch.store().full_start(&[keys[1]], &keys[1], true), None);
+
+    // A group is classified whole before anything is counted or started: a
+    // newer member holds it with nothing left behind; then one pace for all.
+    let pace = [0xAA; 32];
+    let mut group = scratch.store();
+    for _ in 0..3 {
+        assert_eq!(
+            group.full_start(&[keys[0], keys[2]], &pace, true),
+            Some((1, Refusal::NewerFormat))
+        );
+    }
+    assert_eq!(group.counters().u_growth, [0; 4]);
+    assert_eq!(group.full_start(&[keys[0], keys[1]], &pace, true), None);
+    assert_eq!(group.counters().u_growth, [1, 1, 0, 0]);
+    assert_eq!(
+        group.full_start(&[keys[1], keys[0]], &pace, true),
+        Some((0, Refusal::Unbindable))
+    );
+
+    // A T14 member of a paced group keeps its unspent rebuild; it starts with
+    // the group's admitted Full.
+    let mut corrupt = valid.clone();
+    let end = corrupt.len() - 1;
+    corrupt[end] ^= 1;
+    put_record(&record_file(&store, &b.key), &corrupt);
+    let mut t14 = scratch.store();
+    assert_eq!(t14.full_start(&[keys[0]], &pace, true), None);
+    assert_eq!(
+        t14.full_start(&[b.key, keys[0]], &pace, true),
+        Some((1, Refusal::Undecodable))
+    );
+    assert_eq!(t14.counters().t14_rebuild, 1);
+    assert_eq!(t14.counters().t14_rebuild_full_started, 0);
+    t14.advance_clock(U_GROWTH_PACE);
+    assert_eq!(t14.full_start(&[b.key, keys[0]], &pace, true), None);
+    assert_eq!(t14.counters().t14_rebuild_full_started, 1);
+    assert_eq!(t14.counters().u_growth, [2, 0, 1, 0]);
+
+    // At the bound of fresh paces the oldest is forgotten (counted): every
+    // new key's first Full is admitted.
+    let mut bounded = scratch.store();
+    bounded.fill_paces();
+    let many = (100..=164_u8).map(|n| [n; 32]).collect::<Vec<_>>();
+    for key in &many {
+        put_record(&record_file(&store, key), b"bad");
+        assert_eq!(bounded.full_start(&[*key], key, true), None);
+    }
+    assert_eq!(bounded.counters().u_growth, [65, 0, 0, 65]);
+    for (key, bytes) in keys.iter().zip(&records) {
+        assert_eq!(&fs::read(record_file(&store, key)).unwrap(), bytes);
+    }
+}
+
+/// A suspended monotonic clock cannot extend the wall-clock pace. Clock
+/// corrections fail toward a read, then start a fresh pace at the new time.
+#[test]
+fn u_growth_wall_clock_sleep_and_corrections_expire_the_pace() {
+    let scratch = Scratch::new();
+    let key = [0xAB; 32];
+    let record = record_file(&scratch.store(), &key);
+    put_record(&record, b"bad");
+    let start = SystemTime::UNIX_EPOCH + Duration::from_secs(30 * 24 * 60 * 60);
+    for (name, now, expired) in [
+        (
+            "before six hours",
+            start + U_GROWTH_PACE - Duration::from_secs(1),
+            false,
+        ),
+        ("normal six hours", start + U_GROWTH_PACE, true),
+        (
+            "sleep past six hours",
+            start + U_GROWTH_PACE + Duration::from_secs(1),
+            true,
+        ),
+        ("backwards", start - Duration::from_secs(1), true),
+        ("seven days", start + U_GROWTH_MAX_ELAPSED, true),
+        (
+            "implausible forward jump",
+            start + U_GROWTH_MAX_ELAPSED + Duration::from_secs(1),
+            true,
+        ),
+    ] {
+        let mut store = scratch.store();
+        store.clock = start;
+        assert_eq!(store.full_start(&[key], &key, true), None, "{name}");
+        let held = Some((0, Refusal::Undecodable));
+        assert_eq!(store.full_start(&[key], &key, true), held, "{name}");
+        // Only the wall clock moves; the fixture never waits or advances an Instant.
+        store.clock = now;
+        assert_eq!(
+            store.full_start(&[key], &key, true),
+            if expired { None } else { held },
+            "{name}"
+        );
+        assert_eq!(
+            store.full_start(&[key], &key, true),
+            held,
+            "{name}: new pace"
+        );
+        assert_eq!(
+            store.counters().u_growth,
+            if expired { [2, 0, 2, 0] } else { [1, 0, 3, 0] },
+            "{name}"
+        );
+        assert_eq!(fs::read(&record).unwrap(), b"bad", "{name}");
+    }
+}

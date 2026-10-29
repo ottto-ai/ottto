@@ -3057,6 +3057,138 @@ fn durable_hold_on_one_member_holds_the_joined_group() {
     );
 }
 
+/// Undecodable (`b"bad"`) Codex records for `paths` in the store beside
+/// `index_path`: each record's path.
+#[cfg(unix)]
+fn u_records(index_path: &Path, paths: &[PathBuf]) -> Vec<PathBuf> {
+    use crate::durable_tail_store as store;
+    let dir = store::store_dir_for_index(index_path);
+    fs::create_dir_all(&dir).unwrap();
+    paths
+        .iter()
+        .map(|path| {
+            let key = store::key_digest(store::DurableSource::Codex, &local_index_key(path));
+            let hex = key.iter().map(|b| format!("{b:02x}")).collect::<String>();
+            let record = dir.join(format!("{hex}.rec"));
+            fs::write(&record, b"bad").unwrap();
+            record
+        })
+        .collect()
+}
+
+/// R2-U (review P1): a joined group of 65 members, each with an undecodable
+/// record (more members than the pace bound), reads as ONE paced Full on
+/// growth: admitted whole, counted per member reason at its start, no record
+/// touched. More growth inside the pace holds the group (counted once); past
+/// the pace it reads again.
+#[cfg(unix)]
+#[test]
+fn u_held_group_larger_than_the_pace_bound_reads_one_paced_full() {
+    use crate::durable_tail_store as store;
+    use std::io::Write;
+    const MEMBERS: u64 = 65;
+    let root = temp_root("u-group");
+    let sessions = root.join("sessions");
+    let at = |hour: u64, n: u64| format!("2026-10-01T{hour}:{:02}:{:02}Z", n / 60, n % 60);
+    let paths = (0..MEMBERS)
+        .map(|n| {
+            let path = sessions.join(format!("m{n:02}.jsonl"));
+            write_rows(
+                &path,
+                &[
+                    json!({"type":"session_meta","timestamp":at(10, n),"payload":{"id":OWNER}}),
+                    json!({"type":"token_usage_record","timestamp":at(11, n),"payload":{
+                        "thread_id":OWNER,"response_id":format!("r-{n}"),"usage":usage(100),
+                        "thread_token_usage":usage(100 * (n + 1))}}),
+                    json!({"type":"event_msg","timestamp":at(12, n),"payload":{"type":"token_count",
+                        "info":{"last_token_usage":usage(100),"total_token_usage":usage(100 * (n + 1))}}}),
+                ],
+            );
+            path
+        })
+        .collect::<Vec<_>>();
+    let index_path = root.join("index.json");
+    let namespace = Scope("group-fixture".into());
+    let records = u_records(&index_path, &paths);
+    let cache = Arc::new(SharedCache::default());
+    let pass = |index: ScanIndex, n: u32| {
+        cache.durable_begin_pass(SnapshotSource::Codex, &index_path, &namespace, false);
+        next_generation(&root, index, &cache, n)
+    };
+    let read = |result: &SourceScanResult| {
+        result
+            .snapshots
+            .iter()
+            .any(|item| item.source_session_id == OWNER)
+    };
+    let u_growth = || {
+        cache
+            .durable_counters(SnapshotSource::Codex)
+            .unwrap()
+            .1
+            .u_growth
+    };
+    // No committed end: one admitted Full of all 65 members.
+    let (index, result) = pass(ScanIndex::default(), 0);
+    assert!(read(&result), "the whole group reads");
+    assert_eq!(u_growth(), [MEMBERS, 0, 0, 0]);
+    // More growth inside the pace: the group holds, counted once.
+    writeln!(fs::OpenOptions::new().append(true).open(&paths[0]).unwrap()).unwrap();
+    let (index, result) = pass(index, 1);
+    assert!(!read(&result));
+    assert_eq!(u_growth(), [MEMBERS, 0, 1, 0]);
+    // Past the pace: one more Full of the whole group.
+    cache.durable_test_store(SnapshotSource::Codex, |disk| {
+        disk.advance_clock(store::U_GROWTH_PACE)
+    });
+    let (_, result) = pass(index, 2);
+    assert!(read(&result));
+    assert_eq!(u_growth(), [2 * MEMBERS, 0, 1, 0]);
+    for record in &records {
+        assert_eq!(fs::read(record).unwrap(), b"bad");
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// R2-U (review P1/P3): a grown group refused before its Full start (a
+/// newer-format member holds it) counts and keeps nothing, however often,
+/// so nothing waits on a start that never comes. Once the newer record is
+/// gone, the group reads with one Full, counted at its start.
+#[cfg(unix)]
+#[test]
+fn refused_u_group_starts_no_full_and_leaves_no_grant() {
+    use crate::durable_tail_store as store;
+    let (root, _) = fixture();
+    let index_path = root.join("index.json");
+    let namespace = Scope("group-fixture".into());
+    let records = u_records(&index_path, &[root.join("sessions/a.jsonl")]);
+    let newer = u_records(&index_path, &[root.join("sessions/b.jsonl")]).remove(0);
+    let newer_bytes = [b"ottto-dt".as_slice(), &2_u16.to_le_bytes(), &[7_u8; 64]].concat();
+    fs::write(&newer, &newer_bytes).unwrap();
+    let cache = Arc::new(SharedCache::default());
+    let pass = |n: u32| {
+        cache.durable_begin_pass(SnapshotSource::Codex, &index_path, &namespace, false);
+        let (_, result) = next_generation(&root, ScanIndex::default(), &cache, n);
+        result
+            .snapshots
+            .iter()
+            .any(|item| item.source_session_id == OWNER)
+    };
+    for n in 0..3 {
+        assert!(!pass(n), "a newer member holds the group");
+    }
+    let (counts, stats) = cache.durable_counters(SnapshotSource::Codex).unwrap();
+    assert!(counts.durable_held[store::Refusal::NewerFormat as usize] >= 3);
+    assert_eq!(stats.u_growth, [0; 4]);
+    assert_eq!(fs::read(&newer).unwrap(), newer_bytes);
+    fs::remove_file(&newer).unwrap();
+    assert!(pass(3), "the U member's growth reads the group");
+    let (_, stats) = cache.durable_counters(SnapshotSource::Codex).unwrap();
+    assert_eq!(stats.u_growth, [1, 0, 0, 0]);
+    assert_eq!(fs::read(&records[0]).unwrap(), b"bad");
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn compressed_group_probe_initial_swap_and_legacy_tee_never_read() {
     use codex_zst_refusal_tests::assert_refused;

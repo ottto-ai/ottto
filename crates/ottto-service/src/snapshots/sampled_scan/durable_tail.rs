@@ -110,6 +110,7 @@ impl Counters {
              bytes_read={} format_hold[newer,unknown,undecodable,unbindable,known_corrupt]={:?} durable_held={:?} held_census[kept,invalidated]={:?} \
              guard_header_bytes={} guard_verify_bytes={} delete_verify_bytes={} overwrite_verify_bytes={} \
              uninventoried_records={} store_write_skipped[unknown,inventory_overflow]={:?} \
+             u_growth[full_undecodable,full_unbindable,paced,pace_evicted]={:?} \
              gc_records_deleted={} gc_records_read={} gc_bytes_read={} gc_keep_peak={} \
              records_invalidated={} peak_codec_bytes={} t14_rebuild_full_started={}",
             source.api_slug(),
@@ -136,6 +137,7 @@ impl Counters {
             store.overwrite_verify_bytes,
             store.uninventoried_records,
             store.store_write_skipped,
+            store.u_growth,
             store.gc_records_deleted,
             store.gc_records_read,
             store.gc_bytes_read,
@@ -157,9 +159,10 @@ struct Slot {
     namespace: Scope,
     identity_capture: bool,
     /// Keys held (U) by this source, and the totals the last alarm reported:
-    /// [held, t14_rebuild, mode_repaired, disabled, rebuild_full].
+    /// [held, t14_rebuild, mode_repaired, disabled, rebuild_full, u_growth_full,
+    /// pace_evicted].
     held: u64,
-    reported: [u64; 5],
+    reported: [u64; 7],
 }
 
 /// Process-lifetime durable state beside the RAM cache.
@@ -483,17 +486,19 @@ impl SharedCache {
                 namespace: namespace.clone(),
                 identity_capture,
                 held: 0,
-                reported: [0; 5],
+                reported: [0; 7],
             });
         }
     }
 
+    /// `grown`: the held FD is longer than the committed index entry.
     pub(crate) fn durable_hold(
         &self,
         snapshot_source: SnapshotSource,
         key: &str,
+        grown: bool,
     ) -> Option<store::Refusal> {
-        self.durable_guard(snapshot_source, key, false)
+        self.durable_guard(snapshot_source, key, false, grown)
     }
 
     fn durable_guard(
@@ -501,6 +506,7 @@ impl SharedCache {
         snapshot_source: SnapshotSource,
         key: &str,
         restore_recheck: bool,
+        grown: bool,
     ) -> Option<store::Refusal> {
         let ram = !restore_recheck && self.retained().is_ok_and(|ram| ram.peek(key).is_some());
         let source = durable_source(snapshot_source)?;
@@ -509,7 +515,7 @@ impl SharedCache {
             .slot(source)
             .as_mut()?
             .store
-            .hold(&store::key_digest(source, key));
+            .hold_with(&store::key_digest(source, key), grown);
         if held == Some(store::Refusal::Corrupt) && ram {
             Counters::bump(
                 &mut self.durable()?.counters.not_persisted,
@@ -520,6 +526,53 @@ impl SharedCache {
         held
     }
 
+    /// A grouped member's hold; `grown`: some member is past its committed end.
+    pub(crate) fn durable_group_hold(
+        &self,
+        source: SnapshotSource,
+        key: &str,
+        grown: bool,
+    ) -> Option<store::Refusal> {
+        let source = durable_source(source)?;
+        self.durable()?
+            .slot(source)
+            .as_mut()?
+            .store
+            .hold_with(&store::key_digest(source, key), grown)
+    }
+
+    /// The start of one Full of `keys` (a file, or a group paced as one
+    /// `pace`): `store::DurableTailStore::full_start`.
+    pub(crate) fn durable_full_start(
+        &self,
+        source: SnapshotSource,
+        keys: &[String],
+        pace: &str,
+        grown: bool,
+    ) -> Option<(usize, store::Refusal)> {
+        let source = durable_source(source)?;
+        let digests = keys
+            .iter()
+            .map(|key| store::key_digest(source, key))
+            .collect::<Vec<_>>();
+        self.durable()?.slot(source).as_mut()?.store.full_start(
+            &digests,
+            &store::key_digest(source, pace),
+            grown,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn durable_test_store(
+        &self,
+        source: SnapshotSource,
+        f: impl FnOnce(&mut DurableTailStore),
+    ) {
+        let source = durable_source(source).unwrap();
+        f(&mut self.durable().unwrap().slot(source).as_mut().unwrap().store);
+    }
+
+    #[cfg(test)]
     pub(crate) fn durable_full_hold(
         &self,
         source: SnapshotSource,
@@ -599,7 +652,14 @@ impl SharedCache {
         ) {
             Ok(taken) => RestoreOutcome::Restored(Box::new(taken)),
             Err(class) => self
-                .durable_guard(snapshot_source, key, true)
+                .durable_guard(
+                    snapshot_source,
+                    key,
+                    true,
+                    held.metadata().is_ok_and(|metadata| {
+                        metadata.len() > index.files.get(key).map_or(0, |entry| entry.size_bytes)
+                    }),
+                )
                 .map_or(RestoreOutcome::Miss(class), RestoreOutcome::Held),
         }
     }
@@ -1054,6 +1114,9 @@ impl SharedCache {
             t14_rebuild: [u64; 2],
             t14_rebuild_full_started: u64,
             mode_repaired: [u64; 2],
+            u_growth_full: [u64; 2],
+            /// A pacing-map overflow, never folded into `u_growth_full`.
+            pace_evicted: [u64; 2],
             #[serde(skip_serializing_if = "Option::is_none")]
             store_disabled: Option<&'static str>,
         }
@@ -1073,6 +1136,8 @@ impl SharedCache {
             store.mode_repaired,
             u64::from(disabled.is_some()),
             store.t14_rebuild_full_started,
+            store.u_growth[0] + store.u_growth[1],
+            store.u_growth[3],
         ];
         let last = std::mem::replace(&mut slot.reported, now);
         drop(stores);
@@ -1085,6 +1150,8 @@ impl SharedCache {
                     t14_rebuild: pair(1),
                     t14_rebuild_full_started: store.t14_rebuild_full_started,
                     mode_repaired: pair(2),
+                    u_growth_full: pair(5),
+                    pace_evicted: pair(6),
                     store_disabled: disabled.filter(|_| last[3] == 0),
                 },
             );

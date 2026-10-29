@@ -27754,14 +27754,26 @@ impl OwnedSourceScan {
                         }
                     }
                 }
+                // One Full of the whole group, paced as one.
                 #[cfg(unix)]
                 if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
-                    if let Some((member, reason)) = group_members.iter().find_map(|member| {
-                        cache
-                            .durable_full_hold(source, &local_index_key(&member.path), true)
-                            .map(|reason| (member, reason))
-                    }) {
-                        cache.durable_hold_exit(source, reason, index, member, &mut census);
+                    let keys = group_members
+                        .iter()
+                        .map(|member| local_index_key(&member.path))
+                        .collect::<Vec<_>>();
+                    let grown = group_members
+                        .iter()
+                        .any(|member| durable_grown(index, member));
+                    let pace = format!("codex-group\0{owner}");
+                    if let Some((n, reason)) = cache.durable_full_start(source, &keys, &pace, grown)
+                    {
+                        cache.durable_hold_exit(
+                            source,
+                            reason,
+                            index,
+                            &group_members[n],
+                            &mut census,
+                        );
                         pending!();
                     }
                 }
@@ -27877,15 +27889,20 @@ impl OwnedSourceScan {
                         pending!();
                     }
                     // Grouped members bypass the per-candidate guard: one held member holds the group.
+                    // Growth of any member reads the whole group.
                     #[cfg(unix)]
                     if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
+                        let grown = group
+                            .members
+                            .iter()
+                            .any(|member| durable_grown(index, member));
                         if let Some((member, reason)) = group.members.iter().find_map(|member| {
                             Some((
                                 member,
-                                cache.durable_full_hold(
+                                cache.durable_group_hold(
                                     source,
                                     &local_index_key(&member.path),
-                                    false,
+                                    grown,
                                 )?,
                             ))
                         }) {
@@ -31492,9 +31509,9 @@ impl OwnedSourceScan {
             #[cfg(unix)]
             if side_plan.is_none() {
                 if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
-                    if let Some(reason) =
-                        cache.durable_hold(source, &local_index_key(&candidate.path))
-                    {
+                    let key = local_index_key(&candidate.path);
+                    let grown = durable_grown(index, &candidate);
+                    if let Some(reason) = cache.durable_hold(source, &key, grown) {
                         cache.durable_hold_exit(source, reason, index, &candidate, &mut census);
                         pending!();
                     }
@@ -32453,11 +32470,11 @@ impl OwnedSourceScan {
                 })
             {
                 if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
-                    if let Some(reason) = cache.durable_full_hold(
-                        source,
-                        &local_index_key(&active.candidate.path),
-                        true,
-                    ) {
+                    let key = local_index_key(&active.candidate.path);
+                    let grown = durable_grown(index, &active.candidate);
+                    if let Some((_, reason)) =
+                        cache.durable_full_start(source, std::slice::from_ref(&key), &key, grown)
+                    {
                         cache.durable_hold_exit(
                             source,
                             reason,
@@ -42404,6 +42421,17 @@ fn codex_parent_outside_window(
     !sampled_audit::path_requires_verification(files, path)
         && census_unix_seconds
             .is_some_and(|now| !is_recent_enough_at(modified, now, backfill_window_days))
+}
+
+/// R2-U: the opened file (its held-FD size at open) is past the committed
+/// index end; a missing entry commits nothing.
+#[cfg(unix)]
+fn durable_grown(index: &ScanIndex, candidate: &CandidateFile) -> bool {
+    let committed = index
+        .files
+        .get(&local_index_key(&candidate.path))
+        .map_or(0, |entry| entry.size_bytes);
+    candidate.size_bytes > committed
 }
 
 fn effective_backfill_window_days(requested_backfill_window_days: u64) -> u64 {
