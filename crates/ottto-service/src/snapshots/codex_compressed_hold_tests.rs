@@ -1827,9 +1827,17 @@ fn distinct_home_two_archive_family_holds_every_archive() {
             Some(CodexZstCause::FamilyUnproven)
         );
     }
-    assert!(rows
-        .iter()
-        .any(|r| r["counts"]["codex_zst_held"]["CompressedFamilyUnproven"] == 2));
+    assert_eq!(
+        rows.iter()
+            .map(|r| {
+                r["counts"]["codex_zst_held"]["CompressedFamilyUnproven"]
+                    .as_u64()
+                    .unwrap_or(0)
+            })
+            .sum::<u64>(),
+        2,
+        "Pending pages may drain separate batches; the two mints count once each"
+    );
     let saved = root.join("index.json");
     index.save(&saved).unwrap();
     fs::remove_file(&b).unwrap();
