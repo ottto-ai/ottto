@@ -850,3 +850,44 @@ fn upgrade_missing_progresses_past_tracking_window_and_keeps_once_semantics() {
     restart.saved();
     assert!(restart.upgrade_missing("next-indexed-file", true));
 }
+
+#[test]
+fn claude_upgrade_growth_rearms_without_growing_persisted_key_history() {
+    let f = Fixture::new();
+    let mut candidate = f.candidate();
+    let key = local_index_key(&candidate.path);
+    let mut state = State::default();
+    for growth in 1..=3 {
+        candidate.size_bytes += growth;
+        candidate.modified_unix_nanos += 1;
+        assert!(!state.upgrade_growth(&key, &candidate, true));
+        assert!(state.needs_save());
+        assert!(!state.upgrade_claimed(&key));
+        state.saved();
+        assert!(state.upgrade_growth(&key, &candidate, true));
+        assert!(state.upgrade_claimed(&key));
+        assert!(!state.upgrade_growth(&key, &candidate, true));
+        assert_eq!(state.replayed.values().map(BTreeSet::len).sum::<usize>(), 1);
+    }
+    let bytes = serde_json::to_vec(&state).unwrap();
+    let mut restarted: State = serde_json::from_slice(&bytes).unwrap();
+    assert!(!restarted.upgrade_claimed(&key));
+    assert!(!restarted.upgrade_growth(&key, &candidate, true));
+    restarted.saved();
+    assert!(
+        restarted.upgrade_growth(&key, &candidate, true),
+        "accepted transitional restart allowance"
+    );
+    assert_eq!(
+        restarted
+            .replayed
+            .values()
+            .map(BTreeSet::len)
+            .sum::<usize>(),
+        1
+    );
+    restarted.closed = true;
+    candidate.size_bytes += 1;
+    assert!(!restarted.upgrade_growth(&key, &candidate, true));
+    assert!(!restarted.needs_save());
+}

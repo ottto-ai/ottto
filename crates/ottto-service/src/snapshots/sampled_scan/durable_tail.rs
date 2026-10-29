@@ -598,7 +598,8 @@ impl DurableCustody {
 
 pub(crate) struct UpgradeRead {
     object: (u64, u64, u64),
-    started: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    started: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    local_started: bool,
     total: std::sync::Arc<AtomicU64>,
 }
 impl UpgradeRead {
@@ -615,7 +616,11 @@ impl UpgradeRead {
             ));
         }
         let result = file.read(bytes);
-        if !self.started.swap(true, Ordering::Relaxed) {
+        let first = self.started.as_ref().map_or_else(
+            || !std::mem::replace(&mut self.local_started, true),
+            |started| !started.swap(true, Ordering::Relaxed),
+        );
+        if first {
             self.total.fetch_add(1, Ordering::Relaxed);
             #[cfg(test)]
             tests::observe_upgrade_read();
@@ -1012,6 +1017,28 @@ impl SharedCache {
         if !slot.store.absent(&store::key_digest(ds, &key)) {
             return false;
         }
+        if source == SnapshotSource::ClaudeCode {
+            if candidate.size_bytes <= entry.size_bytes {
+                return true;
+            }
+            let claimed = index.reread_guard.upgrade_growth(&key, candidate, consume);
+            if !claimed && index.reread_guard.needs_save() {
+                return true;
+            }
+            if consume {
+                stores.upgrade_claims[ds as usize] += u64::from(claimed);
+                if !claimed {
+                    Counters::bump(
+                        &mut stores.counters.ineligible,
+                        "upgrade_missing.unreserved_full",
+                    );
+                }
+                if let Some(c) = stores.retail_spent.get_mut(&store::key_digest(ds, &key)) {
+                    c.upgrade_started = None;
+                }
+            }
+            return false;
+        }
         if reread_guard::byte_unchanged(entry, candidate)
             || !index.reread_guard.upgrade_missing(&key, consume)
         {
@@ -1038,20 +1065,27 @@ impl SharedCache {
         {
             return Ok(None);
         }
-        if !stores.fund_key(key) {
-            return Err(RetailHold::AccountingLost);
-        }
+        let funded = stores.fund_key(key);
         let m = file.metadata().map_err(|_| RetailHold::Ineligible)?;
-        let started = stores
-            .retail_spent
-            .get_mut(&key)
-            .expect("funded")
-            .upgrade_started
-            .get_or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
-            .clone();
+        let started = if funded {
+            Some(
+                stores
+                    .retail_spent
+                    .get_mut(&key)
+                    .expect("funded")
+                    .upgrade_started
+                    .get_or_insert_with(|| {
+                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))
+                    })
+                    .clone(),
+            )
+        } else {
+            None
+        };
         Ok(Some(UpgradeRead {
             object: (m.dev(), m.ino(), birth_unix_nanos(&m)),
             started,
+            local_started: false,
             total: stores.upgrade_reads.clone(),
         }))
     }
