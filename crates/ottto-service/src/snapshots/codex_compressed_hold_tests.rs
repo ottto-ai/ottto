@@ -2036,7 +2036,10 @@ fn present_family_archive_keeps_legacy_tombstone_across_two_censuses() {
             AckEvidence::LegacyAcked,
             "header-excluded present owner keeps Legacy evidence"
         );
-        assert!(!next.codex_counting_tombstones.contains_key(&other));
+        assert!(
+            next.codex_counting_tombstones.contains_key(&other),
+            "opaque held ownership cannot prove an unrelated tombstone absent"
+        );
         next.save(&saved).unwrap();
         index = ScanIndex::load(&saved).unwrap();
     }
@@ -2152,5 +2155,63 @@ fn historical_family_cannot_weaken_new_member_parent_custody() {
         index.files[&local_index_key(&archive)].codex_compressed_hold,
         Some(CodexZstCause::ParentLedgerUnbound)
     );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn replaced_held_path_cannot_retire_its_hidden_current_legacy_owner() {
+    use codex_counting_version::{AckEvidence, CountingTombstone};
+    let root = crate::test_scratch::private_dir("family-opaque-replacement-absence");
+    let held = member(&root, "sessions", OWNER, false);
+    let replacement = member(&root, "replacement/sessions", PARENT, false);
+    let healthy = member(
+        &root,
+        "sessions",
+        "cccccccc-dddd-4eee-8fff-aaaaaaaaaaaa",
+        false,
+    );
+    let hidden_owner = codex_protected_owner(PARENT);
+    let mut index = accepted(&root, &held);
+    latch(&mut index, &held);
+    fs::rename(&replacement, &held).unwrap();
+    assert!(held.exists());
+    assert!(index.codex_state_only_blocked_by_file[&local_index_key(&held)].contains(OWNER));
+    index.codex_counting_tombstones.insert(
+        hidden_owner.clone(),
+        CountingTombstone {
+            evidence: AckEvidence::LegacyAcked,
+            retired_in: "old-generation".into(),
+            created_unix_ms: None,
+        },
+    );
+    let saved = root.join("index.json");
+    for pass in 0..2 {
+        let paths = [held.clone(), healthy.clone()];
+        let inv = no_open(&held, || inventory(&root, &paths, &mut index));
+        assert!(inv.complete);
+        assert_eq!(inv.headers.len(), 1);
+        assert!(inv.headers.iter().all(|h| h.owner != PARENT));
+        let mut scan = staged(&root, index, std::slice::from_ref(&healthy));
+        scan.index
+            .traversal
+            .as_mut()
+            .unwrap()
+            .codex_rollout_paths
+            .insert(local_index_key(&held));
+        scan.index.known_configured_scan_roots = BTreeSet::from([local_index_key(&root)]);
+        scan.codex_join_inventory = Some(inv);
+        let (mut next, result) = no_open(&held, || run(scan));
+        assert_eq!(result.unreadable_path_count, 0);
+        assert!(result.census_complete, "stable census {pass}");
+        assert_eq!(
+            next.codex_counting_tombstones[&hidden_owner].evidence,
+            AckEvidence::LegacyAcked
+        );
+        assert!(next.files[&local_index_key(&held)]
+            .codex_compressed_hold
+            .is_some());
+        next.save(&saved).unwrap();
+        index = ScanIndex::load(&saved).unwrap();
+    }
     fs::remove_dir_all(root).unwrap();
 }

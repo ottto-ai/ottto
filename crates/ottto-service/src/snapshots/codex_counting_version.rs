@@ -401,6 +401,8 @@ pub(super) fn absence_coverage_complete(
     inventory: &codex_file_join::HeaderInventory,
 ) -> bool {
     inventory.complete
+        // Negative attribution is not a fresh owner census after replacement.
+        && !index.files.values().any(|entry| entry.codex_compressed_hold.is_some())
         && !inventory.custody_refused
         && !inventory.custody_unknown
         && index.legacy_unresolved_root_file_witnesses.is_empty()
