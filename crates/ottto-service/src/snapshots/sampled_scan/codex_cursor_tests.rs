@@ -15117,7 +15117,7 @@ fn plain_cursor_resumes_unchanged_when_its_archive_sibling_is_family_held() {
         );
         while !inv.step_with_archive(&CodexTitleMetadata::default(), &mut index, Some(&cache)) {}
         while !inv.prepare_custody(&index) {}
-        inv.hold_custodied_siblings(&mut index);
+        while !inv.hold_custodied_siblings(&mut index) {}
         assert!(inv.complete_for(Some(&SESSION.to_owned())));
         assert!(inv.member_held(&archive));
         assert!(index
