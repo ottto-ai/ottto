@@ -79,6 +79,16 @@ fn same_size_new_owner_rereads_and_changes_group_key() {
 #[test]
 fn header_cache_production_wake_output_equivalence_join_parent_counting() {
     let (root, group_keys) = tests::counting_v2_fixture();
+    // Acquire the real parent ledger before introducing the fork and joined
+    // members. A fresh fork intentionally needs a later parent-prepass wake.
+    let group_files = group_keys
+        .iter()
+        .map(|key| {
+            let bytes = fs::read(key).unwrap();
+            fs::remove_file(key).unwrap();
+            (key, bytes)
+        })
+        .collect::<Vec<_>>();
     let parent = "019fd6a0-0000-7000-8000-000000000001";
     let child = "019fd6a0-0000-7000-8000-000000000002";
     let turn = json!({"timestamp":"2026-08-02T08:00:01Z","type":"turn_context",
@@ -90,6 +100,8 @@ fn header_cache_production_wake_output_equivalence_join_parent_counting() {
             "last_token_usage":tests::usage(last)}}})
     };
     let first_usage = usage("2026-08-02T08:00:02Z", 100, 100);
+    let mut prior = ScanIndex::default();
+    assert!(prior.record_codex_parent_ref(parent));
     for (id, rows) in [
         (
             parent,
@@ -124,6 +136,19 @@ fn header_cache_production_wake_output_equivalence_join_parent_counting() {
                 .collect::<String>(),
         )
         .unwrap();
+        if id == parent {
+            let (mut index, mut scan) = tests::scan(&root, prior, 100);
+            finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
+            scan.finish_codex_capture_boundary(&mut index);
+            assert!(index.codex_parent_ownership_ledgers[parent].scan_complete);
+            assert!(!index.codex_parent_ownership_ledgers[parent]
+                .signatures
+                .is_empty());
+            prior = index;
+        }
+    }
+    for (key, bytes) in group_files {
+        fs::write(key, bytes).unwrap();
     }
     // Between the August fork and October join: exercise Legacy parent
     // ownership and a non-empty V2 group in the same production scan.
@@ -141,7 +166,7 @@ fn header_cache_production_wake_output_equivalence_join_parent_counting() {
         let mut owned = OwnedSourceScan::new(
             SnapshotSource::Codex,
             &[root.join("sessions")],
-            ScanIndex::default(),
+            prior.clone(),
             "2026-10-06T23:00:00Z",
             183,
             100,
