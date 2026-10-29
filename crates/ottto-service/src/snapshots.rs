@@ -67,7 +67,7 @@ pub(crate) mod claude_request_identity;
 pub(crate) mod claude_request_money;
 mod scan_index_integration;
 pub(crate) mod scan_index_persistence;
-use scan_index_integration::{read_scan_index_representation, scan_index_storage_binding};
+use scan_index_integration::read_scan_index_representation;
 mod idless_retry_marker;
 mod oversized_discovery;
 pub(crate) mod scan_index_health;
@@ -5558,6 +5558,10 @@ fn claude_stale_member_independently_accepted(
     key: &str,
     entry: &ScanIndexEntry,
 ) -> bool {
+    if !index.persistence_available() {
+        return false;
+    }
+
     entry.scan_identity_version.as_deref() == Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
         && entry
             .last_upload_body_witness
@@ -5628,6 +5632,10 @@ fn claude_stale_member_accepted_retry_evidence(
     pending: &ClaudeUsageFamilyPending,
     debt_scope: Option<&BTreeSet<String>>,
 ) -> bool {
+    if !index.persistence_available() {
+        return false;
+    }
+
     if index.claude_request_identity_contract_changed
         && (pending.invalid
             || !debt_scope.is_some_and(|roots| {
@@ -5711,6 +5719,10 @@ fn claude_stream_accepted_retry_carry_inner(
     diagnostics: &mut StaleCarryRejectionCounts,
     debt_scope: Option<&BTreeSet<String>>,
 ) -> Result<ClaudeStaleFamilyCarry, ClaudeRetryAdmissionRefusal> {
+    if !index.persistence_available() {
+        return Err(ClaudeRetryAdmissionRefusal::Structure);
+    }
+
     use crate::heap_layout_bound::{tree_nodes, Counter};
     if !crate::heap_layout_bound::layout_supported() {
         return Err(ClaudeRetryAdmissionRefusal::Structure);
@@ -5879,6 +5891,10 @@ fn claude_fence_closed_retry_carry_observed(
     diagnostics: &mut StaleCarryRejectionCounts,
     debt_scope: Option<&BTreeSet<String>>,
 ) -> ClaudeStaleFamilyCarry {
+    if !index.persistence_available() {
+        return ClaudeStaleFamilyCarry::default();
+    }
+
     #[cfg(test)]
     if KEEP_STALE_CLAUDE_FAMILY_REARM_FOR_TEST.with(std::cell::Cell::get) {
         diagnostics.reject(StaleCarryRejection::MemberEvidence, stale.len());
@@ -6515,6 +6531,10 @@ fn cancel_claude_family_carry_for_member_parse(
     page_snapshots: &[SnapshotItem],
     page: &VecDeque<CandidateFile>,
 ) {
+    if !index.persistence_available() {
+        return;
+    }
+
     let Some(member) = claude_index_path_member_ref(member_path) else {
         return;
     };
@@ -11924,6 +11944,10 @@ fn claude_unchanged_proof_roots<'p>(
     ),
     legacy_request_owners: Option<&BTreeMap<String, ClaudeLegacyRequestOwner>>,
 ) -> Option<BTreeMap<&'p str, bool>> {
+    if !index.persistence_available() {
+        return None;
+    }
+
     let (changed_duplicate_owners, changed_duplicate_request_hashes, duplicated_request_hashes) =
         duplicates;
     let legacy_prefix_hash_count = index

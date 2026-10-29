@@ -2540,7 +2540,7 @@ pub(crate) fn scan_index_storage(source: &'static str, orphans: u64, unavailable
                 traversal_point(
                     "scan_index_storage",
                     source,
-                    &serde_json::json!({"index_shard_unavailable": {"map": ["account_pending", "usage_pending", "request_census"][map], "cause": [crate::snapshots::scan_index_persistence::UnavailableCause::Missing, crate::snapshots::scan_index_persistence::UnavailableCause::Generation, crate::snapshots::scan_index_persistence::UnavailableCause::Digest, crate::snapshots::scan_index_persistence::UnavailableCause::Decode, crate::snapshots::scan_index_persistence::UnavailableCause::Descriptor, crate::snapshots::scan_index_persistence::UnavailableCause::Unsafe][cause].label(), "count": count}}),
+                    &serde_json::json!({"index_shard_unavailable": {"map": (["account_pending", "usage_pending", "request_census"][map]), "cause": ([crate::snapshots::scan_index_persistence::UnavailableCause::Missing, crate::snapshots::scan_index_persistence::UnavailableCause::Generation, crate::snapshots::scan_index_persistence::UnavailableCause::Digest, crate::snapshots::scan_index_persistence::UnavailableCause::Decode, crate::snapshots::scan_index_persistence::UnavailableCause::Descriptor, crate::snapshots::scan_index_persistence::UnavailableCause::Unsafe][cause].label()), "count": count}}),
                 );
             }
         }

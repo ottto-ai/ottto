@@ -1364,6 +1364,9 @@ impl<R: BufRead + Seek> Decoder<R> {
         let Some(marker) = self.damaged_idless_marker(record)? else {
             return self.typed(record);
         };
+        if self.persistence_map {
+            return Err(Error::Refused("incomplete persistence marker"));
+        }
         self.reader.seek(SeekFrom::Start(record.start))?;
         let masked = AbsentMarkerReader {
             reader: &mut self.reader,
@@ -2681,7 +2684,7 @@ pub(super) fn validate_persistence_map(
         None,
     )?;
     anyhow::ensure!(
-        index.decode_holds.0.get(field.name()).is_none(),
+        !index.decode_holds.0.contains_key(field.name()),
         "incomplete persistence map"
     );
     Ok(())
@@ -2707,7 +2710,7 @@ pub(super) fn read_partial_persistence(
         false,
         Some(unavailable),
     )
-    .map_err(scan_index_integration::storage_decode_error)?;
+    .map_err(|error| scan_index_integration::storage_decode_error(error.into()))?;
     index.persistence_unavailable = unavailable;
     Ok(index)
 }

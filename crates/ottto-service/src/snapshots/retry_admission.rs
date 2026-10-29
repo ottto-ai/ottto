@@ -98,6 +98,13 @@ fn claude_retry_admit_batch_observed(
             oversized_after_path: None,
             storage_deferred: false,
         });
+    if !index.persistence_available() {
+        state.complete = false;
+        state.roots_complete = false;
+        state.storage_deferred = true;
+        state.progressed = false;
+        return (ClaudeStaleFamilyCarry::default(), BTreeSet::new(), state);
+    }
     state.progressed = false;
     let lower = state
         .after_root

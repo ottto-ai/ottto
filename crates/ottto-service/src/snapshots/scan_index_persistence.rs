@@ -219,12 +219,18 @@ impl LoadedRoot {
             } => {
                 add(digest.capacity())?;
                 add(manifest.binding.namespace_hash.capacity())?;
+                add(std::mem::align_of::<MapManifest>()
+                    + std::mem::align_of::<Object>()
+                    + std::mem::align_of::<Stamp>())?;
                 add(manifest
                     .maps
                     .capacity()
                     .checked_mul(std::mem::size_of::<MapManifest>())?)?;
                 for map in &manifest.maps {
-                    add(map.buckets.capacity())?;
+                    add(map
+                        .buckets
+                        .capacity()
+                        .checked_add(std::mem::align_of::<u8>())?)?;
                 }
                 add(manifest
                     .objects

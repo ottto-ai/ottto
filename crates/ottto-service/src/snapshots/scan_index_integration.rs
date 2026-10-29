@@ -208,7 +208,7 @@ pub(super) fn publish(
 ) -> Result<scan_index_persistence::LoadedRoot> {
     index.require_persistence_available()?;
     let result = store.write_legacy(expected, index.generation, |out| {
-        lenient_decode::write_index(out, index)
+        lenient_decode::write_index(out, index).map_err(Into::into)
     });
     drain_stats(store, "unattributed");
     result
@@ -235,6 +235,10 @@ pub(super) fn publish_at(
     else {
         return Ok(None);
     };
+    anyhow::ensure!(
+        scan_index_storage_binding(path).as_ref() == Some(&binding),
+        "scan_index_binding"
+    );
     let store =
         scan_index_persistence::LockedStore::new(path, binding.clone(), lenient_decode::FIELDS)?;
     let expected = if let Some((_, expected)) = &index.persistence_root {
