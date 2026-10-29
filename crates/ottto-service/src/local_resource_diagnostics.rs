@@ -58,6 +58,8 @@ pub(crate) enum CodexZstCause {
     DecodeBudget,
     #[serde(rename = "admission_starved")]
     AdmissionStarved,
+    #[serde(rename = "CompressedCorrectionUnapplied")]
+    CorrectionUnapplied,
     #[doc(hidden)]
     #[serde(skip)]
     __Count,
@@ -1369,6 +1371,7 @@ mod tests {
             HeaderInvalid,
             DecodeBudget,
             AdmissionStarved,
+            CorrectionUnapplied,
         ];
         assert_eq!(ALL.len(), super::CODEX_ZST_CAUSES);
         for (index, cause) in ALL.iter().enumerate() {

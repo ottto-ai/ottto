@@ -19,6 +19,130 @@ fn archive_open(f: &ArchiveFixture, index: &ScanIndex, census: &mut ScanCensus) 
     )
     .is_some()
 }
+fn user_context(label: &str) -> String {
+    use sha2::Digest;
+    format!(
+        "{:x}",
+        Sha256::new()
+            .chain_update(b"ottto:codex-archive-user-context:v1\0")
+            .chain_update(label)
+            .finalize()
+    )
+}
+fn synthetic_permission(scan: &mut OwnedSourceScan) {
+    let mut inventory = codex_file_join::HeaderInventory::new(&[], &BTreeSet::new(), None);
+    inventory.archive_work.allowed = true; // synthetic AC + utility QoS, never production activation
+    scan.codex_join_inventory = Some(inventory);
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "funded decoder needs validated heap layout"
+)]
+fn user_setting_generation_redecodes_once_and_internal_churn_does_not() {
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    for _ in 0..2 {
+        // Every affected archive owns its own durable generation.
+        let f = correction_archive();
+        let mut index = ScanIndex::default();
+        index.activate_archive_user_context(user_context("titles-on"));
+        let (mut index, first, _, _) = archive_pass(&f, index, true, None);
+        index.settle_archive_outcome(&ack_bodies(&first), true, None);
+        assert!(matches!(
+            archive_evidence(&index, &f).disposition,
+            ArchiveDisposition::Acquired
+        ));
+        index.activate_upload_context("internal-cache-capability-churn".into());
+        index.activate_archive_user_context(user_context("titles-on"));
+        let (_, quiet, rows, _) = archive_pass(&f, index.clone(), true, None);
+        assert_eq!(decodes(&rows), 0);
+        assert!(quiet.snapshots.is_empty());
+        index.activate_archive_user_context(user_context("titles-off"));
+        index.activate_upload_context("titles-off".into());
+        assert!(archive_evidence(&index, &f).user_change);
+        assert!(
+            archive_evidence(&index, &f).body_witness.is_none(),
+            "old ACK cannot settle a queued correction"
+        );
+        let (mut index, correction, rows, _) =
+            archive_pass_with(&f, index, true, None, &[], synthetic_permission);
+        assert_eq!(decodes(&rows), 1);
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r["counts"]["compressed_user_change"] == 1)
+                .count(),
+            1
+        );
+        assert!(!rows
+            .iter()
+            .any(|r| r["stage"] == "codex_zst_first_read_retry"));
+        assert!(!correction.snapshots.is_empty());
+        index.settle_archive_outcome(&ack_bodies(&correction), true, None);
+        assert!(matches!(
+            archive_evidence(&index, &f).disposition,
+            ArchiveDisposition::Acquired
+        ));
+        let mut restarted: ScanIndex =
+            serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
+        restarted.activate_archive_user_context(user_context("titles-off"));
+        let (_, _, rows, _) = archive_pass(&f, restarted, true, None);
+        assert_eq!(decodes(&rows), 0);
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "funded decoder needs validated heap layout"
+)]
+fn correction_waits_for_power_and_a4_keeps_historical_witness_without_decode() {
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let f = correction_archive();
+    let (mut index, first, _, _) = archive_pass(&f, ScanIndex::default(), true, None);
+    index.settle_archive_outcome(&ack_bodies(&first), true, None);
+    index.activate_archive_user_context(user_context("A"));
+    let old = archive_evidence(&index, &f).body_witness.clone();
+    let prior_incidence = index.file_snapshot_fingerprints.clone();
+    index.accepted_snapshot_fingerprints = ack_bodies(&first).into_keys().collect();
+    let prior_acceptance = index.accepted_snapshot_fingerprints.clone();
+    let historical_entry = index.files[&local_index_key(&f.0)]
+        .last_upload_body_witness
+        .clone();
+    index.prepare_historical_replay("unapproved-code-replay".into());
+    assert_eq!(index.file_snapshot_fingerprints, prior_incidence);
+    assert_eq!(index.accepted_snapshot_fingerprints, prior_acceptance);
+    assert!(matches!(
+        archive_evidence(&index, &f).disposition,
+        ArchiveDisposition::Held {
+            cause: CodexZstCause::CorrectionUnapplied
+        }
+    ));
+    assert_eq!(archive_evidence(&index, &f).body_witness, old);
+    assert_eq!(
+        index.files[&local_index_key(&f.0)].last_upload_body_witness,
+        historical_entry
+    );
+    index.settle_archive_outcome(&ack_bodies(&first), true, None);
+    assert!(matches!(
+        archive_evidence(&index, &f).disposition,
+        ArchiveDisposition::Held {
+            cause: CodexZstCause::CorrectionUnapplied
+        }
+    ));
+    let (_, _, rows, _) = archive_pass(&f, index.clone(), true, None);
+    assert_eq!(decodes(&rows), 0);
+    index.activate_archive_user_context(user_context("B"));
+    let (index, result, rows, _) = archive_pass(&f, index, true, None); // no synthetic AC permission
+    assert_eq!(decodes(&rows), 0);
+    assert!(result.snapshots.is_empty());
+    assert!(archive_evidence(&index, &f).user_change);
+}
+
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -626,4 +750,308 @@ fn crash_lost_terminal_outcomes_stop_at_exactly_six_decodes() {
             cause: CodexZstCause::DecodeBudget
         }
     ));
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "funded decoder needs validated heap layout"
+)]
+fn replaced_archive_uses_new_stamp_first_read_without_old_correction_permission() {
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let f = correction_archive();
+    let mut state = ScanIndex::default();
+    state.activate_archive_user_context(user_context("A"));
+    let (mut state, body, _, _) = archive_pass(&f, state, true, None);
+    state.settle_archive_outcome(&ack_bodies(&body), true, None);
+    state.activate_archive_user_context(user_context("B"));
+    assert!(archive_evidence(&state, &f).user_change);
+    let original_len = fs::metadata(&f.0).unwrap().len();
+    let mut changed = fs::read(&f.0).unwrap();
+    changed.extend(zstd::stream::encode_all(&b"\n"[..], 1).unwrap());
+    fs::write(&f.0, changed).unwrap();
+    assert!(fs::metadata(&f.0).unwrap().len() > original_len);
+    assert!(!archive_evidence(&state, &f).matches(&File::open(&f.0).unwrap()));
+    let (fresh, body, rows, _) = archive_pass(&f, state, true, None); // no correction power permission
+    assert_eq!(decodes(&rows), 1);
+    assert!(!body.snapshots.is_empty());
+    assert_eq!(archive_evidence(&fresh, &f).decode_attempts, 1);
+    assert!(!archive_evidence(&fresh, &f).user_change);
+    assert!(!rows
+        .iter()
+        .any(|r| r["counts"]["compressed_user_change"] == 1));
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "funded decoder needs validated heap layout"
+)]
+fn correction_ack_debt_survives_restart_without_regranting_full() {
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let f = correction_archive();
+    let key = local_index_key(&f.0);
+    let mut index = ScanIndex::default();
+    index.activate_archive_user_context(user_context("A"));
+    let (mut index, first, _, _) = archive_pass(&f, index, true, None);
+    index.settle_archive_outcome(&ack_bodies(&first), true, None);
+    index.activate_archive_user_context(user_context("B"));
+    let (mut index, correction, rows, _) =
+        archive_pass_with(&f, index, true, None, &[], synthetic_permission);
+    assert_eq!(decodes(&rows), 1);
+    assert!(!correction.snapshots.is_empty());
+    assert_eq!(archive_evidence(&index, &f).user_generation, 1);
+    assert_eq!(archive_evidence(&index, &f).user_change_spent, 1);
+    // Transport loss / Deferred / Shed hold the same debt without a terminal count.
+    let mut deferred = index.clone();
+    deferred.settle_archive_outcome(&BTreeMap::new(), false, None);
+    assert!(deferred.files[&key].archive.as_ref().unwrap().user_change);
+    assert_eq!(archive_evidence(&deferred, &f).terminal_failures, 0);
+    // No response/ACK callback at all: persist Pending and expire its deadline on restart.
+    let path = f.0.parent().unwrap().join("correction-debt.json");
+    index.save(&path).unwrap();
+    let mut restored = ScanIndex::load(&path).unwrap();
+    retry_due(&mut restored, &key);
+    restored.activate_archive_user_context(user_context("B"));
+    for _ in 0..5 {
+        let (next, result, rows, _) =
+            archive_pass_with(&f, restored, true, None, &[], synthetic_permission);
+        assert_eq!(decodes(&rows), 0);
+        assert!(result.snapshots.is_empty());
+        assert_eq!(result.unreadable_path_count, 0);
+        assert!(
+            archive_evidence(&next, &f).user_change,
+            "ACK debt must remain"
+        );
+        assert!(matches!(
+            archive_evidence(&next, &f).disposition,
+            ArchiveDisposition::Held {
+                cause: CodexZstCause::CorrectionUnapplied
+            }
+        ));
+        restored = ScanIndex::load(&path).unwrap();
+        retry_due(&mut restored, &key);
+        restored.activate_archive_user_context(user_context("B"));
+    }
+    let witness = archive_evidence(&restored, &f).body_witness.clone();
+    assert!(witness.is_some());
+    restored.settle_archive_outcome(
+        &BTreeMap::from([("unrelated".into(), "a".repeat(64))]),
+        false,
+        None,
+    );
+    assert!(archive_evidence(&restored, &f).user_change);
+    restored.settle_archive_outcome(&ack_bodies(&correction), false, None);
+    assert!(!archive_evidence(&restored, &f).user_change);
+    assert!(matches!(
+        archive_evidence(&restored, &f).disposition,
+        ArchiveDisposition::Acquired
+    ));
+    assert_eq!(archive_evidence(&restored, &f).body_witness, witness);
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "funded decoder needs validated heap layout"
+)]
+fn correction_crash_after_reservation_spends_grant_before_any_byte() {
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let f = correction_archive();
+    let key = local_index_key(&f.0);
+    let mut index = ScanIndex::default();
+    index.activate_archive_user_context(user_context("A"));
+    let (mut index, first, _, _) = archive_pass(&f, index, true, None);
+    index.settle_archive_outcome(&ack_bodies(&first), true, None);
+    index.activate_archive_user_context(user_context("B"));
+    let path = f.0.parent().unwrap().join("a3-reservation.json");
+    index.save(&path).unwrap();
+    let mut scan = staged_archive_with(
+        &f,
+        index.clone(),
+        Arc::new(sampled_scan::SharedCache::default()),
+        synthetic_permission,
+    );
+    assert_eq!(decoded_in(&scan), 0);
+    let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+        scan.persist_archive_reservation(&mut index, &path).unwrap();
+        scan.persist_archive_reservation(&mut index, &path).unwrap();
+    });
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r["counts"]["compressed_user_change"] == 1)
+            .count(),
+        1
+    );
+    assert_eq!(decoded_in(&scan), 0);
+    scan.active_file
+        .take()
+        .unwrap()
+        .parser
+        .reader
+        .reader
+        .close(); // simulated crash before decode
+    let mut restored = ScanIndex::load(&path).unwrap();
+    assert_eq!(archive_evidence(&restored, &f).user_change_spent, 1);
+    assert_eq!(
+        archive_evidence(&restored, &f).decode_attempts,
+        1,
+        "A1 counter unchanged"
+    );
+    retry_due(&mut restored, &key);
+    restored.activate_archive_user_context(user_context("B"));
+    let (mut held, result, rows, _) =
+        archive_pass_with(&f, restored, true, None, &[], synthetic_permission);
+    assert_eq!(decodes(&rows), 0);
+    assert!(result.snapshots.is_empty());
+    assert!(archive_evidence(&held, &f).user_change);
+    assert!(archive_evidence(&held, &f).body_witness.is_none());
+    held.settle_archive_outcome(&ack_bodies(&first), false, None);
+    assert!(
+        archive_evidence(&held, &f).user_change,
+        "old ACK never fakes settlement"
+    );
+    // A later independent setting change remains available despite the spent prior generation.
+    held.activate_archive_user_context(user_context("C"));
+    let (next, body, rows, _) = archive_pass_with(&f, held, true, None, &[], synthetic_permission);
+    assert_eq!(decodes(&rows), 1);
+    assert!(!body.snapshots.is_empty());
+    assert_eq!(archive_evidence(&next, &f).user_change_spent, 2);
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "funded decoder needs validated heap layout"
+)]
+fn sixth_first_read_success_and_repeated_acked_a3_generations_are_independent() {
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let f = correction_archive();
+    let key = local_index_key(&f.0);
+    let mut index = ScanIndex::default();
+    index.activate_archive_user_context(user_context("A"));
+    for attempt in 1..=6 {
+        let (next, body, rows, _) = archive_pass(&f, index, true, None);
+        assert_eq!(decodes(&rows), 1);
+        index = next;
+        if attempt == 6 {
+            index.settle_archive_outcome(&ack_bodies(&body), true, None);
+        } else {
+            index.settle_archive_outcome(&BTreeMap::new(), attempt <= 2, Some(&ack_bodies(&body)));
+            index = checkpoint(&index);
+            retry_due(&mut index, &key);
+        }
+    }
+    assert!(matches!(
+        archive_evidence(&index, &f).disposition,
+        ArchiveDisposition::Acquired
+    ));
+    assert_eq!(archive_evidence(&index, &f).decode_attempts, 6);
+    assert_eq!(archive_evidence(&index, &f).terminal_failures, 2);
+    for generation in 1..=8 {
+        let context = user_context(if generation % 2 == 1 { "B" } else { "A" });
+        index.activate_archive_user_context(context.clone());
+        let (next, body, rows, _) =
+            archive_pass_with(&f, index, true, None, &[], synthetic_permission);
+        index = next;
+        assert_eq!(decodes(&rows), 1, "grant {generation}");
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r["counts"]["compressed_user_change"] == 1)
+                .count(),
+            1
+        );
+        assert!(!rows
+            .iter()
+            .any(|r| r["stage"] == "codex_zst_first_read_retry"
+                || r["stage"] == "codex_zst_retry_alarm"));
+        assert_eq!(archive_evidence(&index, &f).decode_attempts, 6);
+        assert_eq!(archive_evidence(&index, &f).terminal_failures, 2);
+        assert_eq!(archive_evidence(&index, &f).user_change_spent, generation);
+        index.settle_archive_outcome(&ack_bodies(&body), true, None);
+        assert!(matches!(
+            archive_evidence(&index, &f).disposition,
+            ArchiveDisposition::Acquired
+        ));
+        index = serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
+        index.activate_archive_user_context(context);
+        let (next, _, rows, _) = archive_pass(&f, index, true, None);
+        assert_eq!(decodes(&rows), 0);
+        index = next;
+    }
+}
+
+// Partial fields model unreleased intermediate builds, not a released writer.
+#[test]
+fn missing_spent_fields_and_malformed_context_never_mint_a3_permission() {
+    let f = ArchiveFixture::new(b"stamp-only");
+    let mut evidence = ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, None).unwrap();
+    evidence.user_change = true;
+    evidence.user_context = Some(user_context("A"));
+    let mut old = serde_json::to_value(&evidence).unwrap();
+    old.as_object_mut().unwrap().remove("user_generation");
+    old.as_object_mut().unwrap().remove("user_change_spent");
+    let mut restored: ArchiveEvidence = serde_json::from_value(old.clone()).unwrap();
+    assert!(restored.stop_exhausted());
+    old["user_generation"] = serde_json::json!(1);
+    old["user_context"] = serde_json::json!("synthetic raw text must not survive");
+    let restored: ArchiveEvidence = serde_json::from_value(old).unwrap();
+    assert!(restored.user_context.is_none());
+    let key = local_index_key(&f.0);
+    let mut index = ScanIndex::default();
+    index.files.entry(key.clone()).or_default().archive = Some(Box::new(restored));
+    index.activate_archive_user_context(user_context("B"));
+    let restored = index.files.get_mut(&key).unwrap().archive.as_mut().unwrap();
+    assert!(restored.stop_exhausted());
+    assert!(!serde_json::to_string(restored)
+        .unwrap()
+        .contains("synthetic raw text"));
+}
+
+#[test]
+fn missing_only_spent_generation_is_exhausted_until_an_independent_user_change() {
+    let f = ArchiveFixture::new(b"stamp-only");
+    let key = local_index_key(&f.0);
+    let mut evidence = ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, None).unwrap();
+    evidence.user_change = true;
+    evidence.user_context = Some(user_context("A"));
+    evidence.user_generation = 1;
+    let mut value = serde_json::to_value(&evidence).unwrap();
+    value.as_object_mut().unwrap().remove("user_change_spent");
+    let restored: ArchiveEvidence = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(restored.user_change_spent, u64::MAX);
+    assert_eq!(restored.user_generation, 1);
+    let mut index = ScanIndex::default();
+    index.files.entry(key.clone()).or_default().archive = Some(Box::new(restored));
+    index.activate_archive_user_context(user_context("A"));
+    assert!(index
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .archive
+        .as_mut()
+        .unwrap()
+        .stop_exhausted());
+    assert!(archive_evidence(&index, &f).user_change);
+    index.activate_archive_user_context(user_context("B"));
+    let archive = index.files.get_mut(&key).unwrap().archive.as_mut().unwrap();
+    assert_eq!(archive.user_generation, 2);
+    assert_eq!(archive.user_change_spent, 1);
+    assert!(
+        !archive.stop_exhausted(),
+        "new independent grant remains available"
+    );
+    // The other asymmetric missing-field case must also stay closed.
+    value["user_change_spent"] = serde_json::json!(1);
+    value.as_object_mut().unwrap().remove("user_generation");
+    let mut restored: ArchiveEvidence = serde_json::from_value(value).unwrap();
+    assert!(restored.stop_exhausted());
 }

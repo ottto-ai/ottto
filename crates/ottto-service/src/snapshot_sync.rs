@@ -5638,6 +5638,55 @@ fn cycle_upload_context(
     }
 }
 
+// A3 binds user choices only: backend capability and HMAC-key epochs are A4 debt.
+fn archive_user_context(mut policy: SnapshotUploadPolicy) -> String {
+    policy.session_attribution_labels_enabled = false;
+    format!(
+        "{:x}",
+        Sha256::new()
+            .chain_update(b"ottto:codex-archive-user-context:v1\0")
+            .chain_update(snapshot_upload_context_fingerprint(policy, None))
+            .finalize()
+    )
+}
+
+#[cfg(test)]
+#[test]
+fn archive_a3_context_ignores_capability_and_key_epoch_but_tracks_user_choices() {
+    let policy = SnapshotUploadPolicy::default();
+    let baseline = archive_user_context(policy);
+    let capability = SnapshotUploadPolicy {
+        session_attribution_labels_enabled: !policy.session_attribution_labels_enabled,
+        ..policy
+    };
+    assert_eq!(archive_user_context(capability), baseline);
+    assert_ne!(
+        snapshot_upload_context_fingerprint(policy, Some("key-old")),
+        snapshot_upload_context_fingerprint(policy, Some("key-new"))
+    );
+    assert_eq!(archive_user_context(policy), baseline); // archive context has no key-epoch input
+    for changed in [
+        SnapshotUploadPolicy {
+            session_titles_enabled: !policy.session_titles_enabled,
+            ..policy
+        },
+        SnapshotUploadPolicy {
+            workspace_labels_enabled: !policy.workspace_labels_enabled,
+            ..policy
+        },
+        SnapshotUploadPolicy {
+            session_artifacts_enabled: !policy.session_artifacts_enabled,
+            ..policy
+        },
+        SnapshotUploadPolicy {
+            session_attribution_enabled: !policy.session_attribution_enabled,
+            ..policy
+        },
+    ] {
+        assert_ne!(archive_user_context(changed), baseline);
+    }
+}
+
 /// The replay generation of a cycle over `index` (pure; shared as above).
 fn cycle_replay_generation(
     source: SnapshotSource,
@@ -6021,6 +6070,7 @@ fn prepare_sync_source_inner(
             cache_observations_enabled,
         );
     }
+    index.activate_archive_user_context(archive_user_context(upload_policy));
     let upload_context = cycle_upload_context(
         upload_policy,
         checkpoint_namespace.as_deref(),
@@ -6587,6 +6637,7 @@ fn prepare_continuation_source(
         .attribution_context
         .as_ref()
         .map(SessionAttributionContext::checkpoint_namespace);
+    index.activate_archive_user_context(archive_user_context(inputs.upload_policy));
     index.activate_upload_context(cycle_upload_context(
         inputs.upload_policy,
         checkpoint_namespace.as_deref(),

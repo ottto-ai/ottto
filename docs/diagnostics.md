@@ -1004,7 +1004,7 @@ The first body acquisition is A1. Further first-read recovery is the named
 `codex_zst_first_read_retry` EXCEPTION to one A1 per object, **Lead A approved
 2026-10-29**, until **11b-1b resume from retained acquisition** replaces it.
 There is no retained acquisition/output resume on this prerequisite head.
-An unchanged stamp permits at most six committed decode reservations total,
+An unchanged stamp permits at most six committed A1/recovery decode reservations,
 including reservations interrupted before bytes, with six-hour retry deadlines.
 Three DURABLY RECORDED terminal upload failures stop recovery; Completed without
 the current body ACK and Rejected are terminal, while Shed/Deferred/transport
@@ -1014,7 +1014,7 @@ of Stuck(`CompressedSettlementStuck`), never more than six A1/recovery decodes.
 Stuck retains accepted money, stale/unknown, never $0. An exact current-body ACK
 can revive either settlement hold. No counter resets on ordinary retry/restart.
 
-For under-cap compressed size C and decoded size D, body attempts together read
+For under-cap compressed size C and decoded size D, A1/recovery attempts together read
 at most 6C physical / 6D decoded bytes per stamp (over-limit probes add at most one
 decoded byte per attempt); header work has its separate bounds below. Changing
 content stamps starts a new budget; evidence retirement is outside this bound.
@@ -1046,8 +1046,8 @@ the first-read retry bound. Unknown/stuck money is never $0.
 Decoder safety-net release emits `codex_zst_owner.counts.leaked_release`; normal
 success/error releases explicitly after Stores guards drop.
 
-A3/A4 correction permission is a separate prerequisite; this settlement slice
-grants neither. Quiet settled/empty/held/refused stamps decode zero bytes.
+A3 user-setting corrections use separate once-only grants, described below.
+Quiet settled/empty/held/refused stamps decode zero bytes.
 
 Decoder admission keeps fixed headroom of one 8 MiB primary entry plus side-ledger
 bytes; the resident cache is charged once. Each admission yield increments the
@@ -1105,6 +1105,40 @@ that archive's twelfth consecutive yield, then `admission_starved` residue.
 in the existing bounded process map; unrelated admissions never reset them.
 Restart or map eviction loses the RAM-only streak; no durable lifetime bound is
 claimed.
+
+User upload-policy/attribution choices bind A3 `full_reads.user_change` with
+`compressed_user_change`, once per affected archive per observed setting generation.
+The user-only context is a domain-separated SHA-256 digest of policy choices;
+backend label capability, key epochs and internal cache churn do not grant A3.
+A→B→A makes two independent generations, rather than reusing an old context grant.
+`user_generation` increases on an observed user-context change; at reservation
+`user_change_spent` binds that generation before bytes, conservatively including
+a crash before the first byte. Counters survive restart. Missing generation/spent
+fields on an older pending correction fail closed; malformed/absent context never
+authorizes a correction. No reading-record codec or identity version is repinned.
+
+`user_change` is separate output/ACK debt, cleared only by exact current-body
+ACK. After a lost/Shed/Deferred/failed ACK or a reservation-only crash, the spent
+generation holds `CompressedCorrectionUnapplied` with scoped unknown/stale residue,
+zero further decode even after six hours/restart. Existing body/incidence custody
+is retained when available, never fake settlement. A retained exact correction
+ACK can settle this debt; old or missing body evidence cannot. Recovery without
+retained custody waits for a separately allowed generation/recovery path.
+
+A3 consumes neither A1's six-reservation budget nor its terminal-failure counters.
+A sixth-attempt A1 success and any number of ACKed independent changes therefore
+leave the next genuine setting change available. The total read envelope is six
+A1/recovery decodes per stamp plus at most one per independent A3 generation,
+not six across all future user changes. Each A3 delivery emits only its A3 count,
+never the first-read retry count/alarm. HeaderWork's existing fail-closed AC/utility
+permission and shared 30 CPU-s accumulator gate corrections; activation must still
+install real platform pacing and the 1 GiB decoded bound before discovery.
+
+Unapproved A4 code replay/body-revision changes preserve historical body, incidence
+and acceptance, holding `CompressedCorrectionUnapplied` without new decode or ACK
+credit. No A4 grant or replay is added. Post-release counts also include
+`full_reads.user_change` and `compressed_user_change`. The A3/A4 prerequisite
+ships in the same stable release as archive activation, or earlier.
 
 The native parser-construction error boundary permits archive RU only for an
 actual typed admission yield (Z-ADMISSION, until that archive's twelfth yield) or

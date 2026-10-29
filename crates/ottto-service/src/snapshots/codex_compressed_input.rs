@@ -139,7 +139,7 @@ impl super::OwnedSourceScan {
         }
         self.index.generation = committed.generation;
         evidence.reservation_saved = true;
-        if evidence.decode_attempts > 1 {
+        if evidence.decode_attempts > 1 && !evidence.user_change {
             crate::local_resource_diagnostics::traversal_point(
                 "codex_zst_first_read_retry",
                 "codex",
@@ -150,6 +150,13 @@ impl super::OwnedSourceScan {
                 "codex_zst_retry_alarm",
                 "codex",
                 &serde_json::json!({"codex_zst_retry_alarm": 1, "decode_attempt": evidence.decode_attempts}),
+            );
+        }
+        if evidence.user_change {
+            crate::local_resource_diagnostics::traversal_point(
+                "full_reads",
+                "codex",
+                &serde_json::json!({"full_reads": {"user_change": 1}, "compressed_user_change": 1}),
             );
         }
         Ok(())
@@ -176,6 +183,30 @@ pub(crate) struct ArchiveEvidence {
     terminal_failures: u8,
     #[serde(default)]
     terminal_attempt: u8,
+    #[serde(default)]
+    pub(super) user_change: bool,
+    #[serde(default, deserialize_with = "bounded_archive_context")]
+    pub(super) user_context: Option<String>,
+    #[serde(default)]
+    pub(super) user_generation: u64,
+    #[serde(default = "exhausted_archive_generation")]
+    pub(super) user_change_spent: u64,
+}
+fn exhausted_archive_generation() -> u64 {
+    u64::MAX
+}
+// H: only the domain-separated policy digest is retained, never setting values.
+fn valid_archive_context(context: &str) -> bool {
+    context.len() == 64
+        && context
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+fn bounded_archive_context<'de, D: serde::Deserializer<'de>>(
+    de: D,
+) -> Result<Option<String>, D::Error> {
+    use serde::Deserialize;
+    Ok(Option::<String>::deserialize(de)?.filter(|s| valid_archive_context(s)))
 }
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) enum ArchiveDisposition {
@@ -256,15 +287,20 @@ impl ArchiveEvidence {
             .next()
             .ok_or_else(|| invalid("compressed rollout logical id unavailable"))?;
         let logical_id = previous.map_or(logical_id, |old| old.logical_id.clone());
-        let attempts = previous
-            .map_or(0, |old| {
-                old.decode_attempts.max(match old.disposition {
-                    ArchiveDisposition::Pending { attempts, .. } => attempts,
-                    ArchiveDisposition::HeaderValidated => 0,
-                    _ => 1,
+        let correction = previous.is_some_and(|old| old.user_change);
+        let attempts = if correction {
+            previous.map_or(0, |old| old.decode_attempts)
+        } else {
+            previous
+                .map_or(0, |old| {
+                    old.decode_attempts.max(match old.disposition {
+                        ArchiveDisposition::Pending { attempts, .. } => attempts,
+                        ArchiveDisposition::HeaderValidated => 0,
+                        _ => 1,
+                    })
                 })
-            })
-            .saturating_add(1);
+                .saturating_add(1)
+        };
         Ok(Self {
             stamp: stamp.content_only(),
             logical_id,
@@ -274,6 +310,17 @@ impl ArchiveEvidence {
             decode_attempts: attempts,
             terminal_failures: previous.map_or(0, |a| a.terminal_failures),
             terminal_attempt: previous.map_or(0, |a| a.terminal_attempt),
+            user_change: previous.is_some_and(|a| a.user_change),
+            user_context: previous.and_then(|a| a.user_context.clone()),
+            user_generation: previous.map_or(0, |a| a.user_generation),
+            // Written in the reservation before any byte. ACK debt stays separate.
+            user_change_spent: previous.map_or(0, |a| {
+                if correction {
+                    a.user_generation
+                } else {
+                    a.user_change_spent
+                }
+            }),
             header_attempted: previous.is_some_and(|a| a.header_attempted),
             header_validated: previous.and_then(|a| a.header_validated.clone()),
             disposition: ArchiveDisposition::Pending {
@@ -320,6 +367,21 @@ impl ArchiveEvidence {
             && !matches!(self.disposition, ArchiveDisposition::Pending { retry_after, .. } if super::sampled_scan::now_seconds() >= retry_after)
     }
     pub(super) fn stop_exhausted(&mut self) -> bool {
+        if self.user_change {
+            if self
+                .user_context
+                .as_deref()
+                .is_some_and(valid_archive_context)
+                && self.user_change_spent < self.user_generation
+            {
+                return false; // An independent A3 grant does not spend the A1 budget.
+            }
+            self.disposition = ArchiveDisposition::Held {
+                cause: CodexZstCause::CorrectionUnapplied,
+            };
+            codex_zst_refused(CodexZstCause::CorrectionUnapplied);
+            return true;
+        }
         if let ArchiveDisposition::Pending { attempts, .. } = self.disposition {
             self.decode_attempts = self.decode_attempts.max(attempts);
         }
@@ -343,14 +405,22 @@ impl ArchiveEvidence {
             ArchiveDisposition::Held {
                 cause: CodexZstCause::SettlementStuck | CodexZstCause::DecodeBudget
             }
-        );
+        ) || (self.user_change
+            && matches!(
+                self.disposition,
+                ArchiveDisposition::Held {
+                    cause: CodexZstCause::CorrectionUnapplied
+                }
+            ));
         if !(pending || stuck) {
             return;
         }
         if accepted {
             self.disposition = ArchiveDisposition::Acquired;
+            self.user_change = false;
         } else if pending {
             if terminal
+                && !self.user_change
                 && self.body_witness.is_some()
                 && self.terminal_attempt < self.decode_attempts
             {
@@ -777,6 +847,62 @@ impl super::ScanIndex {
                     .any(|o| t.residue.blocked_session_ids.contains(o))
             }
     }
+    pub(crate) fn activate_archive_user_context(&mut self, context: String) {
+        if !valid_archive_context(&context) {
+            return; // Malformed input never creates permission.
+        }
+        self.active_archive_user_context = Some(context.clone());
+        for entry in self.files.values_mut() {
+            let Some(archive) = entry.archive.as_mut() else {
+                continue;
+            };
+            if archive.user_context.is_none() && archive.user_change {
+                archive.user_change_spent = archive.user_generation; // missing/malformed H cannot authorize a Full
+            }
+            let changed = archive
+                .user_context
+                .as_ref()
+                .is_some_and(|old| old != &context);
+            archive.user_context = Some(context.clone());
+            if changed && (archive.body_witness.is_some() || archive.user_change) {
+                archive.user_change = true;
+                // Only an independent policy transition replaces an absent-field sentinel.
+                archive.user_change_spent = archive.user_generation;
+                if let Some(next) = archive.user_generation.checked_add(1) {
+                    archive.user_generation = next;
+                } else {
+                    archive.user_change_spent = u64::MAX; // fail closed at generation exhaustion
+                }
+                archive.body_witness = None;
+                archive.disposition = ArchiveDisposition::Pending {
+                    attempts: archive.decode_attempts,
+                    retry_after: 0,
+                };
+            } else if archive.user_change && archive.user_change_spent >= archive.user_generation {
+                archive.disposition = ArchiveDisposition::Held {
+                    cause: CodexZstCause::CorrectionUnapplied,
+                };
+            }
+        }
+    }
+    pub(super) fn hold_archive_corrections(&mut self, revision: Option<u64>) {
+        for entry in self.files.values_mut() {
+            if revision.is_some_and(|r| entry.effective_upload_body_witness_revision >= r) {
+                continue;
+            }
+            if let Some(archive) = entry
+                .archive
+                .as_mut()
+                .filter(|a| matches!(a.disposition, ArchiveDisposition::Acquired))
+            {
+                archive.disposition = ArchiveDisposition::Held {
+                    cause: CodexZstCause::CorrectionUnapplied,
+                };
+                codex_zst_refused(CodexZstCause::CorrectionUnapplied);
+            }
+        }
+    }
+
     pub fn codex_archive_cli_version(&self, path: &Path) -> Option<&str> {
         self.archive_header(path)?.cli_version()
     }
@@ -925,7 +1051,7 @@ impl super::ScanIndex {
         }
     }
 }
-crate::heap_layout_bound::fields!(ArchiveEvidence; stamp, logical_id, owner, disposition, body_witness, reservation_saved, header_validated, header_attempted, decode_attempts, terminal_failures, terminal_attempt);
+crate::heap_layout_bound::fields!(ArchiveEvidence; stamp, logical_id, owner, disposition, body_witness, reservation_saved, header_validated, header_attempted, decode_attempts, terminal_failures, terminal_attempt, user_change, user_context, user_generation, user_change_spent);
 impl crate::heap_layout_bound::HeapLayoutBound for ArchiveDisposition {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         c.add(0)
@@ -939,6 +1065,7 @@ pub(in crate::snapshots) mod tests {
     include!("codex_archive_ru_tests.rs");
     include!("codex_archive_released_entry_tests.rs");
     include!("codex_archive_downgrade_tests.rs");
+    include!("codex_archive_released_writer_tests.rs");
     use super::super::*;
     use super::*;
     use crate::transcript_acquisition::Scope;
@@ -2254,6 +2381,14 @@ pub(in crate::snapshots) mod tests {
         index: ScanIndex,
         cache: Arc<sampled_scan::SharedCache>,
     ) -> OwnedSourceScan {
+        staged_archive_with(f, index, cache, |_| {})
+    }
+    fn staged_archive_with(
+        f: &ArchiveFixture,
+        index: ScanIndex,
+        cache: Arc<sampled_scan::SharedCache>,
+        setup: impl FnOnce(&mut OwnedSourceScan),
+    ) -> OwnedSourceScan {
         let mut scan = OwnedSourceScan::new(
             SnapshotSource::Codex,
             &[],
@@ -2274,6 +2409,7 @@ pub(in crate::snapshots) mod tests {
             .insert(local_index_key(&f.0));
         scan.codex_join_prepared = true;
         scan.census_unix_seconds = None;
+        setup(&mut scan);
         for _ in 0..1000 {
             scan = match scan.step(None) {
                 OwnedSourceScanStep::Pending(next) => next,
