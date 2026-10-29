@@ -1485,8 +1485,8 @@ fn owned_prepare_moves_guard_to_actual_native_owner_and_ends_it_at_completion() 
         assert!(parser.reader.reader.accepts_durable());
         assert_eq!(
             cache.durable().unwrap().retail_spent.len(),
-            1,
-            "finish never renews allowance"
+            0,
+            "zero-old-byte ownership never enrolls or renews retail allowance"
         );
     }
 }

@@ -220,61 +220,39 @@ fn checked_floor_exact_boundary_and_existing_update_bypass() {
 }
 
 #[test]
-fn failed_unlink_holds_across_memo_clear_then_reconciles_no_record() {
-    for unlink_fails in [false, true] {
-        let scratch = Scratch::new();
-        let lock = LockedStateDir::acquire(&scratch.root).unwrap();
-        let path = scratch.transcript("source.jsonl", b"{}\n");
-        let b = binding("account", "scope", ("fp-a", None));
-        let mut store = scratch.store();
-        store
-            .write_after_save(&lock, 1, 0, vec![pending(b.clone(), certificate(&path), 1)])
-            .unwrap();
-        let original = fs::read(record_file(&store, &b.key)).unwrap();
-        test_hooks::set_before_rename(Some(Box::new(|_, _| Err(io::Error::other("rename EIO")))));
-        if unlink_fails {
-            test_hooks::set_before_unlink(Some(Box::new(|path| {
-                if path.extension().is_some_and(|e| e == "rec") {
-                    Err(io::Error::other("unlink EIO"))
-                } else {
-                    Ok(())
-                }
-            })));
-        }
-        let result = store
-            .write_after_save(&lock, 2, 0, vec![pending(b.clone(), certificate(&path), 2)])
-            .unwrap();
-        test_hooks::set_before_rename(None);
-        test_hooks::set_before_unlink(None);
-        assert_eq!(result.written, 0);
-        assert_eq!(store.receipt_pending(&b.key), unlink_fails);
-        if unlink_fails {
-            assert_eq!(fs::read(record_file(&store, &b.key)).unwrap(), original);
-            assert_eq!(
-                store.read(&b.key),
-                ReadOutcome::Refused(Refusal::ReceiptPending)
-            );
-            store.durable.clear();
-            store.begin_pass();
-            assert!(store.receipt_pending(&b.key));
-            store.gc(&lock, &b.context, &BTreeMap::new()).unwrap();
-            assert_eq!(
-                store.remove_keys(&lock, &BTreeSet::from([b.key])).unwrap(),
-                0
-            );
-            assert_eq!(fs::read(record_file(&store, &b.key)).unwrap(), original);
-            let candidate = store.pending[&b.key].candidate;
-            let ReconcileOutcome::Retired(proof) = store.reconcile_pending(&lock, &b.key).unwrap()
-            else {
-                panic!("verified retirement must return its exact candidate");
-            };
-            assert_eq!(proof.candidate, candidate);
-            assert!(stamp_at(&record_file(&store, &b.key)).unwrap().is_none());
-        }
-        assert!(!record_file(&store, &b.key).exists());
-        assert!(!store.receipt_pending(&b.key));
-        assert_eq!(store.counters().durable_write_failed_published, 1);
-    }
+fn failed_rename_preserves_verified_predecessor_without_receipt_or_retirement() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let path = scratch.transcript("source.jsonl", b"{}\n");
+    let b = binding("account", "scope", ("fp-a", None));
+    let mut store = scratch.store();
+    store
+        .write_after_save(&lock, 1, 0, vec![pending(b.clone(), certificate(&path), 1)])
+        .unwrap();
+    let original = fs::read(record_file(&store, &b.key)).unwrap();
+    test_hooks::set_before_rename(Some(Box::new(|_, _| Err(io::Error::other("rename EIO")))));
+    let result =
+        store.write_after_save(&lock, 2, 0, vec![pending(b.clone(), certificate(&path), 2)]);
+    test_hooks::set_before_rename(None);
+    assert!(result.is_err(), "the native owner must requeue saved RAM");
+    assert_eq!(fs::read(record_file(&store, &b.key)).unwrap(), original);
+    assert!(!store.has_pending(), "no candidate became canonical");
+    assert_eq!(store.counters().durable_write_failed_published, 0);
+    assert_eq!(store.counters().records_invalidated, 0);
+    store.durable.clear();
+    store.begin_pass();
+    assert_eq!(
+        found(store.read(&b.key)).record.body,
+        placeholder_body(1, 14)
+    );
+    let retry = store
+        .write_after_save(&lock, 3, 0, vec![pending(b.clone(), certificate(&path), 2)])
+        .unwrap();
+    assert_eq!(retry.written, 1);
+    assert_eq!(
+        found(store.read(&b.key)).record.body,
+        placeholder_body(2, 14)
+    );
 }
 
 #[test]
@@ -367,9 +345,15 @@ fn exact_survivor_uses_original_trailer_not_canonicalized_retired_fields() {
     assert_eq!(altered_record.envelope_audit_debt, Some(123));
     assert_ne!(altered, original);
     put_record(&disk, &altered);
-    let debt = pending_snapshot(&store);
+    let mut obligation = store.pending[&b.key];
     assert!(store.reconcile_pending(&lock, &b.key).is_err());
-    assert_eq!(pending_snapshot(&store), debt);
+    obligation.failures += 1;
+    let current = store.pending[&b.key];
+    assert_eq!(current.candidate, obligation.candidate);
+    assert_eq!(current.content, obligation.content);
+    assert_eq!(current.prior, obligation.prior);
+    assert_eq!(current.completed, obligation.completed);
+    assert_eq!(current.failures, obligation.failures);
     assert_eq!(fs::read(&disk).unwrap(), altered);
     assert_eq!(store.counters().receipt_reconciled, 0);
     put_record(&disk, &original);
@@ -604,7 +588,7 @@ fn inventory_bound_is_independent_of_memo_and_existing_keys_remain_updateable() 
             .write_after_save(&lock, 100, u64::MAX, records(true))
             .unwrap()
             .written,
-        0 // A0 retains an unmemoized Claude predecessor without mutation proof.
+        1 // A verified v1 predecessor remains updateable after memo eviction.
     );
     let mut extra = records(false).pop().unwrap();
     extra.binding.key = key_digest(DurableSource::ClaudeCode, "bound-plus-one");
@@ -719,7 +703,11 @@ fn post_rename_sync_failure_keeps_b_pending_until_its_exact_receipt() {
             .write_after_save(&lock, 2, 0, vec![replacement.clone()])
             .unwrap();
         test_hooks::set_before_dir_sync(None);
-        assert_eq!(reached.get(), 2, "write then reconcile both reached fsync");
+        assert_eq!(
+            reached.get(),
+            1,
+            "one bounded batch flush; no same-pass retry"
+        );
         assert_eq!(receipt.written, 0);
         assert!(receipt.completed.is_empty());
         assert_eq!(receipt.deferred_keys, vec![b.key]);
@@ -3293,7 +3281,21 @@ fn transition_store_failure_controls_and_verified_retirement() {
         let mut store = scratch.store();
         let record = pending(binding("c", "s", ("e", None)), certificate(&path), 3);
         let fault = fail_store_at(point, 1);
-        assert!(store.write_after_save(&lock, 1, 0, vec![record]).is_err());
+        let result = store.write_after_save(&lock, 1, 0, vec![record]);
+        if matches!(
+            point,
+            CrashPoint::BeforeRename | CrashPoint::BeforeDirectorySync
+        ) {
+            let receipt = result.unwrap();
+            assert_eq!(receipt.written, 0);
+            assert_eq!(receipt.deferred_keys.len(), 1);
+            assert_eq!(
+                store.has_pending(),
+                point == CrashPoint::BeforeDirectorySync
+            );
+        } else {
+            assert!(result.is_err());
+        }
         assert_eq!(
             fault.hits(),
             1,
@@ -3908,12 +3910,24 @@ fn batch_ack_requires_durable_reconciliation_and_never_a_clean_retry() {
                 Err(io::Error::other("injected rename edge"))
             })));
         }
-        let receipt = store
-            .write_after_save(&lock, 2, 0, vec![pending(b.clone(), certificate(&path), 2)])
-            .unwrap();
+        let result =
+            store.write_after_save(&lock, 2, 0, vec![pending(b.clone(), certificate(&path), 2)]);
         test_hooks::set_before_rename(None);
         test_hooks::set_before_dir_sync(None);
         assert!(reached.get(), "actual {edge} reached");
+        if edge == "pre_rename" {
+            assert!(result.is_err(), "failed saved successor must requeue");
+            assert_eq!(fs::read(&disk).unwrap(), before);
+            assert!(store.witness_current(&proof));
+            assert!(!store.has_pending());
+            let retry = store
+                .write_after_save(&lock, 3, 0, vec![pending(b.clone(), certificate(&path), 2)])
+                .unwrap();
+            assert_eq!(retry.written, 1);
+            assert!(store.replacement_committed(&proof, &retry));
+            continue;
+        }
+        let receipt = result.unwrap();
         assert_eq!(receipt.written, usize::from(edge == "post_rename"));
         assert_eq!(
             store.replacement_committed(&proof, &receipt),
@@ -4564,15 +4578,17 @@ fn verified_retirement_requeues_the_unwritten_successor() {
             vec![pending(binding.clone(), certificate(&path), 1)],
         )
         .unwrap();
-    test_hooks::set_before_rename(Some(Box::new(|_, _| Err(io::Error::other("rename EIO")))));
     let successor = pending(binding.clone(), certificate(&path), 2);
-    let retired = store
+    test_hooks::set_before_dir_sync(Some(Box::new(|_| Err(io::Error::other("batch flush EIO")))));
+    let deferred = store
         .write_after_save(&lock, 2, 0, vec![successor.clone()])
         .unwrap();
-    test_hooks::set_before_rename(None);
-    assert_eq!(retired.written, 0);
-    assert!(retired.completed.is_empty());
-    assert_eq!(retired.deferred_keys, vec![binding.key]);
+    test_hooks::set_before_dir_sync(None);
+    assert_eq!(deferred.deferred_keys, vec![binding.key]);
+    assert!(store.has_pending());
+    fs::remove_file(record_file(&store, &binding.key)).unwrap();
+    let retired = store.reconcile_pending(&lock, &binding.key).unwrap();
+    assert!(matches!(retired, ReconcileOutcome::Retired(_)));
     assert!(!store.has_pending());
     assert!(!record_file(&store, &binding.key).exists());
     let retried = store

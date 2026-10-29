@@ -218,6 +218,10 @@ fn n10_clock_rollback_and_custody_overflow_fail_before_any_read() {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "pacing tree admission requires the qualified native heap layout"
+)]
 fn n10_pacing_eviction_allows_growth_without_evicting_spent_authority() {
     let f = Fixture::new();
     let now = Instant::now();

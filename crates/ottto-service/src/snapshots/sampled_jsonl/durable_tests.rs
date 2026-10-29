@@ -1931,6 +1931,7 @@ fn m3_seam_live_bytes_equal_retained_copy_and_output_equals_legacy() {
         // This fixture qualifies an encodable live state; first-prompt raw
         // material is deliberately outside the durable codec's allowlist.
         legacy.accumulator.first_prompt_material = None;
+        legacy.accumulator.first_prompt_title = None;
         let retained = legacy.durable_test_reduction_copy();
         let legacy = items(legacy, &path, source);
         let mut live = parser(&path, source);
@@ -1939,6 +1940,7 @@ fn m3_seam_live_bytes_equal_retained_copy_and_output_equals_legacy() {
         // This fixture qualifies an encodable live state; first-prompt raw
         // material is deliberately outside the durable codec's allowlist.
         live.accumulator.first_prompt_material = None;
+        live.accumulator.first_prompt_title = None;
         let mut seen = Vec::new();
         let at_seam = items_at(
             live,

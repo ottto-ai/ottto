@@ -871,6 +871,17 @@ enum OrderPoint {
 impl OrderPoint {
     const ALL: [Self; 3] = [Self::Staged, Self::BeforeRename, Self::Receipted];
     fn name(self) -> &'static str {
+        // Shared #882 classification is exact; FileSynced is explicitly N/A
+        // for all native-M3 rows (plain-flush engine: no fsync boundary).
+        use sampled_scan::transition_fixture::CrashPoint;
+        assert_eq!(
+            Self::ALL.map(|point| match point {
+                Self::Staged => CrashPoint::Prepared,
+                Self::BeforeRename => CrashPoint::BeforeRename,
+                Self::Receipted => CrashPoint::BeforeNativeEffects,
+            }),
+            CrashPoint::NATIVE_M3
+        );
         match self {
             Self::Staged => "staged",
             Self::BeforeRename => "before_rename",

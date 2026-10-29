@@ -2709,12 +2709,25 @@ impl SharedCache {
                 Refuse::NotRederivable("compressed"),
             )));
         }
+        // Class discovered by an earlier native finish is already durable
+        // in the existing protected-history carrier. begin_pass clears the
+        // per-pass decisions, so that carrier must also refuse old singleton
+        // bytes before any store read, including when GC was deferred.
+        let committed_excluded = snapshot_source == SnapshotSource::Codex
+            && index
+                .files
+                .get(key)
+                .is_some_and(ScanIndexEntry::codex_history_is_protected);
+        if committed_excluded {
+            self.durable_exclude_native_class(key);
+        }
         if snapshot_source == SnapshotSource::Codex
             && self.durable().is_some_and(|mut stores| {
-                let excluded = stores
-                    .slot(DurableSource::Codex)
-                    .as_ref()
-                    .is_some_and(|slot| matches!(slot.decided.get(key), Some(None)));
+                let excluded = committed_excluded
+                    || stores
+                        .slot(DurableSource::Codex)
+                        .as_ref()
+                        .is_some_and(|slot| matches!(slot.decided.get(key), Some(None)));
                 if excluded {
                     Counters::bump(
                         &mut stores.counters.ineligible,
@@ -4202,7 +4215,10 @@ impl SharedCache {
                 if !inventory.contains(&digest) {
                     continue;
                 }
-                if matches!(slot.decided.get(key), Some(None)) {
+                if matches!(slot.decided.get(key), Some(None))
+                    || source == DurableSource::Codex
+                        && index.files[key].codex_history_is_protected()
+                {
                     keep.insert(
                         digest,
                         store::GcKeep::Excluded {

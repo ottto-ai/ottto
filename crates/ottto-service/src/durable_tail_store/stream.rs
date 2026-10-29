@@ -1110,6 +1110,89 @@ mod tests {
     }
 
     #[test]
+    fn native_full_authorized_memo_evicts_only_permission_and_reverifies_for_both_sources() {
+        if !crate::test_isolation::run_here() {
+            return;
+        }
+        for source in [DurableSource::ClaudeCode, DurableSource::Codex] {
+            let scratch = Scratch::new();
+            let writer = crate::locked_state_dir::test_locks::hold(&scratch.root);
+            let mut store = DurableTailStore::new(
+                store_dir_for_index(&scratch.root.join("index.json")),
+                source,
+            );
+            for n in 0..=MAX_RECORDS {
+                if n % MAX_BATCH == 0 {
+                    store.begin_pass();
+                }
+                let (mut h, body) = header(&scratch, source, n as u64 + 1);
+                h.binding.key = key_digest(source, &format!("allowed-{n}"));
+                commit(&mut store, writer, h, &body);
+            }
+            store.begin_pass();
+            // Saturate permissions in ONE pass: begin_pass cannot hide an
+            // allowed-memo starvation by revoking everything between reads.
+            for n in 0..MAX_RECORDS {
+                let key = key_digest(source, &format!("allowed-{n}"));
+                let ReadOutcome::Found(record) = store.read(&key) else {
+                    panic!("native predecessor");
+                };
+                store.authorize(
+                    &record,
+                    &Expected {
+                        binding: record.record.binding.clone(),
+                        committed_generation: 9,
+                    },
+                );
+            }
+            assert_eq!(
+                store
+                    .durable
+                    .values()
+                    .filter(|(_, _, allowed)| *allowed)
+                    .count(),
+                MAX_RECORDS
+            );
+            let evictions = store.counters.memo_evicted;
+            let last = key_digest(source, &format!("allowed-{MAX_RECORDS}"));
+            assert!(matches!(store.read(&last), ReadOutcome::Found(_)));
+            assert_eq!(store.counters.memo_evicted, evictions + 1);
+            assert_eq!(store.durable.len(), MAX_RECORDS);
+            let missing = (0..MAX_RECORDS)
+                .map(|n| key_digest(source, &format!("allowed-{n}")))
+                .find(|key| !store.durable.contains_key(key))
+                .unwrap();
+            assert!(
+                !store.authorized(&missing, FORMAT_V3),
+                "eviction revokes permission"
+            );
+            let before = store.counters.guard_verify_bytes;
+            let ReadOutcome::Found(record) = store.read(&missing) else {
+                panic!("reverify evicted A");
+            };
+            assert_eq!(
+                store.counters.guard_verify_bytes - before,
+                record.wire.as_ref().unwrap().encoded_len,
+                "exactly one bounded full record reread"
+            );
+            store.authorize(
+                &record,
+                &Expected {
+                    binding: record.record.binding.clone(),
+                    committed_generation: 9,
+                },
+            );
+            assert!(store.authorized(&missing, FORMAT_V3));
+            let (mut h, body) = header(&scratch, source, 999);
+            h.binding = record.record.binding;
+            commit(&mut store, writer, h, &body);
+            assert!(store.disabled().is_none());
+            assert!(!store.has_pending());
+            assert_eq!(store.counters.mutation_unproved, 0);
+        }
+    }
+
+    #[test]
     fn newly_staged_codex_record_is_refused_by_both_released_decoders() {
         if !crate::test_isolation::run_here() {
             return;

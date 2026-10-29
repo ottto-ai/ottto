@@ -29024,7 +29024,14 @@ impl OwnedSourceScan {
                             .as_ref()
                             .filter(|scope| *scope == &acquisition.scope)
                             .filter(|_| {
-                                acquisition.audit_due.is_some()
+                                // H3c preserves an already-read prefix while an
+                                // audit waits. A byte-zero Full must instead
+                                // reach normal completion and discharge its
+                                // audit, even when RAM retention is unavailable.
+                                !matches!(
+                                    acquisition.mode,
+                                    crate::transcript_acquisition::ReadMode::Full(_)
+                                ) && acquisition.audit_due.is_some()
                                     && sampled_audit::progress_debt(
                                         index,
                                         &acquisition.key,
@@ -35627,7 +35634,9 @@ fn settle_native_attempt(
                 None => Err(sampled_scan::durable_tail::HeldCause::Fence),
             };
             match fences {
-                Err(_) => {
+                Err(_cause) => {
+                    #[cfg(test)]
+                    eprintln!("M3 native commit fence refused: {_cause:?}");
                     // The fences, not the staging, refused: discard the stage
                     // and hold the custody for an exact retry.
                     discard_staging(cache, staged);
@@ -35733,6 +35742,8 @@ fn write_disposition(
         }
         WriteOutcome::ReceiptPending => owe_receipt(cache, acquisition, candidate),
         WriteOutcome::FailedHeld(cause) => {
+            #[cfg(test)]
+            eprintln!("M3 native write held: {cause:?}");
             if cause == sampled_scan::durable_tail::HeldCause::StaleSurvivor {
                 if let Some(chain) = custody_chain(acquisition.custody()) {
                     cache.retain_owed_discovery(chain.source(), chain.key());

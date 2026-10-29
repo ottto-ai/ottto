@@ -92,11 +92,39 @@ The shared #882 transition fixture is composed by merge, with a draft M3
 `TransitionDriver` using its one emitted-money comparator and an observer at the
 real pre-effects boundary. Its frozen `53d05a43` writer provenance deliberately
 remains unchanged. M3 replaced a pinned envelope entry point and can persist v3
-before that seed expects v1. This is a blocker requiring the fixture owner to
-choose an archived exact v1 producer or a separately versioned M3 seed; current
-hashes must not be substituted as old-writer proof. The inherited `FileSynced`
-crash name also lacks a production traversal in the plain-flush M3 engine;
-existing vocabulary is retained without claiming that boundary was executed.
+before that seed expects v1. E4 chose an exact hash-pinned archived v1 producer in a follow-up after
+#882 lands. Composition stays parked until that PR is available; M3 will then
+merge it forward and add a separately versioned native-M3 seed. The extractor
+and frozen old-writer pins remain unchanged; a format-3 record is never an old
+writer artifact.
+
+For native-M3, `FileSynced` is explicitly N/A: **plain-flush engine: no fsync
+boundary**. The M1/old-writer matrix retains its historical row. A portable
+contract checks the native crash-point enumeration and the real stream/temp
+commit source for file fsync calls. Native stages finish buffered writes before
+rename and exact receipt, so process termination cannot expose partially written
+canonical bytes. Kernel page-cache survival across SIGKILL is sufficient for
+this crash-safety contract. Power loss can discard those bytes; the checksum and
+binding fences refuse incomplete/stale records and fall back through existing
+recovery. Directory flushes remain bounded to the pass, with no synthetic
+per-record fsync or crash boundary.
+
+Round 11 narrows the post-save requeue shortcut to verified predecessors with
+successful temporary cleanup. Corrupt survivors and cleanup ambiguity retain
+their actual pending reconciliation and failure breaker. A native byte-zero Full
+also reaches normal audit completion instead of the H3c prefix-only branch.
+The protected-history fields already in the index now refuse singleton restore
+across passes, even if the bounded per-pass class map cannot insert a marker;
+GC uses that same canonical classification. No persisted field is added.
+Portable cap fixtures cover actual native publication with a full debt map and
+one-pass saturation/eviction of 256 authorized memo entries for both sources.
+
+Linux runtime qualification remains open. The earlier run passed both Clippy
+jobs but exposed runtime failures, including the parked old-writer provenance
+rows. In particular, a native record can exist on an unsupported retained layout;
+a quiet selected file then cannot restore and the existing growth-only resource
+Full policy can defer it. The permitted fallback for a quiet selection remains
+an owner decision; no new Full cause or permission was added here.
 
 At the future E2 B/C composition seam, discovery must use one union of
 `DiscoveryRecovery` and `DiscoveryRetention` at directory traversal, retained

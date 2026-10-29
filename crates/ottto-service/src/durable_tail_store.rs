@@ -1675,7 +1675,7 @@ impl DurableTailStore {
             if previous_content == Some(content) {
                 receipt.clean += 1;
             } else {
-                dirty.push((record, content, prior));
+                dirty.push((record, content, prior, previous_content.is_some()));
             }
         }
         if !self.usable(Some(writer)) {
@@ -1694,7 +1694,7 @@ impl DurableTailStore {
             .scan_disk()
             .inspect_err(|_| self.counters.store_write_failed[1] += 1)?;
         let mut attempted = receipt.completed.len();
-        for (record, content, prior) in dirty {
+        for (record, content, prior, verified_prior) in dirty {
             if attempted >= MAX_BATCH {
                 receipt.deferred += 1;
                 receipt.deferred_keys.push(record.binding.key);
@@ -1798,7 +1798,13 @@ impl DurableTailStore {
                 receipt.deferred_keys.push(key);
                 continue;
             }
-            if attempt.is_err() && prior.is_some() && stamp_at(&path)? == prior {
+            if attempt
+                .as_ref()
+                .is_err_and(|error| !write_cleanup_failed(error))
+                && verified_prior
+                && prior.is_some()
+                && stamp_at(&path)? == prior
+            {
                 // The post-save index already refuses A. A failed rename left
                 // that exact verified predecessor untouched: do not retire it
                 // or lose the retry offer. The caller requeues this saved key,

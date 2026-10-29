@@ -110,6 +110,14 @@ impl CrashPoint {
         Self::RestartOne,
         Self::RestartTwo,
     ];
+    /// The executable native-M3 SIGKILL rows (m3_d3_tests::OrderPoint).
+    /// FileSynced is N/A: plain-flush engine: no fsync boundary.
+    /// The old-writer/M1 ALL matrix above keeps its historical row.
+    pub(crate) const NATIVE_M3: [Self; 3] = [
+        Self::Prepared,
+        Self::BeforeRename,
+        Self::BeforeNativeEffects,
+    ];
     /// Additional physical store edges wired on this fixture branch. The
     /// retirement edges refer to classified remove_keys, never temp cleanup.
     pub(crate) const STORE_EXTENSION: [Self; 6] = [
@@ -822,4 +830,37 @@ fn crash_extension_names_are_disjoint_from_the_m1_matrix() {
     }
     assert_eq!(names.len(), 32);
     assert!(names.contains("BeforeCodexPublication"));
+}
+
+#[test]
+fn native_m3_plain_flush_matrix_has_no_file_fsync_boundary() {
+    assert!(CrashPoint::ALL.contains(&CrashPoint::FileSynced));
+    assert!(
+        !CrashPoint::NATIVE_M3.contains(&CrashPoint::FileSynced),
+        "plain-flush engine: no fsync boundary"
+    );
+    // Qualify the real native engine, not a synthetic crash edge. Any new
+    // file fsync on this path requires revisiting the design and its matrix.
+    let native = include_str!("../../durable_tail_store/stream.rs")
+        .split("#[cfg(test)]\nmod tests")
+        .next()
+        .unwrap();
+    for forbidden in [".sync_all(", ".sync_data(", "libc::fsync(", ".sync()"] {
+        assert!(
+            !native.contains(forbidden),
+            "native-M3 added file fsync: {forbidden}"
+        );
+    }
+    let store = include_str!("../../durable_tail_store.rs");
+    let temp_commit = store
+        .split("fn commit(&mut self, path: &Path, prior: Option<Stamp>)")
+        .nth(1)
+        .unwrap()
+        .split("fn discard(")
+        .next()
+        .unwrap();
+    assert!(
+        !temp_commit.contains(".sync"),
+        "native temp commit added fsync"
+    );
 }
