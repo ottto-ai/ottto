@@ -26686,7 +26686,10 @@ impl OwnedSourceScan {
                 });
             }
             refresh_retained_codex_roster(
-                source, traversal, backfill_window_days, discovery_retention!(index),
+                source,
+                traversal,
+                backfill_window_days,
+                discovery_retention!(index),
             );
             next_generation_hints =
                 enqueue_watcher_hints(source, traversal, hinted_paths, watcher_overflowed);

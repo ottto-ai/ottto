@@ -734,6 +734,9 @@ fn inventory(
     directories.observe(root, &fs::metadata(root).unwrap());
     let mut inventory =
         codex_file_join::HeaderInventory::new(&[root.to_owned()], &paths, Some(&directories));
+    // This direct component seam models admitted archive headers. Production
+    // discovery stays .jsonl-only; cached evidence cannot bypass the QoS gate.
+    inventory.archive_work.allowed = true;
     while !inventory.step_with_archive(&CodexTitleMetadata::default(), index, None) {}
     assert!(inventory.complete);
     assert!(inventory.refused.is_empty());
@@ -1777,6 +1780,8 @@ fn home_inventory(
         &paths.iter().map(|p| local_index_key(p)).collect(),
         Some(&dirs),
     );
+    // Explicit admission permission for this synthetic multi-home seam only.
+    inv.archive_work.allowed = true;
     while !inv.step_with_archive(&CodexTitleMetadata::default(), index, None) {}
     assert!(inv.complete);
     assert!(inv.refused.is_empty());
@@ -2265,6 +2270,26 @@ fn held_archive_replay_does_not_settle_from_historical_fingerprint_alone() {
         assert!(index.prepare_historical_replay("held-archive-current-body".into()));
         let saved = root.join("index.json");
         for _ in 0..3 {
+            let roots = [root.join("sessions")];
+            ensure_bounded_traversal(
+                SnapshotSource::Codex,
+                &roots,
+                &mut index,
+                "2026-10-06T23:00:00Z",
+                7,
+            );
+            let traversal = index.traversal.as_mut().unwrap();
+            traversal.pending_directories.clear();
+            traversal.pending_candidates.push_back(ScanTraversalPath {
+                scan_root: roots[0].clone(),
+                path: path.clone(),
+                census_member: true,
+                watcher_hint: false,
+            });
+            traversal.codex_rollout_paths.insert(key.clone());
+            let mut dirs = codex_file_join::DirectoryCensus::new();
+            dirs.observe(&roots[0], &fs::metadata(&roots[0]).unwrap());
+            traversal.codex_join_directory_census = Some(dirs);
             index.save(&saved).unwrap();
             let ((mut next, result), rows) = capture(|| {
                 no_open(&path, || {
@@ -2272,6 +2297,24 @@ fn held_archive_replay_does_not_settle_from_historical_fingerprint_alone() {
                 })
             });
             assert_no_red(&result, &rows);
+            if let Some(traversal) = &next.traversal {
+                assert!(!traversal.codex_rollout_paths.contains(&key));
+                assert!(traversal.pending_candidates.iter().all(|p| p.path != path));
+            }
+            let gauges = rows
+                .iter()
+                .filter(|r| r["stage"] == "archive_quiet_pending_unacked")
+                .collect::<Vec<_>>();
+            assert_eq!(gauges.len(), 1, "one RAM gauge per completed page");
+            assert_eq!(
+                gauges[0]["counts"]["archive_quiet_pending_unacked_count"], 0,
+                "excluded custody is not a quiet opened unacked attempt"
+            );
+            assert!(!next.files[&key].archive.as_ref().unwrap().reservation_saved);
+            assert_eq!(
+                next.files[&key].archive.as_ref().unwrap().decode_attempts,
+                0
+            );
             assert!(
                 next.accepted_snapshot_fingerprints.contains(&fp),
                 "retain historical money"
