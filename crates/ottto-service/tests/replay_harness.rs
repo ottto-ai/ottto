@@ -113,13 +113,16 @@ impl Fixture {
     }
     fn refused(&self, mut command: Command) {
         let output = command.output().unwrap();
+        self.assert_refused(&output);
+    }
+    fn assert_refused(&self, output: &Output) {
         assert_eq!(
             output.status.code(),
             Some(2),
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        self.assert_private(&output);
+        self.assert_private(output);
         assert!(!self.support.join(".replay-harness").exists());
         assert!(!self.support.join("P0.jsonl").exists());
     }
@@ -1030,6 +1033,61 @@ fn refuses_missing_public_and_symlinked_blinding_keys() {
     fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
     symlink(target, &f.key).unwrap();
     f.refused(f.command("P0"));
+}
+
+#[cfg(target_os = "linux")]
+mod fifo_inputs {
+    use super::*;
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    fn make_fifo(path: &Path) {
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: path is a valid NUL-terminated string for this call.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
+
+    fn refuse_promptly(f: &Fixture, mut command: Command) {
+        let mut child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                // Always kill and reap before failing, including on regression.
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("replay-harness blocked instead of refusing a FIFO input");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        f.assert_refused(&output);
+        assert_eq!(output.stderr, b"replay-harness: isolation refused\n");
+    }
+
+    #[test]
+    fn refuses_fifo_blinding_key_without_blocking() {
+        let f = Fixture::new();
+        fs::remove_file(&f.key).unwrap();
+        make_fifo(&f.key);
+        refuse_promptly(&f, f.command("P0"));
+    }
+
+    #[test]
+    fn refuses_symlink_to_fifo_blinding_key_without_blocking() {
+        let f = Fixture::new();
+        let target = f.base.join("fifo-target");
+        make_fifo(&target);
+        fs::remove_file(&f.key).unwrap();
+        symlink(target, &f.key).unwrap();
+        refuse_promptly(&f, f.command("P0"));
+    }
 }
 
 #[test]
