@@ -226,7 +226,7 @@ fn n10_pacing_eviction_allows_growth_without_evicting_spent_authority() {
             &format!("paced-{n}"),
             &f.file,
             f.checkpoint.sealed_offset(),
-            now + Duration::from_secs(n as u64)
+            std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000 + n as u64)
         ));
     }
     let ((), _) = crate::local_resource_diagnostics::capture(|| {
@@ -236,7 +236,8 @@ fn n10_pacing_eviction_allows_growth_without_evicting_spent_authority() {
         "new-growing-key",
         &f.file,
         f.checkpoint.sealed_offset(),
-        now + Duration::from_secs(2 * store::MAX_RECORDS as u64)
+        std::time::SystemTime::UNIX_EPOCH
+            + Duration::from_secs(1_800_000_000 + 2 * store::MAX_RECORDS as u64)
     ));
     let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
         f.cache.durable_alarm(SnapshotSource::ClaudeCode);

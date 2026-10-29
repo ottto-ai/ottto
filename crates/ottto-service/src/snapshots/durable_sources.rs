@@ -53,7 +53,8 @@ pub(crate) const SOURCES: &[Properties] = &[
         source: DurableSource::ClaudeCode,
         snapshot: SnapshotSource::ClaudeCode,
         tag: 1,
-        write_format: 3,
+        // Advance only with the atomic native write-ahead activation.
+        write_format: 1,
         representations: &representations(
             "8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c",
         ),
@@ -70,7 +71,8 @@ pub(crate) const SOURCES: &[Properties] = &[
         source: DurableSource::Codex,
         snapshot: SnapshotSource::Codex,
         tag: 2,
-        write_format: 3,
+        // Advance only with the atomic native write-ahead activation.
+        write_format: 1,
         representations: &representations(
             "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1",
         ),

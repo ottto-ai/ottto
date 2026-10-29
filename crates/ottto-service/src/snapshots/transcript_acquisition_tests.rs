@@ -4000,6 +4000,7 @@ fn missing_index_debt_carrier_recovers_by_full_in_one_pass_for_both_sources() {
         certificate.audit_debt_unix_seconds = Some(now + 60);
         let mut disk = store::DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
         let pending = store::PendingRecord {
+            acquisition: None,
             binding: store::Binding {
                 source: ds,
                 key: record_key,
@@ -4264,6 +4265,7 @@ fn missing_index_terminal_loss_carries_recovered_debt_until_verified_full_for_bo
         certificate.audit_debt_unix_seconds = Some(now);
         let mut disk = store::DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
         let pending = store::PendingRecord {
+            acquisition: None,
             binding: store::Binding {
                 source: ds,
                 key: record_key,
@@ -4502,6 +4504,7 @@ fn missing_carrier_future_debt_clamps_only_in_live_context_for_both_sources() {
             let mut disk =
                 store::DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
             let pending = store::PendingRecord {
+                acquisition: None,
                 binding: store::Binding {
                     source: ds,
                     key: record_key,

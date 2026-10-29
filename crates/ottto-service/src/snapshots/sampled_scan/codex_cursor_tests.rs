@@ -14163,6 +14163,7 @@ fn parked_singleton_across_fresh_index_reprobes_record_debt() {
     let lock = crate::locked_state_dir::test_locks::hold(&state);
     let mut disk = store::DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
     let pending = store::PendingRecord {
+        acquisition: None,
         binding: store::Binding {
             source: ds,
             key: store::key_digest(ds, &key),

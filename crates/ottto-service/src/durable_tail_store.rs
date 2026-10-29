@@ -86,7 +86,7 @@ const CERTIFICATE_BYTES: usize = 8 * 3 // device, inode, length
 const TRAILER_BYTES: usize = 32;
 // Classifier reallocation (old header + envelope), then input + copied body.
 // Conservative cumulative reservation; no credit is refunded between phases.
-const INPUT_ENVELOPE: usize = RECORD_BYTES + HEADER_BYTES + TRAILER_BYTES + 1;
+const INPUT_ENVELOPE: usize = RECORD_BYTES + HEADER_V3_BYTES + TRAILER_BYTES + 1;
 pub(crate) const RESTORE_INPUT_BYTES: u64 =
     (3 * INPUT_ENVELOPE + std::mem::size_of::<DurableRecord>()) as u64;
 pub(crate) const BODY_BYTES: usize = RECORD_BYTES - HEADER_BYTES - TRAILER_BYTES;
@@ -379,6 +379,8 @@ fn original_digest(record: &DurableRecord, content: &Digest32) -> Digest32 {
             content,
             &record.format.to_le_bytes(),
             &record.index_generation.to_le_bytes(),
+            &record.wire.map_or(0, |w| w.encoded_len).to_le_bytes(),
+            &record.wire.map_or([0; 32], |w| w.trailer),
         ],
     )
 }
@@ -627,6 +629,7 @@ pub(crate) struct DurableTailStore {
     /// Process-lifetime attempts, removed only after a successful replacement.
     rebuilt: BTreeMap<Digest32, Rebuild>,
     startup_synced: bool,
+    gc_after: Option<Digest32>,
     pending: BTreeMap<Digest32, PendingWrite>,
 }
 
@@ -641,7 +644,9 @@ enum Rebuild {
 /// The most record files one GC or inventory pass looks at. Twice the
 /// memo precision bound; existing-key updates remain possible beyond it; any
 /// file past it is left untouched and counted.
-pub(crate) const INVENTORY_BOUND: usize = 2 * MAX_RECORDS;
+const GC_RECORDS_PER_PASS: usize = 512;
+#[cfg(test)]
+const INVENTORY_BOUND: usize = GC_RECORDS_PER_PASS;
 /// T14 rebuilds one pass allows before the store is disabled: more than
 /// `max(T14_BREAKER, 2% of the records loaded)`.
 pub(crate) const T14_BREAKER: u64 = 20;
@@ -664,6 +669,7 @@ impl DurableTailStore {
             pass: [0; 2],
             rebuilt: BTreeMap::new(),
             startup_synced: false,
+            gc_after: None,
             pending: BTreeMap::new(),
         }
     }
@@ -849,15 +855,26 @@ impl DurableTailStore {
             test_hooks::before_access(&path, "header")
                 .map_err(|e| self.read_failure(e, Refusal::Undecodable))?;
             let mut header = Vec::with_capacity(HEADER_V3_BYTES);
-            let first = Read::by_ref(&mut file).take(DISPATCH_BYTES as u64).read_to_end(&mut header);
+            let first = Read::by_ref(&mut file)
+                .take(DISPATCH_BYTES as u64)
+                .read_to_end(&mut header);
             let mut n = header.len();
-            if work == "delete" { self.counters.gc_records_read += 1; self.counters.gc_bytes_read += n as u64; }
-            else { self.counters.guard_header_bytes += n as u64; }
+            if work == "delete" {
+                self.counters.gc_records_read += 1;
+                self.counters.gc_bytes_read += n as u64;
+            } else {
+                self.counters.guard_header_bytes += n as u64;
+            }
             first.map_err(|e| self.read_failure(e, Refusal::Undecodable))?;
             let (_, _, _, size) = dispatch(&header)?;
-            let rest = Read::by_ref(&mut file).take((size - n) as u64).read_to_end(&mut header);
-            if work == "delete" { self.counters.gc_bytes_read += (header.len()-n) as u64; }
-            else { self.counters.guard_header_bytes += (header.len()-n) as u64; }
+            let rest = Read::by_ref(&mut file)
+                .take((size - n) as u64)
+                .read_to_end(&mut header);
+            if work == "delete" {
+                self.counters.gc_bytes_read += (header.len() - n) as u64;
+            } else {
+                self.counters.guard_header_bytes += (header.len() - n) as u64;
+            }
             rest.map_err(|e| self.read_failure(e, Refusal::Corrupt))?;
             n = header.len();
             let mut binding = decode_header(&header, key, self.source)?;
@@ -872,7 +889,8 @@ impl DurableTailStore {
                 return Err(Refusal::Corrupt);
             }
             if let Some((content, old, _)) = self.durable.get(key) {
-                if *old == stamp && (work != "overwrite" || content.is_some()) {
+                if work != "restore" && *old == stamp && (work != "overwrite" || content.is_some())
+                {
                     binding.content = *content;
                     return Ok(Some(binding));
                 }
@@ -893,11 +911,14 @@ impl DurableTailStore {
             }
             self.note_codec(bytes.capacity());
             verify(&bytes, self.source)?;
-            if work == "overwrite" {
+            if work == "overwrite" || work == "restore" {
                 binding.content = Some(stored_digest(&bytes));
             }
             if self.durable.len() < MAX_RECORDS || self.durable.contains_key(key) {
                 self.durable.insert(*key, (None, stamp, false));
+            }
+            if work == "restore" {
+                binding.verified = Some(bytes);
             }
             Ok(Some(binding))
         })();
@@ -1036,23 +1057,14 @@ impl DurableTailStore {
         key: &Digest32,
         writer: Option<&dyn SingleWriter>,
     ) -> Result<Option<VerifiedRecord>, Refusal> {
-        match self.classify(key, "guard", writer) {
-            Err(reason) => return Err(reason),
-            Ok(None) => {
+        let mut header = match self.classify(key, "restore", writer)? {
+            Some(header) => header,
+            None => {
                 self.counters.missing += 1;
                 return Ok(None);
             }
-            Ok(Some(_)) => {}
-        }
-        let bytes = match read_private(&self.record_path(key)) {
-            Ok(Some(bytes)) => bytes,
-            Ok(None) => return Ok(None),
-            Err(e) if e.kind() != io::ErrorKind::InvalidData => {
-                self.disable("record_access");
-                return Ok(None);
-            }
-            _ => return Err(Refusal::Corrupt),
         };
+        let bytes = header.verified.take().ok_or(Refusal::Corrupt)?;
         self.counters.records_read += 1;
         self.counters.bytes_read += bytes.len() as u64;
         self.counters.max_record_bytes = self.counters.max_record_bytes.max(bytes.len() as u64);
@@ -1118,7 +1130,9 @@ impl DurableTailStore {
             }
         }
         if self.source == DurableSource::ClaudeCode && !receipt.completed.is_empty() {
-            let acks = receipt.committed.get_or_insert_with(|| Box::new([None; MAX_BATCH]));
+            let acks = receipt
+                .committed
+                .get_or_insert_with(|| Box::new([None; MAX_BATCH]));
             for (i, proof) in receipt.completed.iter().enumerate() {
                 acks[i] = Some((proof.identity.key, proof.content, proof.stamp));
             }
@@ -1508,8 +1522,10 @@ impl DurableTailStore {
             ) {
                 continue;
             }
-            if receipt.completed.iter().any(|proof| proof.identity.key == key) { continue; }
-            if self.receipt_pending(&key) && self.reconcile_pending(writer, &key).is_err()
+            if receipt
+                .completed
+                .iter()
+                .any(|proof| proof.identity.key == key)
             {
                 continue;
             }
@@ -1538,7 +1554,6 @@ impl DurableTailStore {
                     continue;
                 }
             }
-            let content = content_digest(&record);
             if let Some(PendingWrite {
                 candidate,
                 content: completed_content,
@@ -1618,13 +1633,6 @@ impl DurableTailStore {
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                     Err(error) => return Err(error),
                 }
-            }
-            if !on_disk.contains_key(&key)
-                && on_disk.len() as u64 + unlisted[0] >= INVENTORY_BOUND as u64
-            {
-                self.counters.store_write_skipped[1] += 1;
-                receipt.deferred_keys.push(key);
-                continue;
             }
             let stored = DurableRecord {
                 envelope_audit_debt: record.certificate.audit_debt_unix_seconds,
@@ -1745,6 +1753,7 @@ impl DurableTailStore {
         if !self.usable(Some(writer)) {
             return Ok(());
         }
+        let page = self.inventory()?;
         let entries = match fs::read_dir(&self.dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -1759,7 +1768,6 @@ impl DurableTailStore {
         let mut deleted = false;
         let mut on_disk = BTreeMap::new();
         self.counters.uninventoried_records = 0;
-        let mut seen = 0_usize;
         let mut unlisted_bytes = 0;
         for entry in entries {
             let entry = entry?;
@@ -1777,9 +1785,8 @@ impl DurableTailStore {
             let Some(key) = name.strip_suffix(RECORD_SUFFIX).and_then(parse_hex_digest) else {
                 continue;
             };
-            seen += 1;
             let len = entry.metadata().map_or(0, |m| m.len());
-            if seen > INVENTORY_BOUND {
+            if !page.contains(&key) {
                 self.counters.uninventoried_records += 1;
                 unlisted_bytes += len;
                 continue;
@@ -1827,7 +1834,9 @@ impl DurableTailStore {
                 }
             }
         }
-        self.durable.retain(|key, _| on_disk.contains_key(key));
+        self.gc_after = page.last().copied();
+        self.durable
+            .retain(|key, _| !page.contains(key) || on_disk.contains_key(key));
         if deleted {
             self.sync_store()?;
         }
@@ -1838,12 +1847,21 @@ impl DurableTailStore {
         Ok(())
     }
 
-    /// The record keys on disk now, at most `INVENTORY_BOUND`: GC's caller
-    /// looks up only these keys, never materializing the whole index.
+    /// Same bounded name page used by the caller and GC. A cold restart begins
+    /// at the first key; each completed pass moves past its last inspected key.
+    /// Enumeration uses bounded memory even when disk has many more records.
     pub(crate) fn inventory(&self) -> io::Result<BTreeSet<Digest32>> {
         if self.disabled.is_some() {
             return Ok(BTreeSet::new());
         }
+        let page = self.inventory_after(self.gc_after)?;
+        if page.is_empty() && self.gc_after.is_some() {
+            self.inventory_after(None)
+        } else {
+            Ok(page)
+        }
+    }
+    fn inventory_after(&self, after: Option<Digest32>) -> io::Result<BTreeSet<Digest32>> {
         let entries = match fs::read_dir(&self.dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
@@ -1856,10 +1874,11 @@ impl DurableTailStore {
                 .to_str()
                 .and_then(|name| name.strip_suffix(RECORD_SUFFIX))
                 .and_then(parse_hex_digest)
+                .filter(|key| after.is_none_or(|after| *key > after))
             {
                 keys.insert(key);
-                if keys.len() >= INVENTORY_BOUND {
-                    break;
+                if keys.len() > GC_RECORDS_PER_PASS {
+                    keys.pop_last();
                 }
             }
         }
@@ -1880,10 +1899,13 @@ impl DurableTailStore {
         }
         for key in keys {
             let path = self.record_path(key);
-            if !self.pending.contains_key(key)
-                && matches!(self.classify(key, "delete", Some(writer)), Ok(Some(_)))
-                && self.authorized(key)
-            {
+            let allowed = !self.pending.contains_key(key)
+                && self
+                    .classify(key, "delete", Some(writer))
+                    .ok()
+                    .flatten()
+                    .is_some_and(|header| self.authorized(key, header.format));
+            if allowed {
                 remove_if_present(&path)?;
                 removed += 1;
             }
@@ -1936,7 +1958,7 @@ impl DurableTailStore {
                 continue;
             };
             let len = fs::symlink_metadata(entry.path())?.len();
-            if on_disk.len() < INVENTORY_BOUND {
+            if on_disk.len() < GC_RECORDS_PER_PASS {
                 on_disk.insert(key, len);
             } else {
                 unlisted = [unlisted[0] + 1, unlisted[1] + len];
@@ -2071,48 +2093,6 @@ fn floor_allows(available: Option<u64>, volume: Option<u64>, encoded: u64, index
     })
 }
 
-/// `Ok(None)` when absent. Refuses a non-regular file, a file readable by
-/// group or others, and a file over the record bound.
-fn read_private(path: &Path) -> io::Result<Option<Vec<u8>>> {
-    #[cfg(test)]
-    if let Err(error) = test_hooks::before_access(path, "restore_open") {
-        return if error.kind() == io::ErrorKind::NotFound {
-            Ok(None)
-        } else {
-            Err(error)
-        };
-    }
-    let file = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    #[cfg(test)]
-    test_hooks::before_access(path, "restore_metadata")?;
-    let metadata = file.metadata()?;
-    if metadata.permissions().mode() & 0o077 != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "durable store record not owner-only",
-        ));
-    }
-    if !metadata.is_file()
-        || metadata.len() > (RECORD_BYTES + HEADER_V3_BYTES + TRAILER_BYTES) as u64
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "unusable durable store record",
-        ));
-    }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(metadata.len()).read_to_end(&mut bytes)?;
-    Ok(Some(bytes))
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Stamp([u64; 3], [i64; 4]);
 impl Stamp {
@@ -2152,6 +2132,12 @@ fn dead_temp(name: &str) -> bool {
     let (record, pid, staged) = if let Some((record, pid)) = prefix.rsplit_once('.') {
         if record.ends_with(RECORD_SUFFIX) && last.parse::<u64>().is_ok() {
             (record, pid, true)
+        } else if record.ends_with(RECORD_SUFFIX)
+            && last
+                .strip_prefix('a')
+                .is_some_and(|n| n.parse::<u64>().is_ok())
+        {
+            (record, pid, false)
         } else {
             (prefix, last, false)
         }
@@ -2179,6 +2165,7 @@ struct Header {
     audit_debt: Option<u64>,
     stamp: Option<Stamp>,
     content: Option<Digest32>,
+    verified: Option<Vec<u8>>,
 }
 fn dispatch(bytes: &[u8]) -> Result<(u16, Digest32, DurableSource, usize), Refusal> {
     let mut c = Cursor(bytes);
@@ -2270,6 +2257,7 @@ fn decode_header(bytes: &[u8], key: &Digest32, source: DurableSource) -> Result<
             audit_debt: None,
             stamp: None,
             content: None,
+            verified: None,
         })
     })();
     let mut header = parsed.ok_or(Refusal::Corrupt)?;
@@ -2331,37 +2319,36 @@ struct OwnedTemp {
 
 impl OwnedTemp {
     fn prepare(dir: &Path, path: &Path, cleanup: Arc<TempCleanupCounts>) -> io::Result<Self> {
-        static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
-        Self::create(
-            dir,
-            path,
-            cleanup,
-            Some(NEXT_TEMP.fetch_add(1, Ordering::Relaxed)),
-        )
+        Self::create(dir, path, cleanup, false)
     }
     fn prepare_atomic(
         dir: &Path,
         path: &Path,
         cleanup: Arc<TempCleanupCounts>,
     ) -> io::Result<Self> {
-        // This owner never leaves Stores. GC can retry abandoned same-process
-        // M1 temps after a failed explicit and unwind cleanup.
-        Self::create(dir, path, cleanup, None)
+        // Short-lived owners stay under Stores. GC may reap their failed cleanup
+        // on this process, but must preserve live outliving native stages.
+        Self::create(dir, path, cleanup, true)
     }
     fn create(
         dir: &Path,
         path: &Path,
         cleanup: Arc<TempCleanupCounts>,
-        serial: Option<u64>,
+        atomic: bool,
     ) -> io::Result<Self> {
+        static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+        let serial = NEXT_TEMP
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .map_err(|_| io::Error::other("temp serial exhausted"))?;
         let name = path
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "record name"))?;
-        let temp = dir.join(match serial {
-            Some(serial) => format!(".{name}.{}.{}{TEMP_SUFFIX}", std::process::id(), serial),
-            None => format!(".{name}.{}{TEMP_SUFFIX}", std::process::id()),
-        });
+        let kind = if atomic { "a" } else { "" };
+        let temp = dir.join(format!(
+            ".{name}.{}.{kind}{serial}{TEMP_SUFFIX}",
+            std::process::id()
+        ));
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)

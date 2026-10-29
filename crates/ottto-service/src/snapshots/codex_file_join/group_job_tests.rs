@@ -2941,6 +2941,7 @@ fn spent_known_corrupt_group_keeps_census_healthy_and_peer_progresses() {
         1,
         0,
         vec![store::PendingRecord {
+            acquisition: None,
             binding: store::Binding {
                 source: store::DurableSource::Codex,
                 key: digest,
@@ -3223,6 +3224,7 @@ fn seed_member_debts<W: crate::durable_tail_store::SingleWriter>(
             .collect::<String>();
         seeded.push((path, dir.join(format!("{hex}.rec"))));
         pending.push(store::PendingRecord {
+            acquisition: None,
             binding: store::Binding {
                 source: ds,
                 key: digest,

@@ -111,7 +111,6 @@ fn failed_immediate_cleanup_is_retried_by_same_process_gc() {
         .gc(
             case.writer,
             &case.record.binding.context,
-            &case.record.allowlist,
             &std::collections::BTreeMap::new(),
         )
         .unwrap();

@@ -27,6 +27,9 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub(super) mod acquired;
+pub(crate) use acquired::{AcquiredChain, AcquisitionProtocol, ImmutableCounting};
+
 use super::super::*;
 use super::SharedCache;
 use crate::durable_tail_codec::Refuse;
@@ -165,7 +168,7 @@ impl Counters {
         };
         format!(
             "ottto-service: durable_tail source={} original_v1_mapped={} durable_restore_after_selection_clear={} objects[same,unknown,changed]={:?} s2_skipped_object_changed={} \
-             retail_attempts={} retail_keys={} near_cap={} pace_anomaly={} upgrade_missing_full={} migration[held,await_save,claimed,replaced]={:?} retail_exhausted[full,paced,pace_evicted]={:?} tail_read_bytes={} budget_refused_retail_old_bytes={} repeated_physical_old_bytes={} upgrade_state_missing={} \
+             retail_attempts={} retail_keys={} near_cap={} pace_anomaly={} upgrade_missing_full={} migration[held,await_save,claimed,replaced]={:?} retail_exhausted[full,paced,pace_evicted]={:?} tail_read_bytes={} retail_physical_bytes[process,daily]={:?} budget_refused_retail_old_bytes={} repeated_physical_old_bytes={} upgrade_state_missing={} \
              active_bound[claude,codex,pi]={:?} resource_full={{{}}} rederive_head_bytes={} rederive_named_lines={} rederive_line_bytes={} not_persisted={{{}}} ineligible={{{}}} \
              write_deferred={} write_unlocked={} peak_body_bytes={} store_write_failed[setup,inventory,statvfs]={:?} disk_records={} disk_bytes={} \
              bytes_written={} records_written={} records_clean={} store_budget_refused={} \
@@ -187,6 +190,7 @@ impl Counters {
             self.migration,
             self.retail_full,
             retail_bytes(source, 0),
+            [retail_bytes(source, 2), retail_bytes(source, 3)],
             retail_bytes(source, 1),
             retail_bytes(source, 1),
             self.upgrade_state_missing,
@@ -626,7 +630,7 @@ fn replay_scope_for(
             durable_source(source)
                 .expect("admitted source")
                 .properties()
-                .format,
+                .write_format,
             durable_source(source)
                 .expect("admitted source")
                 .properties()
@@ -848,8 +852,15 @@ pub(crate) enum RetailHold {
     AccountingLost,
     Ineligible,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RetailGrant {
+    Process,
+    Daily,
+}
+const RETAIL_DAILY: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 pub(crate) struct RetailAttempt {
     source: DurableSource,
+    grant: RetailGrant,
     object: (u64, u64, u64),
     next: u64,
     end: u64,
@@ -859,6 +870,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for RetailAttempt {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         let Self {
             source: _,
+            grant: _,
             object: _,
             next: _,
             end: _,
@@ -869,9 +881,9 @@ impl crate::heap_layout_bound::HeapLayoutBound for RetailAttempt {
 }
 
 // Process totals by source: native physical Tail bytes and old-suffix overlap.
-static RETAIL_BYTES: [[AtomicU64; 2]; 2] = [
-    [AtomicU64::new(0), AtomicU64::new(0)],
-    [AtomicU64::new(0), AtomicU64::new(0)],
+static RETAIL_BYTES: [[AtomicU64; 4]; 2] = [
+    [const { AtomicU64::new(0) }; 4],
+    [const { AtomicU64::new(0) }; 4],
 ];
 fn retail_bytes(source: SnapshotSource, metric: usize) -> u64 {
     durable_source(source).map_or(0, |s| {
@@ -969,6 +981,10 @@ impl<R: std::io::Read + std::io::Seek> std::io::Seek for AccountedReader<'_, R> 
     }
 }
 impl RetailAttempt {
+    pub(crate) fn grant(&self) -> RetailGrant {
+        self.grant
+    }
+
     fn range(&self, file: &File, offset: u64) -> std::io::Result<usize> {
         let m = file.metadata()?;
         if (m.dev(), m.ino(), birth_unix_nanos(&m)) != self.object {
@@ -989,6 +1005,13 @@ impl RetailAttempt {
         Ok((self.end - offset).min(usize::MAX as u64) as usize)
     }
     fn count(&mut self, offset: u64, n: usize) {
+        let metric = match self.grant {
+            RetailGrant::Process => 2,
+            RetailGrant::Daily => 3,
+        };
+        RETAIL_BYTES[self.source as usize][metric].fetch_add(n as u64, Ordering::Relaxed);
+        #[cfg(test)]
+        m3_owed_tests::observe_retail(self.grant, offset, n);
         RETAIL_BYTES[self.source as usize][0].fetch_add(n as u64, Ordering::Relaxed);
         RETAIL_BYTES[self.source as usize][1].fetch_add(
             self.old_end.saturating_sub(offset).min(n as u64),
@@ -1120,11 +1143,17 @@ impl SharedCache {
                 return Err(RetailHold::AccountingLost);
             }
             if c.length < *high || accepted_end > c.length {
-                Counters::bump(
-                    &mut stores.counters.ineligible,
-                    "retail_exhausted.budget_refused",
-                );
-                return Err(RetailHold::Exhausted);
+                let Some(deadline) = spent.checked_add(RETAIL_DAILY) else {
+                    Counters::bump(&mut stores.counters.ineligible, "retail_clock_overflow");
+                    return Err(RetailHold::AccountingLost);
+                };
+                if now < deadline {
+                    Counters::bump(
+                        &mut stores.counters.ineligible,
+                        "retail_exhausted.budget_refused",
+                    );
+                    return Err(RetailHold::Exhausted);
+                }
             }
         } else if !stores.retail_spent.contains_key(&key)
             && stores.retail_spent.len() >= store::MAX_RECORDS * 2
@@ -1142,12 +1171,23 @@ impl SharedCache {
         if !stores.fund_key(key) {
             return Err(RetailHold::AccountingLost);
         }
-        let first = stores.retail_spent[&key].spent.is_none();
+        let prior = stores.retail_spent[&key].spent;
+        let first = prior.is_none();
+        let grant = if prior.is_some_and(|(high, _)| c.length < high || accepted_end > c.length) {
+            RetailGrant::Daily
+        } else {
+            RetailGrant::Process
+        };
         stores.counters.retail_keys += u64::from(first);
         stores.counters.retail_attempts += 1;
-        stores.retail_spent.get_mut(&key).expect("funded").spent = Some((end, now));
+        // Spend before any syscall, including interrupted/failed attempts.
+        // Keep the largest physical extent: neither a relabel nor a shorter
+        // object can refund the process allowance. The node is never evicted.
+        let high = prior.map_or(end, |(high, _)| high.max(end));
+        stores.retail_spent.get_mut(&key).expect("funded").spent = Some((high, now));
         Ok(RetailAttempt {
             source,
+            grant,
             object: (c.device, c.inode, c.birth_nanos),
             next: c.length,
             end,
@@ -1708,7 +1748,7 @@ impl SharedCache {
         let key = store::key_digest(source, key);
         let mut stores = self.durable()?;
         let slot = stores.slot(source).as_mut()?;
-        if let Some(writer) = crate::locked_state_dir::held_for(slot.store.dir()) {
+        if let Some(writer) = crate::locked_state_dir::held_for(&slot.dir) {
             if let Ok(store::ReconcileOutcome::Receipted(proof)) =
                 slot.store.reconcile_pending(writer, &key)
             {
@@ -3195,6 +3235,7 @@ impl SharedCache {
                         peak = peak.max(body.len() as u64);
                         offered.insert(expected.binding.key, key);
                         pending.push(PendingRecord {
+                            acquisition: None,
                             binding: expected.binding,
                             certificate,
                             body,
@@ -3880,3 +3921,7 @@ pub(crate) mod tests;
 
 #[cfg(test)]
 pub(crate) use tests::seed_pinned_v1;
+
+#[cfg(all(test, unix))]
+#[path = "m3_owed_tests.rs"]
+mod m3_owed_tests;

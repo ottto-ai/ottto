@@ -533,10 +533,12 @@ fn rederive_refusal_precedes_certificate_io_and_keeps_integrity_separate() {
         committed_generation: 1,
     };
     let mut record = store::DurableRecord {
+        wire: None,
         envelope_audit_debt: None,
         format: store::FORMAT_VERSION,
         index_generation: 1,
         record: PendingRecord {
+            acquisition: None,
             binding,
             certificate: certificate(&path, &scope),
             body,
@@ -1627,6 +1629,7 @@ fn admissible_codex_records_survive_above_the_retired_aggregate_disk_cap() {
     for n in 0..40 {
         let key = store::key_digest(ds, &format!("session-{n}"));
         let pending = PendingRecord {
+            acquisition: None,
             binding: Binding {
                 source: ds,
                 key,
@@ -2420,6 +2423,7 @@ fn gc_on_a_large_index_looks_up_only_the_store_inventory() {
     let pending = keys
         .iter()
         .map(|key| PendingRecord {
+            acquisition: None,
             binding: Binding {
                 source: DurableSource::Codex,
                 key: store::key_digest(DurableSource::Codex, key),
@@ -2653,6 +2657,7 @@ fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
                 index.generation,
                 0,
                 vec![PendingRecord {
+                    acquisition: None,
                     binding,
                     certificate: certificate(&path, &scope),
                     body,
@@ -2809,6 +2814,7 @@ fn attribution_capture_toggle_refuses_the_previous_claude_record() {
                 index.generation,
                 0,
                 vec![PendingRecord {
+                    acquisition: None,
                     binding: binding.clone(),
                     certificate: certificate(&path, &scope),
                     body: codec::encode(&reduction, store::RECORD_BYTES, jsonl_line_cap() as u64)
@@ -3223,6 +3229,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                 // this survivor; Codex retains ordinary selective deletion.
                 let absent_key = store::key_digest(ds, "/synthetic/absent-known.jsonl");
                 let record = |key| PendingRecord {
+                    acquisition: None,
                     binding: Binding {
                         source: ds,
                         key,
@@ -3255,7 +3262,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                     let end = bytes.len() - 1;
                     bytes[end] ^= 1;
                 } else {
-                    bytes[8..10].copy_from_slice(&(store::FORMAT_VERSION + 1).to_le_bytes());
+                    bytes[8..10].copy_from_slice(&(store::FORMAT_V3 + 1).to_le_bytes());
                     let end = bytes.len() - 32;
                     let trailer = Sha256::digest(&bytes[..end]);
                     bytes[end..].copy_from_slice(&trailer);
@@ -3541,6 +3548,7 @@ fn foreign_owned_store_alarms_once_and_holds_nothing() {
     std::fs::write(&cert_path, b"{}\n").unwrap();
     let mut disk = DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
     let pending = PendingRecord {
+        acquisition: None,
         binding: Binding {
             source: ds,
             key: store::key_digest(ds, key),
@@ -3560,7 +3568,7 @@ fn foreign_owned_store_alarms_once_and_holds_nothing() {
         .unwrap()
         .path();
     let mut bytes = std::fs::read(&record_path).unwrap();
-    bytes[8..10].copy_from_slice(&(store::FORMAT_VERSION + 1).to_le_bytes());
+    bytes[8..10].copy_from_slice(&(store::FORMAT_V3 + 1).to_le_bytes());
     std::fs::write(&record_path, &bytes).unwrap();
     let cache = SharedCache::default();
     cache.durable_begin_pass(source, &index_path, &namespace, false);
@@ -3675,6 +3683,7 @@ fn store_io_failures_emit_cold_production_body_without_holds() {
                 1,
                 0,
                 vec![PendingRecord {
+                    acquisition: None,
                     binding: Binding {
                         source: ds,
                         key: digest,
@@ -3821,6 +3830,7 @@ fn t14_without_retention_or_encodable_reduction_holds_on_later_passes() {
             1,
             0,
             vec![PendingRecord {
+                acquisition: None,
                 binding: Binding {
                     source: ds,
                     key: digest,
@@ -4044,6 +4054,7 @@ fn known_corrupt_replacement_case(fail_replacement: bool) {
         1,
         0,
         vec![PendingRecord {
+            acquisition: None,
             binding: Binding {
                 source: DurableSource::ClaudeCode,
                 key: digest,
@@ -4311,6 +4322,7 @@ fn save_without_per_pass_setup_keeps_valid_records() {
     let pending = [indexed, absent]
         .iter()
         .map(|key| PendingRecord {
+            acquisition: None,
             binding: Binding {
                 source: ds,
                 key: store::key_digest(ds, key),
@@ -4416,6 +4428,7 @@ fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites(
             );
             let (reduction, _) = native_record_of(&path, &scope, source);
             let pending = PendingRecord {
+                acquisition: None,
                 binding,
                 certificate: certificate(&path, &scope),
                 body: codec::encode(&reduction, store::RECORD_BYTES, jsonl_line_cap() as u64)
@@ -4651,6 +4664,7 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
             }
         );
         let pending = PendingRecord {
+            acquisition: None,
             binding: expected(
                 DurableSource::Codex,
                 source,
@@ -5078,6 +5092,7 @@ fn store_unavailable_after_t14_breaker_is_not_missing() {
         0,
         keys.iter()
             .map(|key| PendingRecord {
+                acquisition: None,
                 binding: Binding {
                     source: ds,
                     key: *key,
@@ -5187,9 +5202,11 @@ fn compressed_record_refuses_before_certificate_restore_or_body_decode() {
         committed_generation: 1,
     };
     let record = store::DurableRecord {
+        wire: None,
         envelope_audit_debt: None,
         format: store::FORMAT_VERSION,
         record: PendingRecord {
+            acquisition: None,
             binding,
             certificate: certificate(&plain, &scope),
             body: Vec::new(),
@@ -5371,6 +5388,7 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
     let live_context =
         store::context_digest(&scope.0, index.active_upload_context_fingerprint.as_deref());
     let pending = PendingRecord {
+        acquisition: None,
         binding: store::Binding {
             source,
             key: record_key,
@@ -5729,6 +5747,7 @@ fn a_permit_era_record_restores_under_the_always_on_capture() {
             index.generation,
             0,
             vec![PendingRecord {
+                acquisition: None,
                 binding,
                 certificate: certificate(&path, &scope),
                 body: codec::encode(&reduction, store::RECORD_BYTES, jsonl_line_cap() as u64)
@@ -5998,6 +6017,7 @@ fn q11_strict_restore_real_plain_reader_tail_then_retry_holds() {
             index.generation,
             0,
             vec![PendingRecord {
+                acquisition: None,
                 binding: expected.binding,
                 certificate: certificate(&path, &scope),
                 body: codec::encode(&reduction, store::RECORD_BYTES, jsonl_line_cap() as u64)
@@ -6382,6 +6402,7 @@ fn other_source_restore_after_return_release(
             index.generation,
             0,
             vec![PendingRecord {
+                acquisition: None,
                 binding,
                 certificate: certificate(&path, &scope),
                 body: body.clone(),
@@ -6922,10 +6943,12 @@ fn q8_strict_v1_bridge_keeps_unknown_same_and_inode_reuse_conservative() {
     std::fs::write(&path, b"{}\n").unwrap();
     let scope = Scope("q8".into());
     let mut record = store::DurableRecord {
+        wire: None,
         envelope_audit_debt: None,
         format: 1,
         index_generation: 9,
         record: PendingRecord {
+            acquisition: None,
             binding: Binding {
                 source: DurableSource::ClaudeCode,
                 key: [1; 32],
@@ -7338,10 +7361,12 @@ fn a1a_finite_named_revisions_do_not_enumerate_or_mutate_future_records() {
         )
         .unwrap();
         store::DurableRecord {
+            wire: None,
             envelope_audit_debt: None,
             format: 1,
             index_generation: 1,
             record: PendingRecord {
+                acquisition: None,
                 binding: want.binding,
                 certificate: certificate(&path, &scope),
                 body: codec::encode(
@@ -7499,6 +7524,7 @@ fn a1a_frozen_floor_holds_before_certificate_even_after_working_entry_clear() {
         index.generation,
         0,
         vec![PendingRecord {
+            acquisition: None,
             binding,
             certificate: certificate(&path, &scope),
             body: codec::encode(
@@ -7604,6 +7630,7 @@ fn a1a_strict_writer_preserves_cleared_and_reverted_predecessors_after_restore_p
             index.generation,
             0,
             vec![PendingRecord {
+                acquisition: None,
                 binding,
                 certificate: certificate(&path, &scope),
                 body: codec::encode(
@@ -7716,6 +7743,7 @@ fn a1a_supported_unprovable_migration_classifies_stale_on_growth_without_o3() {
         index.generation,
         0,
         vec![PendingRecord {
+            acquisition: None,
             binding,
             certificate: certificate(&path, &scope),
             body: codec::encode(
@@ -10939,6 +10967,7 @@ impl ContinuationDurableState {
         let digest = binding.key;
         let allowlist = ds.properties().allowlist();
         let record = PendingRecord {
+            acquisition: None,
             binding,
             certificate: certificate(Path::new(&key), &old_scope),
             body: crate::snapshots::durable_store_fixture_body(source, 0, 0),
@@ -11559,6 +11588,7 @@ fn s2_unknown_is_same_and_only_independent_replacement_skips_floor() {
     cert.inode = 2;
     cert.birth_nanos = 100;
     let record = store::DurableRecord {
+        wire: None,
         record: store::tests::pending(binding, cert, 1),
         index_generation: 1,
         format: 1,
@@ -12836,6 +12866,7 @@ fn claude_unregistered_money_replay_keeps_typed_stale_and_shared_pace() {
     .binding;
     let (native, _) = native_record(&path, &scope);
     let pending = PendingRecord {
+        acquisition: None,
         binding,
         certificate: certificate(&path, &scope),
         body: codec::encode(&native, store::RECORD_BYTES, jsonl_line_cap() as u64).unwrap(),
@@ -13139,6 +13170,7 @@ fn indexed_debt_carrier_preserves_proven_shrink_before_audit_rearm() {
             index.generation,
             0,
             vec![PendingRecord {
+                acquisition: None,
                 binding: original.binding,
                 certificate: cert,
                 body: crate::snapshots::durable_store_fixture_body(source, 0, 0),
@@ -13341,6 +13373,7 @@ fn member_settlement_and_final_full_probes_reserve_before_any_classifier_io() {
     let mut cert = store::tests::certificate(&path);
     cert.audit_debt_unix_seconds = Some(1);
     let pending = PendingRecord {
+        acquisition: None,
         binding,
         certificate: cert,
         body: crate::snapshots::durable_store_fixture_body(source, 0, 0),
@@ -13836,10 +13869,12 @@ fn b4_workspace_positive_restore_and_funding_before_read() {
         committed_generation: 1,
     };
     let record = store::DurableRecord {
+        wire: None,
         envelope_audit_debt: None,
         format: store::FORMAT_VERSION,
         index_generation: 1,
         record: PendingRecord {
+            acquisition: None,
             binding,
             certificate: certificate(&path, &scope),
             body,

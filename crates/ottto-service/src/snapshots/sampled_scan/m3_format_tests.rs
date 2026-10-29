@@ -75,7 +75,10 @@ fn m3_p4a_source_table_admits_exact_triples_without_repinning_body() {
     for (slot, row) in rows.iter().enumerate() {
         assert_eq!(row.source.slot(), slot);
         assert_eq!(row.tag as usize, slot + 1);
-        assert_eq!(row.write_format, 3);
+        assert_eq!(
+            row.write_format, 1,
+            "P4a preserves the original writer until native activation"
+        );
         assert_eq!(row.representations.len(), 2);
         let pin = row.allowlist();
         assert_eq!(
@@ -113,7 +116,7 @@ fn m3_p4a_wire_offsets_generation_and_mixed_restart_twice() {
         let body = new.body.clone();
         let old_len = old.body.len() + store::HEADER_BYTES + 32;
         let new_len = body.len() + store::HEADER_V3_BYTES + 32;
-        let receipt = store.write_after_save(lock, 81, vec![old, new]).unwrap();
+        let receipt = store.write_after_save(lock, 81, 0, vec![old, new]).unwrap();
         assert_eq!(receipt.written, 2);
         let old_wire = std::fs::read(path(&dir, &old_key)).unwrap();
         let new_wire = std::fs::read(path(&dir, &new_key)).unwrap();
@@ -136,7 +139,7 @@ fn m3_p4a_wire_offsets_generation_and_mixed_restart_twice() {
             store = store::DurableTailStore::new(dir.clone(), row.source);
             let mut records = Vec::new();
             for key in [old_key, new_key] {
-                let record = found(store.read(&key, &row.allowlist()));
+                let record = found(store.read(&key));
                 assert!(!record.record.body.is_empty());
                 assert!(record.wire.is_some());
                 let expected = store::Expected {
@@ -169,7 +172,7 @@ fn m3_p4a_wire_offsets_generation_and_mixed_restart_twice() {
                 records.push(record);
             }
             let before = store.counters().gc_bytes_read;
-            store.gc(lock, &context, &row.allowlist(), &keep).unwrap();
+            store.gc(lock, &context, &keep).unwrap();
             assert_eq!(
                 store.counters().gc_bytes_read - before,
                 (store::HEADER_BYTES + store::HEADER_V3_BYTES) as u64
@@ -197,7 +200,7 @@ fn m3_p4a_v3_dispatch_lengths_and_unknown_survivors() {
         let mut store = store::DurableTailStore::new(dir.clone(), row.source);
         assert_eq!(
             store
-                .write_after_save(lock, 2, vec![record])
+                .write_after_save(lock, 2, 0, vec![record])
                 .unwrap()
                 .written,
             1
@@ -216,36 +219,25 @@ fn m3_p4a_v3_dispatch_lengths_and_unknown_survivors() {
             resign(&mut changed);
             std::fs::write(&file, &changed).unwrap();
             let mut cold = store::DurableTailStore::new(dir.clone(), row.source);
-            assert_eq!(
-                cold.read(&key, &row.allowlist()),
-                ReadOutcome::Refused(expected)
-            );
+            assert_eq!(cold.read(&key), ReadOutcome::Refused(expected));
             if expected != Refusal::Corrupt {
-                cold.gc(lock, &[0; 32], &row.allowlist(), &BTreeMap::new())
-                    .unwrap();
+                cold.gc(lock, &[0; 32], &BTreeMap::new()).unwrap();
                 assert_eq!(std::fs::read(&file).unwrap(), changed);
             }
         }
         for end in [43, 179, 180, 187, store::HEADER_V3_BYTES - 1] {
             std::fs::write(&file, &original[..end]).unwrap();
             let mut cold = store::DurableTailStore::new(dir.clone(), row.source);
-            assert_eq!(
-                cold.read(&key, &row.allowlist()),
-                ReadOutcome::Refused(Refusal::Corrupt)
-            );
+            assert_eq!(cold.read(&key), ReadOutcome::Refused(Refusal::Corrupt));
         }
         let mut future = original.clone();
         future[8..10].copy_from_slice(&4u16.to_le_bytes());
         future.resize(store::RECORD_BYTES + store::HEADER_V3_BYTES + 33, 0);
         std::fs::write(&file, &future).unwrap();
         let mut cold = store::DurableTailStore::new(dir.clone(), row.source);
-        assert_eq!(
-            cold.read(&key, &row.allowlist()),
-            ReadOutcome::Refused(Refusal::NewerFormat)
-        );
+        assert_eq!(cold.read(&key), ReadOutcome::Refused(Refusal::NewerFormat));
         assert_eq!(cold.counters().guard_header_bytes, 43);
-        cold.gc(lock, &[0; 32], &row.allowlist(), &BTreeMap::new())
-            .unwrap();
+        cold.gc(lock, &[0; 32], &BTreeMap::new()).unwrap();
         assert_eq!(std::fs::read(&file).unwrap(), future);
     }
     std::fs::remove_dir_all(root).unwrap();
