@@ -917,6 +917,10 @@ fn scratch_overflow_serves_unheld_plain_in_one_page_and_discloses_pending_custod
             .as_u64()
             .is_some()
     ));
+    assert!(rows
+        .iter()
+        .any(|r| r["stage"] == "durable_tail_alarm"
+            && r["counts"]["custody_overflow"]["events"] == 1));
     let saved = root.join("index.json");
     index.save(&saved).unwrap();
     let reloaded = ScanIndex::load(&saved).unwrap();
@@ -1341,4 +1345,188 @@ fn unattributed_opaque_filename_uses_retained_counting_binding_as_negative_scope
         }
         fs::remove_dir_all(root).unwrap();
     }
+}
+
+#[test]
+fn stale_header_never_mints_custody_after_rewrite_or_replacement_even_on_refusal() {
+    for refused in [false, true] {
+        for change in 0..3 {
+            let root = crate::test_scratch::private_dir("custody-current-header");
+            let old = member(&root, "sessions", OWNER, false);
+            let next = old.with_file_name("b.jsonl");
+            let bytes = fs::read_to_string(&old).unwrap();
+            fs::write(&next, &bytes).unwrap();
+            let mut index = accepted(&root, &old);
+            let witness = index.files[&local_index_key(&old)]
+                .last_upload_body_witness
+                .clone();
+            index.hold_compressed(
+                &old,
+                BTreeSet::from([OWNER.into()]),
+                CodexZstCause::ParentLedgerUnbound,
+            );
+            let mut inv = inventory(&root, std::slice::from_ref(&next), &mut index);
+            while !inv.prepare_custody(&index) {}
+            assert_eq!(
+                inv.headers[0].custody_cause,
+                Some(CodexZstCause::ParentLedgerUnbound)
+            );
+            // Exercise BOTH normal and refused/unknown per-file assignment.
+            inv.custody_refused = refused;
+            let replacement = bytes.replace(OWNER, PARENT);
+            if change == 2 {
+                let temp = next.with_extension("replacement");
+                fs::write(&temp, &replacement).unwrap();
+                fs::rename(temp, &next).unwrap();
+            } else {
+                fs::write(
+                    &next,
+                    if change == 0 {
+                        replacement.clone()
+                    } else {
+                        replacement.clone() + "\n"
+                    },
+                )
+                .unwrap();
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&next)
+                    .unwrap()
+                    .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(2))
+                    .unwrap();
+            }
+            assert!(!inv.headers[0].custody_current());
+            assert!(!inv.hold_custodied_siblings(&mut index));
+            assert!(!index
+                .files
+                .get(&local_index_key(&next))
+                .is_some_and(|e| e.codex_compressed_hold.is_some()));
+            let mut done = false;
+            for step in 0..100 {
+                if !inv.step_with_archive(&CodexTitleMetadata::default(), &mut index, None) {
+                    continue;
+                }
+                if !inv.prepare_custody(&index) {
+                    continue;
+                }
+                if inv.hold_custodied_siblings(&mut index) {
+                    done = true;
+                    break;
+                }
+                assert_ne!(step, 99, "bounded retry must make progress");
+            }
+            assert!(done, "retry completed within100 steps");
+            assert_eq!(inv.headers.len(), 1);
+            assert_eq!(inv.headers[0].owner, PARENT);
+            assert!(!inv.member_held(&next));
+            let mut scan = staged(&root, index, std::slice::from_ref(&next));
+            scan.codex_join_inventory = Some(inv);
+            let (next_index, result) = no_open(&old, || run(scan));
+            assert_eq!(result.unreadable_path_count, 0);
+            assert!(result
+                .snapshots
+                .iter()
+                .any(|s| s.source_session_id == PARENT && s.input_tokens > 0));
+            assert!(next_index.files[&local_index_key(&old)]
+                .codex_compressed_hold
+                .is_some());
+            assert_eq!(
+                next_index.files[&local_index_key(&old)].last_upload_body_witness,
+                witness
+            );
+            assert!(next_index.files[&local_index_key(&next)]
+                .codex_compressed_hold
+                .is_none());
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+}
+
+#[test]
+fn state_only_exclusion_refusal_keeps_prior_fingerprint_activity_and_manifest() {
+    fn with_state(root: &Path, index: ScanIndex) -> (ScanIndex, SourceScanResult) {
+        let mut scan = OwnedSourceScan::new(
+            SnapshotSource::Codex,
+            &[root.join("sessions")],
+            index,
+            "2026-10-06T23:00:00Z",
+            7,
+            10,
+            false,
+            None,
+            &[],
+            false,
+            false,
+        );
+        scan.state_census_complete = true;
+        scan.sidecar_census_complete = true;
+        scan.codex_title_metadata.state_threads.insert(
+            PARENT.into(),
+            CodexStateThread {
+                tokens_used: 1000,
+                updated_at: Some("2026-10-06T00:00:00Z".into()),
+                ..Default::default()
+            },
+        );
+        run(scan)
+    }
+    let root = crate::test_scratch::private_dir("custody-state-refusal-keeps");
+    let held = member(&root, "sessions", OWNER, false);
+    let (mut index, mut seed) = with_state(&root, ScanIndex::default());
+    finalize_scan_after_policy(SnapshotSource::Codex, &mut seed, &mut index);
+    assert!(index
+        .codex_state_only_snapshot_fingerprints
+        .contains_key(PARENT));
+    let fingerprints = index.codex_state_only_snapshot_fingerprints.clone();
+    let activity = index.snapshot_activity_at.clone();
+    let before = serde_json::to_value(
+        index
+            .manifest_for_window(
+                SnapshotSource::Codex,
+                "2000-01-01T00:00:00Z",
+                "2100-01-01T00:00:00Z",
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    let owners = (0..5000)
+        .map(|n| format!("{n:08x}-1111-4111-8111-222222222222"))
+        .chain(std::iter::once(OWNER.into()))
+        .collect();
+    index.hold_compressed(&held, owners, CodexZstCause::ParentLedgerUnbound);
+    assert!(index.files[&local_index_key(&held)]
+        .codex_counting_owner
+        .is_some());
+    for _ in 0..2 {
+        index.traversal = None;
+        let saved = root.join("reload.json");
+        index.save(&saved).unwrap();
+        index = ScanIndex::load(&saved).unwrap();
+        let ((mut next, mut result), rows) =
+            capture(|| no_open(&held, || with_state(&root, index)));
+        assert!(
+            !result.state_census_complete,
+            "refusal must reach finalizer"
+        );
+        assert_eq!(result.unreadable_path_count, 0);
+        assert!(rows.iter().any(|r| r["stage"] == "durable_tail_alarm"
+            && r["counts"]["custody_overflow"]["events"] == 1));
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut next);
+        assert_eq!(next.codex_state_only_snapshot_fingerprints, fingerprints);
+        assert_eq!(next.snapshot_activity_at, activity);
+        assert_eq!(
+            serde_json::to_value(
+                next.manifest_for_window(
+                    SnapshotSource::Codex,
+                    "2000-01-01T00:00:00Z",
+                    "2100-01-01T00:00:00Z"
+                )
+                .unwrap()
+            )
+            .unwrap(),
+            before
+        );
+        index = next;
+    }
+    fs::remove_dir_all(root).unwrap();
 }

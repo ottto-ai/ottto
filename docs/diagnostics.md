@@ -906,3 +906,12 @@ required. Exit = 11c custody-aware group continuation; 11c must keep independent
 unheld offsets without relying on held-member authority. No custody release or
 publication credit is granted here. Counters reset with process observation;
 sum their deltas, not repeated growth observations.
+
+Correctness custody capacity refusal additionally emits
+`durable_tail_alarm.counts.custody_overflow.events = 1`. Units are refused
+inventory passes (owner/file fanout) or state-only exclusion attempts; the
+inventory latch resets with a new inventory, exclusion is attempted once at
+completion. This is separate from held growth and decoder refusal. Keep the
+original cause and durable obligation; no Full, clear or cap increase follows.
+A refused state-only exclusion marks that census incomplete so finalization
+retains the previous state-only fingerprints, activity and manifest coverage.

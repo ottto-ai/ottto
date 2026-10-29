@@ -30504,15 +30504,20 @@ impl OwnedSourceScan {
                     // remains "covered" for this whole generation, the state-only fallback
                     // is delayed one cycle, and a complete terminal manifest can briefly
                     // omit a thread the local state database still proves exists.
-                    let (state_only_scanned, state_only_noops) = append_codex_state_only_snapshots(
+                    let state_only = append_codex_state_only_snapshots(
                         &mut snapshots,
                         &codex_title_metadata,
                         collected_at.as_str(),
                         index,
                         &codex_state_only_blocked_session_ids,
                     );
-                    scanned_session_count += state_only_scanned;
-                    semantic_noop_count += state_only_noops;
+                    if let Some((state_only_scanned, state_only_noops)) = state_only {
+                        scanned_session_count += state_only_scanned;
+                        semantic_noop_count += state_only_noops;
+                    } else {
+                        state_census_complete = false;
+                        index.mark_bounded_sweep_unsettled();
+                    }
                 }
                 // G1: pending re-reads do not hold the restart either.
                 let parent_resolution_restart = traversal_discovery_done
@@ -32617,7 +32622,7 @@ fn append_codex_state_only_snapshots(
     collected_at: &str,
     index: &mut ScanIndex,
     blocked_session_ids: &BTreeSet<String>,
-) -> (usize, usize) {
+) -> Option<(usize, usize)> {
     let blocked_session_ids = blocked_session_ids
         .union(&index.codex_state_only_blocked_session_ids)
         .map(|session_id| resolve_codex_identity(session_id.as_str()))
@@ -32678,7 +32683,8 @@ fn append_codex_state_only_snapshots(
         })();
         if funded.is_none() {
             crate::local_resource_diagnostics::codex_zst_held(CodexZstCause::AdmissionRefused);
-            return (0, 0);
+            crate::local_resource_diagnostics::custody_overflow();
+            return None;
         }
     }
     let protected = index
@@ -32726,7 +32732,7 @@ fn append_codex_state_only_snapshots(
         // durable state and semantic no-op suppression.
         snapshots.push(snapshot);
     }
-    (scanned_session_count, 0)
+    Some((scanned_session_count, 0))
 }
 
 fn codex_state_only_snapshot(

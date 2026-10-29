@@ -14716,12 +14716,8 @@ fn shared_refused_file_obligation_survives_growth_age_cap_and_reloads_then_tails
         assert!(witness.is_some());
         index.save(&index_path).unwrap();
         cache.durable_write_after_save(lock, SnapshotSource::Codex, &index);
-        fixture.append(SESSION, &token_line(2));
-        let length = fixture.len(SESSION);
-        assert!(length > prefix_len);
-        // Exercise the real cap comparison with a small isolated test cap;
-        // no multi-GiB fixture or changed production cap is needed.
-        let cap = over_cap.then_some(length - 1);
+        // Cap is based on the future length; latch before the append below.
+        let cap = over_cap.then_some(fixture.len(SESSION) + token_line(2).len() as u64 - 1);
         codex_compressed_hold_tests::with_file_cap(cap, || {
             // A real current-header sibling inherits known-owner custody;
             // optional owner scratch refuses before file-owned admission.
@@ -14756,6 +14752,9 @@ fn shared_refused_file_obligation_survives_growth_age_cap_and_reloads_then_tails
                 index.files[&key].codex_compressed_hold,
                 Some(CodexZstCause::ParentLedgerUnbound)
             );
+            fixture.append(SESSION, &token_line(2));
+            let length = fixture.len(SESSION);
+            assert!(length > prefix_len);
             let owner = codex_protected_owner(SESSION);
             index.codex_counting_tombstones.insert(
                 owner.clone(),
@@ -14979,5 +14978,93 @@ fn held_foreign_path_keeps_unrelated_output_and_stale_job_retirement() {
         assert!(cache.cursor_slot_free());
         assert_eq!(cache.cursor_charge(), 0);
         assert_eq!(counter(&cache, |c| c.jobs_unavailable_ended), 0);
+    });
+}
+
+#[test]
+fn ordinary_custody_recovery_counts_a1_or_named_full_once_then_never_repeats() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let clock = TestClock;
+    clock.set(1_900_000_000);
+    with_test_limits(2048, 1024, 64, || {
+        for prior in [false, true] {
+            let (fixture, mut index, cache, held, candidate, _) =
+                group_custody_recovery_case(prior);
+            let mut full = 0;
+            let mut a1 = 0;
+            let mut exception = 0;
+            let mut output = false;
+            for _ in 0..64 {
+                index.traversal = None;
+                let ((next, scan, selections), rows) =
+                    crate::local_resource_diagnostics::capture(|| {
+                        codex_compressed_hold_tests::no_open(&held, || {
+                            page_selections(
+                                &fixture,
+                                index,
+                                Some(Arc::clone(&cache)),
+                                "cursor-fixture",
+                                NOW,
+                                |_| {},
+                                usize::MAX,
+                            )
+                        })
+                    });
+                index = next;
+                full += selections.modes.0;
+                for row in rows {
+                    a1 += row["counts"]["custody_group_progress_dropped"]["first_read"]["events"]
+                        .as_u64()
+                        .unwrap_or(0);
+                    if let Some(events) =
+                        row["counts"]["custody_group_restart_full"]["events"].as_u64()
+                    {
+                        exception += events;
+                        assert_eq!(row["stage"], "durable_tail_alarm");
+                        assert_eq!(
+                            row["counts"]["custody_group_restart_full"]["bytes"],
+                            candidate.size_bytes
+                        );
+                    }
+                }
+                assert_eq!(scan.unreadable_path_count, 0);
+                assert!(index.files[&local_index_key(&held)]
+                    .codex_compressed_hold
+                    .is_some());
+                output |= !scan.snapshots.is_empty();
+                if output && cache.cursor_slot_free() {
+                    break;
+                }
+            }
+            assert!(output, "P served within64 pages");
+            assert_eq!(full, 1, "one native Full admission, A1 or named exception");
+            assert_eq!(a1, u64::from(!prior));
+            assert_eq!(exception, u64::from(prior));
+            assert_eq!(counter(&cache, |c| c.groups_started), 1);
+            for _ in 0..5 {
+                index.traversal = None;
+                let ((next, _, selections), rows) =
+                    crate::local_resource_diagnostics::capture(|| {
+                        codex_compressed_hold_tests::no_open(&held, || {
+                            page_selections(
+                                &fixture,
+                                index,
+                                Some(Arc::clone(&cache)),
+                                "cursor-fixture",
+                                NOW,
+                                |_| {},
+                                usize::MAX,
+                            )
+                        })
+                    });
+                index = next;
+                assert_eq!(selections.modes.0, 0, "no repeated accepted-byte Full");
+                assert!(rows
+                    .iter()
+                    .all(|r| r["counts"]["custody_group_restart_full"].is_null()));
+            }
+        }
     });
 }

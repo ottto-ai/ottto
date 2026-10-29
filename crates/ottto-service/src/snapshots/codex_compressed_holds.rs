@@ -224,6 +224,7 @@ impl codex_file_join::HeaderInventory {
         if !self.custody_refused {
             self.custody_refused = true;
             crate::local_resource_diagnostics::codex_zst_held(CodexZstCause::AdmissionRefused);
+            crate::local_resource_diagnostics::custody_overflow();
         }
     }
     pub(super) fn hold_custodied_siblings(&mut self, index: &mut ScanIndex) -> bool {
@@ -231,6 +232,15 @@ impl codex_file_join::HeaderInventory {
             return true;
         };
         if let Some(cause) = header.custody_cause {
+            if !index
+                .files
+                .get(&local_index_key(&header.candidate.path))
+                .is_some_and(|e| e.codex_compressed_hold.is_some())
+                && !header.custody_current()
+            {
+                self.retry_custody_header(self.custody_next);
+                return false;
+            }
             if !self.custody_refused && !self.custody_unknown {
                 index.hold_compressed(
                     &header.candidate.path,

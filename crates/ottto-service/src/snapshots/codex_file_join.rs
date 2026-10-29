@@ -151,6 +151,20 @@ pub(super) struct HeaderWitness {
     metadata: String,
     archive_stamp: Option<crate::transcript_acquisition::FileStamp>,
 }
+impl HeaderWitness {
+    pub(super) fn custody_current(&self) -> bool {
+        fs::symlink_metadata(&self.candidate.path).is_ok_and(|stat| {
+            stat.is_file()
+                && !stat.file_type().is_symlink()
+                && (metadata_witness(&stat) == self.metadata
+                    || self.archive_stamp.as_ref().is_some_and(|old| {
+                        crate::transcript_acquisition::FileStamp::capture(stat)
+                            .is_ok_and(|now| old.same_content(&now))
+                    }))
+        })
+    }
+}
+
 pub(super) fn member_home(root: &Path) -> PathBuf {
     root.ancestors()
         .find(|path| {
@@ -297,6 +311,18 @@ impl HeaderInventory {
                 header.custody_cause = Some(cause);
             }
         }
+    }
+    pub(super) fn retry_custody_header(&mut self, at: usize) {
+        let header = self.headers.remove(at);
+        self.pending.push_front(header.candidate.path);
+        for header in &mut self.headers {
+            header.custody_cause = None;
+        }
+        self.custody_after = None;
+        self.custody_next = 0;
+        self.custody_done = false;
+        // read_bytes is NOT reset: repeated real edits reach the existing bound.
+        crate::local_resource_diagnostics::codex_zst_held(CodexZstCause::OwnerUnproven);
     }
     pub(super) fn complete_for(&self, owner: Option<&String>) -> bool {
         self.complete
