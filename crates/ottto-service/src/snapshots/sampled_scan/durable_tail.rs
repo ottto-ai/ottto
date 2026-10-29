@@ -19,7 +19,8 @@
 //!
 //! The stores live beside the RAM cache for the process lifetime and are not
 //! part of its state budget: each holds at most `MAX_RECORDS` digest and
-//! verification-stamp entries (`STORES_RESIDENT_BOUND`).
+//! verification-stamp entries (`STORES_RESIDENT_BOUND`). Per-key custody maps
+//! have fixed prepaid capacities; per-pass key maps follow the committed index.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -62,16 +63,47 @@ use sampled_jsonl::CachedJsonlReduction;
 /// retained lock stays bounded. Entries past it are deferred to a later save.
 pub(crate) const WRITE_PASS_BYTES: usize = 8 * 1024 * 1024;
 
-/// Upper bound of both stores' resident digest maps (two sources).
-/// Pin history: Lead A approved 65,536 -> 401,408 bytes on 2026-10-29:
-/// memo 2*256*256 = 131,072; pending 2*(32+1)*4096 = 270,336 bytes.
-/// A0-h pays both spent and Full-pacing nodes (1,050,624 bytes): total
-/// 1,452,032 bytes. FullPace's structural bit stays within its 1024-byte node.
-/// Any further growth requires a new owner decision. Native/container evidence
-/// remains required; this pin is not enforcement by the cache's heap walk.
+/// Upper bound of both stores' resident maps (two sources), ONE canonical value:
+/// - memo 2*256*256 = 131,072 bytes;
+/// - compact store pending 2*(32+1)*4096 = 270,336 bytes: a wire pending
+///   entry stays <=320 bytes per node. Root's expanded stage/receipt metadata
+///   (full `RecordIdentity`, boxed in `ReceiptProof`) is NOT pending: it is
+///   charged on the acquisition's active lease inside `stream_reserve_bytes`
+///   with the funded 64 KiB stream scratch;
+/// - A0-h custody (spent, P2 witness, upgrade marker) and Full-pacing nodes,
+///   2*513 nodes of <=1024 bytes = 1,050,624 bytes (`RETAIL_RESERVE_BYTES`);
+/// - M3 per-key debt/D3-hold and P1-1 restore-pending maps, 2*257 nodes of
+///   <=1024 bytes = 526,336 bytes (`KEY_RESERVE_BYTES`).
+///
+/// Total 1,978,368 bytes. Lead A approved 1,452,032 on 2026-10-29; the M3 key
+/// reserve is the r7 owner re-pin request. Native/container evidence remains
+/// required; this pin is not enforcement by the cache's heap walk.
 #[cfg(test)]
-pub(crate) const STORES_RESIDENT_BOUND: usize =
-    2 * store::MAX_RECORDS * 256 + 2 * (store::MAX_BATCH + 1) * 4096 + super::RETAIL_RESERVE_BYTES;
+pub(crate) const STORES_RESIDENT_BOUND: usize = 2 * store::MAX_RECORDS * 256
+    + 2 * (store::MAX_BATCH + 1) * 4096
+    + super::RETAIL_RESERVE_BYTES
+    + KEY_RESERVE_BYTES;
+
+/// M3 per-key maps outside the A0-h custody node, each with its own prepaid
+/// capacity of `MAX_RECORDS` nodes (plus the retained root) of <=1024 bytes:
+/// the receipt-debt/D3-hold map (`owed::KeyDebt`) and the P1-1 restore-pending
+/// map. Neither evicts; each overflow fails toward its existing safe path.
+pub(crate) const KEY_RESERVE_BYTES: usize = 2 * (store::MAX_RECORDS + 1) * 1024;
+const _: () = assert!(KEY_RESERVE_BYTES == 526_336);
+
+/// P1-1: process Tail grants whose accepted end lies within the restored
+/// certificate (no old bytes owed, the write-ahead steady state). They never
+/// take the never-evicted A0-h custody node; a write or receipt at the high
+/// water frees them. Overflow refuses toward the existing paced Full.
+const RESTORE_PENDING_KEYS: usize = store::MAX_RECORDS;
+
+/// P2: restored class-X head re-reads per source and pass. The sampled-read
+/// contract pays `2 * SAMPLE_BYTES` per restore; one cache-full of restores is
+/// 2 MiB, which still admits one maximal `HEAD_BOUND` re-read every pass.
+/// Past it a restore takes the existing counted, paced resource path.
+const REDERIVE_PASS_BYTES: u64 =
+    2 * crate::transcript_acquisition::SAMPLE_BYTES as u64 * store::MAX_RECORDS as u64;
+const _: () = assert!(REDERIVE_PASS_BYTES >= codec::HEAD_BOUND);
 
 #[cfg(test)]
 thread_local! {
@@ -81,6 +113,9 @@ thread_local! {
 pub(in crate::snapshots) fn set_before_carrier_probe(hook: Option<Box<dyn FnMut()>>) {
     BEFORE_CARRIER_PROBE.with(|slot| *slot.borrow_mut() = hook);
 }
+
+/// Pacing cause of a Codex refused stale record's Full (SOURCE cond. 5).
+const STALE_SELECTION_CAUSE: usize = 5;
 
 const RECOVERY_PACE_SECONDS: u64 = 6 * 3600;
 const _: () = assert!(RECOVERY_PACE_SECONDS < 24 * 3600);
@@ -153,6 +188,8 @@ pub(crate) struct Counters {
     pub(crate) rederive_head_bytes: u64,
     pub(crate) rederive_named_lines: u64,
     pub(crate) rederive_line_bytes: u64,
+    /// P2 pass budget refusals: [restores, head bytes not read].
+    pub(crate) rederive_budget: [u64; 2],
     /// Write phase: entries not persisted, by the refusing field or class.
     pub(crate) not_persisted: BTreeMap<&'static str, u64>,
     pub(crate) write_deferred: u64,
@@ -185,7 +222,7 @@ impl Counters {
         format!(
             "ottto-service: durable_tail source={} original_v1_mapped={} durable_restore_after_selection_clear={} objects[same,unknown,changed]={:?} s2_skipped_object_changed={} \
              retail_attempts={} retail_keys={} near_cap={} pace_anomaly={} upgrade_missing_full={} migration[held,await_save,claimed,replaced]={:?} retail_exhausted[full,paced,pace_evicted]={:?} tail_read_bytes={} retail_physical_bytes[process,daily]={:?} budget_refused_retail_old_bytes={} repeated_physical_old_bytes={} upgrade_state_missing={} \
-             active_bound[claude,codex,pi]={:?} resource_full={{{}}} rederive_head_bytes={} rederive_named_lines={} rederive_line_bytes={} not_persisted={{{}}} ineligible={{{}}} \
+             active_bound[claude,codex,pi]={:?} resource_full={{{}}} rederive_head_bytes={} rederive_named_lines={} rederive_line_bytes={} rederive_budget[refused,refused_bytes]={:?} not_persisted={{{}}} ineligible={{{}}} \
              write_deferred={} write_unlocked={} peak_body_bytes={} store_write_failed[setup,inventory,statvfs]={:?} disk_records={} disk_bytes={} \
              bytes_written={} records_written={} records_clean={} store_budget_refused={} \
              bytes_read={} format_hold[newer,unknown,undecodable,unbindable,known_corrupt,retired_upgrade_missing,receipt_pending,behind_accepted]={:?} durable_held={:?} held_census[kept,invalidated]={:?} \
@@ -216,6 +253,7 @@ impl Counters {
             self.rederive_head_bytes,
             self.rederive_named_lines,
             self.rederive_line_bytes,
+            self.rederive_budget,
             classes(&self.not_persisted),
             classes(&self.ineligible),
             self.write_deferred,
@@ -269,6 +307,8 @@ struct Slot {
     reported: [u64; 22],
     /// Last reported D3 Claude hold key count.
     d3_reported: u64,
+    /// Key count of the last committed index seen; sizes the per-pass maps.
+    indexed: usize,
 }
 
 impl Slot {
@@ -381,7 +421,14 @@ pub(crate) struct Stores {
     selected: BTreeMap<String, String>,
     counters: Counters,
     // Source+key only: never clear on passes, scope changes or cache eviction.
+    // A node without authority is freed (`release_idle_custody`).
     retail_spent: BTreeMap<store::Digest32, Box<KeyCustody>>,
+    /// P1-1 zero-old-byte process grants, outside `retail_spent`.
+    restore_pending: BTreeMap<store::Digest32, RestorePending>,
+    /// G3 receipt debt and D3 holds, outside the custody node.
+    key_debt: BTreeMap<store::Digest32, Box<owed::KeyDebt>>,
+    /// P2 restored head bytes reserved this pass, per durable source.
+    rederive_spent: [u64; crate::snapshots::durable_sources::SOURCES.len()],
     retail_full_at: BTreeMap<store::Digest32, FullPace>,
     #[cfg(test)]
     retail_full_now: Option<std::time::SystemTime>,
@@ -393,16 +440,32 @@ pub(crate) struct Stores {
     d3: write_ahead::D3State,
 }
 
+/// A0-h authority only. Its node uses 1,016 of its 1,024 prepaid bytes by
+/// layout arithmetic, so per-key M3 state lives in `key_debt` and
+/// `restore_pending`, never here.
 #[derive(Default)]
 struct KeyCustody {
     spent: Option<(u64, std::time::Instant)>,
     original: Option<store::MutationWitness>,
     upgrade_started: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    /// G3 content-free debt class for this source+key.
-    owed: owed::OwedMark,
-    /// D3: this Claude key's stale predecessor survived a failed write.
-    hold: Option<write_ahead::ClaudeHold>,
 }
+impl KeyCustody {
+    /// Spent, witness and upgrade markers are authority; nothing else is.
+    fn has_authority(&self) -> bool {
+        self.spent.is_some() || self.original.is_some() || self.upgrade_started.is_some()
+    }
+}
+
+/// The high water and grant time a P1-1 process grant would have spent.
+#[derive(Clone, Copy)]
+struct RestorePending {
+    high: u64,
+    at: std::time::Instant,
+}
+fn restore_pending_node_bytes() -> Option<usize> {
+    crate::heap_layout_bound::tree_node_bytes::<store::Digest32, RestorePending>()
+}
+
 fn custody_node_bytes() -> Option<usize> {
     crate::heap_layout_bound::tree_node_bytes::<store::Digest32, Box<KeyCustody>>()?
         // Box::new requests Layout::new::<KeyCustody>(); size_of already
@@ -445,6 +508,116 @@ impl Stores {
         }
         self.retail_spent.entry(key).or_default();
         true
+    }
+
+    /// Frees `key`'s custody node once it carries no authority, so funding
+    /// for a strict check or a consumed witness never pins a slot for life.
+    pub(super) fn release_idle_custody(&mut self, key: &store::Digest32) {
+        if self
+            .retail_spent
+            .get(key)
+            .is_some_and(|custody| !custody.has_authority())
+        {
+            self.retail_spent.remove(key);
+        }
+    }
+
+    /// A write or receipt whose certificate reaches the pending high water
+    /// makes the zero-old-byte grant moot: a later restore starts there.
+    pub(super) fn release_restore_pending(&mut self, key: &store::Digest32, length: u64) {
+        if self
+            .restore_pending
+            .get(key)
+            .is_some_and(|pending| length >= pending.high)
+        {
+            self.restore_pending.remove(key);
+        }
+    }
+
+    /// Records the committed index's key count for `source`.
+    fn note_indexed(&mut self, source: DurableSource, index: &ScanIndex) {
+        if let Some(slot) = self.slot(source).as_mut() {
+            slot.indexed = index.files.len();
+        }
+    }
+
+    /// P1-1: a restore owing no old bytes spends a bounded pending grant, never
+    /// an A0-h custody node. `Ok(None)` hands over to the spent custody: old
+    /// bytes owed, or a re-read behind the pending high water, which is
+    /// promoted with its original grant time so the Daily gate stays exact.
+    fn pending_retail(
+        &mut self,
+        key: store::Digest32,
+        c: &DurableCertificate,
+        attempt: RetailAttempt,
+        now: std::time::Instant,
+    ) -> Result<Option<RetailAttempt>, RetailHold> {
+        let zero_old = attempt.old_end <= c.length;
+        let prior = self.restore_pending.get(&key).copied();
+        if prior.is_some_and(|p| now < p.at) {
+            Counters::bump(&mut self.counters.ineligible, "retail_clock_rollback");
+            return Err(RetailHold::AccountingLost);
+        }
+        if let Some(pending) = prior.filter(|p| !zero_old || c.length < p.high) {
+            if !self.fund_key(key) {
+                // Pending authority is kept; the paced Full reads instead.
+                Counters::bump(&mut self.counters.ineligible, "retail_pending_unpromoted");
+                return Err(RetailHold::AccountingLost);
+            }
+            self.restore_pending.remove(&key);
+            self.retail_spent.get_mut(&key).expect("funded").spent =
+                Some((pending.high, pending.at));
+            return Ok(None);
+        }
+        if !zero_old {
+            return Ok(None);
+        }
+        if c.length > attempt.end || attempt.end < attempt.old_end {
+            Counters::bump(&mut self.counters.ineligible, "retail_range_ineligible");
+            return Err(RetailHold::Ineligible);
+        }
+        if prior.is_none() && self.restore_pending.len() >= RESTORE_PENDING_KEYS {
+            // A grant a full day old gates nothing the Daily grant would not
+            // also allow: reclaim those, never a younger high water.
+            let before = self.restore_pending.len();
+            self.restore_pending.retain(|_, p| {
+                now.checked_duration_since(p.at)
+                    .map_or(true, |age| age < RETAIL_DAILY)
+            });
+            let expired = (before - self.restore_pending.len()) as u64;
+            if expired > 0 {
+                *self
+                    .counters
+                    .ineligible
+                    .entry("retail_pending_expired")
+                    .or_default() += expired;
+            }
+        }
+        if prior.is_none()
+            && (restore_pending_node_bytes().map_or(true, |n| n > 1024)
+                || self.restore_pending.len() >= RESTORE_PENDING_KEYS)
+        {
+            Counters::bump(&mut self.counters.ineligible, "retail_pending_overflow");
+            return Err(RetailHold::AccountingLost);
+        }
+        self.counters.retail_keys += u64::from(prior.is_none());
+        self.counters.retail_attempts += 1;
+        // Spend before any syscall, exactly like the custody grant.
+        let high = prior.map_or(attempt.end, |p| p.high.max(attempt.end));
+        self.restore_pending
+            .insert(key, RestorePending { high, at: now });
+        Ok(Some(attempt))
+    }
+
+    /// Per-pass key maps (`touched`, `selected`) follow the committed indexes,
+    /// with the old fixed capacity as the floor: never a fixed 512-key cliff.
+    fn pass_key_cap(&self) -> usize {
+        self.slots
+            .iter()
+            .flatten()
+            .fold(2 * store::MAX_RECORDS, |cap, slot| {
+                cap.saturating_add(slot.indexed)
+            })
     }
     fn slot(&mut self, source: DurableSource) -> &mut Option<Slot> {
         &mut self.slots[source.slot()]
@@ -1227,6 +1400,7 @@ fn authorize_strict(
     replacement: &Binding,
     certificate: &DurableCertificate,
 ) {
+    slot.indexed = index.files.len();
     slot.store
         .revoke(&store::key_digest(DurableSource::ClaudeCode, key));
     let Some(scope) = slot.decided.get(key) else {
@@ -1303,6 +1477,24 @@ impl SharedCache {
         let source = durable_source(source).ok_or(RetailHold::Ineligible)?;
         let key = store::key_digest(source, key);
         let mut stores = self.durable().ok_or(RetailHold::AccountingLost)?;
+        if stores
+            .retail_spent
+            .get(&key)
+            .and_then(|c| c.spent)
+            .is_none()
+        {
+            let attempt = RetailAttempt {
+                source,
+                grant: RetailGrant::Process,
+                object: (c.device, c.inode, c.birth_nanos),
+                next: c.length,
+                end,
+                old_end: accepted_end,
+            };
+            if let Some(granted) = stores.pending_retail(key, &c, attempt, now)? {
+                return Ok(granted);
+            }
+        }
         if let Some((high, spent)) = stores.retail_spent.get(&key).and_then(|c| c.spent.as_ref()) {
             if now < *spent {
                 Counters::bump(&mut stores.counters.ineligible, "retail_clock_rollback");
@@ -1667,12 +1859,11 @@ impl SharedCache {
         accepted: Option<AcceptedFloor>,
     ) -> Option<()> {
         if let Some(mut stores) = self.durable() {
-            if let Some(c) = stores
-                .retail_spent
-                .get_mut(&store::key_digest(DurableSource::ClaudeCode, key))
-            {
+            let digest = store::key_digest(DurableSource::ClaudeCode, key);
+            if let Some(c) = stores.retail_spent.get_mut(&digest) {
                 c.upgrade_started = None;
             }
+            stores.release_idle_custody(&digest);
         }
         let a = accepted?;
         if a.revision > effective_revision(SnapshotSource::ClaudeCode) {
@@ -1697,6 +1888,11 @@ impl SharedCache {
             return;
         };
         let dir = store::store_dir_for_index(index_path);
+        // P2 head budget is per pass; authorityless custody nodes are freed.
+        stores.rederive_spent[source.slot()] = 0;
+        stores
+            .retail_spent
+            .retain(|_, custody| custody.has_authority());
         let slot = stores.slot(source);
         if let Some(current) = slot.as_mut().filter(|current| current.dir == dir) {
             current.decided.clear();
@@ -1719,6 +1915,7 @@ impl SharedCache {
                 old_binding_no_match: 0,
                 reported: [0; 22],
                 d3_reported: 0,
+                indexed: 0,
             });
         }
         if let Some(slot) = slot.as_mut() {
@@ -2696,6 +2893,64 @@ impl SharedCache {
         true
     }
 
+    /// The refused stale record's Full is counted under its own cause and paced
+    /// once per file in the ONE pacing map; a delayed Full stays Pending. The
+    /// Miss starts its Full this pass, so the stamp is enrolled here.
+    fn stale_selection_full(
+        &self,
+        source: SnapshotSource,
+        key: &str,
+        held: &File,
+    ) -> RestoreOutcome {
+        let near_cap = held
+            .metadata()
+            .is_ok_and(|m| near_source_cap(source, m.len()));
+        let granted = self.paced_with_cause(
+            source,
+            key,
+            SystemTime::now(),
+            (false, near_cap, true),
+            Some(STALE_SELECTION_CAUSE),
+        );
+        if let Some(mut stores) = self.durable() {
+            Counters::bump(
+                &mut stores.counters.ineligible,
+                if granted {
+                    "selection_cleared.stale_record_full"
+                } else {
+                    "selection_cleared.stale_record_full.paced"
+                },
+            );
+        }
+        if granted {
+            MissClass::StaleSelection.into()
+        } else {
+            RestoreOutcome::Pending
+        }
+    }
+
+    /// P2: reserves `bytes` of this pass's restored head budget before input.
+    fn reserve_rederive(&self, source: SnapshotSource, bytes: u64) -> Result<(), Failure> {
+        let Some(ds) = durable_source(source) else {
+            return Ok(());
+        };
+        let mut stores = self
+            .durable()
+            .ok_or(Failure::Resource("stores_unavailable"))?;
+        let spent = stores.rederive_spent[ds.slot()];
+        match spent.checked_add(bytes) {
+            Some(total) if total <= REDERIVE_PASS_BYTES => {
+                stores.rederive_spent[ds.slot()] = total;
+                Ok(())
+            }
+            _ => {
+                stores.counters.rederive_budget[0] += 1;
+                stores.counters.rederive_budget[1] += bytes;
+                Err(Failure::Resource("rederive_budget"))
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn restore_known(
         &self,
@@ -2719,6 +2974,7 @@ impl SharedCache {
                 return Err(MissClass::NoEntry.into());
             }
             stores.counters.restore_attempts += 1;
+            stores.note_indexed(source, index);
             // Codex keeps its predecessor selection gate; Claude first proves the original binding.
             if source == DurableSource::Codex
                 && index
@@ -2727,7 +2983,19 @@ impl SharedCache {
                     .is_some_and(|entry| entry.source_file_fingerprint.is_empty())
             {
                 Counters::bump(&mut stores.counters.ineligible, "selection_cleared");
-                return Err(MissClass::SelectionCleared.into());
+                // SOURCE cond. 5: a record surviving behind a cleared selection
+                // (the D3 strict rebind's carrier, no new persisted field) is a
+                // refused stale record. A disabled store cannot prove absence.
+                let Some(slot) = stores
+                    .slot(source)
+                    .as_mut()
+                    .filter(|slot| !slot.store.absent(&store_key))
+                else {
+                    return Err(MissClass::SelectionCleared.into());
+                };
+                slot.store.note_stale_refusal();
+                drop(stores);
+                return Err(self.stale_selection_full(snapshot_source, key, held));
             }
             // Revision adoption and money-rule replay both use this debt.
             // Check before disk I/O: an owed raw replay may never be served
@@ -3096,6 +3364,7 @@ impl SharedCache {
             if custody.original.is_none() {
                 custody.original = proof;
             }
+            stores.release_idle_custody(&store_key);
         }
         stores.counters.rederive_head_bytes += receipt.head_bytes;
         stores.counters.rederive_named_lines += receipt.named_lines;
@@ -3245,6 +3514,13 @@ impl SharedCache {
         lease
             .charge(charge)
             .map_err(|_| Failure::Resource("rederive_unfunded"))?;
+        if charge > 0 {
+            // The exact head extent the extractor reads, from the pass budget.
+            let head = decoded
+                .head_end()
+                .map_err(|_| Failure::Resource("rederive_unfunded"))?;
+            self.reserve_rederive(source, head)?;
+        }
         let (reduction, receipt) = decoded
             .rederive_content(held)
             .map_err(Failure::NotRederived)?;
@@ -3262,35 +3538,48 @@ impl SharedCache {
         Ok((checkpoint, reduction, receipt))
     }
 
-    /// Notes the file scope `key` is decided under this pass, for GC.
+    /// Notes the file scope `key` is decided under this pass, for GC and the
+    /// strict predecessor check. Sized by the committed index; an overflow is
+    /// counted and only keeps that key's record (GC) or reads it (no write).
     pub(crate) fn durable_note_scope(&self, source: SnapshotSource, key: &str, scope: &Scope) {
         let (Some(source), Some(mut stores)) = (durable_source(source), self.durable()) else {
             return;
         };
-        if let Some(slot) = stores.slot(source).as_mut() {
-            if slot.decided.len() < store::MAX_RECORDS * 2 || slot.decided.contains_key(key) {
-                slot.decided.insert(key.to_string(), scope.clone());
-            }
+        let Some(slot) = stores.slot(source).as_mut() else {
+            return;
+        };
+        if slot.decided.len() < slot.indexed.saturating_add(2 * store::MAX_RECORDS)
+            || slot.decided.contains_key(key)
+        {
+            slot.decided.insert(key.to_string(), scope.clone());
+        } else {
+            Counters::bump(&mut stores.counters.ineligible, "pass_overflow.decided");
         }
     }
 
     /// Records the selection `key`'s admitted reduction was acquired for:
     /// the scanned source-file fingerprint the scan wrote into its entry.
+    /// An overflow is counted; that reduction is not written (it reads later).
     pub(crate) fn durable_note_selection(&self, key: &str, source_file_fingerprint: &str) {
         if let Some(mut stores) = self.durable() {
-            if stores.selected.len() < store::MAX_RECORDS * 2 || stores.selected.contains_key(key) {
+            if stores.selected.len() < stores.pass_key_cap() || stores.selected.contains_key(key) {
                 stores
                     .selected
                     .insert(key.to_string(), source_file_fingerprint.to_string());
+            } else {
+                Counters::bump(&mut stores.counters.ineligible, "pass_overflow.selected");
             }
         }
     }
 
     /// Marks `key` admitted this pass: a write candidate after the next save.
+    /// An overflow is counted; that entry is not written (it reads later).
     pub(super) fn durable_touch(&self, key: &str) {
         if let Some(mut stores) = self.durable() {
-            if stores.touched.len() < store::MAX_RECORDS * 2 {
+            if stores.touched.len() < stores.pass_key_cap() || stores.touched.contains(key) {
                 stores.touched.insert(key.to_string());
+            } else {
+                Counters::bump(&mut stores.counters.ineligible, "pass_overflow.touched");
             }
         }
     }
@@ -3392,6 +3681,7 @@ impl SharedCache {
         let allowlist = source.properties().allowlist();
         let (touched, mut selected, namespace, identity_capture) = {
             let mut stores = self.durable()?;
+            stores.note_indexed(source, index);
             let slot = stores.slot(source).as_ref()?;
             let pass = (slot.namespace.clone(), slot.identity_capture);
             (
@@ -3538,6 +3828,7 @@ impl SharedCache {
                     &replacement.binding,
                     &replacement.certificate,
                 );
+                stores.release_idle_custody(&digest);
             }
         }
         let slot = stores.slot(source).as_mut()?;
@@ -3591,6 +3882,7 @@ impl SharedCache {
                         c.original = None;
                     }
                 }
+                stores.release_idle_custody(digest);
             }
         }
         // Records past the batch limit are offered again after the next save.
@@ -3621,6 +3913,7 @@ impl SharedCache {
         let Some(mut stores) = self.durable() else {
             return Ok(());
         };
+        stores.note_indexed(source, index);
         let Some(slot) = stores.slot(source).as_mut() else {
             return Ok(());
         };
@@ -3924,6 +4217,8 @@ pub(crate) enum MissClass {
     NoEntry,
     AuditCarrier,
     SelectionCleared,
+    /// A Codex record survived a cleared selection: refused, paced Full.
+    StaleSelection,
     HistoryOwed,
     Missing,
     Record(store::Refusal),
@@ -3982,6 +4277,7 @@ impl MissClass {
             Self::NoEntry => "no_entry",
             Self::AuditCarrier => "ineligible.audit_carrier",
             Self::SelectionCleared => "ineligible.selection_cleared",
+            Self::StaleSelection => "ineligible.selection_cleared.stale_record",
             Self::HistoryOwed => "ineligible.history_owed",
             Self::Missing => "missing",
             Self::Resource(phase) | Self::Failure(Failure::Resource(phase)) => prefixed!(
@@ -3993,7 +4289,8 @@ impl MissClass {
                 "input",
                 "cache_key",
                 "certificate_scope",
-                "rederive_unfunded"
+                "rederive_unfunded",
+                "rederive_budget"
             ),
             Self::Unregistered(owed) => match owed.kind {
                 ObligationKind::BodyWitness => "unregistered_replay.body_witness",
@@ -4203,3 +4500,6 @@ pub(crate) use tests::seed_pinned_v1;
 #[cfg(all(test, unix))]
 #[path = "m3_owed_tests.rs"]
 mod m3_owed_tests;
+
+#[cfg(test)]
+mod resources_tests;
