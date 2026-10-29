@@ -269,9 +269,11 @@ hold) registers as one field plus its lines in `discovery_retention!`,
 Codex owed keys are candidates held by an incomplete header inventory or
 refused at a cursor start for want of reduction inputs. That refusal is
 transient, so it is not unreadable (only the inventory's unknown owner
-keeps `alias_parser`): the census completes healthy and carries the key, and
-each generation's walk retries it once, a cheap check counted by the cursor's
-`jobs_deferred_inputs`, with no body read. An owed key's thread gets no
+keeps `alias_parser`): the census completes healthy and carries the key. Its
+walk re-attempts it at most once an hour (a cheap check counted by the
+cursor's `jobs_deferred_inputs`, no body read), and after 24 refusals at most
+every 6 hours; the pace is process-local, so a restart allows one early
+retry. An owed key's thread gets no
 inclusive state-only total before its release. They stay owed across the bounded retry and restarts until the
 committed index entry's size and mtime nanos match the file (checked at page
 start, so after upload acceptance, never at parse completion or by a
@@ -290,7 +292,10 @@ those pages). On Codex pages, `counts.codex_owed` counts `held` (keys that
 became owed), `overflow` (past the 10,000-key bound a new key keeps only the
 window), `oversized` (an owed key over the size cap, kept observed and unread)
 `carried` (owed keys a closing generation handed on), `access_error` (an
-owed key whose stat failed other than ENOENT, kept) and `dropped` (owed
+owed key whose stat failed other than ENOENT, kept), `disabled` (an owed key
+refused for want of inputs 24 times, retried at most every 6 hours from then
+on), `paced` (an owed key's re-attempt deferred by that pace, a counted
+delay) and `dropped` (owed
 keys lost because no next generation started; an open gap that should stay
 zero). An overflow also raises its own
 local alarm, `codex_owed_overflow_alarm` with `overflow=[this call, process

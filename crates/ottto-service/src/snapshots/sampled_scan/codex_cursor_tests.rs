@@ -13882,9 +13882,10 @@ fn owed_page(
 /// Hold rule, N1 variant. A committed large rollout grows while its
 /// reduction inputs are unavailable: each cursor start is refused and the key
 /// is owed. Round 6: the refusal is not unreadable, so each generation (one
-/// page here) completes, carries the key and retries it once by its walk, a
-/// counted cheap check that reads no body; no retry deadline is armed. It
-/// idles past the 7-day window and is walked anyway. Once the inputs return
+/// page here) completes and carries the key. Round 7: its walk re-attempts
+/// it at most hourly (a counted cheap check, no body read); earlier pages
+/// count `paced`. It idles past the 7-day window and is walked anyway. Once
+/// the inputs return
 /// it is caught up by exactly one Tail from the retained prefix (zero Full),
 /// emitted once and equal to a cold Full, and released by the next page that
 /// finds it accepted.
@@ -13961,32 +13962,34 @@ fn reduction_refused_growth_stays_owed_and_catches_up_by_one_tail() {
         assert_eq!((modes, held.snapshots.len()), ((0, 0), 0));
         // Before this slice the refusal recorded nothing.
         assert!(owed(&index), "the refused key is owed");
+        // Round 7: growth and a new generation within the hour: paced, no
+        // attempt (before round 7 each generation re-attempted it).
         fixture.append(SESSION, &token_line(82));
         let (index, held, modes) = page(index, 2, 400);
-        assert_eq!(deferred(), 2, "moved evidence retries once");
+        assert_eq!(deferred(), 1, "paced: within the hour");
         assert_eq!((modes, held.snapshots.len()), ((0, 0), 0));
         assert!(owed(&index));
-        // Unmoved: the next generation's walk retries it once, no body read.
-        // Before round 6 the red (unreadable) census waited for its retry
-        // deadline and made no attempt here.
         let (index, quiet, modes) = page(index, 3, 410);
-        assert_eq!(deferred(), 3, "one cheap retry per generation");
+        assert_eq!(deferred(), 1, "paced: within the hour");
         assert_eq!((modes, quiet.snapshots.len()), ((0, 0), 0));
+        let (early, _) = crate::local_resource_diagnostics::take_codex_owed_for_test();
+        assert!(early.get("paced").is_some_and(|n| *n >= 2), "{early:?}");
+        assert_eq!(early.get("held"), Some(&1));
         // Idle past the window; a partially settled sweep makes the bounded
         // retry walk at day 8 with the inputs still missing.
         let mut index = index;
         index.mark_bounded_sweep_unsettled();
         let (index, held, _) = page(index, 8, 8 * day);
         // Before this slice the retry's walk aged the key out: no attempt.
-        assert_eq!(deferred(), 4, "the aged owed key is still walked");
+        assert_eq!(deferred(), 2, "the aged owed key is still walked");
         assert!(held.snapshots.is_empty());
         assert!(owed(&index));
         assert!(index.files.contains_key(&key), "its entry is kept");
         // D2: a healthy walk arms no retry deadline, so no deadline wake;
-        // the generation's walk retries it, one cheap check, no body read.
+        // past its hourly pace the walk retries it, no body read.
         crate::local_resource_diagnostics::take_codex_owed_wake_for_test();
         let (index, woken, modes) = page(index, 9, 8 * day + 7_200);
-        assert_eq!(deferred(), 5, "one cheap retry per generation");
+        assert_eq!(deferred(), 3, "one cheap retry an hour later");
         assert_eq!((modes, woken.snapshots.len()), ((0, 0), 0), "no body read");
         assert!(owed(&index));
         let wake = crate::local_resource_diagnostics::take_codex_owed_wake_for_test();
@@ -14015,11 +14018,8 @@ fn reduction_refused_growth_stays_owed_and_catches_up_by_one_tail() {
             crate::local_resource_diagnostics::take_codex_owed_for_test();
         // Round 6: each healthy close carried it.
         assert!(owed_counts.remove("carried").is_some());
-        assert_eq!(
-            owed_counts,
-            BTreeMap::from([("held", 1)]),
-            "nothing dropped"
-        );
+        assert_eq!(owed_counts.get("paced"), None, "no pace once due");
+        assert_eq!(owed_counts, BTreeMap::new(), "nothing dropped");
         assert_eq!(released, BTreeMap::from([("caught_up", 1)]));
         (tail, index)
     });
@@ -14095,7 +14095,8 @@ fn owed_key_on_a_growing_file_does_not_hold_the_census() {
         index.mark_bounded_sweep_unsettled();
         for n in 0..4 {
             fixture.append(SESSION, &token_line(82 + n));
-            let (next, scan, modes) = page(index, 8 + n, 1_000 + n * 600);
+            // Past the refusal's hourly pace (round 7).
+            let (next, scan, modes) = page(index, 8 + n, 3_800 + n * 600);
             index = next;
             assert_eq!(modes, (0, 1), "page {n}: its growth by one Tail");
             assert!(owed(&index), "page {n}: still owed, never dropped");
@@ -14109,12 +14110,12 @@ fn owed_key_on_a_growing_file_does_not_hold_the_census() {
         // Before round 4 the owed key held every one of these censuses open.
         assert!(completed >= 3, "the census is not held open: {completed}");
         // Writing stops: the next page start finds it caught up.
-        let (index, quiet, modes) = page(index, 12, 3_400);
+        let (index, quiet, modes) = page(index, 12, 6_200);
         assert_eq!((modes, quiet.snapshots.len()), ((0, 0), 0));
         assert!(!owed(&index), "released once caught up");
         // Later growth is an ordinary, non-owed Tail.
         fixture.append(SESSION, &token_line(90));
-        let (index, _, modes) = page(index, 13, 4_000);
+        let (index, _, modes) = page(index, 13, 6_800);
         assert_eq!(modes, (0, 1));
         assert!(!owed(&index));
         let (owed_counts, released) = crate::local_resource_diagnostics::take_codex_owed_for_test();
@@ -14168,8 +14169,8 @@ fn owed_release_after(lose: impl Fn(ScanIndex, &mut Arc<SharedCache>) -> ScanInd
         assert!(owed(&index), "premise: owed");
         let index = lose(index, &mut cache);
         assert!(owed(&index), "the owed set survives");
-        // The next generation's walk queues it once.
-        let (index, tail, modes) = page(index, &cache, 2, 1_000);
+        // Past its hourly pace the next walk queues it once.
+        let (index, tail, modes) = page(index, &cache, 2, 3_800);
         let reasons = OWED_FULL_REASONS.with(std::cell::Cell::get);
         assert_eq!((modes, reasons), ((0, 1), [0; 11]), "one Tail, no Full");
         let emitted = tail.snapshots.iter();
@@ -14178,7 +14179,7 @@ fn owed_release_after(lose: impl Fn(ScanIndex, &mut Arc<SharedCache>) -> ScanInd
             1
         );
         assert!(owed(&index), "owed until the next page finds it accepted");
-        let (index, _, modes) = page(index, &cache, 3, 1_060);
+        let (index, _, modes) = page(index, &cache, 3, 3_860);
         assert_eq!(modes, (0, 0));
         assert!(!owed(&index));
         let (mut owed_counts, released) =
@@ -14328,5 +14329,104 @@ fn inputs_unavailable_refusal_completes_the_census_and_carries_the_key() {
             .snapshots
             .iter()
             .all(|s| s.source_session_id != SESSION));
+    });
+}
+
+/// Round 7 (Lead A): an owed key refused for want of inputs is re-attempted
+/// at most hourly whatever the generations in between (`paced`); after
+/// `CODEX_OWED_ATTEMPTS` (24) refusals it is `disabled`: still owed and
+/// discoverable, re-attempted at most every 6 h. Inputs returning in that
+/// phase: one Tail catch-up, then the release. Zero Full, nothing dropped.
+#[test]
+fn owed_input_retry_is_paced_hourly_then_every_six_hours() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let refuse = |on: bool| super::super::TEST_REFUSE_REDUCTION_DEPENDENCIES.with(|v| v.set(on));
+    let start = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let at = |secs: u64| {
+        time::OffsetDateTime::from_unix_timestamp((start + secs) as i64)
+            .unwrap()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    };
+    let t0 = std::time::Instant::now();
+    let fixture = ScanRoot::new(80);
+    let key = local_index_key(&fixture.file(SESSION));
+    let owed = |index: &ScanIndex| {
+        let hold = index.traversal.as_ref();
+        let hold = hold.and_then(|traversal| traversal.residue.codex_inventory_hold.as_ref());
+        hold.is_some_and(|hold| hold.owed.contains(&key))
+    };
+    let cache = Arc::new(SharedCache::default());
+    let pages = std::cell::Cell::new(0);
+    let page = |index: ScanIndex, secs: u64| {
+        pages.set(pages.get() + 1);
+        let ahead = std::time::Duration::from_secs(pages.get() * 86_400);
+        with_pace_clock(Some(t0 + ahead), false, || {
+            owed_page(&fixture, index, &cache, &at(secs))
+        })
+    };
+    let deferred = || counter(&cache, |c| c.jobs_deferred_inputs);
+    let hour = 3_600;
+    with_test_limits(2048, 1024, 64, || {
+        let mut index = ScanIndex::default();
+        for step in 0..64 {
+            index = page(index, step).0;
+            if counter(&cache, |c| c.jobs_certified) == 1 {
+                break;
+            }
+        }
+        crate::local_resource_diagnostics::take_codex_owed_for_test();
+        refuse(true);
+        fixture.append(SESSION, &token_line(81));
+        let t = 100;
+        let (mut index, _, _) = page(index, t);
+        assert_eq!(deferred(), 1, "premise: N1 refused the start");
+        // Generations within the hour: no attempt. Before round 7 each one
+        // re-attempted it.
+        for secs in [t + 600, t + 1_200, t + 3_000] {
+            let (next, scan, modes) = page(index, secs);
+            index = next;
+            assert_eq!((modes, scan.snapshots.len()), ((0, 0), 0));
+            assert!(owed(&index));
+        }
+        assert_eq!(deferred(), 1, "at most one attempt per hour");
+        // Hourly until the 24th refusal.
+        for n in 1..24 {
+            index = page(index, t + n * hour).0;
+            assert_eq!(deferred(), 1 + n, "one attempt an hour");
+        }
+        let (counts, _) = crate::local_resource_diagnostics::take_codex_owed_for_test();
+        assert_eq!(counts.get("disabled"), Some(&1));
+        assert!(counts.get("paced").is_some_and(|n| *n >= 3), "{counts:?}");
+        // Disabled: still owed; the next attempt waits 6 h, not 1 h.
+        let last = t + 23 * hour;
+        for secs in [last + hour, last + 5 * hour] {
+            index = page(index, secs).0;
+            assert_eq!(deferred(), 24, "every 6 h once disabled");
+            assert!(owed(&index), "still owed, never dropped");
+        }
+        index = page(index, last + 6 * hour).0;
+        assert_eq!(deferred(), 25);
+        // The inputs return: one Tail at the next 6-hourly attempt, then the
+        // release.
+        refuse(false);
+        let (index, tail, modes) = page(index, last + 12 * hour);
+        assert_eq!(modes, (0, 1), "one Tail, zero Full");
+        let emitted = tail.snapshots.iter();
+        assert_eq!(
+            emitted.filter(|s| s.source_session_id == SESSION).count(),
+            1
+        );
+        let (index, _, modes) = page(index, last + 12 * hour + 60);
+        assert_eq!(modes, (0, 0));
+        assert!(!owed(&index), "released once accepted");
+        let (counts, released) = crate::local_resource_diagnostics::take_codex_owed_for_test();
+        assert_eq!(counts.get("dropped"), None);
+        assert_eq!(released, BTreeMap::from([("caught_up", 1)]));
     });
 }
