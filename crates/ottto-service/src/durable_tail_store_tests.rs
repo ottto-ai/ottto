@@ -2035,6 +2035,7 @@ fn process_rebuild_history_overflow_disables_without_forgetting_an_attempt() {
         let mut b = binding("acct", "scope", ("fp", None));
         b.key = key_digest(DurableSource::ClaudeCode, &format!("corrupt-{n}"));
         let mut bytes = encode(&DurableRecord {
+            format: FORMAT_VERSION,
             record: pending(b.clone(), certificate(&transcript), 1),
             index_generation: 1,
         });
@@ -2140,6 +2141,7 @@ fn scheduling_deferral_preserves_t14_allowance_until_full_actually_starts() {
     let mut store = scratch.store();
     ensure_private_dir(store.dir()).unwrap();
     let mut bytes = encode(&DurableRecord {
+        format: FORMAT_VERSION,
         record: pending(b.clone(), certificate(&transcript), 1),
         index_generation: 1,
     });
