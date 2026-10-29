@@ -826,9 +826,7 @@ fn ordinary_durable_continuation_to_eof(
         &ScanIndex,
     ),
 ) {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
+    assert!(crate::heap_layout_bound::layout_supported());
     use crate::snapshots::{OwnedSourceScan, OwnedSourceScanStep};
     let fixture = ContinuationFixture::quiescent(name);
     let root = fixture.home.join(".codex/sessions");
@@ -962,6 +960,7 @@ fn ordinary_durable_continuation_to_eof(
 
 #[cfg(unix)]
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn continuation_keeps_ordinary_gc_decisions_through_native_eof() {
     ordinary_durable_continuation_to_eof("continuation-durable-gc", |state, cache, index| {
         state.assert_gc_at_eof(cache, index);
@@ -970,6 +969,7 @@ fn continuation_keeps_ordinary_gc_decisions_through_native_eof() {
 
 #[cfg(unix)]
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn continuation_keeps_ordinary_breaker_and_rebuilt_keys_through_native_eof() {
     ordinary_durable_continuation_to_eof("continuation-durable-breaker", |state, cache, _| {
         state.assert_breaker_at_eof(cache);

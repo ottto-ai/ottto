@@ -175,12 +175,12 @@ use claude_response_records::{
 };
 use codex_compressed_input::{refuse_compressed_codex, OpenedInput};
 pub(crate) use pi_retry_inputs::PiRetryInputs;
-#[cfg(all(test, unix))]
-pub(crate) use sampled_scan::durable_tail::tests::ContinuationDurableState;
 #[cfg(test)]
 pub(crate) use sampled_scan::codex_cursor::{cursor_limit_for_test, with_test_limits_for_test};
 #[allow(unused_imports)]
 pub(crate) use sampled_scan::codex_cursor::{CodexCursorPort, CodexCursorTicket};
+#[cfg(all(test, unix))]
+pub(crate) use sampled_scan::durable_tail::tests::ContinuationDurableState;
 
 pub(crate) use context_curve::CONTEXT_CURVE_CONTRACT_VERSION;
 use context_curve::{
@@ -32033,6 +32033,8 @@ impl OwnedSourceScan {
             // Counted once the page actually reads the file (R2-M3): a fence
             // or deferral below does not inflate the read diagnostics.
             let mut planned_mode = None;
+            #[cfg(unix)]
+            let mut paced_full_granted = false;
             // U1a-2a G7: a side read's acquisition is a fresh `Full` read
             // under the side scope: no retained take, no admission observes
             // or counters, no debt. Failures are its charged attempt.
@@ -32255,6 +32257,7 @@ impl OwnedSourceScan {
                                             )
                                             .is_some() =>
                                     {
+                                        paced_full_granted = true;
                                         (None, taken_admission, debt)
                                     }
                                     sampled_scan::durable_tail::RestoreOutcome::Stale(reason)
@@ -32266,6 +32269,7 @@ impl OwnedSourceScan {
                                                 reason,
                                             ) =>
                                     {
+                                        paced_full_granted = true;
                                         (None, taken_admission, debt)
                                     }
                                     sampled_scan::durable_tail::RestoreOutcome::Stale(_) => {
@@ -32320,7 +32324,8 @@ impl OwnedSourceScan {
                                             if matches!(reason,
                                                 sampled_scan::durable_tail::RetailHold::Exhausted |
                                                 sampled_scan::durable_tail::RetailHold::AccountingLost)
-                                                && context.cache.retail_full(&key, file, accepted_end, std::time::Instant::now()) {
+                                                && context.cache.retail_full(&key, file, accepted_end, std::time::SystemTime::now()) {
+                                                paced_full_granted = true;
                                                 return Ok(false);
                                             }
                                             retail_hold = Some(reason);
@@ -32682,6 +32687,17 @@ impl OwnedSourceScan {
                 })
             {
                 if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
+                    if source == SnapshotSource::ClaudeCode
+                        && !paced_full_granted
+                        && !cache.upgrade_full_allowed(
+                            &local_index_key(&active.candidate.path),
+                            active.parser.reader.reader.get_ref(),
+                            index,
+                        )
+                    {
+                        cache.durable_stale_hold(source, index, &active.candidate);
+                        pending!();
+                    }
                     if let Some(reason) = cache.durable_full_hold(
                         source,
                         &local_index_key(&active.candidate.path),

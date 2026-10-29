@@ -61,6 +61,8 @@ pub(crate) fn rederive_head_bytes_total(source: SnapshotSource) -> u64 {
 }
 
 const PACE_SECS: u64 = 6 * 3600;
+// Sleep and implausible clock changes must fail toward reading.
+const PACE_SANITY_SECS: u64 = 7 * 86_400;
 const _: () = assert!(PACE_SECS < 86_400);
 
 /// Content-free outcome counts, by class. Field paths are static names; no
@@ -77,6 +79,8 @@ pub(crate) struct Counters {
     pub(crate) retail_keys: u64,
     pub(crate) retail_full: [u64; 3],
     pub(crate) stale_full: [u64; 3],
+    pub(crate) near_cap: u64,
+    pub(crate) upgrade_missing_full: u64,
     pub(crate) missing: u64,
     pub(crate) upgrade_state_missing: u64,
     pub(crate) refused_record: u64,
@@ -118,7 +122,7 @@ impl Counters {
         };
         format!(
             "ottto-service: durable_tail source={} original_v1_mapped={} durable_restore_after_selection_clear={} objects[same,unknown,changed]={:?} s2_skipped_object_changed={} \
-             retail_attempts={} retail_keys={} retail_exhausted[full,paced,pace_evicted]={:?} tail_read_bytes={} budget_refused_retail_old_bytes={} repeated_physical_old_bytes={} upgrade_state_missing={} \
+             retail_attempts={} retail_keys={} near_cap={} upgrade_missing_full={} retail_exhausted[full,paced,pace_evicted]={:?} tail_read_bytes={} budget_refused_retail_old_bytes={} repeated_physical_old_bytes={} upgrade_state_missing={} \
              rederive_head_bytes={} rederive_named_lines={} rederive_line_bytes={} not_persisted={{{}}} ineligible={{{}}} \
              write_deferred={} write_unlocked={} peak_body_bytes={} disk_records={} disk_bytes={} \
              bytes_written={} records_written={} records_clean={} store_budget_refused={} \
@@ -134,6 +138,8 @@ impl Counters {
             self.s2_skipped_object_changed,
             self.retail_attempts,
             self.retail_keys,
+            self.near_cap,
+            self.upgrade_missing_full,
             self.retail_full,
             retail_bytes(source, 0),
             retail_bytes(source, 1),
@@ -189,7 +195,7 @@ struct Slot {
     /// upgrade_state_missing, old_binding_no_match, retail_exhausted[3], stale_full[3]].
     held: u64,
     old_binding_no_match: u64,
-    reported: [u64; 13],
+    reported: [u64; 15],
 }
 
 /// Process-lifetime durable state beside the RAM cache.
@@ -206,9 +212,9 @@ pub(crate) struct Stores {
     counters: Counters,
     // Source+key only: never clear on passes, scope changes or cache eviction.
     retail_spent: BTreeMap<store::Digest32, Box<KeyCustody>>,
-    retail_full_at: BTreeMap<store::Digest32, std::time::Instant>,
+    retail_full_at: BTreeMap<store::Digest32, std::time::SystemTime>,
     #[cfg(test)]
-    retail_full_now: Option<std::time::Instant>,
+    retail_full_now: Option<std::time::SystemTime>,
     upgrade_reads: std::sync::Arc<AtomicU64>,
 }
 
@@ -928,7 +934,7 @@ impl SharedCache {
         key: &str,
         file: &File,
         accepted_end: u64,
-        now: std::time::Instant,
+        now: std::time::SystemTime,
     ) -> bool {
         self.paced_full(key, file, accepted_end, now, None)
     }
@@ -951,7 +957,7 @@ impl SharedCache {
             "revision_adoption_required" => 2,
             _ => return false,
         };
-        self.paced_full(key, file, a.end, std::time::Instant::now(), Some(cause))
+        self.paced_full(key, file, a.end, std::time::SystemTime::now(), Some(cause))
     }
 
     fn paced_full(
@@ -959,30 +965,36 @@ impl SharedCache {
         key: &str,
         file: &File,
         accepted_end: u64,
-        now: std::time::Instant,
+        now: std::time::SystemTime,
         cause: Option<usize>,
     ) -> bool {
-        if !file.metadata().is_ok_and(|m| m.len() > accepted_end) {
+        let Ok(metadata) = file.metadata() else {
+            return false;
+        };
+        if metadata.len() <= accepted_end {
             return false;
         }
+        let cap = max_jsonl_file_bytes(SnapshotSource::ClaudeCode);
+        let near_cap = metadata.len() >= cap - cap / 10;
         let Some(mut stores) = self.durable() else {
             return true;
         };
         #[cfg(test)]
         let now = stores.retail_full_now.unwrap_or(now);
-        let interval = std::time::Duration::from_secs(PACE_SECS);
         stores.retail_full_at.retain(|_, at| {
-            now.checked_duration_since(*at)
-                .map_or(true, |age| age < interval)
+            now.duration_since(*at)
+                .is_ok_and(|age| age.as_secs() <= PACE_SANITY_SECS && age.as_secs() < PACE_SECS)
         });
         let key = store::key_digest(DurableSource::ClaudeCode, key);
-        if stores.retail_full_at.contains_key(&key) {
+        if !near_cap && stores.retail_full_at.contains_key(&key) {
             if cause.is_none() {
                 stores.counters.retail_full[1] += 1;
             } else {
                 Counters::bump(
                     &mut stores.counters.ineligible,
-                    if cause == Some(3) {
+                    if cause == Some(4) {
+                        "upgrade_state_missing.paced"
+                    } else if cause == Some(3) {
                         "old_binding_no_match.paced"
                     } else {
                         "stale_full.paced"
@@ -991,7 +1003,9 @@ impl SharedCache {
             }
             return false;
         }
-        if stores.retail_full_at.len() >= 2 * store::MAX_RECORDS {
+        if !stores.retail_full_at.contains_key(&key)
+            && stores.retail_full_at.len() >= 2 * store::MAX_RECORDS
+        {
             let oldest = stores
                 .retail_full_at
                 .iter()
@@ -1003,7 +1017,12 @@ impl SharedCache {
             }
         }
         stores.retail_full_at.insert(key, now);
-        if cause == Some(3) {
+        if near_cap {
+            stores.counters.near_cap += 1;
+        }
+        if cause == Some(4) {
+            stores.counters.upgrade_missing_full += 1;
+        } else if cause == Some(3) {
             if let Some(slot) = stores.slot(DurableSource::ClaudeCode).as_mut() {
                 slot.old_binding_no_match += 1;
             }
@@ -1032,7 +1051,7 @@ impl SharedCache {
         if a.revision > effective_revision(SnapshotSource::ClaudeCode) {
             return None;
         }
-        self.paced_full(key, file, a.end, std::time::Instant::now(), Some(3))
+        self.paced_full(key, file, a.end, std::time::SystemTime::now(), Some(3))
             .then_some(())
     }
 
@@ -1066,7 +1085,7 @@ impl SharedCache {
                 identity_capture,
                 held: 0,
                 old_binding_no_match: 0,
-                reported: [0; 13],
+                reported: [0; 15],
             });
         }
     }
@@ -1201,6 +1220,42 @@ impl SharedCache {
             .as_mut()?
             .store
             .full_hold(&store::key_digest(source, key), start)
+    }
+
+    /// Absent upgrade records are counted Misses, never unreadable holds.
+    /// Repeated growth Fulls share the exact same map as stale/no-match/retail.
+    pub(in crate::snapshots) fn upgrade_full_allowed(
+        &self,
+        key: &str,
+        file: &File,
+        index: &ScanIndex,
+    ) -> bool {
+        let Some(entry) = index.files.get(key).filter(|e| {
+            !e.source_file_fingerprint.is_empty() || e.last_upload_body_witness.is_some()
+        }) else {
+            return true;
+        };
+        let absent = self.durable().is_some_and(|mut stores| {
+            stores
+                .slot(DurableSource::ClaudeCode)
+                .as_ref()
+                .is_some_and(|slot| {
+                    slot.store
+                        .absent(&store::key_digest(DurableSource::ClaudeCode, key))
+                })
+        });
+        // Non-growth edits retain their ordinary A2 path. This is only the
+        // repeating, known-absence growth cause, not a new first-read gate.
+        if !absent || !file.metadata().is_ok_and(|m| m.len() > entry.size_bytes) {
+            return true;
+        }
+        self.paced_full(
+            key,
+            file,
+            entry.size_bytes,
+            std::time::SystemTime::now(),
+            Some(4),
+        )
     }
 
     pub(in crate::snapshots) fn upgrade_read(
@@ -2066,6 +2121,8 @@ impl SharedCache {
             retail_exhausted_paced: [u64; 2],
             pace_evicted: [u64; 2],
             upgrade_state_missing: [u64; 2],
+            upgrade_missing_full: [u64; 2],
+            near_cap: [u64; 2],
             t14_rebuild: [u64; 2],
             t14_rebuild_full_started: u64,
             mode_repaired: [u64; 2],
@@ -2095,6 +2152,12 @@ impl SharedCache {
         } else {
             [0; 3]
         };
+        let near_cap = if claude { stores.counters.near_cap } else { 0 };
+        let upgrade_full = if claude {
+            stores.counters.upgrade_missing_full
+        } else {
+            0
+        };
         let Some(slot) = stores.slot(source).as_mut() else {
             return;
         };
@@ -2113,6 +2176,8 @@ impl SharedCache {
             stale[0],
             stale[1],
             stale[2],
+            near_cap,
+            upgrade_full,
         ];
         let last = std::mem::replace(&mut slot.reported, now);
         drop(stores);
@@ -2130,6 +2195,8 @@ impl SharedCache {
                     retail_exhausted_paced: pair(8),
                     pace_evicted: pair(9),
                     upgrade_state_missing: pair(5),
+                    near_cap: pair(13),
+                    upgrade_missing_full: pair(14),
                     t14_rebuild: pair(1),
                     t14_rebuild_full_started: store.t14_rebuild_full_started,
                     mode_repaired: pair(2),
@@ -2153,6 +2220,8 @@ impl SharedCache {
         if source != DurableSource::ClaudeCode {
             counters.retail_full = [0; 3];
             counters.stale_full = [0; 3];
+            counters.near_cap = 0;
+            counters.upgrade_missing_full = 0;
         }
         let store = stores.slot(source).as_ref()?.store.counters();
         Some((counters, store))
