@@ -44220,9 +44220,9 @@ impl ScanIndex {
         result
     }
 
-    /// Attach only the owner proved for this session. A missing or conflicting
-    /// Claude revision is held for a later complete scan; the durable proof
-    /// remains intact.
+    /// Attach only the owner proved for this session. An incomplete Desktop
+    /// census leaves new legacy sessions uploadable without an account tag.
+    /// Conflicting or owner-contradicting revisions keep their existing hold.
     pub(crate) fn bind_session_accounts(
         &mut self,
         source: SnapshotSource,
@@ -44327,10 +44327,20 @@ impl ScanIndex {
                                         && evidence.account_identifier_hash.is_some())
                             })
                     {
-                        // Partial native profiles cannot establish a new owner
-                        // either: an unseen sibling may contradict the cache.
-                        // Use the existing counted account-deferral/retention path.
-                        deferred.insert(session_id.clone());
+                        if item
+                            .session_account_evidence
+                            .as_ref()
+                            .is_some_and(|evidence| {
+                                evidence.identity_disposition == Some("conflict")
+                            })
+                        {
+                            deferred.insert(session_id.clone());
+                        } else {
+                            // An incomplete census vetoes only a new owner: keep
+                            // the usage/cost body uploadable, with no account tag
+                            // borrowed from the partial native-profile cache.
+                            set_session_account_hash(item, None);
+                        }
                         continue;
                     }
                     let observed = exact_session_account_hash(item);
@@ -77863,17 +77873,8 @@ mod tests {
                 .identity_disposition,
             Some("missing")
         );
-        assert_eq!(
-            index.bind_session_accounts(
-                SnapshotSource::ClaudeCode,
-                "machine",
-                std::slice::from_mut(&mut item),
-                &[]
-            ),
-            BTreeSet::from(["native-session".into()])
-        );
-        assert!(index.session_account_bindings.is_empty());
-        assert!(retained
+        let mut retained_item = item.clone();
+        assert!(index
             .bind_session_accounts(
                 SnapshotSource::ClaudeCode,
                 "machine",
@@ -77881,9 +77882,19 @@ mod tests {
                 &[]
             )
             .is_empty());
+        assert!(exact_session_account_hash(&item).is_none());
+        assert!(index.session_account_bindings.is_empty());
+        assert!(retained
+            .bind_session_accounts(
+                SnapshotSource::ClaudeCode,
+                "machine",
+                std::slice::from_mut(&mut retained_item),
+                &[]
+            )
+            .is_empty());
         assert_eq!(retained.session_account_bindings, owners);
-        assert_eq!(item.model_usage, accepted.model_usage);
-        assert_eq!(item.cost, accepted.cost);
+        assert_eq!(retained_item.model_usage, accepted.model_usage);
+        assert_eq!(retained_item.cost, accepted.cost);
         // Removing the conflicting profile from configuration makes the next
         // clean discovery genuinely cover every configured root.
         fs::remove_file(omitted.join("config.json")).unwrap();
@@ -77958,15 +77969,15 @@ mod tests {
                 Some(deadline)
             );
             let mut item = claude_original_carrier_fixture(&partial, "");
-            assert_eq!(
-                index.bind_session_accounts(
+            assert!(index
+                .bind_session_accounts(
                     SnapshotSource::ClaudeCode,
                     "machine",
                     std::slice::from_mut(&mut item),
                     &[]
-                ),
-                BTreeSet::from(["native-session".into()])
-            );
+                )
+                .is_empty());
+            assert!(exact_session_account_hash(&item).is_none());
             assert!(index.session_account_bindings.is_empty());
         }
         fs::remove_file(support.join("at-cap")).unwrap();
@@ -77987,15 +77998,15 @@ mod tests {
         );
         assert!(failed.original_identity_census_incomplete);
         let mut item = claude_original_carrier_fixture(&failed, "");
-        assert_eq!(
-            index.bind_session_accounts(
+        assert!(index
+            .bind_session_accounts(
                 SnapshotSource::ClaudeCode,
                 "machine",
                 std::slice::from_mut(&mut item),
                 &[]
-            ),
-            BTreeSet::from(["native-session".into()])
-        );
+            )
+            .is_empty());
+        assert!(exact_session_account_hash(&item).is_none());
         fs::remove_file(&support).unwrap();
         fs::rename(hidden, &support).unwrap();
         let early = ClaudeTitleMetadata::load_from_roots_with_index(
@@ -78062,15 +78073,16 @@ mod tests {
             Some("missing")
         );
         let mut unbound = ScanIndex::default();
-        assert_eq!(
-            unbound.bind_session_accounts(
+        let mut unbound_item = item.clone();
+        assert!(unbound
+            .bind_session_accounts(
                 SnapshotSource::ClaudeCode,
                 "machine",
-                std::slice::from_mut(&mut item),
+                std::slice::from_mut(&mut unbound_item),
                 &[]
-            ),
-            BTreeSet::from([item.source_session_id.clone()])
-        );
+            )
+            .is_empty());
+        assert!(exact_session_account_hash(&unbound_item).is_none());
         assert!(unbound.session_account_bindings.is_empty());
         let mut completed_index = ScanIndex {
             claude_desktop_identity_census_complete: true,

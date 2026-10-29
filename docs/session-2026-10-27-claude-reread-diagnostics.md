@@ -108,9 +108,10 @@ independently selected native read; census discovery never opens transcripts.
 A healthy spawned session adopts this metadata dependency revision once; unrelated
 profiles and later coverage loss/recovery do not select unchanged transcripts.
 
-A new legacy binding also defers when a Desktop account hash is present but its
-original proof is missing while the Desktop census is incomplete. A cached unique
-hash cannot win before an unseen sibling is read. Existing owners and independently
+An incomplete Desktop census prevents a new legacy owner binding when only a
+cached account hash is available. That body still uploads its full usage and cost,
+with account tags cleared to Unknown; a cached unique hash cannot win before an
+unseen sibling is read. Conflicting evidence, existing owners and independently
 qualified contract-5 requests keep their admission rules. Complete census recovery
 marks existing account-held retries with a now-complete Desktop proof for read
 accounting. Their existing retry/retention path remains authoritative. Recovery

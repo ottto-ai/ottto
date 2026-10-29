@@ -23793,6 +23793,290 @@ mod tests {
         }
     }
     #[test]
+    #[serial(source_manifests)]
+    fn desktop_incomplete_discovery_uploads_new_session_unbound_then_clean_sweep_binds() {
+        // Exercise the legacy owner path as well as its real scan, evidence
+        // fold, hold filter, wire validation, HTTP POST and entity ACK.
+        let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+        let home = crate::test_scratch::ScratchDir::new("desktop-unbound-upload");
+        let projects = home.join(".claude/projects");
+        let support = home.join("Library/Application Support");
+        let store = support
+            .join("Claude/claude-code-sessions")
+            .join("123e4567-e89b-12d3-a456-426614174000")
+            .join("123e4567-e89b-12d3-a456-426614174001");
+        let session = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(support.join("Claude/config.json"), "{}").unwrap();
+        std::fs::write(
+            store.join("local_session.json"),
+            serde_json::json!({
+                "cliSessionId":session,"createdAt":"2026-09-30T10:00:00Z"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut index = ScanIndex::default();
+        let scan = |index: &mut ScanIndex, at| {
+            crate::snapshots::scan_source_roots_with_test_limit(
+                SnapshotSource::ClaudeCode,
+                std::slice::from_ref(&projects),
+                index,
+                at,
+                7,
+                100,
+                false,
+            )
+            .unwrap()
+        };
+        assert!(scan(&mut index, "2026-09-30T09:55:00Z")
+            .snapshots
+            .is_empty());
+        assert_eq!(
+            serde_json::to_value(&index).unwrap()["claude_desktop_identity_census_complete"],
+            true
+        );
+        // Preserve the cached unique hash, then fail discovery before a NEW
+        // transcript arrives. An unopened root could contradict that hash.
+        let saved_support = home.join("saved-support");
+        std::fs::rename(&support, &saved_support).unwrap();
+        std::fs::write(&support, "synthetic enumeration failure").unwrap();
+        let path = projects.join(format!("{session}.jsonl"));
+        let transcript = serde_json::json!({"type":"assistant","sessionId":session,
+            "timestamp":"2026-09-30T10:00:00Z","requestId":"req-owned",
+            "message":{"id":"message-owned","model":"claude-haiku-4-5",
+                "usage":{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":3,
+                    "cache_creation_input_tokens":7,
+                    "cache_creation":{"ephemeral_5m_input_tokens":5,"ephemeral_1h_input_tokens":2}}}}).to_string();
+        std::fs::write(&path, format!("{transcript}\n")).unwrap();
+        let evidence_support = home.join("otel-support");
+        let evidence_dir = evidence_support.join("local-otel/claude-code-effort");
+        std::fs::create_dir_all(&evidence_dir).unwrap();
+        let mut api = crate::claude_local_otel::ClaudeLocalOtelEvidence {
+            capture_revision: "claude_api_request:v2".into(),
+            session_id: session.into(),
+            request_id: "req-owned".into(),
+            client_request_id: "client-owned".into(),
+            observed_at: "2026-09-30T10:00:00Z".into(),
+            model: "claude-haiku-4-5".into(),
+            effort: "high".into(),
+            query_source: "user".into(),
+            app_version: "2.1.309".into(),
+            event_sequence: Some(1),
+            cost_usd_micros: Some(420_000),
+            input_tokens: 100,
+            output_tokens: 20,
+            cache_read_tokens: 3,
+            cache_creation_tokens: 7,
+            cache_creation_5m_tokens: 5,
+            cache_creation_1h_tokens: 2,
+            request_count: 1,
+            account_identity_checked: true,
+            account_identifier_hash: ottto_core::billing_identity_hash(
+                "anthropic",
+                "account",
+                "123e4567-e89b-12d3-a456-426614174000",
+            ),
+            ..Default::default()
+        };
+        api.fingerprint = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&api).unwrap())
+        );
+        std::fs::write(
+            evidence_dir.join(format!("{:x}.jsonl", Sha256::digest(session.as_bytes()))),
+            serde_json::to_string(&api).unwrap() + "\n",
+        )
+        .unwrap();
+        let trace_dir = evidence_support.join("local-otel/claude-code-trace-ownership");
+        std::fs::create_dir_all(&trace_dir).unwrap();
+        let mut trace = crate::claude_local_otel::ClaudeTraceOwnershipEvidence {
+            capture_revision: "claude_llm_request_ownership:v1".into(),
+            session_id: session.into(),
+            request_id: "req-owned".into(),
+            client_request_id: "client-owned".into(),
+            agent_id: String::new(),
+            observed_at: "2026-09-30T10:00:00Z".into(),
+            ..Default::default()
+        };
+        trace.fingerprint = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&trace).unwrap())
+        );
+        std::fs::write(
+            trace_dir.join(format!("{:x}.jsonl", Sha256::digest(session.as_bytes()))),
+            serde_json::to_string(&trace).unwrap() + "\n",
+        )
+        .unwrap();
+        let offered = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let captured = offered.clone();
+        let backend = loopback_backend::Backend::with_listener(
+            TcpListener::bind("127.0.0.1:0").unwrap(),
+            Some(Arc::new(move |wire| {
+                captured.lock().unwrap().push(wire.clone());
+                Ok(())
+            })),
+        )
+        .unwrap();
+        let client = SnapshotApiClient::new(&backend.url)
+            .with_receipt_state_dir(home.join("receipts"))
+            .with_receipt_destination_namespace("a".repeat(64));
+        for (cycle, at) in ["2026-09-30T10:05:00Z", "2026-09-30T10:20:00Z"]
+            .into_iter()
+            .enumerate()
+        {
+            if cycle == 1 {
+                std::fs::remove_file(&support).unwrap();
+                std::fs::rename(&saved_support, &support).unwrap();
+                // An independently changed transcript selects the recovery
+                // read. Census flaps alone must not select unchanged bodies.
+                std::fs::write(&path, format!("{transcript}\n\n")).unwrap();
+            }
+            let mut page = scan(&mut index, at);
+            assert_eq!(page.snapshots.len(), 1, "cycle {cycle}: native read");
+            assert_eq!(
+                serde_json::to_value(&index).unwrap()["claude_desktop_identity_census_complete"],
+                cycle == 1
+            );
+            let (mut disposition, _, _) = try_apply_claude_local_evidence_to_scan_with_comparison(
+                &evidence_support,
+                &mut page,
+                &mut index,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let before = page.snapshots[0].clone();
+            assert_eq!(
+                before.cost.as_ref().unwrap().total_cost_usd.as_deref(),
+                Some("0.42")
+            );
+            assert_eq!(
+                before
+                    .session_account_evidence
+                    .as_ref()
+                    .unwrap()
+                    .identity_disposition,
+                Some(if cycle == 0 { "missing" } else { "complete" })
+            );
+            assert!(before
+                .model_usage
+                .iter()
+                .all(|row| row.account_identifier_hash == api.account_identifier_hash));
+            let deferred = index.bind_session_accounts_with_mixed(
+                SnapshotSource::ClaudeCode,
+                "machine",
+                &mut page.snapshots,
+                &[],
+                &disposition.mixed_uploads,
+            );
+            assert!(
+                deferred.is_empty(),
+                "incomplete census never holds this usage body"
+            );
+            disposition.defer_sessions(deferred);
+            apply_upload_policy(
+                SnapshotSource::ClaudeCode,
+                &mut page.snapshots,
+                SnapshotUploadPolicy::default(),
+            );
+            finalize_scan_after_policy_with_body_witness(
+                SnapshotSource::ClaudeCode,
+                &mut page,
+                &mut index,
+                snapshot_upload_body_witness,
+            );
+            let holds = LocalHoldSettlement::classify(
+                SnapshotSource::ClaudeCode,
+                &mut index,
+                &mut page,
+                &disposition,
+            );
+            assert!(!holds.any());
+            assert_eq!(
+                page.snapshots.len(),
+                1,
+                "survives the actual upload hold filter"
+            );
+            let item = &page.snapshots[0];
+            assert_eq!(
+                (
+                    item.input_tokens,
+                    item.output_tokens,
+                    item.cache_read_tokens,
+                    item.cache_creation_5m_tokens,
+                    item.cache_creation_1h_tokens,
+                    item.request_count
+                ),
+                (100, 20, 3, 5, 2, 1)
+            );
+            assert_eq!(item.cost, before.cost, "no zeroing or cost loss");
+            let mut expected = before.clone();
+            if cycle == 0 {
+                for row in expected.model_usage.iter_mut().chain(
+                    expected
+                        .usage_buckets
+                        .iter_mut()
+                        .flat_map(|b| b.model_usage.iter_mut()),
+                ) {
+                    row.account_identifier_hash = None;
+                }
+            }
+            assert_eq!(item.model_usage, expected.model_usage);
+            assert_eq!(item.usage_buckets, expected.usage_buckets);
+            let owners = serde_json::to_value(&index).unwrap();
+            assert_eq!(
+                owners
+                    .get("session_account_bindings")
+                    .and_then(|v| v.as_object())
+                    .map_or(0, |m| m.len()),
+                cycle
+            );
+            assert!(item
+                .model_usage
+                .iter()
+                .chain(item.usage_buckets.iter().flat_map(|b| b.model_usage.iter()))
+                .all(|r| r.account_identifier_hash.is_some() == (cycle == 1)));
+            let request = SnapshotBatchRequest {
+                schema_version: SNAPSHOT_SCHEMA_VERSION,
+                source: "claude_code".into(),
+                machine_id: "a".repeat(64),
+                collector_version: Some(collector_version()),
+                snapshots: page.snapshots.clone(),
+                upload_policy: SnapshotUploadPolicy::default(),
+                client_report: crate::client_report::ClientReport::empty(),
+            };
+            validate_snapshot_batch_request(&request).unwrap();
+            let response = client
+                .upload_batch("synthetic-relay", &request, false)
+                .unwrap();
+            assert_eq!(
+                response.accepted, 1,
+                "real HTTP upload and validated entity ACK"
+            );
+            let wire = offered.lock().unwrap();
+            assert_eq!(wire.len(), cycle + 1);
+            assert_eq!(wire[cycle]["snapshots"].as_array().unwrap().len(), 1);
+            let body = &wire[cycle]["snapshots"][0];
+            assert_eq!(body["input_tokens"], 100);
+            assert_eq!(body["output_tokens"], 20);
+            assert_eq!(body["cost"]["total_cost_usd"], "0.42");
+            assert_eq!(
+                body["model_usage"],
+                serde_json::to_value(&expected.model_usage).unwrap()
+            );
+            assert_eq!(
+                body["usage_buckets"],
+                serde_json::to_value(&expected.usage_buckets).unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn claude_p92_typed_mixed_uses_full_enrichment_order() {
         // Subject: the legacy account path contract 5 now leaves to untagged bodies.
         let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
