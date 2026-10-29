@@ -103,3 +103,8 @@ compares emitted bodies against a cold Full under the same partial metadata;
 Linux verifies the unsupported-layout Full fallback. A healthy inventory cooldown
 keeps retry_attempt=0, so a subsequent first metadata error retains the existing
 initial one-minute retry rather than accidentally doubling it.
+
+Cached entries retain their canonical Desktop-store scope while that profile's
+directory disappears/reappears during backoff. Inventory discovery must not split
+one cached store into per-file scopes and invalidate unchanged child lineage.
+The scoped re-emission fixture includes this OWN-profile flap in both directions.

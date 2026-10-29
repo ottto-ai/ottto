@@ -16594,7 +16594,26 @@ impl ClaudeTitleMetadata {
                     .iter()
                     .find(|dir| Path::new(path).starts_with(dir))
                     .map(PathBuf::as_path)
-                    .unwrap_or_else(|| Path::new(path)),
+                    .unwrap_or_else(|| {
+                        // A temporarily deconfigured profile still owns its
+                        // cached entries until the metadata sweep removes them.
+                        // Keep their canonical store scope through backoff;
+                        // splitting them into per-file stores would revise
+                        // unchanged children's parent dependencies on a flap.
+                        Path::new(path)
+                            .ancestors()
+                            .find(|scope| {
+                                scope.file_name().and_then(|name| name.to_str())
+                                    == Some("claude-code-sessions")
+                                    && scope
+                                        .parent()
+                                        .and_then(Path::parent)
+                                        .and_then(Path::file_name)
+                                        .and_then(|name| name.to_str())
+                                        == Some("Application Support")
+                            })
+                            .unwrap_or_else(|| Path::new(path))
+                    }),
                 None => Path::new(""), // synthetic durable-index tests
             };
             by_store.entry(scope).or_default().push(entry);

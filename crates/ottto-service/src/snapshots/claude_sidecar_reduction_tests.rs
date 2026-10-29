@@ -117,6 +117,7 @@ impl Drop for Fixture {
 }
 
 struct Run {
+    metadata_fingerprint: String,
     index: ScanIndex,
     result: SourceScanResult,
     modes: (usize, usize, usize),
@@ -173,6 +174,9 @@ fn raw_scan_at(
         true,
         identity_capture,
     );
+    let metadata_fingerprint = scan
+        .claude_title_metadata
+        .session_sidecar_fingerprint(&fixture.session);
     if let Some(cache) = cache {
         scan = scan.with_sampled_acquisition(cache, Scope("sidecar-fixture".into()));
     }
@@ -199,6 +203,7 @@ fn raw_scan_at(
             OwnedSourceScanStep::Pending(next) => scan = next,
             OwnedSourceScanStep::Complete { index, scan, .. } => {
                 return Run {
+                    metadata_fingerprint,
                     index,
                     result: scan,
                     modes,
@@ -1330,6 +1335,9 @@ mod durable_restart {
             capture_by_default(),
         )
         .with_sampled_acquisition(cache, Scope(namespace.into()));
+        let metadata_fingerprint = scan
+            .claude_title_metadata
+            .session_sidecar_fingerprint(&f.session);
         loop {
             let modes = scan.sampling.as_ref().map_or((0, 0, 0), |c| {
                 (c.full_files, c.tail_files, c.unchanged_files)
@@ -1338,6 +1346,7 @@ mod durable_restart {
                 OwnedSourceScanStep::Pending(next) => scan = next,
                 OwnedSourceScanStep::Complete { index, scan, .. } => {
                     return Run {
+                        metadata_fingerprint,
                         index,
                         result: scan,
                         modes,
@@ -1392,8 +1401,10 @@ fn desktop_metadata_reemit_is_session_scoped_even_during_inventory_backoff() {
             .join("123e4567-e89b-12d3-a456-426614174000")
             .join("123e4567-e89b-12d3-a456-426614174001")
     };
-    let main = bucket("Claude");
+    let main = bucket("Claude-OWN");
     fs::create_dir_all(&main).unwrap();
+    let own_config = support.join("Claude-OWN/config.json");
+    fs::write(&own_config, "{}").unwrap();
     let write_child = |title| {
         fs::write(main.join("child.json"), json!({
         "cliSessionId":f.session, "sessionId":"local_child", "title":title, "titleSource":"user",
@@ -1413,6 +1424,7 @@ fn desktop_metadata_reemit_is_session_scoped_even_during_inventory_backoff() {
         .values()
         .any(|entry| entry.cli_session_id == f.session
             && entry.spawned_from_desktop_session_id.is_some()));
+    let metadata_fingerprint = first.metadata_fingerprint.clone();
     let mut index = settle(first);
     let saved: BTreeMap<_, _> = index
         .files
@@ -1434,6 +1446,7 @@ fn desktop_metadata_reemit_is_session_scoped_even_during_inventory_backoff() {
         let (next, rows) = crate::local_resource_diagnostics::capture(|| run(index, at));
         assert_eq!(!next.index.claude_desktop_identity_census_complete, defer);
         assert_eq!(next.native_bytes, 0, "inventory changes never read bodies");
+        assert_eq!(next.metadata_fingerprint, metadata_fingerprint);
         assert!(next.result.snapshots.is_empty(), "no unrelated re-emits");
         assert_eq!(
             saved,
@@ -1451,6 +1464,26 @@ fn desktop_metadata_reemit_is_session_scoped_even_during_inventory_backoff() {
         );
         index = next.index;
     }
+    // A real OWN profile-directory disappearance/reappearance during backoff
+    // preserves the cached store grouping and unchanged child's parent graph.
+    let own_root = support.join("Claude-OWN");
+    let hidden = support.join("temporarily-hidden-profile");
+    fs::rename(&own_root, &hidden).unwrap();
+    let gone = run(index, "2026-08-02T07:12:02Z");
+    assert!(!gone.index.claude_desktop_identity_census_complete);
+    assert!(gone.result.snapshots.is_empty());
+    assert_eq!(gone.native_bytes, 0);
+    assert_eq!(
+        gone.metadata_fingerprint, metadata_fingerprint,
+        "the actual selector input stays stable even if native traversal also backs off"
+    );
+    fs::rename(&hidden, &own_root).unwrap();
+    let back = run(gone.index, "2026-08-02T07:12:03Z");
+    assert!(!back.index.claude_desktop_identity_census_complete);
+    assert!(back.result.snapshots.is_empty());
+    assert_eq!(back.native_bytes, 0);
+    assert_eq!(back.metadata_fingerprint, metadata_fingerprint);
+    let index = back.index;
     let recovered = run(index, "2026-08-02T07:15:00Z");
     assert!(recovered.index.claude_desktop_identity_census_complete);
     assert!(recovered.result.snapshots.is_empty());
@@ -1458,6 +1491,7 @@ fn desktop_metadata_reemit_is_session_scoped_even_during_inventory_backoff() {
     write_child("changed own metadata");
     let (changed, rows) =
         crate::local_resource_diagnostics::capture(|| run(recovered.index, "2026-08-02T07:17:00Z"));
+    assert_ne!(changed.metadata_fingerprint, metadata_fingerprint);
     assert_eq!(changed.result.snapshots.len(), 1);
     assert_eq!(changed.result.snapshots[0].source_session_id, f.session);
     assert_eq!(changed.native_bytes, fs::metadata(&f.path).unwrap().len());
