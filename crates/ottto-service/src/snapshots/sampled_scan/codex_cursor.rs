@@ -6403,11 +6403,11 @@ pub(in crate::snapshots) fn revalidate(
         return Resume::Unavailable;
     };
     if let Some(owner) = meta.owner.as_ref() {
-        if inventory
-            .headers
-            .iter()
-            .any(|header| &header.owner == owner && header.candidate.path != job.candidate.path)
-        {
+        if inventory.headers.iter().any(|header| {
+            &header.owner == owner
+                && header.candidate.path != job.candidate.path
+                && !codex_archive_path(&header.candidate.path)
+        }) {
             return Resume::Changed;
         }
         match held_roster_has_extra(inputs.custody, owner, None, |key| key == meta.key) {
@@ -6434,7 +6434,9 @@ fn held_roster_has_extra(
         if at == codex_file_join::MAX_HEADER_FILES {
             return None;
         }
-        if !is_boot(key)
+        // Archives are outside plain continuation groups, just as in groups().
+        if !codex_archive_path(Path::new(key))
+            && !is_boot(key)
             && index
                 .files
                 .get(key)
@@ -6515,7 +6517,11 @@ fn revalidate_group(job: &mut OwnedActiveFile, inputs: ResumeInputs<'_>) -> Resu
     let mut current = inventory
         .headers
         .iter()
-        .filter(|header| header.owner == group.owner && header.home == group.home)
+        .filter(|header| {
+            header.owner == group.owner
+                && header.home == group.home
+                && !codex_archive_path(&header.candidate.path)
+        })
         .map(|header| local_index_key(&header.candidate.path))
         .collect::<BTreeSet<_>>();
     let members = group

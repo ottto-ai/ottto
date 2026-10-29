@@ -16445,7 +16445,9 @@ fn deferred_custody_group_money_main_pass_and_withhold_then_quiet_restart() {
                 &roster,
                 Some(&dirs),
             );
-            while !inventory.step_with_archive(&CodexTitleMetadata::default(), &mut index, None) {}
+            while inventory.step_with_archive(&CodexTitleMetadata::default(), &mut index, None)
+                != codex_file_join::HeaderStep::Complete
+            {}
             let mut committed = index.clone();
             index.hold_compressed(
                 &held,
@@ -16466,9 +16468,9 @@ fn deferred_custody_group_money_main_pass_and_withhold_then_quiet_restart() {
                     &roster,
                     Some(&dirs),
                 );
-                while !inventory.step_with_archive(&CodexTitleMetadata::default(), &mut index, None)
-                {
-                }
+                while inventory.step_with_archive(&CodexTitleMetadata::default(), &mut index, None)
+                    != codex_file_join::HeaderStep::Complete
+                {}
                 while !inventory.prepare_custody(&index) {}
                 assert!(inventory
                     .headers
@@ -16525,6 +16527,24 @@ fn deferred_custody_group_money_main_pass_and_withhold_then_quiet_restart() {
                 matches!(check(&control, &old_inventory), Resume::Valid),
                 "no-new-member control"
             );
+            // Family archive custody is outside the plain group membership domain.
+            // Its retained roster stub cannot cancel or read the acquired P/H job.
+            let archive = fixture.root.join("unjoined.jsonl.zst");
+            control.hold_compressed(
+                &archive,
+                BTreeSet::from([SESSION.into()]),
+                CodexZstCause::FamilyUnproven,
+            );
+            control
+                .traversal
+                .as_mut()
+                .unwrap()
+                .codex_rollout_paths
+                .insert(local_index_key(&archive));
+            assert!(matches!(
+                codex_compressed_hold_tests::no_open(&archive, || check(&control, &old_inventory)),
+                Resume::Valid
+            ));
             assert!(
                 matches!(check(&index, &inventory), Resume::Changed),
                 "held N is extra membership"
