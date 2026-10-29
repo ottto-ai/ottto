@@ -3840,7 +3840,7 @@ fn a1t_no_match_growth_full_restart_recounts_without_dropping_or_adding_the_pref
     );
     let (disk_path, survivor) = {
         let mut stores = warm.cache.durable().unwrap();
-        let slot = stores.claude.as_mut().unwrap();
+        let slot = stores.slot(DurableSource::ClaudeCode).as_mut().unwrap();
         let ReadOutcome::Found(mut record) = slot.store.read(
             &store::key_digest(ds, &key),
             &codec::allowlist_digest(source),
@@ -3917,7 +3917,7 @@ fn a1t_no_match_growth_full_restart_recounts_without_dropping_or_adding_the_pref
                 .cache
                 .durable()
                 .unwrap()
-                .claude
+                .slot(DurableSource::ClaudeCode)
                 .as_ref()
                 .unwrap()
                 .old_binding_no_match,
@@ -4081,7 +4081,7 @@ fn a1t_no_match_growth_full_restart_recounts_without_dropping_or_adding_the_pref
                 .cache
                 .durable()
                 .unwrap()
-                .claude
+                .slot(DurableSource::ClaudeCode)
                 .as_ref()
                 .unwrap()
                 .old_binding_no_match,
@@ -4182,7 +4182,7 @@ fn a1t_no_match_growth_full_restart_recounts_without_dropping_or_adding_the_pref
             .cache
             .durable()
             .unwrap()
-            .claude
+            .slot(DurableSource::ClaudeCode)
             .as_ref()
             .unwrap()
             .old_binding_no_match,
@@ -4233,7 +4233,7 @@ fn a1t_transitional_full_requires_known_current_floor_and_strict_growth() {
         cache
             .durable()
             .unwrap()
-            .claude
+            .slot(DurableSource::ClaudeCode)
             .as_ref()
             .unwrap()
             .old_binding_no_match,
@@ -4858,7 +4858,7 @@ fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
             .clone();
         let (disk_path, bytes) = {
             let mut stores = warm.cache.durable().unwrap();
-            let slot = stores.claude.as_mut().unwrap();
+            let slot = stores.slot(DurableSource::ClaudeCode).as_mut().unwrap();
             let ReadOutcome::Found(mut record) = slot.store.read(
                 &store::key_digest(ds, &key),
                 &codec::allowlist_digest(source),
@@ -5175,7 +5175,7 @@ fn b1g_absent_growth_twice_overflow_closed_restart_exact_body_and_idle() {
             .cache
             .durable()
             .unwrap()
-            .claude
+            .slot(DurableSource::ClaudeCode)
             .as_ref()
             .unwrap()
             .store
@@ -5521,7 +5521,7 @@ fn b1_future_accepted_floor_blocks_saved_and_closed_claims_before_read() {
             .cache
             .durable()
             .unwrap()
-            .claude
+            .slot(DurableSource::ClaudeCode)
             .as_ref()
             .unwrap()
             .store

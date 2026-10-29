@@ -904,7 +904,10 @@ impl SharedCache {
         {
             return None;
         }
-        self.durable()?.claude.as_mut()?.old_binding_no_match += 1;
+        self.durable()?
+            .slot(DurableSource::ClaudeCode)
+            .as_mut()?
+            .old_binding_no_match += 1;
         Some(())
     }
 
