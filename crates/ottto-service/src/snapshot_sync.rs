@@ -4,6 +4,8 @@ mod loopback_backend;
 #[doc(hidden)]
 #[cfg(feature = "replay-harness")]
 pub mod replay_harness;
+#[cfg(test)]
+pub(crate) mod upload_context_receipt_tests;
 use crate::adaptive_collector::{CadenceConfig, SourceCadence};
 use crate::agent_status::AgentStatusCollection;
 #[cfg(test)]
@@ -1239,6 +1241,11 @@ struct SnapshotUploadProgress {
     reason_reoffer_counts: reason_reoffer::ReofferCounts,
     #[serde(skip)]
     terminal_contract_retry_pending_save: bool,
+    /// Only exact entity ACKs observed in this cycle; never restored from disk.
+    #[serde(skip)]
+    fresh_context_body_acks: BTreeMap<String, String>,
+    #[serde(skip)]
+    context_rearm_entities: BTreeSet<String>,
 }
 
 impl SnapshotUploadProgress {
@@ -1280,6 +1287,8 @@ impl SnapshotUploadProgress {
             attempted_reason_reoffers: BTreeSet::new(),
             reason_reoffer_counts: reason_reoffer::ReofferCounts::default(),
             terminal_contract_retry_pending_save: false,
+            fresh_context_body_acks: BTreeMap::new(),
+            context_rearm_entities: BTreeSet::new(),
         }
     }
 
@@ -1887,9 +1896,16 @@ impl SnapshotUploadProgress {
         if self.active_quarantine_retries.contains(fingerprint) {
             return false;
         }
-        self.accepted_body_witnesses
+        (self
+            .accepted_body_witnesses
             .get(fingerprint)
             .is_some_and(|accepted| accepted == body_witness)
+            && (!self.context_rearm_entities.contains(fingerprint)
+                || self
+                    .fresh_context_body_acks
+                    .get(fingerprint)
+                    .map(String::as_str)
+                    == Some(body_witness)))
             || self
                 .quarantined_fingerprints
                 .get(fingerprint)
@@ -6024,7 +6040,7 @@ fn prepare_sync_source_inner(
         cache_observations_enabled,
     );
     continuation::observe(source, &upload_context, upload_policy);
-    index.activate_upload_context(upload_context);
+    index.activate_file_upload_context(source, upload_context);
     if !context_curve_enabled {
         // Stamp the off transition before taking the partial-commit baseline.
         // If an ordinary no-curve upload is partially accepted and then shed,
@@ -6587,11 +6603,14 @@ fn prepare_continuation_source(
         .attribution_context
         .as_ref()
         .map(SessionAttributionContext::checkpoint_namespace);
-    index.activate_upload_context(cycle_upload_context(
-        inputs.upload_policy,
-        checkpoint_namespace.as_deref(),
-        inputs.cache_observations_enabled,
-    ));
+    index.activate_file_upload_context(
+        SnapshotSource::Codex,
+        cycle_upload_context(
+            inputs.upload_policy,
+            checkpoint_namespace.as_deref(),
+            inputs.cache_observations_enabled,
+        ),
+    );
     // The ordinary selection's in-memory effects, on this page's own copy;
     // the probe above found no claim, so there is nothing to save.
     let claimed = prepare_upload_progress_for_cycle_with_reoffer(
@@ -7282,6 +7301,12 @@ fn finish_sync_source(
     // No absent ACK or unrelated entity borrows those slots.
     let ack_admission_limited =
         upload_progress.admit_upload_input(&mut scan_result.snapshots, &index);
+    let context_receipt_candidates =
+        index.file_upload_context_ack_candidates(&scan_result.snapshots);
+    upload_progress.context_rearm_entities = context_receipt_candidates
+        .iter()
+        .flat_map(|candidate| candidate.entity_fingerprints().cloned())
+        .collect();
     let probes = scan_result
         .snapshots
         .iter()
@@ -7927,6 +7952,10 @@ fn finish_sync_source(
     // comparison already revoked this lease locally and cannot mint a native
     // correction later in this finish. Retire only that Claude prior index
     // before the full disk-index CAS decode; keep every possible receipt path.
+    let context_rearm_counts = index.accept_file_upload_context_acks(
+        &context_receipt_candidates,
+        &upload_progress.fresh_context_body_acks,
+    );
     let retire_prior_index = source == SnapshotSource::ClaudeCode && !comparison_current;
     #[cfg(test)]
     let retire_prior_index = retire_prior_index
@@ -7985,6 +8014,7 @@ fn finish_sync_source(
         &manifest_window_start,
         &manifest_window_end,
     )?;
+    context_rearm_counts.emit(source);
     note_codex_side_saved(daemon, &index_path, true, side_mark);
     #[cfg(unix)]
     crate::snapshots::durable_after_save(&daemon.transcript_cache, support_dir, source, &index);
@@ -9775,7 +9805,11 @@ where
             let item = &items[*index];
             let item_fingerprint = fingerprint(item);
             if settled.contains(item_fingerprint) {
-                progress.record_body(item_fingerprint, &body_witness(item));
+                let body = body_witness(item);
+                progress.record_body(item_fingerprint, &body);
+                progress
+                    .fresh_context_body_acks
+                    .insert(item_fingerprint.to_string(), body);
                 progress.record_cache_state(item, false)?;
             } else if not_stored.contains(item_fingerprint) {
                 progress.hold_unstored_body(item_fingerprint, &body_witness(item));
@@ -11762,6 +11796,7 @@ mod tests {
                 effective_upload_body_witness_revision: 0,
                 opened_changed_nanos: 0,
                 opened_birth_nanos: 0,
+                upload_context_receipt: None,
             },
         );
         index.file_snapshot_fingerprints.insert(
@@ -24085,7 +24120,7 @@ mod tests {
 
 crate::heap_layout_bound::fields!(SourcePreparation; native_comparison_reservation, native_comparison_lease, prepared_claude_evidence, terminal_native_traversal, native_comparison_controller, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
 
-crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save);
+crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save, fresh_context_body_acks, context_rearm_entities);
 
 crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint, group_fingerprint, entities, reselected_heads, settled_entities);
 
