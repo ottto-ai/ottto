@@ -677,7 +677,7 @@ fn start_builtin_relays(daemon: &LocalDaemon) {
         Ok(()) => eprintln!("serving collector check-in heartbeat"),
         Err(error) => eprintln!("collector check-in heartbeat unavailable: {error}"),
     }
-    match ottto_service::mcp_inventory::spawn_mcp_inventory_sync() {
+    match ottto_service::mcp_inventory::spawn_mcp_inventory_sync_for_daemon(daemon) {
         Ok(()) => eprintln!("serving mcp inventory harvest"),
         Err(error) => eprintln!("mcp inventory harvest unavailable: {error}"),
     }

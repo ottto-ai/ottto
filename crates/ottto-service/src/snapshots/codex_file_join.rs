@@ -149,6 +149,7 @@ pub(super) struct HeaderWitness {
     pub(super) home: PathBuf,
     pub(super) created_unix_ms: Option<i64>,
     metadata: String,
+    stamp: crate::transcript_acquisition::FileStamp,
 }
 pub(super) fn member_home(root: &Path) -> PathBuf {
     root.ancestors()
@@ -402,6 +403,15 @@ impl HeaderInventory {
                 || !directories.is_some_and(|value| value.stable),
         }
     }
+    pub(super) fn content_unchanged(&self) -> bool {
+        self.complete
+            && self.pending.is_empty()
+            && self.headers.iter().all(|header| {
+                fs::symlink_metadata(&header.candidate.path)
+                    .and_then(crate::transcript_acquisition::FileStamp::capture)
+                    .is_ok_and(|stamp| header.stamp.same_content(&stamp))
+            })
+    }
     pub(super) fn owner_for_path(&self, path: &Path) -> Option<&str> {
         // Headers append in the pending BTreeSet<String> path order. Compare
         // whole path strings, not Path's component order (a.jsonl vs a/b.jsonl).
@@ -533,6 +543,7 @@ impl HeaderInventory {
                 owner: facts.owner,
                 created_unix_ms: facts.created_unix_ms,
                 metadata: witness,
+                stamp: facts.stamp,
             })
         })();
         match result {
@@ -608,7 +619,7 @@ impl HeaderInventory {
     }
 }
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
-crate::heap_layout_bound::fields!(HeaderWitness; candidate, owner, home, created_unix_ms, metadata);
+crate::heap_layout_bound::fields!(HeaderWitness; candidate, owner, home, created_unix_ms, metadata, stamp);
 crate::heap_layout_bound::fields!(HeaderInventory; roots, pending, headers, directories, complete, read_bytes, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, bounded_out);
 
 #[derive(Clone, Debug)]
@@ -4349,3 +4360,7 @@ pub(in crate::snapshots) mod header_cache_tests {
         fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "codex_file_join/header_cache_output_tests.rs"]
+mod header_cache_output_tests;

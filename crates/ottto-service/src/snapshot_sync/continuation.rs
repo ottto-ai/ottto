@@ -1,49 +1,50 @@
-//! Paced cursor continuation pages (FC1 Stage 1, sync-loop hunks B/C/F).
-//!
-//! A Codex page that pauses a still-valid cursor job only because its byte
-//! budget ran out may ask for the next page sooner than the ordinary cadence.
-//! That next page runs through [`run_page`], a dedicated entry point that is not
-//! `sync_once`: it makes no network call (no relay token, activity hint,
-//! receipt, status or health upload) unless the job reaches EOF, and then only
-//! the existing authorized completion upload, after rechecking the scan
-//! authority, the destination and the upload backoff. Ordinary cycles keep
-//! their own deadline, so other sources' due work and network cadence are
-//! unchanged, and an EOF completion does not move the ordinary Codex cadence.
-//!
-//! Everything here is compiled in and **inert**: [`ENABLED`] is false, and the
-//! platform gates are [`NoPlatformSignals`], whose unknown state falls back to
-//! the ordinary cadence. The cursor side is [`CodexContinuation`], the adapter
-//! over c22's `CodexCursorPort` (hunks A/D/E and the guard). It runs each page
-//! on a short-lived, explicitly joined worker (Option W) and is reached only
-//! behind [`ENABLED`]. Inert parity rests on that constant gate and on review:
-//! the loop takes today's path before it reaches anything in this module.
-
-use super::live_snapshot_retry::LiveRetryOwner;
+//! Enabled Codex cursor pages: AC only, background QoS, EOF parked for ordinary cadence.
 use super::{
-    complete_continuation_eof, enabled_snapshot_sources, load_snapshot_device_credentials,
-    run_continuation_scan, safe_error, snapshot_api_base_url,
-    snapshot_upload_destination_namespace, source_upload_backoff_remaining, with_source_cadence,
-    ContinuationInputs, ContinuationScan, ScanIndex, SnapshotSource, SourcePreparation,
-    SourceScanResult, SNAPSHOT_SYNC_INTERVAL, SNAPSHOT_SYNC_LOCK,
+    enabled_snapshot_sources, load_snapshot_device_credentials, run_continuation_scan, safe_error,
+    snapshot_api_base_url, snapshot_upload_destination_namespace, source_upload_backoff_remaining,
+    with_source_cadence, ContinuationInputs, ContinuationScan, ScanIndex, SnapshotSource,
+    SnapshotUploadPolicy, SourcePreparation, SourceScanResult, SNAPSHOT_SYNC_INTERVAL,
+    SNAPSHOT_SYNC_LOCK, SNAPSHOT_SYNC_WORKER_STACK_BYTES,
 };
 use crate::adaptive_collector::{ContinuationPacing, SourceCadence};
 use crate::snapshots::sampled_scan::SharedCache;
 use crate::snapshots::{CodexCursorPort, CodexCursorTicket};
 use crate::LocalDaemon;
-use anyhow::{anyhow, Result};
+use anyhow::anyhow;
 use ottto_core::LocalDeviceBinding;
 use ottto_protocol::LocalCollectorState;
 use sha2::{Digest, Sha256};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 use zeroize::Zeroize;
 
-/// Off until c22's cursor protocol (A/D/E/guard after #660), the platform
-/// hunks and the exact integration are reviewed. While false, the sync loop
-/// takes exactly today's path and no continuation state is written.
-pub(super) const ENABLED: bool = false;
+pub(super) type RuntimeContext = [Option<([u8; 32], [u8; 32])>; 2];
+static UPLOAD_CONTEXT: Mutex<RuntimeContext> = Mutex::new([None; 2]);
+pub(super) fn runtime_context() -> RuntimeContext {
+    #[cfg(test)]
+    if let Some(context) = tests::runtime_context_override() {
+        return context;
+    }
+    *UPLOAD_CONTEXT.lock().unwrap_or_else(|p| p.into_inner())
+}
+pub(super) fn observe(source: SnapshotSource, context: &str, policy: SnapshotUploadPolicy) {
+    let slot = match source {
+        SnapshotSource::ClaudeCode => 0,
+        SnapshotSource::Codex => 1,
+        SnapshotSource::Pi => return,
+    };
+    let value = (
+        Sha256::digest(context.as_bytes()).into(),
+        Sha256::digest(serde_json::to_vec(&policy).expect("upload policy is serializable")).into(),
+    );
+    #[cfg(test)]
+    if tests::observe_context(slot, value) {
+        return;
+    }
+    UPLOAD_CONTEXT.lock().unwrap_or_else(|p| p.into_inner())[slot] = Some(value);
+}
 
 /// At least 30 s and nine idle seconds per working second between pages.
 pub(super) const PACING: ContinuationPacing = ContinuationPacing {
@@ -104,40 +105,6 @@ impl CursorTicket {
     }
 }
 
-/// What an EOF page hands back: the committed job's preparation, index and
-/// scan, built only from a page whose `continuation_committed()` is true.
-/// StateMissing settles it ([`Host::complete_eof`] or [`Host::defer_eof`])
-/// through the same completion an ordinary Codex finish runs.
-pub(super) struct EofCompletion(EofParts);
-
-enum EofParts {
-    Scan(Box<(SourcePreparation, ScanIndex, SourceScanResult)>),
-    /// A stand-in for the fakes, which have no real scan to complete.
-    #[cfg(test)]
-    Synthetic,
-}
-
-impl EofCompletion {
-    /// The committed page's parts, moved from the worker unchanged.
-    fn of(parts: Box<(SourcePreparation, ScanIndex, SourceScanResult)>) -> Self {
-        Self(EofParts::Scan(parts))
-    }
-
-    #[cfg(test)]
-    pub(super) fn synthetic() -> Self {
-        Self(EofParts::Synthetic)
-    }
-
-    /// The committed job's preparation, index and scan.
-    pub(super) fn into_parts(self) -> Option<(SourcePreparation, ScanIndex, SourceScanResult)> {
-        match self.0 {
-            EofParts::Scan(parts) => Some(*parts),
-            #[cfg(test)]
-            EofParts::Synthetic => None,
-        }
-    }
-}
-
 /// The permission a finished Codex page leaves for the next continuation page.
 /// Both bindings are fixed-size digests; the cursor side's boxed inputs are
 /// charged as process-retained memory ([`retained_bound`]).
@@ -147,22 +114,20 @@ pub(super) struct ContinuationTicket {
     /// The scan authority the asking page ran under ([`current_authority`]).
     authority: [u8; 32],
     cursor: CursorTicket,
-    /// The fixed lifetime of the cached inputs (K2/P-1, [`ticket_lifetime`]):
-    /// valid from `issued` until before `expires`. A page or EOF upload
-    /// outside it never runs, and nothing renews it.
     issued: Instant,
     expires: Instant,
 }
 
 impl ContinuationTicket {
     /// Attach the minting page's inputs (K2: moved from its preparation).
-    pub(super) fn with_inputs(mut self, inputs: ContinuationInputs) -> Self {
+    pub(super) fn with_inputs(mut self, inputs: ContinuationInputs, limit: usize) -> Option<Self> {
         match &mut self.cursor.0 {
             CursorParts::Codex(page) => page.inputs = Some(inputs),
             #[cfg(test)]
             CursorParts::Synthetic => drop(inputs),
         }
-        self
+        self.cursor.retained_bound(limit)?;
+        Some(self)
     }
 
     fn valid_at(&self, now: Instant) -> bool {
@@ -176,8 +141,6 @@ fn lifetime_holds(issued: Instant, expires: Instant, now: Instant) -> bool {
     issued <= now && now < expires
 }
 
-/// How one continuation page ended on the cursor side. No end but `Eof`
-/// saves anything (K7): the job's progress lives in the cursor slot.
 pub(super) enum PageEnd {
     /// The job paused again at its byte budget: the only end that may ask for
     /// another page.
@@ -189,8 +152,6 @@ pub(super) enum PageEnd {
     /// read (K1.1), or it ended with debt or a disclosure it does not save
     /// (K7.2); the job's paths stay pending for the next ordinary pass.
     Deferred,
-    /// The job reached EOF and committed; its upload obligation remains.
-    Eof(EofCompletion),
     /// The lease was lost, the page was dropped, or the process is stopping.
     /// Nothing was saved.
     #[allow(dead_code)] // No stop signal reaches a page yet; the fakes use it.
@@ -200,23 +161,13 @@ pub(super) enum PageEnd {
     Failed(anyhow::Error),
 }
 
-/// The cursor side of a continuation page ([`CodexContinuation`] over c22's
-/// `CodexCursorPort`). None of its methods may make a network call; the EOF
-/// completion upload is StateMissing's ([`Host::complete_eof`]).
+/// Resume only: no network calls or EOF completion.
 pub(super) trait CursorContinuation {
     /// Hunk A: the ticket of a just-finished ordinary Codex page, only for a
     /// valid, budget-exhausted, accelerated pause.
     fn ticket_for(&self, scan: &SourceScanResult) -> Option<CursorTicket>;
     /// `cursor_continuation_ready`: under the cursor lock, with no IO.
     fn ready(&mut self, ticket: &CursorTicket) -> bool;
-    /// One resume-only page: `ScanIndex::load`, the continuation-local
-    /// prepare (K1), `begin_codex_continuation_side_pass`, the scan. No end
-    /// but EOF saves (K7); an EOF page's index and scan go to the parent's
-    /// unchanged finish. Once `deadline` passes, the job pauses at the next
-    /// `step()` return without a ticket (`PausedContended`, K6). The deadline
-    /// is cooperative: the in-progress record, C14, local finalization and
-    /// scheduling may overrun it; it is not a hard lock-hold bound.
-    /// `ordinary_equivalent` is the interval this page stands for (K4).
     fn page(
         &mut self,
         ticket: CursorTicket,
@@ -225,32 +176,9 @@ pub(super) trait CursorContinuation {
     ) -> PageEnd;
 }
 
-/// A cursor side with no continuation, for the inert controls.
-#[cfg(test)]
-pub(super) struct NoCursorContinuation;
-
-#[cfg(test)]
-impl CursorContinuation for NoCursorContinuation {
-    fn ticket_for(&self, _scan: &SourceScanResult) -> Option<CursorTicket> {
-        None
-    }
-    fn ready(&mut self, _ticket: &CursorTicket) -> bool {
-        false
-    }
-    fn page(
-        &mut self,
-        _ticket: CursorTicket,
-        _deadline: Instant,
-        _ordinary_equivalent: Option<Duration>,
-    ) -> PageEnd {
-        PageEnd::Deferred
-    }
-}
-
 /// A platform answer. Anything but `Allowed` falls back to the ordinary
 /// cadence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // `Refused` comes from the platform hunk under review.
 pub(super) enum PlatformState {
     Allowed,
     Refused,
@@ -267,18 +195,87 @@ pub(super) trait PlatformGates {
     fn restore_qos(&mut self);
 }
 
-/// The service has no power, Low Power Mode or QoS call today. The proposed
-/// APIs wait for review, so every answer is unknown and no page runs.
-pub(super) struct NoPlatformSignals;
+#[derive(Default)]
+pub(super) struct MacPlatformSignals {
+    saved: Option<(u32, i32)>,
+    #[cfg(test)]
+    setter: Option<fn(u32, i32) -> bool>,
+}
+fn power_state(answer: i32) -> PlatformState {
+    match answer {
+        1 => PlatformState::Allowed,
+        0 => PlatformState::Refused,
+        _ => PlatformState::Unknown,
+    }
+}
 
-impl PlatformGates for NoPlatformSignals {
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn ottto_power_state() -> i32;
+    fn pthread_get_qos_class_np(thread: libc::pthread_t, class: *mut u32, rel: *mut i32) -> i32;
+    fn pthread_set_qos_class_self_np(class: u32, rel: i32) -> i32;
+}
+fn query_qos() -> Option<(u32, i32)> {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let (mut class, mut rel) = (0, 0);
+        (pthread_get_qos_class_np(libc::pthread_self(), &mut class, &mut rel) == 0)
+            .then_some((class, rel))
+    }
+    #[cfg(not(target_os = "macos"))]
+    None
+}
+fn set_qos(_class: u32, _rel: i32) -> bool {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        pthread_set_qos_class_self_np(_class, _rel) == 0
+    }
+    #[cfg(not(target_os = "macos"))]
+    false
+}
+impl MacPlatformSignals {
+    fn enter(&mut self, saved: Option<(u32, i32)>, set: fn(u32, i32) -> bool) -> PlatformState {
+        if let Some(saved) = saved.filter(|_| set(0x09, 0)) {
+            self.saved = Some(saved);
+            PlatformState::Allowed
+        } else {
+            PlatformState::Unknown
+        }
+    }
+    fn background() -> Option<Self> {
+        let mut signals = Self::default();
+        (signals.enter_background_qos() == PlatformState::Allowed).then_some(signals)
+    }
+}
+impl PlatformGates for MacPlatformSignals {
     fn power(&mut self) -> PlatformState {
-        PlatformState::Unknown
+        #[cfg(target_os = "macos")]
+        let answer = unsafe { ottto_power_state() };
+        #[cfg(not(target_os = "macos"))]
+        let answer = -1;
+        power_state(answer)
     }
     fn enter_background_qos(&mut self) -> PlatformState {
-        PlatformState::Unknown
+        self.enter(query_qos(), set_qos)
     }
-    fn restore_qos(&mut self) {}
+    fn restore_qos(&mut self) {
+        if let Some((class, rel)) = self.saved.take() {
+            // macOS has no "clear explicit QoS": unspecified restores DEFAULT.
+            let class = if class == 0 { 0x15 } else { class };
+            let set = set_qos;
+            #[cfg(test)]
+            let set = self.setter.unwrap_or(set);
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !set(class, rel) && !LOGGED.swap(true, Ordering::Relaxed) {
+                eprintln!("local snapshot continuation QoS restore failed");
+            }
+        }
+    }
+}
+impl Drop for MacPlatformSignals {
+    fn drop(&mut self) {
+        self.restore_qos();
+    }
 }
 
 /// Codex's cadence, for short critical sections.
@@ -287,8 +284,6 @@ pub(super) trait CadenceAccess {
     fn cadence<T>(&mut self, apply: impl FnOnce(&mut SourceCadence) -> T) -> Option<T>;
 }
 
-/// The state a continuation page reads, and StateMissing's settlement of an
-/// EOF page. Only [`Host::complete_eof`] touches the network.
 pub(super) trait Host: CadenceAccess {
     fn now(&mut self) -> Instant;
     /// Whether the server's upload backoff for Codex is still running.
@@ -299,13 +294,6 @@ pub(super) trait Host: CadenceAccess {
     /// record, endpoint and account witness; `None` when Codex is no longer
     /// granted or an input is unavailable.
     fn authority(&mut self) -> Option<[u8; 32]>;
-    /// The existing authorized completion upload, attempted once: the same
-    /// census fence, authority and destination validation and unchanged
-    /// `finish_sync_source` an ordinary Codex finish runs.
-    fn complete_eof(&mut self, completion: EofCompletion) -> Result<()>;
-    /// Completion cannot proceed now: the job's obligations stay owed to the
-    /// next ordinary pass. Never a whole-index save of the un-uploaded commit.
-    fn defer_eof(&mut self, completion: EofCompletion);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -334,9 +322,6 @@ pub(super) enum Outcome {
     /// source is now disabled): ordinary cadence next.
     PausedWithoutRequest,
     Deferred,
-    EofCompleted,
-    EofDeferred,
-    EofFailed,
     Cancelled,
     Failed,
 }
@@ -361,9 +346,6 @@ impl Outcome {
             Outcome::PausedContended => "paused_contended",
             Outcome::PausedWithoutRequest => "paused_without_request",
             Outcome::Deferred => "deferred",
-            Outcome::EofCompleted => "eof_completed",
-            Outcome::EofDeferred => "eof_deferred",
-            Outcome::EofFailed => "eof_failed",
             Outcome::Cancelled => "cancelled",
             Outcome::Failed => "failed",
         }
@@ -381,10 +363,6 @@ impl Outcome {
 /// newer ordinary decision with an older ticket. Clearing needs no lock: it
 /// can only lose a continuation.
 ///
-/// The page receives the earlier of `ordinary_deadline` and
-/// [`CONTENTION_WORK`] after entry as a cooperative deadline. Measured work
-/// runs from entry to just before the lock is released, so preparation, any EOF
-/// completion and finalization all count.
 pub(super) fn run_page<H: Host, P: CursorContinuation, G: PlatformGates>(
     host: &mut H,
     port: &mut P,
@@ -450,6 +428,7 @@ pub(super) fn run_page<H: Host, P: CursorContinuation, G: PlatformGates>(
     if gates.enter_background_qos() != PlatformState::Allowed {
         return skip(host, Skip::Platform);
     }
+    let qos = RestoreQos(gates);
     let ContinuationTicket {
         destination,
         authority,
@@ -466,13 +445,11 @@ pub(super) fn run_page<H: Host, P: CursorContinuation, G: PlatformGates>(
     let ordinary = host
         .cadence(|cadence| ordinary_equivalent(cadence, backoff))
         .flatten();
-    let qos = RestoreQos(gates);
     let ended = if port.ready(&cursor) {
         Some(port.page(cursor, deadline, ordinary))
     } else {
         None
     };
-    // Back to the thread's own QoS before any EOF network work.
     drop(qos);
     let (outcome, next) = match ended {
         None => (Outcome::Skipped(Skip::NotReady), None),
@@ -498,10 +475,6 @@ pub(super) fn run_page<H: Host, P: CursorContinuation, G: PlatformGates>(
             );
             (Outcome::Failed, None)
         }
-        Some(PageEnd::Eof(completion)) => (
-            settle_eof(host, completion, destination, authority, (issued, expires)),
-            None,
-        ),
     };
     let finished = host.now();
     let outcome = match next {
@@ -553,47 +526,6 @@ struct RestoreQos<'a, G: PlatformGates>(&'a mut G);
 impl<G: PlatformGates> Drop for RestoreQos<'_, G> {
     fn drop(&mut self) {
         self.0.restore_qos();
-    }
-}
-
-/// Settle an EOF page, still under the sync lock. The ticket's lifetime
-/// (K2/P-1), the authority, destination and upload backoff are rechecked
-/// immediately before the first network call of the page. The completion
-/// upload is attempted once and never retried here. A deferred completion can
-/// cost a re-read of the whole attempt, not one page.
-///
-/// An EOF completion is not an ordinary scan: the unchanged
-/// `finish_sync_source` records its cadence as one, so the ordinary Codex clock
-/// (tier, last scan, failures, full sweep) is saved first and put back after.
-/// The ordinary Codex cadence is therefore exactly what it was before the page.
-/// Without a saved clock the completion is deferred to the ordinary pass.
-fn settle_eof<H: Host>(
-    host: &mut H,
-    completion: EofCompletion,
-    destination: [u8; 32],
-    authority: [u8; 32],
-    (issued, expires): (Instant, Instant),
-) -> Outcome {
-    let now = host.now();
-    let current = lifetime_holds(issued, expires, now)
-        && !host.upload_backoff()
-        && host.destination() == Some(destination)
-        && host.authority() == Some(authority);
-    let clock = if current {
-        host.cadence(|cadence| cadence.ordinary_clock())
-    } else {
-        None
-    };
-    let Some(clock) = clock else {
-        host.defer_eof(completion);
-        return Outcome::EofDeferred;
-    };
-    let completed = host.complete_eof(completion);
-    host.cadence(|cadence| cadence.restore_ordinary_clock(clock));
-    if completed.is_ok() {
-        Outcome::EofCompleted
-    } else {
-        Outcome::EofFailed
     }
 }
 
@@ -649,12 +581,6 @@ pub(super) trait LoopHost {
     fn page(&mut self, deadline: Instant) -> Outcome;
 }
 
-/// Wait out one ordinary interval, running due continuation pages inside it.
-/// The ordinary deadline is fixed when the wait starts, and each page is given
-/// it as its own deadline. A page can still push the ordinary cycle out by
-/// the record it was reading when the deadline passed, required local
-/// finalization and scheduling, plus any EOF completion upload. There is no
-/// hard elapsed-time guarantee.
 pub(super) fn wait_for_ordinary_cycle(host: &mut impl LoopHost, interval: Duration) {
     let start = host.now();
     let Some(deadline) = start.checked_add(interval) else {
@@ -674,7 +600,7 @@ pub(super) fn wait_for_ordinary_cycle(host: &mut impl LoopHost, interval: Durati
                     return;
                 }
                 let outcome = host.page(deadline);
-                if matches!(outcome, Outcome::EofFailed | Outcome::Failed) {
+                if matches!(outcome, Outcome::Failed) {
                     eprintln!(
                         "local snapshot continuation page ended: {}",
                         outcome.label()
@@ -785,22 +711,14 @@ pub(super) fn ticket_lifetime(prepared_at: Option<Instant>) -> Option<(Instant, 
     .flatten()
 }
 
-/// An ordinary Codex prepare is starting: whatever it learns (a disable, a
-/// new key epoch, another destination) replaces the cached inputs, so the
-/// older ticket and its context are dropped now. Only while enabled.
 pub(super) fn invalidate_on_ordinary_prepare() {
-    if ENABLED {
-        clear(&mut CodexCadence, &TICKET);
-    }
+    clear(&mut CodexCadence, &TICKET);
 }
 
 /// K2 accounting: the held ticket's inputs (context inventories, strings,
 /// cached policy) as process-retained memory, outside every rotation frame.
 /// `None` (unsupported layout, unknown size) makes the rotation discard it.
 pub(super) fn retained_bound(limit: usize) -> Option<usize> {
-    if !ENABLED {
-        return Some(0);
-    }
     match lock_slot(&TICKET).as_ref() {
         None => Some(0),
         Some(ticket) => ticket.cursor.retained_bound(limit),
@@ -809,9 +727,7 @@ pub(super) fn retained_bound(limit: usize) -> Option<usize> {
 
 /// The rotation refused the retained charge: drop the ticket and its inputs.
 pub(super) fn discard_retained() {
-    if ENABLED {
-        clear(&mut CodexCadence, &TICKET);
-    }
+    clear(&mut CodexCadence, &TICKET);
 }
 
 /// After an ordinary Codex finish, under `SNAPSHOT_SYNC_LOCK`: keep the page's
@@ -876,17 +792,11 @@ impl CycleSettlement {
 
 impl Drop for CycleSettlement {
     fn drop(&mut self) {
-        if ENABLED {
-            settle_cycle(&mut CodexCadence, &TICKET, self.succeeded_with_codex);
-        }
+        settle_cycle(&mut CodexCadence, &TICKET, self.succeeded_with_codex);
     }
 }
 
-/// The pending page for the loop planner, or `None` while inert.
 pub(super) fn production_pending() -> Option<(Instant, Duration)> {
-    if !ENABLED {
-        return None;
-    }
     if lock_slot(&TICKET).is_none() {
         return None;
     }
@@ -898,12 +808,8 @@ pub(super) fn production_pending() -> Option<(Instant, Duration)> {
     .flatten()
 }
 
-/// The production host: local reads, plus the EOF completion inputs.
 struct ProductionHost<'a> {
-    home: &'a Path,
-    support_dir: &'a Path,
     daemon: &'a LocalDaemon,
-    retry: &'a mut LiveRetryOwner,
 }
 
 impl CadenceAccess for ProductionHost<'_> {
@@ -933,53 +839,18 @@ impl Host for ProductionHost<'_> {
         let account = self.daemon.snapshot_scan_account_witness().ok()?;
         current_authority(&current, &snapshot_api_base_url().ok()?, &account)
     }
-    fn complete_eof(&mut self, completion: EofCompletion) -> Result<()> {
-        let completed = completion
-            .into_parts()
-            .ok_or_else(|| anyhow!("continuation completion has no scan"))?;
-        complete_continuation_eof(
-            self.home,
-            self.support_dir,
-            self.daemon,
-            self.retry,
-            completed,
-        )
-    }
-    fn defer_eof(&mut self, completion: EofCompletion) {
-        // Nothing is uploaded or saved: the committed job stays owed to the
-        // next ordinary pass. Its attempt was consumed when it committed, so
-        // this can cost a re-read of the whole attempt; it is counted.
-        let deferred = EOF_DEFERRALS.fetch_add(1, Ordering::Relaxed) + 1;
-        eprintln!(
-            "local snapshot continuation EOF deferred to the ordinary pass ({deferred} so far); its attempt may be re-read"
-        );
-        drop(completion);
-    }
 }
 
-/// EOF completions deferred to the ordinary pass, process lifetime.
-static EOF_DEFERRALS: AtomicU64 = AtomicU64::new(0);
-
-/// One production continuation page, or a skip while inert.
 pub(super) fn run_production_page(
     home: &Path,
     support_dir: &Path,
     daemon: &LocalDaemon,
-    retry: &mut LiveRetryOwner,
     ordinary_deadline: Instant,
 ) -> Outcome {
-    if !ENABLED {
-        return Outcome::Skipped(Skip::NoTicket);
-    }
     run_page(
-        &mut ProductionHost {
-            home,
-            support_dir,
-            daemon,
-            retry,
-        },
+        &mut ProductionHost { daemon },
         &mut CodexContinuation::new(&daemon.transcript_cache, home, support_dir),
-        &mut NoPlatformSignals,
+        &mut MacPlatformSignals::default(),
         SNAPSHOT_SYNC_LOCK.get_or_init(|| Mutex::new(())),
         &TICKET,
         ordinary_deadline,
@@ -1021,7 +892,6 @@ static WORKER_LATCHED: AtomicBool = AtomicBool::new(false);
 const _: () = {
     const fn assert_send<T: Send>() {}
     assert_send::<PageEnd>();
-    assert_send::<EofCompletion>();
     assert_send::<WorkerEnd>();
     assert_send::<CodexPage>();
     assert_send::<ContinuationInputs>();
@@ -1052,17 +922,11 @@ fn on_worker<T: Send>(body: impl FnOnce() -> T + Send) -> std::result::Result<T,
     std::thread::scope(|scope| {
         let worker = std::thread::Builder::new()
             .name("ottto-codex-continuation".to_string())
+            .stack_size(SNAPSHOT_SYNC_WORKER_STACK_BYTES)
             .spawn_scoped(scope, body)
             .map_err(|_| WorkerFailure::Spawn)?;
         worker.join().map_err(|_| WorkerFailure::Panicked)
     })
-}
-
-/// W11: the worker's own background QoS, applied inside the worker. The
-/// platform call is hunk F, still under its parent decision, so production
-/// answers `Unknown` and the page reads nothing.
-fn no_worker_qos() -> PlatformState {
-    PlatformState::Unknown
 }
 
 /// How the page ended on the worker. Everything here is `Send` (W1) and
@@ -1078,8 +942,6 @@ enum WorkerEnd {
     Deferred,
     /// The continuation-local prepare refused before any read (K1.1).
     Refused(&'static str),
-    /// The job committed: the parts the parent's unchanged finish uploads.
-    Eof(Box<(SourcePreparation, ScanIndex, SourceScanResult)>),
     /// A non-EOF end produced snapshots (K7.1): nothing is saved, and the
     /// worker latch is set.
     Unexpected,
@@ -1092,8 +954,7 @@ pub(super) struct CodexContinuation<'a> {
     cache: &'a Arc<SharedCache>,
     home: &'a Path,
     support_dir: &'a Path,
-    /// The worker's QoS (W11): [`no_worker_qos`] in production.
-    worker_qos: fn() -> PlatformState,
+    worker_qos: fn() -> Option<MacPlatformSignals>,
     /// The process latch (W8): [`WORKER_LATCHED`] in production.
     latch: &'static AtomicBool,
 }
@@ -1104,7 +965,7 @@ impl<'a> CodexContinuation<'a> {
             cache,
             home,
             support_dir,
-            worker_qos: no_worker_qos,
+            worker_qos: MacPlatformSignals::background,
             latch: &WORKER_LATCHED,
         }
     }
@@ -1187,7 +1048,6 @@ fn page_end(
             eprintln!("local snapshot continuation page refused: {label}");
             PageEnd::Deferred
         }
-        Ok(WorkerEnd::Eof(parts)) => PageEnd::Eof(EofCompletion::of(parts)),
         Ok(WorkerEnd::Unexpected) => {
             latch.store(true, Ordering::SeqCst);
             PageEnd::Failed(anyhow!("continuation page produced snapshots before EOF"))
@@ -1196,9 +1056,6 @@ fn page_end(
     }
 }
 
-/// The whole page on one thread (W4): the worker's QoS, the members, then
-/// the continuation-local prepare and scan. Nothing is saved before EOF (K7),
-/// and no cursor credit, lease or active file outlives this call (W3).
 #[allow(clippy::too_many_arguments)]
 fn page_on_worker(
     cache: &Arc<SharedCache>,
@@ -1207,14 +1064,14 @@ fn page_on_worker(
     mut page: Box<CodexPage>,
     deadline: Instant,
     ordinary_equivalent: Option<Duration>,
-    qos: fn() -> PlatformState,
+    qos: fn() -> Option<MacPlatformSignals>,
 ) -> WorkerEnd {
-    if qos() != PlatformState::Allowed {
-        return WorkerEnd::Deferred;
-    }
-    let Some(members) = CodexCursorPort::new(Arc::clone(cache)).members(&page.cursor) else {
+    let Some(_qos) = qos() else {
         return WorkerEnd::Deferred;
     };
+    if !CodexCursorPort::new(Arc::clone(cache)).ready(&page.cursor) {
+        return WorkerEnd::Deferred;
+    }
     let Some(inputs) = page.inputs.as_mut() else {
         return WorkerEnd::Deferred;
     };
@@ -1223,14 +1080,12 @@ fn page_on_worker(
         support_dir,
         cache,
         inputs,
-        &members,
         ordinary_equivalent,
         deadline,
     ) {
         Err(error) => WorkerEnd::Failed(error),
         Ok(ContinuationScan::Refused(reason)) => WorkerEnd::Refused(reason.label()),
         Ok(ContinuationScan::StepRefused) => WorkerEnd::Deferred,
-        Ok(ContinuationScan::Committed(parts)) => WorkerEnd::Eof(parts),
         Ok(ContinuationScan::Uncommitted { snapshots, .. }) if snapshots != 0 => {
             WorkerEnd::Unexpected
         }
