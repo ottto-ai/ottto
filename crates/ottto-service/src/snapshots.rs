@@ -7707,6 +7707,8 @@ impl SourceScanResult {
 
 #[derive(Debug, Clone)]
 struct PendingIndexFinalization {
+    /// Actual paid decoder on this pass; retained re-emission is never a Full.
+    archive_first_read: bool,
     sampled_audit_verified: bool,
     codex_pending_recovery: bool,
     index_key: String,
@@ -8037,12 +8039,8 @@ pub fn finalize_scan_after_policy_with_body_witness(
         // counts a first A1 on a new archive key with accepted history (including
         // re-upgrades); no owner protection or money proof is manufactured.
         if source == SnapshotSource::Codex
+            && pending.archive_first_read
             && pending.previous_snapshot_fingerprint.is_none()
-            && index
-                .files
-                .get(&pending.index_key)
-                .and_then(|entry| entry.archive.as_deref())
-                .is_some_and(|archive| archive.decode_attempts == 1 && !archive.user_change)
             && final_fingerprints
                 .iter()
                 .any(|fp| index.accepted_snapshot_fingerprints.contains(fp))
@@ -29949,6 +29947,18 @@ impl OwnedSourceScan {
                 };
                 let claude_grown_prefix =
                     source == SnapshotSource::ClaudeCode && parser.reader.sealed_prefix.is_some();
+                let archive_first_read = source == SnapshotSource::Codex
+                    && matches!(
+                        &parser.reader.reader,
+                        codex_compressed_input::OpenedInput::Compressed(..)
+                    )
+                    && index
+                        .files
+                        .get(&index_key)
+                        .and_then(|entry| entry.archive.as_deref())
+                        .is_some_and(|archive| {
+                            archive.decode_attempts == 1 && !archive.user_change
+                        });
                 let archive_owner = parser.accumulator.codex_creator_header_id.clone();
                 let parsed_file = parser.finish_with_repository_identity(
                     &candidate.opened_object_identity,
@@ -30889,6 +30899,7 @@ impl OwnedSourceScan {
                         }
                         let alias_fingerprint = alias.source_file_fingerprint.clone();
                         pending_finalization.push(PendingIndexFinalization {
+                            archive_first_read: false,
                             sampled_audit_verified: false,
                             codex_pending_recovery: index
                                 .files
@@ -30950,6 +30961,7 @@ impl OwnedSourceScan {
                     }
                 }
                 pending_finalization.push(PendingIndexFinalization {
+                    archive_first_read,
                     sampled_audit_verified,
                     codex_pending_recovery: index
                         .files
@@ -92787,7 +92799,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, recovered_audit_due, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, reader, accumulator, archive_checkpoint, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
 crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery; shared codex_versions);
-crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
+crate::heap_layout_bound::fields!(PendingIndexFinalization; archive_first_read, sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::durable_tail_codec::durable_struct!(key RowKey {

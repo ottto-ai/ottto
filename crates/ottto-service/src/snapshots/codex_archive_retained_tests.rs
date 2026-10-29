@@ -47,6 +47,11 @@ fn unsettled_retained_archive_resends_zero_decoded_bytes_and_exact_ack_settles()
         "completed decode actually admitted"
     );
     let attempt = index.files[&key].archive.as_ref().unwrap().decode_attempts;
+    // Exact accepted history is not enough to call a zero-I/O resend a Full.
+    index
+        .accepted_snapshot_fingerprints
+        .insert(first.snapshots[0].snapshot_fingerprint.clone());
+    index.files.get_mut(&key).unwrap().last_snapshot_fingerprint = None;
     retry_due(&mut index, &key);
     let ((mut index, resent), rows) = crate::local_resource_diagnostics::capture(|| {
         finish_selector(retained_archive_scan(&f, index, cache.clone()))
@@ -59,6 +64,7 @@ fn unsettled_retained_archive_resends_zero_decoded_bytes_and_exact_ack_settles()
     assert_eq!(decodes(&rows), 0, "no inventory decoder either");
     assert_eq!(archive_event_count(&rows, "codex_zst_retained_resend"), 1);
     assert_eq!(archive_event_count(&rows, "codex_zst_first_read_retry"), 0);
+    assert_eq!(archive_event_count(&rows, "archive_reupgrade_full"), 0);
     assert_eq!(
         index.files[&key].archive.as_ref().unwrap().decode_attempts,
         attempt

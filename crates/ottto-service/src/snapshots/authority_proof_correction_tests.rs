@@ -853,6 +853,7 @@ fn apc_pending(
     parsed_snapshot_count: usize,
 ) -> PendingIndexFinalization {
     PendingIndexFinalization {
+        archive_first_read: false,
         sampled_audit_verified: false,
         codex_pending_recovery: false,
         index_key: apc_keys()[slot].clone(),

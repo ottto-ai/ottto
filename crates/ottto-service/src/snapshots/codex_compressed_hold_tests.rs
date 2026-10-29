@@ -2524,7 +2524,8 @@ fn historical_census_saved_singleton_schedules_a1_on_reupgrade() {
             false,
             false,
         );
-        // A real activated discovery construction, not a typed decoder fixture.
+        scan.index.archive_pass.power = false; // deterministic permission denial on every host
+                                               // A real activated discovery construction, not a typed decoder fixture.
         for _ in 0..100 {
             if scan
                 .identified_candidates
