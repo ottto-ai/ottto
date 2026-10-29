@@ -14,7 +14,7 @@ No migration occurs in this slice: tag 1 and its scope formula are unchanged.
 An absent record keeps the existing Full-on-miss behavior, including absence
 caused by capacity, inventory overflow, write deferral, failed persistence or GC.
 There is no missing-state hold, counter, alarm or special Codex exemption.
-O3 upgrade recovery belongs to 5b-Claude-A1 (SOURCE SRC-1b): idle hold, then one
+O3 upgrade recovery belongs to 5b-A1a/A1b2d (SOURCE SRC-1b): idle hold, then one
 counted A5 on real new content, excluding keys with no record by design. That
 later slice must supply its durable cause binding; this change grants none.
 GD's retired reservation ledger and positional fields remain retired.

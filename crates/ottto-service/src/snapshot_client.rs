@@ -1652,6 +1652,10 @@ impl SnapshotApiClient {
         crate::relay_auth::binding_key(&self.api_base_url, device, secret, source.api_slug())
     }
 
+    pub(crate) fn api_base_seal(&self) -> [u8; 32] {
+        use sha2::Digest;
+        sha2::Sha256::digest(self.api_base_url.as_bytes()).into()
+    }
     pub(crate) fn matches_api_base(&self, expected: &str) -> bool {
         self.api_base_url == expected
     }
@@ -3202,7 +3206,9 @@ fn truncate_diagnostic(value: &str) -> String {
 /// pre-confirm guards are the crash boundary immediately before the request:
 /// a transport failure after that cut cannot prove the old authority survived.
 pub fn ensure_no_incomplete_device_credential_promotion() -> Result<()> {
-    let pending = FilePendingDeviceCredentialStore::default().load()?;
+    let pending = crate::local_resource_diagnostics::credential_file_read(
+        FilePendingDeviceCredentialStore::default().load(),
+    )?;
     if pending.as_ref().is_some_and(|pending| {
         pending.confirmed_at.is_some()
             || (pending.confirmation_authorized && pending.preconfirm_guards_passed)
@@ -3214,12 +3220,15 @@ pub fn ensure_no_incomplete_device_credential_promotion() -> Result<()> {
 
 pub fn load_snapshot_device_credentials() -> Result<(LocalDeviceBinding, String)> {
     ensure_no_incomplete_device_credential_promotion()?;
-    let device = FileDeviceStore::default()
-        .load()?
-        .ok_or_else(|| anyhow!("relay device binding is missing"))?;
-    let secret = KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
-        .load()
-        .map_err(|error| anyhow!("relay device secret is missing: {error}"))?;
+    let device =
+        crate::local_resource_diagnostics::credential_file_read(FileDeviceStore::default().load())?
+            .ok_or_else(|| anyhow!("relay device binding is missing"))?;
+    let secret = crate::local_resource_diagnostics::credential_file_read(
+        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .load()
+            .map_err(anyhow::Error::new),
+    )
+    .map_err(|error| anyhow!("relay device secret is missing: {error}"))?;
     Ok((device, secret))
 }
 

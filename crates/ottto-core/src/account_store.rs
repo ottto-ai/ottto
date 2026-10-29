@@ -268,8 +268,12 @@ impl FileConnectionStore {
         if !self.path.exists() {
             return Ok(None);
         }
-        let body = fs::read_to_string(&self.path)
-            .with_context(|| format!("read connection binding {}", self.path.display()))?;
+        let body = crate::credential_file::read(
+            fs::File::open(&self.path)
+                .with_context(|| format!("open connection binding {}", self.path.display()))?,
+            crate::CredentialFileCapRefused::ConnectionBinding,
+        )
+        .with_context(|| format!("read connection binding {}", self.path.display()))?;
         serde_json::from_str(&body)
             .with_context(|| format!("parse connection binding {}", self.path.display()))
     }
@@ -360,11 +364,20 @@ impl FileDeviceStore {
         &self.path
     }
 
+    fn read_bounded(&self) -> Result<String> {
+        crate::credential_file::read(
+            fs::File::open(&self.path)?,
+            crate::CredentialFileCapRefused::DeviceBinding,
+        )
+        .map_err(Into::into)
+    }
+
     pub fn load(&self) -> Result<Option<LocalDeviceBinding>> {
         if !self.path.exists() {
             return Ok(None);
         }
-        let body = fs::read_to_string(&self.path)
+        let body = self
+            .read_bounded()
             .with_context(|| format!("read device binding {}", self.path.display()))?;
         serde_json::from_str(&body)
             .with_context(|| format!("parse device binding {}", self.path.display()))
@@ -382,7 +395,8 @@ impl FileDeviceStore {
         if !self.path.exists() {
             return Ok(None);
         }
-        let body = fs::read_to_string(&self.path)
+        let body = self
+            .read_bounded()
             .with_context(|| format!("read device binding {}", self.path.display()))?;
         serde_json::from_str(&body).with_context(|| {
             format!(
@@ -438,8 +452,13 @@ impl FilePendingDeviceCredentialStore {
         if !self.path.exists() {
             return Ok(None);
         }
-        let body = fs::read_to_string(&self.path)
-            .with_context(|| format!("read pending device credential {}", self.path.display()))?;
+        let body = crate::credential_file::read(
+            fs::File::open(&self.path).with_context(|| {
+                format!("open pending device credential {}", self.path.display())
+            })?,
+            crate::CredentialFileCapRefused::PendingDeviceCredential,
+        )
+        .with_context(|| format!("read pending device credential {}", self.path.display()))?;
         serde_json::from_str(&body)
             .with_context(|| format!("parse pending device credential {}", self.path.display()))
     }
@@ -635,6 +654,72 @@ mod tests {
 
         assert_eq!(store.reset().expect("reset connection"), Some(connection));
         assert_eq!(store.load().expect("load reset"), None);
+    }
+
+    #[test]
+    fn connection_and_pending_credential_loads_enforce_64_kib_boundary() {
+        let path = temp_path("retry-other-authority-size-bound");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for pending in [false, true] {
+            let load = || {
+                if pending {
+                    FilePendingDeviceCredentialStore::new(&path)
+                        .load()
+                        .map(|v| v.is_none())
+                } else {
+                    FileConnectionStore::new(&path).load().map(|v| v.is_none())
+                }
+            };
+            let mut bytes = b"null".to_vec();
+            bytes.resize(64 * 1024, b' ');
+            fs::write(&path, &bytes).unwrap();
+            assert!(load().unwrap());
+            bytes.push(b' ');
+            fs::write(&path, &bytes).unwrap();
+            let error = load().unwrap_err();
+            assert!(format!("{error:#}").contains("exceeds 64 KiB"));
+            assert!(error
+                .chain()
+                .filter_map(|e| e.downcast_ref::<std::io::Error>())
+                .any(|e| e
+                    .get_ref()
+                    .is_some_and(|e| e.is::<crate::CredentialFileCapRefused>())));
+            fs::remove_file(&path).unwrap();
+            assert!(load().unwrap());
+        }
+        fs::remove_dir(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn device_binding_loads_enforce_64_kib_boundary() {
+        let path = temp_path("device-size-bound");
+        let store = FileDeviceStore::new(&path);
+        let binding = LocalDeviceCredentialBinding {
+            device: LocalDeviceBinding {
+                device_id: "synthetic-device".into(),
+                machine_id: None,
+                sources: vec!["pi".into()],
+            },
+            credential_generation: 1,
+        };
+        store.save_with_credential_generation(&binding).unwrap();
+        let mut bytes = serde_json::to_vec(&binding).unwrap();
+        bytes.resize(64 * 1024, b' ');
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(store.load().unwrap(), Some(binding.device.clone()));
+        assert_eq!(
+            store.load_with_credential_generation().unwrap(),
+            Some(binding)
+        );
+        bytes.push(b' ');
+        fs::write(&path, &bytes).unwrap();
+        for error in [
+            store.load().unwrap_err(),
+            store.load_with_credential_generation().unwrap_err(),
+        ] {
+            assert!(format!("{error:#}").contains("exceeds 64 KiB"));
+        }
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

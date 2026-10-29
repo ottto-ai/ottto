@@ -4254,7 +4254,7 @@ fn sync_once_with_retry(
     let account_witness = daemon
         .snapshot_scan_account_witness()
         .map_err(|_| anyhow!("snapshot account authority unavailable"))?;
-    let client = snapshot_cycle_client(support_dir, daemon);
+    let client = snapshot_cycle_client(support_dir, daemon)?;
     let enabled_sources = enabled_snapshot_sources(&device);
 
     if let Some(source) = enabled_sources.first().copied() {
@@ -4335,7 +4335,7 @@ fn sync_once_with_retry(
 }
 
 /// The cycle's API client, with the receipt state and context every cycle uses.
-fn snapshot_cycle_client(support_dir: &Path, daemon: &LocalDaemon) -> SnapshotApiClient {
+fn snapshot_cycle_client(support_dir: &Path, daemon: &LocalDaemon) -> Result<SnapshotApiClient> {
     let device_label = daemon
         .machine_for_trusted_client()
         .ok()
@@ -4344,9 +4344,9 @@ fn snapshot_cycle_client(support_dir: &Path, daemon: &LocalDaemon) -> SnapshotAp
         .account_for_trusted_client()
         .ok()
         .map(|account| account.state);
-    SnapshotApiClient::new(snapshot_api_base_url())
+    Ok(SnapshotApiClient::new(snapshot_api_base_url()?)
         .with_receipt_state_dir(support_dir)
-        .with_receipt_context(device_label, account_binding)
+        .with_receipt_context(device_label, account_binding))
 }
 
 /// A continuation job's EOF completion, called with `SNAPSHOT_SYNC_LOCK` held:
@@ -4370,7 +4370,7 @@ fn complete_continuation_eof(
     let account_witness = daemon
         .snapshot_scan_account_witness()
         .map_err(|_| anyhow!("snapshot account authority unavailable"))?;
-    let client = snapshot_cycle_client(support_dir, daemon);
+    let client = snapshot_cycle_client(support_dir, daemon)?;
     let mut transport_cycle = crate::net_resilience::TransportCycleOutcome::default();
     let mut failed_sources = Vec::new();
     SnapshotCycleOwner {
@@ -4634,7 +4634,7 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
         // Read before the scan is consumed; kept only if the finish succeeds.
         let continuation_ticket =
             (continuation::ENABLED && source == SnapshotSource::Codex).then(|| {
-                let endpoint = snapshot_api_base_url();
+                let endpoint = snapshot_api_base_url().ok()?;
                 let authority = self
                     .client
                     .matches_api_base(&endpoint)
@@ -4723,7 +4723,7 @@ pub fn upload_local_health_projection_now(daemon: &LocalDaemon) -> Result<()> {
     let Some(source) = enabled_snapshot_sources(&device).first().copied() else {
         return Err(anyhow!("registered device has no enabled sources"));
     };
-    let client = SnapshotApiClient::new(snapshot_api_base_url());
+    let client = SnapshotApiClient::new(snapshot_api_base_url()?);
     upload_local_health_projection_reporting(
         &client,
         &device,
@@ -4745,7 +4745,7 @@ fn upload_local_health_projection_reporting(
     // The binding this pass's requests are for, captured before any of them.
     // A failure is recorded against it, never against a setup run attached
     // while a request was in flight.
-    let binding = setup_run_refresh_binding(device, device_secret, source);
+    let binding = setup_run_refresh_binding(device, device_secret, source)?;
     let relay_binding = client.relay_auth_binding(device, device_secret, source);
     if let Some(held) = setup_run_refresh_hold_for(&binding) {
         // No request at all while held: the last `AuthRejected` upload event
@@ -4881,14 +4881,14 @@ fn setup_run_refresh_binding(
     device: &LocalDeviceBinding,
     device_secret: &str,
     source: SnapshotSource,
-) -> [u8; 32] {
+) -> Result<[u8; 32]> {
     let mut digest = Sha256::new();
     digest.update(b"ottto:setup-run-refresh-hold:v1\0");
     digest.update(device.device_id.as_bytes());
     digest.update(b"\0");
     digest.update(device_secret.as_bytes());
     digest.update(crate::relay_auth::binding_key(
-        &snapshot_api_base_url(),
+        &snapshot_api_base_url()?,
         device,
         device_secret,
         source.api_slug(),
@@ -4899,7 +4899,7 @@ fn setup_run_refresh_binding(
         digest.update(b"\0");
         digest.update(connection.api_base_url.as_bytes());
     }
-    digest.finalize().into()
+    Ok(digest.finalize().into())
 }
 
 fn setup_run_refresh_hold_duration(failures: u32) -> Duration {
@@ -5069,7 +5069,7 @@ pub fn upload_agent_status_snapshots(snapshots: &[AgentStatusSnapshot]) -> Resul
     let Some(machine_id) = snapshot_machine_id(&device)? else {
         return Err(anyhow!("machine identity is missing"));
     };
-    let client = SnapshotApiClient::new(snapshot_api_base_url());
+    let client = SnapshotApiClient::new(snapshot_api_base_url()?);
 
     let mut uploaded = 0;
     let mut failed_sources = Vec::new();
@@ -6227,6 +6227,7 @@ fn prepare_sync_source_inner(
             &activity_hint,
             &upload_destination_namespace,
             &backfill_state,
+            client.api_base_seal(),
         )
     } else {
         None
@@ -11015,7 +11016,7 @@ fn collector_checkin_once() -> Result<()> {
     if enabled_sources.is_empty() {
         return Err(anyhow!("registered device has no enabled sources"));
     }
-    let client = SnapshotApiClient::new(snapshot_api_base_url());
+    let client = SnapshotApiClient::new(snapshot_api_base_url()?);
     let mut failed_sources = Vec::new();
     for source in enabled_sources {
         if report_checkin_status_with_fresh_relay_token(
@@ -11066,15 +11067,23 @@ pub(crate) fn enabled_snapshot_sources(device: &LocalDeviceBinding) -> Vec<Snaps
     .collect()
 }
 
-pub(crate) fn snapshot_api_base_url() -> String {
-    normalize_api_base_url(
-        FileConnectionStore::default()
-            .load()
-            .ok()
-            .flatten()
-            .map(|binding| binding.api_base_url),
+pub(crate) fn snapshot_api_base_url() -> Result<String> {
+    snapshot_api_base_url_from(
+        FileConnectionStore::default().load(),
         std::env::var("OTTTO_API_BASE_URL").ok(),
     )
+}
+fn snapshot_api_base_url_from(
+    connection: Result<Option<ottto_core::LocalConnectionBinding>>,
+    env_value: Option<String>,
+) -> Result<String> {
+    // Read/parse/cap errors are not an absent binding: never redirect secrets
+    // to the environment/default destination after a persisted binding fails.
+    let connection = crate::local_resource_diagnostics::connection_binding_read(connection)?;
+    Ok(normalize_api_base_url(
+        connection.map(|binding| binding.api_base_url),
+        env_value,
+    ))
 }
 
 fn normalize_api_base_url(connection_value: Option<String>, env_value: Option<String>) -> String {
@@ -11276,10 +11285,11 @@ fn ensure_snapshot_scan_authority(
             operation: "source authority changed during owned scan",
         })
     };
-    let current = ottto_core::FileDeviceStore::default()
-        .load()
-        .map_err(|_| rejected())?
-        .ok_or_else(rejected)?;
+    let current = crate::local_resource_diagnostics::credential_file_read(
+        ottto_core::FileDeviceStore::default().load(),
+    )
+    .map_err(|_| rejected())?
+    .ok_or_else(rejected)?;
     let account = daemon
         .snapshot_scan_account_witness()
         .map_err(|_| rejected())?;
@@ -11287,7 +11297,7 @@ fn ensure_snapshot_scan_authority(
         expected_device,
         &current,
         source,
-        client.matches_api_base(&snapshot_api_base_url()),
+        client.matches_api_base(&snapshot_api_base_url().map_err(|_| rejected())?),
         expected_account,
         &account,
     )
@@ -11463,7 +11473,9 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("; ");
-    if text.contains("relay device") {
+    if text.contains("connection binding") {
+        "connection binding is unavailable or invalid; reconnect this device".to_string()
+    } else if text.contains("relay device") {
         "relay device credentials are unavailable".to_string()
     } else if text.contains("machine identity") {
         "machine identity is unavailable".to_string()
@@ -18259,6 +18271,83 @@ mod tests {
     fn local_health_heartbeat_cadence_is_not_bound_to_snapshot_scans() {
         assert!(LOCAL_HEALTH_PROJECTION_INTERVAL < SNAPSHOT_SYNC_INTERVAL);
         assert!(LOCAL_HEALTH_PROJECTION_INTERVAL <= Duration::from_secs(60));
+    }
+
+    #[test]
+    #[serial]
+    fn endpoint_load_failure_during_scan_is_local_state() {
+        if !crate::test_isolation::run_here() {
+            return;
+        }
+        let root = test_dir("scan-endpoint-load-failure");
+        std::fs::create_dir_all(&root).unwrap();
+        let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+        let device = LocalDeviceBinding {
+            sources: vec!["pi".into()],
+            ..bounded_native_device()
+        };
+        FileDeviceStore::default().save(&device).unwrap();
+        let daemon = test_daemon(&"a".repeat(64));
+        let account = daemon.snapshot_scan_account_witness().unwrap();
+        let client = SnapshotApiClient::new("https://synthetic.invalid");
+        for bytes in [b"invalid-json".to_vec(), vec![b' '; 64 * 1024 + 1]] {
+            std::fs::write(root.join("connection.json"), bytes).unwrap();
+            let load_error = snapshot_api_base_url().unwrap_err();
+            assert_eq!(
+                safe_error(&load_error),
+                "connection binding is unavailable or invalid; reconnect this device"
+            );
+            let error = ensure_snapshot_scan_authority(
+                &device,
+                SnapshotSource::Pi,
+                &client,
+                &account,
+                &daemon,
+            )
+            .unwrap_err();
+            assert_eq!(
+                snapshot_upload_error_class(&error),
+                Some(SnapshotUploadErrorClass::LocalState)
+            );
+            assert_eq!(safe_error(&error), "local snapshot state failed");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn connection_cap_refusal_never_selects_environment_or_default_endpoint() {
+        use std::fs;
+        let root = test_dir("connection-cap-endpoint");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("connection.json");
+        let store = FileConnectionStore::new(&path);
+        let mut bytes = serde_json::to_vec(&serde_json::json!({
+            "setup_run_id": "synthetic", "setup_run_token_expires_at": "synthetic",
+            "machine_id": null, "api_base_url": "https://custom.invalid"
+        }))
+        .unwrap();
+        bytes.resize(64 * 1024, b' ');
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            snapshot_api_base_url_from(store.load(), None).unwrap(),
+            "https://custom.invalid"
+        );
+        bytes.push(b' ');
+        fs::write(&path, &bytes).unwrap();
+        for env in [None, Some("https://fallback.invalid".to_owned())] {
+            let mut client_created = false;
+            let result = snapshot_api_base_url_from(store.load(), env).map(|base| {
+                client_created = true;
+                SnapshotApiClient::new(base)
+            });
+            assert!(result.is_err());
+            assert!(!client_created);
+        }
+        assert_eq!(
+            snapshot_api_base_url_from(Ok(None), Some("https://fallback.invalid".into())).unwrap(),
+            "https://fallback.invalid"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
