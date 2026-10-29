@@ -475,7 +475,8 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
                     .checked_add(entry_slot_bytes::<S>(other.capacity())?)?
                     .checked_add(entry.heap_bytes)?;
             }
-            (count <= self.count_limit && bytes <= limit).then_some(())
+            // Header eviction can relieve bytes, never retained-entry count.
+            ((!victims || count <= self.count_limit) && bytes <= limit).then_some(())
         })()
         .is_some()
     }
@@ -585,9 +586,9 @@ mod tests {
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
     fn insertion_preflight_matches_real_rank_and_reservation_outcomes() {
-        for reserved in [0, 8 * 1024, 24 * 1024, 32 * 1024] {
+        for reserved in [0, 32 * 1024, 96 * 1024, 128 * 1024] {
             for rank in [(9, 0), (10, 0), (20, 0), (30, 0)] {
-                let mut cache = TranscriptCache::new(32 * 1024, 8192, 2);
+                let mut cache = TranscriptCache::new(128 * 1024, 8192, 2);
                 for (key, rank) in [("old", (10, 0)), ("newer", (20, 0))] {
                     assert!(cache.insert_reserving_at_rank(
                         key.into(),
@@ -599,6 +600,12 @@ mod tests {
                 }
                 let incoming = retained("incoming".into());
                 let key = String::from("new");
+                if reserved == 0 {
+                    assert!(
+                        cache.insertion_fits(&key, &incoming, reserved, rank, false),
+                        "count pressure alone must not evict optional headers"
+                    );
+                }
                 let predicted = cache.insertion_fits(&key, &incoming, reserved, rank, true);
                 assert_eq!(
                     predicted,
