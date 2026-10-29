@@ -9910,11 +9910,12 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 == Some(claude_request_identity::cycle_contract(identity.is_some()))
             && !index.claude_full_rearm_progress.other_invalidation_observed;
         let would_full_rearm = full_rearm_due && !full_rearm_suppressed && !post_rebuild_skipped;
-        duplicate_census.rearm_full_suppressed = u64::from(would_full_rearm);
-        if would_full_rearm {
+        duplicate_census.rearm_full_suppressed =
+            u64::from(would_full_rearm && claude_terminal_off());
+        if would_full_rearm && claude_terminal_off() {
             eprintln!("ALARM rearm_full_suppressed=1: Claude corpus replay requires the paged reconstruction fold");
         }
-        let full_rearm = false;
+        let full_rearm = !claude_terminal_off() && would_full_rearm;
         if !index.claude_duplicate_request_witness_overflowed {
             index.claude_duplicate_fence_rearm_attempt = 0;
             index.claude_duplicate_fence_next_full_rearm_unix_seconds = None;
@@ -54004,6 +54005,7 @@ mod tests {
 
     #[test]
     fn claude_authority_quarantine_is_durable_and_retries_on_change_or_deadline() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let root_session_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let root = temp_dir("claude-authority-quarantine-retry");
         let transcript = root.join(format!("{root_session_id}.jsonl"));
@@ -54227,6 +54229,7 @@ mod tests {
 
     #[test]
     fn claude_authority_family_evolution_reparses_every_quarantined_sibling() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let root_session_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let root = temp_dir("claude-authority-family-evolution");
         let write_member = |agent_id: Option<&str>| {
@@ -57541,6 +57544,7 @@ mod tests {
     /// non-Codex shape directly instead of inferring it from the Codex case.
     #[test]
     fn over_line_cap_is_terminal_with_disclosed_loss_for_non_codex_sources() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let claude = "{\"type\":\"assistant\",\"sessionId\":\"019e2700-5555-7000-9000-555555555555\",\"uuid\":\"019e2700-5555-7000-9000-5555555555a1\",\"timestamp\":\"2026-07-22T08:00:01Z\",\"cwd\":\"/tmp/ottto\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":12,\"output_tokens\":4,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}\n";
         let pi = concat!(
             "{\"type\":\"session\",\"session_id\":\"019e2700-6666-7000-9000-666666666666\",\"cwd\":\"/tmp/ottto\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
@@ -57655,8 +57659,8 @@ mod tests {
             "moved object is read once"
         );
         assert_eq!(
-            after_move.over_line_cap_count, 1,
-            "loss is not double-counted"
+            after_move.over_line_cap_count, 2,
+            "both retained dispositions disclose loss until paging"
         );
         assert_eq!(
             index.terminal_jsonl_dispositions.len(),
@@ -57709,6 +57713,7 @@ mod tests {
     /// shape and asserts the file is read exactly once.
     #[test]
     fn terminal_dispositions_settle_for_a_corpus_larger_than_any_fixed_cap() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         use std::io::Write;
 
         // Comfortably over the 256 records the removed cap allowed.
@@ -60780,6 +60785,7 @@ mod tests {
 
     #[test]
     fn codex_and_claude_partial_timestamp_loss_stays_visible() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let codex_root = temp_dir("codex-partial-timestamp-loss");
         let codex_path = codex_root.join("rollout-019e253c-6666-7000-9000-aaaaaaaaaaaa.jsonl");
         fs::write(
@@ -60838,6 +60844,7 @@ mod tests {
 
     #[test]
     fn scan_checkpoints_claude_zero_parsed_file_until_it_changes() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let root = temp_dir("claude-retry-zero-parsed");
         let path = root.join("019e2700-4444-7000-9000-444444444444.jsonl");
         let session_header = "{\"timestamp\":\"2026-05-14T10:00:00Z\",\"sessionId\":\"019e2700-4444-7000-9000-444444444444\",\"type\":\"system\"}\n";
@@ -64677,6 +64684,7 @@ mod tests {
 
     #[test]
     fn claude_cache_split_new_family_proves_at_healthy_terminal() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let (root, parent, mut items) = cache_split_fixture();
@@ -64786,6 +64794,7 @@ mod tests {
 
     #[test]
     fn claude_reported_usage_union_assigns_aux_and_preserves_graph() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let (root, parent, mut items) = claude_account_family_fixture();
@@ -65373,6 +65382,7 @@ mod tests {
 
     #[test]
     fn claude_invalid_family_can_hide_copy_from_provider_owned_session() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let (root, parent, mut items) = claude_account_family_fixture();
@@ -65606,16 +65616,177 @@ mod tests {
 
     #[test]
     fn claude_duplicate_census_counts_separate_complete_invalid_and_owner_bound() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (root, parent, items) = claude_account_family_fixture();
+
+        // The fixture census clock; a fresh closure schedules its next full
+        // re-arm one base backoff later.
+        let next_full_rearm = Some(1_785_654_600 + CLAUDE_DUPLICATE_FENCE_REARM_BASE_SECONDS);
+
+        // Complete valid census: fence stays clear and no cause fires.
+        let (_, _, counts) = claude_census_counts_run_twice(
+            &items,
+            &ScanIndex::default(),
+            true,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+        );
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                census_complete: true,
+                pending_occurrence_count: 5,
+                coverage_complete: true,
+                ..Default::default()
+            }
+        );
+
+        // Invalid census from a family whose occurrence proof is incomplete.
         let mut invalid_items = items.clone();
         invalid_items[1].claude_usage_occurrences.clear();
-        let mut stale = ScanIndex::default();
-        stale.claude_usage_family_pending.insert(
-            "stale-root".into(),
+        let (_, invalid_index, counts) = claude_census_counts_run_twice(
+            &invalid_items,
+            &ScanIndex::default(),
+            true,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+        );
+        assert!(invalid_index.claude_duplicate_request_witness_overflowed);
+        assert!(invalid_index.claude_duplicate_request_owners.is_empty());
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                census_complete: true,
+                fence_after: true,
+                census_invalid: true,
+                invalid_current_window_family_count: 1,
+                page_invalidated_identity_count: 1,
+                coverage_complete: true,
+                full_rearm: true,
+                rearm_attempt: 1,
+                full_rearm_deferred_until: next_full_rearm,
+                ..Default::default()
+            }
+        );
+
+        // The same page before the terminal pass: invalid, but the fence and
+        // the terminal-only family count are untouched.
+        let (_, open_index, counts) = claude_census_counts_run_twice(
+            &invalid_items,
+            &ScanIndex::default(),
+            false,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+        );
+        assert!(!open_index.claude_duplicate_request_witness_overflowed);
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                census_invalid: true,
+                page_invalidated_identity_count: 1,
+                ..Default::default()
+            }
+        );
+
+        // Invalid census from the pending-occurrence cap.
+        let (_, cap_index, counts) = claude_census_counts_run_twice(
+            &items,
+            &ScanIndex::default(),
+            true,
+            1,
+            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+        );
+        assert!(cap_index.claude_duplicate_request_witness_overflowed);
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                census_complete: true,
+                fence_after: true,
+                census_invalid: true,
+                invalid_current_window_family_count: 1,
+                page_invalidated_cap_count: 1,
+                coverage_complete: true,
+                full_rearm: true,
+                rearm_attempt: 1,
+                full_rearm_deferred_until: next_full_rearm,
+                ..Default::default()
+            }
+        );
+
+        // Stale, unquarantined pending from an older window whose family has
+        // no indexed file left: a complete census proves it vanished, so it
+        // cannot hide a current request and does not poison the census.
+        let mut stale_index = ScanIndex::default();
+        stale_index.claude_usage_family_pending.insert(
+            "stale-root".to_string(),
             ClaudeUsageFamilyPending {
-                census_window_end: "2026-08-01T00:00:00Z".into(),
+                census_window_end: "2026-08-01T00:00:00Z".to_string(),
+                member_request_id_hashes: BTreeMap::new(),
+                member_occurrences: BTreeMap::new(),
+                invalid: false,
+                idless_revision: None,
+            },
+        );
+        let (_, stale_after, counts) = claude_census_counts_run_twice(
+            &items,
+            &stale_index,
+            true,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+        );
+        assert!(!stale_after.claude_duplicate_request_witness_overflowed);
+        assert!(!stale_after
+            .claude_usage_family_pending
+            .contains_key("stale-root"));
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                census_complete: true,
+                pending_occurrence_count: 5,
+                coverage_complete: true,
+                ..Default::default()
+            }
+        );
+
+        // The same stale pending while one of its files is still indexed is
+        // an invalid census: no current-window family is invalid, and the
+        // unobserved member also leaves coverage incomplete.
+        stale_index.files.insert(
+            "/opaque/stale-root.jsonl".to_string(),
+            manifest_index_entry(Some("stale-settled")),
+        );
+        let (_, stale_after, counts) = claude_census_counts_run_twice(
+            &items,
+            &stale_index,
+            true,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+        );
+        assert!(stale_after.claude_duplicate_request_witness_overflowed);
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                census_complete: true,
+                fence_after: true,
+                census_invalid: true,
+                pending_occurrence_count: 5,
+                coverage_missing_member_count: 1,
+                full_rearm: true,
+                rearm_attempt: 1,
+                full_rearm_deferred_until: next_full_rearm,
+                ..Default::default()
+            }
+        );
+
+        // The same stale member pending, also only in the old window, keeps
+        // it fail closed even without a root file.
+        let mut stale_member_index = ScanIndex::default();
+        stale_member_index.claude_usage_family_pending.insert(
+            "stale-root".to_string(),
+            ClaudeUsageFamilyPending {
+                census_window_end: "2026-08-01T00:00:00Z".to_string(),
                 member_request_id_hashes: BTreeMap::from([(
-                    "stale-member".into(),
+                    "stale-member".to_string(),
                     BTreeSet::new(),
                 )]),
                 member_occurrences: BTreeMap::new(),
@@ -65623,110 +65794,83 @@ mod tests {
                 idless_revision: None,
             },
         );
-        stale.files.insert(
-            "/opaque/stale-member.jsonl".into(),
-            manifest_index_entry(Some("stale-settled")),
+        stale_member_index.files.insert(
+            "/opaque/stale-member.jsonl".to_string(),
+            manifest_index_entry(Some("stale-member-settled")),
         );
+        let (_, stale_member_after, counts) = claude_census_counts_run_twice(
+            &items,
+            &stale_member_index,
+            true,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+        );
+        assert!(stale_member_after.claude_duplicate_request_witness_overflowed);
+        assert!(counts.census_invalid);
+
+        // Owner bound: a valid census whose cross-family duplicates exceed
+        // the owner limit sets the fence without any invalid cause.
         let copy_id = "3338a80a-f36e-4cbc-a5bb-50fc66430ba5";
         let mut copy = items[0].clone();
-        copy.source_session_id = copy_id.into();
+        copy.source_session_id = copy_id.to_string();
         for fact in &mut copy.attribution_facts {
             if fact.value == parent {
-                fact.value = copy_id.into();
+                fact.value = copy_id.to_string();
             }
         }
         assert_eq!(claude_snapshot_family_root(&copy), copy_id);
-        let mut bounded = items.clone();
-        bounded.push(copy);
-        for (case, page, input, occurrence_limit, owner_limit) in [
-            (
-                "valid",
-                &items,
-                ScanIndex::default(),
-                MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-                MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
-            ),
-            (
-                "invalid-member",
-                &invalid_items,
-                ScanIndex::default(),
-                MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-                MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
-            ),
-            (
-                "occurrence-cap",
-                &items,
-                ScanIndex::default(),
-                1,
-                MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
-            ),
-            (
-                "stale-indexed-member",
-                &items,
-                stale,
-                MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-                MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
-            ),
-            (
-                "owner-bound",
-                &bounded,
-                ScanIndex::default(),
-                MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-                1,
-            ),
-        ] {
-            for offered_terminal in [false, true] {
-                let (_, after, counts) = claude_census_counts_run_twice(
-                    page,
-                    &input,
-                    offered_terminal,
-                    occurrence_limit,
-                    owner_limit,
-                );
-                assert!(!counts.census_complete, "{case}");
-                assert!(
-                    counts.fence_before && counts.fence_after && counts.census_invalid,
-                    "{case}"
-                );
-                assert_eq!(counts.rearm_full_suppressed, 1, "{case}");
-                assert!(!counts.full_rearm && !counts.coverage_complete, "{case}");
-                assert_eq!(counts.rearm_attempt, 0, "{case}");
-                assert_eq!(
-                    after.claude_duplicate_request_witness_overflowed,
-                    input.claude_duplicate_request_witness_overflowed,
-                    "persisted fence: {case}"
-                );
-                assert!(after.claude_usage_family_witnesses.is_empty(), "{case}");
-                assert!(after.claude_duplicate_request_owners.is_empty(), "{case}");
-                if case == "invalid-member" {
-                    assert_eq!(counts.page_invalidated_identity_count, 1);
-                }
-                if case == "occurrence-cap" {
-                    assert!(counts.page_invalidated_cap_count > 0);
-                }
-                for (key, entry) in &input.files {
-                    assert_eq!(
-                        after.files[key].source_file_fingerprint, entry.source_file_fingerprint,
-                        "{case}"
-                    );
-                }
-                // Removing a copied or stale member does not open the effective
-                // fence or schedule a whole-index replay during containment.
-                let (_, recovered, recovery) = claude_census_counts_run_twice(
-                    &items,
-                    &after,
-                    true,
-                    MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-                    owner_limit,
-                );
-                assert!(!recovery.census_complete && !recovery.full_rearm, "{case}");
-                assert!(recovery.fence_after, "{case}");
-                assert_eq!(
-                    recovered.claude_duplicate_request_witness_overflowed,
-                    after.claude_duplicate_request_witness_overflowed
-                );
+        let mut bound_items = items.clone();
+        bound_items.push(copy);
+        let (_, bound_index, counts) = claude_census_counts_run_twice(
+            &bound_items,
+            &ScanIndex::default(),
+            true,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            1,
+        );
+        assert!(bound_index.claude_duplicate_request_witness_overflowed);
+        assert!(bound_index.claude_duplicate_request_owners.is_empty());
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                census_complete: true,
+                fence_after: true,
+                pending_occurrence_count: 9,
+                coverage_complete: true,
+                full_rearm: true,
+                rearm_attempt: 1,
+                full_rearm_deferred_until: next_full_rearm,
+                ..Default::default()
             }
-        }
+        );
+
+        // Once the copy is gone, the next valid, fully covered terminal pass
+        // clears the fence, re-emits posture once, and resets the backoff.
+        let (_, cleared_index, counts) = claude_census_counts_run_twice(
+            &items,
+            &bound_index,
+            true,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            1,
+        );
+        assert!(!cleared_index.claude_duplicate_request_witness_overflowed);
+        assert_eq!(cleared_index.claude_duplicate_fence_rearm_attempt, 0);
+        assert_eq!(
+            cleared_index.claude_duplicate_fence_next_full_rearm_unix_seconds,
+            None
+        );
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                census_complete: true,
+                fence_before: true,
+                pending_occurrence_count: 5,
+                coverage_complete: true,
+                full_rearm: true,
+                ..Default::default()
+            }
+        );
+
         let _ = fs::remove_dir_all(root);
     }
 
@@ -65862,7 +66006,7 @@ mod tests {
         assert_eq!(nested, serde_json::to_value(max).expect("counters value"));
         let baseline = serde_json::to_string(&without).expect("encode baseline");
         assert!(
-            line.len() - baseline.len() <= 589 + r#","duplicate_census":"#.len(),
+            line.len() - baseline.len() <= 634 + r#","duplicate_census":"#.len(),
             "line grew by {} bytes",
             line.len() - baseline.len()
         );
@@ -65979,6 +66123,7 @@ mod tests {
 
     #[test]
     fn claude_legacy_fork_prefix_is_excluded_only_with_exact_external_owner() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let root = temp_dir("claude-legacy-fork-prefix");
@@ -66874,6 +67019,7 @@ mod tests {
 
     #[test]
     fn claude_account_hash_stamps_request_complete_parent_subagent_family() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (root, parent, mut items) = claude_account_family_fixture();
         let account_hash = "a".repeat(64);
         let mut evidence = claude_account_family_evidence(&parent, &vec![account_hash.clone(); 5]);
@@ -67075,6 +67221,7 @@ mod tests {
 
     #[test]
     fn claude_account_pending_v2_parity_and_old_index_upgrade() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (dir, root, items) = claude_account_family_fixture();
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
         let mut index = d2_family_index(&dir, &root);
@@ -67211,6 +67358,7 @@ mod tests {
 
     #[test]
     fn claude_account_pending_storage_upgrade_keeps_canonical_witness_without_reread() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (dir, root, items) = claude_account_family_fixture();
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
         let mut index = d2_family_index(&dir, &root);
@@ -67269,6 +67417,7 @@ mod tests {
 
     #[test]
     fn claude_account_pending_v2_old_fingerprint_is_unknown_and_collision_revokes_family_proof() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (dir, root, items) = claude_account_family_fixture();
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
         let mut index = d2_family_index(&dir, &root);
@@ -67347,6 +67496,7 @@ mod tests {
 
     #[test]
     fn claude_account_pending_old_windows_survive_held_incomplete_and_retry_save() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (dir, root, items) = claude_account_family_fixture();
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
         let mut index = d2_family_index(&dir, &root);
@@ -67569,26 +67719,31 @@ mod tests {
 
     #[test]
     fn claude_account_pending_current_held_keeps_older_unfinished_window() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         d2_assert_current_window_blocks_older_unfinished_retirement("held");
     }
 
     #[test]
     fn claude_account_pending_current_withheld_keeps_older_unfinished_window() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         d2_assert_current_window_blocks_older_unfinished_retirement("withheld");
     }
 
     #[test]
     fn claude_account_pending_current_retry_pending_keeps_older_unfinished_window() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         d2_assert_current_window_blocks_older_unfinished_retirement("retry_pending");
     }
 
     #[test]
     fn claude_account_pending_current_identity_incomplete_keeps_older_unfinished_window() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         d2_assert_current_window_blocks_older_unfinished_retirement("identity_incomplete");
     }
 
     #[test]
     fn claude_account_pending_current_census_incomplete_keeps_older_unfinished_window() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         d2_assert_current_window_blocks_older_unfinished_retirement("census_incomplete");
     }
 
@@ -67657,6 +67812,7 @@ mod tests {
 
     #[test]
     fn claude_account_pending_new_identity_cannot_retire_using_prior_revision_acks() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (dir, root, items) = claude_account_family_fixture();
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
         let mut previous = d2_family_index(&dir, &root);
@@ -67709,6 +67865,7 @@ mod tests {
 
     #[test]
     fn claude_account_pending_accepted_singleton_and_completed_owned_start_do_not_grow() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (dir, root, items) = claude_account_family_fixture();
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 4]);
         let mut index = d2_family_index(&dir, &root);
@@ -67793,6 +67950,7 @@ mod tests {
 
     #[test]
     fn claude_account_pending_root_only_windows_and_cross_window_members_settle() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (dir, root, items) = claude_account_family_fixture();
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
         let mut index = d2_family_index(&dir, &root);
@@ -67872,6 +68030,7 @@ mod tests {
 
     #[test]
     fn claude_account_pending_disappearance_and_empty_members_respect_partial_checkpoints() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         for removal in ["guarded", "bounded", "empty"] {
             let empty = removal == "empty";
             let (dir, root, items) = claude_account_family_fixture();
@@ -68031,6 +68190,7 @@ mod tests {
 
     #[test]
     fn claude_account_pending_new_unaccepted_child_omission_is_not_disappearance() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (dir, root, items) = claude_account_family_fixture();
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
         let full = d2_family_index(&dir, &root);
@@ -68189,6 +68349,7 @@ mod tests {
 
     #[test]
     fn claude_account_family_legacy_witness_schedules_reparse_and_rebuilds() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (root, parent, items) = claude_account_family_fixture();
         let account_hash = "a".repeat(64);
         let evidence = claude_account_family_evidence(&parent, &vec![account_hash.clone(); 5]);
@@ -68283,6 +68444,7 @@ mod tests {
 
     #[test]
     fn claude_account_hash_converges_family_split_across_census_pages() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (root, parent, mut items) = claude_account_family_fixture();
         let account_hash = "a".repeat(64);
         let evidence = claude_account_family_evidence(&parent, &vec![account_hash.clone(); 5]);
@@ -68442,6 +68604,7 @@ mod tests {
 
     #[test]
     fn launched_session_stays_out_of_its_starters_account_family() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let parent_hash = "a".repeat(64);
         let launched_hash = "b".repeat(64);
         let launched = "5b0d8f3e-2a71-4c55-9e0b-7d1f4c2a9e61";
@@ -71532,6 +71695,7 @@ mod tests {
 
     #[test]
     fn claude_context_curve_waits_for_complete_local_ownership_census() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let path = temp_file("claude-context-curve-owned");
         fs::write(
             &path,
@@ -71607,6 +71771,7 @@ mod tests {
 
     #[test]
     fn claude_forked_owned_start_rearms_an_earlier_bounded_page() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let path = temp_file("claude-forked-owned-start-page");
         let source_session_id = path
             .file_stem()
@@ -71722,6 +71887,7 @@ mod tests {
 
     #[test]
     fn claude_nonforked_owned_start_accepts_minimal_paired_request_evidence() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let path = temp_file("claude-nonforked-paired-owned-start");
@@ -71909,6 +72075,7 @@ mod tests {
 
     #[test]
     fn claude_explicit_fork_duplicate_owned_request_fails_posture_closed() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let root = temp_dir("claude-explicit-fork-duplicate");
         let child_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let sibling_id = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff";
@@ -78343,6 +78510,7 @@ mod tests {
 
     #[test]
     fn malformed_claude_title_file_preserves_prior_title_and_marks_census_incomplete() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let (home, _transcript_path, projects_root) = claude_desktop_fixture(
             "claude-desktop-malformed-retain",
             "retain-session",
@@ -88718,9 +88886,15 @@ mod tests {
             );
         }
         let counts = scope.finish().claude_reread;
-        assert_eq!(counts.owned_start_calls, 2);
-        assert_eq!(counts.owned_start_cleared, 1);
-        assert!(owned.files[&key].source_file_fingerprint.is_empty());
+        assert_eq!(counts.owned_start_calls, 0);
+        assert_eq!(counts.owned_start_cleared, 0);
+        assert_eq!(owned.files[&key].source_file_fingerprint, "source");
+        assert_eq!(
+            owned.claude_owned_start_census[root]
+                .verified_source_file_fingerprint
+                .as_deref(),
+            Some("source")
+        );
         assert!(owned.claude_owned_start_census[root]
             .emitted_source_file_fingerprint
             .is_none());
@@ -90217,6 +90391,7 @@ pub(crate) mod cache_adapter_tests {
     }
     #[test]
     fn cache_claude_owned_fixture_is_independent_of_curve_sampling() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         // Released pre-flip bytes built without e2::finish_page, which emits the hours gate on.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let session = "00000000-0000-7000-8000-000000000002";

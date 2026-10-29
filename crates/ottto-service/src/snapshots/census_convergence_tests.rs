@@ -147,6 +147,7 @@ fn decision(
 // re-arm backoff bounds the repeated work.
 #[test]
 fn claude_family_pending_reobservation_stays_exact_within_a_window() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let (root, _, items) = claude_account_family_fixture();
     let full = items[0].clone();
     let mut prefix = full.clone();
@@ -219,6 +220,7 @@ fn claude_family_pending_reobservation_stays_exact_within_a_window() {
 // Coverage counts every indexed family member this window did not observe.
 #[test]
 fn claude_duplicate_fence_coverage_counts_unobserved_indexed_members() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let mut index = ScanIndex::default();
     for key in [
         "/opaque/root-a.jsonl",
@@ -288,6 +290,7 @@ fn claude_duplicate_fence_coverage_counts_unobserved_indexed_members() {
 // scheduling state only costs a replay.
 #[test]
 fn claude_duplicate_fence_full_rearm_backs_off_and_fails_closed() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let now = Some(CENSUS_CLOCK);
     let mut index = ScanIndex::default();
     // Staying open never replays; opening re-emits posture once.
@@ -343,71 +346,120 @@ fn claude_duplicate_fence_full_rearm_backs_off_and_fails_closed() {
 // backoff and the fence opens once coverage completes.
 #[test]
 fn claude_duplicate_fence_reopens_only_after_full_coverage() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let (root, _, items) = claude_account_family_fixture();
     let unobserved = "/opaque/unobserved-root.jsonl";
     let mut closed = ScanIndex {
         claude_duplicate_request_witness_overflowed: true,
         ..ScanIndex::default()
     };
-    closed
+    closed.files.insert(
+        unobserved.to_string(),
+        manifest_index_entry(Some("unobserved")),
+    );
+
+    let (_, after, counts) = claude_census_counts_run_twice(
+        &items,
+        &closed,
+        true,
+        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+        MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+    );
+    assert!(after.claude_duplicate_request_witness_overflowed);
+    assert_eq!(
+        counts,
+        ClaudeDuplicateCensusCounts {
+            census_complete: true,
+            fence_before: true,
+            fence_after: true,
+            pending_occurrence_count: 5,
+            coverage_missing_member_count: 1,
+            full_rearm: true,
+            rearm_attempt: 1,
+            full_rearm_deferred_until: Some(
+                CENSUS_CLOCK + CLAUDE_DUPLICATE_FENCE_REARM_BASE_SECONDS
+            ),
+            ..Default::default()
+        }
+    );
+    assert!(after.files[unobserved].source_file_fingerprint.is_empty());
+
+    // Inside the backoff the same closed census does not replay again.
+    let mut deferred = after.clone();
+    deferred
         .files
-        .insert(unobserved.into(), manifest_index_entry(Some("unobserved")));
-    let before_source = closed.files[unobserved].source_file_fingerprint.clone();
-    for phase in [
-        "unobserved",
-        "backoff",
-        "lost-scheduling",
-        "restored-open",
-        "coverage-restored",
-    ] {
-        let mut input = closed.clone();
-        match phase {
-            "backoff" => {
-                input.claude_duplicate_fence_next_full_rearm_unix_seconds =
-                    Some(CENSUS_CLOCK + 3600)
-            }
-            "lost-scheduling" => {
-                input = serde_json::from_slice(&serde_json::to_vec(&input).unwrap()).unwrap();
-                input.claude_duplicate_fence_rearm_attempt = 0;
-                input.claude_duplicate_fence_next_full_rearm_unix_seconds = None;
-            }
-            "restored-open" => input.claude_duplicate_request_witness_overflowed = false,
-            "coverage-restored" => {
-                input.files.remove(unobserved);
-            }
-            _ => {}
-        }
-        let persisted = input.claude_duplicate_request_witness_overflowed;
-        let (_, after, counts) = claude_census_counts_run_twice(
-            &items,
-            &input,
-            true,
-            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
-        );
-        assert!(!counts.census_complete, "{phase}");
-        assert!(counts.fence_after && counts.census_invalid, "{phase}");
-        assert!(!counts.full_rearm, "{phase}");
-        assert_eq!(counts.rearm_full_suppressed, 1, "{phase}");
-        assert_eq!(
-            after.claude_duplicate_request_witness_overflowed, persisted,
-            "RAM veto only: {phase}"
-        );
-        assert!(
-            after.claude_usage_family_witnesses.is_empty(),
-            "coverage alone cannot mint proof: {phase}"
-        );
-        assert_eq!(
-            after.claude_duplicate_fence_rearm_attempt,
-            input.claude_duplicate_fence_rearm_attempt
-        );
-        if let Some(entry) = after.files.get(unobserved) {
-            assert_eq!(
-                entry.source_file_fingerprint, before_source,
-                "no induced re-read: {phase}"
-            );
-        }
-    }
+        .get_mut(unobserved)
+        .expect("unobserved entry")
+        .source_file_fingerprint = "source".to_string();
+    let (_, deferred_after, counts) = claude_census_counts_run_twice(
+        &items,
+        &deferred,
+        true,
+        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+        MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+    );
+    assert!(deferred_after.claude_duplicate_request_witness_overflowed);
+    assert!(!counts.full_rearm);
+    assert_eq!(counts.rearm_attempt, 1);
+    assert_eq!(
+        counts.full_rearm_deferred_until,
+        Some(CENSUS_CLOCK + CLAUDE_DUPLICATE_FENCE_REARM_BASE_SECONDS)
+    );
+    assert_eq!(
+        deferred_after.files[unobserved].source_file_fingerprint,
+        "source"
+    );
+
+    // Losing the scheduling fields replays rather than opening.
+    let mut lost: ScanIndex =
+        serde_json::from_slice(&serde_json::to_vec(&deferred).expect("encode index"))
+            .expect("decode index");
+    lost.claude_duplicate_fence_rearm_attempt = 0;
+    lost.claude_duplicate_fence_next_full_rearm_unix_seconds = None;
+    let (_, lost_after, counts) = claude_census_counts_run_twice(
+        &items,
+        &lost,
+        true,
+        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+        MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+    );
+    assert!(lost_after.claude_duplicate_request_witness_overflowed);
+    assert!(counts.full_rearm);
+
+    // An open fence is not closed by coverage alone.
+    let mut open = closed.clone();
+    open.claude_duplicate_request_witness_overflowed = false;
+    let (_, open_after, counts) = claude_census_counts_run_twice(
+        &items,
+        &open,
+        true,
+        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+        MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+    );
+    assert!(!open_after.claude_duplicate_request_witness_overflowed);
+    assert!(!counts.coverage_complete);
+    assert!(!counts.full_rearm);
+
+    // Once the unobserved member is gone, the fence opens and posture is
+    // re-emitted once.
+    let mut covered = deferred.clone();
+    covered.files.remove(unobserved);
+    let (_, covered_after, counts) = claude_census_counts_run_twice(
+        &items,
+        &covered,
+        true,
+        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+        MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+    );
+    assert!(!covered_after.claude_duplicate_request_witness_overflowed);
+    assert!(counts.coverage_complete);
+    assert!(counts.full_rearm);
+    assert_eq!(covered_after.claude_duplicate_fence_rearm_attempt, 0);
+    assert_eq!(
+        covered_after.claude_duplicate_fence_next_full_rearm_unix_seconds,
+        None
+    );
+
     let _ = fs::remove_dir_all(root);
 }
 
@@ -416,6 +468,7 @@ fn claude_duplicate_fence_reopens_only_after_full_coverage() {
 // disclosed account deferral, stops blocking traversal progress.
 #[test]
 fn claude_progress_blocking_holds_exclude_only_non_progressing_revisions() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let (root, _, items) = claude_account_family_fixture();
     let mut held = items[0].clone();
     let revision = hex64('a');
@@ -553,6 +606,7 @@ fn claude_progress_blocking_holds_exclude_only_non_progressing_revisions() {
 // unchanged-proof root; the same family without the record is one.
 #[test]
 fn retry_pending_root_is_never_an_unchanged_proof_root() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let root = "root-session".to_string();
     let mut held = ScanIndex::default();
     bind_authority_quarantine(
@@ -625,6 +679,7 @@ fn retry_pending_root_is_never_an_unchanged_proof_root() {
 // not restorable.
 #[test]
 fn locally_held_keys_revert_to_committed_revision_and_keep_manifest() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let activity = "2026-08-02T07:00:00Z";
     let held_key = "/opaque/held.jsonl";
     let sibling_key = "/opaque/sibling.jsonl";
@@ -828,6 +883,7 @@ fn locally_held_keys_revert_to_committed_revision_and_keep_manifest() {
 // the conservative block or drop.
 #[test]
 fn bound_terminal_member_of_committed_family_keeps_delivery_free_membership() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let activity = "2026-08-02T07:00:00Z";
     let root_key = "/opaque/family-root.jsonl";
     let member_key = "/opaque/family-root/subagents/agent-member.jsonl";
@@ -967,6 +1023,7 @@ fn bound_terminal_member_of_committed_family_keeps_delivery_free_membership() {
 // changed upload context; a due retry or changed revision reparses.
 #[test]
 fn bound_terminal_hold_skips_until_family_changes() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let key = "/opaque/terminal-root.jsonl";
     let revision = hex64('c');
     let mut index = ScanIndex::default();
@@ -1025,6 +1082,7 @@ fn bound_terminal_hold_skips_until_family_changes() {
 // parse or proved absence.
 #[test]
 fn claude_account_deferred_holds_are_durable_bounded_and_pruned_by_proof() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let held_key = "/opaque/deferred.jsonl";
     let other_key = "/opaque/other.jsonl";
     let mut index = ScanIndex::default();
@@ -1111,6 +1169,7 @@ fn claude_account_deferred_holds_are_durable_bounded_and_pruned_by_proof() {
 // Each parse is attributed to the first selecting gate, by stable name.
 #[test]
 fn candidate_parse_reasons_name_the_selecting_gate() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let names = CANDIDATE_PARSE_REASON_NAMES
         .iter()
         .copied()
@@ -1206,6 +1265,7 @@ fn transcript_ownership<'i>(
 
 #[test]
 fn transcript_ownership_needs_quarantined_originals_observed() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     use crate::snapshots::claude_request_identity as identity;
     const ORIGINAL: &str = "4669db3d-c69f-4f0f-98ee-83cf99763ed8";
     const COPY: &str = "577aec4e-d7a0-4a10-a9ff-940da0874fe9";
@@ -1346,6 +1406,7 @@ mod witness_reconstruct_scope {
 
 #[test]
 fn p12_experimental_base_exit_duplicate_fence_full_coverage_oracle() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let scope = envelope_selection_experiment::Scope::restart();
     claude_duplicate_fence_reopens_only_after_full_coverage();
     assert_eq!(scope.counts().rearm_suppressed, 0);
@@ -1359,6 +1420,7 @@ fn p12_experimental_base_exit_duplicate_fence_full_coverage_oracle() {
 // observed (root transcript or subagent) or residue stay held.
 #[test]
 fn bounded_absence_fallback_checks_every_retry_pending_root_through_its_cursor() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let _refuse = RefuseClaudeAbsentFamilyScratchForTest::new();
     let window = MAX_CLAUDE_ABSENT_FAMILY_FALLBACK_ROOTS;
     assert_eq!(window, 16);
@@ -1437,6 +1499,7 @@ fn retry_pending_roots_index(
 // present) is untouched.
 #[test]
 fn bounded_absence_fallback_cursor_is_scoped_per_index() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let _refuse = RefuseClaudeAbsentFamilyScratchForTest::new();
     let (mut a, a_observed) = retry_pending_roots_index("a", 32, |number| number != 31);
     let (mut b, b_observed) = retry_pending_roots_index("b", 32, |_| true);
@@ -1482,6 +1545,7 @@ fn bounded_absence_fallback_cursor_is_scoped_per_index() {
 // evicts only the least recently used cursor; every other cursor survives.
 #[test]
 fn bounded_absence_fallback_cursors_evict_only_the_least_recently_used() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let cap = MAX_CLAUDE_ABSENT_FAMILY_FALLBACK_CURSORS;
     assert_eq!(cap, 32);
     let mut cursors = ClaudeAbsentFamilyFallbackCursors::new();
@@ -1529,6 +1593,7 @@ fn drain_fence_at_clean_terminal(
 // every absent family. The clean control retires and tombstones it.
 #[test]
 fn absence_retirement_keeps_every_family_after_any_traversal_problem() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     restart_claude_reemission_stop_for_test();
     let pending_path = || ScanTraversalPath {
         scan_root: PathBuf::from("/synthetic/projects"),
@@ -1614,6 +1679,7 @@ fn absence_retirement_keeps_every_family_after_any_traversal_problem() {
 // unverified-history index each refuse with their own reason.
 #[test]
 fn absence_retirement_names_the_latch_and_unverified_history_refusals() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     restart_claude_reemission_stop_for_test();
     let (mut index, observed) = retry_pending_roots_index("gone", 1, |_| false);
     let traversal = clean_terminal_traversal(observed);
@@ -1649,6 +1715,7 @@ fn save_through_generation(index: &mut ScanIndex, path: &std::path::Path, genera
 // a load with history does not, until a restart forgets the fresh load.
 #[test]
 fn fresh_index_loads_leave_their_path_unverified_until_a_restart() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     forget_claude_unverified_history_indexes_for_test();
     let dir = temp_dir("patha-unverified-history-load");
     let fresh = dir.join("fresh-index.json");
@@ -1693,6 +1760,7 @@ fn fresh_index_loads_leave_their_path_unverified_until_a_restart() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn source_aware_loads_share_history_freshness_and_repair_tombstones() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     forget_claude_unverified_history_indexes_for_test();
     let dir = temp_dir("patha-history-origin-composition");
     let support = dir.join("support");
@@ -1776,6 +1844,7 @@ fn source_aware_loads_share_history_freshness_and_repair_tombstones() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn malformed_tombstones_never_fail_the_index_decode() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let dir = temp_dir("patha-malformed-tombstones");
     let path = dir.join("scan-index.json");
     let kept = claude_retired_family_digest("kept-root");
@@ -1885,6 +1954,7 @@ fn malformed_tombstones_never_fail_the_index_decode() {
 // its member.
 #[test]
 fn full_tombstone_set_refuses_retirement_and_keeps_the_family() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let cap = MAX_CLAUDE_RETIRED_FAMILY_TOMBSTONES;
     assert_eq!(cap, 1024);
     for refuse_scratch in [false, true] {
@@ -2009,6 +2079,7 @@ type IndexJsonEdit<'a> = dyn Fn(&mut serde_json::Map<String, serde_json::Value>)
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn a_lost_tombstone_set_never_restores_new_file_eligibility() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     restart_claude_reemission_stop_for_test();
     let dir = temp_dir("patha-lost-tombstones");
     let path = dir.join("scan-index.json");
@@ -2161,6 +2232,7 @@ fn a_lost_tombstone_set_never_restores_new_file_eligibility() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn an_unplaceable_tombstone_loss_keeps_a_durable_fence() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     restart_claude_reemission_stop_for_test();
     let cap = MAX_CLAUDE_RETIRED_FAMILY_TOMBSTONES;
     let dir = temp_dir("patha-durable-tombstone-fence");
@@ -2266,6 +2338,7 @@ fn an_unplaceable_tombstone_loss_keeps_a_durable_fence() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn an_indexed_member_never_waives_a_lost_tombstone() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     restart_claude_reemission_stop_for_test();
     let dir = temp_dir("patha-indexed-member-lost-tombstone");
     let path = dir.join("scan-index.json");
@@ -2343,6 +2416,7 @@ fn an_indexed_member_never_waives_a_lost_tombstone() {
 // nothing).
 #[test]
 fn tombstone_fence_repair_is_bounded_and_a_refusal_keeps_the_fence() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let cap = MAX_CLAUDE_RETIRED_FAMILY_TOMBSTONES;
     let fallback = MAX_CLAUDE_TOMBSTONE_FENCE_FALLBACK_ROOTS;
     assert_eq!(fallback, 16);
@@ -2589,6 +2663,7 @@ fn tombstone_fence_repair_is_bounded_and_a_refusal_keeps_the_fence() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn a_downgrade_that_drops_the_marker_and_set_fails_closed() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     restart_claude_reemission_stop_for_test();
     let fallback = MAX_CLAUDE_TOMBSTONE_FENCE_FALLBACK_ROOTS;
     let admitted = crate::heap_layout_bound::layout_supported();
@@ -2747,6 +2822,7 @@ fn a_downgrade_that_drops_the_marker_and_set_fails_closed() {
 // than free slots keep the fence up, publish it and alarm at most hourly.
 #[test]
 fn the_fence_drain_skips_present_roots_and_only_absent_roots_block_it() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let cap = MAX_CLAUDE_RETIRED_FAMILY_TOMBSTONES;
     if !crate::heap_layout_bound::layout_supported() {
         // The refused-scratch fallback is covered by
@@ -2919,6 +2995,7 @@ fn the_fence_drain_skips_present_roots_and_only_absent_roots_block_it() {
 // checkpoint that keeps the entry keeps the lowered fence.
 #[test]
 fn a_partial_checkpoint_that_drops_an_exempted_entry_keeps_the_fence() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -2970,6 +3047,7 @@ fn a_partial_checkpoint_that_drops_an_exempted_entry_keeps_the_fence() {
 // tombstone; the present one stays an indexed file.
 #[test]
 fn an_upgrade_false_positive_is_counted_and_bounded_by_the_drain() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     restart_claude_reemission_stop_for_test();
     let dir = temp_dir("patha-upgrade-false-positive");
     let path = dir.join("scan-index.json");
@@ -3045,6 +3123,7 @@ fn hex64_number(number: usize) -> String {
 /// alarm must distinguish that cause from an ordinary scratch refusal.
 #[test]
 fn kept_tombstone_fence_alarm_names_unsupported_layout() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     for (layout_supported, scratch_admitted, cause) in [
         (false, false, "unsupported_layout"),
         (true, false, "scratch_refused"),
@@ -3075,6 +3154,7 @@ fn kept_tombstone_fence_alarm_names_unsupported_layout() {
 /// RetryPending causes, terminal records, and recordless retirement markers.
 #[test]
 fn returning_family_grown_held_counts_only_tombstoned_retry_pending_roots() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let mut index = ScanIndex::default();
     assert_eq!(index.claude_returning_family_grown_held_count(), 0);
     for root in ["ordinary", "returning-a", "returning-b", "terminal"] {

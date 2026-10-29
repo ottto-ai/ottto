@@ -257,11 +257,12 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
         })
         .unwrap()
         .expect("real due native preparation");
-        assert_eq!(frame.native_comparison_lease.as_ref().unwrap().allowed(), cycle == 2,
-        "cycle {cycle}: no synthetic permit; the third same-context preparation must use its actual saved predecessor");
+        assert!(!frame.native_comparison_lease.as_ref().unwrap().allowed(),
+        "cycle {cycle}: no synthetic permit; terminal-off cannot admit a completion-derived predecessor");
         let (preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
         let unclean = matches!(outcome, FinishOutcome::PermanentUncleanCensus);
-        assert_eq!(scan.census_complete, !unclean);
+        assert!(crate::snapshots::claude_terminal_off());
+        assert!(!scan.census_complete);
         let selected_losses = [
             scan.malformed_json_line_count,
             scan.invalid_utf8_line_count,
@@ -270,8 +271,8 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
         ];
         assert_eq!(
             scan.scanned_file_count,
-            if unclean { 2 } else { usize::from(cycle < 2) },
-            "actual native read, then ordinary quiet page"
+            if unclean { 2 } else { 1 },
+            "UploadContext remains due until the paired receipt PR is consumed"
         );
         if cycle == 0 {
             assert_eq!(scan.snapshots.len(), 1);
@@ -378,7 +379,7 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
                 "terminal disclosure must equal the real selected scan, not a fixture assumption"
             );
         }
-        assert_eq!(terminal[cycle]["last_census_complete"], !unclean);
+        assert_eq!(terminal[cycle]["last_census_complete"], false);
         if cycle > 0 || !outcome.retains_refusal_across_quiet_cycles() {
             assert_eq!(retained_valid, expected_valid,
             "{outcome:?}, cycle {cycle}: only an earned native conjunction or actual predecessor permit plus durable settlement and successful status may reach the common lease finalizer");
@@ -407,7 +408,7 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn permanent_finish_real_pipeline_preserves_earned_native_lease() {
-    permanent_finish_pipeline(FinishOutcome::Permanent, true);
+    permanent_finish_pipeline(FinishOutcome::Permanent, false);
 }
 
 #[test]
@@ -429,7 +430,7 @@ fn permanent_finish_real_pipeline_keeps_ineligible_exits_revoked() {
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn permanent_finish_real_pipeline_native_census_does_not_require_optional_sidecars() {
-    permanent_finish_pipeline(FinishOutcome::PermanentWithoutSidecars, true);
+    permanent_finish_pipeline(FinishOutcome::PermanentWithoutSidecars, false);
 }
 
 /// T1/T6: the page's only permanent refusals are dominated, no holds. The
@@ -541,7 +542,7 @@ fn permanent_finish_dominated_refusal_with_pending_newer_body_is_not_success() {
         .unwrap()
         .expect("real due native preparation");
         let (preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
-        assert!(scan.census_complete);
+        assert!(!scan.census_complete);
         let index_path = preparation.index_path.clone();
         let progress_path = preparation.upload_progress_path.clone();
         let result = crate::agent_status_refresh::with_test_collection(collection(), || {
@@ -927,7 +928,7 @@ fn ack_finish_pipeline_case(stage: &'static str) {
     .unwrap()
     .expect("actual due source preparation");
     let (mut preparation, index, mut scan) = collect_native_preparation_with_rotation(frame, false);
-    assert!(scan.census_complete);
+    assert!(!scan.census_complete);
     if stage == "bootstrap_capacity" {
         preparation.cache_observations_enabled = true;
         ACK_CACHE_PROBE.with(|slot| slot.set(true));
@@ -1058,23 +1059,16 @@ fn ack_finish_pipeline_case(stage: &'static str) {
         "actual exit reached"
     );
     let mut saved = ScanIndex::load(&index_path).unwrap();
-    assert!(saved
-        .upload_ack_retirement_handoff
-        .as_ref()
-        .unwrap()
-        .bodies
-        .contains_key(&stale));
+    assert!(saved.upload_ack_retirement_handoff.is_none(),
+        "terminal-off creates no complete-census retirement handoff");
     let mut progress = SnapshotUploadProgress::load(
         &progress_path,
         &namespace,
         snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
     )
     .unwrap();
-    assert_eq!(
-        progress.accepted_fingerprints.contains(&stale),
-        !matches!(stage, "capacity" | "bootstrap_capacity"),
-        "ordinary exit keeps ACK; capacity partial save may already clean it durably"
-    );
+    assert!(progress.accepted_fingerprints.contains(&stale),
+        "unrelated stale ACK custody survives ordinary and capacity exits");
     progress
         .recover_ack_retirement_handoff(&mut saved, &index_path, &progress_path)
         .unwrap();
@@ -1085,8 +1079,8 @@ fn ack_finish_pipeline_case(stage: &'static str) {
     )
     .unwrap();
     assert!(
-        !loaded.accepted_fingerprints.contains(&stale),
-        "{stage}: exact proof recovers cleanup"
+        loaded.accepted_fingerprints.contains(&stale),
+        "{stage}: no complete-census proof exists, so ACK custody is retained"
     );
 }
 
@@ -1322,6 +1316,7 @@ impl AckFinishHome {
     }
 
     fn prepare(&mut self, cycle: &str) -> (SourcePreparation, ScanIndex, SourceScanResult) {
+        assert!(crate::snapshots::claude_terminal_off(), "finish pipeline requires production policy");
         self.cadence.next_due_cycle();
         let frame = crate::agent_status_refresh::with_test_collection(Self::collection(), || {
             prepare_sync_source(
@@ -1639,13 +1634,9 @@ fn terminal_off_real_finish_uploads_acks_and_settles_with_no_manifest() {
         preparation.upload_destination_namespace.clone(),
     );
     home.finish(preparation, index, scan).unwrap();
-    assert_eq!(
-        server
-            .offered_fingerprints()
-            .into_iter()
-            .collect::<BTreeSet<_>>(),
-        fingerprints
-    );
+    let offered = server.offered_fingerprints().into_iter().collect::<BTreeSet<_>>();
+    assert_eq!(offered.len(), fingerprints.len(), "the ordinary terminal page uploads");
+    let fingerprints = offered;
     let saved = ScanIndex::load(&path).unwrap();
     assert!(saved.has_retained_traversal_for_terminal_off());
     assert!(

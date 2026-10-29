@@ -1636,6 +1636,7 @@ fn api_row_without_trace_row_counts_as_owned() {
 
 #[test]
 fn telemetry_proven_session_keeps_todays_numbers() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let dir = temp_dir("claude-file-birth-parity");
@@ -2260,6 +2261,7 @@ fn tail_and_full_read_select_the_same_first_request() {
 /// uses the merged seam; the full remembered-veto table triggers it too.
 #[test]
 fn claude_backfill_stop_latches_until_restart() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let dir = temp_dir("claude-file-birth-backfill-stop");
     let now = OffsetDateTime::now_utc();
     let files = five_request_roots(&dir, now, &[ROOT, SECOND]);
@@ -2426,6 +2428,7 @@ fn claude_backfill_stop_reminder_is_at_most_hourly() {
 /// a different destination's existing history is stopped process-wide.
 #[test]
 fn claude_backfill_index_rebuild_load_latches_until_restart() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     for kind in ["absent", "corrupt", "empty"] {
         for missing_list in [false, true] {
             restart_claude_reemission_stop_for_test();
@@ -2971,6 +2974,7 @@ fn first_own_request_time_is_absent_unless_the_birth_is_measured() {
 /// for the same file the birth rule measures.
 #[test]
 fn strict_path_has_no_first_own_request_time() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let dir = temp_dir("claude-file-birth-first-own-strict");

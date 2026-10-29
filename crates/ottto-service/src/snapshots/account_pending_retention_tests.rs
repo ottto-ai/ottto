@@ -41,6 +41,7 @@ fn retention_decision(mut index: ScanIndex, root: &str) -> (bool, serde_json::Va
 
 #[test]
 fn account_window_collapse_replays_real_retirement_and_holds() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let (dir, root, base) = retention_fixture();
     for blocker in [
         "none", "withheld", "unacked", "revision", "account", "invalid", "absent",

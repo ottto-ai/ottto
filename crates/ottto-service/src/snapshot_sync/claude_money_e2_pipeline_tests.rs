@@ -1,6 +1,9 @@
 // E2 acceptance from synthetic files through the production scan, fresh
 // sidecar read, native finalize, emission, policy, batch and ACK settlement.
 // No supplied accumulators, literal bodies or money totals stand in for reads.
+// Terminal policy is the production default. Quiet-context controls also need
+// the separately paired upload-context receipt change; never opt this suite
+// into future-paging completion just to make those controls pass.
 use super::*;
 use crate::snapshots::claude_request_money::e2;
 use crate::snapshots::e2_pipeline_scan_fixture::{
@@ -138,6 +141,7 @@ impl Corpus {
         sampled: bool,
         hints: &[PathBuf],
     ) -> Page {
+        assert!(crate::snapshots::claude_terminal_off(), "money pipeline requires production policy");
         index.activate_upload_context("e2-synthetic-destination".into());
         index.activate_effective_upload_body_witness_revision(if e2::enabled() {
             3
@@ -2367,8 +2371,8 @@ fn e2_pipeline_legacy_fork_prefix_is_removed_exactly_once() {
         literal(&p);
         assert_eq!(
             e2::pipeline_test_observer::legacy_excluded(&p.index, COPY),
-            1,
-            "the legacy exclusion would remove the shared prefix from the child"
+            0,
+            "terminal-off withholds the legacy completion proof; E2 still removes the copy"
         );
         let copy = body(&p, COPY).expect("the child publishes");
         assert_eq!(

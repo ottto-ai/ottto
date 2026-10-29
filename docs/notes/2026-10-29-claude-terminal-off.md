@@ -77,3 +77,21 @@ cursor; rediscovery cadence is omitted from serialization. Strict-service
 continuation lives in a bounded process-owned context cache, survives ordinary
 index reloads and safely starts over after a daemon restart. Tests use synthetic sources. Local validation is package clippy with
 all targets; tests run in CI, never through local `cargo test`.
+
+
+Completion-path regression fixtures opt in individually to a `#[cfg(test)]`
+thread-scoped guard. It exercises historical completion and re-arm algorithms;
+assertions in those fixtures remain unchanged. This is coverage debt the paged
+fold must repay, not release evidence. Non-test builds compile a constant ON
+policy and a static assertion, with no fixture override state or entry point.
+A guard test checks default/thread/unwind isolation, and another checks that
+money receipts, E2 money, actual finish, upload, history and correction pipelines
+contain no completion override. Those pipelines exercise production containment.
+
+#899 ships ONLY in the same release as, or after, the per-file upload-context receipt PR (e1/upload-context-receipt); never alone.
+
+The standalone draft still fails completion-dependent end-to-end contracts;
+those failures must be migrated explicitly or repaired with their owning change.
+Repeated-context selection controls remain dependent on the paired receipt PR.
+No passing compile or future-completion fixture is a replacement for current-head
+production-default pipeline and release-cut money receipts.

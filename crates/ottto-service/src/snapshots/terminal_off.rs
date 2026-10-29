@@ -1,8 +1,95 @@
 // Temporary containment. No admitted read path or new persisted shape.
 // A future paged fold must replace the reconstruction guard, not just flip a
 // switch: a changed member may have replaced the old window's negative proof.
+// This literal and static assertion belong to every non-test build. There is
+// no feature, environment variable, serialized setting or release override.
+const CLAUDE_RELEASE_TERMINAL_OFF: bool = true;
+const _: () = assert!(CLAUDE_RELEASE_TERMINAL_OFF);
+
 pub(crate) fn claude_terminal_off() -> bool {
-    true
+    #[cfg(test)]
+    if claude_completion_paths_for_test() {
+        return false;
+    }
+    CLAUDE_RELEASE_TERMINAL_OFF
+}
+
+// Future-paging coverage only. A fixture must opt in explicitly, on its own
+// thread; unwind restores the previous policy. Rc makes the guard !Send/!Sync,
+// so moving it cannot silently change another fixture's policy.
+#[cfg(test)]
+thread_local! {
+    static CLAUDE_COMPLETION_PATHS_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+#[cfg(test)]
+fn claude_completion_paths_for_test() -> bool {
+    CLAUDE_COMPLETION_PATHS_FOR_TEST.with(std::cell::Cell::get)
+}
+#[cfg(test)]
+pub(crate) struct ClaudeCompletionPathsForTest {
+    previous: bool,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+#[cfg(test)]
+impl ClaudeCompletionPathsForTest {
+    pub(crate) fn enable() -> Self {
+        let previous = CLAUDE_COMPLETION_PATHS_FOR_TEST.with(|slot| slot.replace(true));
+        Self {
+            previous,
+            _thread: std::marker::PhantomData,
+        }
+    }
+}
+#[cfg(test)]
+impl Drop for ClaudeCompletionPathsForTest {
+    fn drop(&mut self) {
+        CLAUDE_COMPLETION_PATHS_FOR_TEST.with(|slot| slot.set(self.previous));
+    }
+}
+
+#[cfg(test)]
+mod completion_policy_tests {
+    use super::*;
+
+    #[test]
+    fn money_upload_and_history_suites_have_no_completion_override() {
+        for (suite, source) in [
+            ("release-cut money receipts", include_str!("../snapshot_sync/money_equivalence_tests.rs")),
+            ("E2 money pipeline", include_str!("../snapshot_sync/claude_money_e2_pipeline_tests.rs")),
+            ("real finish", include_str!("../snapshot_sync/permanent_finish_pipeline_tests.rs")),
+            ("prior-index finish", include_str!("../snapshot_sync/prior_index_lifetime_tests.rs")),
+            ("history upgrade", include_str!("../snapshot_sync/history_upgrade_pipeline_tests.rs")),
+            ("authority correction upload", include_str!("../snapshot_sync/authority_proof_correction_pipeline_tests.rs")),
+            ("upload batching", include_str!("../snapshot_sync/e2_upload_tests.rs")),
+            ("census pipeline", include_str!("../snapshot_sync/census_convergence_pipeline_tests.rs")),
+        ] {
+            assert!(!source.contains("ClaudeCompletionPathsForTest"), "{suite} must exercise production containment");
+        }
+        assert!(claude_terminal_off());
+    }
+
+    #[test]
+    fn release_terminal_policy_is_constant_and_fixture_override_is_thread_scoped() {
+        assert!(claude_terminal_off());
+        let enabled = ClaudeCompletionPathsForTest::enable();
+        assert!(!claude_terminal_off());
+        // The non-test branch is this constant, even while this fixture opts in.
+        let release_policy = std::hint::black_box(CLAUDE_RELEASE_TERMINAL_OFF);
+        assert!(release_policy);
+        assert!(std::thread::spawn(claude_terminal_off).join().unwrap());
+        {
+            let _nested = ClaudeCompletionPathsForTest::enable();
+            assert!(!claude_terminal_off());
+        }
+        assert!(!claude_terminal_off());
+        drop(enabled);
+        assert!(claude_terminal_off());
+        let _ = std::panic::catch_unwind(|| {
+            let _unwind = ClaudeCompletionPathsForTest::enable();
+            panic!("synthetic fixture unwind");
+        });
+        assert!(claude_terminal_off());
+    }
 }
 
 // The containment veto is process policy, never a persisted fence mutation.
@@ -57,6 +144,12 @@ fn claude_terminal_reconstructed(index: &ScanIndex, window: &str) -> bool {
 }
 
 pub(crate) fn claude_terminal_authority(index: &ScanIndex, offered: bool, window: &str) -> bool {
+    // Only the cfg(test) fixture guard exercises the historical completion
+    // algorithms. A release caller must earn reconstruction before authority.
+    #[cfg(test)]
+    if claude_completion_paths_for_test() {
+        return offered;
+    }
     offered && !claude_terminal_off() && claude_terminal_reconstructed(index, window)
 }
 

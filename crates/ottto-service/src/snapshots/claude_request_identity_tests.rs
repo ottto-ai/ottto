@@ -1829,6 +1829,7 @@ fn assert_usage_conserved(tagged: &SnapshotItem, before: &SnapshotItem) {
 /// refused while the transcript requests keep their telemetry login.
 #[test]
 fn reported_rebuild_groups_requests_without_changing_its_output() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     for (with_aux, aux_login) in [(false, true), (true, true), (true, false)] {
@@ -1946,6 +1947,7 @@ fn reported_rebuild_groups_requests_without_changing_its_output() {
 /// unsettled census, with a fingerprint the upload no-op check cannot match.
 #[test]
 fn proven_reported_members_are_rearmed_and_reoffered_as_contract5() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     use crate::snapshots::claude_request_accounts as accounts;
@@ -2168,6 +2170,7 @@ fn request_hash(request_id: &str) -> String {
 /// admits the child, so this repair takes no such item off contract 5.
 #[test]
 fn legacy_excluded_reported_fork_stays_contract5_by_owned_requests() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let parent_login = "b".repeat(64);
@@ -2260,6 +2263,7 @@ fn legacy_excluded_reported_fork_stays_contract5_by_owned_requests() {
 /// it); every refused item keeps today's bytes.
 #[test]
 fn legacy_exclusion_skew_never_tags_or_borrows_the_parent() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     // Two telemetry-only requests: the 0.1.172 count guard (4 != 3) is

@@ -251,7 +251,8 @@ fn same_input_finish_pair(outcome: FinishOutcome, conflict: bool, count: usize) 
         .expect("actual due preparation");
         assert!(!frame.native_comparison_lease.as_ref().unwrap().allowed());
         let (mut preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
-        assert!(scan.census_complete);
+        assert!(crate::snapshots::claude_terminal_off());
+        assert!(!scan.census_complete);
         assert_eq!(scan.snapshots.len(), 1);
         if common.is_none() {
             common = Some((

@@ -128,6 +128,7 @@ fn terminal_contract_load_is_paced_and_preserves_account_and_history_state() {
 
 #[test]
 fn terminal_contract_retry_reads_only_the_owning_file() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let scratch = crate::test_scratch::ScratchDir::new("terminal-contract-file-read");
     let root = scratch.join("sources");
     fs::create_dir_all(&root).unwrap();

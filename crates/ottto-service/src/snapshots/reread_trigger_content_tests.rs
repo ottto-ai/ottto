@@ -225,6 +225,7 @@ fn metadata_only_changes_never_trigger_a_reread() {
 /// and then settles. Never a loop.
 #[test]
 fn same_bytes_under_a_new_inode_read_once_for_its_object_inputs() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     for (source, name, body) in sources() {
         for preserve_mtime in [false, true] {
             let mut fixture =
@@ -274,6 +275,7 @@ fn same_bytes_under_a_new_inode_read_once_for_its_object_inputs() {
 
 #[test]
 fn real_content_changes_are_reread() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     for (source, name, body) in sources() {
         // Append: size moves.
         let mut fixture = Fixture::settled(source, &format!("{name}-append"), &body);
@@ -369,6 +371,7 @@ fn ctime_mismatch_revalidates_samples_without_a_full_read() {
 /// with its natural mtime: the samples cannot see it, mtime does. Re-read.
 #[test]
 fn truncate_regrow_with_unchanged_samples_is_reread_by_mtime() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     for (source, name, _) in sources() {
         let padding = format!(
             "{{\"type\":\"ottto_reread_padding\",\"pad\":\"{}\"}}\n",
@@ -637,6 +640,7 @@ fn chmod_flip(path: &Path) {
 /// (chmod) must read B, never adopt A's ctime.
 #[test]
 fn reused_inode_with_an_unequal_birth_is_read() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     for (source, name, body) in sources() {
         for earlier in [true, false] {
             let mut fixture =
@@ -680,6 +684,7 @@ fn reused_inode_with_an_unequal_birth_is_read() {
 /// or live, never adopts a stored ctime: the normal path reads.
 #[test]
 fn unavailable_birth_never_adopts_a_stored_ctime() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     for (source, name, body) in sources() {
         // Stored birth unavailable.
         let mut fixture = Fixture::settled(source, &format!("{name}-no-birth"), &body);

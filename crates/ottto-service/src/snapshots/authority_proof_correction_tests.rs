@@ -179,6 +179,7 @@ const PARSE_FOR_AUTHORITY: (CandidateDecision, Option<CandidateParseReason>) = (
 /// member revisions are unchanged; owed members bypass the terminal gate.
 #[test]
 fn changed_proof_rebinds_the_terminal_record_and_owes_every_member() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let mut index = apc_terminal_fixture();
     let before = apc_record(&index).clone();
     for slot in 0..2 {
@@ -238,6 +239,7 @@ fn changed_proof_rebinds_the_terminal_record_and_owes_every_member() {
 /// census proves a family. The pipeline tests exercise those censuses.)
 #[test]
 fn rebind_grants_nothing_without_a_changed_proof_over_an_exactly_bound_record() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let changed = apc_witness('f');
     let unchanged = |mutate: &dyn Fn(&mut ScanIndex), witness: &ClaudeUsageFamilyWitness| {
         let mut index = apc_terminal_fixture();
@@ -308,6 +310,7 @@ fn rebind_grants_nothing_without_a_changed_proof_over_an_exactly_bound_record() 
 /// counter or deadline. Repeating that proof grants nothing.
 #[test]
 fn a_new_proof_over_a_pending_correction_owes_every_member_again() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let mut index = apc_terminal_fixture();
     apc_prove(&mut index, &apc_witness('f'));
     // The root's exact corrected body settled; only the agent still owes.
@@ -363,6 +366,7 @@ fn a_new_proof_over_a_pending_correction_owes_every_member_again() {
 /// the proof) skips unchanged members again until the next changed proof.
 #[test]
 fn only_owed_or_changed_members_bypass_the_terminal_gate() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let mut index = apc_terminal_fixture();
     apc_prove(&mut index, &apc_witness('f'));
     let mut changed = apc_candidate(&index, 0);
@@ -408,6 +412,7 @@ fn apc_load_value(scratch: &Path, name: &str, value: &Value) -> (ScanIndex, bool
 /// shape drops only the authority record and its pending proof state.
 #[test]
 fn invalid_correction_states_drop_only_the_affected_authority_record() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let scratch = crate::test_scratch::ScratchDir::new("proof-correction-load");
     let mut index = apc_terminal_fixture();
     apc_prove(&mut index, &apc_witness('f'));
@@ -523,6 +528,7 @@ fn invalid_correction_states_drop_only_the_affected_authority_record() {
 /// bytes back unchanged.
 #[test]
 fn new_reader_keeps_old_contract_records_byte_identical() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let mut index = apc_terminal_fixture();
     let record = apc_record(&index).clone();
     let [root, agent] = apc_members();
@@ -562,6 +568,7 @@ fn new_reader_keeps_old_contract_records_byte_identical() {
 /// source; it is not an execution of an older binary.
 #[test]
 fn pre_change_decoder_rejects_the_declared_v2_contract_and_rebuilds() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let mut index = apc_terminal_fixture();
     apc_prove(&mut index, &apc_witness('f'));
     let saved = serde_json::to_value(&index).unwrap();
@@ -631,6 +638,7 @@ fn pre_change_decoder_rejects_the_declared_v2_contract_and_rebuilds() {
 /// the retained proof, and reloads intact while the unACKed file reverts.
 #[test]
 fn partial_checkpoint_subset_keeps_every_unsettled_owed_member() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let previous = apc_terminal_fixture();
     let mut current = previous.clone();
     apc_prove(&mut current, &apc_witness('f'));
@@ -697,6 +705,7 @@ fn partial_checkpoint_subset_keeps_every_unsettled_owed_member() {
 /// from the census clears its record and pending proof.
 #[test]
 fn complete_census_retires_only_absent_correction_members() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let [root, agent] = apc_members();
     let mut index = apc_terminal_fixture();
     apc_prove(&mut index, &apc_witness('f'));
@@ -929,6 +938,7 @@ fn apc_quarantine_bytes(index: &ScanIndex) -> Vec<u8> {
 /// survives restart while the present member still owes.
 #[test]
 fn m1_only_a_complete_healthy_absence_retires_the_absent_members_grant() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let [root, _] = apc_members();
     let [_, agent_key] = apc_keys();
     let committed = apc_granted();
@@ -985,6 +995,7 @@ fn m1_only_a_complete_healthy_absence_retires_the_absent_members_grant() {
 /// vanished is not a complete family, so the same existing rule applies.
 #[test]
 fn m1_reappearance_is_a_new_file_and_a_vanished_family_clears_its_record() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let [root, agent] = apc_members();
     let [root_key, agent_key] = apc_keys();
     let mut index = apc_granted();
@@ -1047,6 +1058,7 @@ fn m1_reappearance_is_a_new_file_and_a_vanished_family_clears_its_record() {
 /// complete healthy census drains them at its authority apply after restart.
 #[test]
 fn m2_current_revision_empty_member_drains_without_a_body_only_at_a_complete_census() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let [root, agent] = apc_members();
     let [root_key, _] = apc_keys();
     let current = apc_revisions()[0].clone();
@@ -1089,6 +1101,7 @@ fn m2_current_revision_empty_member_drains_without_a_body_only_at_a_complete_cen
 /// shape then advances on its own same-pass empty parse and drains.
 #[test]
 fn m2_older_legacy_failed_partial_and_unpaired_empty_facts_stay_owed() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let [root, agent] = apc_members();
     let [root_key, _] = apc_keys();
     let current = apc_revisions()[0].clone();
@@ -1186,6 +1199,7 @@ fn m2_older_legacy_failed_partial_and_unpaired_empty_facts_stay_owed() {
 /// including a failed newer revision that produced no snapshot at all.
 #[test]
 fn current_page_reads_defer_a_previously_durable_empty_pair_until_settlement() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let [root, agent] = apc_members();
     let current = apc_revisions()[0].clone();
     let newer = apc_hex('4');
@@ -1230,6 +1244,7 @@ fn current_page_reads_defer_a_previously_durable_empty_pair_until_settlement() {
 /// next complete healthy census then drains the member with no upload.
 #[test]
 fn a1_earlier_partial_empty_page_advances_only_the_map_then_a_complete_census_drains() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let [root, agent] = apc_members();
     let [root_key, _] = apc_keys();
     let new = apc_hex('4');
@@ -1288,6 +1303,7 @@ fn a1_earlier_partial_empty_page_advances_only_the_map_then_a_complete_census_dr
 /// complete healthy census after restart drains the member.
 #[test]
 fn a3_held_restoration_of_an_older_empty_entry_never_advances_or_drains() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let [root, agent] = apc_members();
     let [root_key, _] = apc_keys();
     let older = apc_hex('0');
@@ -1363,6 +1379,7 @@ fn a3_held_restoration_of_an_older_empty_entry_never_advances_or_drains() {
 /// body carries the paired advance intact.
 #[test]
 fn a2_shed_after_an_empty_advance_rolls_the_map_back_and_keeps_the_last_owed_member() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let [root, agent] = apc_members();
     let [root_key, _] = apc_keys();
     let new = apc_hex('4');
@@ -1439,6 +1456,7 @@ fn a2_shed_after_an_empty_advance_rolls_the_map_back_and_keeps_the_last_owed_mem
 /// drains it and clears the record and its pending proof.
 #[test]
 fn a2_partial_save_without_a_prior_entity_carries_the_pair_and_drains_at_a_complete_census() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let [root, agent] = apc_members();
     let [_, agent_key] = apc_keys();
     let new = apc_hex('4');
@@ -1489,6 +1507,7 @@ fn a2_partial_save_without_a_prior_entity_carries_the_pair_and_drains_at_a_compl
 /// the existing R4 path, and the member stays owed through restart.
 #[test]
 fn a3_a_non_empty_parse_never_advances_the_map() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let [root, agent] = apc_members();
     let [root_key, _] = apc_keys();
     let changed = apc_hex('6');
@@ -1525,6 +1544,7 @@ fn a3_a_non_empty_parse_never_advances_the_map() {
 /// changed body set, drains nothing.
 #[test]
 fn an_accepted_unchanged_body_drains_as_a_no_op_without_an_upload() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let [root, agent] = apc_members();
     let [root_key, _] = apc_keys();
     let fingerprint = apc_hex('c');
@@ -1602,6 +1622,7 @@ fn an_accepted_unchanged_body_drains_as_a_no_op_without_an_upload() {
 
 #[test]
 fn terminal_refusal_requires_current_proof_revision_body_and_nonpartial_outcome() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let [root, agent] = apc_members();
     let key = apc_keys()[0].clone();
     let fp = apc_hex('c');
@@ -1730,6 +1751,7 @@ fn apc_cutoff_item(revision: &str, activity: &str) -> SnapshotItem {
 
 #[test]
 fn cutoff_only_completion_carries_its_selected_empty_facts_or_stays_owed() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let [root, agent] = apc_members();
     let key = apc_keys()[0].clone();
     let revision = apc_hex('6');
@@ -1802,6 +1824,7 @@ fn cutoff_only_completion_carries_its_selected_empty_facts_or_stays_owed() {
 
 #[test]
 fn partial_cutoff_keeps_the_remaining_body_on_the_exact_ack_path() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let revision = apc_revisions()[0].clone();
     let before = apc_granted();
     for (complete, held, parsed_count) in [
@@ -1887,6 +1910,7 @@ fn partial_cutoff_keeps_the_remaining_body_on_the_exact_ack_path() {
 /// counts and reasons go only to the existing local diagnostic line.
 #[test]
 fn a_correction_persists_no_diagnostic_metadata() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let value = serde_json::to_value(apc_granted()).unwrap();
     let record = value["claude_usage_authority_quarantine"][APC_ROOT]
         .as_object()
@@ -2128,6 +2152,7 @@ fn apc_m2_advance(index: &mut ScanIndex, roots: usize) {
 /// measured in the pipeline tests.
 #[test]
 fn proof_correction_encoded_and_owned_bytes_receipt() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     for roots in [32, 64] {
         for owed in 1..=APC_M2_MEMBERS {
             let (measured, scope) = probe::measure(|| {
@@ -2429,6 +2454,7 @@ fn binding_family() -> (
 
 #[test]
 fn demotion_after_same_call_reproof_binds_current_witness() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     // Reported-authority replacement/proof corrections; E2 literals never demote to native.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let (scratch, root, mut index, items, mut api, trace) = binding_family();
@@ -2487,6 +2513,7 @@ fn demotion_after_same_call_reproof_binds_current_witness() {
 
 #[test]
 fn witness_removed_while_member_demotes_does_not_quarantine_index() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     // Reported-authority replacement/proof corrections; E2 literals never demote to native.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let (scratch, root, mut index, mut items, api, trace) = binding_family();
@@ -2585,6 +2612,7 @@ fn apc_without_unbound_record(index: &ScanIndex) -> Value {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn load_drops_unbound_authority_record_and_keeps_index() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let scratch = crate::test_scratch::ScratchDir::new("authority-load-containment");
     let index = apc_unbound_fixture();
     let expected = apc_without_unbound_record(&index);
@@ -2617,6 +2645,7 @@ fn load_drops_unbound_authority_record_and_keeps_index() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn contained_unbound_authority_record_does_not_latch_claude_reemission_stop() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let scratch = crate::test_scratch::ScratchDir::new("authority-load-no-rebuild-stop");
     let index = apc_unbound_fixture();
     let path = scratch.join("index.json");
@@ -2640,6 +2669,7 @@ fn contained_unbound_authority_record_does_not_latch_claude_reemission_stop() {
 /// debug and release alike; the save succeeds and the result loads as is.
 #[test]
 fn save_drops_existing_orphan_authority_record_and_succeeds() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let scratch = crate::test_scratch::ScratchDir::new("authority-save-containment");
     let path = scratch.join("index.json");
     let mut index = apc_unbound_fixture();
@@ -2679,6 +2709,7 @@ fn save_drops_existing_orphan_authority_record_and_succeeds() {
 
 #[test]
 fn empty_map_restore_never_removes_owed_member() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let scratch = crate::test_scratch::ScratchDir::new("authority-empty-restore");
     let mut index = apc_granted();
     let member = apc_members()[1].clone();

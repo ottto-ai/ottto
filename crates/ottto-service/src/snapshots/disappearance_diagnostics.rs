@@ -651,6 +651,7 @@ mod tests {
     /// removal: no disappeared count, a complete census, the entry gone.
     #[test]
     fn claude_queued_member_deleted_while_its_remove_hint_is_deduped_retires_as_removal() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let dir = crate::test_scratch::ScratchDir::new("absence-deduped-hint");
         let first = "a1111111-1111-4111-8111-111111111111";
         let second = "b2222222-2222-4222-8222-222222222222";
@@ -751,6 +752,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn claude_deleted_audit_debt_member_of_forced_quarantined_family_is_removal() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let fixture = ForcedFamilyFixture::new("absence-forced-family");
         let member_key = local_index_key(&fixture.member_path);
         let mut index = fixture.index();
@@ -851,6 +853,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn claude_member_removal_matches_remove_hint_for_quarantined_family() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let fixture = ForcedFamilyFixture::new("absence-quarantine-control");
         let initial = fixture.index();
         let failures_before =
@@ -891,6 +894,7 @@ mod tests {
     /// removal goes with its entry, and that removal is counted.
     #[test]
     fn claude_vanished_member_drops_its_request_census_record_and_counts_it() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let dir = crate::test_scratch::ScratchDir::new("absence-request-census");
         let first = "a1111111-1111-4111-8111-111111111111";
         let second = "b2222222-2222-4222-8222-222222222222";
@@ -931,6 +935,7 @@ mod tests {
     /// member's snapshot fingerprints stay (N3).
     #[test]
     fn claude_vanished_audit_debt_member_drops_its_request_census_record_and_counts_it() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let dir = crate::test_scratch::ScratchDir::new("absence-debt-request-census");
         let first = "a1111111-1111-4111-8111-111111111111";
         let second = "b2222222-2222-4222-8222-222222222222";
@@ -1000,6 +1005,7 @@ mod tests {
     /// quiet.
     #[test]
     fn claude_selected_member_deleted_before_open_retires_through_the_page_merge() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let dir = crate::test_scratch::ScratchDir::new("absence-open-pipeline");
         let first = "a1111111-1111-4111-8111-111111111111";
         let second = "b2222222-2222-4222-8222-222222222222";
@@ -1089,6 +1095,7 @@ mod tests {
     /// indexed in the same generation.
     #[test]
     fn claude_single_file_rename_retires_old_path_and_indexes_new_path() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let dir = crate::test_scratch::ScratchDir::new("absence-rename");
         let first = "a1111111-1111-4111-8111-111111111111";
         let second = "b2222222-2222-4222-8222-222222222222";

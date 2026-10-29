@@ -33,6 +33,7 @@ fn off_line(member: &str, request: &str) -> String {
 }
 
 fn off_scan(index: &mut ScanIndex, root: &Path, at: &str, limit: usize) -> SourceScanResult {
+    assert!(claude_terminal_off(), "containment receipts require production policy");
     // The production prepare activates context after every reload.
     if index.active_upload_context_fingerprint.is_none() {
         index.activate_upload_context("settled-destination".into());
@@ -120,6 +121,8 @@ fn terminal_off_w1_w2_open_fence_skipped_duplicate_never_verifies() {
         let mut text = fs::read_to_string(&root_path).unwrap();
         text.push_str("{\"type\":\"user\",\"message\":{\"content\":\"metadata only\"}}\n");
         fs::write(&root_path, text).unwrap();
+        // Activation is process-local and is restored by prepare after load.
+        index.activate_upload_context("settled-destination".into());
         off_suppression_preconditions(&index);
         index.traversal = None;
         index.claude_duplicate_request_witness_overflowed = initially_closed;
@@ -411,7 +414,9 @@ fn terminal_off_delete_defers_all_raw_effects_and_full_rearm() {
         index.files[&key].source_file_fingerprint, before,
         "exact removal withheld before raw effects"
     );
-    assert!(index.claude_duplicate_request_witness_overflowed);
+    assert!(claude_effective_duplicate_fence_closed(&index));
+    assert!(!index.claude_duplicate_request_witness_overflowed,
+        "containment does not mutate the persisted fence");
     let api = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
     let trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
     let d = apply_claude_reported_usage_with_index(&mut [], &api, &trace, &mut index, true, W2);
@@ -442,7 +447,7 @@ fn terminal_off_context_change_and_contract_debt_still_select() {
         SnapshotSource::ClaudeCode,
         &[scratch.to_path_buf()],
         &mut index,
-        W2,
+        "2026-08-20T10:22:00Z",
         BACKFILL_WINDOW_DAYS,
     );
     assert!(index.files[&local_index_key(&path)]

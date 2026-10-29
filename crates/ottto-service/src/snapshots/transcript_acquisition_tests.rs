@@ -3978,6 +3978,7 @@ fn completed_full_audit_before_durable_replacement_recovers_after_restart() {
 #[cfg(unix)]
 #[test]
 fn missing_index_debt_carrier_recovers_by_full_in_one_pass_for_both_sources() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     use crate::durable_tail_store as store;
     use crate::transcript_acquisition::ReadPlan;
     use std::io::Read;
@@ -4242,6 +4243,7 @@ fn missing_index_debt_carrier_recovers_by_full_in_one_pass_for_both_sources() {
 #[cfg(unix)]
 #[test]
 fn missing_index_terminal_loss_carries_recovered_debt_until_verified_full_for_both_sources() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     use crate::durable_tail_store as store;
     use crate::transcript_acquisition::ReadPlan;
     use std::io::Read;

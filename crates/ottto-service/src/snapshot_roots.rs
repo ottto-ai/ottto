@@ -251,7 +251,7 @@ mod tests {
             30,
         )
         .unwrap();
-        assert!(imported.census_complete);
+        assert!(!imported.census_complete);
         assert_eq!(imported.snapshots.len(), 3);
         assert_eq!(
             imported
@@ -278,7 +278,7 @@ mod tests {
             30,
         )
         .unwrap();
-        assert!(repeated.census_complete);
+        assert!(!repeated.census_complete);
         assert!(repeated.snapshots.is_empty());
         let first = &roots[0];
         write_session(first, "session-0", 15);

@@ -376,6 +376,7 @@ fn assert_layout_mode(actual: (usize, usize, usize), reuse: (usize, usize, usize
 
 #[test]
 fn sidecar_only_late_evidence_reuses_prefix_and_matches_enriched_full() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let f = Fixture::new(2);
@@ -471,6 +472,7 @@ fn root_telemetry_reselects_every_child_without_invalidating_reduction() {
 
 #[test]
 fn mid_acquisition_telemetry_is_joined_freshly_in_both_modes() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let f = Fixture::new(2);
     let cache = Arc::new(SharedCache::default());
     let prior = seed_predecessor(&f, &cache);
@@ -621,6 +623,7 @@ fn true_scope_change_at_completion_still_refuses_cached_publication() {
 
 #[test]
 fn sidecar_cap_loss_matches_full_and_keeps_prior_authority_quarantine() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let f = Fixture::new(2);
@@ -648,6 +651,7 @@ fn sidecar_cap_loss_matches_full_and_keeps_prior_authority_quarantine() {
 
 #[test]
 fn cached_context_and_hourly_audit_debt_survive_telemetry_only_cycles() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let f = Fixture::new(1);
     let cache = Arc::new(SharedCache::default());
     let prior = seed_predecessor(&f, &cache);
@@ -717,6 +721,7 @@ fn missing_trace_and_conflicting_evidence_keep_full_oracle_disposition() {
 
 #[test]
 fn cold_full_mid_read_sidecars_complete_but_true_scope_and_object_changes_refuse() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     for change in ["sidecars", "context", "object"] {
         let f = Fixture::new(2);
         f.write_rows(false, &f.api[..2]);
@@ -1047,6 +1052,7 @@ mod durable_restart {
     /// invalidated and a restart reads Full.
     #[test]
     fn a_reduction_ahead_of_the_saved_selection_is_never_written() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         let f = Fixture::new(1);
         let state = State::new(&f);
         let prior = seed_and_persist(&f, &state);

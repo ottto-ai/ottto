@@ -101,6 +101,7 @@ fn assert_native(scan: &SourceScanResult, requests: u64) {
 
 #[test]
 fn oversized_claude_shrink_then_grow_keeps_unread_content_unproven() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let fixture = Fixture::new();
     let path = fixture.path();
     let mut file = File::create(&path).unwrap();

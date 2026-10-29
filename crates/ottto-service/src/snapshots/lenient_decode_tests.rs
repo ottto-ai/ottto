@@ -3495,6 +3495,7 @@ fn carried_ack_at_entry_cap_is_never_lost_or_reoffered() {
 #[test]
 #[serial_test::serial(source_manifests)]
 fn carried_ack_for_unvisited_family_hold_survives_until_reconstruction() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let scratch = crate::test_scratch::ScratchDir::new("carried-unvisited-family-hold");
     let root = scratch.join("projects");
     let path = scratch.join("index.json");
@@ -3595,6 +3596,7 @@ fn carried_ack_for_unvisited_family_hold_survives_until_reconstruction() {
 
 #[test]
 fn carried_ack_age_survives_restart_and_alarms_without_eviction_until_release() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     const START: u64 = 2_000_000_000;
     const WEEK: u64 = 7 * 24 * 60 * 60;
     let at = |seconds| UNIX_EPOCH + std::time::Duration::from_secs(seconds);

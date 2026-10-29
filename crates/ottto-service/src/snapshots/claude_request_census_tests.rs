@@ -530,6 +530,7 @@ fn census_derivation_canary_fails_on_a_missed_bump() {
 /// never covered by the old revision, and the copied ids join the census.
 #[test]
 fn census_residue_reparse_never_keeps_the_old_record() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let scratch = crate::test_scratch::ScratchDir::new("census-residue-reparse");
     let root = scratch.join("projects");
     census_write(
@@ -622,6 +623,7 @@ fn census_residue_reparse_never_keeps_the_old_record() {
 /// a cap-exceeding occurrence total), while the real fence stays BASE.
 #[test]
 fn census_shadow_would_open_where_the_base_fence_closes() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let api = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
         evidence: BTreeMap::new(),
         health: Default::default(),
@@ -1160,6 +1162,7 @@ fn census_derivation_drift_tripwire_counts_changed_ids_at_one_revision() {
 /// bounce back.
 #[test]
 fn census_retired_record_survives_an_unchanged_reparse() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let scratch = crate::test_scratch::ScratchDir::new("census-retired-reparse");
     let root = scratch.join("projects");
     census_write(

@@ -417,9 +417,10 @@ impl HistoryFixture {
 
     /// Every file sent and stamped at revision 1 under a fresh install.
     fn baseline(&self) -> ScanIndex {
+        assert!(crate::snapshots::claude_terminal_off(), "history pipeline requires production policy");
         let outcome = self.cycle("2026-08-02T08:00:00Z", HISTORY_BASELINE);
         assert_eq!(outcome.uploaded.len(), HISTORY_SESSIONS.len());
-        assert!(outcome.scan.census_complete);
+        assert!(!outcome.scan.census_complete);
         assert!(outcome
             .index
             .files
@@ -480,7 +481,7 @@ fn quarantined_index_after_bootstrap_holds_all_history_without_a_list() {
         );
         assert!(rebuilt.uploaded.is_empty(), "{:?}", rebuilt.uploaded);
         assert_eq!(rebuilt.corrections, 0, "no correction carries them");
-        assert!(rebuilt.scan.census_complete);
+        assert!(!rebuilt.scan.census_complete);
         assert_eq!(rebuilt.index.files.len(), HISTORY_SESSIONS.len());
         assert_eq!(HistoryFixture::census_keys(&rebuilt.index), 3);
         for entry in rebuilt.index.files.values() {

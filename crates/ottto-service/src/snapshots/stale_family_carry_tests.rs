@@ -645,6 +645,7 @@ fn carry_controls() -> Vec<CarryControl> {
 /// the index and the row identical to BASE.
 #[test]
 fn c1b_negative_controls_rearm_exactly_like_base() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     for control in carry_controls() {
         let ((fix, row), (base, base_row)) = carry_arms(&*control.mutate, control.days);
         assert_eq!(row, base_row, "{}: the row is BASE's", control.name);
@@ -1209,6 +1210,7 @@ fn carry_resumed_index(base: bool, passed: bool) -> ScanIndex {
 /// Exercise refund even where native carry funding is unavailable.
 #[test]
 fn unfunded_replay_clears_fingerprints_on_every_platform() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let mut fix = carry_index();
     fix.claude_stale_family_carry
         .roots
@@ -3271,6 +3273,7 @@ fn scoped_unhealthy_retry_preserves_member_protection_and_scratch_refusal() {
 
 #[test]
 fn scoped_retry_preserves_actual_rearms_and_selection() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     // Portable CI exercises BASE fallback; macOS exercises the funded carry.
     let supported = crate::heap_layout_bound::layout_supported();
     let mut fixture = scoped_retry_fixture(3, 320, true);
@@ -3751,6 +3754,7 @@ include!("retry_admission_tests.rs");
 // walk, changing the actual carry, or adding fields to the old transition row.
 #[test]
 fn stale_carry_rejection_histogram_reports_first_start_gate() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     for (stage, mutate) in [
         ("provenance_or_context", 0),
         ("contract", 1),

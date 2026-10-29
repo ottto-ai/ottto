@@ -12,6 +12,7 @@ fn p12_experimental_base_exit_claude_duplicate_across_pages_stays_refused_withou
 
 #[test]
 fn p12_experimental_base_exit_claude_explicit_fork_duplicate_owned_request_fails_posture_closed() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     let scope = crate::snapshots::envelope_selection_experiment::Scope::restart();
     claude_explicit_fork_duplicate_owned_request_fails_posture_closed();
     assert_eq!(scope.counts().rearm_suppressed, 0);

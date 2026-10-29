@@ -559,12 +559,14 @@ fn observe_base_prelude(experimental_base_exit: bool) {
 }
 #[test]
 fn p12_member_change_base_control_reveals_unmet_original_prelude() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     observe_base_prelude(false);
 }
 #[test]
 fn p12_member_change_experiment_base_exit_reveals_unmet_original_prelude() {
+    let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
     // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     observe_base_prelude(true);

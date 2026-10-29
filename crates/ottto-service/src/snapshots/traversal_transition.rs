@@ -396,7 +396,11 @@ mod tests {
 
     #[test]
     fn traversal_transition_actual_stale_rearm_is_counted_without_content() {
-        let mut index = ScanIndex::default();
+        // This is genuine semantic debt, not a redundant stale-start clear.
+        let mut index = ScanIndex {
+            claude_request_identity_contract_changed: true,
+            ..ScanIndex::default()
+        };
         let key = "/not-logged/private-session.jsonl";
         index.files.insert(
             key.into(),
