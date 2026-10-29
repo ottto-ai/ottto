@@ -3215,7 +3215,19 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                         "cold Claude keeps unproved records; Codex deletes verified absences"
                     );
                     let (_, cleanup) = cache.durable_counters(source).unwrap();
-                    assert_eq!(cleanup.gc_records_deleted, u64::from(!claude));
+                    // The unmarked control also has a known selected record
+                    // with no index entry: Codex collects both known absences.
+                    let selected_survives = claude || kind != "none";
+                    assert_eq!(record_path.exists(), selected_survives, "{source:?}/{kind}");
+                    assert_eq!(
+                        cleanup.gc_records_deleted,
+                        if claude {
+                            0
+                        } else {
+                            1 + u64::from(kind == "none")
+                        },
+                        "{source:?}/{kind}: exact known absent records collected"
+                    );
                     assert_eq!(
                         cleanup.mutation_unproved,
                         if claude {
