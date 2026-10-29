@@ -1646,24 +1646,21 @@ pub(super) mod tests {
     use super::*;
 
     thread_local! {
-        static HEADER_READ_PROBE: std::cell::RefCell<Option<(PathBuf, usize)>> = const {
+        static HEADER_READ_PROBE: std::cell::RefCell<Option<BTreeMap<PathBuf, usize>>> = const {
             std::cell::RefCell::new(None)
         };
     }
     pub(in crate::snapshots) fn header_read_started(path: &Path) {
         HEADER_READ_PROBE.with(|probe| {
-            if let Some((observed, reads)) = probe.borrow_mut().as_mut() {
-                if observed == path {
-                    *reads += 1;
-                }
+            if let Some(reads) = probe.borrow_mut().as_mut() {
+                *reads.entry(path.to_owned()).or_default() += 1;
             }
         });
     }
     /// Opt-in instrumentation at the real header I/O entry, including retries.
-    pub(in crate::snapshots) fn count_header_reads<T>(
-        path: &Path,
+    pub(in crate::snapshots) fn header_reads<T>(
         run: impl FnOnce() -> T,
-    ) -> (T, usize) {
+    ) -> (T, BTreeMap<PathBuf, usize>) {
         struct Reset;
         impl Drop for Reset {
             fn drop(&mut self) {
@@ -1672,12 +1669,19 @@ pub(super) mod tests {
         }
         HEADER_READ_PROBE.with(|probe| {
             assert!(probe.borrow().is_none());
-            *probe.borrow_mut() = Some((path.to_owned(), 0));
+            *probe.borrow_mut() = Some(BTreeMap::new());
         });
         let _reset = Reset;
         let result = run();
-        let reads = HEADER_READ_PROBE.with(|probe| probe.borrow().as_ref().unwrap().1);
+        let reads = HEADER_READ_PROBE.with(|probe| probe.borrow_mut().take().unwrap());
         (result, reads)
+    }
+    pub(in crate::snapshots) fn count_header_reads<T>(
+        path: &Path,
+        run: impl FnOnce() -> T,
+    ) -> (T, usize) {
+        let (result, reads) = header_reads(run);
+        (result, reads.get(path).copied().unwrap_or_default())
     }
 
     pub(crate) fn usage(input: u64) -> Value {

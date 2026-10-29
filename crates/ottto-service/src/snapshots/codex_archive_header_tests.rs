@@ -1329,3 +1329,292 @@ fn excluded_archive_inventory_hold_survives_restart_without_plain_header_reread(
         fs::remove_dir_all(state_root).unwrap();
     }
 }
+
+#[test]
+fn denied_only_inventory_hold_reoffers_owed_plain_at_bounded_retry_generation() {
+    use codex_file_join::{tests::header_reads, DirectoryCensus, HeaderInventory};
+
+    fn page(
+        roots: &[PathBuf],
+        index: ScanIndex,
+        clock: &str,
+    ) -> (ScanIndex, SourceScanResult, usize) {
+        let mut scan = OwnedSourceScan::new(
+            SnapshotSource::Codex,
+            roots,
+            index,
+            clock,
+            BACKFILL_WINDOW_DAYS,
+            10,
+            false,
+            None,
+            &[],
+            false,
+            false,
+        );
+        let mut header_bytes = 0;
+        for _ in 0..1000 {
+            if let Some(inventory) = &scan.codex_join_inventory {
+                header_bytes = header_bytes.max(inventory.read_bytes);
+            }
+            scan = match scan.step(None) {
+                OwnedSourceScanStep::Pending(next) => next,
+                OwnedSourceScanStep::Complete { index, scan, .. } => {
+                    return (index, scan, header_bytes);
+                }
+            };
+        }
+        panic!("bounded retry page did not finish");
+    }
+
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut f = ArchiveFixture::new(b"stable-refused-archive");
+    let state_root = f.0.parent().unwrap().to_owned();
+    let root = state_root.join("sessions");
+    fs::create_dir(&root).unwrap();
+    let archive_path = root.join(f.0.file_name().unwrap());
+    fs::rename(&f.0, &archive_path).unwrap();
+    f.0 = archive_path;
+    let roots = [root.clone()];
+    let plain = root.join("rollout-owed-plain.jsonl");
+    let settled = root.join("rollout-settled-plain.jsonl");
+    let rollout = String::from_utf8(synthetic_rollout()).unwrap();
+    fs::write(
+        &settled,
+        rollout.replace("compressed-fixture", "settled-plain"),
+    )
+    .unwrap();
+    // Q is genuinely parsed, finalized and ACKed, rather than a fabricated
+    // unchanged entry whose missing ownership evidence could hide a replay.
+    let (mut index, mut first, _) = page(&roots, ScanIndex::default(), NOW);
+    assert_eq!(first.snapshots.len(), 1);
+    assert_eq!(first.snapshots[0].source_session_id, "settled-plain");
+    finalize_scan_after_policy(SnapshotSource::Codex, &mut first, &mut index);
+    first.finish_codex_capture_boundary(&mut index);
+    let accepted = first
+        .snapshots
+        .iter()
+        .map(|item| item.snapshot_fingerprint.clone())
+        .collect();
+    index = index.committable_subset(&ScanIndex::default(), &accepted, &BTreeMap::new());
+    index.record_accepted_snapshot_fingerprints(&accepted);
+    let plain_key = local_index_key(&plain);
+    let settled_key = local_index_key(&settled);
+    assert!(codex_index_file_body_accepted(
+        &index,
+        &settled_key,
+        &index.files[&settled_key]
+    ));
+    let settled_before = serde_json::to_value(&index.files[&settled_key]).unwrap();
+    let settled_incidence = index.file_snapshot_fingerprints[&settled_key].clone();
+    fs::write(&plain, rollout.replace("compressed-fixture", "owed-plain")).unwrap();
+    let mut directories = DirectoryCensus::new();
+    directories.observe(&root, &fs::metadata(&root).unwrap());
+    // P's first record was already read in the failed inventory, but its body
+    // has not settled. The saved hold below models that archive-enabled writer.
+    let mut inventory = HeaderInventory::new(
+        &roots,
+        &BTreeSet::from([plain_key.clone(), settled_key.clone()]),
+        Some(&directories),
+    );
+    while !inventory.step(&CodexTitleMetadata::default()) {}
+    assert!(inventory.complete);
+    assert_eq!(inventory.headers.len(), 2);
+    let archive_key = local_index_key(&f.0);
+    let mut evidence = ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, None).unwrap();
+    evidence.disposition = ArchiveDisposition::Refused {
+        cause: CodexZstCause::HeaderInvalid,
+    };
+    let historical = "a".repeat(64);
+    index.files.insert(
+        archive_key.clone(),
+        ScanIndexEntry {
+            source_file_fingerprint: "historical-archive".into(),
+            last_snapshot_fingerprint: Some(historical.clone()),
+            last_upload_body_witness: Some("historical-body".into()),
+            archive: Some(Box::new(evidence)),
+            ..Default::default()
+        },
+    );
+    index
+        .file_snapshot_fingerprints
+        .insert(archive_key.clone(), BTreeSet::from([historical.clone()]));
+    index
+        .accepted_snapshot_fingerprints
+        .insert(historical.clone());
+    index.files.insert(
+        plain_key.clone(),
+        ScanIndexEntry {
+            size_bytes: fs::metadata(&plain).unwrap().len(),
+            source_file_fingerprint: "held-unsettled-plain".into(),
+            ..Default::default()
+        },
+    );
+    ensure_bounded_traversal(
+        SnapshotSource::Codex,
+        &roots,
+        &mut index,
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+    );
+    let delay = unhealthy_scan_retry_delay_seconds(UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS);
+    assert_eq!(delay, 3600);
+    let retry_at = rfc3339_unix_seconds(NOW).unwrap() + delay;
+    let hold = CodexInventoryHold {
+        owed: BTreeSet::from([plain_key.clone()]),
+        refused_headers: BTreeMap::from([(
+            archive_key.clone(),
+            codex_file_join::path_witness(&f.0),
+        )]),
+        awaiting_directories: false,
+        ..Default::default()
+    };
+    let traversal = index.traversal.as_mut().unwrap();
+    traversal.pending_directories.clear();
+    traversal.pending_candidates.clear();
+    traversal.codex_rollout_paths =
+        BTreeSet::from([archive_key.clone(), plain_key.clone(), settled_key.clone()]);
+    traversal.observed_index_keys = traversal.codex_rollout_paths.clone();
+    traversal.codex_join_directory_census = Some(directories);
+    traversal.residue.index_keys.insert(archive_key.clone());
+    traversal.residue.codex_inventory_hold = Some(hold.clone());
+    traversal
+        .counts
+        .record_unreadable(UnreadableCause::AliasParser, 1);
+    traversal.unhealthy_retry_attempt = UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS;
+    traversal.unhealthy_retry_not_before_unix_seconds = Some(retry_at);
+    let archive_before = serde_json::to_value(&index.files[&archive_key]).unwrap();
+    let archive_incidence = index.file_snapshot_fingerprints[&archive_key].clone();
+    let saved = state_root.join("retry-index.json");
+    index.save(&saved).unwrap();
+    let (restored, origin) = ScanIndex::load_inner(&saved, Some(SnapshotSource::Codex)).unwrap();
+    assert!(matches!(origin, LoadOrigin::Loaded(_)));
+    assert_eq!(
+        restored
+            .traversal
+            .as_ref()
+            .unwrap()
+            .residue
+            .codex_inventory_hold
+            .as_ref(),
+        Some(&hold)
+    );
+    let constructions = super::super::codex_zst_refusal_tests::decoder_construction_count();
+    let (((index, emissions), body_reads), headers) = header_reads(|| {
+        terminal_contract_retry::source_acquisitions(|| {
+            let (mut index, quiet, bytes) = page(&roots, restored, NOW);
+            assert!(quiet.snapshots.is_empty());
+            assert_eq!(quiet.scanned_file_count, 0);
+            assert_eq!(bytes, 0);
+            let traversal = index.traversal.as_ref().unwrap();
+            assert_eq!(traversal.residue.codex_inventory_hold.as_ref(), Some(&hold));
+            assert_eq!(traversal.counts.unreadable_path_count, 1);
+            assert_eq!(
+                traversal.unhealthy_retry_not_before_unix_seconds,
+                Some(retry_at)
+            );
+            // Save/load once more after exclusion, with the empty queue intact.
+            index.save(&saved).unwrap();
+            index = ScanIndex::load_inner(&saved, Some(SnapshotSource::Codex))
+                .unwrap()
+                .0;
+            let due = OffsetDateTime::from_unix_timestamp((retry_at + 1) as i64)
+                .unwrap()
+                .format(&Rfc3339)
+                .unwrap();
+            let expected_header_bytes = [&plain, &settled]
+                .iter()
+                .map(|path| {
+                    fs::read(path)
+                        .unwrap()
+                        .split_inclusive(|b| *b == b'\n')
+                        .next()
+                        .unwrap()
+                        .len()
+                })
+                .sum::<usize>();
+            assert!(expected_header_bytes < 2 * codex_file_join::MAX_HEADER_BYTES);
+            let mut emissions = 0;
+            let mut inventory_bytes = 0;
+            let mut completed = false;
+            for _ in 0..4 {
+                let previous = index.clone();
+                let (mut next, mut result, bytes) = page(&roots, index, &due);
+                inventory_bytes += bytes;
+                assert_eq!(
+                    result.unreadable_path_count, 0,
+                    "old RU retires with its generation"
+                );
+                assert_eq!(result.ownership_incomplete_file_count, 0);
+                assert!(result
+                    .snapshots
+                    .iter()
+                    .all(|item| item.source_session_id == "owed-plain"));
+                finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut next);
+                result.finish_codex_capture_boundary(&mut next);
+                emissions += result.snapshots.len();
+                let accepted = result
+                    .snapshots
+                    .iter()
+                    .map(|item| item.snapshot_fingerprint.clone())
+                    .collect();
+                let census_complete = result.census_complete;
+                index = next.committable_subset(&previous, &accepted, &BTreeMap::new());
+                index.record_accepted_snapshot_fingerprints(&accepted);
+                if census_complete {
+                    assert!(
+                        index.traversal.is_none(),
+                        "normal completed generation retires"
+                    );
+                    completed = true;
+                    break;
+                }
+            }
+            assert!(
+                completed,
+                "owed work completes within four bounded pages after retry"
+            );
+            assert_eq!(
+                inventory_bytes, expected_header_bytes,
+                "one bounded first record per admitted file"
+            );
+            (index, emissions)
+        })
+    });
+    assert_eq!(emissions, 1);
+    assert_eq!(
+        body_reads,
+        BTreeMap::from([(plain.clone(), 1)]),
+        "Q and A have zero body reads"
+    );
+    assert_eq!(headers, BTreeMap::from([(plain, 1), (settled, 1)]));
+    assert_eq!(
+        super::super::codex_zst_refusal_tests::decoder_construction_count(),
+        constructions
+    );
+    assert!(codex_index_file_body_accepted(
+        &index,
+        &plain_key,
+        &index.files[&plain_key]
+    ));
+    assert_eq!(
+        serde_json::to_value(&index.files[&settled_key]).unwrap(),
+        settled_before
+    );
+    assert_eq!(
+        index.file_snapshot_fingerprints[&settled_key],
+        settled_incidence
+    );
+    assert_eq!(
+        serde_json::to_value(&index.files[&archive_key]).unwrap(),
+        archive_before
+    );
+    assert_eq!(
+        index.file_snapshot_fingerprints[&archive_key],
+        archive_incidence
+    );
+    assert!(index.accepted_snapshot_fingerprints.contains(&historical));
+    fs::remove_dir_all(state_root).unwrap();
+}
