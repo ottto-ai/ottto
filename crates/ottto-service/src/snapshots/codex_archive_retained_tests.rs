@@ -631,9 +631,11 @@ fn compressed_retained_save_never_writes_a_durable_record() {
     assert_eq!(result.snapshots.len(), 1);
     let key = local_index_key(&f.0);
     assert!(cache.retained_checkpoint(&key).unwrap().is_compressed());
-    // Force selection/touch as a hostile caller: the actual writer must fence
-    // this even though normal archive admission never marks it for persistence.
+    // Archives must not spend the bounded selection quota for plain entries.
+    assert_eq!(cache.durable_selected_count_for_test(), 0);
     cache.durable_note_selection(&key, &index.files[&key].source_file_fingerprint);
+    assert_eq!(cache.durable_selected_count_for_test(), 0);
+    // Force a hostile touch: the actual writer must independently fence this.
     cache.durable_touch_for_test(&key);
     index.save(&index_path).unwrap();
     cache.durable_write_after_save(writer, SnapshotSource::Codex, &index);

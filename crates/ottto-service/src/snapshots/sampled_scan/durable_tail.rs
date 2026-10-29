@@ -957,6 +957,10 @@ impl SharedCache {
     /// Records the selection `key`'s admitted reduction was acquired for:
     /// the scanned source-file fingerprint the scan wrote into its entry.
     pub(crate) fn durable_note_selection(&self, key: &str, source_file_fingerprint: &str) {
+        // RAM-only archives cannot spend the bounded plain selection quota.
+        if codex_archive_path(Path::new(key)) {
+            return;
+        }
         if let Some(mut stores) = self.durable() {
             if stores.selected.len() < store::MAX_RECORDS * 2 || stores.selected.contains_key(key) {
                 stores
@@ -964,6 +968,11 @@ impl SharedCache {
                     .insert(key.to_string(), source_file_fingerprint.to_string());
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(in crate::snapshots) fn durable_selected_count_for_test(&self) -> usize {
+        self.durable().map_or(0, |stores| stores.selected.len())
     }
 
     /// Marks `key` admitted this pass: a write candidate after the next save.
