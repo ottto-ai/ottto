@@ -29189,7 +29189,7 @@ impl OwnedSourceScan {
                                     && sampled_audit::progress_debt(
                                         index,
                                         &acquisition.key,
-                                        sampled_scan::now_seconds(),
+                                        audit_now,
                                     )
                                     .is_none()
                                     && sampling.as_ref().is_some_and(|context| {

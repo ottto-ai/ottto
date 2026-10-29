@@ -605,8 +605,8 @@ impl OwnedSourceScan {
         self.durable_guard = Some(Arc::downgrade(&cache));
         sampled_audit::normalize_marker_storage(&mut self.index);
         if self.source == SnapshotSource::ClaudeCode {
-            sampled_audit::restore_held_audit_deadlines(&mut self.index, now_seconds());
-            self.prepare_held_audit_progress(now_seconds());
+            sampled_audit::restore_held_audit_deadlines(&mut self.index, self.audit_now);
+            self.prepare_held_audit_progress(self.audit_now);
         }
         let pending = self
             .index

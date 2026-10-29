@@ -2275,6 +2275,146 @@ fn fe_n1_option_b_age_rejections_keep_deferred_hold_through_settlement_and_reloa
     }
 }
 
+/// Capture and attachment straddle D in both directions. A pre-due page
+/// cannot spend a virtual turn merely because attachment occurs after D.
+#[test]
+fn fe_n1_option_b_attachment_uses_captured_audit_time_across_due_edge() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    use crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS as INTERVAL;
+    use crate::transcript_cache::CACHE_ENTRIES;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _clock = TestClock;
+    let due = sampled_scan::now_seconds();
+    for saturated in [false, true] {
+        let hold = erased_hold(due);
+        let key = hold.key.clone();
+        File::open(&hold.fixture.file.0)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH)
+            .unwrap();
+        let mut index = hold.index;
+        assert!(sampled_audit::awaits_hold_deadline_restoration(
+            &index, &key
+        ));
+        if saturated {
+            for n in 0..CACHE_ENTRIES - 1 {
+                let mut pending = index.files[&key].clone();
+                pending.set_unverified_deadline(due);
+                index
+                    .files
+                    .insert(format!("/attachment-unavailable/{n}"), pending);
+            }
+            index.held_audit_progress = Some(sampled_audit::HeldAuditProgress {
+                key: key.clone(),
+                due,
+                attempted: false,
+            });
+        }
+        for captured in [due - 1, due] {
+            if !saturated && captured == due {
+                break; // The free-slot arm restores a new ordinary deadline.
+            }
+            sampled_scan::set_test_now(Some(captured));
+            let scan = OwnedSourceScan::new(
+                CLAUDE,
+                std::slice::from_ref(&hold.fixture.root),
+                index,
+                NOW,
+                BACKFILL_WINDOW_DAYS,
+                10,
+                false,
+                None,
+                &[],
+                false,
+                true,
+            );
+            assert_eq!(scan.audit_now, captured);
+            assert!(
+                !scan
+                    .identified_candidates
+                    .iter()
+                    .any(|candidate| local_index_key(&candidate.path) == key),
+                "the old unmarked file needs held-slot rescue"
+            );
+            // Unlike a before_step/setup hook, this is BEFORE attachment.
+            sampled_scan::set_test_now(Some(if captured < due { due + 1 } else { due - 1 }));
+            let scan = scan.with_sampled_acquisition(hold.cache.clone(), Scope(NAMESPACE.into()));
+            let scheduled = captured == due;
+            if saturated {
+                let slot = scan.index.held_audit_progress.as_ref().unwrap();
+                assert_eq!(slot.key, key);
+                assert_eq!(
+                    slot.due, due,
+                    "attachment never postpones the original turn"
+                );
+                if !scheduled {
+                    assert!(
+                        !slot.attempted,
+                        "no spent turn before the captured deadline"
+                    );
+                }
+                assert_eq!(
+                    sampled_audit::progress_debt(&scan.index, &key, scan.audit_now).is_some(),
+                    scheduled
+                );
+                assert_eq!(
+                    scan.identified_candidates
+                        .iter()
+                        .any(|candidate| local_index_key(&candidate.path) == key),
+                    scheduled
+                );
+                assert_eq!(scan.sampling.as_ref().unwrap().audit_slots, 1);
+                assert!(!scan.index.files[&key].has_unverified_source());
+            } else {
+                let restored_due = captured + INTERVAL;
+                assert_eq!(
+                    scan.index.files[&key].unverified_deadline(),
+                    Some(restored_due),
+                    "ordinary restoration is also dated by the captured clock"
+                );
+                assert!(!scan.index.files[&key].audit_requires_full(scan.audit_now));
+                assert!(scan.index.held_audit_progress.is_none());
+            }
+            let (next, raw, _, modes, _) = finish_production_scan_page(scan, CLAUDE);
+            index = next;
+            assert_eq!(modes, (usize::from(scheduled), 0, 0));
+            if scheduled {
+                assert!(
+                    !raw.snapshots.is_empty(),
+                    "the original due turn performs its native read"
+                );
+                assert!(!sampled_audit::awaits_hold_deadline_restoration(
+                    &index, &key
+                ));
+                assert_eq!(index.held_audit_progress.as_ref().unwrap().due, due);
+            } else {
+                assert!(index
+                    .claude_request_census_for_test()
+                    .get(&key)
+                    .unwrap()
+                    .identity_incomplete_hold());
+                if saturated {
+                    let slot = index.held_audit_progress.as_ref().unwrap();
+                    assert_eq!(slot.due, due);
+                    assert!(
+                        !slot.attempted,
+                        "rescue and completion did not spend a future turn"
+                    );
+                }
+            }
+            index.save(&hold.index_path).unwrap();
+            index = ScanIndex::load(&hold.index_path).unwrap();
+            if saturated && !scheduled {
+                let slot = index.held_audit_progress.as_ref().unwrap();
+                assert_eq!(slot.due, due, "D survives save/reload unchanged");
+                assert!(!slot.attempted);
+            }
+        }
+    }
+}
+
 /// Saturate the marker pool with debts that cannot drain, then cross the
 /// 255 boundary with readable old downgraded holds. Real pages, saved and
 /// reloaded on every turn, must give every readable member its due Full.
