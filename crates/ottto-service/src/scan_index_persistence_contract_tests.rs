@@ -124,15 +124,22 @@ fn durable_round_trip(s: &Scratch, index: &ScanIndex, generation: u64) {
         .collect::<Vec<_>>()
         .try_into()
         .unwrap();
-    let logical=serde_json::to_value(index).unwrap();
-    let entry=index.files.get("synthetic-file").unwrap();
-    let context=logical["upload_context_fingerprint"].as_str();
+    let logical = serde_json::to_value(index).unwrap();
+    let entry = index.files.get("synthetic-file").unwrap();
+    let context = logical["upload_context_fingerprint"].as_str();
     let binding = durable::Binding {
         source,
         key: durable::key_digest(source, "synthetic-file"),
-        context: durable::context_digest(&"a".repeat(64),context),
+        context: durable::context_digest(&"a".repeat(64), context),
         scope: durable::scope_digest("synthetic-scope", &allowlist, "identity:v1", "legacy"),
-        entry: durable::replay_entry_digest(&durable::entry_digest(&entry.source_file_fingerprint,entry.last_upload_body_witness.as_deref()),entry.effective_upload_body_witness_revision,0),
+        entry: durable::replay_entry_digest(
+            &durable::entry_digest(
+                &entry.source_file_fingerprint,
+                entry.last_upload_body_witness.as_deref(),
+            ),
+            entry.effective_upload_body_witness_revision,
+            0,
+        ),
     };
     let record = durable::PendingRecord {
         binding: binding.clone(),
@@ -165,10 +172,23 @@ fn durable_round_trip(s: &Scratch, index: &ScanIndex, generation: u64) {
     assert_eq!(restored.index_generation, generation);
     assert_eq!(restored.record, record);
     // The actual #865 admission seam checks entry/context/scope AND generation.
-    let expected=durable::Expected{binding:binding.clone(),committed_generation:root["generation"].as_u64().unwrap()};
+    let expected = durable::Expected {
+        binding: binding.clone(),
+        committed_generation: root["generation"].as_u64().unwrap(),
+    };
     assert!(restored.eligible(&expected).is_ok());
-    assert!(restored.eligible(&durable::Expected{binding:binding.clone(),committed_generation:generation-1}).is_err());
-    assert!(restored.eligible(&durable::Expected{binding,committed_generation:generation+1}).is_ok());
+    assert!(restored
+        .eligible(&durable::Expected {
+            binding: binding.clone(),
+            committed_generation: generation - 1
+        })
+        .is_err());
+    assert!(restored
+        .eligible(&durable::Expected {
+            binding,
+            committed_generation: generation + 1
+        })
+        .is_ok());
     assert!(restored.index_generation <= root["generation"].as_u64().unwrap());
     assert!(crate::snapshots::verify_durable_body(
         &restored.record.body,
