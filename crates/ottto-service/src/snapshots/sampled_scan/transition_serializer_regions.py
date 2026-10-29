@@ -8,6 +8,14 @@ prefixes; production reachability wins over test reachability. Unowned files
 stay included conservatively.
 Headers track generic angle depth and balanced const/type groups through where
 clauses. Unparseable impl/durable-macro headers raise instead of being skipped.
+Implemented TypePaths retain their segment names across optional ::<...>,
+qualified prefixes and negative-impl markers. Raw identifiers remain distinct
+from keywords; identifier comparisons normalize their r# prefix. Inherent dyn
+impls are not trait impls; unsafe/lifetime headers follow the same classifier.
+Attributes belong before impl (or inside generic parameters), not between impl
+and its trait. Literal impls inside macro_rules! bodies are visible, but expansion
+through a metavariable trait name or token construction is not Rust resolution:
+unclassifiable literal headers raise; generated/aliased names need owner review.
 Unknown cfg predicates stay included, so platform-specific codecs are covered.
 Every durable_struct!/durable_enum! invocation and Durable-family impl is a
 root. Referenced local constants/helpers are followed to a fixed point; explicit
@@ -47,7 +55,7 @@ LEXEME = re.compile(
     r'\s+|//[^\n]*|/\*|(?:br|cr|r)(?P<hashes>\#*)"'
     r'|(?:b|c)?"(?:\\.|[^"\\])*"'
     r"|b?'(?:\\(?:u\{[0-9A-Fa-f]+\}|x[0-9A-Fa-f]{2}|.)|[^'\\\n])'"
-    r'|[A-Za-z_][A-Za-z_0-9]*|[0-9][A-Za-z_0-9]*|.', re.DOTALL
+    r'|r\#[A-Za-z_][A-Za-z_0-9]*|[A-Za-z_][A-Za-z_0-9]*|[0-9][A-Za-z_0-9]*|.', re.DOTALL
 )
 TRAITS = {"Durable", "HDigest", "DurableKey", "HDigestKey", "DurableEmpty"}
 ROOT_FUNCTIONS = {
@@ -104,6 +112,64 @@ def balanced(t):
     return ends
 
 
+def identifier(token):
+    """Identifier value for name matching, without creating keyword tokens."""
+    if re.fullmatch(r'(?:r#)?[A-Za-z_][A-Za-z_0-9]*', token):
+        return token[2:] if token.startswith("r#") else token
+    return None
+
+
+def angle_end(t, ends, start, limit):
+    """Skip a complete generic group, including const blocks and Fn arrows."""
+    at, depth = start, 0
+    while at < limit:
+        if t[at] == "<":
+            depth += 1
+        elif t[at] == ">" and t[at - 1] not in ("-", "="):
+            depth -= 1
+            if not depth:
+                return at + 1
+        at = ends.get(at, at + 1)
+    raise ValueError("unsupported impl header: unclosed generic group")
+
+
+def type_path_name(t, ends, start, end):
+    """Classify TraitImpl's TypePath, never a trailing punctuation token.
+
+    TypePathSegment is a name followed by optional (::)? GenericArgs. Keep
+    segment identity while consuming angle/parenthesized arguments; a Fn-style
+    return type is an argument, not another implemented trait. This is header
+    classification, not validation/resolution of generic arguments/self types.
+    """
+    at = start + 2 if t[start:start + 2] == [":", ":"] else start
+    while at < end:
+        # $crate occurs in literal macro_rules bodies. Other metavariable trait
+        # names cannot be classified and must fail, rather than silently escape.
+        if t[at:at + 2] == ["$", "crate"]:
+            name, at = "crate", at + 2
+        else:
+            name = identifier(t[at])
+            if name is None or t[at] in {"impl", "dyn", "for", "where", "unsafe", "fn", "const"}:
+                raise ValueError("unsupported impl header: unclassifiable trait TypePath")
+            at += 1
+        if t[at:at + 3] in ([":", ":", "<"], [":", ":", "("]):
+            at += 2
+        if at < end and t[at] == "<":
+            at = angle_end(t, ends, at, end)
+        elif at < end and t[at] == "(":
+            at = ends[at]
+            if t[at:at + 2] == ["-", ">"]:
+                if at + 2 >= end:
+                    raise ValueError("unsupported impl header: missing Fn return type")
+                return name
+        if at == end:
+            return name
+        if t[at:at + 2] != [":", ":"]:
+            raise ValueError("unsupported impl header: unclassifiable trait TypePath suffix")
+        at += 2
+    raise ValueError("unsupported impl header: missing trait path segment")
+
+
 def body_start(t, ends, start, field=False):
     """Find an item body after all generic/where-clause bounds, or fail closed.
 
@@ -145,35 +211,43 @@ def impl_header(t, ends, start):
     body = body_start(t, ends, start + 1)
     if t[body] != "{":
         raise ValueError("unsupported impl header: expected braced impl body")
-    angle, top = 0, []
-    at = start + 1
+    first = start + 1
+    if t[first] == "<":
+        first = angle_end(t, ends, first, body)
+    top = []
+    at = first
     while at < body:
         part = t[at]
         if part == "<":
-            angle += 1
-        elif part == ">" and t[at - 1] not in ("-", "="):
-            angle -= 1
-        elif not angle:
-            top.append(part)
+            at = angle_end(t, ends, at, body)
+            continue
+        if part == "where":
+            break
+        top.append((part, at))
         at = ends.get(at, at + 1)
-    if not top or any(part in top for part in ("=", ";", "!")):
+    if not top or any(part in ("=", ";", "#") for part, _ in top):
         raise ValueError("unsupported impl header: cannot classify implementation")
-    top = top[:top.index("where")] if "where" in top else top
-    fors = [n for n, part in enumerate(top) if part == "for"]
+    # `for<'a> fn(...)` is a higher-ranked self type, not TraitImpl's separator.
+    fors = [n for n, (part, at) in enumerate(top)
+            if part == "for" and t[at + 1:at + 2] != ["<"]]
     if len(fors) > 1 or (fors and (not fors[0] or fors[0] == len(top) - 1)):
         raise ValueError("unsupported impl header: ambiguous trait/self type")
-    return body, {top[fors[0] - 1]} if fors else set()
+    if not fors:
+        return body, set()
+    if t[first] == "!":
+        first += 1
+    return body, {type_path_name(t, ends, first, top[fors[0]][1])}
 
 
 def definitions(t, ends):
     """Index helper functions and constants, including inherent impl methods."""
     out = []
     for i, token in enumerate(t[:-1]):
-        if token == "fn" and re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*', t[i + 1]):
+        if token == "fn" and identifier(t[i + 1]):
             body = body_start(t, ends, i + 2)
             if body < len(t) and t[body] == "{":
-                out.append((t[i + 1], i, ends[body], "fn"))
-        elif token in ("const", "static") and re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*', t[i + 1]) and t[i + 2:i + 3] == [":"]:
+                out.append((identifier(t[i + 1]), i, ends[body], "fn"))
+        elif token in ("const", "static") and identifier(t[i + 1]) and t[i + 2:i + 3] == [":"]:
             # Skip const generic parameters; declarations end at a semicolon.
             if i and t[i - 1] in ("<", ","):
                 continue
@@ -181,7 +255,7 @@ def definitions(t, ends):
             while at < len(t) and t[at] not in (";", ">"):
                 at = ends.get(at, at + 1)
             if at < len(t) and t[at] == ";":
-                out.append((t[i + 1], i, at + 1, "const"))
+                out.append((identifier(t[i + 1]), i, at + 1, "const"))
     return out
 
 
@@ -189,7 +263,7 @@ def regions(path, t):
     ends = balanced(t)
     signatures = []
     for i, part in enumerate(t[:-1]):
-        if part == "fn" and re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*', t[i + 1]):
+        if part == "fn" and identifier(t[i + 1]):
             signatures.append((i, body_start(t, ends, i + 2)))
     chosen = set()
     for i, token in enumerate(t):
@@ -203,13 +277,11 @@ def regions(path, t):
                 attr_start = next(a for a, b in ends.items() if b == start)
                 start = attr_start - 1
             chosen.add((start, ends[body]))
-        if token in ("durable_struct", "durable_enum") and t[i + 1:i + 2] == ["!"]:
+        if identifier(token) in ("durable_struct", "durable_enum") and t[i + 1:i + 2] == ["!"]:
             if t[i + 2:i + 3] not in (["("], ["["], ["{"]):
                 raise ValueError("unsupported durable macro header: missing token-tree delimiter")
             start = i
-            while start >= 3 and t[start - 2:start] == [":", ":"] and re.fullmatch(
-                r'[A-Za-z_][A-Za-z_0-9]*', t[start - 3]
-            ):
+            while start >= 3 and t[start - 2:start] == [":", ":"] and identifier(t[start - 3]):
                 start -= 3
             chosen.add((start, ends[i + 2]))
         elif token == "impl":
@@ -217,7 +289,7 @@ def regions(path, t):
             if any(a < i < b for a, b in signatures):
                 continue
             body, traits = impl_header(t, ends, i)
-            header = t[i:body]
+            header = [identifier(part) or part for part in t[i:body]]
             owned_deref = path == "owned_heap.rs" and (not traits or traits & {"Deref", "Default", "From"}) and any(
                 name in header for name in ("OwnedVec", "OwnedMap")
             )
@@ -238,13 +310,13 @@ def regions(path, t):
     while True:
         identifiers, calls = set(), set()
         for a, b in chosen:
-            identifiers.update(t[a:b])
+            identifiers.update(identifier(part) or part for part in t[a:b])
             for token in t[a:b]:
                 identifiers.update(re.findall(r'(?<!\{)\{([A-Za-z_][A-Za-z_0-9]*)(?=[:}])', token))
             for i in range(a, b - 1):
                 # Local bare calls only: no guessed resolution of .method/::name.
                 if t[i + 1] == "(" and (i == a or t[i - 1] not in (".", ":", "fn")):
-                    calls.add(t[i])
+                    calls.add(identifier(t[i]) or t[i])
         extended = chosen | {
             (a, b) for name, a, b, kind in defs
             if name in (identifiers if kind == "const" else calls)
@@ -363,7 +435,9 @@ def production_tokens(path, source):
         directory = max(owners)[1] if owners else root_dir
         attrs = attrs_by_item.get(i, [])
         explicit = [attr[2].strip('"') for attr in attrs if attr[:2] == ["path", "="]]
-        name = t[i + 1]
+        name = identifier(t[i + 1])
+        if name is None:
+            raise ValueError("unsupported module header: missing identifier")
         if explicit:
             directory = (directory if owners else parent) / explicit[0]
         else:
@@ -452,23 +526,24 @@ def reference_names(t):
             attributes.update(range(at, ends[at + 2]))
     keywords = {"if", "while", "for", "match", "return", "fn", "impl", "pub", "where", "loop"}
     for i, token in enumerate(t):
-        if i in attributes or not re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*', token):
+        value = identifier(token)
+        if i in attributes or value is None:
             continue
         call = t[i + 1:i + 2] == ["("] or t[i + 1:i + 3] == ["!", "("]
         # Include turbofish calls and qualified function values, e.g. T::key.
         if t[i + 1:i + 4] == [":", ":", "<"]:
             call = True
-        if t[max(0, i - 2):i] == [":", ":"] and token[0].islower() and t[i + 1:i + 2] in ([","], [")"], ["]"]):
+        if t[max(0, i - 2):i] == [":", ":"] and value[0].islower() and t[i + 1:i + 2] in ([","], [")"], ["]"]):
             call = True
-        function_value = token[0].islower() and t[max(0, i - 1):i] in (["("], [","], ["="]) and t[i + 1:i + 2] in ([","], [")"], [";"], ["as"])
-        const = token.isupper() and len(token) > 1
+        function_value = value[0].islower() and t[max(0, i - 1):i] in (["("], [","], ["="]) and t[i + 1:i + 2] in ([","], [")"], [";"], ["as"])
+        const = value.isupper() and len(value) > 1
         call = call or function_value
         if (not call and not const) or token in keywords or t[max(0, i - 1):i] == ["fn"]:
             continue
         start = i
-        while start >= 3 and t[start - 2:start] == [":", ":"] and re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*', t[start - 3]):
+        while start >= 3 and t[start - 2:start] == [":", ":"] and identifier(t[start - 3]):
             start -= 3
-        name = "".join(t[start:i + 1])
+        name = "".join(identifier(part) or part for part in t[start:i + 1])
         if start and t[start - 1] == ".":
             name = "." + name
         if t[i + 1:i + 2] == ["!"]:

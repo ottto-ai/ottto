@@ -8,6 +8,10 @@
 //! Only tests launch it; production has no subprocess or dependency change.
 //! It balances Rust tokens, preserves literals, removes comments/whitespace,
 //! discovers durable macros/trait impls and follows local helpers/constants.
+//! Trait paths accept qualified prefixes and optional :: before generic args;
+//! raw identifiers stay distinct from keywords. Unsupported trait paths fail.
+//! Literal macro_rules impls are scanned; generated trait names/token assembly
+//! still require owner review (no macro expansion or name resolution here).
 //! Explicit roots cover body encoding, allowlist labels, session-start content
 //! hashes, source slugs, native body publication/store framing/verification,
 //! and owned-container inherent dispatch plus Deref/Default/From. See the tool docstring for
@@ -460,6 +464,62 @@ fn pinned_v1_refuses_where_clause_impl_and_body_drift() {
 }
 
 #[test]
+fn pinned_v1_refuses_trait_path_turbofish_and_body_drift() {
+    // E1's exact counterexample, including its actual trait import and type.
+    assert_added_source_and_body_refused(&format!(
+        "use crate::durable_tail_codec::{{Corrupt, Dec, Durable, Enc, Refuse, Shape}};\nstruct Added;\nimpl Durable::<> for Added {{ {ADDED_DURABLE_METHODS} }}"
+    ));
+    for header in [
+        "impl crate::durable_tail_codec::Durable::<> for Added",
+        "impl self::Durable::<> for Added",
+        "impl super::Durable::<> for Added",
+        "impl ::ottto_service::Durable::<> for Added",
+        "impl<'a> Durable::<> for Added<'a>",
+    ] {
+        assert_added_impl_and_body_refused(header);
+    }
+}
+
+#[test]
+fn pinned_v1_accepts_raw_keyword_identifier_and_discovers_raw_self_type() {
+    assert_eq!(
+        verify_pinned_sources(Some(("fixture_added_source.rs", "struct r#impl;"))),
+        Ok(())
+    );
+    assert_added_source_and_body_refused(&format!(
+        "struct r#impl; impl Durable for r#impl {{ {ADDED_DURABLE_METHODS} }}"
+    ));
+    // Raw spelling must normalize for trait matching and helper discovery too.
+    assert_added_source_and_body_refused(&format!(
+        "impl r#Durable for Added {{ {ADDED_DURABLE_METHODS} }}"
+    ));
+    assert_added_source_and_body_refused(&format!(
+        "fn r#put_body(e: &mut Enc) -> Result<(), Refuse> {{ e.varint(9) }} impl Durable for Added {{ {} }}",
+        ADDED_DURABLE_METHODS.replace("e.varint(9)", "r#put_body(e)")
+    ));
+}
+
+#[test]
+fn pinned_v1_accepts_negative_and_higher_ranked_self_type_headers() {
+    // Previously `!` failed classification even for an unrelated negative impl;
+    // a second top-level HRTB `for` falsely looked like a trait separator.
+    // These are lexical premises, not assertions that feature-gated negative
+    // impls or these synthetic types compile with the workspace's stable Rust.
+    for source in [
+        "struct Added; impl !Unpin for Added {}",
+        "unsafe impl<'a> Send for Added<'a> {}",
+        "trait Added {} impl dyn Added {}",
+        "trait Added {} impl Added for for<'a> fn(&'a ()) {}",
+    ] {
+        assert_eq!(
+            verify_pinned_sources(Some(("fixture_added_source.rs", source))),
+            Ok(())
+        );
+    }
+    assert_added_impl_and_body_refused("impl Durable for for<'a> fn(&'a ())");
+}
+
+#[test]
 fn pinned_v1_refuses_impl_with_opaque_header_tokens() {
     // Each form must independently select the impl and its changed put body;
     // a second serializer must not mask an omitted impl.
@@ -505,6 +565,14 @@ fn pinned_v1_unparseable_headers_fail_loudly() {
             "unsupported item header",
         ),
         ("impl Durable for Added;", "unsupported impl header"),
+        (
+            "impl Durable::<>: for Added {}",
+            "unclassifiable trait TypePath",
+        ),
+        (
+            "impl #[cfg(unix)] Durable for Added {}",
+            "cannot classify implementation",
+        ),
         (
             "crate::durable_tail_codec::durable_struct! Added;",
             "unsupported durable macro header",
