@@ -78,6 +78,12 @@ impl AcceptedAccounts {
     }
 }
 
+impl crate::heap_layout_bound::HeapLayoutBound for AcceptedAccounts {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.0, c)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
