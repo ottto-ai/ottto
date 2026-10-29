@@ -34,6 +34,15 @@ reassessment never leases an ordinary retry before its existing deadline. Empty
 or policy-suppressed files gain no receipt and retain their existing source-wide
 context gate, allowing a later policy to make them uploadable.
 
+Interrupted uploads continue to honor the existing durable exact-body ACK
+ledger: accepted pages are not sent again merely because a whole-file receipt
+is absent. Those restored ACKs cannot mint a receipt; only current-cycle exact
+ACKs do so. Ordinary and continuation prepares share the activation seam for
+the index and progress quarantine witnesses and reset runtime receipt evidence
+at that boundary. The common finish path captures each page's candidates after
+admission. The synthetic head-CAS ACK helper returns an accepted head etag for
+cache-bearing requests and leaves the production validator intact.
+
 The change grants no census completion, absence, retirement, tombstone drain,
 account-window retirement, sole-login or terminal-fold authority. Destination
 admission and privacy projection still run before receipt candidates are captured.

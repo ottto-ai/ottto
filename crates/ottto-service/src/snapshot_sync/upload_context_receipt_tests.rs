@@ -5,10 +5,8 @@ pub(crate) fn exact_acks(
     source: SnapshotSource,
     items: &[SnapshotItem],
 ) -> BTreeMap<String, String> {
-    let mut progress = SnapshotUploadProgress::new(
-        "a".repeat(64),
-        snapshot_quarantine_witness(SnapshotSource::Codex),
-    );
+    let mut progress =
+        SnapshotUploadProgress::new("a".repeat(64), snapshot_quarantine_witness(source));
     let mut accepted = 0;
     upload_resumable_batches_with_body_witness(
         items,
@@ -39,7 +37,10 @@ pub(crate) fn exact_acks(
                                 crate::snapshot_client::snapshot_ack_body_witness_version(item)
                                     .unwrap()
                                     .map(|_| snapshot_upload_body_witness(item)),
-                            head_etag: None,
+                            head_etag: batch
+                                .iter()
+                                .any(|item| item.cache_observations.is_some())
+                                .then(|| "e".repeat(64)),
                             head_challenge: None,
                             unchanged_basis: None,
                         })
@@ -68,7 +69,7 @@ pub(crate) fn exact_acks(
 }
 
 #[test]
-fn upload_context_rearm_bypasses_old_body_ack_but_preserves_refusal_backoff() {
+fn upload_context_transport_resume_keeps_body_acks_without_receipt_authority() {
     let mut progress = SnapshotUploadProgress::new(
         "a".repeat(64),
         snapshot_quarantine_witness(SnapshotSource::Codex),
@@ -76,19 +77,52 @@ fn upload_context_rearm_bypasses_old_body_ack_but_preserves_refusal_backoff() {
     let entity = "b".repeat(64);
     let body = "c".repeat(64);
     progress.record_body(&entity, &body);
-    progress.context_rearm_entities.insert(entity.clone());
-    assert!(!progress.contains_body(&entity, &body));
-    progress
-        .fresh_context_body_acks
-        .insert(entity.clone(), body.clone());
     assert!(progress.contains_body(&entity, &body));
+    assert!(progress.fresh_context_body_acks.is_empty());
     let restored: SnapshotUploadProgress =
         serde_json::from_slice(&serde_json::to_vec(&progress).unwrap()).unwrap();
     assert!(restored.fresh_context_body_acks.is_empty());
-    progress.fresh_context_body_acks.clear();
+    assert!(
+        restored.contains_body(&entity, &body),
+        "resume never resends this exact body"
+    );
     progress.quarantine_permanent_body(&entity, &body, "synthetic_refusal");
     assert!(progress.contains_body(&entity, &body));
     assert!(progress.fresh_context_body_acks.is_empty());
+}
+
+#[test]
+fn upload_context_prepare_preserves_resume_but_clears_prior_context_receipt_authority() {
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let mut index = ScanIndex::default();
+        let mut progress = SnapshotUploadProgress::new(
+            "a".repeat(64),
+            crate::snapshots::snapshot_quarantine_witness_for_context(source, &"c".repeat(64)),
+        );
+        let entity = "b".repeat(64);
+        let body = "d".repeat(64);
+        progress.record_body(&entity, &body);
+        progress
+            .fresh_context_body_acks
+            .insert(entity.clone(), body.clone());
+        activate_source_upload_context(source, "e".repeat(64), &mut index, &mut progress);
+        assert_eq!(
+            progress.active_quarantine_witness,
+            Some(crate::snapshots::snapshot_quarantine_witness_for_context(
+                source,
+                &"e".repeat(64)
+            ))
+        );
+        assert!(
+            progress.contains_body(&entity, &body),
+            "transport ACK survives"
+        );
+        assert!(
+            progress.fresh_context_body_acks.is_empty(),
+            "old-context ACK cannot mint"
+        );
+        assert!(progress.context_receipt_candidates.is_empty());
+    }
 }
 
 #[test]
@@ -140,11 +174,6 @@ pub(crate) fn partial_context_checkpoint(
         crate::snapshots::snapshot_quarantine_witness_for_context(source, &"d".repeat(64)),
     );
     progress.context_receipt_candidates = index.file_upload_context_ack_candidates(items);
-    progress.context_rearm_entities = progress
-        .context_receipt_candidates
-        .iter()
-        .flat_map(|candidate| candidate.entity_fingerprints().cloned())
-        .collect();
     let exact = exact_acks(source, items);
     for (entity, body) in &exact {
         progress.record_body(entity, body);

@@ -20,11 +20,6 @@ pub(crate) struct Candidate {
     historical_replay_generation: Option<String>,
     bodies: BTreeMap<String, String>,
 }
-impl Candidate {
-    pub(crate) fn entity_fingerprints(&self) -> impl Iterator<Item = &String> {
-        self.bodies.keys()
-    }
-}
 
 #[derive(Default, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct RearmCounts {
