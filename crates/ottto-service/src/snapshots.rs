@@ -27552,10 +27552,16 @@ impl OwnedSourceScan {
                         .into_values()
                         .map(|group| (own_page(&group), group))
                         .collect::<Vec<_>>();
-                    // G1: after own-page groups, census members' groups go
-                    // ahead of groups whose selected members are re-reads.
+                    // Context-only groups spend only the file allowance left by
+                    // ordinary groups. Partition before admission can defer a
+                    // group; sorting the admitted queue would be too late.
                     groups.sort_by_key(|(own, group)| {
                         (
+                            index.file_upload_context_enabled
+                                && group
+                                    .members
+                                    .iter()
+                                    .all(|member| index.context_only_read(member)),
                             !*own,
                             !sampled_scan::codex_cursor::census_member(
                                 &codex_selected_flags,

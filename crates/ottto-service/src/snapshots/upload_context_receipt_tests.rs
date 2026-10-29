@@ -65,13 +65,20 @@ impl Fixture {
         &self.index.files[&self.key()]
     }
     fn walk(&mut self, finalize: bool) -> (SourceScanResult, u64) {
+        self.walk_with_file_limit(finalize, 10)
+    }
+    fn walk_with_file_limit(
+        &mut self,
+        finalize: bool,
+        file_limit: usize,
+    ) -> (SourceScanResult, u64) {
         let mut scan = OwnedSourceScan::new(
             self.source,
             std::slice::from_ref(&self.root),
             std::mem::take(&mut self.index),
             "2026-10-29T12:00:00Z",
             BACKFILL_WINDOW_DAYS,
-            10,
+            file_limit,
             false,
             None,
             &[],
@@ -1187,12 +1194,19 @@ fn real_scan_joined_codex_context_catchup_admits_the_whole_alias_unit() {
     let (scan, _) = f.walk(true);
     assert_eq!(scan.scanned_file_count, 2, "joined aliases are admitted atomically, not permanently deferred after the first reservation");
     f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
+    let (files, rearm_bytes) = f
+        .uploader
+        .send(f.source, &mut f.index, &previous, &scan.snapshots)
+        .unwrap();
+    assert_eq!(files, 2);
+    let wire_bytes = scan
+        .snapshots
+        .iter()
+        .map(|item| crate::snapshot_sync::snapshot_packing_json_length(item).unwrap() as u64)
+        .sum::<u64>();
     assert_eq!(
-        f.uploader
-            .send(f.source, &mut f.index, &previous, &scan.snapshots)
-            .unwrap()
-            .0,
-        2
+        rearm_bytes, wire_bytes,
+        "joined aliases do not double-count wire bodies"
     );
     f.assert_quiet();
 }
@@ -1320,7 +1334,8 @@ fn real_scan_ordinary_codex_group_precedes_context_group_under_read_cap() {
         .activate_file_upload_context(f.source, "e".repeat(64));
     f.cache = Arc::default();
     let previous = f.index.clone();
-    let ((scan, _), order) = upload_context_read::with_read_limit(limit, || f.walk(true));
+    let ((scan, _), order) =
+        upload_context_read::with_read_limit(limit, || f.walk_with_file_limit(true, 3));
     assert!(
         order
             .first()

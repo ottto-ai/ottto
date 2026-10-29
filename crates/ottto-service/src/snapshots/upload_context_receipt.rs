@@ -19,7 +19,7 @@ pub(crate) struct Candidate {
     receipt: Receipt,
     historical_replay_generation: Option<String>,
     bodies: BTreeMap<String, String>,
-    wire_bytes: u64,
+    wire_bytes: BTreeMap<String, u64>,
 }
 
 impl Candidate {
@@ -162,7 +162,7 @@ impl ScanIndex {
             return Vec::new();
         };
         let mut by_source: BTreeMap<&str, BTreeMap<String, String>> = BTreeMap::new();
-        let mut by_source_bytes = BTreeMap::<&str, u64>::new();
+        let mut by_source_bytes = BTreeMap::<&str, BTreeMap<String, u64>>::new();
         for item in items {
             if let Some(source) = item.source_file_fingerprint.as_deref() {
                 if !by_source
@@ -171,8 +171,10 @@ impl ScanIndex {
                 {
                     let bytes = crate::snapshot_sync::snapshot_packing_json_length(item)
                         .unwrap_or(0) as u64;
-                    let total = by_source_bytes.entry(source).or_default();
-                    *total = total.saturating_add(bytes);
+                    by_source_bytes
+                        .entry(source)
+                        .or_default()
+                        .insert(item.snapshot_fingerprint.clone(), bytes);
                 }
                 by_source.entry(source).or_default().insert(
                     item.snapshot_fingerprint.clone(),
@@ -215,8 +217,8 @@ impl ScanIndex {
                     bodies: bodies.clone(),
                     wire_bytes: by_source_bytes
                         .get(entry.source_file_fingerprint.as_str())
-                        .copied()
-                        .unwrap_or(0),
+                        .cloned()
+                        .unwrap_or_default(),
                 })
             })
             .collect()
@@ -233,6 +235,8 @@ impl ScanIndex {
             local_bytes: self.context_read_counts.local_bytes,
             ..RearmCounts::default()
         };
+        // Joined file aliases can earn separate receipts for one wire entity.
+        let mut counted_entities = BTreeSet::new();
         for candidate in candidates {
             if self.active_upload_context_fingerprint.as_ref()
                 != Some(&candidate.receipt.context_fingerprint)
@@ -275,7 +279,11 @@ impl ScanIndex {
             entry.upload_context_receipt = Some(candidate.receipt.clone());
             if rearmed {
                 counts.files += 1;
-                counts.bytes = counts.bytes.saturating_add(candidate.wire_bytes);
+                for (entity, bytes) in &candidate.wire_bytes {
+                    if counted_entities.insert(entity) {
+                        counts.bytes = counts.bytes.saturating_add(*bytes);
+                    }
+                }
             }
         }
         counts
