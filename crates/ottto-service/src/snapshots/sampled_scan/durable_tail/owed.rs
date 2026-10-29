@@ -33,13 +33,14 @@ pub(super) struct KeyDebt {
     hold: Option<ClaudeHold>,
 }
 impl KeyDebt {
-    fn is_empty(&self) -> bool {
+    pub(super) fn is_empty(&self) -> bool {
         self.owed == OwedMark::None && self.hold.is_none()
     }
 }
 /// Funded nodes per map: owed/hold keys need no more than the RAM cache's
-/// key count, and overflow already fails safe (conservative source bit,
-/// counted unfunded hold marker).
+/// key count. Native writes reserve a node before any fault can create a
+/// D3 hold. A full map defers an unstarted write as counted NotPersisted;
+/// existing receipt/debt overflow retains the conservative discovery bit.
 const KEY_DEBT_KEYS: usize = store::MAX_RECORDS;
 pub(super) fn key_debt_node_bytes() -> Option<usize> {
     crate::heap_layout_bound::tree_node_bytes::<store::Digest32, Box<KeyDebt>>()?
@@ -125,7 +126,7 @@ pub(in crate::snapshots) enum OwedCompletionAdmission {
 
 impl Stores {
     /// Funds `digest`'s debt node; never evicts another key's debt or hold.
-    fn fund_debt(&mut self, digest: store::Digest32) -> Option<&mut KeyDebt> {
+    pub(super) fn fund_debt(&mut self, digest: store::Digest32) -> Option<&mut KeyDebt> {
         if key_debt_node_bytes().map_or(true, |n| n > 1024)
             || (!self.key_debt.contains_key(&digest) && self.key_debt.len() >= KEY_DEBT_KEYS)
         {

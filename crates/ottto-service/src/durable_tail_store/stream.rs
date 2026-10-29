@@ -555,6 +555,7 @@ impl DurableTailStore {
             content: [0; 32],
         };
         let mut protected = None;
+        let mut budget_refused = false;
         let result = (|| {
             self.check_writer(writer)?;
             if self.disabled.is_some() {
@@ -586,12 +587,18 @@ impl DurableTailStore {
                     .map_or(true, |bytes| bytes > WRITE_PASS_BYTES)
             {
                 self.counters.records_deferred += 1;
-                protected = Some(Refusal::ReceiptPending);
+                self.counters.budget_refused += 1;
+                budget_refused = true;
                 return Err(io::Error::other("native pass allowance exhausted"));
             }
-            if self.pending.contains_key(&key) || self.pending.len() >= MAX_BATCH {
+            if self.pending.contains_key(&key) {
                 protected = Some(Refusal::ReceiptPending);
-                return Err(io::Error::other("pending bound"));
+                return Err(io::Error::other("same key receipt pending"));
+            }
+            if self.pending.len() >= MAX_BATCH {
+                self.counters.budget_refused += 1;
+                budget_refused = true;
+                return Err(io::Error::other("pending capacity"));
             }
             attempt.prior = stamp_at(&attempt.path)?;
             if let Some(prior) = attempt.prior {
@@ -634,7 +641,14 @@ impl DurableTailStore {
         match result {
             Ok(()) => Ok(StreamPreparation { attempt, header }),
             Err(error) => {
-                let mut failure = attempt.failure("stream_prepare", error);
+                let mut failure = attempt.failure(
+                    if budget_refused {
+                        "stream_budget"
+                    } else {
+                        "stream_prepare"
+                    },
+                    error,
+                );
                 failure.protected = protected;
                 Err(failure)
             }
@@ -1045,6 +1059,93 @@ mod tests {
             .commit()
             .unwrap();
         store.finish_stream(committed).unwrap()
+    }
+    #[test]
+    fn native_population_beyond_memo_bound_reverifies_and_updates_without_hold() {
+        if !crate::test_isolation::run_here() {
+            return;
+        }
+        let scratch = Scratch::new();
+        let writer = crate::locked_state_dir::test_locks::hold(&scratch.root);
+        let mut store = DurableTailStore::new(
+            store_dir_for_index(&scratch.root.join("index.json")),
+            DurableSource::Codex,
+        );
+        for n in 0..=MAX_RECORDS {
+            if n % MAX_BATCH == 0 {
+                store.begin_pass();
+            }
+            let (mut header, body) = header(&scratch, DurableSource::Codex, n as u64 + 1);
+            header.binding.key = key_digest(DurableSource::Codex, &format!("native-{n}"));
+            commit(&mut store, writer, header, &body);
+            assert!(store.durable.len() <= MAX_RECORDS);
+            assert!(!store.has_pending());
+        }
+        assert_eq!(store.counters.records_written, MAX_RECORDS as u64 + 1);
+        assert!(store.counters.memo_evicted > 0);
+        let (mut next, body) = header(&scratch, DurableSource::Codex, 999);
+        next.binding.key = key_digest(DurableSource::Codex, "native-0");
+        store.begin_pass();
+        let before = store.counters.guard_verify_bytes;
+        let record = match store.read(&next.binding.key) {
+            ReadOutcome::Found(record) => record,
+            other => panic!("cold memo record was refused: {other:?}"),
+        };
+        store.authorize(
+            &record,
+            &Expected {
+                binding: record.record.binding.clone(),
+                committed_generation: next.generation,
+            },
+        );
+        assert!(
+            store.counters.guard_verify_bytes > before,
+            "cold memo reread counted"
+        );
+        commit(&mut store, writer, next, &body);
+        assert_eq!(store.counters.records_written, MAX_RECORDS as u64 + 2);
+        assert!(store.durable.len() <= MAX_RECORDS);
+        assert_eq!(store.counters.mutation_unproved, 0);
+        assert!(store.disabled().is_none());
+    }
+
+    #[test]
+    fn newly_staged_codex_record_is_refused_by_both_released_decoders() {
+        if !crate::test_isolation::run_here() {
+            return;
+        }
+        let scratch = Scratch::new();
+        let writer = crate::locked_state_dir::test_locks::hold(&scratch.root);
+        let mut store = DurableTailStore::new(
+            store_dir_for_index(&scratch.root.join("index.json")),
+            DurableSource::Codex,
+        );
+        let (header, body) = header(&scratch, DurableSource::Codex, 3);
+        let key = header.binding.key;
+        let original = PendingRecord {
+            binding: header.binding.clone(),
+            certificate: header.certificate.clone(),
+            body: body.clone(),
+            allowlist: header.allowlist,
+            acquisition: None,
+        };
+        let receipt = commit(&mut store, writer, header, &body);
+        assert_eq!(receipt.identity().format(), FORMAT_V3);
+        assert_eq!(
+            receipt.identity().protocol(),
+            crate::snapshots::AcquisitionProtocol::WriteAhead
+        );
+        let bytes = fs::read(store.record_path(&key)).unwrap();
+        super::super::released_decoders_tests::assert_old_readers_refuse_native_v3(
+            &bytes,
+            &original,
+            receipt.generation(),
+        );
+        assert_eq!(
+            fs::read(store.record_path(&key)).unwrap(),
+            bytes,
+            "old reader leaves A unchanged"
+        );
     }
     #[test]
     fn stream_is_byte_identical_and_flush_is_once_per_dirty_pass() {

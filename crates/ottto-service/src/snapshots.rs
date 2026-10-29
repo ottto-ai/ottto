@@ -28052,6 +28052,17 @@ impl OwnedSourceScan {
             };
             if active_file.is_none() && !rereads_wait() {
                 if let Some(group) = codex_join_groups.pop_front() {
+                    #[cfg(unix)]
+                    if let Some(context) = sampling.as_ref() {
+                        // Inventory already proved this owner has multiple
+                        // members. Refuse singleton restore before any member
+                        // probe; its old record can retire only through GC.
+                        for member in &group.members {
+                            context
+                                .cache
+                                .durable_exclude_native_class(&local_index_key(&member.path));
+                        }
+                    }
                     if group
                         .members
                         .iter()
@@ -29349,6 +29360,16 @@ impl OwnedSourceScan {
                 // duplicated, never read, before the parser is consumed: the
                 // commit fences check it after a native Ok.
                 #[cfg(unix)]
+                let excluded_native_class = source == SnapshotSource::Codex
+                    && (side_origin.is_some()
+                        || !aliases.is_empty()
+                        || applied_receipts.values().any(Option::is_some)
+                        || !sampled_scan::compatible_reduction(&parser.accumulator)
+                        || codex_compressed_input::is_compressed_codex_rollout(
+                            Some(&candidate.path),
+                            Some(&parser.reader.reader),
+                        ));
+                #[cfg(unix)]
                 let m3_route = sampling
                     .as_ref()
                     .zip(file_sampling.as_ref())
@@ -29417,6 +29438,19 @@ impl OwnedSourceScan {
                 };
                 #[cfg(not(unix))]
                 let parsed_file = parser.finish_native(finish_request, None);
+                #[cfg(unix)]
+                if excluded_native_class && parsed_file.is_ok() {
+                    if let Some(context) = sampling.as_ref() {
+                        context
+                            .cache
+                            .durable_exclude_native_class(&local_index_key(&candidate.path));
+                        for alias in &aliases {
+                            context
+                                .cache
+                                .durable_exclude_native_class(&local_index_key(&alias.path));
+                        }
+                    }
+                }
                 // A held completion has no effect at all: no cursor success,
                 // birth, census, entry, body or fold. The committed entry keeps
                 // its accepted body and witness; the key stays indexed and its

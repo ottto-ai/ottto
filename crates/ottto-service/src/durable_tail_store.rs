@@ -582,6 +582,8 @@ pub(crate) struct StoreCounters {
     pub(crate) bytes_read: u64,
     pub(crate) records_read: u64,
     pub(crate) mutation_unproved: u64,
+    /// Bounded verification memo turnover; never removes pending/spent authority.
+    pub(crate) memo_evicted: u64,
     pub(crate) missing: u64,
     pub(crate) format_hold: [u64; 8],
     /// Writes skipped: predecessor unknown, or a new key while record files
@@ -599,6 +601,8 @@ pub(crate) struct StoreCounters {
     pub(crate) uninventoried_records: u64,
     /// GC deletions: records and stale temp files.
     pub(crate) gc_records_deleted: u64,
+    pub(crate) native_class_retired: u64,
+    pub(crate) native_class_parked: u64,
     pub(crate) gc_temps_deleted: u64,
     /// Actual dispatch/representation header bytes read by GC; body verification has separate counters.
     pub(crate) gc_records_read: u64,
@@ -607,6 +611,15 @@ pub(crate) struct StoreCounters {
     pub(crate) records_invalidated: u64,
     /// Peak transient encode/decode buffer, in bytes.
     pub(crate) peak_codec_bytes: u64,
+}
+
+/// GC's bounded, RAM-only view of decisions made by the native class owner.
+/// An unknown class preserves A; exclusion never grants mutation authority.
+#[derive(Clone, Copy)]
+pub(crate) enum GcKeep {
+    Unknown,
+    Scope(Digest32),
+    Excluded { audit_debt: Option<u64> },
 }
 
 /// Fixed-size key/content/target identities for the strict Claude caller.
@@ -956,9 +969,11 @@ impl DurableTailStore {
             if work == "overwrite" || work == "restore" {
                 binding.content = Some(stored_digest(&bytes));
             }
-            if self.durable.len() < MAX_RECORDS || self.durable.contains_key(key) {
-                self.durable.insert(*key, (None, stamp, false));
-            }
+            let content = stored_digest(&bytes);
+            let allowed = self.durable.get(key).is_some_and(|(old, saved, allowed)| {
+                *allowed && *saved == stamp && *old == Some(content)
+            });
+            self.memoize(*key, (Some(content), stamp, allowed));
             if work == "restore" {
                 binding.verified = Some(bytes);
             }
@@ -1182,10 +1197,7 @@ impl DurableTailStore {
         for proof in &receipt.completed {
             let key = proof.identity.key;
             self.rebuilt.remove(&key);
-            if self.durable.len() < MAX_RECORDS || self.durable.contains_key(&key) {
-                self.durable
-                    .insert(key, (Some(proof.content), proof.stamp, true));
-            }
+            self.memoize(key, (Some(proof.content), proof.stamp, true));
             self.pending.remove(&key);
             self.counters.max_record_bytes = self
                 .counters
@@ -1407,19 +1419,30 @@ impl DurableTailStore {
         {
             return;
         }
-        if self.durable.len() >= MAX_RECORDS && !self.durable.contains_key(&proof.key) {
-            let Some(key) = self
+        self.memoize(proof.key, (Some(content), proof.stamp, true));
+    }
+    /// The memo is a bounded optimization, never custody or receipt authority.
+    /// Revoke a non-pending entry when full: its next mutation must re-verify
+    /// the real predecessor. No spent grant or original witness is refunded.
+    fn memoize(&mut self, key: Digest32, value: (Option<Digest32>, Stamp, bool)) {
+        if self.durable.len() >= MAX_RECORDS && !self.durable.contains_key(&key) {
+            let victim = self
                 .durable
                 .iter()
-                .find_map(|(k, (_, _, allowed))| (!allowed).then_some(*k))
-            else {
+                .filter(|(digest, _)| !self.pending.contains_key(*digest))
+                .min_by_key(|(_, (_, _, allowed))| *allowed)
+                .map(|(digest, _)| *digest);
+            let Some(victim) = victim else {
+                // pending is bounded at 32, smaller than the 256-entry memo.
+                self.counters.mutation_unproved += 1;
                 return;
             };
-            self.durable.remove(&key); // Never evict a current mutation permission.
+            self.durable.remove(&victim);
+            self.counters.memo_evicted += 1;
         }
-        self.durable
-            .insert(proof.key, (Some(content), proof.stamp, true));
+        self.durable.insert(key, value);
     }
+
     /// Only the supported no-match acquisition classifier calls this, BEFORE O3 reserve.
     pub(crate) fn migration_witness(
         &self,
@@ -1797,13 +1820,9 @@ impl DurableTailStore {
                 }
             };
             let encoded_len = proof.identity.encoded_len;
-            self.retain_receipt(proof)?;
-            let pending = self.pending.get(&key).expect("retained completion");
-            receipt.completed.push(WireReceiptProof {
-                identity: pending.candidate,
-                stamp: pending.completed.expect("completed stamp"),
-                content: pending.content,
-            });
+            // A rename alone is not a legacy batch receipt. Keep pending
+            // incomplete until the one batch flush and final stamp check.
+            receipt.completed.push(proof);
             on_disk.insert(key, encoded_len);
             receipt.written += 1;
             receipt.bytes_written += encoded_len;
@@ -1814,9 +1833,41 @@ impl DurableTailStore {
         self.counters.budget_refused += receipt.budget_refused as u64;
         self.set_disk_level(&on_disk, unlisted);
         if !receipt.completed.is_empty() {
-            // One flush for the whole bounded batch. Receipt delivery follows
-            // this boundary; there is no file/directory fsync per record.
-            self.sync_store()?;
+            // One flush for the whole bounded batch. A fault or a path swap
+            // leaves every candidate pending and requeues its retained RAM;
+            // it cannot deliver a receipt or turn a retry into a clean ACK.
+            let delivery = self.sync_store().and_then(|()| {
+                for proof in &receipt.completed {
+                    if stamp_at(&self.record_path(&proof.identity.key))? != Some(proof.stamp) {
+                        return Err(io::Error::other("batch survivor changed"));
+                    }
+                }
+                Ok(())
+            });
+            if delivery.is_err() {
+                self.counters.store_write_failed[2] += 1;
+                for proof in receipt.completed.drain(..) {
+                    if let Some(pending) = self.pending.get_mut(&proof.identity.key) {
+                        pending.completed = None;
+                    }
+                    receipt.deferred_keys.push(proof.identity.key);
+                    receipt.deferred += 1;
+                }
+                receipt.written = 0;
+                receipt.bytes_written = 0;
+                receipt.committed = None;
+            } else {
+                for proof in &receipt.completed {
+                    let pending = self
+                        .pending
+                        .get_mut(&proof.identity.key)
+                        .filter(|pending| {
+                            pending.candidate == proof.identity && pending.content == proof.content
+                        })
+                        .ok_or_else(|| io::Error::other("batch candidate changed"))?;
+                    pending.completed = Some(proof.stamp);
+                }
+            }
         }
         self.finish_batch(receipt)
     }
@@ -1833,6 +1884,27 @@ impl DurableTailStore {
         writer: &W,
         live_context: &Digest32,
         keep: &BTreeMap<Digest32, Option<Digest32>>,
+    ) -> io::Result<()> {
+        let keep = keep
+            .iter()
+            .map(|(key, scope)| {
+                (
+                    *key,
+                    match scope {
+                        Some(scope) => GcKeep::Scope(*scope),
+                        None => GcKeep::Unknown,
+                    },
+                )
+            })
+            .collect();
+        self.gc_classified(writer, live_context, &keep)
+    }
+
+    pub(crate) fn gc_classified<W: SingleWriter>(
+        &mut self,
+        writer: &W,
+        live_context: &Digest32,
+        keep: &BTreeMap<Digest32, GcKeep>,
     ) -> io::Result<()> {
         self.check_writer(writer)?;
         if !self.usable(Some(writer)) {
@@ -1881,6 +1953,32 @@ impl DurableTailStore {
                 continue;
             }
             let verdict = match self.classify(&key, "delete", Some(writer)) {
+                Ok(Some(header))
+                    if (matches!(keep.get(&key), Some(GcKeep::Excluded { .. }))
+                        || !keep.contains_key(&key))
+                        && header.format == FORMAT_V3
+                        && header.record.acquisition.is_some_and(|fields| {
+                            fields.protocol == crate::snapshots::AcquisitionProtocol::WriteAhead
+                        })
+                        && header.record.binding.context == *live_context =>
+                {
+                    let audit_debt = match keep.get(&key) {
+                        Some(GcKeep::Excluded { audit_debt }) => *audit_debt,
+                        _ => None,
+                    };
+                    // Class exclusion is an explicit owner decision, not restore
+                    // or overwrite authority. Retire only a verified native v3
+                    // record, after its #865 debt is carried by the index.
+                    if header.audit_debt.is_some_and(|due| {
+                        !audit_debt.is_some_and(|carrier| carrier > 0 && carrier <= due)
+                    }) {
+                        self.counters.native_class_parked += 1;
+                        Some(len)
+                    } else {
+                        self.counters.native_class_retired += 1;
+                        None
+                    }
+                }
                 Ok(Some(header)) if !self.authorized(&key, header.format) => Some(len),
                 Ok(Some(header)) => {
                     // Missing membership cannot erase its debt evidence. A
@@ -1897,8 +1995,8 @@ impl DurableTailStore {
                     let binding = header.record.binding;
                     let live = binding.context == *live_context
                         && match keep.get(&key) {
-                            Some(Some(scope)) => *scope == binding.scope,
-                            Some(None) => true,
+                            Some(GcKeep::Scope(scope)) => *scope == binding.scope,
+                            Some(GcKeep::Unknown | GcKeep::Excluded { .. }) => true,
                             None => false,
                         };
                     live.then_some(len)
@@ -2936,3 +3034,7 @@ pub(crate) mod test_hooks {
 #[cfg(test)]
 #[path = "durable_tail_store_tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(test)]
+#[path = "durable_tail_store/released_decoders_tests.rs"]
+mod released_decoders_tests;

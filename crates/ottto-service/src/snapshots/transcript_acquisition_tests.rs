@@ -1433,9 +1433,8 @@ fn durable_codex_restart_restores_then_tails_and_matches_cold_full() {
         let records = fs::read_dir(crate::durable_tail_store::store_dir_for_index(&index_path))
             .map_or(0, |entries| entries.count());
         assert_eq!(
-            records,
-            usize::from(supported),
-            "{arm}: written after the save"
+            records, 1,
+            "{arm}: native write precedes final cache admission"
         );
 
         fixture.file.append(&usage(source, 130, 1, "fixture-model"));
@@ -1698,7 +1697,7 @@ fn durable_inventory_overflow_keeps_tail_reuse_and_defers_new_keys() {
     assert_eq!(modes, (1, 0, 0));
     index.save(&index_path).unwrap();
     first.durable_write_after_save(lock, source, &index);
-    assert_eq!(records(), usize::from(supported));
+    assert_eq!(records(), 1, "native record exists before cache admission");
 
     // Kept U records (opaque headers) past the inventory bound.
     fs::DirBuilder::new()

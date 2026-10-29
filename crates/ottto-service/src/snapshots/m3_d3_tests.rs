@@ -1191,3 +1191,93 @@ fn m3_d3_sigkill_at_pre_ack_fault_barrier_preserves_pre_facts() {
         assert_eq!(rig.temps(), 0);
     }
 }
+
+#[test]
+fn m3_codex_native_pass_budget_is_counted_not_persisted_without_hold_or_debt() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    let mut rig = Rig::new(SnapshotSource::Codex, "m3-codex-pass-budget");
+    let sessions = (0..33)
+        .map(|n| format!("0199f7a0-0000-7000-8000-{n:012x}"))
+        .collect::<Vec<_>>();
+    for session in &sessions {
+        rig.create(session, 2);
+    }
+    let pass = rig.pass();
+    for session in &sessions {
+        assert_eq!(
+            pass.witness(session),
+            Some(rig.cold(session)),
+            "budget cannot withhold native money"
+        );
+        assert!(
+            !rig.cache.owes_discovery(rig.source, &rig.key(session)),
+            "no receipt debt for a declined optional record"
+        );
+    }
+    let (counts, disk) = rig.counters();
+    assert_eq!(disk.records_written, 32);
+    assert_eq!(disk.budget_refused, 1);
+    assert_eq!(disk.store_faults, 0);
+    assert_eq!(disk.receipt_pending_records, 0);
+    assert_eq!(counts.not_persisted.get("wa.pass_budget"), Some(&1));
+    assert!(!pass.disabled());
+}
+
+/// SOURCE singleton condition 2: the production owner changes from one plain
+/// file to a grouped pair; old native bytes cannot enter the joined reduction.
+#[test]
+fn m3_codex_singleton_to_group_refuses_native_restore_and_retires_record() {
+    let mut rig = Rig::new(SnapshotSource::Codex, "m3-singleton-group");
+    rig.create(CODEX_SESSION, 2);
+    assert_eq!(rig.pass().published(CODEX_SESSION), 1);
+    rig.assert_native_record(CODEX_SESSION);
+    let stale = fs::read(rig.record(CODEX_SESSION)).unwrap();
+    let alias = rig.sessions.join("joined.jsonl");
+    fs::copy(rig.path(CODEX_SESSION), &alias).unwrap();
+    rig.append(CODEX_SESSION, 1);
+    rig.cache = Arc::new(SharedCache::default());
+    let grouped = rig.pass();
+    assert_eq!(
+        grouped.witness(CODEX_SESSION),
+        Some(rig.cold(CODEX_SESSION))
+    );
+    assert!(
+        !rig.record(CODEX_SESSION).exists(),
+        "the old singleton record retired"
+    );
+    let (counts, before) = rig.counters();
+    assert!(counts.ineligible["wa.class_changed.excluded"] > 0);
+    assert_eq!(before.native_class_retired, 1);
+    // A class refusal is before lease/read/decode even if old A reappears.
+    // This simulates a delayed old file, not an approved restore generation.
+    fs::write(rig.record(CODEX_SESSION), &stale).unwrap();
+    let key = rig.key(CODEX_SESSION);
+    let scope = Scope("no-singleton-scope".into());
+    let interpretation = sampled_scan::durable_tail::Interpretation::of(
+        SnapshotSource::Codex,
+        &key,
+        &rig.index,
+        true,
+        &rig.namespace,
+    );
+    let mut held = File::open(rig.path(CODEX_SESSION)).unwrap();
+    assert!(matches!(
+        rig.cache.durable_restore(
+            SnapshotSource::Codex,
+            &key,
+            &rig.path(CODEX_SESSION),
+            &scope,
+            &mut held,
+            &rig.index,
+            &interpretation
+        ),
+        sampled_scan::durable_tail::RestoreOutcome::Miss(
+            sampled_scan::durable_tail::MissClass::ExcludedClass
+        )
+    ));
+    let (_, after) = rig.counters();
+    assert_eq!(after.bytes_read, before.bytes_read, "zero wrong bytes");
+    assert_eq!(after.records_read, before.records_read);
+}

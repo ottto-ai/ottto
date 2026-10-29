@@ -468,3 +468,31 @@ fn codex_cleared_selection_over_a_surviving_record_is_refused_and_paced() {
     );
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn native_debt_reservation_refuses_before_io_and_preserves_every_funded_hold() {
+    use super::owed::OwedMark;
+    let cache = SharedCache::default();
+    let mut stores = cache.durable().unwrap();
+    for n in 0..store::MAX_RECORDS {
+        let key = digest(&format!("reserved-{n}"));
+        assert!(stores.fund_debt(key).is_some());
+        stores.hold_key(key, Some(((1, n as u64 + 1, 3), 17)));
+    }
+    assert_eq!(stores.holds().count(), store::MAX_RECORDS);
+    assert!(stores.fund_debt(digest("unstarted")).is_none());
+    assert_eq!(stores.holds().count(), store::MAX_RECORDS);
+    assert!(stores.owed_overflow.iter().all(|bit| !bit));
+    assert!(stores.retail_spent.is_empty());
+    assert_eq!(stores.counters.ineligible["key_debt_unfunded"], 1);
+    assert_eq!(
+        stores.counters.d3[super::write_ahead::D3_HOLD_UNFUNDED],
+        0,
+        "no unfunded hold created"
+    );
+    // Existing-key settlement always retains its reserved node at capacity.
+    let key = digest("reserved-0");
+    assert!(stores.fund_debt(key).is_some());
+    stores.set_owed(key, OwedMark::Hold(DurableSource::ClaudeCode));
+    assert!(stores.hold(&key).is_some());
+}

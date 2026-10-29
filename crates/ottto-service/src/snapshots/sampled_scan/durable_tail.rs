@@ -294,7 +294,7 @@ struct Slot {
     store: DurableTailStore,
     /// File scopes decided this pass, by key: GC drops a record bound to
     /// another scope. Keys not decided this pass keep their records.
-    decided: BTreeMap<String, Scope>,
+    decided: BTreeMap<String, Option<Scope>>,
     /// The pass's sampled scope and identity-capture mode.
     namespace: Scope,
     identity_capture: bool,
@@ -359,7 +359,11 @@ impl Slot {
         {
             return Err("o3.context");
         }
-        let scope = self.decided.get(key).ok_or("o3.scope_missing")?;
+        let scope = self
+            .decided
+            .get(key)
+            .and_then(Option::as_ref)
+            .ok_or("o3.scope_missing")?;
         let i = Interpretation::of(
             SnapshotSource::ClaudeCode,
             key,
@@ -1453,7 +1457,7 @@ fn authorize_strict(
     slot.indexed = index.files.len();
     slot.store
         .revoke(&store::key_digest(DurableSource::ClaudeCode, key));
-    let Some(scope) = slot.decided.get(key) else {
+    let Some(scope) = slot.decided.get(key).and_then(Option::as_ref) else {
         return;
     };
     let source = durable_source(snapshot_source).expect("durable source");
@@ -1940,6 +1944,9 @@ impl SharedCache {
         let dir = store::store_dir_for_index(index_path);
         // P2 head budget is per pass; authorityless custody nodes are freed.
         stores.rederive_spent[source.slot()] = 0;
+        // A native error may discard staging without a publication. Its empty
+        // reservation carries no authority and cannot pin next-pass capacity.
+        stores.key_debt.retain(|_, debt| !debt.is_empty());
         stores
             .retail_spent
             .retain(|_, custody| custody.has_authority());
@@ -2701,6 +2708,23 @@ impl SharedCache {
             return RestoreOutcome::Miss(MissClass::Failure(Failure::NotRederived(
                 Refuse::NotRederivable("compressed"),
             )));
+        }
+        if snapshot_source == SnapshotSource::Codex
+            && self.durable().is_some_and(|mut stores| {
+                let excluded = stores
+                    .slot(DurableSource::Codex)
+                    .as_ref()
+                    .is_some_and(|slot| matches!(slot.decided.get(key), Some(None)));
+                if excluded {
+                    Counters::bump(
+                        &mut stores.counters.ineligible,
+                        "wa.class_changed.restore_refused",
+                    );
+                }
+                excluded
+            })
+        {
+            return RestoreOutcome::Miss(MissClass::ExcludedClass);
         }
         if let Some(reason) = self.reconcile_pending_key(snapshot_source, key) {
             return RestoreOutcome::Held(reason);
@@ -3733,6 +3757,38 @@ impl SharedCache {
         Ok((checkpoint, reduction, receipt))
     }
 
+    /// A proved non-singleton class keeps its native owner. No mark or pending
+    /// receipt is cleared by a class flag; outstanding debt stays counted/parked.
+    pub(in crate::snapshots) fn durable_exclude_native_class(&self, key: &str) {
+        let Some(mut stores) = self.durable() else {
+            return;
+        };
+        let digest = store::key_digest(DurableSource::Codex, key);
+        let parked = stores.owed_mark(&digest) != owed::OwedMark::None
+            || stores
+                .slot(DurableSource::Codex)
+                .as_ref()
+                .is_some_and(|slot| slot.store.receipt_pending(&digest));
+        let Some(slot) = stores.slot(DurableSource::Codex).as_mut() else {
+            return;
+        };
+        if slot.decided.len() < slot.indexed.saturating_add(2 * store::MAX_RECORDS)
+            || slot.decided.contains_key(key)
+        {
+            slot.decided.insert(key.to_string(), None);
+            Counters::bump(
+                &mut stores.counters.ineligible,
+                if parked {
+                    "wa.class_changed.owed_parked"
+                } else {
+                    "wa.class_changed.excluded"
+                },
+            );
+        } else {
+            Counters::bump(&mut stores.counters.ineligible, "pass_overflow.decided");
+        }
+    }
+
     /// Notes the file scope `key` is decided under this pass, for GC and the
     /// strict predecessor check. Sized by the committed index; an overflow is
     /// counted and only keeps that key's record (GC) or reads it (no write).
@@ -3746,7 +3802,9 @@ impl SharedCache {
         if slot.decided.len() < slot.indexed.saturating_add(2 * store::MAX_RECORDS)
             || slot.decided.contains_key(key)
         {
-            slot.decided.insert(key.to_string(), scope.clone());
+            if !matches!(slot.decided.get(key), Some(None)) {
+                slot.decided.insert(key.to_string(), Some(scope.clone()));
+            }
         } else {
             Counters::bump(&mut stores.counters.ineligible, "pass_overflow.decided");
         }
@@ -4140,23 +4198,41 @@ impl SharedCache {
                 if !inventory.contains(&digest) {
                     continue;
                 }
-                let scope = slot.decided.get(key).and_then(|scope| {
-                    if index.files[key].has_unverified_source() {
-                        return None; // Keep the predecessor until a verified Full replaces it.
-                    }
-                    let interpretation = Interpretation::of(
-                        snapshot_source,
-                        key,
-                        index,
-                        identity_capture,
-                        namespace,
+                if matches!(slot.decided.get(key), Some(None)) {
+                    keep.insert(
+                        digest,
+                        store::GcKeep::Excluded {
+                            audit_debt: index.files[key].unverified_deadline(),
+                        },
                     );
-                    if source == DurableSource::ClaudeCode {
-                        let ReadOutcome::Found(record) = slot.store.read(&digest) else {
-                            return None;
-                        };
-                        let (original, _) =
-                            match claude_expected(key, scope, index, &interpretation, &record) {
+                    continue;
+                }
+                let scope = slot
+                    .decided
+                    .get(key)
+                    .and_then(Option::as_ref)
+                    .and_then(|scope| {
+                        if index.files[key].has_unverified_source() {
+                            return None; // Keep the predecessor until a verified Full replaces it.
+                        }
+                        let interpretation = Interpretation::of(
+                            snapshot_source,
+                            key,
+                            index,
+                            identity_capture,
+                            namespace,
+                        );
+                        if source == DurableSource::ClaudeCode {
+                            let ReadOutcome::Found(record) = slot.store.read(&digest) else {
+                                return None;
+                            };
+                            let (original, _) = match claude_expected(
+                                key,
+                                scope,
+                                index,
+                                &interpretation,
+                                &record,
+                            ) {
                                 Ok(proof) => proof,
                                 Err(reason) => {
                                     Counters::bump(&mut mapping_holds, reason);
@@ -4164,32 +4240,35 @@ impl SharedCache {
                                     return None;
                                 }
                             };
-                        slot.store.authorize(&record, &original);
-                        return Some(original.binding.scope);
-                    }
-                    let (format, allowlist) = slot.store.representation(&digest)?;
-                    if format == store::FORMAT_V3 {
-                        return None;
-                    }
-                    expected(
-                        source,
-                        snapshot_source,
-                        key,
-                        scope,
-                        index,
-                        &interpretation,
-                        Some((format, allowlist, effective_revision(snapshot_source))),
-                    )
-                    .map(|expected| {
-                        if source == DurableSource::ClaudeCode {
-                            if let ReadOutcome::Found(record) = slot.store.read(&digest) {
-                                slot.store.authorize(&record, &expected);
-                            }
+                            slot.store.authorize(&record, &original);
+                            return Some(original.binding.scope);
                         }
-                        expected.binding.scope
-                    })
-                });
-                keep.insert(digest, scope);
+                        let (format, allowlist) = slot.store.representation(&digest)?;
+                        if format == store::FORMAT_V3 {
+                            return None;
+                        }
+                        expected(
+                            source,
+                            snapshot_source,
+                            key,
+                            scope,
+                            index,
+                            &interpretation,
+                            Some((format, allowlist, effective_revision(snapshot_source))),
+                        )
+                        .map(|expected| {
+                            if source == DurableSource::ClaudeCode {
+                                if let ReadOutcome::Found(record) = slot.store.read(&digest) {
+                                    slot.store.authorize(&record, &expected);
+                                }
+                            }
+                            expected.binding.scope
+                        })
+                    });
+                keep.insert(
+                    digest,
+                    scope.map_or(store::GcKeep::Unknown, store::GcKeep::Scope),
+                );
             }
         }
         for (reason, n) in mapping_holds {
@@ -4199,7 +4278,7 @@ impl SharedCache {
         let Some(slot) = stores.slot(source).as_mut() else {
             return Ok(());
         };
-        slot.store.gc(writer, &context, &keep)
+        slot.store.gc_classified(writer, &context, &keep)
     }
 
     /// Fresh-index cleanup uses the same verified, bounded GC; U/T14 survive.
@@ -4431,6 +4510,7 @@ impl SharedCache {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum MissClass {
     AcceptedFloor,
+    ExcludedClass,
     RealEdit(FullReason),
     Unavailable,
     NoEntry,
@@ -4483,6 +4563,7 @@ impl MissClass {
             };
         }
         match self {
+            Self::ExcludedClass => "class_excluded",
             Self::AcceptedFloor => "accepted_body_floor",
             Self::RealEdit(reason) => match reason {
                 FullReason::Replaced => "s2_skipped_real_edit.replaced",

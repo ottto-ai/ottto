@@ -1379,7 +1379,7 @@ fn owned_prepare_rejects_with_original_box_graph_flags_and_unique_guard() {
                 assert_eq!((attempt.object, attempt.next, attempt.end), expected_guard);
                 attempt.finish();
                 assert!(owner.is_empty());
-                assert_eq!(cache.durable().unwrap().retail_spent.len(), 1);
+                assert_eq!(cache.durable().unwrap().retail_spent.len(), 0);
                 continue;
             }
             let rejected = match result {
@@ -1422,7 +1422,7 @@ fn owned_prepare_rejects_with_original_box_graph_flags_and_unique_guard() {
             let attempt = owner.take_retail().expect("unique guard survived");
             assert_eq!((attempt.object, attempt.next, attempt.end), expected_guard);
             attempt.finish();
-            assert_eq!(cache.durable().unwrap().retail_spent.len(), 1);
+            assert_eq!(cache.durable().unwrap().retail_spent.len(), 0);
         }
     }
 }
@@ -5210,8 +5210,8 @@ fn compressed_record_refuses_before_certificate_restore_or_body_decode() {
             acquisition: None,
             binding,
             certificate: certificate(&plain, &scope),
-            body: Vec::new(),
-            allowlist: [0; 32],
+            body: crate::snapshots::durable_store_fixture_body(SnapshotSource::Codex, 1, 1),
+            allowlist: DurableSource::Codex.properties().allowlist(),
         },
         index_generation: 1,
     };
@@ -11035,7 +11035,7 @@ impl ContinuationDurableState {
         assert_eq!(slot.namespace, self.namespace, "ordinary namespace binding");
         assert!(!slot.identity_capture);
         assert_eq!(
-            slot.decided.get(&self.key),
+            slot.decided.get(&self.key).and_then(Option::as_ref),
             Some(&self.scope),
             "ordinary GC decision survives continuation"
         );
@@ -12562,7 +12562,7 @@ fn o3_changed_object_and_scope_memo_capacity_read_without_replacement_authority(
                 .unwrap();
             for n in 0..2 * store::MAX_RECORDS {
                 slot.decided
-                    .insert(format!("other-{n}"), Scope("bounded".into()));
+                    .insert(format!("other-{n}"), Some(Scope("bounded".into())));
             }
         }
         let mut saved = f.prior.clone();

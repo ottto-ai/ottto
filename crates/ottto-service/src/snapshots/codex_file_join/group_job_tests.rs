@@ -3041,7 +3041,7 @@ fn durable_hold_on_one_member_holds_the_joined_group() {
         let record = dir.join(format!("{hex}.rec"));
         let bytes = [
             b"ottto-dt".as_slice(),
-            &(crate::durable_tail_store::FORMAT_VERSION + 1).to_le_bytes(),
+            &(crate::durable_tail_store::FORMAT_V3 + 1).to_le_bytes(),
             &[7_u8; 64],
         ]
         .concat();
@@ -3577,7 +3577,7 @@ fn protected_group_peer_does_not_spend_corruption_rebuild_before_input() {
     let records = seed_member_debts(&root, writer, &[("a", 1, None), ("b", 1, None)]);
     let newer = [
         b"ottto-dt".as_slice(),
-        &(crate::durable_tail_store::FORMAT_VERSION + 1).to_le_bytes(),
+        &(crate::durable_tail_store::FORMAT_V3 + 1).to_le_bytes(),
         &[7_u8; 64],
     ]
     .concat();

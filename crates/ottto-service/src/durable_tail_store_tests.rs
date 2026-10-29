@@ -2349,14 +2349,7 @@ fn every_mutation_preserves_unknown_and_known_corrupt_predecessors_unprimed() {
                     Refusal::Unknown
                 }
                 "newer" | "reserved_v2" | "spent_v2" | "oversized_newer" | "r2_v3" => {
-                    set_version(
-                        &mut bytes,
-                        if kind == "r2_v3" {
-                            3
-                        } else {
-                            FORMAT_VERSION + 1
-                        },
-                    );
+                    set_version(&mut bytes, FORMAT_V3 + 1);
                     // Future fields are opaque here; 5a1 must not interpret a mark.
                     if kind == "oversized_newer" {
                         bytes.resize(RECORD_BYTES + HEADER_BYTES + TRAILER_BYTES + 1, 0);
@@ -3142,9 +3135,9 @@ fn restore_read_access_failure_disables_but_disappearance_is_absence() {
         let path = record_file(&store, &b.key);
         let before = fs::read(&path).unwrap();
         test_hooks::set_before_access(Some(Box::new(move |_, op| match (arm, op) {
-            ("permission", "restore_open") => Err(io::ErrorKind::PermissionDenied.into()),
-            ("metadata", "restore_metadata") => Err(io::ErrorKind::Other.into()),
-            ("missing", "restore_open") => Err(io::ErrorKind::NotFound.into()),
+            ("permission", "open") => Err(io::ErrorKind::PermissionDenied.into()),
+            ("metadata", "fstat") => Err(io::ErrorKind::Other.into()),
+            ("missing", "open") => Err(io::ErrorKind::NotFound.into()),
             _ => Ok(()),
         })));
         let mut cold = scratch.store();
@@ -3177,6 +3170,11 @@ fn non_format_io_errors_disable_at_every_read_boundary_without_spending_t14() {
             let record = record_file(&store, &b.key);
             let before = fs::read(&record).unwrap();
             test_hooks::set_before_access(Some(Box::new(move |_, op| {
+                let stage = match stage {
+                    "restore_open" => "open",
+                    "restore_metadata" => "fstat",
+                    stage => stage,
+                };
                 if op == stage {
                     Err(io::Error::from_raw_os_error(errno))
                 } else {

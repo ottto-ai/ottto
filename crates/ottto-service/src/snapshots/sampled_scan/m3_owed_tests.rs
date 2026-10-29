@@ -245,11 +245,11 @@ fn n10_pacing_eviction_allows_growth_without_evicting_spent_authority() {
     let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
         f.cache.durable_alarm(SnapshotSource::ClaudeCode);
     });
-    assert_eq!(alarms.len(), 1);
-    assert_eq!(
-        alarms[0]["counts"]["pace_evicted"],
-        serde_json::json!([1, 1])
-    );
+    let pace = alarms
+        .iter()
+        .filter_map(|alarm| alarm["counts"].get("pace_evicted"))
+        .collect::<Vec<_>>();
+    assert_eq!(pace, vec![&serde_json::json!([1, 1])]);
     let stores = f.cache.durable().unwrap();
     assert_eq!(stores.retail_spent[&digest].spent, prior);
     assert_eq!(stores.retail_spent.len(), 1);

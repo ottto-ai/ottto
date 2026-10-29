@@ -116,6 +116,7 @@ pub(crate) enum NotPersisted {
     Certificate,
     Unsealed,
     ActiveBound,
+    PassBudget,
     Layout,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -656,6 +657,13 @@ impl SharedCache {
             let Some(mut stores) = self.durable() else {
                 return PrepareOutcome::Degraded(Degraded::Disabled);
             };
+            // Reserve correctness state before I/O can create a surviving-A
+            // hold. Allocation refusal is an unstarted budget deferral, never
+            // an unfunded D3 disposition or a source-wide hold. Successful
+            // settlement releases this empty reservation through clear_owed.
+            if stores.fund_debt(chain.binding().key).is_none() {
+                return PrepareOutcome::NotPersisted(NotPersisted::PassBudget);
+            }
             let Some(slot) = stores.slot(source).as_mut() else {
                 return PrepareOutcome::Degraded(Degraded::Disabled);
             };
@@ -672,6 +680,9 @@ impl SharedCache {
             }
             match slot.store.prepare_stream(writer, header) {
                 Ok(preparation) => preparation,
+                Err(failure) if failure.stage() == "stream_budget" => {
+                    return PrepareOutcome::NotPersisted(NotPersisted::PassBudget);
+                }
                 Err(failure) => return PrepareOutcome::StoreFailed(failure),
             }
         };
@@ -1150,6 +1161,11 @@ impl SharedCache {
     /// The native classifier proved a genuine content change (real edit or
     /// replacement): the surviving predecessor can no longer bind.
     pub(in crate::snapshots) fn durable_release_hold(&self, source: SnapshotSource, key: &str) {
+        // Only Claude has D3 holds. Codex real edits must not fill this map
+        // with inactive Claude content-change proofs.
+        if source != SnapshotSource::ClaudeCode {
+            return;
+        }
         let Some(ds) = durable_source(source) else {
             return;
         };
@@ -1170,6 +1186,7 @@ impl SharedCache {
                     NotPersisted::Certificate => "wa.certificate",
                     NotPersisted::Unsealed => "wa.unsealed",
                     NotPersisted::ActiveBound => "wa.active_bound",
+                    NotPersisted::PassBudget => "wa.pass_budget",
                     NotPersisted::Layout => "wa.layout",
                 },
             );

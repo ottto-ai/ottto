@@ -1320,7 +1320,7 @@ fn budget_bounds_hold() {
     // Beside the cache, outside its state budget: both stores' digest maps.
     assert_eq!(
         crate::snapshots::sampled_scan::durable_tail::STORES_RESIDENT_BOUND,
-        1_452_032
+        1_978_368
     );
     // Per write pass: at most MAX_BATCH records of at most RECORD_BYTES.
     assert_eq!(MAX_BATCH, 32);
@@ -1928,11 +1928,17 @@ fn m3_seam_live_bytes_equal_retained_copy_and_output_equals_legacy() {
         let mut legacy = parser(&path, source);
         while !legacy.step().unwrap() {}
         legacy.accumulator.codex_turn_traces = traces();
+        // This fixture qualifies an encodable live state; first-prompt raw
+        // material is deliberately outside the durable codec's allowlist.
+        legacy.accumulator.first_prompt_material = None;
         let retained = legacy.durable_test_reduction_copy();
         let legacy = items(legacy, &path, source);
         let mut live = parser(&path, source);
         while !live.step().unwrap() {}
         live.accumulator.codex_turn_traces = traces();
+        // This fixture qualifies an encodable live state; first-prompt raw
+        // material is deliberately outside the durable codec's allowlist.
+        live.accumulator.first_prompt_material = None;
         let mut seen = Vec::new();
         let at_seam = items_at(
             live,
