@@ -279,6 +279,9 @@ fn witness_only_ack_rejection_recovers_through_the_next_conflict() {
     );
     assert_eq!(progress.accepted_cache_heads[&key], stale_head());
     assert!(progress.head_conflict_challenges.is_empty());
+    assert!(
+        crate::snapshot_client::ANSWERED_WITNESS_WARNINGS.with(|lines| lines.borrow().is_empty())
+    );
 
     // That predecessor is now stale on the server: conflict with challenge.
     let (result, _) = cycle(&mut progress, &item, 1_001, |item| {
@@ -293,8 +296,39 @@ fn witness_only_ack_rejection_recovers_through_the_next_conflict() {
         challenge(0xd)
     );
 
+    // Residual risk: the answered upload's ACK echoes another witness. The
+    // cycle does not settle, and one content-free warning names the session
+    // hash and versions. An unanswered rejection (above) warns nothing.
+    let warnings = || {
+        crate::snapshot_client::ANSWERED_WITNESS_WARNINGS
+            .with(|lines| std::mem::take(&mut *lines.borrow_mut()))
+    };
+    let version = crate::snapshot_client::snapshot_ack_body_witness_version(&item)
+        .unwrap()
+        .unwrap();
+    let (result, _) = cycle(&mut progress, &item, 1_002, |item| {
+        let mut ack = accepted(item, &"2".repeat(64));
+        ack.accepted_entities[0].body_witness_digest = Some("0".repeat(64));
+        ack
+    });
+    assert!(result.is_err());
+    assert_eq!(
+        warnings(),
+        [format!(
+            "warning: local snapshot head-CAS answer ACK rejected: session_hash={} \
+             witness_version={version} echoed_witness_version={version} \
+             reason=ack_body_witness_mismatch; the next conflict re-records the challenge",
+            &key[..8]
+        )]
+    );
+    assert_eq!(progress.accepted_cache_heads[&key], stale_head());
+    assert_eq!(
+        progress.head_conflict_challenges[&key].challenge,
+        challenge(0xd)
+    );
+
     // The challenge answer settles and the saved head is current again.
-    let (result, wire) = cycle(&mut progress, &item, 1_002, |item| {
+    let (result, wire) = cycle(&mut progress, &item, 1_003, |item| {
         accepted(item, &"3".repeat(64))
     });
     assert_eq!(result.unwrap(), ResumableUploadResult::Completed);

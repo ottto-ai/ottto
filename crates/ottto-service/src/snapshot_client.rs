@@ -1029,6 +1029,7 @@ impl SnapshotBatchResponse {
 
     fn validate_body_witness_ack(&self, request: &SnapshotBatchRequest) -> Result<()> {
         let mut expected = std::collections::BTreeMap::new();
+        let mut answered = std::collections::BTreeSet::new();
         for item in &request.snapshots {
             let Some(public_version) = snapshot_ack_body_witness_version(item)? else {
                 continue;
@@ -1037,6 +1038,9 @@ impl SnapshotBatchResponse {
                 item.source_session_id.clone(),
                 item.snapshot_fingerprint.clone(),
             );
+            if item.cache_conflict_answer.is_some() {
+                answered.insert(key.clone());
+            }
             let proof = (public_version, snapshot_upload_body_witness(item));
             if expected
                 .insert(key, proof.clone())
@@ -1062,6 +1066,13 @@ impl SnapshotBatchResponse {
             if reference.body_witness_version.as_ref() != Some(expected_version)
                 || reference.body_witness_digest.as_ref() != Some(expected_digest)
             {
+                if answered.contains(&key) {
+                    warn_answered_body_witness_rejection(
+                        &reference.source_session_id,
+                        *expected_version,
+                        reference.body_witness_version,
+                    );
+                }
                 return Err(anyhow!(
                     "snapshot ACK lacks exact durable context curve body witness proof"
                 ));
@@ -1151,6 +1162,38 @@ impl SnapshotBatchResponse {
         }
         Ok(())
     }
+}
+
+/// The one residual risk of a head-CAS challenge answer: the server stored
+/// it, but its ACK echoes a different body witness, so this cycle cannot
+/// settle. The next upload conflicts again and the existing refused-answer
+/// count and window take over. Session hash and versions only; no content.
+fn warn_answered_body_witness_rejection(
+    source_session_id: &str,
+    expected_version: u64,
+    echoed_version: Option<u64>,
+) {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(source_session_id.as_bytes());
+    let line = format!(
+        "warning: local snapshot head-CAS answer ACK rejected: session_hash={:02x}{:02x}{:02x}{:02x} \
+         witness_version={expected_version} echoed_witness_version={} \
+         reason=ack_body_witness_mismatch; the next conflict re-records the challenge",
+        digest[0],
+        digest[1],
+        digest[2],
+        digest[3],
+        echoed_version.map_or_else(|| "none".to_string(), |version| version.to_string()),
+    );
+    eprintln!("{line}");
+    #[cfg(test)]
+    ANSWERED_WITNESS_WARNINGS.with(|lines| lines.borrow_mut().push(line));
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static ANSWERED_WITNESS_WARNINGS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 fn valid_snapshot_head_token(value: Option<&str>) -> bool {
