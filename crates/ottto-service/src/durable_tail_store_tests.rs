@@ -73,7 +73,7 @@ impl Drop for Scratch {
 /// Exact in-memory custody oracle; no new production representation/hash.
 pub(crate) fn pending_snapshot(store: &DurableTailStore) -> Vec<u8> {
     let mut out = Vec::new();
-    for (key, (prior, generation, content, allowlist)) in &store.pending {
+    for (key, (prior, generation, content, allowlist, failures)) in &store.pending {
         out.extend_from_slice(key);
         out.push(u8::from(prior.is_some()));
         if let Some(stamp) = prior {
@@ -87,6 +87,7 @@ pub(crate) fn pending_snapshot(store: &DurableTailStore) -> Vec<u8> {
         out.extend_from_slice(&generation.to_le_bytes());
         out.extend_from_slice(content);
         out.extend_from_slice(allowlist);
+        out.push(*failures);
     }
     out
 }
@@ -2431,4 +2432,57 @@ fn claude_mutation_proof_expires_at_pass_boundary_and_unmemoized_records_survive
         0
     );
     assert_eq!(fs::read(&disk).unwrap(), before);
+}
+
+#[test]
+fn receipt_failure_bound_is_per_obligation_and_disable_preserves_custody() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let path = scratch.transcript("source.jsonl", b"{}\n");
+    let b = binding("account", "scope", ("fp-a", None));
+    let mut store = scratch.store();
+    store
+        .write_after_save(&lock, 1, 0, vec![pending(b.clone(), certificate(&path), 1)])
+        .unwrap();
+    test_hooks::set_before_rename(Some(Box::new(|_, _| Err(io::Error::other("rename EIO")))));
+    test_hooks::set_before_unlink(Some(Box::new(|_| Err(io::Error::other("unlink EIO")))));
+    store
+        .write_after_save(&lock, 2, 0, vec![pending(b.clone(), certificate(&path), 2)])
+        .unwrap();
+    test_hooks::set_before_rename(None);
+    let original = fs::read(record_file(&store, &b.key)).unwrap();
+    assert_eq!(
+        store.pending[&b.key].4, 1,
+        "writer's actual reconcile failed"
+    );
+    for attempt in 2..=RECEIPT_RECONCILE_FAILURES {
+        store.begin_pass();
+        assert_eq!(store.hold(&b.key), Some(Refusal::ReceiptPending));
+        assert!(store.reconcile_pending(&lock, &b.key).is_err());
+        assert_eq!(store.pending[&b.key].4, attempt);
+        assert_eq!(
+            store.disabled(),
+            (attempt == RECEIPT_RECONCILE_FAILURES).then_some("receipt_unreconciled")
+        );
+    }
+    test_hooks::set_before_unlink(None);
+    let debt = pending_snapshot(&store);
+    assert_eq!(store.hold(&b.key), None, "D-DISABLED releases the hold");
+    assert_eq!(
+        store.read(&b.key, &placeholder_allowlist()),
+        ReadOutcome::Missing
+    );
+    assert!(store.reconcile_pending(&lock, &b.key).is_err());
+    assert_eq!(
+        pending_snapshot(&store),
+        debt,
+        "disabled retry cannot alter custody"
+    );
+    assert_eq!(fs::read(record_file(&store, &b.key)).unwrap(), original);
+    assert_eq!(store.counters().receipt_reconciled, 0);
+    let mut restarted = scratch.store();
+    assert!(matches!(
+        restarted.read(&b.key, &placeholder_allowlist()),
+        ReadOutcome::Found(_)
+    ));
 }
