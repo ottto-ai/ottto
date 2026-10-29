@@ -1578,7 +1578,10 @@ fn known_corrupt_fixture_capture_and_audit_premises_match() {
         &namespace,
         "2026-10-20T12:00:00Z",
     );
-    assert!(scan.census_complete);
+    assert!(
+        !scan.census_complete,
+        "audit capture does not grant terminal authority"
+    );
     std::fs::remove_dir_all(root).unwrap();
 }
 

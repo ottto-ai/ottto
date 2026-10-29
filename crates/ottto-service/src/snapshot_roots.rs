@@ -286,7 +286,7 @@ mod tests {
             SnapshotSource::ClaudeCode,
             &roots,
             &mut restarted,
-            "2026-10-07T12:03:00Z",
+            "2026-10-07T12:08:00Z",
             30,
         )
         .unwrap();

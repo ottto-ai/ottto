@@ -67,6 +67,7 @@ impl E2ScanFixture {
         hints: &[PathBuf],
     ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
         self.observed.lock().unwrap().clear();
+        let relist = hints.is_empty() && index.scan_traversal_exhausted_for_test();
         let mut scan = OwnedSourceScan::new_with_identity_capture(
             SnapshotSource::ClaudeCode,
             roots,
@@ -77,7 +78,11 @@ impl E2ScanFixture {
             false,
             Some(support),
             hints,
-            false,
+            // These fixtures explicitly request re-lists at a frozen clock.
+            // Model the production metadata-rediscovery event; a retained
+            // traversal cannot infer a new walk from an identical timestamp.
+            // This changes discovery only, never terminal/proof authority.
+            relist,
             true,
             CLAUDE_IDENTITY_CAPTURE,
         );

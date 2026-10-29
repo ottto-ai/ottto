@@ -95,3 +95,35 @@ those failures must be migrated explicitly or repaired with their owning change.
 Repeated-context selection controls remain dependent on the paired receipt PR.
 No passing compile or future-completion fixture is a replacement for current-head
 production-default pipeline and release-cut money receipts.
+
+
+Round 12 uses the completed Linux run 40914407804 at cccf06891: 119
+failures, grouped before expectation changes (58 completion fold, 28 context
+or history backoff, 25 new proof/grant, and 8 investigation cases; no remaining
+full-rearm group). These are previous-head results, not this head's receipts.
+Absent-family and stale-ACK controls now retain exact custody without absence
+retirement, tombstones or manifests. Return/capacity scenarios explicitly
+restore old-reader retirement inputs after proving current containment retains
+the debt. User-repair vanished history keeps carried ACKs and incidence until
+paging. Status receipts remain incomplete/degraded, with loss counts intact.
+
+Frozen-clock scanner fixtures now deliver actual watcher-loss/hint events or
+advance through the metadata cadence. Exact-body finish tests check the ACK's
+body-set witness in the saved index after normal transfer from progress. The
+historical identity/fence latch disjuncts are restored behind effective
+completion; release terminal-off still cannot clear a genuine latch.
+
+R3 is unfinished: new-cohort proof/grant pipeline migrations and later history
+and custody assertions need current-head runtime review. Zero-read, budget,
+money, request-count and exact-ACK contracts are not weakened to call the branch
+green. The paired receipt change must use source-wide mismatch AND no matching
+receipt, including SOURCE's current-context ACK/re-send requirements.
+
+C1 is also pending. A mixed terminal file cannot earn the approved all-entities
+ACK receipt, and current persisted accepted fingerprints do not distinguish a
+byte-identical C ACK from a fresh D ACK. The source-general receipt PR owns the
+approved ACK-context state needed for the terminal once-rearm/quiet exit. This
+branch adds no receipt/context field or unconditional mixed skip. After that
+state merges, implement the mixed backoff, immediate privacy reduction,
+terminal exit, counters and all three real-flow fixtures; preserve confirmed
+empty Claude/Codex context-loop disclosure until measured and contained.

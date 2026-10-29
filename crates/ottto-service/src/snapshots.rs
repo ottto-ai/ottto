@@ -10076,7 +10076,12 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         // or refused CAS) keeps the latch; so does a partial save of this one,
         // and so does any RetryPending authority family.
         if census_complete
-            && (full_rearm || !latch_rearms || (e2_identity_upgrade && !e2_identity_owed))
+            && !claude_terminal_off()
+            && (full_rearm
+                || identity_contract_rearm
+                || !latch_rearms
+                || fence_recovery_rearm
+                || (e2_identity_upgrade && !e2_identity_owed))
             && identity_contract_recorded
             && sweep_fully_settled
         {
@@ -50538,6 +50543,11 @@ where
         .into()
 }
 
+#[cfg(test)]
+pub(crate) fn snapshot_file_upload_body_set_for_test(witnesses: &[String]) -> String {
+    snapshot_file_upload_body_set_hex(witnesses.iter().collect::<BTreeSet<_>>())
+}
+
 /// Lowercase hex of [`snapshot_file_upload_body_set_digest`], as
 /// finalization records it.
 fn snapshot_file_upload_body_set_hex<I>(witnesses: I) -> String
@@ -75155,7 +75165,8 @@ mod tests {
             ),
         );
         index.adopt_effective_upload_body_witness_revision_monotonically();
-        scan_source_roots_with_limit(
+        let relist = index.scan_traversal_exhausted_for_test();
+        scan_source_roots_with_limit_and_attribution(
             SnapshotSource::ClaudeCode,
             &[root.to_path_buf()],
             index,
@@ -75163,6 +75174,10 @@ mod tests {
             BACKFILL_WINDOW_DAYS,
             limit,
             true,
+            None,
+            None,
+            &[],
+            relist,
         )
         .unwrap()
     }
@@ -75216,7 +75231,10 @@ mod tests {
             claude_context_backfill_scan(&root, &mut unbudgeted, MAX_BACKFILL_FILES_PER_SOURCE)
         });
         assert_eq!(deferred.scanned_file_count, 0);
-        assert!(deferred.census_complete, "deferral never holds the census");
+        assert!(
+            !deferred.census_complete,
+            "terminal-off withholds authority even when adoption is deferred"
+        );
         assert!(unbudgeted
             .files
             .values()
@@ -75267,7 +75285,7 @@ mod tests {
         assert_eq!(parsed, 4, "no file was read twice");
         let stable = claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
         assert_eq!((stable.scanned_file_count, stable.snapshots.len()), (0, 0));
-        assert!(stable.census_complete);
+        assert!(!stable.census_complete);
         let _ = fs::remove_dir_all(home);
     }
 
@@ -75408,7 +75426,10 @@ mod tests {
                 let previous = index.clone();
                 let mut scan =
                     claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
-                assert!(scan.census_complete, "deferral never holds the census");
+                assert!(
+                    !scan.census_complete,
+                    "terminal-off withholds authority even when adoption is deferred"
+                );
                 parsed_per_page.push(scan.scanned_file_count);
                 index = claude_context_backfill_settle(&home, &previous, &mut scan, &mut index);
                 if scan.scanned_file_count == 0 || parsed_per_page.len() > 5 {
@@ -75447,7 +75468,10 @@ mod tests {
                         &mut index,
                         MAX_BACKFILL_FILES_PER_SOURCE,
                     );
-                    assert!(scan.census_complete, "deferral never holds the census");
+                    assert!(
+                        !scan.census_complete,
+                        "terminal-off withholds authority even when adoption is deferred"
+                    );
                     parsed_per_page.push(scan.scanned_file_count);
                     index = claude_context_backfill_settle(&home, &previous, &mut scan, &mut index);
                     if scan.scanned_file_count == 0 || parsed_per_page.len() > 7 {
@@ -75720,7 +75744,7 @@ mod tests {
             held.scanned_file_count, 0,
             "old entities are not re-emitted"
         );
-        assert!(held.census_complete);
+        assert!(!held.census_complete);
         assert_eq!(stamps(&old), vec![1; 4]);
         let changed = old.files.keys().next().unwrap().clone();
         let mut appended = old.clone();
@@ -75863,14 +75887,16 @@ mod tests {
             format!("{base}{}", "{}\n".repeat(revision)),
         )
         .expect("write forced-parse fixture");
-        let mut result = scan_source_roots_with_limit(
+        let mut result = scan_source_roots_with_attribution_and_hints(
             SnapshotSource::ClaudeCode,
             &[root.to_path_buf()],
             index,
             "2026-08-20T12:05:00Z",
             BACKFILL_WINDOW_DAYS,
-            MAX_BACKFILL_FILES_PER_SOURCE,
             true,
+            None,
+            &[root.join("curve-session.jsonl")],
+            false,
         )
         .expect("scan forced-parse fixture");
         assert_eq!(result.snapshots.len(), 1);
@@ -76049,14 +76075,16 @@ mod tests {
             revision += 1;
             fs::write(&path, format!("{base}{}", "{}\n".repeat(revision)))
                 .expect("write forced-parse fixture");
-            let mut result = scan_source_roots_with_limit(
+            let mut result = scan_source_roots_with_attribution_and_hints(
                 SnapshotSource::ClaudeCode,
                 std::slice::from_ref(&root),
                 &mut index,
                 "2026-08-20T12:05:00Z",
                 BACKFILL_WINDOW_DAYS,
-                MAX_BACKFILL_FILES_PER_SOURCE,
                 true,
+                None,
+                std::slice::from_ref(&path),
+                false,
             )
             .expect("scan forced-parse fixture");
             assert_eq!(result.snapshots.len(), 1);

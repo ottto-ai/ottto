@@ -19886,8 +19886,8 @@ mod tests {
             "exhausted-claude-authority-receipt",
             &[("unproven_terminal", 3)],
         );
-        assert!(exhausted.census_complete);
-        assert!(!exhausted.scan_cap_hit);
+        assert!(!exhausted.census_complete);
+        assert!(exhausted.scan_cap_hit);
         assert_eq!(exhausted.ownership_incomplete_file_count, 3);
         assert_eq!(exhausted.terminal_ownership_incomplete_file_count, 3);
         assert_eq!(exhausted.zero_snapshot_usage_evidence_count, 0);
@@ -19902,10 +19902,10 @@ mod tests {
             RESIDUE_ADMITTING_HINT,
         );
         assert_eq!(receipt["source"], "claude_code");
-        assert_eq!(receipt["last_error_code"], "census_residue");
-        assert_eq!(receipt["consecutive_failures"], 0);
-        assert!(receipt["last_success_at"].is_string());
-        assert_eq!(receipt["last_success_at"], receipt["last_scan_finished_at"]);
+        assert_eq!(receipt["last_error_code"], "parse_error");
+        assert_eq!(receipt["consecutive_failures"], 1);
+        assert!(receipt["last_success_at"].is_null());
+        assert_eq!(receipt["last_census_complete"], false);
         assert_eq!(
             receipt["last_terminal_ownership_incomplete_file_count"],
             receipt["last_ownership_incomplete_file_count"]
@@ -19974,7 +19974,7 @@ mod tests {
             &[("unproven_terminal", 1)],
         )
         .with_snapshot_terminal_counts(&held);
-        assert!(counts.census_complete);
+        assert!(!counts.census_complete);
         assert_eq!(counts.ownership_incomplete_file_count, 2);
         assert_eq!(counts.terminal_ownership_incomplete_file_count, 1);
 
@@ -21827,7 +21827,7 @@ mod tests {
                     receipt_window_days,
                     "{replay_name} terminal manifest reports the exact hint"
                 );
-                assert!(counts.census_complete);
+                assert_eq!(counts.census_complete, source != SnapshotSource::ClaudeCode);
                 let _ = std::fs::remove_dir_all(root);
             }
         }

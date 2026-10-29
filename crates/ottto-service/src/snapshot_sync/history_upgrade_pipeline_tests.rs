@@ -417,7 +417,10 @@ impl HistoryFixture {
 
     /// Every file sent and stamped at revision 1 under a fresh install.
     fn baseline(&self) -> ScanIndex {
-        assert!(crate::snapshots::claude_terminal_off(), "history pipeline requires production policy");
+        assert!(
+            crate::snapshots::claude_terminal_off(),
+            "history pipeline requires production policy"
+        );
         let outcome = self.cycle("2026-08-02T08:00:00Z", HISTORY_BASELINE);
         assert_eq!(outcome.uploaded.len(), HISTORY_SESSIONS.len());
         assert!(!outcome.scan.census_complete);
@@ -934,7 +937,7 @@ fn user_repair_override_carries_accepted_history_through_census_and_release() {
     };
     crate::snapshots::with_no_list_cutoff(u64::MAX, || {
         let held = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_REVISION_2);
-        assert!(held.scan.census_complete);
+        assert!(!held.scan.census_complete);
         assert!(held.uploaded.is_empty());
         assert_eq!(held.corrections, 0);
         assert!(held.index.current_snapshot_fingerprints().is_empty());
@@ -949,7 +952,7 @@ fn user_repair_override_carries_accepted_history_through_census_and_release() {
                     .contains("retained_carried_entries=3 history_held_carried_entries=3"))
         );
         let again = fixture.cycle("2026-08-02T10:00:00Z", HISTORY_REVISION_2);
-        assert!(again.scan.census_complete);
+        assert!(!again.scan.census_complete);
         assert_eq!(
             again.scan.scanned_file_count, 0,
             "held files never re-parse"
@@ -972,7 +975,7 @@ fn user_repair_override_carries_accepted_history_through_census_and_release() {
         );
         fixture.install_list(&[]);
         let released = fixture.cycle("2026-08-02T11:00:00Z", HISTORY_REVISION_2);
-        assert!(released.scan.census_complete);
+        assert!(!released.scan.census_complete);
         assert_eq!(
             released.scan.scanned_file_count,
             HISTORY_SESSIONS.len(),
@@ -1049,7 +1052,7 @@ fn user_repair_carried_history_vanished_file_releases_at_healthy_terminal() {
     };
     crate::snapshots::with_no_list_cutoff(u64::MAX, || {
         let held = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_REVISION_2);
-        assert!(held.scan.census_complete);
+        assert!(!held.scan.census_complete);
         assert!(held.uploaded.is_empty());
         assert_eq!(held.corrections, 0);
         assert!(held.index.current_snapshot_fingerprints().is_empty());
@@ -1058,7 +1061,7 @@ fn user_repair_carried_history_vanished_file_releases_at_healthy_terminal() {
             serde_json::to_value(&held.index).unwrap()["accepted_rebuild_incidence"].clone();
         assert_eq!(carried, state["file_snapshot_fingerprints"]);
         let again = fixture.cycle("2026-08-02T10:00:00Z", HISTORY_REVISION_2);
-        assert!(again.scan.census_complete);
+        assert!(!again.scan.census_complete);
         assert_eq!(
             again.scan.scanned_file_count, 0,
             "held files never re-parse"
@@ -1080,15 +1083,18 @@ fn user_repair_carried_history_vanished_file_releases_at_healthy_terminal() {
             .collect::<BTreeSet<_>>();
         std::fs::remove_file(fixture.root.join(format!("{}.jsonl", HISTORY_SESSIONS[0]))).unwrap();
         let gone = fixture.cycle("2026-08-02T10:30:00Z", HISTORY_REVISION_2);
-        assert!(gone.scan.census_complete);
+        assert!(!gone.scan.census_complete);
         assert!(gone.uploaded.is_empty());
-        assert!(!gone.index.files.contains_key(&vanished_key));
+        assert!(
+            gone.index.files.contains_key(&vanished_key),
+            "terminal-off retains absent history custody"
+        );
         let gone_state = serde_json::to_value(&gone.index).unwrap();
         let debt = gone_state["accepted_rebuild_incidence"]
             .as_object()
             .unwrap();
-        assert!(!debt.contains_key(&vanished_key));
-        assert_eq!(debt.len(), HISTORY_SESSIONS.len() - 1);
+        assert!(debt.contains_key(&vanished_key));
+        assert_eq!(debt.len(), HISTORY_SESSIONS.len());
         assert!(gone_state["accepted_incidence_pending_census"]
             .as_bool()
             .unwrap());
@@ -1101,7 +1107,7 @@ fn user_repair_carried_history_vanished_file_releases_at_healthy_terminal() {
             .all(|fp| gone.index.accepted_snapshot_fingerprint_recorded(fp)));
         assert!(vanished_acks
             .iter()
-            .all(|fp| !gone.index.accepted_snapshot_fingerprint_recorded(fp)));
+            .all(|fp| gone.index.accepted_snapshot_fingerprint_recorded(fp)));
     });
 }
 

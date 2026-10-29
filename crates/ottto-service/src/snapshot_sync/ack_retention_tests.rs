@@ -750,65 +750,66 @@ fn partial_index_replacement_retires_only_proven_state_only_ack() {
 #[test]
 fn vanished_files_retire_acks_at_the_next_committed_complete_census_without_growth() {
     let f = AckFixture::new(true);
+    let mut owed = BTreeMap::new();
     for revision in 0..20 {
         let (committed, mut progress) = f.load();
         let name = format!("vanished-{revision}");
         AckFixture::write_source(&f.sources, &name);
         let mut indexed = committed.clone();
         let scan = AckFixture::scan(&f.sources, &mut indexed);
-        assert!(scan.census_complete);
+        assert!(!scan.census_complete);
         assert_eq!(scan.snapshots.len(), 1);
         let fingerprint = scan.snapshots[0].snapshot_fingerprint.clone();
         let body = snapshot_upload_body_witness(&scan.snapshots[0]);
         f.upload(&mut progress, &scan.snapshots, exact_ack).unwrap();
         settle_index_after_upload(&mut indexed, &committed, &progress);
         indexed.save(&f.index_path).unwrap();
-        // Retain the real saved ACK across restart before cycle cleanup. The
-        // file subsequently vanishes while its containing scan root stays live.
-        drop(indexed);
-        drop(progress);
+        owed.insert(fingerprint.clone(), body.clone());
         let (committed, mut progress) = f.load();
         assert!(committed.accepted_snapshot_fingerprint_recorded(&fingerprint));
         assert_eq!(progress.accepted_body_witnesses[&fingerprint], body);
-        assert!(progress.accepted_fingerprints.len() <= 2);
         std::fs::remove_file(f.sources.join(format!("{name}.jsonl"))).unwrap();
         let mut selected = committed.clone();
         let empty = AckFixture::scan(&f.sources, &mut selected);
         assert!(
-            empty.census_complete,
-            "one complete census is the retirement bound"
+            !empty.census_complete,
+            "terminal-off supplies no absence authority"
         );
         assert!(
             empty.snapshots.is_empty(),
-            "live accepted sibling needs no new body"
+            "an empty delta must not re-send the live sibling"
         );
-        assert!(!selected
+        assert!(selected
             .upload_progress_ack_incidence()
             .any(|fp| fp == fingerprint));
         let retired = progress.retired_ack_candidates(&committed, &selected);
-        assert!(retired.contains(&fingerprint));
-        // Neither omitted input nor the tentative index may erase durable ACKs.
+        assert!(!retired.contains(&fingerprint));
+        assert!(progress
+            .complete_census_ack_retirements(&selected, empty.census_complete)
+            .is_empty());
         f.upload(&mut progress, &empty.snapshots, |_| {
             panic!("empty delta must not POST")
         })
         .unwrap();
-        assert_eq!(f.load().1.accepted_body_witnesses[&fingerprint], body);
         settle_index_after_upload(&mut selected, &committed, &progress);
         selected.save(&f.index_path).unwrap();
         let selected = ScanIndex::load(&f.index_path).unwrap();
-        assert!(!selected.accepted_snapshot_fingerprint_recorded(&fingerprint));
+        assert!(selected.accepted_snapshot_fingerprint_recorded(&fingerprint));
         assert!(selected.accepted_snapshot_fingerprint_recorded(&f.item.snapshot_fingerprint));
         progress.retire_acks_after_index_save(&selected, &retired, &BTreeSet::new());
         progress.finish_cycle(&f.progress_path).unwrap();
         let (saved, progress) = f.load();
         f.assert_identity(&saved);
-        assert!(
-            progress.accepted_fingerprints.is_empty(),
-            "no retired revision accumulates"
-        );
-        assert!(!progress.accepted_body_witnesses.contains_key(&fingerprint));
-        assert_eq!(saved.current_snapshot_fingerprints().len(), 1);
-        assert!(saved.accepted_snapshot_fingerprint_recorded(&f.item.snapshot_fingerprint));
+        f.assert_ack(&progress);
+        for (fp, witness) in &owed {
+            assert_eq!(
+                progress.accepted_body_witnesses.get(fp),
+                Some(witness),
+                "absence never erases an exact ACK"
+            );
+            assert!(saved.accepted_snapshot_fingerprint_recorded(fp));
+        }
+        assert_eq!(saved.current_snapshot_fingerprints().len(), revision + 2);
     }
 }
 
@@ -1319,7 +1320,7 @@ fn complete_census_retires_never_committed_vanished_acks_after_partial_error() {
     let (previous, progress) = f.load();
     let mut scanned = previous.clone();
     let scan = AckFixture::scan(&f.sources, &mut scanned);
-    assert!(scan.census_complete);
+    assert!(!scan.census_complete);
     assert!(scan.snapshots.is_empty());
     let absent = progress.complete_census_ack_retirements(&scanned, false);
     assert!(
@@ -1327,7 +1328,10 @@ fn complete_census_retires_never_committed_vanished_acks_after_partial_error() {
         "incomplete census is not retirement evidence"
     );
     let absent = progress.complete_census_ack_retirements(&scanned, scan.census_complete);
-    assert!(absent.contains(&first.snapshot_fingerprint));
+    assert!(
+        absent.is_empty(),
+        "never-committed absence is not proof under containment"
+    );
     progress
         .stage_ack_retirement_handoff_with_census(
             &previous,
@@ -1343,7 +1347,13 @@ fn complete_census_retires_never_committed_vanished_acks_after_partial_error() {
     progress
         .recover_ack_retirement_handoff(&mut saved, &f.index_path, &f.progress_path)
         .unwrap();
-    assert!(f.load().1.accepted_fingerprints.is_empty());
+    assert!(
+        f.load().1.contains_body(
+            &first.snapshot_fingerprint,
+            &snapshot_upload_body_witness(&first)
+        ),
+        "the exact partial-upload ACK survives the absence and reload"
+    );
 }
 
 #[test]
@@ -1358,13 +1368,13 @@ fn complete_census_recovers_a_stale_full_cap_and_allows_new_unrelated_upload() {
     progress.configure_ack_capacity(&previous);
     assert_eq!(progress.retained_stale_ack_count, 5000);
     assert!(progress.admit_ack_batch(1).is_err());
-    // The real scanner's complete census includes the unrelated live file;
-    // even partial settlement may retire only ACKs absent from THAT census.
+    let before = progress.accepted_body_witnesses.clone();
     let mut scanned = previous.clone();
     let scan = AckFixture::scan(&f.sources, &mut scanned);
-    assert!(scan.census_complete);
-    let absent = progress.complete_census_ack_retirements(&scanned, true);
-    assert_eq!(absent.len(), 5000);
+    assert!(!scan.census_complete);
+    assert!(progress
+        .complete_census_ack_retirements(&scanned, scan.census_complete)
+        .is_empty());
     let mut selected = checkpoint_partial_snapshot_index(
         &scanned,
         &previous,
@@ -1377,31 +1387,27 @@ fn complete_census_recovers_a_stale_full_cap_and_allows_new_unrelated_upload() {
         || Ok(()),
     )
     .unwrap();
-    assert_eq!(
-        selected
-            .upload_ack_retirement_handoff
-            .as_ref()
-            .unwrap()
-            .bodies
-            .len(),
-        5000
-    );
+    assert!(selected.upload_ack_retirement_handoff.is_none());
     progress
         .recover_ack_retirement_handoff(&mut selected, &f.index_path, &f.progress_path)
         .unwrap();
     let (saved, mut progress) = f.load();
-    assert!(progress.accepted_fingerprints.is_empty());
-    assert_eq!(progress.retained_stale_ack_count, 0);
+    assert_eq!(
+        progress.accepted_body_witnesses, before,
+        "unproven absence cannot make room by losing ACKs"
+    );
+    assert_eq!(progress.retained_stale_ack_count, 5000);
     let mut items = vec![f.item.clone()];
-    assert!(progress.admit_upload_input(&mut items, &saved).is_none());
-    let mut attempts = 0;
-    f.upload(&mut progress, &items, |batch| {
-        attempts += 1;
-        exact_ack(batch)
+    assert!(progress.admit_upload_input(&mut items, &saved).is_some());
+    assert!(
+        items.is_empty(),
+        "capacity delays the new body without offering it"
+    );
+    f.upload(&mut progress, &items, |_| {
+        panic!("capacity stop must not POST")
     })
     .unwrap();
-    assert_eq!(attempts, 1);
-    f.assert_ack(&f.load().1);
+    assert!(!saved.accepted_snapshot_fingerprint_recorded(&f.item.snapshot_fingerprint));
 }
 
 #[test]
@@ -1469,6 +1475,7 @@ fn resumed_probe_capacity_preserves_durable_equality_for_census_retirement() {
         let fp = format!("{entity:064x}");
         progress.record_body(&fp, &fp);
     }
+    let exact_before = progress.accepted_body_witnesses.clone();
     progress.save(&f.progress_path).unwrap();
     progress.configure_ack_capacity(&committed);
     let generation = progress.generation;
@@ -1488,13 +1495,12 @@ fn resumed_probe_capacity_preserves_durable_equality_for_census_retirement() {
         .is_some());
     assert_eq!(progress.generation, generation);
     assert_eq!(
-        progress.accepted_body_witnesses,
-        f.load().1.accepted_body_witnesses,
+        progress.accepted_body_witnesses, exact_before,
         "resumed exact probe ACK must remain present before partial checkpoint CAS"
     );
     let mut scanned = committed.clone();
     let mut scan = AckFixture::scan(&f.sources, &mut scanned);
-    assert!(scan.census_complete);
+    assert!(!scan.census_complete);
     scan.snapshots = vec![item];
     let saved = checkpoint_partial_snapshot_index(
         &scanned,
@@ -1518,36 +1524,28 @@ fn resumed_probe_capacity_preserves_durable_equality_for_census_retirement() {
         )
         .unwrap();
     let (_, mut progress) = f.load();
-    assert_eq!(progress.accepted_fingerprints.len(), 1);
+    assert_eq!(progress.accepted_fingerprints.len(), 5002);
     assert!(progress
         .accepted_fingerprints
         .contains(&probe.snapshot_fingerprint));
-    let mut attempts = 0;
-    bootstrap_cache_heads_with_budget(
+    assert_eq!(
+        progress.accepted_body_witnesses, exact_before,
+        "partial CAS cannot retire the resumed exact probe or stale ACK custody"
+    );
+    let error = bootstrap_cache_heads_with_budget(
         std::slice::from_ref(&probe),
         &unique_poison_scope(),
         &mut progress,
         true,
         &mut InplaceRetryBudget::default(),
-        |batch, _| {
-            attempts += 1;
-            let mut response = exact_ack(batch)?;
-            for entity in &mut response.accepted_entities {
-                entity.head_etag = Some("a".repeat(64));
-            }
-            Ok(response)
-        },
+        |_, _| panic!("no complete-census capacity evidence, so no POST"),
         |state| state.save(&f.progress_path),
     )
-    .unwrap();
-    assert_eq!(
-        attempts, 1,
-        "live re-offer succeeds once stale debt is durably retired"
-    );
-    assert_eq!(
-        f.load().1.accepted_cache_heads[&cache_session_key(&probe.source_session_id)],
-        "a".repeat(64)
-    );
+    .unwrap_err();
+    assert!(error
+        .downcast_ref::<ack_retention::AckSettlementRequired>()
+        .is_some());
+    assert_eq!(progress.accepted_fingerprints.len(), 5002);
 }
 
 // #778 R2-2: an obligation left by a held save reappears in a new file whose

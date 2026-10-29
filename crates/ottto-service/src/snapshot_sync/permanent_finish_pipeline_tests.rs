@@ -1059,16 +1059,20 @@ fn ack_finish_pipeline_case(stage: &'static str) {
         "actual exit reached"
     );
     let mut saved = ScanIndex::load(&index_path).unwrap();
-    assert!(saved.upload_ack_retirement_handoff.is_none(),
-        "terminal-off creates no complete-census retirement handoff");
+    assert!(
+        saved.upload_ack_retirement_handoff.is_none(),
+        "terminal-off creates no complete-census retirement handoff"
+    );
     let mut progress = SnapshotUploadProgress::load(
         &progress_path,
         &namespace,
         snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
     )
     .unwrap();
-    assert!(progress.accepted_fingerprints.contains(&stale),
-        "unrelated stale ACK custody survives ordinary and capacity exits");
+    assert!(
+        progress.accepted_fingerprints.contains(&stale),
+        "unrelated stale ACK custody survives ordinary and capacity exits"
+    );
     progress
         .recover_ack_retirement_handoff(&mut saved, &index_path, &progress_path)
         .unwrap();
@@ -1316,7 +1320,10 @@ impl AckFinishHome {
     }
 
     fn prepare(&mut self, cycle: &str) -> (SourcePreparation, ScanIndex, SourceScanResult) {
-        assert!(crate::snapshots::claude_terminal_off(), "finish pipeline requires production policy");
+        assert!(
+            crate::snapshots::claude_terminal_off(),
+            "finish pipeline requires production policy"
+        );
         self.cadence.next_due_cycle();
         let frame = crate::agent_status_refresh::with_test_collection(Self::collection(), || {
             prepare_sync_source(
@@ -1634,8 +1641,15 @@ fn terminal_off_real_finish_uploads_acks_and_settles_with_no_manifest() {
         preparation.upload_destination_namespace.clone(),
     );
     home.finish(preparation, index, scan).unwrap();
-    let offered = server.offered_fingerprints().into_iter().collect::<BTreeSet<_>>();
-    assert_eq!(offered.len(), fingerprints.len(), "the ordinary terminal page uploads");
+    let offered = server
+        .offered_fingerprints()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        offered.len(),
+        fingerprints.len(),
+        "the ordinary terminal page uploads"
+    );
     let fingerprints = offered;
     let saved = ScanIndex::load(&path).unwrap();
     assert!(saved.has_retained_traversal_for_terminal_off());
@@ -1647,9 +1661,43 @@ fn terminal_off_real_finish_uploads_acks_and_settles_with_no_manifest() {
         .iter()
         .all(|fp| saved.accepted_snapshot_fingerprint_recorded(fp)));
     let progress = home.progress(&paths);
-    assert!(fingerprints
-        .iter()
-        .all(|fp| progress.accepted_fingerprints.contains(fp)));
+    // Successful selected-save transfers exact ACK custody into the index.
+    assert!(progress.accepted_fingerprints.is_empty());
+    let offered = server.offered.lock().unwrap();
+    assert_eq!(offered.len(), 1);
+    let item = &offered[0];
+    assert!(item.get("cache_observations").is_none());
+    assert!(item.get("context_curve").is_none());
+    let mut payload = serde_json::Map::new();
+    for key in [
+        "session_account_evidence",
+        "tool_usage",
+        "tool_usage_truncated",
+    ] {
+        if let Some(value) = item.get(key) {
+            payload.insert(key.into(), value.clone());
+        }
+    }
+    // This is the exact digest the scripted HTTP ACK sent and the client
+    // validated, folded with the production file-witness function.
+    let ack_body = format!(
+        "{:x}",
+        Sha256::digest(
+            crate::canonical_json::canonicalize(&serde_json::Value::Object(payload)).unwrap()
+        )
+    );
+    assert_eq!(saved.files.len(), 1);
+    assert_eq!(
+        saved
+            .files
+            .values()
+            .next()
+            .unwrap()
+            .last_upload_body_witness,
+        Some(crate::snapshots::snapshot_file_upload_body_set_for_test(&[
+            ack_body
+        ]))
+    );
     assert!(!crate::snapshots::claude_terminal_authority(
         &saved,
         true,
