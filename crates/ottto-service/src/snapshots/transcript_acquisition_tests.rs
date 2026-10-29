@@ -4052,6 +4052,20 @@ fn missing_index_debt_carrier_holds_in_the_production_scanner_for_both_sources()
             &namespace,
             source == SnapshotSource::ClaudeCode,
         );
+        begin_durable_pass(
+            &cache,
+            &fixture.dir,
+            source,
+            &index_path,
+            true,
+            &namespace,
+            source == SnapshotSource::ClaudeCode,
+        );
+        assert_eq!(
+            fs::read(&record_path).unwrap(),
+            original,
+            "fresh-index cleanup preserves missing debt carrier"
+        );
         let (index, scan, modes) = production_scan(
             &fixture,
             source,
@@ -4074,6 +4088,52 @@ fn missing_index_debt_carrier_holds_in_the_production_scanner_for_both_sources()
         );
         assert!(store.format_hold[store::Refusal::Unbindable as usize] > 0);
         assert_eq!(fs::read(&record_path).unwrap(), original);
+        // Production saves incomplete censuses too: preserve the hold/evidence
+        // through the actual post-save callback and two process/index reloads.
+        let mut saved = index;
+        let mut active = cache;
+        for _ in 0..2 {
+            saved.save(&index_path).unwrap();
+            durable_after_save(&active, &fixture.dir, source, &saved);
+            assert_eq!(
+                fs::read(&record_path).unwrap(),
+                original,
+                "post-save GC preserves held debt"
+            );
+            assert_eq!(
+                active
+                    .durable_counters(source)
+                    .unwrap()
+                    .1
+                    .gc_records_deleted,
+                0
+            );
+            let restart = Arc::new(sampled_scan::SharedCache::default());
+            restart.durable_begin_pass(
+                source,
+                &index_path,
+                &namespace,
+                source == SnapshotSource::ClaudeCode,
+            );
+            let (next, scan, modes) = production_scan(
+                &fixture,
+                source,
+                ScanIndex::load(&index_path).unwrap(),
+                Some(restart.clone()),
+                &namespace.0,
+            );
+            assert_eq!(modes, (0, 0, 0));
+            assert!(!next.files.contains_key(&key));
+            assert!(scan.snapshots.is_empty());
+            assert!(!scan.census_complete);
+            assert_eq!(
+                restart.durable_counters(source).unwrap().0.durable_held
+                    [store::Refusal::Unbindable as usize],
+                1
+            );
+            saved = next;
+            active = restart;
+        }
         // Discriminating no-record control: same real scanner now publishes.
         fs::remove_file(&record_path).unwrap();
         let control = Arc::new(sampled_scan::SharedCache::default());

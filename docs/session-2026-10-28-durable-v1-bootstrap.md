@@ -11,7 +11,10 @@ so a decoded checkpoint cannot erase debt needed by downgrade readers. Invalid
 debt tags or inconsistent flag/deadline pairs are preserved as Unbindable holds.
 A debt-bearing record with an absent index entry is held by the common
 pre-acquisition guard, before sampling admission can skip restore. This uses
-the existing classified header and performs no additional read. An existing entry with a reset/postponed carrier re-arms an immediate
+the existing classified header and performs no additional read. Post-save GC
+preserves same-context missing-carrier debt records; fresh-index cleanup also
+retains debt evidence without a trusted context. Portable production tests keep
+the hold and byte-identical record across save/GC and two reloads. An existing entry with a reset/postponed carrier re-arms an immediate
 index audit, recovering the normal completed-audit/index-saved/record-old crash
 window through Full(AuditDue). The envelope never restores checkpoint debt;
 the index remains deadline authority and later offers cannot postpone it.

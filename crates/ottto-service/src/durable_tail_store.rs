@@ -985,8 +985,19 @@ impl DurableTailStore {
                 continue;
             }
             let verdict = match self.classify(&key, "delete") {
-                Ok(Some(binding)) => {
-                    let binding = binding.record.binding;
+                Ok(Some(header)) => {
+                    // Missing membership cannot erase its debt evidence. A
+                    // fresh-index cleanup has no trusted context (zero).
+                    if header.audit_debt.is_some()
+                        && !keep.contains_key(&key)
+                        && (header.record.binding.context == *live_context
+                            || *live_context == [0; 32])
+                    {
+                        self.counters.format_hold[Refusal::Unbindable as usize] += 1;
+                        on_disk.insert(key, len);
+                        continue;
+                    }
+                    let binding = header.record.binding;
                     let live = binding.context == *live_context
                         && match keep.get(&key) {
                             Some(Some(scope)) => *scope == binding.scope,

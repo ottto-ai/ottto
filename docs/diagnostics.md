@@ -185,7 +185,11 @@ entry is absent is held by the common acquisition guard before sampling
 admission, including when sampling is disabled, without inventing membership.
 That guard uses the already classified store header, adds no read, and counts
 `format_hold.unbindable`; the normal held exit counts `durable_held.unbindable`.
-A direct restore refusal also counts `ineligible.audit_carrier`. An existing entry with reset/postponed debt instead
+A direct restore refusal also counts `ineligible.audit_carrier`. Post-save GC
+preserves same-context debt-bearing records whose key is absent from the index;
+fresh-index cleanup (without a trusted context) preserves their debt evidence
+too. These preservation decisions count `format_hold.unbindable`. Proven
+foreign-context records remain ordinary GC candidates. An existing entry with reset/postponed debt instead
 re-arms an immediate index audit and plans Full(`audit_due`); this also recovers
 an index-new/record-old crash after a successful audit. `ineligible.audit_carrier`
 counts direct restore refusals; only the missing-entry held exit increments the
