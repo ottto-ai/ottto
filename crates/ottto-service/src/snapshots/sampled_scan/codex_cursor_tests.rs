@@ -7458,6 +7458,7 @@ fn memo_digest_fences_receipt_contents_context_census_flags_and_members() {
                 codex_captured_uncommitted: false,
                 codex_counting_v2: false,
                 codex_counting_owner: None,
+                archive: None,
                 opened_changed_nanos: 0,
                 opened_birth_nanos: 0,
             },

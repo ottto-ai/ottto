@@ -79,6 +79,20 @@ fn compressed_reader_families_refuse_without_parsing_or_emitting_a_body() {
         assert!(parse_codex_jsonl_file(&path, "2026-10-28T10:00:00Z", "fixture".into()).is_err());
         assert!(parse_codex_jsonl_file(&path, "2026-10-28T10:00:00Z", "fixture".into()).is_err());
     });
+    assert_refused(CodexZstCause::ConstructorUnfunded, || {
+        assert!(OwnedJsonlParser::new(
+            file(),
+            &path,
+            SnapshotSource::Codex,
+            apply_codex_line,
+            Some(&CodexTitleMetadata::default()),
+            None,
+            None,
+            false,
+            false
+        )
+        .is_err());
+    });
     assert_refused(CodexZstCause::ReplayNotAuthorized, || {
         assert!(
             reopen_for_replay(SnapshotSource::Codex, &member, &OpenedInput::plain(file())).is_err()
@@ -128,6 +142,15 @@ fn compressed_reader_families_refuse_without_parsing_or_emitting_a_body() {
             &sampled_scan::SharedCache::default()
         )
         .is_err());
+    });
+    assert_refused(CodexZstCause::ParentLedgerUnbound, || {
+        let (parent, retained) = retained_codex_parent(
+            census,
+            "synthetic.jsonl",
+            &sampled_scan::SharedCache::default(),
+        );
+        assert!(parent.is_err());
+        assert!(retained.is_none());
     });
     let source = SnapshotSource::Codex;
     let index = ScanIndex::default();

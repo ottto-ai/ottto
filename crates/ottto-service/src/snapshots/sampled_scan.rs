@@ -3,6 +3,7 @@
 use super::*;
 use crate::heap_layout_bound::{Counter, HeapLayoutBound};
 use crate::local_resource_diagnostics::cache_lifecycle::{record, Event};
+use crate::local_resource_diagnostics::{codex_zst_refused, traversal_point};
 use crate::transcript_acquisition::{ReadMode, Scope};
 use crate::transcript_cache::{Release, TranscriptCache, CACHE_BYTES, CACHE_ENTRIES, ENTRY_BYTES};
 use sampled_jsonl::CachedJsonlReduction;
@@ -1977,10 +1978,64 @@ pub(super) fn new_source_parser(
     artifacts: bool,
     curve: bool,
     identity_capture: bool,
-    index: &ScanIndex,
+    index: &mut ScanIndex,
+    cache: Option<&Arc<SharedCache>>,
 ) -> Result<OwnedJsonlParser> {
-    let mut parser = OwnedJsonlParser::new(
-        file,
+    let input =
+        if source == SnapshotSource::Codex
+            && is_compressed_codex_rollout(Some(&candidate.path), None)
+        {
+            let key = local_index_key(&candidate.path);
+            if let Some(archive) = index.files.get_mut(&key).and_then(|e| e.archive.as_mut()) {
+                anyhow::ensure!(
+                    !archive.quiet(&file),
+                    "compressed rollout already attempted"
+                );
+                if matches!(
+                    archive.disposition,
+                    ArchiveDisposition::Pending { attempts: 3.., .. }
+                ) && archive.matches(&file)
+                {
+                    archive.settle(false);
+                    anyhow::bail!("compressed settlement exhausted");
+                }
+            }
+            index.codex_state_only_blocked_session_ids.extend(
+                codex_session_id_candidates_from_path(&candidate.path.with_extension("")),
+            );
+            let input = match cache {
+                Some(cache) => OpenedInput::funded(file, cache)?,
+                None => {
+                    codex_zst_refused(CodexZstCause::AdmissionRefused);
+                    None
+                }
+            };
+            let Some(input) = input else {
+                if codex_compressed_input::admission_streak(&key, true) == 12 {
+                    let counts = serde_json::json!({"consecutive_yields": 12});
+                    traversal_point("codex_zst_admission_alarm", "codex", &counts);
+                }
+                anyhow::bail!("compressed rollout admission yielded");
+            };
+            codex_compressed_input::admission_streak(&key, false);
+            let evidence = match codex_compressed_input::ArchiveEvidence::begin(
+                input.get_ref(),
+                &candidate.path,
+                index.files.get(&key).and_then(|e| e.archive.as_deref()),
+            ) {
+                Ok(e) => e,
+                Err(e) => {
+                    input.close();
+                    return Err(e.into());
+                }
+            };
+            index.files.entry(key).or_default().archive = Some(Box::new(evidence));
+            input
+        } else {
+            OpenedInput::plain(file)
+        };
+    let mut parser = OwnedJsonlParser::new_opened(
+        input,
         &candidate.path,
         source,
         match source {
@@ -1994,6 +2049,7 @@ pub(super) fn new_source_parser(
         artifacts,
         curve,
     )?;
+    // S2: route archive decodes through the single Full gate.
     parser.accumulator.claude_request_identity_capture = identity_capture;
     if source == SnapshotSource::Codex {
         configure_tier_replay(&mut parser, candidate, index);

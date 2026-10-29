@@ -13,8 +13,8 @@ pub(crate) mod claude_reread;
 pub(crate) mod codex_memo_lifecycle;
 pub(crate) mod codex_side_lifecycle;
 
-/// Closed, content-free refusal labels; cumulative process counters on #799.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+/// Persisted via ArchiveDisposition: never rename/remove; retain retired variants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, serde::Deserialize)]
 pub(crate) enum CodexZstCause {
     #[serde(rename = "CompressedReplayNotAuthorized")]
     ReplayNotAuthorized,
@@ -40,8 +40,26 @@ pub(crate) enum CodexZstCause {
     CompatibilityUnfunded,
     #[serde(rename = "CompressedAdmissionRefused")]
     AdmissionRefused,
+    #[serde(rename = "CompressedDecodeFailed")]
+    DecodeFailed,
+    #[serde(rename = "CompressedOwnerUnproven")]
+    OwnerUnproven,
+    #[serde(rename = "CompressedOutputHeld")]
+    OutputHeld,
+    #[serde(rename = "CompressedSettlementStuck")]
+    SettlementStuck,
+    #[serde(rename = "CompressedConstructorUnfunded")]
+    ConstructorUnfunded,
+    #[serde(rename = "CompressedDecodedOverLimit")]
+    DecodedOverLimit,
 }
-const CODEX_ZST_CAUSES: usize = CodexZstCause::AdmissionRefused as usize + 1;
+impl std::fmt::Display for CodexZstCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+impl std::error::Error for CodexZstCause {}
+const CODEX_ZST_CAUSES: usize = CodexZstCause::DecodedOverLimit as usize + 1;
 static CODEX_ZST_REFUSED: [AtomicU64; CODEX_ZST_CAUSES] =
     [const { AtomicU64::new(0) }; CODEX_ZST_CAUSES];
 
@@ -1333,6 +1351,12 @@ mod tests {
             HeaderUnfunded,
             CompatibilityUnfunded,
             AdmissionRefused,
+            DecodeFailed,
+            OwnerUnproven,
+            OutputHeld,
+            SettlementStuck,
+            ConstructorUnfunded,
+            DecodedOverLimit,
         ];
         assert_eq!(ALL.len(), super::CODEX_ZST_CAUSES);
         for (index, cause) in ALL.iter().enumerate() {

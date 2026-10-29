@@ -5414,7 +5414,17 @@ impl SourcePreparation {
                 }
                 SourcePreparationStep::Refused(self, reason)
             }
-            Ok(crate::snapshots::OwnedSourceScanStep::Pending(next)) => {
+            Ok(crate::snapshots::OwnedSourceScanStep::Pending(mut next)) => {
+                if next
+                    .persist_archive_reservation(&mut self.committed_index, &self.index_path)
+                    .is_err()
+                {
+                    self.scan = Some(next);
+                    return SourcePreparationStep::Refused(
+                        self,
+                        crate::source_rotation::LocalRefusal("archive reservation save refused"),
+                    );
+                }
                 self.scan = Some(next);
                 SourcePreparationStep::Pending(self)
             }
@@ -7508,6 +7518,8 @@ fn finish_sync_source(
     // obligations this full scan references before any selection (#794 F1).
     let ack_scan_referenced =
         upload_progress.ack_retirement_scan_references(&committed_index, &index);
+    // Settle exact current bodies before selection can restore older file facts.
+    index.settle_archive_bodies(&upload_progress.accepted_body_witnesses);
     match upload_result {
         Ok(ResumableUploadResult::Completed) => {
             clear_shed_streak(source);
@@ -11748,6 +11760,7 @@ mod tests {
                 codex_counting_v2: false,
                 codex_counting_owner: None,
                 effective_upload_body_witness_revision: 0,
+                archive: None,
                 opened_changed_nanos: 0,
                 opened_birth_nanos: 0,
             },
