@@ -1970,10 +1970,13 @@ fn present_family_archive_keeps_legacy_tombstone_across_two_censuses() {
     let root = crate::test_scratch::private_dir("family-present-tombstone");
     let archive = member(&root, "sessions", OWNER, true);
     let plain = member(&root, "sessions", PARENT, false);
+    let invalid_owner = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
+    let invalid = member(&root, "sessions", invalid_owner, true);
+    let invalid_hash = codex_protected_owner(invalid_owner);
     let held = codex_protected_owner(OWNER);
     let other = codex_protected_owner("unrelated-absent");
     let mut index = ScanIndex::default();
-    for owner in [&held, &other] {
+    for owner in [&held, &invalid_hash, &other] {
         index.codex_counting_tombstones.insert(
             owner.clone(),
             CountingTombstone {
@@ -1984,6 +1987,17 @@ fn present_family_archive_keeps_legacy_tombstone_across_two_censuses() {
         );
     }
     seed_archive(&mut index, &archive, OWNER);
+    let mut evidence =
+        ArchiveEvidence::begin(&File::open(&invalid).unwrap(), &invalid, None).unwrap();
+    evidence.disposition = ArchiveDisposition::Held {
+        cause: CodexZstCause::HeaderInvalid,
+    };
+    assert!(evidence.header_validated.is_none());
+    index
+        .files
+        .entry(local_index_key(&invalid))
+        .or_default()
+        .archive = Some(Box::new(evidence));
     index.hold_compressed(
         &archive,
         BTreeSet::from([OWNER.into()]),
@@ -1991,17 +2005,23 @@ fn present_family_archive_keeps_legacy_tombstone_across_two_censuses() {
     );
     let saved = root.join("index.json");
     for _ in 0..2 {
-        let paths = [archive.clone(), plain.clone()];
+        let paths = [archive.clone(), plain.clone(), invalid.clone()];
         let inv = no_open(&archive, || inventory(&root, &paths, &mut index));
         assert_eq!(inv.headers.len(), 1);
         assert_eq!(inv.headers[0].owner, PARENT);
+        assert!(invalid.exists());
+        assert!(inv.complete);
+        assert!(inv.held_owners.contains(invalid_owner));
+        assert!(index.files[&local_index_key(&invalid)]
+            .codex_compressed_hold
+            .is_none());
         let mut scan = staged(&root, index, std::slice::from_ref(&plain));
         scan.index
             .traversal
             .as_mut()
             .unwrap()
             .codex_rollout_paths
-            .insert(local_index_key(&archive));
+            .extend([local_index_key(&archive), local_index_key(&invalid)]);
         scan.index.known_configured_scan_roots = BTreeSet::from([local_index_key(&root)]);
         scan.codex_join_inventory = Some(inv);
         let ((mut next, result), _) = capture(|| no_open(&archive, || run(scan)));
@@ -2010,6 +2030,11 @@ fn present_family_archive_keeps_legacy_tombstone_across_two_censuses() {
         assert_eq!(
             next.codex_counting_tombstones[&held].evidence,
             AckEvidence::LegacyAcked
+        );
+        assert_eq!(
+            next.codex_counting_tombstones[&invalid_hash].evidence,
+            AckEvidence::LegacyAcked,
+            "header-excluded present owner keeps Legacy evidence"
         );
         assert!(!next.codex_counting_tombstones.contains_key(&other));
         next.save(&saved).unwrap();

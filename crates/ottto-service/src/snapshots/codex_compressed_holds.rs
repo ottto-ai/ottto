@@ -140,6 +140,14 @@ impl codex_file_join::HeaderInventory {
                 }
             }
             self.custody_peak = cost.bytes;
+            if !self.custody_refused {
+                for owner in &self.held_owners {
+                    let protected = codex_protected_owner(owner);
+                    if index.codex_counting_tombstones.contains_key(&protected) {
+                        self.absence_held.insert(protected);
+                    }
+                }
+            }
             self.classify_compressed_families();
         }
         let after = self.custody_after.as_ref().map_or(Unbounded, Excluded);
