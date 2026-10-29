@@ -2857,11 +2857,14 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
     certificate.audit_debt_unix_seconds = Some(due);
     let source = DurableSource::ClaudeCode;
     let record_key = store::key_digest(source, &key);
+    // Match the production writer: debt belongs to this namespace/upload context.
+    let live_context =
+        store::context_digest(&scope.0, index.active_upload_context_fingerprint.as_deref());
     let pending = PendingRecord {
         binding: store::Binding {
             source,
             key: record_key,
-            context: [0; 32],
+            context: live_context,
             scope: [1; 32],
             entry: [2; 32],
         },
@@ -2950,6 +2953,14 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
         } else {
             missing.files.remove(&key);
         }
+        assert_eq!(
+            store::context_digest(
+                &scope.0,
+                missing.active_upload_context_fingerprint.as_deref(),
+            ),
+            live_context,
+            "carrier reset preserves the writer namespace/upload context"
+        );
         let cache = SharedCache::default();
         cache.durable_begin_pass(SnapshotSource::ClaudeCode, &index_path, &scope, true);
         let interpretation =
