@@ -156,37 +156,286 @@ fn session(rows: &[Value]) -> &Value {
         .expect("emitted session")
 }
 
-// Strict disk-restore contract: no transitional cause or missing-record alias.
-fn validate_growth_full_causes(rows: &[Value]) -> Result<(), String> {
-    if totals(rows)["full_reads"].as_u64() != Some(0) {
-        return Err("P2 requires zero Full reads".into());
+const PLATFORM_QUALIFICATION: &str = "platform: durable retention unsupported on this layout; restore is qualified on macOS by the native durable_tail/#865 fixtures in normal macOS CI";
+
+#[derive(Clone, Debug)]
+struct RetentionWitness {
+    bound_refused: u64,
+    insert_admitted: u64,
+    other_refusals: u64,
+}
+#[derive(Clone, Debug)]
+struct PlatformDiagnostics {
+    layout_supported: bool,
+    records_after_p0: u64,
+    p0: RetentionWitness,
+    page: RetentionWitness,
+    full: u64,
+    tail: u64,
+    full_causes: Value,
+    restore_outcome: Value,
+}
+impl PlatformDiagnostics {
+    fn validate_p0(&self) -> Result<(), &'static str> {
+        if self.p0.other_refusals != 0 {
+            return Err("P0 non-layout refusal");
+        }
+        if self.layout_supported {
+            if self.records_after_p0 == 0 {
+                return Err("supported layout requires durable P0 records");
+            }
+        } else if self.records_after_p0 != 0
+            || self.p0.bound_refused == 0
+            || self.p0.insert_admitted != 0
+        {
+            return Err("unsupported layout requires zero records and a real P0 layout witness");
+        }
+        Ok(())
     }
-    let mut pages = 0;
-    for row in rows
+
+    fn validate_growth(&self) -> Result<(), &'static str> {
+        self.validate_p0()?;
+        if self.page.other_refusals != 0 {
+            return Err("growth non-layout refusal");
+        }
+        if self.layout_supported {
+            if self.full != 0 || self.tail == 0 || self.full_causes != json!({}) {
+                return Err("supported layout requires Full0/Tail>=1/no cause");
+            }
+            if self.restore_outcome.get("miss").is_some() {
+                return Err("supported layout must not miss a durable restore");
+            }
+        } else {
+            // This one-file fixture must account for its one Full precisely.
+            // state_missing is never accepted without BOTH actual witnesses.
+            if self.full > 1 {
+                return Err("unsupported one-file growth exceeds Full bound");
+            }
+            if self.full != 1
+                || self.full_causes != json!({"state_missing":1})
+                || self.restore_outcome != json!({"miss":{"missing":1}})
+                || self.page.bound_refused == 0
+                || self.page.insert_admitted != 0
+            {
+                return Err("unsupported layout requires exact state_missing/miss:missing and layout witness");
+            }
+        }
+        Ok(())
+    }
+}
+
+fn retention_witness(rows: &[Value]) -> RetentionWitness {
+    let counts = &rows
         .iter()
-        .filter(|row| row["record"]["stage"] == "native_collection_page")
-    {
-        pages += 1;
-        let reads = &row["record"]["counts"]["sampled_acquisition"];
-        if reads["full_selections"].as_u64() != Some(0) {
-            return Err("P2 page requires zero Full reads".into());
-        }
-        let reasons = reads["page_events"]["full_reasons"]
-            .as_object()
-            .ok_or("P2 Full causes unavailable")?;
-        if !reasons.is_empty() {
-            return Err("P2 requires no Full cause".into());
+        .rev()
+        .find(|row| row["record"]["stage"] == "process_retained_cache_lifecycle_totals")
+        .expect("actual lifecycle witness required")["record"]["counts"];
+    let mut other_refusals = 0u64;
+    for (field, count) in counts.as_object().expect("lifecycle counts required") {
+        let non_layout = (field.starts_with("retention_")
+            && field != "retention_bound_refused"
+            && field != "retention_produced")
+            || (field.starts_with("insert_")
+                && field != "insert_admitted"
+                && field != "insert_entries_evicted")
+            || field.contains("poisoned")
+            || field == "copy_refusal_walk_visit_limit";
+        if non_layout {
+            other_refusals = other_refusals
+                .checked_add(count.as_u64().expect("refusal count required"))
+                .expect("refusal overflow");
         }
     }
-    if pages == 0 {
-        return Err("P2 page diagnostics unavailable".into());
+    RetentionWitness {
+        bound_refused: counts["retention_bound_refused"]
+            .as_u64()
+            .expect("layout witness required"),
+        insert_admitted: counts["insert_admitted"]
+            .as_u64()
+            .expect("admission witness required"),
+        other_refusals,
     }
-    Ok(())
+}
+
+fn refusal_count(value: &Value) -> u64 {
+    match value {
+        Value::Object(map) => map.values().map(refusal_count).sum(),
+        Value::Array(values) => values.iter().map(refusal_count).sum(),
+        _ => value.as_u64().expect("write refusal count required"),
+    }
+}
+
+fn p0_diagnostics(rows: &[Value]) -> PlatformDiagnostics {
+    let row = rows
+        .iter()
+        .find(|row| row["kind"] == "durable_after_save_diagnostics")
+        .expect("actual P0 store diagnostics required");
+    eprintln!("P0 durable_after_save={row}");
+    assert_eq!(row["state_lock_held"], true);
+    assert_eq!(row["store_initialized"], true);
+    assert!(row.as_object().unwrap().contains_key("store_disabled"));
+    assert_eq!(row["store_disabled"], Value::Null);
+    assert!(matches!(
+        row["inventory"].as_str(),
+        Some("counted" | "directory_absent")
+    ));
+    let layout_supported = row["heap_layout_supported"]
+        .as_bool()
+        .expect("real layout diagnostic required");
+    if !layout_supported {
+        assert_eq!(row["platform_qualification"], PLATFORM_QUALIFICATION);
+        eprintln!("{PLATFORM_QUALIFICATION}");
+    }
+    let records_after_p0 = row["records_after_save"]
+        .as_u64()
+        .expect("P0 inventory required");
+    assert_eq!(totals(rows)["durable_records_after_save"], records_after_p0);
+    let mut witness = retention_witness(rows);
+    for field in [
+        "not_persisted",
+        "write_unlocked",
+        "write_deferred",
+        "budget_refused",
+        "records_deferred",
+        "store_write_skipped",
+        "format_hold",
+        "t14_rebuild",
+        "records_invalidated",
+    ] {
+        witness.other_refusals += refusal_count(&row["write_counters"][field]);
+    }
+    PlatformDiagnostics {
+        layout_supported,
+        records_after_p0,
+        p0: witness.clone(),
+        page: witness,
+        full: 0,
+        tail: 0,
+        full_causes: json!({}),
+        restore_outcome: json!({}),
+    }
+}
+
+fn growth_diagnostics(p0: &PlatformDiagnostics, rows: &[Value]) -> PlatformDiagnostics {
+    let mut pages = rows
+        .iter()
+        .filter(|row| row["record"]["stage"] == "native_collection_page");
+    let row = pages.next().expect("growth page required");
+    assert!(
+        pages.next().is_none(),
+        "single-file fixture expects one page"
+    );
+    let counts = &row["record"]["counts"];
+    let reads = &counts["sampled_acquisition"];
+    let mut observed = p0.clone();
+    observed.page = retention_witness(rows);
+    observed.full = reads["full_selections"]
+        .as_u64()
+        .expect("page Full count required");
+    observed.tail = reads["tail_selections"]
+        .as_u64()
+        .expect("page Tail count required");
+    observed.full_causes = reads["page_events"]["full_reasons"]
+        .as_object()
+        .expect("actual Full causes required")
+        .clone()
+        .into();
+    observed.restore_outcome = counts["full_causes"]["restore_outcome"]
+        .as_object()
+        .expect("restore outcome required")
+        .clone()
+        .into();
+    // P3's killed child has no fabricated totals; its completed page is proof.
+    if let Some(total) = rows.iter().find(|row| row["kind"] == "pass_totals") {
+        assert_eq!(total["full_reads"], observed.full);
+        assert_eq!(total["tail_reads"], observed.tail);
+    }
+    observed
+}
+
+fn linux_witness() -> PlatformDiagnostics {
+    let witness = RetentionWitness {
+        bound_refused: 1,
+        insert_admitted: 0,
+        other_refusals: 0,
+    };
+    PlatformDiagnostics {
+        layout_supported: false,
+        records_after_p0: 0,
+        p0: witness.clone(),
+        page: witness,
+        full: 1,
+        tail: 0,
+        full_causes: json!({"state_missing":1}),
+        restore_outcome: json!({"miss":{"missing":1}}),
+    }
+}
+#[test]
+fn platform_gate_accepts_linux_only_with_the_layout_witness() {
+    assert!(linux_witness().validate_growth().is_ok());
+}
+#[test]
+fn platform_gate_rejects_a_different_full_cause() {
+    let mut d = linux_witness();
+    d.full_causes = json!({"audit_due":1});
+    assert!(d.validate_growth().is_err());
+}
+#[test]
+fn platform_gate_rejects_records_with_a_restore_miss() {
+    let mut d = linux_witness();
+    d.records_after_p0 = 1;
+    assert!(d.validate_growth().is_err());
+    d.layout_supported = true;
+    d.full = 0;
+    d.tail = 1;
+    d.full_causes = json!({});
+    assert!(d.validate_growth().is_err());
+}
+
+#[test]
+fn platform_gate_rejects_non_layout_refusals() {
+    let mut d = linux_witness();
+    d.page.other_refusals = 1;
+    assert!(d.validate_growth().is_err());
+    d.page.other_refusals = 0;
+    d.p0.other_refusals = 1;
+    assert!(d.validate_growth().is_err());
+}
+#[test]
+fn platform_gate_rejects_a_supported_layout_full() {
+    let mut d = linux_witness();
+    d.layout_supported = true;
+    d.records_after_p0 = 1;
+    d.tail = 1;
+    d.full_causes = json!({});
+    d.restore_outcome = json!({"restored":1});
+    assert!(d.validate_growth().is_err());
+}
+
+#[test]
+fn platform_gate_rejects_a_missing_layout_witness() {
+    let mut d = linux_witness();
+    d.page.bound_refused = 0;
+    assert!(d.validate_growth().is_err());
+    d.page.bound_refused = 1;
+    d.p0.bound_refused = 0;
+    assert!(d.validate_growth().is_err());
+}
+#[test]
+fn platform_gate_accepts_supported_layout_restore_and_tail_only() {
+    let mut d = linux_witness();
+    d.layout_supported = true;
+    d.records_after_p0 = 1;
+    d.full = 0;
+    d.tail = 1;
+    d.full_causes = json!({});
+    d.restore_outcome = json!({"restored":1});
+    assert!(d.validate_growth().is_ok());
 }
 
 fn assert_quiet_restart(rows: &[Value]) {
     let counts = totals(rows);
-    eprintln!("P1 aggregate={counts}");
+    eprintln!("{} aggregate={counts}", counts["pass"].as_str().unwrap());
     assert_eq!(counts["full_reads"], 0);
     assert_eq!(counts["tail_reads"], 0);
     // Completed native plus guard bytes: also proves zero transcript body bytes.
@@ -200,29 +449,6 @@ fn assert_quiet_restart(rows: &[Value]) {
         );
     }
     assert!(!rows.iter().any(|row| row["kind"] == "session"));
-}
-
-#[test]
-fn growth_full_gate_rejects_unknown_and_unaccounted_causes() {
-    let rows = |causes: Value, full: u64| {
-        vec![
-            json!({"kind":"local_resources", "record":{"stage":"native_collection_page", "counts":{
-            "sampled_acquisition":{"full_selections":full,"page_events":{"full_reasons":causes}}}}}),
-            json!({"kind":"pass_totals","full_reads":full}),
-        ]
-    };
-    assert!(validate_growth_full_causes(&rows(json!({}), 0)).is_ok());
-    for cause in [
-        "state_missing",
-        "missing",
-        "old_binding_no_match",
-        "upgrade_missing_full",
-        "new_unapproved_cause",
-    ] {
-        assert!(validate_growth_full_causes(&rows(json!({cause:1}), 1)).is_err());
-        assert!(validate_growth_full_causes(&rows(json!({cause:1}), 0)).is_err());
-    }
-    assert!(validate_growth_full_causes(&rows(json!({}), 1)).is_err());
 }
 
 #[test]
@@ -437,17 +663,11 @@ fn refuses_missing_and_external_secret_fallback() {
 fn synthetic_cold_quiet_growth_kill_and_restart() {
     let f = Fixture::new();
     let cold = f.run("P0");
-    for row in &cold {
-        if row["kind"] == "durable_after_save_diagnostics" {
-            eprintln!("P0 durable_after_save={row}");
-        }
-    }
-    assert!(
-        totals(&cold)["durable_records_after_save"]
-            .as_u64()
-            .expect("P0 store inventory unavailable")
-            > 0,
-        "P0 must persist records; inspect write diagnostics before attributing a P2 miss"
+    let platform = p0_diagnostics(&cold);
+    platform.validate_p0().expect("P0 platform premise");
+    eprintln!(
+        "P0 platform premise PASS; layout_supported={}",
+        platform.layout_supported
     );
     assert!(totals(&cold)["full_reads"].as_u64().unwrap() > 0);
     assert_eq!(session(&cold)["entity_count"], 1);
@@ -479,9 +699,13 @@ fn synthetic_cold_quiet_growth_kill_and_restart() {
             eprintln!("P2 aggregate_page={}", row["record"]);
         }
     }
-    validate_growth_full_causes(&growth)
-        .expect("P2 restore finding for E1; no Full cause is allowed");
-    assert!(totals(&growth)["tail_reads"].as_u64().unwrap() > 0);
+    let p2 = growth_diagnostics(&platform, &growth);
+    p2.validate_growth()
+        .expect("P2 platform-qualified acquisition");
+    eprintln!(
+        "P2 platform-qualified PASS full={} tail={}",
+        p2.full, p2.tail
+    );
     assert_eq!(
         session(&cold)["blinded_session_hash"],
         session(&growth)["blinded_session_hash"]
@@ -498,6 +722,13 @@ fn synthetic_cold_quiet_growth_kill_and_restart() {
         .unwrap();
     assert_eq!(killed.status.signal(), Some(libc::SIGKILL));
     let before_restart = f.rows("P3");
+    let p3 = growth_diagnostics(&platform, &before_restart);
+    p3.validate_growth()
+        .expect("P3 completed page platform-qualified acquisition");
+    eprintln!(
+        "P3 killed-page platform-qualified PASS full={} tail={}",
+        p3.full, p3.tail
+    );
     assert!(before_restart
         .iter()
         .any(|row| row["kind"] == "page_finished"));
@@ -509,8 +740,12 @@ fn synthetic_cold_quiet_growth_kill_and_restart() {
         session(&before_restart)["blinded_session_hash"]
     );
     let restart = f.run("P3");
-    assert_eq!(totals(&restart)["full_reads"], 0);
-    assert_eq!(totals(&restart)["tail_reads"], 0);
+    // P3 output is append-only: keep the killed revision for the oracle, and
+    // assert quiet restart against only the newly appended invocation rows.
+    assert_eq!(&restart[..before_restart.len()], before_restart.as_slice());
+    let restart = &restart[before_restart.len()..];
+    assert_quiet_restart(restart);
+    eprintln!("P3 restart PASS: quiet index reuse, zero acquisition/store reads");
     assert!(restart.iter().any(|row| row["kind"] == "local_resources"));
     // Independent fresh scratch uses the same production cycle over the final
     // synthetic transcript; cumulative money must equal the restarted chain.
@@ -523,18 +758,22 @@ fn synthetic_cold_quiet_growth_kill_and_restart() {
     )
     .unwrap();
     let oracle = fresh.run("COLD");
-    assert_eq!(
-        session(&before_restart)["token_totals"],
-        session(&oracle)["token_totals"]
-    );
-    assert_eq!(
-        session(&before_restart)["money_oracle"],
-        session(&oracle)["money_oracle"]
-    );
-    assert_eq!(
-        session(&before_restart)["emitted_body_digest"],
-        session(&oracle)["emitted_body_digest"]
-    );
+    for field in [
+        "blinded_session_hash",
+        "source",
+        "token_totals",
+        "entity_count",
+        "money_oracle",
+        "money_oracle_encoding",
+        "emitted_body_digest",
+    ] {
+        assert_eq!(
+            session(&before_restart)[field],
+            session(&oracle)[field],
+            "COLD output field {field}"
+        );
+    }
+    eprintln!("P3 chain-to-COLD OUTPUT equality PASS; no Linux restore qualification");
 }
 #[test]
 fn command_is_hidden() {

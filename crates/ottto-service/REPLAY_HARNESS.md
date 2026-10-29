@@ -91,11 +91,13 @@ session and body domains remain `replay-session-v1\0` and
 `replay-emitted-body-v1\0`. All commitments use the same supplied key.
 
 The feature-enabled synthetic integration target declares `required-features`.
-The separate, path-filtered `Replay harness (feature)` Linux job runs it and the
-oracle unit tests explicitly, in parallel with default tests. This advisory job
-is non-required and pending the CI-speed owner's OK. It uses the existing Linux
-cache scheme and enables the feature only for these targets. Both commands run
-even if one fails, and either failure fails the step:
+The CI-speed owner approved the separate `.github/workflows/replay-harness.yml`
+workflow. It runs on path-filtered PRs, nightly on main at 03:30 UTC, and manual
+dispatch. It has no push/merge-group trigger and is advisory, non-required and
+Linux-only. Its own `replay-harness-linux` cache restores on PRs and saves only
+on main; concurrency is per ref with cancellation for PRs. Default Linux tests
+and release/default features are unchanged. Both feature commands run even if
+one fails, and either failure fails the workflow:
 
 ```
 cargo test -p ottto-service --test replay_harness --features replay-harness --locked -- --nocapture
@@ -119,11 +121,26 @@ disabled reason, heap-layout support and existing write/refusal counters.
 Unavailable or unsafe inventories remain null; a missing directory counts zero.
 `durable_records_after_save` in P0 totals aggregates these inventories. Later
 passes do not perform this extra directory inventory. The synthetic chain
-requires a positive P0 count before testing restarts. Unsupported native heap
-layouts remain visible as degraded; this tool never bypasses production admission.
+reads the real `heap_layout_supported` diagnostic to qualify assertions.
+Unsupported native heap layouts remain visible as degraded; this tool never
+bypasses or stubs production layout admission.
 
-P2 requires zero Full, a positive Tail count and no Full cause. There are no
-transitional exceptions or aliases for missing records. Every P2 prints the
-exact `full_causes`, `restore_outcome` and aggregate page record. A panicking
-synthetic fixture retains its directory and prints aggregate JSONL to the test
-log. P3 and the final chain-to-COLD equality count only after P2 succeeds.
+On a supported layout, P0 must have durable records and P2 requires zero Full,
+a positive Tail count and no Full cause. On an unsupported layout, the single-file
+synthetic chain instead requires zero P0 records, actual P0 and growth layout
+refusals, zero admitted inserts and no other refusal. Its one growth Full must
+have exactly `state_missing` and `restore_outcome.miss.missing=1`. A missing
+witness, any other cause/refusal or positive records with a miss fails. This is
+a platform-qualified fixture assertion, not a general missing-record allowance.
+
+The unsupported-layout diagnostic is explicit:
+
+> platform: durable retention unsupported on this layout; restore is qualified on macOS by the native durable_tail/#865 fixtures in normal macOS CI
+
+Every P2 prints the exact `full_causes`, `restore_outcome` and aggregate page.
+P3's killed completed page uses the same platform gate; its quiet restart
+requires zero Full/Tail/native+guard bytes and store reads. Final independent
+COLD equality compares emitted output (all 15 money commitments, entity count,
+latest body digest, identity/source and token totals), not acquisition counts.
+Linux results do not qualify durable restore. A panicking synthetic fixture
+retains its directory and prints aggregate JSONL to the test log.

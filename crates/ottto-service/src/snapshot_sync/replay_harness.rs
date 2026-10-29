@@ -15,6 +15,7 @@ use std::sync::Arc;
 const MARKER: &str = ".replay-harness";
 const MARKER_BYTES: &[u8] = b"ottto isolated replay v1\n";
 const INPUT_LIMIT: u64 = 1024 * 1024;
+const PLATFORM_QUALIFICATION: &str = "platform: durable retention unsupported on this layout; restore is qualified on macOS by the native durable_tail/#865 fixtures in normal macOS CI";
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
@@ -1038,6 +1039,7 @@ fn durable_after_save_diagnostics(
         "kind":"durable_after_save_diagnostics", "pass":"P0", "source":source.api_slug(),
         "state_lock_held":crate::locked_state_dir::held_for(support).is_some(),
         "heap_layout_supported":layout_supported, "store_state":store_state,
+        "platform_qualification":(!layout_supported).then_some(PLATFORM_QUALIFICATION),
         "store_initialized":metadata.is_some(), "store_disabled":disabled,
         "records_after_save":records, "inventory":inventory, "write_counters":counters,
         "counter_scope":"process lifetime; write/refusal totals; source store totals",
