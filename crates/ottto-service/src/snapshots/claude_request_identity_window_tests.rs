@@ -575,7 +575,8 @@ fn sticky_assert_joint_pair_survives(large_parts: bool) {
     identity::apply_with_accepted_for_test(&mut item, &proof, &accepted).unwrap();
     accepted.record(&serde_json::to_value(&item).unwrap());
     let extras = if large_parts { 15 } else { 16 };
-    for prototype in proof[2..].to_vec() {
+    let prototypes = proof[2..].to_vec();
+    for prototype in prototypes {
         for n in 0..extras {
             let mut extra = prototype.clone();
             extra.identity = RequestIdentity::Tagged(AuthorityKey {
@@ -619,4 +620,111 @@ fn sticky_unencodable_bucket_preserves_a_jointly_reconcilable_accepted_pair() {
 #[test]
 fn sticky_individually_over_parts_bucket_preserves_joint_accepted_money_proof() {
     sticky_assert_joint_pair_survives(true);
+}
+
+
+#[test]
+fn sticky_byte_cap_keeps_collectively_fitting_accepted_pair_when_another_cannot_fit() {
+    let requests = [
+        display_request(Some("max"), HOUR_10, 1, login_key(OWNER_A), Some(HOUR_10)),
+        display_request(Some("max"), HOUR_11, 1, login_key(OWNER_A), Some(HOUR_11)),
+        display_request(Some("pro"), "2026-09-01T09:00:00Z", 1, login_key(OWNER_A), Some("2026-09-01T09:00:00Z")),
+        display_request(Some("pro"), "2026-09-01T09:00:00Z", 1, login_key(D64), Some("2026-09-01T09:00:00Z")),
+    ];
+    let (mut item, timed) = display_item(&requests);
+    item.collected_at = "2026-09-01T12:05:00Z".into();
+    item.input_tokens = 4;
+    item.request_count = 4;
+    item.output_tokens = 0;
+    item.cache_read_tokens = 0;
+    item.cache_creation_5m_tokens = 0;
+    item.cache_creation_1h_tokens = 0;
+    item.reasoning_output_tokens = 0;
+    item.unattributed_total_tokens = 0;
+    item.cost = None;
+    item.session_display_name = Some("x".into());
+    item.workspace_display_label = Some("x".into());
+    item.repository_label = Some("x".into());
+    let mut proof = timed.into_iter().map(|(c, _)| c).collect::<Vec<_>>();
+    let mut accepted = identity::AcceptedBuckets::default();
+    identity::apply_with_accepted_for_test(&mut item, &proof, &accepted).unwrap();
+    accepted.record(&serde_json::to_value(&item).unwrap());
+    let mut clean = stripped(&item);
+    clean.provenance.collector = identity::COLLECTOR.into();
+    let base = identity::item_bytes(&clean);
+    let extra = |kept: usize| {
+        let mut candidate = clean.clone();
+        let mut shares = proof.clone();
+        for share in shares.iter_mut().skip(kept) {
+            share.identity = RequestIdentity::Missing;
+        }
+        identity::apply_with_accepted_for_test(&mut candidate, &shares, &identity::AcceptedBuckets::default()).unwrap();
+        candidate.request_identity_refusals = if kept == 2 { 1 } else { 2 };
+        identity::item_bytes(&candidate) - base
+    };
+    let pair_extra = extra(2);
+    let single_extra = extra(1);
+    assert!(pair_extra < single_extra, "the complete top row collapses to Single");
+    let headroom = (pair_extra + single_extra) / 2;
+    let target = identity::MAX_ITEM_BYTES - headroom;
+    let mut filler = clean.usage_buckets[0].model_usage[0].clone();
+    filler.model = "claude-filler".into();
+    filler.input_tokens = 1;
+    filler.request_count = 1;
+    let start = OffsetDateTime::parse("2026-01-01T00:00:00Z", &Rfc3339).unwrap();
+    let with_fillers = |count: usize| {
+        let mut candidate = clean.clone();
+        let mut top = filler.clone();
+        top.input_tokens = count as u64;
+        top.request_count = count as u64;
+        candidate.model_usage.push(top);
+        candidate.input_tokens += count as u64;
+        candidate.request_count += count as u64;
+        for hour in 0..count {
+            candidate.usage_buckets.push(SnapshotUsageBucket {
+                bucket_start: (start + time::Duration::hours(hour as i64)).format(&Rfc3339).unwrap(),
+                model_usage: vec![filler.clone()],
+                first_activity_at: None,
+                last_activity_at: None,
+            });
+        }
+        candidate
+    };
+    // A bounded binary search pads with valid untagged hourly rows. Three
+    // bounded display labels fill the final sub-bucket byte gap exactly.
+    let (mut low, mut high) = (1usize, 4_997usize);
+    while low < high {
+        let middle = (low + high).div_ceil(2);
+        if identity::item_bytes(&with_fillers(middle)) <= target {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    let mut padded = with_fillers(low);
+    let mut gap = target - identity::item_bytes(&padded);
+    for label in [&mut padded.session_display_name, &mut padded.workspace_display_label, &mut padded.repository_label] {
+        let take = gap.min(254);
+        label.as_mut().unwrap().push_str(&"x".repeat(take));
+        gap -= take;
+    }
+    assert_eq!(gap, 0);
+    assert_eq!(identity::item_bytes(&padded), target);
+    assert!(target + pair_extra <= identity::MAX_ITEM_BYTES);
+    assert!(target + single_extra > identity::MAX_ITEM_BYTES);
+    for bucket in padded.usage_buckets.iter().skip(3) {
+        proof.push(Contribution {
+            bucket_start: bucket.bucket_start.clone(),
+            row_key: row_key_from_model_usage(&filler),
+            usage: holder_usage(&filler, None),
+            identity: RequestIdentity::Missing,
+        });
+    }
+    identity::apply_with_accepted_for_test(&mut padded, &proof, &accepted).unwrap();
+    // The item orders buckets by start, so the independent 09:00 bucket is first.
+    assert!(!sticky_tagged(&padded.usage_buckets[0].model_usage[0]));
+    assert!(sticky_tagged(&padded.usage_buckets[1].model_usage[0]));
+    assert!(sticky_tagged(&padded.usage_buckets[2].model_usage[0]));
+    assert_eq!(padded.request_identity_refusals, 1);
+    sticky_assert_reconciled(&padded);
 }

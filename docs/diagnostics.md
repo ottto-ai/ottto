@@ -1153,6 +1153,14 @@ the kept bucket shares and the untagged remainder, as required by receiver
 reconciliation. Evidence is pruned and references remapped. Display names only
 accounts still proved by emitted bucket rows.
 
+Accepted overflow removes buckets from the collective set in that drop order,
+using reversible per-share sums and money-presence counts. A bucket need not
+fit alone: multiple buckets can collapse a temporary top-level parts row or
+reconcile missing money only together. Only an unavoidable representation
+lower bound can exclude an impossible bucket before the collective check.
+Row byte deltas and reference widths are updated incrementally; allocation
+does not serialize the growing item for each candidate or removal.
+
 The destination-scoped upload progress stores class L priority hints only:
 hashed session keys and sorted bucket-start timestamps, with no identities.
 Only stored-body ACKs update them; an unchanged response that did not store the

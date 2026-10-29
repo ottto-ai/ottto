@@ -157,87 +157,180 @@ fn evidence_bytes(evidence: &BTreeSet<EvidenceKey>, refusals: u64) -> Option<usi
     let comma = usize::from(!fields.is_empty());
     Some(serde_json::to_vec(&fields).ok()?.len() - 2 + comma)
 }
-fn subtract_amounts(total: &mut Amounts, part: &Amounts) -> Option<()> {
-    for (total, value) in total.counts.iter_mut().zip(part.counts) {
-        *total = total.checked_sub(value)?;
+// Invertible sums of the actual wire contributions. Presence counts let an
+// overflow removal restore known money after the last missing share leaves.
+#[derive(Clone, Default)]
+struct Aggregate {
+    amount: Amounts,
+    present: [usize; 5],
+    missing: [usize; 5],
+}
+impl Aggregate {
+    fn change(&mut self, amount: &Amounts, remove: bool) -> Option<()> {
+        for (total, value) in self.amount.counts.iter_mut().zip(amount.counts) {
+            *total = if remove {
+                total.checked_sub(value)?
+            } else {
+                total.checked_add(value)?
+            };
+        }
+        self.amount.observed = true;
+        for field in 0..5 {
+            let value = amount.wire(field);
+            let count = if value.is_some() {
+                &mut self.present[field]
+            } else {
+                &mut self.missing[field]
+            };
+            *count = if remove {
+                count.checked_sub(1)?
+            } else {
+                count.checked_add(1)?
+            };
+            let total = self.amount.costs[field].unwrap_or(0);
+            let value = value.unwrap_or(0);
+            let total = if remove {
+                total.checked_sub(value)?
+            } else {
+                total.checked_add(value)?
+            };
+            self.amount.costs[field] = (self.present[field] > 0).then_some(total);
+            self.amount.poisoned[field] = self.missing[field] > 0;
+        }
+        Some(())
     }
-    for (total, part) in total.costs.iter_mut().zip(part.costs) {
-        if let (Some(total), Some(part)) = (total, part) {
-            *total = total.checked_sub(part)?;
+}
+
+fn bucket_amount(row: &SnapshotModelUsage, group: &RowGroup) -> Amounts {
+    let mut amount = group.total.clone();
+    amount.observed = true;
+    for (field, cost) in row_costs(row).into_iter().enumerate() {
+        amount.poisoned[field] = cost.is_none();
+    }
+    amount
+}
+
+fn share_amount(row: &SnapshotModelUsage, amount: &Amounts) -> Amounts {
+    let mut amount = amount.clone();
+    for (field, cost) in row_costs(row).into_iter().enumerate() {
+        if cost.is_none() {
+            amount.poisoned[field] = true;
         }
     }
-    Some(())
+    amount
 }
 
 #[derive(Clone)]
 struct Selection {
-    top: Vec<BTreeMap<Option<AuthorityKey>, Amounts>>,
+    top: Vec<BTreeMap<Option<AuthorityKey>, Aggregate>>,
     top_metrics: Vec<Metrics>,
-    residual_missing: Vec<[usize; 5]>,
     metrics: Metrics,
     keys: BTreeSet<AuthorityKey>,
     refused_rows: u64,
 }
 
-fn add_bucket(
+// A lower bound, not a standalone fit check. Other buckets can collapse a
+// temporary top Parts row to Single or poison its money. Charge only the
+// unavoidable top representation: Single for one key, key-only parts with no
+// money for multiple keys. Excluding a bucket on this bound cannot exclude a
+// collectively fitting set, including the otherwise protected open bucket.
+fn intrinsically_fits(item: &SnapshotItem, grouping: &Grouping, index: usize, base: usize) -> bool {
+    let minimum = || -> Option<Metrics> {
+        let mut total = Metrics::default();
+        let mut keys = BTreeSet::new();
+        for row in &item.usage_buckets[index].model_usage {
+            let group = grouping.get(
+                &item.usage_buckets[index].bucket_start,
+                &row_key_from_model_usage(row),
+            )?;
+            if group.truncated {
+                return None;
+            }
+            let tagged = group
+                .by_key
+                .iter()
+                .filter_map(|(key, amount)| {
+                    (amount.counts != [0; 8]).then_some((key.as_ref()?, amount))
+                })
+                .collect::<Vec<_>>();
+            keys.extend(tagged.iter().map(|(key, _)| (*key).clone()));
+            let zero_index = keys
+                .iter()
+                .map(|key: &AuthorityKey| (key.evidence(), 0))
+                .collect();
+            total.add(&metrics(
+                row,
+                &row_identity(row, &group.by_key, &zero_index).ok()?,
+            )?);
+            let identity = match tagged.as_slice() {
+                [] => RowIdentity::Untagged,
+                [(key, _)] => RowIdentity::Single((*key).clone()),
+                _ => RowIdentity::Parts(
+                    tagged
+                        .into_iter()
+                        .map(|(key, amount)| {
+                            let mut amount = amount.clone();
+                            amount.costs = [None; 5];
+                            (Some(key.clone()), amount)
+                        })
+                        .collect(),
+                ),
+            };
+            total.add(&metrics(row, &identity)?);
+        }
+        let evidence = keys
+            .iter()
+            .map(AuthorityKey::evidence)
+            .collect::<BTreeSet<_>>();
+        (keys.len() <= MAX_AUTHORITY_KEYS && evidence.len() <= MAX_EVIDENCE_ENTRIES)
+            .then_some(total)
+    };
+    minimum().is_some_and(|minimum| {
+        minimum.parts <= MAX_PARTS_PER_ITEM
+            && base
+                .checked_add(minimum.bytes)
+                .is_some_and(|bytes| bytes <= MAX_ITEM_BYTES)
+    })
+}
+
+fn change_bucket(
     item: &SnapshotItem,
     grouping: &Grouping,
     selection: &Selection,
     row_index: &BTreeMap<RowKey, usize>,
     index: usize,
+    remove: bool,
 ) -> Option<(Selection, Vec<RowIdentity>)> {
     let bucket = &item.usage_buckets[index];
     let mut next = selection.clone();
     let mut identities = Vec::new();
     let mut changed = BTreeSet::new();
-    let mut valid = true;
     for row in &bucket.model_usage {
         let key = row_key_from_model_usage(row);
         let group = grouping.get(&bucket.bucket_start, &key)?;
         if group.truncated {
-            valid = false;
-            break;
+            return None;
         }
         let top_index = row_index[&key];
-        let untagged = group
-            .by_key
-            .get(&None)
-            .is_some_and(|amount| amount.counts != [0; 8]);
-        let absent = row_costs(row).map(Option::is_none);
-        for (count, absent) in next.residual_missing[top_index].iter_mut().zip(absent) {
-            if absent && !untagged {
-                *count -= 1;
-            }
-        }
         let top = &mut next.top[top_index];
-        let residual = top.get_mut(&None)?;
-        subtract_amounts(residual, &group.total)?;
-        for (poisoned, count) in residual
-            .poisoned
-            .iter_mut()
-            .zip(next.residual_missing[top_index])
-        {
-            *poisoned = count > 0;
+        if !remove {
+            top.entry(None)
+                .or_default()
+                .change(&bucket_amount(row, group), true)?;
         }
         for (key, amount) in &group.by_key {
-            let mut wire_amount = amount.clone();
-            // Missing bucket money is missing on every emitted part,
-            // even when the request regrouping held a partial amount.
-            for (field, absent) in absent.into_iter().enumerate() {
-                if absent {
-                    wire_amount.costs[field] = None;
-                    wire_amount.poisoned[field] = true;
-                }
+            if amount.counts != [0; 8] {
+                top.entry(key.clone())
+                    .or_default()
+                    .change(&share_amount(row, amount), remove)?;
             }
-            top.entry(key.clone()).or_default().merge(&wire_amount)?;
         }
-        next.keys.extend(
-            group
-                .by_key
-                .iter()
-                .filter(|(_, amount)| amount.counts != [0; 8])
-                .filter_map(|(key, _)| key.clone()),
-        );
+        if remove {
+            top.entry(None)
+                .or_default()
+                .change(&bucket_amount(row, group), false)?;
+        }
+        top.retain(|key, aggregate| key.is_none() || aggregate.amount.counts != [0; 8]);
         let zero_index = group
             .by_key
             .keys()
@@ -245,21 +338,30 @@ fn add_bucket(
             .map(|key| (key.evidence(), 0))
             .collect();
         let identity = row_identity(row, &group.by_key, &zero_index).ok()?;
-        let Some(measured) = metrics(row, &identity) else {
-            valid = false;
-            break;
-        };
-        next.metrics.add(&measured);
+        let measured = metrics(row, &identity)?;
+        if remove {
+            next.metrics.subtract(&measured);
+        } else {
+            next.metrics.add(&measured);
+        }
         let has_tag = !matches!(identity, RowIdentity::Untagged);
         if has_tag && !group.refused {
-            next.refused_rows -= 1;
+            if remove {
+                next.refused_rows += 1;
+            } else {
+                next.refused_rows -= 1;
+            }
         }
         identities.push(identity);
-        changed.insert(row_index[&key]);
+        changed.insert(top_index);
     }
-    if !valid {
-        return None;
-    }
+    next.keys = next
+        .top
+        .iter()
+        .flat_map(BTreeMap::keys)
+        .flatten()
+        .cloned()
+        .collect();
     let evidence = next
         .keys
         .iter()
@@ -271,16 +373,14 @@ fn add_bucket(
     let zero_index = evidence.iter().map(|key| (key.clone(), 0)).collect();
     for top in changed {
         next.metrics.subtract(&next.top_metrics[top]);
-        let identity = row_identity(&item.model_usage[top], &next.top[top], &zero_index).ok()?;
-        let Some(measured) = metrics(&item.model_usage[top], &identity) else {
-            valid = false;
-            break;
-        };
+        let by_key = next.top[top]
+            .iter()
+            .map(|(key, aggregate)| (key.clone(), aggregate.amount.clone()))
+            .collect();
+        let identity = row_identity(&item.model_usage[top], &by_key, &zero_index).ok()?;
+        let measured = metrics(&item.model_usage[top], &identity)?;
         next.metrics.add(&measured);
         next.top_metrics[top] = measured;
-    }
-    if !valid {
-        return None;
     }
     Some((next, identities))
 }
@@ -294,12 +394,12 @@ fn fits(
     for (row, groups) in item.model_usage.iter().zip(&selection.top) {
         if groups
             .values()
-            .filter(|amount| amount.counts != [0; 8])
+            .filter(|amount| amount.amount.counts != [0; 8])
             .any(|amount| {
                 row_costs(row)
                     .iter()
                     .enumerate()
-                    .any(|(field, cost)| cost.is_none() && amount.wire(field).is_some())
+                    .any(|(field, cost)| cost.is_none() && amount.amount.wire(field).is_some())
             })
         {
             return None;
@@ -393,17 +493,10 @@ pub(super) fn select(
     let mut selection = Selection {
         top: vec![BTreeMap::new(); item.model_usage.len()],
         top_metrics: vec![Metrics::default(); item.model_usage.len()],
-        residual_missing: vec![[0; 5]; item.model_usage.len()],
         metrics: Metrics::default(),
         keys: BTreeSet::new(),
         refused_rows: 0,
     };
-    for (row, group) in grouping.rows() {
-        selection.top[*row_index.get(row)?]
-            .entry(None)
-            .or_default()
-            .merge(&group.total)?;
-    }
     for bucket in &item.usage_buckets {
         for row in &bucket.model_usage {
             let group = grouping.get(&bucket.bucket_start, &row_key_from_model_usage(row))?;
@@ -412,13 +505,11 @@ pub(super) fn select(
                 .iter()
                 .any(|(key, amount)| key.is_some() && amount.counts != [0; 8]);
             selection.refused_rows += u64::from(group.refused || has_tag);
-            let top = row_index[&row_key_from_model_usage(row)];
-            for (count, cost) in selection.residual_missing[top]
-                .iter_mut()
-                .zip(row_costs(row))
-            {
-                *count += usize::from(cost.is_none());
-            }
+            let top = *row_index.get(&row_key_from_model_usage(row))?;
+            selection.top[top]
+                .entry(None)
+                .or_default()
+                .change(&bucket_amount(row, group), false)?;
         }
     }
     strip(item);
@@ -442,50 +533,47 @@ pub(super) fn select(
         .iter()
         .map(|bucket| vec![RowIdentity::Untagged; bucket.model_usage.len()])
         .collect::<Vec<_>>();
-    // Try the complete accepted set before considering overflow. Derived top
-    // rows can collapse, and missing money can reconcile only when all of an
-    // authority's accepted buckets are present. Intermediate fit is not a
-    // prerequisite for the final accepted set to fit. An individually
-    // unencodable bucket is excluded without aborting the collective trial.
-    for check_individual_caps in [false, true] {
-        let mut all_accepted = selection.clone();
-        let mut accepted_rows = Vec::new();
-        for index in order.iter().copied().filter(|&index| is_accepted[index]) {
-            if check_individual_caps {
-                let Some((single, _)) = add_bucket(item, grouping, &selection, &row_index, index)
-                else {
-                    continue;
-                };
-                // Ignore intermediate money reconciliation here: independent
-                // accepted buckets may need each other to reconcile. Exclude
-                // only buckets that cannot fit even the representation caps.
-                if fits_caps(&single, base_bytes, prior_refusals).is_none() {
-                    continue;
-                }
-            }
-            let Some((next, rows)) = add_bucket(item, grouping, &all_accepted, &row_index, index)
-            else {
-                continue;
-            };
-            all_accepted = next;
-            accepted_rows.push((index, rows));
+    // Build accepted proof collectively. Intermediate bytes, parts and money
+    // can fail even when the complete set fits (a top Parts row may collapse
+    // to Single). If it overflows, remove in the prescribed drop order; never
+    // use standalone fit as a prerequisite for collectively fitting proof.
+    let accepted_order = order
+        .iter()
+        .copied()
+        .filter(|&index| is_accepted[index])
+        .collect::<Vec<_>>();
+    for &index in &accepted_order {
+        if !intrinsically_fits(item, grouping, index, base_bytes) {
+            continue;
         }
-        if fits(item, &all_accepted, base_bytes, prior_refusals).is_some() {
-            selection = all_accepted;
-            for (index, rows) in accepted_rows {
-                kept[index] = true;
-                bucket_identities[index] = rows;
-            }
+        let Some((next, rows)) =
+            change_bucket(item, grouping, &selection, &row_index, index, false)
+        else {
+            continue;
+        };
+        selection = next;
+        kept[index] = true;
+        bucket_identities[index] = rows;
+    }
+    for &index in accepted_order.iter().rev() {
+        if fits(item, &selection, base_bytes, prior_refusals).is_some() {
             break;
         }
-        drop(accepted_rows);
+        if !kept[index] {
+            continue;
+        }
+        let (next, _) = change_bucket(item, grouping, &selection, &row_index, index, true)?;
+        selection = next;
+        kept[index] = false;
+        bucket_identities[index].fill(RowIdentity::Untagged);
     }
     // One unencodable candidate cannot discard independent accepted proof.
     for index in order {
         if kept[index] {
             continue;
         }
-        let Some((next, identities)) = add_bucket(item, grouping, &selection, &row_index, index)
+        let Some((next, identities)) =
+            change_bucket(item, grouping, &selection, &row_index, index, false)
         else {
             continue;
         };
@@ -509,7 +597,13 @@ pub(super) fn select(
         .model_usage
         .iter()
         .zip(&selection.top)
-        .map(|(row, by_key)| row_identity(row, by_key, &zero_index))
+        .map(|(row, aggregates)| {
+            let by_key = aggregates
+                .iter()
+                .map(|(key, aggregate)| (key.clone(), aggregate.amount.clone()))
+                .collect();
+            row_identity(row, &by_key, &zero_index)
+        })
         .collect::<Result<Vec<_>, _>>()
         .ok()?;
     install(
