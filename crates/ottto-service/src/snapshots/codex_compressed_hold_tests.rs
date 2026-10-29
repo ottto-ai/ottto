@@ -752,6 +752,13 @@ fn staged(root: &Path, index: ScanIndex, paths: &[PathBuf]) -> OwnedSourceScan {
         .iter()
         .map(|p| codex_zst_refusal_tests::candidate(p))
         .collect();
+    scan.identified_candidates.retain(|candidate| {
+        !scan
+            .index
+            .files
+            .get(&local_index_key(&candidate.path))
+            .is_some_and(|entry| entry.codex_compressed_hold.is_some())
+    });
     for candidate in &mut scan.identified_candidates {
         candidate.scan_root = root.to_owned();
         candidate.size_bytes = fs::metadata(&candidate.path).map_or(0, |s| s.len());
