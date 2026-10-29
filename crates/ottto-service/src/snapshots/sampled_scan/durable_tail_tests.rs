@@ -7052,6 +7052,7 @@ fn s2_unknown_is_same_and_only_independent_replacement_skips_floor() {
         generation: 1,
         entry,
         strict: true,
+        verified_extent: true,
     };
     assert!(
         !accepted_object_changed(&record, a, 1, 2, 100),
@@ -7187,7 +7188,16 @@ fn verified_warm_shrink_reads_exact_changed_body_once_and_preserves_ack() {
         prefix
     ));
     let prior = accepted.clone();
-    let (changed, body, modes) = run(cache.clone(), accepted);
+    let ((changed, body, modes), events) =
+        crate::local_resource_diagnostics::capture(|| run(cache.clone(), accepted));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["counts"]["full_reads"]["real_edit"]["shrunk"] == 1)
+            .count(),
+        1,
+        "one named A2 admission at the actual native Full boundary"
+    );
     assert_eq!(body.snapshots.len(), 1);
     assert_eq!(
         body.snapshots[0].input_tokens, 100,

@@ -33001,6 +33001,13 @@ impl OwnedSourceScan {
                     }
                 }
             }
+            #[cfg(unix)]
+            if native_edit_proven {
+                crate::local_resource_diagnostics::durable_tail_alarm(
+                    source.api_slug(),
+                    &serde_json::json!({"full_reads": {"real_edit": {"shrunk": 1}}}),
+                );
+            }
             if let Some((context, (mode, audit_due))) = sampling.as_mut().zip(planned_mode) {
                 context.record_mode(mode, audit_due);
                 if active_bound_degraded {
