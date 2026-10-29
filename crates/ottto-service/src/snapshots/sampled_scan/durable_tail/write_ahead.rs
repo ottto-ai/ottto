@@ -305,7 +305,7 @@ impl<'a> CommitFences<'a> {
 }
 
 impl SharedCache {
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn expire_resource_pause_for_test(&self, source: SnapshotSource) {
         if let Some(ds) = durable_source(source) {
             if let Some(mut stores) = self.durable() {

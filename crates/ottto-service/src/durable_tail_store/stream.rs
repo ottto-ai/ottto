@@ -903,7 +903,7 @@ impl DurableTailStore {
             });
         }
     }
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn expire_resource_pause_for_test(&mut self) {
         if let Some(pause) = self.resource_pause.as_mut() {
             pause.next_probe = SystemTime::UNIX_EPOCH;
