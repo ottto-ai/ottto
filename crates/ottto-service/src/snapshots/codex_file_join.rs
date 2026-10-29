@@ -170,6 +170,8 @@ fn read_header_bytes(candidate: &CandidateFile) -> Result<(Vec<u8>, String, usiz
         None,
         CodexZstCause::GroupReadUnsupported,
     )?;
+    #[cfg(test)]
+    tests::header_read_started(&candidate.path);
     let file = open_candidate_beneath_root(candidate)?;
     let before = file.metadata()?;
     anyhow::ensure!(before.is_file(), "Codex header is not a regular file");
@@ -1642,6 +1644,41 @@ impl crate::heap_layout_bound::HeapLayoutBound for Tokens {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    thread_local! {
+        static HEADER_READ_PROBE: std::cell::RefCell<Option<(PathBuf, usize)>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+    pub(in crate::snapshots) fn header_read_started(path: &Path) {
+        HEADER_READ_PROBE.with(|probe| {
+            if let Some((observed, reads)) = probe.borrow_mut().as_mut() {
+                if observed == path {
+                    *reads += 1;
+                }
+            }
+        });
+    }
+    /// Opt-in instrumentation at the real header I/O entry, including retries.
+    pub(in crate::snapshots) fn count_header_reads<T>(
+        path: &Path,
+        run: impl FnOnce() -> T,
+    ) -> (T, usize) {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                HEADER_READ_PROBE.with(|probe| *probe.borrow_mut() = None);
+            }
+        }
+        HEADER_READ_PROBE.with(|probe| {
+            assert!(probe.borrow().is_none());
+            *probe.borrow_mut() = Some((path.to_owned(), 0));
+        });
+        let _reset = Reset;
+        let result = run();
+        let reads = HEADER_READ_PROBE.with(|probe| probe.borrow().as_ref().unwrap().1);
+        (result, reads)
+    }
 
     pub(crate) fn usage(input: u64) -> Value {
         json!({"input_tokens":input,"cached_input_tokens":0,"cache_write_input_tokens":0,

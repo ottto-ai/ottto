@@ -1107,3 +1107,225 @@ fn cached_archive_header_does_not_bypass_permission_gate() {
         "cached metadata remains available"
     );
 }
+
+#[test]
+fn excluded_archive_inventory_hold_survives_restart_without_plain_header_reread() {
+    use codex_file_join::{tests::count_header_reads, DirectoryCensus, HeaderInventory};
+    for outside_roster in [false, true] {
+        let mut f = ArchiveFixture::new(b"refused-archive-stamp");
+        let state_root = f.0.parent().unwrap().to_owned();
+        let root = state_root.join("sessions");
+        fs::create_dir(&root).unwrap();
+        let archive_path = root.join(f.0.file_name().unwrap());
+        fs::rename(&f.0, &archive_path).unwrap();
+        f.0 = archive_path;
+        let roots = [root.clone()];
+        let plain = root.join("rollout-owed-plain.jsonl");
+        fs::write(
+            &plain,
+            String::from_utf8(synthetic_rollout())
+                .unwrap()
+                .replace("compressed-fixture", "owed-plain"),
+        )
+        .unwrap();
+        let archive_key = local_index_key(&f.0);
+        let plain_key = local_index_key(&plain);
+        let archive_witness = codex_file_join::path_witness(&f.0);
+        assert!(archive_witness.is_some());
+        let plain_witness = codex_file_join::path_witness(&plain).unwrap();
+        let mut directories = DirectoryCensus::new();
+        directories.observe(&root, &fs::metadata(&root).unwrap());
+        // Prove the plain first record was actually inventoried before the
+        // persisted hold, and prove that our I/O probe observes a real read.
+        let (_, prior_reads) = count_header_reads(&plain, || {
+            let mut inventory = HeaderInventory::new(
+                &roots,
+                &BTreeSet::from([plain_key.clone()]),
+                Some(&directories),
+            );
+            while !inventory.step(&CodexTitleMetadata::default()) {}
+            assert!(inventory.complete);
+            assert_eq!(inventory.headers.len(), 1);
+            assert!(inventory.read_bytes > 0);
+        });
+        assert_eq!(prior_reads, 1);
+        let mut evidence = ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, None).unwrap();
+        evidence.disposition = ArchiveDisposition::Refused {
+            cause: CodexZstCause::HeaderInvalid,
+        };
+        let mut index = ScanIndex::default();
+        index.files.entry(archive_key.clone()).or_default().archive = Some(Box::new(evidence));
+        index.files.insert(
+            plain_key.clone(),
+            ScanIndexEntry {
+                size_bytes: fs::metadata(&plain).unwrap().len(),
+                source_file_fingerprint: "held-plain".into(),
+                ..Default::default()
+            },
+        );
+        ensure_bounded_traversal(
+            SnapshotSource::Codex,
+            &roots,
+            &mut index,
+            NOW,
+            BACKFILL_WINDOW_DAYS,
+        );
+        let hold = CodexInventoryHold {
+            owed: BTreeSet::from([plain_key.clone()]),
+            refused_headers: if outside_roster {
+                BTreeMap::new()
+            } else {
+                BTreeMap::from([(archive_key.clone(), archive_witness.clone())])
+            },
+            outside_roster: if outside_roster {
+                BTreeMap::from([(archive_key.clone(), archive_witness.clone())])
+            } else {
+                BTreeMap::new()
+            },
+            awaiting_directories: false,
+        };
+        let retry_after = rfc3339_unix_seconds(NOW).unwrap() + 1800;
+        let traversal = index.traversal.as_mut().unwrap();
+        traversal.pending_directories.clear();
+        traversal.pending_candidates.clear();
+        traversal.codex_rollout_paths = BTreeSet::from([plain_key.clone()]);
+        if !outside_roster {
+            traversal.codex_rollout_paths.insert(archive_key.clone());
+        }
+        traversal
+            .observed_index_keys
+            .extend([archive_key.clone(), plain_key.clone()]);
+        traversal.residue.index_keys.insert(archive_key.clone());
+        traversal.residue.codex_inventory_hold = Some(hold.clone());
+        traversal.codex_join_directory_census = Some(directories);
+        // An incomplete-inventory page already carries retryable debt. Its
+        // retained generation is not due for a fresh walk in this fixture.
+        traversal
+            .counts
+            .record_unreadable(UnreadableCause::AliasParser, 1);
+        traversal.unhealthy_retry_not_before_unix_seconds = Some(retry_after);
+        let archive_before = serde_json::to_value(&index.files[&archive_key]).unwrap();
+        let saved = state_root.join("held-index.json");
+        let run_page = |index, hints: &[PathBuf], quiet| {
+            let mut scan = OwnedSourceScan::new(
+                SnapshotSource::Codex,
+                &roots,
+                index,
+                NOW,
+                BACKFILL_WINDOW_DAYS,
+                10,
+                false,
+                None,
+                hints,
+                false,
+                false,
+            );
+            let traversal = scan.index.traversal.as_ref().unwrap();
+            assert!(!traversal.codex_rollout_paths.contains(&archive_key));
+            assert_eq!(traversal.residue.codex_inventory_hold.as_ref(), Some(&hold));
+            if quiet {
+                assert!(traversal.pending_candidates.is_empty());
+                assert!(scan.identified_candidates.is_empty());
+                assert!(scan.codex_join_inventory.is_none());
+            } else {
+                assert!(scan
+                    .identified_candidates
+                    .iter()
+                    .any(|candidate| candidate.path == plain));
+            }
+            for _ in 0..1000 {
+                scan = match scan.step(None) {
+                    OwnedSourceScanStep::Pending(next) => next,
+                    OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan),
+                };
+            }
+            panic!("inventory-held page did not complete");
+        };
+        for pass in 0..3 {
+            index.save(&saved).unwrap();
+            let (restored, origin) =
+                ScanIndex::load_inner(&saved, Some(SnapshotSource::Codex)).unwrap();
+            assert!(matches!(origin, LoadOrigin::Loaded(_)));
+            let traversal = restored.traversal.as_ref().unwrap();
+            assert!(
+                traversal.pending_candidates.is_empty() && traversal.pending_directories.is_empty()
+            );
+            assert!(traversal
+                .codex_join_directory_census
+                .as_ref()
+                .unwrap()
+                .moved_directories()
+                .is_empty());
+            assert_eq!(traversal.residue.codex_inventory_hold.as_ref(), Some(&hold));
+            assert_eq!(
+                codex_file_join::path_witness(&plain).as_deref(),
+                Some(plain_witness.as_str())
+            );
+            if pass < 2 {
+                assert_eq!(codex_file_join::path_witness(&f.0), archive_witness);
+            }
+            let ((next, result), reads) =
+                count_header_reads(&plain, || run_page(restored, &[], true));
+            assert_eq!(reads, 0, "no recovery header read of unchanged plain work");
+            assert_eq!(result.scanned_file_count, 0);
+            assert!(result.snapshots.is_empty());
+            let traversal = next.traversal.as_ref().unwrap();
+            assert_eq!(traversal.residue.codex_inventory_hold.as_ref(), Some(&hold));
+            assert_eq!(
+                traversal.counts.unreadable_path_count, 1,
+                "exclusion adds no retryable debt"
+            );
+            assert_eq!(
+                traversal.unhealthy_retry_not_before_unix_seconds,
+                Some(retry_after)
+            );
+            assert_eq!(
+                serde_json::to_value(&next.files[&archive_key]).unwrap(),
+                archive_before
+            );
+            index = next;
+            if pass == 1 {
+                // Even a denied neighbor's real metadata change cannot rearm P.
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(&f.0)
+                    .unwrap()
+                    .write_all(b"changed")
+                    .unwrap();
+                assert_ne!(codex_file_join::path_witness(&f.0), archive_witness);
+            }
+        }
+        // A real edit of admitted P keeps its existing watcher admission path.
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&plain)
+            .unwrap()
+            .write_all(b"\n")
+            .unwrap();
+        assert_ne!(
+            codex_file_join::path_witness(&plain).as_deref(),
+            Some(plain_witness.as_str())
+        );
+        index.save(&saved).unwrap();
+        let (restored, origin) =
+            ScanIndex::load_inner(&saved, Some(SnapshotSource::Codex)).unwrap();
+        assert!(matches!(origin, LoadOrigin::Loaded(_)));
+        let ((next, result), reads) = count_header_reads(&plain, || {
+            run_page(restored, std::slice::from_ref(&plain), false)
+        });
+        assert!(
+            reads > 0,
+            "changed admitted P reaches real header inventory"
+        );
+        assert_eq!(result.scanned_file_count, 1);
+        assert!(result
+            .snapshots
+            .iter()
+            .any(|snapshot| snapshot.source_session_id == "owed-plain"));
+        assert_eq!(
+            serde_json::to_value(&next.files[&archive_key]).unwrap(),
+            archive_before
+        );
+        fs::remove_dir_all(state_root).unwrap();
+    }
+}
