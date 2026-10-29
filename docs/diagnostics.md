@@ -863,3 +863,87 @@ counts. Callers close the decoder and explicitly release after Stores drops.
 Fallback Drop release counts `codex_zst_owner.counts.leaked_release`; it is a
 cancellation/unwind safety net. Stores-held debug assertions guard admission and
 explicit release, including real durable I/O paths.
+
+
+## Codex ownership-incomplete causes
+
+The existing `snapshot terminal_census source=codex` line appends nonzero,
+count-only `ownership_incomplete_contributions{bucket="<name>"}=<count>` fields.
+The labels are closed: the six causes below and `unattributed`, emitted last.
+Omitted new fields mean zero in their stated scope. Existing fields keep their
+order; no paths, ids, tokens, membership, distinct counts or cap flags are emitted.
+
+Contributions reset at the generation-start marker (`ownership_incomplete_generation_start`).
+
+**Buckets count CONTRIBUTIONS, not distinct files.** Contributions are
+generation-cumulative, restart-retained, the same unit as scanner S in
+`ownership_incomplete_files`. Both the scalar and buckets are generation-cumulative;
+repeated selections, memo replays and holds contribute again. Compare totals across
+generation starts: growth means new work, stable means the same work recurring.
+This is a contribution comparison, not proof that particular paths are identical.
+`unproven_terminal` (U) and any existing account-deferred term added to the public
+scalar remain separate from S and the bucket partition.
+
+**First-match precedence: exactly one bucket for each existing scalar addition:**
+
+| Order / bucket | Matching site and contribution unit |
+| --- | --- |
+| 1. `inventory_hold` | Compound A1/group-preparation refusal: group member count. Incomplete-inventory remaining-singleton clear: remaining candidate count. |
+| 2. `other_group_receipt_legacy` | Strict group member count; one per terminal member disclosure or failed tier replay candidate; receipt-cap alias members (minimum one); incomplete joined-replacement alias members; distinct affected keys per legacy-hold invocation. |
+| 3. `parent_unresolvable` | One per held parsed rollout with an exact parent cause, including Absent, DeferredRef and DeferredRestart. |
+| 4. `created_thread_proof` | One per held parsed rollout in the native-created-thread-only path, including failed parentless A2 conjuncts, after parent precedence. |
+| 5. `protected_absent` | Newly missing protected path index keys excluded by the existing traversal residue set. |
+| 6. `other_parser` | One per remaining ownership-incomplete parsed rollout. |
+| 7. `unattributed` | Last-resort remainder of scanner S without a recorded cause, never U. |
+
+Precedence matches the site/outcome of the individual addition, not every fact
+that might apply to its path. Inventory and group exits do not also merge a
+parsed-rollout contribution. Held memo replays retain their original cause.
+Post-parse legacy holds are separate contributions, not reassignment. No path
+membership is retained or consulted. Round 4 removes input-encoding counters too:
+the only cause observations retained are contributions; no Absent-parent origin
+is inferred. Two original input slots remain decode-compatible but are never
+incremented or emitted.
+
+The six classified buckets plus `unattributed` equal S exactly in the terminal
+projection. `unattributed` is expected approximately zero by construction:
+**nonzero = chase this**. Pre-upgrade checkpoints and an older object-form save
+can legitimately lose the split until the next fresh traversal. Otherwise
+investigate a missing hook or the invalid/reset disclosure below.
+
+`ownership_incomplete_generation_start` is the existing traversal's frozen census
+window boundary, expressed as Unix seconds: a numeric generation-start marker.
+It is derived from the already-persisted `census_window_end` each page, so routine
+save/load/resume and process restart preserve it. Fresh traversals use their new
+window boundary. It has second resolution: separate traversals started within the
+same second can share a marker; compare across timestamped generation starts,
+not as a globally unique id. Invalid/nonpositive timestamps omit the zero marker.
+No new generation field is persisted or used for admission.
+
+Checked additions and checked aggregate/subtraction arithmetic protect the new
+counters. Per-slot addition/merge overflow clears the diagnostic split, counts a
+reset, and later contributions may be classified again. At terminal projection,
+an unrepresentable sum or classified sum greater than S instead clears the
+projected split and reports all S as `unattributed`. It does not rewrite S or
+repair the stored record. `ownership_incomplete_invalid_resets` counts arithmetic
+resets observed by the in-memory traversal owner, plus one when the current
+projection is invalid. Repeated invalid projections each disclose that condition;
+they do not accumulate repeated reads as additional stored reset events. The
+reset count saturates at `usize::MAX` and resets on checkpoint reload (including restart) or a fresh generation; lost
+attribution remains visible in the restart-retained unattributed remainder.
+This explicitly discloses lost attribution; silent clamping is forbidden. A
+legacy S overflow is detected if it leaves classification greater than the
+observed scalar; the pre-existing scalar arithmetic itself is unchanged.
+
+Persistence uses the existing traversal counts: `causes` is a trailing defaulted
+slot after retired positional slots. Its eight numeric contribution slots keep
+the prior order (six causes, two retired input counters). Empty `causes` is omitted
+from object-form checkpoints and #799 JSON rows, including Claude/Pi defaults;
+fixed positional arrays retain zero elements because position is their schema.
+SOURCE approved class N counts and these absence/re-upgrade semantics on
+2026-10-29. Object form is the only supported downgrade representation;
+positional array form is never emitted. An older object reader ignores `causes`
+and drops the split on save; re-upgrade preserves S as all-unattributed, without
+backfill. Existing old-object/old-array decoding stays supported. No format,
+parser or scan-identity bump, new reader, hold, selection, admission or upload
+behavior is introduced.

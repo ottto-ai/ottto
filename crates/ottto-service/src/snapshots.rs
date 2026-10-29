@@ -41,11 +41,13 @@ pub(crate) use claude_context_file_birth::{
 };
 mod claude_history_upgrade;
 mod codex_root_copies;
+pub(crate) mod ownership_diagnostics;
 #[cfg(test)]
 pub(crate) use claude_history_upgrade::{
     local_count as history_local_count, with_max_gated_claude_revision,
     LocalCount as HistoryLocalCount, REQUEST_OWNED_USAGE_CONTRACT,
 };
+use ownership_diagnostics as ownership;
 #[cfg(test)]
 mod claude_history_upgrade_tests;
 mod claude_reemission_exclusions;
@@ -2499,6 +2501,8 @@ struct ScanTraversalCounts {
     /// retired_<old>: decode-only placeholder; keeps positional slots; never written.
     #[serde(rename = "reread_budget_refused", default, skip_serializing)]
     retired_reread_budget_refused: serde::de::IgnoredAny,
+    #[serde(skip_serializing_if = "ownership::Counts::is_empty")]
+    causes: ownership::Counts,
 }
 
 /// Residue a generation disclosed as terminal after settling. Counts exclude
@@ -7340,6 +7344,7 @@ pub struct SourceScanResult {
     pub over_line_cap_count: usize,
     pub recognized_usage_drop_count: usize,
     pub ownership_incomplete_file_count: usize,
+    pub(crate) causes: ownership::Counts,
     pub zero_snapshot_confirmed_count: usize,
     pub zero_snapshot_usage_evidence_count: usize,
     pub dropped_usage_record_count: u64,
@@ -7521,6 +7526,7 @@ impl SourceScanResult {
             );
         }
         self.ownership_incomplete_file_count += keys.len();
+        self.causes.add(ownership::GROUP, keys.len());
         for key in &keys {
             index.remove_file_entry(key);
             if let Some(entry) = previous.files.get(key) {
@@ -7543,6 +7549,7 @@ impl SourceScanResult {
         });
         if let Some(traversal) = index.traversal.as_mut() {
             traversal.counts.ownership_incomplete_file_count += keys.len();
+            traversal.counts.causes.add(ownership::GROUP, keys.len());
             traversal
                 .counts
                 .record_unreadable(UnreadableCause::LegacyHold, 1);
@@ -26354,6 +26361,8 @@ impl OwnedSourceScan {
             pending_paths.extend(members);
             pending_paths.extend(rereads);
         }
+        let census_unix_seconds = rfc3339_unix_seconds(&census_window_end);
+        let causes = traversal.counts.causes.page(census_unix_seconds);
         if source == SnapshotSource::ClaudeCode {
             finish_claude_retry_selection(
                 index,
@@ -26363,8 +26372,10 @@ impl OwnedSourceScan {
             );
         }
         index.resume_census_window_end = Some(census_window_end.clone());
-        let census_unix_seconds = rfc3339_unix_seconds(&census_window_end);
-        let mut census = ScanCensus::default();
+        let mut census = ScanCensus {
+            causes,
+            ..ScanCensus::default()
+        };
         let codex_selected_flags = if source == SnapshotSource::Codex {
             pending_paths
                 .iter()
@@ -27117,6 +27128,7 @@ impl OwnedSourceScan {
                             || group.members.len() < 2
                         {
                             census.ownership_incomplete_file_count += group.members.len();
+                            census.causes.add(ownership::INVENTORY, group.members.len());
                             census.record_unreadable(UnreadableCause::AliasParser, 1);
                             residue_index_keys.extend(
                                 group
@@ -27246,6 +27258,9 @@ impl OwnedSourceScan {
                     if !inventory.complete {
                         census.record_unreadable(UnreadableCause::AliasParser, 1);
                         census.ownership_incomplete_file_count += identified_candidates.len();
+                        census
+                            .causes
+                            .add(ownership::INVENTORY, identified_candidates.len());
                         residue_index_keys.extend(
                             identified_candidates
                                 .iter()
@@ -28514,6 +28529,7 @@ impl OwnedSourceScan {
                                 context.cache.cursor_published(publication, false);
                             }
                             census.ownership_incomplete_file_count += 1;
+                            census.causes.add(ownership::GROUP, 1);
                             census.record_unreadable(UnreadableCause::AliasParser, 1);
                             residue_index_keys.insert(local_index_key(&candidate.path));
                             if let Some(owner) = parser.accumulator.source_session_id.as_ref() {
@@ -28548,6 +28564,7 @@ impl OwnedSourceScan {
                         context.cache.cursor_published(publication, false);
                     }
                     census.ownership_incomplete_file_count += aliases.len().max(1);
+                    census.causes.add(ownership::GROUP, aliases.len().max(1));
                     census.record_unreadable(UnreadableCause::AliasParser, 1);
                     residue_index_keys.insert(local_index_key(&candidate.path));
                     residue_index_keys
@@ -29263,6 +29280,7 @@ impl OwnedSourceScan {
                     // Joining authorizes a complete replacement only. Native
                     // ownership/parser loss cannot publish a partial union body.
                     census.ownership_incomplete_file_count += aliases.len();
+                    census.causes.add(ownership::GROUP, aliases.len());
                     census.record_unreadable(UnreadableCause::AliasParser, 1);
                     residue_index_keys
                         .extend(aliases.iter().map(|member| local_index_key(&member.path)));
@@ -29615,6 +29633,7 @@ impl OwnedSourceScan {
                                         reason:
                                             sampled_scan::codex_cursor::DebtReason::HeldTerminal,
                                         ownership_incomplete_file_count,
+                                        cause: parsed_file.cause,
                                         zero_snapshot_usage_evidence,
                                         state_only_blocked_session_ids: parsed_file
                                             .state_only_blocked_session_ids
@@ -30049,6 +30068,9 @@ impl OwnedSourceScan {
                 census.over_line_cap_count += report.over_line_cap_count;
                 census.recognized_usage_drop_count += recognized_usage_drop_count;
                 census.ownership_incomplete_file_count += ownership_incomplete_file_count;
+                census
+                    .causes
+                    .add(parsed_file.cause, ownership_incomplete_file_count);
                 census.zero_snapshot_usage_evidence_count +=
                     usize::from(zero_snapshot_usage_evidence);
                 census.dropped_usage_record_count = census
@@ -30171,6 +30193,7 @@ impl OwnedSourceScan {
                         census.recognized_usage_drop_count;
                     traversal.counts.ownership_incomplete_file_count +=
                         census.ownership_incomplete_file_count;
+                    traversal.counts.causes.merge(&census.causes);
                     traversal.counts.zero_snapshot_usage_evidence_count +=
                         census.zero_snapshot_usage_evidence_count;
                     traversal.counts.dropped_usage_record_count = traversal
@@ -30335,6 +30358,10 @@ impl OwnedSourceScan {
                             let newly_missing =
                                 missing.difference(&traversal.residue.index_keys).count();
                             traversal.counts.ownership_incomplete_file_count += newly_missing;
+                            traversal
+                                .counts
+                                .causes
+                                .add(ownership::ABSENT, newly_missing);
                             traversal.counts.record_unreadable(
                                 UnreadableCause::ProtectedAbsence,
                                 usize::from(newly_missing > 0),
@@ -30764,6 +30791,7 @@ impl OwnedSourceScan {
                     over_line_cap_count: counts.over_line_cap_count,
                     recognized_usage_drop_count: counts.recognized_usage_drop_count,
                     ownership_incomplete_file_count: counts.ownership_incomplete_file_count,
+                    causes: counts.causes,
                     zero_snapshot_confirmed_count,
                     zero_snapshot_usage_evidence_count,
                     dropped_usage_record_count,
@@ -33020,6 +33048,7 @@ struct ParsedJsonlFile {
     report: JsonlReadReport,
     recognized_usage_drop_count: usize,
     ownership_incomplete_file_count: usize,
+    cause: usize,
     zero_snapshot_usage_evidence: bool,
     dropped_usage_record_count: u64,
     /// Local diagnostic only: Claude compaction summaries that name a
@@ -33064,6 +33093,7 @@ impl ParsedJsonlFile {
         debug_assert!(cause.deferred() && self.codex_parent_resolution_pending);
         self.codex_parent_resolution_pending = false;
         self.ownership_incomplete_file_count = 1;
+        self.cause = ownership::PARENT;
         self.codex_parent_unresolvable = Some(cause);
         // No ledger proved this parse; the memo dependency records the probe,
         // not a stale fence identity.
@@ -33558,6 +33588,13 @@ impl OwnedJsonlParser {
         // Computed before the clear below, which empties the ledger of a held,
         // lossy or pending file.
         let codex_parent_unresolvable = accumulator.codex_parent_unresolvable;
+        let cause = if codex_parent_unresolvable.is_some() {
+            ownership::PARENT
+        } else if accumulator.codex_created_thread_native_only {
+            ownership::CREATED
+        } else {
+            ownership::PARSER
+        };
         let codex_parent_ledger_consulted = accumulator.codex_parent_ledger_consulted;
         let codex_parent_prefix_decided = accumulator.codex_parent_prefix_decided;
         let codex_parent_proof_used = accumulator
@@ -33668,6 +33705,7 @@ impl OwnedJsonlParser {
             report,
             recognized_usage_drop_count,
             ownership_incomplete_file_count,
+            cause,
             zero_snapshot_usage_evidence,
             dropped_usage_record_count: recognized_usage_drop_count as u64,
             claude_compaction_unlinked_parent_count,
@@ -38306,6 +38344,7 @@ impl OpenedObjectStat {
 
 #[derive(Debug, Default)]
 struct ScanCensus {
+    causes: ownership::Counts,
     #[cfg(test)]
     discovered_file_count: usize,
     directory_entry_cap_exceeded_count: usize,
@@ -82297,6 +82336,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ownership_created_and_other_parser_sites_keep_their_original_scalar() {
+        let clock = ParentlessClock::now();
+        let values = parentless_created_thread_values(&clock, PARENTLESS_CHILD);
+        let parsed = parse_parentless_created_thread(
+            "ownership-created",
+            PARENTLESS_CHILD,
+            &clock,
+            &jsonl_body(&values),
+            |metadata, _| metadata.state_created_threads.clear(),
+        );
+        assert_eq!(parsed.ownership_incomplete_file_count, 1);
+        assert_eq!(parsed.cause, ownership::CREATED);
+        let root = temp_dir("ownership-other-parser");
+        let path = root.join(format!("rollout-{PARENTLESS_CHILD}.jsonl"));
+        fs::write(&path, "").unwrap();
+        let parsed = parse_codex_test_with_ledgers(&path, BTreeMap::new());
+        assert_eq!(parsed.ownership_incomplete_file_count, 1);
+        assert_eq!(parsed.cause, ownership::PARSER);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn assert_parentless_held(parsed: &ParsedJsonlFile, case: &str, session_id: &str) {
         assert!(parsed.snapshots.is_empty(), "{case}: {parsed:#?}");
         assert_eq!(parsed.ownership_incomplete_file_count, 1, "{case}");
@@ -89330,7 +89391,7 @@ crate::heap_layout_bound::fields!(CodexTitleCandidate; title, source);
 crate::heap_layout_bound::fields!(CodexTitleMetadata; local_diagnostics, titles, state_threads, rollout_extents, root_sidecars, state_created_threads, spawn_parents, spawn_parent_conflicts, identity_conflicts, state_census_incomplete, sidecar_census_incomplete, state_census_unscoped_incomplete, sidecar_census_unscoped_incomplete, created_thread_census_unscoped_incomplete, legacy_sidecar_fingerprint, legacy_config_file_present);
 crate::heap_layout_bound::fields!(CodexTurnTraceMap; priority_turns, incomplete);
 crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized_usage_drop_count, claude_compaction_unlinked_parent_count,
-    ownership_incomplete_file_count, zero_snapshot_usage_evidence, dropped_usage_record_count,
+    ownership_incomplete_file_count, cause, zero_snapshot_usage_evidence, dropped_usage_record_count,
     terminal_line_loss_count, state_only_blocked_session_ids, codex_parent_session_ref,
     codex_parent_ledger_identity_used, codex_parent_resolution_pending, codex_parent_ownership_ledger,
     codex_parent_unresolvable, codex_parent_ledger_unusable, codex_parent_ledger_consulted,
@@ -89354,12 +89415,12 @@ crate::durable_tail_codec::durable_struct!(key RowKey {
     U model_provider: Option<String>,
     U subscription_product: Option<String>,
 });
-crate::heap_layout_bound::fields!(ScanCensus; oversized_discovery, #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, parse_reasons, codex_selections, codex_counting_v2, claude_compaction_unlinked_parent_count);
+crate::heap_layout_bound::fields!(ScanCensus; causes, oversized_discovery, #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, parse_reasons, codex_selections, codex_counting_v2, claude_compaction_unlinked_parent_count);
 crate::heap_layout_bound::fields!(ScanIndex; decode_holds, schema_version, generation, upload_ack_retirement_handoff, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_retired_family_tombstones, claude_retired_family_tombstones_initialized, claude_retired_family_tombstones_uncertain, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_full_rearm_progress, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, codex_counting_moved_evidence, codex_counting_tombstones, codex_counting_evicted_legacy, codex_counting_evictions, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_move_not_full, claude_history_move_released, accepted_incidence_pending_census, accepted_rebuild_incidence, accepted_rebuild_pending_since_unix_seconds, accepted_rebuild_last_alarm_unix_seconds, claude_no_list_policy, claude_history_emission, reason_reoffer_retries, terminal_contract_retries, claude_history_unverified_in_process, claude_rebuild_read_load_eligible, reason_reoffer_cooldowns, retired_reread_guard, held_audit_progress, claude_money_birth_store);
 crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);
-crate::heap_layout_bound::fields!(ScanTraversalCounts; retired_unchanged_reread_admitted, retired_reread_budget_refused, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count);
+crate::heap_layout_bound::fields!(ScanTraversalCounts; causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count);
 crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_member, watcher_hint);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarry; origin, roots, capped_roots, replay);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarryOrigin; context_fingerprint, process, full_rearm_window, admission);

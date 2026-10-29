@@ -871,9 +871,15 @@ mod tests {
 
     fn max_traversal_counts() -> ScanTraversalCounts {
         let mut value = serde_json::to_value(ScanTraversalCounts::default()).unwrap();
+        value["causes"] = json!({"contributions": vec![u64::MAX; 8]});
         for (name, value) in value.as_object_mut().unwrap() {
             if let Some(object) = value.as_object_mut() {
-                for counter in object.get_mut("counts").unwrap().as_array_mut().unwrap() {
+                let field = if name == "causes" {
+                    "contributions"
+                } else {
+                    "counts"
+                };
+                for counter in object.get_mut(field).unwrap().as_array_mut().unwrap() {
                     *counter = json!(u64::MAX);
                 }
             } else {
