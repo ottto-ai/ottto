@@ -167,9 +167,10 @@ fn future_ledger_is_visible_but_io_and_strict_shape_errors_do_not_claim_newer_ap
     let scratch = crate::test_scratch::private_dir("index-ledger-health");
     let root = scratch.join("index.json");
     let source = SnapshotSource::Codex;
-    std::fs::write(&root, br#"{"schema_version":2,"generation":7,"files":{},"accepted_snapshot_fingerprint_ledger_version":65535}"#).unwrap();
+    std::fs::write(&root, br#"{"schema_version":2,"generation":7,"files":{},"accepted_snapshot_fingerprint_ledger_version":255}"#).unwrap();
     assert!(ScanIndex::load_for_snapshot_source_with_origin(&root, source, &scratch).is_err());
     assert!(health::current(source).is_some());
+    assert_eq!(std::fs::read(&root).unwrap(), br#"{"schema_version":2,"generation":7,"files":{},"accepted_snapshot_fingerprint_ledger_version":255}"#);
     let changed = health::transitions(source);
     std::fs::remove_file(&root).unwrap();
     // Missing/default is not the compatible root required to clear a refusal.

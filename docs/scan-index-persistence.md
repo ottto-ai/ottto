@@ -186,6 +186,13 @@ The production adapter must supply the existing semantic map decoder through
 `open_with_map_validator`; semantic decoder failure becomes scoped Unknown,
 never a default empty census. Structural `open` is available only in tests; already-serialized publication reconciliation uses a private structural helper. Production load cannot use a public no-op validator.
 
+Unshipped draft roots have no compatibility inference: missing map inventories
+or bucket descriptors remain Unknown, and absent reference generations never
+become current generations. A known-empty map requires its explicit, paired empty
+inventory. Unpaired metadata refuses the root; paired metadata remains readable
+while affected maps block export and publication. Fixtures cover descriptor loss
+for each of the three maps and the rejected unshipped draft shape.
+
 `ReadStats` exposes `index_shard_unavailable{map,cause}` and
 `scanindex_orphan_init_discarded` for the existing diagnostic registry. These are
 fixed map/cause axes, never keys or digests. Shared integration must drain these
