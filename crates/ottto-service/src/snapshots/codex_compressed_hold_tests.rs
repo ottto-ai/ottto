@@ -2558,3 +2558,77 @@ fn historical_census_saved_singleton_schedules_a1_on_reupgrade() {
         );
     }
 }
+
+#[test]
+fn declined_ordinary_archive_ack_replacement_keeps_custody_and_accepted_body() {
+    let root = crate::test_scratch::private_dir("activation-declined-archive-ack");
+    let archive = member(&root, "sessions", OWNER, true);
+    let key = local_index_key(&archive);
+    let mut previous = accepted(&root, &archive);
+    seed_archive(&mut previous, &archive, OWNER);
+    previous.hold_compressed(
+        &archive,
+        BTreeSet::from([OWNER.into()]),
+        CodexZstCause::ParentLedgerUnbound,
+    );
+    let before = previous.files[&key].clone();
+    let incidence = previous.file_snapshot_fingerprints.clone();
+    let mut working = previous.clone();
+    let entry = working.files.get_mut(&key).unwrap();
+    entry.source_file_fingerprint = "declined-source".into();
+    entry.last_snapshot_fingerprint = Some("declined-entity".into());
+    entry.last_upload_body_witness = Some("declined-body".into());
+    let evidence = entry.archive.as_mut().unwrap();
+    evidence.decode_attempts = 1;
+    evidence.disposition = ArchiveDisposition::Pending {
+        attempts: 1,
+        retry_after: 0,
+    };
+    evidence.body_witness = Some(snapshot_file_upload_body_set_hex(BTreeSet::from([
+        &"declined-body".to_owned(),
+    ])));
+    working
+        .file_snapshot_fingerprints
+        .insert(key.clone(), BTreeSet::from(["declined-entity".into()]));
+    let submitted = BTreeMap::from([("declined-entity".into(), "declined-body".into())]);
+    working.settle_archive_outcome(&BTreeMap::new(), false, Some(&submitted));
+    let mut next = working.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
+    assert_eq!(
+        next.files[&key].source_file_fingerprint,
+        before.source_file_fingerprint
+    );
+    assert_eq!(
+        next.files[&key].last_snapshot_fingerprint,
+        before.last_snapshot_fingerprint
+    );
+    assert_eq!(
+        next.files[&key].last_upload_body_witness,
+        before.last_upload_body_witness
+    );
+    assert_eq!(next.file_snapshot_fingerprints, incidence);
+    assert!(!next
+        .accepted_snapshot_fingerprints
+        .contains("declined-entity"));
+    assert_eq!(
+        next.files[&key].codex_compressed_hold,
+        Some(CodexZstCause::ParentLedgerUnbound)
+    );
+    assert!(matches!(
+        next.files[&key].archive.as_ref().unwrap().disposition,
+        ArchiveDisposition::Pending { .. }
+    ));
+    let saved = root.join("index.json");
+    next.save(&saved).unwrap();
+    let ((next, result), rows) = capture(|| {
+        no_open(&archive, || {
+            normal(&root, ScanIndex::load(&saved).unwrap(), &[])
+        })
+    });
+    assert_no_red(&result, &rows);
+    assert_eq!(next.file_snapshot_fingerprints, incidence);
+    assert_eq!(
+        next.files[&key].last_upload_body_witness,
+        before.last_upload_body_witness
+    );
+    fs::remove_dir_all(root).unwrap();
+}
