@@ -32488,6 +32488,8 @@ impl OwnedSourceScan {
             let mut migration_floor = None;
             let mut active_bound_degraded = false;
             let mut resource_full_pending = None;
+            #[cfg(unix)]
+            let mut stale_selection_pending = false;
             // U1a-2a G7: a side read's acquisition is a fresh `Full` read
             // under the side scope: no retained take, no admission observes
             // or counters, no debt. Failures are its charged attempt.
@@ -32960,6 +32962,8 @@ impl OwnedSourceScan {
                                             if let sampled_scan::durable_tail::MissClass::Resource(phase) = class {
                                                 resource_full_pending = Some(phase);
                                             }
+                                            stale_selection_pending = matches!(class,
+                                                sampled_scan::durable_tail::MissClass::StaleSelection);
                                         }
                                         if matches!(
                                             class,
@@ -33630,6 +33634,23 @@ impl OwnedSourceScan {
                                 pending!();
                             }
                         }
+                    }
+                }
+                #[cfg(unix)]
+                if stale_selection_pending
+                    && planned_mode.map_or(true, |(mode, _)| {
+                        matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
+                    })
+                {
+                    let key = local_index_key(&active.candidate.path);
+                    if !context.cache.start_stale_selection_full(
+                        source,
+                        &key,
+                        active.parser.reader.reader.get_ref(),
+                    ) {
+                        residue_index_keys.insert(key);
+                        drop(codex_cursor_lease.take());
+                        pending!();
                     }
                 }
                 if let Some((mode, audit_due)) = planned_mode {

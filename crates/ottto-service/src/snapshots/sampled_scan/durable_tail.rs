@@ -2943,14 +2943,47 @@ impl SharedCache {
     }
 
     /// The refused stale record's Full is counted under its own cause and paced
-    /// once per file in the ONE pacing map; a delayed Full stays Pending. The
-    /// Miss starts its Full this pass, so the stamp is enrolled here.
+    /// once per file in the ONE pacing map; a delayed Full stays Pending.
+    /// This is eligibility only: a cursor/page can still defer before input.
     fn stale_selection_full(
         &self,
         source: SnapshotSource,
         key: &str,
         held: &File,
     ) -> RestoreOutcome {
+        let near_cap = held
+            .metadata()
+            .is_ok_and(|m| near_source_cap(source, m.len()));
+        let granted = self.paced_with_cause(
+            source,
+            key,
+            SystemTime::now(),
+            (false, near_cap, false),
+            Some(STALE_SELECTION_CAUSE),
+        );
+        if !granted {
+            if let Some(mut stores) = self.durable() {
+                Counters::bump(
+                    &mut stores.counters.ineligible,
+                    "selection_cleared.stale_record_full.paced",
+                );
+            }
+        }
+        if granted {
+            MissClass::StaleSelection.into()
+        } else {
+            RestoreOutcome::Pending
+        }
+    }
+
+    /// Enroll the source-fault cause only after native/page admission, at
+    /// the same input boundary as the real Full selection counter.
+    pub(in crate::snapshots) fn start_stale_selection_full(
+        &self,
+        source: SnapshotSource,
+        key: &str,
+        held: &File,
+    ) -> bool {
         let near_cap = held
             .metadata()
             .is_ok_and(|m| near_source_cap(source, m.len()));
@@ -2971,11 +3004,7 @@ impl SharedCache {
                 },
             );
         }
-        if granted {
-            MissClass::StaleSelection.into()
-        } else {
-            RestoreOutcome::Pending
-        }
+        granted
     }
 
     /// P2: reserves `bytes` of this pass's restored head budget before input.
@@ -4206,6 +4235,18 @@ impl SharedCache {
     /// A U hold keeps the source census retryable; T14 holds keep it healthy.
     pub(crate) fn durable_alarm(&self, snapshot_source: SnapshotSource) {
         #[derive(serde::Serialize)]
+        struct HoldAlarm {
+            keys: u64,
+            oldest_age: u64,
+        }
+        #[derive(serde::Serialize)]
+        struct StoreAlarm {
+            #[serde(flatten)]
+            store: store::StoreCounters,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            d3_claude_hold: Option<HoldAlarm>,
+        }
+        #[derive(serde::Serialize)]
         struct Alarm {
             held_keys: [u64; 2],
             old_binding_no_match: [u64; 2],
@@ -4307,10 +4348,19 @@ impl SharedCache {
         // with cause-only totals omits an empty snapshot, including on repeat
         // calls after its delta has been reported.
         let cause_only = now[..5] == [0; 5] && now[5..].iter().any(|&n| n != 0);
-        if store != store::StoreCounters::default() || !cause_only {
+        if store != store::StoreCounters::default() || !cause_only || hold_alarm || hold_changed {
+            // One existing store snapshot carries the fault reason, degraded
+            // publishes, refusals, pause duration and per-key hold age together.
             crate::local_resource_diagnostics::durable_tail_alarm(
                 snapshot_source.api_slug(),
-                &store,
+                &StoreAlarm {
+                    store,
+                    d3_claude_hold: (claude && (hold_keys > 0 || hold_alarm || hold_changed))
+                        .then_some(HoldAlarm {
+                            keys: hold_keys,
+                            oldest_age,
+                        }),
+                },
             );
         }
         if now != last {
@@ -4336,15 +4386,6 @@ impl SharedCache {
                     mode_repaired: pair(2),
                     store_disabled: disabled.filter(|_| last[3] == 0),
                 },
-            );
-        }
-        // D3: the first Claude hold alarms at once; the key count and oldest
-        // age then travel whenever the count changes. Store faults, degraded
-        // publishes, stale refusals and pause seconds ride the store counters.
-        if hold_alarm || hold_changed {
-            crate::local_resource_diagnostics::durable_tail_alarm(
-                snapshot_source.api_slug(),
-                &serde_json::json!({"d3_claude_hold": {"keys": hold_keys, "oldest_age": oldest_age}}),
             );
         }
     }

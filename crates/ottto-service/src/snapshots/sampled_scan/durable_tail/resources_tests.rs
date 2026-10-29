@@ -447,10 +447,20 @@ fn codex_cleared_selection_over_a_surviving_record_is_refused_and_paced() {
         label(attempt()),
         "ineligible.selection_cleared.stale_record"
     );
-    assert_eq!(label(attempt()), "pending", "paced once per file");
+    assert_eq!(
+        label(attempt()),
+        "ineligible.selection_cleared.stale_record",
+        "a page deferral must not spend the Full permission"
+    );
+    assert!(cache.start_stale_selection_full(source, &key, &File::open(&path).unwrap()));
+    assert_eq!(
+        label(attempt()),
+        "pending",
+        "paced once per actual Full start"
+    );
     let (counts, disk) = cache.durable_counters(source).unwrap();
-    assert_eq!(disk.stale_record_refused, 2);
-    assert_eq!(counts.ineligible["selection_cleared"], 3);
+    assert_eq!(disk.stale_record_refused, 3);
+    assert_eq!(counts.ineligible["selection_cleared"], 4);
     assert_eq!(counts.ineligible["selection_cleared.stale_record_full"], 1);
     assert_eq!(
         counts.ineligible["selection_cleared.stale_record_full.paced"],
