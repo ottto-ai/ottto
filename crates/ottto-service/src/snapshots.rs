@@ -5223,20 +5223,10 @@ fn claude_index_file_body_accepted(
             })
 }
 
-// Retention and coverage require a non-quarantined body ACK, not a refusal checkpoint.
+// Coverage requires a non-quarantined body ACK, not a refusal checkpoint.
 fn codex_index_file_body_accepted(index: &ScanIndex, key: &str, entry: &ScanIndexEntry) -> bool {
     codex_counting_version::proven_owner(entry).is_some()
         && claude_index_file_body_accepted(index, key, entry)
-}
-
-fn codex_file_activity(index: &ScanIndex, key: &str) -> Option<u64> {
-    index
-        .file_snapshot_fingerprints
-        .get(key)?
-        .iter()
-        .filter_map(|fp| index.snapshot_activity_at.get(fp)?.as_deref())
-        .filter_map(rfc3339_unix_seconds)
-        .max()
 }
 
 /// Whether the accepted ledger is current and not being rebuilt by the
@@ -8149,10 +8139,9 @@ pub fn finalize_scan_after_policy_with_body_witness(
         .flat_map(BTreeSet::iter)
         .chain(index.codex_state_only_snapshot_fingerprints.values())
         .collect::<BTreeSet<_>>();
-    let opaque = index.decode_has_opaque_file_incidence();
     index
         .snapshot_activity_at
-        .retain(|fingerprint, _| opaque || current_fingerprints.contains(fingerprint));
+        .retain(|fingerprint, _| current_fingerprints.contains(fingerprint));
 }
 
 /// The producer-side event clock mirrored by the accepted-log append path.
@@ -30129,10 +30118,11 @@ impl OwnedSourceScan {
                     .zip(codex_side_pass.as_ref())
                     .map(|(context, pass)| (&*context.cache, pass.ns));
                 for index_key in &census.removed_index_keys {
-                    if !index.files.get(index_key).is_some_and(|entry| {
-                        entry.codex_history_is_protected()
-                            || codex_index_file_body_accepted(index, index_key, entry)
-                    }) {
+                    if !index
+                        .files
+                        .get(index_key)
+                        .is_some_and(ScanIndexEntry::codex_history_is_protected)
+                    {
                         // A Claude member that vanished beneath its present
                         // parent also drops its unverified audit debt (SOURCE
                         // N2); every other removal keeps that debt. Both
@@ -30262,11 +30252,7 @@ impl OwnedSourceScan {
                     && state_census_complete
                     && sidecar_census_complete
                 {
-                    reconcile_missing_index_entries_bounded(
-                        index,
-                        codex_side_drop,
-                        backfill_window_days,
-                    )
+                    reconcile_missing_index_entries_bounded(index, codex_side_drop)
                 } else {
                     false
                 };
@@ -41822,26 +41808,19 @@ fn candidate_from_traversal_path_at(
 fn reconcile_missing_index_entries_bounded(
     index: &mut ScanIndex,
     codex_side_drop: Option<(&sampled_scan::SharedCache, u128)>,
-    window_days: u64,
 ) -> bool {
-    reconcile_missing_index_entries_with_side(
-        index,
-        MAX_BACKFILL_FILES_PER_SOURCE,
-        codex_side_drop,
-        window_days,
-    )
+    reconcile_missing_index_entries_with_side(index, MAX_BACKFILL_FILES_PER_SOURCE, codex_side_drop)
 }
 
 #[cfg(test)]
 fn reconcile_missing_index_entries_with_limit(index: &mut ScanIndex, limit: usize) -> bool {
-    reconcile_missing_index_entries_with_side(index, limit, None, BACKFILL_WINDOW_DAYS)
+    reconcile_missing_index_entries_with_side(index, limit, None)
 }
 
 fn reconcile_missing_index_entries_with_side(
     index: &mut ScanIndex,
     limit: usize,
     codex_side_drop: Option<(&sampled_scan::SharedCache, u128)>,
-    window_days: u64,
 ) -> bool {
     let Some(snapshot) = index.traversal.as_ref() else {
         return false;
@@ -41849,7 +41828,6 @@ fn reconcile_missing_index_entries_with_side(
     let Some(upper_bound) = snapshot.reconciliation_upper_bound.clone() else {
         return true;
     };
-    let now = rfc3339_unix_seconds(&snapshot.census_window_end);
     let after = snapshot.reconciliation_after.clone();
     let lower_bound = after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
     let page = index
@@ -41872,14 +41850,6 @@ fn reconcile_missing_index_entries_with_side(
                 .files
                 .get(key)
                 .is_some_and(ScanIndexEntry::retain_history_evidence)
-            && !index.files.get(key).is_some_and(|entry| {
-                codex_index_file_body_accepted(index, key, entry)
-                    && now
-                        .zip(codex_file_activity(index, key))
-                        .map_or(true, |(now, activity)| {
-                            is_recent_enough_at(activity, now, window_days)
-                        })
-            })
             && !sampled_audit::awaits_hold_deadline_restoration(index, key)
             && codex_counting_version::tombstone_before_retire(index, key)
         {
@@ -45677,14 +45647,12 @@ impl ScanIndex {
     }
 
     pub(crate) fn record_accepted_snapshot_fingerprints(&mut self, accepted: &BTreeSet<String>) {
-        let fresh = accepted - &self.accepted_snapshot_fingerprints;
         for fingerprint in accepted {
             if !self.decode_holds_entity(fingerprint) {
                 self.accepted_snapshot_fingerprints
                     .insert(fingerprint.clone());
             }
         }
-        self.retire_superseded_codex_bodies(&fresh);
         let current = self.current_snapshot_fingerprints();
         let opaque_incidence = self.decode_has_opaque_file_incidence();
         let carried = self.carried_ack_fingerprints();
@@ -47283,10 +47251,9 @@ impl ScanIndex {
         }
         result.restore_claude_empty_map_advances(empty_advances);
         let current = result.current_snapshot_fingerprints();
-        let opaque = result.decode_has_opaque_file_incidence();
         result
             .snapshot_activity_at
-            .retain(|fingerprint, _| opaque || current.contains(fingerprint));
+            .retain(|fingerprint, _| current.contains(fingerprint));
         result
     }
 
@@ -47403,9 +47370,8 @@ impl ScanIndex {
         }
         self.restore_claude_empty_map_advances(empty_advances);
         let current = self.current_snapshot_fingerprints();
-        let opaque = self.decode_has_opaque_file_incidence();
         self.snapshot_activity_at
-            .retain(|fingerprint, _| opaque || current.contains(fingerprint));
+            .retain(|fingerprint, _| current.contains(fingerprint));
         self
     }
 
@@ -47570,7 +47536,7 @@ impl ScanIndex {
                 }
             }
         }
-        let mut committable_fingerprints = file_snapshot_fingerprints
+        let committable_fingerprints = file_snapshot_fingerprints
             .values()
             .flat_map(BTreeSet::iter)
             .chain(codex_state_only_snapshot_fingerprints.values())
@@ -47618,9 +47584,6 @@ impl ScanIndex {
                 || committable_fingerprints.contains(fingerprint))
                 && !retained_quarantine.contains_key(fingerprint)
         });
-        if opaque_incidence {
-            committable_fingerprints.extend(&accepted_snapshot_fingerprints);
-        }
         let mut snapshot_activity_at = BTreeMap::new();
         for fingerprint in committable_fingerprints {
             if let Some(activity_at) = self
@@ -47845,60 +47808,9 @@ impl ScanIndex {
             }
         }
         result.restore_claude_empty_map_advances(empty_advances);
-        let fresh = accepted - &previous.accepted_snapshot_fingerprints;
-        result.retire_superseded_codex_bodies(&fresh);
         result.retain_quarantined_fingerprints(&retained_quarantine);
         result.reconcile_codex_recovery_settlement(previous, accepted);
         result
-    }
-
-    fn retire_superseded_codex_bodies(&mut self, fresh: &BTreeSet<String>) {
-        if fresh.is_empty() {
-            return;
-        }
-        let mut newer = BTreeMap::<String, u64>::new();
-        for (key, entry) in &self.files {
-            if codex_index_file_body_accepted(self, key, entry)
-                && self.file_snapshot_fingerprints[key]
-                    .iter()
-                    .any(|fp| fresh.contains(fp))
-            {
-                if let (Some(owner), Some(activity)) =
-                    (&entry.codex_counting_owner, codex_file_activity(self, key))
-                {
-                    let newest = newer.entry(owner.clone()).or_insert(activity);
-                    *newest = (*newest).max(activity);
-                }
-            }
-        }
-        let obsolete = self
-            .files
-            .iter()
-            .filter_map(|(key, entry)| {
-                let new = newer.get(entry.codex_counting_owner.as_ref()?)?;
-                let old = codex_file_activity(self, key)?;
-                (!entry.codex_history_is_protected()
-                    && !entry.has_unverified_source()
-                    && codex_index_file_body_accepted(self, key, entry)
-                    && *new >= old
-                    && self.file_snapshot_fingerprints[key]
-                        .iter()
-                        .all(|fp| !fresh.contains(fp)))
-                .then(|| key.clone())
-            })
-            .collect::<Vec<_>>();
-        for key in obsolete {
-            self.files.remove(&key);
-            self.file_snapshot_fingerprints.remove(&key);
-            self.terminal_jsonl_dispositions.remove(&key);
-            self.drop_codex_proof_items(&key, None);
-        }
-        if !self.decode_has_opaque_file_incidence() {
-            let mut current = self.current_snapshot_fingerprints();
-            current.extend(self.upload_progress_ack_incidence().map(str::to_owned));
-            self.snapshot_activity_at
-                .retain(|fp, _| current.contains(fp));
-        }
     }
 
     pub fn retain_quarantined_fingerprints(
@@ -48010,9 +47922,11 @@ impl ScanIndex {
         if self.decode_holds_file(key) {
             return;
         }
-        if self.files.get(key).is_some_and(|entry| {
-            entry.has_unverified_source() || codex_index_file_body_accepted(self, key, entry)
-        }) {
+        if self
+            .files
+            .get(key)
+            .is_some_and(ScanIndexEntry::has_unverified_source)
+        {
             return;
         }
         for session_id in codex_session_id_candidates_from_path(Path::new(key)) {
@@ -59095,225 +59009,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_retained_missing_body_ages_out_by_semantic_activity_not_mtime() {
-        let (_, index, _) = ambiguous_state_only_fixture("019e253c-9999-7000-9000-cccccccccccc");
-        let key = index.files.keys().next().unwrap().clone();
-        let activity = codex_file_activity(&index, &key).unwrap();
-        let boundary = activity + BACKFILL_WINDOW_DAYS * 86400;
-        for now in [boundary, boundary + 1] {
-            let mut index = index.clone();
-            index.files.get_mut(&key).unwrap().modified_unix_seconds = now; // New mtime cannot renew semantic history.
-            let mut traversal = terminal_unhealthy_traversal("age-out".into());
-            traversal.census_window_end = OffsetDateTime::from_unix_timestamp(now as i64)
-                .unwrap()
-                .format(&Rfc3339)
-                .unwrap();
-            traversal.reconciliation_upper_bound = Some(key.clone());
-            index.traversal = Some(traversal);
-            assert!(reconcile_missing_index_entries_with_limit(&mut index, 10));
-            assert_eq!(index.files.contains_key(&key), now == boundary);
-            assert_eq!(
-                index.file_snapshot_fingerprints.contains_key(&key),
-                now == boundary
-            );
-        }
-    }
-
-    #[test]
-    fn codex_moved_then_resumed_accepted_body_manifest_matches_server_heads() {
-        let root = temp_dir("codex-retained-moved-resumed");
-        let owner = "019e253c-9999-7000-9000-cccccccccccc";
-        let old = root.join(format!("rollout-{owner}.jsonl"));
-        let bytes = |input: u64, timestamp: &str| {
-            format!(
-                "{}\n{}\n",
-                json!({"type":"session_meta","payload":{"id":owner}}),
-                codex_test_token_line(timestamp, None, (input, 8, 9, 1), Some((input, 8, 9, 1)))
-            )
-        };
-        fs::write(&old, bytes(50, "2026-05-14T10:00:00Z")).unwrap();
-        let mut index = ScanIndex::default();
-        let mut first = scan_source_roots(
-            SnapshotSource::Codex,
-            std::slice::from_ref(&root),
-            &mut index,
-            "2026-05-14T10:04:00Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .unwrap();
-        finalize_scan_after_policy(SnapshotSource::Codex, &mut first, &mut index);
-        let first_fp = first.snapshots[0].snapshot_fingerprint.clone();
-        let committed = index.committable_subset(
-            &ScanIndex::default(),
-            &BTreeSet::from([first_fp.clone()]),
-            &BTreeMap::new(),
-        );
-        let moved_dir = root.join("archived");
-        fs::create_dir(&moved_dir).unwrap();
-        let moved = moved_dir.join(old.file_name().unwrap());
-        fs::rename(&old, &moved).unwrap();
-        fs::write(&moved, bytes(80, "2026-05-14T11:00:00Z")).unwrap();
-        let mut working = committed.clone();
-        let mut resumed = scan_source_roots(
-            SnapshotSource::Codex,
-            std::slice::from_ref(&root),
-            &mut working,
-            "2026-05-14T11:04:00Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .unwrap();
-        finalize_scan_after_policy(SnapshotSource::Codex, &mut resumed, &mut working);
-        assert_eq!(resumed.snapshots.len(), 1);
-        let item = &resumed.snapshots[0];
-        assert_eq!(item.input_tokens, 80);
-        assert_ne!(first_fp, item.snapshot_fingerprint);
-        let not_acked = working.committable_subset(&committed, &BTreeSet::new(), &BTreeMap::new());
-        assert_eq!(
-            not_acked.current_snapshot_fingerprints(),
-            BTreeSet::from([first_fp.clone()])
-        );
-        let server_heads = BTreeSet::from([item.snapshot_fingerprint.clone()]);
-        let cumulative_acks = BTreeSet::from([first_fp.clone(), item.snapshot_fingerprint.clone()]);
-        for partial in [false, true] {
-            let opaque_key = "/synthetic/future-format.jsonl";
-            let mut value = serde_json::to_value(&working).unwrap();
-            value["files"][opaque_key] = json!(false);
-            let mut held =
-                lenient_decode::read_bounded(&serde_json::to_vec(&value).unwrap()).unwrap();
-            assert!(held.decode_has_opaque_file_incidence());
-            let mut settled = if partial {
-                held.committable_subset(&held, &server_heads, &BTreeMap::new())
-            } else {
-                held.record_accepted_snapshot_fingerprints(&cumulative_acks);
-                held
-            };
-            assert!(!settled.files.contains_key(&local_index_key(&old)));
-            assert_eq!(settled.current_snapshot_fingerprints(), server_heads);
-            assert!(settled.accepted_snapshot_fingerprints.contains(&first_fp));
-            assert!(settled.snapshot_activity_at.contains_key(&first_fp));
-            assert_eq!(
-                serde_json::to_value(&settled).unwrap()["files"][opaque_key],
-                json!(false)
-            );
-            settled = lenient_decode::read_bounded(&serde_json::to_vec(&settled).unwrap()).unwrap();
-            assert_eq!(settled.current_snapshot_fingerprints(), server_heads);
-            settled = settled.committable_subset(&settled, &BTreeSet::new(), &BTreeMap::new());
-            assert!(settled.snapshot_activity_at.contains_key(&first_fp));
-            let previous = settled.clone();
-            settled = settled.with_locally_held_keys_reverted(
-                &previous,
-                &BTreeSet::new(),
-                &BTreeSet::new(),
-            );
-            assert!(settled.snapshot_activity_at.contains_key(&first_fp));
-            settled = settled.into_locally_held_keys_reverted(
-                &previous,
-                &BTreeSet::new(),
-                &BTreeSet::new(),
-            );
-            assert!(settled.snapshot_activity_at.contains_key(&first_fp));
-            let mut quiet = scan_source_roots(
-                SnapshotSource::Codex,
-                std::slice::from_ref(&root),
-                &mut settled,
-                "2026-05-14T11:05:00Z",
-                BACKFILL_WINDOW_DAYS,
-            )
-            .unwrap();
-            finalize_scan_after_policy(SnapshotSource::Codex, &mut quiet, &mut settled);
-            settled = lenient_decode::read_bounded(&serde_json::to_vec(&settled).unwrap()).unwrap();
-            assert!(settled.snapshot_activity_at.contains_key(&first_fp));
-            assert!(settled.accepted_snapshot_fingerprints.contains(&first_fp));
-            assert_eq!(
-                serde_json::to_value(&settled).unwrap()["files"][opaque_key],
-                json!(false)
-            );
-            assert_eq!(settled.current_snapshot_fingerprints(), server_heads);
-            // A later exact empty incidence resolves the unrelated opaque debt.
-            settled
-                .file_snapshot_fingerprints
-                .insert(opaque_key.into(), BTreeSet::new());
-            assert!(!settled.decode_has_opaque_file_incidence());
-            assert!(server_heads.is_subset(&settled.accepted_snapshot_fingerprints));
-            settled.record_accepted_snapshot_fingerprints(&server_heads);
-            assert!(!settled.accepted_snapshot_fingerprints.contains(&first_fp));
-            finalize_scan_after_policy(SnapshotSource::Codex, &mut quiet, &mut settled);
-            assert!(!settled.snapshot_activity_at.contains_key(&first_fp));
-            assert!(!settled.files.contains_key(&local_index_key(&old)));
-            assert_eq!(settled.current_snapshot_fingerprints(), server_heads);
-        }
-        let mut full = working.clone();
-        full.record_accepted_snapshot_fingerprints(&cumulative_acks);
-        assert_eq!(
-            full.current_snapshot_fingerprints(),
-            server_heads,
-            "full-success settlement retires the old key even with cumulative ACKs"
-        );
-        let restarted: ScanIndex =
-            serde_json::from_slice(&serde_json::to_vec(&full).unwrap()).unwrap();
-        assert_eq!(restarted.current_snapshot_fingerprints(), server_heads);
-        let acked = working.committable_subset(&committed, &server_heads, &BTreeMap::new());
-        assert!(!acked.files.contains_key(&local_index_key(&old)));
-        assert!(acked.files.contains_key(&local_index_key(&moved)));
-        assert_eq!(acked.current_snapshot_fingerprints(), server_heads);
-        assert!(!acked.accepted_snapshot_fingerprints.contains(&first_fp));
-        assert!(!acked.snapshot_activity_at.contains_key(&first_fp));
-        let mut server = ScanIndex::default();
-        server
-            .file_snapshot_fingerprints
-            .insert("server-head".into(), server_heads);
-        server.snapshot_activity_at.insert(
-            item.snapshot_fingerprint.clone(),
-            snapshot_semantic_activity_at(item),
-        );
-        let window = ("2026-05-01T00:00:00Z", "2026-06-01T00:00:00Z");
-        assert_eq!(
-            acked
-                .manifest_for_window(SnapshotSource::Codex, window.0, window.1)
-                .unwrap(),
-            server
-                .manifest_for_window(SnapshotSource::Codex, window.0, window.1)
-                .unwrap()
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn codex_retained_body_index_size_receipt() {
-        let empty_bytes = serde_json::to_vec(&ScanIndex::default()).unwrap().len();
-        for count in [1_usize, 128, 1024] {
-            let mut index = ScanIndex::default();
-            let mut string_bytes = 0;
-            for n in 0..count {
-                let fp = codex_protected_owner(&format!("synthetic-body-{n}"));
-                let key = format!("/synthetic/codex/sessions/rollout-{n:036}.jsonl");
-                let entry: ScanIndexEntry = serde_json::from_value(json!({"size_bytes":1000,"modified_unix_seconds":1778752800_u64,"source_file_fingerprint":fp,"last_snapshot_fingerprint":fp,"last_upload_body_witness":fp,"codex_counting_owner":fp,"scan_identity_version":LOCAL_SCAN_INDEX_IDENTITY_VERSION})).unwrap();
-                string_bytes += key.capacity()
-                    + entry.source_file_fingerprint.capacity()
-                    + entry.last_snapshot_fingerprint.as_ref().unwrap().capacity()
-                    + entry.last_upload_body_witness.as_ref().unwrap().capacity()
-                    + entry.codex_counting_owner.as_ref().unwrap().capacity()
-                    + entry.scan_identity_version.as_ref().unwrap().capacity();
-                index.files.insert(key.clone(), entry);
-                index
-                    .file_snapshot_fingerprints
-                    .insert(key, BTreeSet::from([fp.clone()]));
-                index.accepted_snapshot_fingerprints.insert(fp.clone());
-                index
-                    .snapshot_activity_at
-                    .insert(fp, Some("2026-05-14T10:00:00Z".into()));
-            }
-            let delta = serde_json::to_vec(&index).unwrap().len() - empty_bytes;
-            println!("E2_13_RETAINED_SIZE entries={count} serialized_delta={delta} bytes_per_entry={} entry_inline={} entry_and_key_string_capacity_per_entry={} auxiliary_maps=included_in_serialized heap_node_slack=unmeasured", delta / count, std::mem::size_of::<ScanIndexEntry>(), string_bytes / count);
-            assert!(
-                delta <= count * 1200,
-                "synthetic retained index must scale linearly within the measured fixture budget"
-            );
-        }
-    }
-
-    #[test]
-    fn codex_retirement_does_not_treat_quarantine_as_accepted_body_coverage() {
+    fn codex_state_only_falls_back_after_main_retires_quarantined_body() {
         let owner = "019e253c-9999-7000-9000-cccccccccccc";
         for reconcile in [false, true] {
             let (metadata, mut index, native) = ambiguous_state_only_fixture(owner);
@@ -59421,95 +59117,6 @@ mod tests {
         assert_eq!(
             state_only.provenance.input_token_scope.as_deref(),
             Some("total_only")
-        );
-        let _ = fs::remove_dir_all(codex_dir);
-    }
-
-    #[test]
-    fn codex_state_only_retains_accepted_body_after_rollout_retirement() {
-        let codex_dir = temp_dir("codex-state-deleted-rollout");
-        let sessions_dir = codex_dir.join("sessions");
-        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
-        let session_id = "019e253c-bbbb-7000-9000-ffffffffffff";
-        let rollout = sessions_dir.join(format!("rollout-2026-05-14T10-00-00-{session_id}.jsonl"));
-        fs::write(
-            &rollout,
-            format!(
-                "{{\"timestamp\":\"2026-05-14T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session_id}\"}}}}\n{{\"timestamp\":\"2026-05-14T10:03:00Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":50,\"output_tokens\":9}},\"model\":\"gpt-5.5\"}}}}}}\n"
-            ),
-        )
-        .expect("write rollout");
-        let connection = Connection::open(codex_dir.join("state_5.sqlite")).expect("open sqlite");
-        connection
-            .execute(CODEX_THREADS_DDL, [])
-            .expect("create threads");
-        connection
-            .execute(
-                CODEX_THREADS_INSERT,
-                (
-                    session_id,
-                    "Deleted Rollout",
-                    59_i64,
-                    0_i64,
-                    1_777_777_000_i64,
-                    1_777_777_100_i64,
-                    1_777_777_000_000_i64,
-                    1_777_777_100_000_i64,
-                    "gpt-5.5",
-                ),
-            )
-            .expect("insert thread");
-        drop(connection);
-        let mut index = ScanIndex::default();
-
-        let mut first = scan_source_roots(
-            SnapshotSource::Codex,
-            std::slice::from_ref(&sessions_dir),
-            &mut index,
-            "2026-05-14T10:04:00Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("scan file-backed session");
-        finalize_scan_after_policy(SnapshotSource::Codex, &mut first, &mut index);
-        assert!(first.census_complete);
-        assert_eq!(first.snapshots.len(), 1);
-        assert_eq!(first.snapshots[0].unattributed_total_tokens, 0);
-
-        let key = local_index_key(&rollout);
-        index = index.committable_subset(
-            &ScanIndex::default(),
-            &BTreeSet::from([first.snapshots[0].snapshot_fingerprint.clone()]),
-            &BTreeMap::new(),
-        );
-        assert!(codex_index_file_body_accepted(
-            &index,
-            &key,
-            &index.files[&key]
-        ));
-        let accepted = serde_json::to_value(&index.files[&key]).unwrap();
-        fs::remove_file(&rollout).expect("remove rollout while state row remains");
-        index.remove_file_entry(&key); // Exact removal/age paths retain accepted Codex evidence.
-        assert!(index.files.contains_key(&key));
-        let mut index: ScanIndex =
-            serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
-        let replacement = scan_source_roots(
-            SnapshotSource::Codex,
-            std::slice::from_ref(&sessions_dir),
-            &mut index,
-            "2026-05-14T10:05:00Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("reconcile deletion and state fallback together");
-
-        assert!(replacement.census_complete);
-        assert!(
-            replacement.snapshots.is_empty(),
-            "retired accepted body must not be replaced by state-only output"
-        );
-        assert_eq!(serde_json::to_value(&index.files[&key]).unwrap(), accepted);
-        assert!(
-            !index.files[&key].codex_history_is_protected(),
-            "retention alone adds no joined-history refusal"
         );
         let _ = fs::remove_dir_all(codex_dir);
     }

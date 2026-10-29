@@ -700,21 +700,15 @@ explicit release, including real durable I/O paths.
 
 Prior coverage retains both the uniquely resolved filename identity and the
 existing committed header/counting or protected owner hash, including a header
-outside both filename candidates. Accepted-body retention requires nonempty
+outside both filename candidates. Accepted-owner coverage requires nonempty
 exact file incidence whose entities are accepted, not quarantined or decode-held;
 a permanent refusal or local wire-size rejection grants no new coverage.
 
-Missing ordinary accepted entries age out when their latest fingerprint semantic
-activity leaves the configured backfill window, using the existing window
-predicate rather than file mtime. Missing/invalid activity stays held conservatively;
-strong joined-history and unverified/decode holds retain their existing rules.
-Once a fresh accepted body for the same counting owner has at least as recent
-activity, the older ordinary body is retired. Its superseded fingerprint leaves
-the manifest so moved-then-resumed sessions agree with the server's current head.
-Unrelated opaque incidence preserves ACK/activity custody while known superseded
-file associations retire, including through later scan, partial-settlement and
-local-hold pruning. No new store, field or transcript read is introduced;
-Claude and Pi emitted-body policies are unchanged.
+Checkpoint retention and expiry follow the existing rules; local retention
+changes are deferred. The backend downgrade fence
+(`usage_accounting_authority_downgrade`) protects attributed usage floors against
+an uncontracted state-only successor. Local coverage reduces redundant emission;
+it does not replace that backend money protection.
 
 With a prior snapshot fingerprint, exactly two evidence-supported filename
 identities, and no committed owner coverage, both candidates are withheld from
