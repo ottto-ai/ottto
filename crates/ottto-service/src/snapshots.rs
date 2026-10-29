@@ -32264,6 +32264,27 @@ impl OwnedSourceScan {
                                 .retained_entry_rejected_by_eligibility
                                 .saturating_add(1);
                         }
+                        // An ineligible cold route cannot prove replacement.
+                        // Keep S2 even when sampling itself is unavailable.
+                        #[cfg(unix)]
+                        if !allow_sample
+                            && accepted_floor.is_some_and(|a| {
+                                parser
+                                    .reader
+                                    .reader
+                                    .get_ref()
+                                    .metadata()
+                                    .map_or(true, |m| a.behind(m.len()))
+                            })
+                        {
+                            context.cache.durable_custody_hold(
+                                source,
+                                "accepted_body_floor",
+                                index,
+                                &candidate,
+                            );
+                            pending!();
+                        }
                         let scope = context.file_scope(
                             source,
                             &candidate,
@@ -41999,7 +42020,7 @@ fn refresh_retained_codex_roster(
                 .ok()
                 .and_then(unix_seconds)
                 .unwrap_or_default();
-            if !sampled_audit::path_requires_recovery(files, &path, metadata.len())
+            if !sampled_audit::path_requires_recovery(source, files, &path, metadata.len())
                 && census_unix_seconds.is_some_and(|now| {
                     !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
                 })
@@ -42334,7 +42355,7 @@ fn advance_bounded_directory_traversal_with_budget(
                 .ok()
                 .and_then(unix_seconds)
                 .unwrap_or_default();
-            if !sampled_audit::path_requires_recovery(files, &path, metadata.len())
+            if !sampled_audit::path_requires_recovery(source, files, &path, metadata.len())
                 && census_unix_seconds.is_some_and(|now| {
                     !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
                 })
@@ -42489,7 +42510,7 @@ fn candidate_from_traversal_path_at(
         .ok()
         .and_then(unix_seconds)
         .unwrap_or_default();
-    if !sampled_audit::path_requires_recovery(files, &pending.path, metadata.len())
+    if !sampled_audit::path_requires_recovery(source, files, &pending.path, metadata.len())
         && census_unix_seconds.is_some_and(|now| {
             !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
         })
@@ -42768,6 +42789,7 @@ fn codex_parent_outside_window(
         .and_then(unix_seconds)
         .unwrap_or_default();
     !sampled_audit::path_requires_recovery(
+        SnapshotSource::Codex,
         files,
         path,
         metadata.as_ref().map_or(u64::MAX, std::fs::Metadata::len),
@@ -42997,7 +43019,12 @@ fn open_and_identify_scan_candidate_with_rescue(
             }
         };
     if !verification_rescue
-        && !sampled_audit::path_requires_recovery(files, &candidate.path, candidate.size_bytes)
+        && !sampled_audit::path_requires_recovery(
+            source,
+            files,
+            &candidate.path,
+            candidate.size_bytes,
+        )
         && !opened_candidate_is_within_frozen_window(
             &candidate,
             census_unix_seconds,

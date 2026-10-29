@@ -17,7 +17,8 @@ Both maps reserve their worst-case nodes from the existing cache allowance; the
 cache total does not grow. The pace is statically bounded below one day.
 
 Growth beyond the committed size bypasses every existing metadata and opened-FD
-age filter. This is the discovery backstop, not recovery authorization: the
+age filter. Shorter extents and future accepted revisions also retain their
+entries so age pruning cannot erase S2. This is discovery, not recovery authorization: the
 refusing owner must also grant paced recovery. Held attempts retain their
 accepted entry and committed census evidence, and grant no settlement credit.
 Missing records retain the integrated counted-Miss behavior rather than the

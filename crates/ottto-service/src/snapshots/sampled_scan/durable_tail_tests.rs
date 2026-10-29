@@ -6693,6 +6693,26 @@ fn accepted_floor_missing_record_is_neutral_and_freezes_before_mutation() {
     assert_eq!(serde_json::to_value(diagnostics).unwrap()["held"], 1);
     assert!(frozen.behind(3));
     assert!(!frozen.behind(6), "equal accepted end remains eligible");
+    // Age pruning must not erase S2, and discovery invents no audit/ACK marker.
+    index.files.get_mut(&key).unwrap().size_bytes = frozen.end;
+    assert!(sampled_audit::path_requires_recovery(
+        source,
+        &index.files,
+        &path,
+        3
+    ));
+    assert!(sampled_audit::path_requires_recovery(
+        source,
+        &index.files,
+        &path,
+        7
+    ));
+    assert!(!sampled_audit::path_requires_recovery(
+        source,
+        &index.files,
+        &path,
+        6
+    ));
 }
 
 #[test]
@@ -6783,7 +6803,7 @@ fn growth_hold_wall_expiry_restart_recovers_exact_body_without_prefix_duplicatio
             source,
             std::slice::from_ref(&sessions),
             index,
-            "2028-10-29T12:00:00Z",
+            "2026-10-29T12:00:00Z",
             1,
             100,
             false,
@@ -6812,7 +6832,7 @@ fn growth_hold_wall_expiry_restart_recovers_exact_body_without_prefix_duplicatio
         .unwrap()
         .set_times(
             std::fs::FileTimes::new().set_modified(
-                std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_856_433_600),
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_793_275_200),
             ),
         )
         .unwrap();
