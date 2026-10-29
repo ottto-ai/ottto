@@ -27027,7 +27027,10 @@ impl OwnedSourceScan {
             }
             if source == SnapshotSource::Codex && !codex_join_prepared {
                 if let Some(inventory) = codex_join_inventory.as_mut() {
-                    if !inventory.step(&codex_title_metadata) {
+                    if !inventory.step_cached(
+                        &codex_title_metadata,
+                        sampling.as_ref().map(|context| context.cache.as_ref()),
+                    ) {
                         pending!();
                     }
                     let selected = identified_candidates
