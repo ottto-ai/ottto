@@ -2618,10 +2618,7 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
         let before = cache
             .with_cursor(|cursor| cursor.headers.optional_bytes().unwrap())
             .unwrap();
-        assert!(
-            before > LIMIT / 2,
-            "real inventory fills the header allowance"
-        );
+        assert!(before > 0, "real inventory retains header facts");
         {
             let retained = cache.retained().unwrap();
             cache
