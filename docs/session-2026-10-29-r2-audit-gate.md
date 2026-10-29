@@ -306,3 +306,19 @@ pacing, partial-save and Tail assertions remain. The partial-save regression
 retains its original quiet-before-growing order check. Optional header and
 decoder admission rules are unchanged. Local Clippy compiles all targets;
 runtime tests remain CI-only.
+
+
+Round18 captures one pinnable clock sample per selecting page and carries it
+through audit priority, candidate selection, adoption-only comparison and quiet
+retirement, including yields. The due-edge fixture moves the clock across the
+deadline after construction in both directions: selection and retirement must
+still agree, with no Full or verification-time credit.
+
+A provisionally retired quiet path stays in the existing deduplicated traversal
+queue with its original scan root. Partial-save reconciliation can restore the
+marker after consuming the path; a queued paced sibling must not strand that
+obligation until another traversal. A committed retirement makes the queued
+quiet visit skip without body reads. This queue entry is not a census member
+and grants no census credit. The original multi-pass partial-save fixture and
+its order assertions remain byte-identical. Exact-head native execution and a
+fresh money delta review are required; all-target Clippy is compilation only.

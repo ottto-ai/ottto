@@ -576,6 +576,84 @@ fn partial_saves_cannot_reuse_quiet_slots_before_retirement_commits() {
 }
 
 #[test]
+fn quiet_retirement_selection_and_due_gate_share_the_captured_edge() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _clock = Clock::at(START);
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        sampled_scan::set_test_now(Some(START));
+        let fixture = ScanFixture::new(source);
+        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let (index, _, _) = production_scan(
+            &fixture,
+            source,
+            ScanIndex::default(),
+            Some(cache.clone()),
+            "due-edge",
+        );
+        fixture.file.append(&usage(source, 130, 1, "fixture-model"));
+        let (mut index, _, modes) =
+            production_scan(&fixture, source, index, Some(cache.clone()), "due-edge");
+        assert_eq!(modes, (0, 1, 0));
+        let key = local_index_key(&fixture.file.0);
+        let due = index.files[&key].unverified_deadline().unwrap();
+        let verified = cache
+            .retained_checkpoint(&key)
+            .unwrap()
+            .last_full_verified();
+        for selected_at in [due - 1, due] {
+            sampled_scan::set_test_now(Some(selected_at));
+            let ((next, _, modes, _), diagnostics) =
+                crate::local_resource_diagnostics::capture(|| {
+                    production_scan_at_with_setup(
+                        &fixture,
+                        source,
+                        index,
+                        Some(cache.clone()),
+                        "due-edge",
+                        NOW,
+                        |scan| {
+                            assert_eq!(scan.audit_now, selected_at);
+                            assert_eq!(
+                                scan.index.files[&key].audit_requires_full(scan.audit_now),
+                                selected_at == due
+                            );
+                            // Cross the edge after selection, in either direction.
+                            // Re-reading the clock in the gate would disagree.
+                            sampled_scan::set_test_now(Some(if selected_at == due {
+                                due - 1
+                            } else {
+                                due + 1
+                            }));
+                        },
+                    )
+                });
+            index = next;
+            assert_eq!(modes, (0, 0, usize::from(selected_at == due)));
+            assert_eq!(
+                index.files[&key].has_unverified_source(),
+                selected_at != due
+            );
+            let checkpoint = cache.retained_checkpoint(&key).unwrap();
+            assert_eq!(checkpoint.audit_debt().is_some(), selected_at != due);
+            assert_eq!(checkpoint.last_full_verified(), verified);
+            let page = diagnostics
+                .iter()
+                .find(|row| row["stage"] == "native_collection_page")
+                .unwrap();
+            let counts = &page["counts"]["sampled_acquisition"];
+            assert_eq!(
+                counts["index_state_at_page_end"]["audit_quiet_retired"],
+                usize::from(selected_at == due)
+            );
+            assert_eq!(counts["page_events"]["audits_completed"], 0);
+        }
+    }
+}
+
+#[test]
 fn cap_delayed_growth_survives_age_and_replacement_traversal() {
     if !crate::heap_layout_bound::layout_supported() {
         return;

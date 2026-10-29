@@ -1126,6 +1126,27 @@ mod provenance_tests {
     }
 }
 
+/// Keep a provisionally retired path selectable if partial-save reconciliation
+/// restores its marker. Preserve the actual read's root: guessing from nested
+/// roots could change the acquisition scope. A committed retirement skips it.
+pub(super) fn queue_quiet_retirement(index: &mut ScanIndex, key: &str, scan_root: PathBuf) {
+    if let Some(traversal) = index.traversal.as_mut() {
+        let path = Path::new(key);
+        if !traversal
+            .pending_candidates
+            .iter()
+            .any(|queued| queued.path == path)
+        {
+            traversal.pending_candidates.push_back(ScanTraversalPath {
+                scan_root,
+                path: path.to_owned(),
+                census_member: false,
+                watcher_hint: false,
+            });
+        }
+    }
+}
+
 /// A cap delay is still owed: persist an age-bypassing retry without advancing
 /// the committed file size or claiming source/census completion.
 pub(super) fn queue_cap_retry(index: &mut ScanIndex, candidate: &CandidateFile) {
