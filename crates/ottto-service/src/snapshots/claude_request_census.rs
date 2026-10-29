@@ -2799,7 +2799,7 @@ pub(crate) fn settle_claude_request_census_terminal(
         .claude_request_census
         .retain_keys(|key| files.contains_key(key) || observed_index_keys.contains(key));
     let window = rfc3339_unix_seconds(census_window_end).unwrap_or_default();
-    let aged = retire_claude_transcript_records(index, window);
+    let aged = retire_claude_transcript_records(index, window, residue_index_keys);
     note_transcript_retirements(aged, vanished);
     let join = ClaudeRequestCensusJoin::new(index, window, residue_index_keys);
     let mut counts = join.counts(true);
@@ -2857,7 +2857,11 @@ pub(crate) fn transcript_retirements() -> (u64, u64) {
 /// counts it, so a copy elsewhere owns those ids under the approved rule
 /// (telemetry owner first, else the copy). Retirement edits records in
 /// place: nothing is cloned.
-fn retire_claude_transcript_records(index: &mut ScanIndex, window: u64) -> u64 {
+fn retire_claude_transcript_records(
+    index: &mut ScanIndex,
+    window: u64,
+    held: &BTreeSet<String>,
+) -> u64 {
     if window == 0 {
         return 0;
     }
@@ -2867,6 +2871,11 @@ fn retire_claude_transcript_records(index: &mut ScanIndex, window: u64) -> u64 {
     let mut aged = 0_u64;
     let mut freed = (0_usize, 0_usize);
     for (key, record) in census.records.iter_mut() {
+        // A paced/correctness residue still owns unread growth. Its old
+        // committed stamp must not retire the request evidence before catch-up.
+        if held.contains(key.as_str()) {
+            continue;
+        }
         if record.is_birth_stub() || record.retired.is_some() || record.hash_count() == 0 {
             continue;
         }

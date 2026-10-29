@@ -13569,3 +13569,51 @@ fn compressed_memo_rechecks_refuse_decoded_offsets() {
             .is_none());
     });
 }
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "validated native cursor layout")]
+fn active_bound_no_record_cursor_preserves_scope_resumes_and_publishes() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    assert!(crate::heap_layout_bound::layout_supported());
+    let fixture = ScanRoot::new(80);
+    let (_, oracle) = page(&fixture, ScanIndex::default(), None);
+    assert!(!oracle.snapshots.is_empty());
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        let (mut index, first) = page(&fixture, ScanIndex::default(), Some(cache.clone()));
+        assert!(first.snapshots.is_empty());
+        assert_eq!(counter(&cache, |c| c.jobs_paused), 1);
+        cache
+            .with_cursor(|cursor| {
+                let Slot::Paused(job) = &mut cursor.slot else {
+                    panic!("real paused job")
+                };
+                let acquisition = job.sampling.as_mut().expect("resume scope metadata");
+                acquisition.no_record = true;
+                assert!(!acquisition.scope.0.is_empty(), "real file scope retained");
+            })
+            .unwrap();
+        for _ in 0..64 {
+            let (next, scan) = page(&fixture, index, Some(cache.clone()));
+            index = next;
+            if counter(&cache, |c| c.jobs_certified) > 0 {
+                assert_eq!(fingerprints(&scan), fingerprints(&oracle));
+                assert!(counter(&cache, |c| c.jobs_resumed) > 0);
+                assert_eq!(counter(&cache, |c| c.jobs_lost), 0);
+                assert!(
+                    cache
+                        .retained()
+                        .unwrap()
+                        .peek(&local_index_key(&fixture.file(SESSION)))
+                        .is_none(),
+                    "native publication retains no optional graph"
+                );
+                return;
+            }
+            assert!(scan.snapshots.is_empty());
+        }
+        panic!("no-record cursor never completed");
+    });
+}

@@ -49,7 +49,8 @@ pub(crate) const WRITE_PASS_BYTES: usize = 8 * 1024 * 1024;
 /// Upper bound of both stores' resident digest maps (two sources).
 /// Pin history: Lead A approved 65,536 -> 401,408 bytes on 2026-10-29:
 /// memo 2*256*256 = 131,072; pending 2*(32+1)*4096 = 270,336 bytes.
-/// Total also includes A0's 525,312-byte retail reserve: 926,720 bytes.
+/// A0-h pays both spent and Full-pacing nodes (1,050,624 bytes): total
+/// 1,452,032 bytes. FullPace's structural bit stays within its 1024-byte node.
 /// Any further growth requires a new owner decision. Native/container evidence
 /// remains required; this pin is not enforcement by the cache's heap walk.
 pub(crate) const STORES_RESIDENT_BOUND: usize =
@@ -67,6 +68,18 @@ pub(crate) fn rederive_head_bytes_total(source: SnapshotSource) -> u64 {
     })
 }
 
+/// Actual physical class-X bytes, including a later capture/hash refusal.
+/// The success receipt is separate; never hide input behind a refusal label.
+pub(in crate::snapshots) fn record_rederive_input(source: SnapshotSource, bytes: u64) {
+    if let Some(ds) = durable_source(source) {
+        REDERIVE_HEAD_BYTES[ds as usize].fetch_add(bytes, Ordering::Relaxed);
+    }
+    crate::local_resource_diagnostics::durable_tail_alarm(
+        source.api_slug(),
+        &serde_json::json!({"rederive_input_bytes": bytes}),
+    );
+}
+
 const PACE_SECS: u64 = 6 * 3600;
 const _: () = assert!(PACE_SECS < 86_400);
 
@@ -79,6 +92,8 @@ pub(crate) struct Counters {
     pub(crate) retail_attempts: u64,
     pub(crate) retail_keys: u64,
     pub(crate) retail_full: [u64; 3],
+    /// [Full, paced] per Claude/Codex/Pi; process-lifetime, not store-owned.
+    pub(crate) active_bound: [[u64; 2]; 3],
     pub(crate) missing: u64,
     pub(crate) upgrade_state_missing: u64,
     pub(crate) refused_record: u64,
@@ -123,7 +138,7 @@ impl Counters {
         format!(
             "ottto-service: durable_tail source={} restore_attempts={} restored={} missing={} \
              retail_attempts={} retail_keys={} retail_exhausted[full,paced,pace_evicted]={:?} tail_read_bytes={} budget_refused_retail_old_bytes={} repeated_physical_old_bytes={} refused_record={} upgrade_state_missing={} ineligible={{{}}} certificate_refused={{{}}} corrupt_body={} \
-             not_rederived={{{}}} budget_refused={} resource_full={{{}}} rederive_head_bytes={} \
+             not_rederived={{{}}} budget_refused={} resource_full={{{}}} active_bound[claude,codex,pi]={:?} rederive_head_bytes={} \
              rederive_named_lines={} rederive_line_bytes={} not_persisted={{{}}} \
              write_deferred={} write_unlocked={} peak_body_bytes={} store_write_failed[setup,inventory,statvfs]={:?} disk_records={} disk_bytes={} \
              bytes_written={} records_written={} records_clean={} store_budget_refused={} \
@@ -150,6 +165,7 @@ impl Counters {
             classes(&self.not_rederived),
             self.budget_refused,
             classes(&self.resource_full),
+            self.active_bound,
             self.rederive_head_bytes,
             self.rederive_named_lines,
             self.rederive_line_bytes,
@@ -201,6 +217,20 @@ struct Slot {
     reported: [u64; 8],
 }
 
+/// Fixed-size stamp in the existing paid pacing node. Remember structural
+/// classification after the first no-record publication changes index binding.
+#[derive(Clone, Copy)]
+struct FullPace {
+    at: std::time::Instant,
+    structural: bool,
+}
+fn full_pace_key(source: SnapshotSource, key: &str) -> store::Digest32 {
+    match durable_source(source) {
+        Some(ds) => store::key_digest(ds, key),
+        None => store::context_digest(source.api_slug(), Some(key)),
+    }
+}
+
 /// Process-lifetime durable state beside the RAM cache.
 #[derive(Default)]
 pub(crate) struct Stores {
@@ -217,7 +247,7 @@ pub(crate) struct Stores {
     // Source+key only: never clear on passes, scope changes or cache eviction.
     retail_spent: BTreeMap<store::Digest32, (u64, std::time::Instant)>,
     // Independently paid pacing, never used to renew Q11 spent authority.
-    retail_full_at: BTreeMap<store::Digest32, std::time::Instant>,
+    retail_full_at: BTreeMap<store::Digest32, FullPace>,
     #[cfg(test)]
     retail_full_now: Option<std::time::Instant>,
 }
@@ -681,35 +711,107 @@ impl SharedCache {
         if !file.metadata().is_ok_and(|m| m.len() > accepted_end) {
             return false;
         }
+        self.paced_full(SnapshotSource::ClaudeCode, key, now, false)
+    }
+
+    /// The ONE shared Full pacing map. A full map evicts oldest and reads.
+    /// Cause is deliberately absent from the key: switching causes cannot
+    /// refresh a same-source/key allowance. Pi uses the same paid owner.
+    fn paced_full(
+        &self,
+        source: SnapshotSource,
+        key: &str,
+        now: std::time::Instant,
+        active_bound: bool,
+    ) -> bool {
         let Some(mut stores) = self.durable() else {
-            return true;
+            return false; // no accounted owner; cannot manufacture a paced grant
         };
         #[cfg(test)]
         let now = stores.retail_full_now.unwrap_or(now);
         let interval = std::time::Duration::from_secs(PACE_SECS);
-        stores.retail_full_at.retain(|_, at| {
-            now.checked_duration_since(*at)
+        let key = full_pace_key(source, key);
+        let delayed = stores.retail_full_at.get(&key).is_some_and(|stamp| {
+            now.checked_duration_since(stamp.at)
                 .is_none_or(|age| age < interval)
         });
-        let key = store::key_digest(DurableSource::ClaudeCode, key);
-        if stores.retail_full_at.contains_key(&key) {
-            stores.counters.retail_full[1] += 1;
-            return false;
-        }
-        if stores.retail_full_at.len() >= 2 * store::MAX_RECORDS {
-            let oldest = stores
-                .retail_full_at
-                .iter()
-                .min_by_key(|(_, at)| **at)
-                .map(|(key, _)| *key);
-            if let Some(oldest) = oldest {
-                stores.retail_full_at.remove(&oldest);
-                stores.counters.retail_full[2] += 1;
+        let mut evicted = false;
+        if !delayed {
+            if stores.retail_full_at.len() >= 2 * store::MAX_RECORDS
+                && !stores.retail_full_at.contains_key(&key)
+            {
+                let oldest = stores
+                    .retail_full_at
+                    .iter()
+                    .min_by_key(|(_, stamp)| stamp.at)
+                    .map(|(key, _)| *key);
+                if let Some(oldest) = oldest {
+                    stores.retail_full_at.remove(&oldest);
+                    stores.counters.retail_full[2] += 1;
+                    evicted = true;
+                }
             }
+            let structural = active_bound
+                || stores
+                    .retail_full_at
+                    .get(&key)
+                    .is_some_and(|stamp| stamp.structural);
+            stores.retail_full_at.insert(
+                key,
+                FullPace {
+                    at: now,
+                    structural,
+                },
+            );
         }
-        stores.retail_full_at.insert(key, now);
-        stores.counters.retail_full[0] += 1;
-        true
+        if let Some(stamp) = stores.retail_full_at.get_mut(&key).filter(|_| active_bound) {
+            stamp.structural = true;
+        }
+        let total = if active_bound {
+            let slot = match source {
+                SnapshotSource::ClaudeCode => 0,
+                SnapshotSource::Codex => 1,
+                SnapshotSource::Pi => 2,
+            };
+            stores.counters.active_bound[slot][usize::from(delayed)] += 1;
+            stores.counters.active_bound[slot][usize::from(delayed)]
+        } else {
+            stores.counters.retail_full[usize::from(delayed)] += 1;
+            stores.counters.retail_full[usize::from(delayed)]
+        };
+        let eviction_total = stores.counters.retail_full[2];
+        drop(stores);
+        if evicted {
+            // Its OWN alarm, independent of any normal growth-read counter.
+            crate::local_resource_diagnostics::durable_tail_alarm(
+                source.api_slug(),
+                &serde_json::json!({"pace_evicted": [1, eviction_total]}),
+            );
+        }
+        if active_bound {
+            let class = if delayed {
+                "active_bound_delay"
+            } else {
+                "degraded_no_record"
+            };
+            crate::local_resource_diagnostics::durable_tail_alarm(
+                source.api_slug(),
+                &serde_json::json!({(class): {"active_bound": [1, total]}}),
+            );
+        }
+        !delayed
+    }
+
+    /// Resource hold: growth only. Committed end stays old while paced, so
+    /// selection remains Parse; 6h < minimum 1-day discovery window.
+    pub(in crate::snapshots) fn active_bound_full(
+        &self,
+        source: SnapshotSource,
+        key: &str,
+        file: &File,
+        index: &ScanIndex,
+    ) -> bool {
+        grown(file, index, key) && self.paced_full(source, key, std::time::Instant::now(), true)
     }
 
     fn durable(&self) -> Option<std::sync::MutexGuard<'_, Stores>> {
@@ -817,13 +919,13 @@ impl SharedCache {
         source: SnapshotSource,
         candidate: &CandidateFile,
         index: &mut ScanIndex,
-    ) -> Result<Option<store::Refusal>, store::ActiveOverBudget> {
+    ) -> Result<Option<store::Refusal>, &'static str> {
         let Some(ds) = durable_source(source) else {
             return Ok(None);
         };
         {
             let Some(mut stores) = self.durable() else {
-                return Err(store::ActiveOverBudget);
+                return Err("active_owner_unavailable");
             };
             if stores
                 .slot(ds)
@@ -838,10 +940,10 @@ impl SharedCache {
             return Ok(Some(reason));
         }
         // Guard classification also allocates an envelope: fund it outside Stores.
-        let store::LeaseWait::Granted(lease) =
-            self.acquire_active(source, store::RESTORE_INPUT_BYTES)
-        else {
-            return Err(store::ActiveOverBudget);
+        let lease = match self.acquire_active(source, store::RESTORE_INPUT_BYTES) {
+            store::LeaseWait::Granted(lease) => lease,
+            store::LeaseWait::Busy => return Err("active_input_pending"),
+            store::LeaseWait::OverBudget => return Err("active_input_over_budget"),
         };
         let result = self.durable_hold(source, &key).or_else(|| {
             self.durable_upgrade_missing(source, candidate, index)
@@ -961,8 +1063,8 @@ impl SharedCache {
 
     /// Restores `key` from the durable store into the RAM cache and takes it,
     /// or a typed pending/integrity/missing outcome. `held` is
-    /// the parser's opened FD for `path`, not yet read; a duplicate of it
-    /// serves the bounded re-derivation, and the read plan repositions it.
+    /// the parser's opened FD for `path`, not yet read; bounded positional
+    /// content reads preserve its offset, and the read plan repositions it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn durable_restore(
         &self,
@@ -985,9 +1087,14 @@ impl SharedCache {
         }
         #[cfg(test)]
         tests::before_cold_transfer();
-        let store::LeaseWait::Granted(mut lease) = self.acquire_prepared_transfer(snapshot_source)
-        else {
-            return self.restore_resource_pending(snapshot_source, "active_wait", false);
+        let mut lease = match self.acquire_prepared_transfer(snapshot_source) {
+            store::LeaseWait::Granted(lease) => lease,
+            store::LeaseWait::Busy => {
+                return self.restore_resource_pending(snapshot_source, "active_wait", false)
+            }
+            store::LeaseWait::OverBudget => {
+                return self.restore_active_bound(snapshot_source, key, held, index)
+            }
         };
         // Incoming key, admission scratch/stored key and dirty-candidate key.
         // The initial transfer reserve separately covers one <=8MiB victim key.
@@ -1002,6 +1109,31 @@ impl SharedCache {
                 snapshot_source,
                 "cache_key",
                 grown(held, index, key),
+            );
+        }
+        let structural = self.durable().is_some_and(|stores| {
+            stores
+                .retail_full_at
+                .get(&full_pace_key(snapshot_source, key))
+                .is_some_and(|stamp| stamp.structural)
+        });
+        if structural
+            && grown(held, index, key)
+            && !index.effective_upload_body_witness_revision_requires_adoption(key)
+        {
+            // Only unread growth consumes a structural memo. Real same-size
+            // corrections/shrink and approved replay keep ordinary admission.
+            // Classify the current survivor under funding before applying a
+            // RAM memo. Unknown/newer/receipt holds still outrank the grant.
+            if lease.charge(store::RESTORE_INPUT_BYTES).is_err() {
+                lease.release();
+                return RestoreOutcome::Pending;
+            }
+            let hold = self.durable_hold(snapshot_source, key);
+            lease.release();
+            return hold.map_or_else(
+                || self.restore_active_bound(snapshot_source, key, held, index),
+                RestoreOutcome::Held,
             );
         }
         let result = self.restore_known(
@@ -1037,7 +1169,11 @@ impl SharedCache {
             }
             Some(Err(phase)) => {
                 lease.release();
-                self.restore_resource_pending(snapshot_source, phase, grown(held, index, key))
+                if matches!(phase, "decode" | "input" | "certificate_scope") {
+                    self.restore_active_bound(snapshot_source, key, held, index)
+                } else {
+                    self.restore_resource_pending(snapshot_source, phase, grown(held, index, key))
+                }
             }
             None => {
                 let result = self
@@ -1049,8 +1185,22 @@ impl SharedCache {
         }
     }
 
+    fn restore_active_bound(
+        &self,
+        source: SnapshotSource,
+        key: &str,
+        file: &File,
+        index: &ScanIndex,
+    ) -> RestoreOutcome {
+        if self.active_bound_full(source, key, file, index) {
+            RestoreOutcome::Degraded
+        } else {
+            RestoreOutcome::Pending
+        }
+    }
+
     /// A busy lease is a bounded FIFO delay. Every other phase repeats for
-    /// this record and cache state (e.g. `rederive_unfunded` until b4), so a
+    /// this record and cache state (including unsupported content obligations), so a
     /// file grown past its committed end takes the ordinary counted Full
     /// (a fresh native parse, its own funding) instead of an idle-drop hold.
     fn restore_resource_pending(
@@ -1176,7 +1326,10 @@ impl SharedCache {
                     Failure::Resource(phase) => return Some(Err(phase)),
                     Failure::Corrupt => counters.corrupt_body += 1,
                     Failure::NotRederived(refuse) => {
-                        Counters::bump(&mut counters.not_rederived, refuse_class(refuse))
+                        Counters::bump(&mut counters.not_rederived, refuse_class(refuse));
+                        // Typed cap/hash/read refusal cannot authorize an idle
+                        // Full. Keep the same no-read/growth safety net.
+                        return Some(Err("rederive_unfunded"));
                     }
                 }
                 return None;
@@ -1186,7 +1339,6 @@ impl SharedCache {
             slot.store.authorize(&record, &expected);
         }
         stores.counters.rederive_head_bytes += receipt.head_bytes;
-        REDERIVE_HEAD_BYTES[source as usize].fetch_add(receipt.head_bytes, Ordering::Relaxed);
         stores.counters.rederive_named_lines += receipt.named_lines;
         stores.counters.rederive_line_bytes += receipt.line_bytes;
         drop(stores);
@@ -1231,11 +1383,19 @@ impl SharedCache {
         if counting.is_some_and(|c| c.0 != cutover) {
             return Err(Failure::Ineligible(store::Ineligible::Scope));
         }
-        // No certificate sample, descriptor clone, native parser or JSON value
-        // may allocate/read for an obligation without proved pre-growth funding.
-        let (reduction, receipt) = decoded
-            .without_rederive()
+        // One content-only extractor; unsupported obligations refuse BEFORE
+        // certificate samples or allocations. Never construct a native parser.
+        let charge = decoded
+            .content_charge()
             .map_err(|_| Failure::Resource("rederive_unfunded"))?;
+        lease
+            .charge(charge)
+            .map_err(|_| Failure::Resource("rederive_unfunded"))?;
+        let before = crate::transcript_acquisition::FileStamp::capture(
+            held.metadata()
+                .map_err(|_| Failure::Certificate(FullReason::Replaced))?,
+        )
+        .map_err(|_| Failure::Certificate(FullReason::Replaced))?;
         lease
             .charge(scope.0.len() as u64)
             .map_err(|_| Failure::Resource("certificate_scope"))?;
@@ -1244,6 +1404,17 @@ impl SharedCache {
             .certificate
             .restore(held, scope.clone())
             .map_err(Failure::Certificate)?;
+        let (reduction, receipt) = decoded
+            .rederive_content(held)
+            .map_err(Failure::NotRederived)?;
+        let after = crate::transcript_acquisition::FileStamp::capture(
+            held.metadata()
+                .map_err(|_| Failure::Certificate(FullReason::Replaced))?,
+        )
+        .map_err(|_| Failure::Certificate(FullReason::Replaced))?;
+        if !before.same_content(&after) {
+            return Err(Failure::Certificate(FullReason::Replaced));
+        }
         Ok((checkpoint, reduction, receipt))
     }
 
@@ -1285,6 +1456,9 @@ impl SharedCache {
         source: SnapshotSource,
         key: &str,
     ) -> Result<Option<(Taken<CachedJsonlReduction>, store::ActiveLease)>, ()> {
+        if self.retained().is_ok_and(|cache| cache.peek(key).is_none()) {
+            return Ok(None);
+        }
         let store::LeaseWait::Granted(lease) = self.acquire_prepared_transfer(source) else {
             return Err(());
         };
@@ -1316,16 +1490,19 @@ impl SharedCache {
                 source.api_slug(),
                 &serde_json::json!({"active_budget_refused":1}),
             );
-            return store::LeaseWait::Busy;
+            return store::LeaseWait::OverBudget;
         }
-        if let store::LeaseWait::Granted(mut lease) = store::ActiveLease::acquire(source.api_slug())
-        {
-            match lease.charge(need_bytes) {
-                Ok(()) => return store::LeaseWait::Granted(lease),
-                Err(store::ActiveOverBudget) => lease.release(),
+        match store::ActiveLease::acquire(source.api_slug()) {
+            store::LeaseWait::Granted(mut lease) => {
+                if lease.charge(need_bytes).is_ok() {
+                    store::LeaseWait::Granted(lease)
+                } else {
+                    lease.release();
+                    store::LeaseWait::OverBudget
+                }
             }
+            other => other,
         }
-        store::LeaseWait::Busy
     }
 
     /// After a successful save of `index` (the committed generation), writes
@@ -1730,6 +1907,8 @@ impl SharedCache {
 pub(crate) enum RestoreOutcome {
     Restored(Box<Taken<CachedJsonlReduction>>, store::ActiveLease),
     Pending,
+    /// Explicit structural grant: ordinary Full, no retained/new durable graph.
+    Degraded,
     Miss,
     Held(store::Refusal),
 }
@@ -1771,7 +1950,7 @@ mod restore_test {
                     taken: Some(taken),
                     lease: Some(lease),
                 }),
-                Self::Miss => None,
+                Self::Miss | Self::Degraded => None,
                 Self::Pending if !crate::heap_layout_bound::layout_supported() => None,
                 Self::Pending => panic!("ordinary restore unexpectedly Pending"),
                 Self::Held(reason) => panic!("ordinary restore unexpectedly Held: {reason:?}"),
@@ -1786,6 +1965,7 @@ fn grown(held: &File, index: &ScanIndex, key: &str) -> bool {
     held.metadata().is_ok_and(|m| m.len() > committed)
 }
 
+#[derive(Debug)]
 enum Failure {
     Resource(&'static str),
     Ineligible(store::Ineligible),

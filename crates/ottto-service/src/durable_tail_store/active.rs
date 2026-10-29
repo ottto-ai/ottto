@@ -113,6 +113,10 @@ impl ActiveLease {
         event(self.source, "active_current_bytes", total);
         Ok(())
     }
+    #[cfg(test)]
+    pub(crate) fn charged_for_test(&self) -> u64 {
+        self.bytes
+    }
     pub(crate) fn release(mut self) {
         self.finish(false);
     }
@@ -149,6 +153,7 @@ impl Drop for ActiveLease {
 pub(crate) enum LeaseWait {
     Granted(ActiveLease),
     Busy,
+    OverBudget,
 }
 #[derive(Debug)]
 pub(crate) struct ActiveOverBudget;
@@ -212,7 +217,7 @@ mod tests {
     fn granted() -> ActiveLease {
         match ActiveLease::acquire("claude_code") {
             LeaseWait::Granted(lease) => lease,
-            LeaseWait::Busy => panic!("test owner unavailable"),
+            LeaseWait::Busy | LeaseWait::OverBudget => panic!("test owner unavailable"),
         }
     }
 

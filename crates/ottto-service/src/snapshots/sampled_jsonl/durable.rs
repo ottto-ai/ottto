@@ -5,11 +5,10 @@
 //! The body holds the allowlisted fields (`N`/`H`/`U`/`L`, see
 //! `durable_tail_codec`) and, for each re-derived content field, the digest of
 //! its value. The marks (`DurableMarks`, `SessionStartState::content_end`) say
-//! where in the file each was last assigned. Production restore holds any
-//! nonempty re-derivation obligation before input: native parser/JSON growth
-//! has no proved allocation owner. Empty obligations move the paid decoded
-//! graph directly. The legacy test oracle retains head/named-line bounds and
-//! every hash fence; it grants no production read permission.
+//! where in the file each was last assigned. Production restore funds the
+//! bounded typed workspace extractor before input. Other content obligations
+//! still refuse before input. Empty obligations move the paid decoded graph.
+//! The native parser remains a cfg(test) differential oracle only.
 #![cfg_attr(not(test), allow(dead_code))]
 
 #[cfg(test)]
@@ -271,7 +270,10 @@ impl CachedJsonlReduction {
             .map(|c| c.durable_contract())
     }
 }
-/// Native re-derive allocations have no proved pre-growth owner yet.
+#[cfg(unix)]
+mod content;
+
+/// Content obligations without a supported, pre-funded extractor.
 #[derive(Debug)]
 pub(crate) struct RederiveUnfunded;
 
@@ -292,7 +294,6 @@ impl Decoded {
 
     /// How far the head re-parse must read: the latest mark of a field to
     /// re-derive. 0 when nothing needs the head.
-    #[cfg(test)]
     pub(crate) fn head_end(&self) -> Result<u64, Refuse> {
         let acc = &self.reduction.accumulator;
         let marks = acc.durable_marks;

@@ -27666,12 +27666,9 @@ impl OwnedSourceScan {
                                     member,
                                     &mut census,
                                 ),
-                                Err(_) => cache.durable_custody_hold(
-                                    source,
-                                    "active_input_pending",
-                                    index,
-                                    member,
-                                ),
+                                Err(class) => {
+                                    cache.durable_custody_hold(source, class, index, member)
+                                }
                                 Ok(None) => unreachable!(),
                             }
                             pending!();
@@ -28483,7 +28480,8 @@ impl OwnedSourceScan {
                 // compact records and their selector table were already charged
                 // by copy_budget_step. A refusal disables retention, preserving
                 // the ordinary native finish and its loss/output semantics.
-                let cache_compatible = sampled_scan::compatible_reduction(&parser.accumulator)
+                let cache_compatible = !file_sampling.as_ref().is_some_and(|a| a.no_record)
+                    && sampled_scan::compatible_reduction(&parser.accumulator)
                     && aliases.is_empty()
                     && applied_receipts.values().all(Option::is_none);
                 // Retain the reduction only when every applied byte is in
@@ -31251,13 +31249,9 @@ impl OwnedSourceScan {
                             cache.durable_hold_exit(source, reason, index, &candidate, &mut census);
                             pending!();
                         }
-                        Err(_) => {
-                            cache.durable_custody_hold(
-                                source,
-                                "active_input_pending",
-                                index,
-                                &candidate,
-                            );
+                        Err(class) => {
+                            residue_index_keys.insert(local_index_key(&candidate.path));
+                            cache.durable_custody_hold(source, class, index, &candidate);
                             pending!();
                         }
                     }
@@ -31677,6 +31671,7 @@ impl OwnedSourceScan {
             // or deferral below does not inflate the read diagnostics.
             let mut planned_mode = None;
             let mut returned_refusal = None;
+            let mut active_bound_degraded = false;
             // U1a-2a G7: a side read's acquisition is a fresh `Full` read
             // under the side scope: no retained take, no admission observes
             // or counters, no debt. Failures are its charged attempt.
@@ -31694,6 +31689,7 @@ impl OwnedSourceScan {
                     Ok(mode) => {
                         sampled_scan::configure_tier_replay(&mut parser, &candidate, index);
                         file_sampling = Some(sampled_scan::Active {
+                            no_record: active_bound_degraded,
                             key: local_index_key(&candidate.path),
                             scope,
                             mode,
@@ -32003,6 +31999,7 @@ impl OwnedSourceScan {
                                         (Some(taken), Some(admission))
                                     }
                                     sampled_scan::durable_tail::RestoreOutcome::Pending => {
+                                        residue_index_keys.insert(key.clone());
                                         context.cache.durable_custody_hold(
                                             source,
                                             "prepared_funding_pending",
@@ -32010,6 +32007,10 @@ impl OwnedSourceScan {
                                             &candidate,
                                         );
                                         pending!();
+                                    }
+                                    sampled_scan::durable_tail::RestoreOutcome::Degraded => {
+                                        active_bound_degraded = true;
+                                        (None, taken_admission)
                                     }
                                     sampled_scan::durable_tail::RestoreOutcome::Miss => {
                                         (None, taken_admission)
@@ -32144,6 +32145,7 @@ impl OwnedSourceScan {
                             !matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
                         });
                         file_sampling = Some(sampled_scan::Active {
+                            no_record: active_bound_degraded,
                             key,
                             scope,
                             mode,
@@ -32215,6 +32217,7 @@ impl OwnedSourceScan {
                         sampled_scan::configure_tier_replay(&mut parser, &candidate, index);
                         planned_mode = Some((mode, None));
                         file_sampling = Some(sampled_scan::Active {
+                            no_record: active_bound_degraded,
                             key,
                             scope,
                             mode,
@@ -32416,6 +32419,12 @@ impl OwnedSourceScan {
             }
             if let Some((context, (mode, audit_due))) = sampling.as_mut().zip(planned_mode) {
                 context.record_mode(mode, audit_due);
+                if active_bound_degraded {
+                    crate::local_resource_diagnostics::durable_tail_alarm(
+                        source.api_slug(),
+                        &serde_json::json!({"full_reads": {"degraded_no_record": {"active_bound": 1}}}),
+                    );
+                }
                 if matches!(mode, crate::transcript_acquisition::ReadMode::Full(_)) {
                     if let Some(reason) = returned_refusal {
                         crate::local_resource_diagnostics::durable_tail_alarm(
@@ -41569,6 +41578,7 @@ fn refresh_retained_codex_roster(
                 .and_then(unix_seconds)
                 .unwrap_or_default();
             if !sampled_audit::path_requires_verification(files, &path)
+                && !indexed_growth(files, &path, metadata.len())
                 && census_unix_seconds.is_some_and(|now| {
                     !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
                 })
@@ -41904,6 +41914,7 @@ fn advance_bounded_directory_traversal_with_budget(
                 .and_then(unix_seconds)
                 .unwrap_or_default();
             if !sampled_audit::path_requires_verification(files, &path)
+                && !indexed_growth(files, &path, metadata.len())
                 && census_unix_seconds.is_some_and(|now| {
                     !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
                 })
@@ -42059,6 +42070,7 @@ fn candidate_from_traversal_path_at(
         .and_then(unix_seconds)
         .unwrap_or_default();
     if !sampled_audit::path_requires_verification(files, &pending.path)
+        && !indexed_growth(files, &pending.path, metadata.len())
         && census_unix_seconds.is_some_and(|now| {
             !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
         })
@@ -42310,6 +42322,14 @@ fn is_recent_enough_at(
     modified_unix_seconds >= now_unix_seconds.saturating_sub(window_seconds)
 }
 
+/// Metadata-only discoverability of unread growth. Selection still owns
+/// Parse and acquisition still owns permission; age cannot prune its old end.
+fn indexed_growth(files: &BTreeMap<String, ScanIndexEntry>, path: &Path, length: u64) -> bool {
+    files
+        .get(&local_index_key(path))
+        .is_some_and(|entry| length > entry.size_bytes)
+}
+
 fn opened_candidate_is_within_frozen_window(
     candidate: &CandidateFile,
     census_unix_seconds: Option<u64>,
@@ -42550,6 +42570,7 @@ fn open_and_identify_scan_candidate_with_rescue(
         };
     if !verification_rescue
         && !sampled_audit::path_requires_verification(files, &candidate.path)
+        && !indexed_growth(files, &candidate.path, candidate.size_bytes)
         && !opened_candidate_is_within_frozen_window(
             &candidate,
             census_unix_seconds,

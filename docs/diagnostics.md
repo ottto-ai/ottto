@@ -158,6 +158,24 @@ retryable (red) for the whole hold, so census close, retirement and
 account-family proof wait for that source; a held key is not yet terminal
 disclosed residue.
 
+The shared six-hour Full pace also owns structural active-budget fallback.
+`degraded_no_record.active_bound` and `active_bound_delay.active_bound` are
+`[event delta, source process total]` on the same alarm carrier. The source
+leaf is `claude_code`, `codex`, or `pi`; missing means zero events, never a
+successful restore. `pace_evicted` has its own alarm record and process total:
+at capacity the oldest stamp is evicted, the new key is enrolled and the read
+is allowed. A busy FIFO lease remains `active_wait_busy`, a transient delay.
+These are RAM-only counters and stamps; restart can admit one extra growth
+Full. Structural Full publishes without a replacement retained/durable record.
+
+Workspace re-derivation captures at most 4096 bytes per selected field and
+requires the original digest. Unsupported first-prompt, title, agent-label
+and session-start obligations remain `rederive_unfunded`. Capture/hash/read
+refusals are counted as `not_rederived`; no altered value is published.
+`rederive_input_bytes` counts each actual physical read, including bytes read
+before a later capture/hash refusal. Success receipts count successful restores
+separately; do not add the two byte counters together.
+
 ## Line Delivery Counters
 
 Schema 2's `native_collection_page` can add two sparse, counts-only objects.

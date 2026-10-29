@@ -301,14 +301,11 @@ fn production_cold_resources_delay_lease_wait_and_read_growth_once() {
     let _reset = ResetActiveBudget;
     let _clear = ClearPreparationFault;
     let source = SnapshotSource::ClaudeCode;
-    for phase in ["guard", "decode", "rederive", "cache"] {
-        let limit = match phase {
-            "guard" => 0,
-            "decode" => {
-                store::RESTORE_INPUT_BYTES
-                    + (store::RECORD_BYTES + super::super::AUDIT_AND_SCRATCH_BYTES) as u64
-            }
-            _ => store::ACTIVE_BYTES,
+    for phase in ["guard", "rederive", "cache"] {
+        let limit = if phase == "guard" {
+            0
+        } else {
+            store::ACTIVE_BYTES
         };
         let root = crate::test_scratch::ScratchDir::new("cold-decode-budget");
         let lock = test_locks::hold(&root);
@@ -329,11 +326,6 @@ fn production_cold_resources_delay_lease_wait_and_read_growth_once() {
                 .unwrap();
         }
         let key = local_index_key(&path);
-        let limit = if phase == "decode" {
-            limit + 4 * key.len() as u64
-        } else {
-            limit
-        };
         let index_path = root.join("index.json");
         let namespace = Scope("bounded-decode".into());
         let cache = Arc::new(SharedCache::default());
@@ -2141,7 +2133,7 @@ fn oversized_active_request_refuses_without_waiting_or_opening_a_store() {
     let (result, events) = crate::local_resource_diagnostics::capture(|| {
         cache.acquire_active(SnapshotSource::Codex, store::ACTIVE_BYTES + 1)
     });
-    assert!(matches!(result, store::LeaseWait::Busy));
+    assert!(matches!(result, store::LeaseWait::OverBudget));
     assert_eq!(events.len(), 1);
     assert_eq!(events[0]["counts"]["active_budget_refused"], 1);
     assert!(cache.durable_counters(SnapshotSource::Codex).is_none());
@@ -4367,7 +4359,7 @@ fn q11_complete_map_is_paid_before_the_first_key() {
             .unwrap();
     let reserve = super::super::RETAIL_RESERVE_BYTES;
     assert!((2 * store::MAX_RECORDS + 1) * nodes <= reserve);
-    assert_eq!(STORES_RESIDENT_BOUND, 926_720);
+    assert_eq!(STORES_RESIDENT_BOUND, 1_452_032);
     assert_eq!(
         super::super::STATE_BYTES
             + reserve
@@ -5278,7 +5270,7 @@ fn a0h_pacing_is_funded_nonrenewing_and_evicts_oldest() {
         .retail_full_at
         .contains_key(&store::key_digest(DurableSource::ClaudeCode, "k")));
     assert_eq!(
-        stores.retail_full_at[&store::key_digest(DurableSource::ClaudeCode, "overflow")],
+        stores.retail_full_at[&store::key_digest(DurableSource::ClaudeCode, "overflow")].at,
         later
     );
     drop(stores);
@@ -5290,8 +5282,7 @@ fn a0h_pacing_is_funded_nonrenewing_and_evicts_oldest() {
         cache.durable().unwrap().retail_spent.is_empty(),
         "pacing mints no Q11 authority"
     );
-    let node =
-        crate::heap_layout_bound::tree_node_bytes::<store::Digest32, std::time::Instant>().unwrap();
+    let node = crate::heap_layout_bound::tree_node_bytes::<store::Digest32, FullPace>().unwrap();
     assert!(node <= 1024);
     assert_eq!(
         super::super::RETAIL_RESERVE_BYTES,
@@ -5631,4 +5622,366 @@ fn a0h_pace_evicted_alone_emits_one_alarm_without_a_full_delta() {
     let ((), repeated) = crate::local_resource_diagnostics::capture(|| cache.durable_alarm(source));
     assert!(repeated.is_empty());
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn b4_shared_pace_cross_cause_source_and_overflow_alarm() {
+    let cache = SharedCache::default();
+    let now = std::time::Instant::now();
+    assert!(cache.paced_full(SnapshotSource::ClaudeCode, "same", now, false));
+    assert!(!cache.paced_full(SnapshotSource::ClaudeCode, "same", now, true));
+    assert!(cache.paced_full(SnapshotSource::Codex, "same", now, true));
+    // Populate the same paid map, not another active-bound map.
+    for n in 2..2 * store::MAX_RECORDS {
+        assert!(cache.paced_full(SnapshotSource::ClaudeCode, &format!("fill-{n}"), now, false));
+    }
+    let (allowed, events) = crate::local_resource_diagnostics::capture(|| {
+        cache.paced_full(
+            SnapshotSource::Codex,
+            "overflow",
+            now + std::time::Duration::from_secs(1),
+            true,
+        )
+    });
+    assert!(allowed);
+    assert_eq!(
+        cache.durable().unwrap().retail_full_at.len(),
+        2 * store::MAX_RECORDS
+    );
+    assert_eq!(cache.durable().unwrap().counters.retail_full[2], 1);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["counts"]["pace_evicted"] == serde_json::json!([1, 1]))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(
+                |e| e["counts"]["degraded_no_record"]["active_bound"] == serde_json::json!([1, 2])
+            )
+            .count(),
+        1
+    );
+    assert!(
+        !cache.paced_full(SnapshotSource::Codex, "overflow", now, true),
+        "rollback delays"
+    );
+    assert!(cache.paced_full(
+        SnapshotSource::Codex,
+        "overflow",
+        now + std::time::Duration::from_secs(PACE_SECS + 1),
+        true
+    ));
+}
+
+/// A real production restore with the enabled obligation, including the
+/// certificate fences; funding refusal is tested with an unreadable FD.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "validated native decode layout")]
+fn b4_workspace_positive_restore_and_funding_before_read() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    assert!(crate::heap_layout_bound::layout_supported());
+    let root = crate::test_scratch::ScratchDir::new("b4-workspace-production");
+    let path = root.join("source.jsonl");
+    std::fs::write(
+        &path,
+        b"{\"type\":\"progress\",\"cwd\":\"/tmp/synthetic-workspace\"}\n",
+    )
+    .unwrap();
+    let source = SnapshotSource::ClaudeCode;
+    let scope = Scope("b4-content".into());
+    let native = native_record(&path, &scope).0;
+    let body = codec::encode(&native, store::BODY_BYTES, jsonl_line_cap() as u64).unwrap();
+    let decoded = codec::decode(&body, source).unwrap();
+    assert!(
+        decoded.without_rederive().is_err(),
+        "real nonempty obligation"
+    );
+    let binding = store::tests::binding("account", "scope", ("fp-a", None));
+    let expected = Expected {
+        binding: binding.clone(),
+        committed_generation: 1,
+    };
+    let record = store::DurableRecord {
+        format: store::FORMAT_VERSION,
+        index_generation: 1,
+        record: PendingRecord {
+            binding,
+            certificate: certificate(&path, &scope),
+            body,
+            allowlist: codec::allowlist_digest(source),
+        },
+    };
+    let index = ScanIndex::default();
+    let interpretation = Interpretation::of(source, "key", &index, false, &scope);
+    let cache = SharedCache::default();
+    let store::LeaseWait::Granted(mut lease) = cache.acquire_prepared_transfer(source) else {
+        panic!("owner")
+    };
+    let (checkpoint, bounded, receipt) = cache
+        .durable_restore_record(
+            source,
+            &record,
+            &expected,
+            &path,
+            &scope,
+            &mut File::open(&path).unwrap(),
+            &interpretation,
+            &mut lease,
+        )
+        .unwrap();
+    assert_eq!(
+        bounded.accumulator.workspace_path,
+        native.accumulator.workspace_path
+    );
+    assert_eq!(receipt.head_bytes, std::fs::metadata(&path).unwrap().len());
+    assert_eq!(checkpoint.sealed_offset(), receipt.head_bytes);
+    drop(bounded);
+    drop(checkpoint);
+    lease.release();
+    // The decoded graph fits, but no content funding remains. A certificate
+    // on this write-only FD would fail: resource refusal must precede it.
+    let store::LeaseWait::Granted(mut lease) = cache.acquire_prepared_transfer(source) else {
+        panic!("owner")
+    };
+    let before = lease.charged_for_test();
+    let decoded = codec::decode_bounded(&record.record.body, source, &mut lease).unwrap();
+    let decode_bytes = lease.charged_for_test() - before;
+    assert!(decoded.content_charge().unwrap() > 0);
+    drop(decoded);
+    lease
+        .charge(store::ACTIVE_BYTES - lease.charged_for_test() - decode_bytes)
+        .unwrap();
+    let mut unreadable = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    assert!(matches!(
+        cache.durable_restore_record(
+            source,
+            &record,
+            &expected,
+            &path,
+            &scope,
+            &mut unreadable,
+            &interpretation,
+            &mut lease
+        ),
+        Err(Failure::Resource("rederive_unfunded"))
+    ));
+    use std::io::Seek;
+    assert_eq!(unreadable.stream_position().unwrap(), 0);
+    lease.release();
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "validated native decode layout")]
+fn b4_structural_growth_paced_no_record_reselection_no_prune_and_restart() {
+    use std::io::Write;
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    assert!(crate::heap_layout_bound::layout_supported());
+    let _gate = claude_request_money::e2::GateForTest::set(true);
+    let _reset = ResetActiveBudget;
+    let root = crate::test_scratch::ScratchDir::new("b4-structural-growth");
+    let lock = test_locks::hold(&root);
+    let sessions = root.join("sessions");
+    std::fs::create_dir(&sessions).unwrap();
+    let path = sessions.join("11111111-2222-4333-8444-555555555555.jsonl");
+    native_fixture(&path);
+    let source = SnapshotSource::ClaudeCode;
+    let key = local_index_key(&path);
+    let namespace = Scope("b4-structural".into());
+    let index_path = root.join("index.json");
+    let cache = Arc::new(SharedCache::default());
+    cache.durable_begin_pass(source, &index_path, &namespace, true);
+    let run = |cache: Arc<SharedCache>, index, at: &str| {
+        let mut scan = OwnedSourceScan::new_with_identity_capture(
+            source,
+            std::slice::from_ref(&sessions),
+            index,
+            at,
+            1,
+            100,
+            false,
+            None,
+            &[],
+            false,
+            true,
+            true,
+        )
+        .with_sampled_acquisition(cache, namespace.clone());
+        let mut modes = (0, 0, 0);
+        for _ in 0..10_000 {
+            if let Some(c) = scan.sampling.as_ref() {
+                modes = (c.full_files, c.tail_files, c.native_bytes);
+            }
+            match scan.step(None) {
+                OwnedSourceScanStep::Pending(next) => scan = next,
+                OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan, modes),
+            }
+        }
+        panic!("scan did not finish");
+    };
+    let (mut index, first, _) = run(cache.clone(), ScanIndex::default(), "2026-10-29T12:00:00Z");
+    assert_eq!(first.snapshots.len(), 1);
+    assert!(index.claude_request_census.get(&key).is_some());
+    index.save(&index_path).unwrap();
+    assert_eq!(
+        cache
+            .durable_write_after_save(lock, source, &index)
+            .unwrap()
+            .written,
+        1
+    );
+    cache.retained().unwrap().clear();
+    let original_disk = store_snapshot(&store::store_dir_for_index(&index_path));
+    let append =
+        |id: &str| {
+            let text = a0h_row(id, 25).replace(
+                "1338a80a-f36e-4cbc-a5bb-50fc66430ba5",
+                "11111111-2222-4333-8444-555555555555",
+            );
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(text.as_bytes())
+                .unwrap();
+            // Actual opened source is idle beyond requested 1-day window.
+            File::open(&path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(1793059200),
+                ))
+                .unwrap();
+        };
+    append("growth-1");
+    let end = std::fs::metadata(&path).unwrap().len();
+    let now = std::time::Instant::now();
+    cache.durable().unwrap().retail_full_now = Some(now);
+    // Exactly enough for input + transferred graph reserve, but not typed
+    // decode. This is structural even when the global FIFO is idle.
+    let limit = store::RESTORE_INPUT_BYTES
+        + (store::RECORD_BYTES + super::super::AUDIT_AND_SCRATCH_BYTES) as u64
+        + 4 * key.len() as u64;
+    store::active::set_active_budget_for_test(Some(limit));
+    let ((next, caught, modes), reads) =
+        a0h_observe(|| run(cache.clone(), index, "2026-10-29T12:00:00Z"));
+    assert_eq!(modes, (1, 0, end));
+    assert_eq!(reads.1, end, "actual single Full input extent");
+    assert_eq!(caught.snapshots[0].input_tokens, 125);
+    assert_eq!(
+        next.files[&key].size_bytes, end,
+        "paced read commits catch-up"
+    );
+    assert!(
+        cache.retained().unwrap().peek(&key).is_none(),
+        "no-record publication"
+    );
+    assert_eq!(
+        store_snapshot(&store::store_dir_for_index(&index_path)),
+        original_disk
+    );
+    index = next;
+    append("growth-2");
+    let old_incidence = index.accepted_rebuild_incidence.clone();
+    let old_census = serde_json::to_value(&index.claude_request_census).unwrap();
+    for _ in 0..2 {
+        let ((held, output, modes), reads) =
+            a0h_observe(|| run(cache.clone(), index, "2026-10-29T12:00:00Z"));
+        assert!(output.snapshots.is_empty());
+        assert_eq!(modes, (0, 0, 0));
+        assert_eq!(reads.1, 0);
+        assert_eq!(
+            held.files[&key].size_bytes, end,
+            "old size retained for Parse"
+        );
+        assert_eq!(
+            held.accepted_rebuild_incidence, old_incidence,
+            "no incidence prune"
+        );
+        assert_eq!(
+            serde_json::to_value(&held.claude_request_census).unwrap(),
+            old_census,
+            "no census prune"
+        );
+        assert_eq!(output.oversized_file_count, 0, "no size prune");
+        index = held;
+    }
+    assert_eq!(cache.durable().unwrap().counters.active_bound[0], [1, 2]);
+    cache.durable().unwrap().retail_full_now =
+        Some(now + std::time::Duration::from_secs(PACE_SECS));
+    let (mut index, caught, modes) = run(cache.clone(), index, "2026-10-29T12:00:00Z");
+    let final_end = std::fs::metadata(&path).unwrap().len();
+    assert_eq!(modes, (1, 0, final_end));
+    assert_eq!(caught.snapshots[0].input_tokens, 150);
+    assert_eq!(index.files[&key].size_bytes, final_end);
+    assert_eq!(cache.durable().unwrap().counters.active_bound[0], [2, 2]);
+    index.save(&index_path).unwrap();
+    drop(cache);
+    let restarted = Arc::new(SharedCache::default());
+    restarted.durable_begin_pass(source, &index_path, &namespace, true);
+    let (index, idle, modes) = run(
+        restarted,
+        ScanIndex::load(&index_path).unwrap(),
+        "2026-10-29T12:00:00Z",
+    );
+    assert!(idle.snapshots.is_empty());
+    assert_eq!(modes, (0, 0, 0));
+    // After catch-up normal quiet-file retirement is safe; the restart
+    // contract here is zero reacquisition and no duplicate publication.
+    drop(index);
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "validated native restore layout")]
+fn b4_structural_memo_does_not_hold_same_size_shrink_or_approved_replay() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    assert!(crate::heap_layout_bound::layout_supported());
+    let root = crate::test_scratch::ScratchDir::new("b4-memo-correction");
+    let path = root.join("source.jsonl");
+    std::fs::write(&path, b"{}\n").unwrap();
+    let key = local_index_key(&path);
+    let source = SnapshotSource::ClaudeCode;
+    let scope = Scope("memo-correction".into());
+    let cache = SharedCache::default();
+    cache.durable_begin_pass(source, &root.join("index.json"), &scope, false);
+    assert!(cache.paced_full(source, &key, std::time::Instant::now(), true));
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        key.clone(),
+        serde_json::from_value(serde_json::json!({
+            "size_bytes":3, "modified_unix_seconds":1, "source_file_fingerprint":"fp"
+        }))
+        .unwrap(),
+    );
+    for length in [3, 6, 1] {
+        index.files.get_mut(&key).unwrap().size_bytes = length;
+        if length == 1 {
+            index.activate_effective_upload_body_witness_revision(3);
+            assert!(index.effective_upload_body_witness_revision_requires_adoption(&key));
+        }
+        let interpretation = Interpretation::of(source, &key, &index, false, &scope);
+        assert!(
+            matches!(
+                cache.durable_restore(
+                    source,
+                    &key,
+                    &path,
+                    &scope,
+                    &mut File::open(&path).unwrap(),
+                    &index,
+                    &interpretation
+                ),
+                RestoreOutcome::Miss
+            ),
+            "same-size/shrink/owed replay bypass growth-only memo"
+        );
+    }
 }

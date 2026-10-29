@@ -1620,6 +1620,7 @@ fn group_with_legacy_tee_is_byte_charged() {
     )
     .unwrap();
     let sampling = active.sampling.replace(sampled_scan::Active {
+        no_record: false,
         key: String::new(),
         scope: Scope("group-fixture".into()),
         mode: crate::transcript_acquisition::ReadMode::Tail,
