@@ -2693,6 +2693,7 @@ fn live_job_charge_is_estimated_between_bounded_walks() {
         census_trusted: true,
         pages: 0,
         unavailable_resumes: 0,
+        custody_deferred: None,
         charge: None,
         eof_applied: false,
         pace: JobPace::new([0; 2], std::time::Instant::now(), false),
@@ -6400,7 +6401,7 @@ fn durable_restore_then_tail_beside_a_held_fork_memo_and_parent_ledger_matches_c
     const SINGLE: &str = "019fa111-2222-7333-8444-cccccccccccc";
     let source = SnapshotSource::Codex;
     let namespace = Scope("cursor-fixture".into());
-    let capture = true; // Outside a sync cycle every scan captures.
+    let capture = true; // OwnedSourceScan::new captures in parser fixtures.
     let home = ForkHome::new(&ForkHome::diverging_child(3));
     fs::write(
         home.fixture.file(SINGLE),
@@ -11965,7 +11966,7 @@ fn held_growth_survives_old_window_cap_and_reload_then_synthetic_release_tails()
         let lock = crate::locked_state_dir::test_locks::hold(&state);
         let cache = Arc::new(SharedCache::default());
         let namespace = Scope("cursor-fixture".into());
-        let capture = crate::snapshots::claude_request_identity::capture_by_default();
+        let capture = true; // OwnedSourceScan::new captures in parser fixtures.
         cache.durable_begin_pass(SnapshotSource::Codex, &index_path, &namespace, capture);
         let (mut index, seed) = page(&fixture, ScanIndex::default(), Some(Arc::clone(&cache)));
         assert!(!seed.snapshots.is_empty());
@@ -12547,6 +12548,7 @@ fn pace_meta(temp: &Temp, pace: JobPace) -> JobMeta {
         census_trusted: true,
         pages: 1,
         unavailable_resumes: 0,
+        custody_deferred: None,
         charge: None,
         eof_applied: false,
         pace,
@@ -14973,4 +14975,676 @@ pub(in crate::snapshots) fn seed_join_provenance(cache: &SharedCache, owner: &st
                 .insert(owner.to_owned(), (0, key.to_owned()));
         })
         .expect("synthetic cursor lock");
+}
+
+#[test]
+fn deferred_custody_saves_decision_before_frozen_continuation_and_restart() {
+    use crate::local_resource_diagnostics::CodexZstCause;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::with_sessions(&[(SESSION, 80), (SESSION_B, 2)]);
+    let held = fixture.file(SESSION);
+    let key = local_index_key(&held);
+    let (_, main) = page(&fixture, ScanIndex::default(), None);
+    let expected = main
+        .snapshots
+        .iter()
+        .find(|s| s.source_session_id == SESSION_B)
+        .expect("unrelated plain publishes on main")
+        .snapshot_fingerprint
+        .clone();
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        let (mut index, first) = page(&fixture, ScanIndex::default(), Some(Arc::clone(&cache)));
+        assert!(first
+            .snapshots
+            .iter()
+            .any(|s| s.snapshot_fingerprint == expected));
+        let members = cache
+            .paused_members_for_test()
+            .expect("current acquired job");
+        let started = counter(&cache, |c| c.jobs_started);
+        let frozen = fs::metadata(&held).unwrap().len();
+        let mut dirs = codex_file_join::DirectoryCensus::new();
+        dirs.observe(&fixture.root, &fs::metadata(&fixture.root).unwrap());
+        let paths = BTreeSet::from([key.clone(), local_index_key(&fixture.file(SESSION_B))]);
+        let mut inventory = codex_file_join::HeaderInventory::new(
+            std::slice::from_ref(&fixture.root),
+            &paths,
+            Some(&dirs),
+        );
+        while !inventory.step_with_archive(&CodexTitleMetadata::default(), &mut index, None) {}
+        assert!(inventory.complete);
+        let mut committed = index.clone();
+        let before = committed.files.get(&key).cloned().unwrap_or_default();
+        index
+            .files
+            .entry(key.clone())
+            .or_default()
+            .codex_compressed_hold = Some(CodexZstCause::ParentLedgerUnbound);
+        let saved = fixture._dir.0.join("custody-decision.json");
+        let mut holder = codex_scan(&fixture, index, NOW)
+            .with_sampled_acquisition(Arc::clone(&cache), Scope("cursor-fixture".into()));
+        let (_, decisions) = crate::local_resource_diagnostics::capture(|| {
+            holder
+                .persist_custody_decisions(&mut committed, &saved)
+                .unwrap();
+        });
+        let persisted = ScanIndex::load(&saved).unwrap();
+        assert_eq!(
+            persisted.files[&key].codex_compressed_hold,
+            Some(CodexZstCause::ParentLedgerUnbound)
+        );
+        assert_eq!(persisted.files[&key].size_bytes, before.size_bytes);
+        assert_eq!(
+            persisted.files[&key].last_snapshot_fingerprint,
+            before.last_snapshot_fingerprint
+        );
+        assert_eq!(
+            persisted.files[&key].last_upload_body_witness,
+            before.last_upload_body_witness
+        );
+        // Independent restart branch: no cache/job survives, no header/body read.
+        let cold = Arc::new(SharedCache::default());
+        codex_compressed_hold_tests::no_open(&held, || {
+            let (_, scan) = page(&fixture, persisted, Some(Arc::clone(&cold)));
+            assert!(scan
+                .snapshots
+                .iter()
+                .all(|s| s.source_session_id != SESSION));
+        });
+        assert_eq!(counter(&cold, |c| c.jobs_started), 0);
+        let mut index = holder.index.clone();
+        // Growth happens AFTER the decision and save; continuation owns only frozen.
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&held)
+            .unwrap()
+            .write_all(b"\n")
+            .unwrap();
+        let mut events = decisions
+            .iter()
+            .filter_map(|r| r["counts"]["custody_latch_deferred"]["events"].as_u64())
+            .sum::<u64>();
+        assert_eq!(events, 1, "decision observed before continuation");
+        for _ in 0..128 {
+            let ((next, scan), rows) = crate::local_resource_diagnostics::capture(|| {
+                continuation_page(&fixture, index, &cache, &members, |scan| {
+                    scan.codex_join_inventory = Some(inventory.clone());
+                    scan.codex_join_prepared = true;
+                })
+            });
+            index = next;
+            assert_eq!(
+                counter(&cache, |c| c.jobs_started),
+                started,
+                "no replacement acquisition"
+            );
+            assert!(scan
+                .snapshots
+                .iter()
+                .all(|s| s.source_session_id != SESSION));
+            events += rows
+                .iter()
+                .filter_map(|r| r["counts"]["custody_latch_deferred"]["events"].as_u64())
+                .sum::<u64>();
+            assert_eq!(index.files[&key].size_bytes, before.size_bytes);
+            assert_eq!(
+                index.files[&key].last_snapshot_fingerprint,
+                before.last_snapshot_fingerprint
+            );
+            assert_eq!(
+                index.files[&key].last_upload_body_witness,
+                before.last_upload_body_witness
+            );
+            let consumed = cache
+                .with_cursor(|cursor| match &cursor.slot {
+                    Slot::Paused(job) => Some(job.parser.reader.consumed_bytes()),
+                    _ => None,
+                })
+                .flatten();
+            assert!(consumed.is_none_or(|n| n <= frozen));
+            if cache.cursor_slot_free() {
+                break;
+            }
+        }
+        assert!(cache.cursor_slot_free(), "bounded current job ends");
+        assert_eq!(events, 1);
+        assert!(index.files[&key].codex_compressed_hold.is_some());
+        index.save(&saved).unwrap();
+        let mut restarted = ScanIndex::load(&saved).unwrap();
+        let cold = Arc::new(SharedCache::default());
+        for _ in 0..3 {
+            let (next, _) = codex_compressed_hold_tests::no_open(&held, || {
+                page(&fixture, restarted, Some(Arc::clone(&cold)))
+            });
+            restarted = next;
+            assert!(restarted.files[&key].codex_compressed_hold.is_some());
+            assert_eq!(counter(&cold, |c| c.jobs_started), 0);
+        }
+    });
+}
+
+fn deferred_group_fixture(prior: bool) -> (ScanRoot, ScanIndex, Arc<SharedCache>, PathBuf) {
+    use crate::snapshots::codex_file_join::tests::usage;
+    fn chain(created: &str, start: u64, count: u64) -> Vec<u8> {
+        let mut bytes = codex_line(json!({"type":"session_meta", "timestamp":created,
+            "payload":{"id":SESSION,"timestamp":created}}));
+        for n in 1..=count {
+            bytes.extend(codex_line(
+                json!({"type":"token_usage_record", "timestamp":NOW,
+                "payload":{"thread_id":SESSION,"response_id":format!("{start}-{n}"),
+                "usage":usage(10),"thread_token_usage":usage(start+n*10)}}),
+            ));
+            bytes.extend(codex_line(json!({"type":"event_msg","timestamp":NOW,
+                "payload":{"type":"token_count","info":{"last_token_usage":usage(10),
+                "total_token_usage":usage(start+n*10)}}})));
+        }
+        bytes
+    }
+    let fixture = ScanRoot::new(0);
+    let path = fixture.file(SESSION);
+    let key = local_index_key(&path);
+    let cache = Arc::new(SharedCache::default());
+    let mut index = ScanIndex::default();
+    if prior {
+        fs::write(&path, chain("2026-10-07T10:00:00Z", 0, 1)).unwrap();
+        let (next, seed, _) = page_selections(
+            &fixture,
+            index,
+            Some(Arc::clone(&cache)),
+            "prior-incompatible-scope",
+            NOW,
+            |_| {},
+            usize::MAX,
+        );
+        index = next;
+        assert!(!seed.snapshots.is_empty());
+        assert!(index.files[&key].last_snapshot_fingerprint.is_some());
+        assert!(cache.retained_checkpoint(&key).is_some());
+    }
+    fs::write(&path, chain("2026-10-07T10:00:00Z", 0, 30)).unwrap();
+    let held = fixture.root.join("later.jsonl");
+    fs::write(&held, chain("2026-10-07T10:30:00Z", 300, 30)).unwrap();
+    for _ in 0..8 {
+        index.traversal = None;
+        index = page(&fixture, index, Some(Arc::clone(&cache))).0;
+        if cache.paused_members_for_test().is_some() {
+            break;
+        }
+    }
+    let consumed = cache
+        .with_cursor(|cursor| {
+            let Slot::Paused(job) = &cursor.slot else {
+                panic!("paused GROUP");
+            };
+            let group = job.group.as_ref().expect("real group");
+            assert_eq!(group.current, 0);
+            assert_eq!(job.candidate.path, path);
+            job.parser.reader.consumed_bytes()
+        })
+        .unwrap();
+    assert!(consumed > 0);
+    assert_eq!(
+        index
+            .files
+            .get(&key)
+            .is_some_and(|e| e.last_snapshot_fingerprint.is_some()),
+        prior
+    );
+    if prior {
+        assert!(
+            cache.retained_checkpoint(&key).is_some(),
+            "non-reusable record PRESENT"
+        );
+    } else {
+        assert!(!index.files.contains_key(&key));
+    }
+    (fixture, index, cache, held)
+}
+
+#[test]
+fn deferred_group_preserves_accepted_extent_and_releases_through_existing_ends() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for end in ["complete", "cancel", "drop", "evict", "unavailable"] {
+        with_test_limits(2048, 1024, 64, || {
+            let (fixture, mut index, cache, held) = deferred_group_fixture(true);
+            let members = cache.paused_members_for_test().unwrap();
+            let paths = members.clone();
+            let mut dirs = codex_file_join::DirectoryCensus::new();
+            dirs.observe(&fixture.root, &fs::metadata(&fixture.root).unwrap());
+            let mut inventory = codex_file_join::HeaderInventory::new(
+                std::slice::from_ref(&fixture.root),
+                &paths,
+                Some(&dirs),
+            );
+            while !inventory.step_with_archive(&CodexTitleMetadata::default(), &mut index, None) {}
+            assert!(inventory.complete);
+            let before = index.files.clone();
+            let mut committed = index.clone();
+            let key = local_index_key(&held);
+            index
+                .files
+                .entry(key.clone())
+                .or_default()
+                .codex_compressed_hold = Some(CodexZstCause::ParentLedgerUnbound);
+            let saved = fixture._dir.0.join("deferred-group.json");
+            let mut holder = codex_scan(&fixture, index, NOW)
+                .with_sampled_acquisition(Arc::clone(&cache), Scope("cursor-fixture".into()));
+            holder
+                .persist_custody_decisions(&mut committed, &saved)
+                .unwrap();
+            let mut index = holder.index.clone();
+            let started = counter(&cache, |c| c.jobs_started);
+            match end {
+                "cancel" | "drop" => {
+                    let (job, lease) = cache
+                        .cursor_resume(&Scope("cursor-fixture".into()), false)
+                        .unwrap();
+                    drop(job);
+                    if end == "cancel" {
+                        lease.release();
+                    } else {
+                        drop(lease);
+                    }
+                }
+                "evict" => {
+                    cache.with_cursor(|cursor| cursor.rotation.page += NAMESPACE_STALE_PAGES);
+                    assert!(cache
+                        .cursor_resume(&Scope("foreign".into()), false)
+                        .is_none());
+                }
+                _ => {
+                    for _ in 0..128 {
+                        let scan = OwnedSourceScan::new(
+                            SnapshotSource::Codex,
+                            std::slice::from_ref(&fixture.root),
+                            index,
+                            NOW,
+                            BACKFILL_WINDOW_DAYS,
+                            10,
+                            false,
+                            None,
+                            &[],
+                            false,
+                            true,
+                        )
+                        .with_sampled_acquisition(
+                            Arc::clone(&cache),
+                            Scope("cursor-fixture".into()),
+                        );
+                        let mut scan = scan;
+                        scan.codex_join_inventory = Some(inventory.clone());
+                        scan.codex_join_prepared = true;
+                        if end == "unavailable" {
+                            scan.codex_join_inventory.as_mut().unwrap().complete = false;
+                        }
+                        let (next, output) = finish_page(scan);
+                        index = next;
+                        assert!(output.snapshots.is_empty(), "no unproven group body");
+                        assert_eq!(counter(&cache, |c| c.jobs_started), started);
+                        if cache.cursor_slot_free() {
+                            break;
+                        }
+                    }
+                }
+            }
+            assert!(cache.cursor_slot_free(), "end={end}");
+            for (key, previous) in &before {
+                let now = &index.files[key];
+                assert_eq!(now.size_bytes, previous.size_bytes, "withheld extent {end}");
+                assert_eq!(
+                    now.last_snapshot_fingerprint,
+                    previous.last_snapshot_fingerprint
+                );
+                assert_eq!(
+                    now.last_upload_body_witness,
+                    previous.last_upload_body_witness
+                );
+                assert_eq!(
+                    serde_json::to_value(&now.codex_applied_tier_receipt).unwrap(),
+                    serde_json::to_value(&previous.codex_applied_tier_receipt).unwrap()
+                );
+            }
+            assert!(index.files[&key].codex_compressed_hold.is_some());
+            // Shutdown and scope changes share the same durable negative decision.
+            let restarted = ScanIndex::load(&saved).unwrap();
+            let cold = Arc::new(SharedCache::default());
+            codex_compressed_hold_tests::no_open(&held, || {
+                let (_, output) = page(&fixture, restarted, Some(Arc::clone(&cold)));
+                assert!(output.snapshots.is_empty());
+            });
+            assert_eq!(counter(&cold, |c| c.jobs_started), 0);
+        });
+    }
+}
+
+#[test]
+fn failed_custody_save_survives_preparation_loss_and_job_eviction() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for evict in [false, true] {
+        let fixture = ScanRoot::new(80);
+        let held = fixture.file(SESSION);
+        let key = local_index_key(&held);
+        let cache = Arc::new(SharedCache::default());
+        with_test_limits(2048, 1024, 64, || {
+            let (mut index, _) = paused_singleton(&fixture, &cache);
+            let valid = fixture._dir.0.join("committed.json");
+            index.save(&valid).unwrap();
+            let original = index.files.get(&key).cloned().unwrap_or_default();
+            let mut committed = index.clone();
+            index
+                .files
+                .entry(key.clone())
+                .or_default()
+                .codex_compressed_hold = Some(CodexZstCause::ParentLedgerUnbound);
+            let mut stale = committed.clone();
+            stale.generation += 1;
+            let mut lost = codex_scan(&fixture, index, NOW)
+                .with_sampled_acquisition(Arc::clone(&cache), Scope("cursor-fixture".into()));
+            assert!(lost.persist_custody_decisions(&mut stale, &valid).is_err());
+            drop(lost); // Production Refused drops this working index.
+            assert!(committed
+                .files
+                .get(&key)
+                .is_none_or(|e| e.codex_compressed_hold.is_none()));
+            if evict {
+                cache.with_cursor(|cursor| cursor.rotation.page += NAMESPACE_STALE_PAGES);
+                assert!(cache
+                    .cursor_resume(&Scope("foreign".into()), false)
+                    .is_none());
+                assert!(cache.cursor_slot_free());
+            }
+            let started = counter(&cache, |c| c.jobs_started);
+            let retry = codex_scan(&fixture, ScanIndex::load(&valid).unwrap(), NOW)
+                .with_sampled_acquisition(
+                    Arc::clone(&cache),
+                    Scope(if evict {
+                        "new-context".into()
+                    } else {
+                        "cursor-fixture".into()
+                    }),
+                );
+            let step = codex_compressed_hold_tests::no_open(&held, || retry.step(None));
+            let OwnedSourceScanStep::Pending(mut retry) = step else {
+                panic!("yield before reads");
+            };
+            assert!(cache.replay_custody_decision());
+            assert_eq!(counter(&cache, |c| c.jobs_started), started);
+            retry
+                .persist_custody_decisions(&mut committed, &valid)
+                .unwrap();
+            let loaded = ScanIndex::load(&valid).unwrap();
+            assert!(loaded.files[&key].codex_compressed_hold.is_some());
+            assert_eq!(loaded.files[&key].size_bytes, original.size_bytes);
+            assert_eq!(
+                loaded.files[&key].last_snapshot_fingerprint,
+                original.last_snapshot_fingerprint
+            );
+            assert_eq!(
+                loaded.files[&key].last_upload_body_witness,
+                original.last_upload_body_witness
+            );
+            assert!(cache
+                .with_cursor(|cursor| cursor.custody_unsaved.is_none())
+                .unwrap());
+        });
+    }
+}
+
+#[test]
+fn custody_negative_payload_survives_save_failure_funding_refusal_and_restart() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    with_test_limits(2048, 1024, 64, || {
+        for failure in 0..3 {
+            let (fixture, mut index, cache, held) = deferred_group_fixture(true);
+            let key = local_index_key(&held);
+            let plain = local_index_key(&fixture.file(SESSION));
+            assert_eq!(held.file_name().unwrap(), "later.jsonl");
+            assert!(codex_session_id_candidates_from_path(&held).is_empty());
+            let entry = index.files.get_mut(&plain).unwrap();
+            entry.codex_protected_owner = None;
+            entry.codex_counting_owner = None;
+            entry.codex_joined_member_set = None;
+            let old = entry.clone();
+            assert!(old.last_snapshot_fingerprint.is_some());
+            assert!(old.last_upload_body_witness.is_some());
+            let incidence = index.file_snapshot_fingerprints.clone();
+            let accepted = index.accepted_snapshot_fingerprints.clone();
+            let saved = fixture._dir.0.join("negative-payload.json");
+            index.save(&saved).unwrap();
+            let mut committed = index.clone();
+            index
+                .files
+                .entry(key.clone())
+                .or_default()
+                .codex_compressed_hold = Some(CodexZstCause::ParentLedgerUnbound);
+            index
+                .codex_state_only_blocked_by_file
+                .insert(key.clone(), BTreeSet::from([SESSION.into()]));
+            index
+                .codex_state_only_blocked_session_ids
+                .insert(SESSION.into());
+            let mut scan = codex_scan(&fixture, index, NOW)
+                .with_sampled_acquisition(Arc::clone(&cache), Scope("cursor-fixture".into()));
+            let mut stale = committed.clone();
+            if failure == 1 {
+                stale.generation += 1;
+            }
+            if failure == 2 {
+                cache.with_cursor(|cursor| cursor.reserved = STATE_BYTES);
+            }
+            let result = scan.persist_custody_decisions(
+                if failure == 1 {
+                    &mut stale
+                } else {
+                    &mut committed
+                },
+                &saved,
+            );
+            if failure == 0 {
+                result.unwrap();
+            } else {
+                assert!(result.is_err());
+                assert!(
+                    cache.replay_custody_decision(),
+                    "refusal owns COMPLETE debt"
+                );
+                assert!(!committed
+                    .codex_state_only_blocked_by_file
+                    .contains_key(&key));
+                assert!(!committed
+                    .codex_state_only_blocked_session_ids
+                    .contains(SESSION));
+                drop(scan); // Real Refused preparation loss.
+                if failure == 2 {
+                    cache.with_cursor(|cursor| cursor.reserved = 0);
+                }
+                let foreign = fixture._dir.0.join("foreign-index.json");
+                let mut other = committed.clone();
+                other.generation = 0;
+                other.save(&foreign).unwrap();
+                let bytes_before = fs::read(&foreign).unwrap();
+                let mut foreign_scan = codex_scan(&fixture, other.clone(), NOW)
+                    .with_sampled_acquisition(
+                        Arc::clone(&cache),
+                        Scope("foreign-destination".into()),
+                    );
+                assert!(foreign_scan
+                    .persist_custody_decisions(&mut other, &foreign)
+                    .is_err());
+                assert_eq!(fs::read(&foreign).unwrap(), bytes_before);
+                assert!(cache.replay_custody_decision());
+                drop(foreign_scan);
+                cache.with_cursor(|cursor| cursor.rotation.page += NAMESPACE_STALE_PAGES);
+                assert!(cache
+                    .cursor_resume(&Scope("foreign".into()), false)
+                    .is_none());
+                assert!(cache.cursor_slot_free());
+                let retry = codex_scan(&fixture, ScanIndex::load(&saved).unwrap(), NOW)
+                    .with_sampled_acquisition(Arc::clone(&cache), Scope("new-context".into()));
+                let OwnedSourceScanStep::Pending(mut retry) =
+                    codex_compressed_hold_tests::no_open(&held, || retry.step(None))
+                else {
+                    panic!("save precedes discovery");
+                };
+                retry
+                    .persist_custody_decisions(&mut committed, &saved)
+                    .unwrap();
+            }
+            let loaded = ScanIndex::load(&saved).unwrap();
+            assert_eq!(
+                loaded.files[&key].codex_compressed_hold,
+                Some(CodexZstCause::ParentLedgerUnbound)
+            );
+            assert!(loaded.codex_state_only_blocked_by_file[&key].contains(SESSION));
+            assert!(loaded
+                .codex_state_only_blocked_session_ids
+                .contains(SESSION));
+            assert_eq!(
+                loaded.files[&plain].last_snapshot_fingerprint,
+                old.last_snapshot_fingerprint
+            );
+            assert_eq!(
+                loaded.files[&plain].last_upload_body_witness,
+                old.last_upload_body_witness
+            );
+            assert_eq!(loaded.files[&plain].size_bytes, old.size_bytes);
+            assert_eq!(loaded.file_snapshot_fingerprints, incidence);
+            assert_eq!(loaded.accepted_snapshot_fingerprints, accepted);
+        }
+    });
+}
+
+#[test]
+fn deferred_custody_tail_priority_eof_never_reopens_as_full() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let clock = TestClock;
+    clock.set(1_900_000_000);
+    with_test_limits(2048, 8192, 64, || {
+        let fixture = ScanRoot::new(40);
+        let path = fixture.file(SESSION);
+        let key = local_index_key(&path);
+        let cache = Arc::new(SharedCache::default());
+        let mut index = ScanIndex::default();
+        for _ in 0..64 {
+            index = page(&fixture, index, Some(Arc::clone(&cache))).0;
+            if counter(&cache, |c| c.jobs_certified) == 1 {
+                break;
+            }
+        }
+        let checkpoint = cache
+            .retained_checkpoint(&key)
+            .expect("accepted Tail checkpoint");
+        assert_eq!(checkpoint.sealed_offset(), fixture.len(SESSION));
+        for n in 41..=80 {
+            fixture.append(SESSION, &token_line(n));
+        }
+        let mut priority = codex_line(
+            json!({"timestamp":"2026-10-07T10:30:00Z","type":"event_msg",
+            "payload":{"type":"token_count","service_tier":"priority","info":{"model":"fixture-model",
+            "total_token_usage":{"input_tokens":8100,"cached_input_tokens":4050,"output_tokens":810},
+            "last_token_usage":{"input_tokens":100,"cached_input_tokens":50,"output_tokens":10}}}}),
+        );
+        priority.pop();
+        fixture.append(SESSION, &priority);
+        let mut paused = false;
+        for number in 1..=64 {
+            let (next, output, _) = page_at(
+                &fixture,
+                index,
+                Some(Arc::clone(&cache)),
+                "cursor-fixture",
+                &collected_at(number),
+            );
+            index = next;
+            assert!(output.snapshots.is_empty());
+            paused = cache
+                .with_cursor(|cursor| match &cursor.slot {
+                    Slot::Paused(job) => job
+                        .sampling
+                        .as_ref()
+                        .is_some_and(|acquisition| matches!(acquisition.mode, ReadMode::Tail)),
+                    _ => false,
+                })
+                .unwrap();
+            if paused {
+                break;
+            }
+        }
+        assert!(paused, "real acquired Tail paused before priority EOF");
+        let prior = index.files[&key].clone();
+        assert!(prior.last_upload_body_witness.is_some());
+        let saved = fixture._dir.0.join("priority-custody.json");
+        index.save(&saved).unwrap();
+        let mut committed = index.clone();
+        index.files.get_mut(&key).unwrap().codex_compressed_hold =
+            Some(CodexZstCause::ParentLedgerUnbound);
+        index
+            .codex_state_only_blocked_by_file
+            .insert(key.clone(), BTreeSet::from([SESSION.into()]));
+        index
+            .codex_state_only_blocked_session_ids
+            .insert(SESSION.into());
+        let mut scan = codex_scan(&fixture, index, NOW)
+            .with_sampled_acquisition(Arc::clone(&cache), Scope("cursor-fixture".into()));
+        scan.persist_custody_decisions(&mut committed, &saved)
+            .unwrap();
+        index = scan.index;
+        let started = counter(&cache, |c| c.jobs_started);
+        let eof_before = counter(&cache, |c| c.eof_record_applied);
+        for number in 65..=192 {
+            let (next, output, modes) = page_at(
+                &fixture,
+                index,
+                Some(Arc::clone(&cache)),
+                "cursor-fixture",
+                &collected_at(number),
+            );
+            index = next;
+            assert_eq!(modes.0, 0, "custody must veto protected-tier Full replay");
+            assert!(output.snapshots.is_empty());
+            assert_eq!(index.files[&key].size_bytes, prior.size_bytes);
+            assert_eq!(
+                index.files[&key].last_snapshot_fingerprint,
+                prior.last_snapshot_fingerprint
+            );
+            assert_eq!(
+                index.files[&key].last_upload_body_witness,
+                prior.last_upload_body_witness
+            );
+            if cache.cursor_slot_free() {
+                break;
+            }
+        }
+        assert!(cache.cursor_slot_free());
+        assert_eq!(counter(&cache, |c| c.jobs_started), started);
+        assert_eq!(
+            counter(&cache, |c| c.eof_record_applied),
+            eof_before + 1,
+            "priority EOF reached the replay gate"
+        );
+        let cold = Arc::new(SharedCache::default());
+        codex_compressed_hold_tests::no_open(&path, || {
+            let (_, output, modes) = page_at(
+                &fixture,
+                ScanIndex::load(&saved).unwrap(),
+                Some(Arc::clone(&cold)),
+                "cursor-fixture",
+                NOW,
+            );
+            assert!(output.snapshots.is_empty());
+            assert_eq!(modes.0, 0);
+        });
+        assert_eq!(counter(&cold, |c| c.jobs_started), 0);
+    });
 }

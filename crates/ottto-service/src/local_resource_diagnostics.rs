@@ -94,6 +94,17 @@ pub(crate) fn codex_held_growth(bytes: u64, over_cap: u64) {
     );
 }
 
+/// Per-job deferrals and observed lifetime gauges, counts only.
+pub(crate) fn custody_latch_deferred(events: u64, pages: u64, age_seconds: u64) {
+    traversal_point(
+        "custody_latch_deferred",
+        "codex",
+        &serde_json::json!({
+            "custody_latch_deferred": {"events": events, "pages": pages, "age_seconds": age_seconds}
+        }),
+    );
+}
+
 pub(crate) fn codex_zst_refused(cause: CodexZstCause) {
     let counter = &CODEX_ZST_REFUSED[cause as usize];
     let previous = counter

@@ -146,6 +146,7 @@ impl DirectoryCensus {
 pub(super) struct HeaderWitness {
     pub(super) candidate: CandidateFile,
     pub(super) owner: String,
+    pub(super) custody_cause: Option<CodexZstCause>,
     pub(super) home: PathBuf,
     pub(super) created_unix_ms: Option<i64>,
     metadata: String,
@@ -401,8 +402,32 @@ fn group_key(home: &Path, owner: &str) -> String {
 }
 
 impl HeaderInventory {
+    pub(super) fn refresh_custody(&mut self, index: &ScanIndex) {
+        for header in &mut self.headers {
+            if let Some(cause) = index
+                .files
+                .get(&local_index_key(&header.candidate.path))
+                .and_then(|entry| entry.codex_compressed_hold)
+            {
+                header.custody_cause = Some(cause);
+            }
+        }
+    }
+    pub(super) fn member_held(&self, path: &Path) -> bool {
+        self.headers
+            .binary_search_by(|h| h.candidate.path.as_os_str().cmp(path.as_os_str()))
+            .is_ok_and(|at| self.headers[at].custody_cause.is_some())
+    }
+
     pub(super) fn complete_for(&self, owner: Option<&String>) -> bool {
-        self.complete && !owner.is_some_and(|owner| self.held_owners.contains(owner))
+        self.complete
+            && !owner.is_some_and(|owner| {
+                self.held_owners.contains(owner)
+                    || self
+                        .headers
+                        .iter()
+                        .any(|h| &h.owner == owner && h.custody_cause.is_some())
+            })
     }
     pub(super) fn new(
         roots: &[PathBuf],
@@ -643,6 +668,7 @@ impl HeaderInventory {
                 }
             };
             Ok(HeaderWitness {
+                custody_cause: None,
                 home: member_home(&candidate.scan_root),
                 candidate,
                 owner: facts.owner,
@@ -683,7 +709,11 @@ impl HeaderInventory {
     }
     pub(super) fn groups(&self) -> BTreeMap<String, Group> {
         let mut groups = BTreeMap::<String, Group>::new();
-        for header in &self.headers {
+        for header in self
+            .headers
+            .iter()
+            .filter(|h| !self.member_held(&h.candidate.path))
+        {
             let key = group_key(&header.home, &header.owner);
             groups
                 .entry(key)
@@ -715,7 +745,11 @@ impl HeaderInventory {
             self.directories.validate(home)?;
         }
         let mut checked_headers = 0;
-        for header in &self.headers {
+        for header in self
+            .headers
+            .iter()
+            .filter(|h| !self.member_held(&h.candidate.path))
+        {
             let Some(selected) = owners.get(&header.home) else {
                 continue;
             };
@@ -744,8 +778,9 @@ impl HeaderInventory {
     }
 }
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
-crate::heap_layout_bound::fields!(HeaderWitness; candidate, owner, home, created_unix_ms, metadata, stamp);
+crate::heap_layout_bound::fields!(HeaderWitness; custody_cause, candidate, owner, home, created_unix_ms, metadata, stamp);
 crate::heap_layout_bound::fields!(HeaderInventory; custody_incomplete, roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, archive_work, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, bounded_out);
+
 
 
 #[derive(Clone, Debug)]

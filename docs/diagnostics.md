@@ -1334,3 +1334,26 @@ values.
 A later complete native parse still emits its exclusive body for a session with
 an earlier state-only row. An emitted total alone does not prove a server-side
 overwrite; backend authority rules independently govern successor acceptance.
+
+
+### Deferred custody on a running Codex job
+
+`custody_latch_deferred` uses the existing counts-only `local_resources` carrier.
+`events` is one per already-acquired job that first observes a new correctness
+custody decision. `pages` and `age_seconds` are observed lifetime gauges for that
+job, not additive byte counts; no file path or session id is logged. Existing
+native collection counters account for the job's continuation bytes.
+
+The dedicated optional custody field saves the negative decision before another
+continuation byte. Only that existing job can continue, within its original
+frozen extent and original stamp, scope and counting checks. New jobs exclude
+held members. A restart loads ordinary quiet custody before header acquisition.
+The job's output is withheld as a unit before accepted extent, ACK, fingerprint
+or witness updates. Its normal completion, error, loss, eviction or scope change
+releases the slot through the existing lifecycle; the saved decision then permits
+no further read. Unavailable group evidence ends after three ordinary resume
+pages; group jobs are never accelerated. Catch-up/release remains owner work.
+No cleanup drops consumed progress and no custody restart-Full exception exists.
+
+Post-release counts: `custody_latch_deferred.events`; observe its `pages` and
+`age_seconds` lifetime gauges alongside existing held-growth and native read counts.

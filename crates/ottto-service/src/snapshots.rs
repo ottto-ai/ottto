@@ -27337,6 +27337,13 @@ impl OwnedSourceScan {
         attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
         capture_credit: Option<&mut Option<crate::source_rotation::PaidReservation>>,
     ) -> Result<OwnedSourceScanStep, crate::source_rotation::LocalRefusal> {
+        if self.source == SnapshotSource::Codex {
+            if let Some(context) = self.sampling.as_ref() {
+                if context.cache.replay_custody_decision() {
+                    return Ok(OwnedSourceScanStep::Pending(self));
+                }
+            }
+        }
         let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(
             self.source == SnapshotSource::ClaudeCode,
         );
@@ -27552,6 +27559,7 @@ impl OwnedSourceScan {
                     if !done {
                         pending!();
                     }
+                    inventory.refresh_custody(index);
                     if inventory.custody_incomplete
                         || index
                             .files
@@ -27572,6 +27580,7 @@ impl OwnedSourceScan {
                         codex_join_prepared = true;
                         pending!();
                     }
+
                     let unresolved = &inventory.held_owners;
                     residue_blocked_session_ids.extend(unresolved.iter().cloned());
                     codex_state_only_blocked_session_ids.extend(unresolved.iter().cloned());
@@ -28383,6 +28392,8 @@ impl OwnedSourceScan {
                 // never spins within a page.
                 if let Some(context) = sampling.as_ref().filter(|_| {
                     !codex_page.cursor_exhausted(sampled_scan::codex_cursor::Limits::current())
+                        // Custody cleanup above is namespace-scoped; foreign
+                        // jobs must reach cursor_resume's stale-job retirement.
                         && codex_join_inventory.is_some()
                         && (!codex_page.continuation() || codex_parent_identities.census_valid())
                         && codex_page.claim_resume()
@@ -28868,6 +28879,17 @@ impl OwnedSourceScan {
                             plan.metrics().native_bytes,
                         );
                     }
+                }
+                // A deferred correctness decision withholds this job as a unit.
+                // Accepted extents, ACKs and witnesses remain at their prior end.
+                if source == SnapshotSource::Codex
+                    && active.cursor.is_some()
+                    && sampled_scan::codex_cursor::job_has_custody(&active, index)
+                {
+                    if let Some(lease) = codex_cursor_lease.take() {
+                        lease.release();
+                    }
+                    pending!();
                 }
                 if active.sampling.as_ref().is_some_and(|acquisition| {
                     !matches!(

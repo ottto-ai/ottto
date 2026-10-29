@@ -5435,12 +5435,15 @@ impl SourcePreparation {
             Ok(crate::snapshots::OwnedSourceScanStep::Pending(mut next)) => {
                 if next
                     .persist_archive_reservation(&mut self.committed_index, &self.index_path)
+                    .and_then(|()| {
+                        next.persist_custody_decisions(&mut self.committed_index, &self.index_path)
+                    })
                     .is_err()
                 {
                     self.scan = Some(next);
                     return SourcePreparationStep::Refused(
                         self,
-                        crate::source_rotation::LocalRefusal("archive reservation save refused"),
+                        crate::source_rotation::LocalRefusal("read reservation save refused"),
                     );
                 }
                 self.scan = Some(next);

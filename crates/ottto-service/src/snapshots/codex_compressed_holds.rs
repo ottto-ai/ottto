@@ -81,3 +81,115 @@ pub(super) fn deserialize_hold<'de, D: serde::Deserializer<'de>>(
     }
     de.deserialize_any(Hold)
 }
+
+impl OwnedSourceScan {
+    /// Save only negative decisions for the current paused job before another
+    /// byte can be read. Never advances accepted extent, fingerprint or ACK.
+    pub(crate) fn persist_custody_decisions(
+        &mut self,
+        committed: &mut ScanIndex,
+        path: &Path,
+    ) -> Result<()> {
+        if self.source != SnapshotSource::Codex {
+            return Ok(());
+        }
+        let Some(context) = self.sampling.as_ref() else {
+            return Ok(());
+        };
+        while let Some(transaction) = context.cache.custody_decision_to_save(
+            &context.namespace,
+            &mut self.index,
+            committed,
+            path,
+        )? {
+            let d = transaction.decision.as_ref().expect("owned decision");
+            // Charge resident escrow + every staging/rollback/working-copy
+            // key, set and node BEFORE cloning or mutating either index.
+            use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+            let mut cost = Counter::new(crate::source_rotation::PARKED_BUDGET);
+            let peak = (|| {
+                d.heap_bound(&mut cost)?;
+                for _ in 0..4 {
+                    d.owners.heap_bound(&mut cost)?;
+                    d.veto.heap_bound(&mut cost)?;
+                    if let Some(owners) = committed.codex_state_only_blocked_by_file.get(&d.key) {
+                        owners.heap_bound(&mut cost)?;
+                    }
+                    cost.add(d.key.len())?;
+                    cost.add(crate::heap_layout_bound::tree_node_bytes::<
+                        String,
+                        ScanIndexEntry,
+                    >()?)?;
+                    cost.add(crate::heap_layout_bound::tree_node_bytes::<
+                        String,
+                        BTreeSet<String>,
+                    >()?)?;
+                }
+                cost.add(16384)?;
+                Some(cost.bytes)
+            })();
+            let _funding = peak
+                .and_then(|bytes| transaction.fund(bytes))
+                .ok_or_else(|| anyhow::anyhow!("custody negative transaction unfunded"))?;
+            let mut owners = committed
+                .codex_state_only_blocked_by_file
+                .get(&d.key)
+                .cloned()
+                .unwrap_or_default();
+            owners.extend(d.owners.iter().cloned());
+            let mut added_veto = BTreeSet::new();
+            for owner in d.veto.iter().chain(&d.owners) {
+                if !committed
+                    .codex_state_only_blocked_session_ids
+                    .contains(owner)
+                {
+                    added_veto.insert(owner.clone());
+                }
+            }
+            let existed = committed.files.contains_key(&d.key);
+            let previous = committed
+                .files
+                .entry(d.key.clone())
+                .or_default()
+                .codex_compressed_hold;
+            committed
+                .files
+                .get_mut(&d.key)
+                .expect("present decision")
+                .codex_compressed_hold = Some(d.cause);
+            let previous_owners = committed
+                .codex_state_only_blocked_by_file
+                .insert(d.key.clone(), owners);
+            committed
+                .codex_state_only_blocked_session_ids
+                .extend(added_veto.iter().cloned());
+            if let Err(error) = committed.save(path) {
+                if existed {
+                    committed
+                        .files
+                        .get_mut(&d.key)
+                        .expect("present decision")
+                        .codex_compressed_hold = previous;
+                } else {
+                    committed.files.remove(&d.key);
+                }
+                if let Some(owners) = previous_owners {
+                    committed
+                        .codex_state_only_blocked_by_file
+                        .insert(d.key.clone(), owners);
+                } else {
+                    committed.codex_state_only_blocked_by_file.remove(&d.key);
+                }
+                for owner in &added_veto {
+                    committed.codex_state_only_blocked_session_ids.remove(owner);
+                }
+                // Drop restores the entire pending payload, including owner
+                // scope, even if this preparation and its job are then lost.
+                return Err(error);
+            }
+            self.index.generation = committed.generation;
+            transaction.complete(&mut self.index);
+        }
+        Ok(())
+    }
+}
