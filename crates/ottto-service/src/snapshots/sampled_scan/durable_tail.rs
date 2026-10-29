@@ -192,7 +192,8 @@ struct Slot {
     /// Keys held (U) by this source, and the totals the last alarm reported:
     /// [held, t14_rebuild, mode_repaired, disabled, upgrade_state_missing].
     held: u64,
-    reported: [u64; 5],
+    old_binding_no_match: u64,
+    reported: [u64; 6],
 }
 
 /// Process-lifetime durable state beside the RAM cache.
@@ -802,6 +803,16 @@ impl SharedCache {
     fn durable(&self) -> Option<std::sync::MutexGuard<'_, Stores>> {
         self.durable.lock().ok()
     }
+    pub(crate) fn no_match_full(&self, file: &File, a: Option<AcceptedFloor>) -> Option<()> {
+        let a = a?;
+        if a.revision > effective_revision(SnapshotSource::ClaudeCode)
+            || file.metadata().ok()?.len() <= a.end
+        {
+            return None;
+        }
+        self.durable()?.claude.as_mut()?.old_binding_no_match += 1;
+        Some(())
+    }
 
     /// Selects `source`'s store for this pass, the sibling of `index_path`,
     /// under the pass's sampled scope (`namespace`) and identity-capture
@@ -832,7 +843,8 @@ impl SharedCache {
                 namespace: namespace.clone(),
                 identity_capture,
                 held: 0,
-                reported: [0; 5],
+                old_binding_no_match: 0,
+                reported: [0; 6],
             });
         }
     }
@@ -1677,6 +1689,7 @@ impl SharedCache {
         #[derive(serde::Serialize)]
         struct Alarm {
             held_keys: [u64; 2],
+            old_binding_no_match: [u64; 2],
             upgrade_state_missing: [u64; 2],
             upgrade_count_basis: &'static str,
             t14_rebuild: [u64; 2],
@@ -1705,6 +1718,7 @@ impl SharedCache {
             store.mode_repaired,
             u64::from(disabled.is_some()),
             upgrade,
+            slot.old_binding_no_match,
         ];
         let last = std::mem::replace(&mut slot.reported, now);
         drop(stores);
@@ -1714,6 +1728,7 @@ impl SharedCache {
                 snapshot_source.api_slug(),
                 &Alarm {
                     held_keys: pair(0),
+                    old_binding_no_match: pair(5),
                     upgrade_state_missing: pair(4),
                     upgrade_count_basis: if source == DurableSource::ClaudeCode {
                         "native_read"

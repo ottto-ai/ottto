@@ -31877,7 +31877,22 @@ impl OwnedSourceScan {
                                         );
                                         (Some(taken.retained), Some(admission))
                                     }
-                                    sampled_scan::durable_tail::RestoreOutcome::Stale(_reason) => {
+                                    sampled_scan::durable_tail::RestoreOutcome::Stale(
+                                        "old_binding_no_match",
+                                    ) if source == SnapshotSource::ClaudeCode
+                                        && parse_reason
+                                            == Some(CandidateParseReason::TranscriptChanged)
+                                        && context
+                                            .cache
+                                            .no_match_full(
+                                                parser.reader.reader.get_ref(),
+                                                durable_accepted,
+                                            )
+                                            .is_some() =>
+                                    {
+                                        (None, taken_admission)
+                                    }
+                                    sampled_scan::durable_tail::RestoreOutcome::Stale(_) => {
                                         context.cache.durable_stale_hold(source, index, &candidate);
                                         pending!();
                                     }
