@@ -141,7 +141,11 @@ impl codex_file_join::HeaderInventory {
                 let Some(cost) = crate::heap_layout_bound::tree_node_bytes::<String, ()>()
                     .and_then(|cost| cost.checked_add(owner.capacity()))
                     .and_then(|cost| self.feed_peak.checked_add(cost))
-                    .filter(|cost| *cost <= crate::source_rotation::PARKED_BUDGET / 2)
+                    .filter(|cost| {
+                        self.decode_peak
+                            .checked_add(*cost)
+                            .is_some_and(|total| total <= crate::source_rotation::PARKED_BUDGET / 2)
+                    })
                 else {
                     self.refuse_custody();
                     break;
@@ -174,6 +178,7 @@ impl codex_file_join::HeaderInventory {
             if cost
                 .add(OWNER_LOOKUP_SLACK)
                 .and_then(|_| cost.add(self.feed_peak))
+                .and_then(|_| cost.add(self.decode_peak))
                 .is_none()
             {
                 self.refuse_custody();

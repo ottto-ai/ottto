@@ -26533,7 +26533,10 @@ impl OwnedSourceScan {
             claude_twin_only_family_reparses: Default::default(),
             identified_candidates: Default::default(),
             active_file: Default::default(),
-            codex_join_inventory: evidence.map(|e| e.inventory),
+            codex_join_inventory: evidence.map(|mut e| {
+                e.inventory.reset_decode_custody();
+                e.inventory
+            }),
             codex_join_prepared: true,
             codex_join_groups: Default::default(),
             codex_join_active: None,
@@ -27614,6 +27617,15 @@ impl OwnedSourceScan {
                 () => {
                     break 'scan_step
                 };
+            }
+            // Carried header facts do not carry custody for a newly loaded
+            // index. Rebuild the bounded raw scope before any cursor resumes.
+            if source == SnapshotSource::Codex && codex_page.continuation() {
+                if let Some(inventory) = codex_join_inventory.as_mut() {
+                    if !inventory.prepare_decode_custody(index) {
+                        pending!();
+                    }
+                }
             }
             if source == SnapshotSource::Codex && !codex_join_prepared {
                 if let Some(inventory) = codex_join_inventory.as_mut() {

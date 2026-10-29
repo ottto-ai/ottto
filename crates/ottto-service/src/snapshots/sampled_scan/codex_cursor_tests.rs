@@ -16742,6 +16742,16 @@ fn omitted_raw_archive_fences_paused_singleton_and_group_across_reload() {
                         let (i, _) = paused_singleton(&f, &c);
                         (f, i, c)
                     };
+                    let resumed = counter(&cache, |c| c.jobs_resumed);
+                    let (next, control_output) = continuation_page(&fixture, index, &cache, |_| {});
+                    index = next;
+                    assert_eq!(
+                        counter(&cache, |c| c.jobs_resumed),
+                        resumed + 1,
+                        "positive control: same job/context is compatible before raw reload"
+                    );
+                    assert!(control_output.snapshots.is_empty());
+                    assert!(cache.paused_members_for_test().is_some());
                     let external = crate::test_scratch::ScratchDir::new("cursor-omitted-raw-home");
                     let archive = external
                         .as_ref()
@@ -16814,10 +16824,7 @@ fn omitted_raw_archive_fences_paused_singleton_and_group_across_reload() {
                     let certified = counter(&cache, |c| c.jobs_certified);
                     let decoders =
                         crate::snapshots::codex_zst_refusal_tests::decoder_construction_count();
-                    let (next, output) = continuation_page(&fixture, index, &cache, |scan| {
-                        scan.codex_join_inventory = Some(inventory.clone());
-                        scan.codex_join_prepared = false;
-                    });
+                    let (next, output) = continuation_page(&fixture, index, &cache, |_| {});
                     index = next;
                     assert!(output.snapshots.is_empty());
                     assert_eq!(counter(&cache, |c| c.jobs_certified), certified);

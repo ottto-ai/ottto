@@ -412,6 +412,7 @@ pub(super) struct HeaderInventory {
     decode_after: Option<String>,
     decode_done: bool,
     decode_unknown: bool,
+    pub(super) decode_peak: usize,
     pub(super) first_read_archives: BTreeSet<String>,
     pub(super) deferred_archives: BTreeSet<String>,
     /// Bound archives held by name with a resolved family sibling (value: twin).
@@ -450,15 +451,19 @@ impl HeaderInventory {
             if !self.decode_held_owners.contains(&owner) {
                 let cost = crate::heap_layout_bound::tree_node_bytes::<String, ()>()
                     .and_then(|node| node.checked_add(owner.capacity()))
-                    .and_then(|node| self.feed_peak.checked_add(node))
-                    .filter(|cost| *cost <= crate::source_rotation::PARKED_BUDGET / 2);
+                    .and_then(|node| self.decode_peak.checked_add(node))
+                    .filter(|cost| {
+                        self.feed_peak
+                            .checked_add(*cost)
+                            .is_some_and(|total| total <= crate::source_rotation::PARKED_BUDGET / 2)
+                    });
                 let Some(cost) = cost else {
                     self.complete = false;
                     self.bounded_out = true;
                     self.decode_unknown = true;
                     return;
                 };
-                self.feed_peak = cost;
+                self.decode_peak = cost;
                 self.decode_held_owners.insert(owner);
             }
         } else {
@@ -475,6 +480,13 @@ impl HeaderInventory {
             }
         }
     }
+    pub(super) fn reset_decode_custody(&mut self) {
+        self.decode_after = None;
+        self.decode_done = false;
+        self.decode_unknown = false;
+        self.decode_peak = 0;
+        self.decode_held_owners = BTreeSet::new();
+    }
     pub(super) fn prepare_decode_custody(&mut self, index: &ScanIndex) -> bool {
         if self.decode_done {
             return true;
@@ -482,18 +494,18 @@ impl HeaderInventory {
         if let Some(key) = index.decode_held_file_after(self.decode_after.as_deref()) {
             // The continuation cursor is charged before copying its raw key,
             // alongside the existing owner scratch (not a new allowance).
-            let Some(cost) = self
-                .feed_peak
-                .checked_add(key.len())
-                .filter(|cost| *cost <= crate::source_rotation::PARKED_BUDGET / 2)
-            else {
+            let Some(cost) = self.decode_peak.checked_add(key.len()).filter(|cost| {
+                self.feed_peak
+                    .checked_add(*cost)
+                    .is_some_and(|total| total <= crate::source_rotation::PARKED_BUDGET / 2)
+            }) else {
                 self.decode_unknown = true;
                 self.complete = false;
                 self.bounded_out = true;
                 self.decode_done = true;
                 return true;
             };
-            self.feed_peak = cost;
+            self.decode_peak = cost;
             self.record_decode_custody(index, key);
             self.decode_after = Some(key.to_owned());
             return false;
@@ -642,6 +654,7 @@ impl HeaderInventory {
             decode_after: None,
             decode_done: false,
             decode_unknown: false,
+            decode_peak: 0,
             first_read_archives: BTreeSet::new(),
             deferred_archives: BTreeSet::new(),
             family_held: BTreeMap::new(),
@@ -1125,7 +1138,7 @@ impl HeaderInventory {
 }
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
 crate::heap_layout_bound::fields!(HeaderWitness; plain_twin, custody_cause, candidate, owner, home, created_unix_ms, metadata, stamp);
-crate::heap_layout_bound::fields!(HeaderInventory; cached_archives_only, feed_prepared, feed_after, feed_peak, custody_next, absence_held, custody_unknown, custody_after, custody_done, custody_peak, custody_refused, roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, decode_held_owners, decode_after, decode_done, decode_unknown, archive_work, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, bounded_out, first_read_archives, deferred_archives, family_held);
+crate::heap_layout_bound::fields!(HeaderInventory; cached_archives_only, feed_prepared, feed_after, feed_peak, custody_next, absence_held, custody_unknown, custody_after, custody_done, custody_peak, custody_refused, roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, decode_held_owners, decode_after, decode_done, decode_unknown, decode_peak, archive_work, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, bounded_out, first_read_archives, deferred_archives, family_held);
 
 #[derive(Clone, Debug)]
 pub(super) struct Group {
