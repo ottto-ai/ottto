@@ -5716,19 +5716,21 @@ fn prepare_sync_source(
     let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(
         source == SnapshotSource::ClaudeCode,
     );
-    let result = prepare_sync_source_inner(
-        client,
-        device,
-        device_secret,
-        source,
-        machine_id,
-        home,
-        support_dir,
-        daemon,
-        transport_cycle,
-        account_witness,
-        retry_enabled,
-    );
+    let result = crate::local_resource_diagnostics::source_prepare(source.api_slug(), || {
+        prepare_sync_source_inner(
+            client,
+            device,
+            device_secret,
+            source,
+            machine_id,
+            home,
+            support_dir,
+            daemon,
+            transport_cycle,
+            account_witness,
+            retry_enabled,
+        )
+    });
     let counts = diagnostics.finish();
     if let Ok(Some(preparation)) = &result {
         if let Some(lease) = preparation.native_comparison_lease.as_ref() {
