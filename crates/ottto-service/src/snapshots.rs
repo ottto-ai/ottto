@@ -29052,7 +29052,7 @@ impl OwnedSourceScan {
                         })
                 {
                     let owners = parsed_file.state_only_blocked_session_ids.clone();
-                    let fanout_admitted = if let Some(inventory) = codex_join_inventory.as_mut() {
+                    if let Some(inventory) = codex_join_inventory.as_mut() {
                         inventory
                             .headers
                             .sort_unstable_by(|a, b| a.owner.cmp(&b.owner));
@@ -29067,28 +29067,14 @@ impl OwnedSourceScan {
                         });
                         inventory.custody_next = 0;
                         codex_join_prepared = false;
-                        !inventory.custody_refused
-                            && !inventory.custody_unknown
-                            && aliases
-                                .iter()
-                                .all(|alias| inventory.member_held(&alias.path))
-                    } else {
-                        aliases.is_empty()
-                    };
+                    }
+                    // Sibling/alias minting must use paged current-witness
+                    // qualification, including the refused admission path.
                     index.hold_compressed(
                         &candidate.path,
                         owners.clone(),
                         CodexZstCause::ParentLedgerUnbound,
                     );
-                    if fanout_admitted {
-                        for alias in &aliases {
-                            index.hold_compressed(
-                                &alias.path,
-                                owners.clone(),
-                                CodexZstCause::ParentLedgerUnbound,
-                            );
-                        }
-                    }
                     codex_state_only_blocked_session_ids.extend(owners);
                     pending!();
                 }
