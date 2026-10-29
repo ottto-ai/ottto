@@ -208,6 +208,7 @@ impl Family {
             None,
             Some(completion.fold_view(Some(&lease))),
             &BTreeMap::new(),
+            true,
         );
         items.clone_from_slice(&scan.snapshots);
         completion.capture_native_corrections(

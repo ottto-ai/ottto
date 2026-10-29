@@ -73,7 +73,7 @@ current certificate supports only the conservative complete rebuild; the paged
 fold must implement its bounded equivalent before authority can resume.
 
 No persisted fields or format revision are added. Admission uses the existing
-cursor; rediscovery cadence and the strict-service cursor are explicitly
-omitted from serialization and safely resets on
-restart. Tests use synthetic sources. Local validation is package clippy with
+cursor; rediscovery cadence is omitted from serialization. Strict-service
+continuation lives in a bounded process-owned context cache, survives ordinary
+index reloads and safely starts over after a daemon restart. Tests use synthetic sources. Local validation is package clippy with
 all targets; tests run in CI, never through local `cargo test`.

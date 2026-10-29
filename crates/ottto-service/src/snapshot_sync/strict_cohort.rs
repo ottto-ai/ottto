@@ -7,7 +7,38 @@ pub(super) struct Plan {
     pub deferred: BTreeSet<String>,
     pub deferred_bytes: u64,
 }
+// A normal source cycle reloads ScanIndex. Keep scheduling in bounded
+// process-owned memory, scoped to support directory + active context/replay.
+// Eviction/restart only revisits a prefix; neither grants nor drops evidence.
+static CURSORS: std::sync::Mutex<VecDeque<(String, Option<String>)>> =
+    std::sync::Mutex::new(VecDeque::new());
+const CURSOR_SCOPES: usize = 64;
 pub(super) fn plan(
+    support: &Path,
+    roots: Vec<String>,
+    page: &BTreeSet<String>,
+    scope: &str,
+) -> Plan {
+    let key = format!(
+        "{:x}",
+        Sha256::digest(format!("{}:{scope}", support.display()).as_bytes())
+    );
+    let mut cursors = CURSORS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut cursor = cursors
+        .iter()
+        .position(|(saved, _)| saved == &key)
+        .and_then(|at| cursors.remove(at))
+        .and_then(|(_, cursor)| cursor);
+    let result = select(support, roots, page, &mut cursor);
+    if cursors.len() >= CURSOR_SCOPES {
+        cursors.pop_front();
+    }
+    cursors.push_back((key, cursor));
+    result
+}
+fn select(
     support: &Path,
     roots: Vec<String>,
     page: &BTreeSet<String>,
@@ -21,7 +52,7 @@ pub(super) fn plan(
     ordered.extend(
         roots
             .iter()
-            .filter(|r| !page.contains(*r) && after.is_none_or(|a| r.as_str() > a)),
+            .filter(|r| !page.contains(*r) && after.map_or(true, |a| r.as_str() > a)),
     );
     ordered.extend(
         roots
@@ -83,8 +114,14 @@ mod tests {
             }
         }
         let page = BTreeSet::from([roots[0].clone()]);
-        let mut cursor = None;
-        let first = plan(&scratch, roots.clone(), &page, &mut cursor);
+        let mut index = ScanIndex::default();
+        index.activate_upload_context("cohort-context".into());
+        let first = plan(
+            &scratch,
+            roots.clone(),
+            &page,
+            &index.claude_strict_service_scope(),
+        );
         assert_eq!(first.roots.len(), ROOTS_PER_PASS);
         assert_eq!(first.deferred.len(), 3);
         assert_eq!(first.deferred_bytes, 6, "two EOF sentinels per paired root");
@@ -112,7 +149,17 @@ mod tests {
             "actual consumed sidecar bytes, not estimated sizes"
         );
         drop(allowance);
-        let second = plan(&scratch, roots, &page, &mut cursor);
+        // Production prepare reloads the index every cycle, not only after a
+        // daemon restart. This continuation must survive that ordinary load.
+        let mut loaded: ScanIndex =
+            serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
+        loaded.activate_upload_context("cohort-context".into());
+        let second = plan(
+            &scratch,
+            roots,
+            &page,
+            &loaded.claude_strict_service_scope(),
+        );
         assert!(
             first
                 .deferred

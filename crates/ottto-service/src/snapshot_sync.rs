@@ -8924,7 +8924,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         .into_iter()
         .collect::<Vec<_>>();
     stats.candidate_root_count = usage_roots.len();
-    let mut strict_cursor = index.claude_strict_cursor().clone();
     let request_owned_enabled = crate::snapshots::claude_request_money::e2::enabled();
     // A family kept on ordinary money (listed) reads its telemetry as gate off.
     let request_owned =
@@ -8972,8 +8971,12 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     let page_roots = claude_evidence_root_session_ids(&scan_result.snapshots)
         .into_iter()
         .collect::<BTreeSet<_>>();
-    let strict_plan =
-        strict_cohort::plan(support_dir, usage_roots, &page_roots, &mut strict_cursor);
+    let strict_plan = strict_cohort::plan(
+        support_dir,
+        usage_roots,
+        &page_roots,
+        &index.claude_strict_service_scope(),
+    );
     let mut deferred_roots = strict_plan.deferred.len();
     let mut deferred_bytes = strict_plan.deferred_bytes;
     if deferred_roots > 0 {
@@ -9077,16 +9080,12 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             trace_report.evidence.insert(root_session_id, rows);
         }
     }
-    *index.claude_strict_cursor() = strict_cursor;
     let strict_bytes = strict_budget.consumed();
     drop(strict_budget);
     eprintln!("strict_cohort_deferred roots={deferred_roots} bytes={} consumed_bytes={strict_bytes} allowance_bytes={} custody=UNPROVEN", deferred_bytes, strict_cohort::BYTES_PER_PASS);
-    if deferred_roots > 0 {
-        // Legacy cross-root owner/negative dependencies are not complete.
-        // Do not infer uniqueness/absence from the serviced subset. Contract-5
-        // page-local reads keep their independent per-root health verdicts.
-        api_report.health.unreadable_lines += 1;
-    }
+    // Keep global negative-dependency debt separate from per-root health:
+    // page-local healthy accounting must not become an unrelated read error.
+    scan_result.strict_cohort_deferred_root_count = deferred_roots;
     if stats.request_set_mismatch_root_count > 0 {
         index.note_claude_ignored_rearm_veto(
             &scan_result.census_window_end,

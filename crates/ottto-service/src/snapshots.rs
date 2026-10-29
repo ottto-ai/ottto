@@ -2271,8 +2271,6 @@ impl ClaudeStaleFamilyCarry {
 struct ClaudeFullRearmProgress {
     #[serde(skip)]
     terminal_off_rediscovery_after: u64,
-    #[serde(skip)]
-    terminal_off_strict_after: Option<String>,
     // Process-local proof: every decode drops it. A restart between read and
     // close therefore fails closed, even if persisted scheduling survives.
     #[serde(skip)]
@@ -7387,6 +7385,8 @@ pub struct SourceScanResult {
     pub scanned_session_count: usize,
     pub semantic_noop_count: usize,
     pub census_complete: bool,
+    // Per-page strict I/O debt, never serialized into ScanIndex.
+    pub(crate) strict_cohort_deferred_root_count: usize,
     pub census_window_end: String,
     /// State-only Codex census is separate from transcript discovery. If an
     /// existing SQLite source was unreadable, its previous durable map must be
@@ -8609,6 +8609,7 @@ fn apply_claude_reported_usage_with_index_and_limits(
         None,
         None,
         &BTreeMap::new(),
+        true,
     )
 }
 
@@ -8724,6 +8725,7 @@ pub(crate) fn apply_claude_reported_usage_to_scan_with_comparison(
         observations,
         comparison,
         veto_api_rows,
+        scan.strict_cohort_deferred_root_count == 0,
     );
     // Slice D1: report only. The shadow was measured by the scan; no fold
     // input above read it.
@@ -8755,7 +8757,7 @@ fn claude_owned_start_eligible(
                 return None;
             }
             let request_hashes = pending.member_request_id_hashes.get(source_session_id)?;
-            if !request_hashes.is_disjoint(&duplicated_request_hashes) {
+            if !request_hashes.is_disjoint(duplicated_request_hashes) {
                 return None;
             }
             let indexed_fingerprint = index.files.iter().find_map(|(index_key, entry)| {
@@ -8784,6 +8786,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     observations: Option<ClaudeNativeObservations>,
     comparison: Option<claude_native_comparison::FoldView<'_>>,
     veto_api_rows: &ClaudeVetoApiRows,
+    negative_dependencies_complete: bool,
 ) -> ClaudeUsageAuthorityDisposition {
     let census_complete = claude_terminal_authority(index, census_complete, census_window_end);
     let complete_rebuild_read =
@@ -8820,7 +8823,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     // The canonical ownership reducer validates semantic evidence too (row
     // fingerprints/revisions/clocks and paired clients), beyond file health.
     // No evidence is healthy: the reducer returns Some(empty), not a refusal.
-    let ownership = reports_healthy.then(|| {
+    let ownership = (reports_healthy && negative_dependencies_complete).then(|| {
         classify_claude_legacy_request_owners(api_report.evidence.iter(), &trace_report.evidence)
     });
     let ownership_refusal = ownership
@@ -9274,7 +9277,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         trace_report,
         veto_api_rows,
     );
-    if !reports_healthy {
+    if !reports_healthy || !negative_dependencies_complete {
         file_birth_tripwire.refuse_incomplete_dependencies();
     }
 
@@ -31117,6 +31120,7 @@ impl OwnedSourceScan {
                     );
                 }
                 let scan = SourceScanResult {
+                    strict_cohort_deferred_root_count: 0,
                     source,
                     backfill_window_days,
                     backfill_file_limit: file_limit,
@@ -44035,8 +44039,14 @@ impl ScanIndex {
             && canonicalize_codex_identity_map(&mut self.codex_parent_ownership_ledgers)
     }
 
-    pub(crate) fn claude_strict_cursor(&mut self) -> &mut Option<String> {
-        &mut self.claude_full_rearm_progress.terminal_off_strict_after
+    pub(crate) fn claude_strict_service_scope(&self) -> String {
+        sha256_hex(&[
+            "strict-cohort:v1",
+            self.active_upload_context_fingerprint
+                .as_deref()
+                .unwrap_or(""),
+            self.historical_replay_generation.as_deref().unwrap_or(""),
+        ])
     }
 
     pub fn activate_upload_context(&mut self, fingerprint: String) {
@@ -90468,7 +90478,7 @@ crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_mem
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarry; origin, roots, capped_roots, replay);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarryOrigin; context_fingerprint, process, full_rearm_window, admission);
 crate::heap_layout_bound::fields!(ClaudeRetryAdmission; after_root, upper_root, complete, roots_complete, progressed, served_before, due_through, due_after_path, due_upper_path, due_complete, oversized_root, oversized_after_path, storage_deferred);
-crate::heap_layout_bound::fields!(ClaudeFullRearmProgress; terminal_off_rediscovery_after, terminal_off_strict_after, rebuild_read_full, complete_rebuild_read, observed_window, structural_roots, other_invalidation_observed, ignored_vetoes, structural_rearm_owed, structural_record, traversal_origin, full_rearm_window_next, full_rearm_window, stale_rearm_fence_deadline, stale_rearms_at_deadline, first_proof_hold_since_full_rearm, held_family_roots, contract_cutover);
+crate::heap_layout_bound::fields!(ClaudeFullRearmProgress; terminal_off_rediscovery_after, rebuild_read_full, complete_rebuild_read, observed_window, structural_roots, other_invalidation_observed, ignored_vetoes, structural_rearm_owed, structural_record, traversal_origin, full_rearm_window_next, full_rearm_window, stale_rearm_fence_deadline, stale_rearms_at_deadline, first_proof_hold_since_full_rearm, held_family_roots, contract_cutover);
 crate::heap_layout_bound::fields!(ClaudeCompleteRebuildRead; origin, members_digest);
 crate::heap_layout_bound::fields!(ClaudeStructuralInvalidRecord; basis, families, suppressed_since_unix_seconds, skipped_full_rearms);
 crate::heap_layout_bound::fields!(ClaudeFullRearmWindow; context_fingerprint, process, window_ends, member_digests);

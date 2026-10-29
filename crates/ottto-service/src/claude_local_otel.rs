@@ -1415,9 +1415,11 @@ impl<'a> TraceSidecarDecoder<'a> {
 }
 
 #[cfg(test)]
+type TraceBeforeReadHook = Box<dyn FnOnce(&Path)>;
+#[cfg(test)]
 thread_local! {
 static TRACE_BYTES_FOR_TEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-static TRACE_BEFORE_READ: std::cell::RefCell<Option<Box<dyn FnOnce(&Path)>>> = const { std::cell::RefCell::new(None) };
+static TRACE_BEFORE_READ: std::cell::RefCell<Option<TraceBeforeReadHook>> = const { std::cell::RefCell::new(None) };
 static TRACE_READ_RECEIPT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
 #[cfg(test)]

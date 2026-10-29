@@ -160,7 +160,7 @@ fn terminal_off_w1_w2_open_fence_skipped_duplicate_never_verifies() {
                 assert!(guarded.claude_usage_family_witnesses.is_empty(), "{route}");
                 assert!(guarded.claude_account_family_witnesses.is_empty(), "{route}");
                 assert!(guarded.claude_owned_start_census.values().all(|w| w.verified_source_file_fingerprint.is_none()), "{route}");
-                assert!(guarded_page.snapshots.iter().all(|item| item.cache_observations.is_none() && item.context_curve.as_ref().is_none_or(|curve| !matches!(curve.coverage.as_str(), "complete" | "sampled"))), "{route}");
+                assert!(guarded_page.snapshots.iter().all(|item| item.cache_observations.is_none() && item.context_curve.as_ref().map_or(true, |curve| !matches!(curve.coverage.as_str(), "complete" | "sampled"))), "{route}");
             }
         }
 
@@ -257,6 +257,11 @@ fn terminal_off_fresh_start_zero_parses_and_bounded_identity_samples() {
         page.pending_finalization.is_empty(),
         "no parsed body is finalized"
     );
+    START_IDENTITY_SAMPLES.with(|counts| {
+        let counts = counts.borrow();
+        assert_eq!(counts.files.len(), N);
+        assert_eq!(counts.observations, N as u64);
+    });
     assert_eq!(after.0 - before.0, N as u64);
     assert!(after.1 - before.1 > 0);
     assert!(after.1 - before.1 <= (N * 2 * FILE_CONTENT_SAMPLE_BYTES) as u64);
