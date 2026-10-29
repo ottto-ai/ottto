@@ -330,7 +330,7 @@ pub(crate) fn assert_child_killed(
 
 pub(crate) mod money_oracle {
     use super::*;
-    const FIELDS: &[&str] = &[
+    pub(crate) const FIELDS: &[&str] = &[
         "input_tokens",
         "output_tokens",
         "cache_read_tokens",
@@ -701,6 +701,11 @@ pub(crate) fn native_effects(
             "residue_archived": scan.census_residue_archived_rollout_count,
         },
     })
+}
+
+/// Read native ACK membership without granting or copying it into another index.
+pub(crate) fn accepted_fingerprints(index: &super::super::ScanIndex) -> &BTreeSet<String> {
+    &index.accepted_snapshot_fingerprints
 }
 
 /// A scoped error at a REAL store call. Install on the worker thread. Existing

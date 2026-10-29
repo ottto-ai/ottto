@@ -795,6 +795,29 @@ struct Codex24b {
     disk: Disk,
     prior: ScanIndex,
     pages: BTreeMap<Mode, (E2ScanFixture, ScanIndex)>,
+    observations: BTreeMap<Mode, Codex24bObservation>,
+}
+
+struct Codex24bObservation {
+    raw: Vec<SnapshotItem>,
+    semantic_noops: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Codex24bAcceptedState {
+    accepted: BTreeSet<String>,
+    group: Option<String>,
+    body_witness: Option<String>,
+}
+impl Codex24bAcceptedState {
+    fn of(index: &ScanIndex, key: &str) -> Self {
+        let entry = &index.files[key];
+        Self {
+            accepted: fixture::accepted_fingerprints(index).clone(),
+            group: entry.last_snapshot_fingerprint.clone(),
+            body_witness: entry.last_upload_body_witness.clone(),
+        }
+    }
 }
 impl TransitionDriver for Codex24b {
     fn emit_bodies(&mut self, mode: Mode) -> RouteResult {
@@ -811,8 +834,12 @@ impl TransitionDriver for Codex24b {
             self.disk.owner(source)
         };
         scanner.versions = Some(feed.clone());
-        let ((index, scan, modes), consumed) =
-            fixture::observe_consumed(|| other_page(&self.c, &scanner, source, self.prior.clone()));
+        let mut raw = Vec::new();
+        let ((index, scan, modes), consumed) = fixture::observe_consumed(|| {
+            other_page_observing_raw(&self.c, &scanner, source, self.prior.clone(), |items| {
+                raw = items.to_vec();
+            })
+        });
         let (sample, observed, rejected) = feed.snapshot();
         let sample = sample.expect("production EOF observes restored SessionStartState");
         assert_eq!(sample.version(), Some("0.148.9"));
@@ -850,6 +877,13 @@ impl TransitionDriver for Codex24b {
                 json!([s.input_tokens,s.output_tokens,s.request_count])))
                 .collect::<BTreeMap<_,_>>()
         });
+        self.observations.insert(
+            mode,
+            Codex24bObservation {
+                raw,
+                semantic_noops: scan.semantic_noop_count,
+            },
+        );
         self.pages.insert(mode, (scanner, index));
         result
     }
@@ -862,6 +896,7 @@ impl TransitionDriver for Codex24b {
     }
     fn restart(&mut self) {
         self.pages.clear();
+        self.observations.clear();
         self.prior = ScanIndex::load(&self.disk.index).unwrap();
     }
 }
@@ -906,6 +941,7 @@ fn codex_24b_old_writer_row(require_zero_old_bytes: bool) {
         disk,
         prior,
         pages: BTreeMap::new(),
+        observations: BTreeMap::new(),
     };
     for restart in 0..2 {
         let suffix = codex_rows(&format!("appended-{restart}"), 20 + restart);
@@ -935,7 +971,12 @@ fn codex_24b_old_writer_row(require_zero_old_bytes: bool) {
         }
         money_oracle::assert_equivalent(&cold, &tail);
         driver.save_gc(Mode::DiskRestore);
+        let key = fixture::local_key(&path);
+        let committed = Codex24bAcceptedState::of(&driver.prior, &key);
+        assert!(!committed.accepted.is_empty(), "native ACK baseline exists");
+        assert!(committed.group.is_some() && committed.body_witness.is_some());
         driver.restart();
+        assert_eq!(Codex24bAcceptedState::of(&driver.prior, &key), committed);
         // Select the unchanged file for EOF version observation without
         // changing its replay binding or accepted money. Give BOTH the cold
         // reference and restored arm this same post-commit selection input.
@@ -965,6 +1006,51 @@ fn codex_24b_old_writer_row(require_zero_old_bytes: bool) {
             "quiet EOF must not re-emit money"
         );
         assert!(quiet.batches.is_empty());
+        // Mirror #870: prove native bodies exist before finalization, every
+        // item was suppressed specifically as a semantic no-op, and the
+        // committed ACK/group/body witnesses survive on BOTH independent arms.
+        let mut raw_bodies = BTreeMap::new();
+        for mode in [Mode::ColdFull, Mode::Restart] {
+            let observation = &driver.observations[&mode];
+            assert!(!observation.raw.is_empty(), "{mode:?}: native body exists");
+            assert_eq!(
+                observation.semantic_noops,
+                observation.raw.len(),
+                "{mode:?}: every raw item was suppressed as a semantic no-op"
+            );
+            let bodies = observation
+                .raw
+                .iter()
+                .map(|item| {
+                    assert!(item.request_count > 0);
+                    (
+                        item.source_session_id.clone(),
+                        serde_json::to_value(item).unwrap(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(bodies.len(), observation.raw.len(), "unique raw entities");
+            raw_bodies.insert(mode, bodies);
+            assert_eq!(
+                Codex24bAcceptedState::of(&driver.pages[&mode].1, &key),
+                committed,
+                "{mode:?}: native accepted/group/body witnesses unchanged"
+            );
+        }
+        let cold_raw = &raw_bodies[&Mode::ColdFull];
+        let restored_raw = &raw_bodies[&Mode::Restart];
+        assert_eq!(
+            cold_raw.keys().collect::<Vec<_>>(),
+            restored_raw.keys().collect::<Vec<_>>()
+        );
+        for (entity, cold_body) in cold_raw {
+            for field in money_oracle::FIELDS {
+                assert_eq!(
+                    cold_body[*field], restored_raw[entity][*field],
+                    "raw entity/{entity}/{field}"
+                );
+            }
+        }
         money_oracle::assert_equivalent(&quiet_cold, &quiet);
         driver.save_gc(Mode::Restart);
     }
