@@ -3034,7 +3034,12 @@ fn durable_hold_on_one_member_holds_the_joined_group() {
         let dir = store::store_dir_for_index(&index_path);
         let hex = key.iter().map(|b| format!("{b:02x}")).collect::<String>();
         let record = dir.join(format!("{hex}.rec"));
-        let bytes = [b"ottto-dt".as_slice(), &2_u16.to_le_bytes(), &[7_u8; 64]].concat();
+        let bytes = [
+            b"ottto-dt".as_slice(),
+            &(crate::durable_tail_store::FORMAT_VERSION + 1).to_le_bytes(),
+            &[7_u8; 64],
+        ]
+        .concat();
         if held {
             fs::create_dir_all(&dir).unwrap();
             fs::write(&record, &bytes).unwrap();
@@ -3159,5 +3164,387 @@ fn compressed_group_probe_initial_swap_and_legacy_tee_never_read() {
             Err(cursor::StartRefusal::Unstartable)
         ));
     });
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// A valid debt-bearing v1 record per `(member, due, upload context)` and no
+/// index membership: the reset state the grouped missing-carrier handoff
+/// recovers. Returns each member path with its record path.
+#[cfg(unix)]
+fn seed_member_debts<W: crate::durable_tail_store::SingleWriter>(
+    root: &Path,
+    writer: &W,
+    debts: &[(&str, u64, Option<&str>)],
+) -> Vec<(PathBuf, PathBuf)> {
+    use crate::durable_tail_store as store;
+    use std::io::Read;
+    let scope = Scope("group-fixture".into());
+    let now = sampled_scan::now_seconds();
+    let ds = store::DurableSource::Codex;
+    let dir = store::store_dir_for_index(&root.join("index.json"));
+    let mut seeded = Vec::new();
+    let mut pending = Vec::new();
+    for (name, due, context) in debts {
+        let path = root.join(format!("sessions/{name}.jsonl"));
+        let mut file = fs::File::open(&path).unwrap();
+        let mut plan =
+            crate::transcript_acquisition::ReadPlan::prepare(&mut file, None, &scope, None, now)
+                .unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        plan.observe_complete_records(&bytes).unwrap();
+        let mut certificate = plan
+            .commit_after_native_completion(&file, &scope, now)
+            .unwrap()
+            .durable_certificate(0)
+            .unwrap();
+        certificate.audit_debt_unix_seconds = Some(*due);
+        let digest = store::key_digest(ds, &local_index_key(&path));
+        let hex = digest
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        seeded.push((path, dir.join(format!("{hex}.rec"))));
+        pending.push(store::PendingRecord {
+            binding: store::Binding {
+                source: ds,
+                key: digest,
+                context: store::context_digest(&scope.0, *context),
+                scope: [0; 32],
+                entry: [0; 32],
+            },
+            certificate,
+            body: crate::snapshots::durable_store_fixture_body(SnapshotSource::Codex, 0, 0),
+            allowlist: sampled_jsonl::durable::allowlist_digest(SnapshotSource::Codex),
+        });
+    }
+    let mut disk = store::DurableTailStore::new(dir, ds);
+    let written = disk.write_after_save(writer, 1, pending).unwrap().written;
+    assert_eq!(written, debts.len());
+    seeded
+}
+
+/// One scan of `root` through its group's completion: a single unpaged page,
+/// or cursor pages under the scaled singleton budget.
+#[cfg(unix)]
+fn group_pass(
+    root: &Path,
+    index: ScanIndex,
+    cache: &Arc<SharedCache>,
+    collected_at: &str,
+    paged: bool,
+) -> (ScanIndex, SourceScanResult) {
+    if !paged {
+        return sampled_at(root, index, 10, cache, collected_at);
+    }
+    let before = completions(cache);
+    with_test_limits(2048, 1024, 64, || {
+        let (index, result, _) = pages_at(root, index, cache, collected_at, || {
+            completions(cache) > before
+        });
+        (index, result)
+    })
+}
+
+/// #865 P1 / SOURCE Addendum 6: reset + debt-bearing joined members (the
+/// non-live alias `a` and the live member `b`) + complete join inventory +
+/// incomplete sidecar census. The group publishes unverified; each member's
+/// own native entry carries its own deadline through save, post-save GC and
+/// restart, is selected past W, and a later verified Full retires both with
+/// the existing completion counter. Paged and unpaged reads share the one
+/// job-start capture and the one settlement; both are exercised.
+#[cfg(unix)]
+fn grouped_missing_carriers_mark_each_member_until_verified(paged: bool) {
+    let source = SnapshotSource::Codex;
+    let root = if paged {
+        paged_corpus("missing-carrier")
+    } else {
+        fixture().0
+    };
+    let lock = crate::locked_state_dir::test_locks::hold(&root);
+    let index_path = root.join("index.json");
+    let namespace = Scope("group-fixture".into());
+    let now = sampled_scan::now_seconds();
+    let dues = [now - 120, now - 60];
+    let seeded = seed_member_debts(&root, lock, &[("a", dues[0], None), ("b", dues[1], None)]);
+    let originals = seeded
+        .iter()
+        .map(|(_, record)| fs::read(record).unwrap())
+        .collect::<Vec<_>>();
+    fs::write(root.join("session_index.jsonl"), "{not valid json}\n").unwrap();
+    let cache = Arc::new(SharedCache::default());
+    cache.durable_begin_pass(source, &index_path, &namespace, false);
+    let (mut index, result) = group_pass(
+        &root,
+        ScanIndex::default(),
+        &cache,
+        "2026-10-06T23:00:00Z",
+        paged,
+    );
+    assert!(!result.sidecar_census_complete);
+    assert!(
+        result
+            .snapshots
+            .iter()
+            .any(|item| item.source_session_id == OWNER),
+        "the unverified group publishes"
+    );
+    for ((path, _), due) in seeded.iter().zip(dues) {
+        let entry = &index.files[&local_index_key(path)];
+        assert!(entry.has_unverified_source(), "{path:?}");
+        assert_eq!(
+            entry.unverified_deadline(),
+            Some(due),
+            "each member keeps its own recovered debt"
+        );
+    }
+    let (counts, _) = cache.durable_counters(source).unwrap();
+    assert_eq!(
+        counts.ineligible.get("audit_carrier"),
+        Some(&2),
+        "counted once per recovered member"
+    );
+    assert_eq!(
+        counts.ineligible.get("audit_carrier_staged_unverified"),
+        Some(&2)
+    );
+    assert_eq!(counts.restored, 0);
+    assert_eq!(counts.durable_held, [0; 5]);
+    // Actual save and post-save GC keep both predecessors while debt is owed.
+    index.save(&index_path).unwrap();
+    crate::snapshots::durable_after_save(&cache, &root, source, &index);
+    assert_eq!(
+        cache.durable_counters(source).unwrap().1.gc_records_deleted,
+        0
+    );
+    for ((_, record), original) in seeded.iter().zip(&originals) {
+        assert_eq!(&fs::read(record).unwrap(), original);
+    }
+    drop(cache);
+    let mut loaded = ScanIndex::load(&index_path).unwrap();
+    for ((path, _), due) in seeded.iter().zip(dues) {
+        assert_eq!(
+            loaded.files[&local_index_key(path)].unverified_deadline(),
+            Some(due)
+        );
+        assert!(crate::snapshots::sampled_audit::path_requires_verification(
+            &loaded.files,
+            path
+        ));
+    }
+    // Later: the sidecar census is repaired; discovery runs past W on a
+    // fresh cache, and only the markers select the idle members.
+    fs::remove_file(root.join("session_index.jsonl")).unwrap();
+    loaded.traversal = None;
+    let aged = (::time::OffsetDateTime::now_utc() + ::time::Duration::days(8))
+        .format(&::time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let restart = Arc::new(SharedCache::default());
+    restart.durable_begin_pass(source, &index_path, &namespace, false);
+    let ((verified, clean), rows) = crate::local_resource_diagnostics::capture(|| {
+        group_pass(&root, loaded, &restart, &aged, paged)
+    });
+    assert!(clean.sidecar_census_complete);
+    assert!(clean
+        .snapshots
+        .iter()
+        .any(|item| item.source_session_id == OWNER));
+    for (path, _) in &seeded {
+        let entry = &verified.files[&local_index_key(path)];
+        assert!(!entry.has_unverified_source(), "{path:?}");
+        assert_eq!(entry.unverified_deadline(), None);
+    }
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row["stage"] == "native_collection_page")
+            .map(|row| {
+                row["counts"]["sampled_acquisition"]["page_events"]["audits_completed"]
+                    .as_u64()
+                    .expect("production page_events exposes the completion counter")
+            })
+            .sum::<u64>(),
+        2,
+        "the existing completion counter retires each member once"
+    );
+    let (counts, _) = restart.durable_counters(source).unwrap();
+    assert_eq!(
+        counts.ineligible.get("audit_carrier"),
+        None,
+        "verifying a marked member is not a new miss"
+    );
+    assert_eq!(
+        counts.ineligible.get("audit_carrier_staged_unverified"),
+        None
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn grouped_missing_carriers_mark_each_unpaged_member_until_verified() {
+    grouped_missing_carriers_mark_each_member_until_verified(false);
+}
+
+#[cfg(unix)]
+#[test]
+fn grouped_missing_carriers_mark_each_paged_member_until_verified() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    grouped_missing_carriers_mark_each_member_until_verified(true);
+}
+
+/// Grouped controls: a valid foreign-context record on the alias contributes
+/// no obligation or count; the live member's future envelope deadline clamps
+/// once to the recovery boundary's now, and later offers cannot renew it.
+#[cfg(unix)]
+#[test]
+fn grouped_missing_carrier_requires_live_context_and_clamps_future_debt() {
+    let source = SnapshotSource::Codex;
+    let (root, _) = fixture();
+    let lock = crate::locked_state_dir::test_locks::hold(&root);
+    let now = sampled_scan::now_seconds();
+    let seeded = seed_member_debts(
+        &root,
+        lock,
+        &[
+            ("a", now - 60, Some("foreign-account")),
+            ("b", now + 600, Some("live-account")),
+        ],
+    );
+    fs::write(root.join("session_index.jsonl"), "{not valid json}\n").unwrap();
+    let cache = Arc::new(SharedCache::default());
+    cache.durable_begin_pass(
+        source,
+        &root.join("index.json"),
+        &Scope("group-fixture".into()),
+        false,
+    );
+    let live = ScanIndex {
+        active_upload_context_fingerprint: Some("live-account".into()),
+        ..ScanIndex::default()
+    };
+    let before = sampled_scan::now_seconds();
+    let (mut index, result) = sampled(&root, live, 10, &cache);
+    let after = sampled_scan::now_seconds();
+    assert!(!result.sidecar_census_complete);
+    assert!(result
+        .snapshots
+        .iter()
+        .any(|item| item.source_session_id == OWNER));
+    let alias = local_index_key(&seeded[0].0);
+    let member = local_index_key(&seeded[1].0);
+    assert!(
+        !index.files[&alias].has_unverified_source(),
+        "a foreign envelope contributes no obligation"
+    );
+    assert_eq!(index.files[&alias].unverified_deadline(), None);
+    let due = index.files[&member].unverified_deadline().unwrap();
+    assert!(
+        (before..=after).contains(&due),
+        "clamped at the recovery boundary"
+    );
+    assert!(due < now + 600, "the future envelope cannot postpone audit");
+    let (counts, _) = cache.durable_counters(source).unwrap();
+    assert_eq!(counts.ineligible.get("audit_carrier"), Some(&1));
+    assert_eq!(
+        counts.ineligible.get("audit_carrier_staged_unverified"),
+        Some(&1)
+    );
+    let fingerprint = index.files[&member].source_file_fingerprint.clone();
+    assert!(index.stage_sampled_audit(
+        &member,
+        &fingerprint,
+        crate::transcript_acquisition::AuditDebt {
+            due_unix_seconds: now + 1200
+        }
+    ));
+    assert_eq!(
+        index.files[&member].unverified_deadline(),
+        Some(due),
+        "later offers cannot renew the clamped debt"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// R1: a paged group captures its dues while both members are indexed (none
+/// owed), then parks; the per-pass index loses their entries (a fresh load).
+/// On resume the job keeps its progress, and settlement re-probes each absent
+/// member's record and stages its own marker, counted once. The singleton
+/// paged re-probe is the same settlement block (`dues.1`, via the singleton
+/// guard), so this group fixture covers the shared path.
+#[cfg(unix)]
+#[test]
+fn parked_group_across_fresh_index_reprobes_member_debt_on_resume() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::Codex;
+    let root = paged_corpus("missing-carrier-r1");
+    fs::write(root.join("session_index.jsonl"), "{not valid json}\n").unwrap();
+    let (mut index, seed) = sampled(
+        &root,
+        ScanIndex::default(),
+        10,
+        &Arc::new(SharedCache::default()),
+    );
+    assert!(seed
+        .snapshots
+        .iter()
+        .any(|item| item.source_session_id == OWNER));
+    let lock = crate::locked_state_dir::test_locks::hold(&root);
+    let now = sampled_scan::now_seconds();
+    let dues = [now - 120, now - 60];
+    let seeded = seed_member_debts(&root, lock, &[("a", dues[0], None), ("b", dues[1], None)]);
+    append_rows(
+        &root.join("sessions/b.jsonl"),
+        &chain_rows(OWNER, "b2", "2026-10-01T10:30:00Z", 600, 5)[1..],
+    );
+    let cache = Arc::new(SharedCache::default());
+    cache.durable_begin_pass(
+        source,
+        &root.join("index.json"),
+        &Scope("group-fixture".into()),
+        false,
+    );
+    index.traversal = None;
+    let collected_at = "2026-10-06T23:01:00Z";
+    let (fresh, done) = with_test_limits(2048, 1024, 64, || {
+        let (mut index, _, _) = pages_at(&root, index, &cache, collected_at, || {
+            cache.paused_group_position().is_some()
+        });
+        assert!(seeded
+            .iter()
+            .all(|(path, _)| index.files.contains_key(&local_index_key(path))));
+        // The per-pass index loads without the members' entries.
+        index.files.clear();
+        let (index, result, _) = pages_at(&root, index, &cache, collected_at, || {
+            completions(&cache) > 0
+        });
+        (index, result)
+    });
+    assert!(done
+        .snapshots
+        .iter()
+        .any(|item| item.source_session_id == OWNER));
+    let counted = counters(&cache);
+    assert_eq!(
+        counted.groups_started, 1,
+        "resumed, not rebooted: {counted:?}"
+    );
+    assert_eq!(counted.jobs_invalidated, 0, "{counted:?}");
+    for ((path, _), due) in seeded.iter().zip(dues) {
+        assert_eq!(
+            fresh.files[&local_index_key(path)].unverified_deadline(),
+            Some(due),
+            "{path:?}: staged from the record on resume"
+        );
+    }
+    let (durable, _) = cache.durable_counters(source).unwrap();
+    assert_eq!(durable.ineligible.get("audit_carrier"), Some(&2));
+    assert_eq!(
+        durable.ineligible.get("audit_carrier_staged_unverified"),
+        Some(&2)
+    );
     fs::remove_dir_all(root).unwrap();
 }

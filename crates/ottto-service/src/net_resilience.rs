@@ -62,7 +62,7 @@ const DNS_PROBE_MIN_INTERVAL: Duration = Duration::from_secs(60);
 /// for the connect timeout; keep them rare during a transport outage.
 const TCP_PROBE_MIN_INTERVAL: Duration = Duration::from_secs(60);
 /// Bound for the out-of-process TCP-connect probe's connect attempt.
-#[cfg(not(test))]
+#[cfg(all(target_os = "macos", not(test)))]
 const TCP_PROBE_CONNECT_TIMEOUT_SECS: u32 = 5;
 /// Loud fallback log lines are rate-limited so a multi-hour outage does not
 /// flood the error log the way the original incident's 47 identical lines did.
@@ -641,6 +641,7 @@ fn out_of_process_resolve(host: &str, timeout: Duration) -> Option<Vec<IpAddr>> 
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn bounded_command_output(
     program: &str,
     args: &[&str],
@@ -936,6 +937,7 @@ fn parse_probe_target(base: &str) -> Option<(String, u16)> {
 /// or address change, every pooled socket may be bound to a dead local IP, so
 /// drop them all instead of waiting for error-classification streaks — this
 /// is independent of (and faster than) both outage ladders.
+#[cfg(target_os = "macos")]
 pub(crate) fn force_rebuild_upstream_agents(reason: &str) {
     eprintln!(
         "OTTTO-NET-TRANSITION: rebuilding upstream HTTP agent pools after {reason} so the \
