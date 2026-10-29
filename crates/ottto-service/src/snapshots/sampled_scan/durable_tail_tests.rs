@@ -2961,7 +2961,8 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
         assert_eq!(current.audit_debt_unix_seconds, Some(due));
         let mut rewritten = record.record.clone();
         rewritten.certificate = current;
-        let old_wire = store::tests::pinned_v1_bytes(&rewritten, index.generation);
+        // C/#865: generation-only saves are clean, not dirty replacements.
+        let old_wire = store::tests::pinned_v1_bytes(&rewritten, record.index_generation);
         let mut writer = DurableTailStore::new(dir.clone(), source);
         let original = match writer.read(&record_key) {
             ReadOutcome::Found(original) => original,
@@ -2974,12 +2975,13 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
                 committed_generation: index.generation,
             },
         );
+        let receipt = writer
+            .write_after_save(lock, index.generation, vec![rewritten])
+            .unwrap();
         assert_eq!(
-            writer
-                .write_after_save(lock, index.generation, vec![rewritten])
-                .unwrap()
-                .written,
-            1
+            (receipt.written, receipt.clean),
+            (0, 1),
+            "same stored debt is byte-clean despite later index generation"
         );
 
         let record_path = dir.join(format!(
