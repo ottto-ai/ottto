@@ -12159,16 +12159,27 @@ struct ConfigPatchResult {
 }
 
 fn local_relay_base_url_for_daemon(daemon: &LocalDaemon) -> String {
-    daemon
-        .status_for_trusted_client()
-        .map(|status| crate::otlp_relay::local_relay_base_url_from_state(&status.relay))
-        .unwrap_or_else(|_| crate::otlp_relay::default_local_relay_base_url())
+    crate::otlp_relay::local_relay_base_url_for_port(local_relay_port_for_daemon(daemon))
 }
 
+/// The port settings writers record. Only a relay bound and serving right now
+/// (Connected) supplies its live port. While unbound or mid-rebind the
+/// endpoint settings already approve stays, so a transient never moves it.
 fn local_relay_port_for_daemon(daemon: &LocalDaemon) -> u16 {
     daemon
         .status_for_trusted_client()
-        .map(|status| crate::otlp_relay::local_relay_port_from_state(&status.relay))
+        .ok()
+        .filter(|status| status.relay.state == ottto_protocol::RelayRuntimeState::Connected)
+        .and_then(|status| status.relay.endpoint)
+        .as_deref()
+        .and_then(crate::otlp_relay::local_relay_port_from_endpoint)
+        .or_else(|| {
+            approved_managed_claude_relay_endpoint()
+                .ok()
+                .flatten()
+                .as_deref()
+                .and_then(crate::otlp_relay::local_relay_port_from_endpoint)
+        })
         .unwrap_or(crate::otlp_relay::LOCAL_RELAY_DEFAULT_PORT)
 }
 
@@ -31809,6 +31820,61 @@ X-API-Key = "otel_redacted"
         crate::otlp_relay::candidate_relay_ports(unsafe { libc::getuid() })
     }
 
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn settings_port_follows_only_a_bound_relay() {
+        let (root, _guards) = managed_claude_relay_fixture();
+        let settings = root.join(".claude/settings.json");
+        let daemon = daemon().with_account(connected_account());
+        let relay = |state, port: u16| ottto_protocol::RelayState {
+            state,
+            endpoint: Some(crate::otlp_relay::local_relay_base_url_for_port(port)),
+            last_connected_at: None,
+            last_error: None,
+        };
+        use ottto_protocol::RelayRuntimeState::{Connected, Failed, Unknown};
+        // Not bound, or a rebind in flight: the approved 48123 stays.
+        for state in [Unknown, Failed] {
+            daemon
+                .set_relay_state_for_trusted_client(relay(state, 43119))
+                .unwrap();
+            assert_eq!(local_relay_port_for_daemon(&daemon), 48123);
+        }
+        // Bound on the approved port: writing it changes nothing.
+        daemon
+            .set_relay_state_for_trusted_client(relay(Connected, 48123))
+            .unwrap();
+        assert_eq!(local_relay_port_for_daemon(&daemon), 48123);
+        // Bound on a fallback: it is written, and the mismatch then clears.
+        daemon
+            .set_relay_state_for_trusted_client(relay(Connected, 43119))
+            .unwrap();
+        for _ in 0..2 {
+            daemon.status_for_trusted_client().unwrap();
+        }
+        assert!(daemon
+            .status_for_trusted_client()
+            .unwrap()
+            .relay
+            .last_error
+            .is_some());
+        assert_eq!(local_relay_port_for_daemon(&daemon), 43119);
+        write_startup_relay_settings(&root, &local_relay_base_url_for_daemon(&daemon));
+        let status = daemon.status_for_trusted_client().unwrap();
+        assert!(status.relay.last_error.is_none());
+        assert!(status
+            .canonical_health
+            .unwrap()
+            .blockers
+            .iter()
+            .all(|blocker| blocker.code != "claude_relay_endpoint_mismatch"));
+        assert!(fs::read_to_string(&settings)
+            .unwrap()
+            .contains("127.0.0.1:43119"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn write_startup_relay_settings(root: &Path, base: &str) {
         let env: serde_json::Map<String, serde_json::Value> =
             claude_code_relay_env_for_machine_id("machine_test", base)
@@ -31935,6 +32001,350 @@ X-API-Key = "otel_redacted"
         assert_eq!(
             listener.local_addr().unwrap().port(),
             crate::otlp_relay::LOCAL_RELAY_DEFAULT_PORT
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn rebind_retries_busy_approved_port_instead_of_old_or_default_port() {
+        let (root, _guards) = managed_claude_relay_fixture();
+        let ports = startup_relay_candidates();
+        write_startup_relay_settings(
+            &root,
+            &crate::otlp_relay::local_relay_base_url_for_port(ports[1]),
+        );
+        let settings = root.join(".claude/settings.json");
+        let before = fs::read(&settings).unwrap();
+        let mut busy = Some(std::net::TcpListener::bind(("127.0.0.1", ports[1])).unwrap());
+        let mut attempts = 0;
+        let listener =
+            crate::otlp_relay::rebind_relay_listener(ports[0], &mut |old_port, attempt| {
+                attempts += 1;
+                let result =
+                    crate::otlp_relay::bind_replacement_local_relay_listener(old_port, attempt);
+                if attempts == 1 {
+                    assert!(
+                        result.is_err(),
+                        "must retry approved port even while default is free"
+                    );
+                    drop(busy.take());
+                }
+                result
+            });
+        assert_eq!(attempts, 2);
+        assert_eq!(listener.local_addr().unwrap().port(), ports[1]);
+        assert_eq!(fs::read(settings).unwrap(), before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn rebind_uses_free_approved_port_before_old_port() {
+        let (root, _guards) = managed_claude_relay_fixture();
+        let ports = startup_relay_candidates();
+        write_startup_relay_settings(
+            &root,
+            &crate::otlp_relay::local_relay_base_url_for_port(ports[1]),
+        );
+        let mut attempts = 0;
+        let listener = crate::otlp_relay::rebind_relay_listener(ports[0], &mut |old, attempt| {
+            attempts += 1;
+            crate::otlp_relay::bind_replacement_local_relay_listener(old, attempt)
+        });
+        assert_eq!(attempts, 1);
+        assert_eq!(listener.local_addr().unwrap().port(), ports[1]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn rebind_busy_approved_port_falls_back_after_three_attempts_and_serves() {
+        use std::io::{Read, Write};
+
+        let (root, _guards) = managed_claude_relay_fixture();
+        let ports = startup_relay_candidates();
+        let approved = ports[1];
+        let old = ports[2];
+        write_startup_relay_settings(
+            &root,
+            &crate::otlp_relay::local_relay_base_url_for_port(approved),
+        );
+        let settings = root.join(".claude/settings.json");
+        let before = fs::read(&settings).unwrap();
+        let _busy = std::net::TcpListener::bind(("127.0.0.1", approved)).unwrap();
+        let mut attempts = 0;
+        let listener = crate::otlp_relay::rebind_relay_listener(old, &mut |port, attempt| {
+            attempts += 1;
+            assert!(attempt <= 3, "approved retry must be bounded");
+            let result = crate::otlp_relay::bind_replacement_local_relay_listener(port, attempt);
+            if attempt < 3 {
+                assert!(result.is_err(), "approved port gets its retry budget first");
+            }
+            result
+        });
+        assert_eq!(attempts, 3);
+        let addr = listener.local_addr().unwrap();
+        assert_eq!(addr.port(), old, "old port precedes the free default port");
+        let daemon = daemon().with_account(connected_account());
+        let connected = ottto_protocol::RelayState {
+            state: ottto_protocol::RelayRuntimeState::Connected,
+            endpoint: Some(format!("http://{addr}")),
+            last_connected_at: None,
+            last_error: None,
+        };
+        daemon
+            .set_relay_state_for_trusted_client(connected.clone())
+            .unwrap();
+        // A listener failure between sightings ends the streak: recovery to the
+        // same mismatch needs two fresh sightings again.
+        assert!(daemon
+            .status_for_trusted_client()
+            .unwrap()
+            .relay
+            .last_error
+            .is_none());
+        daemon
+            .set_relay_state_for_trusted_client(ottto_protocol::RelayState {
+                state: ottto_protocol::RelayRuntimeState::Failed,
+                endpoint: Some(format!("http://{addr}")),
+                last_connected_at: None,
+                last_error: Some(StableMessage {
+                    code: "relay_listener_failed".into(),
+                    text: "listener failed".into(),
+                }),
+            })
+            .unwrap();
+        let failed = daemon.status_for_trusted_client().unwrap().relay;
+        assert_eq!(failed.last_error.unwrap().code, "relay_listener_failed");
+        daemon
+            .set_relay_state_for_trusted_client(connected)
+            .unwrap();
+        let first = daemon.status_for_trusted_client().unwrap().relay;
+        assert!(first.last_error.is_none(), "one sighting is not reported");
+        let relay = daemon.status_for_trusted_client().unwrap().relay;
+        assert_eq!(relay.state, ottto_protocol::RelayRuntimeState::Connected);
+        let finding = relay.last_error.unwrap();
+        assert_eq!(finding.code, "claude_relay_endpoint_mismatch");
+        assert!(finding.text.contains(&format!("127.0.0.1:{approved}")));
+        assert!(finding.text.contains(&format!("127.0.0.1:{old}")));
+
+        // Serve a real health request on the recovered listener, not just bind it.
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            crate::otlp_relay::serve_test_connection(stream, daemon);
+        });
+        let mut client =
+            std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        server.join().unwrap();
+        assert_eq!(fs::read(settings).unwrap(), before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn rebind_without_approval_keeps_old_default_and_fallback_chain() {
+        let (root, _guards) = managed_claude_relay_fixture();
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "test".into(),
+                machine_id: None,
+                sources: vec!["codex".into()],
+            })
+            .unwrap();
+        let ports = startup_relay_candidates();
+        let bind =
+            || crate::otlp_relay::bind_replacement_local_relay_listener(ports[1], 1).unwrap();
+        let old = bind();
+        assert_eq!(old.local_addr().unwrap().port(), ports[1]);
+        let default = bind();
+        assert_eq!(default.local_addr().unwrap().port(), ports[0]);
+        let fallback = bind();
+        assert_eq!(fallback.local_addr().unwrap().port(), ports[2]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn rebind_ignores_approved_port_outside_candidate_list() {
+        let (root, _guards) = managed_claude_relay_fixture();
+        // The fixture's approved 48123 endpoint is outside every uid's list.
+        let ports = startup_relay_candidates();
+        let _busy_old = std::net::TcpListener::bind(("127.0.0.1", ports[1])).unwrap();
+        let listener =
+            crate::otlp_relay::bind_replacement_local_relay_listener(ports[1], 1).unwrap();
+        assert_eq!(listener.local_addr().unwrap().port(), ports[0]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn relay_endpoint_mismatch_is_response_only_and_clears_with_settings_or_consent() {
+        let (root, _guards) = managed_claude_relay_fixture();
+        let daemon = daemon().with_account(connected_account());
+        let saved_account = daemon.account_for_trusted_client().unwrap();
+        let live = ottto_protocol::RelayState {
+            state: ottto_protocol::RelayRuntimeState::Connected,
+            endpoint: Some("http://127.0.0.1:43119".into()),
+            last_connected_at: None,
+            last_error: None,
+        };
+        daemon
+            .set_relay_state_for_trusted_client(live.clone())
+            .unwrap();
+        let settings = root.join(".claude/settings.json");
+        let before = fs::read(&settings).unwrap();
+        // No flapping: the first sighting raises neither finding nor blocker.
+        let first = daemon.status_for_trusted_client().unwrap();
+        assert!(first.relay.last_error.is_none());
+        assert!(first
+            .canonical_health
+            .as_ref()
+            .unwrap()
+            .blockers
+            .iter()
+            .all(|blocker| blocker.code != "claude_relay_endpoint_mismatch"));
+        let finding = daemon
+            .status_for_trusted_client()
+            .unwrap()
+            .relay
+            .last_error
+            .unwrap();
+        assert_eq!(finding.code, "claude_relay_endpoint_mismatch");
+        assert_eq!(
+            finding.text,
+            "Relay connected (127.0.0.1:43119) but Claude settings point at 127.0.0.1:48123."
+        );
+        let mismatch_blockers = |status: &ottto_protocol::DaemonStatus| {
+            let health = status.canonical_health.as_ref().unwrap();
+            let codes = health
+                .blockers
+                .iter()
+                .filter(|blocker| blocker.code == finding.code)
+                .map(|blocker| (blocker.severity.clone(), blocker.owner.clone()))
+                .collect::<Vec<_>>();
+            (codes, health.overall.state.clone())
+        };
+        // The uploaded projection re-reads status, then re-projects it.
+        let mut uploaded = daemon.status_for_trusted_client().unwrap();
+        crate::refresh_canonical_local_health(&mut uploaded);
+        // One projection per status: a raised blocker never takes a revision
+        // above the cleared status that follows it.
+        let revision = |status: &ottto_protocol::DaemonStatus| {
+            status.canonical_health.as_ref().unwrap().revision
+        };
+        let raised_revision = revision(&daemon.status_for_trusted_client().unwrap());
+        for status in [daemon.status_for_trusted_client().unwrap(), uploaded] {
+            let (codes, overall) = mismatch_blockers(&status);
+            assert_eq!(
+                codes,
+                vec![(
+                    ottto_protocol::LocalHealthSeverity::Warning,
+                    "source".to_string()
+                )]
+            );
+            assert_ne!(overall, ottto_protocol::LocalHealthOverallState::Healthy);
+        }
+        let diagnostics = crate::claude_local_otel::support_health::diagnostics_items(
+            &root.join("support"),
+            &live,
+        );
+        assert_eq!(
+            diagnostics[&finding.code],
+            ottto_protocol::RedactedValue::String(finding.text.clone())
+        );
+        // Doctor and status share this command. Both retry postures expose it.
+        for retry in [false, true] {
+            let response = handle_request(
+                &daemon,
+                LocalControlRequest {
+                    request_id: "relay-health".into(),
+                    protocol_version: PROTOCOL_VERSION,
+                    token: Some("token".into()),
+                    client_kind: Some(LocalClientKind::Cli),
+                    client_install_owner: None,
+                    command: LocalControlCommand::Status {
+                        refresh_agent_status: false,
+                        retry_relay_authorization: retry,
+                    },
+                },
+            );
+            assert!(response.ok, "{response:?}");
+            let payload = response.payload.unwrap();
+            assert_eq!(payload["relay"]["state"], "connected");
+            assert_eq!(payload["relay"]["last_error"]["text"], finding.text);
+        }
+        assert_eq!(daemon.account_for_trusted_client().unwrap(), saved_account);
+        assert_eq!(fs::read(&settings).unwrap(), before);
+        assert_eq!(daemon.state().unwrap().relay, live);
+
+        write_startup_relay_settings(&root, "http://127.0.0.1:43119");
+        let cleared = daemon.status_for_trusted_client().unwrap();
+        assert!(cleared.relay.last_error.is_none());
+        assert_eq!(revision(&cleared), raised_revision);
+        assert!(
+            mismatch_blockers(&cleared).0.is_empty(),
+            "blocker clears on match"
+        );
+        assert!(
+            !crate::claude_local_otel::support_health::diagnostics_items(
+                &root.join("support"),
+                &live
+            )
+            .contains_key(&finding.code)
+        );
+        write_startup_relay_settings(&root, "http://127.0.0.1:48123");
+        assert!(
+            daemon
+                .status_for_trusted_client()
+                .unwrap()
+                .relay
+                .last_error
+                .is_none(),
+            "an agreeing check resets the streak"
+        );
+        let disabled = EnvVarGuard::set_str("OTTTO_PATCH_CLAUDE_CODE_DISABLED", "1");
+        assert!(daemon
+            .status_for_trusted_client()
+            .unwrap()
+            .relay
+            .last_error
+            .is_none());
+        drop(disabled);
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "test".into(),
+                machine_id: None,
+                sources: vec!["codex".into()],
+            })
+            .unwrap();
+        assert!(daemon
+            .status_for_trusted_client()
+            .unwrap()
+            .relay
+            .last_error
+            .is_none());
+        assert!(
+            !crate::claude_local_otel::support_health::diagnostics_items(
+                &root.join("support"),
+                &live
+            )
+            .contains_key(&finding.code)
         );
         fs::remove_dir_all(root).unwrap();
     }
