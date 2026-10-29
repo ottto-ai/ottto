@@ -124,17 +124,15 @@ impl codex_file_join::HeaderInventory {
             }
             if index.codex_counting_tombstones.len()
                 > codex_counting_version::MAX_COUNTING_TOMBSTONES
-            {
-                self.refuse_custody();
-            } else if !index.codex_counting_tombstones.is_empty()
-                && (crate::heap_layout_bound::tree_nodes::<String, ()>(
-                    index.codex_counting_tombstones.len(),
-                    &mut cost,
-                )
-                .is_none()
-                    || cost
-                        .add(index.codex_counting_tombstones.len().saturating_mul(128))
-                        .is_none())
+                || (!index.codex_counting_tombstones.is_empty()
+                    && (crate::heap_layout_bound::tree_nodes::<String, ()>(
+                        index.codex_counting_tombstones.len(),
+                        &mut cost,
+                    )
+                    .is_none()
+                        || cost
+                            .add(index.codex_counting_tombstones.len().saturating_mul(128))
+                            .is_none()))
             {
                 self.refuse_custody();
             }
