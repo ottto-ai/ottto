@@ -26,8 +26,10 @@ quarantine contract witness is bound to the upload-context H, so a policy change
 can reconstruct a previously refused body. An identical re-projected refused
 entity/body keeps its existing disposition, deadline and failure budget under
 the new witness, without gaining acceptance. This adds 80 bytes to each retained
-quarantine contract string; it adds no field or identifier. Empty or
-policy-suppressed files have no body to acknowledge and gain no receipt.
+quarantine contract string; it adds no field or identifier. A context-only
+reassessment never leases an ordinary retry before its existing deadline. Empty
+or policy-suppressed files gain no receipt and retain their existing source-wide
+context gate, allowing a later policy to make them uploadable.
 
 The change grants no census completion, absence, retirement, tombstone drain,
 account-window retirement, sole-login or terminal-fold authority. Destination

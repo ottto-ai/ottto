@@ -65,16 +65,14 @@ impl ScanIndex {
     }
 
     pub(super) fn file_upload_context_requires_adoption(&self, key: &str) -> bool {
-        if !self.file_upload_context_enabled {
+        if !self.file_upload_context_enabled || self.confirmed_empty_files.contains(key) {
+            // A suppressed/empty result has no ACK receipt. Keep its existing
+            // census-context gate so a new policy can make it uploadable.
             return self.upload_context_fingerprint != self.active_upload_context_fingerprint;
         }
-        // Empty/policy-suppressed files have no body to ACK. This is an empty
-        // outcome, never an inferred acceptance under the active context.
-        !self.confirmed_empty_files.contains(key)
-            && self
-                .files
-                .get(key)
-                .map_or(true, |entry| !self.receipt_matches(entry))
+        self.files
+            .get(key)
+            .map_or(true, |entry| !self.receipt_matches(entry))
     }
 
     pub(super) fn file_upload_context_backoff_holds(&self, candidate: &CandidateFile) -> bool {

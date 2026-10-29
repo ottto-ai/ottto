@@ -195,3 +195,96 @@ pub(crate) fn reproject_context_refusal(
     assert!(progress.accepted_fingerprints.is_empty());
     progress.quarantined_fingerprints
 }
+
+#[test]
+fn upload_context_pending_refusal_preserves_cooldown_through_prepare_and_reprojection() {
+    let item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+    let entity = item.snapshot_fingerprint.clone();
+    let body = snapshot_upload_body_witness(&item);
+    let mut record = crate::snapshots::snapshot_quarantine_record(SnapshotSource::Codex);
+    record.witness = crate::snapshots::snapshot_quarantine_witness_for_context(
+        SnapshotSource::Codex,
+        &"c".repeat(64),
+    );
+    record.upload_body_witness = Some(body.clone());
+    record.retry_after_unix_seconds = current_unix_seconds() + 3600;
+    let mut progress = SnapshotUploadProgress::new(
+        "a".repeat(64),
+        crate::snapshots::snapshot_quarantine_witness_for_context(
+            SnapshotSource::Codex,
+            &"d".repeat(64),
+        ),
+    );
+    progress
+        .quarantined_fingerprints
+        .insert(entity.clone(), record.clone());
+    assert!(!progress.prepare_quarantine_retries(&BTreeMap::new()));
+    assert_eq!(progress.quarantined_fingerprints[&entity], record);
+    assert!(progress.active_quarantine_retries.is_empty());
+    assert!(progress.note_reprojected_context_refusals(std::slice::from_ref(&item)));
+    let rebound = &progress.quarantined_fingerprints[&entity];
+    assert_eq!(
+        rebound.retry_after_unix_seconds,
+        record.retry_after_unix_seconds
+    );
+    assert_eq!(
+        rebound.failed_reconstruction_count,
+        record.failed_reconstruction_count
+    );
+    assert_eq!(rebound.contract_retry_claims, record.contract_retry_claims);
+    assert!(progress.contains_body(&entity, &body));
+    assert!(progress.fresh_context_body_acks.is_empty());
+}
+#[test]
+fn upload_context_due_refusal_still_uses_existing_retry_lease() {
+    let item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+    let entity = item.snapshot_fingerprint.clone();
+    let body = snapshot_upload_body_witness(&item);
+    let mut record = crate::snapshots::snapshot_quarantine_record(SnapshotSource::Codex);
+    record.witness = crate::snapshots::snapshot_quarantine_witness_for_context(
+        SnapshotSource::Codex,
+        &"c".repeat(64),
+    );
+    record.upload_body_witness = Some(body.clone());
+    record.retry_after_unix_seconds = current_unix_seconds().saturating_sub(1);
+    let mut progress = SnapshotUploadProgress::new(
+        "a".repeat(64),
+        crate::snapshots::snapshot_quarantine_witness_for_context(
+            SnapshotSource::Codex,
+            &"d".repeat(64),
+        ),
+    );
+    progress
+        .quarantined_fingerprints
+        .insert(entity.clone(), record);
+    assert!(progress.prepare_quarantine_retries(&BTreeMap::new()));
+    assert!(progress.active_quarantine_retries.contains(&entity));
+    assert!(!progress.contains_body(&entity, &body));
+}
+#[test]
+fn upload_context_changed_body_can_correct_pending_refusal() {
+    let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+    let entity = item.snapshot_fingerprint.clone();
+    let mut record = crate::snapshots::snapshot_quarantine_record(SnapshotSource::Codex);
+    record.witness = crate::snapshots::snapshot_quarantine_witness_for_context(
+        SnapshotSource::Codex,
+        &"c".repeat(64),
+    );
+    record.upload_body_witness = Some(snapshot_upload_body_witness(&item));
+    record.retry_after_unix_seconds = current_unix_seconds() + 3600;
+    let mut progress = SnapshotUploadProgress::new(
+        "a".repeat(64),
+        crate::snapshots::snapshot_quarantine_witness_for_context(
+            SnapshotSource::Codex,
+            &"d".repeat(64),
+        ),
+    );
+    progress
+        .quarantined_fingerprints
+        .insert(entity.clone(), record);
+    assert!(!progress.prepare_quarantine_retries(&BTreeMap::new()));
+    item.tool_usage_truncated = !item.tool_usage_truncated;
+    let corrected = snapshot_upload_body_witness(&item);
+    assert!(!progress.note_reprojected_context_refusals(&[item]));
+    assert!(!progress.contains_body(&entity, &corrected));
+}

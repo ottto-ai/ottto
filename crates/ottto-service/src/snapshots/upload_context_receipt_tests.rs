@@ -522,3 +522,22 @@ fn upload_context_policy_change_reprojects_old_refusal_then_keeps_backoff() {
     f.assert_quiet();
     assert!(f.entry().upload_context_receipt.is_none());
 }
+
+#[test]
+fn upload_context_policy_suppressed_file_rearms_on_context_change() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    f.index
+        .activate_file_upload_context(f.source, "c".repeat(64));
+    f.pending();
+    let key = f.key();
+    f.index.confirmed_empty_files.insert(key.clone());
+    f.index.file_snapshot_fingerprints.remove(&key);
+    let entry = f.index.files.get_mut(&key).unwrap();
+    entry.last_snapshot_fingerprint = None;
+    entry.last_upload_body_witness = None;
+    assert!(!f.index.file_upload_context_requires_adoption(&key));
+    f.index
+        .activate_file_upload_context(f.source, "d".repeat(64));
+    assert!(f.index.file_upload_context_requires_adoption(&key));
+    assert_eq!(f.walk(true).0.scanned_file_count, 1);
+}

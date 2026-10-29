@@ -4281,6 +4281,22 @@ pub(crate) fn snapshot_quarantine_witness_for_context(
     witness
 }
 
+/// A policy-only reassessment must not spend an ordinary retry or move its deadline.
+pub(crate) fn quarantine_context_only_changed(
+    previous: &SnapshotQuarantineWitness,
+    active: &SnapshotQuarantineWitness,
+) -> bool {
+    if previous.contract == active.contract
+        || previous.contract.split(":upload_context:").next()
+            != active.contract.split(":upload_context:").next()
+    {
+        return false;
+    }
+    let mut normalized = previous.clone();
+    normalized.contract.clone_from(&active.contract);
+    normalized == *active
+}
+
 pub fn snapshot_quarantine_record(source: SnapshotSource) -> SnapshotQuarantineRecord {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)

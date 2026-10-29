@@ -1535,7 +1535,12 @@ impl SnapshotUploadProgress {
                             == Some(permanent.body_witness.as_str())
                     })
                     && record.disposition == SnapshotQuarantineDisposition::RetryPending
-                    && ((record.contract_retry_claims.is_none() && &record.witness != active)
+                    && ((record.contract_retry_claims.is_none()
+                        && &record.witness != active
+                        && !crate::snapshots::quarantine_context_only_changed(
+                            &record.witness,
+                            active,
+                        ))
                         || record.retry_after_unix_seconds <= now)
             })
             .map(|(fingerprint, record)| {
