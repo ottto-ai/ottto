@@ -140,13 +140,30 @@ fn raw_scan_capturing(
     index: ScanIndex,
     cache: Option<Arc<SharedCache>>,
     identity_capture: bool,
+    after_start: impl FnMut(&mut OwnedSourceScan),
+) -> Run {
+    raw_scan_at(
+        fixture,
+        index,
+        cache,
+        identity_capture,
+        COLLECTED,
+        after_start,
+    )
+}
+fn raw_scan_at(
+    fixture: &Fixture,
+    index: ScanIndex,
+    cache: Option<Arc<SharedCache>>,
+    identity_capture: bool,
+    collected_at: &str,
     mut after_start: impl FnMut(&mut OwnedSourceScan),
 ) -> Run {
     let mut scan = OwnedSourceScan::new_with_identity_capture(
         SOURCE,
         std::slice::from_ref(&fixture.dir),
         index,
-        COLLECTED,
+        collected_at,
         BACKFILL_WINDOW_DAYS,
         100,
         false,
@@ -1348,4 +1365,111 @@ impl RestoreTestOutcome for sampled_scan::durable_tail::RestoreOutcome {
             Self::Held(reason) => panic!("ordinary restore unexpectedly Held: {reason:?}"),
         }
     }
+}
+
+#[test]
+fn desktop_metadata_reemit_is_session_scoped_even_during_inventory_backoff() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    let home = crate::test_scratch::ScratchDir::new("desktop-reemit-scope");
+    let mut f = Fixture::new(1);
+    let old_dir = f.dir.clone();
+    f.dir = home.join(".claude/projects");
+    fs::create_dir_all(&f.dir).unwrap();
+    let next_path = f.dir.join(format!("{}.jsonl", f.session));
+    fs::rename(&f.path, &next_path).unwrap();
+    f.path = next_path;
+    fs::remove_dir_all(old_dir).unwrap();
+    let other = "00000000-0000-4000-8000-000000000099";
+    fs::write(f.dir.join(format!("{other}.jsonl")), json!({
+        "timestamp":"2026-08-02T07:00:00Z", "type":"assistant", "sessionId":other,
+        "requestId":"req_other", "message":{"model":"claude-haiku-4-5", "usage":{"input_tokens":3,"output_tokens":2}}
+    }).to_string()+"\n").unwrap();
+    let support = home.join("Library/Application Support");
+    let bucket = |name: &str| {
+        support
+            .join(name)
+            .join("claude-code-sessions")
+            .join("123e4567-e89b-12d3-a456-426614174000")
+            .join("123e4567-e89b-12d3-a456-426614174001")
+    };
+    let main = bucket("Claude");
+    fs::create_dir_all(&main).unwrap();
+    let write_child = |title| {
+        fs::write(main.join("child.json"), json!({
+        "cliSessionId":f.session, "sessionId":"local_child", "title":title, "titleSource":"user",
+        "spawnedFrom":{"sessionId":"local_parent"}, "createdAt":"2026-08-02T06:59:00Z"
+    }).to_string()).unwrap()
+    };
+    write_child("first");
+    fs::write(main.join("parent.json"), json!({"cliSessionId":other,"sessionId":"local_parent","title":"other","titleSource":"user"}).to_string()).unwrap();
+    let cache = Arc::new(SharedCache::default());
+    let run = |index, at| raw_scan_at(&f, index, Some(cache.clone()), true, at, |_| {});
+    let first = run(ScanIndex::default(), "2026-08-02T07:10:00Z");
+    assert_eq!(first.result.snapshots.len(), 2);
+    assert!(!first.index.claude_desktop_title_files.is_empty());
+    assert!(first
+        .index
+        .claude_desktop_title_files
+        .values()
+        .any(|entry| entry.cli_session_id == f.session
+            && entry.spawned_from_desktop_session_id.is_some()));
+    let mut index = settle(first);
+    let saved: BTreeMap<_, _> = index
+        .files
+        .iter()
+        .map(|(key, entry)| (key.clone(), entry.source_file_fingerprint.clone()))
+        .collect();
+    for (profile, at, defer) in [
+        ("Claude-UNRELATED", "2026-08-02T07:12:00Z", false),
+        ("Claude-ANOTHER", "2026-08-02T07:12:01Z", true),
+    ] {
+        let store = bucket(profile);
+        fs::create_dir_all(&store).unwrap();
+        fs::write(support.join(profile).join("config.json"), "{}").unwrap();
+        fs::write(
+            store.join("unrelated.json"),
+            json!({"cliSessionId":profile,"title":"unrelated"}).to_string(),
+        )
+        .unwrap();
+        let (next, rows) = crate::local_resource_diagnostics::capture(|| run(index, at));
+        assert_eq!(!next.index.claude_desktop_identity_census_complete, defer);
+        assert_eq!(next.native_bytes, 0, "inventory changes never read bodies");
+        assert!(next.result.snapshots.is_empty(), "no unrelated re-emits");
+        assert_eq!(
+            saved,
+            next.index
+                .files
+                .iter()
+                .map(|(key, entry)| (key.clone(), entry.source_file_fingerprint.clone()))
+                .collect()
+        );
+        assert_eq!(
+            rows.iter()
+                .filter_map(|row| row["counts"]["desktop_metadata"]["inventory_restarts"].as_u64())
+                .sum::<u64>(),
+            1
+        );
+        index = next.index;
+    }
+    let recovered = run(index, "2026-08-02T07:15:00Z");
+    assert!(recovered.index.claude_desktop_identity_census_complete);
+    assert!(recovered.result.snapshots.is_empty());
+    assert_eq!(recovered.native_bytes, 0);
+    write_child("changed own metadata");
+    let (changed, rows) =
+        crate::local_resource_diagnostics::capture(|| run(recovered.index, "2026-08-02T07:17:00Z"));
+    assert_eq!(changed.result.snapshots.len(), 1);
+    assert_eq!(changed.result.snapshots[0].source_session_id, f.session);
+    assert_eq!(changed.native_bytes, fs::metadata(&f.path).unwrap().len());
+    assert_eq!(
+        rows.iter()
+            .filter_map(
+                |row| row["counts"]["desktop_metadata"]["source_revision_body_rereads"].as_u64()
+            )
+            .sum::<u64>(),
+        1
+    );
+    let quiet = run(settle(changed), "2026-08-02T07:19:00Z");
+    assert_eq!(quiet.native_bytes, 0);
+    assert!(quiet.result.snapshots.is_empty());
 }

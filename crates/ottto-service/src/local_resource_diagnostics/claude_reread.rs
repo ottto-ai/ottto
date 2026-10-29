@@ -199,6 +199,8 @@ impl Rearm {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct Counts {
+    #[serde(skip_serializing_if = "DesktopMetadata::is_empty")]
+    pub(crate) desktop_metadata: DesktopMetadata,
     #[serde(skip_serializing_if = "IgnoredVetoCounts::is_empty")]
     pub(crate) rearm_veto_ignored: IgnoredVetoCounts,
     #[serde(skip_serializing_if = "super::is_zero")]
@@ -213,6 +215,60 @@ pub(crate) struct Counts {
     pub(crate) claude_reread: Rearm,
     #[serde(skip_serializing_if = "CachePage::is_empty")]
     pub(crate) retained_cache_page_events: CachePage,
+}
+/// Counts only, on the existing page line. Revisions count actual body reads,
+/// not selection, metadata IO, sample verification, or an unchanged RAM reuse.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct DesktopMetadata {
+    #[serde(skip_serializing_if = "super::is_zero")]
+    pub(crate) inventory_restarts: u64,
+    #[serde(skip_serializing_if = "super::is_zero")]
+    pub(crate) source_revision_body_rereads: u64,
+    #[serde(skip_serializing_if = "super::is_zero")]
+    pub(crate) legacy_identity_body_rereads: u64,
+    #[serde(skip_serializing_if = "super::is_zero")]
+    pub(crate) lineage_window_read_attempts: u64,
+}
+impl DesktopMetadata {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+    fn merge(&mut self, other: Self) {
+        self.inventory_restarts = self
+            .inventory_restarts
+            .saturating_add(other.inventory_restarts);
+        self.source_revision_body_rereads = self
+            .source_revision_body_rereads
+            .saturating_add(other.source_revision_body_rereads);
+        self.legacy_identity_body_rereads = self
+            .legacy_identity_body_rereads
+            .saturating_add(other.legacy_identity_body_rereads);
+        self.lineage_window_read_attempts = self
+            .lineage_window_read_attempts
+            .saturating_add(other.lineage_window_read_attempts);
+    }
+}
+pub(crate) fn desktop_inventory_restart() {
+    update(|counts| {
+        let n = &mut counts.desktop_metadata.inventory_restarts;
+        *n = n.saturating_add(1);
+    });
+}
+pub(crate) fn desktop_revision_body_read(legacy: bool) {
+    update(|counts| {
+        let n = if legacy {
+            &mut counts.desktop_metadata.legacy_identity_body_rereads
+        } else {
+            &mut counts.desktop_metadata.source_revision_body_rereads
+        };
+        *n = n.saturating_add(1);
+    });
+}
+pub(crate) fn desktop_lineage_window_read() {
+    update(|counts| {
+        let n = &mut counts.desktop_metadata.lineage_window_read_attempts;
+        *n = n.saturating_add(1);
+    });
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct CachePage {
@@ -262,6 +318,7 @@ pub(crate) fn cache_capacity_eviction(count_pressure: bool) {
 }
 impl Counts {
     pub(crate) fn merge(&mut self, other: Self) {
+        self.desktop_metadata.merge(other.desktop_metadata);
         self.rearm_veto_ignored.merge(other.rearm_veto_ignored);
         self.rearm_structural_native_duplicate = self
             .rearm_structural_native_duplicate
@@ -472,6 +529,33 @@ impl crate::heap_layout_bound::HeapLayoutBound for Reinsertion {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn desktop_metadata_counts_are_sparse_saturating_and_scope_local() {
+        let scope = super::Scope::begin(true);
+        super::desktop_inventory_restart();
+        super::desktop_revision_body_read(false);
+        super::desktop_revision_body_read(true);
+        super::desktop_lineage_window_read();
+        let mut counts = scope.finish();
+        counts.desktop_metadata.inventory_restarts = u64::MAX;
+        let scope = super::Scope::begin(true);
+        super::desktop_inventory_restart();
+        counts.merge(scope.finish());
+        assert_eq!(
+            serde_json::to_value(counts).unwrap()["desktop_metadata"],
+            serde_json::json!({
+                "inventory_restarts":u64::MAX, "source_revision_body_rereads":1,
+                "legacy_identity_body_rereads":1, "lineage_window_read_attempts":1
+            })
+        );
+        assert!(serde_json::to_value(super::Counts::default())
+            .unwrap()
+            .get("desktop_metadata")
+            .is_none());
+        let scope = super::Scope::begin(false);
+        super::desktop_inventory_restart();
+        assert_eq!(scope.finish(), super::Counts::default());
+    }
     use super::*;
     #[test]
     fn held_reasons_are_sparse_saturating_and_merged_across_scopes() {

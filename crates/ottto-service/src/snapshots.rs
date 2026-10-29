@@ -16011,9 +16011,20 @@ struct ClaudeTitleMetadata {
     /// (`spawnedFrom`), resolved through the store to the parent's own
     /// transcript id. Only unambiguous, acyclic links are kept.
     spawn_lineage: BTreeMap<String, ClaudeDesktopSpawnLineage>,
+    /// Metadata dependencies, independent of census coverage and transcript IO.
+    lineage_revisions: BTreeMap<String, BTreeSet<String>>,
+    /// Only ambiguous stores need transcript-window resolution. Defer it until
+    /// an independently selected file finalizes, never during the census.
+    deferred_lineage_stores: Vec<Vec<ClaudeDesktopTitleIndexEntry>>,
     legacy_sidecar_fingerprint: String,
     sidecar_census_incomplete: bool,
     original_identity_census_incomplete: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    // true = transcript-window open, false = Desktop metadata open.
+    static CLAUDE_DESKTOP_READ_FOR_TEST: std::cell::Cell<Option<fn(bool)>> = const { std::cell::Cell::new(None) };
 }
 
 /// A launched session's direct starting session. No root or depth: the child
@@ -16150,21 +16161,26 @@ impl ClaudeTitleMetadata {
                 .unwrap_or(""),
             account_identity,
         ];
-        // Per-session carrier revision revisits reachable indexed files once
-        // through the existing bounded scan; no accepted-history repair. Census
-        // recovery/loss must also re-evaluate the retained original witness.
+        // Census completeness is a control-plane hold, not this session's
+        // metadata revision. An inventory reset must not invalidate every
+        // transcript. Keep the released healthy spelling for byte compatibility;
+        // session_account_evidence still refuses completeness during a sweep.
         parts.extend([
             "original_session_carrier:v1",
             &original_identity,
-            if self.original_identity_census_incomplete {
-                "incomplete"
-            } else {
-                "complete"
-            },
+            "complete",
         ]);
         // Appended only when a link exists, so sessions nobody spawned keep
         // their fingerprint and only spawned children re-emit once.
-        if let Some(lineage) = self.spawn_lineage.get(source_session_id) {
+        let lineage_revision = self
+            .lineage_revisions
+            .get(source_session_id)
+            .map(|revisions| {
+                serde_json::to_string(revisions).expect("lineage revisions serialize")
+            });
+        if let Some(revision) = &lineage_revision {
+            parts.extend(["desktop_spawn_metadata:v1", revision]);
+        } else if let Some(lineage) = self.spawn_lineage.get(source_session_id) {
             parts.extend([
                 "desktop_spawn_lineage:v1",
                 lineage.parent_session_id.as_str(),
@@ -16177,10 +16193,67 @@ impl ClaudeTitleMetadata {
         self.spawn_lineage.get(source_session_id)
     }
 
+    fn resolve_deferred_lineage(&mut self, index: &ScanIndex) {
+        if self.deferred_lineage_stores.is_empty() {
+            return;
+        }
+        self.spawn_lineage =
+            Self::resolve_lineage_stores(self.deferred_lineage_stores.drain(..).map(|entries| {
+                let lineage = claude_desktop_spawn_lineage(entries.iter(), |cli_session_id| {
+                    let file_name = format!("{cli_session_id}.jsonl");
+                    claude_transcript_live_window(index.files.keys().map(Path::new).filter(
+                        |path| {
+                            path.file_name().and_then(|name| name.to_str())
+                                == Some(file_name.as_str())
+                        },
+                    ))
+                });
+                entries
+                    .iter()
+                    .map(|entry| {
+                        (
+                            entry.cli_session_id.clone(),
+                            lineage
+                                .get(&entry.cli_session_id)
+                                .map(|edge| edge.parent_session_id.clone()),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }));
+    }
+
+    fn resolve_lineage_stores(
+        stores: impl Iterator<Item = Vec<(String, Option<String>)>>,
+    ) -> BTreeMap<String, ClaudeDesktopSpawnLineage> {
+        let mut candidates: BTreeMap<String, BTreeSet<Option<String>>> = BTreeMap::new();
+        for entries in stores {
+            for (child, parent) in entries {
+                candidates.entry(child).or_default().insert(parent);
+            }
+        }
+        candidates
+            .into_iter()
+            .filter_map(|(child, parents)| {
+                if parents.len() != 1 {
+                    return None;
+                }
+                Some((
+                    child,
+                    ClaudeDesktopSpawnLineage {
+                        parent_session_id: parents.into_iter().next()??,
+                    },
+                ))
+            })
+            .collect()
+    }
+
     #[cfg(test)]
     fn load_from_roots(roots: &[PathBuf]) -> Self {
         let mut index = ScanIndex::default();
-        Self::load_from_roots_with_index(roots, &mut index, "2026-07-31T00:00:00Z", true)
+        let mut metadata =
+            Self::load_from_roots_with_index(roots, &mut index, "2026-07-31T00:00:00Z", true);
+        metadata.resolve_deferred_lineage(&index);
+        metadata
     }
 
     /// `identity_capture`: this scan captures (every Claude cycle), so the
@@ -16215,7 +16288,8 @@ impl ClaudeTitleMetadata {
     ) -> Self {
         let now = rfc3339_unix_seconds(collected_at);
         let inventory = claude_request_identity::inventory_digest(store_dirs);
-        if index.claude_desktop_store_inventory.as_ref() != Some(&inventory) {
+        let inventory_changed = index.claude_desktop_store_inventory.as_ref() != Some(&inventory);
+        if inventory_changed {
             // A new store may sort before the old cursor (or after its frozen
             // ceiling). Neither that page nor a completed census covers it.
             // Reset before the retry check, including for older saved indexes.
@@ -16226,6 +16300,7 @@ impl ClaudeTitleMetadata {
             index.claude_desktop_identity_census_complete = false;
             index.claude_desktop_lineage_census_complete = false;
             index.claude_desktop_census_witness = None;
+            crate::local_resource_diagnostics::claude_reread::desktop_inventory_restart();
         }
         let retry_due = match (
             now,
@@ -16252,7 +16327,10 @@ impl ClaudeTitleMetadata {
             return Self::from_durable_index_with_metadata(
                 index,
                 Self {
-                    sidecar_census_incomplete: true,
+                    sidecar_census_incomplete: !index.claude_desktop_identity_census_complete
+                        || !index.claude_desktop_lineage_census_complete
+                        || index.claude_desktop_store_cursor.is_some()
+                        || index.claude_desktop_store_sweep_had_errors,
                     original_identity_census_incomplete: !index
                         .claude_desktop_identity_census_complete,
                     ..Self::default()
@@ -16376,7 +16454,10 @@ impl ClaudeTitleMetadata {
             sweep_had_errors
         };
 
-        if metadata.sidecar_census_incomplete {
+        if metadata.sidecar_census_incomplete || inventory_changed {
+            // Also cool down a completed inventory restart. Otherwise a small
+            // profile can flap forever without ever entering the error backoff.
+            // Healthy cached metadata remains usable during this quiet period.
             index.claude_desktop_store_retry_attempt =
                 index.claude_desktop_store_retry_attempt.saturating_add(1);
             let now = now.unwrap_or_default();
@@ -16393,7 +16474,7 @@ impl ClaudeTitleMetadata {
 
     #[cfg(test)]
     fn from_durable_index(index: &ScanIndex, sidecar_census_incomplete: bool) -> Self {
-        Self::from_durable_index_with_metadata(
+        let mut metadata = Self::from_durable_index_with_metadata(
             index,
             Self {
                 sidecar_census_incomplete,
@@ -16401,7 +16482,9 @@ impl ClaudeTitleMetadata {
                 ..Self::default()
             },
             None,
-        )
+        );
+        metadata.resolve_deferred_lineage(index);
+        metadata
     }
 
     fn from_durable_index_with_metadata(
@@ -16440,59 +16523,73 @@ impl ClaudeTitleMetadata {
                 }
             }
         }
-        if index.claude_desktop_lineage_census_complete {
-            // Desktop-local parent ids are meaningful only inside their own
-            // app store. Keep indexed paths as the scope, without changing the
-            // persisted entry format or exporting a root identifier.
-            let mut by_store: BTreeMap<&Path, Vec<&ClaudeDesktopTitleIndexEntry>> = BTreeMap::new();
-            for (path, entry) in &index.claude_desktop_title_files {
-                let scope = match store_dirs {
-                    Some(dirs) => dirs
-                        .iter()
-                        .find(|dir| Path::new(path).starts_with(dir))
-                        .map(PathBuf::as_path)
-                        .unwrap_or_else(|| Path::new(path)),
-                    None => Path::new(""), // synthetic durable-index tests
-                };
-                by_store.entry(scope).or_default().push(entry);
-            }
-            let mut candidates: BTreeMap<String, BTreeSet<Option<String>>> = BTreeMap::new();
-            for entries in by_store.into_values() {
-                let lineage =
-                    claude_desktop_spawn_lineage(entries.iter().copied(), |cli_session_id| {
-                        let file_name = format!("{cli_session_id}.jsonl");
-                        claude_transcript_live_window(index.files.keys().map(Path::new).filter(
-                            |path| {
-                                path.file_name().and_then(|name| name.to_str())
-                                    == Some(file_name.as_str())
-                            },
-                        ))
-                    });
-                for entry in entries {
-                    candidates
-                        .entry(entry.cli_session_id.clone())
+        // Group by store before either fingerprinting or resolving. A desktop
+        // id in another app can neither provide nor veto this store's parent.
+        let mut by_store: BTreeMap<&Path, Vec<&ClaudeDesktopTitleIndexEntry>> = BTreeMap::new();
+        for (path, entry) in &index.claude_desktop_title_files {
+            let scope = match store_dirs {
+                Some(dirs) => dirs
+                    .iter()
+                    .find(|dir| Path::new(path).starts_with(dir))
+                    .map(PathBuf::as_path)
+                    .unwrap_or_else(|| Path::new(path)),
+                None => Path::new(""), // synthetic durable-index tests
+            };
+            by_store.entry(scope).or_default().push(entry);
+        }
+        let linked: BTreeSet<&str> = index
+            .claude_desktop_title_files
+            .values()
+            .filter(|entry| {
+                entry.spawned_from_desktop_session_id.is_some() || entry.spawned_from_unresolved
+            })
+            .map(|entry| entry.cli_session_id.as_str())
+            .collect();
+        let mut needs_windows = false;
+        for entries in by_store.values() {
+            let mut by_desktop: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+            for entry in entries {
+                if let Some(id) = entry.desktop_session_id.as_deref() {
+                    by_desktop
+                        .entry(id)
                         .or_default()
-                        .insert(
-                            lineage
-                                .get(&entry.cli_session_id)
-                                .map(|edge| edge.parent_session_id.clone()),
-                        );
+                        .insert(&entry.cli_session_id);
                 }
             }
-            metadata.spawn_lineage = candidates
-                .into_iter()
-                .filter_map(|(child, parents)| {
-                    if parents.len() != 1 {
-                        return None;
-                    }
-                    Some((
-                        child,
-                        ClaudeDesktopSpawnLineage {
-                            parent_session_id: parents.into_iter().next()??,
-                        },
-                    ))
-                })
-                .collect();
+            needs_windows |= by_desktop.values().any(|clis| clis.len() > 1);
+            for (child, revision) in claude_desktop_lineage_revisions(entries, &linked) {
+                metadata
+                    .lineage_revisions
+                    .entry(child)
+                    .or_default()
+                    .insert(revision);
+            }
+        }
+        if index.claude_desktop_lineage_census_complete {
+            // Most links are metadata-only. For ambiguous desktop ids retain
+            // the same per-store graph, but resolve its bounded transcript
+            // windows only after a file was independently selected and read.
+            metadata.spawn_lineage =
+                Self::resolve_lineage_stores(by_store.values().map(|entries| {
+                    let lineage = claude_desktop_spawn_lineage(entries.iter().copied(), |_| None);
+                    entries
+                        .iter()
+                        .map(|entry| {
+                            (
+                                entry.cli_session_id.clone(),
+                                lineage
+                                    .get(&entry.cli_session_id)
+                                    .map(|edge| edge.parent_session_id.clone()),
+                            )
+                        })
+                        .collect()
+                }));
+            if needs_windows {
+                metadata.deferred_lineage_stores = by_store
+                    .into_values()
+                    .map(|entries| entries.into_iter().cloned().collect())
+                    .collect();
+            }
         }
         let sidecar_parts = metadata
             .titles
@@ -16502,6 +16599,62 @@ impl ClaudeTitleMetadata {
         metadata.legacy_sidecar_fingerprint = sha256_hex_owned(&sidecar_parts);
         metadata
     }
+}
+
+/// Hash only the child's metadata and its reachable parent metadata in one
+/// store. Unrelated sessions/profiles and census completeness cannot change it.
+/// This is selection evidence only; the existing resolver still decides links.
+fn claude_desktop_lineage_revisions(
+    entries: &[&ClaudeDesktopTitleIndexEntry],
+    linked: &BTreeSet<&str>,
+) -> BTreeMap<String, String> {
+    let mut by_cli: BTreeMap<&str, Vec<&ClaudeDesktopTitleIndexEntry>> = BTreeMap::new();
+    let mut by_desktop: BTreeMap<&str, Vec<&ClaudeDesktopTitleIndexEntry>> = BTreeMap::new();
+    for &entry in entries {
+        by_cli.entry(&entry.cli_session_id).or_default().push(entry);
+        if let Some(id) = entry.desktop_session_id.as_deref() {
+            by_desktop.entry(id).or_default().push(entry);
+        }
+    }
+    let mut revisions = BTreeMap::new();
+    for (&child, child_entries) in &by_cli {
+        if !linked.contains(child) {
+            continue;
+        }
+        let mut pending = child_entries.clone();
+        let mut seen = BTreeSet::new();
+        while let Some(entry) = pending.pop() {
+            let leaf = serde_json::to_string(&(
+                &entry.cli_session_id,
+                &entry.desktop_session_id,
+                &entry.spawned_from_desktop_session_id,
+                entry.spawned_from_unresolved,
+                entry
+                    .original_identity
+                    .as_ref()
+                    .and_then(|identity| identity.source_created_at.as_deref()),
+            ))
+            .expect("lineage metadata serializes");
+            if !seen.insert(leaf) {
+                continue;
+            }
+            if let Some(siblings) = by_cli.get(entry.cli_session_id.as_str()) {
+                pending.extend(siblings.iter().copied());
+            }
+            if let Some(parents) = entry
+                .spawned_from_desktop_session_id
+                .as_deref()
+                .and_then(|id| by_desktop.get(id))
+            {
+                pending.extend(parents.iter().copied());
+            }
+        }
+        revisions.insert(
+            child.to_owned(),
+            sha256_hex_owned(&seen.into_iter().collect::<Vec<_>>()),
+        );
+    }
+    revisions
 }
 
 /// When the earliest and latest event of one transcript were written, as far
@@ -16718,6 +16871,12 @@ fn read_claude_transcript_live_window(
     struct Stamp {
         timestamp: Option<String>,
     }
+    #[cfg(test)]
+    CLAUDE_DESKTOP_READ_FOR_TEST.with(|hook| {
+        if let Some(observe) = hook.get() {
+            observe(true);
+        }
+    });
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -16727,6 +16886,7 @@ fn read_claude_transcript_live_window(
     if !metadata.is_file() {
         return Err(anyhow::anyhow!("Claude transcript was not a file"));
     }
+    crate::local_resource_diagnostics::claude_reread::desktop_lineage_window_read();
     let len = metadata.len();
     let bound = CLAUDE_TRANSCRIPT_WINDOW_READ_BYTES;
     // (bytes, starts at a line start, ends at a line end)
@@ -16985,6 +17145,12 @@ fn load_claude_desktop_session_title(
     account_identifier_hash: Option<String>,
     mut original_identity: Option<ClaudeDesktopIdentityEvidence>,
 ) -> Result<Option<ClaudeDesktopTitleIndexEntry>> {
+    #[cfg(test)]
+    CLAUDE_DESKTOP_READ_FOR_TEST.with(|hook| {
+        if let Some(observe) = hook.get() {
+            observe(false);
+        }
+    });
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -26947,7 +27113,7 @@ impl OwnedSourceScan {
             claude_request_identity_capture,
             claude_effort_support_dir,
             codex_title_metadata,
-            claude_title_metadata,
+            mut claude_title_metadata,
             state_census_complete,
             sidecar_census_complete,
             codex_turn_traces,
@@ -27939,6 +28105,7 @@ impl OwnedSourceScan {
                 }
             }
             if let Some(mut active) = active_file.take() {
+                let before_body_read = active.parser.reader.consumed_bytes();
                 if let Some(delivery) = line_delivery.as_mut() {
                     delivery.begin_armed(&active, &roots);
                 }
@@ -27985,6 +28152,23 @@ impl OwnedSourceScan {
                 } else {
                     active.parser.step()
                 };
+                if source == SnapshotSource::ClaudeCode
+                    && before_body_read == 0
+                    && active.parser.reader.consumed_bytes() > 0
+                {
+                    // Count only the first actual body bytes. SourceChanged
+                    // includes Desktop/usage sidecar and object revisions;
+                    // LegacyIdentity is the separate one-time legacy upgrade.
+                    match index.candidate_decision_with_reason(&active.candidate).1 {
+                        Some(CandidateParseReason::SourceChanged) => {
+                            crate::local_resource_diagnostics::claude_reread::desktop_revision_body_read(false);
+                        }
+                        Some(CandidateParseReason::LegacyIdentity) => {
+                            crate::local_resource_diagnostics::claude_reread::desktop_revision_body_read(true);
+                        }
+                        _ => {}
+                    }
+                }
                 if source == SnapshotSource::Codex {
                     let consumed = active.parser.reader.consumed_bytes();
                     let moved = codex_file_join::take_charge(&mut active);
@@ -28596,6 +28780,9 @@ impl OwnedSourceScan {
                     });
                     Some((digest, live, stamp, sidecar))
                 });
+                if source == SnapshotSource::ClaudeCode {
+                    claude_title_metadata.resolve_deferred_lineage(index);
+                }
                 let OwnedActiveFile {
                     comparison_target,
                     sampling: file_sampling,
@@ -75455,6 +75642,149 @@ mod tests {
         );
     }
 
+    struct DesktopReadGuard;
+    impl DesktopReadGuard {
+        fn new(hook: fn(bool)) -> Self {
+            CLAUDE_DESKTOP_READ_FOR_TEST.with(|slot| assert!(slot.replace(Some(hook)).is_none()));
+            Self
+        }
+    }
+    impl Drop for DesktopReadGuard {
+        fn drop(&mut self) {
+            CLAUDE_DESKTOP_READ_FOR_TEST.with(|slot| slot.set(None));
+        }
+    }
+
+    #[test]
+    fn desktop_unknown_inventory_restarts_once_and_flapping_waits_for_retry() {
+        use crate::local_resource_diagnostics::claude_reread::Scope;
+        let root = crate::test_scratch::ScratchDir::new("desktop-inventory-backoff");
+        let store = root.join("main");
+        fs::create_dir_all(&store).unwrap();
+        let path = store.join("one.json");
+        fs::write(
+            &path,
+            r#"{"cliSessionId":"one","title":"old","titleSource":"user"}"#,
+        )
+        .unwrap();
+        let dirs = BTreeSet::from([store.clone()]);
+        let load = |dirs: &BTreeSet<PathBuf>, index: &mut ScanIndex, at| {
+            ClaudeTitleMetadata::load_from_store_dirs_with_index(dirs, index, at, true)
+        };
+        let mut index = ScanIndex::default();
+        let scope = Scope::begin(true);
+        let first = load(&dirs, &mut index, "2026-10-25T10:00:00Z");
+        assert!(!first.sidecar_census_incomplete);
+        assert!(index.claude_desktop_store_inventory.is_some());
+        assert_eq!(
+            index.claude_desktop_store_retry_not_before_unix_seconds,
+            Some(rfc3339_unix_seconds("2026-10-25T10:01:00Z").unwrap())
+        );
+        load(&dirs, &mut index, "2026-10-25T10:00:01Z");
+        assert_eq!(scope.finish().desktop_metadata.inventory_restarts, 1);
+        let deadline = index.claude_desktop_store_retry_not_before_unix_seconds;
+        fs::write(
+            &path,
+            r#"{"cliSessionId":"one","title":"changed","titleSource":"user"}"#,
+        )
+        .unwrap();
+        let guard =
+            DesktopReadGuard::new(|_| panic!("backoff must open neither metadata nor transcripts"));
+        for n in 0..6 {
+            let mut flapping = dirs.clone();
+            if n % 2 == 0 {
+                flapping.insert(root.join("appearing-profile"));
+            }
+            let metadata = load(&flapping, &mut index, "2026-10-25T10:00:02Z");
+            assert!(metadata.sidecar_census_incomplete);
+            assert_eq!(metadata.titles["one"].title, "old");
+            assert!(index.claude_desktop_census_witness.is_none());
+            assert_eq!(
+                index.claude_desktop_store_retry_not_before_unix_seconds,
+                deadline
+            );
+        }
+        drop(guard);
+        let resumed = load(&dirs, &mut index, "2026-10-25T10:01:00Z");
+        assert!(
+            !resumed.sidecar_census_incomplete,
+            "the hold exits at the existing deadline"
+        );
+        assert_eq!(resumed.titles["one"].title, "changed");
+        assert!(index.claude_desktop_census_witness.is_some());
+    }
+
+    #[test]
+    fn desktop_inventory_census_defers_all_transcript_window_io() {
+        use crate::local_resource_diagnostics::claude_reread::Scope;
+        let home = crate::test_scratch::ScratchDir::new("desktop-metadata-only-census");
+        let projects = home.join(".claude/projects");
+        let store = home.join("store");
+        fs::create_dir_all(&store).unwrap();
+        fs::create_dir_all(&projects).unwrap();
+        let ids = [spawn_cli("old"), spawn_cli("new"), spawn_cli("child")];
+        for (n, id) in ids.iter().enumerate() {
+            fs::write(
+                store.join(format!("{n}.json")),
+                json!({
+                    "cliSessionId":id, "sessionId":if n < 2 {"local_parent"} else {"local_child"},
+                    "createdAt":"2026-09-18T11:29:54Z",
+                    "spawnedFrom":if n == 2 {json!({"sessionId":"local_parent"})} else {Value::Null}
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+        let mut index = ScanIndex::default();
+        for (id, stamp) in [
+            (&ids[0], "2026-09-18T11:29:54Z"),
+            (&ids[1], "2026-09-28T11:29:54Z"),
+        ] {
+            let path = projects.join(format!("{id}.jsonl"));
+            fs::write(&path, json!({"timestamp":stamp}).to_string() + "\n").unwrap();
+            index
+                .files
+                .insert(local_index_key(&path), manifest_index_entry(None));
+        }
+        let scope = Scope::begin(true);
+        let guard = DesktopReadGuard::new(|transcript| {
+            assert!(!transcript, "metadata census opened a transcript")
+        });
+        let mut metadata = ClaudeTitleMetadata::load_from_store_dirs_with_index(
+            &BTreeSet::from([store]),
+            &mut index,
+            "2026-09-30T10:00:00Z",
+            true,
+        );
+        assert!(
+            !metadata.deferred_lineage_stores.is_empty(),
+            "ambiguous Desktop id needs real native windows"
+        );
+        assert!(metadata.spawn_lineage(&ids[2]).is_none());
+        assert!(metadata.lineage_revisions.contains_key(&ids[2]));
+        let fingerprint = metadata.session_sidecar_fingerprint(&ids[2]);
+        drop(guard);
+        assert_eq!(
+            scope.finish().desktop_metadata.lineage_window_read_attempts,
+            0
+        );
+        let scope = Scope::begin(true);
+        metadata.resolve_deferred_lineage(&index);
+        assert_eq!(
+            metadata.spawn_lineage(&ids[2]).unwrap().parent_session_id,
+            ids[0]
+        );
+        assert_eq!(
+            metadata.session_sidecar_fingerprint(&ids[2]),
+            fingerprint,
+            "window resolution never changes metadata selection"
+        );
+        assert_eq!(
+            scope.finish().desktop_metadata.lineage_window_read_attempts,
+            2
+        );
+    }
+
     #[test]
     fn claude_desktop_sibling_discovery_restarts_paged_census() {
         let home = crate::test_scratch::ScratchDir::new("desktop-inventory-pages");
@@ -75841,9 +76171,9 @@ mod tests {
         incomplete.sidecar_census_incomplete = true;
         incomplete.original_identity_census_incomplete = true;
         let partial = incomplete.session_sidecar_fingerprint("native-session");
-        assert_ne!(
+        assert_eq!(
             healthy, partial,
-            "census recovery must re-evaluate unchanged transcripts"
+            "census coverage alone must not re-read unchanged transcripts"
         );
         incomplete.sidecar_census_incomplete = false;
         incomplete.original_identity_census_incomplete = false;
@@ -75869,8 +76199,8 @@ mod tests {
         candidate.source_file_fingerprint = healthy;
         assert_eq!(
             index.candidate_decision(&candidate),
-            CandidateDecision::Parse,
-            "actual selection must revisit unchanged transcript after census recovery"
+            CandidateDecision::Skip,
+            "census recovery changes no session metadata or accepted body"
         );
         index.record(
             candidate.clone(),
@@ -89893,7 +90223,7 @@ crate::durable_tail_codec::durable_struct!(ClaudeResponseObservation {
     N desktop_request: bool,
 });
 crate::heap_layout_bound::fields!(ClaudeTitleCandidate; title, user_set);
-crate::heap_layout_bound::fields!(ClaudeTitleMetadata; titles, account_identifier_hashes, original_identity_evidence, spawn_lineage, legacy_sidecar_fingerprint, sidecar_census_incomplete, original_identity_census_incomplete);
+crate::heap_layout_bound::fields!(ClaudeTitleMetadata; titles, account_identifier_hashes, original_identity_evidence, spawn_lineage, lineage_revisions, deferred_lineage_stores, legacy_sidecar_fingerprint, sidecar_census_incomplete, original_identity_census_incomplete);
 crate::heap_layout_bound::fields!(ClaudeTranscriptUsageOccurrence; sequence, usage, model, selector, reasoning_effort, timestamp, event_clock_complete, desktop_request, effective_input_context, telemetry_attached, e2_inherited);
 crate::heap_layout_bound::fields!(ClaudeTranscriptUsageOccurrenceWitness; sequence, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, model, speed_mode, reasoning_effort);
 crate::heap_layout_bound::fields!(ClaudeUsageAuthorityQuarantineRecord; contract, proven_witness_fingerprint, member_source_file_fingerprints, failed_reconstruction_count, disposition, retry_after_unix_seconds, proof_correction);

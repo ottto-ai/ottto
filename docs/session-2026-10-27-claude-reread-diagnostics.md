@@ -44,3 +44,34 @@ through the existing decision carrier; leased error reporting stays unchanged.
 A real preparation regression loads an unbound record and forces progress
 generation overflow under both gate states, checking one reported clear and the
 unchanged failure and durable progress.
+
+Desktop metadata uses the existing page `local_resources` counts carrier under
+`desktop_metadata`. All four fields are sparse, saturating integers, scoped to
+Claude work and merged across cooperative steps. There is no new emitter or
+wire field:
+
+- `inventory_restarts`: changed/unknown ordered store inventory resets the
+  metadata cursor, ceiling and coverage claims. An old absent inventory counts
+  once when established; subsequent unchanged loads count zero.
+- `source_revision_body_rereads`: a `SourceChanged` selection actually consumes
+  its first transcript body bytes. This includes Desktop/usage sidecar revisions
+  and opened-object revisions; it is not exclusively Desktop attribution.
+- `legacy_identity_body_rereads`: the same actual-read event selected by the
+  separate legacy identity adoption path. Both body counters count files per
+  attempt, including attempts that later fail; selection or an unchanged native
+  reduction reuse alone counts zero.
+- `lineage_window_read_attempts`: a selected-file finalization opens an uncached
+  parent transcript to resolve an ambiguous Desktop id. Existing head/tail caps
+  apply (256 KiB at each end); cached windows and metadata census work count zero.
+
+Inventory changes cool down even a successful small metadata sweep using the
+existing 60-second initial retry and one-hour ceiling. A changed inventory during
+backoff revokes the census witness immediately, retains the deadline, and does
+no metadata-file or transcript-window reads. A completed cached census remains
+usable during its quiet period. Census coverage does not itself revise session
+selection: original-account evidence still refuses completeness while coverage
+is missing. Selection hashes only that session's metadata, including reachable
+parent metadata in its own store. Ambiguous parent windows resolve after an
+independently selected native read; census discovery never opens transcripts.
+A healthy spawned session adopts this metadata dependency revision once; unrelated
+profiles and later coverage loss/recovery do not select unchanged transcripts.

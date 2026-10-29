@@ -30097,6 +30097,153 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn desktop_profile_names_stay_local_in_actual_status_post() {
+        use crate::snapshot_client::{AgentStatusSnapshotUploadRequest, SnapshotApiClient};
+        use std::net::TcpListener;
+        let home = crate::test_scratch::ScratchDir::new("desktop-private-post");
+        let support = home.join("Library/Application Support");
+        let names = ["Claude-PRIMARY-PRIVATE-ROOT", "Claude-SIBLING-PRIVATE-ROOT"];
+        let uuid = |n: u32| format!("00000000-0000-4000-8000-{n:012}");
+        let at = "2026-08-12T08:00:00Z";
+        let until = "2026-08-12T08:15:00Z";
+        for (n, name) in names.iter().enumerate() {
+            let root = support.join(name);
+            let account = uuid(n as u32 + 1);
+            let bucket = root
+                .join("claude-code-sessions")
+                .join(&account)
+                .join(uuid(n as u32 + 11));
+            fs::create_dir_all(&bucket).unwrap();
+            fs::write(
+                root.join("config.json"),
+                format!(r#"{{"lastKnownAccountUuid":"{account}"}}"#),
+            )
+            .unwrap();
+            fs::write(bucket.join("local_session.json"), format!(r#"{{"cliSessionId":"session-{n}","lastActivityAt":1786000000,"planType":"max"}}"#)).unwrap();
+        }
+        let roots = crate::claude_desktop::support_roots(&home);
+        let fingerprint =
+            claude_default_account_fingerprint_from_paths(&roots, &home.join("absent-cli.json"))
+                .unwrap();
+        assert!(
+            fingerprint.contains(names[1]),
+            "the canary really enters the local fingerprint"
+        );
+        let scan = claude_desktop_scan_from_roots(&roots, at);
+        assert_eq!(scan.pairs.pairs.len(), 2);
+        let primary = scan
+            .pairs
+            .pairs
+            .iter()
+            .find(|pair| pair.observation.account_id.as_deref() == Some(uuid(1).as_str()))
+            .unwrap();
+        let sibling = scan
+            .pairs
+            .pairs
+            .iter()
+            .find(|pair| pair.observation.account_id.as_deref() == Some(uuid(2).as_str()))
+            .unwrap();
+        assert_ne!(primary.binding, sibling.binding);
+        let mut metered = base_snapshot(
+            SourceKind::ClaudeCode,
+            AgentStatusState::Available,
+            AgentStatusCollectionMethod::CliJson,
+            at.into(),
+            until.into(),
+        );
+        let mut account = unsupported_account("anthropic");
+        account.account_identifier_hash = Some(primary.binding.account_identifier_hash.clone());
+        account.organization_identifier_hash =
+            Some(primary.binding.organization_identifier_hash.clone());
+        metered.account = Some(account);
+        metered.quota_windows = claude_oauth_quota_windows(
+            &serde_json::json!({"five_hour":{"utilization":24.0,"resets_at":"2026-08-12T10:00:00+00:00"}}),
+        );
+        let mut current = primary.observation.clone();
+        current.is_current = Some(true);
+        metered.plan_observations = vec![current];
+        let mut uploads = vec![metered.clone()];
+        append_claude_desktop_pairs_snapshot(&mut uploads, &scan.pairs, at, until);
+        assert_eq!(uploads.len(), 2);
+        assert_eq!(uploads[0], metered);
+        assert_eq!(
+            uploads[1].plan_observations,
+            vec![sibling.observation.clone()]
+        );
+        assert_eq!(uploads[1].plan_observations[0].is_current, Some(false));
+        assert_eq!(
+            uploads[1].quota_windows,
+            vec![unsupported_quota_window("usage")]
+        );
+        assert!(uploads[1].account.is_none());
+        assert!(uploads[1].credit_balances.is_empty());
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.starts_with("POST /api/v1/agent-status/snapshots "));
+            let mut length = None;
+            loop {
+                line.clear();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        length = Some(value.trim().parse::<usize>().unwrap());
+                    }
+                }
+            }
+            let length = length.expect("bounded JSON request");
+            assert!(length < 2 * 1024 * 1024);
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            drop(reader);
+            let response = r#"{"accepted":2,"machine_id":"fixture","sources":["claude_code"]}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+            String::from_utf8(body).unwrap()
+        });
+        let request = AgentStatusSnapshotUploadRequest {
+            machine_id: "fixture".into(),
+            snapshots: uploads
+                .iter()
+                .cloned()
+                .map(AgentStatusSnapshot::redacted_for_backend)
+                .collect(),
+        };
+        SnapshotApiClient::new(format!("http://{address}"))
+            .upload_agent_status("synthetic-relay-token", &request)
+            .unwrap();
+        let body = server.join().unwrap();
+        assert!(!body.contains(&fingerprint));
+        assert!(!body.contains(home.to_str().unwrap()));
+        for name in names {
+            assert!(!body.contains(name));
+            assert!(!body.contains(support.join(name).to_str().unwrap()));
+        }
+        let posted: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            posted["snapshots"][0],
+            serde_json::to_value(metered.redacted_for_backend()).unwrap()
+        );
+        assert_eq!(
+            posted["snapshots"][1]["plan_observations"][0]["account_id"],
+            uuid(2)
+        );
+        assert!(posted["snapshots"][1]["plan_observations"][0]
+            .get("desktop_recent_at")
+            .is_none());
+    }
+
+    #[test]
     fn claude_desktop_duplicate_session_owner_fails_closed_on_tie() {
         let builders = vec![
             ClaudeDesktopProfileBuilder {
