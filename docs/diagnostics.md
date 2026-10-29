@@ -272,6 +272,10 @@ An unchanged withheld key is skipped and not counted; the memo behind that skip
 is RAM only. `counts.withheld_hold_released.deleted` counts holds released
 because the held file was proved absent. Both are drained like
 `line_delivery_unselected`.
+`counts.withheld_memo` is a gauge of that memo: `entries` (at most 4,096) and
+`retained_bytes`, the bytes charged to the sync owner's process-retained bound
+(absent where the requested layout is unsupported). A refused charge drops the
+memo with the other retained graphs. Omitted while the memo is empty.
 
 ## Context Footprint Discovery
 
