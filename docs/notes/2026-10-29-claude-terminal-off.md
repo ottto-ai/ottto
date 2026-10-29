@@ -321,3 +321,21 @@ acquires separately through each held/failed reloaded retry Scope. Both must
 remain Unchanged, with no ScopeChanged Full. No new persisted state, authority,
 body-read cause or budget is introduced. Native Scope execution remains a
 branch-Mac obligation.
+
+### Local receipt composition: mixed-file selection
+
+The local receipt composition derives RAM selection hints from the existing
+per-ACK context/body ledger. Every use rechecks context, replay epoch, source,
+body set, exact member incidence and quarantine witness. Missing stamps or
+cleared source debt cannot hold a new destination's projection. No partial file
+receipt is minted, no source-wide context is adopted and no census/proof credit
+is granted. The hints are skipped by serialization and included in heap bounds.
+
+A current-context non-due mixed file holds until retry; a terminal refusal ends
+the hold. Already-ACKed siblings remain quiet in their own context. A destination
+or privacy change gets its own projection/ACK, then becomes quiet. The ordinary
+candidate gates retain independent audit/history/correction authority. Mixed
+holds are counted per preparation; confirmed-empty context reparses are counted
+separately and remain a disclosed limitation. Context-only rediscovery consumes
+the receipt API so accepted files and non-due mixed holds do not force a corpus
+walk. These changes remain local until the source-general receipt PR merges.

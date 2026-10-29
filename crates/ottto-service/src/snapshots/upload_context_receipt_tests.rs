@@ -1954,3 +1954,158 @@ fn real_scan_settled_alias_cannot_evict_an_ordinary_singleton_beside_ordinary_gr
     }
     f.assert_quiet();
 }
+
+// A retained post-policy group can contain multiple entities even when the
+// current parser emits one session. Model that existing index shape through
+// the real finalizer (as the source-matched mixed control does), settle only
+// the accepted sibling through validated transport, and retain refusal debt.
+// This is a selection/transport fixture, not a monetary equivalence oracle.
+fn c1_retained_mixed_file() -> (Fixture, SnapshotItem) {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    let mut row: Value = serde_json::from_str(fs::read_to_string(&f.path).unwrap().trim()).unwrap();
+    row["customTitle"] = json!("Synthetic private title");
+    fs::write(&f.path, format!("{row}\n")).unwrap();
+    let (mut scan, _) = f.walk(false);
+    assert_eq!(scan.snapshots.len(), 1);
+    assert!(scan.snapshots[0].session_display_name.is_some());
+    let mut sibling = scan.snapshots[0].clone();
+    sibling.source_session_id = "019fa111-2222-7333-8444-666666666666".into();
+    scan.snapshots.push(sibling);
+    finalize_scan_after_policy(f.source, &mut scan, &mut f.index);
+    assert_eq!(f.index.file_snapshot_fingerprints[&f.key()].len(), 2);
+    let refused = scan.snapshots[1].clone();
+    f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
+    f.uploader.hold_body(&mut f.index, &refused, false);
+    let previous = f.index.clone();
+    f.uploader
+        .send(f.source, &mut f.index, &previous, &scan.snapshots[..1])
+        .unwrap();
+    assert_eq!(f.uploader.fresh_count(), 1, "one actual exact ACK");
+    assert!(
+        f.entry().upload_context_receipt.is_none(),
+        "no partial file receipt"
+    );
+    assert_ne!(
+        f.index.upload_context_fingerprint,
+        f.index.active_upload_context_fingerprint
+    );
+    assert!(f.uploader.retains_quarantine(&refused.snapshot_fingerprint));
+    (f, refused)
+}
+
+#[test]
+fn c1_mixed_current_context_holds_three_relists_with_zero_body_reads() {
+    let (mut f, refused) = c1_retained_mixed_file();
+    let persisted = serde_json::to_value(&f.index).unwrap();
+    f.uploader
+        .prepare_for_scan(f.source, "d".repeat(64), &mut f.index);
+    assert_eq!(
+        serde_json::to_value(&f.index).unwrap(),
+        persisted,
+        "view never persists"
+    );
+    f.assert_quiet(); // Three walks assert actual parses AND native/group bytes.
+    assert!(f.index.mixed_context_view.held_files > 0);
+    assert!(f.entry().upload_context_receipt.is_none());
+    assert!(f.uploader.retains_quarantine(&refused.snapshot_fingerprint));
+    assert!(!claude_terminal_authority(
+        &f.index,
+        true,
+        "2026-10-29T12:00:00Z"
+    ));
+}
+
+#[test]
+fn c1_privacy_reduction_never_holds_old_context_siblings() {
+    let (mut f, refused) = c1_retained_mixed_file();
+    f.uploader.policy = SnapshotUploadPolicy {
+        session_titles_enabled: false,
+        ..SnapshotUploadPolicy::default()
+    };
+    f.uploader
+        .prepare_for_scan(f.source, "e".repeat(64), &mut f.index);
+    assert!(f.index.file_upload_context_requires_adoption(&f.key()));
+    let previous = f.index.clone();
+    let (mut scan, _) = f.walk(false);
+    assert_eq!(scan.scanned_file_count, 1, "D gets its own projection");
+    assert!(scan
+        .snapshots
+        .iter()
+        .any(|item| item.session_display_name.is_some()));
+    apply_upload_policy(f.source, &mut scan.snapshots, f.uploader.policy);
+    assert!(scan
+        .snapshots
+        .iter()
+        .all(|item| item.session_display_name.is_none()));
+    finalize_scan_after_policy(f.source, &mut scan, &mut f.index);
+    f.uploader
+        .send(f.source, &mut f.index, &previous, &scan.snapshots)
+        .unwrap();
+    assert!(f
+        .uploader
+        .posts
+        .last()
+        .unwrap()
+        .iter()
+        .all(|item| item.get("session_display_name").is_none_or(Value::is_null)));
+    assert_eq!(f.index.mixed_context_view.held_files, 0);
+    assert!(f.uploader.retains_quarantine(&refused.snapshot_fingerprint));
+    f.assert_quiet();
+}
+
+#[test]
+fn c1_terminal_ends_hold_and_destination_siblings_rearm_once_then_quiet() {
+    let (mut f, refused) = c1_retained_mixed_file();
+    f.uploader.hold_body(&mut f.index, &refused, true);
+    f.uploader
+        .prepare_for_scan(f.source, "d".repeat(64), &mut f.index);
+    assert!(
+        !f.index.file_upload_context_waits_for_retry(&f.key()),
+        "terminal ends hold"
+    );
+    f.assert_quiet(); // A sibling already ACKed under this context is not re-sent.
+    assert_eq!(f.index.mixed_context_view.held_files, 0);
+    // Move C→D after the terminal transition: D cannot use C's sibling ACK.
+    f.uploader
+        .prepare_for_scan(f.source, "e".repeat(64), &mut f.index);
+    let previous = f.index.clone();
+    let (scan, _) = f.walk(true);
+    assert_eq!(scan.scanned_file_count, 1);
+    let before = f.uploader.posts.len();
+    let (rearmed, _) = f
+        .uploader
+        .send(f.source, &mut f.index, &previous, &scan.snapshots)
+        .unwrap();
+    assert_eq!(rearmed, 1, "one counted D re-arm");
+    assert_eq!(f.uploader.posts.len(), before + 1);
+    f.assert_quiet();
+    assert_eq!(f.uploader.posts.len(), before + 1, "no repeat D POST");
+    assert!(f.uploader.retains_quarantine(&refused.snapshot_fingerprint));
+    assert_ne!(
+        f.index.upload_context_fingerprint,
+        f.index.active_upload_context_fingerprint
+    );
+}
+
+#[test]
+fn c1_missing_current_stamp_or_cleared_source_never_holds_a_context_move() {
+    let (mut f, _) = c1_retained_mixed_file();
+    f.uploader.forget_stamps();
+    f.uploader
+        .prepare_for_scan(f.source, "d".repeat(64), &mut f.index);
+    assert!(!f.index.file_upload_context_waits_for_retry(&f.key()));
+    let key = f.key();
+    f.index
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .source_file_fingerprint
+        .clear();
+    f.uploader
+        .prepare_for_scan(f.source, "d".repeat(64), &mut f.index);
+    assert!(!f.index.file_upload_context_waits_for_retry(&key));
+    assert!(
+        f.entry().source_file_fingerprint.is_empty(),
+        "no overwritten clear debt"
+    );
+}

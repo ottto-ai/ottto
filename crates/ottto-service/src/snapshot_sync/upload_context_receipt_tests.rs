@@ -333,6 +333,7 @@ pub(crate) struct Uploader {
     pub not_stored: bool,
     pub refuse: bool,
     pub fail_after: Option<usize>,
+    pub policy: SnapshotUploadPolicy,
 }
 impl Uploader {
     pub(crate) fn new(source: SnapshotSource) -> Self {
@@ -349,6 +350,7 @@ impl Uploader {
             not_stored: false,
             refuse: false,
             fail_after: None,
+            policy: SnapshotUploadPolicy::default(),
         }
     }
     pub(crate) fn activate(
@@ -419,6 +421,7 @@ impl Uploader {
         let fail_after = self.fail_after;
         let not_stored = self.not_stored;
         let refuse = self.refuse;
+        let policy = self.policy;
         upload_resumable_batches_with_body_witness(
             items,
             "context-real-uploader",
@@ -504,7 +507,7 @@ impl Uploader {
                     machine_id: "synthetic".into(),
                     collector_version: None,
                     snapshots: batch,
-                    upload_policy: SnapshotUploadPolicy::default(),
+                    upload_policy: policy,
                     client_report: crate::client_report::ClientReport::empty(),
                 })?;
                 Ok(response)
@@ -542,84 +545,16 @@ impl Uploader {
         )?;
         Ok(retired)
     }
-    pub(crate) fn restart(&mut self, source: SnapshotSource, context: &str) {
-        self.progress = SnapshotUploadProgress::load(
-            &self.scratch.join("progress.json"),
-            &"a".repeat(64),
-            crate::snapshots::snapshot_quarantine_witness_for_context(source, context),
-        )
-        .unwrap();
+    pub(crate) fn hold_body(&mut self, index: &mut ScanIndex, item: &SnapshotItem, terminal: bool) {
+        let body = snapshot_upload_body_witness(item);
+        if terminal {
+            self.progress
+                .quarantine_permanent_body(&item.snapshot_fingerprint, &body, "invalid");
+        } else {
+            self.progress
+                .quarantine_body(&item.snapshot_fingerprint, &body);
+        }
+        index.quarantined_snapshot_fingerprints = self.progress.quarantined_fingerprints.clone();
     }
-    pub(crate) fn replay(&mut self, generation: &str) {
-        assert!(self.progress.prepare_historical_replay(generation));
-    }
-    pub(crate) fn forget_stamps(&mut self) {
-        let mut old = serde_json::to_value(&self.progress).unwrap();
-        old.as_object_mut()
-            .unwrap()
-            .remove("accepted_body_contexts");
-        let path = self.scratch.join("progress.json");
-        std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
-        self.progress = SnapshotUploadProgress::load(
-            &path,
-            &"a".repeat(64),
-            self.progress.active_quarantine_witness.clone().unwrap(),
-        )
-        .unwrap();
-        assert!(self.progress.accepted_body_contexts.is_empty());
-    }
-    pub(crate) fn not_stored_files(&self) -> usize {
-        self.progress.context_resend.not_stored_files()
-    }
-
-    pub(crate) fn set_byte_allowance(&mut self, bytes: usize) {
-        self.progress.context_resend.set_byte_allowance(bytes);
-    }
-    pub(crate) fn counts(&self) -> (u64, u64, u64, u64) {
-        let c = &self.progress.context_resend.counts;
-        (c.entities, c.bytes, c.identical, c.changed)
-    }
-    pub(crate) fn fresh_count(&self) -> usize {
-        self.progress.fresh_context_body_acks.len()
-    }
-}
-
-#[test]
-fn upload_context_progress_released_201_202_203_ignore_stamps_and_old_is_unknown() {
-    let scratch = crate::test_scratch::ScratchDir::new("context-progress-codec");
-    let mut progress = SnapshotUploadProgress::new(
-        "a".repeat(64),
-        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
-    );
-    progress.record_body(&"b".repeat(64), &"c".repeat(64));
-    progress
-        .accepted_body_contexts
-        .insert("b".repeat(64), "d".repeat(64));
-    let encoded = serde_json::to_value(&progress).unwrap();
-    let old: released_progress::SnapshotUploadProgress = serde_json::from_value(encoded).unwrap();
-    let old_json = serde_json::to_value(old).unwrap();
-    assert!(old_json.get("accepted_body_contexts").is_none());
-    let path = scratch.join("old.json");
-    std::fs::write(&path, serde_json::to_vec(&old_json).unwrap()).unwrap();
-    let loaded = SnapshotUploadProgress::load(
-        &path,
-        &"a".repeat(64),
-        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
-    )
-    .unwrap();
-    assert!(loaded.accepted_body_contexts.is_empty());
-    assert_eq!(
-        loaded.accepted_body_witnesses,
-        progress.accepted_body_witnesses
-    );
-    // The payload is64B; a separate keyed compact-JSON map costs134B/stamp,
-    // plus one fixed field/header. Pin the actual second-entry increment.
-    let before = serde_json::to_vec(&progress).unwrap().len();
-    progress.record_body(&"e".repeat(64), &"f".repeat(64));
-    let bare = serde_json::to_vec(&progress).unwrap().len();
-    progress
-        .accepted_body_contexts
-        .insert("e".repeat(64), "d".repeat(64));
-    assert_eq!(serde_json::to_vec(&progress).unwrap().len() - bare, 134);
-    assert!(bare > before);
-}
+    pub(crate) fn retains_quarantine(&self, entity: &str) -> bool {
+        self.progress.quarantined_fingerprints.contains_key(entity)

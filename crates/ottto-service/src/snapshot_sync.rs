@@ -8632,6 +8632,20 @@ fn activate_source_upload_context(
         crate::snapshots::snapshot_quarantine_witness_for_context(source, &context),
     );
     index.activate_file_upload_context(source, context.clone());
+    index.prepare_mixed_file_context_view(
+        source,
+        progress.historical_replay_generation.as_deref(),
+        |entity| {
+            (progress.accepted_body_contexts.get(entity) == Some(&context))
+                .then(|| {
+                    progress
+                        .accepted_body_witnesses
+                        .get(entity)
+                        .map(String::as_str)
+                })
+                .flatten()
+        },
+    );
     progress.fresh_context_body_acks.clear();
     progress.context_receipt_candidates.clear();
     progress.context_resend =

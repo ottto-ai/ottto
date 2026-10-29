@@ -428,8 +428,8 @@ fn refresh_terminal_off_discovery(
         .values()
         .any(|key| !sampled_audit::candidate_open_blocked(key, now))
         || index.files.iter().any(|(key, entry)| {
-            let needs_service = index.upload_context_fingerprint
-                != index.active_upload_context_fingerprint
+            let needs_service = (index.file_upload_context_requires_adoption(key)
+                && !index.file_upload_context_waits_for_retry(key))
                 || entry.source_file_fingerprint.is_empty()
                 || (!entry.has_unverified_source()
                     && entry.scan_identity_version.as_deref()
