@@ -4202,10 +4202,9 @@ impl SharedCache {
                     charge
                         .checked_add(super::ENTRY_BYTES + super::side_ledger::SIDE_LEDGER_BYTES)
                         .is_some_and(|with_floor| {
-                            let needed = !proof_free_room(&retained, cursor, with_floor);
-                            reclaim_headers(cursor, needed, |cursor| {
-                                proof_free_room(&retained, cursor, with_floor)
-                            });
+                            // Decoders use free room only: preserve the real primary
+                            // tail floor without evicting any resident state. Header
+                            // reclamation belongs to feasible progress/retained admission.
                             proof_free_room(&retained, cursor, with_floor)
                         })
                 } else {

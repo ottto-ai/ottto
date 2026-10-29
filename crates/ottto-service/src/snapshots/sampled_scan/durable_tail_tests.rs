@@ -2510,7 +2510,7 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
     use crate::snapshots::sampled_scan::{codex_cursor, STATE_BYTES};
     use crate::transcript_acquisition::ReadMode;
     use crate::transcript_cache::{FrozenCacheState, Retained, TranscriptCache};
-    const LIMIT: usize = 256 * 1024;
+    const INVENTORY_LIMIT: usize = 256 * 1024;
     let root = crate::test_scratch::private_dir("ottto-header-restore");
     let lock = test_locks::hold(&root);
     let sessions = root.join("sessions");
@@ -2602,16 +2602,36 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
         suffix,
     )
     .unwrap();
+    // Size the actual restored representation, including codec/rederive
+    // capacities, rather than assuming that 256 KiB covers the native layout.
+    let sizing = SharedCache::default();
+    sizing.durable_begin_pass(source, &index_path, &namespace, false);
+    let incoming = match sizing.durable_restore(
+        source,
+        &key,
+        &path,
+        &scope,
+        &mut File::open(&path).unwrap(),
+        &index,
+        &interpretation,
+    ) {
+        RestoreOutcome::Restored(taken) => taken.retained,
+        _ => panic!("unscaled sizing restore must succeed"),
+    };
+    let incoming_heap = bound(&incoming, crate::transcript_cache::ENTRY_BYTES).unwrap()
+        - std::mem::size_of_val(&incoming);
+    let incoming_slot =
+        crate::transcript_cache::entry_slot_bytes::<CachedJsonlReduction>(key.capacity()).unwrap();
     let rank = crate::transcript_cache::admission_rank(
         incoming.checkpoint.modified_hint(),
         crate::transcript_cache::admission_now(),
     );
-    for (fits, limit) in [(true, LIMIT), (false, 1)] {
+    for fits in [true, false] {
         let cache = SharedCache::default();
-        *cache.retained().unwrap() = TranscriptCache::with_byte_limit(limit);
         cache.durable_begin_pass(source, &index_path, &namespace, false);
         READ_CALLS.with(|count| count.set(0));
-        let inventory = codex_cursor::with_test_state_budget(LIMIT, || page(&root, &paths, &cache));
+        let inventory =
+            codex_cursor::with_test_state_budget(INVENTORY_LIMIT, || page(&root, &paths, &cache));
         assert!(inventory.complete);
         assert_eq!(inventory.reuse_misses, paths.len());
         assert_eq!(READ_CALLS.with(std::cell::Cell::get), paths.len());
@@ -2620,20 +2640,40 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
             .unwrap();
         assert!(before > 0, "real inventory retains header facts");
         {
-            let retained = cache.retained().unwrap();
+            let mut retained = cache.retained().unwrap();
             cache
                 .with_cursor(|cursor| {
-                    let reserved = bound(cursor, STATE_BYTES).unwrap()
-                        + crate::snapshots::sampled_scan::side_ledger::SIDE_LEDGER_BYTES;
-                    assert!(!retained.insertion_fits(&key, &incoming, reserved, rank, true));
                     let headers = std::mem::take(&mut cursor.headers);
-                    let reserved = bound(cursor, STATE_BYTES).unwrap()
-                        + crate::snapshots::sampled_scan::side_ledger::SIDE_LEDGER_BYTES;
+                    let cursor_bytes = bound(cursor, STATE_BYTES).unwrap();
+                    let side = crate::snapshots::sampled_scan::side_ledger::SIDE_LEDGER_BYTES;
+                    let empty_retained = bound(&*retained, STATE_BYTES).unwrap();
+                    // The empty retained root and the incoming entry's node
+                    // are both charged; the incoming inline state lives in
+                    // that node, and only its heap is added separately.
+                    let minimum = cursor_bytes + side + empty_retained + incoming_slot + incoming_heap;
+                    assert!(minimum < STATE_BYTES);
+                    let one_byte_short = TranscriptCache::with_byte_limit(minimum - 1);
+                    assert!(!one_byte_short.insertion_fits(
+                        &key,
+                        &incoming,
+                        cursor_bytes + side,
+                        rank,
+                        true
+                    ));
+                    *retained = TranscriptCache::with_byte_limit(if fits { minimum } else { 1 });
+                    println!(
+                        "header_restore_layout: cursor={cursor_bytes} side={side} \
+                         empty_retained={empty_retained} slot={incoming_slot} \
+                         incoming_heap={incoming_heap} minimum={minimum} headers={before} fits={fits}"
+                    );
                     assert_eq!(
-                        retained.insertion_fits(&key, &incoming, reserved, rank, true),
-                        fits
+                        retained.insertion_fits(&key, &incoming, cursor_bytes + side, rank, true),
+                        fits,
+                        "derived minimum must discriminate the header-free arm"
                     );
                     cursor.headers = headers;
+                    let reserved = bound(cursor, STATE_BYTES).unwrap() + side;
+                    assert!(!retained.insertion_fits(&key, &incoming, reserved, rank, true));
                 })
                 .unwrap();
         }
@@ -2671,7 +2711,9 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
             );
             while !parser.step().unwrap() {}
             assert_eq!(parser.reader.consumed_bytes(), suffix.len() as u64);
-            let next = codex_cursor::with_test_state_budget(LIMIT, || page(&root, &paths, &cache));
+            let next = codex_cursor::with_test_state_budget(INVENTORY_LIMIT, || {
+                page(&root, &paths, &cache)
+            });
             assert!(next.complete);
             assert_eq!(next.reuse_hits, 0);
             assert_eq!(next.reuse_misses, paths.len());
@@ -2688,7 +2730,9 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
                     .unwrap(),
                 before
             );
-            let next = codex_cursor::with_test_state_budget(LIMIT, || page(&root, &paths, &cache));
+            let next = codex_cursor::with_test_state_budget(INVENTORY_LIMIT, || {
+                page(&root, &paths, &cache)
+            });
             assert!(next.reuse_hits > 0);
             assert_eq!(next.reuse_evictions, 0, "hopeless restore preserves facts");
         }

@@ -7868,6 +7868,17 @@ fn admission_floor(cache: &SharedCache) -> usize {
     retained_floor(cache) + crate::snapshots::sampled_scan::side_ledger::SIDE_LEDGER_BYTES
 }
 
+/// Boundary requests must use the least cursor state admission can reach.
+/// Real scan pages also warm optional header facts; those can yield before
+/// provenance, witnesses or retained copies, and are not a mandatory floor.
+/// Keep `cursor_resident` whole so no-eviction assertions still include them.
+fn cursor_without_header_facts(cache: &SharedCache) -> usize {
+    let headers = cache
+        .with_cursor(|cursor| cursor.headers.optional_bytes().unwrap())
+        .unwrap();
+    cache.cursor_resident().checked_sub(headers).unwrap()
+}
+
 /// Every release `release_join_owners` reports, with its member keys.
 fn released(
     cache: &SharedCache,
@@ -8140,7 +8151,7 @@ fn hopeless_admission_evicts_nothing() {
         // Measured with no retained copy and no provenance: the least an
         // admission could ever evict down to.
         let floor = admission_floor(&cache);
-        let empty = cache.cursor_resident();
+        let empty = cursor_without_header_facts(&cache);
         cache.insert(
             key.clone(),
             sampled_jsonl::CompletedNativeAcquisition {
@@ -8176,9 +8187,12 @@ fn hopeless_admission_evicts_nothing() {
         }
         // Optional twin: room for the claim, not for the claim and the floor.
         let claim = join_charge(JOIN_THIRD, &members);
-        with_test_state_budget(resident + claim + floor - 1, || {
-            cache.record_join_owner(JOIN_THIRD, &members);
-        });
+        with_test_state_budget(
+            cursor_without_header_facts(&cache) + claim + floor - 1,
+            || {
+                cache.record_join_owner(JOIN_THIRD, &members);
+            },
+        );
         assert_eq!(join_entry(&cache, JOIN_THIRD), None);
         intact();
         assert_eq!(cache.cursor_resident(), resident);
@@ -8313,7 +8327,7 @@ fn outstanding_claim_is_charged_against_a_retained_insert() {
         assert!(cache.retained_checkpoint(&key).is_some());
         // F4b: the side ledger's reservation is part of the floor.
         let with_copy = admission_floor(&cache);
-        let state = cache.cursor_resident();
+        let state = cursor_without_header_facts(&cache);
         assert!(with_copy + state <= STATE_BYTES);
         let copy = cache.take(&key).expect("retained").retained;
         // F4b exact boundary: a claim that leaves exactly the copy's room
@@ -8855,7 +8869,7 @@ fn witness_admission() -> WitnessAdmission {
         .unwrap_or_else(|| panic!("a certified copy: {}", counters(&cache)))
         .retained;
     let floor = admission_floor(&cache);
-    let empty = cache.cursor_resident();
+    let empty = cursor_without_header_facts(&cache);
     // A single-session root has no parent refs: no `parents` entry exists.
     assert!(cache
         .with_cursor(|cursor| cursor.parents.is_empty())
@@ -8945,7 +8959,7 @@ fn hopeless_admission_keeps_every_witness() {
         }
         // Optional twin: a third namespace inside the floor window.
         let refused = counter(cache, |c| c.parent_witness_refused);
-        with_test_state_budget(resident + setup.floor + 1, || {
+        with_test_state_budget(cursor_without_header_facts(cache) + setup.floor + 1, || {
             assert!(!cache.witness_parent(
                 &Scope("witness-namespace-3".into()),
                 "scope",
@@ -8960,7 +8974,7 @@ fn hopeless_admission_keeps_every_witness() {
         // witness (its node and key) are forgotten.
         let node =
             crate::heap_layout_bound::tree_node_bytes::<String, (ParentWitness, usize)>().unwrap();
-        let after = resident
+        let after = cursor_without_header_facts(cache)
             - join_charge(JOIN_OWNER, &setup.members)
             - join_charge(JOIN_OTHER, &setup.members)
             - node
