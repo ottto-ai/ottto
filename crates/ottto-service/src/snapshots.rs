@@ -147,6 +147,8 @@ pub(crate) mod discovery_growth;
 mod discovery_growth_tests;
 #[cfg(test)]
 pub(crate) mod e2_pipeline_scan_fixture;
+#[cfg(test)]
+mod held_audit_restore_tests;
 pub(crate) mod line_delivery;
 #[cfg(test)]
 mod line_delivery_tests;
@@ -47816,7 +47818,16 @@ impl ScanIndex {
             match previous.files.get(key) {
                 Some(committed) => {
                     let mut committed = committed.clone();
-                    if let Some(working) = self.files.get(key) {
+                    // Account retry preserves its sampled audit obligation;
+                    // authority/family-only holds keep their existing restore
+                    // semantics (E1 #870 owns that separate composition).
+                    if let Some(working) = self.files.get(key).filter(|_| {
+                        self.claude_account_deferred_holds.contains_key(key)
+                            || self
+                                .file_snapshot_fingerprints
+                                .get(key)
+                                .is_some_and(|fingerprints| !fingerprints.is_disjoint(reparse_held))
+                    }) {
                         committed.carry_sampled_audit(working);
                     }
                     if reparse {
@@ -47944,7 +47955,16 @@ impl ScanIndex {
             match previous.files.get(key) {
                 Some(committed) => {
                     let mut committed = committed.clone();
-                    if let Some(working) = self.files.get(key) {
+                    // Account retry preserves its sampled audit obligation;
+                    // authority/family-only holds keep their existing restore
+                    // semantics (E1 #870 owns that separate composition).
+                    if let Some(working) = self.files.get(key).filter(|_| {
+                        self.claude_account_deferred_holds.contains_key(key)
+                            || self
+                                .file_snapshot_fingerprints
+                                .get(key)
+                                .is_some_and(|fingerprints| !fingerprints.is_disjoint(reparse_held))
+                    }) {
                         committed.carry_sampled_audit(working);
                     }
                     if reparse {
@@ -48541,6 +48561,7 @@ impl ScanIndex {
         {
             return false;
         }
+        let census_record = self.claude_request_census.get(key).is_some();
         let protected = self
             .files
             .get(key)
@@ -48570,6 +48591,12 @@ impl ScanIndex {
         withheld_account::released_deleted(key);
         if !protected && !audit {
             self.remove_file_entry_unless_held(key, true);
+        }
+        if census_record && self.claude_request_census.get(key).is_none() {
+            disappearance_diagnostics::vanished(
+                SnapshotSource::ClaudeCode,
+                disappearance_diagnostics::Vanished::RequestCensusRemoved,
+            );
         }
         true
     }

@@ -185,8 +185,9 @@ impl ScanIndex {
     /// temporary PARSED witness supports trigger accounting only; it cannot
     /// grant a Skip. Completion immediately overwrites it with CONTENT.
     pub(super) fn note_withheld_account_parse(&self, key: &str, fingerprint: &str, was_held: bool) {
-        let held = self.claude_account_deferred_holds.contains_key(key);
-        if !was_held && !held {
+        // Called before the durable hold is changed; only prior holds have
+        // a reparse trigger. A first admission is recorded by completion.
+        if !was_held {
             return;
         }
         let parsed = self
@@ -206,21 +207,15 @@ impl ScanIndex {
                 }
                 _ => WithheldEvent::ReparseEvidence,
             };
-            if held {
-                if let Some(entry) = state.entry(key) {
-                    entry.seen = parsed;
-                }
-            } else {
-                state.entries.remove(&key);
+            if let Some(entry) = state.entry(key) {
+                entry.seen = parsed;
             }
             trigger
         })
         .unwrap_or(WithheldEvent::ReparseStart);
         // Lock failure still counts the actual parse; never emit under a
         // failed lock, and never let missing advisory state grant a Skip.
-        if was_held {
-            withheld_event(trigger, 1);
-        }
+        withheld_event(trigger, 1);
     }
 }
 

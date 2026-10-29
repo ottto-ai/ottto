@@ -933,66 +933,73 @@ mod tests {
     /// member's snapshot fingerprints stay (N3).
     #[test]
     fn claude_vanished_audit_debt_member_drops_its_request_census_record_and_counts_it() {
-        let dir = crate::test_scratch::ScratchDir::new("absence-debt-request-census");
-        let first = "a1111111-1111-4111-8111-111111111111";
-        let second = "b2222222-2222-4222-8222-222222222222";
-        let first_path = dir.join(format!("{first}.jsonl"));
-        let second_path = dir.join(format!("{second}.jsonl"));
-        let second_key = local_index_key(&second_path);
-        fs::write(&first_path, claude_line(first, "request-first")).unwrap();
-        fs::write(&second_path, claude_line(second, "request-second")).unwrap();
-        let mut index = ScanIndex::default();
-        assert!(
-            claude_generation(&mut index, &dir, NOW, 1, &[])
-                .last()
+        for account_held in [false, true] {
+            let dir = crate::test_scratch::ScratchDir::new("absence-debt-request-census");
+            let first = "a1111111-1111-4111-8111-111111111111";
+            let second = "b2222222-2222-4222-8222-222222222222";
+            let first_path = dir.join(format!("{first}.jsonl"));
+            let second_path = dir.join(format!("{second}.jsonl"));
+            let second_key = local_index_key(&second_path);
+            fs::write(&first_path, claude_line(first, "request-first")).unwrap();
+            fs::write(&second_path, claude_line(second, "request-second")).unwrap();
+            let mut index = ScanIndex::default();
+            assert!(
+                claude_generation(&mut index, &dir, NOW, 1, &[])
+                    .last()
+                    .unwrap()
+                    .census_complete
+            );
+            // The next generation walks both and selects only the first.
+            claude_page(&mut index, &dir, LATER, 1, &[]);
+            assert!(index
+                .traversal
+                .as_ref()
                 .unwrap()
-                .census_complete
-        );
-        // The next generation walks both and selects only the first.
-        claude_page(&mut index, &dir, LATER, 1, &[]);
-        assert!(index
-            .traversal
-            .as_ref()
-            .unwrap()
-            .pending_candidates
-            .iter()
-            .any(|pending| pending.path == second_path && pending.census_member));
-        assert!(
-            index
+                .pending_candidates
+                .iter()
+                .any(|pending| pending.path == second_path && pending.census_member));
+            assert!(
+                index
+                    .claude_request_census_for_test()
+                    .get(&second_key)
+                    .is_some(),
+                "precondition: the real parse recorded the member's census"
+            );
+            let entry = index.files.get_mut(&second_key).unwrap();
+            entry.scan_identity_version = Some(format!(
+                "{}:4000000000",
+                super::super::sampled_audit::UNVERIFIED_IDENTITY
+            ));
+            assert!(entry.has_unverified_source());
+            if account_held {
+                index
+                    .claude_account_deferred_holds
+                    .insert(second_key.clone(), entry.source_file_fingerprint.clone());
+            }
+            let fingerprints_before = index.file_snapshot_fingerprints.get(&second_key).cloned();
+            fs::remove_file(&second_path).unwrap();
+            let ((pages, sites), vanished) = observe_vanished(|| {
+                observe_sites(|| claude_generation(&mut index, &dir, LATER, 1, &[]))
+            });
+            let mut expected_sites = [[[0; OUTCOMES]; SITES]; 3];
+            expected_sites[1][Site::CandidateWalk.index()] = [0, 1];
+            assert_eq!(sites, expected_sites);
+            assert!(pages.iter().all(|page| page.disappeared_file_count == 0));
+            assert!(
+                !index.files.contains_key(&second_key),
+                "the entry and its marker are gone"
+            );
+            assert!(index
                 .claude_request_census_for_test()
                 .get(&second_key)
-                .is_some(),
-            "precondition: the real parse recorded the member's census"
-        );
-        let entry = index.files.get_mut(&second_key).unwrap();
-        entry.scan_identity_version = Some(format!(
-            "{}:4000000000",
-            super::super::sampled_audit::UNVERIFIED_IDENTITY
-        ));
-        assert!(entry.has_unverified_source());
-        let fingerprints_before = index.file_snapshot_fingerprints.get(&second_key).cloned();
-        fs::remove_file(&second_path).unwrap();
-        let ((pages, sites), vanished) = observe_vanished(|| {
-            observe_sites(|| claude_generation(&mut index, &dir, LATER, 1, &[]))
-        });
-        let mut expected_sites = [[[0; OUTCOMES]; SITES]; 3];
-        expected_sites[1][Site::CandidateWalk.index()] = [0, 1];
-        assert_eq!(sites, expected_sites);
-        assert!(pages.iter().all(|page| page.disappeared_file_count == 0));
-        assert!(
-            !index.files.contains_key(&second_key),
-            "the entry and its marker are gone"
-        );
-        assert!(index
-            .claude_request_census_for_test()
-            .get(&second_key)
-            .is_none());
-        assert_eq!(vanished, [[0; VANISHED], [1, 1], [0; VANISHED]]);
-        assert_eq!(
-            index.file_snapshot_fingerprints.get(&second_key),
-            fingerprints_before.as_ref()
-        );
-        assert!(index.files.contains_key(&local_index_key(&first_path)));
+                .is_none());
+            assert_eq!(vanished, [[0; VANISHED], [1, 1], [0; VANISHED]]);
+            assert_eq!(
+                index.file_snapshot_fingerprints.get(&second_key),
+                fingerprints_before.as_ref()
+            );
+            assert!(index.files.contains_key(&local_index_key(&first_path)));
+        }
     }
 
     /// D11 through the real pipeline: an indexed Claude file is in the frozen
@@ -1520,11 +1527,12 @@ mod tests {
         assert!(account_retirement.contains("audit_retired_absent(\"claude_code\")"));
         assert!(!account_retirement.contains("disappeared_file_count"));
         let vanished = calls("vanished");
-        assert_eq!(vanished.len(), 3);
+        assert_eq!(vanished.len(), 4);
         for (call, kind) in vanished.into_iter().zip([
             "AuditDebtDropped",
             "RequestCensusRemoved",
             "AuditDebtDropped",
+            "RequestCensusRemoved",
         ]) {
             assert!(call.contains(&format!("Vanished::{kind}")));
         }
