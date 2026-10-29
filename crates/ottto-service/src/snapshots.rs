@@ -27742,16 +27742,34 @@ impl OwnedSourceScan {
                 ) {
                     // Each member's missing-carrier deadline rides with the
                     // job across pause and defer to its own native entry.
-                    if let Some((member, reason)) = group_members.iter().find_map(|member| {
+                    let mut refused = false;
+                    for member in &group_members {
                         let mut due = None;
                         let key = local_index_key(&member.path);
-                        let held = cache.durable_member_hold(source, &key, index, &mut due);
-                        if let Some(at) = group.members.iter().position(|m| m.path == member.path) {
-                            group.recovered[at] = due;
+                        match cache.durable_member_hold(source, &key, index, &mut due) {
+                            Ok(None) => {
+                                if let Some(at) =
+                                    group.members.iter().position(|m| m.path == member.path)
+                                {
+                                    group.recovered[at] = due;
+                                }
+                            }
+                            Ok(Some(reason)) => {
+                                refused = true;
+                                cache.durable_hold_exit(source, reason, index, member, &mut census);
+                            }
+                            Err(_) => {
+                                refused = true;
+                                cache.durable_custody_hold(
+                                    source,
+                                    "member_input_pending",
+                                    index,
+                                    member,
+                                );
+                            }
                         }
-                        held.map(|reason| (member, reason))
-                    }) {
-                        cache.durable_hold_exit(source, reason, index, member, &mut census);
+                    }
+                    if refused {
                         pending!();
                     }
                 }
@@ -27874,7 +27892,7 @@ impl OwnedSourceScan {
                         for member in &group.members {
                             let key = local_index_key(&member.path);
                             match cache.durable_funded_guard(source, &key, |cache| {
-                                cache.durable_full_hold(source, &key, false)
+                                cache.durable_full_hold_active(source, &key, false)
                             }) {
                                 Ok(None) => {}
                                 Ok(Some(reason)) => {
@@ -29940,11 +29958,23 @@ impl OwnedSourceScan {
                         for (member, due) in aliases.iter().zip(dues.0.iter_mut()) {
                             let key = local_index_key(&member.path);
                             if due.is_none() && absent(&key) {
-                                *due = cache.durable_carrier_reprobe(source, &key, index);
+                                *due = cache.durable_carrier_reprobe(source, &key, index).map_err(
+                                    |_| {
+                                        crate::source_rotation::LocalRefusal(
+                                            "durable settlement funding pending",
+                                        )
+                                    },
+                                )?;
                             }
                         }
                         if dues.0.is_empty() && dues.1.is_none() && absent(&index_key) {
-                            dues.2 = cache.durable_carrier_reprobe(source, &index_key, index);
+                            dues.2 = cache
+                                .durable_carrier_reprobe(source, &index_key, index)
+                                .map_err(|_| {
+                                    crate::source_rotation::LocalRefusal(
+                                        "durable settlement funding pending",
+                                    )
+                                })?;
                             dues.1 = dues.2;
                             if dues.2.is_some() {
                                 cache.durable_note_carrier("audit_carrier");
@@ -32389,7 +32419,7 @@ impl OwnedSourceScan {
                                         pending!();
                                     }
                                     sampled_scan::durable_tail::RestoreOutcome::Miss(class) => {
-                                        if matches!(class, sampled_scan::durable_tail::MissClass::RealEdit) {
+                                        if matches!(class, sampled_scan::durable_tail::MissClass::RealEdit(_)) {
                                             restore_floor = None;
                                         }
                                         let rearmed = class.rearm_audit(
@@ -32855,19 +32885,34 @@ impl OwnedSourceScan {
                 })
             {
                 if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
-                    if let Some(reason) = cache.durable_full_hold(
+                    match cache.durable_full_hold(
                         source,
                         &local_index_key(&active.candidate.path),
                         true,
                     ) {
-                        cache.durable_hold_exit(
-                            source,
-                            reason,
-                            index,
-                            &active.candidate,
-                            &mut census,
-                        );
-                        pending!();
+                        Ok(None) => {}
+                        Ok(Some(reason)) => {
+                            cache.durable_hold_exit(
+                                source,
+                                reason,
+                                index,
+                                &active.candidate,
+                                &mut census,
+                            );
+                            pending!();
+                        }
+                        Err(_) => {
+                            cache.durable_custody_hold(
+                                source,
+                                "full_input_pending",
+                                index,
+                                &active.candidate,
+                            );
+                            // No body or Full-start count yet. Re-offer the
+                            // candidate; accepted state and spend stay intact.
+                            identified_candidates.push_front(active.candidate);
+                            pending!();
+                        }
                     }
                 }
             }

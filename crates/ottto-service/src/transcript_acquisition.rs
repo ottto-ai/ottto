@@ -1569,11 +1569,13 @@ impl DurableCertificate {
         Ok((checkpoint, admission))
     }
 
-    #[allow(clippy::type_complexity)]
-    fn admit_samples(
-        &self,
-        file: &mut File,
-    ) -> Result<(DurableAdmission, Vec<u8>, Vec<u8>, FileStamp), CertificateRefusal> {
+    /// The existing allocation-free certificate edits. Keep these before
+    /// typed decode/rederive admission so resource pressure cannot hide A2.
+    pub(crate) fn check_metadata(&self, file: &File) -> Result<(), CertificateRefusal> {
+        self.checked_stamp(file).map(|_| ())
+    }
+
+    fn checked_stamp(&self, file: &File) -> Result<FileStamp, CertificateRefusal> {
         let metadata = file.metadata().map_err(|_| CertificateRefusal::ReadError)?;
         let stamp =
             FileStamp::capture(metadata.clone()).map_err(|_| CertificateRefusal::ReadError)?;
@@ -1592,10 +1594,19 @@ impl DurableCertificate {
         if stamp.length < self.length {
             return Err(CertificateRefusal::Changed(FullReason::Shrunk));
         }
-        let unchanged = stamp.length == self.length;
-        if unchanged && stamp.modified != self.modified {
+        if stamp.length == self.length && stamp.modified != self.modified {
             return Err(CertificateRefusal::Changed(FullReason::SameSizeEdit));
         }
+        Ok(stamp)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn admit_samples(
+        &self,
+        file: &mut File,
+    ) -> Result<(DurableAdmission, Vec<u8>, Vec<u8>, FileStamp), CertificateRefusal> {
+        let stamp = self.checked_stamp(file)?;
+        let unchanged = stamp.length == self.length;
         let len = self.sample_len as usize;
         let mut read = 0;
         #[cfg(test)]

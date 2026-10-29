@@ -954,6 +954,10 @@ impl DurableTailStore {
         }
         self.pending.remove(key);
         if receipted {
+            // This is the exact positive receipt boundary, including a later
+            // reconciliation outside the original write batch. Negative or
+            // unresolved outcomes must never regrant a failed T14 rebuild.
+            self.rebuilt.remove(key);
             self.counters.receipt_reconciled += 1;
         } else {
             self.counters.durable_write_failed_published += 1;

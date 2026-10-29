@@ -2589,6 +2589,7 @@ fn rebuilt_t14_replaces_once_or_stays_memory_only_until_restart() {
                 Err(io::Error::other("replacement refused"))
             })));
         }
+        let expected_content = content_digest(&replacement);
         let result = cold.write_after_save(&lock, 2, 0, vec![replacement]);
         test_hooks::set_before_rename(None);
         if arm == "success" {
@@ -2607,7 +2608,56 @@ fn rebuilt_t14_replaces_once_or_stays_memory_only_until_restart() {
             assert!(restarted.rebuilt.is_empty(), "restart needs no rebuild");
             continue;
         }
-        assert_eq!(result.is_err(), arm == "write_failure");
+        if arm == "write_failure" {
+            let receipt = result.unwrap();
+            assert_eq!(receipt.written, 0);
+            assert_eq!(receipt.deferred_keys, vec![b.key]);
+            assert_eq!(cold.rebuilt.get(&b.key), Some(&Rebuild::Started));
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                bytes,
+                "original corrupt survivor preserved"
+            );
+            assert_eq!(cold.hold(&b.key), Some(Refusal::ReceiptPending));
+            let obligation = cold.pending.get(&b.key).copied().expect("custody remains");
+            assert_eq!(obligation.1, 2, "exact offered generation retained");
+            assert_eq!(
+                obligation.2, expected_content,
+                "exact offered graph digest retained"
+            );
+            assert_eq!(obligation.3, 1, "one actual failed reconciliation");
+            for attempt in 2..=RECEIPT_RECONCILE_FAILURES {
+                assert!(cold.reconcile_pending(&lock, &b.key).is_err());
+                assert_eq!(cold.pending.get(&b.key).unwrap().3, attempt);
+                assert_eq!(fs::read(&path).unwrap(), bytes);
+                assert_eq!(cold.rebuilt.get(&b.key), Some(&Rebuild::Started));
+                assert_eq!(cold.counters().t14_rebuild_full_started, 1);
+                if attempt < RECEIPT_RECONCILE_FAILURES {
+                    assert_eq!(cold.full_hold(&b.key, true), Some(Refusal::ReceiptPending));
+                }
+            }
+            assert_eq!(cold.disabled(), Some("receipt_unreconciled"));
+            assert!(
+                cold.pending.contains_key(&b.key),
+                "disable never drops custody"
+            );
+            assert_eq!(
+                cold.full_hold(&b.key, true),
+                None,
+                "disabled native path, no second T14 grant"
+            );
+            assert_eq!(cold.counters().t14_rebuild_full_started, 1);
+            let mut restarted = scratch.store();
+            assert_eq!(
+                restarted.full_hold(&b.key, true),
+                None,
+                "restart has its own allowance"
+            );
+            assert_eq!(restarted.counters().t14_rebuild_full_started, 1);
+            assert_eq!(restarted.full_hold(&b.key, true), Some(Refusal::Corrupt));
+            continue;
+        }
+        assert_eq!(result.unwrap().budget_refused, 1);
         assert_eq!(cold.rebuilt.get(&b.key), Some(&Rebuild::NotReplaced));
         assert_eq!(fs::read(&path).unwrap(), bytes);
         assert_eq!(cold.counters().t14_rebuild, 1);
@@ -3176,4 +3226,81 @@ fn receipt_failure_bound_is_per_obligation_and_disable_preserves_custody() {
     assert_eq!(store.counters().receipt_reconciled, 0);
     let mut restarted = scratch.store();
     assert!(matches!(restarted.read(&b.key), ReadOutcome::Found(_)));
+}
+
+/// Cross-mechanism regression: a delayed positive receipt must retire T14's
+/// rebuild latch even if the next offer is clean and needs no physical write.
+#[test]
+fn delayed_t14_receipt_allows_clean_then_changed_offer_without_second_rebuild() {
+    for reconcile_before_offer in [false, true] {
+        let _reset = ResetFaults;
+        let scratch = Scratch::new();
+        let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+        let transcript = scratch.transcript("t.jsonl", b"{}\n");
+        let mut b = binding("acct", "scope", ("fp", None));
+        b.source = DurableSource::Codex;
+        b.key = key_digest(DurableSource::Codex, INDEX_KEY);
+        let new_store = || {
+            DurableTailStore::new(
+                store_dir_for_index(&scratch.index_path()),
+                DurableSource::Codex,
+            )
+        };
+        let item = |n| {
+            let mut record = pending(b.clone(), certificate(&transcript), n);
+            record.allowlist = crate::snapshots::sampled_jsonl::durable::allowlist_digest(
+                crate::snapshots::SnapshotSource::Codex,
+            );
+            record
+        };
+        let mut store = new_store();
+        store.write_after_save(&lock, 1, 0, vec![item(1)]).unwrap();
+        let path = record_file(&store, &b.key);
+        let mut corrupt = fs::read(&path).unwrap();
+        *corrupt.last_mut().unwrap() ^= 1;
+        put_record(&path, &corrupt);
+        let mut cold = new_store();
+        assert_eq!(cold.full_hold(&b.key, true), None);
+        assert_eq!(cold.counters().t14_rebuild_full_started, 1);
+        assert_eq!(cold.full_hold(&b.key, true), Some(Refusal::Corrupt));
+        // Startup is already checked; fail post-rename store sync AND the
+        // immediate reconciliation sync, leaving the exact replacement on disk.
+        test_hooks::set_before_dir_sync(Some(Box::new(|_| Err(io::Error::other("late sync")))));
+        let replacement = item(2);
+        let receipt = cold
+            .write_after_save(&lock, 2, 0, vec![replacement.clone()])
+            .unwrap();
+        assert_eq!(receipt.deferred_keys, vec![b.key]);
+        assert!(cold.pending.contains_key(&b.key));
+        assert_eq!(cold.rebuilt.get(&b.key), Some(&Rebuild::Started));
+        assert_ne!(fs::read(&path).unwrap(), corrupt, "rename happened");
+        test_hooks::set_before_dir_sync(None);
+        if reconcile_before_offer {
+            assert!(cold.reconcile_pending(&lock, &b.key).unwrap());
+            assert!(
+                !cold.rebuilt.contains_key(&b.key),
+                "external positive receipt clears latch"
+            );
+        }
+        let clean = cold
+            .write_after_save(&lock, 2, 0, vec![replacement])
+            .unwrap();
+        assert_eq!((clean.written, clean.clean), (0, 1));
+        assert!(!cold.pending.contains_key(&b.key));
+        assert!(
+            !cold.rebuilt.contains_key(&b.key),
+            "clean offer must not relatch NotReplaced"
+        );
+        let changed = item(3);
+        let receipt = cold
+            .write_after_save(&lock, 3, 0, vec![changed.clone()])
+            .unwrap();
+        assert_eq!(receipt.written, 1, "future healthy update remains writable");
+        assert_eq!(cold.counters().t14_rebuild_full_started, 1);
+        let record = found(new_store().read(&b.key));
+        assert_eq!(record.index_generation, 3);
+        assert_eq!(record.record, changed);
+        assert_eq!(cold.full_hold(&b.key, true), None);
+        assert_eq!(cold.counters().t14_rebuild_full_started, 1);
+    }
 }

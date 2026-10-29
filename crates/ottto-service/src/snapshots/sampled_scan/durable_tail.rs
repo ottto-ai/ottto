@@ -839,6 +839,7 @@ impl SharedCache {
             file,
             accepted_end,
             SystemTime::now(),
+            "retail_exhausted_full",
         )
     }
 
@@ -849,6 +850,7 @@ impl SharedCache {
         file: &File,
         accepted_end: u64,
         now: SystemTime,
+        cause: &'static str,
     ) -> bool {
         if !file.metadata().is_ok_and(|m| m.len() > accepted_end) {
             return false;
@@ -898,7 +900,7 @@ impl SharedCache {
         drop(stores);
         crate::local_resource_diagnostics::durable_tail_alarm(
             source.api_slug(),
-            &serde_json::json!({"retail_exhausted_full":1}),
+            &serde_json::json!({(cause):1}),
         );
         if evicted {
             // Separate alarm: capacity pressure is not ordinary source growth.
@@ -1020,6 +1022,18 @@ impl SharedCache {
     /// group settlement counts it once per member that publishes.
     pub(crate) fn durable_member_hold(
         &self,
+        source: SnapshotSource,
+        key: &str,
+        index: &ScanIndex,
+        recovered_audit_due: &mut Option<u64>,
+    ) -> Result<Option<store::Refusal>, store::ActiveOverBudget> {
+        self.durable_funded_guard(source, key, |cache| {
+            cache.durable_member_hold_active(source, key, index, recovered_audit_due)
+        })
+    }
+
+    fn durable_member_hold_active(
+        &self,
         snapshot_source: SnapshotSource,
         key: &str,
         index: &ScanIndex,
@@ -1050,6 +1064,19 @@ impl SharedCache {
     /// takes the same live-context, once-clamped debt at settlement, read
     /// only (`carrier_debt`): no hold, T14, breaker or RAM side effect.
     pub(crate) fn durable_carrier_reprobe(
+        &self,
+        source: SnapshotSource,
+        key: &str,
+        index: &ScanIndex,
+    ) -> Result<Option<u64>, store::ActiveOverBudget> {
+        // Settlement stays read-only: no pending reconciliation, T14 grant,
+        // rebuild count or Full-start effect is imported to obtain credit.
+        self.durable_funded_probe(source, |cache| {
+            cache.durable_carrier_reprobe_active(source, key, index)
+        })
+    }
+
+    fn durable_carrier_reprobe_active(
         &self,
         snapshot_source: SnapshotSource,
         key: &str,
@@ -1139,17 +1166,38 @@ impl SharedCache {
         if let Some(reason) = self.reconcile_pending_key(source, key) {
             return Ok(Some(reason));
         }
+        self.durable_funded_probe(source, guard)
+    }
+
+    fn durable_funded_probe<T>(
+        &self,
+        source: SnapshotSource,
+        probe: impl FnOnce(&Self) -> T,
+    ) -> Result<T, store::ActiveOverBudget> {
+        // Reserve BEFORE taking Stores; mutex serialization cannot fund a
+        // classifier envelope while another worker decodes outside Stores.
         let store::LeaseWait::Granted(lease) =
             self.acquire_active(source, store::RESTORE_INPUT_BYTES)
         else {
             return Err(store::ActiveOverBudget);
         };
-        let result = guard(self);
+        let result = probe(self);
         lease.release();
         Ok(result)
     }
 
     pub(crate) fn durable_full_hold(
+        &self,
+        source: SnapshotSource,
+        key: &str,
+        start: bool,
+    ) -> Result<Option<store::Refusal>, store::ActiveOverBudget> {
+        self.durable_funded_guard(source, key, |cache| {
+            cache.durable_full_hold_active(source, key, start)
+        })
+    }
+
+    pub(in crate::snapshots) fn durable_full_hold_active(
         &self,
         source: SnapshotSource,
         key: &str,
@@ -1263,7 +1311,7 @@ impl SharedCache {
         tests::before_cold_transfer();
         let store::LeaseWait::Granted(mut lease) = self.acquire_prepared_transfer(snapshot_source)
         else {
-            return self.restore_resource_pending(snapshot_source, "active_wait", false);
+            return self.restore_resource_pending(snapshot_source, "active_wait", key, held, index);
         };
         // Incoming key, admission scratch/stored key and dirty-candidate key.
         // The initial transfer reserve separately covers one <=8MiB victim key.
@@ -1277,11 +1325,7 @@ impl SharedCache {
             if floor_behind {
                 return RestoreOutcome::FloorHeld;
             }
-            return self.restore_resource_pending(
-                snapshot_source,
-                "cache_key",
-                grown(held, index, key),
-            );
+            return self.restore_resource_pending(snapshot_source, "cache_key", key, held, index);
         }
         let result = self.restore_known(
             snapshot_source,
@@ -1310,7 +1354,9 @@ impl SharedCache {
                         self.restore_resource_pending(
                             snapshot_source,
                             "cache_transit",
-                            grown(held, index, key),
+                            key,
+                            held,
+                            index,
                         )
                     }
                 }
@@ -1320,13 +1366,13 @@ impl SharedCache {
                 if floor_behind {
                     return RestoreOutcome::FloorHeld;
                 }
-                self.restore_resource_pending(snapshot_source, phase, grown(held, index, key))
+                self.restore_resource_pending(snapshot_source, phase, key, held, index)
             }
             Err(MissClass::AcceptedFloor) => {
                 lease.release();
                 RestoreOutcome::FloorHeld
             }
-            Err(class @ MissClass::RealEdit) => {
+            Err(class @ MissClass::RealEdit(_)) => {
                 lease.release();
                 RestoreOutcome::Miss(class)
             }
@@ -1356,9 +1402,19 @@ impl SharedCache {
         &self,
         source: SnapshotSource,
         phase: &'static str,
-        grown: bool,
+        key: &str,
+        held: &File,
+        index: &ScanIndex,
     ) -> RestoreOutcome {
-        let full = grown && phase != "active_wait";
+        let full = phase != "active_wait"
+            && self.paced_growth_full(
+                source,
+                key,
+                held,
+                index.files.get(key).map_or(0, |entry| entry.size_bytes),
+                SystemTime::now(),
+                "resource_full_granted",
+            );
         if let Some(mut stores) = self.durable() {
             if full {
                 Counters::bump(&mut stores.counters.resource_full, phase);
@@ -1453,6 +1509,44 @@ impl SharedCache {
                 }
             }
         };
+        let expected = expected(
+            source,
+            snapshot_source,
+            key,
+            scope,
+            index,
+            interpretation,
+            Some((record.format, record.record.allowlist)),
+        )
+        .ok_or(MissClass::NoEntry)?;
+        // A future body revision is a downgrade hold even on changed input.
+        if interpretation
+            .accepted
+            .is_some_and(|a| a.revision > effective_revision(snapshot_source))
+        {
+            return Err(MissClass::AcceptedFloor);
+        }
+        let original_matches = record.eligible(&expected).is_ok()
+            && interpretation.accepted.map_or(true, |a| {
+                a.strict
+                    && a.entry == record.record.binding.entry
+                    && record.record.certificate.length == a.end
+                    && record.index_generation <= a.generation
+            });
+        if original_matches {
+            if let Err(CertificateRefusal::Changed(
+                reason @ (FullReason::Shrunk | FullReason::SameSizeEdit),
+            )) = record.record.certificate.check_metadata(held)
+            {
+                if let Some(mut stores) = self.durable() {
+                    Counters::bump(
+                        &mut stores.counters.certificate_refused,
+                        full_reason_class(reason),
+                    );
+                }
+                return Err(MissClass::RealEdit(reason));
+            }
+        }
         if let Some(a) = interpretation.accepted {
             let metadata = held.metadata().map_err(|_| MissClass::AcceptedFloor)?;
             if a.revision <= effective_revision(SnapshotSource::ClaudeCode)
@@ -1477,7 +1571,7 @@ impl SharedCache {
                         "s2_skipped_real_edit.replaced",
                     );
                 }
-                return Err(MissClass::RealEdit);
+                return Err(MissClass::RealEdit(FullReason::Replaced));
             }
             if a.behind(metadata.len()) {
                 if let Some(mut stores) = self.durable() {
@@ -1509,16 +1603,7 @@ impl SharedCache {
             return Err(MissClass::AuditCarrier);
         }
         index.files.get(key).ok_or(MissClass::NoEntry)?;
-        let expected = expected(
-            source,
-            snapshot_source,
-            key,
-            scope,
-            index,
-            interpretation,
-            Some((record.format, record.record.allowlist)),
-        )
-        .ok_or(MissClass::NoEntry)?;
+
         let restored = self.durable_restore_record(
             snapshot_source,
             &record,
@@ -1567,6 +1652,14 @@ impl SharedCache {
                 if let Some(owed) = owed {
                     return Err(MissClass::Unregistered(owed));
                 }
+                if original_matches {
+                    if let Failure::Certificate(CertificateRefusal::Changed(
+                        reason @ (FullReason::HeadChanged | FullReason::BoundaryChanged),
+                    )) = class
+                    {
+                        return Err(MissClass::RealEdit(reason));
+                    }
+                }
                 return Err(MissClass::Failure(class));
             }
         };
@@ -1610,6 +1703,19 @@ impl SharedCache {
                 .map_err(|_| Failure::NotRederived(Refuse::NotRederivable("compressed")))?;
         }
         record.eligible(expected).map_err(Failure::Ineligible)?;
+        record
+            .record
+            .certificate
+            .check_metadata(held)
+            .map_err(Failure::Certificate)?;
+        lease
+            .charge(scope.0.len() as u64)
+            .map_err(|_| Failure::Resource("certificate_scope"))?;
+        let (checkpoint, _) = record
+            .record
+            .certificate
+            .restore(held, scope.clone())
+            .map_err(Failure::Certificate)?;
         let decoded = codec::decode_bounded(&record.record.body, source, lease).map_err(
             |reason| match reason {
                 crate::durable_tail_codec::DecodeFailure::Budget => Failure::Resource("decode"),
@@ -1622,19 +1728,12 @@ impl SharedCache {
         {
             return Err(Failure::Ineligible(store::Ineligible::Scope));
         }
-        // No certificate sample, descriptor clone, native parser or JSON value
-        // may allocate/read for an obligation without proved pre-growth funding.
+        // Existing bounded certificate samples run before a repeatable resource
+        // refusal. No content rederive/parser/JSON allocation is admitted here.
         let (reduction, receipt) = decoded
             .without_rederive()
             .map_err(|_| Failure::Resource("rederive_unfunded"))?;
-        lease
-            .charge(scope.0.len() as u64)
-            .map_err(|_| Failure::Resource("certificate_scope"))?;
-        let (checkpoint, _) = record
-            .record
-            .certificate
-            .restore(held, scope.clone())
-            .map_err(Failure::Certificate)?;
+
         Ok((checkpoint, reduction, receipt))
     }
 
@@ -2105,7 +2204,7 @@ impl SharedCache {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum MissClass {
     AcceptedFloor,
-    RealEdit,
+    RealEdit(FullReason),
     Unavailable,
     NoEntry,
     AuditCarrier,
@@ -2156,7 +2255,14 @@ impl MissClass {
         }
         match self {
             Self::AcceptedFloor => "accepted_body_floor",
-            Self::RealEdit => "s2_skipped_real_edit.replaced",
+            Self::RealEdit(reason) => match reason {
+                FullReason::Replaced => "s2_skipped_real_edit.replaced",
+                FullReason::Shrunk => "s2_skipped_real_edit.shrunk",
+                FullReason::SameSizeEdit => "s2_skipped_real_edit.same_size_edit",
+                FullReason::HeadChanged => "s2_skipped_real_edit.head_changed",
+                FullReason::BoundaryChanged => "s2_skipped_real_edit.boundary_changed",
+                _ => "s2_skipped_real_edit.invalid_checkpoint",
+            },
             Self::Unavailable => "unavailable",
             Self::NoEntry => "no_entry",
             Self::AuditCarrier => "ineligible.audit_carrier",
@@ -2289,12 +2395,6 @@ mod restore_test {
             }
         }
     }
-}
-
-/// Held-FD length past the committed end; metadata only, no read.
-fn grown(held: &File, index: &ScanIndex, key: &str) -> bool {
-    let committed = index.files.get(key).map_or(0, |e| e.size_bytes);
-    held.metadata().is_ok_and(|m| m.len() > committed)
 }
 
 #[derive(Clone, Copy, Debug)]
