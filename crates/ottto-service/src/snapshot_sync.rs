@@ -2666,6 +2666,8 @@ fn save_index_and_publish_manifest(
     window_start: &str,
     window_end: &str,
 ) -> Result<()> {
+    let census_complete = census_complete
+        && (source != SnapshotSource::ClaudeCode || !crate::snapshots::claude_terminal_off());
     // The server may already hold this pass's new entities. Keep the previous
     // process-cache witness withdrawn until the exact replacement index is
     // durable; a failed CAS/save or manifest derivation must not let a
@@ -8843,6 +8845,11 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         fallback.withhold(scan_result);
     }
     let builds_evidence = crate::snapshots::claude_request_identity::builds_evidence();
+    scan_result.census_complete = crate::snapshots::claude_terminal_authority(
+        index,
+        scan_result.census_complete,
+        &scan_result.census_window_end,
+    );
     let census_complete = scan_result.census_complete;
     // Preserve this scan's original carrier independently from later request
     // logins; only a fully qualified mixed body may undo the legacy login veto.

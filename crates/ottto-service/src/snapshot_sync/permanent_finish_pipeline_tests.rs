@@ -1341,7 +1341,10 @@ impl AckFinishHome {
         .unwrap()
         .expect("actual due source preparation");
         let (preparation, index, mut scan) = collect_native_preparation_with_rotation(frame, false);
-        assert!(scan.census_complete, "{cycle}: the real scan is clean");
+        assert!(
+            !scan.census_complete,
+            "{cycle}: terminal-off retains the real scan owner"
+        );
         assert_eq!(
             scan.snapshots.len(),
             1,
@@ -1614,4 +1617,51 @@ fn ack_huge_file_real_finish_converges_after_transport_failure_with_full_debt() 
         progress.accepted_fingerprints, debt_set,
         "only the unrelated debt remains"
     );
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn terminal_off_real_finish_uploads_acks_and_settles_with_no_manifest() {
+    let server = AckScriptedServer::new();
+    let mut home = AckFinishHome::new(&server);
+    let (preparation, index, scan) = home.prepare("terminal-off");
+    assert!(!scan.census_complete);
+    assert!(index.has_retained_traversal_for_terminal_off());
+    let fingerprints = scan
+        .snapshots
+        .iter()
+        .map(|i| i.snapshot_fingerprint.clone())
+        .collect::<BTreeSet<_>>();
+    let path = preparation.index_path.clone();
+    let paths = (
+        preparation.upload_progress_path.clone(),
+        preparation.upload_destination_namespace.clone(),
+    );
+    home.finish(preparation, index, scan).unwrap();
+    assert_eq!(
+        server
+            .offered_fingerprints()
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        fingerprints
+    );
+    let saved = ScanIndex::load(&path).unwrap();
+    assert!(saved.has_retained_traversal_for_terminal_off());
+    assert!(
+        cached_source_manifest(&paths.1, SnapshotSource::ClaudeCode).is_none(),
+        "no complete manifest, including stale/deleted incidence, can publish"
+    );
+    assert!(fingerprints
+        .iter()
+        .all(|fp| saved.accepted_snapshot_fingerprint_recorded(fp)));
+    let progress = home.progress(&paths);
+    assert!(fingerprints
+        .iter()
+        .all(|fp| progress.accepted_fingerprints.contains(fp)));
+    assert!(!crate::snapshots::claude_terminal_authority(
+        &saved,
+        true,
+        "2099-01-01T00:00:00Z"
+    ));
 }

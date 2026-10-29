@@ -4447,3 +4447,415 @@ fn scanner_records_actual_contract_only_when_its_traversal_starts() {
         "a real resumed page retains the placeholder"
     );
 }
+
+mod terminal_off_admission_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_off_four_batches_resume_across_mid_admission_restart() {
+        // 385 roots = three full 128-root batches plus one; scaled from 8,500.
+        if !crate::heap_layout_bound::layout_supported() {
+            return;
+        }
+        let mut fixture = retry_durable_fixture(1, 384);
+        let root = fixture._scratch.to_path_buf();
+        retry_test_context(&mut fixture.index, &root);
+        {
+            let t = fixture.index.traversal.as_mut().unwrap();
+            t.pending_directories.clear();
+            t.pending_candidates.clear();
+            t.counts = ScanTraversalCounts::default();
+        }
+        let window = fixture
+            .index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .census_window_end
+            .clone();
+        // Seed stale data independently of the window; all 385 are old roots.
+        for p in fixture.index.claude_usage_family_pending.values_mut() {
+            p.census_window_end = "2026-08-01T07:00:00Z".into();
+        }
+        let stale = claude_terminal_stale_roots(&fixture.index, &window);
+        let context = fixture
+            .index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .context_fingerprint
+            .clone();
+        fixture.index.claude_stale_family_carry.origin = Some(ClaudeStaleFamilyCarryOrigin {
+            context_fingerprint: context,
+            process: claude_full_rearm_process(),
+            full_rearm_window: false,
+            admission: Some(claude_retry_admission_start(
+                &fixture.index,
+                &stale,
+                CARRY_RETRY,
+                None,
+            )),
+        });
+        let original = fixture
+            .index
+            .files
+            .iter()
+            .map(|(k, e)| (k.clone(), e.source_file_fingerprint.clone()))
+            .collect::<BTreeMap<_, _>>();
+        for batch in 0..4 {
+            assert_eq!(
+                ensure_bounded_traversal(
+                    SnapshotSource::ClaudeCode,
+                    std::slice::from_ref(&root),
+                    &mut fixture.index,
+                    CARRY_RETRY,
+                    BACKFILL_WINDOW_DAYS
+                ),
+                TraversalProgress::Resumed
+            );
+            let state = fixture
+                .index
+                .claude_stale_family_carry
+                .origin
+                .as_ref()
+                .unwrap()
+                .admission
+                .as_ref()
+                .unwrap();
+            let covered = ((batch + 1) * 128).min(385);
+            assert_eq!(
+                state.after_root.as_deref(),
+                Some(fixture.roots[covered - 1].as_str())
+            );
+            assert!(state.progressed);
+            assert_eq!(
+                fixture.index.traversal.as_ref().unwrap().census_window_end,
+                window
+            );
+            for (k, fp) in &original {
+                assert_eq!(&fixture.index.files[k].source_file_fingerprint, fp);
+            }
+            assert!(
+                !fixture
+                    .index
+                    .claude_stale_family_carry
+                    .contains(&fixture.roots[0]),
+                "held family never credited"
+            );
+            let (families, age) = carry_admission_debt(&fixture.index, CARRY_RETRY);
+            assert_eq!(
+                families,
+                385 - fixture.index.claude_stale_family_carry.roots.len()
+            );
+            assert_eq!(
+                age,
+                rfc3339_unix_seconds(CARRY_RETRY).unwrap()
+                    - rfc3339_unix_seconds("2026-08-01T07:00:00Z").unwrap()
+            );
+            if batch == 1 {
+                // Real old-decoder-compatible JSON roundtrip, then simulate the
+                // next process's invalid old-process carry provenance.
+                fixture.index = retry_test_reload(&mut fixture.index, &root.join("index.json"));
+                fixture
+                    .index
+                    .claude_stale_family_carry
+                    .origin
+                    .as_mut()
+                    .unwrap()
+                    .process = claude_full_rearm_process().wrapping_add(1);
+            }
+        }
+        claude_retry_queue_due_families(&mut fixture.index, CARRY_RETRY);
+        assert!(
+            fixture
+                .index
+                .claude_stale_family_carry
+                .origin
+                .as_ref()
+                .unwrap()
+                .admission
+                .as_ref()
+                .unwrap()
+                .roots_complete
+        );
+        assert!(!claude_terminal_authority(&fixture.index, true, &window));
+    }
+
+    #[test]
+    fn terminal_off_rejected_with_holds_resumes_but_real_loss_retries() {
+        let mut fixture = retry_durable_fixture(1, 2);
+        let root = fixture._scratch.to_path_buf();
+        retry_test_context(&mut fixture.index, &root);
+        let t = fixture.index.traversal.as_mut().unwrap();
+        t.pending_directories.clear();
+        t.pending_candidates.clear();
+        t.counts = ScanTraversalCounts::default();
+        let window = t.census_window_end.clone();
+        let stale = fixture.roots.iter().cloned().collect();
+        let state = claude_retry_admission_start(&fixture.index, &stale, CARRY_RETRY, None);
+        let context = fixture
+            .index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .context_fingerprint
+            .clone();
+        fixture.index.claude_stale_family_carry.origin = Some(ClaudeStaleFamilyCarryOrigin {
+            context_fingerprint: context,
+            process: claude_full_rearm_process(),
+            full_rearm_window: false,
+            admission: Some(state),
+        });
+        fixture
+            .index
+            .mark_bounded_sweep_unsettled_by(UnsettledUploadCause::RejectedWithHolds);
+        let bits = fixture.index.unsettled_cause_bits();
+        assert_eq!(
+            ensure_bounded_traversal(
+                SnapshotSource::ClaudeCode,
+                std::slice::from_ref(&root),
+                &mut fixture.index,
+                CARRY_RETRY,
+                BACKFILL_WINDOW_DAYS
+            ),
+            TraversalProgress::Resumed
+        );
+        assert_eq!(
+            fixture.index.unsettled_cause_bits(),
+            bits,
+            "scheduling does not settle rejection/transport debt"
+        );
+        assert_eq!(
+            fixture.index.traversal.as_ref().unwrap().census_window_end,
+            window
+        );
+        fixture
+            .index
+            .traversal
+            .as_mut()
+            .unwrap()
+            .counts
+            .disappeared_file_count = 1;
+        assert_eq!(
+            ensure_bounded_traversal(
+                SnapshotSource::ClaudeCode,
+                &[root],
+                &mut fixture.index,
+                CARRY_RETRY,
+                BACKFILL_WINDOW_DAYS
+            ),
+            TraversalProgress::Started
+        );
+    }
+
+    #[test]
+    fn terminal_off_cancel_refund_and_passed_rewind_never_overwrite_debt() {
+        let mut index = carry_index();
+        let [root, child] = carry_family_keys();
+        let original = index.files[&child].source_file_fingerprint.clone();
+        let window = index.traversal.as_ref().unwrap().census_window_end.clone();
+        let t = index.traversal.as_mut().unwrap();
+        t.scan_roots = vec![PathBuf::from("/carry/projects")];
+        t.observed_index_keys.insert(child.clone());
+        index
+            .claude_stale_family_carry
+            .roots
+            .insert(CARRY_ROOT.into());
+        {
+            let _budget = ClaudeStaleFamilyCarryFundingBudgetForTest::new(0);
+            assert!(refund_claude_stale_family_carry(&mut index));
+        }
+        assert_eq!(index.files[&child].source_file_fingerprint, original);
+        assert_eq!(index.traversal.as_ref().unwrap().census_window_end, window);
+        assert!(!index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .pending_directories
+            .is_empty());
+        index
+            .files
+            .get_mut(&root)
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+        index
+            .claude_stale_family_carry
+            .roots
+            .insert(CARRY_ROOT.into());
+        let (cleared, _) =
+            replay_and_rearm_claude_family(&mut index, CARRY_ROOT, &root, &VecDeque::new(), false);
+        assert_eq!(cleared, 0);
+        assert_eq!(index.files[&child].source_file_fingerprint, original);
+        assert!(index.files[&root].source_file_fingerprint.is_empty());
+    }
+
+    #[test]
+    fn terminal_off_hard_gate_rejects_partial_coverage_even_with_matching_certificate() {
+        let mut index = carry_index();
+        let member = carry_member(CARRY_ROOT, Some(CARRY_AGENT));
+        let pending = index
+            .claude_usage_family_pending
+            .get_mut(CARRY_ROOT)
+            .unwrap();
+        pending.census_window_end = CARRY_RETRY.into();
+        pending.member_request_id_hashes.remove(&member);
+        pending.member_occurrences.remove(&member);
+        let origin = ClaudeFullRearmWindow {
+            context_fingerprint: "scope".into(),
+            process: claude_full_rearm_process(),
+            window_ends: BTreeSet::from([CARRY_RETRY.into()]),
+            member_digests: BTreeMap::new(),
+        };
+        index.claude_full_rearm_progress.traversal_origin = Some(origin.clone());
+        index.claude_full_rearm_progress.complete_rebuild_read = Some(ClaudeCompleteRebuildRead {
+            origin,
+            members_digest: claude_rebuild_members_digest(&index),
+        });
+        assert!(
+            !claude_terminal_reconstructed(&index, CARRY_RETRY),
+            "matching revisions cannot substitute for unread child coverage"
+        );
+        assert!(!claude_terminal_authority(&index, true, CARRY_RETRY));
+    }
+
+    #[test]
+    fn terminal_off_completed_admission_still_services_a_new_due_horizon() {
+        let mut fixture = retry_durable_fixture(1, 2);
+        let root = fixture._scratch.to_path_buf();
+        retry_test_context(&mut fixture.index, &root);
+        let t = fixture.index.traversal.as_mut().unwrap();
+        t.counts = ScanTraversalCounts::default();
+        t.pending_directories.clear();
+        t.pending_candidates.clear();
+        let context = t.context_fingerprint.clone();
+        let stale = fixture.roots.iter().cloned().collect();
+        let mut state = claude_retry_admission_start(&fixture.index, &stale, CARRY_FAILED, None);
+        state.after_root = stale.last().cloned();
+        state.roots_complete = true;
+        state.due_complete = true;
+        state.complete = true;
+        let cutoff = state.due_through;
+        fixture
+            .index
+            .claude_usage_authority_quarantine
+            .get_mut(&fixture.roots[0])
+            .unwrap()
+            .retry_after_unix_seconds = cutoff + 1;
+        fixture.index.claude_stale_family_carry.origin = Some(ClaudeStaleFamilyCarryOrigin {
+            context_fingerprint: context,
+            process: claude_full_rearm_process(),
+            full_rearm_window: false,
+            admission: Some(state),
+        });
+        assert_eq!(
+            ensure_bounded_traversal(
+                SnapshotSource::ClaudeCode,
+                &[root],
+                &mut fixture.index,
+                CARRY_RETRY,
+                BACKFILL_WINDOW_DAYS
+            ),
+            TraversalProgress::Resumed
+        );
+        claude_retry_queue_due_families(&mut fixture.index, CARRY_RETRY);
+        let state = fixture
+            .index
+            .claude_stale_family_carry
+            .origin
+            .as_ref()
+            .unwrap()
+            .admission
+            .as_ref()
+            .unwrap();
+        assert_eq!(state.served_before, cutoff);
+        assert!(state.due_through > cutoff);
+        assert!(fixture
+            .index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .pending_candidates
+            .iter()
+            .any(|p| claude_index_path_member_ref(&p.path)
+                .is_some_and(|m| m.root == fixture.roots[0])));
+    }
+
+    #[test]
+    fn terminal_off_new_due_horizon_advances_64_missing_paths_then_next_after_reload() {
+        if !crate::heap_layout_bound::layout_supported() {
+            return;
+        }
+        let mut fixture = retry_durable_fixture(65, 0);
+        let root = fixture._scratch.to_path_buf();
+        retry_test_context(&mut fixture.index, &root);
+        let t = fixture.index.traversal.as_mut().unwrap();
+        t.counts = ScanTraversalCounts::default();
+        t.pending_directories.clear();
+        t.pending_candidates.clear();
+        let context = t.context_fingerprint.clone();
+        let window = t.census_window_end.clone();
+        let stale = fixture.roots.iter().cloned().collect();
+        let mut state = claude_retry_admission_start(&fixture.index, &stale, CARRY_FAILED, None);
+        state.after_root = stale.last().cloned();
+        state.roots_complete = true;
+        state.due_complete = true;
+        state.complete = true;
+        let cutoff = state.due_through;
+        for record in fixture.index.claude_usage_authority_quarantine.values_mut() {
+            record.retry_after_unix_seconds = cutoff + 1;
+        }
+        let keys = fixture.index.files.keys().cloned().collect::<Vec<_>>();
+        for key in &keys {
+            fs::remove_file(key).unwrap();
+        }
+        fixture.index.claude_stale_family_carry.origin = Some(ClaudeStaleFamilyCarryOrigin {
+            context_fingerprint: context,
+            process: claude_full_rearm_process(),
+            full_rearm_window: false,
+            admission: Some(state),
+        });
+        let (index, page, _) = retry_test_page(fixture.index, &root, CARRY_RETRY, 64);
+        fixture.index = index;
+        assert_eq!(page.scanned_file_count, 0);
+        let state = fixture
+            .index
+            .claude_stale_family_carry
+            .origin
+            .as_ref()
+            .unwrap()
+            .admission
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            state.due_after_path.as_ref(),
+            Some(&keys[63]),
+            "actual selection records service past the frozen census clock"
+        );
+        assert_eq!(
+            fixture.index.traversal.as_ref().unwrap().census_window_end,
+            window
+        );
+        fixture.index = retry_test_reload(&mut fixture.index, &root.join("due-index.json"));
+        let (index, _, _) = retry_test_page(fixture.index, &root, CARRY_RETRY, 64);
+        fixture.index = index;
+        let state = fixture
+            .index
+            .claude_stale_family_carry
+            .origin
+            .as_ref()
+            .unwrap()
+            .admission
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            state.due_after_path.as_ref(),
+            keys.last(),
+            "later missing path is not starved by the first 64"
+        );
+        assert_eq!(
+            fixture.index.traversal.as_ref().unwrap().census_window_end,
+            window
+        );
+    }
+}
