@@ -413,6 +413,7 @@ pub(super) struct HeaderInventory {
     decode_done: bool,
     decode_unknown: bool,
     pub(super) decode_peak: usize,
+    decode_refused_peak: usize,
     pub(super) first_read_archives: BTreeSet<String>,
     pub(super) deferred_archives: BTreeSet<String>,
     /// Bound archives held by name with a resolved family sibling (value: twin).
@@ -480,6 +481,9 @@ impl HeaderInventory {
                             .is_some_and(|total| total <= crate::source_rotation::PARKED_BUDGET / 2)
                     });
                 if let Some(cost) = cost {
+                    self.decode_refused_peak = self
+                        .decode_refused_peak
+                        .saturating_add(cost - self.decode_peak);
                     self.decode_peak = cost;
                     self.refused
                         .insert(key.to_owned(), path_witness(Path::new(key)));
@@ -500,7 +504,9 @@ impl HeaderInventory {
         self.decode_after = None;
         self.decode_done = false;
         self.decode_unknown = false;
-        self.decode_peak = 0;
+        // Refused witnesses stay in the carried inventory; keep their charge
+        // while releasing only the old raw cursor and owner-set scratch.
+        self.decode_peak = self.decode_refused_peak;
         self.decode_held_owners = BTreeSet::new();
     }
     pub(super) fn prepare_decode_custody(&mut self, index: &ScanIndex) -> bool {
@@ -671,6 +677,7 @@ impl HeaderInventory {
             decode_done: false,
             decode_unknown: false,
             decode_peak: 0,
+            decode_refused_peak: 0,
             first_read_archives: BTreeSet::new(),
             deferred_archives: BTreeSet::new(),
             family_held: BTreeMap::new(),
@@ -1154,7 +1161,7 @@ impl HeaderInventory {
 }
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
 crate::heap_layout_bound::fields!(HeaderWitness; plain_twin, custody_cause, candidate, owner, home, created_unix_ms, metadata, stamp);
-crate::heap_layout_bound::fields!(HeaderInventory; cached_archives_only, feed_prepared, feed_after, feed_peak, custody_next, absence_held, custody_unknown, custody_after, custody_done, custody_peak, custody_refused, roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, decode_held_owners, decode_after, decode_done, decode_unknown, decode_peak, archive_work, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, bounded_out, first_read_archives, deferred_archives, family_held);
+crate::heap_layout_bound::fields!(HeaderInventory; cached_archives_only, feed_prepared, feed_after, feed_peak, custody_next, absence_held, custody_unknown, custody_after, custody_done, custody_peak, custody_refused, roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, decode_held_owners, decode_after, decode_done, decode_unknown, decode_peak, decode_refused_peak, archive_work, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, bounded_out, first_read_archives, deferred_archives, family_held);
 
 #[derive(Clone, Debug)]
 pub(super) struct Group {
