@@ -15065,15 +15065,41 @@ fn deferred_custody_saves_decision_before_frozen_continuation_and_restart() {
             .unwrap();
         let mut events = decisions
             .iter()
+            .filter(|r| r["stage"] == "custody_latch_deferred")
             .filter_map(|r| r["counts"]["custody_latch_deferred"]["events"].as_u64())
             .sum::<u64>();
         assert_eq!(events, 1, "decision observed before continuation");
+        assert!(decisions.iter().any(|r| r["stage"] == "durable_tail_alarm"
+            && r["counts"]["custody_latch_deferred"]["count"] == 1));
         for _ in 0..128 {
             let ((next, scan), rows) = crate::local_resource_diagnostics::capture(|| {
-                continuation_page(&fixture, index, &cache, |scan| {
+                let (next, output) = continuation_page(&fixture, index, &cache, |scan| {
                     scan.codex_join_inventory = Some(inventory.clone());
                     scan.codex_join_prepared = true;
-                })
+                });
+                assert!(
+                    output.snapshots.is_empty(),
+                    "resume-only page never publishes"
+                );
+                if cache
+                    .with_cursor(|cursor| {
+                        matches!(&cursor.slot,
+                    Slot::Paused(job) if job.parser.reader.finished)
+                    })
+                    .unwrap()
+                {
+                    // PR A parks EOF in continuation; only an ordinary page
+                    // runs native finish (here, the singleton custody veto).
+                    let mut ordinary = codex_scan(&fixture, next, NOW).with_sampled_acquisition(
+                        Arc::clone(&cache),
+                        Scope("cursor-fixture".into()),
+                    );
+                    ordinary.codex_join_inventory = Some(inventory.clone());
+                    ordinary.codex_join_prepared = true;
+                    finish_page(ordinary)
+                } else {
+                    (next, output)
+                }
             });
             index = next;
             assert_eq!(
@@ -15087,6 +15113,7 @@ fn deferred_custody_saves_decision_before_frozen_continuation_and_restart() {
                 .all(|s| s.source_session_id != SESSION));
             events += rows
                 .iter()
+                .filter(|r| r["stage"] == "custody_latch_deferred")
                 .filter_map(|r| r["counts"]["custody_latch_deferred"]["events"].as_u64())
                 .sum::<u64>();
             assert_eq!(index.files[&key].size_bytes, before.size_bytes);
@@ -15958,10 +15985,29 @@ fn plain_cursor_resumes_unchanged_when_its_archive_sibling_is_family_held() {
         let mut emitted = None;
         for _ in 0..64 {
             let resumed = counter(&cache, |c| c.jobs_resumed);
-            let (next, scan) = continuation_page(&fixture, index, &cache, |scan| {
+            let (next, continuation) = continuation_page(&fixture, index, &cache, |scan| {
                 scan.codex_join_inventory = Some(inv.clone());
                 scan.codex_join_prepared = false;
             });
+            assert!(
+                continuation.snapshots.is_empty(),
+                "resume-only page never publishes"
+            );
+            let (next, scan) = if cache
+                .with_cursor(|cursor| {
+                    matches!(&cursor.slot,
+                Slot::Paused(job) if job.parser.reader.finished)
+                })
+                .unwrap()
+            {
+                let mut ordinary = codex_scan(&fixture, next, NOW)
+                    .with_sampled_acquisition(Arc::clone(&cache), Scope("cursor-fixture".into()));
+                ordinary.codex_join_inventory = Some(inv.clone());
+                ordinary.codex_join_prepared = false;
+                finish_page(ordinary)
+            } else {
+                (next, continuation)
+            };
             index = next;
             assert_eq!(counter(&cache, |c| c.jobs_resumed), resumed + 1);
             assert_eq!(
