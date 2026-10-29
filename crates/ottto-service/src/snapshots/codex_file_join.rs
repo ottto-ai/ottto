@@ -5444,7 +5444,13 @@ pub(in crate::snapshots) mod header_cache_tests {
             let archive = archive_root
                 .as_ref()
                 .join(format!("rollout-{owner}.jsonl.zst"));
-            fs::write(&archive, b"already validated object").unwrap();
+            let header_bytes =
+                format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{owner}\"}}}}\n");
+            fs::write(
+                &archive,
+                zstd::stream::encode_all(header_bytes.as_bytes(), 1).unwrap(),
+            )
+            .unwrap();
             let key = local_index_key(&archive);
             let mut evidence =
                 ArchiveEvidence::begin(&File::open(&archive).unwrap(), &archive, None).unwrap();

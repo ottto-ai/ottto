@@ -16756,7 +16756,13 @@ fn omitted_raw_archive_fences_paused_singleton_and_group_across_reload() {
                     let archive = external
                         .as_ref()
                         .join(format!("rollout-{SESSION}.jsonl.zst"));
-                    fs::write(&archive, b"previous FD-validated archive").unwrap();
+                    let header_bytes =
+                        codex_line(json!({"type":"session_meta","payload":{"id":SESSION}}));
+                    fs::write(
+                        &archive,
+                        zstd::stream::encode_all(header_bytes.as_slice(), 1).unwrap(),
+                    )
+                    .unwrap();
                     let key = local_index_key(&archive);
                     assert!(!index
                         .traversal

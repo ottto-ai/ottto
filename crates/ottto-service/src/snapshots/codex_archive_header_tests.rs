@@ -2088,10 +2088,19 @@ fn production_inventory_denial_holds_scoped_and_sibling_progresses() {
         let ((mut state, result), rows) =
             crate::local_resource_diagnostics::capture(|| finish_selector(scan));
         assert_eq!(decodes(&rows), 0, "{gate}");
-        assert!(
-            !rows.iter().any(|r| r["stage"] == "codex_zst_refused"),
-            "{gate}"
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r["stage"] == "codex_zst_refused")
+                .count(),
+            usize::from(gate == "admission"),
+            "only an actual A header claim emits its funding refusal"
         );
+        if gate == "admission" {
+            assert!(rows.iter().any(|r| r["counts"]["codex_zst_refused"]
+                ["CompressedAdmissionRefused"]
+                .as_u64()
+                .is_some_and(|count| count > 0)));
+        }
         assert_eq!(result.unreadable_path_count, 0, "{gate}");
         assert_eq!(result.ownership_incomplete_file_count, 0, "{gate}");
         assert_eq!(result.scanned_file_count, 1, "{gate}");
@@ -3028,6 +3037,28 @@ fn power_plain_sibling(f: &ArchiveFixture) -> CandidateFile {
     candidate
 }
 
+// Exercise the activated metadata-only F3 feed rather than the predecessor's
+// explicit header-inventory admission seam used by selector_scan's callers.
+fn activated_selector_scan(
+    f: &ArchiveFixture,
+    index: ScanIndex,
+    cache: Arc<sampled_scan::SharedCache>,
+    candidates: VecDeque<CandidateFile>,
+) -> OwnedSourceScan {
+    let paths = candidates
+        .iter()
+        .map(|candidate| local_index_key(&candidate.path))
+        .collect();
+    let mut scan = selector_scan(f, index, cache, candidates, false);
+    let inventory = scan.codex_join_inventory.as_mut().unwrap();
+    inventory.feed_prepared = false;
+    inventory.cached_archives_only = true;
+    let traversal = scan.index.traversal.as_mut().unwrap();
+    traversal.codex_rollout_paths = paths;
+    traversal.scan_roots = vec![f.0.parent().unwrap().to_owned()];
+    scan
+}
+
 #[test]
 fn archive_power_loss_after_construction_defers_without_read_or_attempt_and_plain_progresses() {
     for denied in [Some(false), None] {
@@ -3040,12 +3071,11 @@ fn archive_power_loss_after_construction_defers_without_read_or_attempt_and_plai
         let decoders = codex_zst_refusal_tests::decoder_construction_count();
         let (((state, result), rows), before) =
             crate::snapshot_sync::with_archive_power(&[Some(true), denied], || {
-                let mut scan = selector_scan(
+                let mut scan = activated_selector_scan(
                     &f,
                     ScanIndex::default(),
                     cache,
                     VecDeque::from([plain, f.candidate()]),
-                    false,
                 );
                 assert!(scan.index.archive_pass.power, "constructed while Allowed");
                 scan.index.archive_pass.cpu = 123;
@@ -3105,12 +3135,11 @@ fn archive_power_loss_between_header_and_body_preserves_paid_header_and_plain_pr
         let ((state, result), rows) = crate::snapshot_sync::with_archive_power(
             &[Some(true), Some(true), Some(true), denied],
             || {
-                let scan = selector_scan(
+                let scan = activated_selector_scan(
                     &f,
                     ScanIndex::default(),
                     cache,
                     VecDeque::from([plain, f.candidate()]),
-                    false,
                 );
                 crate::local_resource_diagnostics::capture(|| finish_selector(scan))
             },
@@ -3174,12 +3203,11 @@ fn activated_selector_reaches_inherited_header_claim_starvation_and_resets_on_pr
         .unwrap();
     admission_streak(&key, false);
     for attempt in 1..=14 {
-        let scan = selector_scan(
+        let scan = activated_selector_scan(
             &f,
             ScanIndex::default(),
             cache.clone(),
             VecDeque::from([f.candidate()]),
-            false,
         );
         let ((index, result), rows) =
             crate::local_resource_diagnostics::capture(|| finish_selector(scan));
@@ -3209,12 +3237,11 @@ fn activated_selector_reaches_inherited_header_claim_starvation_and_resets_on_pr
         );
     }
     occupied.close();
-    let scan = selector_scan(
+    let scan = activated_selector_scan(
         &f,
         ScanIndex::default(),
         cache,
         VecDeque::from([f.candidate()]),
-        false,
     );
     let ((index, result), rows) =
         crate::local_resource_diagnostics::capture(|| finish_selector(scan));
