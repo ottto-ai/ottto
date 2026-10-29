@@ -47515,6 +47515,9 @@ impl ScanIndex {
         let mut recorded = true;
         for (index_key, source_file_fingerprint) in completed_parses {
             let was_held = self.claude_account_deferred_holds.contains_key(index_key);
+            // Count against the prior witness before resolution removes it.
+            // New holds have no reparse event; completion installs CONTENT.
+            self.note_withheld_account_parse(index_key, source_file_fingerprint, was_held);
             let (held, tokens) = (self.file_snapshot_fingerprints.get(index_key).into_iter())
                 .flatten()
                 .filter_map(|fingerprint| account_deferred_tokens.get(fingerprint))
@@ -47543,7 +47546,6 @@ impl ScanIndex {
                 withheld_event(WithheldEvent::UnrecordedEvents, 1);
                 withheld_event(WithheldEvent::UnrecordedTokens, tokens);
             }
-            self.note_withheld_account_parse(index_key, source_file_fingerprint, was_held);
         }
         withheld_account::retain_held(&self.claude_account_deferred_holds);
         recorded
@@ -48467,21 +48469,34 @@ impl ScanIndex {
         {
             return false;
         }
-        if let Some(entry) = self
+        let protected = self
             .files
-            .get_mut(key)
-            .filter(|e| e.has_unverified_source())
-        {
-            entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
+            .get(key)
+            .is_some_and(ScanIndexEntry::codex_history_is_protected);
+        let audit = self
+            .files
+            .get(key)
+            .is_some_and(ScanIndexEntry::has_unverified_source);
+        if audit {
+            if protected {
+                self.files
+                    .get_mut(key)
+                    .expect("audit entry")
+                    .scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
+            } else {
+                // Preserve SOURCE N3 incidence handling: retiring audit debt
+                // does not itself grant authority to prune its fingerprints.
+                self.retire_vanished_claude_audit_debt_entry(key);
+            }
             crate::local_resource_diagnostics::audit_retired_absent("claude_code");
+            disappearance_diagnostics::vanished(
+                SnapshotSource::ClaudeCode,
+                disappearance_diagnostics::Vanished::AuditDebtDropped,
+            );
         }
         self.claude_account_deferred_holds.remove(key);
         withheld_account::released_deleted(key);
-        if !self
-            .files
-            .get(key)
-            .is_some_and(ScanIndexEntry::codex_history_is_protected)
-        {
+        if !protected && !audit {
             self.remove_file_entry_unless_held(key, true);
         }
         true

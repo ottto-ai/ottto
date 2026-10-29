@@ -592,8 +592,8 @@ const PIPELINE_HOLD_CYCLE: PipelineCycle<'static> = PipelineCycle {
 /// its accepted revision, activity, and manifest entry; the new body is never
 /// uploaded or accepted; health stays red through a non-terminal ownership
 /// count; backfill and context-curve replay stay pending; and the next
-/// ordinary traversal reparses only the held file instead of every unchanged
-/// file.
+/// ordinary traversal skips unchanged held content; later growth reparses only
+/// that held file instead of every unchanged sibling.
 #[test]
 #[serial(source_manifests)]
 fn account_deferred_hold_lets_a_bounded_claude_traversal_converge() {
@@ -694,8 +694,27 @@ fn account_deferred_hold_lets_a_bounded_claude_traversal_converge() {
     assert!(settled.context_curve_replay_needed(PIPELINE_HOLD_CYCLE.replay_generation));
     assert_eq!(settled.claude_account_deferred_hold_count(), 1);
 
-    // The next ordinary traversal reparses only the held file.
-    let next = fixture.traversal(10, &PIPELINE_HOLD_CYCLE);
+    // R14: the real Completed/save/reload path preserves the content memo.
+    let idle = fixture.traversal(10, &PIPELINE_HOLD_CYCLE);
+    assert_eq!(
+        idle.iter()
+            .map(|page| page.scan.scanned_file_count)
+            .sum::<usize>(),
+        0,
+        "unchanged held content is not parsed again"
+    );
+    assert!(idle.iter().all(|page| page.uploaded.is_empty()));
+    assert_eq!(
+        idle.last()
+            .unwrap()
+            .index
+            .claude_account_deferred_hold_count(),
+        1
+    );
+    assert!(!idle.last().unwrap().fully_settled);
+    // Preserve the one-key reparse assertion, with real growth as its trigger.
+    fixture.append(PIPELINE_HELD_SESSION, "req_0_3");
+    let next = fixture.traversal(11, &PIPELINE_HOLD_CYCLE);
     let next_last = next.last().expect("next traversal page");
     assert!(next_last.scan.census_complete);
     assert_eq!(
@@ -1796,7 +1815,25 @@ fn real_rejected_page_records_account_hold_across_reload_and_reparses_next_gener
     );
 
     let before = terminal_hold_settlement_count();
-    let next = fixture.traversal(10, &PIPELINE_HOLD_CYCLE);
+    let idle = fixture.traversal(10, &PIPELINE_HOLD_CYCLE);
+    assert_eq!(
+        idle.iter()
+            .map(|page| page.scan.scanned_file_count)
+            .sum::<usize>(),
+        0,
+        "reloaded held content skips until evidence or content changes"
+    );
+    assert!(idle.iter().all(|page| page.uploaded.is_empty()));
+    assert_eq!(
+        idle.last()
+            .unwrap()
+            .index
+            .claude_account_deferred_hold_count(),
+        1
+    );
+    assert!(!idle.last().unwrap().fully_settled);
+    fixture.append(PIPELINE_HELD_SESSION, "req_0_3");
+    let next = fixture.traversal(11, &PIPELINE_HOLD_CYCLE);
     let last = next.last().unwrap();
     assert!(last.scan.census_complete);
     assert_eq!(
@@ -1939,11 +1976,10 @@ fn assert_real_rejected_hold(
     if account_hold {
         for page in [&first, &last] {
             assert_eq!(page.index.claude_account_deferred_hold_count(), 1);
-            assert!(
-                page.index.files[&held_key]
-                    .source_file_fingerprint
-                    .is_empty(),
-                "restoration retains the account reparse debt"
+            assert_eq!(
+                page.index.files[&held_key].source_file_fingerprint,
+                baseline.files[&held_key].source_file_fingerprint,
+                "R14: restoration preserves committed identity; memo owns account retry"
             );
             assert!(!page.fully_settled);
             assert!(!page.backfill_succeeded);

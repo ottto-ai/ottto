@@ -754,8 +754,9 @@ mod tests {
         let fixture = ForcedFamilyFixture::new("absence-forced-family");
         let member_key = local_index_key(&fixture.member_path);
         let mut index = fixture.index();
-        // N3: the member's own snapshot fingerprints and account hold are not
-        // released with its marker; their own rules settle them.
+        // N3: the member's snapshot fingerprints keep their own census rules.
+        // R14/H1 explicitly releases a positively absent account hold together
+        // with its now-unfulfillable audit debt; no body/ACK credit is granted.
         let held = std::collections::BTreeSet::from(["held-member-body".to_string()]);
         index
             .file_snapshot_fingerprints
@@ -804,7 +805,8 @@ mod tests {
                     .claude_account_deferred_holds
                     .get(&member_key)
                     .map(String::as_str),
-                Some("held-member-revision")
+                None,
+                "R14/H1: positively absent account hold is released"
             );
         }
     }
