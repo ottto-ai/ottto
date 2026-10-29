@@ -626,10 +626,10 @@ reading at most the newest ten JSON backups with the existing size and
 no-symlink checks. Ports must be in the current user's relay candidate list;
 seed discovery does not guess ports or connect to them. Busy ports are skipped
 and retried every 60 seconds. Legacy binds first probe IPv4 and dual-stack
-IPv6 wildcard addresses,
-then bind IPv4 loopback. All three binds use `SO_REUSEADDR`: live wildcard or
-loopback listeners veto the port, while our connected sockets and TIME_WAIT
-allow immediate listener replacement.
+IPv6 wildcard addresses, then bind IPv4 loopback. Successful wildcard probes
+stay bound through the loopback bind and listen, closing that acquisition gap.
+All three binds use `SO_REUSEADDR`: live wildcard or IPv4 loopback listeners veto
+the port, while our connected sockets and TIME_WAIT allow immediate replacement.
 IPv4 remains available when the probe reports that IPv6 is unavailable.
 A port observed as the current approval is removed from legacy ingress; primary
 recovery releases that legacy socket before attempting its bind.
@@ -638,13 +638,15 @@ Every legacy export rechecks Claude endpoint approval and the listener's live
 approval generation immediately before capture. Refused exports return 403 and
 store no evidence or successful-request activity. Claude telemetry disable,
 default-approval removal and setup opt-out operations invalidate that generation
-synchronously and wait up to two seconds for the
-supervisor to persist retirement and close sockets. Secondary-account removal
+synchronously and wait up to two seconds for the supervisor to persist
+retirement and close sockets. Secondary-account removal
 and browser-login cleanup preserve legacy listeners and default approval;
 acknowledgement waits never hold the Claude settings lock. Each tick captures
 its generation before reading approval, so a concurrent revoke also fences
-sockets created later in that tick. Periodic checks retire ports
-only after two consecutive definite non-approval reads. I/O errors, missing
+sockets created later in that tick. A pending revoke also blocks exports and
+new/refreshed listener activity until retirement is persisted and sockets close.
+Periodic checks retire ports only after two consecutive definite non-approval
+reads. I/O errors, missing
 settings and truncated or unparsable JSON are unknown: that export is refused,
 but listeners/history are preserved and the consecutive-revocation streak resets.
 Idle expiry also retires a port. Retirement survives restarts and prevents

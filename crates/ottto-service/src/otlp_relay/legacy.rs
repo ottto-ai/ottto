@@ -34,6 +34,9 @@ enum Command {
 #[derive(Default)]
 struct Admission {
     generation: AtomicU64,
+    // Zero clears the pending flag; count overlapping hooks until every Revoke
+    // has persisted retirement and closed its listeners.
+    revoke_pending: AtomicUsize,
     // Drain already-admitted exports before acknowledging a revoke.
     exports: RwLock<()>,
 }
@@ -190,7 +193,8 @@ impl Activity {
         // Re-read settings immediately before capture, even for an accepted
         // connection whose body arrived after consent was removed.
         let approved = request_approval();
-        if approved != Approval::Approved(self.approved)
+        if self.admission.revoke_pending.load(Ordering::SeqCst) != 0
+            || approved != Approval::Approved(self.approved)
             || approved == Approval::Approved(self.port)
             || !self.live.load(Ordering::SeqCst)
             || self.generation != self.admission.generation.load(Ordering::SeqCst)
@@ -591,7 +595,13 @@ impl Supervisor {
     fn handle_command(&mut self, command: Command) -> Result<()> {
         let (result, ack) = match command {
             Command::Release(port, ack) => (self.remove(port), ack),
-            Command::Revoke(ack) => (self.revoke(), ack),
+            Command::Revoke(ack) => {
+                let result = self.revoke();
+                if result.is_ok() {
+                    self.admission.revoke_pending.fetch_sub(1, Ordering::SeqCst);
+                }
+                (result, ack)
+            }
         };
         let _ = ack.send(());
         result
@@ -617,6 +627,9 @@ impl Supervisor {
         seed: &[u16],
         generation: u64,
     ) -> Result<()> {
+        if self.admission.revoke_pending.load(Ordering::SeqCst) != 0 {
+            return Ok(());
+        }
         let approved = approved.filter(|port| candidates.contains(port));
         self.durable_retired
             .retain(|port| candidates.contains(port));
@@ -641,6 +654,9 @@ impl Supervisor {
             .exports
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if admission.revoke_pending.load(Ordering::SeqCst) != 0 {
+            return Ok(());
+        }
         let before = serde_json::to_vec(&self.record)?;
         self.record.observe(approved, candidates, seed);
         for entry in &mut self.record.ports {
@@ -671,6 +687,9 @@ impl Supervisor {
         self.open.retain(|port, _| {
             self.record.ports.iter().any(|entry| entry.port == *port) && *port != primary
         });
+        if admission.revoke_pending.load(Ordering::SeqCst) != 0 {
+            return Ok(());
+        }
         if changed_approval {
             if let Some(approved) = approved {
                 for open in self.open.values_mut() {
@@ -686,6 +705,9 @@ impl Supervisor {
             }
             match socket::bind(entry.port) {
                 Ok(listener) => {
+                    if admission.revoke_pending.load(Ordering::SeqCst) != 0 {
+                        break;
+                    }
                     let first = *entry.idle_since.get_or_insert(now);
                     let activity = Activity::new(
                         entry.port,
@@ -728,6 +750,9 @@ impl Supervisor {
         seed: &[u16],
         generation: u64,
     ) -> Result<()> {
+        if self.admission.revoke_pending.load(Ordering::SeqCst) != 0 {
+            return Ok(());
+        }
         let approved = match approval {
             Approval::Unknown => {
                 self.revoked_ticks = 0;
@@ -863,6 +888,10 @@ pub(super) fn release_for_primary(port: u16) {
 /// Fence workers immediately, then retire and close sockets before the ack.
 pub(crate) fn revoke_now() {
     if let Some(endpoint) = endpoint() {
+        endpoint
+            .admission
+            .revoke_pending
+            .fetch_add(1, Ordering::SeqCst);
         endpoint.admission.generation.fetch_add(1, Ordering::SeqCst);
         send_and_wait(&endpoint, Command::Revoke);
     }

@@ -91,23 +91,37 @@ pub(super) fn bind_with_probe(
     port: u16,
     probe: impl FnOnce(u16) -> io::Result<OwnedFd>,
 ) -> io::Result<TcpListener> {
-    // Reuse ignores connected/TIME_WAIT sockets, while an exact live wildcard
-    // listener still vetoes its wildcard probe. Close both probes immediately.
-    drop(bind_ipv4(port, Ipv4Addr::UNSPECIFIED)?);
-    match probe(port) {
-        Ok(fd) => drop(fd),
+    bind_with_probe_and_hook(port, probe, || {})
+}
+
+#[cfg(unix)]
+pub(super) fn bind_with_probe_and_hook(
+    port: u16,
+    probe: impl FnOnce(u16) -> io::Result<OwnedFd>,
+    after_probe: impl FnOnce(),
+) -> io::Result<TcpListener> {
+    // Keep both reservations through listen: a same-uid wildcard contender
+    // must not enter between our probes and the specific loopback bind.
+    let ipv4_guard = bind_ipv4(port, Ipv4Addr::UNSPECIFIED)?;
+    let ipv6_guard = match probe(port) {
+        Ok(fd) => Some(fd),
         // These mean IPv6 cannot serve here, not that another holder owns the
         // port. Keep IPv4 service available on hosts with IPv6 disabled.
         Err(error)
             if matches!(
                 error.raw_os_error(),
                 Some(libc::EAFNOSUPPORT | libc::EPROTONOSUPPORT | libc::EADDRNOTAVAIL)
-            ) => {}
+            ) =>
+        {
+            None
+        }
         Err(error) => return Err(error),
-    }
+    };
+    after_probe();
     let fd = bind_ipv4(port, Ipv4Addr::LOCALHOST)?;
     // SAFETY: listen operates on our uniquely owned, bound socket.
     checked(unsafe { libc::listen(fd.as_raw_fd(), 128) })?;
+    drop((ipv4_guard, ipv6_guard));
     let listener = TcpListener::from(fd);
     listener.set_nonblocking(true)?;
     Ok(listener)

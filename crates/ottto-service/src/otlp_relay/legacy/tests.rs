@@ -1346,3 +1346,128 @@ fn changed_approval_tick_cannot_adopt_a_concurrent_revokes_generation() {
             .is_none());
     });
 }
+
+#[test]
+fn wildcard_guards_cover_the_probe_to_listen_seam() {
+    let port = spare_port();
+    let mut attempted = false;
+    let mut competitor = None;
+    let listener = socket::bind_with_probe_and_hook(port, socket::bind_ipv6_wildcard, || {
+        attempted = true;
+        match TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)) {
+            Ok(owner) => competitor = Some(owner),
+            Err(error) => assert_eq!(error.kind(), io::ErrorKind::AddrInUse),
+        }
+    });
+    assert!(attempted, "both probe acquisitions reached the seam");
+    #[cfg(target_os = "macos")]
+    {
+        assert!(
+            competitor.is_none(),
+            "held exact wildcard reservation vetoes the owner"
+        );
+        assert!(
+            listener.is_ok(),
+            "our held reuse guards permit our loopback listener: {listener:?}"
+        );
+    }
+    // Linux may allow reuse bind+listen over bound-but-not-listening guards.
+    // In that case its live wildcard listener must veto our final listener.
+    assert!(competitor.is_none() || listener.is_err());
+    drop(listener);
+    drop(competitor);
+    // Success/failure both release guards as well as any real listener.
+    let _released = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).unwrap();
+}
+
+#[test]
+fn pending_revoke_before_snapshot_blocks_tick_and_matching_epoch_export() {
+    let (_dir, mut supervisor) = scratch();
+    let busy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = busy.local_addr().unwrap().port();
+    let candidates = [APPROVED, port];
+    supervisor
+        .reconcile_current(100, Some(APPROVED), 0, &candidates, &[port])
+        .unwrap();
+    assert!(supervisor.open.is_empty());
+    // Reverse the previous race fixture: the hook sets pending and advances
+    // first; only afterward does this tick snapshot and read unchanged approval.
+    supervisor
+        .admission
+        .revoke_pending
+        .fetch_add(1, Ordering::SeqCst);
+    supervisor
+        .admission
+        .generation
+        .fetch_add(1, Ordering::SeqCst);
+    let generation = supervisor.admission.generation.load(Ordering::SeqCst);
+    let approval = Approval::Approved(APPROVED);
+    drop(busy);
+    supervisor
+        .tick(160, approval, 0, &candidates, &[], generation)
+        .unwrap();
+    assert!(
+        supervisor.open.is_empty(),
+        "pending revoke prevents activity creation"
+    );
+    assert_eq!(supervisor.record.last_approved, Some(APPROVED));
+    // Even if a native bind completed during that tick, a matching generation
+    // cannot authorize its activity while the hook's Revoke remains pending.
+    let _bound = socket::bind(port).unwrap();
+    let activity = Activity::new(
+        port,
+        APPROVED,
+        100,
+        generation,
+        supervisor.counters.clone(),
+        supervisor.admission.clone(),
+    );
+    assert_eq!(
+        activity.generation,
+        supervisor.admission.generation.load(Ordering::SeqCst)
+    );
+    with_request_approval(Some(APPROVED), || {
+        assert!(activity
+            .export_if_approved(|| panic!("pending epoch authorized capture"))
+            .is_none());
+    });
+    assert_eq!(supervisor.counters.requests.load(Ordering::Relaxed), 0);
+    let (ack, done) = mpsc::sync_channel(1);
+    supervisor.handle_command(Command::Revoke(ack)).unwrap();
+    done.recv().unwrap();
+    assert_eq!(
+        supervisor.admission.revoke_pending.load(Ordering::SeqCst),
+        0
+    );
+    let disk: Record = load_private_record(&supervisor.path).unwrap();
+    assert!(disk.retired.contains(&port));
+}
+
+#[test]
+fn pending_revoke_is_cleared_only_after_all_commands_succeed() {
+    let (_dir, mut supervisor) = scratch();
+    supervisor
+        .admission
+        .revoke_pending
+        .store(2, Ordering::SeqCst);
+    for remaining in [1, 0] {
+        let (ack, done) = mpsc::sync_channel(1);
+        supervisor.handle_command(Command::Revoke(ack)).unwrap();
+        done.recv().unwrap();
+        assert_eq!(
+            supervisor.admission.revoke_pending.load(Ordering::SeqCst),
+            remaining
+        );
+    }
+    supervisor
+        .admission
+        .revoke_pending
+        .store(1, Ordering::SeqCst);
+    supervisor.fail_save.set(true);
+    let (ack, _done) = mpsc::sync_channel(1);
+    assert!(supervisor.handle_command(Command::Revoke(ack)).is_err());
+    assert_eq!(
+        supervisor.admission.revoke_pending.load(Ordering::SeqCst),
+        1
+    );
+}

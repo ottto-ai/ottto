@@ -29,7 +29,8 @@ Claude telemetry disable/default-approval removal and setup opt-out hooks
 invalidate workers synchronously and request
 persisted retirement/socket closure with a two-second acknowledgement bound,
 without holding the settings lock. Ticks snapshot the generation before reading
-approval; new and refreshed listeners cannot inherit a concurrent revoke.
+approval; pending revoke blocks exports and new/refreshed listener activity
+until retirement persists and sockets close.
 Previously accepted connections are fenced, and already-admitted exports drain
 before a successful acknowledgement. Periodic revocation remains a fallback. Idle expiry also
 retires ports. Retirement persists across restarts and re-seeding; only a fresh
@@ -42,7 +43,8 @@ If both state and tombstone persistence fail, supervision exits and logs the
 residual risk of losing retirement across restart.
 
 Busy ports use IPv4 and dual-stack IPv6 wildcard probes followed by a loopback
-bind, all with reuse: live holders veto the port, while connected sockets and
+bind, all with reuse. The successful wildcard probes remain bound through
+loopback listen. Live wildcard/IPv4 loopback holders veto; connected sockets and
 TIME_WAIT permit immediate rebind. Unavailable IPv6 still permits IPv4.
 Empty supervision waits until its next tick; active sockets
 drain up to 16 accepts, back off resource errors and close unusable sockets for
