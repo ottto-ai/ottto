@@ -247,6 +247,10 @@ fn rejected_ordinary_taken_returns_custody_rank_charge_and_held_flag_under_one_l
     )
     .unwrap();
     assert!(cache.return_prepared_taken(key.clone(), taken));
+    assert!(
+        cache.durable().unwrap().touched.is_empty(),
+        "a rejected acquisition is not a fresh M1 writer candidate"
+    );
     let mut returned = cache.take(&key).expect("real cache admission");
     assert_eq!(returned.modified_hint, (17, 19));
     assert_eq!(returned.finalization_charge, 23);

@@ -343,7 +343,7 @@ impl SharedCache {
         completed: sampled_jsonl::CompletedNativeAcquisition,
         live_bytes: usize,
     ) -> bool {
-        self.insert_with_custody(key, completed, live_bytes, false)
+        self.insert_with_custody(key, completed, live_bytes, false, true)
     }
     pub(super) fn return_prepared_taken(
         &self,
@@ -368,6 +368,7 @@ impl SharedCache {
             },
             finalization_charge,
             e2_held_new_file,
+            false,
         )
     }
     fn insert_with_custody(
@@ -376,14 +377,11 @@ impl SharedCache {
         completed: sampled_jsonl::CompletedNativeAcquisition,
         live_bytes: usize,
         held_new: bool,
+        _write_candidate: bool,
     ) -> bool {
         // This ordinary path accepts only fixed inline custody; dynamic debt uses b2.
-        if crate::heap_layout_bound::bound(
-            &completed.durable,
-            std::mem::size_of_val(&completed.durable),
-        )
-        .is_none()
-        {
+        if completed.durable.heap_bound(&mut Counter::new(0)).is_none() {
+            record(Event::InsertEntryBoundRefused);
             return false;
         }
         if let Some(state) = completed.reduction {
@@ -427,7 +425,7 @@ impl SharedCache {
                 // M1: an admitted copy is a durable write candidate after the
                 // next successful index save (the durable lock is a leaf).
                 #[cfg(unix)]
-                if admitted {
+                if admitted && _write_candidate {
                     self.durable_touch(&touched);
                 }
                 return admitted;
