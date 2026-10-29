@@ -290,8 +290,18 @@ mod tests {
             wake: Condvar::new(),
             read,
         });
+        struct Release(Option<std::thread::JoinHandle<()>>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                RELEASE.store(true, Relaxed);
+                if let Some(handle) = self.0.take() {
+                    let _ = handle.join();
+                }
+            }
+        }
         let worker = slow.clone();
-        let handle = std::thread::spawn(move || worker.sample());
+        // Released and joined on every exit, including a failed assertion.
+        let release = Release(Some(std::thread::spawn(move || worker.sample())));
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !IN_READ.load(Relaxed) && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(1));
@@ -300,8 +310,7 @@ mod tests {
         // The registry stays free for stage entry/exit during the OS read.
         assert!(slow.slots.try_lock().is_ok());
         slow.slots.lock().unwrap()[stage.index] = None;
-        RELEASE.store(true, Relaxed);
-        handle.join().unwrap();
+        drop(release);
         // The stage closed mid-read, so the late sample never lands on it.
         assert_eq!(stage.counters.samples.load(Relaxed), 1);
         drop(stage);
