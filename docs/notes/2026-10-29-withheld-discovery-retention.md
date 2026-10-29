@@ -30,3 +30,18 @@ workflow is dispatched by this implementation task; PR remains draft for E3.
 See diagnostics.md for counter units and accepted rename, interior-edit,
 unstamped-evidence and overflow-attempt limitations. No parser or identity
 version bump, upload authority, or production configuration change.
+
+Round 17 repairs both absence exits: reconciliation completes account retirement
+without falling through into ordinary incidence deletion, and a bounded inventory
+also checks hold-only checkpoints. The common absence proof opens each parent
+beneath a configured root without following links, checks final-name absence,
+then revalidates the directory chain. Missing ancestors or uncertain identity
+retain debt. Healthy-census deletion tests keep the original fingerprint set and
+ACK state through real Completed settlement. A watcher hint through an
+intermediate symlink grants no removal authority.
+
+A durable account retry whose CONTENT memo is missing, refused, poisoned or
+unusable cannot obtain the ordinary equal-fingerprint Skip. Existing authority,
+audit, correction and genuine rearm rules retain priority; recovery uses the
+existing counted parse path and preserves the committed fingerprint. Real
+Completed/save/reload fixtures cover equal fingerprints and advisory recovery.

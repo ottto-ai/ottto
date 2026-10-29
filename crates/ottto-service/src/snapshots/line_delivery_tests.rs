@@ -3025,7 +3025,7 @@ fn withheld_equal_fingerprint_recovers_from_unusable_memo() {
     };
     let (mut previous, _, _) = page(ScanIndex::default());
     let fingerprint = previous.files[&key].source_file_fingerprint.clone();
-    previous.upload_context_fingerprint = "retry-context".into();
+    previous.upload_context_fingerprint = Some("retry-context".into());
     let (parsed, scan, recorder) = page(previous.clone());
     assert_eq!(scan.scanned_file_count, 1);
     assert_eq!(parsed.files[&key].source_file_fingerprint, fingerprint);
