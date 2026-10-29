@@ -801,7 +801,7 @@ pub(crate) fn with_reader<T>(reader: Reader, f: impl FnOnce() -> T) -> (Reader, 
     drop(reset);
     (reader, result)
 }
-pub(super) fn active_for(support: &Path) -> bool {
+pub(in crate::claude_local_otel) fn active_for(support: &Path) -> bool {
     ACTIVE.with(|active| {
         active
             .borrow()

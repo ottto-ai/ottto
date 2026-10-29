@@ -121,7 +121,7 @@ fn durable_sidecar_money_full_ram_disk_tail_late_latest_wins() {
         let expected = cold(&c);
         assert_reported(&expected, 2);
         reader.begin_pass();
-        let (mut reader, (_, ram)) =
+        let (reader, (_, ram)) =
             with_durable_sidecar_reader(reader, || render(&c, accepted_index.clone(), Mode::Ram));
         assert_eq!(
             reader.body_bytes(),
