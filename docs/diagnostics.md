@@ -1060,12 +1060,18 @@ explicit release, including real durable I/O paths.
 
 Pi joins the shared sampled RAM reader. Its `native_collection_page` acquisition
 counts report Full, Tail and Unchanged decisions with the actual planner reasons.
-Audit age, clock changes and audit-slot pressure do not gate checkpoint reuse.
+Age and clock changes do not invalidate checkpoints. Admission of a new sampled
+obligation follows the shared audit cap: with no slot left, an unmarked change
+reads a counted cap Full (or waits); already-marked files keep Tailing.
 Until Pi durable records are enabled, an already-indexed file that changes
 without a RAM reduction still reads Full: the transitional `pi` leaf in
 `retained_cache_page_events` counts that attempt once at read start, alongside
 `state_missing`. A newly discovered file's first Full read does not increment
-that leaf. Restart or RAM eviction never triggers a read of an idle file.
+that leaf. A no-RAM-copy cap Full on a changed indexed file can increment both
+`pi` and `audit_cap_full` for one read. Audit, upload-context and other non-content
+reparse reasons do not increment `pi`. After a restart or eviction, an idle Pi
+file whose 1 h verification marker falls due is read once (audit); Pi-b2's durable
+record removes this. The verified Full retires the marker without re-staging it.
 This is a staged exception; it does not turn a cache miss into a first-read
 authorization.
 
@@ -1076,7 +1082,8 @@ the completed reduction's measured allocation charge, summed across refusals.
 not be measured; zero bytes with that count is unavailable, not a zero-sized
 copy. These counters do not mean a durable write was attempted or refused.
 `cache_evicted_by_pi_claude_code` and `cache_evicted_by_pi_codex` count respective
-victims removed by Pi cache insertion. They also appear on the existing
+insert-time capacity victims (excludes `Release::CopyAdmission` releases).
+They also appear on the existing
 `process_retained_cache_lifecycle_totals` line (source `unknown`): cumulative,
 saturating process totals since startup, shared across namespaces. They are
 counts and bytes only, with no file names, response ids or content.

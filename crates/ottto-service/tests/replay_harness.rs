@@ -274,7 +274,7 @@ const LIFECYCLE_COUNTERS: &[(&str, CounterClass)] = &[
     ("insert_poisoned_lock", CounterClass::NonLayoutFailure),
     // transcript_cache.rs::admit_at_rank: capacity victim action; not refusal.
     ("insert_entries_evicted", CounterClass::Observation),
-    // snapshots/sampled_jsonl.rs insertion: Claude/Codex victims of a Pi
+    // transcript_cache.rs::admit_at_rank: Claude/Codex victims of a Pi
     // insertion, a subset of insert_entries_evicted.
     ("cache_evicted_by_pi_claude_code", CounterClass::Observation),
     ("cache_evicted_by_pi_codex", CounterClass::Observation),
