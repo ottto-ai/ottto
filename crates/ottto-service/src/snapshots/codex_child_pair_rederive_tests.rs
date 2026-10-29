@@ -749,3 +749,42 @@ fn codex_child_pair_restart_probe() {
         "a stamped child never reacquires in a fresh process"
     );
 }
+
+#[test]
+fn codex_child_pair_old_positional_entry_keeps_nondefault_tail_neighbors() {
+    let fixture = Fixture::new("named");
+    let (index, _, _) = fixture.run(ScanIndex::default(), None, &CodexTitleMetadata::default());
+    let entry = &index.files[&local_index_key(&fixture.path)];
+    let mut old: old_202::ScanIndexEntry =
+        serde_json::from_value(serde_json::to_value(entry).unwrap()).unwrap();
+    old.opened_changed_nanos = 111;
+    old.opened_birth_nanos = 222;
+    // Build a valid old positional array from every typed field; None is
+    // serialized by its real type, never manufactured as a sparse hole.
+    let positional = json!([
+        old.size_bytes,
+        old.modified_unix_seconds,
+        old.modified_unix_nanos,
+        old.source_file_fingerprint,
+        old.last_snapshot_fingerprint,
+        old.last_upload_body_witness,
+        old.effective_upload_body_witness_revision,
+        old.scan_identity_version,
+        old.codex_joined_member_set,
+        old.codex_captured_joined_member_set,
+        old.codex_protected_owner,
+        old.codex_applied_tier_receipt,
+        old.codex_applied_tier_receipt_required,
+        old.codex_captured_tier_receipt,
+        old.codex_captured_tier_receipt_required,
+        old.codex_captured_uncommitted,
+        old.codex_counting_v2,
+        old.codex_counting_owner,
+        old.opened_changed_nanos,
+        old.opened_birth_nanos
+    ]);
+    let current: ScanIndexEntry = serde_json::from_value(positional).unwrap();
+    assert_eq!(current.opened_changed_nanos, 111);
+    assert_eq!(current.opened_birth_nanos, 222);
+    assert!(current.codex_child_pair_rederive.is_none());
+}

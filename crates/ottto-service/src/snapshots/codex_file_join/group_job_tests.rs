@@ -3548,3 +3548,73 @@ fn parked_group_across_fresh_index_reprobes_member_debt_on_resume() {
     );
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn child_pair_repair_group_checks_identified_members_and_honors_backoff_and_growth() {
+    use codex_child_pair_rederive::Stamp;
+    struct Clock;
+    impl Drop for Clock {
+        fn drop(&mut self) {
+            sampled_scan::set_test_now(None);
+        }
+    }
+    let _clock = Clock;
+    sampled_scan::set_test_now(Some(100));
+    for both_pending in [false, true] {
+        let root = temp_root("child-repair-group");
+        let a = root.join("sessions/a.jsonl");
+        let b = root.join("sessions/b.jsonl");
+        write_rows(&a, &chain_rows(OWNER, "a", "2026-10-01T10:00:00Z", 0, 1));
+        write_rows(&b, &chain_rows(OWNER, "b", "2026-10-01T10:30:00Z", 10, 1));
+        let (mut index, initial) = scan(&root, ScanIndex::default(), 10);
+        assert_eq!(initial.snapshots.len(), 2, "settled native group premise");
+        for path in std::iter::once(&a).chain(both_pending.then_some(&b)) {
+            let key = local_index_key(path);
+            let fp = index.files[&key].source_file_fingerprint.clone();
+            assert!(index.stage_sampled_audit(
+                &key,
+                &fp,
+                crate::transcript_acquisition::AuditDebt {
+                    due_unix_seconds: 100
+                }
+            ));
+            index.files.get_mut(&key).unwrap().codex_child_pair_rederive = Some(Stamp::Pending {
+                attempts: 1,
+                retry_after: 108,
+                running: false,
+                previous_due: None,
+            });
+        }
+        let mut boot = GroupBoot::new(group_of(&root), &index);
+        for _ in 0..2 {
+            assert!(matches!(boot.step(None, &index), Boot::Pending));
+        }
+        assert!(
+            boot.group
+                .members
+                .iter()
+                .all(|member| member.source_file_fingerprint
+                    == index.files[&local_index_key(&member.path)].source_file_fingerprint),
+            "group guard must see identified fingerprints"
+        );
+        assert!(
+            matches!(boot.step(None, &index), Boot::Strict),
+            "quiet excluded sibling or retry backoff keeps the repair owed"
+        );
+        assert!(
+            boot.headers.is_empty(),
+            "no replay header/probe consumed during repair hold"
+        );
+        write_rows(&b, &chain_rows(OWNER, "b", "2026-10-01T10:30:00Z", 10, 2));
+        let mut changed = GroupBoot::new(group_of(&root), &index);
+        for _ in 0..2 {
+            assert!(matches!(changed.step(None, &index), Boot::Pending));
+        }
+        assert!(
+            matches!(changed.step(None, &index), Boot::Pending),
+            "real growth keeps the ordinary whole-group path during backoff"
+        );
+        assert!(changed.admitted);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
