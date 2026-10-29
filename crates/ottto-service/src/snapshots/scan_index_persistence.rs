@@ -207,6 +207,7 @@ impl LegacyRecovery {
 }
 
 impl LoadedRoot {
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn observed_missing() -> Self {
         Self(Arc::new(Root::Missing))
     }
