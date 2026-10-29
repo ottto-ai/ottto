@@ -1279,13 +1279,13 @@ fn fallback_classes_over_the_synthetic_corpus() {
 /// Budget receipt (static): the bounds every restore and write is held to.
 #[test]
 fn budget_bounds_hold() {
-    use crate::durable_tail_store::{MAX_BATCH, MAX_RECORDS, RECORD_BYTES, STORE_BYTES};
+    use crate::durable_tail_store::{INVENTORY_BOUND, MAX_BATCH, MAX_RECORDS, RECORD_BYTES};
     // A restored copy is charged to the 31 MiB state budget like any
     // retained copy; one record never exceeds one cache entry.
     assert_eq!(RECORD_BYTES, crate::transcript_cache::ENTRY_BYTES);
     assert_eq!(MAX_RECORDS, crate::transcript_cache::CACHE_ENTRIES);
-    // Disk: at most 32 MiB per source store.
-    assert_eq!(STORE_BYTES, 32 * 1024 * 1024);
+    // Disk admission is independent of memo precision; the old writer inventories 512 keys.
+    assert_eq!(INVENTORY_BOUND, 512);
     // Per restore: one record read, two 4 KiB sample windows, a head
     // re-parse of at most 1 MiB and at most NAMED_LINES capped lines.
     assert_eq!(HEAD_BOUND, 1024 * 1024);
@@ -1293,7 +1293,7 @@ fn budget_bounds_hold() {
     // Beside the cache, outside its state budget: both stores' digest maps.
     assert_eq!(
         crate::snapshots::sampled_scan::durable_tail::STORES_RESIDENT_BOUND,
-        64 * 1024 + 513 * 1024
+        926_720
     );
     // Per write pass: at most MAX_BATCH records of at most RECORD_BYTES.
     assert_eq!(MAX_BATCH, 32);
@@ -1492,6 +1492,86 @@ fn structural_verifier_large_body_still_allocates_nothing() {
     );
 }
 
+fn assert_borrowed_count_identity(reduction: &CachedJsonlReduction) {
+    take_l_spans();
+    let rederive = rederive_digests(&reduction.accumulator, line_cap()).unwrap();
+    let mut old = Enc::bytes(crate::durable_tail_store::RECORD_BYTES);
+    reduction.put(&mut old).unwrap();
+    rederive.put(&mut old).unwrap();
+    let expected = old.into_bytes();
+    take_l_spans();
+    let (count, stats) = crate::retry_allocation_probe::measure_caller_thread(|| {
+        let mut count = Enc::count(expected.len());
+        reduction.put(&mut count).unwrap();
+        rederive.put(&mut count).unwrap();
+        count.counted()
+    });
+    assert_eq!(stats.allocations, 0, "count must not allocate: {stats:?}");
+    assert_eq!(count, expected.len());
+    let (refused, stats) = crate::retry_allocation_probe::measure_caller_thread(|| {
+        let mut count = Enc::count(expected.len() - 1);
+        reduction
+            .put(&mut count)
+            .and_then(|()| rederive.put(&mut count))
+    });
+    assert_eq!(refused, Err(Refuse::TooLarge));
+    assert_eq!(stats.allocations, 0, "refusal precedes any body allocation");
+    assert!(
+        take_l_spans().is_empty(),
+        "count is not a second L-span output"
+    );
+    let actual = encode(reduction, expected.len(), line_cap()).unwrap();
+    assert_eq!(
+        actual, expected,
+        "borrowed parts preserve the original codec bytes"
+    );
+    assert_eq!(actual.capacity(), actual.len());
+    assert_eq!(
+        encode(reduction, expected.len() - 1, line_cap()),
+        Err(Refuse::TooLarge)
+    );
+    let (_, options) = crate::durable_tail_codec::trace_verify(|| verify(&actual).unwrap());
+    assert!(options >= 5, "fixture must populate nested optional state");
+    take_l_spans();
+}
+
+#[test]
+fn borrowed_count_exact_encoding_matches_populated_both_source_canaries() {
+    let scratch = Scratch::new("borrowed-count-canaries");
+    let mut covered = BTreeSet::new();
+    for case in cases() {
+        let path = scratch.write("nested.jsonl", &case.lines);
+        let (reduction, _) = full_read(&path, case.source);
+        covered.insert(case.source.api_slug());
+        assert_borrowed_count_identity(&reduction);
+    }
+    assert_eq!(covered, BTreeSet::from(["claude_code", "codex"]));
+}
+
+#[test]
+fn borrowed_count_identity_covers_codex_absent_legacy_and_v2_state() {
+    use codex_counting_version::AckEvidence;
+    let scratch = Scratch::new("borrowed-count-contract");
+    let path = scratch.write("codex.jsonl", &codex_lines());
+    for (evidence, version) in [
+        (None, 0),
+        (Some(AckEvidence::LegacyAcked), 1),
+        (Some(AckEvidence::None), 2),
+    ] {
+        let mut parser = parser(&path, SnapshotSource::Codex);
+        if let Some(evidence) = evidence {
+            codex_counting_version::configure(&mut parser.accumulator, evidence, Some(0));
+        }
+        parser
+            .prepare_acquisition(None, &scope(), None, NOW)
+            .unwrap();
+        while !parser.step().unwrap() {}
+        let reduction = parser.durable_test_reduction_copy();
+        assert_eq!(reduction.durable_counting().map_or(0, |c| c.1), version);
+        assert_borrowed_count_identity(&reduction);
+    }
+}
+
 #[test]
 fn compressed_rederive_refuses_before_seek_or_jsonl_parse() {
     let scratch = Scratch::new("zst-refusal");
@@ -1570,4 +1650,51 @@ fn tail_reuse_allowance_cannot_block_an_independently_due_full() {
         encode(&cold, 1 << 20, 1 << 20).unwrap(),
         "fallback uses the fresh native reduction"
     );
+}
+
+#[test]
+fn no_input_completion_requires_every_rederive_digest_absent() {
+    for field in 0..5 {
+        let mut obligation = Rederive::default();
+        let slot = match field {
+            0 => &mut obligation.first_prompt,
+            1 => &mut obligation.workspace,
+            2 => &mut obligation.agent_label,
+            3 => &mut obligation.session_start,
+            _ => &mut obligation.title,
+        };
+        *slot = Some([1; 32]);
+        let decoded = Decoded {
+            reduction: CachedJsonlReduction {
+                accumulator: SnapshotAccumulator::new(SnapshotSource::ClaudeCode),
+                report: JsonlReadReport::default(),
+                recognized_usage_drop_count: 0,
+                positive_recognized_usage_count: 0,
+                positive_usage_evidence: false,
+            },
+            rederive: obligation,
+        };
+        let (result, stats) =
+            crate::retry_allocation_probe::measure_caller_thread(|| decoded.without_rederive());
+        assert!(
+            result.is_err(),
+            "obligation{field} cannot use a zero/missing head mark as absence"
+        );
+        assert_eq!(stats.allocations, 0);
+    }
+    let decoded = Decoded {
+        reduction: CachedJsonlReduction {
+            accumulator: SnapshotAccumulator::new(SnapshotSource::ClaudeCode),
+            report: JsonlReadReport::default(),
+            recognized_usage_drop_count: 0,
+            positive_recognized_usage_count: 0,
+            positive_usage_evidence: false,
+        },
+        rederive: Rederive::default(),
+    };
+    let (result, stats) =
+        crate::retry_allocation_probe::measure_caller_thread(|| decoded.without_rederive());
+    let (_, receipt) = result.unwrap();
+    assert_eq!(receipt, RederiveReceipt::default());
+    assert_eq!(stats.allocations, 0);
 }

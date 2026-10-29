@@ -347,54 +347,99 @@ impl SharedCache {
         completed: sampled_jsonl::CompletedNativeAcquisition,
         live_bytes: usize,
     ) -> bool {
-        if let Some(state) = completed.reduction {
-            if let Ok(mut cache) = self.retained() {
-                // The whole cursor state (paused job, memo, parked and rotation
-                // records, outstanding claims) and the side ledger's fixed charge
-                // keep their charge: admission may not fill the state budget
-                // underneath them. Measured under the retained lock, so every
-                // claim made before this insert is seen. The side term is the
-                // same constant `heap_bound` adds and cursor admission keeps
-                // (`codex_cursor::admission_budget`, F4b). Slice M order: PR-R,
-                // then M2, extend this reservation; they keep this term.
-                // U1a-2a ss-6: the cursor term is main's (`cursor_resident_for_main`,
-                // no suspended proof), so the insert decides as with no proof;
-                // the proof is then retired under this same lock if the insert
-                // took its room.
-                // `live_bytes` is this copy's own finalization charge: kept on
-                // the entry, so its next shape-F completion reserves it beside
-                // the copy (P1-RETAIN β, `K = max(C, F_prev)`). A copy whose R0
-                // release ran is admitted at exactly the rank that release
-                // ranked residents against.
-                let live_bytes_in = live_bytes;
-                #[cfg(unix)]
-                let touched = key.clone();
-                let reserved = live_bytes
-                    .saturating_add(self.cursor_resident_for_main())
-                    .saturating_add(side_ledger::SIDE_LEDGER_BYTES);
-                let admitted = cache.insert_reserving_at_rank(
-                    key,
-                    crate::transcript_cache::Retained {
-                        checkpoint: completed.checkpoint,
-                        state,
-                    },
-                    reserved,
-                    live_bytes,
-                    completed.released,
-                );
-                self.drop_suspended_proof_if_over(&cache, live_bytes_in);
-                // M1: an admitted copy is a durable write candidate after the
-                // next successful index save (the durable lock is a leaf).
-                #[cfg(unix)]
-                if admitted {
-                    self.durable_touch(&touched);
-                }
-                return admitted;
-            } else {
-                record(Event::InsertPoisonedLock);
-            }
+        self.insert_with_custody(key, completed, live_bytes, false, true, false)
+            .is_ok()
+    }
+    pub(super) fn return_prepared_taken(
+        &self,
+        key: String,
+        taken: Box<crate::transcript_cache::Taken<CachedJsonlReduction>>,
+    ) -> Result<(), Box<crate::transcript_cache::Taken<CachedJsonlReduction>>> {
+        self.insert_taken(key, taken, false, false).map(|_| ())
+    }
+    fn insert_taken<I: crate::transcript_cache::Incoming<CachedJsonlReduction>>(
+        &self,
+        key: String,
+        incoming: I,
+        _write_candidate: bool,
+        take_back: bool,
+    ) -> Result<Option<crate::transcript_cache::Taken<CachedJsonlReduction>>, I> {
+        let taken: &crate::transcript_cache::Taken<CachedJsonlReduction> = incoming.borrow();
+        let fits = taken.durable.heap_bound(&mut Counter::new(0)).is_some();
+        #[cfg(test)]
+        let fits = fits && !sampled_jsonl::preparation_tests::heap_refused();
+        if !fits {
+            record(Event::InsertEntryBoundRefused);
+            return Err(incoming);
         }
-        false
+        let Ok(mut cache) = self.retained() else {
+            record(Event::InsertPoisonedLock);
+            return Err(incoming);
+        };
+        let live_bytes = taken.finalization_charge;
+        let reserved = live_bytes
+            .saturating_add(self.cursor_resident_for_main())
+            .saturating_add(side_ledger::SIDE_LEDGER_BYTES);
+        let touched = key.clone();
+        let result = cache.insert_taken_reserving(key, incoming, reserved);
+        self.drop_suspended_proof_if_over(&cache, live_bytes);
+        #[cfg(unix)]
+        if result.is_ok() && _write_candidate {
+            self.durable_touch(&touched);
+        }
+        // No cold copy is observable between admission and take: both happen
+        // under this retained guard, with ordinary cursor/side reservations.
+        result.map(|()| {
+            if take_back {
+                cache.take(&touched)
+            } else {
+                None
+            }
+        })
+    }
+    // Refusal returns the original inline graph; boxing adds an unfunded allocation.
+    #[allow(clippy::result_large_err)]
+    fn insert_with_custody(
+        &self,
+        key: String,
+        mut completed: sampled_jsonl::CompletedNativeAcquisition,
+        live_bytes: usize,
+        held_new: bool,
+        write_candidate: bool,
+        take_back: bool,
+    ) -> Result<
+        Option<crate::transcript_cache::Taken<CachedJsonlReduction>>,
+        sampled_jsonl::CompletedNativeAcquisition,
+    > {
+        let Some(state) = completed.reduction.take() else {
+            return Err(completed);
+        };
+        let rank = completed.released.unwrap_or_else(|| {
+            crate::transcript_cache::admission_rank(
+                completed.checkpoint.modified_hint(),
+                crate::transcript_cache::admission_now(),
+            )
+        });
+        let taken = crate::transcript_cache::Taken {
+            retained: crate::transcript_cache::Retained {
+                checkpoint: completed.checkpoint,
+                state,
+            },
+            durable: completed.durable,
+            modified_hint: rank,
+            finalization_charge: live_bytes,
+            e2_held_new_file: held_new,
+        };
+        match self.insert_taken(key, taken, write_candidate, take_back) {
+            Ok(taken) => Ok(taken),
+            Err(taken) => Err(sampled_jsonl::CompletedNativeAcquisition {
+                checkpoint: taken.retained.checkpoint,
+                reduction: Some(taken.retained.state),
+                durable: taken.durable,
+                released: completed.released,
+                unsealed: completed.unsealed,
+            }),
+        }
     }
 }
 
@@ -588,6 +633,7 @@ impl OwnedSourceScan {
 /// where another implies it today.
 fn owns_no_optimization_state(active: &OwnedActiveFile) -> bool {
     active.sampling.is_none()
+        && active.parser.pending_taken.is_none()
         && active.cursor.is_none()
         && active.group.is_none()
         && active.aliases.is_empty()

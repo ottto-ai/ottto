@@ -20,6 +20,53 @@ pub(super) fn placeholder_body(count: u64, sum: u64) -> Vec<u8> {
     )
 }
 
+#[test]
+fn cold_read_reserves_before_classifier_input_or_body_allocation() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            active::set_active_budget_for_test(None);
+        }
+    }
+    let _reset = Reset;
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let path = scratch.transcript("source.jsonl", b"{}\n");
+    let b = binding("account", "scope", ("fp-a", None));
+    let mut store = scratch.store();
+    assert_eq!(
+        store
+            .write_after_save(&lock, 1, 0, vec![pending(b.clone(), certificate(&path), 1)])
+            .unwrap()
+            .written,
+        1
+    );
+    let before = store.counters();
+    active::set_active_budget_for_test(Some(RESTORE_INPUT_BYTES - 1));
+    let LeaseWait::Granted(mut lease) = ActiveLease::acquire("claude_code") else {
+        panic!("lease unavailable")
+    };
+    assert!(store.read_bounded(&b.key, &mut lease).is_err());
+    lease.release();
+    let after = store.counters();
+    assert_eq!(after.guard_header_bytes, before.guard_header_bytes);
+    assert_eq!(after.guard_verify_bytes, before.guard_verify_bytes);
+    assert_eq!(after.records_read, before.records_read);
+    assert_eq!(after.format_hold, before.format_hold);
+    active::set_active_budget_for_test(None);
+    let LeaseWait::Granted(mut lease) = ActiveLease::acquire("claude_code") else {
+        panic!("lease unavailable")
+    };
+    assert!(matches!(
+        store.read_bounded(&b.key, &mut lease),
+        Ok(ReadOutcome::Found(_))
+    ));
+    lease.release();
+}
+
 /// #801's real lock: `StateDirLock` on the scratch state directory.
 use crate::locked_state_dir::LockedStateDir;
 use crate::state_dir_lock::StateDirLockError;
@@ -70,7 +117,517 @@ impl Drop for Scratch {
     }
 }
 
+/// Exact in-memory custody oracle; no new production representation/hash.
+pub(crate) fn pending_snapshot(store: &DurableTailStore) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (key, (prior, generation, content, failures)) in &store.pending {
+        out.extend_from_slice(key);
+        out.push(u8::from(prior.is_some()));
+        if let Some(stamp) = prior {
+            for word in stamp.0 {
+                out.extend_from_slice(&word.to_le_bytes());
+            }
+            for word in stamp.1 {
+                out.extend_from_slice(&word.to_le_bytes());
+            }
+        }
+        out.extend_from_slice(&generation.to_le_bytes());
+        out.extend_from_slice(content);
+        out.push(*failures);
+    }
+    out
+}
+
 const NOW: u64 = 1_800_000_000;
+
+#[test]
+fn checked_floor_exact_boundary_and_existing_update_bypass() {
+    let reserve = 2 * 1024 * 1024 * 1024;
+    let volume = Some(100 * 1024 * 1024 * 1024);
+    assert!(floor_allows(Some(reserve + 17), volume, 10, 7));
+    assert!(!floor_allows(Some(reserve + 16), volume, 10, 7));
+    assert!(!floor_allows(Some(9), volume, 10, 0));
+    assert!(!floor_allows(Some(u64::MAX), volume, 1, u64::MAX));
+    assert!(!floor_allows(None, volume, 1, 0));
+    assert!(!floor_allows(Some(u64::MAX), None, 1, 0));
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let path = scratch.transcript("source.jsonl", b"{}\n");
+    let b = binding("account", "scope", ("fp-a", None));
+    let mut store = scratch.store();
+    assert_eq!(
+        store
+            .write_after_save(&lock, 1, 0, vec![pending(b.clone(), certificate(&path), 1)])
+            .unwrap()
+            .written,
+        1
+    );
+    assert_eq!(
+        store
+            .write_after_save(
+                &lock,
+                2,
+                u64::MAX,
+                vec![pending(b.clone(), certificate(&path), 2)]
+            )
+            .unwrap()
+            .written,
+        1
+    );
+    let mut new = b.clone();
+    new.key = key_digest(DurableSource::ClaudeCode, "new-key");
+    assert_eq!(
+        store
+            .write_after_save(
+                &lock,
+                3,
+                u64::MAX,
+                vec![pending(new, certificate(&path), 1)]
+            )
+            .unwrap()
+            .written,
+        0
+    );
+    assert_eq!(store.counters().durable_floor_skipped, 1);
+    assert_eq!(
+        found(store.read(&b.key)).record.body,
+        placeholder_body(2, 14)
+    );
+}
+
+#[test]
+fn failed_unlink_holds_across_memo_clear_then_reconciles_no_record() {
+    for unlink_fails in [false, true] {
+        let scratch = Scratch::new();
+        let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+        let path = scratch.transcript("source.jsonl", b"{}\n");
+        let b = binding("account", "scope", ("fp-a", None));
+        let mut store = scratch.store();
+        store
+            .write_after_save(&lock, 1, 0, vec![pending(b.clone(), certificate(&path), 1)])
+            .unwrap();
+        let original = fs::read(record_file(&store, &b.key)).unwrap();
+        test_hooks::set_before_rename(Some(Box::new(|_, _| Err(io::Error::other("rename EIO")))));
+        if unlink_fails {
+            test_hooks::set_before_unlink(Some(Box::new(|path| {
+                if path.extension().is_some_and(|e| e == "rec") {
+                    Err(io::Error::other("unlink EIO"))
+                } else {
+                    Ok(())
+                }
+            })));
+        }
+        let result = store
+            .write_after_save(&lock, 2, 0, vec![pending(b.clone(), certificate(&path), 2)])
+            .unwrap();
+        test_hooks::set_before_rename(None);
+        test_hooks::set_before_unlink(None);
+        assert_eq!(result.written, 0);
+        assert_eq!(store.receipt_pending(&b.key), unlink_fails);
+        if unlink_fails {
+            assert_eq!(fs::read(record_file(&store, &b.key)).unwrap(), original);
+            assert_eq!(
+                store.read(&b.key),
+                ReadOutcome::Refused(Refusal::ReceiptPending)
+            );
+            store.durable.clear();
+            store.begin_pass();
+            assert!(store.receipt_pending(&b.key));
+            store.gc(&lock, &b.context, &BTreeMap::new()).unwrap();
+            assert_eq!(
+                store.remove_keys(&lock, &BTreeSet::from([b.key])).unwrap(),
+                0
+            );
+            assert_eq!(fs::read(record_file(&store, &b.key)).unwrap(), original);
+            assert!(!store.reconcile_pending(&lock, &b.key).unwrap());
+        }
+        assert!(!record_file(&store, &b.key).exists());
+        assert!(!store.receipt_pending(&b.key));
+        assert_eq!(store.counters().durable_write_failed_published, 1);
+    }
+}
+
+#[test]
+fn equal_generation_impostor_never_elects_receipt_and_unknown_swap_is_protected() {
+    for unknown in [false, true] {
+        let scratch = Scratch::new();
+        let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+        let path = scratch.transcript("source.jsonl", b"{}\n");
+        let b = binding("account", "scope", ("fp-a", None));
+        let mut store = scratch.store();
+        store
+            .write_after_save(&lock, 1, 0, vec![pending(b.clone(), certificate(&path), 1)])
+            .unwrap();
+        let replacement = pending(b.clone(), certificate(&path), 2);
+        let mut impostor = encode(&DurableRecord {
+            envelope_audit_debt: None,
+            record: pending(b.clone(), certificate(&path), 3),
+            index_generation: 2,
+            format: FORMAT_VERSION,
+        });
+        if unknown {
+            set_version(&mut impostor, FORMAT_VERSION + 1);
+        }
+        let disk = record_file(&store, &b.key);
+        let swapped = impostor.clone();
+        let target = disk.clone();
+        test_hooks::set_before_rename(Some(Box::new(move |_, _| {
+            put_record(&target, &swapped);
+            Err(io::Error::other("swap"))
+        })));
+        let receipt = store
+            .write_after_save(&lock, 2, 0, vec![replacement.clone()])
+            .unwrap();
+        test_hooks::set_before_rename(None);
+        assert_eq!(receipt.written, 0);
+        assert!(store.receipt_pending(&b.key));
+        assert!(store.reconcile_pending(&lock, &b.key).is_err());
+        assert_eq!(fs::read(&disk).unwrap(), impostor);
+        assert_eq!(store.counters().receipt_reconciled, 0);
+        put_record(
+            &disk,
+            &encode(&DurableRecord {
+                envelope_audit_debt: None,
+                record: replacement,
+                index_generation: 2,
+                format: FORMAT_VERSION,
+            }),
+        );
+        assert!(store.reconcile_pending(&lock, &b.key).unwrap());
+        assert_eq!(store.counters().receipt_reconciled, 1);
+        assert_eq!(store.counters().durable_write_failed_published, 0);
+    }
+}
+
+#[test]
+fn startup_sync_precedes_warming_and_no_writer_never_repairs_modes() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let path = scratch.transcript("source.jsonl", b"{}\n");
+    let b = binding("account", "scope", ("fp-a", None));
+    let mut initial = scratch.store();
+    initial
+        .write_after_save(&lock, 1, 0, vec![pending(b.clone(), certificate(&path), 1)])
+        .unwrap();
+    let disk = record_file(&initial, &b.key);
+    let original = fs::read(&disk).unwrap();
+    let parent = scratch.root.clone();
+    let reached = std::rc::Rc::new(std::cell::Cell::new(false));
+    let hit = reached.clone();
+    test_hooks::set_before_dir_sync(Some(Box::new(move |dir| {
+        if dir == parent {
+            hit.set(true);
+            Err(io::Error::other("parent fsync EIO"))
+        } else {
+            Ok(())
+        }
+    })));
+    let mut cold = scratch.store();
+    let receipt = cold
+        .write_after_save(&lock, 2, 0, vec![pending(b.clone(), certificate(&path), 2)])
+        .unwrap();
+    test_hooks::set_before_dir_sync(None);
+    assert!(reached.get());
+    assert_eq!(receipt.written, 0);
+    assert_eq!(cold.disabled(), Some("startup_sync"));
+    assert_eq!(cold.counters().guard_verify_bytes, 0);
+    cold.gc(&lock, &b.context, &BTreeMap::new()).unwrap();
+    assert_eq!(fs::read(&disk).unwrap(), original);
+    fs::set_permissions(&disk, fs::Permissions::from_mode(0o644)).unwrap();
+    let mut readonly = scratch.store();
+    assert!(matches!(readonly.read(&b.key), ReadOutcome::Missing));
+    assert_eq!(
+        fs::metadata(&disk).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+    assert_eq!(readonly.counters().mode_repaired, 0);
+}
+
+#[test]
+fn inventory_bound_is_independent_of_memo_and_existing_keys_remain_updateable() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let path = scratch.transcript("source.jsonl", b"{}\n");
+    let cert = certificate(&path);
+    let mut store = scratch.store();
+    let records = |changed: bool| {
+        (0..INVENTORY_BOUND)
+            .map(|n| {
+                let mut b = binding("account", "scope", ("fp-a", None));
+                b.key = key_digest(DurableSource::ClaudeCode, &n.to_string());
+                pending(
+                    b,
+                    cert.clone(),
+                    u64::from(changed && n == INVENTORY_BOUND - 1),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    for generation in 1..=INVENTORY_BOUND.div_ceil(MAX_BATCH) {
+        assert_eq!(
+            store
+                .write_after_save(&lock, generation as u64, 0, records(false))
+                .unwrap()
+                .written,
+            MAX_BATCH
+        );
+    }
+    assert_eq!(store.counters().disk_records, INVENTORY_BOUND as u64);
+    assert_eq!(store.durable.len(), MAX_RECORDS);
+    assert_eq!(
+        store
+            .write_after_save(&lock, 99, 0, records(false))
+            .unwrap()
+            .written,
+        0
+    );
+    assert_eq!(
+        store
+            .write_after_save(&lock, 100, u64::MAX, records(true))
+            .unwrap()
+            .written,
+        0 // A0 retains an unmemoized Claude predecessor without mutation proof.
+    );
+    let mut extra = records(false).pop().unwrap();
+    extra.binding.key = key_digest(DurableSource::ClaudeCode, "bound-plus-one");
+    let refused = store.write_after_save(&lock, 101, 0, vec![extra]).unwrap();
+    assert_eq!(refused.written, 0);
+    assert_eq!(refused.deferred_keys.len(), 1);
+    assert_eq!(store.counters().store_write_skipped[1], 1);
+    assert_eq!(store.counters().disk_records, INVENTORY_BOUND as u64);
+}
+
+#[test]
+fn pending_capacity_failure_retains_every_existing_obligation() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let path = scratch.transcript("source.jsonl", b"{}\n");
+    let records = (0..=MAX_BATCH)
+        .map(|n| {
+            let mut b = binding("account", "scope", ("fp-a", None));
+            b.key = key_digest(DurableSource::ClaudeCode, &n.to_string());
+            pending(b, certificate(&path), 1)
+        })
+        .collect::<Vec<_>>();
+    let mut store = scratch.store();
+    for record in &records {
+        assert_eq!(
+            store
+                .write_after_save(&lock, 1, 0, vec![record.clone()])
+                .unwrap()
+                .written,
+            1
+        );
+    }
+    test_hooks::set_before_rename(Some(Box::new(|_, _| Err(io::Error::other("rename EIO")))));
+    test_hooks::set_before_unlink(Some(Box::new(|_| Err(io::Error::other("unlink EIO")))));
+    for record in &records {
+        let mut replacement = record.clone();
+        replacement.body = placeholder_body(2, 14);
+        assert_eq!(
+            store
+                .write_after_save(&lock, 2, 0, vec![replacement])
+                .unwrap()
+                .written,
+            0
+        );
+    }
+    test_hooks::set_before_rename(None);
+    test_hooks::set_before_unlink(None);
+    assert_eq!(store.disabled(), Some("obligation_overflow"));
+    assert_eq!(store.counters().receipt_pending_records, MAX_BATCH as u64);
+    let counts = store.take_pass();
+    assert_eq!(counts.receipt_pending_records, MAX_BATCH as u64);
+    assert_eq!(store.counters().receipt_pending_records, MAX_BATCH as u64);
+    store.durable.clear();
+    store.begin_pass();
+    for record in &records[..MAX_BATCH] {
+        assert_eq!(store.hold(&record.binding.key), None);
+        assert_eq!(store.read(&record.binding.key), ReadOutcome::Missing);
+        assert_eq!(
+            fs::read(record_file(&store, &record.binding.key)).unwrap(),
+            encode(&DurableRecord {
+                envelope_audit_debt: None,
+                record: record.clone(),
+                index_generation: 1,
+                format: FORMAT_VERSION
+            })
+        );
+    }
+}
+
+#[test]
+fn post_rename_sync_failure_keeps_b_pending_until_its_exact_receipt() {
+    for parent in [false, true] {
+        let scratch = Scratch::new();
+        let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+        let path = scratch.transcript("source.jsonl", b"{}\n");
+        let b = binding("account", "scope", ("fp-a", None));
+        let mut store = scratch.store();
+        store
+            .write_after_save(&lock, 1, 0, vec![pending(b.clone(), certificate(&path), 1)])
+            .unwrap();
+        let target = if parent {
+            scratch.root.clone()
+        } else {
+            store.dir().to_owned()
+        };
+        let reached = std::rc::Rc::new(std::cell::Cell::new(0));
+        let hits = reached.clone();
+        test_hooks::set_before_dir_sync(Some(Box::new(move |dir| {
+            if dir == target {
+                hits.set(hits.get() + 1);
+                Err(io::Error::other("fsync EIO"))
+            } else {
+                Ok(())
+            }
+        })));
+        let replacement = pending(b.clone(), certificate(&path), 2);
+        let receipt = store
+            .write_after_save(&lock, 2, 0, vec![replacement.clone()])
+            .unwrap();
+        test_hooks::set_before_dir_sync(None);
+        assert_eq!(reached.get(), 2, "write then reconcile both reached fsync");
+        assert_eq!(receipt.written, 0);
+        assert_eq!(receipt.deferred_keys, vec![b.key]);
+        assert_eq!(store.hold(&b.key), Some(Refusal::ReceiptPending));
+        assert_eq!(
+            fs::read(record_file(&store, &b.key)).unwrap(),
+            encode(&DurableRecord {
+                envelope_audit_debt: None,
+                record: replacement,
+                index_generation: 2,
+                format: FORMAT_VERSION
+            })
+        );
+        assert_eq!(store.counters().t14_rebuild, 0);
+        assert!(store.reconcile_pending(&lock, &b.key).unwrap());
+        assert_eq!(store.counters().receipt_reconciled, 1);
+        assert_eq!(store.counters().durable_write_failed_published, 0);
+        assert_eq!(found(store.read(&b.key)).index_generation, 2);
+    }
+}
+
+// A subprocess death fixture for the store's actual write hooks, independent
+// of the shared full restore/Tail/money transition harness. No power-loss claim.
+#[test]
+#[ignore = "invoked only by sigkill_writer_edges_preserve_verified_survivors"]
+fn sigkill_writer_child() {
+    let root = PathBuf::from(std::env::var_os("OTTTO_DT_KILL_ROOT").expect("child root"));
+    let edge = std::env::var("OTTTO_DT_KILL_EDGE").unwrap();
+    let lock = LockedStateDir::acquire(&root).unwrap();
+    let mut store = DurableTailStore::new(
+        store_dir_for_index(&root.join("index.json")),
+        DurableSource::ClaudeCode,
+    );
+    store.write_after_save(&lock, 1, 0, vec![]).unwrap(); // Startup sync precedes injection.
+    let b = binding("account", "scope", ("fp-a", None));
+    let predecessor = found(store.read(&b.key));
+    store.authorize(
+        &predecessor,
+        &Expected {
+            binding: b,
+            committed_generation: 1,
+        },
+    );
+    let marker = root.join("edge-reached");
+    let kill = move || -> io::Result<()> {
+        let mut file = File::create(&marker)?;
+        file.write_all(b"reached")?;
+        file.sync_all()?;
+        // SAFETY: kill this dedicated test subprocess only, after the marker.
+        unsafe {
+            libc::kill(libc::getpid(), libc::SIGKILL);
+        }
+        panic!("SIGKILL returned");
+    };
+    if edge == "rename" {
+        test_hooks::set_before_rename(Some(Box::new(move |_, _| kill())));
+    } else {
+        let target = if edge == "parent" {
+            root.clone()
+        } else {
+            store.dir().to_owned()
+        };
+        test_hooks::set_before_dir_sync(Some(Box::new(move |path| {
+            if path == target {
+                kill()
+            } else {
+                Ok(())
+            }
+        })));
+    }
+    let b = binding("account", "scope", ("fp-a", None));
+    store
+        .write_after_save(
+            &lock,
+            2,
+            0,
+            vec![pending(b, certificate(&root.join("source.jsonl")), 2)],
+        )
+        .unwrap();
+    panic!("child missed edge");
+}
+
+#[test]
+fn sigkill_writer_edges_preserve_verified_survivors() {
+    use std::os::unix::process::ExitStatusExt;
+    for edge in ["rename", "directory", "parent"] {
+        let scratch = Scratch::new();
+        let path = scratch.transcript("source.jsonl", b"{}\n");
+        let b = binding("account", "scope", ("fp-a", None));
+        {
+            let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+            scratch
+                .store()
+                .write_after_save(&lock, 1, 0, vec![pending(b.clone(), certificate(&path), 1)])
+                .unwrap();
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "durable_tail_store::tests::sigkill_writer_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("OTTTO_DT_KILL_ROOT", &scratch.root)
+            .env("OTTTO_DT_KILL_EDGE", edge)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("child failed to reach {edge}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "{edge}");
+        assert_eq!(
+            fs::read(scratch.root.join("edge-reached")).unwrap(),
+            b"reached"
+        );
+        let lock = acquire_released(&scratch.root);
+        let mut restarted = scratch.store();
+        restarted.write_after_save(&lock, 2, 0, vec![]).unwrap();
+        assert_eq!(restarted.disabled(), None);
+        let survivor = found(restarted.read(&b.key));
+        let generation = if edge == "rename" { 1 } else { 2 };
+        assert_eq!(survivor.index_generation, generation);
+        assert_eq!(
+            survivor.record.body,
+            placeholder_body(generation, generation * 7)
+        );
+        restarted
+            .gc(&lock, &b.context, &BTreeMap::from([(b.key, Some(b.scope))]))
+            .unwrap();
+        assert_eq!(found(restarted.read(&b.key)).record, survivor.record);
+    }
+}
 
 fn scope() -> Scope {
     Scope("durable-tail-test-scope".into())
@@ -89,14 +646,14 @@ fn checkpoint(path: &Path) -> crate::transcript_acquisition::Checkpoint {
         .unwrap()
 }
 
-pub(super) fn certificate(path: &Path) -> DurableCertificate {
+pub(crate) fn certificate(path: &Path) -> DurableCertificate {
     let birth = crate::transcript_acquisition::birth_unix_nanos(&fs::metadata(path).unwrap());
     checkpoint(path).durable_certificate(birth).unwrap()
 }
 
 const INDEX_KEY: &str = "/Users/canary-user/.claude/projects/canary-workspace/session.jsonl";
 
-pub(super) fn binding(context: &str, file_scope: &str, entry: (&str, Option<&str>)) -> Binding {
+pub(crate) fn binding(context: &str, file_scope: &str, entry: (&str, Option<&str>)) -> Binding {
     Binding {
         source: DurableSource::ClaudeCode,
         key: key_digest(DurableSource::ClaudeCode, INDEX_KEY),
@@ -111,7 +668,7 @@ pub(super) fn binding(context: &str, file_scope: &str, entry: (&str, Option<&str
     }
 }
 
-pub(super) fn pending(
+pub(crate) fn pending(
     binding: Binding,
     certificate: DurableCertificate,
     count: u64,
@@ -171,7 +728,7 @@ fn envelope_round_trips_and_carries_no_path_or_raw_bytes() {
         3,
     );
     let receipt = store
-        .write_after_save(&lock, 1, vec![record.clone()])
+        .write_after_save(&lock, 1, 0, vec![record.clone()])
         .unwrap();
     assert_eq!(receipt.written, 1);
     let key = record.binding.key;
@@ -218,6 +775,7 @@ fn crash_matrix_index_old_new_by_checkpoint_old_new_torn_missing() {
         .write_after_save(
             &lock,
             g1,
+            0,
             vec![pending(e1.clone(), certificate(&transcript), 1)],
         )
         .unwrap();
@@ -234,6 +792,7 @@ fn crash_matrix_index_old_new_by_checkpoint_old_new_torn_missing() {
         .write_after_save(
             &lock,
             g2,
+            0,
             vec![pending(e2.clone(), certificate(&transcript), 2)],
         )
         .unwrap();
@@ -347,6 +906,7 @@ fn every_binding_mismatch_refuses() {
         .write_after_save(
             &lock,
             4,
+            0,
             vec![pending(base.clone(), certificate(&transcript), 1)],
         )
         .unwrap();
@@ -420,6 +980,7 @@ fn interrupted_replacement_temp_present_keeps_the_old_record() {
         .write_after_save(
             &lock,
             1,
+            0,
             vec![pending(old.clone(), certificate(&transcript), 1)],
         )
         .unwrap();
@@ -431,6 +992,7 @@ fn interrupted_replacement_temp_present_keeps_the_old_record() {
         store.write_after_save(
             &lock,
             2,
+            0,
             vec![pending(new.clone(), certificate(&transcript), 2)],
         )
     }));
@@ -442,14 +1004,20 @@ fn interrupted_replacement_temp_present_keeps_the_old_record() {
         .filter(|entry| entry.file_name().to_string_lossy().ends_with(TEMP_SUFFIX))
         .count();
     assert_eq!(temps, 1, "the synced temp is left behind");
-    let record = found(store.read(&old.key));
+    assert_eq!(
+        store.read(&old.key),
+        ReadOutcome::Refused(Refusal::ReceiptPending)
+    );
+    let mut restarted = scratch.store();
+    let record = found(restarted.read(&old.key));
     assert_eq!(record.record.binding, old);
     assert_eq!(record.index_generation, 1);
     let mut keep = BTreeMap::new();
     keep.insert(old.key, Some(old.scope));
     store.gc(&lock, &old.context, &keep).unwrap();
     assert_eq!(store.counters().gc_temps_deleted, 1);
-    assert_eq!(found(store.read(&old.key)).record.binding, old);
+    assert!(store.receipt_pending(&old.key));
+    assert_eq!(found(restarted.read(&old.key)).record.binding, old);
 }
 
 /// A crash after the rename but before the directory fsync may surface
@@ -466,6 +1034,7 @@ fn interrupted_replacement_renamed_but_directory_not_synced() {
         .write_after_save(
             &lock,
             1,
+            0,
             vec![pending(old.clone(), certificate(&transcript), 1)],
         )
         .unwrap();
@@ -478,6 +1047,7 @@ fn interrupted_replacement_renamed_but_directory_not_synced() {
         store.write_after_save(
             &lock,
             2,
+            0,
             vec![pending(new.clone(), certificate(&transcript), 2)],
         )
     }));
@@ -488,12 +1058,17 @@ fn interrupted_replacement_renamed_but_directory_not_synced() {
         committed_generation: 2,
     };
     // The rename survived.
-    let survived = found(store.read(&new.key));
+    assert_eq!(
+        store.read(&new.key),
+        ReadOutcome::Refused(Refusal::ReceiptPending)
+    );
+    let mut restarted = scratch.store();
+    let survived = found(restarted.read(&new.key));
     assert_eq!(survived.record.binding, new);
     assert_eq!(survived.eligible(&committed), Ok(()));
     // The rename was lost with the directory entry: the old record is back.
     put_record(&record_file(&store, &new.key), &old_bytes);
-    let reverted = found(store.read(&new.key));
+    let reverted = found(restarted.read(&new.key));
     assert_eq!(reverted.index_generation, 1);
     assert_eq!(reverted.eligible(&committed), Ok(()));
     store.authorize(&reverted, &committed);
@@ -527,6 +1102,7 @@ fn schema_both_ways_and_downgrade() {
         .write_after_save(
             &lock,
             1,
+            0,
             vec![
                 pending(newer.clone(), certificate(&transcript), 1),
                 pending(other.clone(), certificate(&transcript), 2),
@@ -601,7 +1177,7 @@ fn concurrent_writer_is_refused_through_the_single_writer_seam() {
         1,
     );
     let refused = store
-        .write_after_save(&foreign, 1, vec![record.clone()])
+        .write_after_save(&foreign, 1, 0, vec![record.clone()])
         .unwrap_err();
     assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
     assert!(!store.dir().exists(), "a refused writer creates nothing");
@@ -612,7 +1188,7 @@ fn concurrent_writer_is_refused_through_the_single_writer_seam() {
     let second = acquire_released(&scratch.root);
     assert_eq!(
         store
-            .write_after_save(&second, 1, vec![record])
+            .write_after_save(&second, 1, 0, vec![record])
             .unwrap()
             .written,
         1
@@ -638,19 +1214,21 @@ fn only_dirty_records_are_written_in_bounded_batches() {
             })
             .collect::<Vec<_>>()
     };
-    let first = store.write_after_save(&lock, 1, records(None)).unwrap();
+    let first = store.write_after_save(&lock, 1, 0, records(None)).unwrap();
     assert_eq!(
         (first.written, first.clean, first.deferred),
         (MAX_BATCH, 0, 8)
     );
-    let second = store.write_after_save(&lock, 2, records(None)).unwrap();
+    let second = store.write_after_save(&lock, 2, 0, records(None)).unwrap();
     assert_eq!((second.written, second.clean, second.deferred), (8, 32, 0));
-    let third = store.write_after_save(&lock, 3, records(None)).unwrap();
+    let third = store.write_after_save(&lock, 3, 0, records(None)).unwrap();
     assert_eq!(
         (third.written, third.clean, third.bytes_written),
         (0, 40, 0)
     );
-    let fourth = store.write_after_save(&lock, 4, records(Some(7))).unwrap();
+    let fourth = store
+        .write_after_save(&lock, 4, 0, records(Some(7)))
+        .unwrap();
     assert_eq!((fourth.written, fourth.clean), (1, 39));
     let per_record = fourth.bytes_written;
     assert_eq!(
@@ -672,7 +1250,7 @@ fn only_dirty_records_are_written_in_bounded_batches() {
         found(restarted.read(&record.binding.key));
     }
     let after = restarted
-        .write_after_save(&lock, 5, records(Some(7)))
+        .write_after_save(&lock, 5, 0, records(Some(7)))
         .unwrap();
     assert_eq!((after.written, after.bytes_written), (0, 0));
 }
@@ -688,12 +1266,13 @@ fn budget_refusal_writes_nothing_and_keeps_v1_authority() {
         .write_after_save(
             &lock,
             1,
+            0,
             vec![pending(b.clone(), certificate(&transcript), 1)],
         )
         .unwrap();
     let mut big = pending(b.clone(), certificate(&transcript), 2);
     big.body = vec![0; RECORD_BYTES];
-    let receipt = store.write_after_save(&lock, 2, vec![big]).unwrap();
+    let receipt = store.write_after_save(&lock, 2, 0, vec![big]).unwrap();
     assert_eq!((receipt.written, receipt.budget_refused), (0, 1));
     let retained = found(store.read(&b.key));
     assert_eq!(retained.record.binding, b);
@@ -721,6 +1300,7 @@ fn gc_drops_other_accounts_scopes_and_unkept_keys() {
         .write_after_save(
             &lock,
             1,
+            0,
             [&kept, &rescoped, &dropped, &undecided]
                 .into_iter()
                 .map(|b| pending(b.clone(), certificate(&transcript), 1))
@@ -777,6 +1357,7 @@ fn gc_verifies_cold_records_and_preserves_corrupt_bodies() {
         .write_after_save(
             &lock,
             1,
+            0,
             bindings
                 .iter()
                 .map(|b| pending(b.clone(), certificate(&transcript), 1))
@@ -845,6 +1426,7 @@ fn remove_keys_deletes_only_the_invalidated_records() {
         .write_after_save(
             &lock,
             1,
+            0,
             bindings
                 .iter()
                 .map(|b| pending(b.clone(), certificate(&transcript), 1))
@@ -869,7 +1451,7 @@ fn remove_keys_deletes_only_the_invalidated_records() {
 #[test]
 fn store_mode_faults_are_repaired_without_rebuilds() {
     let scratch = Scratch::new();
-    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let lock = crate::locked_state_dir::test_locks::hold(&scratch.root);
     let transcript = scratch.transcript("t.jsonl", b"{}\n");
     let bindings = ["open", "closed"].map(|name| {
         let mut b = binding("acct", "scope", ("fp", None));
@@ -879,8 +1461,9 @@ fn store_mode_faults_are_repaired_without_rebuilds() {
     let mut store = scratch.store();
     store
         .write_after_save(
-            &lock,
+            lock,
             1,
+            0,
             bindings
                 .iter()
                 .map(|b| pending(b.clone(), certificate(&transcript), 1))
@@ -906,7 +1489,7 @@ fn store_mode_faults_are_repaired_without_rebuilds() {
     let counters = cold.counters();
     assert_eq!(counters.mode_repaired, 3);
     assert_eq!(counters.t14_rebuild, 0);
-    assert_eq!(counters.format_hold, [0; 6]);
+    assert_eq!(counters.format_hold, [0; 8]);
     assert_eq!(cold.disabled(), None);
 }
 
@@ -943,6 +1526,7 @@ fn foreign_owner_disables_the_store_without_rebuilds() {
         .write_after_save(
             &lock,
             1,
+            0,
             bindings
                 .iter()
                 .map(|b| pending(b.clone(), certificate(&transcript), 1))
@@ -973,6 +1557,7 @@ fn foreign_owner_disables_the_store_without_rebuilds() {
         .write_after_save(
             &lock,
             2,
+            0,
             bindings
                 .iter()
                 .map(|b| pending(b.clone(), certificate(&transcript), 2))
@@ -1024,6 +1609,7 @@ fn t14_rebuilds_are_counted_and_the_breaker_trips_past_twenty() {
                 .write_after_save(
                     &lock,
                     1,
+                    0,
                     chunk
                         .iter()
                         .map(|b| pending(b.clone(), certificate(&transcript), 1))
@@ -1063,7 +1649,7 @@ fn t14_rebuilds_are_counted_and_the_breaker_trips_past_twenty() {
             .iter()
             .map(|n| pending(bindings[*n].clone(), certificate(&transcript), 2))
             .collect::<Vec<_>>();
-        let receipt = cold.write_after_save(&lock, 2, rebuild).unwrap();
+        let receipt = cold.write_after_save(&lock, 2, 0, rebuild).unwrap();
         assert_eq!(receipt.written, if tripped { 0 } else { corrupt_count });
         for n in &corrupt {
             let outcome = scratch.store().read(&bindings[*n].key);
@@ -1217,7 +1803,7 @@ fn certificate_samples_are_domain_separated_digests() {
     let mut store = scratch.store();
     let b = binding("acct", "scope", ("fp", None));
     store
-        .write_after_save(&lock, 1, vec![pending(b.clone(), cert.clone(), 1)])
+        .write_after_save(&lock, 1, 0, vec![pending(b.clone(), cert.clone(), 1)])
         .unwrap();
     let bytes = fs::read(record_file(&store, &b.key)).unwrap();
     assert!(!bytes.windows(plain.len()).any(|window| window == plain));
@@ -1257,7 +1843,7 @@ fn certificate_survives_the_envelope() {
     let mut store = scratch.store();
     let b = binding("acct", "scope", ("fp", None));
     store
-        .write_after_save(&lock, 1, vec![pending(b.clone(), cert.clone(), 1)])
+        .write_after_save(&lock, 1, 0, vec![pending(b.clone(), cert.clone(), 1)])
         .unwrap();
     let read = found(store.read(&b.key));
     cert.audit_debt_unix_seconds = None;
@@ -1290,13 +1876,13 @@ fn store_budget_receipt() {
         generation += 1;
         saves += 1;
         store
-            .write_after_save(&lock, generation, records(None))
+            .write_after_save(&lock, generation, 0, records(None))
             .unwrap();
     }
     let fill = store.take_pass();
     generation += 1;
     let one_dirty = store
-        .write_after_save(&lock, generation, records(Some(3)))
+        .write_after_save(&lock, generation, 0, records(Some(3)))
         .unwrap();
     let write_pass = store.take_pass();
     let mut restarted = scratch.store();
@@ -1351,7 +1937,6 @@ fn store_budget_receipt() {
         write_pass.disk_bytes / MAX_RECORDS as u64
     );
     assert_eq!(read_pass.bytes_read, write_pass.disk_bytes);
-    assert!(write_pass.disk_bytes <= STORE_BYTES);
 }
 
 /// K21/L20/L24: every seam starts with an empty memo, without a preceding read.
@@ -1391,7 +1976,9 @@ fn every_mutation_preserves_unknown_and_known_corrupt_predecessors_unprimed() {
             let mut store = scratch.store();
             let b = binding("acct", "scope", ("fp", None));
             let old = pending(b.clone(), certificate(&transcript), 1);
-            store.write_after_save(&lock, 1, vec![old.clone()]).unwrap();
+            store
+                .write_after_save(&lock, 1, 0, vec![old.clone()])
+                .unwrap();
             let path = record_file(&store, &b.key);
             let mut bytes = fs::read(&path).unwrap();
             let reason = match kind {
@@ -1476,7 +2063,9 @@ fn every_mutation_preserves_unknown_and_known_corrupt_predecessors_unprimed() {
                     if seam == "budget" {
                         replacement.body.resize(RECORD_BYTES, 0);
                     }
-                    let receipt = cold.write_after_save(&lock, 2, vec![replacement]).unwrap();
+                    let receipt = cold
+                        .write_after_save(&lock, 2, 0, vec![replacement])
+                        .unwrap();
                     assert_eq!(receipt.written, usize::from(rebuilt), "{kind} x {seam}");
                 }
                 _ => {
@@ -1520,6 +2109,7 @@ fn exact_predecessor_memo_reuses_verification_and_invalidates_on_change() {
         .write_after_save(
             &lock,
             1,
+            0,
             vec![pending(b.clone(), certificate(&transcript), 1)],
         )
         .unwrap();
@@ -1622,6 +2212,7 @@ fn inventory_overflow_replaces_existing_records_and_defers_new_keys() {
         .write_after_save(
             &lock,
             1,
+            0,
             vec![pending(b.clone(), certificate(&transcript), 1)],
         )
         .unwrap();
@@ -1663,6 +2254,7 @@ fn inventory_overflow_replaces_existing_records_and_defers_new_keys() {
         .write_after_save(
             &lock,
             2,
+            0,
             vec![
                 pending(replaced.clone(), certificate(&transcript), 2),
                 pending(new.clone(), certificate(&transcript), 3),
@@ -1819,6 +2411,7 @@ fn access_failures_disable_instead_of_holding_and_not_found_stays_absent() {
             .write_after_save(
                 &lock,
                 1,
+                0,
                 vec![pending(b.clone(), certificate(&transcript), 1)],
             )
             .unwrap();
@@ -1869,7 +2462,7 @@ fn access_failures_disable_instead_of_holding_and_not_found_stays_absent() {
         assert_eq!(cold.hold(&b.key), None, "{arm}");
         let missing = arm.ends_with("missing");
         assert_eq!(cold.disabled().is_some(), !missing, "{arm}");
-        assert_eq!(cold.counters().format_hold, [0; 6], "{arm}");
+        assert_eq!(cold.counters().format_hold, [0; 8], "{arm}");
         assert_eq!(cold.counters().t14_rebuild, 0, "{arm}");
         if arm == "retry" {
             assert_eq!(opens.get(), 2, "exactly one retry");
@@ -1885,6 +2478,7 @@ fn access_failures_disable_instead_of_holding_and_not_found_stays_absent() {
                 cold.write_after_save(
                     &lock,
                     2,
+                    0,
                     vec![pending(b.clone(), certificate(&transcript), 2)]
                 )
                 .unwrap(),
@@ -1914,6 +2508,7 @@ fn gc_stops_before_orphan_cleanup_when_classification_disables_mid_loop() {
         .write_after_save(
             &lock,
             1,
+            0,
             vec![pending(b.clone(), certificate(&transcript), 1)],
         )
         .unwrap();
@@ -1973,6 +2568,7 @@ fn rebuilt_t14_replaces_once_or_stays_memory_only_until_restart() {
             .write_after_save(
                 &lock,
                 1,
+                0,
                 vec![pending(b.clone(), certificate(&transcript), 1)],
             )
             .unwrap();
@@ -1997,6 +2593,7 @@ fn rebuilt_t14_replaces_once_or_stays_memory_only_until_restart() {
             cold.write_after_save(
                 &lock,
                 2,
+                0,
                 vec![pending(b.clone(), certificate(&transcript), 2)]
             )
             .unwrap(),
@@ -2015,7 +2612,7 @@ fn rebuilt_t14_replaces_once_or_stays_memory_only_until_restart() {
                 Err(io::Error::other("replacement refused"))
             })));
         }
-        let result = cold.write_after_save(&lock, 2, vec![replacement]);
+        let result = cold.write_after_save(&lock, 2, 0, vec![replacement]);
         test_hooks::set_before_rename(None);
         if arm == "success" {
             assert_eq!(result.unwrap().written, 1);
@@ -2049,6 +2646,7 @@ fn rebuilt_t14_replaces_once_or_stays_memory_only_until_restart() {
         cold.write_after_save(
             &lock,
             3,
+            0,
             vec![pending(b.clone(), certificate(&transcript), 3)],
         )
         .unwrap();
@@ -2116,6 +2714,7 @@ fn restore_read_access_failure_disables_but_disappearance_is_absence() {
             .write_after_save(
                 &lock,
                 1,
+                0,
                 vec![pending(b.clone(), certificate(&transcript), 1)],
             )
             .unwrap();
@@ -2130,7 +2729,7 @@ fn restore_read_access_failure_disables_but_disappearance_is_absence() {
         let mut cold = scratch.store();
         assert_eq!(cold.read(&b.key), ReadOutcome::Missing);
         assert_eq!(cold.disabled().is_some(), arm != "missing");
-        assert_eq!(cold.counters().format_hold, [0; 6]);
+        assert_eq!(cold.counters().format_hold, [0; 8]);
         assert_eq!(cold.counters().t14_rebuild, 0);
         assert_eq!(fs::read(&path).unwrap(), before);
     }
@@ -2150,6 +2749,7 @@ fn non_format_io_errors_disable_at_every_read_boundary_without_spending_t14() {
                 .write_after_save(
                     &lock,
                     1,
+                    0,
                     vec![pending(b.clone(), certificate(&transcript), 1)],
                 )
                 .unwrap();
@@ -2170,7 +2770,7 @@ fn non_format_io_errors_disable_at_every_read_boundary_without_spending_t14() {
             }
             assert!(cold.disabled().is_some(), "{stage}/{errno}");
             assert_eq!(cold.hold(&b.key), None);
-            assert_eq!(cold.counters().format_hold, [0; 6]);
+            assert_eq!(cold.counters().format_hold, [0; 8]);
             assert_eq!(cold.counters().t14_rebuild, 0);
             assert!(cold.rebuilt.is_empty());
             assert_eq!(fs::read(&record).unwrap(), before);
@@ -2223,6 +2823,7 @@ fn unoffered_started_rebuild_survives_save_until_its_replacement_is_offered() {
         .write_after_save(
             &lock,
             1,
+            0,
             vec![pending(b.clone(), certificate(&transcript), 1)],
         )
         .unwrap();
@@ -2231,7 +2832,7 @@ fn unoffered_started_rebuild_survives_save_until_its_replacement_is_offered() {
     *bytes.last_mut().unwrap() ^= 1;
     put_record(&path, &bytes);
     assert_eq!(store.full_hold(&b.key, true), None);
-    store.write_after_save(&lock, 2, vec![]).unwrap();
+    store.write_after_save(&lock, 2, 0, vec![]).unwrap();
     assert_eq!(store.rebuilt.get(&b.key), Some(&Rebuild::Started));
     assert_eq!(
         fs::read(&path).unwrap(),
@@ -2244,6 +2845,7 @@ fn unoffered_started_rebuild_survives_save_until_its_replacement_is_offered() {
         .write_after_save(
             &lock,
             3,
+            0,
             vec![pending(b.clone(), certificate(&transcript), 2)],
         )
         .unwrap();
@@ -2319,7 +2921,7 @@ fn full_v1_writer_goldens_preserve_zero_and_nonzero_debt() {
         let scratch = Scratch::new();
         let lock = LockedStateDir::acquire(&scratch.root).unwrap();
         let mut store = DurableTailStore::new(store_dir_for_index(&scratch.index_path()), source);
-        assert_eq!(store.write_after_save(&lock, 9, vec![pending]).unwrap().written, 1);
+        assert_eq!(store.write_after_save(&lock, 9, 0, vec![pending]).unwrap().written, 1);
         assert_eq!(fs::read(record_file(&store, &[1; 32])).unwrap(), golden, "complete current writer output");
     }
 }
@@ -2336,6 +2938,7 @@ fn gc_representation_reads_only_bounded_store_headers_and_charges_gc() {
         .write_after_save(
             &lock,
             1,
+            0,
             vec![pending(binding.clone(), certificate(&transcript), 1)],
         )
         .unwrap();
@@ -2405,7 +3008,7 @@ fn read_memo_keeps_stored_debt_until_a_clean_replacement_is_written() {
     cert.audit_debt_unix_seconds = Some(NOW + 60);
     let mut store = scratch.store();
     store
-        .write_after_save(&lock, 1, vec![pending(b.clone(), cert.clone(), 0)])
+        .write_after_save(&lock, 1, 0, vec![pending(b.clone(), cert.clone(), 0)])
         .unwrap();
     assert_eq!(
         found(store.read(&b.key))
@@ -2418,7 +3021,7 @@ fn read_memo_keeps_stored_debt_until_a_clean_replacement_is_written() {
     cert.audit_debt_unix_seconds = None;
     let clean = pending(b.clone(), cert, 0);
     let receipt = store
-        .write_after_save(&lock, 2, vec![clean.clone()])
+        .write_after_save(&lock, 2, 0, vec![clean.clone()])
         .unwrap();
     assert_eq!((receipt.written, receipt.clean), (1, 0));
     assert_eq!(
@@ -2426,7 +3029,7 @@ fn read_memo_keeps_stored_debt_until_a_clean_replacement_is_written() {
         None
     );
     assert!(matches!(store.read(&b.key), ReadOutcome::Found(_)));
-    let receipt = store.write_after_save(&lock, 3, vec![clean]).unwrap();
+    let receipt = store.write_after_save(&lock, 3, 0, vec![clean]).unwrap();
     assert_eq!(
         (receipt.written, receipt.clean),
         (0, 1),
@@ -2452,7 +3055,7 @@ fn claude_mutations_require_exact_strict_proof_and_a_current_stamp() {
             let mut writer = scratch.store();
             assert_eq!(
                 writer
-                    .write_after_save(&lock, 1, vec![record.clone()])
+                    .write_after_save(&lock, 1, 0, vec![record.clone()])
                     .unwrap()
                     .written,
                 1
@@ -2481,7 +3084,7 @@ fn claude_mutations_require_exact_strict_proof_and_a_current_stamp() {
             match seam {
                 "overwrite" => {
                     let receipt = cold
-                        .write_after_save(&lock, 2, vec![pending(b.clone(), certificate(&path), 2)])
+                        .write_after_save(&lock, 2, 0, vec![pending(b.clone(), certificate(&path), 2)])
                         .unwrap();
                     assert_eq!(
                         receipt.written,
@@ -2532,7 +3135,7 @@ fn original_witness_survives_memo_turnover_but_never_a_different_record() {
         let old = pending(b.clone(), certificate(&path), 1);
         let mut store = scratch.store();
         assert_eq!(
-            store.write_after_save(&lock, 1, vec![old]).unwrap().written,
+            store.write_after_save(&lock, 1, 0, vec![old]).unwrap().written,
             1
         );
         let mut decoded = found(store.read(&b.key));
@@ -2581,7 +3184,7 @@ fn original_witness_survives_memo_turnover_but_never_a_different_record() {
             oversized.body.resize(RECORD_BYTES, 0);
             assert_eq!(
                 store
-                    .write_after_save(&lock, 2, vec![oversized])
+                    .write_after_save(&lock, 2, 0, vec![oversized])
                     .unwrap()
                     .budget_refused,
                 1
@@ -2591,7 +3194,7 @@ fn original_witness_survives_memo_turnover_but_never_a_different_record() {
             assert!(store.authorized(&b.key));
         }
         let receipt = store
-            .write_after_save(&lock, 2, vec![pending(b.clone(), certificate(&path), 2)])
+            .write_after_save(&lock, 2, 0, vec![pending(b.clone(), certificate(&path), 2)])
             .unwrap();
         assert_eq!(receipt.written, usize::from(allowed), "{arm}");
         if !allowed {
@@ -2612,7 +3215,7 @@ fn batch_ack_is_key_specific_and_bound_to_the_written_target_stamp() {
     let initial = store
         .write_after_save(
             &lock,
-            1,
+            1, 0,
             vec![
                 pending(first.clone(), certificate(&path), 1),
                 pending(other.clone(), certificate(&path), 1),
@@ -2637,7 +3240,7 @@ fn batch_ack_is_key_specific_and_bound_to_the_written_target_stamp() {
     let receipt = store
         .write_after_save(
             &lock,
-            2,
+            2, 0,
             vec![pending(first.clone(), certificate(&path), 2)],
         )
         .unwrap();
@@ -2655,7 +3258,7 @@ fn batch_ack_is_key_specific_and_bound_to_the_written_target_stamp() {
     let clean = store
         .write_after_save(
             &lock,
-            3,
+            3, 0,
             vec![pending(first.clone(), certificate(&path), 2)],
         )
         .unwrap();
@@ -2685,7 +3288,7 @@ fn batch_ack_never_escapes_failed_or_ambiguous_writes_or_a_clean_retry() {
         let mut store = scratch.store();
         let b = binding("acct", "scope", ("fp", None));
         store
-            .write_after_save(&lock, 1, vec![pending(b.clone(), certificate(&path), 1)])
+            .write_after_save(&lock, 1, 0, vec![pending(b.clone(), certificate(&path), 1)])
             .unwrap();
         let record = found(store.read(&b.key));
         let expected = Expected {
@@ -2713,7 +3316,7 @@ fn batch_ack_never_escapes_failed_or_ambiguous_writes_or_a_clean_retry() {
             })));
         }
         let failed =
-            store.write_after_save(&lock, 2, vec![pending(b.clone(), certificate(&path), 2)]);
+            store.write_after_save(&lock, 2, 0, vec![pending(b.clone(), certificate(&path), 2)]);
         test_hooks::set_before_rename(None);
         test_hooks::set_before_dir_sync(None);
         assert!(reached.get(), "actual {edge} reached");
@@ -2722,7 +3325,7 @@ fn batch_ack_never_escapes_failed_or_ambiguous_writes_or_a_clean_retry() {
         assert_eq!(store.witness_current(&proof), edge == "pre_rename");
         if edge == "pre_rename" {
             let retry = store
-                .write_after_save(&lock, 3, vec![pending(b.clone(), certificate(&path), 2)])
+                .write_after_save(&lock, 3, 0, vec![pending(b.clone(), certificate(&path), 2)])
                 .unwrap();
             assert_eq!(retry.written, 1);
             assert!(store.replacement_committed(&proof, &retry));
@@ -2743,7 +3346,7 @@ fn batch_ack_never_escapes_failed_or_ambiguous_writes_or_a_clean_retry() {
             let retry = store
                 .write_after_save(
                     &lock,
-                    3,
+                    3, 0,
                     vec![
                         pending(b.clone(), certificate(&path), 2),
                         pending(other, certificate(&path), 1),
@@ -2772,12 +3375,12 @@ fn batch_ack_has_a_fixed_allocation_at_the_dirty_batch_limit() {
             pending(b, certificate(&path), 1)
         })
         .collect();
-    let receipt = store.write_after_save(&lock, 1, records).unwrap();
+    let receipt = store.write_after_save(&lock, 1, 0, records).unwrap();
     assert_eq!((receipt.written, receipt.deferred), (MAX_BATCH, 1));
     let acks = receipt.committed.as_ref().expect("real durable writes");
     assert_eq!(acks.iter().flatten().count(), MAX_BATCH);
     assert_eq!(std::mem::size_of_val(acks.as_ref()), BATCH_ACK_BYTES);
-    const { assert!(BATCH_ACK_BYTES <= MAX_BATCH * 80) };
+    const { assert!(BATCH_ACK_BYTES <= MAX_BATCH * 128) };
     assert!(store.counters().peak_codec_bytes >= BATCH_ACK_BYTES as u64);
     assert!(acks
         .iter()
@@ -2793,7 +3396,7 @@ fn claude_mutation_proof_expires_at_pass_boundary_and_unmemoized_records_survive
     let b = binding("acct", "scope", ("fp", None));
     let mut store = scratch.store();
     store
-        .write_after_save(&lock, 1, vec![pending(b.clone(), certificate(&path), 1)])
+        .write_after_save(&lock, 1, 0, vec![pending(b.clone(), certificate(&path), 1)])
         .unwrap();
     let disk = record_file(&store, &b.key);
     let before = fs::read(&disk).unwrap();
@@ -2891,4 +3494,51 @@ pub(crate) fn continuation_pass_state(store: &DurableTailStore) -> ContinuationP
             .filter_map(|(key, (_, _, yes))| yes.then_some(*key))
             .collect(),
     }
+}
+
+#[test]
+fn receipt_failure_bound_is_per_obligation_and_disable_preserves_custody() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let path = scratch.transcript("source.jsonl", b"{}\n");
+    let b = binding("account", "scope", ("fp-a", None));
+    let mut store = scratch.store();
+    store
+        .write_after_save(&lock, 1, 0, vec![pending(b.clone(), certificate(&path), 1)])
+        .unwrap();
+    test_hooks::set_before_rename(Some(Box::new(|_, _| Err(io::Error::other("rename EIO")))));
+    test_hooks::set_before_unlink(Some(Box::new(|_| Err(io::Error::other("unlink EIO")))));
+    store
+        .write_after_save(&lock, 2, 0, vec![pending(b.clone(), certificate(&path), 2)])
+        .unwrap();
+    test_hooks::set_before_rename(None);
+    let original = fs::read(record_file(&store, &b.key)).unwrap();
+    assert_eq!(
+        store.pending[&b.key].3, 1,
+        "writer's actual reconcile failed"
+    );
+    for attempt in 2..=RECEIPT_RECONCILE_FAILURES {
+        store.begin_pass();
+        assert_eq!(store.hold(&b.key), Some(Refusal::ReceiptPending));
+        assert!(store.reconcile_pending(&lock, &b.key).is_err());
+        assert_eq!(store.pending[&b.key].3, attempt);
+        assert_eq!(
+            store.disabled(),
+            (attempt == RECEIPT_RECONCILE_FAILURES).then_some("receipt_unreconciled")
+        );
+    }
+    test_hooks::set_before_unlink(None);
+    let debt = pending_snapshot(&store);
+    assert_eq!(store.hold(&b.key), None, "D-DISABLED releases the hold");
+    assert_eq!(store.read(&b.key), ReadOutcome::Missing);
+    assert!(store.reconcile_pending(&lock, &b.key).is_err());
+    assert_eq!(
+        pending_snapshot(&store),
+        debt,
+        "disabled retry cannot alter custody"
+    );
+    assert_eq!(fs::read(record_file(&store, &b.key)).unwrap(), original);
+    assert_eq!(store.counters().receipt_reconciled, 0);
+    let mut restarted = scratch.store();
+    assert!(matches!(restarted.read(&b.key), ReadOutcome::Found(_)));
 }

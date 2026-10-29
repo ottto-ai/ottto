@@ -2624,7 +2624,8 @@ fn held_original_production_exit_conserves_copy_money_while_committed_entry_unch
         };
         match arm {
             "cold" => {
-                assert_eq!(counts.durable_held, [0; 6]);
+                assert_eq!(counts.durable_held, [0; 8]);
+                assert_eq!(counts.durable_held[6], 0, "no pending receipt");
                 assert_eq!(copy_status, ClaudeCensusMemberStatus::SharesHash);
                 // Money conservation premise: a cold read of the unchanged
                 // original emits nothing new; its accepted body stands.

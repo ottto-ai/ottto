@@ -253,6 +253,11 @@ pub(crate) struct Checkpoint {
 }
 
 impl Checkpoint {
+    /// The interpretation scope this checkpoint was made under.
+    pub(crate) fn scope(&self) -> &Scope {
+        &self.scope
+    }
+
     /// A cache admission hint only. Source validation still uses the complete
     /// stamp, scope, samples and independent audit obligation.
     pub(crate) fn modified_hint(&self) -> (i64, i64) {
@@ -792,6 +797,12 @@ impl ReadPlan {
             scope,
             now,
             |at| {
+                #[cfg(test)]
+                if OLD_SAMPLE_IO_ERROR.with(std::cell::Cell::get) {
+                    return Err(io::Error::other(
+                        "injected persistent old-checkpoint sample I/O",
+                    ));
+                }
                 let old = checkpoint.expect("samples are compared only with a checkpoint");
                 match at {
                     SampleAt::Head => sample_at(file, 0, &old.samples.head, &mut guard_bytes_read),
@@ -1475,11 +1486,6 @@ pub(crate) fn birth_unix_nanos(metadata: &Metadata) -> u64 {
 impl Checkpoint {
     /// This checkpoint as a content-free durable certificate. `None` when its
     /// samples are not valid for its stamp (such a checkpoint never admits).
-    /// The interpretation scope this checkpoint was made under.
-    pub(crate) fn scope(&self) -> &Scope {
-        &self.scope
-    }
-
     pub(crate) fn durable_certificate(&self, birth_nanos: u64) -> Option<DurableCertificate> {
         if !self.samples.valid_for(self.stamp.length)
             || self.samples.head.len() != self.samples.boundary.len()
@@ -1649,6 +1655,7 @@ impl DurableCertificate {
 
 #[cfg(test)]
 thread_local! {
+    pub(crate) static OLD_SAMPLE_IO_ERROR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static SAMPLES_MATCH_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static BETWEEN_GUARDS: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
         const { std::cell::RefCell::new(None) };

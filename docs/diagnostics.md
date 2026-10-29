@@ -245,8 +245,10 @@ recovering an index-new/record-old crash after a successful audit. Direct restor
 misses also count `ineligible.audit_carrier`, without becoming held exits.
 Re-arming changes no accepted body, witness or ACK; native completion alone can
 clear the obligation. No record means ordinary Full-on-miss admission.
-The `format_hold` and `durable_held` arrays keep five slots:
-`newer,unknown,undecodable,unbindable,known_corrupt`.
+The `format_hold` and `durable_held` arrays keep seven slots:
+`newer,unknown,undecodable,unbindable,known_corrupt,retired_upgrade_missing,receipt_pending`.
+The retired coordinate (slot 5) stays zero; the removed hold is not restored.
+ReceiptPending remains slot 6.
 
 Store header reads for GC (including representation lookup for a decided key)
 are counted in `gc_records_read` / `gc_bytes_read`, using actual bytes read;
@@ -874,6 +876,7 @@ restore-class totals on that text line are retired.
 |---|---|
 | `restored` | Restore returned a charged, retained reduction. |
 | `held` | Restore's existing integrity guard returned Held. |
+| `pending` | Restore yielded for active funding or a quiet resource refusal; no successful restore or read permission. |
 | `miss.<class>` | Restore returned no retained reduction, with the class below. |
 | `stale.<reason>` | Claude restore kept the accepted body stale: a typed, content-free reason from the original-binding proof or restore semantics (for example `old_binding_no_match`, `context`, `restore_semantics`, `revision_adoption_required`, `descriptor`, `accepted_floor_missing`). Growth past the accepted end may take the paced counted Full on the `durable_tail` alarm. |
 
@@ -886,9 +889,10 @@ Retries count again; a cooperative yield does not recount a completed decision.
 Miss keys are fixed, content-free class labels. Dots below are part of the
 JSON class key, not extra nested objects:
 
-- `unavailable`, `no_entry`, `missing`, `budget_refused`, `restore_take_lost`;
+- `unavailable`, `no_entry`, `missing`;
+- `resource_full.{decode,cache_transit,stores_unavailable,input,cache_key,certificate_scope,rederive_unfunded}` records a growing-file resource refusal returning an ordinary Full miss; it grants no independent read permission;
 - `ineligible.{selection_cleared,history_owed,source,key,context,scope,generation_ahead,entry_changed}`;
-- `refused_record.{newer,unknown,undecodable,unbindable,corrupt}`, `corrupt_body`;
+- `refused_record.{newer,unknown,undecodable,unbindable,corrupt,receipt_pending}`, `corrupt_body`;
 - `certificate_refused.{replaced,shrunk,same_size_edit,head_changed,boundary_changed,invalid_checkpoint,read_error}`;
 - `not_rederived.<field>` preserves the existing codec's static field/class
   labels, including `SnapshotAccumulator.title` and `compressed`; these are

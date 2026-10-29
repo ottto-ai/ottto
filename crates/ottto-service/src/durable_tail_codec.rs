@@ -53,8 +53,16 @@ pub(crate) enum Refuse {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Corrupt;
 
+/// Resource refusal never authorizes corrupt-record recovery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DecodeFailure {
+    Integrity,
+    Budget,
+}
+
 enum Sink {
     Bytes { out: Vec<u8>, limit: usize },
+    Count { len: usize, limit: usize },
     Hash(Box<Sha256>),
 }
 
@@ -68,9 +76,20 @@ impl Enc {
     pub(crate) fn bytes(limit: usize) -> Self {
         Self {
             sink: Sink::Bytes {
-                out: Vec::new(),
+                out: Vec::with_capacity(limit),
                 limit,
             },
+        }
+    }
+    pub(crate) fn count(limit: usize) -> Self {
+        Self {
+            sink: Sink::Count { len: 0, limit },
+        }
+    }
+    pub(crate) fn counted(&self) -> usize {
+        match &self.sink {
+            Sink::Count { len, .. } => *len,
+            _ => unreachable!("only a count sink has a counted length"),
         }
     }
     pub(crate) fn hash(domain: &str) -> Self {
@@ -84,12 +103,12 @@ impl Enc {
     pub(crate) fn hashing(&self) -> bool {
         matches!(self.sink, Sink::Hash(_))
     }
-    /// Bytes written so far; `None` in hash mode. Tests only.
+    /// Byte-output position; counting and hashing never record `L` spans.
     #[cfg(test)]
     pub(crate) fn position(&self) -> Option<usize> {
         match &self.sink {
             Sink::Bytes { out, .. } => Some(out.len()),
-            Sink::Hash(_) => None,
+            Sink::Hash(_) | Sink::Count { .. } => None,
         }
     }
     pub(crate) fn raw(&mut self, bytes: &[u8]) -> Result<(), Refuse> {
@@ -101,6 +120,12 @@ impl Enc {
                 out.extend_from_slice(bytes);
             }
             Sink::Hash(hasher) => hasher.update(bytes),
+            Sink::Count { len, limit } => {
+                *len = len.checked_add(bytes.len()).ok_or(Refuse::TooLarge)?;
+                if *len > *limit {
+                    return Err(Refuse::TooLarge);
+                }
+            }
         }
         Ok(())
     }
@@ -128,7 +153,7 @@ impl Enc {
     pub(crate) fn into_bytes(self) -> Vec<u8> {
         match self.sink {
             Sink::Bytes { out, .. } => out,
-            Sink::Hash(_) => Vec::new(),
+            Sink::Hash(_) | Sink::Count { .. } => Vec::new(),
         }
     }
     /// Hash mode: the digest.
@@ -136,6 +161,7 @@ impl Enc {
         match self.sink {
             Sink::Hash(hasher) => hasher.finalize().into(),
             Sink::Bytes { out, .. } => Sha256::digest(out).into(),
+            Sink::Count { .. } => unreachable!("counting is not hashing"),
         }
     }
 }
@@ -144,11 +170,54 @@ impl Enc {
 pub(crate) struct Dec<'a> {
     bytes: &'a [u8],
     at: usize,
+    allowance: Option<&'a mut dyn FnMut(u64) -> bool>,
+    refused: bool,
 }
 
 impl<'a> Dec<'a> {
     pub(crate) fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, at: 0 }
+        Self {
+            bytes,
+            at: 0,
+            allowance: None,
+            refused: false,
+        }
+    }
+    pub(crate) fn bounded(bytes: &'a [u8], allowance: &'a mut dyn FnMut(u64) -> bool) -> Self {
+        Self {
+            bytes,
+            at: 0,
+            allowance: Some(allowance),
+            refused: false,
+        }
+    }
+    fn reserve(&mut self, bytes: Option<usize>) -> Result<(), Corrupt> {
+        if self.allowance.is_none() {
+            return Ok(());
+        }
+        let granted = bytes
+            .and_then(|n| u64::try_from(n).ok())
+            .is_some_and(|n| self.allowance.as_mut().is_some_and(|grant| grant(n)));
+        self.refused |= !granted;
+        granted.then_some(()).ok_or(Corrupt)
+    }
+    fn slots<T>(&mut self, len: usize) -> Result<(), Corrupt> {
+        self.reserve(len.checked_mul(std::mem::size_of::<T>()))
+    }
+    fn tree<K, V>(&mut self, len: usize) -> Result<(), Corrupt> {
+        self.reserve(
+            len.checked_add(1)
+                .and_then(|n| n.checked_mul(crate::heap_layout_bound::tree_node_bytes::<K, V>()?)),
+        )
+    }
+    pub(crate) fn outcome<T>(&self, value: Result<T, Corrupt>) -> Result<T, DecodeFailure> {
+        value.map_err(|_| {
+            if self.refused {
+                DecodeFailure::Budget
+            } else {
+                DecodeFailure::Integrity
+            }
+        })
     }
     pub(crate) fn raw(&mut self, len: usize) -> Result<&'a [u8], Corrupt> {
         let end = self.at.checked_add(len).ok_or(Corrupt)?;
@@ -288,10 +357,15 @@ impl HDigest for String {
         e.raw(&bytes)
     }
     fn take_h(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
-        Ok(d.raw(32)?
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect())
+        let bytes = d.raw(32)?;
+        d.slots::<u8>(64)?;
+        let mut out = String::with_capacity(64);
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for byte in bytes {
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 15) as usize] as char);
+        }
+        Ok(out)
     }
     fn verify_h(d: &mut Dec<'_>) -> Result<(), Corrupt> {
         d.raw(32).map(|_| ())
@@ -343,6 +417,7 @@ impl<T: HDigestKey + Ord> HDigest for BTreeSet<T> {
     }
     fn take_h(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
         let len = d.take_len()?;
+        d.tree::<T, ()>(len)?;
         let mut out = BTreeSet::new();
         for _ in 0..len {
             if !out.insert(T::take_h(d)?) {
@@ -380,6 +455,7 @@ impl<T: HDigest + crate::heap_layout_bound::HeapLayoutBound> HDigest
     }
     fn take_h(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
         let len = d.take_len()?;
+        d.slots::<T>(len)?;
         let mut out = Vec::with_capacity(len);
         for _ in 0..len {
             out.push(T::take_h(d)?);
@@ -497,10 +573,8 @@ fn verify_entries<'a, K: Ord>(
             sorted &= p < &current;
         }
         if !sorted {
-            let mut earlier = Dec {
-                bytes: d.bytes,
-                at: start,
-            };
+            let mut earlier = Dec::new(d.bytes);
+            earlier.at = start;
             for _ in 0..i {
                 if key(&mut earlier)? == current {
                     return Err(Corrupt);
@@ -701,6 +775,7 @@ impl Durable for String {
     }
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
         let bytes = d.len_prefixed()?;
+        d.slots::<u8>(bytes.len())?;
         std::str::from_utf8(bytes)
             .map(str::to_string)
             .map_err(|_| Corrupt)
@@ -732,7 +807,9 @@ impl Durable for std::path::PathBuf {
         e.len_prefixed(self.as_os_str().as_encoded_bytes())
     }
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
-        String::take(d).map(Self::from)
+        let value = String::take(d)?;
+        d.slots::<u8>(value.len())?; // Conservative conversion overlap, including non-Unix.
+        Ok(Self::from(value))
     }
     fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
         String::verify(d)
@@ -823,6 +900,7 @@ impl<T: Durable> Durable for Box<T> {
         (**self).put(e)
     }
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
+        d.slots::<T>(1)?;
         T::take(d).map(Box::new)
     }
     fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
@@ -851,6 +929,7 @@ impl<T: Durable> Durable for Vec<T> {
     }
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
         let len = d.take_len()?;
+        d.slots::<T>(len)?;
         let mut out = Vec::with_capacity(len);
         for _ in 0..len {
             out.push(T::take(d)?);
@@ -877,7 +956,10 @@ impl<T: Durable> Durable for VecDeque<T> {
         put_seq(e, self.len(), self.iter())
     }
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
-        Vec::<T>::take(d).map(VecDeque::from)
+        let values = Vec::<T>::take(d)?;
+        // Fund both allocations even if the native conversion transfers storage.
+        d.slots::<T>(values.capacity())?;
+        Ok(VecDeque::from(values))
     }
     fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
         Vec::<T>::verify(d)
@@ -897,6 +979,7 @@ impl<T: Durable, const N: usize> Durable for [T; N] {
         Ok(())
     }
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
+        d.slots::<T>(N)?;
         let mut out = Vec::with_capacity(N);
         for _ in 0..N {
             out.push(T::take(d)?);
@@ -921,6 +1004,7 @@ impl<T: DurableKey + Ord> Durable for BTreeSet<T> {
     }
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
         let len = d.take_len()?;
+        d.tree::<T, ()>(len)?;
         let mut out = BTreeSet::new();
         for _ in 0..len {
             if !out.insert(T::take(d)?) {
@@ -963,6 +1047,7 @@ impl<K: DurableKey + Ord, V: Durable> Durable for BTreeMap<K, V> {
     }
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
         let len = d.take_len()?;
+        d.tree::<K, V>(len)?;
         let mut out = BTreeMap::new();
         for _ in 0..len {
             let key = K::take(d)?;
@@ -1023,6 +1108,7 @@ where
     }
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
         let len = d.take_len()?;
+        d.tree::<K, V>(len)?;
         let mut out = Self::new();
         for _ in 0..len {
             let key = K::take(d)?;
@@ -1465,6 +1551,121 @@ pub(crate) fn trace_verify(f: impl FnOnce()) -> (Vec<(usize, bool)>, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Direct codec fixtures: the actual allocator proves the first refused
+    // constructor allocates nothing; paid successful peaks include overlap.
+    fn budget_probe<T>(bytes: &[u8], take: fn(&mut Dec<'_>) -> Result<T, Corrupt>) {
+        let mut calls = 0;
+        let mut paid = 0u64;
+        let mut grant = |bytes: u64| {
+            calls += 1;
+            paid = paid.checked_add(bytes).unwrap();
+            true
+        };
+        let (result, stats) = crate::retry_allocation_probe::measure_caller_thread(|| {
+            let mut d = Dec::bounded(bytes, &mut grant);
+            let result = take(&mut d);
+            assert_eq!(d.remaining(), 0);
+            d.outcome(result)
+        });
+        assert!(result.is_ok());
+        drop(result);
+        assert!(calls > 0, "allocation hook missing");
+        assert!(
+            stats.requested_peak_with_overlap as u64 <= paid,
+            "{stats:?}, paid={paid}"
+        );
+        let mut refused = 0;
+        let mut deny = |_: u64| {
+            refused += 1;
+            false
+        };
+        let (result, stats) = crate::retry_allocation_probe::measure_caller_thread(|| {
+            let mut d = Dec::bounded(bytes, &mut deny);
+            let result = take(&mut d);
+            d.outcome(result)
+        });
+        assert!(matches!(result, Err(DecodeFailure::Budget)));
+        assert_eq!(refused, 1);
+        assert_eq!(
+            stats.allocations, 0,
+            "allocation before allowance: {stats:?}"
+        );
+        // Stop at each later hook too; already-funded children must be dropped.
+        for cutoff in 1..calls {
+            let mut seen = 0;
+            let mut grant = |_: u64| {
+                seen += 1;
+                seen <= cutoff
+            };
+            let mut d = Dec::bounded(bytes, &mut grant);
+            let result = take(&mut d);
+            assert!(matches!(d.outcome(result), Err(DecodeFailure::Budget)));
+            assert_eq!(seen, cutoff + 1);
+        }
+    }
+    fn budget_round<T: Durable>(value: T) {
+        let mut e = Enc::bytes(1 << 20);
+        value.put(&mut e).unwrap();
+        budget_probe(&e.into_bytes(), T::take);
+    }
+    #[test]
+    fn bounded_decode_funds_every_scalar_sequence_ordered_and_owned_constructor() {
+        budget_round(String::from("scalar"));
+        budget_round(Box::new(String::from("boxed")));
+        budget_round(vec![String::from("one"), String::from("two")]);
+        budget_round(VecDeque::from([String::from("deque")]));
+        budget_round([String::from("array")]);
+        budget_round(BTreeSet::from([String::from("set")]));
+        budget_round(BTreeMap::from([(
+            String::from("key"),
+            String::from("value"),
+        )]));
+        budget_round(crate::owned_heap::OwnedVec::from(vec![String::from(
+            "owned",
+        )]));
+        let mut map = crate::owned_heap::OwnedMap::new();
+        map.insert(String::from("key"), String::from("owned value"));
+        budget_round(map);
+        let digest = "ab".repeat(32);
+        let mut e = Enc::bytes(1 << 20);
+        <String as HDigest>::put_h(&digest, &mut e, "fixture").unwrap();
+        budget_probe(&e.into_bytes(), <String as HDigest>::take_h);
+        let mut e = Enc::bytes(1 << 20);
+        <BTreeSet<String> as HDigest>::put_h(&BTreeSet::from([digest.clone()]), &mut e, "fixture")
+            .unwrap();
+        budget_probe(&e.into_bytes(), <BTreeSet<String> as HDigest>::take_h);
+        let mut e = Enc::bytes(1 << 20);
+        <crate::owned_heap::OwnedVec<String> as HDigest>::put_h(
+            &crate::owned_heap::OwnedVec::from(vec![digest]),
+            &mut e,
+            "fixture",
+        )
+        .unwrap();
+        budget_probe(
+            &e.into_bytes(),
+            <crate::owned_heap::OwnedVec<String> as HDigest>::take_h,
+        );
+        // PathBuf is never persisted as X, but its trait conversion is funded.
+        let mut e = Enc::bytes(32);
+        String::from("path").put(&mut e).unwrap();
+        budget_probe(&e.into_bytes(), std::path::PathBuf::take);
+    }
+    #[test]
+    fn bounded_decode_keeps_integrity_distinct_and_checks_budget_arithmetic() {
+        let mut deny = |_: u64| false;
+        let mut d = Dec::bounded(&[2], &mut deny);
+        let result = bool::take(&mut d);
+        assert_eq!(d.outcome(result), Err(DecodeFailure::Integrity));
+        let mut d = Dec::bounded(&[7], &mut deny);
+        assert_eq!(u64::take(&mut d), Ok(7)); // Inline scalar needs no heap.
+        let mut d = Dec::bounded(&[], &mut deny);
+        let result = d.tree::<u128, u128>(usize::MAX);
+        assert_eq!(d.outcome(result), Err(DecodeFailure::Budget));
+        let mut d = Dec::bounded(&[127], &mut deny);
+        let result = Vec::<String>::take(&mut d);
+        assert!(matches!(d.outcome(result), Err(DecodeFailure::Integrity)));
+    }
 
     fn round_bytes<T: Durable>(value: T) {
         let mut e = Enc::bytes(1 << 20);

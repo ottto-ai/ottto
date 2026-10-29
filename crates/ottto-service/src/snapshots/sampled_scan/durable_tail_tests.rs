@@ -1,10 +1,2243 @@
 //! GC against a committed index much larger than the store (F3, F5).
 use super::*;
 use crate::locked_state_dir::test_locks;
+use crate::snapshots::sampled_scan::codex_cursor;
 use crate::transcript_acquisition::ReadPlan;
 use std::io::Read;
 
 const INDEX_KEYS: usize = 20_000;
+
+thread_local! {
+    static BEFORE_COLD_TRANSFER: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+pub(super) fn before_cold_transfer() {
+    let hook = BEFORE_COLD_TRANSFER.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+fn owned_fixture(
+    source: SnapshotSource,
+    path: &Path,
+    scope: &Scope,
+) -> Box<Taken<CachedJsonlReduction>> {
+    if source == SnapshotSource::Codex {
+        codex_budget_fixture(path, "019fa111-2222-7333-8444-555555555555", None);
+    } else {
+        native_fixture(path);
+    }
+    let (state, checkpoint) = native_record_of(path, scope, source);
+    Box::new(Taken {
+        retained: crate::transcript_cache::Retained { checkpoint, state },
+        durable: Default::default(),
+        modified_hint: (17, 19),
+        finalization_charge: 23,
+        e2_held_new_file: true,
+    })
+}
+fn owned_parser(source: SnapshotSource, path: &Path, file: File) -> OwnedJsonlParser {
+    let apply = if source == SnapshotSource::Codex {
+        apply_codex_line
+    } else {
+        apply_claude_code_line
+    };
+    OwnedJsonlParser::new(file, path, source, apply, None, None, None, false, true).unwrap()
+}
+
+struct ClearPreparationFault;
+impl Drop for ClearPreparationFault {
+    fn drop(&mut self) {
+        sampled_jsonl::preparation_tests::set(None);
+        sampled_jsonl::preparation_tests::refuse_heap(false);
+        BEFORE_COLD_TRANSFER.with(|slot| slot.borrow_mut().take());
+    }
+}
+
+// Direct owned API: reason precedence cannot turn an incompatible scope into
+// an audit/clock Full. The write-only FD also makes any body read fail.
+#[test]
+fn empty_custody_scope_rejection_precedes_audit_clock_and_all_body_reads() {
+    use crate::transcript_acquisition::{AuditDebt, ReadMode};
+    use std::io::Seek;
+    let _clear = ClearPreparationFault;
+    for reason in ["ordinary", "audit", "clock"] {
+        let root = crate::test_scratch::ScratchDir::new("scope-before-read");
+        let path = root.join("source.jsonl");
+        let scope = Scope("original".into());
+        let taken = owned_fixture(SnapshotSource::ClaudeCode, &path, &scope);
+        assert!(taken.durable.is_empty());
+        let address = &*taken as *const _ as usize;
+        let body = codec::encode(
+            &taken.retained.state,
+            store::BODY_BYTES,
+            jsonl_line_cap() as u64,
+        )
+        .unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let mut parser = owned_parser(SnapshotSource::ClaudeCode, &path, file);
+        let debt = (reason == "audit").then_some(AuditDebt {
+            due_unix_seconds: 1,
+        });
+        let now = if reason == "clock" { 1 } else { 1_800_000_000 };
+        let result =
+            parser.prepare_acquisition_owned(Some(taken), &Scope("changed".into()), debt, now);
+        assert_eq!(
+            usize::from(matches!(&result, Ok(ReadMode::Full(_)))),
+            0,
+            "0 Full"
+        );
+        let rejected = match result {
+            Err(error) => error,
+            Ok(_) => panic!("scope reused"),
+        };
+        assert!(rejected.error.to_string().contains("scope"));
+        assert_eq!(
+            rejected.refusal,
+            sampled_jsonl::PreparationRefusal::NonTransient("prepare_scope")
+        );
+        let original = rejected.taken.unwrap();
+        assert_eq!(&*original as *const _ as usize, address);
+        assert_eq!(
+            codec::encode(
+                &original.retained.state,
+                store::BODY_BYTES,
+                jsonl_line_cap() as u64
+            )
+            .unwrap(),
+            body
+        );
+        assert_eq!(parser.reader.consumed_bytes(), 0, "0 body bytes");
+        assert!(parser.reader.reader.buffer().is_empty());
+        assert!(parser.reader.acquisition.is_none());
+        assert_eq!(parser.reader.reader.get_mut().stream_position().unwrap(), 0);
+    }
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "validated native admission layout")]
+fn direct_return_keeps_attached_guard_on_heap_poison_and_self_eviction() {
+    use crate::local_resource_diagnostics::cache_lifecycle::observe;
+    assert!(crate::heap_layout_bound::layout_supported());
+    let _clear = ClearPreparationFault;
+    for arm in ["heap", "poison", "self"] {
+        let root = crate::test_scratch::ScratchDir::new("return-original-refusal");
+        let path = root.join("source.jsonl");
+        let cache = SharedCache::default();
+        let mut taken = owned_fixture(SnapshotSource::ClaudeCode, &path, &Scope("original".into()));
+        let guard = cache
+            .begin_retail(
+                SnapshotSource::ClaudeCode,
+                "key",
+                &taken.retained.checkpoint,
+                &File::open(&path).unwrap(),
+                taken.retained.checkpoint.sealed_offset(),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        let guard_facts = (guard.object, guard.next, guard.end, guard.old_end);
+        taken.durable.put_retail(guard);
+        let address = &*taken as *const _ as usize;
+        let checkpoint = format!("{:?}", taken.retained.checkpoint);
+        let body = codec::encode(
+            &taken.retained.state,
+            store::BODY_BYTES,
+            jsonl_line_cap() as u64,
+        )
+        .unwrap();
+        match arm {
+            "heap" => sampled_jsonl::preparation_tests::refuse_heap(true),
+            "poison" => cache.poison_retained(),
+            "self" => {
+                let floor = crate::heap_layout_bound::bound(
+                    &crate::transcript_cache::TranscriptCache::<CachedJsonlReduction>::default(),
+                    usize::MAX,
+                )
+                .unwrap();
+                let limit = floor
+                    + taken.finalization_charge
+                    + cache.cursor_resident_for_main()
+                    + super::super::side_ledger::SIDE_LEDGER_BYTES;
+                *cache.retained().unwrap() =
+                    crate::transcript_cache::TranscriptCache::with_byte_limit(limit);
+            }
+            _ => unreachable!(),
+        }
+        let (result, counts) = observe(|| cache.return_prepared_taken("key".into(), taken));
+        let mut returned = result.expect_err("real refusal");
+        assert_eq!(&*returned as *const _ as usize, address);
+        assert_eq!(format!("{:?}", returned.retained.checkpoint), checkpoint);
+        assert_eq!(
+            codec::encode(
+                &returned.retained.state,
+                store::BODY_BYTES,
+                jsonl_line_cap() as u64
+            )
+            .unwrap(),
+            body
+        );
+        assert_eq!(returned.modified_hint, (17, 19));
+        assert_eq!(returned.finalization_charge, 23);
+        assert!(returned.e2_held_new_file);
+        let guard = returned.durable.take_retail().expect("attached at refusal");
+        assert_eq!(
+            (guard.object, guard.next, guard.end, guard.old_end),
+            guard_facts
+        );
+        guard.finish();
+        match arm {
+            "heap" => assert_eq!(counts.insert_entry_bound_refused, 1),
+            "poison" => {
+                assert!(cache.lock_poisoned_for_test(super::super::TestLock::Retained));
+                assert_eq!(counts.insert_poisoned_lock, 1);
+            }
+            "self" => assert_eq!(counts.insert_self_evicted, 1),
+            _ => unreachable!(),
+        }
+        sampled_jsonl::preparation_tests::refuse_heap(false);
+    }
+}
+
+#[test]
+fn direct_completed_absence_and_heap_refusal_return_checkpoint_and_custody() {
+    let _clear = ClearPreparationFault;
+    for absent in [true, false] {
+        let root = crate::test_scratch::ScratchDir::new("completed-refusal");
+        let path = root.join("source.jsonl");
+        let cache = SharedCache::default();
+        let mut taken = owned_fixture(SnapshotSource::ClaudeCode, &path, &Scope("original".into()));
+        let guard = cache
+            .begin_retail(
+                SnapshotSource::ClaudeCode,
+                "key",
+                &taken.retained.checkpoint,
+                &File::open(&path).unwrap(),
+                taken.retained.checkpoint.sealed_offset(),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        taken.durable.put_retail(guard);
+        let checkpoint = format!("{:?}", taken.retained.checkpoint);
+        let original = sampled_jsonl::CompletedNativeAcquisition {
+            checkpoint: taken.retained.checkpoint,
+            reduction: (!absent).then_some(taken.retained.state),
+            durable: taken.durable,
+            released: Some((17, 19)),
+            unsealed: true,
+        };
+        if !absent {
+            sampled_jsonl::preparation_tests::refuse_heap(true);
+        }
+        let mut returned = cache
+            .insert_with_custody("key".into(), original, 23, true, false, false)
+            .err()
+            .expect("no destructive refusal");
+        assert_eq!(format!("{:?}", returned.checkpoint), checkpoint);
+        assert_eq!(returned.reduction.is_none(), absent);
+        assert_eq!(returned.released, Some((17, 19)));
+        assert!(returned.unsealed);
+        returned
+            .durable
+            .take_retail()
+            .expect("same actual guard")
+            .finish();
+    }
+}
+
+// Direct legacy codec oracle, not a production cold restore or read grant.
+fn legacy_rederive_oracle(
+    path: &Path,
+    body: &[u8],
+    source: SnapshotSource,
+) -> CachedJsonlReduction {
+    let decoded = codec::decode(body, source).unwrap();
+    let parser = codec::rederive_parser(File::open(path).unwrap(), path, &decoded).unwrap();
+    decoded
+        .rederive(
+            parser,
+            &mut File::open(path).unwrap(),
+            jsonl_line_cap() as u64,
+        )
+        .unwrap()
+        .0
+}
+fn assert_rederive_pending(
+    outcome: RestoreOutcome,
+    cache: &SharedCache,
+    source: SnapshotSource,
+    key: &str,
+) {
+    assert!(matches!(outcome, RestoreOutcome::Pending));
+    assert!(cache.retained().unwrap().peek(key).is_none());
+    let resource_full = cache.durable_counters(source).unwrap().0.resource_full;
+    assert!(resource_full.is_empty(), "idle: no growth Full");
+    assert!(cache
+        .durable_counters(source)
+        .unwrap()
+        .0
+        .ineligible
+        .get("rederive_unfunded")
+        .is_some_and(|n| *n > 0));
+}
+
+struct ResetActiveBudget;
+impl Drop for ResetActiveBudget {
+    fn drop(&mut self) {
+        store::active::set_active_budget_for_test(None);
+    }
+}
+
+// Actual OwnedSourceScan cold caller after RAM clear and append: a busy lease
+// is a fair delay (pending, predecessor kept, no Q11 or native Tail). Every
+// repeating refusal reads that growth once by the ordinary counted Full,
+// publishing the cumulative body (no duplicated prefix), then idles at 0 reads.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "validated native admission layout")]
+fn production_cold_resources_delay_lease_wait_and_read_growth_once() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    assert!(crate::heap_layout_bound::layout_supported());
+    let _gate = claude_request_money::e2::GateForTest::set(true);
+    let _reset = ResetActiveBudget;
+    let _clear = ClearPreparationFault;
+    let source = SnapshotSource::ClaudeCode;
+    for phase in ["guard", "decode", "rederive", "cache"] {
+        let limit = match phase {
+            "guard" => 0,
+            "decode" => {
+                store::RESTORE_INPUT_BYTES
+                    + (store::RECORD_BYTES + super::super::AUDIT_AND_SCRATCH_BYTES) as u64
+            }
+            _ => store::ACTIVE_BYTES,
+        };
+        let root = crate::test_scratch::ScratchDir::new("cold-decode-budget");
+        let lock = test_locks::hold(&root);
+        let sessions = root.join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let path = sessions.join("11111111-2222-4333-8444-555555555555.jsonl");
+        native_fixture(&path);
+        if phase == "rederive" {
+            use std::io::Write;
+            let prompt = serde_json::json!({"type":"user","sessionId":"11111111-2222-4333-8444-555555555555",
+                "timestamp":"2026-10-07T10:00:01Z","uuid":"prompt-budget","cwd":"/tmp/synthetic-budget",
+                "message":{"role":"user","content":"synthetic prompt requiring rederive"}}).to_string()+"\n";
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(prompt.as_bytes())
+                .unwrap();
+        }
+        let key = local_index_key(&path);
+        let limit = if phase == "decode" {
+            limit + 4 * key.len() as u64
+        } else {
+            limit
+        };
+        let index_path = root.join("index.json");
+        let namespace = Scope("bounded-decode".into());
+        let cache = Arc::new(SharedCache::default());
+        cache.durable_begin_pass(source, &index_path, &namespace, true);
+        let start = |index| {
+            OwnedSourceScan::new_with_identity_capture(
+                source,
+                std::slice::from_ref(&sessions),
+                index,
+                "2026-10-20T12:00:00Z",
+                365,
+                100,
+                false,
+                None,
+                &[],
+                false,
+                true,
+                true,
+            )
+            .with_sampled_acquisition(cache.clone(), namespace.clone())
+        };
+        let finish = |mut scan: OwnedSourceScan| {
+            let mut modes = (0, 0, 0);
+            for _ in 0..10_000 {
+                if let Some(context) = scan.sampling.as_ref() {
+                    modes = (context.full_files, context.tail_files, context.native_bytes);
+                }
+                match scan.step(None) {
+                    OwnedSourceScanStep::Pending(next) => scan = next,
+                    OwnedSourceScanStep::Complete { index, scan, .. } => {
+                        return (index, scan, modes)
+                    }
+                }
+            }
+            panic!("scan did not complete");
+        };
+        let (mut index, first, _) = finish(start(ScanIndex::default()));
+        assert_eq!(first.snapshots.len(), 1);
+        assert_eq!(first.snapshots[0].input_tokens, 100);
+        assert!(cache.retained().unwrap().peek(&key).is_some());
+        index.save(&index_path).unwrap();
+        assert_eq!(
+            cache
+                .durable_write_after_save(lock, source, &index)
+                .unwrap()
+                .written,
+            1
+        );
+        cache.retained().unwrap().clear();
+        let entry = serde_json::to_value(&index.files[&key]).unwrap();
+        use std::io::Write;
+        let suffix = serde_json::json!({"type":"assistant","sessionId":"11111111-2222-4333-8444-555555555555",
+            "timestamp":"2026-10-07T10:01:00Z","requestId":"req-budget-tail",
+            "message":{"id":"msg-budget-tail","model":"fixture-model","usage":{"input_tokens":25,"output_tokens":3}}}).to_string()+"\n";
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(suffix.as_bytes())
+            .unwrap();
+        let before = cache.durable_counters(source).unwrap();
+        let old_bytes = (retail_bytes(source, 0), retail_bytes(source, 1));
+        store::active::set_active_budget_for_test(Some(limit));
+        sampled_jsonl::preparation_tests::refuse_heap(phase == "cache");
+        let cause = match phase {
+            "rederive" => "rederive_unfunded",
+            "cache" => "cache_transit",
+            other => other,
+        };
+        let mut entry = entry;
+        for pass in 0..5 {
+            let (next, result, modes) = finish(start(index));
+            assert_eq!(result.unreadable_path_count, 0);
+            if phase != "guard" && pass == 0 {
+                let len = std::fs::metadata(&path).unwrap().len();
+                assert_eq!(modes, (1, 0, len), "{phase}: one ordinary Full");
+                assert_eq!(result.snapshots.len(), 1);
+                assert_eq!(result.snapshots[0].input_tokens, 125, "cumulative once");
+                assert_eq!(next.files[&key].size_bytes, len);
+                entry = serde_json::to_value(&next.files[&key]).unwrap();
+            } else {
+                assert!(result.snapshots.is_empty());
+                assert_eq!(modes, (0, 0, 0), "no Full, Tail or native body bytes");
+            }
+            assert_eq!(serde_json::to_value(&next.files[&key]).unwrap(), entry);
+            if phase == "guard" {
+                assert!(cache.retained().unwrap().peek(&key).is_none());
+            }
+            assert_eq!(
+                (retail_bytes(source, 0), retail_bytes(source, 1)),
+                old_bytes
+            );
+            assert!(cache.durable().unwrap().retail_spent.is_empty());
+            index = next;
+        }
+        let after = cache.durable_counters(source).unwrap();
+        assert_eq!(after.0.corrupt_body, before.0.corrupt_body);
+        assert_eq!(after.1.format_hold, before.1.format_hold);
+        assert_eq!(after.1.t14_rebuild, before.1.t14_rebuild);
+        if limit == 0 {
+            assert_eq!(after.1.guard_header_bytes, before.1.guard_header_bytes);
+            assert_eq!(after.1.records_read, before.1.records_read);
+        } else {
+            assert_eq!(
+                after.1.records_read - before.1.records_read,
+                1,
+                "actual cold decode reached once, then idle skips"
+            );
+            assert_eq!(after.0.resource_full.get(cause), Some(&1));
+            assert_eq!(after.0.ineligible.get(cause), None, "not counted pending");
+        }
+        store::active::set_active_budget_for_test(None);
+        sampled_jsonl::preparation_tests::refuse_heap(false);
+        if phase != "guard" {
+            assert_eq!(
+                (after.0.rederive_head_bytes, after.0.rederive_line_bytes),
+                (0, 0)
+            );
+            let store::LeaseWait::Granted(lease) =
+                cache.acquire_active(source, store::ACTIVE_BYTES)
+            else {
+                panic!("{phase} refusal leaked credit")
+            };
+            lease.release();
+            continue;
+        }
+        assert!(after.0.resource_full.is_empty(), "a busy lease never reads");
+        let (_, result, modes) = finish(start(index));
+        assert_eq!(result.snapshots.len(), 1);
+        assert_eq!(result.snapshots[0].input_tokens, 125);
+        assert_eq!((modes.0, modes.1), (0, 1));
+        assert_eq!(retail_bytes(source, 0) - old_bytes.0, suffix.len() as u64);
+        assert_eq!(retail_bytes(source, 1) - old_bytes.1, 0);
+        let store::LeaseWait::Granted(lease) = cache.acquire_active(source, store::ACTIVE_BYTES)
+        else {
+            panic!("budget exit leaked lease")
+        };
+        lease.release();
+    }
+}
+
+// Direct production factory. A write-only FD discriminates any certificate,
+// head or named-line read before the typed resource refusal.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "validated native decode layout")]
+fn rederive_refusal_precedes_certificate_io_and_keeps_integrity_separate() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    assert!(crate::heap_layout_bound::layout_supported());
+    use std::io::Seek;
+    let root = crate::test_scratch::ScratchDir::new("unfunded-rederive-no-read");
+    let path = root.join("source.jsonl");
+    let source = SnapshotSource::ClaudeCode;
+    let scope = Scope("pre-read-budget".into());
+    native_fixture(&path);
+    use std::io::Write;
+    let prompt =
+        serde_json::json!({"type":"user","sessionId":"11111111-2222-4333-8444-555555555555",
+        "timestamp":"2026-10-07T10:00:01Z","cwd":"/tmp/synthetic",
+        "message":{"role":"user","content":"native prompt"}})
+        .to_string()
+            + "\n";
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(prompt.as_bytes())
+        .unwrap();
+    let body = codec::encode(
+        &native_record(&path, &scope).0,
+        store::BODY_BYTES,
+        jsonl_line_cap() as u64,
+    )
+    .unwrap();
+    assert!(codec::decode(&body, source)
+        .unwrap()
+        .without_rederive()
+        .is_err());
+    let binding = store::tests::binding("account", "scope", ("fp-a", None));
+    let expected = Expected {
+        binding: binding.clone(),
+        committed_generation: 1,
+    };
+    let mut record = store::DurableRecord {
+        envelope_audit_debt: None,
+        format: store::FORMAT_VERSION,
+        index_generation: 1,
+        record: PendingRecord {
+            binding,
+            certificate: certificate(&path, &scope),
+            body,
+            allowlist: codec::allowlist_digest(source),
+        },
+    };
+    let cache = SharedCache::default();
+    let store::LeaseWait::Granted(mut lease) = cache.acquire_prepared_transfer(source) else {
+        panic!("lease unavailable")
+    };
+    let mut held = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    assert!(matches!(
+        cache.durable_restore_record(
+            source, &record, &expected, &path, &scope, &mut held, &mut lease
+        ),
+        Err(Failure::Resource("rederive_unfunded"))
+    ));
+    assert_eq!(held.stream_position().unwrap(), 0);
+    record.record.body.clear();
+    assert!(matches!(
+        cache.durable_restore_record(
+            source, &record, &expected, &path, &scope, &mut held, &mut lease
+        ),
+        Err(Failure::Corrupt)
+    ));
+    lease.release();
+    // Empty obligations are a positive decode, but never bypass certificate IO.
+    native_fixture(&path);
+    record.record.body = codec::encode(
+        &native_record(&path, &scope).0,
+        store::BODY_BYTES,
+        jsonl_line_cap() as u64,
+    )
+    .unwrap();
+    record.record.certificate = certificate(&path, &scope);
+    assert!(codec::decode(&record.record.body, source)
+        .unwrap()
+        .without_rederive()
+        .is_ok());
+    assert_eq!(record.eligible(&expected), Ok(()));
+    let store::LeaseWait::Granted(mut lease) = cache.acquire_prepared_transfer(source) else {
+        panic!("lease unavailable")
+    };
+    assert!(matches!(
+        cache.durable_restore_record(
+            source, &record, &expected, &path, &scope, &mut held, &mut lease
+        ),
+        Err(Failure::Certificate(_))
+    ));
+    let restored = cache.durable_restore_record(
+        source,
+        &record,
+        &expected,
+        &path,
+        &scope,
+        &mut File::open(&path).unwrap(),
+        &mut lease,
+    );
+    assert!(restored.is_ok());
+    drop(restored);
+    lease.release();
+    let store::LeaseWait::Granted(lease) = cache.acquire_active(source, store::ACTIVE_BYTES) else {
+        panic!("error left active credit")
+    };
+    lease.release();
+}
+
+// Direct ordinary admission primitive with take-back enabled. The original
+// graph, rank, guard and flags survive refusal; success has no RAM residue.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "validated native cache layout")]
+fn atomic_cache_transit_returns_same_graph_and_custody_or_retains_original_refusal() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    assert!(crate::heap_layout_bound::layout_supported());
+    let _clear = ClearPreparationFault;
+    for arm in ["accept", "heap", "capacity", "poison", "absent"] {
+        let root = crate::test_scratch::ScratchDir::new("atomic-cache-transit");
+        let path = root.join("source.jsonl");
+        let source = SnapshotSource::ClaudeCode;
+        let cache = SharedCache::default();
+        let mut taken = *owned_fixture(source, &path, &Scope("transit".into()));
+        let body = codec::encode(
+            &taken.retained.state,
+            store::BODY_BYTES,
+            jsonl_line_cap() as u64,
+        )
+        .unwrap();
+        let guard = cache
+            .begin_retail(
+                source,
+                "key",
+                &taken.retained.checkpoint,
+                &File::open(&path).unwrap(),
+                taken.retained.checkpoint.sealed_offset(),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        let facts = (guard.object, guard.next, guard.end, guard.old_end);
+        taken.durable.put_retail(guard);
+        let checkpoint = format!("{:?}", taken.retained.checkpoint);
+        let mut completed = sampled_jsonl::CompletedNativeAcquisition {
+            durable: taken.durable,
+            checkpoint: taken.retained.checkpoint,
+            reduction: Some(taken.retained.state),
+            released: Some((17, 19)),
+            unsealed: false,
+        };
+        match arm {
+            "heap" => sampled_jsonl::preparation_tests::refuse_heap(true),
+            "capacity" => {
+                *cache.retained().unwrap() =
+                    crate::transcript_cache::TranscriptCache::with_byte_limit(0)
+            }
+            "poison" => cache.poison_retained(),
+            "absent" => {
+                drop(completed.reduction.take());
+            }
+            _ => {}
+        }
+        let store::LeaseWait::Granted(lease) = cache.acquire_prepared_transfer(source) else {
+            panic!("lease unavailable")
+        };
+        let result = cache.insert_with_custody("key".into(), completed, 23, true, false, true);
+        let mut durable = if arm == "accept" {
+            let mut returned = match result {
+                Ok(Some(taken)) => taken,
+                _ => panic!("expected actual admission and take"),
+            };
+            assert!(cache.retained().unwrap().peek("key").is_none());
+            assert_eq!(format!("{:?}", returned.retained.checkpoint), checkpoint);
+            assert_eq!(
+                codec::encode(
+                    &returned.retained.state,
+                    store::BODY_BYTES,
+                    jsonl_line_cap() as u64
+                )
+                .unwrap(),
+                body
+            );
+            assert_eq!(
+                (
+                    returned.modified_hint,
+                    returned.finalization_charge,
+                    returned.e2_held_new_file
+                ),
+                ((17, 19), 23, true)
+            );
+            std::mem::take(&mut returned.durable)
+        } else {
+            let original = match result {
+                Err(original) => original,
+                _ => panic!("refusal lost original"),
+            };
+            assert_eq!(format!("{:?}", original.checkpoint), checkpoint);
+            assert_eq!(original.released, Some((17, 19)));
+            assert!(!original.unsealed);
+            if arm == "absent" {
+                assert!(original.reduction.is_none());
+            } else {
+                assert_eq!(
+                    codec::encode(
+                        original.reduction.as_ref().unwrap(),
+                        store::BODY_BYTES,
+                        jsonl_line_cap() as u64
+                    )
+                    .unwrap(),
+                    body
+                );
+            }
+            original.durable
+        };
+        let guard = durable.take_retail().expect("one original guard");
+        assert_eq!((guard.object, guard.next, guard.end, guard.old_end), facts);
+        guard.finish();
+        assert!(durable.is_empty(), "custody ended before credit release");
+        lease.release();
+        sampled_jsonl::preparation_tests::refuse_heap(false);
+    }
+}
+
+// Direct bounded snapshot API, with real encoded native Claude and Codex graphs.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "validated native decode layout")]
+fn bounded_snapshot_result_refuses_before_graph_allocation_and_then_decodes_both_sources() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    assert!(crate::heap_layout_bound::layout_supported());
+    let _reset = ResetActiveBudget;
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let root = crate::test_scratch::ScratchDir::new("bounded-snapshot-result");
+        let path = root.join("source.jsonl");
+        let taken = owned_fixture(source, &path, &Scope("snapshot-budget".into()));
+        let body = codec::encode(
+            &taken.retained.state,
+            store::BODY_BYTES,
+            jsonl_line_cap() as u64,
+        )
+        .unwrap();
+        store::active::set_active_budget_for_test(Some(0));
+        let store::LeaseWait::Granted(mut lease) = store::ActiveLease::acquire(source.api_slug())
+        else {
+            panic!("lease unavailable")
+        };
+        assert!(matches!(
+            codec::decode_bounded(&body, source, &mut lease),
+            Err(crate::durable_tail_codec::DecodeFailure::Budget)
+        ));
+        lease.release();
+        store::active::set_active_budget_for_test(None);
+        let store::LeaseWait::Granted(mut lease) = store::ActiveLease::acquire(source.api_slug())
+        else {
+            panic!("lease unavailable")
+        };
+        let decoded = codec::decode_bounded(&body, source, &mut lease).unwrap();
+        assert_eq!(decoded.counting(), taken.retained.state.durable_counting());
+        assert_eq!(
+            decoded.head_end().unwrap(),
+            codec::decode(&body, source).unwrap().head_end().unwrap()
+        );
+        drop(decoded);
+        assert!(matches!(
+            codec::decode_bounded(&[], source, &mut lease),
+            Err(crate::durable_tail_codec::DecodeFailure::Integrity)
+        ));
+        lease.release();
+    }
+}
+
+// Actual production caller, not the direct API fixtures above. The accepted
+// frontier is the record's frontier: this fixture's exact old-byte overlap is0;
+// its positive Tail and physical guarded bytes discriminate the lost-guard bug.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "validated native admission layout")]
+fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    assert!(crate::heap_layout_bound::layout_supported());
+    let _gate = claude_request_money::e2::GateForTest::set(true);
+    let _clear = ClearPreparationFault;
+    for return_mode in [
+        "accept",
+        "capacity",
+        "poison",
+        "persistent_capacity",
+        "spent",
+        "funding",
+        "funding_spent",
+    ] {
+        let refuse_return = matches!(return_mode, "capacity" | "poison" | "persistent_capacity");
+        let root = crate::test_scratch::ScratchDir::new("cold-prepare-return-tail");
+        let lock = test_locks::hold(&root);
+        let sessions = root.join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let path = sessions.join("11111111-2222-4333-8444-555555555555.jsonl");
+        native_fixture(&path);
+        let key = local_index_key(&path);
+        let source = SnapshotSource::ClaudeCode;
+        let namespace = Scope("cold-owned-prepare".into());
+        let index_path = root.join("index.json");
+        let cache = Arc::new(SharedCache::default());
+        cache.durable_begin_pass(source, &index_path, &namespace, true);
+        let start = |index| {
+            OwnedSourceScan::new_with_identity_capture(
+                source,
+                std::slice::from_ref(&sessions),
+                index,
+                "2026-10-20T12:00:00Z",
+                365,
+                100,
+                false,
+                None,
+                &[],
+                false,
+                true,
+                true,
+            )
+            .with_sampled_acquisition(cache.clone(), namespace.clone())
+        };
+        let finish = |mut scan: OwnedSourceScan| {
+            let mut modes = (0, 0, 0);
+            for _ in 0..10_000 {
+                if let Some(context) = scan.sampling.as_ref() {
+                    modes = (context.full_files, context.tail_files, context.native_bytes);
+                }
+                match scan.step(None) {
+                    OwnedSourceScanStep::Pending(next) => scan = next,
+                    OwnedSourceScanStep::Complete { index, scan, .. } => {
+                        return (index, scan, modes)
+                    }
+                }
+            }
+            panic!("scan did not complete");
+        };
+        let (mut index, first, _) = finish(start(ScanIndex::default()));
+        assert_eq!(first.snapshots.len(), 1);
+        assert_eq!(first.snapshots[0].input_tokens, 100);
+        assert!(cache.retained().unwrap().peek(&key).is_some());
+        index.save(&index_path).unwrap();
+        assert_eq!(
+            cache
+                .durable_write_after_save(lock, source, &index)
+                .unwrap()
+                .written,
+            1
+        );
+        let checkpoint = cache
+            .retained()
+            .unwrap()
+            .peek(&key)
+            .unwrap()
+            .checkpoint
+            .clone();
+        cache.retained().unwrap().clear();
+        let record_end = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(index.files[&key].size_bytes, record_end);
+        let suffix = serde_json::json!({"type":"assistant","sessionId":"11111111-2222-4333-8444-555555555555",
+            "timestamp":"2026-10-07T10:01:00Z","requestId":"req-tail",
+            "message":{"id":"msg-tail","model":"fixture-model","usage":{"input_tokens":25,"output_tokens":3}}}).to_string()+"\n";
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(suffix.as_bytes())
+            .unwrap();
+        if return_mode.starts_with("funding") {
+            let spent = return_mode == "funding_spent";
+            let suffix_bytes = suffix.len() as u64;
+            let attempts_before = cache.durable().unwrap().counters.restore_attempts;
+            let records_before = cache.durable_counters(source).unwrap().1.records_read;
+            if spent {
+                cache
+                    .begin_retail(
+                        source,
+                        &key,
+                        &checkpoint,
+                        &File::open(&path).unwrap(),
+                        record_end,
+                        std::time::Instant::now(),
+                    )
+                    .unwrap()
+                    .finish();
+            }
+            let before = (retail_bytes(source, 0), retail_bytes(source, 1));
+            let census = index.claude_request_census.get(&key).unwrap().clone();
+            let blocked = Arc::new(Mutex::new(None));
+            let owner = blocked.clone();
+            let pressure = cache.clone();
+            let lookup = key.clone();
+            BEFORE_COLD_TRANSFER.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    // The cold owner is acquired before decode and RAM visibility.
+                    assert!(pressure.retained().unwrap().peek(&lookup).is_none());
+                    assert_eq!(
+                        pressure.durable().unwrap().counters.restore_attempts,
+                        attempts_before
+                    );
+                    assert_eq!(
+                        pressure.durable_counters(source).unwrap().1.records_read,
+                        records_before
+                    );
+                    let store::LeaseWait::Granted(lease) =
+                        pressure.acquire_active(source, store::ACTIVE_BYTES)
+                    else {
+                        panic!("competing active owner must win before cold allocation")
+                    };
+                    *owner.lock().unwrap() = Some(lease);
+                    // Exercise the real owner/FIFO deadline path, not a fabricated Busy.
+                    store::ActiveLease::timeout_next_acquire_for_test(
+                        std::time::Duration::from_millis(5),
+                    );
+                }))
+            });
+            let ((pending_index, result, modes), events) =
+                crate::local_resource_diagnostics::capture(|| finish(start(index)));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["counts"]["active_wait_busy"] == 1)
+                    .count(),
+                1
+            );
+            assert!(!events
+                .iter()
+                .any(|event| event["counts"]["active_drop_release"] == 1));
+            assert!(result.snapshots.is_empty());
+            assert_eq!((modes.0, modes.1, modes.2), (0, 0, 0));
+            assert!(
+                cache.retained().unwrap().peek(&key).is_none(),
+                "Pending leaves no guardless RAM A"
+            );
+            assert_eq!(pending_index.claude_request_census.get(&key), Some(&census));
+            assert_eq!((retail_bytes(source, 0), retail_bytes(source, 1)), before);
+            {
+                let stores = cache.durable().unwrap();
+                assert_eq!(
+                    stores.counters.ineligible.get("prepared_funding_pending"),
+                    Some(&1)
+                );
+                assert_eq!(stores.counters.held_census, [1, 0]);
+                assert_eq!(stores.counters.restored, 0);
+                assert_eq!(stores.retail_spent.len(), usize::from(spent));
+                assert_eq!(stores.counters.retail_attempts, u64::from(spent));
+            }
+            blocked
+                .lock()
+                .unwrap()
+                .take()
+                .expect("actual competing owner")
+                .release();
+            let observed = Arc::new(Mutex::new(0));
+            let observed_guard = observed.clone();
+            sampled_jsonl::preparation_tests::set(Some(Box::new(move |taken| {
+                let guard = taken
+                    .durable
+                    .retail
+                    .as_ref()
+                    .expect("next-pass cold Tail requires Q11");
+                assert_eq!(
+                    (guard.next, guard.end, guard.old_end),
+                    (record_end, record_end + suffix_bytes, record_end)
+                );
+                *observed_guard.lock().unwrap() += 1;
+                Ok(())
+            })));
+            let (next_index, result, modes) = finish(start(pending_index));
+            sampled_jsonl::preparation_tests::set(None);
+            assert_eq!(modes.0, 0);
+            if spent {
+                assert_eq!(*observed.lock().unwrap(), 0, "spent gate precedes prepare");
+                assert!(result.snapshots.is_empty());
+                assert_eq!((modes.1, modes.2), (0, 0));
+                assert_eq!(
+                    cache
+                        .durable()
+                        .unwrap()
+                        .counters
+                        .ineligible
+                        .get("retail_hold.exhausted"),
+                    Some(&1)
+                );
+                assert_eq!(cache.durable().unwrap().counters.held_census, [2, 0]);
+                assert_eq!((retail_bytes(source, 0), retail_bytes(source, 1)), before);
+                assert_eq!(next_index.claude_request_census.get(&key), Some(&census));
+                assert!(cache.retained().unwrap().peek(&key).is_none());
+            } else {
+                assert_eq!(*observed.lock().unwrap(), 1);
+                assert_eq!(result.snapshots.len(), 1);
+                assert_eq!(result.snapshots[0].input_tokens, 125);
+                assert_eq!(modes.1, 1);
+                assert_eq!(modes.2, suffix_bytes);
+                assert_eq!(retail_bytes(source, 0) - before.0, suffix.len() as u64);
+                assert_eq!(
+                    retail_bytes(source, 1) - before.1,
+                    0,
+                    "exact accepted overlap"
+                );
+            }
+            assert_eq!(cache.durable().unwrap().retail_spent.len(), 1);
+            assert_eq!(cache.durable().unwrap().counters.retail_attempts, 1);
+            let store::LeaseWait::Granted(lease) =
+                cache.acquire_active(source, store::ACTIVE_BYTES)
+            else {
+                panic!("Pending or spent refusal leaked transfer funding")
+            };
+            lease.release();
+            continue;
+        }
+        let other_restore = other_source_restore_after_return_release(&root, lock);
+        let original_record = store_snapshot(&store::store_dir_for_index(&index_path));
+        let granted = Arc::new(Mutex::new(None));
+        let observation = granted.clone();
+        let pressure = cache.clone();
+        sampled_jsonl::preparation_tests::set(Some(Box::new(move |taken| {
+            let guard = taken
+                .durable
+                .retail
+                .as_ref()
+                .expect("guard BEFORE owned prepare");
+            let facts = (
+                guard.object,
+                guard.next,
+                guard.end,
+                guard.old_end,
+                taken.modified_hint,
+                taken.finalization_charge,
+                taken.e2_held_new_file,
+                taken as *const _ as usize,
+                guard as *const _ as usize,
+            );
+            *observation.lock().unwrap() = Some(facts);
+            if return_mode == "poison" {
+                pressure.poison_retained();
+            } else if refuse_return {
+                *pressure.retained().unwrap() =
+                    crate::transcript_cache::TranscriptCache::with_byte_limit(0);
+            }
+            anyhow::bail!("injected native prepare failure")
+        })));
+        let before = (retail_bytes(source, 0), retail_bytes(source, 1));
+        let mut scan = start(index);
+        for _ in 0..10_000 {
+            scan = match scan.step(None) {
+                OwnedSourceScanStep::Pending(next) => next,
+                _ => panic!("error must retain a pending pass"),
+            };
+            if granted.lock().unwrap().is_some() {
+                break;
+            }
+        }
+        let facts = granted
+            .lock()
+            .unwrap()
+            .expect("real cold path reached hook");
+        assert_eq!(facts.1, record_end);
+        assert_eq!(facts.2, record_end + suffix.len() as u64);
+        assert_eq!(facts.3, record_end);
+        assert_eq!(
+            (retail_bytes(source, 0), retail_bytes(source, 1)),
+            before,
+            "prepare failure reads no suffix"
+        );
+        assert_eq!(cache.durable().unwrap().retail_spent.len(), 1);
+        assert_eq!(cache.durable().unwrap().counters.retail_attempts, 1);
+        assert_eq!(scan.sampling.as_ref().unwrap().full_files, 0);
+        assert_eq!(scan.sampling.as_ref().unwrap().native_bytes, 0);
+        if matches!(return_mode, "poison" | "persistent_capacity") {
+            let active = scan.active_file.as_ref().expect("funded persistent hold");
+            assert!(active
+                .parser
+                .pending_taken
+                .as_ref()
+                .unwrap()
+                .durable
+                .retail
+                .is_some());
+            assert!(active.parser.pending_funding.is_some());
+            assert_eq!(
+                cache.lock_poisoned_for_test(super::super::TestLock::Retained),
+                return_mode == "poison"
+            );
+            store::ActiveLease::timeout_next_acquire_for_test(std::time::Duration::from_millis(5));
+            assert!(matches!(
+                cache.acquire_active(SnapshotSource::Codex, 0),
+                store::LeaseWait::Busy
+            ));
+            let (scan, events) = crate::local_resource_diagnostics::capture(|| {
+                for attempt in 2..=RETURN_ADMISSION_ATTEMPTS {
+                    scan = match scan.step(None) {
+                        OwnedSourceScanStep::Pending(next) => next,
+                        _ => panic!("return retries must remain cooperative"),
+                    };
+                    assert_eq!(
+                        scan.active_file.is_some(),
+                        attempt < RETURN_ADMISSION_ATTEMPTS
+                    );
+                }
+                scan
+            });
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["counts"]["prepared_return_dropped"] == 1)
+                    .count(),
+                1
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| event["counts"]["active_drop_release"] == 1),
+                "terminal release is explicit"
+            );
+            assert!(scan.active_file.is_none());
+            assert_eq!(scan.sampling.as_ref().unwrap().native_bytes, 0);
+            assert_eq!(scan.sampling.as_ref().unwrap().full_files, 0);
+            drop(scan);
+            sampled_jsonl::preparation_tests::set(None);
+            other_restore(); // Real other-source cold restore now acquires the owner.
+            assert_eq!(
+                store_snapshot(&store::store_dir_for_index(&index_path)),
+                original_record
+            );
+
+            let store::LeaseWait::Granted(lease) =
+                cache.acquire_active(source, store::ACTIVE_BYTES)
+            else {
+                panic!("cancel leaked funding")
+            };
+            lease.release();
+            assert_eq!((retail_bytes(source, 0), retail_bytes(source, 1)), before);
+            assert_eq!(cache.durable().unwrap().retail_spent.len(), 1);
+            sampled_jsonl::preparation_tests::set(None);
+            continue;
+        }
+        if refuse_return {
+            let active = scan
+                .active_file
+                .as_deref_mut()
+                .expect("funded actual native owner");
+            let taken = active.parser.pending_taken.as_mut().expect("original held");
+            assert!(active.parser.pending_funding.is_some());
+            assert_eq!(
+                &**taken as *const _ as usize, facts.7,
+                "same original through refused return"
+            );
+            assert_eq!(
+                taken.durable.retail_mut().unwrap() as *mut _ as usize,
+                facts.8,
+                "same one guard"
+            );
+            assert!(
+                active.parser.step().is_err(),
+                "held original cannot read through parser"
+            );
+            *cache.retained().unwrap() = crate::transcript_cache::TranscriptCache::default();
+        } else {
+            assert!(cache.retained().unwrap().peek(&key).is_some());
+        }
+        sampled_jsonl::preparation_tests::set(None);
+        let index = if refuse_return {
+            // Return to RAM before reading, then re-offer the same candidate.
+            scan = match scan.step(None) {
+                OwnedSourceScanStep::Pending(next) => next,
+                _ => panic!("return is a continuation"),
+            };
+            assert!(scan.active_file.is_none());
+            assert!(cache.retained().unwrap().peek(&key).is_some());
+            let (index, result, modes) = finish(scan);
+            assert_eq!(result.snapshots.len(), 1);
+            assert_eq!(result.snapshots[0].input_tokens, 125);
+            assert_eq!(modes.0, 0);
+            assert_eq!(modes.1, 1);
+            index
+        } else {
+            let (index, result, modes) = finish(scan);
+            assert!(
+                result.snapshots.is_empty(),
+                "failed attempt publishes nothing"
+            );
+            assert_eq!(modes.0, 0);
+            index
+        };
+        if return_mode == "spent" {
+            let mut old = cache.take(&key).expect("returned original");
+            old.durable.take_retail().expect("one grant").finish();
+            drop(old); // Model cancellation: never reinsert an explicitly ended guard.
+            let mut index = index;
+            for _ in 0..5 {
+                let (next, result, modes) = finish(start(index));
+                assert!(result.snapshots.is_empty());
+                assert_eq!((modes.0, modes.1, modes.2), (0, 0, 0));
+                assert!(
+                    cache.retained().unwrap().peek(&key).is_none(),
+                    "spent guard cannot leave reusable A"
+                );
+                assert_eq!((retail_bytes(source, 0), retail_bytes(source, 1)), before);
+                index = next;
+            }
+            assert_eq!(cache.durable().unwrap().counters.retail_attempts, 1);
+            let store::LeaseWait::Granted(lease) =
+                cache.acquire_active(source, store::ACTIVE_BYTES)
+            else {
+                panic!("denied grant leaked funding")
+            };
+            lease.release();
+            continue;
+        }
+        if !refuse_return {
+            let (_, result, modes) = finish(start(index));
+            assert_eq!(result.snapshots.len(), 1);
+            assert_eq!(result.snapshots[0].input_tokens, 125);
+            assert_eq!(modes.0, 0);
+            assert_eq!(modes.1, 1);
+        }
+        assert_eq!(retail_bytes(source, 0) - before.0, suffix.len() as u64);
+        assert_eq!(
+            retail_bytes(source, 1) - before.1,
+            0,
+            "exact old accepted overlap"
+        );
+        assert_eq!(
+            cache.durable().unwrap().retail_spent.len(),
+            1,
+            "no second Q11 grant"
+        );
+        assert_eq!(cache.durable().unwrap().counters.retail_attempts, 1);
+        let (_, events) = crate::local_resource_diagnostics::capture(|| {
+            let store::LeaseWait::Granted(lease) =
+                cache.acquire_active(source, store::ACTIVE_BYTES)
+            else {
+                panic!("lease leaked")
+            };
+            lease.release();
+        });
+        assert!(!events
+            .iter()
+            .any(|event| event["counts"]["active_drop_release"] == 1));
+    }
+}
+
+#[test]
+fn owned_prepare_rejects_with_original_box_graph_flags_and_unique_guard() {
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        for arm in [
+            "capture",
+            "scope",
+            "read_error",
+            "buffered",
+            "finished",
+            "occupied",
+            "source",
+            "priority",
+        ] {
+            if arm == "priority" && source != SnapshotSource::Codex {
+                continue;
+            }
+            let root = crate::test_scratch::ScratchDir::new("owned-prepare-reject");
+            let path = root.join("source.jsonl");
+            let scope = Scope("owned-file".into());
+            let mut taken = owned_fixture(source, &path, &scope);
+            let cache = SharedCache::default();
+            let attempt = cache
+                .begin_retail(
+                    source,
+                    &local_index_key(&path),
+                    &taken.retained.checkpoint,
+                    &File::open(&path).unwrap(),
+                    taken.retained.checkpoint.sealed_offset(),
+                    std::time::Instant::now(),
+                )
+                .unwrap();
+            let expected_guard = (attempt.object, attempt.next, attempt.end);
+            taken.durable.put_retail(attempt);
+            if arm == "capture" {
+                taken
+                    .retained
+                    .state
+                    .accumulator_for_test()
+                    .claude_request_identity_capture = true;
+            }
+            if arm == "priority" {
+                taken
+                    .retained
+                    .state
+                    .accumulator_for_test()
+                    .codex_observed_priority_turns =
+                    Some(BTreeMap::from([("turn-1".into(), true)]));
+            }
+            let body = codec::encode(
+                &taken.retained.state,
+                store::BODY_BYTES,
+                jsonl_line_cap() as u64,
+            )
+            .unwrap();
+            let address = (&*taken) as *const Taken<CachedJsonlReduction> as usize;
+            let file = if arm == "read_error" {
+                std::io::Write::write_all(
+                    &mut std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&path)
+                        .unwrap(),
+                    b"{}\n",
+                )
+                .unwrap();
+                std::fs::OpenOptions::new().write(true).open(&path).unwrap()
+            } else {
+                File::open(&path).unwrap()
+            };
+            let mut parser = owned_parser(source, &path, file);
+            assert!(!parser.reader.reader.is_compressed());
+            assert!(parser.reader.reader.buffer().is_empty() && !parser.reader.finished);
+            assert!(
+                parser.reader.reader.accepts_durable(),
+                "fresh native invariant"
+            );
+            if arm == "source" {
+                parser.source = SnapshotSource::Pi;
+            }
+            if arm == "buffered" {
+                assert!(!parser.reader.reader.fill_buf().unwrap().is_empty());
+            }
+            if arm == "finished" {
+                parser.reader.finished = true;
+            }
+            if arm == "occupied" {
+                parser
+                    .reader
+                    .reader
+                    .put_durable(std::mem::take(&mut taken.durable));
+            }
+            let passed_scope = if arm == "scope" {
+                Scope("other-file".into())
+            } else {
+                scope
+            };
+            let (result, events) = crate::local_resource_diagnostics::capture(|| {
+                parser.prepare_acquisition_owned(Some(taken), &passed_scope, None, 1_800_000_000)
+            });
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["counts"]["prepare_invariant"] == 1)
+                    .count(),
+                usize::from(matches!(arm, "buffered" | "finished" | "occupied")),
+                "fixed invariant alarm, distinct from old-checkpoint I/O"
+            );
+            let rejected = match result {
+                Ok(_) => panic!("{source:?}/{arm} unexpectedly accepted"),
+                Err(rejected) => rejected,
+            };
+            let expected_refusal = match arm {
+                "scope" => sampled_jsonl::PreparationRefusal::NonTransient("prepare_scope"),
+                "read_error" => sampled_jsonl::PreparationRefusal::NonTransient("prepare_io"),
+                "source" | "capture" | "counting" | "priority" => {
+                    sampled_jsonl::PreparationRefusal::NonTransient("prepare_incompatible")
+                }
+                _ => sampled_jsonl::PreparationRefusal::Transient,
+            };
+            assert_eq!(rejected.refusal, expected_refusal, "{source:?}/{arm}");
+            let mut returned = rejected.taken.expect("every rejection returns Taken");
+            assert_eq!(
+                (&*returned) as *const Taken<CachedJsonlReduction> as usize,
+                address,
+                "{arm}"
+            );
+            assert_eq!(returned.modified_hint, (17, 19));
+            assert_eq!(returned.finalization_charge, 23);
+            assert!(returned.e2_held_new_file);
+            assert_eq!(
+                codec::encode(
+                    &returned.retained.state,
+                    store::BODY_BYTES,
+                    jsonl_line_cap() as u64
+                )
+                .unwrap(),
+                body
+            );
+            let owner = if arm == "occupied" {
+                parser.reader.reader.take_durable()
+            } else {
+                std::mem::take(&mut returned.durable)
+            };
+            let mut owner = owner;
+            let attempt = owner.take_retail().expect("unique guard survived");
+            assert_eq!((attempt.object, attempt.next, attempt.end), expected_guard);
+            attempt.finish();
+            assert_eq!(cache.durable().unwrap().retail_spent.len(), 1);
+        }
+    }
+}
+
+#[test]
+fn owned_prepare_moves_guard_to_actual_native_owner_and_ends_it_at_completion() {
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let root = crate::test_scratch::ScratchDir::new("owned-prepare-success");
+        let path = root.join("source.jsonl");
+        let scope = Scope("owned-file".into());
+        let mut taken = owned_fixture(source, &path, &scope);
+        let cache = SharedCache::default();
+        let attempt = cache
+            .begin_retail(
+                source,
+                &local_index_key(&path),
+                &taken.retained.checkpoint,
+                &File::open(&path).unwrap(),
+                taken.retained.checkpoint.sealed_offset(),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        taken.durable.put_retail(attempt);
+        let body = codec::encode(
+            &taken.retained.state,
+            store::BODY_BYTES,
+            jsonl_line_cap() as u64,
+        )
+        .unwrap();
+        let mut parser = owned_parser(source, &path, File::open(&path).unwrap());
+        let mode = match parser.prepare_acquisition_owned(Some(taken), &scope, None, 1_800_000_000)
+        {
+            Ok(mode) => mode,
+            Err(rejected) => panic!("{}", rejected.error),
+        };
+        assert_eq!(mode, crate::transcript_acquisition::ReadMode::Unchanged);
+        assert!(
+            !parser.reader.reader.accepts_durable(),
+            "actual NativeFile owns the guard"
+        );
+        assert_eq!(
+            codec::encode(
+                &parser.durable_test_reduction_copy(),
+                store::BODY_BYTES,
+                jsonl_line_cap() as u64
+            )
+            .unwrap(),
+            body
+        );
+        let sampled_jsonl::SideCertificate::Certified { completed, .. } = parser
+            .certify_without_retention(&scope, 1_800_000_000)
+            .unwrap()
+        else {
+            panic!("certified native completion required")
+        };
+        assert!(
+            completed.durable.is_empty(),
+            "finished retail cannot grant future growth reads"
+        );
+        assert!(parser.reader.reader.accepts_durable());
+        assert_eq!(
+            cache.durable().unwrap().retail_spent.len(),
+            1,
+            "finish never renews allowance"
+        );
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "needs native retained admission layout"
+)]
+fn rejected_ordinary_taken_returns_custody_rank_charge_and_held_flag_under_one_lock() {
+    assert!(crate::heap_layout_bound::layout_supported());
+    let root = crate::test_scratch::ScratchDir::new("owned-return");
+    let path = root.join("source.jsonl");
+    let scope = Scope("owned-file".into());
+    let mut taken = owned_fixture(SnapshotSource::ClaudeCode, &path, &scope);
+    let cache = SharedCache::default();
+    let key = local_index_key(&path);
+    let attempt = cache
+        .begin_retail(
+            SnapshotSource::ClaudeCode,
+            &key,
+            &taken.retained.checkpoint,
+            &File::open(&path).unwrap(),
+            taken.retained.checkpoint.sealed_offset(),
+            std::time::Instant::now(),
+        )
+        .unwrap();
+    taken.durable.put_retail(attempt);
+    let body = codec::encode(
+        &taken.retained.state,
+        store::BODY_BYTES,
+        jsonl_line_cap() as u64,
+    )
+    .unwrap();
+    assert!(cache.return_prepared_taken(key.clone(), taken).is_ok());
+    assert!(
+        cache.durable().unwrap().touched.is_empty(),
+        "a rejected acquisition is not a fresh M1 writer candidate"
+    );
+    let mut returned = cache.take(&key).expect("real cache admission");
+    assert_eq!(returned.modified_hint, (17, 19));
+    assert_eq!(returned.finalization_charge, 23);
+    assert!(returned.e2_held_new_file);
+    assert!(returned.durable.retail_mut().is_some());
+    assert_eq!(
+        codec::encode(
+            &returned.retained.state,
+            store::BODY_BYTES,
+            jsonl_line_cap() as u64
+        )
+        .unwrap(),
+        body
+    );
+    *cache.retained().unwrap() = crate::transcript_cache::TranscriptCache::with_byte_limit(0);
+    let original = Box::new(returned);
+    let address = &*original as *const _ as usize;
+    let mut refused = cache
+        .return_prepared_taken(key.clone(), original)
+        .expect_err("cache refuses");
+    assert_eq!(&*refused as *const _ as usize, address);
+    refused
+        .durable
+        .take_retail()
+        .expect("refused guard still attached")
+        .finish();
+    assert!(cache.take(&key).is_none());
+    assert_eq!(cache.durable().unwrap().retail_spent.len(), 1);
+}
+
+#[test]
+fn owned_fresh_none_and_unowned_real_edit_keep_native_full_semantics() {
+    let root = crate::test_scratch::ScratchDir::new("owned-full");
+    let path = root.join("source.jsonl");
+    let scope = Scope("owned-file".into());
+    let taken = owned_fixture(SnapshotSource::ClaudeCode, &path, &scope);
+    assert!(taken.durable.is_empty());
+    let changed = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("100", "101");
+    std::fs::write(&path, changed).unwrap();
+    let mut parser = owned_parser(
+        SnapshotSource::ClaudeCode,
+        &path,
+        File::open(&path).unwrap(),
+    );
+    let mode = match parser.prepare_acquisition_owned(Some(taken), &scope, None, 1_800_000_000) {
+        Ok(mode) => mode,
+        Err(rejected) => panic!("{}", rejected.error),
+    };
+    assert!(
+        matches!(mode, crate::transcript_acquisition::ReadMode::Full(_)),
+        "actual source edit"
+    );
+    while !parser.step().unwrap() {}
+    let (cold, _) = native_record_of(&path, &scope, SnapshotSource::ClaudeCode);
+    assert_eq!(
+        codec::encode(
+            &parser.durable_test_reduction_copy(),
+            store::BODY_BYTES,
+            jsonl_line_cap() as u64
+        )
+        .unwrap(),
+        codec::encode(&cold, store::BODY_BYTES, jsonl_line_cap() as u64).unwrap()
+    );
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let mut parser = owned_parser(source, &path, File::open(&path).unwrap());
+        let mode = match parser.prepare_acquisition_owned(None, &scope, None, 1_800_000_000) {
+            Ok(mode) => mode,
+            Err(rejected) => panic!("{}", rejected.error),
+        };
+        assert!(matches!(
+            mode,
+            crate::transcript_acquisition::ReadMode::Full(_)
+        ));
+    }
+}
+
+#[test]
+fn admissible_codex_records_survive_above_the_retired_aggregate_disk_cap() {
+    let root = crate::test_scratch::ScratchDir::new("dt-aggregate-disk");
+    let lock = crate::locked_state_dir::LockedStateDir::acquire(&root).unwrap();
+    let path = root.join("source.jsonl");
+    codex_budget_fixture(
+        &path,
+        "019fa111-2222-7333-8444-555555555555",
+        Some(1024 * 1024),
+    );
+    let scope = Scope("aggregate-file".into());
+    let (reduction, _) = native_record_of(&path, &scope, SnapshotSource::Codex);
+    let body = codec::encode(&reduction, store::BODY_BYTES, jsonl_line_cap() as u64).unwrap();
+    assert!(
+        body.len() >= 1024 * 1024,
+        "the real open-call id is retained"
+    );
+    assert!(body.len() <= store::BODY_BYTES);
+    let ds = DurableSource::Codex;
+    let allowlist = codec::allowlist_digest(SnapshotSource::Codex);
+    let mut disk = DurableTailStore::new(store::store_dir_for_index(&root.join("index.json")), ds);
+    let mut keys = Vec::new();
+    for n in 0..40 {
+        let key = store::key_digest(ds, &format!("session-{n}"));
+        let pending = PendingRecord {
+            binding: Binding {
+                source: ds,
+                key,
+                context: store::context_digest("aggregate", None),
+                scope: store::scope_digest(&scope.0, &allowlist, "identity", "v2"),
+                entry: store::entry_digest("fp", None),
+            },
+            certificate: certificate(&path, &scope),
+            body: body.clone(),
+            allowlist,
+        };
+        assert_eq!(
+            disk.write_after_save(&lock, 1, 0, vec![pending])
+                .unwrap()
+                .written,
+            1
+        );
+        keys.push(key);
+    }
+    assert_eq!(disk.counters().disk_records, 40);
+    assert!(disk.counters().disk_bytes > 32 * 1024 * 1024);
+    assert_eq!(disk.counters().budget_refused, 0);
+    let mut cold = DurableTailStore::new(disk.dir().to_owned(), ds);
+    for key in keys {
+        let record = store::tests::found(cold.read(&key));
+        assert_eq!(record.record.body, body);
+    }
+}
+
+#[test]
+fn receipt_pending_guard_keeps_accepted_witness_and_census_without_unreadable() {
+    use std::os::unix::fs::MetadataExt;
+    let root = crate::test_scratch::ScratchDir::new("dt-pending-census");
+    let lock = test_locks::hold(&root);
+    let source = SnapshotSource::ClaudeCode;
+    let path = root.join("source.jsonl");
+    native_fixture(&path);
+    let mut census = ScanCensus::default();
+    let mut candidate = candidate_from_traversal_path(
+        source,
+        ScanTraversalPath {
+            scan_root: root.to_path_buf(),
+            path: path.clone(),
+            census_member: true,
+            watcher_hint: false,
+        },
+        &mut census,
+        None,
+        365,
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    candidate.source_file_fingerprint = "b".repeat(64); // Synthetic committed version.
+    let key = local_index_key(&path);
+    let modified = candidate.modified_unix_seconds;
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        key.clone(),
+        serde_json::from_value(serde_json::json!({
+            "size_bytes":candidate.size_bytes,"modified_unix_seconds":modified,
+            "source_file_fingerprint":candidate.source_file_fingerprint,
+        "last_upload_body_witness":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }))
+        .unwrap(),
+    );
+    let metadata = std::fs::metadata(&path).unwrap();
+    candidate.physical_identity = Some([metadata.dev(), metadata.ino()]);
+    let census_record = claude_request_census::ClaudeRequestCensusRecord::synthetic_for_test(
+        &candidate.source_file_fingerprint,
+        1_800_000_000,
+        claude_request_census::ClaudeRequestCensusShape::Exact,
+        vec![11, 22],
+    )
+    .with_modified_for_test(Some(modified))
+    .with_birth_for_test(Some(claude_request_census::ClaudeRequestBirth {
+        unix_seconds: 1,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }));
+    index
+        .claude_request_census
+        .insert(key.clone(), census_record.clone());
+    assert!(claude_request_census::retain_held(&mut index, &candidate));
+    let before = serde_json::to_value(&index).unwrap();
+    let cache = SharedCache::default();
+    let index_path = root.join("index.json");
+    cache.durable_begin_pass(source, &index_path, &Scope("pending".into()), false);
+    let mut b = store::tests::binding("account", "scope", ("fp-a", None));
+    b.key = store::key_digest(DurableSource::ClaudeCode, &key);
+    {
+        let mut stores = cache.durable().unwrap();
+        let slot = stores.slot(DurableSource::ClaudeCode).as_mut().unwrap();
+        let cert = store::tests::certificate(&path);
+        slot.store
+            .write_after_save(
+                lock,
+                1,
+                0,
+                vec![store::tests::pending(b.clone(), cert.clone(), 1)],
+            )
+            .unwrap();
+        store::test_hooks::set_before_rename(Some(Box::new(|_, _| {
+            Err(std::io::Error::other("rename EIO"))
+        })));
+        store::test_hooks::set_before_unlink(Some(Box::new(|_| {
+            Err(std::io::Error::other("unlink EIO"))
+        })));
+        slot.store
+            .write_after_save(lock, 2, 0, vec![store::tests::pending(b, cert, 2)])
+            .unwrap();
+        store::test_hooks::set_before_rename(None);
+        assert!(slot.store.has_pending());
+    }
+    let reason = cache
+        .durable_funded_guard(source, &key, |cache| {
+            cache.durable_hold(source, &key, &index, &mut None)
+        })
+        .unwrap()
+        .unwrap();
+    store::test_hooks::set_before_unlink(None);
+    assert_eq!(reason, store::Refusal::ReceiptPending);
+    cache.durable_hold_exit(source, reason, &mut index, &candidate, &mut census);
+    assert_eq!(census.unreadable_path_count, 0);
+    assert_eq!(serde_json::to_value(&index).unwrap(), before);
+    assert_eq!(index.claude_request_census.get(&key), Some(&census_record));
+    let (counts, disk) = cache.durable_counters(source).unwrap();
+    assert_eq!(counts.durable_held.len(), 7);
+    assert_eq!(store::Refusal::ReceiptPending as usize, 6);
+    assert_eq!(counts.durable_held[5], 0, "retired coordinate stays zero");
+    assert_eq!(counts.durable_held[6], 1);
+    assert_eq!(counts.held_census, [1, 0]);
+    assert_eq!(counts.restored, 0);
+    assert_eq!(disk.receipt_pending_records, 1);
+    // Switching store namespaces cannot discard an unresolved obligation.
+    cache.durable_begin_pass(
+        source,
+        &root.join("other-index.json"),
+        &Scope("other".into()),
+        false,
+    );
+    let mut stores = cache.durable().unwrap();
+    let slot = stores.slot(DurableSource::ClaudeCode).as_mut().unwrap();
+    assert_eq!(slot.index_path, index_path);
+    assert!(slot.store.has_pending());
+    assert_eq!(slot.store.disabled(), Some("namespace_pending"));
+}
+
+/// Includes the directory itself, all names/bytes, identity, mode and mutation times.
+fn store_snapshot(dir: &Path) -> BTreeMap<PathBuf, (Vec<u8>, Vec<i128>)> {
+    use std::os::unix::fs::MetadataExt;
+    let mut paths = vec![dir.to_path_buf()];
+    paths.extend(std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()));
+    paths
+        .into_iter()
+        .map(|path| {
+            let m = std::fs::symlink_metadata(&path).unwrap();
+            let bytes = if m.is_file() {
+                std::fs::read(&path).unwrap()
+            } else {
+                Vec::new()
+            };
+            let stamp = vec![
+                m.dev() as i128,
+                m.ino() as i128,
+                m.len() as i128,
+                m.mode() as i128,
+                m.mtime() as i128,
+                m.mtime_nsec() as i128,
+                m.ctime() as i128,
+                m.ctime_nsec() as i128,
+            ];
+            (path, (bytes, stamp))
+        })
+        .collect()
+}
+
+struct ClearWriteFaults;
+impl Drop for ClearWriteFaults {
+    fn drop(&mut self) {
+        store::test_hooks::set_write_failure(None);
+        store::test_hooks::set_before_rename(None);
+        store::test_hooks::set_before_unlink(None);
+        store::test_hooks::set_before_dir_sync(None);
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "needs native cache admission layout"
+)]
+fn disabled_pending_store_publishes_valid_ram_through_production_scan_without_mutation() {
+    assert!(crate::heap_layout_bound::layout_supported());
+    let _gate = claude_request_money::e2::GateForTest::set(true);
+    for cause in [
+        "obligation_overflow",
+        "namespace_pending",
+        "receipt_unreconciled",
+    ] {
+        let root = crate::test_scratch::ScratchDir::new("dt-disabled-native");
+        let lock = test_locks::hold(&root);
+        let _clear = ClearWriteFaults;
+        let source = SnapshotSource::ClaudeCode;
+        let ds = DurableSource::ClaudeCode;
+        let namespace = Scope("disabled-native".into());
+        let index_path = root.join("index.json");
+        let sessions = root.join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let path = sessions.join("11111111-2222-4333-8444-555555555555.jsonl");
+        native_fixture(&path);
+        let key = local_index_key(&path);
+        let cache = Arc::new(SharedCache::default());
+        cache.durable_begin_pass(source, &index_path, &namespace, true);
+        let run = |index| {
+            let mut scan = OwnedSourceScan::new(
+                source,
+                std::slice::from_ref(&sessions),
+                index,
+                "2026-10-20T12:00:00Z",
+                365,
+                100,
+                false,
+                None,
+                &[],
+                false,
+                true,
+            )
+            .with_sampled_acquisition(cache.clone(), namespace.clone());
+            for _ in 0..10_000 {
+                match scan.step(None) {
+                    OwnedSourceScanStep::Pending(next) => scan = next,
+                    OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan),
+                }
+            }
+            panic!("production scan did not complete");
+        };
+        let (mut index, first) = run(ScanIndex::default());
+        assert_eq!(first.snapshots.len(), 1, "real native output premise");
+        assert_eq!(first.snapshots[0].input_tokens, 100);
+        assert_eq!(first.snapshots[0].output_tokens, 10);
+        assert!(
+            cache.retained().unwrap().peek(&key).is_some(),
+            "funded native RAM premise"
+        );
+        let expected_body = snapshot_upload_body_witness(&first.snapshots[0]);
+        // Retry the same valid body through ordinary gates; keep its accepted witness/census.
+        index.files.get_mut(&key).unwrap().last_snapshot_fingerprint = None;
+        let witness = index.files[&key]
+            .last_upload_body_witness
+            .clone()
+            .expect("accepted witness");
+        let census = index
+            .claude_request_census
+            .get(&key)
+            .cloned()
+            .expect("native census");
+        let records = (0..=store::MAX_BATCH)
+            .map(|n| {
+                let mut b = store::tests::binding("account", "scope", ("fp-a", None));
+                b.key = store::key_digest(ds, if n == 0 { &key } else { "unused" });
+                if n > 0 {
+                    b.key = store::key_digest(ds, &format!("pending-{n}"));
+                }
+                store::tests::pending(b, store::tests::certificate(&path), 1)
+            })
+            .collect::<Vec<_>>();
+        {
+            let mut stores = cache.durable().unwrap();
+            let slot = stores.slot(ds).as_mut().unwrap();
+            for record in &records {
+                assert_eq!(
+                    slot.store
+                        .write_after_save(lock, 1, 0, vec![record.clone()])
+                        .unwrap()
+                        .written,
+                    1
+                );
+            }
+            store::test_hooks::set_before_rename(Some(Box::new(|_, _| {
+                Err(std::io::Error::other("rename EIO"))
+            })));
+            store::test_hooks::set_before_unlink(Some(Box::new(|_| {
+                Err(std::io::Error::other("unlink EIO"))
+            })));
+            for record in &records[..store::MAX_BATCH] {
+                let mut next = record.clone();
+                next.body =
+                    store::tests::pending(next.binding.clone(), next.certificate.clone(), 2).body;
+                assert_eq!(
+                    slot.store
+                        .write_after_save(lock, 2, 0, vec![next])
+                        .unwrap()
+                        .written,
+                    0
+                );
+            }
+            assert_eq!(
+                slot.store.counters().receipt_pending_records,
+                store::MAX_BATCH as u64
+            );
+            assert_eq!(slot.store.disabled(), None, "fill table before disabling");
+            if cause == "receipt_unreconciled" {
+                for _ in 0..2 {
+                    assert!(slot
+                        .store
+                        .reconcile_pending(lock, &records[0].binding.key)
+                        .is_err());
+                }
+            }
+            if cause == "obligation_overflow" {
+                let mut next = records[store::MAX_BATCH].clone();
+                next.body =
+                    store::tests::pending(next.binding.clone(), next.certificate.clone(), 2).body;
+                assert_eq!(
+                    slot.store
+                        .write_after_save(lock, 2, 0, vec![next])
+                        .unwrap()
+                        .written,
+                    0
+                );
+            }
+        }
+        // Remove the injected failure: no retirement/reconciliation may erase custody.
+        store::test_hooks::set_before_rename(None);
+        store::test_hooks::set_before_unlink(None);
+        if cause == "namespace_pending" {
+            cache.durable_begin_pass(
+                source,
+                &root.join("other-index.json"),
+                &Scope("other".into()),
+                true,
+            );
+        }
+        let dir = store::store_dir_for_index(&index_path);
+        let before = store_snapshot(&dir);
+        let (debt, counters) = {
+            let mut stores = cache.durable().unwrap();
+            let slot = stores.slot(ds).as_mut().unwrap();
+            assert_eq!(slot.store.disabled(), Some(cause));
+            assert!(slot.store.receipt_pending(&store::key_digest(ds, &key)));
+            (
+                store::tests::pending_snapshot(&slot.store),
+                slot.store.counters(),
+            )
+        };
+        // These hooks prove no write/unlink/sync, in addition to full disk equality.
+        store::test_hooks::set_before_rename(Some(Box::new(|_, _| panic!("disabled rename"))));
+        store::test_hooks::set_before_unlink(Some(Box::new(|_| panic!("disabled unlink"))));
+        store::test_hooks::set_before_dir_sync(Some(Box::new(|_| panic!("disabled sync"))));
+        assert_eq!(cache.reconcile_pending_key(source, &key), None);
+        assert_eq!(cache.durable_hold(source, &key, &index, &mut None), None);
+        let ((mut index, degraded), events) =
+            crate::local_resource_diagnostics::capture(|| run(index));
+        assert_eq!(
+            degraded.snapshots.len(),
+            1,
+            "disabled capacity must publish"
+        );
+        assert_eq!(
+            snapshot_upload_body_witness(&degraded.snapshots[0]),
+            expected_body
+        );
+        assert_eq!(degraded.unreadable_path_count, 0);
+        assert!(events
+            .iter()
+            .any(|e| e["counts"]["store_disabled"] == cause));
+        assert_eq!(
+            index.files[&key].last_upload_body_witness.as_ref(),
+            Some(&witness)
+        );
+        assert_eq!(index.claude_request_census.get(&key), Some(&census));
+        let reads = events
+            .iter()
+            .filter_map(|e| e["counts"].get("sampled_acquisition"))
+            .filter(|r| r.is_object())
+            .collect::<Vec<_>>();
+        assert!(!reads.is_empty(), "real acquisition diagnostics reached");
+        assert!(reads.iter().all(|r| r["full_selections"] == 0));
+        assert!(reads
+            .iter()
+            .any(|r| r["unchanged_selections"].as_u64().unwrap() > 0));
+        assert!(reads.iter().all(|r| r["completed_native_bytes"] == 0));
+        let (counts, _) = cache.durable_counters(source).unwrap();
+        assert_eq!(counts.restored, 0);
+        assert_eq!(counts.durable_held, [0; 8]);
+        {
+            let mut stores = cache.durable().unwrap();
+            let slot = stores.slot(ds).as_mut().unwrap();
+            assert_eq!(store::tests::pending_snapshot(&slot.store), debt);
+            assert_eq!(
+                slot.store.read(&store::key_digest(ds, &key)),
+                ReadOutcome::Missing
+            );
+            assert_eq!(
+                slot.store.counters(),
+                counters,
+                "disabled store performs no work"
+            );
+        }
+        index.save(&index_path).unwrap();
+        assert_eq!(
+            cache
+                .durable_write_after_save(lock, source, &index)
+                .unwrap()
+                .written,
+            0
+        );
+        cache.durable_gc(lock, source, &index).unwrap();
+        assert_eq!(store_snapshot(&dir), before);
+        let mut stores = cache.durable().unwrap();
+        assert_eq!(
+            store::tests::pending_snapshot(&stores.slot(ds).as_ref().unwrap().store),
+            debt
+        );
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "needs native cache admission layout"
+)]
+fn m1_setup_inventory_and_statvfs_failures_are_counted_and_retry_with_original_provenance() {
+    assert!(crate::heap_layout_bound::layout_supported());
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        for (stage_index, stage) in ["setup", "inventory", "statvfs"].into_iter().enumerate() {
+            let root = crate::test_scratch::ScratchDir::new("dt-write-attempt-failure");
+            let lock = test_locks::hold(&root);
+            let _clear = ClearWriteFaults;
+            let path = root.join("source.jsonl");
+            if source == SnapshotSource::Codex {
+                codex_budget_fixture(&path, "019fa111-2222-7333-8444-555555555555", None);
+            } else {
+                native_fixture(&path);
+            }
+            let scope = Scope("failure-file".into());
+            let namespace = Scope("failure-attempt".into());
+            let index_path = root.join("index.json");
+            let key = local_index_key(&path);
+            let cache = SharedCache::default();
+            cache.durable_begin_pass(source, &index_path, &namespace, false);
+            let (reduction, checkpoint) = native_record_of(&path, &scope, source);
+            let expected_body =
+                codec::encode(&reduction, store::BODY_BYTES, jsonl_line_cap() as u64).unwrap();
+            assert!(cache.insert_admitted(
+                key.clone(),
+                sampled_jsonl::CompletedNativeAcquisition {
+                    durable: Default::default(),
+                    checkpoint,
+                    reduction: Some(reduction),
+                    released: None,
+                    unsealed: false,
+                },
+                0
+            ));
+            cache.durable_note_selection(&key, "original-fingerprint");
+            let mut index = ScanIndex::default();
+            index.files.insert(
+                key.clone(),
+                serde_json::from_value(serde_json::json!({
+                    "size_bytes":std::fs::metadata(&path).unwrap().len(),
+                    "modified_unix_seconds":1,"source_file_fingerprint":"original-fingerprint"
+                }))
+                .unwrap(),
+            );
+            index.save(&index_path).unwrap();
+            store::test_hooks::set_write_failure(Some(stage));
+            let (failed, events) = crate::local_resource_diagnostics::capture(|| {
+                cache.durable_write_after_save(lock, source, &index)
+            });
+            store::test_hooks::set_write_failure(None);
+            assert!(
+                failed.is_none(),
+                "no false batch receipt: {source:?}/{stage}"
+            );
+            let (counts, disk) = cache.durable_counters(source).unwrap();
+            assert_eq!(counts.not_persisted.get(stage), Some(&1));
+            assert_eq!(
+                disk.store_write_failed,
+                std::array::from_fn(|i| u64::from(i == stage_index))
+            );
+            assert_eq!(disk.records_written, 0);
+            assert_eq!(disk.receipt_pending_records, 0);
+            assert_eq!(disk.receipt_reconciled, 0);
+            assert!(events
+                .iter()
+                .any(|e| e["counts"]["store_write_failed"][stage] == 1
+                    && e["counts"]["not_persisted"][stage] == 1
+                    && e["source"] == source.api_slug()));
+            {
+                let stores = cache.durable().unwrap();
+                assert!(stores.touched.contains(&key));
+                assert_eq!(
+                    stores.selected.get(&key).map(String::as_str),
+                    Some("original-fingerprint")
+                );
+            }
+            let ds = durable_source(source).unwrap();
+            {
+                let mut stores = cache.durable().unwrap();
+                assert_eq!(
+                    stores
+                        .slot(ds)
+                        .as_mut()
+                        .unwrap()
+                        .store
+                        .read(&store::key_digest(ds, &key)),
+                    ReadOutcome::Missing
+                );
+            }
+            // No new selection/admission/acquisition: next save retries the same provenance.
+            cache.durable_begin_pass(source, &index_path, &namespace, false);
+            index.save(&index_path).unwrap();
+            assert_eq!(
+                cache
+                    .durable_write_after_save(lock, source, &index)
+                    .unwrap()
+                    .written,
+                1
+            );
+            let mut stores = cache.durable().unwrap();
+            assert!(!stores.touched.contains(&key));
+            assert!(!stores.selected.contains_key(&key));
+            let record = store::tests::found(
+                stores
+                    .slot(ds)
+                    .as_mut()
+                    .unwrap()
+                    .store
+                    .read(&store::key_digest(ds, &key)),
+            );
+            assert_eq!(record.record.body, expected_body);
+            assert_eq!(record.index_generation, index.generation);
+        }
+    }
+}
+
+#[test]
+fn oversized_active_request_refuses_without_waiting_or_opening_a_store() {
+    let cache = SharedCache::default();
+    let (result, events) = crate::local_resource_diagnostics::capture(|| {
+        cache.acquire_active(SnapshotSource::Codex, store::ACTIVE_BYTES + 1)
+    });
+    assert!(matches!(result, store::LeaseWait::Busy));
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["counts"]["active_budget_refused"], 1);
+    assert!(cache.durable_counters(SnapshotSource::Codex).is_none());
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "needs native cache admission layout"
+)]
+fn existing_m1_writer_uses_and_releases_active_credit_on_success_and_io_error() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+        Arc,
+    };
+    assert!(crate::heap_layout_bound::layout_supported());
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let root = crate::test_scratch::private_dir("ottto-writer-active-credit");
+        let lock = test_locks::hold(&root);
+        let index_path = root.join("index.json");
+        let scope = Scope("writer-active-file".into());
+        let cache = SharedCache::default();
+        cache.durable_begin_pass(source, &index_path, &Scope("writer-active".into()), false);
+        let mut index = ScanIndex::default();
+        for fail in [false, true] {
+            let path = root.join(if fail { "fault.jsonl" } else { "success.jsonl" });
+            if source == SnapshotSource::Codex {
+                codex_budget_fixture(&path, "019fa111-2222-7333-8444-555555555555", None);
+            } else {
+                std::fs::write(&path, serde_json::json!({"type":"assistant", "sessionId":"active-credit",
+                    "message":{"id":"msg-active", "model":"claude-opus-4-1", "role":"assistant", "content":[],
+                        "usage":{"input_tokens":5,"output_tokens":2}}}).to_string()+"\n").unwrap();
+            }
+            let key = local_index_key(&path);
+            let (reduction, checkpoint) = native_record_of(&path, &scope, source);
+            let body =
+                codec::encode(&reduction, store::RECORD_BYTES, jsonl_line_cap() as u64).unwrap();
+            assert!(cache.insert_admitted(
+                key.clone(),
+                sampled_jsonl::CompletedNativeAcquisition {
+                    durable: Default::default(),
+                    checkpoint,
+                    reduction: Some(reduction),
+                    released: None,
+                    unsealed: false,
+                },
+                0
+            ));
+            cache.durable_note_selection(&key, "fp");
+            index.files.insert(
+                key.clone(),
+                serde_json::from_value(serde_json::json!({
+                    "size_bytes":std::fs::metadata(&path).unwrap().len(),
+                    "modified_unix_seconds":1,"source_file_fingerprint":"fp"
+                }))
+                .unwrap(),
+            );
+            index.save(&index_path).unwrap();
+            let reached = Arc::new(AtomicBool::new(false));
+            if fail {
+                let reached = reached.clone();
+                store::test_hooks::set_before_rename(Some(Box::new(move |_, _| {
+                    reached.store(true, AtomicOrdering::SeqCst);
+                    Err(std::io::Error::other("synthetic rename failure"))
+                })));
+            }
+            let (receipt, events) = crate::local_resource_diagnostics::capture(|| {
+                cache.durable_write_after_save(lock, source, &index)
+            });
+            store::test_hooks::set_before_rename(None);
+            assert_eq!(reached.load(AtomicOrdering::SeqCst), fail);
+            assert!(receipt.is_some());
+            if fail {
+                assert_eq!(receipt.as_ref().unwrap().written, 0);
+                assert_eq!(
+                    cache
+                        .durable_counters(source)
+                        .unwrap()
+                        .1
+                        .durable_write_failed_published,
+                    1
+                );
+            }
+            if !fail {
+                assert_eq!(receipt.unwrap().written, 1);
+                let ds = durable_source(source).unwrap();
+                let mut disk = DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+                let ReadOutcome::Found(record) = disk.read(&store::key_digest(ds, &key)) else {
+                    panic!("real M1 write produced no readable record");
+                };
+                assert_eq!(record.record.body, body);
+            }
+            let reserved = (4 * store::RECORD_BYTES + WRITE_PASS_BYTES) as u64;
+            assert!(events
+                .iter()
+                .any(|e| e["counts"]["active_current_bytes"] == reserved));
+            assert!(events
+                .iter()
+                .any(|e| e["counts"]["active_peak_bytes"] == reserved));
+            assert!(events
+                .iter()
+                .any(|e| e["counts"]["active_current_bytes"] == 0));
+            assert!(!events
+                .iter()
+                .any(|e| e["counts"]["active_drop_release"] == 1));
+            let store::LeaseWait::Granted(lease) = cache.acquire_active(source, 0) else {
+                panic!("writer exit leaked active ownership");
+            };
+            lease.release();
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
 
 fn indexed_key(n: usize) -> String {
     format!("/synthetic/sessions/rollout-{n:05}.jsonl")
@@ -77,7 +2310,7 @@ fn gc_on_a_large_index_looks_up_only_the_store_inventory() {
             allowlist,
         })
         .collect();
-    store.write_after_save(lock, 1, pending).unwrap();
+    store.write_after_save(lock, 1, 0, pending).unwrap();
 
     cache.durable_gc(lock, source, &index).unwrap();
     let (counters, stats) = cache.durable_counters(source).unwrap();
@@ -296,6 +2529,7 @@ fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
             .write_after_save(
                 lock,
                 index.generation,
+                0,
                 vec![PendingRecord {
                     binding,
                     certificate: certificate(&path, &scope),
@@ -369,6 +2603,7 @@ fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
             assert!(cache.insert_admitted(
                 key.clone(),
                 sampled_jsonl::CompletedNativeAcquisition {
+                    durable: Default::default(),
                     checkpoint,
                     reduction: Some(reduction),
                     released: None,
@@ -450,6 +2685,7 @@ fn attribution_capture_toggle_refuses_the_previous_claude_record() {
             .write_after_save(
                 lock,
                 index.generation,
+                0,
                 vec![PendingRecord {
                     binding: binding.clone(),
                     certificate: certificate(&path, &scope),
@@ -550,8 +2786,8 @@ fn open_call(call_id_bytes: usize) -> serde_json::Value {
 /// (`WRITE_PASS_BYTES`) keeps its acquired selection provenance. Its next
 /// save, with no rescan or admission of the key in between, writes its
 /// record: no selection refusal, no invalidation of the key's existing
-/// record (intact while its replacement waits), and a restart restores the
-/// replacement. Arm `spent`: the first two bodies use the allowance exactly
+/// record (intact while its replacement waits). The restart preserves the
+/// content-bearing replacement under the explicit pre-read resource hold. Arm `spent`: the first two bodies use the allowance exactly
 /// (`budget == 0`); arm `too_large`: the third body exceeds the remainder.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
@@ -580,6 +2816,7 @@ fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
         assert!(cache.insert_admitted(
             key.clone(),
             sampled_jsonl::CompletedNativeAcquisition {
+                durable: Default::default(),
                 checkpoint,
                 reduction: Some(reduction),
                 released: None,
@@ -752,56 +2989,36 @@ fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
         }
         drop(cache);
 
-        // Restart: all three restore from the committed index.
+        // Restart: all three content-bearing records hold before native input.
         let loaded = ScanIndex::load(&index_path).unwrap();
         let restart = SharedCache::default();
         restart.durable_begin_pass(source, &index_path, &namespace, false);
         for (path, body) in [(&a, &body_a), (&b, &body_b), (&c, &body_c)] {
             let key = local_index_key(path);
             let interpretation = Interpretation::of(source, &key, &loaded, false, &namespace);
-            let taken = restart
-                .durable_restore(
-                    source,
-                    &key,
-                    path,
-                    &scope,
-                    &mut File::open(path).unwrap(),
-                    &loaded,
-                    &interpretation,
-                )
-                .into_test_option()
-                .unwrap_or_else(|| {
-                    let (counts, disk) = restart.durable_counters(source).unwrap();
-                    panic!("{arm}: restore: {}", counts.summary(source, &disk))
-                });
+            let outcome = restart.durable_restore(
+                source,
+                &key,
+                path,
+                &scope,
+                &mut File::open(path).unwrap(),
+                &loaded,
+                &interpretation,
+            );
+            assert_rederive_pending(outcome, &restart, source, &key);
+            let direct = legacy_rederive_oracle(path, body, source);
             assert_eq!(
-                codec::encode(&taken.retained.state, store::RECORD_BYTES, cap).unwrap(),
+                codec::encode(&direct, store::RECORD_BYTES, cap).unwrap(),
                 *body,
                 "{arm}"
             );
         }
         let (counts, disk) = restart.durable_counters(source).unwrap();
         println!("dt_budget {arm} restart: {}", counts.summary(source, &disk));
-        assert_eq!(counts.restored, 3, "{arm}");
+        assert_eq!(counts.restored, 0, "{arm}: resource holds grant no restore");
+        assert_eq!(counts.ineligible.get("rederive_unfunded"), Some(&3));
         assert_eq!(disk.t14_rebuild_full_started, 0);
         let _ = std::fs::remove_dir_all(root);
-    }
-}
-
-trait RestoreTestOutcome {
-    fn into_test_option(
-        self,
-    ) -> Option<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>>;
-}
-impl RestoreTestOutcome for sampled_scan::durable_tail::RestoreOutcome {
-    fn into_test_option(
-        self,
-    ) -> Option<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>> {
-        match self {
-            Self::Restored(taken) => Some(*taken),
-            Self::Miss(_) | Self::Stale(_) | Self::Held(store::Refusal::BehindAccepted) => None,
-            Self::Held(reason) => panic!("ordinary restore unexpectedly Held: {reason:?}"),
-        }
     }
 }
 
@@ -887,7 +3104,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                     body: crate::snapshots::durable_store_fixture_body(source, 0, 0),
                     allowlist: codec::allowlist_digest(source),
                 };
-                disk.write_after_save(lock, 1, vec![record(store_key), record(absent_key)])
+                disk.write_after_save(lock, 1, 0, vec![record(store_key), record(absent_key)])
                     .unwrap();
                 let hex = |key: store::Digest32| {
                     key.iter().map(|b| format!("{b:02x}")).collect::<String>()
@@ -975,7 +3192,9 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                     scan.sampling = None;
                 }
                 if bypass == "allow_sample_false" {
-                    scan.sampling.as_mut().unwrap().audit_metadata_supported = false;
+                    if let Some(context) = scan.sampling.as_mut() {
+                        context.audit_metadata_supported = false;
+                    }
                 }
                 if bypass == "state_false" {
                     scan.state_census_complete = false;
@@ -1129,7 +3348,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                     );
                     assert_eq!(std::fs::read(&record_path).unwrap(), bytes);
                 } else {
-                    assert_eq!(counts.durable_held, [0; 6]);
+                    assert_eq!(counts.durable_held, [0; 8]);
                 }
                 assert_eq!(counts.restored, 0);
                 let _ = std::fs::remove_dir_all(root);
@@ -1171,7 +3390,7 @@ fn foreign_owned_store_alarms_once_and_holds_nothing() {
         body: crate::snapshots::durable_store_fixture_body(source, 0, 0),
         allowlist: codec::allowlist_digest(source),
     };
-    disk.write_after_save(lock, 1, vec![pending]).unwrap();
+    disk.write_after_save(lock, 1, 0, vec![pending]).unwrap();
     let record_path = std::fs::read_dir(disk.dir())
         .unwrap()
         .next()
@@ -1283,6 +3502,7 @@ fn store_io_failures_emit_cold_production_body_without_holds() {
             disk.write_after_save(
                 lock,
                 1,
+                0,
                 vec![PendingRecord {
                     binding: Binding {
                         source: ds,
@@ -1366,8 +3586,8 @@ fn store_io_failures_emit_cold_production_body_without_holds() {
                 ])
             );
             let (counts, stats) = cache.durable_counters(source).unwrap();
-            assert_eq!(counts.durable_held, [0; 6]);
-            assert_eq!(stats.format_hold, [0; 6]);
+            assert_eq!(counts.durable_held, [0; 8]);
+            assert_eq!(stats.format_hold, [0; 8]);
             assert_eq!(stats.records_written, 0);
             assert_eq!(stats.gc_records_deleted + stats.gc_temps_deleted, 0);
             assert_eq!(std::fs::read(&record).unwrap(), before);
@@ -1419,6 +3639,7 @@ fn t14_without_retention_or_encodable_reduction_holds_on_later_passes() {
         disk.write_after_save(
             lock,
             1,
+            0,
             vec![PendingRecord {
                 binding: Binding {
                     source: ds,
@@ -1453,6 +3674,7 @@ fn t14_without_retention_or_encodable_reduction_holds_on_later_passes() {
         let admitted = cache.insert_admitted(
             key.clone(),
             sampled_jsonl::CompletedNativeAcquisition {
+                durable: Default::default(),
                 checkpoint,
                 reduction: (arm == "codec").then_some(reduction),
                 released: None,
@@ -1486,7 +3708,7 @@ fn t14_without_retention_or_encodable_reduction_holds_on_later_passes() {
             );
             let (counts, stats) = cache.durable_counters(source).unwrap();
             assert_eq!(stats.t14_rebuild, 1);
-            assert_eq!(counts.durable_held, [0; 6]);
+            assert_eq!(counts.durable_held, [0; 8]);
             assert_eq!(
                 stats.format_hold[store::Refusal::Corrupt as usize],
                 previous_holds + n
@@ -1640,6 +3862,7 @@ fn known_corrupt_replacement_case(fail_replacement: bool) {
     disk.write_after_save(
         lock,
         1,
+        0,
         vec![PendingRecord {
             binding: Binding {
                 source: DurableSource::ClaudeCode,
@@ -1828,7 +4051,7 @@ fn known_corrupt_replacement_case(fail_replacement: bool) {
     let (counts, stats) = cache.durable_counters(source).unwrap();
     assert!(counts.not_persisted["known_corrupt_memory_only"] > 0);
     assert!(counts.not_persisted["known_corrupt_held"] > 0);
-    assert_eq!(counts.durable_held, [0; 6]);
+    assert_eq!(counts.durable_held, [0; 8]);
     assert_eq!(stats.t14_rebuild_full_started, 1);
     let ((), alarms) = crate::local_resource_diagnostics::capture(|| cache.durable_alarm(source));
     assert!(alarms
@@ -1920,7 +4143,10 @@ fn save_without_per_pass_setup_keeps_valid_records() {
             allowlist: codec::allowlist_digest(source),
         })
         .collect();
-    assert_eq!(disk.write_after_save(lock, 1, pending).unwrap().written, 2);
+    assert_eq!(
+        disk.write_after_save(lock, 1, 0, pending).unwrap().written,
+        2
+    );
     let path = |key: &str| {
         let hex = store::key_digest(ds, key)
             .iter()
@@ -1993,7 +4219,7 @@ fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites(
             let namespace = Scope("v1-bindings".into());
             let scope = Scope("v1-file-scope".into());
             let mut index = ScanIndex::default();
-            index.files.insert(key.clone(),serde_json::from_value(serde_json::json!({"size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"real-native"})).unwrap());
+            index.files.insert(key.clone(),serde_json::from_value(serde_json::json!({"size_bytes":std::fs::metadata(&path).unwrap().len(),"modified_unix_seconds":1,"source_file_fingerprint":"real-native"})).unwrap());
             index.save(&index_path).unwrap();
             let interp = Interpretation::of(source, &key, &index, false, &namespace);
             let ds = durable_source(source).unwrap();
@@ -2054,20 +4280,25 @@ fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites(
             }
             let cache = SharedCache::default();
             cache.durable_begin_pass(source, &index_path, &changed_namespace, false);
-            let result = cache
-                .durable_restore(
-                    source,
-                    &key,
-                    &path,
-                    &changed_scope,
-                    &mut File::open(&path).unwrap(),
-                    &index,
-                    &changed,
-                )
-                .into_test_option();
+            let outcome = cache.durable_restore(
+                source,
+                &key,
+                &path,
+                &changed_scope,
+                &mut File::open(&path).unwrap(),
+                &index,
+                &changed,
+            );
+            let content_hold = source == SnapshotSource::Codex && arm == "equal";
+            let result = if content_hold {
+                assert_rederive_pending(outcome, &cache, source, &key);
+                None
+            } else {
+                outcome.into_test_option()
+            };
             assert_eq!(
                 result.is_some(),
-                arm == "equal"
+                (arm == "equal" && !content_hold)
                     || (source == SnapshotSource::ClaudeCode
                         && matches!(arm, "entry" | "generation")),
                 "{source:?} {arm}"
@@ -2077,16 +4308,27 @@ fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites(
                 bytes,
                 "bootstrap never eagerly replaces"
             );
-            if let Some(taken) = result {
-                assert_eq!(
-                    codec::encode(
-                        &taken.retained.state,
-                        store::RECORD_BYTES,
-                        jsonl_line_cap() as u64
-                    )
-                    .unwrap(),
-                    pending.body
-                );
+            if arm == "equal" {
+                if content_hold {
+                    let direct = legacy_rederive_oracle(&path, &pending.body, source);
+                    assert_eq!(
+                        codec::encode(&direct, store::RECORD_BYTES, jsonl_line_cap() as u64)
+                            .unwrap(),
+                        pending.body
+                    );
+                } else {
+                    let taken = result.expect("no-input record actually restored");
+                    assert_eq!(
+                        codec::encode(
+                            &taken.retained.state,
+                            store::RECORD_BYTES,
+                            jsonl_line_cap() as u64
+                        )
+                        .unwrap(),
+                        pending.body
+                    );
+                    drop(taken);
+                }
                 // A failed format-only write leaves v1 authoritative even after GC.
                 store::test_hooks::set_before_rename(Some(Box::new(|_, _| {
                     Err(std::io::Error::other("injected"))
@@ -2118,9 +4360,14 @@ fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites(
                 }
                 assert_eq!(predecessor.eligible(&proof), Ok(()));
                 disk_store.authorize(&predecessor, &proof);
-                assert!(disk_store
-                    .write_after_save(lock, index.generation, vec![v2])
-                    .is_err());
+                let receipt = disk_store
+                    .write_after_save(lock, index.generation, 0, vec![v2])
+                    .unwrap();
+                assert_eq!(
+                    receipt.written, 1,
+                    "the byte-identical survivor is a reconciled receipt"
+                );
+                assert_eq!(disk_store.counters().receipt_reconciled, 1);
                 store::test_hooks::set_before_rename(None);
                 cache.durable_note_scope(source, &key, &scope);
                 cache.durable_gc(lock, source, &index).unwrap();
@@ -2132,8 +4379,10 @@ fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites(
                     .unwrap()
                     .binding;
                 over_budget.body.resize(store::RECORD_BYTES, 0);
+                let predecessor = store::tests::found(disk_store.read(&pending.binding.key));
+                disk_store.authorize(&predecessor, &proof);
                 let receipt = disk_store
-                    .write_after_save(lock, index.generation, vec![over_budget])
+                    .write_after_save(lock, index.generation, 0, vec![over_budget])
                     .unwrap();
                 assert_eq!(receipt.budget_refused, 1);
                 assert_eq!(receipt.written, 0);
@@ -2141,18 +4390,20 @@ fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites(
                 assert_eq!(std::fs::read(&disk).unwrap(), bytes);
                 let restart = SharedCache::default();
                 restart.durable_begin_pass(source, &index_path, &namespace, false);
-                assert!(restart
-                    .durable_restore(
-                        source,
-                        &key,
-                        &path,
-                        &scope,
-                        &mut File::open(&path).unwrap(),
-                        &index,
-                        &interp
-                    )
-                    .into_test_option()
-                    .is_some());
+                let outcome = restart.durable_restore(
+                    source,
+                    &key,
+                    &path,
+                    &scope,
+                    &mut File::open(&path).unwrap(),
+                    &index,
+                    &interp,
+                );
+                if content_hold {
+                    assert_rederive_pending(outcome, &restart, source, &key);
+                } else {
+                    assert!(outcome.into_test_option().is_some());
+                }
             } else {
                 let (counts, _) = cache.durable_counters(source).unwrap();
                 assert_eq!(
@@ -2205,7 +4456,7 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
         let namespace = Scope("counting-namespace".into());
         let index_path = root.join("index.json");
         let mut index = ScanIndex::default();
-        let mut entry: ScanIndexEntry=serde_json::from_value(serde_json::json!({"size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"native-owned"})).unwrap();
+        let mut entry: ScanIndexEntry=serde_json::from_value(serde_json::json!({"size_bytes":std::fs::metadata(&path).unwrap().len(),"modified_unix_seconds":1,"source_file_fingerprint":"native-owned"})).unwrap();
         if evidence == AckEvidence::LegacyAcked {
             entry.last_snapshot_fingerprint = Some("prior-Legacy-ACK".into());
         }
@@ -2271,24 +4522,36 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
         if crate::heap_layout_bound::layout_supported() {
             let cache = SharedCache::default();
             cache.durable_begin_pass(source, &index_path, &namespace, false);
-            let restored = cache
-                .durable_restore(
-                    source,
-                    &key,
-                    &path,
-                    &scope,
-                    &mut File::open(&path).unwrap(),
-                    &index,
-                    &interpretation,
-                )
-                .into_test_option()
-                .expect("v1 maps without content acquisition");
-            assert_eq!(restored.retained.state.durable_counting(), Some(fact));
+            let outcome = cache.durable_restore(
+                source,
+                &key,
+                &path,
+                &scope,
+                &mut File::open(&path).unwrap(),
+                &index,
+                &interpretation,
+            );
+            assert_rederive_pending(outcome, &cache, source, &key);
+            assert_eq!(
+                std::fs::read(&disk).unwrap(),
+                bytes,
+                "resource hold preserves old representation"
+            );
+            // Separate direct native writer control; no cold restore claimed.
+            assert_eq!(reduction.durable_counting(), Some(fact));
+            let checkpoint = match parser
+                .certify_without_retention(&scope, 1_800_000_000)
+                .unwrap()
+            {
+                sampled_jsonl::SideCertificate::Certified { completed, .. } => completed.checkpoint,
+                _ => panic!("native counting control certified"),
+            };
             cache.insert(
                 key.clone(),
                 sampled_jsonl::CompletedNativeAcquisition {
-                    checkpoint: restored.retained.checkpoint,
-                    reduction: Some(restored.retained.state),
+                    durable: Default::default(),
+                    checkpoint,
+                    reduction: Some(reduction),
                     released: None,
                     unsealed: false,
                 },
@@ -2310,19 +4573,20 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
             assert_eq!(next.format, store::FORMAT_VERSION);
             let restart = SharedCache::default();
             restart.durable_begin_pass(source, &index_path, &namespace, false);
-            let second = restart
-                .durable_restore(
-                    source,
-                    &key,
-                    &path,
-                    &scope,
-                    &mut File::open(&path).unwrap(),
-                    &index,
-                    &interpretation,
-                )
-                .into_test_option()
-                .expect("second restart");
-            assert_eq!(second.retained.state.durable_counting(), Some(fact));
+            let second = restart.durable_restore(
+                source,
+                &key,
+                &path,
+                &scope,
+                &mut File::open(&path).unwrap(),
+                &index,
+                &interpretation,
+            );
+            assert_rederive_pending(second, &restart, source, &key);
+            assert_eq!(
+                codec::decode(&next.record.body, source).unwrap().counting(),
+                Some(fact)
+            );
             // A record whose old pinned binding proves the configured cutover
             // but whose own decoded cutover disagrees is R29, never mapped.
             let _new_cutover = TestCutover::set(1);
@@ -2510,7 +4774,7 @@ fn restore_reports_each_early_exit_without_changing_old_totals() {
     assert_eq!((old.restore_attempts, old.missing, old.restored), (4, 1, 0));
     assert_eq!(old.ineligible["selection_cleared"], 1);
     assert_eq!(old.ineligible["history_owed"], 1);
-    assert_eq!(old.durable_held, [0; 6]);
+    assert_eq!(old.durable_held, [0; 8]);
     let text = old.summary(source, &disk);
     assert!(!text.contains("restore_attempts="));
     assert!(text.contains("disk_records="));
@@ -2617,6 +4881,7 @@ fn store_unavailable_after_t14_breaker_is_not_missing() {
     disk.write_after_save(
         lock,
         1,
+        0,
         keys.iter()
             .map(|key| PendingRecord {
                 binding: Binding {
@@ -2739,6 +5004,9 @@ fn compressed_record_refuses_before_certificate_restore_or_body_decode() {
         index_generation: 1,
     };
     let mut held = File::open(&plain).unwrap();
+    let store::LeaseWait::Granted(mut lease) = store::ActiveLease::acquire("codex") else {
+        panic!("test lease unavailable")
+    };
     codex_zst_refusal_tests::assert_refused(CodexZstCause::DurableTailUnsupported, || {
         assert!(matches!(
             SharedCache::default().durable_restore_record(
@@ -2748,10 +5016,12 @@ fn compressed_record_refuses_before_certificate_restore_or_body_decode() {
                 &compressed,
                 &scope,
                 &mut held,
+                &mut lease,
             ),
             Err(Failure::NotRederived(_))
         ));
     });
+    lease.release();
     // #830's wrapper rechecks holds on a restore miss. The compressed
     // refusal must precede that record IO too, not just restore_known.
     let lock = test_locks::hold(&root);
@@ -2760,7 +5030,7 @@ fn compressed_record_refuses_before_certificate_restore_or_body_decode() {
         store::store_dir_for_index(&index_path),
         DurableSource::Codex,
     );
-    disk.write_after_save(lock, 1, vec![record.record.clone()])
+    disk.write_after_save(lock, 1, 0, vec![record.record.clone()])
         .unwrap();
     let record_path = disk.dir().join(format!(
         "{}.rec",
@@ -2920,7 +5190,7 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
     };
     let dir = store::store_dir_for_index(&index_path);
     DurableTailStore::new(dir.clone(), source)
-        .write_after_save(lock, index.generation, vec![pending])
+        .write_after_save(lock, index.generation, 0, vec![pending])
         .unwrap();
     for pass in 0..2 {
         let mut index = ScanIndex::load(&index_path).unwrap();
@@ -2945,7 +5215,7 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
         rewritten.certificate = current;
         let old_wire = store::tests::pinned_v1_bytes(&rewritten, index.generation);
         DurableTailStore::new(dir.clone(), source)
-            .write_after_save(lock, index.generation, vec![rewritten])
+            .write_after_save(lock, index.generation, 0, vec![rewritten])
             .unwrap();
         let record_path = dir.join(format!(
             "{}.rec",
@@ -3059,7 +5329,7 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
             let mut replacement = record.record;
             replacement.certificate = certificate_at(&key, &checkpoint, &missing, now).unwrap();
             assert_eq!(
-                disk.write_after_save(lock, missing.generation, vec![replacement])
+                disk.write_after_save(lock, missing.generation, 0, vec![replacement])
                     .unwrap()
                     .written,
                 1,
@@ -3194,6 +5464,7 @@ fn a_permit_era_record_restores_under_the_always_on_capture() {
         .write_after_save(
             lock,
             index.generation,
+            0,
             vec![PendingRecord {
                 binding,
                 certificate: certificate(&path, &scope),
@@ -3422,7 +5693,7 @@ fn q11_overflow_never_forgets_a_spent_key_and_pread_charges_actual_bytes() {
     assert_eq!(retail_reads(), vec![(3, 3, 3)]);
     let summary = Counters {
         retail_keys: 1,
-        ..Counters::default()
+        ..Default::default()
     };
     let line = summary.summary(SnapshotSource::ClaudeCode, &store::StoreCounters::default());
     assert!(line.contains("retail_keys=1"));
@@ -3462,6 +5733,7 @@ fn q11_strict_restore_real_plain_reader_tail_then_retry_holds() {
         disk.write_after_save(
             lock,
             index.generation,
+            0,
             vec![PendingRecord {
                 binding: expected.binding,
                 certificate: certificate(&path, &scope),
@@ -3506,6 +5778,7 @@ fn q11_strict_restore_real_plain_reader_tail_then_retry_holds() {
         )
         .into_test_option()
         .expect("strict record restores");
+    let (taken, lease) = taken.into_parts();
     let attempt = cache
         .begin_retail(
             source,
@@ -3523,6 +5796,7 @@ fn q11_strict_restore_real_plain_reader_tail_then_retry_holds() {
         crate::transcript_acquisition::ReadMode::Tail
     );
     parser.reader.reader.put_retail(attempt);
+    lease.release(); // Actual native parser now owns the acquisition.
     retail_reads();
     while !parser.step().unwrap() {}
     assert_eq!(retail_reads(), vec![(accepted_end, 3, 0)]);
@@ -3560,13 +5834,12 @@ fn q11_strict_restore_real_plain_reader_tail_then_retry_holds() {
 
 #[test]
 fn q11_complete_map_is_paid_before_the_first_key() {
-    let nodes = custody_node_bytes().unwrap();
+    let nodes =
+        crate::heap_layout_bound::tree_node_bytes::<store::Digest32, (u64, std::time::Instant)>()
+            .unwrap();
     let reserve = super::super::RETAIL_RESERVE_BYTES;
     assert!((2 * store::MAX_RECORDS + 1) * nodes <= reserve);
-    assert_eq!(
-        STORES_RESIDENT_BOUND,
-        2 * store::MAX_RECORDS * 128 + reserve
-    );
+    assert_eq!(STORES_RESIDENT_BOUND, 926_720);
     assert_eq!(
         super::super::STATE_BYTES
             + reserve
@@ -3580,27 +5853,802 @@ fn q11_complete_map_is_paid_before_the_first_key() {
     );
 }
 
-thread_local! {
-    static CONSUMED: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
-}
-pub(super) fn record_consumed(bytes: u64) {
-    CONSUMED.with(|total| {
-        if let Some(n) = total.get() {
-            total.set(Some(n + bytes));
+/// Real guard + native scan: repeated receipt failure cannot outlive a quiet
+/// sampled obligation. Existing audit debt keeps this file discoverable past W.
+#[test]
+fn receipt_retry_bound_reads_growth_after_quiet_window_and_restart_is_idle() {
+    use std::io::Write;
+    assert!(crate::heap_layout_bound::layout_supported());
+    let _gate = claude_request_money::e2::GateForTest::set(true);
+    let root = crate::test_scratch::ScratchDir::new("receipt-growth-quiet");
+    let lock = test_locks::hold(&root);
+    let _clear = ClearWriteFaults;
+    let source = SnapshotSource::ClaudeCode;
+    let ds = DurableSource::ClaudeCode;
+    let namespace = Scope("receipt-growth".into());
+    let index_path = root.join("index.json");
+    let sessions = root.join("sessions");
+    std::fs::create_dir(&sessions).unwrap();
+    let path = sessions.join("11111111-2222-4333-8444-555555555555.jsonl");
+    native_fixture(&path);
+    let key = local_index_key(&path);
+    let cache = Arc::new(SharedCache::default());
+    cache.durable_begin_pass(source, &index_path, &namespace, true);
+    let run = |cache: Arc<SharedCache>, index, at: &str| {
+        let mut scan = OwnedSourceScan::new(
+            source,
+            std::slice::from_ref(&sessions),
+            index,
+            at,
+            365,
+            100,
+            false,
+            None,
+            &[],
+            false,
+            true,
+        )
+        .with_sampled_acquisition(cache, namespace.clone());
+        for _ in 0..10000 {
+            match scan.step(None) {
+                OwnedSourceScanStep::Pending(next) => scan = next,
+                OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan),
+            }
         }
+        panic!("native scan did not complete")
+    };
+    let (index, first) = run(cache.clone(), ScanIndex::default(), "2026-10-29T12:00:00Z");
+    assert_eq!(first.snapshots.len(), 1);
+    let append = |n| {
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .replace("req-dt-owed", &format!("req-growth-{n}"))
+            .replace("msg-dt-owed", &format!("msg-growth-{n}"));
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+            "{text}"
+        )
+        .unwrap();
+    };
+    append(1);
+    let (mut index, tail) = run(cache.clone(), index, "2026-10-29T12:00:00Z");
+    assert_eq!(
+        tail.snapshots[0].input_tokens, 200,
+        "no prefix duplication on real Tail"
+    );
+    assert!(
+        index.files[&key].has_unverified_source(),
+        "real sampled discoverability premise"
+    );
+    let mut binding = store::tests::binding("account", "scope", ("fp-a", None));
+    binding.key = store::key_digest(ds, &key);
+    {
+        let mut stores = cache.durable().unwrap();
+        let slot = stores.slot(ds).as_mut().unwrap();
+        let cert = store::tests::certificate(&path);
+        slot.store
+            .write_after_save(
+                lock,
+                1,
+                0,
+                vec![store::tests::pending(binding.clone(), cert.clone(), 1)],
+            )
+            .unwrap();
+        store::test_hooks::set_before_rename(Some(Box::new(|_, _| {
+            Err(std::io::Error::other("rename EIO"))
+        })));
+        store::test_hooks::set_before_unlink(Some(Box::new(|_| {
+            Err(std::io::Error::other("unlink EIO"))
+        })));
+        slot.store
+            .write_after_save(
+                lock,
+                2,
+                0,
+                vec![store::tests::pending(binding.clone(), cert, 2)],
+            )
+            .unwrap();
+        assert!(slot.store.receipt_pending(&binding.key));
+    }
+    append(2);
+    let before_disk = store_snapshot(&store::store_dir_for_index(&index_path));
+    let ((held, scan), events) = crate::local_resource_diagnostics::capture(|| {
+        run(cache.clone(), index, "2026-10-29T12:00:00Z")
     });
+    assert!(scan.snapshots.is_empty());
+    assert!(events.iter().all(
+        |e| e["counts"]["sampled_acquisition"]["completed_native_bytes"]
+            .as_u64()
+            .unwrap_or(0)
+            == 0
+    ));
+    assert_eq!(
+        cache
+            .durable()
+            .unwrap()
+            .slot(ds)
+            .as_ref()
+            .unwrap()
+            .store
+            .disabled(),
+        None
+    );
+    index = held;
+    // Preserve genuine sampled debt; move its existing deadline past due as in
+    // the native audit fixtures. The source mtime is now more than W old.
+    index
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .set_unverified_deadline(1);
+    std::fs::File::open(&path)
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1791370000)),
+        )
+        .unwrap();
+    let (_, oracle) = run(
+        Arc::new(SharedCache::default()),
+        index.clone(),
+        "2028-10-29T12:00:00Z",
+    );
+    assert_eq!(
+        oracle.snapshots.len(),
+        1,
+        "independent real Full under the same persisted audit obligation"
+    );
+    let expected_body = serde_json::to_value(&oracle.snapshots).unwrap();
+    let ((mut index, caught), events) = crate::local_resource_diagnostics::capture(|| {
+        run(cache.clone(), index, "2028-10-29T12:00:00Z")
+    });
+    assert_eq!(
+        cache
+            .durable()
+            .unwrap()
+            .slot(ds)
+            .as_ref()
+            .unwrap()
+            .store
+            .disabled(),
+        Some("receipt_unreconciled")
+    );
+    assert_eq!(caught.snapshots.len(), 1);
+    assert_eq!(caught.snapshots[0].input_tokens, 300);
+    assert_eq!(caught.snapshots[0].output_tokens, 30);
+    let reads = events
+        .iter()
+        .filter_map(|e| e["counts"].get("sampled_acquisition"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reads
+            .iter()
+            .filter_map(|r| r["full_selections"].as_u64())
+            .sum::<u64>(),
+        1
+    );
+    assert_eq!(
+        reads
+            .iter()
+            .filter_map(|r| r["completed_native_bytes"].as_u64())
+            .sum::<u64>(),
+        std::fs::metadata(&path).unwrap().len()
+    );
+    let witness = snapshot_upload_body_witness(&caught.snapshots[0]);
+    assert_eq!(
+        serde_json::to_value(&caught.snapshots).unwrap(),
+        expected_body,
+        "exact independent Full body, no repeated prefix"
+    );
+    assert_eq!(witness, snapshot_upload_body_witness(&oracle.snapshots[0]));
+    assert_eq!(
+        store_snapshot(&store::store_dir_for_index(&index_path)),
+        before_disk
+    );
+    store::test_hooks::set_before_rename(None);
+    store::test_hooks::set_before_unlink(None);
+    index.save(&index_path).unwrap();
+    drop(cache);
+    let restarted = Arc::new(SharedCache::default());
+    restarted.durable_begin_pass(source, &index_path, &namespace, true);
+    let ((index, idle), events) = crate::local_resource_diagnostics::capture(|| {
+        run(
+            restarted,
+            ScanIndex::load(&index_path).unwrap(),
+            "2028-10-29T12:00:00Z",
+        )
+    });
+    assert!(
+        idle.snapshots.is_empty(),
+        "quiet restart publishes no duplicate prefix"
+    );
+    assert!(events.iter().all(
+        |e| e["counts"]["sampled_acquisition"]["completed_native_bytes"]
+            .as_u64()
+            .unwrap_or(0)
+            == 0
+    ));
+    assert!(!index
+        .files
+        .get(&key)
+        .is_some_and(ScanIndexEntry::has_unverified_source));
 }
-fn observe_consumed<T>(f: impl FnOnce() -> T) -> (T, u64) {
-    struct Reset;
-    impl Drop for Reset {
+
+/// Seeds an actual no-content Codex record before the Claude owner is parked.
+/// The returned action drives the ordinary cold caller after bounded release.
+fn other_source_restore_after_return_release(
+    root: &Path,
+    lock: &crate::locked_state_dir::LockedStateDir,
+) -> impl FnOnce() {
+    let source = SnapshotSource::Codex;
+    let ds = DurableSource::Codex;
+    let path = root.join("019fa111-2222-7333-8444-555555555555.jsonl");
+    std::fs::write(&path, b"{}\n").unwrap();
+    let key = local_index_key(&path);
+    let namespace = Scope("other-owner".into());
+    let scope = Scope("other-file".into());
+    let index_path = root.join("other-index.json");
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        key.clone(),
+        serde_json::from_value(serde_json::json!({
+            "size_bytes": 3, "modified_unix_seconds": 1, "source_file_fingerprint": "other-fp"
+        }))
+        .unwrap(),
+    );
+    index.save(&index_path).unwrap();
+    let cache = SharedCache::default();
+    cache.durable_begin_pass(source, &index_path, &namespace, false);
+    let interp = Interpretation::of(source, &key, &index, false, &namespace);
+    let binding = expected(ds, source, &key, &scope, &index, &interp, None)
+        .unwrap()
+        .binding;
+    let (reduction, _) = native_record_of(&path, &scope, source);
+    let body = codec::encode(&reduction, store::BODY_BYTES, jsonl_line_cap() as u64).unwrap();
+    let mut disk = DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+    assert_eq!(
+        disk.write_after_save(
+            lock,
+            index.generation,
+            0,
+            vec![PendingRecord {
+                binding,
+                certificate: certificate(&path, &scope),
+                body: body.clone(),
+                allowlist: codec::allowlist_digest(source)
+            }]
+        )
+        .unwrap()
+        .written,
+        1
+    );
+    move || {
+        let interp = Interpretation::of(source, &key, &index, false, &namespace);
+        let restored = cache
+            .durable_restore(
+                source,
+                &key,
+                &path,
+                &scope,
+                &mut File::open(&path).unwrap(),
+                &index,
+                &interp,
+            )
+            .into_test_option()
+            .expect("other-source actual cold restore after terminal release");
+        assert_eq!(
+            codec::encode(
+                &restored.retained.state,
+                store::BODY_BYTES,
+                jsonl_line_cap() as u64
+            )
+            .unwrap(),
+            body
+        );
+        drop(restored);
+        let store::LeaseWait::Granted(lease) = cache.acquire_active(source, store::ACTIVE_BYTES)
+        else {
+            panic!("other restore leaked the released owner")
+        };
+        lease.release();
+    }
+}
+
+/// Existing MAIN/S2 leaves: a real resident take is losslessly returned, then
+/// this SAME native step starts Full with no old graph. These are not cold API tests.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "validated native admission layout")]
+fn production_returned_nontransient_original_reads_growth_once_then_quiet_restart_is_idle() {
+    use std::io::Write;
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    assert!(crate::heap_layout_bound::layout_supported());
+    let _gate = claude_request_money::e2::GateForTest::set(true);
+    struct DependenciesReset;
+    impl Drop for DependenciesReset {
         fn drop(&mut self) {
-            CONSUMED.with(|n| n.set(None));
+            super::super::TEST_REFUSE_REDUCTION_DEPENDENCIES.with(|v| v.set(false));
+            crate::transcript_acquisition::OLD_SAMPLE_IO_ERROR.with(|v| v.set(false));
+            sampled_jsonl::preparation_tests::set(None);
         }
     }
-    CONSUMED.with(|n| assert!(n.replace(Some(0)).is_none()));
-    let _reset = Reset;
-    let value = f();
-    (value, CONSUMED.with(|n| n.get().unwrap()))
+    let _reset = DependenciesReset;
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        for reason in [
+            "eligibility",
+            "prepare_scope",
+            "prepare_incompatible",
+            "dependency",
+            "census",
+            "prepare_io",
+            "prepare_full",
+            "large_dependency",
+            "large_header",
+        ] {
+            if reason.starts_with("large_") && source != SnapshotSource::Codex {
+                continue;
+            }
+            let root = crate::test_scratch::ScratchDir::new("returned-original-full");
+            let _lock = test_locks::hold(&root);
+            let sessions = root.join("sessions");
+            std::fs::create_dir(&sessions).unwrap();
+            let path = sessions.join(if source == SnapshotSource::Codex {
+                "rollout-2026-10-07T10-00-00-019fa111-2222-7333-8444-555555555555.jsonl"
+            } else {
+                "11111111-2222-4333-8444-555555555555.jsonl"
+            });
+            if source == SnapshotSource::Codex {
+                codex_budget_fixture(&path, "019fa111-2222-7333-8444-555555555555", None);
+            } else {
+                native_fixture(&path);
+            }
+            let key = local_index_key(&path);
+            let index_path = root.join("index.json");
+            let cache = Arc::new(SharedCache::default());
+            let guard_facts = std::rc::Rc::new(std::cell::Cell::new(None));
+            let guard_checks = std::rc::Rc::new(std::cell::Cell::new(0));
+            let full_frame_checks = std::cell::Cell::new(0);
+            let run = |index: ScanIndex,
+                       cache: Option<Arc<SharedCache>>,
+                       namespace: &str,
+                       refusal: &str,
+                       at: &str| {
+                let cache_probe = cache.clone();
+                let mut scan = OwnedSourceScan::new_with_identity_capture(
+                    source,
+                    std::slice::from_ref(&sessions),
+                    index,
+                    at,
+                    365,
+                    100,
+                    false,
+                    None,
+                    &[],
+                    false,
+                    true,
+                    true,
+                );
+                if at.starts_with("2028") {
+                    assert_eq!(
+                        scan.census_window_end, at,
+                        "fresh census, not a frozen 2026 walk"
+                    );
+                    let census = scan.census_unix_seconds.expect("real discovery clock");
+                    let modified =
+                        unix_seconds(std::fs::metadata(&path).unwrap().modified().unwrap())
+                            .unwrap();
+                    assert!(census - modified > 365 * 86400, "quiet genuinely past W");
+                    assert_eq!(scan.backfill_window_days, 365);
+                }
+                if let Some(cache) = cache {
+                    scan = scan.with_sampled_acquisition(cache, Scope(namespace.into()));
+                }
+                if refusal == "eligibility" {
+                    if let Some(context) = scan.sampling.as_mut() {
+                        context.audit_metadata_supported = false;
+                    }
+                }
+                if refusal == "census" {
+                    scan.state_census_complete = false;
+                }
+                super::super::TEST_REFUSE_REDUCTION_DEPENDENCIES
+                    .with(|v| v.set(matches!(refusal, "dependency" | "large_dependency")));
+                crate::transcript_acquisition::OLD_SAMPLE_IO_ERROR
+                    .with(|v| v.set(refusal == "prepare_io"));
+                let mut header_removed = false;
+                let mut full_checked = false;
+                let mut metrics = (0, 0, 0);
+                let mut saw_original = false;
+                let mut saw_missing_input = false;
+                for _ in 0..10000 {
+                    if refusal == "large_header" && scan.codex_join_prepared && !header_removed {
+                        let inventory = scan
+                            .codex_join_inventory
+                            .as_mut()
+                            .expect("real owning inventory");
+                        assert!(inventory.complete);
+                        assert!(inventory
+                            .headers
+                            .iter()
+                            .any(|header| header.candidate.path == path));
+                        inventory
+                            .headers
+                            .retain(|header| header.candidate.path != path);
+                        header_removed = true;
+                    }
+                    if let Some(cache) = cache_probe
+                        .as_ref()
+                        .filter(|_| refusal == "prepare_full" && !full_checked)
+                    {
+                        if let Some(active) = scan.active_file.as_mut() {
+                            let acquisition =
+                                active.sampling.as_ref().expect("real sampled Full frame");
+                            assert!(matches!(
+                                acquisition.mode,
+                                crate::transcript_acquisition::ReadMode::Full(_)
+                            ));
+                            assert_eq!(active.parser.reader.consumed_bytes(), 0);
+                            assert_eq!(
+                                active
+                                    .parser
+                                    .reader
+                                    .reader
+                                    .get_mut()
+                                    .stream_position()
+                                    .unwrap(),
+                                0
+                            );
+                            assert!(
+                                active.parser.reader.reader.accepts_durable(),
+                                "old guard never copied into fresh reader"
+                            );
+                            store::ActiveLease::timeout_next_acquire_for_test(
+                                std::time::Duration::from_millis(5),
+                            );
+                            let store::LeaseWait::Granted(lease) = cache.acquire_active(source, 0)
+                            else {
+                                panic!("preparation lease must release BEFORE zero-based Full");
+                            };
+                            lease.release();
+                            let mut original =
+                                cache.take(&key).expect("returned original still resident");
+                            let guard = original
+                                .durable
+                                .retail_mut()
+                                .expect("unique returned custody");
+                            assert_eq!(
+                                Some((guard.object, guard.next, guard.end, guard.old_end)),
+                                guard_facts.get()
+                            );
+                            assert!(cache
+                                .return_prepared_taken(key.clone(), Box::new(original))
+                                .is_ok());
+                            full_checked = true;
+                            full_frame_checks.set(full_frame_checks.get() + 1);
+                        }
+                    }
+                    if let Some(context) = scan.sampling.as_ref() {
+                        metrics = (context.full_files, context.tail_files, context.native_bytes);
+                        if refusal.starts_with("large_") {
+                            let admission = serde_json::to_value(context.admission).unwrap();
+                            saw_original |=
+                                admission["retained_entry"]["matched"].as_u64().unwrap_or(0) > 0;
+                            let gate = if refusal == "large_header" {
+                                "owning_header_current"
+                            } else {
+                                "reduction_dependencies_available"
+                            };
+                            saw_missing_input |= admission[gate]["assessed"].as_u64().unwrap_or(0)
+                                > 0
+                                && admission[gate]["matched"] == 0;
+                        }
+                    }
+                    match scan.step(None) {
+                        OwnedSourceScanStep::Pending(next) => scan = next,
+                        OwnedSourceScanStep::Complete {
+                            mut index, scan, ..
+                        } => {
+                            super::super::TEST_REFUSE_REDUCTION_DEPENDENCIES.with(|v| v.set(false));
+                            // The old-checkpoint fault remains enabled throughout
+                            // Full completion; only a reused old plan can trip it.
+                            if refusal == "large_header" {
+                                assert!(header_removed);
+                            }
+                            if refusal.starts_with("large_") {
+                                assert!(saw_original, "actual native take of resident original");
+                                assert!(
+                                    saw_missing_input,
+                                    "actual unavailable-input admission gate"
+                                );
+                            }
+                            let mut projected = scan.clone();
+                            apply_upload_policy(
+                                source,
+                                &mut projected.snapshots,
+                                SnapshotUploadPolicy::default(),
+                            );
+                            finalize_scan_after_policy(source, &mut projected, &mut index);
+                            let accepted = projected
+                                .snapshots
+                                .iter()
+                                .map(|item| item.snapshot_fingerprint.clone())
+                                .collect();
+                            index.record_accepted_snapshot_fingerprints(&accepted);
+                            return (index, scan, metrics);
+                        }
+                    }
+                }
+                panic!("real scanner did not complete")
+            };
+            let (index, first, _) = run(
+                ScanIndex::default(),
+                Some(cache.clone()),
+                "original",
+                "",
+                "2026-10-29T12:00:00Z",
+            );
+            assert_eq!(first.snapshots.len(), 1, "native seed {source:?}");
+            assert!(
+                cache.retained().unwrap().peek(&key).is_some(),
+                "actual resident premise"
+            );
+            let (mut index, idle, metrics) = run(
+                index,
+                Some(cache.clone()),
+                "original",
+                "",
+                "2026-10-29T12:00:00Z",
+            );
+            assert!(idle.snapshots.is_empty());
+            assert_eq!(
+                (metrics.0, metrics.2),
+                (0, 0),
+                "idle0Full/0body before growth"
+            );
+            if reason == "prepare_incompatible" {
+                let mut original = cache.take(&key).expect("real original");
+                // Real source/counting graph incompatibility; capture-only
+                // equality is pre-cutover and disappears with main #840.
+                let other_path = root.join("other-source.jsonl");
+                let other_source = if source == SnapshotSource::Codex {
+                    SnapshotSource::ClaudeCode
+                } else {
+                    SnapshotSource::Codex
+                };
+                let capture = original
+                    .retained
+                    .state
+                    .accumulator_for_test()
+                    .claude_request_identity_capture;
+                let mut other = owned_fixture(other_source, &other_path, &Scope("other".into()));
+                other
+                    .retained
+                    .state
+                    .accumulator_for_test()
+                    .claude_request_identity_capture = capture;
+                assert_eq!(
+                    other
+                        .retained
+                        .state
+                        .accumulator_for_test()
+                        .claude_request_identity_capture,
+                    original
+                        .retained
+                        .state
+                        .accumulator_for_test()
+                        .claude_request_identity_capture
+                );
+                assert_ne!(other.retained.state.accumulator_for_test().source, source);
+                original.retained.state = other.retained.state;
+                assert!(cache
+                    .return_prepared_taken(key.clone(), Box::new(original))
+                    .is_ok());
+            }
+            let suffix = if source == SnapshotSource::Codex {
+                let total = 100 * crate::snapshots::session_start::WINDOW_REQUESTS as u64 + 25;
+                serde_json::json!({"type":"event_msg","timestamp":"2026-10-07T10:02:00Z","payload":{"type":"token_count","info":{
+                    "model":"gpt-5.2","total_token_usage":{"input_tokens":total,"output_tokens":total/10},
+                    "last_token_usage":{"input_tokens":25,"output_tokens":3}}}})
+            } else {
+                serde_json::json!({"type":"assistant","sessionId":"11111111-2222-4333-8444-555555555555","timestamp":"2026-10-07T10:02:00Z",
+                    "requestId":"req-fallthrough","message":{"id":"msg-fallthrough","model":"fixture-model","usage":{"input_tokens":25,"output_tokens":3}}})
+            };
+            writeln!(
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap(),
+                "{suffix}"
+            )
+            .unwrap();
+            if reason == "prepare_full" {
+                let mut original = cache.take(&key).expect("actual native resident");
+                assert!(original.durable.is_empty());
+                let attempt = cache
+                    .begin_retail(
+                        source,
+                        &key,
+                        &original.retained.checkpoint,
+                        &File::open(&path).unwrap(),
+                        original.retained.checkpoint.sealed_offset(),
+                        std::time::Instant::now(),
+                    )
+                    .unwrap();
+                guard_facts.set(Some((
+                    attempt.object,
+                    attempt.next,
+                    attempt.end,
+                    attempt.old_end,
+                )));
+                original.durable.put_retail(attempt);
+                assert!(cache
+                    .return_prepared_taken(key.clone(), Box::new(original))
+                    .is_ok());
+                index
+                    .files
+                    .get_mut(&key)
+                    .unwrap()
+                    .set_unverified_deadline(1);
+                let facts = guard_facts.clone();
+                let checks = guard_checks.clone();
+                sampled_jsonl::preparation_tests::set(Some(Box::new(move |taken| {
+                    let guard = taken
+                        .durable
+                        .retail
+                        .as_ref()
+                        .expect("custody before real ReadPlan Full");
+                    assert_eq!(
+                        Some((guard.object, guard.next, guard.end, guard.old_end)),
+                        facts.get()
+                    );
+                    checks.set(checks.get() + 1);
+                    Ok(())
+                })));
+            }
+            let namespace = if reason == "prepare_scope" {
+                "changed"
+            } else {
+                "original"
+            };
+            let original_len = std::fs::metadata(&path).unwrap().len();
+            if reason.starts_with("large_") {
+                assert!(
+                    cache.retained().unwrap().peek(&key).is_some(),
+                    "real retained original before refusal"
+                );
+                assert_eq!(cache.counters_for_test().jobs_started, 0);
+                let (_, held, modes) =
+                    codex_cursor::with_test_limits(original_len * 2, original_len - 1, 64, || {
+                        assert!(
+                            std::fs::metadata(&path).unwrap().len()
+                                > codex_cursor::Limits::current().singleton()
+                        );
+                        run(
+                            index,
+                            Some(cache.clone()),
+                            namespace,
+                            reason,
+                            "2026-10-29T12:00:00Z",
+                        )
+                    });
+                assert!(held.snapshots.is_empty());
+                assert_eq!(modes, (0, 0, 0), "missing inputs cannot grant Full/body");
+                let counters = cache.counters_for_test();
+                assert_eq!(counters.jobs_started, 0, "no cursor start");
+                assert!(
+                    counters.jobs_deferred_inputs > 0,
+                    "actual no-plan InputsUnavailable gate"
+                );
+                assert!(
+                    cache.retained().unwrap().peek(&key).is_some(),
+                    "original returned losslessly"
+                );
+                continue;
+            }
+            let (_, oracle, _) = run(
+                index.clone(),
+                None,
+                namespace,
+                reason,
+                "2026-10-29T12:00:00Z",
+            );
+            assert_eq!(oracle.snapshots.len(), 1, "independent native Full premise");
+            let ((mut index, grown, metrics), events) =
+                crate::local_resource_diagnostics::capture(|| {
+                    run(
+                        index,
+                        Some(cache.clone()),
+                        namespace,
+                        reason,
+                        "2026-10-29T12:00:00Z",
+                    )
+                });
+            assert_eq!(
+                metrics,
+                (1, 0, original_len),
+                "same-step counted Full {source:?}/{reason}"
+            );
+            assert_eq!(
+                serde_json::to_value(&grown.snapshots).unwrap(),
+                serde_json::to_value(&oracle.snapshots).unwrap(),
+                "exact cumulative body with no duplicated prefix"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["counts"]["returned_original_full"][reason] == 1)
+                    .count(),
+                1,
+                "actual refused-original caller reached"
+            );
+            assert_eq!(index.files[&key].size_bytes, original_len);
+            if reason == "prepare_full" {
+                assert_eq!(
+                    guard_checks.get(),
+                    1,
+                    "one original guard, actual prepare_full branch"
+                );
+                assert_eq!(
+                    full_frame_checks.get(),
+                    1,
+                    "lease released before actual Full body"
+                );
+                assert!(events
+                    .iter()
+                    .all(|event| event["counts"]["active_drop_release"] != 1));
+                let full = events
+                    .iter()
+                    .position(|event| event["counts"]["returned_original_full"][reason] == 1)
+                    .unwrap();
+                assert!(events[..full]
+                    .iter()
+                    .any(|event| event["counts"]["active_current_bytes"] == 0));
+                sampled_jsonl::preparation_tests::set(None);
+            }
+            // A quiet period longer than W cannot hide unread suffix: growth
+            // was already fully counted and committed before entering quiet.
+            let (next, quiet, metrics) = run(
+                index,
+                Some(cache.clone()),
+                namespace,
+                if reason == "prepare_io" {
+                    "prepare_io"
+                } else {
+                    ""
+                },
+                "2028-10-29T12:00:00Z",
+            );
+            assert!(quiet.snapshots.is_empty());
+            assert_eq!((metrics.0, metrics.2), (0, 0), "quiet >=W0Full/0body");
+            index = next;
+            index.save(&index_path).unwrap();
+            drop(cache);
+            let (restarted, idle, metrics) = run(
+                ScanIndex::load(&index_path).unwrap(),
+                Some(Arc::new(SharedCache::default())),
+                namespace,
+                if reason == "prepare_io" {
+                    "prepare_io"
+                } else {
+                    ""
+                },
+                "2028-10-29T12:00:00Z",
+            );
+            assert!(idle.snapshots.is_empty());
+            assert_eq!((metrics.0, metrics.2), (0, 0), "quiet restart0Full/0body");
+            assert!(restarted
+                .files
+                .get(&key)
+                .map_or(true, |entry| entry.size_bytes == original_len));
+        }
+    }
 }
 
 #[test]
@@ -4099,7 +7147,7 @@ fn a1a_finite_named_revisions_do_not_enumerate_or_mutate_future_records() {
         DurableSource::ClaudeCode,
     );
     assert_eq!(
-        disk.write_after_save(lock, index.generation, vec![future.record.clone()])
+        disk.write_after_save(lock, index.generation, 0, vec![future.record.clone()])
             .unwrap()
             .written,
         1
@@ -4183,7 +7231,7 @@ fn a1a_frozen_floor_holds_before_certificate_even_after_working_entry_clear() {
     );
     disk.write_after_save(
         lock,
-        index.generation,
+        index.generation, 0,
         vec![PendingRecord {
             binding,
             certificate: certificate(&path, &scope),
@@ -4287,7 +7335,7 @@ fn a1a_strict_writer_preserves_cleared_and_reverted_predecessors_after_restore_p
         );
         disk.write_after_save(
             lock,
-            index.generation,
+            index.generation, 0,
             vec![PendingRecord {
                 binding,
                 certificate: certificate(&path, &scope),
@@ -4395,7 +7443,7 @@ fn a1a_supported_unprovable_migration_classifies_stale_on_growth_without_o3() {
     );
     disk.write_after_save(
         lock,
-        index.generation,
+        index.generation, 0,
         vec![PendingRecord {
             binding,
             certificate: certificate(&path, &scope),
@@ -4470,11 +7518,6 @@ fn a1a_supported_unprovable_migration_classifies_stale_on_growth_without_o3() {
         loaded.save(&index_path).unwrap();
     }
     let _ = std::fs::remove_dir_all(root);
-}
-
-thread_local! { static UPGRADE_OBSERVED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
-pub(super) fn observe_upgrade_read() {
-    UPGRADE_OBSERVED.with(|n| n.set(n.get() + 1));
 }
 
 #[test]
@@ -5191,188 +8234,6 @@ fn c_strict_writer_retires_only_a_successfully_acknowledged_replacement() {
     }
 }
 
-/// Ordinary-pass state that must survive the production continuation builder and EOF.
-pub(crate) struct ContinuationDurableState {
-    key: String,
-    digest: store::Digest32,
-    scope: Scope,
-    namespace: Scope,
-    dir: PathBuf,
-    corrupt: Vec<store::Digest32>,
-    initial: store::tests::ContinuationPassState,
-    guard_header_bytes: u64,
-}
-
-impl ContinuationDurableState {
-    pub(crate) fn seed(
-        cache: &SharedCache,
-        index: &mut ScanIndex,
-        index_path: &Path,
-        namespace: &Scope,
-        writer: &crate::locked_state_dir::LockedStateDir,
-    ) -> Self {
-        let source = SnapshotSource::Codex;
-        let ds = DurableSource::Codex;
-        let key = index_path.parent().unwrap().join("ordinary-only.jsonl");
-        std::fs::write(&key, b"{}\n").unwrap();
-        let key = local_index_key(&key);
-        index.files.insert(
-            key.clone(),
-            serde_json::from_value(serde_json::json!({
-                "size_bytes":3, "modified_unix_seconds":1, "source_file_fingerprint":"ordinary-fp"
-            }))
-            .unwrap(),
-        );
-        index.save(index_path).unwrap();
-        let scope = Scope("ordinary-decided-scope".into());
-        let old_scope = Scope("obsolete-stored-scope".into());
-        let interpretation = Interpretation::of(source, &key, index, false, namespace);
-        let binding = expected(ds, source, &key, &old_scope, index, &interpretation, None)
-            .unwrap()
-            .binding;
-        let current = expected(ds, source, &key, &scope, index, &interpretation, None).unwrap();
-        assert_ne!(
-            binding.scope, current.binding.scope,
-            "ordinary GC has a real obsolete-scope decision"
-        );
-        let digest = binding.key;
-        let allowlist = ds.properties().allowlist();
-        let record = PendingRecord {
-            binding,
-            certificate: certificate(Path::new(&key), &old_scope),
-            body: crate::snapshots::durable_store_fixture_body(source, 0, 0),
-            allowlist,
-        };
-        let corrupt: Vec<_> = (0..=store::T14_BREAKER)
-            .map(|n| store::key_digest(ds, &format!("corrupt-{n}")))
-            .collect();
-        let mut pending = vec![record.clone()];
-        for key in &corrupt {
-            let mut record = record.clone();
-            record.binding.key = *key;
-            pending.push(record);
-        }
-        cache.durable_note_scope(source, &key, &scope);
-        let mut stores = cache.durable().unwrap();
-        let slot = stores.slot(ds).as_mut().unwrap();
-        let receipt = slot
-            .store
-            .write_after_save(writer, index.generation, pending)
-            .unwrap();
-        assert_eq!(receipt.written, corrupt.len() + 1);
-        let record = match slot.store.read(&digest) {
-            ReadOutcome::Found(record) => record,
-            other => panic!("seeded ordinary record: {other:?}"),
-        };
-        slot.store.authorize(
-            &record,
-            &Expected {
-                binding: record.record.binding.clone(),
-                committed_generation: index.generation,
-            },
-        );
-        for key in &corrupt {
-            let name = key.iter().map(|b| format!("{b:02x}")).collect::<String>();
-            let path = slot.dir.join(format!("{name}.rec"));
-            let mut bytes = std::fs::read(&path).unwrap();
-            *bytes.last_mut().unwrap() ^= 1;
-            std::fs::write(&path, bytes).unwrap();
-        }
-        for key in corrupt.iter().take(store::T14_BREAKER as usize - 1) {
-            assert_eq!(slot.store.hold(key), None);
-        }
-        let initial = store::tests::continuation_pass_state(&slot.store);
-        assert!(initial.checked);
-        assert_eq!(initial.counts, [store::T14_BREAKER - 1; 2]);
-        assert_eq!(initial.rebuilt.len() as u64, store::T14_BREAKER - 1);
-        assert!(initial.authorized.contains(&digest));
-        assert_eq!(slot.store.disabled(), None);
-        Self {
-            key,
-            digest,
-            scope,
-            namespace: namespace.clone(),
-            dir: slot.dir.clone(),
-            corrupt,
-            initial,
-            guard_header_bytes: slot.store.counters().guard_header_bytes,
-        }
-    }
-
-    pub(crate) fn assert_preserved(&self, cache: &SharedCache) {
-        let mut stores = cache.durable().unwrap();
-        let slot = stores.slot(DurableSource::Codex).as_mut().unwrap();
-        assert_eq!(slot.dir, self.dir, "ordinary directory binding");
-        assert_eq!(slot.namespace, self.namespace, "ordinary namespace binding");
-        assert!(!slot.identity_capture);
-        assert_eq!(
-            slot.decided.get(&self.key),
-            Some(&self.scope),
-            "ordinary GC decision survives continuation"
-        );
-        assert_eq!(
-            store::tests::continuation_pass_state(&slot.store),
-            self.initial,
-            "continuation cannot reset checks, breaker, rebuilt keys or authority"
-        );
-        assert_eq!(
-            slot.store.counters().guard_header_bytes - self.guard_header_bytes,
-            0,
-            "continuation adds zero guard header bytes to the ordinary pass"
-        );
-    }
-
-    pub(crate) fn assert_gc_at_eof(&self, cache: &SharedCache, index: &ScanIndex) {
-        assert!(
-            index.files.contains_key(&self.key),
-            "ordinary key remains indexed"
-        );
-        let name = self
-            .digest
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>();
-        assert!(
-            !self.dir.join(format!("{name}.rec")).exists(),
-            "retained ordinary decision rejects obsolete scope at EOF GC"
-        );
-        let (_, stats) = cache.durable_counters(SnapshotSource::Codex).unwrap();
-        assert_eq!(stats.gc_records_deleted, 1);
-    }
-
-    pub(crate) fn assert_breaker_at_eof(&self, cache: &SharedCache) {
-        let mut stores = cache.durable().unwrap();
-        let slot = stores.slot(DurableSource::Codex).as_mut().unwrap();
-        let before = store::tests::continuation_pass_state(&slot.store);
-        assert!(before.checked);
-        assert_eq!(before.counts, self.initial.counts);
-        assert_eq!(before.rebuilt, self.initial.rebuilt);
-        assert_eq!(slot.store.hold(&self.corrupt[0]), None);
-        assert_eq!(
-            slot.store.counters().t14_rebuild,
-            store::T14_BREAKER - 1,
-            "repeat rebuilt key is not recounted"
-        );
-        assert_eq!(
-            slot.store
-                .hold(&self.corrupt[store::T14_BREAKER as usize - 1]),
-            None
-        );
-        assert_eq!(slot.store.counters().t14_rebuild, store::T14_BREAKER);
-        assert_eq!(slot.store.disabled(), None);
-        assert_eq!(
-            slot.store.hold(&self.corrupt[store::T14_BREAKER as usize]),
-            None
-        );
-        assert_eq!(
-            slot.store.disabled(),
-            Some("t14_breaker"),
-            "ordinary and continuation share one breaker budget"
-        );
-        assert_eq!(slot.store.counters().t14_rebuild, store::T14_BREAKER);
-    }
-}
-
 // Movable A1a-t row: real scanner, original accepted prefix and pinned v1 image.
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
@@ -5852,37 +8713,12 @@ fn a1t_transitional_full_requires_known_current_floor_and_strict_growth() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-// Movable A0-h rows: actual Plain read observer and production native wire path.
-thread_local! {
-    static A0H_READS: std::cell::Cell<Option<(usize, u64)>> = const { std::cell::Cell::new(None) };
-}
-pub(crate) fn a0h_record_read(read: &std::io::Result<usize>) {
-    A0H_READS.with(|v| {
-        if let Some((calls, bytes)) = v.get() {
-            v.set(Some((
-                calls + 1,
-                bytes + read.as_ref().copied().unwrap_or(0) as u64,
-            )));
-        }
-    });
-}
-fn a0h_observe<T>(f: impl FnOnce() -> T) -> (T, (usize, u64)) {
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            A0H_READS.with(|v| v.set(None));
-        }
-    }
-    A0H_READS.with(|v| assert!(v.replace(Some((0, 0))).is_none()));
-    let _reset = Reset;
-    let result = f();
-    (result, A0H_READS.with(|v| v.get().unwrap()))
-}
 fn a0h_row(id: &str, input: u64) -> String {
     serde_json::json!({"type":"assistant","sessionId":"1338a80a-f36e-4cbc-a5bb-50fc66430ba5",
         "timestamp":"2026-08-02T07:00:10Z","requestId":id,
         "message":{"id":id,"model":"claude-sonnet-4-5","usage":{"input_tokens":input,"output_tokens":10}}}).to_string()+"\n"
 }
+
 fn a0h_wire(root: &Path, index: &mut ScanIndex, scan: &mut SourceScanResult) -> Vec<u8> {
     let source = SnapshotSource::ClaudeCode;
     crate::snapshot_sync::apply_claude_local_evidence_to_scan(root, scan, index);
@@ -5903,6 +8739,7 @@ fn a0h_wire(root: &Path, index: &mut ScanIndex, scan: &mut SourceScanResult) -> 
     validate_snapshot_batch_request(&body).unwrap();
     serde_json::to_vec(&body).unwrap()
 }
+
 fn a0h_scan(
     owner: &crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture,
     roots: &[PathBuf],
@@ -6982,24 +9819,6 @@ fn stale_full_evicts_oldest_shared_stamp_and_paces_the_new_key() {
     assert!(!cache.retail_full("new", &file, 3, now + std::time::Duration::from_secs(2)));
     assert_eq!(cache.durable().unwrap().counters.retail_full[2], 1);
     let _ = std::fs::remove_dir_all(root);
-}
-
-thread_local! {
-    static B1_METADATA_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-pub(super) fn b1_metadata_fails() -> bool {
-    B1_METADATA_FAIL.with(|v| v.get())
-}
-fn b1_with_metadata_failure<T>(f: impl FnOnce() -> T) -> T {
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            B1_METADATA_FAIL.with(|v| v.set(false));
-        }
-    }
-    B1_METADATA_FAIL.with(|v| v.set(true));
-    let _reset = Reset;
-    f()
 }
 
 fn b1g_before_read(
