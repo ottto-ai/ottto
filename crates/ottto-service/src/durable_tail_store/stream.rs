@@ -1162,10 +1162,12 @@ mod tests {
                 .map(|n| key_digest(source, &format!("allowed-{n}")))
                 .find(|key| !store.durable.contains_key(key))
                 .unwrap();
+            let unproved = store.counters.mutation_unproved;
             assert!(
                 !store.authorized(&missing, FORMAT_V3),
                 "eviction revokes permission"
             );
+            assert_eq!(store.counters.mutation_unproved, unproved + 1);
             let before = store.counters.guard_verify_bytes;
             let header_before = store.counters.guard_header_bytes;
             let ReadOutcome::Found(record) = store.read(&missing) else {
@@ -1190,7 +1192,11 @@ mod tests {
             commit(&mut store, writer, h, &body);
             assert!(store.disabled().is_none());
             assert!(!store.has_pending());
-            assert_eq!(store.counters.mutation_unproved, 0);
+            assert_eq!(
+                store.counters.mutation_unproved,
+                unproved + 1,
+                "only the deliberate refusal before re-verification is unproved"
+            );
         }
     }
 

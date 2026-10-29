@@ -13,6 +13,7 @@ const SESSION: &str = "11111111-2222-4333-8444-555555555555";
 
 struct Fixture {
     root: crate::test_scratch::ScratchDir,
+    writer: &'static crate::locked_state_dir::LockedStateDir,
     sessions: PathBuf,
     path: PathBuf,
     namespace: Scope,
@@ -26,13 +27,14 @@ struct Read {
 impl Fixture {
     fn new() -> Self {
         let root = crate::test_scratch::ScratchDir::new("m3-layout-selection");
-        test_locks::hold(&root);
+        let writer = test_locks::hold(&root);
         let sessions = root.join("sessions");
         fs::create_dir(&sessions).unwrap();
         let path = sessions.join(format!("{SESSION}.jsonl"));
         fs::write(&path, Self::line(1)).unwrap();
         Self {
             root,
+            writer,
             sessions,
             path,
             namespace: Scope("m3-layout".into()),
@@ -97,9 +99,8 @@ impl Fixture {
     }
     fn settle(&self, cache: &SharedCache, read: &mut Read) {
         read.index.save(&self.index_path()).unwrap();
-        let writer = test_locks::hold(&self.root);
-        cache.durable_write_after_save(writer, SOURCE, &read.index);
-        cache.durable_gc(writer, SOURCE, &read.index).unwrap();
+        cache.durable_write_after_save(self.writer, SOURCE, &read.index);
+        cache.durable_gc(self.writer, SOURCE, &read.index).unwrap();
     }
     fn seed_record(&self, index: &ScanIndex) -> PathBuf {
         // Actual native stream creates v3. This is a current fixture artifact,
@@ -130,9 +131,8 @@ impl Fixture {
             generation: index.generation,
             body_len: body.len(),
         };
-        let writer = test_locks::hold(&self.root);
         let prepared = disk
-            .prepare_stream(writer, header)
+            .prepare_stream(self.writer, header)
             .unwrap()
             .write(|out| {
                 out.write_all(&body)
@@ -141,7 +141,7 @@ impl Fixture {
             })
             .unwrap();
         let commit = disk
-            .commit_stream(writer, prepared)
+            .commit_stream(self.writer, prepared)
             .unwrap()
             .commit()
             .unwrap();
@@ -215,8 +215,7 @@ fn preexisting_v3_on_unsupported_layout_reads_only_selected_key_then_retires_aft
         let original = fs::read(&record).unwrap();
         // No selected read => no retirement, even after an ordinary GC pass.
         let idle = f.cache();
-        idle.durable_gc(test_locks::hold(&f.root), SOURCE, &initial)
-            .unwrap();
+        idle.durable_gc(f.writer, SOURCE, &initial).unwrap();
         assert_eq!(fs::read(&record).unwrap(), original);
         f.select_audit(&mut initial);
         let cache = f.cache();
@@ -370,9 +369,7 @@ fn unsupported_layout_budget_deferral_keeps_a_until_a_real_selected_read() {
             sampled_scan::durable_tail::RestoreOutcome::Pending
         ));
         drop(reset);
-        cache
-            .durable_gc(test_locks::hold(&f.root), SOURCE, &index)
-            .unwrap();
+        cache.durable_gc(f.writer, SOURCE, &index).unwrap();
         assert_eq!(
             fs::read(&path).unwrap(),
             bytes,

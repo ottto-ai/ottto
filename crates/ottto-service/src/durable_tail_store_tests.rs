@@ -241,9 +241,14 @@ fn failed_rename_preserves_verified_predecessor_without_receipt_or_retirement() 
     assert_eq!(store.counters().records_invalidated, 0);
     store.durable.clear();
     store.begin_pass();
-    assert_eq!(
-        found(store.read(&b.key)).record.body,
-        placeholder_body(1, 7)
+    let predecessor = found(store.read(&b.key));
+    assert_eq!(predecessor.record.body, placeholder_body(1, 7));
+    store.authorize(
+        &predecessor,
+        &Expected {
+            binding: b.clone(),
+            committed_generation: 3,
+        },
     );
     let retry = store
         .write_after_save(&lock, 3, 0, vec![pending(b.clone(), certificate(&path), 2)])
