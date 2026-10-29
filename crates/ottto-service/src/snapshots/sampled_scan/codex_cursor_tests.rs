@@ -15993,6 +15993,7 @@ fn plain_cursor_resumes_unchanged_when_its_archive_sibling_is_family_held() {
                 continuation.snapshots.is_empty(),
                 "resume-only page never publishes"
             );
+            assert_eq!(counter(&cache, |c| c.jobs_resumed), resumed + 1);
             let (next, scan) = if cache
                 .with_cursor(|cursor| {
                     matches!(&cursor.slot,
@@ -16009,7 +16010,6 @@ fn plain_cursor_resumes_unchanged_when_its_archive_sibling_is_family_held() {
                 (next, continuation)
             };
             index = next;
-            assert_eq!(counter(&cache, |c| c.jobs_resumed), resumed + 1);
             assert_eq!(
                 counter(&cache, |c| c.jobs_started),
                 started,
