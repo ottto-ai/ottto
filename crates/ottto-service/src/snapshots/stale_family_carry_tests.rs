@@ -1231,7 +1231,7 @@ fn unfunded_replay_clears_fingerprints_on_every_platform() {
 /// R1, re-funding refused at a reload before the walk passed any member: the
 /// family is uncarried in place, every member's revision cleared, and the
 /// index equals a real BASE arm resumed the same way, apart from the carried
-/// pending the start compacted, which credits no evidence and which this
+/// pending the start retained, which credits no evidence and which this
 /// window's reads replace. Counted once.
 #[test]
 fn c1b_unfunded_replay_at_a_reload_uncarries_to_the_base_start() {
@@ -1266,7 +1266,8 @@ fn c1b_unfunded_replay_at_a_reload_uncarries_to_the_base_start() {
     for key in carry_family_keys() {
         assert!(fix.files[&key].source_file_fingerprint.is_empty());
     }
-    assert!(fix.claude_usage_family_pending[CARRY_ROOT]
+    // Phase 1 keeps the carried family's detailed old-window proof.
+    assert!(!fix.claude_usage_family_pending[CARRY_ROOT]
         .member_occurrences
         .is_empty());
     let mut fix_value = serde_json::to_value(&fix).unwrap();
