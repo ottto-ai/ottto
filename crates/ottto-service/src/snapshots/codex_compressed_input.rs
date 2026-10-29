@@ -667,7 +667,42 @@ pub(super) struct HeaderWork {
     pub(super) cpu_micros: u64,
 }
 crate::heap_layout_bound::fields!(HeaderWork; allowed, physical_bytes, decoded_bytes, cpu_micros);
+#[derive(Debug)]
+pub(super) struct ArchiveAdmissionYield;
+impl std::fmt::Display for ArchiveAdmissionYield {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("compressed rollout admission yielded")
+    }
+}
+impl std::error::Error for ArchiveAdmissionYield {}
 impl super::ScanCensus {
+    pub(super) fn archive_parser_failure(
+        &mut self,
+        source: super::SnapshotSource,
+        index: &super::ScanIndex,
+        path: &Path,
+        error: &anyhow::Error,
+    ) {
+        let archive = index
+            .files
+            .get(&super::local_index_key(path))
+            .and_then(|e| e.archive.as_deref());
+        let bodyless_pending = archive.is_some_and(|a| {
+            matches!(a.disposition, ArchiveDisposition::Pending { .. }) && a.body_witness.is_none()
+        });
+        if source != super::SnapshotSource::Codex
+            || !is_compressed_codex_rollout(Some(path), None)
+            || error.is::<ArchiveAdmissionYield>()
+            || bodyless_pending
+        {
+            self.archive_failure(index, path, super::UnreadableCause::Reduction);
+        } else {
+            let cause = archive
+                .and_then(|a| a.terminal_cause())
+                .unwrap_or(CodexZstCause::ConstructorUnfunded);
+            self.archive_residue(path, archive, cause);
+        }
+    }
     pub(super) fn archive_failure(
         &mut self,
         index: &super::ScanIndex,
@@ -901,6 +936,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for ArchiveDisposition {
 pub(in crate::snapshots) mod tests {
     include!("codex_archive_header_tests.rs");
     include!("codex_archive_correction_tests.rs");
+    include!("codex_archive_ru_tests.rs");
     use super::super::*;
     use super::*;
     use crate::transcript_acquisition::Scope;

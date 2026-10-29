@@ -16,3 +16,10 @@ in 11b-1b retained-acquisition resume. A3/A4 is deferred to 11a.4b. Discovery st
 off until the 1 GiB catch-up bound and real pacing are installed. Static fixtures
 cover reservation/terminal-outcome crash windows, save refusal, exact ACK,
 scoped removal hints and starvation. Tests/compiler/CI remain unexecuted.
+
+The three native RU exits are covered by dedicated synthetic scan fixtures:
+quiet terminal stamps, settlement-exhausted parser construction, and native
+OutputHeld finish. Parser construction now distinguishes a typed admission yield
+from other errors; only Z-ADMISSION and bodyless Z-PENDING use archive RU there.
+The fixtures check zero terminal RU, named residue and healthy state-only progress;
+execution remains deferred to the authorized validation lane.

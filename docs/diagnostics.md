@@ -817,3 +817,12 @@ that archive's twelfth consecutive yield, then `admission_starved` residue.
 in the existing bounded process map; unrelated admissions never reset them.
 Restart or map eviction loses the RAM-only streak; no durable lifetime bound is
 claimed.
+
+The native parser-construction error boundary permits archive RU only for an
+actual typed admission yield (Z-ADMISSION, until that archive's twelfth yield) or
+bodyless Pending (Z-PENDING). It does not infer a yield from a generic error or
+an old streak. Known settlement exhaustion stays terminal scoped residue;
+other construction failures without those exceptions disclose scoped
+`CompressedConstructorUnfunded` residue. Actual read/decode I/O keeps its separate
+failure classification. Quiet Held/Refused and native terminal OutputHeld also
+use scoped residue, letting healthy siblings complete census-gated work.

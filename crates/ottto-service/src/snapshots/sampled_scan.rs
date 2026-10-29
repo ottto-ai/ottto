@@ -2009,7 +2009,7 @@ pub(super) fn new_source_parser(
                 let counts = serde_json::json!({"consecutive_yields": 12, "admission_starved_count": codex_compressed_input::admission_starved_count(None)});
                 traversal_point("codex_zst_admission_alarm", "codex", &counts);
             }
-            anyhow::bail!("compressed rollout admission yielded");
+            anyhow::bail!(codex_compressed_input::ArchiveAdmissionYield);
         };
         codex_compressed_input::admission_streak(&key, false);
         let evidence = match codex_compressed_input::ArchiveEvidence::begin(

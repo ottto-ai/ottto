@@ -31701,14 +31701,14 @@ impl OwnedSourceScan {
                     }
                     pending!();
                 }
-                Err(_) => {
+                Err(error) => {
                     if source == SnapshotSource::ClaudeCode {
                         claude_request_census::invalidate_claude_request_census(
                             index,
                             &candidate.path,
                         );
                     }
-                    census.archive_failure(index, &candidate.path, UnreadableCause::Reduction);
+                    census.archive_parser_failure(source, index, &candidate.path, &error);
                     pending!();
                 }
             };
