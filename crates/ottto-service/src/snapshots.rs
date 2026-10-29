@@ -26760,7 +26760,7 @@ impl OwnedSourceScan {
             claude_effort_support_dir,
             codex_title_metadata,
             claude_title_metadata,
-            state_census_complete,
+            mut state_census_complete,
             sidecar_census_complete,
             codex_turn_traces,
             mut codex_parent_identities,
