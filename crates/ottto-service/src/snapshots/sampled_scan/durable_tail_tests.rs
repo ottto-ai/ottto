@@ -1756,7 +1756,8 @@ fn receipt_pending_guard_keeps_accepted_witness_and_census_without_unreadable() 
     assert_eq!(serde_json::to_value(&index).unwrap(), before);
     assert_eq!(index.claude_request_census.get(&key), Some(&census_record));
     let (counts, disk) = cache.durable_counters(source).unwrap();
-    assert_eq!(counts.durable_held.len(), 7);
+    // The composed floor owner adds slot7; receipt custody keeps slot6.
+    assert_eq!(counts.durable_held.len(), 8);
     assert_eq!(store::Refusal::ReceiptPending as usize, 6);
     assert_eq!(counts.durable_held[5], 0, "retired coordinate stays zero");
     assert_eq!(counts.durable_held[6], 1);
@@ -7468,10 +7469,9 @@ fn a1a_finite_named_revisions_do_not_enumerate_or_mutate_future_records() {
                     )
                 })
             });
-        assert!(matches!(
-            outcome,
-            RestoreOutcome::Stale("revision_downgrade")
-        ));
+        // S2's future accepted revision is a neutral floor hold, before any
+        // certificate read. Finite original revision mapping above is unchanged.
+        assert!(matches!(outcome, RestoreOutcome::FloorHeld));
         assert_eq!(consumed, 0);
         assert!(samples.is_empty());
         cache.durable_gc(lock, source, &index).unwrap();
@@ -7583,10 +7583,8 @@ fn a1a_frozen_floor_holds_before_certificate_even_after_working_entry_clear() {
                 RestoreOutcome::Stale("accepted_floor_missing")
             ));
         } else {
-            assert!(matches!(
-                outcome,
-                RestoreOutcome::Held(store::Refusal::BehindAccepted)
-            ));
+            // S2 freezes the accepted floor independently of the working entry.
+            assert!(matches!(outcome, RestoreOutcome::FloorHeld));
         }
         assert_eq!(cache.durable_counters(source).unwrap().0.restored, 0);
     }
@@ -11198,6 +11196,13 @@ fn shared_pace_near_cap_bypasses_cooldown_counts_and_alarms_without_tail_credit(
         &Scope("pace".into()),
         false,
     );
+    let ((), idle) = crate::local_resource_diagnostics::capture(|| cache.durable_alarm(source));
+    assert_eq!(
+        idle.len(),
+        1,
+        "idle store snapshot precedes cause-only totals"
+    );
+    assert_eq!(idle[0]["counts"]["records_read"], serde_json::json!(0));
     let now = std::time::SystemTime::now();
     let cap = max_jsonl_file_bytes(source);
     let threshold = cap - cap / 10;
@@ -11216,6 +11221,11 @@ fn shared_pace_near_cap_bypasses_cooldown_counts_and_alarms_without_tail_credit(
     let ((), alarms) = crate::local_resource_diagnostics::capture(|| cache.durable_alarm(source));
     assert_eq!(alarms.len(), 1);
     assert_eq!(alarms[0]["counts"]["near_cap"], serde_json::json!([2, 2]));
+    let ((), repeated) = crate::local_resource_diagnostics::capture(|| cache.durable_alarm(source));
+    assert!(
+        repeated.is_empty(),
+        "no duplicate cause-only alarm or blank snapshot"
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -12419,6 +12429,13 @@ fn o3_failed_atomic_replacement_never_retires_original_without_its_receipt() {
 
 #[test]
 fn o3_observation_fits_the_prepaid_full_custody_node() {
+    let root_and_shared_counter =
+        crate::heap_layout_bound::tree_node_bytes::<store::Digest32, Box<KeyCustody>>().unwrap()
+            + arc_allocation_bytes::<AtomicU64>().unwrap();
+    assert!(
+        root_and_shared_counter <= 1024,
+        "the shared counter fits the already-paid root credit"
+    );
     assert!(
         custody_node_bytes().unwrap() <= 1024,
         "full node + Box + unchanged Arc allowance"
@@ -14441,7 +14458,7 @@ fn migration_input_refusal_has_no_classifier_claim_or_pace_side_effects() {
     index.files.insert(
         key.clone(),
         serde_json::from_value(serde_json::json!({
-            "size_bytes": 3, "source_file_fingerprint": "accepted",
+            "size_bytes": 3, "modified_unix_seconds": 1, "source_file_fingerprint": "accepted",
             "effective_upload_body_witness_revision": effective_revision(source)
         }))
         .unwrap(),
@@ -14476,7 +14493,7 @@ fn codex_resource_probe_deferral_does_not_spend_recovery_pace() {
     index.files.insert(
         key.clone(),
         serde_json::from_value(serde_json::json!({
-            "size_bytes": 3, "source_file_fingerprint": "accepted"
+            "size_bytes": 3, "modified_unix_seconds": 1, "source_file_fingerprint": "accepted"
         }))
         .unwrap(),
     );
