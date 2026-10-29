@@ -80,6 +80,29 @@ impl Fixture {
             index_path,
         }
     }
+    fn assert_restart_quiet(&self, depth2: bool, label: &str) {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "snapshots::codex_child_pair_rederive::tests::codex_child_pair_restart_probe",
+                "--nocapture",
+            ])
+            .env("OTTTO_CHILD_PAIR_TEST_ROOT", &self.root)
+            .env("OTTTO_CHILD_PAIR_TEST_INDEX", &self.index_path)
+            .env(
+                "OTTTO_CHILD_PAIR_TEST_DEPTH2",
+                if depth2 { "1" } else { "0" },
+            )
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "fresh-process restart {label}: {} {}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+    }
     fn cache(&self) -> Arc<sampled_scan::SharedCache> {
         let cache = Arc::new(sampled_scan::SharedCache::default());
         cache.durable_begin_pass(
@@ -314,27 +337,7 @@ fn codex_child_pair_named_conflict_incomplete_read_once_then_two_restarts() {
         assert_eq!(reads, 0, "next pass {kind}");
         for restart in 0..2 {
             index.save(&fixture.index_path).unwrap();
-            let child = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--ignored",
-                    "--exact",
-                    "snapshots::codex_child_pair_rederive::tests::codex_child_pair_restart_probe",
-                    "--nocapture",
-                ])
-                .env("OTTTO_CHILD_PAIR_TEST_ROOT", &fixture.root)
-                .env("OTTTO_CHILD_PAIR_TEST_INDEX", &fixture.index_path)
-                .env(
-                    "OTTTO_CHILD_PAIR_TEST_DEPTH2",
-                    if kind == "depth2" { "1" } else { "0" },
-                )
-                .output()
-                .unwrap();
-            assert!(
-                child.status.success(),
-                "fresh-process restart {restart} {kind}: {} {}",
-                String::from_utf8_lossy(&child.stdout),
-                String::from_utf8_lossy(&child.stderr)
-            );
+            fixture.assert_restart_quiet(kind == "depth2", &format!("{restart} {kind}"));
             let loaded = ScanIndex::load(&fixture.index_path).unwrap();
             let (next, _, reads) = fixture.run(loaded, Some(fixture.cache()), &metadata);
             assert_eq!(reads, 0, "restart {restart} {kind}");
@@ -563,6 +566,7 @@ fn codex_child_pair_injected_read_failures_back_off_and_stop_after_three_retries
     for _ in 0..2 {
         sampled_scan::set_test_now(Some(1_000));
         index.save(&fixture.index_path).unwrap();
+        fixture.assert_restart_quiet(false, "unreadable");
         let loaded = ScanIndex::load(&fixture.index_path).unwrap();
         let (next, _, reads) =
             fixture.run_inner(loaded, Some(fixture.cache()), &metadata, Some(&faults));
@@ -620,7 +624,17 @@ fn codex_child_pair_child_own_account_changes_without_touching_parent() {
         serde_json::to_value(&index.files[&key]).unwrap(),
         original_parent_entry
     );
-    assert_eq!(parent.session_account_evidence, evidence);
+    assert_eq!(
+        evidence.as_ref().unwrap().account_identifier_hash,
+        ottto_core::billing_identity_hash("openai", "account", "synthetic-parent-user")
+    );
+    assert!(
+        after
+            .snapshots
+            .iter()
+            .all(|item| item.source_session_id != PARENT),
+        "child repair cannot replace the parent's previously emitted account"
+    );
     let child = after
         .snapshots
         .iter()
