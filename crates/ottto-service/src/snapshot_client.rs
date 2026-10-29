@@ -1581,8 +1581,24 @@ pub struct AgentStatusSnapshotUploadRequest {
     pub snapshots: Vec<AgentStatusSnapshot>,
 }
 
+// Missing org is unknown; only an explicitly uploaded empty component can
+// admit personal-account display metadata from the response.
+fn uploaded_nickname_identity_matches(
+    pair: &ottto_protocol::AccountNicknamePairV1,
+    account: &Option<String>,
+    organization: &Option<String>,
+) -> bool {
+    pair.account_identifier_hash.is_some()
+        && pair.organization_identifier_hash.is_some()
+        && &pair.account_identifier_hash == account
+        && &pair.organization_identifier_hash == organization
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AgentStatusSnapshotUploadResponse {
+    /// Optional display metadata: absent/malformed must never fail ingest.
+    #[serde(default, deserialize_with = "decode_account_nicknames")]
+    pub account_nicknames: Option<Vec<ottto_protocol::AccountNicknameV1>>,
     pub accepted: u64,
     pub machine_id: String,
     pub sources: Vec<String>,
@@ -1593,6 +1609,19 @@ pub struct AgentStatusSnapshotUploadResponse {
     pub machine_icon_url: Option<String>,
     #[serde(default)]
     pub machine_icon_version: Option<i64>,
+}
+
+fn decode_account_nicknames<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<ottto_protocol::AccountNicknameV1>>, D::Error> {
+    let value = Value::deserialize(deserializer)?;
+    Ok(value.as_array().map(|values| {
+        values
+            .iter()
+            .filter(|value| value.get("nickname").is_some())
+            .filter_map(|value| serde_json::from_value(value.clone()).ok())
+            .collect()
+    }))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1630,8 +1659,13 @@ fn require_cloud_session_success(
     }
 }
 
+type NicknameGenerations = std::sync::Arc<
+    std::sync::Mutex<std::collections::BTreeMap<[u8; 32], crate::account_nicknames::Generation>>,
+>;
+
 #[derive(Debug, Clone)]
 pub struct SnapshotApiClient {
+    nickname_generations: NicknameGenerations,
     api_base_url: String,
     #[cfg(test)]
     bounded_retry_loopback_http_for_test: bool,
@@ -1652,6 +1686,10 @@ impl SnapshotApiClient {
         crate::relay_auth::binding_key(&self.api_base_url, device, secret, source.api_slug())
     }
 
+    pub(crate) fn api_base_seal(&self) -> [u8; 32] {
+        use sha2::Digest;
+        sha2::Sha256::digest(self.api_base_url.as_bytes()).into()
+    }
     pub(crate) fn matches_api_base(&self, expected: &str) -> bool {
         self.api_base_url == expected
     }
@@ -1671,6 +1709,7 @@ impl SnapshotApiClient {
         // See `net_resilience` for the 2026-07-15 incident this hardens against.
         let (agent, batch_agent) = crate::net_resilience::shared_agents();
         Self {
+            nickname_generations: Default::default(),
             api_base_url: api_base_url.into(),
             #[cfg(test)]
             bounded_retry_loopback_http_for_test: false,
@@ -1736,6 +1775,35 @@ impl SnapshotApiClient {
             account_binding,
         };
         self
+    }
+
+    /// Status uploads alone carry the optional nickname projection. Tag the
+    /// token before its network request; all other relay clients stay unchanged.
+    pub(crate) fn issue_status_relay_token(
+        &self,
+        device: &LocalDeviceBinding,
+        device_secret: &str,
+        source: SnapshotSource,
+    ) -> Result<String> {
+        let nickname_generation = if crate::snapshot_sync::snapshot_api_base_url()
+            .is_ok_and(|base| self.matches_api_base(&base))
+        {
+            crate::account_nicknames::generation_for_device(device)
+        } else {
+            None
+        };
+        let token = self.issue_relay_token(device, device_secret, source)?;
+        if let Some(generation) = nickname_generation {
+            use sha2::Digest;
+            let key: [u8; 32] = sha2::Sha256::digest(token.as_bytes()).into();
+            if let Ok(mut generations) = self.nickname_generations.lock() {
+                if generations.len() >= 32 {
+                    generations.clear();
+                }
+                generations.insert(key, generation);
+            }
+        }
+        Ok(token)
     }
 
     pub fn issue_relay_token(
@@ -2364,6 +2432,42 @@ impl SnapshotApiClient {
             .map_err(|error| anyhow!("parse snapshot status response failed: {error}"))
     }
 
+    /// One explicit write through the existing relay credential. No redirects,
+    /// no body parsing before 2xx admission, no raw error body or request logs.
+    pub(crate) fn put_account_nickname(
+        &self,
+        relay_token: &str,
+        body: &Value,
+    ) -> std::result::Result<Option<ottto_protocol::AccountNicknameV1>, u16> {
+        let response = credential_timeout_agent(SNAPSHOT_HTTP_READ_TIMEOUT)
+            .put(&self.api_url("/api/v1/agent-status/account-nickname"))
+            .set("Accept", "application/json")
+            .set("Authorization", &format!("Bearer {relay_token}"))
+            .send_json(body)
+            .map_err(|error| match error {
+                ureq::Error::Status(code, _) => code,
+                _ => 0,
+            })?;
+        if !(200..300).contains(&response.status()) {
+            return Err(response.status());
+        }
+        let mut bytes = Vec::new();
+        response
+            .into_reader()
+            .take(65537)
+            .read_to_end(&mut bytes)
+            .map_err(|_| 0u16)?;
+        if bytes.len() > 65536 {
+            return Err(0);
+        }
+        let value: Value = serde_json::from_slice(&bytes).map_err(|_| 0u16)?;
+        let value = value
+            .get("account_nickname")
+            .or_else(|| value.get("entry"))
+            .unwrap_or(&value);
+        Ok(serde_json::from_value(value.clone()).ok())
+    }
+
     pub fn upload_agent_status(
         &self,
         relay_token: &str,
@@ -2376,9 +2480,58 @@ impl SnapshotApiClient {
             .set("Authorization", &format!("Bearer {relay_token}"))
             .send_json(request)
         {
-            Ok(response) => response
-                .into_json()
-                .map_err(|error| anyhow!("parse agent status response failed: {error}")),
+            Ok(response) => {
+                let response: AgentStatusSnapshotUploadResponse = response
+                    .into_json()
+                    .map_err(|error| anyhow!("parse agent status response failed: {error}"))?;
+                use sha2::Digest;
+                let key: [u8; 32] = sha2::Sha256::digest(relay_token.as_bytes()).into();
+                let generation = self
+                    .nickname_generations
+                    .lock()
+                    .ok()
+                    .and_then(|generations| generations.get(&key).cloned());
+                let admitted = response.account_nicknames.as_ref().map(|entries| {
+                    entries
+                        .iter()
+                        .filter(|entry| {
+                            entry.pair.as_ref().is_some_and(|pair| {
+                                request.snapshots.iter().any(|snapshot| {
+                                    let source_matches = matches!(
+                                        (&snapshot.source, pair.source),
+                                        (
+                                            ottto_protocol::SourceKind::ClaudeCode,
+                                            ottto_protocol::SessionLaunchProviderV1::ClaudeCode
+                                        ) | (
+                                            ottto_protocol::SourceKind::Codex,
+                                            ottto_protocol::SessionLaunchProviderV1::Codex
+                                        )
+                                    );
+                                    source_matches
+                                        && (snapshot.account.as_ref().is_some_and(|account| {
+                                            uploaded_nickname_identity_matches(
+                                                pair,
+                                                &account.account_identifier_hash,
+                                                &account.organization_identifier_hash,
+                                            )
+                                        }) || snapshot.plan_observations.iter().any(
+                                            |observation| {
+                                                uploaded_nickname_identity_matches(
+                                                    pair,
+                                                    &observation.account_identifier_hash,
+                                                    &observation.organization_identifier_hash,
+                                                )
+                                            },
+                                        ))
+                                })
+                            })
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>()
+                });
+                crate::account_nicknames::apply_upload(generation.as_ref(), admitted.as_deref());
+                Ok(response)
+            }
             Err(ureq::Error::Status(code, response)) => {
                 Err(anyhow::Error::new(UploadFailureDiagnostics::http(
                     "agent status upload",
@@ -3202,7 +3355,9 @@ fn truncate_diagnostic(value: &str) -> String {
 /// pre-confirm guards are the crash boundary immediately before the request:
 /// a transport failure after that cut cannot prove the old authority survived.
 pub fn ensure_no_incomplete_device_credential_promotion() -> Result<()> {
-    let pending = FilePendingDeviceCredentialStore::default().load()?;
+    let pending = crate::local_resource_diagnostics::credential_file_read(
+        FilePendingDeviceCredentialStore::default().load(),
+    )?;
     if pending.as_ref().is_some_and(|pending| {
         pending.confirmed_at.is_some()
             || (pending.confirmation_authorized && pending.preconfirm_guards_passed)
@@ -3214,12 +3369,15 @@ pub fn ensure_no_incomplete_device_credential_promotion() -> Result<()> {
 
 pub fn load_snapshot_device_credentials() -> Result<(LocalDeviceBinding, String)> {
     ensure_no_incomplete_device_credential_promotion()?;
-    let device = FileDeviceStore::default()
-        .load()?
-        .ok_or_else(|| anyhow!("relay device binding is missing"))?;
-    let secret = KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
-        .load()
-        .map_err(|error| anyhow!("relay device secret is missing: {error}"))?;
+    let device =
+        crate::local_resource_diagnostics::credential_file_read(FileDeviceStore::default().load())?
+            .ok_or_else(|| anyhow!("relay device binding is missing"))?;
+    let secret = crate::local_resource_diagnostics::credential_file_read(
+        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .load()
+            .map_err(anyhow::Error::new),
+    )
+    .map_err(|error| anyhow!("relay device secret is missing: {error}"))?;
     Ok((device, secret))
 }
 
@@ -3263,6 +3421,70 @@ mod tests {
             assert!(request.contains(&format!("X-Ottto-Device-Secret: {secret}")));
             assert_never_logged(&secret);
         }
+    }
+
+    #[test]
+    fn nickname_write_keeps_relay_principal_body_private_and_rejects_redirects() {
+        use crate::retry_tls::credential_test_support::{
+            assert_never_logged, install_host_logger, RedirectingBackend,
+        };
+        install_host_logger();
+        let token = "synthetic-private-relay";
+        let body = json!({"machine_id":"machine-synthetic","source":"codex", "account_identifier_hash":"a".repeat(64), "organization_identifier_hash":"", "nickname":"כינוי 🚀", "base_revision":2});
+        for status in ["302 Found", "307 Temporary Redirect", "401 Unauthorized"] {
+            let backend = RedirectingBackend::start(status);
+            let code = SnapshotApiClient::new(backend.base_url.clone())
+                .put_account_nickname(token, &body)
+                .unwrap_err();
+            assert_eq!(code.to_string(), &status[..3]);
+            let request = backend.finish();
+            assert!(request.starts_with("PUT /api/v1/agent-status/account-nickname "));
+            assert!(request.contains(&format!("Authorization: Bearer {token}")));
+            assert!(!request.contains("X-Ottto-Device-Secret"));
+            let sent: Value =
+                serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(sent, body);
+            assert_never_logged(token);
+            assert_never_logged("כינוי 🚀");
+        }
+    }
+
+    #[test]
+    fn nickname_admission_requires_explicit_organization_evidence() {
+        let mut pair = ottto_protocol::AccountNicknamePairV1 {
+            source: ottto_protocol::SessionLaunchProviderV1::Codex,
+            account_identifier_hash: Some("a".repeat(64)),
+            organization_identifier_hash: Some(String::new()),
+        };
+        let account = pair.account_identifier_hash.clone();
+        assert!(!uploaded_nickname_identity_matches(&pair, &account, &None));
+        assert!(uploaded_nickname_identity_matches(
+            &pair,
+            &account,
+            &Some(String::new())
+        ));
+        pair.organization_identifier_hash = None;
+        assert!(!uploaded_nickname_identity_matches(&pair, &account, &None));
+    }
+
+    #[test]
+    fn optional_nickname_metadata_cannot_fail_ingest() {
+        for extra in [
+            json!(null),
+            json!("unsupported"),
+            json!([{"pair":"malformed"}]),
+            json!([{"revision":1}]),
+        ] {
+            let response: AgentStatusSnapshotUploadResponse = serde_json::from_value(json!({"accepted":1,"machine_id":"synthetic","sources":["codex"],"account_nicknames":extra})).unwrap();
+            assert!(response
+                .account_nicknames
+                .map_or(true, |entries| entries.is_empty()));
+        }
+        let response: AgentStatusSnapshotUploadResponse = serde_json::from_value(
+            json!({"accepted":1,"machine_id":"synthetic","sources":["codex"]}),
+        )
+        .unwrap();
+        assert!(response.account_nicknames.is_none());
     }
 
     #[test]
@@ -5050,6 +5272,7 @@ crate::heap_layout_bound::fields!(ActivityHintResponse; source, server_time, las
 impl crate::heap_layout_bound::HeapLayoutBound for SnapshotApiClient {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         let Self {
+            nickname_generations,
             api_base_url,
             #[cfg(test)]
                 bounded_retry_loopback_http_for_test: _,
@@ -5062,6 +5285,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for SnapshotApiClient {
         // Both Agent handles clone the existing process-wide shared_agents pool;
         // SourcePreparation creates no new pool. Inline handles are charged by
         // their owning frame, and this bound covers its incremental owned heap.
+        nickname_generations.heap_bound(c)?;
         api_base_url.heap_bound(c)?;
         receipt_state_dir.heap_bound(c)?;
         receipt_destination_namespace.heap_bound(c)?;

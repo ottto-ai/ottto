@@ -543,7 +543,6 @@ fn bounded_retry_actual_owner_boundary_fairness_same_source_block_and_recovery()
         "native owner requested-allocation peak={} (finite loopback proof)",
         allocation.requested_peak
     );
-    assert!(!super::bounded_snapshot_retry::production_activation_reviewed());
 }
 
 #[test]

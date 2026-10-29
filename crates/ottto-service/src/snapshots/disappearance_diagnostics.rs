@@ -1491,14 +1491,15 @@ mod tests {
             source
                 .matches(".retire_vanished_claude_audit_debt_entry(")
                 .count(),
-            1
+            3
         );
         let vanished = calls("vanished");
-        assert_eq!(vanished.len(), 2);
-        for (call, kind) in vanished
-            .into_iter()
-            .zip(["AuditDebtDropped", "RequestCensusRemoved"])
-        {
+        assert_eq!(vanished.len(), 3);
+        for (call, kind) in vanished.into_iter().zip([
+            "AuditDebtDropped",
+            "RequestCensusRemoved",
+            "AuditDebtDropped",
+        ]) {
             assert!(call.contains(&format!("Vanished::{kind}")));
         }
         assert_eq!(source.matches("Site::CandidateWalk,").count(), 1);

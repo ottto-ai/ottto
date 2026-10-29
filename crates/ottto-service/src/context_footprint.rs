@@ -241,6 +241,7 @@ pub fn spawn_context_footprint_sync(daemon: &crate::LocalDaemon) -> Result<()> {
     let home = crate::snapshot_sync::home_dir()?;
     let support_dir = default_support_dir();
     let projection = Arc::clone(&daemon.footprint_cwds);
+    let codex_preludes = Arc::clone(&daemon.codex_preludes);
     std::thread::Builder::new()
         .name("ottto-context-footprint-sync".to_string())
         .spawn(move || loop {
@@ -255,7 +256,9 @@ pub fn spawn_context_footprint_sync(daemon: &crate::LocalDaemon) -> Result<()> {
                 }
             };
             // Codex session starts share this thread: no extra background job.
-            if let Err(error) = crate::codex_prelude_footprint::harvest_once(&home, &support_dir) {
+            if let Err(error) =
+                crate::codex_prelude_footprint::harvest_once(&home, &support_dir, &codex_preludes)
+            {
                 eprintln!(
                     "codex session start harvest skipped: {}",
                     crate::snapshot_sync::safe_error(&error)
@@ -285,7 +288,7 @@ fn harvest_all_once(
     let Some(machine_id) = crate::snapshot_sync::snapshot_machine_id(&device)? else {
         return Err(anyhow!("machine identity is missing"));
     };
-    let api_base_url = crate::snapshot_sync::snapshot_api_base_url();
+    let api_base_url = crate::snapshot_sync::snapshot_api_base_url()?;
     let client = SnapshotApiClient::new(api_base_url.clone());
     harvest_source(
         &client,
@@ -1512,46 +1515,6 @@ fn dedupe_workspace_candidates_by_repository(
     out
 }
 
-/// Recent plain `.jsonl` transcripts under `dir`. Recent `.jsonl.zst` archives
-/// are counted in `compressed` and never opened.
-pub(crate) fn collect_recent_jsonl_files(
-    dir: &Path,
-    now: SystemTime,
-    out: &mut Vec<(PathBuf, SystemTime)>,
-    compressed: &mut usize,
-) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        if metadata.is_dir() {
-            collect_recent_jsonl_files(&path, now, out, compressed);
-            continue;
-        }
-        let plain = path.extension().and_then(|value| value.to_str()) == Some("jsonl");
-        let archive = !plain
-            && path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .is_some_and(|name| name.ends_with(".jsonl.zst"));
-        if !plain && !archive {
-            continue;
-        }
-        let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-        if now.duration_since(mtime).unwrap_or(Duration::ZERO) <= RECENT_WORKSPACE_WINDOW {
-            if plain {
-                out.push((path, mtime));
-            } else {
-                *compressed += 1;
-            }
-        }
-    }
-}
-
 fn string_at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
     let mut current = value;
     for key in path {
@@ -1762,6 +1725,46 @@ pub(crate) fn workspace_label(workspace: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// Recent plain `.jsonl` transcripts under `dir`. Recent `.jsonl.zst` archives
+    /// are counted in `compressed` and never opened.
+    fn collect_recent_jsonl_files(
+        dir: &Path,
+        now: SystemTime,
+        out: &mut Vec<(PathBuf, SystemTime)>,
+        compressed: &mut usize,
+    ) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if metadata.is_dir() {
+                collect_recent_jsonl_files(&path, now, out, compressed);
+                continue;
+            }
+            let plain = path.extension().and_then(|value| value.to_str()) == Some("jsonl");
+            let archive = !plain
+                && path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|name| name.ends_with(".jsonl.zst"));
+            if !plain && !archive {
+                continue;
+            }
+            let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            if now.duration_since(mtime).unwrap_or(Duration::ZERO) <= RECENT_WORKSPACE_WINDOW {
+                if plain {
+                    out.push((path, mtime));
+                } else {
+                    *compressed += 1;
+                }
+            }
+        }
+    }
+
     use super::*;
     use std::fs::File;
     use std::io::{BufRead, BufReader};
@@ -2550,6 +2553,7 @@ mod tests {
                 observer.line(
                     &view,
                     &PhysicalLine {
+                        end: 0,
                         value: value.as_ref(),
                     },
                 );
@@ -2562,6 +2566,8 @@ mod tests {
         let (object, _) = FileObject::of(&File::open(path).unwrap()).unwrap();
         FileView {
             source: SnapshotSource::ClaudeCode,
+            root: Some(0),
+            start: 0,
             object,
             mtime: Some(mtime),
             mode,
@@ -2911,9 +2917,21 @@ mod tests {
         let want = observer.begin(view);
         if want == Want::Lines {
             for value in lines {
-                observer.line(view, &PhysicalLine { value: Some(value) });
+                observer.line(
+                    view,
+                    &PhysicalLine {
+                        end: 0,
+                        value: Some(value),
+                    },
+                );
             }
-            observer.line(view, &PhysicalLine { value: None });
+            observer.line(
+                view,
+                &PhysicalLine {
+                    end: 0,
+                    value: None,
+                },
+            );
         }
         observer.end(view, &end);
     }

@@ -34,6 +34,8 @@ pub enum TokenStoreError {
     Store(String),
     #[error("control token is not valid UTF-8")]
     InvalidUtf8,
+    #[error("file-backed secret exceeds 64 KiB")]
+    OversizeRefused,
     /// A daemon owns local state but has not saved its control token yet.
     #[error("ottto-service is starting and has not created its control token yet")]
     DaemonNotReady,
@@ -738,7 +740,13 @@ fn set_user_only_directory_permissions(path: &Path) -> Result<(), TokenStoreErro
 }
 
 fn load_file_secret(account: &str) -> Result<String, TokenStoreError> {
-    match fs::read_to_string(file_secret_path(account)) {
+    let read = || {
+        crate::credential_file::read(
+            fs::File::open(file_secret_path(account))?,
+            crate::CredentialFileCapRefused::FileSecret,
+        )
+    };
+    match read() {
         Ok(value) => {
             let token = value.trim().to_string();
             if token.is_empty() {
@@ -748,6 +756,13 @@ fn load_file_secret(account: &str) -> Result<String, TokenStoreError> {
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(TokenStoreError::Missing),
+        Err(error)
+            if error
+                .get_ref()
+                .is_some_and(|e| e.is::<crate::CredentialFileCapRefused>()) =>
+        {
+            Err(TokenStoreError::OversizeRefused)
+        }
         Err(error) => Err(TokenStoreError::Store(error.to_string())),
     }
 }
@@ -816,6 +831,7 @@ pub fn isolated_test_secret_dir() -> Option<PathBuf> {
     None
 }
 
+#[cfg(target_os = "macos")]
 fn explicit_file_secret_store() -> bool {
     test_secret_store_enabled() || std::env::var_os(OTTTO_SECRET_FALLBACK_DIR_ENV).is_some()
 }
@@ -937,6 +953,31 @@ mod tests {
         store.delete().expect("delete token");
         assert!(matches!(store.load(), Err(TokenStoreError::Missing)));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_secret_load_enforces_64_kib_boundary() {
+        let _env = lock_secret_fallback_dir_env();
+        let account = "e2-9-synthetic-size-bound";
+        save_file_secret(account, &"s".repeat(64 * 1024)).unwrap();
+        assert_eq!(load_file_secret(account).unwrap().len(), 64 * 1024);
+        {
+            use std::io::Write;
+            fs::OpenOptions::new()
+                .append(true)
+                .open(file_secret_path(account))
+                .unwrap()
+                .write_all(b"s")
+                .unwrap();
+        }
+        let error = load_file_secret(account).unwrap_err();
+        assert!(matches!(error, TokenStoreError::OversizeRefused));
+        assert!(error.to_string().contains("exceeds 64 KiB"));
+        delete_file_secret(account).unwrap();
+        assert!(matches!(
+            load_file_secret(account),
+            Err(TokenStoreError::Missing)
+        ));
     }
 
     #[test]

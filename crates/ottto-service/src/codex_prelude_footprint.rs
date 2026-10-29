@@ -3,10 +3,7 @@
 //!
 //! [`CodexPreludeParser`] is the one Codex prelude parser (CROSS-LANE R1): it
 //! takes rollout rows already decoded, so the session sink can share it. This
-//! module's uploader reads only the prelude of each NEW rollout (the rows
-//! before the first token record, typically ~15 lines / ~160 KB; bounded by
-//! [`MAX_PRELUDE_LINES`] and [`MAX_PRELUDE_BYTES`]) once, and remembers the
-//! outcome in a small local index. For each repository scope it uploads the
+//! uploader consumes bounded RAM from main line delivery, uploading each scope's
 //! newest owned fresh start as a context-footprint snapshot with
 //! `agent_source = "codex"`, dated at that session's start: one rollout is one
 //! observation and is never sent again.
@@ -35,9 +32,9 @@
 
 use crate::context_file_counts::{load_or_create_salt, measure_bytes, FileCounts, MAX_FILE_BYTES};
 use crate::context_footprint::{
-    collect_recent_jsonl_files, request_content_hash_for_request, resolve_repository_identity,
-    safe_text, sha256_hex, workspace_label, ContextFootprintCategoryInput,
-    ContextFootprintIngestRequest, ContextFootprintItemInput, RepositoryIdentity,
+    request_content_hash_for_request, resolve_repository_identity, safe_text, sha256_hex,
+    workspace_label, ContextFootprintCategoryInput, ContextFootprintIngestRequest,
+    ContextFootprintItemInput, RepositoryIdentity,
 };
 use crate::snapshot_client::{
     load_snapshot_device_credentials, workspace_labels_allowed, SnapshotApiClient,
@@ -51,8 +48,9 @@ use ottto_core::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read};
+use std::fs;
+#[cfg(test)]
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -60,12 +58,9 @@ use toml_edit::{DocumentMut, Item};
 
 const CYCLE_BUDGET: Duration = Duration::from_secs(2 * 60);
 const MAX_PRELUDE_LINES: usize = 200;
-const MAX_PRELUDE_BYTES: u64 = 2 * 1024 * 1024;
 /// Rows read past the first request while its context window is unknown.
 const MAX_LINES_FOR_WINDOW: usize = 8;
 const MAX_WORKSPACES_PER_CYCLE: usize = 12;
-/// New preludes read per cycle; the index makes later cycles skip them.
-const MAX_NEW_PRELUDES_PER_CYCLE: usize = 400;
 const MAX_SKILL_ITEMS: usize = 512;
 const MAX_STALENESS_SECS: i64 = 7 * 24 * 60 * 60;
 const DEFAULT_PROJECT_DOC_MAX_BYTES: u64 = 32 * 1024;
@@ -78,7 +73,6 @@ const COMBINED_CHAIN_NAME: &str = "AGENTS.md (chain)";
 /// backend owns the character-to-token ratio and converts on admission.
 /// Category `pct` is 0 for the same reason.
 const COUNTER_SOURCE: &str = "codex_rollout_prelude_chars_v1";
-const INDEX_SCHEMA: &str = "codex-session-start-index-v2";
 const STATE_DIR: &str = "codex_session_start";
 const LOCAL_DISABLE_ENV: &str = "OTTTO_CODEX_SESSION_START_HARVEST_DISABLED";
 
@@ -191,11 +185,7 @@ impl CodexPrelude {
     }
 }
 
-fn read_prelude(path: &Path) -> std::io::Result<CodexPrelude> {
-    let file = File::open(path)?;
-    parse_prelude(BufReader::new(file.take(MAX_PRELUDE_BYTES)))
-}
-
+#[cfg(test)]
 pub(crate) fn parse_prelude(mut reader: impl BufRead) -> std::io::Result<CodexPrelude> {
     let mut parser = CodexPreludeParser::default();
     let mut line = Vec::new();
@@ -282,6 +272,22 @@ impl CodexPreludeParser {
         value: &Value,
         on_block: impl FnMut(BlockKind, &str),
     ) -> PreludeStep {
+        self.observe_inner(value, on_block, usize::MAX, &mut false)
+    }
+
+    fn observe_bounded(&mut self, value: &Value, skills_cap: usize) -> (PreludeStep, bool) {
+        let mut capped = false;
+        let step = self.observe_inner(value, |_, _| {}, skills_cap, &mut capped);
+        (step, capped)
+    }
+
+    fn observe_inner(
+        &mut self,
+        value: &Value,
+        on_block: impl FnMut(BlockKind, &str),
+        skills_cap: usize,
+        capped: &mut bool,
+    ) -> PreludeStep {
         let prelude = &mut self.prelude;
         if prelude.complete {
             self.rows_after_first_request += 1;
@@ -329,7 +335,14 @@ impl CodexPreludeParser {
                             .get("host_skills")
                             .and_then(|skills| skills.get("body"))
                             .and_then(Value::as_str)
-                            .map(str::to_string);
+                            .map(|text| {
+                                let mut end = text.len().min(skills_cap);
+                                while !text.is_char_boundary(end) {
+                                    end -= 1;
+                                }
+                                *capped = end < text.len();
+                                text[..end].to_string()
+                            });
                     }
                 }
             }
@@ -1031,41 +1044,8 @@ pub(crate) fn build_request(inputs: RequestInputs<'_>) -> Option<ContextFootprin
     })
 }
 
-// -------------------------------------------------------------------------
-// Local index: each rollout prelude is read once.
-// -------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct PreludeIndex {
-    schema: String,
-    /// Rollout path -> outcome of its (final) prelude.
-    files: BTreeMap<String, IndexedPrelude>,
-    /// Session directory -> repository scope, so `git` runs once per cwd.
-    scopes: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct IndexedPrelude {
-    cwd: Option<String>,
-    fresh: bool,
-    /// Session start (unix seconds); file mtime only when the rollout has none.
-    started_at: i64,
-}
-
-fn index_path(support_dir: &Path) -> PathBuf {
-    support_dir.join(STATE_DIR).join("index.json")
-}
-
-fn read_index(support_dir: &Path) -> PreludeIndex {
-    fs::read(index_path(support_dir))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<PreludeIndex>(&bytes).ok())
-        .filter(|index| index.schema == INDEX_SCHEMA)
-        .unwrap_or_else(|| PreludeIndex {
-            schema: INDEX_SCHEMA.to_string(),
-            ..PreludeIndex::default()
-        })
-}
+mod feed;
+pub(crate) use feed::CodexPreludeFeed;
 
 fn write_json_atomic(path: &Path, value: &impl Serialize) {
     let Some(dir) = path.parent() else {
@@ -1128,7 +1108,8 @@ fn upload_cache_path(support_dir: &Path, workspace_hash: &str) -> PathBuf {
 // -------------------------------------------------------------------------
 
 /// One pass, called from the Claude Code footprint thread after its cycle.
-pub(crate) fn harvest_once(home: &Path, support_dir: &Path) -> Result<()> {
+pub(crate) fn harvest_once(home: &Path, support_dir: &Path, feed: &CodexPreludeFeed) -> Result<()> {
+    feed.cleanup_index(support_dir);
     if local_harvest_disabled(support_dir) {
         return Ok(());
     }
@@ -1139,7 +1120,7 @@ pub(crate) fn harvest_once(home: &Path, support_dir: &Path) -> Result<()> {
     let Some(machine_id) = crate::snapshot_sync::snapshot_machine_id(&device)? else {
         return Err(anyhow!("machine identity is missing"));
     };
-    let api_base_url = crate::snapshot_sync::snapshot_api_base_url();
+    let api_base_url = crate::snapshot_sync::snapshot_api_base_url()?;
     let client = SnapshotApiClient::new(api_base_url.clone());
     let relay_token = client.issue_relay_token(&device, &device_secret, SnapshotSource::Codex)?;
     let identity = destination_identity(&device, &machine_id, &api_base_url);
@@ -1161,17 +1142,12 @@ pub(crate) fn harvest_once(home: &Path, support_dir: &Path) -> Result<()> {
     let roots = registered_scan_roots(SnapshotSource::Codex, home)?;
     let salt = load_or_create_salt(support_dir);
     let deadline = Instant::now() + CYCLE_BUDGET;
-    let mut compressed = 0usize;
-    let candidates = select_candidates(&roots, support_dir, &identity, deadline, &mut compressed);
+    let candidates = select_candidates(feed, &roots, support_dir, &identity, deadline);
     let (mut uploaded, mut skipped, mut failed) = (0usize, 0usize, 0usize);
-    for (file, workspace, codex_home) in candidates {
+    for (prelude, workspace, codex_home) in candidates {
         if Instant::now() >= deadline {
             break;
         }
-        let Ok(prelude) = read_prelude(&file) else {
-            failed += 1;
-            continue;
-        };
         let request = build_request(RequestInputs {
             prelude: &prelude,
             workspace: &workspace,
@@ -1207,131 +1183,66 @@ pub(crate) fn harvest_once(home: &Path, support_dir: &Path) -> Result<()> {
         }
     }
     eprintln!(
-        "codex_session_start_harvest_metrics discovered={} uploaded={uploaded} skipped={skipped} failed={failed} compressed_skipped={compressed}",
-        uploaded + skipped + failed
+        "codex_session_start_harvest_metrics discovered={} uploaded={uploaded} skipped={skipped} failed={failed} {}",
+        uploaded + skipped + failed, feed.metrics()
     );
     Ok(())
 }
 
-/// Newest owned fresh start per repository scope, newest scope first, with
-/// the Codex home that wrote it. Reads only preludes not already in the
-/// index. "Newest" is the session start time: an older session resumed later
-/// must not hide a newer start.
 fn select_candidates(
+    feed: &CodexPreludeFeed,
     roots: &[PathBuf],
     support_dir: &Path,
     identity: &str,
     deadline: Instant,
-    compressed: &mut usize,
-) -> Vec<(PathBuf, PathBuf, PathBuf)> {
-    let mut files = Vec::new();
-    let mut homes: BTreeMap<String, PathBuf> = BTreeMap::new();
-    for root in roots {
-        // Roots are `<codex home>/sessions` or `<codex home>/archived_sessions`.
-        let Some(codex_home) = root.parent() else {
-            continue;
-        };
-        let first = files.len();
-        collect_recent_jsonl_files(root, SystemTime::now(), &mut files, compressed);
-        for (file, _) in &files[first..] {
-            homes.insert(
-                file.to_string_lossy().into_owned(),
-                codex_home.to_path_buf(),
-            );
-        }
-    }
-    files.sort_by_key(|(_, mtime)| std::cmp::Reverse(*mtime));
-
-    let mut index = read_index(support_dir);
-    let live: BTreeSet<String> = files
-        .iter()
-        .map(|(file, _)| file.to_string_lossy().into_owned())
-        .collect();
-    index.files.retain(|path, _| live.contains(path));
-
-    // Phase 1: make sure every recent rollout has a (bounded) index entry.
-    let mut new_reads = 0usize;
-    for (file, mtime) in &files {
-        if Instant::now() >= deadline || new_reads >= MAX_NEW_PRELUDES_PER_CYCLE {
-            break;
-        }
-        let key = file.to_string_lossy().into_owned();
-        if index.files.contains_key(&key) {
-            continue;
-        }
-        new_reads += 1;
-        let Ok(prelude) = read_prelude(file) else {
-            continue;
-        };
-        // No request yet: the prelude may still grow. Retry later.
-        if !prelude.complete {
-            continue;
-        }
-        let fallback = OffsetDateTime::from(*mtime).unix_timestamp();
-        index.files.insert(
-            key,
-            IndexedPrelude {
-                fresh: prelude.is_owned_fresh_start(),
-                started_at: prelude.started_at.unwrap_or(fallback),
-                cwd: prelude.cwd,
-            },
-        );
-    }
-
-    // Phase 2: newest start per directory, then per repository scope.
-    let mut starts: Vec<(i64, &String, &String)> = index
-        .files
-        .iter()
-        .filter(|(_, entry)| entry.fresh)
-        .filter_map(|(path, entry)| Some((entry.started_at, path, entry.cwd.as_ref()?)))
-        .collect();
-    starts.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(right.1)));
-    let mut seen_cwds: BTreeSet<&String> = BTreeSet::new();
-    let mut seen_scopes: BTreeSet<String> = BTreeSet::new();
-    let mut scopes = index.scopes.clone();
+) -> Vec<(CodexPrelude, PathBuf, PathBuf)> {
+    let (mut starts, mut scopes) = feed.snapshot(SystemTime::now());
+    starts.retain(|(_, p, home, _, _)| {
+        p.is_owned_fresh_start() && roots.iter().any(|r| r.parent() == Some(home.as_path()))
+    });
+    let rank = |s: &feed::Start| {
+        s.1.started_at
+            .unwrap_or(OffsetDateTime::from(s.4).unix_timestamp())
+    };
+    starts.sort_by(|a, b| rank(b).cmp(&rank(a)).then_with(|| a.0.cmp(&b.0)));
+    let mut seen_cwds = BTreeSet::new();
+    let mut seen_scopes = BTreeSet::new();
     let mut chosen = Vec::new();
-    for (started, path, cwd) in starts {
+    for (_, prelude, codex_home, capped, mtime) in starts {
         if Instant::now() >= deadline || chosen.len() >= MAX_WORKSPACES_PER_CYCLE {
             break;
         }
-        if !seen_cwds.insert(cwd) {
+        let cwd = prelude.cwd.as_ref().expect("fresh start has cwd");
+        if !seen_cwds.insert(cwd.clone()) {
             continue;
         }
         let workspace = PathBuf::from(cwd);
         if !workspace.is_dir() {
             continue;
         }
-        let scope = scopes
-            .entry(cwd.clone())
-            .or_insert_with(|| {
-                resolve_repository_identity(&workspace, false)
-                    .repository_hash
-                    .unwrap_or_else(|| sha256_hex(&[cwd.as_str()]))
-            })
-            .clone();
-        let Some(codex_home) = homes.get(path.as_str()) else {
-            continue;
+        let scope = if let Some((_, scope)) = scopes.iter().find(|(key, _)| key == cwd) {
+            scope.clone()
+        } else {
+            let scope = resolve_repository_identity(&workspace, false)
+                .repository_hash
+                .unwrap_or_else(|| sha256_hex(&[cwd.as_str()]));
+            scopes.push((cwd.clone(), scope.clone()));
+            scope
         };
         if !seen_scopes.insert(scope) {
             continue;
         }
-        // Nothing newer than what this workspace already sent: leave the slot
-        // to other scopes, so every repository gets measured.
+        let started = prelude
+            .started_at
+            .unwrap_or(OffsetDateTime::from(mtime).unix_timestamp());
         let sent = last_upload(support_dir, identity, &sha256_hex(&[cwd.as_str()]))
             .and_then(|entry| entry.started_at)
             .is_some_and(|sent| started <= sent);
-        if !sent {
-            chosen.push((PathBuf::from(path), workspace, codex_home.clone()));
+        if !sent && !capped {
+            chosen.push((prelude, workspace, codex_home));
         }
     }
-    let indexed_cwds: BTreeSet<&String> = index
-        .files
-        .values()
-        .filter_map(|entry| entry.cwd.as_ref())
-        .collect();
-    scopes.retain(|cwd, _| indexed_cwds.contains(cwd));
-    index.scopes = scopes;
-    write_json_atomic(&index_path(support_dir), &index);
+    feed.remember_scopes(scopes);
     chosen
 }
 
@@ -1420,4 +1331,4 @@ fn local_harvest_disabled(support_dir: &Path) -> bool {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -99,7 +99,8 @@ impl FileStamp {
 
 /// LD: an opened object's RAM-only identity, never a path, persisted field or
 /// proof authority. A reused inode can alias an old entry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// Ordering is for deterministic tie-breaks only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct FileObject {
     dev: u64,
     ino: u64,
@@ -107,6 +108,19 @@ pub(crate) struct FileObject {
 }
 
 impl FileObject {
+    /// Reuse the primary open's stat, with the same birth granularity as LD.
+    pub(crate) fn from_opened_identity(
+        identity: Option<[u64; 2]>,
+        birth_nanos: u64,
+    ) -> Option<Self> {
+        let [dev, ino] = identity?;
+        Some(Self {
+            dev,
+            ino,
+            birth: (birth_nanos != 0).then_some(birth_nanos / 1_000_000_000),
+        })
+    }
+
     /// One fstat of the held descriptor; `None` off unix.
     #[cfg(unix)]
     pub(crate) fn of(file: &File) -> Option<(Self, Metadata)> {
@@ -1972,7 +1986,7 @@ mod tests {
                 f.append(b"two\n");
             }
             let mut disk = store::DurableTailStore::new(state.0.join("cache"), source);
-            let certificate = match disk.read(&key, &allowlist) {
+            let certificate = match disk.read(&key) {
                 store::ReadOutcome::Found(record) => record.record.certificate,
                 other => panic!("{other:?}"),
             };

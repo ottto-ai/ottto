@@ -708,6 +708,7 @@ fn parsed(parent: Option<&str>) -> ParsedJsonlFile {
         snapshots: Vec::new(),
         report: JsonlReadReport::default(),
         recognized_usage_drop_count: 0,
+        cause: ownership::PARSER,
         ownership_incomplete_file_count: 0,
         zero_snapshot_usage_evidence: false,
         dropped_usage_record_count: 0,
@@ -1522,6 +1523,8 @@ fn hook_context(cache: &Arc<sampled_scan::SharedCache>) -> sampled_scan::Context
         audits_completed: 0,
         audit_quiet_retired: 0,
         audit_cap_full: 0,
+        audit_cap_delay: 0,
+        pace_evicted: 0,
         start_overdue_seconds: 0,
         completion_overdue_seconds: 0,
         admission: Default::default(),
@@ -2526,6 +2529,7 @@ fn held_memo(cache: &sampled_scan::SharedCache, key: &str, file: &Path) -> Strin
         None,
         Disclosure {
             reason: DebtReason::HeldTerminal,
+            cause: ownership::PARENT,
             ownership_incomplete_file_count: 1,
             zero_snapshot_usage_evidence: false,
             state_only_blocked_session_ids: vec![CHILD.into()],
@@ -2981,4 +2985,19 @@ fn an_eof_continuation_save_reopens_the_side_gate() {
             .gate
             .side_allowed
     );
+}
+
+#[test]
+fn ownership_deferred_parent_site_sets_parent_cause_for_both_restart_dispositions() {
+    for cause in [
+        CodexParentUnresolvable::DeferredRef,
+        CodexParentUnresolvable::DeferredRestart,
+    ] {
+        let mut file = parsed(Some(PARENT));
+        file.codex_parent_resolution_pending = true;
+        file.defer_parent_resolution(cause);
+        assert_eq!(file.ownership_incomplete_file_count, 1);
+        assert_eq!(file.cause, ownership::PARENT);
+        assert!(!file.codex_parent_resolution_pending);
+    }
 }

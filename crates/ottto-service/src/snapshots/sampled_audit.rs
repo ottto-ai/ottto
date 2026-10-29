@@ -1093,3 +1093,38 @@ mod provenance_tests {
         }
     }
 }
+
+/// A cap delay is still owed: persist an age-bypassing retry without advancing
+/// the committed file size or claiming source/census completion.
+pub(super) fn queue_cap_retry(index: &mut ScanIndex, candidate: &CandidateFile) {
+    if let Some(traversal) = index.traversal.as_mut() {
+        if !traversal
+            .pending_candidates
+            .iter()
+            .any(|path| path.path == candidate.path)
+        {
+            traversal.pending_candidates.push_back(ScanTraversalPath {
+                scan_root: candidate.scan_root.clone(),
+                path: candidate.path.clone(),
+                census_member: true,
+                watcher_hint: true,
+            });
+        }
+    }
+}
+
+/// Positive removal only: the path is NotFound beneath a present readable
+/// parent AND a configured, readable root. Missing mounts/parents, symlinks,
+/// permission errors and unreadable roots keep the audit and account debt.
+/// This is absence authority, never source verification or census credit.
+pub(super) fn proven_absent(path: &Path, roots: &[PathBuf]) -> bool {
+    fn readable_directory(path: &Path) -> bool {
+        fs::symlink_metadata(path).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+            && fs::read_dir(path).is_ok()
+    }
+    matches!(fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        && path.parent().is_some_and(readable_directory)
+        && roots
+            .iter()
+            .any(|root| path.starts_with(root) && readable_directory(root))
+}

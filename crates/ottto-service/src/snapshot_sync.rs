@@ -3471,6 +3471,7 @@ struct SyncCounts {
     over_line_cap_count: u64,
     recognized_usage_drop_count: u64,
     ownership_incomplete_file_count: u64,
+    causes: crate::snapshots::ownership_diagnostics::Summary,
     snapshot_unproven_terminal_count: u64,
     snapshot_superseded_terminal_count: u64,
     cooldown_conflict_deferred: usize,
@@ -3594,6 +3595,9 @@ impl SyncCounts {
             over_line_cap_count: scan_result.over_line_cap_count as u64,
             recognized_usage_drop_count: scan_result.recognized_usage_drop_count as u64,
             ownership_incomplete_file_count: scan_result.ownership_incomplete_file_count as u64,
+            causes: scan_result
+                .causes
+                .summary(scan_result.ownership_incomplete_file_count),
             snapshot_unproven_terminal_count: 0,
             snapshot_superseded_terminal_count: 0,
             cooldown_conflict_deferred: 0,
@@ -3621,7 +3625,7 @@ impl SyncCounts {
     }
 
     fn terminal_census_line(&self, source: &str) -> String {
-        format!(
+        let mut line = format!(
             "snapshot terminal_census source={source} census_complete={} scanned_files={} \
              uploaded={} unproven_terminal={} superseded_terminal={} \
              ownership_incomplete_files={} zero_snapshot_usage_evidence_files={} \
@@ -3637,7 +3641,11 @@ impl SyncCounts {
             self.cooldown_conflict_deferred,
             crate::snapshots::terminal_contract_retry::local_count(),
             crate::snapshots::terminal_contract_retry::exhausted_count(),
-        )
+        );
+        if source == "codex" {
+            line.push_str(&crate::snapshots::ownership_diagnostics::line(self.causes));
+        }
+        line
     }
 
     fn with_snapshot_terminal_counts(mut self, index: &ScanIndex) -> Self {
@@ -3947,15 +3955,6 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
                 // The cycle cadence itself is unchanged. What the tiers gate is the
                 // expensive part — the local transcript scan and its upload — while
                 // agent-status/quota freshness has an independent source owner.
-                if !continuation::ENABLED {
-                    collect_file_activity_for(
-                        SNAPSHOT_SYNC_INTERVAL,
-                        watcher.as_ref(),
-                        &mut account_switch,
-                        delivery_wake(&mut retry, &home, &support_dir, &daemon),
-                    );
-                    continue;
-                }
                 // Paced cursor continuation pages run inside the same ordinary
                 // interval; the ordinary cycle keeps its deadline.
                 continuation::wait_for_ordinary_cycle(
@@ -4025,13 +4024,7 @@ impl continuation::LoopHost for ContinuationLoop<'_> {
         continuation::production_pending()
     }
     fn page(&mut self, deadline: Instant) -> continuation::Outcome {
-        continuation::run_production_page(
-            self.home,
-            self.support_dir,
-            self.daemon,
-            self.retry,
-            deadline,
-        )
+        continuation::run_production_page(self.home, self.support_dir, self.daemon, deadline)
     }
 }
 
@@ -4406,7 +4399,7 @@ fn sync_once_with_retry(
     let account_witness = daemon
         .snapshot_scan_account_witness()
         .map_err(|_| anyhow!("snapshot account authority unavailable"))?;
-    let client = snapshot_cycle_client(support_dir, daemon);
+    let client = snapshot_cycle_client(support_dir, daemon)?;
     let enabled_sources = enabled_snapshot_sources(&device);
 
     if let Some(source) = enabled_sources.first().copied() {
@@ -4487,7 +4480,7 @@ fn sync_once_with_retry(
 }
 
 /// The cycle's API client, with the receipt state and context every cycle uses.
-fn snapshot_cycle_client(support_dir: &Path, daemon: &LocalDaemon) -> SnapshotApiClient {
+fn snapshot_cycle_client(support_dir: &Path, daemon: &LocalDaemon) -> Result<SnapshotApiClient> {
     let device_label = daemon
         .machine_for_trusted_client()
         .ok()
@@ -4496,51 +4489,9 @@ fn snapshot_cycle_client(support_dir: &Path, daemon: &LocalDaemon) -> SnapshotAp
         .account_for_trusted_client()
         .ok()
         .map(|account| account.state);
-    SnapshotApiClient::new(snapshot_api_base_url())
+    Ok(SnapshotApiClient::new(snapshot_api_base_url()?)
         .with_receipt_state_dir(support_dir)
-        .with_receipt_context(device_label, account_binding)
-}
-
-/// A continuation job's EOF completion, called with `SNAPSHOT_SYNC_LOCK` held:
-/// the existing authorized completion upload through
-/// [`SnapshotCycleOwner::finish_completed`], the same completion an ordinary
-/// Codex finish runs. Its local inputs are read as `sync_once_with_retry`
-/// reads them. It sends no cycle-start receipt, health upload or activity-hint
-/// request, and it is not a sync cycle, so its transport outcome does not feed
-/// the cycle streak.
-fn complete_continuation_eof(
-    home: &Path,
-    support_dir: &Path,
-    daemon: &LocalDaemon,
-    retry: &mut live_snapshot_retry::LiveRetryOwner,
-    completed: (SourcePreparation, ScanIndex, SourceScanResult),
-) -> Result<()> {
-    let (device, device_secret) = load_snapshot_device_credentials()?;
-    let Some(machine_id) = snapshot_machine_id(&device)? else {
-        return Err(anyhow!("machine identity is missing"));
-    };
-    let account_witness = daemon
-        .snapshot_scan_account_witness()
-        .map_err(|_| anyhow!("snapshot account authority unavailable"))?;
-    let client = snapshot_cycle_client(support_dir, daemon);
-    let mut transport_cycle = crate::net_resilience::TransportCycleOutcome::default();
-    let mut failed_sources = Vec::new();
-    SnapshotCycleOwner {
-        client: &client,
-        device: &device,
-        device_secret: &device_secret,
-        machine_id: &machine_id,
-        home,
-        support_dir,
-        daemon,
-        transport_cycle: &mut transport_cycle,
-        failed_sources: &mut failed_sources,
-        started: Instant::now(),
-        codex_started: None,
-        account_witness,
-        retry,
-    }
-    .finish_completed(completed)
+        .with_receipt_context(device_label, account_binding))
 }
 
 #[allow(dead_code)] // Native retained-copy preparation; activation review remains closed.
@@ -4675,9 +4626,6 @@ struct SnapshotCycleOwner<'a> {
     codex_started: Option<Instant>,
 }
 impl SnapshotCycleOwner<'_> {
-    /// One completed source scan: the census fence over the authority and
-    /// destination rechecks, then the unchanged `finish_sync_source`. An
-    /// ordinary finish and a continuation job's EOF completion both run this.
     fn finish_completed(
         &mut self,
         (preparation, index, scan): (SourcePreparation, ScanIndex, SourceScanResult),
@@ -4719,7 +4667,7 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
         source: SnapshotSource,
         remaining: Option<usize>,
     ) -> Result<Option<SourcePreparation>> {
-        if continuation::ENABLED && source == SnapshotSource::Codex {
+        if source == SnapshotSource::Codex {
             self.codex_started = Some(Instant::now());
             // K2: this prepare's policy replaces any older cached inputs.
             continuation::invalidate_on_ordinary_prepare();
@@ -4784,34 +4732,32 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
         completed.0.accept_native_rotation_turn(remaining);
         let source = completed.0.source;
         // Read before the scan is consumed; kept only if the finish succeeds.
-        let continuation_ticket =
-            (continuation::ENABLED && source == SnapshotSource::Codex).then(|| {
-                let endpoint = snapshot_api_base_url();
-                let authority = self
-                    .client
-                    .matches_api_base(&endpoint)
-                    .then(|| {
-                        continuation::current_authority(
-                            self.device,
-                            &endpoint,
-                            &self.account_witness,
-                        )
-                    })
-                    .flatten();
-                continuation::ordinary_ticket(
-                    &continuation::CodexContinuation::new(
-                        &self.daemon.transcript_cache,
-                        self.home,
-                        self.support_dir,
-                    ),
-                    &completed.2,
-                    &completed.0.upload_destination_namespace,
-                    authority,
-                    continuation::ticket_lifetime(self.codex_started),
-                )
-                // K2: moved out only when a ticket was minted.
-                .map(|ticket| ticket.with_inputs(take_continuation_inputs(&mut completed.0)))
-            });
+        let continuation_ticket = (source == SnapshotSource::Codex
+            && completed.2.continuation_ticket().is_some())
+        .then(|| {
+            let endpoint = snapshot_api_base_url().ok()?;
+            let authority =
+                continuation::current_authority(self.device, &endpoint, &self.account_witness)
+                    .filter(|_| self.client.matches_api_base(&endpoint));
+            continuation::ordinary_ticket(
+                &continuation::CodexContinuation::new(
+                    &self.daemon.transcript_cache,
+                    self.home,
+                    self.support_dir,
+                ),
+                &completed.2,
+                &completed.0.upload_destination_namespace,
+                authority,
+                continuation::ticket_lifetime(self.codex_started),
+            )
+            .and_then(continuation_finish_inputs(
+                &mut completed.0,
+                &mut completed.2,
+                remaining,
+                &self.daemon.codex_preludes,
+                self.daemon.codex_versions.clone(),
+            ))
+        });
         let finished = crate::local_resource_diagnostics::source_finish(source.api_slug(), || {
             self.finish_completed(completed)
         });
@@ -4821,7 +4767,7 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
         finished
     }
     fn outcome(&mut self, source: SnapshotSource, result: Result<()>) {
-        if continuation::ENABLED && source == SnapshotSource::Codex && result.is_err() {
+        if source == SnapshotSource::Codex && result.is_err() {
             continuation::after_ordinary_codex_failure();
         }
         match result {
@@ -4846,14 +4792,17 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
         self.started.elapsed()
     }
     fn retained_bound(&self, limit: usize) -> Option<usize> {
+        let versions = crate::heap_layout_bound::bound(&self.daemon.codex_versions, limit)?;
         let native = if crate::snapshots::claude_native_comparison::enabled() {
-            self.daemon.native_comparison.retained_bound(limit)?
+            self.daemon
+                .native_comparison
+                .retained_bound(limit.checked_sub(versions)?)?
         } else {
             0
         };
-        // Stage 1 (K2): a held continuation ticket's inputs; zero while inert.
-        let continuation = continuation::retained_bound(limit.checked_sub(native)?)?;
-        native.checked_add(continuation)
+        let owned = versions.checked_add(native)?;
+        let continuation = continuation::retained_bound(limit.checked_sub(owned)?)?;
+        owned.checked_add(continuation)
     }
     fn discard_retained(&mut self) {
         if crate::snapshots::claude_native_comparison::enabled() {
@@ -4875,7 +4824,7 @@ pub fn upload_local_health_projection_now(daemon: &LocalDaemon) -> Result<()> {
     let Some(source) = enabled_snapshot_sources(&device).first().copied() else {
         return Err(anyhow!("registered device has no enabled sources"));
     };
-    let client = SnapshotApiClient::new(snapshot_api_base_url());
+    let client = SnapshotApiClient::new(snapshot_api_base_url()?);
     upload_local_health_projection_reporting(
         &client,
         &device,
@@ -4897,7 +4846,7 @@ fn upload_local_health_projection_reporting(
     // The binding this pass's requests are for, captured before any of them.
     // A failure is recorded against it, never against a setup run attached
     // while a request was in flight.
-    let binding = setup_run_refresh_binding(device, device_secret, source);
+    let binding = setup_run_refresh_binding(device, device_secret, source)?;
     let relay_binding = client.relay_auth_binding(device, device_secret, source);
     if let Some(held) = setup_run_refresh_hold_for(&binding) {
         // No request at all while held: the last `AuthRejected` upload event
@@ -5033,14 +4982,14 @@ fn setup_run_refresh_binding(
     device: &LocalDeviceBinding,
     device_secret: &str,
     source: SnapshotSource,
-) -> [u8; 32] {
+) -> Result<[u8; 32]> {
     let mut digest = Sha256::new();
     digest.update(b"ottto:setup-run-refresh-hold:v1\0");
     digest.update(device.device_id.as_bytes());
     digest.update(b"\0");
     digest.update(device_secret.as_bytes());
     digest.update(crate::relay_auth::binding_key(
-        &snapshot_api_base_url(),
+        &snapshot_api_base_url()?,
         device,
         device_secret,
         source.api_slug(),
@@ -5051,7 +5000,7 @@ fn setup_run_refresh_binding(
         digest.update(b"\0");
         digest.update(connection.api_base_url.as_bytes());
     }
-    digest.finalize().into()
+    Ok(digest.finalize().into())
 }
 
 fn setup_run_refresh_hold_duration(failures: u32) -> Duration {
@@ -5221,7 +5170,7 @@ pub fn upload_agent_status_snapshots(snapshots: &[AgentStatusSnapshot]) -> Resul
     let Some(machine_id) = snapshot_machine_id(&device)? else {
         return Err(anyhow!("machine identity is missing"));
     };
-    let client = SnapshotApiClient::new(snapshot_api_base_url());
+    let client = SnapshotApiClient::new(snapshot_api_base_url()?);
 
     let mut uploaded = 0;
     let mut failed_sources = Vec::new();
@@ -5240,7 +5189,7 @@ pub fn upload_agent_status_snapshots(snapshots: &[AgentStatusSnapshot]) -> Resul
         if source_snapshots.is_empty() {
             continue;
         }
-        let relay_token = match client.issue_relay_token(&device, &device_secret, source) {
+        let relay_token = match client.issue_status_relay_token(&device, &device_secret, source) {
             Ok(token) => token,
             Err(error) => {
                 transport_cycle.note_error(&error);
@@ -5970,7 +5919,7 @@ fn prepare_sync_source_inner(
         diagnostic.emit();
     }
     let scan_started_at = current_rfc3339();
-    let relay_token = client.issue_relay_token(device, device_secret, source)?;
+    let relay_token = client.issue_status_relay_token(device, device_secret, source)?;
     let mut activity_hint = client.get_activity_hint(&relay_token)?;
     // Treat the activity hint as the only authority for the semantic evidence
     // window. Missing/malformed hints already fail JSON decoding; future
@@ -6212,11 +6161,13 @@ fn prepare_sync_source_inner(
             cache_observations_enabled,
         );
     }
-    index.activate_upload_context(cycle_upload_context(
+    let upload_context = cycle_upload_context(
         upload_policy,
         checkpoint_namespace.as_deref(),
         cache_observations_enabled,
-    ));
+    );
+    continuation::observe(source, &upload_context, upload_policy);
+    index.activate_upload_context(upload_context);
     if !context_curve_enabled {
         // Stamp the off transition before taking the partial-commit baseline.
         // If an ordinary no-curve upload is partially accepted and then shed,
@@ -6379,6 +6330,7 @@ fn prepare_sync_source_inner(
             &activity_hint,
             &upload_destination_namespace,
             &backfill_state,
+            client.api_base_seal(),
         )
     } else {
         None
@@ -6419,9 +6371,12 @@ fn prepare_sync_source_inner(
         request_identity_capture,
     )
     .with_sampled_acquisition(daemon.transcript_cache.clone(), sampled_scope.clone())
-    .with_codex_side_pass(codex_side_pass);
+    .with_codex_side_pass(codex_side_pass)
+    .with_codex_versions(daemon.codex_versions.clone());
     if source == SnapshotSource::ClaudeCode {
         scan = scan.with_line_observer("footprint", daemon.footprint_cwds.observer());
+    } else if source == SnapshotSource::Codex {
+        scan = scan.with_line_observer("codex_prelude", daemon.codex_preludes.observer(&roots));
     }
     if crate::snapshots::claude_native_comparison::enabled() {
         scan.enable_native_comparison();
@@ -6476,6 +6431,8 @@ fn prepare_sync_source_inner(
 /// every other end. Charged as process-retained memory
 /// (`continuation::retained_bound`).
 struct ContinuationInputs {
+    codex_preludes: std::sync::Arc<crate::codex_prelude_footprint::CodexPreludeFeed>,
+    codex_versions: std::sync::Arc<crate::snapshots::codex_version::CodexVersionFeed>,
     account_witness: [u8; 32],
     activity_hint: crate::snapshot_client::ActivityHintResponse,
     receipt_window_days: u64,
@@ -6488,12 +6445,14 @@ struct ContinuationInputs {
     receipt_client: SnapshotApiClient,
     index_path: PathBuf,
     upload_progress_path: PathBuf,
+    evidence: Option<crate::snapshots::CodexContinuationEvidence>,
+    runtime_context: continuation::RuntimeContext,
 }
 
-crate::heap_layout_bound::fields!(ContinuationInputs; account_witness, activity_hint,
+crate::heap_layout_bound::fields!(ContinuationInputs; codex_preludes, account_witness, activity_hint,
     receipt_window_days, context_curve_enabled, cache_observations_enabled,
     scan_agent_status_collection, attribution_context, upload_policy,
-    upload_destination_namespace, receipt_client, index_path, upload_progress_path);
+    upload_destination_namespace, receipt_client, index_path, upload_progress_path, evidence, runtime_context; shared codex_versions);
 
 impl ContinuationInputs {
     /// Whether the moved attribution context is present (tests read this
@@ -6504,17 +6463,45 @@ impl ContinuationInputs {
     }
 }
 
+fn continuation_finish_inputs<'a>(
+    preparation: &'a mut SourcePreparation,
+    scan: &'a mut SourceScanResult,
+    remaining: Option<usize>,
+    codex_preludes: &'a std::sync::Arc<crate::codex_prelude_footprint::CodexPreludeFeed>,
+    codex_versions: std::sync::Arc<crate::snapshots::codex_version::CodexVersionFeed>,
+) -> impl FnOnce(continuation::ContinuationTicket) -> Option<continuation::ContinuationTicket> + 'a
+{
+    move |ticket| {
+        let evidence = scan.take_continuation_evidence()?;
+        let mut inputs = take_continuation_inputs(preparation, codex_preludes, codex_versions);
+        inputs.evidence = Some(evidence);
+        let refusal = remaining.map_or("no_remaining", |_| "over_bound");
+        let ticket = remaining.and_then(|limit| ticket.with_inputs(inputs, limit));
+        crate::local_resource_diagnostics::codex_continuation_mint(
+            ticket.as_ref().map_or(refusal, |_| "minted"),
+        );
+        ticket
+    }
+}
 /// Stage 1 (K2): the continuation inputs of a just-finished ordinary Codex
 /// page, taken before its finish. `finish_sync_source` never reads the
 /// attribution context, so moving it out changes nothing for the finish.
 /// Called only while continuation pages are enabled and a ticket was minted.
-fn take_continuation_inputs(preparation: &mut SourcePreparation) -> ContinuationInputs {
+fn take_continuation_inputs(
+    preparation: &mut SourcePreparation,
+    codex_preludes: &std::sync::Arc<crate::codex_prelude_footprint::CodexPreludeFeed>,
+    codex_versions: std::sync::Arc<crate::snapshots::codex_version::CodexVersionFeed>,
+) -> ContinuationInputs {
     let mut activity_hint = preparation.activity_hint.clone();
     // The prepare took the raw key out of its hint already; never keep one.
     if let Some(mut key) = activity_hint.session_attribution_hmac_key.take() {
         key.zeroize();
     }
     ContinuationInputs {
+        codex_preludes: std::sync::Arc::clone(codex_preludes),
+        codex_versions,
+        evidence: None,
+        runtime_context: continuation::runtime_context(),
         account_witness: preparation.account_witness,
         activity_hint,
         receipt_window_days: preparation.receipt_window_days,
@@ -6542,6 +6529,7 @@ enum ContinuationRefusal {
     LegacySettlement,
     UploadClaim,
     ReasonReoffer,
+    EvidenceChanged,
 }
 
 impl ContinuationRefusal {
@@ -6552,6 +6540,7 @@ impl ContinuationRefusal {
             Self::LegacySettlement => "legacy_settlement_pending",
             Self::UploadClaim => "upload_progress_claim_needed",
             Self::ReasonReoffer => "reason_reoffer_active",
+            Self::EvidenceChanged => "continuation_evidence_changed",
         }
     }
 }
@@ -6589,56 +6578,69 @@ enum ContinuationScan {
         ticket: Option<crate::snapshots::CodexCursorTicket>,
         snapshots: usize,
     },
-    /// The job committed (EOF): the preparation, index and scan for the
-    /// unchanged finish on the parent.
-    Committed(Box<(SourcePreparation, ScanIndex, SourceScanResult)>),
 }
 
-/// Stage 1 (K1 a″): one Codex continuation page on the worker: the
-/// continuation-local prepare, then the scan to its end. The working index
-/// and its committed copy (K3) are dropped here on every end but EOF (K7: no
-/// save). The attribution context moves into the preparation and, on every
-/// end but EOF, back into `inputs`.
 fn run_continuation_scan(
     home: &Path,
     support_dir: &Path,
     cache: &std::sync::Arc<crate::snapshots::sampled_scan::SharedCache>,
     inputs: &mut ContinuationInputs,
-    members: &BTreeSet<String>,
     ordinary_equivalent: Option<Duration>,
     deadline: Instant,
 ) -> Result<ContinuationScan> {
+    let current = continuation::runtime_context();
+    let contexts = |value: continuation::RuntimeContext| value.map(|slot| slot.map(|v| v.0));
+    let held = if contexts(inputs.runtime_context) != contexts(current) {
+        "context_changed"
+    } else if inputs.runtime_context != current {
+        "policy_changed"
+    } else if inputs.evidence.is_none() {
+        "other"
+    } else {
+        "roster_changed"
+    };
+    if inputs.runtime_context != current
+        || !inputs
+            .evidence
+            .as_ref()
+            .is_some_and(|evidence| evidence.content_unchanged())
+    {
+        crate::local_resource_diagnostics::codex_continuation(Some(held));
+        return Ok(ContinuationScan::Refused(
+            ContinuationRefusal::EvidenceChanged,
+        ));
+    }
     let mut preparation = match prepare_continuation_source(
         home,
         support_dir,
         cache,
         inputs,
-        members,
         ordinary_equivalent,
         deadline,
-    )? {
+    )
+    .inspect_err(|_| crate::local_resource_diagnostics::codex_continuation(Some("other")))?
+    {
         Ok(preparation) => preparation,
-        Err(reason) => return Ok(ContinuationScan::Refused(reason)),
+        Err(reason) => {
+            crate::local_resource_diagnostics::codex_continuation(Some("other"));
+            return Ok(ContinuationScan::Refused(reason));
+        }
     };
+    crate::local_resource_diagnostics::codex_continuation(None);
     loop {
         match preparation.step() {
             SourcePreparationStep::Pending(next) => preparation = next,
             SourcePreparationStep::Refused(mut refused, _) => {
+                crate::local_resource_diagnostics::codex_continuation(Some("other"));
                 inputs.attribution_context = refused.attribution_context.take();
                 return Ok(ContinuationScan::StepRefused);
             }
             SourcePreparationStep::Complete {
                 mut preparation,
-                index,
-                scan,
+                index: _,
+                mut scan,
             } => {
-                if scan.continuation_committed() {
-                    return Ok(ContinuationScan::Committed(Box::new((
-                        preparation,
-                        index,
-                        scan,
-                    ))));
-                }
+                inputs.evidence = scan.take_continuation_evidence();
                 inputs.attribution_context = preparation.attribution_context.take();
                 return Ok(ContinuationScan::Uncommitted {
                     ticket: scan.continuation_ticket().cloned(),
@@ -6663,7 +6665,6 @@ fn prepare_continuation_source(
     support_dir: &Path,
     cache: &std::sync::Arc<crate::snapshots::sampled_scan::SharedCache>,
     inputs: &mut ContinuationInputs,
-    members: &BTreeSet<String>,
     ordinary_equivalent: Option<Duration>,
     deadline: Instant,
 ) -> Result<std::result::Result<SourcePreparation, ContinuationRefusal>> {
@@ -6676,11 +6677,6 @@ fn prepare_continuation_source(
     )?;
     let (mut index, _) =
         ScanIndex::load_for_snapshot_source_with_origin(&inputs.index_path, source, support_dir)?;
-    upload_progress.recover_ack_retirement_handoff(
-        &mut index,
-        &inputs.index_path,
-        &inputs.upload_progress_path,
-    )?;
     upload_progress.configure_ack_capacity(&index);
     let backfill_state = load_backfill_state(support_dir);
     let replay_generation = cycle_replay_generation(
@@ -6736,9 +6732,6 @@ fn prepare_continuation_source(
         checkpoint_namespace.as_deref(),
         inputs.cache_observations_enabled,
     ));
-    if !inputs.context_curve_enabled {
-        index.mark_context_curve_capability_disabled();
-    }
     // The ordinary selection's in-memory effects, on this page's own copy;
     // the probe above found no claim, so there is nothing to save.
     let claimed = prepare_upload_progress_for_cycle_with_reoffer(
@@ -6783,8 +6776,8 @@ fn prepare_continuation_source(
         MAX_BACKFILL_FILES_PER_SOURCE,
         inputs.upload_policy.session_artifacts_enabled,
         inputs.context_curve_enabled,
-        members,
         ordinary_equivalent,
+        inputs.evidence.take(),
     )
     .with_continuation_deadline(deadline)
     .with_sampled_acquisition(
@@ -6798,7 +6791,9 @@ fn prepare_continuation_source(
             false,
         ),
     )
-    .with_codex_side_pass(Some(codex_side_pass));
+    .with_codex_side_pass(Some(codex_side_pass))
+    .with_line_observer("codex_prelude", inputs.codex_preludes.observer(&roots))
+    .with_codex_versions(inputs.codex_versions.clone());
     Ok(Ok(SourcePreparation {
         native_comparison_reservation: None,
         native_comparison_lease: None,
@@ -8153,7 +8148,13 @@ fn finish_sync_source(
     )?;
     note_codex_side_saved(daemon, &index_path, true, side_mark);
     #[cfg(unix)]
-    crate::snapshots::durable_after_save(&daemon.transcript_cache, support_dir, source, &index);
+    crate::snapshots::durable_after_save_and_retire(
+        &daemon.transcript_cache,
+        support_dir,
+        source,
+        &mut index,
+        &index_path,
+    );
     #[cfg(test)]
     tests::permanent_finish_pipeline_tests::ack_post_save_failure("native_receipt")?;
     if upload_fully_settled
@@ -9211,7 +9212,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             stats.exact_request_set_root_count += 1;
         } else {
             stats.request_set_mismatch_root_count += 1;
-            full_rearm_evidence_complete = false;
             stats.api_only_request_count += api_request_ids.difference(&trace_request_ids).count();
             stats.trace_only_request_count +=
                 trace_request_ids.difference(&api_request_ids).count();
@@ -9224,6 +9224,12 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             stats.trace_evidence_row_count += rows.len();
             trace_report.evidence.insert(root_session_id, rows);
         }
+    }
+    if stats.request_set_mismatch_root_count > 0 {
+        index.note_claude_ignored_rearm_veto(
+            &scan_result.census_window_end,
+            crate::local_resource_diagnostics::claude_reread::IgnoredVeto::EvidenceGap.bit(),
+        );
     }
     // E2 side calls need the trace-named owner, so they follow the trace read.
     let side_calls_unresolved = crate::snapshots::claude_request_money::e2::side_calls_page(
@@ -11188,7 +11194,7 @@ fn collector_checkin_once() -> Result<()> {
     if enabled_sources.is_empty() {
         return Err(anyhow!("registered device has no enabled sources"));
     }
-    let client = SnapshotApiClient::new(snapshot_api_base_url());
+    let client = SnapshotApiClient::new(snapshot_api_base_url()?);
     let mut failed_sources = Vec::new();
     for source in enabled_sources {
         if report_checkin_status_with_fresh_relay_token(
@@ -11239,15 +11245,23 @@ pub(crate) fn enabled_snapshot_sources(device: &LocalDeviceBinding) -> Vec<Snaps
     .collect()
 }
 
-pub(crate) fn snapshot_api_base_url() -> String {
-    normalize_api_base_url(
-        FileConnectionStore::default()
-            .load()
-            .ok()
-            .flatten()
-            .map(|binding| binding.api_base_url),
+pub(crate) fn snapshot_api_base_url() -> Result<String> {
+    snapshot_api_base_url_from(
+        FileConnectionStore::default().load(),
         std::env::var("OTTTO_API_BASE_URL").ok(),
     )
+}
+fn snapshot_api_base_url_from(
+    connection: Result<Option<ottto_core::LocalConnectionBinding>>,
+    env_value: Option<String>,
+) -> Result<String> {
+    // Read/parse/cap errors are not an absent binding: never redirect secrets
+    // to the environment/default destination after a persisted binding fails.
+    let connection = crate::local_resource_diagnostics::connection_binding_read(connection)?;
+    Ok(normalize_api_base_url(
+        connection.map(|binding| binding.api_base_url),
+        env_value,
+    ))
 }
 
 fn normalize_api_base_url(connection_value: Option<String>, env_value: Option<String>) -> String {
@@ -11449,10 +11463,11 @@ fn ensure_snapshot_scan_authority(
             operation: "source authority changed during owned scan",
         })
     };
-    let current = ottto_core::FileDeviceStore::default()
-        .load()
-        .map_err(|_| rejected())?
-        .ok_or_else(rejected)?;
+    let current = crate::local_resource_diagnostics::credential_file_read(
+        ottto_core::FileDeviceStore::default().load(),
+    )
+    .map_err(|_| rejected())?
+    .ok_or_else(rejected)?;
     let account = daemon
         .snapshot_scan_account_witness()
         .map_err(|_| rejected())?;
@@ -11460,7 +11475,7 @@ fn ensure_snapshot_scan_authority(
         expected_device,
         &current,
         source,
-        client.matches_api_base(&snapshot_api_base_url()),
+        client.matches_api_base(&snapshot_api_base_url().map_err(|_| rejected())?),
         expected_account,
         &account,
     )
@@ -11636,7 +11651,9 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("; ");
-    if text.contains("relay device") {
+    if text.contains("connection binding") {
+        "connection binding is unavailable or invalid; reconnect this device".to_string()
+    } else if text.contains("relay device") {
         "relay device credentials are unavailable".to_string()
     } else if text.contains("machine identity") {
         "machine identity is unavailable".to_string()
@@ -18435,6 +18452,83 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn endpoint_load_failure_during_scan_is_local_state() {
+        if !crate::test_isolation::run_here() {
+            return;
+        }
+        let root = test_dir("scan-endpoint-load-failure");
+        std::fs::create_dir_all(&root).unwrap();
+        let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+        let device = LocalDeviceBinding {
+            sources: vec!["pi".into()],
+            ..bounded_native_device()
+        };
+        FileDeviceStore::default().save(&device).unwrap();
+        let daemon = test_daemon(&"a".repeat(64));
+        let account = daemon.snapshot_scan_account_witness().unwrap();
+        let client = SnapshotApiClient::new("https://synthetic.invalid");
+        for bytes in [b"invalid-json".to_vec(), vec![b' '; 64 * 1024 + 1]] {
+            std::fs::write(root.join("connection.json"), bytes).unwrap();
+            let load_error = snapshot_api_base_url().unwrap_err();
+            assert_eq!(
+                safe_error(&load_error),
+                "connection binding is unavailable or invalid; reconnect this device"
+            );
+            let error = ensure_snapshot_scan_authority(
+                &device,
+                SnapshotSource::Pi,
+                &client,
+                &account,
+                &daemon,
+            )
+            .unwrap_err();
+            assert_eq!(
+                snapshot_upload_error_class(&error),
+                Some(SnapshotUploadErrorClass::LocalState)
+            );
+            assert_eq!(safe_error(&error), "local snapshot state failed");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn connection_cap_refusal_never_selects_environment_or_default_endpoint() {
+        use std::fs;
+        let root = test_dir("connection-cap-endpoint");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("connection.json");
+        let store = FileConnectionStore::new(&path);
+        let mut bytes = serde_json::to_vec(&serde_json::json!({
+            "setup_run_id": "synthetic", "setup_run_token_expires_at": "synthetic",
+            "machine_id": null, "api_base_url": "https://custom.invalid"
+        }))
+        .unwrap();
+        bytes.resize(64 * 1024, b' ');
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            snapshot_api_base_url_from(store.load(), None).unwrap(),
+            "https://custom.invalid"
+        );
+        bytes.push(b' ');
+        fs::write(&path, &bytes).unwrap();
+        for env in [None, Some("https://fallback.invalid".to_owned())] {
+            let mut client_created = false;
+            let result = snapshot_api_base_url_from(store.load(), env).map(|base| {
+                client_created = true;
+                SnapshotApiClient::new(base)
+            });
+            assert!(result.is_err());
+            assert!(!client_created);
+        }
+        assert_eq!(
+            snapshot_api_base_url_from(Ok(None), Some("https://fallback.invalid".into())).unwrap(),
+            "https://fallback.invalid"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn api_base_url_prefers_persisted_connection_then_env() {
         assert_eq!(
             normalize_api_base_url(
@@ -24170,3 +24264,38 @@ crate::heap_layout_bound::fields!(PermanentSnapshotRejection; body_witness, reas
 
 crate::heap_layout_bound::fields!(PreparedTraceRead; generation, report);
 crate::heap_layout_bound::fields!(PreparedClaudeLocalEvidence; sessions, api, api_failed, trace_rows, traces, healthy_roots);
+
+#[cfg(test)]
+mod ownership_census_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_appends_scanner_partition_only_for_codex_and_keeps_unproven_separate() {
+        let mut contributions = [0; 8];
+        contributions[0] = 2;
+        let counts = SyncCounts {
+            ownership_incomplete_file_count: 5,
+            snapshot_unproven_terminal_count: 3,
+            causes: (contributions, [0, 77, 0]),
+            ..SyncCounts::default()
+        };
+        let line = counts.terminal_census_line("codex");
+        assert!(line.contains("unproven_terminal=3"));
+        assert!(line.contains("ownership_incomplete_files=5"));
+        assert!(line.contains("ownership_incomplete_contributions{bucket=\"inventory_hold\"}=2"));
+        assert!(line.contains("ownership_incomplete_generation_start=77"));
+        assert!(!line.contains("ownership_incomplete_distinct_paths{"));
+        assert!(!line.contains("bucket=\"unattributed\""));
+        assert!(
+            line.find("terminal_contract_retry_exhausted=").unwrap()
+                < line
+                    .find("ownership_incomplete_contributions{bucket=")
+                    .unwrap()
+        );
+        for source in ["claude_code", "pi"] {
+            assert!(!counts
+                .terminal_census_line(source)
+                .contains("ownership_incomplete_contributions{bucket="));
+        }
+    }
+}

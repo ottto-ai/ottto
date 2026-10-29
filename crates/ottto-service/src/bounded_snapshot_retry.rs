@@ -4,16 +4,77 @@ use super::*;
 use crate::heap_layout_bound::{Counter, HeapLayoutBound};
 use crate::snapshot_retry::RetryBudget;
 
-/// This gate is intentionally closed in production while the complete live
-/// dependency/policy witness and wake integration receive activation review.
-/// It is not an environment option or a new scheduler.
-const ACTIVATED: bool = false;
-// A single shared overlap budget:8MiB parked scans +4MiB retained native
-// context +20MiB reserved send/checkpoint allowance. The latter remains an
-// activation-review bound, not a physical-memory claim from loopback evidence.
-const RETAINED_BUDGET: usize = crate::source_rotation::OVERLAP_BUDGET
-    - crate::source_rotation::PARKED_BUDGET
-    - 20 * 1024 * 1024;
+/// Accepted E9-2 requested-layout evidence (Lead A ruling, 2026-10-28):
+/// 4H for outgoing clone, selected checkpoint/restoration, ACK maps and JSON
+/// comparisons; 4 MiB auxiliary decode (8192 nodes, capped 128 KiB input);
+/// 4 MiB encoded index/request/response copies, gzip and ACK response growth;
+/// 8 MiB transport/TLS workspace. Admission enforces 4H + 16 MiB <= 20 MiB,
+/// hence H <= 1 MiB before copies. The partition model plus native peak receipts
+/// at the largest admitted pages is the accepted evidence, not a universal
+/// decoder/TLS or RSS proof. The retained owner is charged separately below.
+/// Initial checkpoint validation streams a comparison, with no native decode
+/// or serialized index copies; native ACK/selected-index bounded decoders stay.
+/// Fresh binding/file-secret loads are capped at 64 KiB before reading.
+/// Keychain loads belong to the shared ordinary-path resource domain and are
+/// not charged to the retry reserve. Allocator slack and process RSS are separate.
+const SEND_BUDGET: usize = 20 * 1024 * 1024;
+const SEND_FIXED: usize = 16 * 1024 * 1024;
+const RETAINED_BUDGET: usize =
+    crate::source_rotation::OVERLAP_BUDGET - crate::source_rotation::PARKED_BUDGET - SEND_BUDGET;
+
+fn turn_peak_bound(retained: usize) -> Option<usize> {
+    retained
+        .checked_mul(4)?
+        .checked_add(SEND_FIXED)
+        .filter(|peak| *peak <= SEND_BUDGET)
+}
+
+// Compare exactly the native writer's encoding, without decoding competing
+// state. A differently formatted checkpoint safely returns to ordinary work.
+pub(super) fn checkpoint_matches<T: Serialize>(
+    path: &Path,
+    expected: &T,
+    pretty: bool,
+) -> Result<bool> {
+    struct Compare<'a>(&'a [u8]);
+    impl std::io::Write for Compare<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if !self.0.starts_with(bytes) {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    "checkpoint changed",
+                ));
+            }
+            self.0 = &self.0[bytes.len()..];
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let bytes = crate::snapshot_retry::read_state(path, crate::snapshot_retry::RESPONSE_BYTES)?;
+    crate::snapshot_retry::state_shape(&bytes)?;
+    let mut compare = Compare(&bytes);
+    let result = if pretty {
+        serde_json::to_writer_pretty(&mut compare, expected)
+    } else {
+        serde_json::to_writer(&mut compare, expected)
+    };
+    if result.is_ok() && compare.0.is_empty() {
+        return Ok(true);
+    }
+    // The native index writer uses pretty JSON when decode holds exist.
+    // On mismatch serialize a second time for that alternate native encoding.
+    // Both sequential passes compare against the same RESPONSE_BYTES-capped
+    // buffer, with no decode or serialized output copy; reserves are not doubled.
+    compare.0 = &bytes;
+    let result = if pretty {
+        serde_json::to_writer(&mut compare, expected)
+    } else {
+        serde_json::to_writer_pretty(&mut compare, expected)
+    };
+    Ok(result.is_ok() && compare.0.is_empty())
+}
 
 struct BodyProof {
     fingerprint: [u8; 64],
@@ -93,6 +154,7 @@ impl PreparedRetry {
         if proof_size > crate::retry_retention_bound::PROOF_RESERVE {
             return None;
         }
+        turn_peak_bound(counter.bytes)?;
         let budget = RetryBudget::after_shed(now, delay)?;
         let mut copied = Vec::with_capacity(items.len());
         let mut proof = Vec::with_capacity(items.len());
@@ -131,6 +193,9 @@ impl PreparedRetry {
     ) -> bool {
         let mut counter = Counter::new(allowance.min(RETAINED_BUDGET));
         if counter.add(self.bound).is_none() || live.heap_bound(&mut counter).is_none() {
+            return false;
+        }
+        if turn_peak_bound(counter.bytes).is_none() {
             return false;
         }
         self.bound = counter.bytes;
@@ -175,6 +240,10 @@ impl PreparedRetry {
     pub(super) fn bound(&self) -> usize {
         self.bound
     }
+    #[cfg(test)]
+    pub(super) fn peak_bound(&self) -> usize {
+        turn_peak_bound(self.bound).expect("admitted requested-layout peak")
+    }
     fn validate_body(&self, current: &[SnapshotItem], authority: &[u8; 32]) -> Result<()> {
         if authority != &self.authority
             || !self.proof.iter().all(|proof| {
@@ -198,32 +267,17 @@ impl PreparedRetry {
 
     fn validate_native_checkpoint(&self) -> Result<()> {
         let _lock = SnapshotProgressLock::acquire(&self.progress_path)?;
-        let bytes = crate::snapshot_retry::read_state(
-            &self.progress_path,
-            crate::snapshot_retry::RESPONSE_BYTES,
-        )?;
-        let mut durable: SnapshotUploadProgress = crate::snapshot_retry::decode_state(&bytes)?;
-        durable.active_quarantine_witness = self.progress.active_quarantine_witness.clone();
-        durable.active_quarantine_retries = self.progress.active_quarantine_retries.clone();
-        durable.ack_capacity = self.progress.ack_capacity;
-        durable.retained_stale_ack_count = self.progress.retained_stale_ack_count;
-        if crate::heap_layout_bound::bound(&durable, RETAINED_BUDGET).is_none()
-            || durable != self.progress
+        // All heap admission precedes auxiliary reads/decodes. Compare against
+        // already bounded native state; never decode a changed checkpoint first.
+        anyhow::ensure!(
+            turn_peak_bound(self.bound).is_some(),
+            "retry peak exceeds budget"
+        );
+        if !checkpoint_matches(&self.progress_path, &self.progress, true)?
+            || !checkpoint_matches(&self.index_path, &self.baseline, false)?
         {
             return Err(anyhow::Error::new(SnapshotLocalStateRejected {
-                operation: "progress changed before optional snapshot retry",
-            }));
-        }
-        let bytes = crate::snapshot_retry::read_state(
-            &self.index_path,
-            crate::snapshot_retry::RESPONSE_BYTES,
-        )?;
-        let current: ScanIndex = crate::snapshot_retry::decode_state(&bytes)?;
-        if crate::heap_layout_bound::bound(&current, RETAINED_BUDGET).is_none()
-            || serde_json::to_vec(&current)? != serde_json::to_vec(&self.baseline)?
-        {
-            return Err(anyhow::Error::new(SnapshotLocalStateRejected {
-                operation: "index changed before optional snapshot retry",
+                operation: "checkpoint changed before optional snapshot retry",
             }));
         }
         Ok(())
@@ -231,8 +285,7 @@ impl PreparedRetry {
 
     /// Called only by the existing owner at an admitted collection boundary.
     /// `validate` must establish fresh account/device/destination/stop plus
-    /// complete native dependency and policy authority; activation stays off
-    /// until that actual source-owned hook is reviewed, not supplied by a flag.
+    /// complete native dependency and policy authority.
     pub(super) fn turn(
         &mut self,
         client: &SnapshotApiClient,
@@ -400,12 +453,6 @@ impl PreparedRetry {
         self.baseline = checkpoint;
         Ok(outcome)
     }
-}
-
-/// Activation review is intentionally still closed. The daemon now owns the
-/// live plumbing, but its production constructor cannot capture or send.
-pub(super) fn production_activation_reviewed() -> bool {
-    ACTIVATED
 }
 
 /// Complete bodies share one bounded owner reservation. One source slot and
