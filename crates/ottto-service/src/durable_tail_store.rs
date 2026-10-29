@@ -1773,6 +1773,14 @@ impl DurableTailStore {
                 receipt.deferred_keys.push(key);
                 continue;
             }
+            if attempt.is_err() && prior.is_some() && stamp_at(&path)? == prior {
+                // The post-save index already refuses A. A failed rename left
+                // that exact verified predecessor untouched: do not retire it
+                // or lose the retry offer. The caller requeues this saved key,
+                // and the next selected pass can rewrite it from retained RAM.
+                self.pending.remove(&key);
+                return Err(attempt.err().expect("checked failed write"));
+            }
             let outcome = attempt.or_else(|_| self.reconcile_pending(writer, &key));
             let proof = match outcome {
                 Ok(ReconcileOutcome::Receipted(proof)) if proof.identity == candidate => proof,

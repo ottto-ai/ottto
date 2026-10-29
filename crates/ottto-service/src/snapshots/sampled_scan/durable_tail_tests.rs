@@ -14530,3 +14530,154 @@ fn codex_resource_probe_deferral_does_not_spend_recovery_pace() {
     );
     assert!(stores.retail_spent.is_empty());
 }
+
+/// Failed post-ACK rename -> a quiet selected pass rewrites the retained
+/// reduction without acquisition or selection renewal -> fresh-owner restore.
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "requires native cache admission layout"
+)]
+fn m3_post_save_failed_rename_requeues_quiet_ram_then_restart_restores_without_full() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    assert!(crate::heap_layout_bound::layout_supported());
+    let root = crate::test_scratch::ScratchDir::new("m3-post-save-requeue");
+    let lock = test_locks::hold(&root);
+    let _clear = ClearWriteFaults;
+    let source = SnapshotSource::Codex;
+    let ds = durable_source(source).unwrap();
+    let path = root.join("source.jsonl");
+    codex_budget_fixture(&path, "019fa111-2222-7333-8444-555555555555", None);
+    let key = local_index_key(&path);
+    let scope = Scope("m3-post-save-file".into());
+    let namespace = Scope("m3-post-save".into());
+    let index_path = root.join("index.json");
+    let cache = SharedCache::default();
+    cache.durable_begin_pass(source, &index_path, &namespace, false);
+    let admit = |fingerprint: &str| {
+        let (reduction, checkpoint) = native_record_of(&path, &scope, source);
+        let body = codec::encode(&reduction, store::BODY_BYTES, jsonl_line_cap() as u64).unwrap();
+        assert!(cache.insert_admitted(
+            key.clone(),
+            sampled_jsonl::CompletedNativeAcquisition {
+                durable: Default::default(),
+                checkpoint,
+                reduction: Some(reduction),
+                released: None,
+                unsealed: false,
+            },
+            0
+        ));
+        cache.durable_note_selection(&key, fingerprint);
+        cache.durable_note_scope(source, &key, &scope);
+        body
+    };
+    let first_body = admit("fp-a");
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        key.clone(),
+        serde_json::from_value(serde_json::json!({
+            "size_bytes":std::fs::metadata(&path).unwrap().len(),
+            "modified_unix_seconds":1,"source_file_fingerprint":"fp-a"
+        }))
+        .unwrap(),
+    );
+    index.save(&index_path).unwrap();
+    assert_eq!(
+        cache
+            .durable_write_after_save(lock, source, &index)
+            .unwrap()
+            .written,
+        1
+    );
+    let digest = store::key_digest(ds, &key);
+    let record_path = {
+        let mut stores = cache.durable().unwrap();
+        let dir = stores.slot(ds).as_ref().unwrap().store.dir();
+        dir.join(format!(
+            "{}.rec",
+            digest
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        ))
+    };
+    let a = std::fs::read(&record_path).unwrap();
+    std::io::Write::write_all(&mut std::fs::OpenOptions::new().append(true).open(&path).unwrap(),
+        b"{\"type\":\"event_msg\",\"timestamp\":\"2026-10-07T10:01:00Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":300,\"output_tokens\":30},\"last_token_usage\":{\"input_tokens\":200,\"output_tokens\":20}}}}\n").unwrap();
+    let body = admit("fp-b");
+    assert_ne!(body, first_body, "new retained reduction B premise");
+    let entry = index.files.get_mut(&key).unwrap();
+    entry.size_bytes = std::fs::metadata(&path).unwrap().len();
+    entry.source_file_fingerprint = "fp-b".into();
+    index.save(&index_path).unwrap();
+    let accepted = serde_json::to_value(&index.files[&key]).unwrap();
+    store::test_hooks::set_before_rename(Some(Box::new(|_, _| {
+        Err(std::io::Error::other("rename EIO"))
+    })));
+    assert!(cache
+        .durable_write_after_save(lock, source, &index)
+        .is_none());
+    store::test_hooks::set_before_rename(None);
+    assert_eq!(std::fs::read(&record_path).unwrap(), a, "A preserved");
+    assert_eq!(cache.durable().unwrap().selected.get(&key).unwrap(), "fp-b");
+    assert!(cache.durable().unwrap().touched.contains(&key));
+    cache.durable_begin_pass(source, &index_path, &namespace, false);
+    assert!(cache
+        .durable()
+        .unwrap()
+        .slot(ds)
+        .as_ref()
+        .unwrap()
+        .decided
+        .is_empty());
+    // No new parse, admission, selection, ACK undo or POST between attempts.
+    index.save(&index_path).unwrap();
+    assert_eq!(
+        cache
+            .durable_write_after_save(lock, source, &index)
+            .unwrap()
+            .written,
+        1
+    );
+    assert_ne!(std::fs::read(&record_path).unwrap(), a);
+    assert_eq!(serde_json::to_value(&index.files[&key]).unwrap(), accepted);
+    assert!(!cache.durable().unwrap().touched.contains(&key));
+    let fresh = SharedCache::default();
+    fresh.durable_begin_pass(source, &index_path, &namespace, false);
+    let loaded = ScanIndex::load(&index_path).unwrap();
+    let interpretation = Interpretation::of(source, &key, &loaded, false, &namespace);
+    let mut file = File::open(&path).unwrap();
+    let restored = fresh.durable_restore(
+        source,
+        &key,
+        &path,
+        &scope,
+        &mut file,
+        &loaded,
+        &interpretation,
+    );
+    let RestoreOutcome::Restored(taken, lease) = restored else {
+        panic!("expected actual disk restore");
+    };
+    assert_eq!(
+        codec::encode(
+            &taken.retained.state,
+            store::BODY_BYTES,
+            jsonl_line_cap() as u64
+        )
+        .unwrap(),
+        body
+    );
+    assert_eq!(fresh.durable_counters(source).unwrap().0.restored, 1);
+    lease.release();
+    let mut parser = owned_parser(source, &path, file);
+    assert_eq!(
+        parser
+            .prepare_acquisition_owned(Some(taken), &scope, None, 1_800_000_000)
+            .unwrap_or_else(|_| panic!("restored quiet checkpoint must prepare")),
+        crate::transcript_acquisition::ReadMode::Unchanged
+    );
+}

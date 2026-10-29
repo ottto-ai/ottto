@@ -3889,6 +3889,9 @@ impl SharedCache {
         let namespace = &namespace;
         let mut pending = Vec::new();
         let mut offered = BTreeMap::new();
+        // The M1 active allowance covers these small provenance copies beside
+        // its bounded body batch. A quiet retry has no new selector scope.
+        let mut offered_scopes = Vec::new();
         let mut later = BTreeSet::new();
         let mut budget = WRITE_PASS_BYTES;
         let mut not_persisted = Vec::new();
@@ -3969,6 +3972,7 @@ impl SharedCache {
                     Ok(body) => {
                         budget = budget.saturating_sub(body.len());
                         peak = peak.max(body.len() as u64);
+                        offered_scopes.push((key.clone(), retained.checkpoint.scope().clone()));
                         offered.insert(expected.binding.key, key);
                         pending.push(PendingRecord {
                             acquisition: None,
@@ -3985,6 +3989,11 @@ impl SharedCache {
                     Err(refuse) => not_persisted.push(refuse_class(refuse)),
                 }
             }
+        }
+        // Reconstruct from the actual retained acquisition, not the new index
+        // or an old namespace. begin_pass cleared the per-pass classifier map.
+        for (key, scope) in offered_scopes {
+            self.durable_note_scope(snapshot_source, &key, &scope);
         }
         let mut stores = self.durable()?;
         let deferred = later.len() as u64;
