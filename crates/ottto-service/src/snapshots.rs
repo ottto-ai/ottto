@@ -67,6 +67,7 @@ pub(crate) mod claude_request_identity;
 pub(crate) mod claude_request_money;
 mod idless_retry_marker;
 mod oversized_discovery;
+pub(crate) mod scan_index_health;
 #[cfg(test)]
 pub(crate) use tests::claude_request_account_mixed_fixture;
 #[cfg(test)]
@@ -46595,6 +46596,7 @@ impl ScanIndex {
     ) -> Result<(Self, ScanIndexLoadOrigin)> {
         let loaded =
             Self::load_inner_with_support(path, Some(source), Some(support_dir), SystemTime::now());
+        scan_index_health::observe(source, &loaded);
         let (mut index, origin) = match loaded {
             Ok(loaded) => {
                 note_scan_index_rebuild_paused(source, false);

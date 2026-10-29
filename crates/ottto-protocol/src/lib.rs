@@ -456,7 +456,8 @@ pub struct LocalHealthBlockerV1 {
     pub code: String,
     pub severity: LocalHealthSeverity,
     pub owner: String,
-    pub source: LocalHealthAuthority,
+    // Existing wire string: authority for machine blockers, slug for source blockers.
+    pub source: String,
     pub since: Rfc3339Timestamp,
     pub clear_condition: String,
 }

@@ -206,3 +206,23 @@ fn reader_loads_frozen_writer_bytes_and_preserves_logical2_and_durable_generatio
     assert_eq!(root.generation(), Some(7));
     durable_round_trip(&s, &actual, root.generation().unwrap());
 }
+
+#[test]
+fn future_representation_version_is_classified_for_the_health_adapter() {
+    let s = Scratch::new();
+    let logical = s.install();
+    let mut root: Value = serde_json::from_slice(&fs::read(s.root()).unwrap()).unwrap();
+    for field in ["schema_version", "storage_format", "logical_schema_version"] {
+        let old = root[field].clone();
+        root[field] = serde_json::json!(999);
+        fs::write(s.root(), serde_json::to_vec(&root).unwrap()).unwrap();
+        let error = match s.store(&logical).open() {
+            Err(error) => error,
+            Ok(_) => panic!("future version admitted"),
+        };
+        assert!(crate::snapshots::scan_index_health::is_version_refusal(
+            &error
+        ));
+        root[field] = old;
+    }
+}
