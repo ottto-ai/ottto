@@ -2173,6 +2173,7 @@ fn fe_n1_option_b_age_rejections_keep_deferred_hold_through_settlement_and_reloa
         let hold = erased_hold(due);
         let key = hold.key.clone();
         let pending = || ScanTraversalPath {
+            order_modified: None,
             scan_root: hold.fixture.root.clone(),
             path: hold.fixture.file.0.clone(),
             census_member: true,

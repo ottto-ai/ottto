@@ -2139,8 +2139,11 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ScanTraversalPath {
+    /// RAM-only scheduling fact, never membership, custody or read authority.
+    #[serde(skip)]
+    order_modified: Option<(std::time::SystemTime, usize)>,
     scan_root: PathBuf,
     path: PathBuf,
     #[serde(default = "default_true")]
@@ -2148,6 +2151,16 @@ struct ScanTraversalPath {
     #[serde(default)]
     watcher_hint: bool,
 }
+
+impl PartialEq for ScanTraversalPath {
+    fn eq(&self, other: &Self) -> bool {
+        self.scan_root == other.scan_root
+            && self.path == other.path
+            && self.census_member == other.census_member
+            && self.watcher_hint == other.watcher_hint
+    }
+}
+impl Eq for ScanTraversalPath {}
 
 /// C1b: the stale Claude families a red-retry traversal start carried instead
 /// of re-arming them, and the one replay buffer that start funded for their
@@ -6714,6 +6727,7 @@ fn replay_and_rearm_claude_family(
                 continue;
             };
             replay.push(ScanTraversalPath {
+                order_modified: None,
                 scan_root: scan_root.clone(),
                 path: PathBuf::from(index_key),
                 census_member: true,
@@ -26709,6 +26723,9 @@ impl OwnedSourceScan {
                 discovery_retention!(index),
             );
             release_codex_inventory_hold(source, traversal);
+            if source == SnapshotSource::Codex {
+                codex_archive_catchup::order_pending(&mut traversal.pending_candidates);
+            }
         }
         if source == SnapshotSource::Codex {
             // L-SB: an index from before blocked-set attribution moves its
@@ -26994,28 +27011,6 @@ impl OwnedSourceScan {
         } else {
             BTreeMap::new()
         };
-        // Sort only the selected page; never stat or allocate sort scratch for
-        // the entire pending roster on every construction. Live work first.
-        if source == SnapshotSource::Codex {
-            let mut metadata_checks = 0_u64;
-            pending_paths.sort_by_cached_key(|p| {
-                let archive = codex_archive_path(&p.path);
-                let modified = archive
-                    .then(|| {
-                        metadata_checks += 1;
-                        fs::symlink_metadata(&p.path)
-                            .and_then(|m| m.modified())
-                            .ok()
-                    })
-                    .flatten();
-                (archive, std::cmp::Reverse(modified))
-            });
-            crate::local_resource_diagnostics::traversal_point(
-                "codex_zst_order_metadata",
-                "codex",
-                &BTreeMap::from([("codex_zst_order_metadata_checks", metadata_checks)]),
-            );
-        }
         let mut files = pending_paths
             .into_iter()
             .filter_map(|pending| {
@@ -27233,6 +27228,7 @@ impl OwnedSourceScan {
                     source,
                     disappearance_diagnostics::Site::CandidateForcedIndex,
                     ScanTraversalPath {
+                        order_modified: None,
                         scan_root,
                         path,
                         census_member: true,
@@ -28027,6 +28023,7 @@ impl OwnedSourceScan {
                                 for member in &group.members {
                                     if selected.contains(&local_index_key(&member.path)) {
                                         traversal.pending_candidates.push_back(ScanTraversalPath {
+                                            order_modified: None,
                                             scan_root: member.scan_root.clone(),
                                             path: member.path.clone(),
                                             // G1: a re-read is not re-enrolled.
@@ -28140,6 +28137,7 @@ impl OwnedSourceScan {
                                         &candidate.path,
                                     );
                                 traversal.pending_candidates.push_front(ScanTraversalPath {
+                                    order_modified: None,
                                     scan_root: candidate.scan_root,
                                     path: candidate.path,
                                     census_member,
@@ -32364,6 +32362,7 @@ impl OwnedSourceScan {
                             if hold == HistoryHold::Budget && history_upgrade.admitted_any() {
                                 if let Some(traversal) = index.traversal.as_mut() {
                                     traversal.pending_candidates.push_back(ScanTraversalPath {
+                                        order_modified: None,
                                         scan_root: candidate.scan_root.clone(),
                                         path: candidate.path.clone(),
                                         census_member: false,
@@ -42669,6 +42668,7 @@ fn ensure_bounded_traversal(
             index.known_configured_scan_roots.insert(root_key);
             scan_roots.push(scan_root.clone());
             pending_directories.push_back(ScanTraversalPath {
+                order_modified: None,
                 scan_root: scan_root.clone(),
                 path: scan_root,
                 census_member: true,
@@ -42853,6 +42853,7 @@ fn enqueue_watcher_hints(
             if source == SnapshotSource::Codex {
                 if let Some(candidate) = traversal.pending_candidates.get_mut(position) {
                     candidate.watcher_hint = true;
+                    candidate.order_modified = None;
                 }
             }
             continue;
@@ -42879,6 +42880,7 @@ fn enqueue_watcher_hints(
         // of an older remove/rename hint in a small bounded page.
         pending.insert(path.clone(), traversal.pending_candidates.len());
         traversal.pending_candidates.push_back(ScanTraversalPath {
+            order_modified: None,
             scan_root,
             path: path.clone(),
             census_member,
@@ -43027,8 +43029,10 @@ fn refresh_retained_codex_roster(
             {
                 existing.census_member = true;
                 existing.watcher_hint = true;
+                existing.order_modified = None;
             } else {
                 traversal.pending_candidates.push_back(ScanTraversalPath {
+                    order_modified: None,
                     scan_root: scan_root.clone(),
                     path,
                     census_member: true,
@@ -43042,6 +43046,7 @@ fn refresh_retained_codex_roster(
         traversal
             .pending_directories
             .extend(new_directories.into_iter().map(|path| ScanTraversalPath {
+                order_modified: None,
                 scan_root: scan_root.clone(),
                 path,
                 census_member: true,
@@ -43160,6 +43165,7 @@ fn release_codex_inventory_hold(source: SnapshotSource, traversal: &mut ScanTrav
             continue;
         };
         traversal.pending_candidates.push_back(ScanTraversalPath {
+            order_modified: None,
             scan_root,
             path,
             census_member: true,
@@ -43296,6 +43302,7 @@ fn advance_bounded_directory_traversal_with_budget(
             // history walk starts unmarked, so cold history stays FIFO.
             if file_type.is_dir() {
                 traversal.pending_directories.push_back(ScanTraversalPath {
+                    order_modified: None,
                     scan_root: directory.scan_root.clone(),
                     path,
                     census_member: true,
@@ -43368,6 +43375,7 @@ fn advance_bounded_directory_traversal_with_budget(
                 existing.watcher_hint |= directory.watcher_hint;
             } else {
                 traversal.pending_candidates.push_back(ScanTraversalPath {
+                    order_modified: None,
                     scan_root: directory.scan_root.clone(),
                     path,
                     census_member: true,
@@ -52129,6 +52137,7 @@ mod tests {
             let deferred_path = project.join(format!("{deferred}.jsonl"));
             let healthy_path = project.join("33333333-3333-4333-8333-333333333333.jsonl");
             let path = |path: &Path| ScanTraversalPath {
+                order_modified: None,
                 scan_root: project.clone(),
                 path: path.to_owned(),
                 census_member: true,
@@ -54925,6 +54934,7 @@ mod tests {
         let mut candidate = candidate_from_traversal_path(
             SnapshotSource::Pi,
             ScanTraversalPath {
+                order_modified: None,
                 scan_root: root.clone(),
                 path: path.clone(),
                 census_member: true,
@@ -92109,6 +92119,7 @@ mod tests {
 
     fn one_pending_directory() -> VecDeque<ScanTraversalPath> {
         VecDeque::from([ScanTraversalPath {
+            order_modified: None,
             scan_root: std::path::PathBuf::from("/test"),
             path: std::path::PathBuf::from("/test/sub"),
             census_member: true,
@@ -92768,7 +92779,7 @@ crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seco
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);
 crate::heap_layout_bound::fields!(ScanTraversalCounts; causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count);
-crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_member, watcher_hint);
+crate::heap_layout_bound::fields!(ScanTraversalPath; order_modified, scan_root, path, census_member, watcher_hint);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarry; origin, roots, capped_roots, replay);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarryOrigin; context_fingerprint, process, full_rearm_window, admission);
 crate::heap_layout_bound::fields!(ClaudeRetryAdmission; after_root, upper_root, complete, roots_complete, progressed, served_before, due_through, due_after_path, due_upper_path, due_complete, oversized_root, oversized_after_path, storage_deferred);
@@ -93322,6 +93333,7 @@ mod census_unreadable_tests {
         assert!(candidate_from_traversal_path(
             SnapshotSource::Codex,
             ScanTraversalPath {
+                order_modified: None,
                 scan_root: root.clone(),
                 path: path.clone(),
                 census_member: true,
@@ -93346,6 +93358,7 @@ mod census_unreadable_tests {
         let candidate = candidate_from_traversal_path(
             SnapshotSource::Codex,
             ScanTraversalPath {
+                order_modified: None,
                 scan_root: root.clone(),
                 path: path.clone(),
                 census_member: true,

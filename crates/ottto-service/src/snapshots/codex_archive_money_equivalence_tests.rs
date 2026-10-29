@@ -178,6 +178,7 @@ fn archive_hints_are_backlog_and_newest_archive_is_selected_first() {
         .set_modified(now)
         .unwrap();
     let pending = ScanTraversalPath {
+        order_modified: None,
         scan_root: f.0.parent().unwrap().into(),
         path: f.0.clone(),
         census_member: true,
@@ -348,17 +349,41 @@ fn rejected_archives_then_late_eligible_entry_bounded_prep() {
     fs::write(&plain, synthetic_rollout()).unwrap();
     let paths = (0..codex_file_join::MAX_HEADER_FILES + 5)
         .map(|n| local_index_key(&root.join(format!("rollout-{n:06}.jsonl.zst"))))
-        .chain(std::iter::once(local_index_key(&plain)))
+        .chain([local_index_key(&f.0), local_index_key(&plain)])
         .collect();
     let mut dirs = codex_file_join::DirectoryCensus::new();
     dirs.observe(&root, &fs::metadata(&root).unwrap());
     let mut index = ScanIndex::default();
+    // An actual archive evidence entry forces the metadata path, but supplies
+    // no cached owning header: it must still be rejected without decoding.
+    index
+        .files
+        .entry(local_index_key(&f.0))
+        .or_default()
+        .archive = Some(Box::new(
+        ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, None).unwrap(),
+    ));
     let mut inventory =
         codex_file_join::HeaderInventory::new(std::slice::from_ref(&root), &paths, Some(&dirs));
-    index.archive_pass.prep_after = inventory.retain_cached_archives(&index, &paths);
+    let (_, first_rows) = crate::local_resource_diagnostics::capture(|| {
+        index.archive_pass.prep_after = inventory.retain_cached_archives(&index, &paths);
+    });
+    assert_eq!(
+        archive_event_count(&first_rows, "codex_zst_cached_inventory_metadata_checks"),
+        0
+    );
     assert!(!inventory.complete);
     assert!(index.archive_pass.prep_after.is_some());
-    index.archive_pass.prep_after = inventory.retain_cached_archives(&index, &paths);
+    let (_, later_rows) = crate::local_resource_diagnostics::capture(|| {
+        index.archive_pass.prep_after = inventory.retain_cached_archives(&index, &paths);
+    });
+    assert_eq!(
+        archive_event_count(&later_rows, "codex_zst_cached_inventory_metadata_checks"),
+        1,
+        "positive control: the rejected cached archive performs exactly one real metadata check"
+    );
+    assert_eq!(decoded_archive_bytes(&later_rows), 0);
+
     assert!(
         !inventory.complete,
         "later quantum is not whole-roster authority"

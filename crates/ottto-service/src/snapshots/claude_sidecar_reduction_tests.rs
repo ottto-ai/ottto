@@ -77,6 +77,7 @@ impl Fixture {
         candidate_from_traversal_path(
             SOURCE,
             ScanTraversalPath {
+                order_modified: None,
                 scan_root: self.dir.clone(),
                 path: path.to_owned(),
                 census_member: true,

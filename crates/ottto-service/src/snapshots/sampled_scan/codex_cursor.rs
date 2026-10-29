@@ -5959,6 +5959,7 @@ pub(in crate::snapshots) fn requeue(
         .copied()
         .unwrap_or((true, false));
     traversal.pending_candidates.push_back(ScanTraversalPath {
+        order_modified: None,
         scan_root: candidate.scan_root.clone(),
         path: candidate.path.clone(),
         census_member,
@@ -6010,6 +6011,7 @@ pub(in crate::snapshots) fn requeue_members<'a>(
             .copied()
             .unwrap_or((true, false));
         traversal.pending_candidates.push_back(ScanTraversalPath {
+            order_modified: None,
             scan_root: candidate.scan_root.clone(),
             path: candidate.path.clone(),
             census_member,
@@ -6071,6 +6073,7 @@ pub(in crate::snapshots) fn release_path(
     });
     if !kept {
         traversal.pending_candidates.push_back(ScanTraversalPath {
+            order_modified: None,
             scan_root: candidate.scan_root.clone(),
             path: candidate.path.clone(),
             census_member,

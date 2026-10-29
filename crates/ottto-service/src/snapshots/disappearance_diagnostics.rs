@@ -389,6 +389,7 @@ mod tests {
                 candidate_from_traversal_path(
                     source,
                     ScanTraversalPath {
+                        order_modified: None,
                         scan_root: dir.to_path_buf(),
                         path: path.clone(),
                         census_member: member,
@@ -532,6 +533,7 @@ mod tests {
             let candidate = candidate_from_traversal_path(
                 source,
                 ScanTraversalPath {
+                    order_modified: None,
                     scan_root: dir.to_path_buf(),
                     path: path.clone(),
                     census_member: true,
@@ -1141,6 +1143,7 @@ mod tests {
                 candidate_from_traversal_path(
                     SnapshotSource::ClaudeCode,
                     ScanTraversalPath {
+                        order_modified: None,
                         scan_root: dir.to_path_buf(),
                         path: path.clone(),
                         census_member: true,
@@ -1166,6 +1169,7 @@ mod tests {
         let candidate = candidate_from_traversal_path(
             SnapshotSource::ClaudeCode,
             ScanTraversalPath {
+                order_modified: None,
                 scan_root: dir.to_path_buf(),
                 path: path.clone(),
                 census_member: true,
@@ -1215,6 +1219,7 @@ mod tests {
             candidate_from_traversal_path(
                 SnapshotSource::ClaudeCode,
                 ScanTraversalPath {
+                    order_modified: None,
                     scan_root: dir.to_path_buf(),
                     path: path.clone(),
                     census_member: true,
@@ -1239,6 +1244,7 @@ mod tests {
         let dir = crate::test_scratch::ScratchDir::new("disappearance-sites");
         let path = dir.join("session.jsonl");
         let pending = || ScanTraversalPath {
+            order_modified: None,
             scan_root: dir.to_path_buf(),
             path: path.clone(),
             census_member: true,
@@ -1626,6 +1632,7 @@ mod absence_parent_counts_tests {
                         SnapshotSource::ClaudeCode,
                         site,
                         ScanTraversalPath {
+                            order_modified: None,
                             scan_root: dir.to_path_buf(),
                             path: path.clone(),
                             census_member: true,
@@ -1690,6 +1697,7 @@ mod absence_parent_counts_tests {
                         SnapshotSource::ClaudeCode,
                         site,
                         ScanTraversalPath {
+                            order_modified: None,
                             scan_root: dir.to_path_buf(),
                             path,
                             census_member: true,
@@ -1731,6 +1739,7 @@ mod absence_parent_counts_tests {
         let candidate = candidate_from_traversal_path(
             SnapshotSource::ClaudeCode,
             ScanTraversalPath {
+                order_modified: None,
                 scan_root: dir.to_path_buf(),
                 path: path.clone(),
                 census_member: true,
@@ -1804,6 +1813,7 @@ mod absence_parent_counts_tests {
             candidate_from_traversal_path(
                 source,
                 ScanTraversalPath {
+                    order_modified: None,
                     scan_root: dir.to_path_buf(),
                     path: dir.join("missing/member.jsonl"),
                     census_member,

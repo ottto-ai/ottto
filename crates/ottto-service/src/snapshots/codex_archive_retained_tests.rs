@@ -369,3 +369,149 @@ fn plain_retained_output_and_charge_are_unchanged_beside_archive_pressure() {
     }
     assert_eq!(observations[0], observations[1]);
 }
+
+#[test]
+fn global_newest_archive_order_survives_small_pages_and_plain_fifo_is_first() {
+    let f = ArchiveFixture::new(b"no content read");
+    let root = f.0.parent().unwrap();
+    let mut pending = VecDeque::new();
+    let now = std::time::SystemTime::now();
+    let mut expected = Vec::new();
+    for (name, age) in [("older", 120), ("newest", 0), ("middle", 60)] {
+        let path = root.join(format!("rollout-{name}.jsonl.zst"));
+        fs::write(&path, b"not decoded").unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(now - std::time::Duration::from_secs(age))
+            .unwrap();
+        expected.push(path.clone());
+        pending.push_back(ScanTraversalPath {
+            order_modified: None,
+            scan_root: root.to_owned(),
+            path,
+            census_member: true,
+            watcher_hint: false,
+        });
+    }
+    let plain = [
+        root.join("rollout-z-plain.jsonl"),
+        root.join("rollout-a-plain.jsonl"),
+    ];
+    for path in &plain {
+        pending.push_back(ScanTraversalPath {
+            order_modified: None,
+            scan_root: root.to_owned(),
+            path: path.clone(),
+            census_member: true,
+            watcher_hint: false,
+        });
+    }
+    let (_, first) = crate::local_resource_diagnostics::capture(|| {
+        codex_archive_catchup::order_pending(&mut pending)
+    });
+    assert_eq!(
+        archive_event_count(&first, "codex_zst_order_metadata_checks"),
+        3
+    );
+    assert_eq!(pending.pop_front().unwrap().path, plain[0]);
+    assert_eq!(
+        pending.pop_front().unwrap().path,
+        plain[1],
+        "plain native FIFO preserved"
+    );
+    for path in [&expected[1], &expected[2], &expected[0]] {
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            codex_archive_catchup::order_pending(&mut pending)
+        });
+        assert_eq!(
+            archive_event_count(&rows, "codex_zst_order_metadata_checks"),
+            0,
+            "metadata fact reused on later pages"
+        );
+        assert_eq!(decoded_archive_bytes(&rows), 0);
+        assert_eq!(&pending.pop_front().unwrap().path, path);
+    }
+    assert!(pending.is_empty());
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "funded decoder needs validated heap layout"
+)]
+fn only_pending_sibling_resolves_to_another_owner_then_exactly_one_a1() {
+    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let f = ArchiveFixture::new(&zstd::stream::encode_all(&large_header_rollout()[..], 1).unwrap());
+    let peer_owner = "2026-10-07T00-00-00-compressed-fixture";
+    let peer =
+        f.0.with_file_name(format!("rollout-{peer_owner}.jsonl.zst"));
+    let peer_bytes = String::from_utf8(synthetic_rollout())
+        .unwrap()
+        .replace("compressed-fixture", peer_owner);
+    fs::write(
+        &peer,
+        zstd::stream::encode_all(peer_bytes.as_bytes(), 1).unwrap(),
+    )
+    .unwrap();
+    let mut peer_candidate = super::super::codex_zst_refusal_tests::candidate(&peer);
+    peer_candidate.size_bytes = fs::metadata(&peer).unwrap().len();
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let mut index = ScanIndex::default();
+    assert!(matches!(
+        index
+            .inventory_archive_header(&f.candidate(), Some(&cache), &mut funded_header_work())
+            .unwrap(),
+        HeaderRead::BoundReached
+    ));
+    let mut scan = selector_scan(
+        &f,
+        index,
+        cache.clone(),
+        VecDeque::from([f.candidate(), peer_candidate.clone()]),
+        false,
+    );
+    let (index, deferred) = finish_selector_with(scan, |scan| {
+        if scan.codex_join_prepared {
+            let inventory = scan.codex_join_inventory.as_ref().unwrap();
+            assert!(inventory.deferred_archives.contains(&local_index_key(&f.0)));
+        }
+    });
+    assert!(deferred.snapshots.is_empty());
+    let mut index = index;
+    index
+        .inventory_archive_header(&peer_candidate, Some(&cache), &mut funded_header_work())
+        .unwrap();
+    scan = selector_scan(
+        &f,
+        index,
+        cache,
+        VecDeque::from([f.candidate(), peer_candidate]),
+        true,
+    );
+    // The peer remains a validated inventory member but only X is selected.
+    scan.identified_candidates
+        .retain(|candidate| candidate.path == f.0);
+    let ((mut index, acquired), rows) =
+        crate::local_resource_diagnostics::capture(|| finish_selector(scan));
+    assert_eq!(
+        decodes(&rows),
+        1,
+        "the resolved peer grants exactly one A1 body decode"
+    );
+    assert_eq!(acquired.snapshots.len(), 1);
+    assert_eq!(
+        acquired.snapshots[0].source_session_id,
+        "compressed-fixture"
+    );
+    index.settle_archive_bodies(&ack_bodies(&acquired));
+    assert!(matches!(
+        index.files[&local_index_key(&f.0)]
+            .archive
+            .as_ref()
+            .unwrap()
+            .disposition,
+        ArchiveDisposition::Acquired
+    ));
+}

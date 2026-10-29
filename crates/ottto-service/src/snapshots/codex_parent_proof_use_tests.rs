@@ -640,6 +640,7 @@ fn a_missing_foreign_or_refused_proof_installs_nothing() {
         .unwrap()
         .pending_directories
         .push_back(ScanTraversalPath {
+            order_modified: None,
             scan_root: scene.root.clone(),
             path: scene.root.join("sub"),
             census_member: true,
@@ -2850,6 +2851,7 @@ fn a_hold_built_before_its_proof_is_not_memoized() {
         .unwrap()
         .pending_directories
         .push_back(ScanTraversalPath {
+            order_modified: None,
             scan_root: scene.root.clone(),
             path: scene.root.join("sub"),
             census_member: true,

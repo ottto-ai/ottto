@@ -2343,6 +2343,7 @@ fn held_original_keeps_dependent_copy_proof_only_while_committed_entry_unchanged
     let mut candidate = candidate_from_traversal_path(
         SnapshotSource::ClaudeCode,
         ScanTraversalPath {
+            order_modified: None,
             scan_root: root.clone(),
             path: path.clone(),
             census_member: true,

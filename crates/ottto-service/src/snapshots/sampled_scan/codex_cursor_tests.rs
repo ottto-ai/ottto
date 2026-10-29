@@ -3800,6 +3800,7 @@ fn freshness_priority_ignores_metadata_and_identical_replacement() {
     let (index, _) = page(&fixture, ScanIndex::default(), None);
     let path = fixture.file(SESSION);
     let candidate = ScanTraversalPath {
+        order_modified: None,
         scan_root: fixture.root.clone(),
         path: path.clone(),
         census_member: false,

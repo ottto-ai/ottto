@@ -31,6 +31,7 @@ fn current_candidate(f: &ScanFixture, index: &ScanIndex) -> CandidateFile {
     let mut candidate = candidate_from_traversal_path(
         source,
         ScanTraversalPath {
+            order_modified: None,
             scan_root: f.root.clone(),
             path: f.file.0.clone(),
             census_member: true,

@@ -19,3 +19,19 @@ This development checkpoint still requires native power, owner-wide custody,
 retention, accepted-state retry and consumer integration before activation can
 ship. An unsettled attempt currently defers rather than decoding again; retained
 body resending remains unfinished. Synthetic fixtures are present but unexecuted.
+
+
+Completed archive reductions may enter the existing process cache under its
+normal accounting and admission rules. An unchanged pending archive can resend
+that reduction through native finalization and exact body ACK settlement without
+creating a decoder. `codex_zst_retained_resend` counts these hits. Losing the
+retained copy still permits the existing paced, bounded
+`codex_zst_first_read_retry` exception; release approval for this residual is
+pending. Archives remain replace-only and excluded from durable restoration.
+The cache's archive witness grants no physical prefix or side-ledger seal.
+
+Queued archive scheduling metadata is RAM-only and charged with its existing
+queue owner. Within the complete header-inventory population it orders archives
+newest first before page selection, preserves plain FIFO, and reuses the metadata
+on later pages. The preparation bound stays at the existing header population;
+an oversized population keeps the existing inventory/custody limitations.

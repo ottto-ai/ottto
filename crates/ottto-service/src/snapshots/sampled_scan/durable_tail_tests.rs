@@ -992,6 +992,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                     let candidate = candidate_from_traversal_path(
                         source,
                         ScanTraversalPath {
+                            order_modified: None,
                             scan_root: transcripts.clone(),
                             path: path.clone(),
                             census_member: true,
@@ -1856,6 +1857,7 @@ fn known_corrupt_replacement_case(fail_replacement: bool) {
     let candidate = candidate_from_traversal_path(
         source,
         ScanTraversalPath {
+            order_modified: None,
             scan_root: sessions.clone(),
             path: held.clone(),
             census_member: true,

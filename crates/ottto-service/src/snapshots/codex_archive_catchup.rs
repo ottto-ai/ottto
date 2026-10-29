@@ -94,6 +94,9 @@ impl ScanIndex {
             t.codex_rollout_paths.iter().any(|p| {
                 p != &key
                     && codex_archive_path(Path::new(p))
+                    && !inventory
+                        .and_then(|i| i.owner_for_path(Path::new(p)))
+                        .is_some_and(|owner| !ids.iter().any(|id| id == owner))
                     && codex_session_id_candidates_from_path(Path::new(p))
                         .iter()
                         .any(|id| ids.contains(id))
@@ -106,7 +109,9 @@ impl ScanIndex {
                 || self.files.iter().any(|(path, e)| {
                     path != &key
                         && (e.codex_protected_owner.as_ref() == Some(&owner)
-                            || codex_session_id_candidates_from_path(Path::new(path)).contains(id))
+                            || (!codex_archive_path(Path::new(path))
+                                && codex_session_id_candidates_from_path(Path::new(path))
+                                    .contains(id)))
                 })
         });
         if family || (!retry && old_carrier) {
@@ -175,4 +180,59 @@ impl ScanIndex {
             HeaderRead::Validated(_) | HeaderRead::BoundReached => Ok(Admission::Read),
         }
     }
+}
+
+/// Order the supported header population globally before selecting a page.
+/// Each archive stat is cached on its queued path; comparisons do no I/O and
+/// unstable sorting needs no roster-sized sort scratch. Larger populations
+/// retain the existing bounded inventory/custody behavior, never an unbounded
+/// prep walk. Plain work always sorts ahead of archive backlog.
+pub(super) fn order_pending(pending: &mut VecDeque<ScanTraversalPath>) {
+    let quantum = codex_file_join::MAX_HEADER_FILES;
+    let mut checks = 0_u64;
+    for (position, member) in pending.iter_mut().take(quantum).enumerate() {
+        let modified = if codex_archive_path(&member.path) {
+            match member.order_modified {
+                Some((modified, _)) => modified,
+                None => {
+                    checks += 1;
+                    fs::symlink_metadata(&member.path)
+                        .and_then(|m| m.modified())
+                        .unwrap_or(std::time::UNIX_EPOCH)
+                }
+            }
+        } else {
+            std::time::UNIX_EPOCH
+        };
+        member.order_modified = Some((modified, position));
+    }
+    if pending.len() <= quantum {
+        let compare = |a: &ScanTraversalPath, b: &ScanTraversalPath| {
+            let a_archive = codex_archive_path(&a.path);
+            let b_archive = codex_archive_path(&b.path);
+            a_archive.cmp(&b_archive).then_with(|| {
+                if a_archive {
+                    std::cmp::Reverse(a.order_modified.map(|(mtime, _)| mtime))
+                        .cmp(&std::cmp::Reverse(b.order_modified.map(|(mtime, _)| mtime)))
+                        .then_with(|| a.path.cmp(&b.path))
+                } else {
+                    a.order_modified
+                        .map(|(_, position)| position)
+                        .cmp(&b.order_modified.map(|(_, position)| position))
+                }
+            })
+        };
+        if !pending
+            .iter()
+            .zip(pending.iter().skip(1))
+            .all(|(a, b)| compare(a, b) != std::cmp::Ordering::Greater)
+        {
+            pending.make_contiguous().sort_unstable_by(compare);
+        }
+    }
+    crate::local_resource_diagnostics::traversal_point(
+        "codex_zst_order_metadata",
+        "codex",
+        &BTreeMap::from([("codex_zst_order_metadata_checks", checks)]),
+    );
 }

@@ -826,6 +826,7 @@ fn carry_fill_queue(index: &mut ScanIndex) {
     let pending = &mut index.traversal.as_mut().unwrap().pending_candidates;
     while pending.is_empty() || pending.len() < pending.capacity() {
         pending.push_back(ScanTraversalPath {
+            order_modified: None,
             scan_root: PathBuf::new(),
             path: PathBuf::new(),
             census_member: true,
@@ -937,6 +938,7 @@ fn c1b_admitted_carry_cancellation_rearms_and_queues_the_passed_member() {
 /// The replay entry a cancel queues for a passed member.
 fn carry_replayed(key: &str) -> ScanTraversalPath {
     ScanTraversalPath {
+        order_modified: None,
         scan_root: PathBuf::from(CARRY_SCAN_ROOT),
         path: PathBuf::from(key),
         census_member: true,
@@ -1198,6 +1200,7 @@ fn carry_resumed_index(base: bool, passed: bool) -> ScanIndex {
         traversal.observed_index_keys.extend(carry_family_keys());
     }
     traversal.pending_candidates.push_back(ScanTraversalPath {
+        order_modified: None,
         scan_root: PathBuf::new(),
         path: PathBuf::new(),
         census_member: true,
@@ -1834,6 +1837,7 @@ fn fix2_persisted_carry_with_lost_progress_or_origin_restarts_as_base() {
             .observed_index_keys
             .insert(carry_key(CARRY_ROOT, None));
         traversal.pending_candidates.push_back(ScanTraversalPath {
+            order_modified: None,
             scan_root: PathBuf::from(CARRY_SCAN_ROOT),
             path: PathBuf::from(carry_key(CARRY_OTHER, None)),
             census_member: true,
@@ -4132,6 +4136,7 @@ fn contract_start_status_preserves_resume_placeholder_and_reowes_only_once() {
                 .unwrap()
                 .pending_directories
                 .push_back(ScanTraversalPath {
+                    order_modified: None,
                     path: PathBuf::from("/synthetic"),
                     scan_root: PathBuf::from("/synthetic"),
                     census_member: true,
@@ -4419,6 +4424,7 @@ fn scanner_records_actual_contract_only_when_its_traversal_starts() {
         .unwrap()
         .pending_directories
         .push_back(ScanTraversalPath {
+            order_modified: None,
             path: fixture._scratch.join("missing"),
             scan_root: fixture._scratch.to_path_buf(),
             census_member: true,
