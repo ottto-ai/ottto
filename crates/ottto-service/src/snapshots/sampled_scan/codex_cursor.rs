@@ -2249,6 +2249,7 @@ fn exact_copy(value: &str) -> String {
 static NEXT_CURSOR_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 pub(in crate::snapshots) struct CursorState {
+    pub(in crate::snapshots) headers: codex_file_join::HeaderCache,
     slot: Slot,
     slot_key: Option<String>,
     /// Member keys of the slot's group job (empty for a singleton): selection
@@ -2302,6 +2303,7 @@ pub(in crate::snapshots) struct CursorState {
 impl Default for CursorState {
     fn default() -> Self {
         Self {
+            headers: codex_file_join::HeaderCache::default(),
             slot: Slot::Empty,
             slot_key: None,
             slot_members: BTreeSet::new(),
@@ -2332,6 +2334,7 @@ impl Default for CursorState {
 impl HeapLayoutBound for CursorState {
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
         let Self {
+            headers,
             slot,
             slot_key,
             slot_members,
@@ -2365,6 +2368,7 @@ impl HeapLayoutBound for CursorState {
             Slot::Empty | Slot::ActiveElsewhere { .. } => c.add(0)?,
             Slot::Paused(_) => c.add(*slot_charge)?,
         }
+        headers.heap_bound(c)?;
         slot_key.heap_bound(c)?;
         slot_members.heap_bound(c)?;
         // Owner strings and joined member keys are visited (one each).
@@ -4086,7 +4090,10 @@ fn admit_locked(
 impl SharedCache {
     /// The cursor lock, marked held (`CursorHeld`) for `run`. Also R0's
     /// blocking resident measure (`SharedCache::heap_bound`).
-    pub(super) fn with_cursor<T>(&self, run: impl FnOnce(&mut CursorState) -> T) -> Option<T> {
+    pub(in crate::snapshots) fn with_cursor<T>(
+        &self,
+        run: impl FnOnce(&mut CursorState) -> T,
+    ) -> Option<T> {
         // Checked before locking: a relock would deadlock, not panic.
         debug_assert!(
             !cursor_held(),
