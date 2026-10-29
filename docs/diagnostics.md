@@ -909,7 +909,8 @@ sum their deltas, not repeated growth observations.
 
 Correctness custody capacity refusal additionally emits
 `durable_tail_alarm.counts.custody_overflow.events = 1`. Units are refused
-inventory passes (owner/file fanout) or state-only exclusion attempts; the
+inventory passes (owner/file fanout), receipt admission attempts, or state-only
+exclusion attempts; the
 inventory latch resets with a new inventory, exclusion is attempted once at
 completion. This is separate from held growth and decoder refusal. Keep the
 original cause and durable obligation; no Full, clear or cap increase follows.
