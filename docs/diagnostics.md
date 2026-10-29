@@ -862,6 +862,7 @@ restore-class totals on that text line are retired.
 |---|---|
 | `restored` | Restore returned a charged, retained reduction. |
 | `held` | Restore's existing integrity guard returned Held. |
+| `pending` | Restore yielded for active funding or a quiet resource refusal; no successful restore or read permission. |
 | `miss.<class>` | Restore returned no retained reduction, with the class below. |
 
 Zero fields and an empty `full_causes` block are omitted. An absent miss
@@ -873,9 +874,10 @@ Retries count again; a cooperative yield does not recount a completed decision.
 Miss keys are fixed, content-free class labels. Dots below are part of the
 JSON class key, not extra nested objects:
 
-- `unavailable`, `no_entry`, `missing`, `budget_refused`, `restore_take_lost`;
+- `unavailable`, `no_entry`, `missing`;
+- `resource_full.{decode,cache_transit,stores_unavailable,input,cache_key,certificate_scope,rederive_unfunded}` records a growing-file resource refusal returning an ordinary Full miss; it grants no independent read permission;
 - `ineligible.{selection_cleared,history_owed,source,key,context,scope,generation_ahead,entry_changed}`;
-- `refused_record.{newer,unknown,undecodable,unbindable,corrupt}`, `corrupt_body`;
+- `refused_record.{newer,unknown,undecodable,unbindable,corrupt,receipt_pending}`, `corrupt_body`;
 - `certificate_refused.{replaced,shrunk,same_size_edit,head_changed,boundary_changed,invalid_checkpoint,read_error}`;
 - `not_rederived.<field>` preserves the existing codec's static field/class
   labels, including `SnapshotAccumulator.title` and `compressed`; these are

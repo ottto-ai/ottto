@@ -268,6 +268,7 @@ fn equal_generation_impostor_never_elects_receipt_and_unknown_swap_is_protected(
             .unwrap();
         let replacement = pending(b.clone(), certificate(&path), 2);
         let mut impostor = encode(&DurableRecord {
+            envelope_audit_debt: None,
             record: pending(b.clone(), certificate(&path), 3),
             index_generation: 2,
             format: FORMAT_VERSION,
@@ -294,6 +295,7 @@ fn equal_generation_impostor_never_elects_receipt_and_unknown_swap_is_protected(
         put_record(
             &disk,
             &encode(&DurableRecord {
+                envelope_audit_debt: None,
                 record: replacement,
                 index_generation: 2,
                 format: FORMAT_VERSION,
@@ -459,6 +461,7 @@ fn pending_capacity_failure_retains_every_existing_obligation() {
         assert_eq!(
             fs::read(record_file(&store, &record.binding.key)).unwrap(),
             encode(&DurableRecord {
+                envelope_audit_debt: None,
                 record: record.clone(),
                 index_generation: 1,
                 format: FORMAT_VERSION
@@ -505,6 +508,7 @@ fn post_rename_sync_failure_keeps_b_pending_until_its_exact_receipt() {
         assert_eq!(
             fs::read(record_file(&store, &b.key)).unwrap(),
             encode(&DurableRecord {
+                envelope_audit_debt: None,
                 record: replacement,
                 index_generation: 2,
                 format: FORMAT_VERSION

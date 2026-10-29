@@ -519,6 +519,7 @@ fn rederive_refusal_precedes_certificate_io_and_keeps_integrity_separate() {
         committed_generation: 1,
     };
     let mut record = store::DurableRecord {
+        envelope_audit_debt: None,
         format: store::FORMAT_VERSION,
         index_generation: 1,
         record: PendingRecord {
@@ -528,8 +529,6 @@ fn rederive_refusal_precedes_certificate_io_and_keeps_integrity_separate() {
             allowlist: codec::allowlist_digest(source),
         },
     };
-    let index = ScanIndex::default();
-    let interpretation = Interpretation::of(source, "key", &index, false, &scope);
     let cache = SharedCache::default();
     let store::LeaseWait::Granted(mut lease) = cache.acquire_prepared_transfer(source) else {
         panic!("lease unavailable")
@@ -537,14 +536,7 @@ fn rederive_refusal_precedes_certificate_io_and_keeps_integrity_separate() {
     let mut held = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
     assert!(matches!(
         cache.durable_restore_record(
-            source,
-            &record,
-            &expected,
-            &path,
-            &scope,
-            &mut held,
-            &interpretation,
-            &mut lease
+            source, &record, &expected, &path, &scope, &mut held, &mut lease
         ),
         Err(Failure::Resource("rederive_unfunded"))
     ));
@@ -552,14 +544,7 @@ fn rederive_refusal_precedes_certificate_io_and_keeps_integrity_separate() {
     record.record.body.clear();
     assert!(matches!(
         cache.durable_restore_record(
-            source,
-            &record,
-            &expected,
-            &path,
-            &scope,
-            &mut held,
-            &interpretation,
-            &mut lease
+            source, &record, &expected, &path, &scope, &mut held, &mut lease
         ),
         Err(Failure::Corrupt)
     ));
@@ -583,14 +568,7 @@ fn rederive_refusal_precedes_certificate_io_and_keeps_integrity_separate() {
     };
     assert!(matches!(
         cache.durable_restore_record(
-            source,
-            &record,
-            &expected,
-            &path,
-            &scope,
-            &mut held,
-            &interpretation,
-            &mut lease
+            source, &record, &expected, &path, &scope, &mut held, &mut lease
         ),
         Err(Failure::Certificate(_))
     ));
@@ -3694,6 +3672,7 @@ fn t14_without_retention_or_encodable_reduction_holds_on_later_passes() {
         let admitted = cache.insert_admitted(
             key.clone(),
             sampled_jsonl::CompletedNativeAcquisition {
+                durable: Default::default(),
                 checkpoint,
                 reduction: (arm == "codec").then_some(reduction),
                 released: None,
