@@ -264,7 +264,7 @@ impl OwnedJsonlParser {
         let reusable = taken
             .as_ref()
             .map(|taken| &taken.retained)
-            .is_none_or(|old| {
+            .map_or(true, |old| {
                 // Capture is a function of the source (contract 5 always on,
                 // `claude_request_identity::captures`), so the same source keeps
                 // the capture mode its markers were built in.

@@ -1,6 +1,7 @@
 //! GC against a committed index much larger than the store (F3, F5).
 use super::*;
 use crate::locked_state_dir::test_locks;
+use crate::snapshots::sampled_scan::codex_cursor;
 use crate::transcript_acquisition::ReadPlan;
 use std::io::Read;
 
@@ -163,7 +164,7 @@ fn direct_return_keeps_attached_guard_on_heap_poison_and_self_eviction() {
             _ => unreachable!(),
         }
         let (result, counts) = observe(|| cache.return_prepared_taken("key".into(), taken));
-        let mut returned = result.err().expect("real refusal");
+        let mut returned = result.expect_err("real refusal");
         assert_eq!(&*returned as *const _ as usize, address);
         assert_eq!(format!("{:?}", returned.retained.checkpoint), checkpoint);
         assert_eq!(
@@ -579,7 +580,6 @@ fn rederive_refusal_precedes_certificate_io_and_keeps_integrity_separate() {
         &path,
         &scope,
         &mut File::open(&path).unwrap(),
-        &interpretation,
         &mut lease,
     );
     assert!(restored.is_ok());
@@ -700,7 +700,7 @@ fn atomic_cache_transit_returns_same_graph_and_custody_or_retains_original_refus
         let guard = durable.take_retail().expect("one original guard");
         assert_eq!((guard.object, guard.next, guard.end, guard.old_end), facts);
         guard.finish();
-        drop(durable);
+        assert!(durable.is_empty(), "custody ended before credit release");
         lease.release();
         sampled_jsonl::preparation_tests::refuse_heap(false);
     }
@@ -821,7 +821,7 @@ fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
             }
             panic!("scan did not complete");
         };
-        let (index, first, _) = finish(start(ScanIndex::default()));
+        let (mut index, first, _) = finish(start(ScanIndex::default()));
         assert_eq!(first.snapshots.len(), 1);
         assert_eq!(first.snapshots[0].input_tokens, 100);
         assert!(cache.retained().unwrap().peek(&key).is_some());
@@ -1497,8 +1497,7 @@ fn rejected_ordinary_taken_returns_custody_rank_charge_and_held_flag_under_one_l
     let address = &*original as *const _ as usize;
     let mut refused = cache
         .return_prepared_taken(key.clone(), original)
-        .err()
-        .expect("cache refuses");
+        .expect_err("cache refuses");
     assert_eq!(&*refused as *const _ as usize, address);
     refused
         .durable
@@ -1696,7 +1695,9 @@ fn receipt_pending_guard_keeps_accepted_witness_and_census_without_unreadable() 
         assert!(slot.store.has_pending());
     }
     let reason = cache
-        .durable_guard(source, &candidate, &mut index)
+        .durable_funded_guard(source, &key, |cache| {
+            cache.durable_hold(source, &key, &index, &mut None)
+        })
         .unwrap()
         .unwrap();
     store::test_hooks::set_before_unlink(None);
@@ -1708,6 +1709,7 @@ fn receipt_pending_guard_keeps_accepted_witness_and_census_without_unreadable() 
     let (counts, disk) = cache.durable_counters(source).unwrap();
     assert_eq!(counts.durable_held.len(), 7);
     assert_eq!(store::Refusal::ReceiptPending as usize, 6);
+    assert_eq!(counts.durable_held[5], 0, "retired coordinate stays zero");
     assert_eq!(counts.durable_held[6], 1);
     assert_eq!(counts.held_census, [1, 0]);
     assert_eq!(counts.restored, 0);
@@ -1929,7 +1931,7 @@ fn disabled_pending_store_publishes_valid_ram_through_production_scan_without_mu
         store::test_hooks::set_before_unlink(Some(Box::new(|_| panic!("disabled unlink"))));
         store::test_hooks::set_before_dir_sync(Some(Box::new(|_| panic!("disabled sync"))));
         assert_eq!(cache.reconcile_pending_key(source, &key), None);
-        assert_eq!(cache.durable_hold(source, &key), None);
+        assert_eq!(cache.durable_hold(source, &key, &index, &mut None), None);
         let ((mut index, degraded), events) =
             crate::local_resource_diagnostics::capture(|| run(index));
         assert_eq!(
@@ -1963,7 +1965,7 @@ fn disabled_pending_store_publishes_valid_ram_through_production_scan_without_mu
         assert!(reads.iter().all(|r| r["completed_native_bytes"] == 0));
         let (counts, _) = cache.durable_counters(source).unwrap();
         assert_eq!(counts.restored, 0);
-        assert_eq!(counts.durable_held, [0; 6]);
+        assert_eq!(counts.durable_held, [0; 7]);
         {
             let mut stores = cache.durable().unwrap();
             let slot = stores.slot(ds).as_mut().unwrap();
@@ -3346,7 +3348,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                     );
                     assert_eq!(std::fs::read(&record_path).unwrap(), bytes);
                 } else {
-                    assert_eq!(counts.durable_held, [0; 6]);
+                    assert_eq!(counts.durable_held, [0; 7]);
                 }
                 assert_eq!(counts.restored, 0);
                 let _ = std::fs::remove_dir_all(root);
@@ -3584,8 +3586,8 @@ fn store_io_failures_emit_cold_production_body_without_holds() {
                 ])
             );
             let (counts, stats) = cache.durable_counters(source).unwrap();
-            assert_eq!(counts.durable_held, [0; 6]);
-            assert_eq!(stats.format_hold, [0; 6]);
+            assert_eq!(counts.durable_held, [0; 7]);
+            assert_eq!(stats.format_hold, [0; 7]);
             assert_eq!(stats.records_written, 0);
             assert_eq!(stats.gc_records_deleted + stats.gc_temps_deleted, 0);
             assert_eq!(std::fs::read(&record).unwrap(), before);
@@ -3706,7 +3708,7 @@ fn t14_without_retention_or_encodable_reduction_holds_on_later_passes() {
             );
             let (counts, stats) = cache.durable_counters(source).unwrap();
             assert_eq!(stats.t14_rebuild, 1);
-            assert_eq!(counts.durable_held, [0; 6]);
+            assert_eq!(counts.durable_held, [0; 7]);
             assert_eq!(
                 stats.format_hold[store::Refusal::Corrupt as usize],
                 previous_holds + n
@@ -4049,7 +4051,7 @@ fn known_corrupt_replacement_case(fail_replacement: bool) {
     let (counts, stats) = cache.durable_counters(source).unwrap();
     assert!(counts.not_persisted["known_corrupt_memory_only"] > 0);
     assert!(counts.not_persisted["known_corrupt_held"] > 0);
-    assert_eq!(counts.durable_held, [0; 6]);
+    assert_eq!(counts.durable_held, [0; 7]);
     assert_eq!(stats.t14_rebuild_full_started, 1);
     let ((), alarms) = crate::local_resource_diagnostics::capture(|| cache.durable_alarm(source));
     assert!(alarms
@@ -4757,7 +4759,7 @@ fn restore_reports_each_early_exit_without_changing_old_totals() {
     assert_eq!((old.restore_attempts, old.missing, old.restored), (4, 1, 0));
     assert_eq!(old.ineligible["selection_cleared"], 1);
     assert_eq!(old.ineligible["history_owed"], 1);
-    assert_eq!(old.durable_held, [0; 6]);
+    assert_eq!(old.durable_held, [0; 7]);
     let text = old.summary(source, &disk);
     assert!(!text.contains("restore_attempts="));
     assert!(text.contains("disk_records="));
@@ -5674,8 +5676,10 @@ fn q11_overflow_never_forgets_a_spent_key_and_pread_charges_actual_bytes() {
     file.seek(SeekFrom::Start(3)).unwrap();
     assert_eq!(failed.read(&mut file, &mut [0; 128]).unwrap(), 3);
     assert_eq!(retail_reads(), vec![(3, 3, 3)]);
-    let mut summary = Counters::default();
-    summary.retail_keys = 1;
+    let summary = Counters {
+        retail_keys: 1,
+        ..Default::default()
+    };
     let line = summary.summary(SnapshotSource::ClaudeCode, &store::StoreCounters::default());
     assert!(line.contains("retail_keys=1"));
     assert!(line.contains("budget_refused_retail_old_bytes="));
@@ -6264,7 +6268,10 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
                             .retain(|header| header.candidate.path != path);
                         header_removed = true;
                     }
-                    if refusal == "prepare_full" && cache_probe.is_some() && !full_checked {
+                    if let Some(cache) = cache_probe
+                        .as_ref()
+                        .filter(|_| refusal == "prepare_full" && !full_checked)
+                    {
                         if let Some(active) = scan.active_file.as_mut() {
                             let acquisition =
                                 active.sampling.as_ref().expect("real sampled Full frame");
@@ -6287,7 +6294,6 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
                                 active.parser.reader.reader.accepts_durable(),
                                 "old guard never copied into fresh reader"
                             );
-                            let cache = cache_probe.as_ref().unwrap();
                             store::ActiveLease::timeout_next_acquire_for_test(
                                 std::time::Duration::from_millis(5),
                             );
@@ -6625,7 +6631,7 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
             assert!(restarted
                 .files
                 .get(&key)
-                .is_none_or(|entry| entry.size_bytes == original_len));
+                .map_or(true, |entry| entry.size_bytes == original_len));
         }
     }
 }

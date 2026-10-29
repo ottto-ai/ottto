@@ -309,7 +309,8 @@ pub(crate) enum Refusal {
     Undecodable,
     Unbindable,
     Corrupt,
-    ReceiptPending,
+    // Slot 5 belongs to the retired UpgradeMissing alarm coordinate.
+    ReceiptPending = 6,
 }
 
 /// The outcome of reading one key.
@@ -402,7 +403,7 @@ pub(crate) struct StoreCounters {
     pub(crate) records_read: u64,
     pub(crate) mutation_unproved: u64,
     pub(crate) missing: u64,
-    pub(crate) format_hold: [u64; 6],
+    pub(crate) format_hold: [u64; 7],
     /// Writes skipped: predecessor unknown, or a new key while record files
     /// exceed `INVENTORY_BOUND` (offered again after the next save).
     pub(crate) store_write_skipped: [u64; 2],
@@ -1510,8 +1511,8 @@ fn above_floor(dir: &Path, encoded: u64, index_len: u64) -> io::Result<bool> {
     }
     // SAFETY: statvfs succeeded and initialized the structure.
     let stat = unsafe { stat.assume_init() };
-    let available = (stat.f_bavail as u64).checked_mul(stat.f_frsize as u64);
-    let volume = (stat.f_blocks as u64).checked_mul(stat.f_frsize as u64);
+    let available = (stat.f_bavail as u64).checked_mul(stat.f_frsize);
+    let volume = (stat.f_blocks as u64).checked_mul(stat.f_frsize);
     Ok(floor_allows(available, volume, encoded, index_len))
 }
 fn floor_allows(available: Option<u64>, volume: Option<u64>, encoded: u64, index_len: u64) -> bool {

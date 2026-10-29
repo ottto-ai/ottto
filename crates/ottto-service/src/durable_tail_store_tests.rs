@@ -120,7 +120,7 @@ impl Drop for Scratch {
 /// Exact in-memory custody oracle; no new production representation/hash.
 pub(crate) fn pending_snapshot(store: &DurableTailStore) -> Vec<u8> {
     let mut out = Vec::new();
-    for (key, (prior, generation, content, allowlist, failures)) in &store.pending {
+    for (key, (prior, generation, content, failures)) in &store.pending {
         out.extend_from_slice(key);
         out.push(u8::from(prior.is_some()));
         if let Some(stamp) = prior {
@@ -133,7 +133,6 @@ pub(crate) fn pending_snapshot(store: &DurableTailStore) -> Vec<u8> {
         }
         out.extend_from_slice(&generation.to_le_bytes());
         out.extend_from_slice(content);
-        out.extend_from_slice(allowlist);
         out.push(*failures);
     }
     out
@@ -234,14 +233,7 @@ fn failed_unlink_holds_across_memo_clear_then_reconciles_no_record() {
             store.durable.clear();
             store.begin_pass();
             assert!(store.receipt_pending(&b.key));
-            store
-                .gc(
-                    &lock,
-                    &b.context,
-                    &placeholder_allowlist(),
-                    &BTreeMap::new(),
-                )
-                .unwrap();
+            store.gc(&lock, &b.context, &BTreeMap::new()).unwrap();
             assert_eq!(
                 store.remove_keys(&lock, &BTreeSet::from([b.key])).unwrap(),
                 0
@@ -339,13 +331,7 @@ fn startup_sync_precedes_warming_and_no_writer_never_repairs_modes() {
     assert_eq!(receipt.written, 0);
     assert_eq!(cold.disabled(), Some("startup_sync"));
     assert_eq!(cold.counters().guard_verify_bytes, 0);
-    cold.gc(
-        &lock,
-        &b.context,
-        &placeholder_allowlist(),
-        &BTreeMap::new(),
-    )
-    .unwrap();
+    cold.gc(&lock, &b.context, &BTreeMap::new()).unwrap();
     assert_eq!(fs::read(&disk).unwrap(), original);
     fs::set_permissions(&disk, fs::Permissions::from_mode(0o644)).unwrap();
     let mut readonly = scratch.store();
@@ -637,12 +623,7 @@ fn sigkill_writer_edges_preserve_verified_survivors() {
             placeholder_body(generation, generation * 7)
         );
         restarted
-            .gc(
-                &lock,
-                &b.context,
-                &placeholder_allowlist(),
-                &BTreeMap::from([(b.key, Some(b.scope))]),
-            )
+            .gc(&lock, &b.context, &BTreeMap::from([(b.key, Some(b.scope))]))
             .unwrap();
         assert_eq!(found(restarted.read(&b.key)).record, survivor.record);
     }
@@ -1493,7 +1474,7 @@ fn store_mode_faults_are_repaired_without_rebuilds() {
     let counters = cold.counters();
     assert_eq!(counters.mode_repaired, 3);
     assert_eq!(counters.t14_rebuild, 0);
-    assert_eq!(counters.format_hold, [0; 6]);
+    assert_eq!(counters.format_hold, [0; 7]);
     assert_eq!(cold.disabled(), None);
 }
 
@@ -2458,7 +2439,7 @@ fn access_failures_disable_instead_of_holding_and_not_found_stays_absent() {
         assert_eq!(cold.hold(&b.key), None, "{arm}");
         let missing = arm.ends_with("missing");
         assert_eq!(cold.disabled().is_some(), !missing, "{arm}");
-        assert_eq!(cold.counters().format_hold, [0; 6], "{arm}");
+        assert_eq!(cold.counters().format_hold, [0; 7], "{arm}");
         assert_eq!(cold.counters().t14_rebuild, 0, "{arm}");
         if arm == "retry" {
             assert_eq!(opens.get(), 2, "exactly one retry");
@@ -2725,7 +2706,7 @@ fn restore_read_access_failure_disables_but_disappearance_is_absence() {
         let mut cold = scratch.store();
         assert_eq!(cold.read(&b.key), ReadOutcome::Missing);
         assert_eq!(cold.disabled().is_some(), arm != "missing");
-        assert_eq!(cold.counters().format_hold, [0; 6]);
+        assert_eq!(cold.counters().format_hold, [0; 7]);
         assert_eq!(cold.counters().t14_rebuild, 0);
         assert_eq!(fs::read(&path).unwrap(), before);
     }
@@ -2766,7 +2747,7 @@ fn non_format_io_errors_disable_at_every_read_boundary_without_spending_t14() {
             }
             assert!(cold.disabled().is_some(), "{stage}/{errno}");
             assert_eq!(cold.hold(&b.key), None);
-            assert_eq!(cold.counters().format_hold, [0; 6]);
+            assert_eq!(cold.counters().format_hold, [0; 7]);
             assert_eq!(cold.counters().t14_rebuild, 0);
             assert!(cold.rebuilt.is_empty());
             assert_eq!(fs::read(&record).unwrap(), before);
@@ -3100,14 +3081,7 @@ fn claude_mutations_require_exact_strict_proof_and_a_current_stamp() {
                         "{seam} {arm}"
                     );
                 }
-                _ => cold
-                    .gc(
-                        &lock,
-                        &b.context,
-                        &placeholder_allowlist(),
-                        &BTreeMap::new(),
-                    )
-                    .unwrap(),
+                _ => cold.gc(&lock, &b.context, &BTreeMap::new()).unwrap(),
             }
             if arm == "eligible" {
                 if seam == "overwrite" {
@@ -3135,14 +3109,7 @@ fn claude_mutation_proof_expires_at_pass_boundary_and_unmemoized_records_survive
     let disk = record_file(&store, &b.key);
     let before = fs::read(&disk).unwrap();
     store.begin_pass();
-    store
-        .gc(
-            &lock,
-            &b.context,
-            &placeholder_allowlist(),
-            &BTreeMap::new(),
-        )
-        .unwrap();
+    store.gc(&lock, &b.context, &BTreeMap::new()).unwrap();
     assert_eq!(
         fs::read(&disk).unwrap(),
         before,
@@ -3182,14 +3149,14 @@ fn receipt_failure_bound_is_per_obligation_and_disable_preserves_custody() {
     test_hooks::set_before_rename(None);
     let original = fs::read(record_file(&store, &b.key)).unwrap();
     assert_eq!(
-        store.pending[&b.key].4, 1,
+        store.pending[&b.key].3, 1,
         "writer's actual reconcile failed"
     );
     for attempt in 2..=RECEIPT_RECONCILE_FAILURES {
         store.begin_pass();
         assert_eq!(store.hold(&b.key), Some(Refusal::ReceiptPending));
         assert!(store.reconcile_pending(&lock, &b.key).is_err());
-        assert_eq!(store.pending[&b.key].4, attempt);
+        assert_eq!(store.pending[&b.key].3, attempt);
         assert_eq!(
             store.disabled(),
             (attempt == RECEIPT_RECONCILE_FAILURES).then_some("receipt_unreconciled")

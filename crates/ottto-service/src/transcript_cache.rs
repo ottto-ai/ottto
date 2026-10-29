@@ -560,7 +560,7 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
                 .iter()
                 .min_by_key(|(_, entry)| (entry.modified_hint, entry.used));
             let own = admitted
-                && victim.is_none_or(|(_, entry)| {
+                && victim.map_or(true, |(_, entry)| {
                     (taken.modified_hint, next) < (entry.modified_hint, entry.used)
                 });
             let count_pressure = self.entries.len() + usize::from(admitted) > self.count_limit;
@@ -841,7 +841,7 @@ mod tests {
         let (result, events) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
             cache.insert_taken_reserving("unfrozen".into(), taken, 0)
         });
-        let returned = result.err().expect("unfrozen refuses");
+        let returned = result.expect_err("unfrozen refuses");
         assert_eq!(&*returned as *const _ as usize, pointer);
         assert_eq!(returned.retained.state.0, "unfrozen");
         assert_eq!(events.insert_frozen_charge_refused, 1);
@@ -969,8 +969,7 @@ mod tests {
         cache.byte_limit = heap_layout_bound::bound(&cache, usize::MAX).unwrap();
         let mut returned = cache
             .insert_taken_reserving("synthetic".into(), taken, 0)
-            .err()
-            .expect("virtual self eviction");
+            .expect_err("virtual self eviction");
         assert_eq!(&*returned as *const _ as usize, pointer);
         assert_eq!(
             returned.durable.retail_mut().unwrap() as *mut _ as usize,

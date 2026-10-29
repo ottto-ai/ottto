@@ -77,7 +77,7 @@ pub(crate) struct Counters {
     pub(crate) retail_keys: u64,
     pub(crate) missing: u64,
     pub(crate) refused_record: u64,
-    pub(crate) durable_held: [u64; 6],
+    pub(crate) durable_held: [u64; 7],
     pub(crate) held_census: [u64; 2],
     pub(crate) ineligible: BTreeMap<&'static str, u64>,
     pub(crate) certificate_refused: BTreeMap<&'static str, u64>,
@@ -121,7 +121,7 @@ impl Counters {
              rederive_named_lines={} rederive_line_bytes={} not_persisted={{{}}} ineligible={{{}}} \
              write_deferred={} write_unlocked={} peak_body_bytes={} store_write_failed[setup,inventory,statvfs]={:?} disk_records={} disk_bytes={} \
              bytes_written={} records_written={} records_clean={} store_budget_refused={} \
-             bytes_read={} format_hold[newer,unknown,undecodable,unbindable,known_corrupt,receipt_pending]={:?} durable_held={:?} held_census[kept,invalidated]={:?} \
+             bytes_read={} format_hold[newer,unknown,undecodable,unbindable,known_corrupt,retired_upgrade_missing,receipt_pending]={:?} durable_held={:?} held_census[kept,invalidated]={:?} \
              guard_header_bytes={} guard_verify_bytes={} delete_verify_bytes={} overwrite_verify_bytes={} \
              uninventoried_records={} store_write_skipped[unknown,inventory_overflow]={:?} \
              gc_records_deleted={} gc_records_read={} gc_bytes_read={} gc_keep_peak={} \
@@ -644,6 +644,7 @@ impl RetailAttempt {
         self.range(file, at)?;
         self.accounted(file).read(bytes)
     }
+    #[cfg(test)]
     pub(crate) fn read_at(
         &mut self,
         file: &File,
@@ -706,7 +707,7 @@ impl SharedCache {
         now: std::time::Instant,
     ) -> Result<RetailAttempt, RetailHold> {
         if crate::heap_layout_bound::tree_node_bytes::<store::Digest32, (u64, std::time::Instant)>()
-            .is_none_or(|n| n > 1024)
+            .map_or(true, |n| n > 1024)
         {
             return Err(RetailHold::AccountingLost);
         }
@@ -947,7 +948,7 @@ impl SharedCache {
         let key = store::key_digest(source, key);
         let mut stores = self.durable()?;
         let slot = stores.slot(source).as_mut()?;
-        if let Some(writer) = crate::locked_state_dir::held_for(slot.store.dir()) {
+        if let Some(writer) = crate::locked_state_dir::held_for(&slot.dir) {
             let _ = slot.store.reconcile_pending(writer, &key);
         }
         // Only a still-pending receipt holds here; the caller's guard classifies
@@ -975,7 +976,7 @@ impl SharedCache {
             if stores
                 .slot(ds)
                 .as_ref()
-                .is_none_or(|slot| slot.store.disabled().is_some())
+                .map_or(true, |slot| slot.store.disabled().is_some())
             {
                 return Ok(None); // Disabled stores never hold native acquisition.
             }
@@ -1112,7 +1113,7 @@ impl SharedCache {
             .len()
             .checked_mul(4)
             .and_then(|n| u64::try_from(n).ok())
-            .is_none_or(|bytes| lease.charge(bytes).is_err())
+            .map_or(true, |bytes| lease.charge(bytes).is_err())
         {
             lease.release();
             return self.restore_resource_pending(

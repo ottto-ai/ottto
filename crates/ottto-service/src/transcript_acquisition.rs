@@ -1473,7 +1473,6 @@ pub(crate) fn birth_unix_nanos(metadata: &Metadata) -> u64 {
 impl Checkpoint {
     /// This checkpoint as a content-free durable certificate. `None` when its
     /// samples are not valid for its stamp (such a checkpoint never admits).
-
     pub(crate) fn durable_certificate(&self, birth_nanos: u64) -> Option<DurableCertificate> {
         if !self.samples.valid_for(self.stamp.length)
             || self.samples.head.len() != self.samples.boundary.len()
