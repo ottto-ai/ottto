@@ -1769,7 +1769,7 @@ fn prepared(inv: &mut codex_file_join::HeaderInventory, index: &mut ScanIndex) -
         steps += 1;
         assert!(steps <= index.files.len() + 2);
     }
-    inv.hold_custodied_siblings(index);
+    while !inv.hold_custodied_siblings(index) {}
     steps
 }
 
