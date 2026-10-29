@@ -232,6 +232,8 @@ fn e2_pipeline_tags_a_copied_transcript_once() {
     let mut file = fs::OpenOptions::new().append(true).open(&copy).unwrap();
     writeln!(file, "{own}").unwrap();
     drop(file);
+    // Explicitly service discovery of the copy append at this fixed clock.
+    expire_terminal_off_discovery_for_test(&index);
     let (items, disposition, _) = e2_page(&dirs, &support, &mut index);
     let roots = items
         .iter()

@@ -79475,6 +79475,9 @@ mod tests {
         )
         .expect("write late account mapping");
 
+        // Service the late metadata notification explicitly at the fixed
+        // fixture clock; this control measures selection/enrichment, not idle cadence.
+        expire_terminal_off_discovery_for_test(&index);
         let second = scan_source_roots(
             SnapshotSource::ClaudeCode,
             std::slice::from_ref(&projects_root),
@@ -79551,6 +79554,9 @@ mod tests {
             1
         );
 
+        // Service the late metadata notification explicitly at the fixed
+        // fixture clock; this control measures selection/enrichment, not idle cadence.
+        expire_terminal_off_discovery_for_test(&index);
         let mut second = scan_source_roots_with_attribution_and_claude_effort(
             SnapshotSource::ClaudeCode,
             std::slice::from_ref(&projects_root),

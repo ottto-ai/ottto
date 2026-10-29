@@ -69,6 +69,9 @@ fn scan(root: &Path, index: &mut ScanIndex, context: &str, revision: u64) -> Sou
     index.activate_upload_context(context.into());
     index.activate_effective_upload_body_witness_revision(revision);
     index.adopt_effective_upload_body_witness_revision_monotonically();
+    // This fixed-clock classifier driver requests the next bounded history
+    // discovery walk; keep its body-byte, privacy and pacing assertions exact.
+    expire_terminal_off_discovery_for_test(index);
     scan_source_roots_with_limit(
         SnapshotSource::ClaudeCode,
         &[root.to_path_buf()],

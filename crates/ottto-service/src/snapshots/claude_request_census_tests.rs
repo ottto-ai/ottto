@@ -2594,6 +2594,9 @@ fn held_original_production_exit_conserves_copy_money_while_committed_entry_unch
                 .unwrap()
                 .modified_unix_seconds += 5;
         }
+        // Each cold/held arm is a separate counterfactual discovery service;
+        // one arm must not consume another's process cadence opportunity.
+        expire_terminal_off_discovery_for_test(&index);
         let mut scan = OwnedSourceScan::new(
             SnapshotSource::ClaudeCode,
             std::slice::from_ref(&root),

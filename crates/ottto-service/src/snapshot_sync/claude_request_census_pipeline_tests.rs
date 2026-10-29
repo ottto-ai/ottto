@@ -248,6 +248,7 @@ fn census_pre_hold_bodies(
     collected_at: &str,
     cycle: &PipelineCycle<'_>,
 ) -> CensusPreHoldBodies {
+    let _preview = crate::snapshots::TerminalOffDiscoveryPreviewForTest::begin();
     let mut index = ScanIndex::load(&fixture.index_path).expect("preview index");
     index.activate_upload_context(cycle.upload_context.to_owned());
     let mut reset_owed_members = 0;

@@ -160,6 +160,10 @@ fn raw_scan_at(
     collected_at: &str,
     mut after_start: impl FnMut(&mut OwnedSourceScan),
 ) -> Run {
+    // Each call compares a deliberately serviced native-reader page with a
+    // cold Full oracle. Expire metadata cadence explicitly; these controls
+    // exercise identity, reuse and exact bodies, not idle tick scheduling.
+    crate::snapshots::expire_terminal_off_discovery_for_test(&index);
     let mut scan = OwnedSourceScan::new_with_identity_capture(
         SOURCE,
         std::slice::from_ref(&fixture.dir),

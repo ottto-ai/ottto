@@ -325,6 +325,38 @@ fn terminal_off_rediscovery_due(scope: String, now: u64, force: bool) -> bool {
     #[cfg(test)]
     TERMINAL_OFF_REDISCOVERY.with(|memo| check(&mut memo.borrow_mut()))
 }
+// Reader/identity fixture drivers model an explicitly due discovery walk,
+// rather than an idle daemon tick at the same fixed fixture timestamp.
+#[cfg(test)]
+pub(crate) fn expire_terminal_off_discovery_for_test(index: &ScanIndex) {
+    if let Some(scope) = terminal_off_rediscovery_scope(index) {
+        TERMINAL_OFF_REDISCOVERY.with(|memo| memo.borrow_mut().remove(&scope));
+    }
+}
+
+// A counterfactual preview must not consume the real page owner's process
+// scheduling turn. Restore only the test-local memo, including on unwind.
+#[cfg(test)]
+pub(crate) struct TerminalOffDiscoveryPreviewForTest {
+    saved: BTreeMap<String, u64>,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+#[cfg(test)]
+impl TerminalOffDiscoveryPreviewForTest {
+    pub(crate) fn begin() -> Self {
+        Self {
+            saved: TERMINAL_OFF_REDISCOVERY.with(|memo| memo.borrow().clone()),
+            _thread: std::marker::PhantomData,
+        }
+    }
+}
+#[cfg(test)]
+impl Drop for TerminalOffDiscoveryPreviewForTest {
+    fn drop(&mut self) {
+        TERMINAL_OFF_REDISCOVERY.with(|memo| *memo.borrow_mut() = std::mem::take(&mut self.saved));
+    }
+}
+
 fn terminal_off_rediscovery_scope(index: &ScanIndex) -> Option<String> {
     let traversal = index.traversal.as_ref()?;
     let mut digest = Sha256::new();
@@ -386,7 +418,22 @@ fn refresh_terminal_off_discovery(
             .retain(|p| traversal.scan_roots.contains(&p.scan_root));
     }
     let scope = terminal_off_rediscovery_scope(index).expect("retained traversal");
-    if !terminal_off_rediscovery_due(scope, now, changed || overflow) {
+    // Cadence parks only discovery of otherwise idle work. It must not
+    // suppress already admitted reconstruction/transport/history debt when
+    // the corresponding path was consumed earlier in this retained window.
+    // This wakes the existing bounded metadata walk; the ordinary candidate
+    // selector and privacy/history/backoff gates still own every body read.
+    let owed = !index.terminal_contract_retries.is_empty()
+        || index.upload_context_fingerprint != index.active_upload_context_fingerprint
+        || index.files.iter().any(|(key, entry)| {
+            entry.source_file_fingerprint.is_empty()
+                || (!entry.has_unverified_source()
+                    && entry.scan_identity_version.as_deref()
+                        != Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION))
+                || sampled_audit::debt_for_key(index, key, now).is_some()
+                || index.effective_upload_body_witness_revision_requires_adoption(key)
+        });
+    if !terminal_off_rediscovery_due(scope, now, changed || overflow || owed) {
         return;
     }
     let traversal = index.traversal.as_mut().expect("retained traversal");

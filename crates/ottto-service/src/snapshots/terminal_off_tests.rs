@@ -379,9 +379,8 @@ fn terminal_off_offline_create_overflow_and_cadence_discover_without_restart() {
             index = serde_json::from_value(serde_json::to_value(index).unwrap()).unwrap();
         }
         if n == 3 {
-            index
-                .claude_full_rearm_progress
-                .terminal_off_rediscovery_after = 0;
+            // The process memo, not the skipped diagnostic scalar, owns time.
+            expire_terminal_off_discovery_for_test(&index);
         }
         refresh_terminal_off_discovery(&mut index, &[scratch.to_path_buf()], W2, overflow);
         let result = off_scan(&mut index, &scratch, W2, 10);
@@ -1078,4 +1077,107 @@ fn terminal_off_service_round_preserves_failed_page_retry_without_minting_comple
     assert!(!first.census_complete && !second.census_complete);
     assert!(index.accepted_snapshot_fingerprints.is_empty());
     assert!(!claude_terminal_authority(&index, true, W1));
+}
+
+#[test]
+fn terminal_off_idle_cadence_never_parks_already_owed_read_work() {
+    let scratch = crate::test_scratch::ScratchDir::new("terminal-off-cadence-owed");
+    let path = scratch.join(format!("{OFF_ROOT}.jsonl"));
+    fs::write(&path, off_line(OFF_ROOT, "X")).unwrap();
+    let key = local_index_key(&path);
+    let mut settled = off_index();
+    let first = off_scan(&mut settled, &scratch, W1, 10);
+    off_accept(&mut settled, &first);
+    let at = "2026-08-20T10:03:00Z";
+    refresh_terminal_off_discovery(&mut settled, &[scratch.to_path_buf()], at, false);
+    assert!(settled
+        .traversal
+        .as_ref()
+        .unwrap()
+        .pending_directories
+        .is_empty());
+    let before = START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get);
+    let accepted = settled.accepted_snapshot_fingerprints.clone();
+    for cause in [
+        "audit",
+        "contract",
+        "cleared",
+        "history",
+        "context",
+        "legacy_identity",
+    ] {
+        let mut index = settled.clone();
+        match cause {
+            "audit" => index
+                .files
+                .get_mut(&key)
+                .unwrap()
+                .set_unverified_deadline(1),
+            "contract" => {
+                index
+                    .terminal_contract_retries
+                    .insert("exact-entity".into(), "body".into());
+            }
+            "cleared" => index
+                .files
+                .get_mut(&key)
+                .unwrap()
+                .source_file_fingerprint
+                .clear(),
+            "history" => {
+                index.active_effective_upload_body_witness_revision = u64::MAX;
+            }
+            "context" => {
+                index.active_upload_context_fingerprint = Some("new-context".into());
+            }
+            "legacy_identity" => {
+                index.files.get_mut(&key).unwrap().scan_identity_version =
+                    Some("claude_code_jsonl:v29".into());
+            }
+            _ => unreachable!(),
+        }
+        refresh_terminal_off_discovery(&mut index, &[scratch.to_path_buf()], at, false);
+        assert_eq!(
+            index.traversal.as_ref().unwrap().pending_directories.len(),
+            1,
+            "{cause}: only bounded metadata scheduling wakes"
+        );
+        assert_eq!(
+            START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get),
+            before,
+            "no identity/body work before ordinary selection"
+        );
+        assert_eq!(
+            index.accepted_snapshot_fingerprints, accepted,
+            "no new ACK credit"
+        );
+        assert!(
+            !claude_terminal_authority(&index, true, W1),
+            "no proof/completion credit"
+        );
+    }
+}
+
+#[test]
+fn terminal_off_counterfactual_preview_preserves_the_actual_discovery_turn() {
+    let scratch = crate::test_scratch::ScratchDir::new("terminal-off-preview-turn");
+    let mut index = off_index();
+    ensure_bounded_traversal(
+        SnapshotSource::ClaudeCode,
+        &[scratch.to_path_buf()],
+        &mut index,
+        W1,
+        183,
+    );
+    let scope = terminal_off_rediscovery_scope(&index).unwrap();
+    expire_terminal_off_discovery_for_test(&index);
+    {
+        let _preview = TerminalOffDiscoveryPreviewForTest::begin();
+        assert!(terminal_off_rediscovery_due(scope.clone(), 100, false));
+        assert!(!terminal_off_rediscovery_due(scope.clone(), 101, false));
+    }
+    assert!(
+        terminal_off_rediscovery_due(scope, 100, false),
+        "the control clone did not consume the real owner's turn"
+    );
 }
