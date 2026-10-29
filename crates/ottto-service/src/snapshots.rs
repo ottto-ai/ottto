@@ -48337,6 +48337,8 @@ impl ScanIndex {
                         .filter(|key| !self.files.contains_key(*key)),
                 ),
         );
+        let mut o3_replay = self.o3_replay.clone();
+        o3_replay.preserve_spends_from(&previous.o3_replay);
         let mut result = ScanIndex {
             claude_money_birth_store,
             codex_counting_moved_evidence: self.codex_counting_moved_evidence.clone(),
@@ -48352,7 +48354,7 @@ impl ScanIndex {
             generation: previous.generation,
             upload_ack_retirement_handoff: previous.upload_ack_retirement_handoff.clone(),
             upload_context_fingerprint: previous.upload_context_fingerprint.clone(),
-            o3_replay: upgrade_replay::State::default(),
+            o3_replay,
             files,
             session_account_bindings: self.session_account_bindings.clone(),
             terminal_jsonl_dispositions: previous.terminal_jsonl_dispositions.clone(),

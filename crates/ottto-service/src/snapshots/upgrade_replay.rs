@@ -106,6 +106,30 @@ impl State {
             ottto_core::compiled_release_version()
         )
     }
+    pub(super) fn refused() -> Self {
+        Self {
+            closed: true,
+            ..Self::default()
+        }
+    }
+    /// Copies carry only negative evidence. Union both checkpoint lineages so
+    /// a partial/error settlement cannot mint a previously spent A5 grant.
+    pub(super) fn preserve_spends_from(&mut self, other: &Self) {
+        self.closed |= other.closed;
+        for (release, keys) in &other.replayed {
+            let spent = self.replayed.entry(release.clone()).or_default();
+            for key in keys {
+                if spent.contains(key) {
+                    continue;
+                }
+                if spent.len() >= MAX_KEYS {
+                    self.closed = true;
+                    break;
+                }
+                spent.insert(*key);
+            }
+        }
+    }
     pub(super) fn is_empty(&self) -> bool {
         !self.closed && self.replayed.is_empty()
     }
@@ -184,11 +208,42 @@ mod tests {
         assert!(!copied.o3_replay.upgrade_missing("file", true));
         let mut restarted = ScanIndex::load(&path).unwrap();
         assert!(!restarted.o3_replay.upgrade_missing("file", true));
+        let encoded = std::fs::read(&path).unwrap();
+        let mut native = claude_request_census::decode_index(&encoded).unwrap();
+        assert!(!native.o3_replay.upgrade_missing("file", true));
+        let mut bounded = lenient_decode::read_bounded(&encoded).unwrap();
+        assert!(!bounded.o3_replay.upgrade_missing("file", true));
         assert!(index.o3_replay.upgrade_missing("file", true));
         assert!(
             !index.o3_replay.upgrade_missing("file", true),
             "one live claim only"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+    #[test]
+    fn partial_checkpoint_unions_negative_spends_without_live_permissions() {
+        let mut committed = ScanIndex::default();
+        assert!(!committed.o3_replay.upgrade_missing("old", true));
+        committed.o3_replay.saved();
+        assert!(committed.o3_replay.upgrade_missing("old", true));
+        let mut working = ScanIndex::default();
+        assert!(!working.o3_replay.upgrade_missing("new", true));
+        working.o3_replay.saved();
+        let mut partial = working.committable_subset_with_local_holds(
+            &committed,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeSet::from(["held".to_owned()]),
+        );
+        assert!(!partial.o3_replay.upgrade_missing("old", true));
+        assert!(!partial.o3_replay.upgrade_missing("new", true));
+        let encoded = serde_json::to_vec(&partial).unwrap();
+        let mut restarted = lenient_decode::read_bounded(&encoded).unwrap();
+        assert!(!restarted.o3_replay.upgrade_missing("old", true));
+        assert!(!restarted.o3_replay.upgrade_missing("new", true));
+        assert!(
+            working.o3_replay.upgrade_missing("new", true),
+            "original process owns its saved ticket"
+        );
     }
 }

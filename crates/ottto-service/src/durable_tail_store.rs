@@ -294,6 +294,7 @@ pub(crate) struct DurableRecord {
 pub(crate) struct MutationWitness {
     key: Digest32,
     original: Digest32,
+    content: Digest32,
     stamp: Stamp,
     migration: Option<MigrationBinding>,
 }
@@ -878,6 +879,7 @@ impl DurableTailStore {
         let proof = MutationWitness {
             key,
             original: original_digest(record, &digest),
+            content: digest,
             stamp: *stamp,
             migration: None,
         };
@@ -897,6 +899,7 @@ impl DurableTailStore {
         receipt.committed.as_ref().is_some_and(|acks| {
             acks.iter().flatten().any(|(key, content, stamp)| {
                 *key == proof.key
+                    && *content != proof.content
                     && *stamp != proof.stamp
                     && self.durable.get(key).is_some_and(|(have, current, _)| {
                         *have == Some(*content) && current == stamp
