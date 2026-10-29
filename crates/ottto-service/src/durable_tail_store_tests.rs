@@ -124,7 +124,7 @@ pub(super) fn pending(
     }
 }
 
-pub(super) fn found(outcome: ReadOutcome) -> DurableRecord {
+pub(crate) fn found(outcome: ReadOutcome) -> DurableRecord {
     match outcome {
         ReadOutcome::Found(record) => *record,
         other => panic!("expected a record, got {other:?}"),
