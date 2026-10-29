@@ -216,15 +216,29 @@ def production_tokens(path, source):
     """Remove test items; return external test module roots to exclude too."""
     t = tokens(source)
     ends = balanced(t)
-    for i in range(len(t)):
-        if t[i:i + 3] == ["#", "!", "["]:
-            attr = t[i + 3:ends[i + 2] - 1]
-            if attr[:2] == ["cfg", "("] and cfg_without_test(attr[2:-1]) is False:
-                return [], {path}
     removed, test_modules = set(), set()
+    modules = []
+    for i, part in enumerate(t):
+        if part == "mod":
+            body = body_start(t, ends, i + 1)
+            if t[body:body + 1] == ["{"]:
+                modules.append((i, body, ends[body]))
+    for i in range(len(t)):
+        if t[i:i + 3] != ["#", "!", "["]:
+            continue
+        attr = t[i + 3:ends[i + 2] - 1]
+        if attr[:2] != ["cfg", "("] or cfg_without_test(attr[2:-1]) is not False:
+            continue
+        owners = [(a, end) for a, body, end in modules if body < i < end]
+        if owners:
+            # Inner cfg belongs to its innermost module, not the whole file.
+            start, end = max(owners)
+            removed.update(range(start, end))
+        else:
+            return [], {path}
     at = 0
     while at < len(t):
-        if t[at:at + 2] != ["#", "["]:
+        if at in removed or t[at:at + 2] != ["#", "["]:
             at += 1
             continue
         start, attrs = at, []

@@ -314,6 +314,10 @@ fn pinned_v1_refuses_serializer_in_non_catalog_source() {
     for (path, original) in [
         ("canonical_json.rs", include_str!("../../canonical_json.rs")),
         ("fixture_added_source.rs", ""),
+        (
+            "fixture_with_nested_test.rs",
+            "mod test_only { #![cfg(test)] crate::durable_tail_codec::durable_struct!(TestOnly { N n: u64 }); }",
+        ),
     ] {
         assert!(!PINNED_SOURCES.iter().any(|pin| pin.path == path));
         let changed = format!(
@@ -330,6 +334,11 @@ fn pinned_v1_refuses_serializer_in_non_catalog_source() {
 fn pinned_v1_accepts_test_only_serializers_outside_catalog() {
     // Inline, file-level and externally declared test modules are excluded.
     let changed = "#[cfg(all(test, unix))] mod tests { crate::durable_tail_codec::durable_struct!(Added { N n: u64 }); }";
+    assert_eq!(
+        verify_pinned_sources(Some(("fixture_added_source.rs", changed))),
+        Ok(())
+    );
+    let changed = "mod test_only { #![cfg(test)] crate::durable_tail_codec::durable_struct!(Added { N n: u64 }); }";
     assert_eq!(
         verify_pinned_sources(Some(("fixture_added_source.rs", changed))),
         Ok(())
