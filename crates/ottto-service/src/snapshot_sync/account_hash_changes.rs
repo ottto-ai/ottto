@@ -69,7 +69,7 @@ impl AcceptedAccounts {
             Sha256::digest(serde_json::to_vec(&accounts).expect("account hashes serialize"))
         );
         if self.0.get(&key).is_some_and(|previous| previous != &digest) {
-            crate::local_resource_diagnostics::account_hash_changed();
+            crate::local_resource_diagnostics::account_hash_changed(&key);
         }
         if !self.0.contains_key(&key) && self.0.len() >= MAX_SESSIONS {
             self.0.pop_first();
@@ -116,7 +116,15 @@ mod tests {
         same["model_usage"][0]["input_tokens"] = 99.into();
         same["usage_buckets"] = serde_json::json!([{"model_usage":same["model_usage"]}]);
         assert_eq!(observed(|| accounts.record(&same)), 0);
-        assert_eq!(observed(|| accounts.record(&body(Some("account-b")))), 1);
+        assert_eq!(
+            observed(|| {
+                accounts.record(&body(Some("account-b")));
+                accounts.record(&body(Some("account-c")));
+                accounts.record(&body(Some("account-b")));
+            }),
+            1,
+            "count sessions rather than revisions within a finish"
+        );
         assert_eq!(observed(|| accounts.record(&body(Some("account-b")))), 0);
         assert_eq!(observed(|| accounts.record(&body(None))), 1);
         assert_eq!(observed(|| accounts.record(&body(Some("account-a")))), 1);

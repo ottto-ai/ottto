@@ -531,10 +531,13 @@ impl Observation {
 // Updated only for server-acknowledged stored bodies on this source worker.
 // Drained by the existing finish record; no identifiers reach the log.
 thread_local! {
-    static ACCOUNT_HASH_CHANGED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static ACCOUNT_HASH_CHANGED: std::cell::RefCell<std::collections::BTreeSet<String>> =
+        const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
 }
-pub(crate) fn account_hash_changed() {
-    ACCOUNT_HASH_CHANGED.with(|count| count.set(count.get().saturating_add(1)));
+pub(crate) fn account_hash_changed(session_key: &str) {
+    ACCOUNT_HASH_CHANGED.with(|sessions| {
+        sessions.borrow_mut().insert(session_key.to_string());
+    });
 }
 
 /// Observe only a normally returned finish; move its value/error through unchanged.
@@ -547,7 +550,7 @@ pub(crate) fn source_finish<T>(
     struct Counts {
         account_hash_changed: u64,
     }
-    ACCOUNT_HASH_CHANGED.with(|count| count.set(0));
+    ACCOUNT_HASH_CHANGED.with(|sessions| sessions.borrow_mut().clear());
     let probe = Probe::start();
     let result = inner();
     emit(&Record {
@@ -557,7 +560,11 @@ pub(crate) fn source_finish<T>(
         source: Source::from_slug(source),
         observation: probe.observation(),
         counts: Counts {
-            account_hash_changed: ACCOUNT_HASH_CHANGED.with(|count| count.replace(0)),
+            account_hash_changed: ACCOUNT_HASH_CHANGED.with(|sessions| {
+                let count = sessions.borrow().len() as u64;
+                sessions.borrow_mut().clear();
+                count
+            }),
         },
     });
     result
