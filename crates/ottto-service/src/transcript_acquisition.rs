@@ -624,12 +624,38 @@ fn earlier_debt(a: Option<AuditDebt>, b: Option<AuditDebt>) -> Option<AuditDebt>
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static SAMPLE_READ_BYTES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Physical certificate input observer; production reads/credit are unchanged.
+#[cfg(test)]
+pub(crate) fn capture_sample_bytes<T>(run: impl FnOnce() -> T) -> (T, usize) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SAMPLE_READ_BYTES.set(None);
+        }
+    }
+    assert!(SAMPLE_READ_BYTES.replace(Some(0)).is_none());
+    let _reset = Reset;
+    let output = run();
+    (output, SAMPLE_READ_BYTES.get().unwrap())
+}
+
 fn read_sample(file: &mut File, offset: u64, len: usize, count: &mut usize) -> io::Result<Vec<u8>> {
     file.seek(SeekFrom::Start(offset))?;
     let mut bytes = vec![0; len];
     let mut read = 0;
     while read < bytes.len() {
         let n = file.read(&mut bytes[read..])?;
+        #[cfg(test)]
+        SAMPLE_READ_BYTES.with(|bytes| {
+            if let Some(total) = bytes.get() {
+                bytes.set(Some(total + n));
+            }
+        });
         *count += n;
         if n == 0 {
             return Err(io::Error::new(

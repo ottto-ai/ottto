@@ -891,6 +891,10 @@ impl RestoreCounts {
             RestoreOutcome::Held(_) | RestoreOutcome::FloorHeld => &mut self.held,
             RestoreOutcome::Pending => &mut self.pending,
             RestoreOutcome::Miss(class) => self.miss.entry(class.label()).or_default(),
+            RestoreOutcome::Degraded => self
+                .miss
+                .entry("degraded_no_record.active_bound")
+                .or_default(),
         };
         *count = count.saturating_add(1);
     }

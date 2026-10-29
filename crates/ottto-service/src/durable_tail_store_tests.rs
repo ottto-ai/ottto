@@ -6,6 +6,7 @@ use super::*;
 use crate::snapshots::ScanIndex;
 use crate::transcript_acquisition::{DurableAdmission, FullReason, ReadPlan, Scope};
 use std::collections::BTreeMap;
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 
 /// Real compiled v1 body/allowlist; arbitrary test-only representations are U.

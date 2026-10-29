@@ -1515,8 +1515,15 @@ fn above_floor(dir: &Path, encoded: u64, index_len: u64) -> io::Result<bool> {
     }
     // SAFETY: statvfs succeeded and initialized the structure.
     let stat = unsafe { stat.assume_init() };
-    let available = (stat.f_bavail as u64).checked_mul(stat.f_frsize);
-    let volume = (stat.f_blocks as u64).checked_mul(stat.f_frsize);
+    // libc typedef widths vary by target; keep the checked product in u64.
+    #[allow(clippy::unnecessary_cast)]
+    let (fragment_bytes, available_blocks, volume_blocks) = (
+        stat.f_frsize as u64,
+        stat.f_bavail as u64,
+        stat.f_blocks as u64,
+    );
+    let available = available_blocks.checked_mul(fragment_bytes);
+    let volume = volume_blocks.checked_mul(fragment_bytes);
     Ok(floor_allows(available, volume, encoded, index_len))
 }
 fn floor_allows(available: Option<u64>, volume: Option<u64>, encoded: u64, index_len: u64) -> bool {

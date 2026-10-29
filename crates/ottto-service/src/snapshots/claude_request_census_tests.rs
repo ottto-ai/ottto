@@ -2671,3 +2671,59 @@ fn held_original_production_exit_conserves_copy_money_while_committed_entry_unch
         "macOS records carry an opened birth"
     );
 }
+
+#[test]
+fn paced_restore_residue_prevents_35_day_census_retirement_until_catchup() {
+    let scratch = crate::test_scratch::ScratchDir::new("census-paced-retention");
+    let root = scratch.join("projects");
+    census_write(
+        &root,
+        "paced.jsonl",
+        &[census_response(
+            "paced",
+            Some("req_paced"),
+            "msg_paced",
+            1,
+            10,
+        )],
+    );
+    let mut index = ScanIndex::default();
+    census_scan(&root, &mut index, "2026-10-29T09:00:00Z");
+    let key = census_key(&index, &root, "paced.jsonl");
+    let before = index
+        .claude_request_census_for_test()
+        .record_for_test(&key)
+        .unwrap();
+    assert_eq!(before.retired_for_test(), None);
+    let held = BTreeSet::from([key.clone()]);
+    claude_request_census::settle_claude_request_census_terminal(
+        &mut index,
+        &held,
+        &held,
+        "2027-03-01T09:00:00Z",
+    );
+    assert_eq!(
+        index
+            .claude_request_census_for_test()
+            .record_for_test(&key)
+            .unwrap()
+            .retired_for_test(),
+        None,
+        "paced unread residue retains exact hashes past 35 days"
+    );
+    claude_request_census::settle_claude_request_census_terminal(
+        &mut index,
+        &held,
+        &BTreeSet::new(),
+        "2027-03-01T09:00:00Z",
+    );
+    assert_eq!(
+        index
+            .claude_request_census_for_test()
+            .record_for_test(&key)
+            .unwrap()
+            .retired_for_test(),
+        Some(1),
+        "negative control: ordinary quiet retirement remains enabled after catch-up"
+    );
+}

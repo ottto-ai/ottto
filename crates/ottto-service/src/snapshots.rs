@@ -28782,7 +28782,8 @@ impl OwnedSourceScan {
                 // compact records and their selector table were already charged
                 // by copy_budget_step. A refusal disables retention, preserving
                 // the ordinary native finish and its loss/output semantics.
-                let cache_compatible = sampled_scan::compatible_reduction(&parser.accumulator)
+                let cache_compatible = !file_sampling.as_ref().is_some_and(|a| a.no_record)
+                    && sampled_scan::compatible_reduction(&parser.accumulator)
                     && aliases.is_empty()
                     && applied_receipts.values().all(Option::is_none);
                 // Retain the reduction only when every applied byte is in
@@ -31647,6 +31648,7 @@ impl OwnedSourceScan {
                             pending!();
                         }
                         Err(_) => {
+                            residue_index_keys.insert(local_index_key(&candidate.path));
                             cache.durable_custody_hold(
                                 source,
                                 "active_input_pending",
@@ -32072,6 +32074,7 @@ impl OwnedSourceScan {
             // or deferral below does not inflate the read diagnostics.
             let mut planned_mode = None;
             let mut returned_refusal = None;
+            let mut active_bound_degraded = false;
             // U1a-2a G7: a side read's acquisition is a fresh `Full` read
             // under the side scope: no retained take, no admission observes
             // or counters, no debt. Failures are its charged attempt.
@@ -32089,6 +32092,7 @@ impl OwnedSourceScan {
                     Ok(mode) => {
                         sampled_scan::configure_tier_replay(&mut parser, &candidate, index);
                         file_sampling = Some(sampled_scan::Active {
+                            no_record: active_bound_degraded,
                             key: local_index_key(&candidate.path),
                             scope,
                             mode,
@@ -32114,6 +32118,7 @@ impl OwnedSourceScan {
                     Ok(Some((taken, lease))) => (Some(taken), Some(lease)),
                     Ok(None) => (None, None),
                     Err(()) => {
+                        residue_index_keys.insert(key.clone());
                         context.cache.durable_custody_hold(
                             source,
                             "prepared_funding_pending",
@@ -32346,6 +32351,8 @@ impl OwnedSourceScan {
                         #[cfg(unix)]
                         context.cache.durable_note_scope(source, &key, &scope);
                         #[cfg(unix)]
+                        let mut restored_plan = None;
+                        #[cfg(unix)]
                         let (mut retained, taken_admission, debt) = match retained {
                             None if allow_sample && !parser.reader.reader.is_compressed() => {
                                 let mut interpretation =
@@ -32381,6 +32388,15 @@ impl OwnedSourceScan {
                                                 if let Some(lease) = preparation_lease.take() { lease.release(); }
                                                 pending!();
                                             };
+                                            // Plan native Full causes before consulting the irrevocable
+                                            // Tail allowance. Exhaustion cannot veto an audit/edit/clock Full.
+                                            restored_plan = crate::transcript_acquisition::ReadPlan::prepare(
+                                                parser.reader.reader.get_mut(),
+                                                Some(&taken.retained.checkpoint), &scope, debt,
+                                                sampled_scan::now_seconds(),
+                                            ).ok();
+                                            let independent_full = restored_plan.as_ref().map_or(true, |plan| matches!(plan.mode(), crate::transcript_acquisition::ReadMode::Full(_)));
+                                            if !independent_full {
                                             match context.cache.begin_retail(
                                                 source,
                                                 &key,
@@ -32394,17 +32410,19 @@ impl OwnedSourceScan {
                                                     let full = matches!(reason,
                                                         sampled_scan::durable_tail::RetailHold::Exhausted
                                                         | sampled_scan::durable_tail::RetailHold::AccountingLost)
-                                                        && context.cache.retail_full(&key, parser.reader.reader.get_ref(), accepted_end);
+                                                        && context.cache.retail_full(&key, parser.reader.reader.get_ref(), accepted_end, std::time::SystemTime::now());
                                                     // Drop optional graph before its lease; never refund
                                                     // retail_spent or expose guardless old custody.
                                                     drop(taken);
                                                     if let Some(lease) = preparation_lease.take() { lease.release(); }
                                                     if full {
+                                                        restored_plan = None;
                                                         break 'restored (None, taken_admission, debt);
                                                     }
                                                     context.cache.durable_retail_hold(source, reason, index, &candidate);
                                                     pending!();
                                                 }
+                                            }
                                             }
                                         }
                                         retained_offset =
@@ -32421,6 +32439,7 @@ impl OwnedSourceScan {
                                         pending!();
                                     }
                                     sampled_scan::durable_tail::RestoreOutcome::Pending => {
+                                        residue_index_keys.insert(key.clone());
                                         context.cache.durable_custody_hold(
                                             source,
                                             "prepared_funding_pending",
@@ -32428,6 +32447,10 @@ impl OwnedSourceScan {
                                             &candidate,
                                         );
                                         pending!();
+                                    }
+                                    sampled_scan::durable_tail::RestoreOutcome::Degraded => {
+                                        active_bound_degraded = true;
+                                        (None, taken_admission, debt)
                                     }
                                     sampled_scan::durable_tail::RestoreOutcome::Miss(class) => {
                                         if matches!(class, sampled_scan::durable_tail::MissClass::RealEdit(_)) {
@@ -32466,14 +32489,17 @@ impl OwnedSourceScan {
                                 return_original!(taken, Some("eligibility"));
                             }
                         }
+                        #[cfg(not(unix))]
+                        let restored_plan = None;
                         let old = retained;
                         context.admission.prepare_started =
                             context.admission.prepare_started.saturating_add(1);
-                        let mode = match parser.prepare_acquisition_owned(
+                        let mode = match parser.prepare_acquisition_owned_planned(
                             old,
                             &scope,
                             debt,
                             sampled_scan::now_seconds(),
+                            restored_plan,
                         ) {
                             Ok(mode) => mode,
                             Err(rejected) => {
@@ -32593,6 +32619,7 @@ impl OwnedSourceScan {
                             !matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
                         });
                         file_sampling = Some(sampled_scan::Active {
+                            no_record: active_bound_degraded,
                             key,
                             scope,
                             mode,
@@ -32664,6 +32691,7 @@ impl OwnedSourceScan {
                         sampled_scan::configure_tier_replay(&mut parser, &candidate, index);
                         planned_mode = Some((mode, recovered_audit_due));
                         file_sampling = Some(sampled_scan::Active {
+                            no_record: active_bound_degraded,
                             key,
                             scope,
                             mode,
@@ -32927,8 +32955,30 @@ impl OwnedSourceScan {
                     }
                 }
             }
+            if active_bound_degraded {
+                if let Some(context) = sampling.as_ref() {
+                    let key = local_index_key(&active.candidate.path);
+                    if !context.cache.start_active_bound_full(
+                        source,
+                        &key,
+                        active.parser.reader.reader.get_ref(),
+                    ) {
+                        residue_index_keys.insert(key);
+                        // A concurrent same-key start can win after the probe.
+                        // Return any pre-input cursor slot before retrying.
+                        drop(codex_cursor_lease.take());
+                        pending!();
+                    }
+                }
+            }
             if let Some((context, (mode, audit_due))) = sampling.as_mut().zip(planned_mode) {
                 context.record_mode(mode, audit_due);
+                if active_bound_degraded {
+                    crate::local_resource_diagnostics::durable_tail_alarm(
+                        source.api_slug(),
+                        &serde_json::json!({"full_reads": {"degraded_no_record": {"active_bound": 1}}}),
+                    );
+                }
                 if matches!(mode, crate::transcript_acquisition::ReadMode::Full(_)) {
                     if let Some(reason) = returned_refusal {
                         crate::local_resource_diagnostics::durable_tail_alarm(
@@ -42883,7 +42933,17 @@ fn effective_backfill_window_days(requested_backfill_window_days: u64) -> u64 {
     requested_backfill_window_days.min(BACKFILL_WINDOW_DAYS)
 }
 
+#[cfg(test)]
+thread_local! {
+    // Scale the existing SIZE boundary in synthetic transition fixtures only.
+    static TEST_JSONL_FILE_CAP: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
 fn max_jsonl_file_bytes(source: SnapshotSource) -> u64 {
+    #[cfg(test)]
+    if let Some(cap) = TEST_JSONL_FILE_CAP.get() {
+        return cap;
+    }
     match source {
         SnapshotSource::Codex => MAX_CODEX_JSONL_FILE_BYTES,
         SnapshotSource::ClaudeCode => MAX_CLAUDE_JSONL_FILE_BYTES,
