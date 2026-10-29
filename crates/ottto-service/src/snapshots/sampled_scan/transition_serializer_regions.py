@@ -217,25 +217,26 @@ def production_tokens(path, source):
     t = tokens(source)
     ends = balanced(t)
     removed, test_modules = set(), set()
-    modules = []
+    items = []
     for i, part in enumerate(t):
-        if part == "mod":
+        if part in ("mod", "fn", "impl", "trait"):
             body = body_start(t, ends, i + 1)
             if t[body:body + 1] == ["{"]:
-                modules.append((i, body, ends[body]))
+                items.append((i, body, ends[body]))
     for i in range(len(t)):
         if t[i:i + 3] != ["#", "!", "["]:
             continue
         attr = t[i + 3:ends[i + 2] - 1]
         if attr[:2] != ["cfg", "("] or cfg_without_test(attr[2:-1]) is not False:
             continue
-        owners = [(a, end) for a, body, end in modules if body < i < end]
-        if owners:
-            # Inner cfg belongs to its innermost module, not the whole file.
-            start, end = max(owners)
-            removed.update(range(start, end))
-        else:
+        blocks = [(a, end) for a, end in ends.items() if t[a] == "{" and a < i < end]
+        if not blocks:
             return [], {path}
+        body, end = max(blocks)
+        # Inner cfg belongs to its enclosing item/block, never the whole file
+        # merely because it happens inside an inline module or function body.
+        start = next((a for a, block, _ in items if block == body), body)
+        removed.update(range(start, end))
     at = 0
     while at < len(t):
         if at in removed or t[at:at + 2] != ["#", "["]:

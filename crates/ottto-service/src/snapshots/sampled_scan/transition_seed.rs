@@ -315,6 +315,10 @@ fn pinned_v1_refuses_serializer_in_non_catalog_source() {
         ("canonical_json.rs", include_str!("../../canonical_json.rs")),
         ("fixture_added_source.rs", ""),
         (
+            "fixture_with_test_function.rs",
+            "fn test_only() { #![cfg(test)] crate::durable_tail_codec::durable_struct!(TestOnly { N n: u64 }); }",
+        ),
+        (
             "fixture_with_nested_test.rs",
             "mod test_only { #![cfg(test)] crate::durable_tail_codec::durable_struct!(TestOnly { N n: u64 }); }",
         ),
@@ -339,6 +343,11 @@ fn pinned_v1_accepts_test_only_serializers_outside_catalog() {
         Ok(())
     );
     let changed = "mod test_only { #![cfg(test)] crate::durable_tail_codec::durable_struct!(Added { N n: u64 }); }";
+    assert_eq!(
+        verify_pinned_sources(Some(("fixture_added_source.rs", changed))),
+        Ok(())
+    );
+    let changed = "fn test_only() { #![cfg(test)] crate::durable_tail_codec::durable_struct!(Added { N n: u64 }); }";
     assert_eq!(
         verify_pinned_sources(Some(("fixture_added_source.rs", changed))),
         Ok(())
