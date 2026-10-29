@@ -5,6 +5,7 @@ use super::*;
 pub(crate) struct LocalCounts {
     pub files: u64,
     pub local_bytes: u64,
+    pub wire_allowance: usize,
 }
 #[derive(Debug)]
 pub(super) struct Budget {
@@ -15,6 +16,7 @@ pub(super) struct Budget {
     admitted: BTreeSet<String>,
     read_files: BTreeSet<String>,
     cursor_ordinary_charged: bool,
+    deferred: Vec<CandidateFile>,
 }
 impl Budget {
     pub(super) fn new(source: SnapshotSource) -> Self {
@@ -32,23 +34,40 @@ impl Budget {
             admitted: BTreeSet::new(),
             read_files: BTreeSet::new(),
             cursor_ordinary_charged: false,
+            deferred: Vec::new(),
         }
     }
     pub(super) fn admit(
         &mut self,
         source: SnapshotSource,
-        index: &ScanIndex,
+        index: &mut ScanIndex,
         candidate: &CandidateFile,
         ordinary: &[SnapshotItem],
     ) -> bool {
-        let key = local_index_key(&candidate.path);
-        if self.admitted.contains(&key) {
+        self.admit_unit(source, index, std::slice::from_ref(candidate), ordinary)
+    }
+    pub(super) fn admit_unit(
+        &mut self,
+        source: SnapshotSource,
+        index: &mut ScanIndex,
+        candidates: &[CandidateFile],
+        ordinary: &[SnapshotItem],
+    ) -> bool {
+        let keys = candidates
+            .iter()
+            .map(|candidate| local_index_key(&candidate.path))
+            .collect::<BTreeSet<_>>();
+        if keys.iter().all(|key| self.admitted.contains(key)) {
             return true;
         }
-        let entities = index
-            .file_snapshot_fingerprints
-            .get(&key)
-            .map_or(1, BTreeSet::len)
+        // A joined owner has aliases at several paths. Reserve its unique
+        // entities atomically, not once per physical alias (which cannot fit).
+        let entities = keys
+            .iter()
+            .filter_map(|key| index.file_snapshot_fingerprints.get(key))
+            .flatten()
+            .collect::<BTreeSet<_>>()
+            .len()
             .max(1);
         // Three legal item bodies reserve both optional head-bootstrap stages
         // and the final POST, including separators. No persisted size field.
@@ -80,17 +99,17 @@ impl Budget {
             .saturating_sub(self.wire_reserved);
         // Oversized Codex singletons keep their existing resumable cursor;
         // each page pays only its bounded chunk. Claude legal files fit 1GiB.
-        let read = if source == SnapshotSource::Codex {
-            candidate.size_bytes.min(self.native_limit)
-        } else {
-            candidate.size_bytes
-        };
-        if read
-            > self
-                .native_limit
-                .saturating_sub(self.native_read)
-                .saturating_sub(self.native_reserved)
-        {
+        let available = self
+            .native_limit
+            .saturating_sub(self.native_read)
+            .saturating_sub(self.native_reserved);
+        let size = candidates.iter().fold(0u64, |sum, candidate| {
+            sum.saturating_add(candidate.size_bytes)
+        });
+        let cursor = source == SnapshotSource::Codex
+            && size > sampled_scan::codex_cursor::Limits::current().singleton();
+        let read = if cursor { size.min(available) } else { size };
+        if read == 0 || read > available {
             return false;
         }
         let alone = ordinary.is_empty() && self.admitted.is_empty();
@@ -99,8 +118,22 @@ impl Budget {
         }
         self.wire_reserved = self.wire_reserved.saturating_add(wire);
         self.native_reserved = self.native_reserved.saturating_add(read);
-        self.admitted.insert(key);
+        if wire > crate::snapshot_sync::SNAPSHOT_BATCH_MAX_BYTES {
+            // The explicitly allowed single oversized logical unit gets its
+            // own bounded transport allowance so its final ACK set is atomic
+            // within this pass. Individual request packing is unchanged.
+            index.context_read_counts.wire_allowance = wire;
+        }
+        self.admitted.extend(keys);
         true
+    }
+    pub(super) fn defer(&mut self, candidate: CandidateFile) {
+        self.deferred.push(candidate);
+    }
+    pub(super) fn flush(&mut self, index: &mut ScanIndex, flags: &BTreeMap<String, (bool, bool)>) {
+        // One pending-queue walk per page, not one walk per deferred file.
+        sampled_scan::codex_cursor::requeue_members(index, flags, &self.deferred);
+        self.deferred.clear();
     }
     pub(super) fn record(&mut self, index: &mut ScanIndex, candidate: &CandidateFile, bytes: u64) {
         if bytes == 0 || !index.file_upload_context_enabled {
@@ -180,5 +213,5 @@ pub(super) fn with_read_limit<T>(limit: u64, f: impl FnOnce() -> T) -> (T, Vec<P
     let order = TEST_READ_ORDER.with(|order| order.replace(None).unwrap());
     (result, order)
 }
-crate::heap_layout_bound::fields!(LocalCounts; files, local_bytes);
-crate::heap_layout_bound::fields!(Budget; native_limit, native_read, native_reserved, wire_reserved, admitted, read_files, cursor_ordinary_charged);
+crate::heap_layout_bound::fields!(LocalCounts; files, local_bytes, wire_allowance);
+crate::heap_layout_bound::fields!(Budget; native_limit, native_read, native_reserved, wire_reserved, admitted, read_files, cursor_ordinary_charged, deferred);

@@ -186,3 +186,17 @@ fixture forces cold acquisition, spans more than three pages, puts a changed
 file first under a tight native limit, checks every file parses exactly once,
 requires a receipt for every parsed file in that same page and checks actual
 local bytes against the source lengths. No macOS-gated fixture is modified.
+
+Review follow-up: joined Codex aliases are admitted atomically using their
+unique entity union, so aliases do not reserve the same wire body repeatedly.
+A single conservatively oversized logical unit may use its own source-pass
+allowance (the explicitly allowed alone exception). That allowance travels
+only in runtime state to transport, allowing its complete current-pass ACK set;
+each individual POST still uses the normal2MiB packing limit. This prevents
+partial ACK/stamp progress from making a multi-entity file permanently owe a
+fresh receipt. Resumed jobs reserve the same allowances and return intact to
+the cursor slot when deferred. A batched requeue preserves original watcher
+and census flags with one queue walk, avoiding quadratic deferred-tail work.
+New portable fixtures cover joined Codex aliases and a synthetic post-policy
+multi-entity file above the normal aggregate wire allowance, in addition to
+the cold eight-file scan across more than three pages.

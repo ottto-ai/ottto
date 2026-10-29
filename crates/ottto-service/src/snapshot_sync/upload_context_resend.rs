@@ -24,6 +24,7 @@ pub(super) struct Cycle {
     // bodies reserve first, even when they exceed this allowance; only
     // stamp-only catch-up is capped by the existing packing byte target.
     remaining_bytes: usize,
+    alone_allowance: usize,
     ordinary_pending: BTreeSet<String>,
     pub deferred: BTreeSet<String>,
     pub bootstrap_blocks_catchup: bool,
@@ -54,6 +55,12 @@ impl Cycle {
     }
     pub(super) fn reserve_ordinary_bytes(&mut self, bytes: usize) {
         self.remaining_bytes = self.remaining_bytes.saturating_sub(bytes);
+        // Selection admits at most one oversized logical unit. Its complete
+        // ACK set must fit this pass; each POST retains the normal size cap.
+        if self.alone_allowance > 0 {
+            self.remaining_bytes = self.remaining_bytes.max(self.alone_allowance);
+            self.alone_allowance = 0;
+        }
     }
     pub(super) fn admit_catchup_bytes(&mut self, bytes: usize) -> bool {
         if bytes > self.remaining_bytes {
@@ -136,6 +143,7 @@ impl SnapshotUploadProgress {
         previous: &ScanIndex,
         items: &[SnapshotItem],
     ) {
+        self.context_resend.alone_allowance = index.context_read_counts.wire_allowance;
         self.context_resend.counts.files = index.context_read_counts.files;
         self.context_resend.counts.local_bytes = index.context_read_counts.local_bytes;
         self.context_receipt_candidates = index.file_upload_context_ack_candidates(items);
@@ -184,7 +192,7 @@ impl SnapshotUploadProgress {
     }
 }
 crate::heap_layout_bound::fields!(ResendCounts; entities, bytes, files, local_bytes, identical, changed);
-crate::heap_layout_bound::fields!(Cycle; active, source_matches, candidates, resends, attempted, files, not_stored, counts, remaining_bytes, ordinary_pending, deferred, bootstrap_blocks_catchup);
+crate::heap_layout_bound::fields!(Cycle; active, source_matches, candidates, resends, attempted, files, not_stored, counts, remaining_bytes, alone_allowance, ordinary_pending, deferred, bootstrap_blocks_catchup);
 
 #[cfg(test)]
 thread_local! { static LAST_COUNTS: std::cell::Cell<(u64,u64)> = const { std::cell::Cell::new((0,0)) }; }

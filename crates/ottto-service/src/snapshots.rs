@@ -26888,19 +26888,20 @@ impl OwnedSourceScan {
             causes,
             ..ScanCensus::default()
         };
-        let codex_selected_flags = if source == SnapshotSource::Codex {
-            pending_paths
-                .iter()
-                .map(|pending| {
-                    (
-                        local_index_key(&pending.path),
-                        (pending.census_member, pending.watcher_hint),
-                    )
-                })
-                .collect()
-        } else {
-            BTreeMap::new()
-        };
+        let codex_selected_flags =
+            if source == SnapshotSource::Codex || index.file_upload_context_enabled {
+                pending_paths
+                    .iter()
+                    .map(|pending| {
+                        (
+                            local_index_key(&pending.path),
+                            (pending.census_member, pending.watcher_hint),
+                        )
+                    })
+                    .collect()
+            } else {
+                BTreeMap::new()
+            };
         let mut files = pending_paths
             .into_iter()
             .filter_map(|pending| {
@@ -28282,6 +28283,29 @@ impl OwnedSourceScan {
                     ) {
                         sampled_scan::codex_cursor::Resumed::Active(job, lease) => {
                             if index.context_only_read(&job.candidate) {
+                                let admitted = if job.aliases.is_empty() {
+                                    context_read_budget.admit(
+                                        source,
+                                        index,
+                                        &job.candidate,
+                                        &snapshots,
+                                    )
+                                } else {
+                                    context_read_budget.admit_unit(
+                                        source,
+                                        index,
+                                        &job.aliases,
+                                        &snapshots,
+                                    )
+                                };
+                                if !admitted {
+                                    // Return the intact parser and lease, never restart a Full.
+                                    drop(sampled_scan::codex_cursor::ActiveFrame::new(
+                                        Some(job),
+                                        Some(lease),
+                                    ));
+                                    pending!();
+                                }
                                 context_read_budget.charge_cursor_ordinary(&mut codex_page);
                             }
                             codex_cursor_lease = Some(lease);
@@ -28352,9 +28376,12 @@ impl OwnedSourceScan {
                             .members
                             .iter()
                             .all(|candidate| index.context_only_read(candidate))
-                        && group.members.iter().any(|candidate| {
-                            !context_read_budget.admit(source, index, candidate, &snapshots)
-                        })
+                        && !context_read_budget.admit_unit(
+                            source,
+                            index,
+                            &group.members,
+                            &snapshots,
+                        )
                     {
                         sampled_scan::codex_cursor::requeue_members(
                             index,
@@ -30835,6 +30862,7 @@ impl OwnedSourceScan {
                 pending!();
             }
             let Some(mut candidate) = identified_candidates.pop_front() else {
+                context_read_budget.flush(index, &codex_selected_flags);
                 if codex_page.continuation() {
                     let continuation_evidence = codex_join_inventory.map(|inventory| {
                         Arc::new(Mutex::new(Some(CodexContinuationEvidence {
@@ -31707,7 +31735,7 @@ impl OwnedSourceScan {
             if index.context_only_read(&candidate)
                 && !context_read_budget.admit(source, index, &candidate, &snapshots)
             {
-                sampled_scan::codex_cursor::requeue(index, &codex_selected_flags, &candidate);
+                context_read_budget.defer(candidate);
                 pending!();
             }
             if let Some(context) = sampling

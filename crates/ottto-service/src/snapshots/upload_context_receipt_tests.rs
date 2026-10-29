@@ -1152,3 +1152,118 @@ fn real_scan_context_catchup_reads_each_file_once_across_many_passes() {
         f.assert_quiet();
     }
 }
+
+#[test]
+fn real_scan_joined_codex_context_catchup_admits_the_whole_alias_unit() {
+    let (root, _) = codex_file_join::tests::counting_v2_fixture();
+    let _cutover = codex_counting_version::TestCutover::set(0);
+    let mut f = Fixture::new(SnapshotSource::Codex);
+    fs::remove_file(&f.path).unwrap();
+    for name in ["a", "b"] {
+        let body = fs::read_to_string(root.join("sessions").join(format!("{name}.jsonl"))).unwrap();
+        fs::write(
+            f.root.join(format!("{name}.jsonl")),
+            body.replace("2026-10-01", "2026-10-29"),
+        )
+        .unwrap();
+    }
+    fs::remove_dir_all(root).unwrap();
+    f.path = f.root.join("a.jsonl");
+    let previous = f.index.clone();
+    let (scan, _) = f.walk(true);
+    assert_eq!(scan.scanned_file_count, 2);
+    f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
+    assert_eq!(
+        f.uploader
+            .send(f.source, &mut f.index, &previous, &scan.snapshots)
+            .unwrap()
+            .0,
+        2
+    );
+    f.index
+        .activate_file_upload_context(f.source, "e".repeat(64));
+    f.cache = Arc::default();
+    let previous = f.index.clone();
+    let (scan, _) = f.walk(true);
+    assert_eq!(scan.scanned_file_count, 2, "joined aliases are admitted atomically, not permanently deferred after the first reservation");
+    f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
+    assert_eq!(
+        f.uploader
+            .send(f.source, &mut f.index, &previous, &scan.snapshots)
+            .unwrap()
+            .0,
+        2
+    );
+    f.assert_quiet();
+}
+
+#[test]
+fn real_scan_oversized_context_unit_gets_all_fresh_acks_without_reparse() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    let previous = f.index.clone();
+    let (mut scan, _) = f.walk(false);
+    let template = scan.snapshots[0].clone();
+    // Synthetic post-policy multi-entity file shape, through the real finalizer
+    // and uploader. Each legal-sized item fits; their sum exceeds the pass cap.
+    scan.snapshots = (0..4)
+        .map(|n| {
+            let mut item = template.clone();
+            item.source_session_id = format!("oversized-group-{n}");
+            item.session_display_name = Some("x".repeat(600 * 1024));
+            item.session_display_name_source = Some("synthetic".into());
+            item
+        })
+        .collect();
+    finalize_scan_after_policy(f.source, &mut scan, &mut f.index);
+    let items = scan.snapshots.clone();
+    assert!(items
+        .iter()
+        .all(|item| serde_json::to_vec(item).unwrap().len() < MAX_SNAPSHOT_ITEM_WIRE_BYTES));
+    assert!(
+        serde_json::to_vec(&items).unwrap().len() > crate::snapshot_sync::SNAPSHOT_BATCH_MAX_BYTES
+    );
+    f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
+    assert_eq!(
+        f.uploader
+            .send(f.source, &mut f.index, &previous, &items)
+            .unwrap()
+            .0,
+        1
+    );
+    f.index
+        .activate_file_upload_context(f.source, "e".repeat(64));
+    f.cache = Arc::default();
+    let previous = f.index.clone();
+    let (((mut scan, _), parses), _) =
+        upload_context_read::with_read_limit(fs::metadata(&f.path).unwrap().len(), || {
+            terminal_contract_retry::source_acquisitions(|| f.walk(false))
+        });
+    assert_eq!(parses.get(&f.path), Some(&1));
+    assert!(
+        f.index.context_read_counts.wire_allowance > crate::snapshot_sync::SNAPSHOT_BATCH_MAX_BYTES
+    );
+    scan.snapshots = items;
+    finalize_scan_after_policy(f.source, &mut scan, &mut f.index);
+    f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
+    let first = f.uploader.posts.len();
+    assert_eq!(
+        f.uploader
+            .send(f.source, &mut f.index, &previous, &scan.snapshots)
+            .unwrap()
+            .0,
+        1,
+        "the complete unit receives fresh ACKs in the same pass"
+    );
+    assert_eq!(
+        f.uploader.posts[first..]
+            .iter()
+            .map(Vec::len)
+            .sum::<usize>(),
+        4
+    );
+    assert!(f.uploader.posts[first..]
+        .iter()
+        .all(|post| serde_json::to_vec(post).unwrap().len()
+            <= crate::snapshot_sync::SNAPSHOT_BATCH_MAX_BYTES));
+    f.assert_quiet();
+}
