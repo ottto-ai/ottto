@@ -14208,10 +14208,10 @@ fn owed_set_survives_save_and_load_before_release() {
 /// C6 / DoD 12, RAM eviction between refusal and release. Strict: the
 /// catch-up must not be a Full (StateMissing is not an allowed cause). Today
 /// the shared acquisition gate reads it Full(StateMissing): an acquisition
-/// binding defect owned by E1's cause gate / R1 restore, not by E3's release
-/// (which only queues the key). Kept strict, never weakened.
+/// binding defect owned by E1's R2 restore, not by E3's release (which only
+/// queues the key). Kept strict, never weakened.
 #[test]
-#[ignore = "acquisition binding defect: Full(StateMissing) after RAM eviction (E1 cause gate / R1)"]
+#[ignore = "un-ignore at E1 R2 5b-Codex row: evicted Codex owed-inputs key → restore + Tail, 0 Full"]
 fn owed_release_after_ram_eviction_is_not_a_full() {
     owed_release_after(|index, cache| {
         cache.clear();
