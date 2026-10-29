@@ -1344,7 +1344,7 @@ fn structurally_decodes(body: &[u8]) -> bool {
         SnapshotSource::Pi,
     ]
     .into_iter()
-    .any(|source| decode(body, source).is_ok())
+    .any(|source| decode_body(body, source).is_ok())
 }
 
 fn verified_without_allocation(body: &[u8]) -> Result<(), Corrupt> {

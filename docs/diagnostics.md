@@ -356,6 +356,41 @@ The safe diagnostic names the connection binding and asks to reconnect; it
 contains no path or endpoint URL. During owned-scan authority revalidation,
 an endpoint load failure remains a local-state rejection.
 
+Claude's supported old-binding migration reports `counts.migration` as four
+`[delta, process total]` pairs in this order: held classification, awaiting
+reservation save, claimed A5, durably replaced. These are events, not unique
+file gauges. `upgrade_state_missing` counts actual first native read attempts
+under A5; claiming or saving a reservation alone does not increment it. The
+saved release/key spend survives restart. A witness's captured floor remains
+immutable for that permission. Completed native output, exact saved selection
+and the current-target directory-sync receipt are required to count replacement.
+
+O3 adds a termination path to the existing option (i). Other migration refusals
+on real growth use the counted, shared paced `old_binding_no_match` Full, with
+no migration/replacement authority and no A5 refund. This includes spent grants,
+a shorter current extent, obsolete certificate length, generation-ahead records,
+object changes and resource failures. Genuine idle and correctness barriers
+(future revision, owed replay, context/namespace or downgrade) stay held.
+Fallback counts and pacing are separate from A5 reads and durable replacements.
+Generic growth eligibility past the activity window remains an integration
+dependency; this migration path does not add a Claude-only discovery exception.
+Idle migration files take no body read. A changed object or mtime can require
+existing bounded certificate samples before a stale/no-match hold; samples are
+counted separately from body I/O and mtime alone grants no real-edit acquisition.
+
+Only O3's negative release/key spends use the existing `reread_guard` wire slot,
+under `replayed[upgrade_state_missing:<release>]`. They survive production decode,
+partial checkpoints and restart; live grants never survive serialization or an
+index copy. Ambiguous or malformed spend evidence refuses migration authority.
+The retired generic reread budgets and selection holds remain absent.
+
+Unregistered replay rejected by a Claude binding is still Stale policy. The
+existing restore carrier includes its typed `stale_attribution`; this is neither
+a generic Miss nor an ACK. `pace_anomaly` reports implausible wall-clock stamps
+separately from capacity `pace_evicted`; both are delta/process-total pairs.
+Clock anomalies expire the Full pace toward reading without refunding Tail
+allowance already spent.
+
 ## Line Delivery Counters
 
 Schema 2's `native_collection_page` can add two sparse, counts-only objects.
@@ -1083,3 +1118,37 @@ and drops the split on save; re-upgrade preserves S as all-unattributed, without
 backfill. Existing old-object/old-array decoding stays supported. No format,
 parser or scan-identity bump, new reader, hold, selection, admission or upload
 behavior is introduced.
+
+## Codex state-only identity coverage
+
+Prior coverage retains both the uniquely resolved filename identity and the
+existing committed header/counting or protected owner hash, including a header
+outside both filename candidates. Accepted-owner coverage requires nonempty
+exact file incidence whose entities are accepted, not quarantined or decode-held;
+a permanent refusal or local wire-size rejection grants no new coverage.
+
+Checkpoint retention and expiry follow the existing rules; local retention
+changes are deferred. The backend downgrade fence
+(`usage_accounting_authority_downgrade`) protects attributed usage floors against
+an uncontracted state-only successor. Local coverage reduces redundant emission;
+it does not replace that backend money protection.
+
+With a prior snapshot fingerprint, exactly two evidence-supported filename
+identities, and no committed owner coverage, both candidates are withheld from
+state-only output. No fingerprint preserves ordinary fallback; zero supported
+candidates are not counted. The existing `local_resources` carrier emits at most
+one `codex_state_only_ambiguous_identity` line per state-only pass, whose
+`counts.codex_state_only_ambiguous_identity` is the number of ambiguous entry
+observations in that pass. Repeated passes observe the same entries again: this
+is NOT a distinct-entry/file/session count, and sums must not be reported as
+files. Alongside the count, `counts.codex_state_only_ambiguous_identity_tokens`
+is the saturating sum of the supported state threads' `tokens_used` per observed
+ambiguous entry in that pass (units: tokens). The token sum is an UPPER BOUND on
+possibly withheld state-only usage: repeated candidates and already-covered
+usage can contribute again. A zero-token observation reports zero tokens. Only
+aggregate counts and token sums are logged, with no paths, ids or per-session
+values.
+
+A later complete native parse still emits its exclusive body for a session with
+an earlier state-only row. An emitted total alone does not prove a server-side
+overwrite; backend authority rules independently govern successor acceptance.

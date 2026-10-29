@@ -3604,6 +3604,8 @@ fn codex_compaction_events_and_points_match_full_read_at_every_tail_split() {
 fn pinned_v1_bootstrap_ordinary_save_then_second_restart_tails_without_a_full() {
     use crate::durable_tail_store as store;
     assert!(crate::heap_layout_bound::layout_supported());
+    // Match OwnedSourceScan::new capture mode for both sources.
+    let identity_capture = true;
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let fixture = ScanFixture::new(source);
         fixture.file.append(&usage(source, 100, 0, "fixture-model"));
@@ -3613,12 +3615,7 @@ fn pinned_v1_bootstrap_ordinary_save_then_second_restart_tails_without_a_full() 
         let lock = crate::locked_state_dir::test_locks::hold(&state);
         let index_path = state.join("index.json");
         let first = Arc::new(sampled_scan::SharedCache::default());
-        first.durable_begin_pass(
-            source,
-            &index_path,
-            &namespace,
-            source == SnapshotSource::ClaudeCode,
-        );
+        first.durable_begin_pass(source, &index_path, &namespace, identity_capture);
         let (mut index, _, modes) = production_scan(
             &fixture,
             source,
@@ -3647,12 +3644,7 @@ fn pinned_v1_bootstrap_ordinary_save_then_second_restart_tails_without_a_full() 
         drop(first);
         fixture.file.append(&usage(source, 130, 1, "fixture-model"));
         let second = Arc::new(sampled_scan::SharedCache::default());
-        second.durable_begin_pass(
-            source,
-            &index_path,
-            &namespace,
-            source == SnapshotSource::ClaudeCode,
-        );
+        second.durable_begin_pass(source, &index_path, &namespace, identity_capture);
         let loaded = ScanIndex::load(&index_path).unwrap();
         let (mut warm, scan, modes) = production_scan(
             &fixture,
@@ -3717,12 +3709,7 @@ fn pinned_v1_bootstrap_ordinary_save_then_second_restart_tails_without_a_full() 
         drop(second);
         fixture.file.append(&usage(source, 160, 2, "fixture-model"));
         let third = Arc::new(sampled_scan::SharedCache::default());
-        third.durable_begin_pass(
-            source,
-            &index_path,
-            &namespace,
-            source == SnapshotSource::ClaudeCode,
-        );
+        third.durable_begin_pass(source, &index_path, &namespace, identity_capture);
         let loaded = ScanIndex::load(&index_path).unwrap();
         let (_, scan, modes) =
             production_scan(&fixture, source, loaded.clone(), Some(third), &namespace.0);
@@ -3852,6 +3839,8 @@ fn no_record_keys_keep_existing_full_admission_after_restart() {
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn completed_full_audit_before_durable_replacement_recovers_after_restart() {
     assert!(crate::heap_layout_bound::layout_supported());
+    // Match OwnedSourceScan::new capture mode for both sources.
+    let identity_capture = true;
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let fixture = ScanFixture::new(source);
         fixture.file.append(&usage(source, 100, 0, "fixture-model"));
@@ -3862,12 +3851,7 @@ fn completed_full_audit_before_durable_replacement_recovers_after_restart() {
         let index_path = state.join("index.json");
         let begin = || {
             let cache = Arc::new(sampled_scan::SharedCache::default());
-            cache.durable_begin_pass(
-                source,
-                &index_path,
-                &namespace,
-                source == SnapshotSource::ClaudeCode,
-            );
+            cache.durable_begin_pass(source, &index_path, &namespace, identity_capture);
             cache
         };
         let cache = begin();
@@ -3992,6 +3976,8 @@ fn missing_index_debt_carrier_recovers_by_full_in_one_pass_for_both_sources() {
     use crate::durable_tail_store as store;
     use crate::transcript_acquisition::ReadPlan;
     use std::io::Read;
+    // Match production_scan's cfg(test) capture mode for both sources.
+    let identity_capture = true;
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let fixture = ScanFixture::new(source);
         fixture.file.append(&usage(source, 100, 0, "fixture-model"));
@@ -4043,12 +4029,7 @@ fn missing_index_debt_carrier_recovers_by_full_in_one_pass_for_both_sources() {
         );
         drop(disk);
         let cache = Arc::new(sampled_scan::SharedCache::default());
-        cache.durable_begin_pass(
-            source,
-            &index_path,
-            &namespace,
-            source == SnapshotSource::ClaudeCode,
-        );
+        cache.durable_begin_pass(source, &index_path, &namespace, identity_capture);
         begin_durable_pass(
             &cache,
             &fixture.dir,
@@ -4056,7 +4037,7 @@ fn missing_index_debt_carrier_recovers_by_full_in_one_pass_for_both_sources() {
             &index_path,
             true,
             &namespace,
-            source == SnapshotSource::ClaudeCode,
+            identity_capture,
         );
         assert_eq!(
             fs::read(&record_path).unwrap(),
@@ -4216,12 +4197,7 @@ fn missing_index_debt_carrier_recovers_by_full_in_one_pass_for_both_sources() {
         index.save(&index_path).unwrap();
         drop(cache);
         let restart = Arc::new(sampled_scan::SharedCache::default());
-        restart.durable_begin_pass(
-            source,
-            &index_path,
-            &namespace,
-            source == SnapshotSource::ClaudeCode,
-        );
+        restart.durable_begin_pass(source, &index_path, &namespace, identity_capture);
         let (index, idle, modes, bytes) = production_scan_at(
             &fixture,
             source,
@@ -4239,6 +4215,20 @@ fn missing_index_debt_carrier_recovers_by_full_in_one_pass_for_both_sources() {
         assert_eq!(counts.ineligible.get("audit_carrier"), None);
         assert_eq!(counts.restore_attempts, 0);
         assert_eq!(counts.durable_held, [0; 8]);
+        // Quiet restart alone never probes the record. A new suffix must
+        // restore the ordinary replacement under the same capture binding.
+        fixture.file.append(&usage(source, 190, 3, "fixture-model"));
+        let (_, warm, modes) = production_scan(
+            &fixture,
+            source,
+            index.clone(),
+            Some(restart.clone()),
+            &namespace.0,
+        );
+        let (_, cold, _) = production_scan(&fixture, source, index, None, &namespace.0);
+        assert_eq!(modes, (0, 1, 0), "replacement restart {source:?}");
+        assert_eq!(restart.durable_counters(source).unwrap().0.restored, 1);
+        assert_eq!(production_body(source, warm), production_body(source, cold));
     }
 }
 
@@ -4250,6 +4240,8 @@ fn missing_index_terminal_loss_carries_recovered_debt_until_verified_full_for_bo
     use crate::durable_tail_store as store;
     use crate::transcript_acquisition::ReadPlan;
     use std::io::Read;
+    // Match production_scan's cfg(test) capture mode for both sources.
+    let identity_capture = true;
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let fixture = ScanFixture::new(source);
         fixture.file.append(&usage(source, 100, 0, "fixture-model"));
@@ -4301,12 +4293,7 @@ fn missing_index_terminal_loss_carries_recovered_debt_until_verified_full_for_bo
         );
         drop(disk);
         let cache = Arc::new(sampled_scan::SharedCache::default());
-        cache.durable_begin_pass(
-            source,
-            &index_path,
-            &namespace,
-            source == SnapshotSource::ClaudeCode,
-        );
+        cache.durable_begin_pass(source, &index_path, &namespace, identity_capture);
         begin_durable_pass(
             &cache,
             &fixture.dir,
@@ -4314,7 +4301,7 @@ fn missing_index_terminal_loss_carries_recovered_debt_until_verified_full_for_bo
             &index_path,
             true,
             &namespace,
-            source == SnapshotSource::ClaudeCode,
+            identity_capture,
         );
         assert_eq!(
             fs::read(&record_path).unwrap(),
@@ -4398,12 +4385,7 @@ fn missing_index_terminal_loss_carries_recovered_debt_until_verified_full_for_bo
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap();
         let restart = Arc::new(sampled_scan::SharedCache::default());
-        restart.durable_begin_pass(
-            source,
-            &index_path,
-            &namespace,
-            source == SnapshotSource::ClaudeCode,
-        );
+        restart.durable_begin_pass(source, &index_path, &namespace, identity_capture);
         let (mut verified, clean, modes, _) = production_scan_at(
             &fixture,
             source,
@@ -4467,6 +4449,23 @@ fn missing_index_terminal_loss_carries_recovered_debt_until_verified_full_for_bo
                 panic!("verified Full must replace the old debt record");
             };
             assert_eq!(record.envelope_audit_debt, None);
+            // Verify the replacement can actually restore after restart;
+            // merely inspecting its envelope misses a capture-mode mismatch.
+            fixture.file.append(&usage(source, 170, 2, "fixture-model"));
+            let fresh = Arc::new(sampled_scan::SharedCache::default());
+            fresh.durable_begin_pass(source, &index_path, &namespace, identity_capture);
+            let loaded = ScanIndex::load(&index_path).unwrap();
+            let (_, warm, modes) = production_scan(
+                &fixture,
+                source,
+                loaded.clone(),
+                Some(fresh.clone()),
+                &namespace.0,
+            );
+            let (_, cold, _) = production_scan(&fixture, source, loaded, None, &namespace.0);
+            assert_eq!(modes, (0, 1, 0), "verified replacement restart {source:?}");
+            assert_eq!(fresh.durable_counters(source).unwrap().0.restored, 1);
+            assert_eq!(production_body(source, warm), production_body(source, cold));
         }
     }
 }

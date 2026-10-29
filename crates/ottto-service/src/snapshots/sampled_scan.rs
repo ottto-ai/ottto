@@ -23,7 +23,7 @@ const STATE_BYTES: usize = CACHE_BYTES
 pub(super) mod codex_cursor;
 #[cfg(unix)]
 pub(super) mod durable_tail;
-#[cfg(all(unix, test))]
+#[cfg(unix)]
 pub(crate) use durable_tail::MissClass;
 #[cfg(unix)]
 pub(crate) use durable_tail::RestoreOutcome;

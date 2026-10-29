@@ -2111,11 +2111,7 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
         serde_json::from_slice(&bytes).unwrap();
     assert_eq!(
         encoded.keys().map(String::as_str).collect::<BTreeSet<_>>(),
-        lenient_decode::FIELDS
-            .iter()
-            .copied()
-            .filter(|name| *name != "reread_guard")
-            .collect()
+        lenient_decode::FIELDS.iter().copied().collect()
     );
     let decoded =
         lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
@@ -4527,7 +4523,8 @@ fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
     }
 }
 
-/// Retired evidence cannot reset live census, move slots or select another read.
+/// Generic retired evidence cannot reset census or move slots. O3 may retain
+/// only negative evidence; it must never restore a live read permission.
 #[test]
 fn retired_reread_guard_keeps_legacy_map_and_full_array_custody() {
     let seed = every_persisted_field_fixture();
@@ -4663,11 +4660,11 @@ fn retired_reread_guard_keeps_legacy_map_and_full_array_custody() {
                 census
             );
             let saved = fs::read_to_string(&path).unwrap();
-            for retired in [
-                "reread_guard",
-                "unchanged_reread_admitted",
-                "reread_budget_refused",
-            ] {
+            assert!(
+                saved.contains("\"reread_guard\":"),
+                "negative refusal survives save"
+            );
+            for retired in ["unchanged_reread_admitted", "reread_budget_refused"] {
                 assert!(!saved.contains(&format!("\"{retired}\":")));
             }
         }
@@ -4698,7 +4695,8 @@ fn retired_reread_new_writer_keeps_previous_default_contract() {
         reread_guard: Option<Value>,
         traversal: Option<PreviousTraversal>,
     }
-    let seed = every_persisted_field_fixture();
+    let mut seed = every_persisted_field_fixture();
+    seed.o3_replay = upgrade_replay::State::default();
     let bytes = serde_json::to_vec(&seed).unwrap();
     let old: PreviousIndex = serde_json::from_slice(&bytes).expect("old defaults accept new map");
     assert!(old.reread_guard.is_none());
@@ -4717,4 +4715,71 @@ fn retired_reread_new_writer_keeps_previous_default_contract() {
         serde_json::to_vec(&old.claude_request_census).unwrap(),
         serde_json::to_vec(&seed.claude_request_census).unwrap()
     );
+}
+
+#[test]
+fn o3_negative_spend_crosses_full_positional_and_named_readers() {
+    let mut seed = every_persisted_field_fixture();
+    seed.o3_replay = upgrade_replay::State::default();
+    assert!(!seed.o3_replay.upgrade_missing("old-bound-file", true));
+    let named = serde_json::to_value(&seed).unwrap();
+    let array = Value::Array(
+        lenient_decode::FIELDS
+            .iter()
+            .map(|field| named[*field].clone())
+            .collect(),
+    );
+    for form in [named, array] {
+        let bytes = serde_json::to_vec(&form).unwrap();
+        let native = claude_request_census::decode_index(bytes.as_slice()).unwrap();
+        let bounded = lenient_decode::read_bounded(&bytes).unwrap();
+        let streaming =
+            lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
+        for mut decoded in [native, bounded, streaming] {
+            assert!(!decoded.o3_replay.upgrade_missing("old-bound-file", true));
+            assert_eq!(
+                serde_json::to_vec(&decoded).unwrap(),
+                serde_json::to_vec(&seed).unwrap()
+            );
+        }
+    }
+}
+
+#[test]
+fn o3_ambiguous_negative_evidence_refuses_through_every_reader() {
+    let release = format!(
+        "upgrade_state_missing:{}",
+        ottto_core::compiled_release_version()
+    );
+    let spent = format!("{{\"{}\":[\"{}\"]}}", release, "a".repeat(32));
+    let forms = [
+        r#""reread_guard":{},"reread_guard":{"closed":true}"#.to_owned(),
+        r#""reread_guard":{"closed":true,"closed":false}"#.to_owned(),
+        format!(r#""reread_guard":{{"replayed":{spent},"replayed":{{}}}}"#),
+        format!(
+            r#""reread_guard":{{"replayed":{{"{release}":["{}"],"{release}":[]}}}}"#,
+            "a".repeat(32)
+        ),
+    ];
+    for fields in forms {
+        let bytes = format!("{{\"files\":{{}},{fields}}}").into_bytes();
+        let native = claude_request_census::decode_index(bytes.as_slice()).unwrap();
+        let bounded = lenient_decode::read_bounded(&bytes).unwrap();
+        let streaming =
+            lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
+        for mut decoded in [native, bounded, streaming] {
+            assert!(
+                !decoded.o3_replay.upgrade_missing("never-seen-key", true),
+                "{fields}"
+            );
+            assert!(
+                !decoded.o3_replay.needs_save(),
+                "refusal cannot reserve a fresh ticket: {fields}"
+            );
+            let saved = serde_json::to_vec(&decoded).unwrap();
+            let mut reopened = lenient_decode::read_bounded(&saved).unwrap();
+            assert!(!reopened.o3_replay.upgrade_missing("another-key", true));
+            assert!(!reopened.o3_replay.needs_save());
+        }
+    }
 }

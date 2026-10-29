@@ -1399,12 +1399,19 @@ pub(super) fn decode_index<R: std::io::Read>(reader: R) -> serde_json::Result<Sc
     CensusRead::new(reader).decode()
 }
 
-pub(super) fn normalized_bounded_bytes(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, bool, bool)> {
+pub(super) fn normalized_bounded_bytes(
+    bytes: &[u8],
+) -> anyhow::Result<(Vec<u8>, bool, bool, bool)> {
     use std::io::Read;
     let mut normalized = Vec::new();
     let mut reader = CensusRead::new(bytes);
     reader.read_to_end(&mut normalized)?;
-    Ok((normalized, reader.duplicate_census, reader.duplicate_shadow))
+    Ok((
+        normalized,
+        reader.duplicate_census,
+        reader.duplicate_shadow,
+        reader.duplicate_upgrade,
+    ))
 }
 
 pub(super) fn decode_bounded_index(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
@@ -1477,12 +1484,14 @@ struct CensusRead<R> {
     root_array: bool,
     array_index: usize,
     sequence_fields: (usize, usize, usize),
-    retired_guard: bool,
+    upgrade_guard: bool,
     quoted: bool,
     escaped: bool,
     expect_key: bool,
     seen_census: bool,
     seen_shadow: bool,
+    seen_upgrade: bool,
+    duplicate_upgrade: bool,
     duplicate_census: bool,
     duplicate_shadow: bool,
     shadow_key: bool,
@@ -1505,12 +1514,14 @@ impl<R: std::io::Read> CensusRead<R> {
             root_array: false,
             array_index: 0,
             sequence_fields: sequence_fields(),
-            retired_guard: false,
+            upgrade_guard: false,
             quoted: false,
             escaped: false,
             expect_key: false,
             seen_census: false,
             seen_shadow: false,
+            seen_upgrade: false,
+            duplicate_upgrade: false,
             duplicate_census: false,
             duplicate_shadow: false,
             shadow_key: false,
@@ -1535,6 +1546,9 @@ impl<R: std::io::Read> CensusRead<R> {
     fn invalidate_duplicates(&self, index: &mut ScanIndex) {
         if self.duplicate_census {
             index.claude_request_census = ClaudeRequestCensus::default();
+        }
+        if self.duplicate_upgrade {
+            index.o3_replay = super::upgrade_replay::State::refused();
         }
         if self.duplicate_shadow {
             index.claude_request_census_shadow = ClaudeRequestCensusShadowState::default();
@@ -1562,7 +1576,7 @@ impl<R: std::io::Read> CensusRead<R> {
             }
         }
         self.shadow_key = false;
-        self.retired_guard = false;
+        self.upgrade_guard = false;
         if !self.quoted {
             if let Ok(name) = serde_json::from_slice::<String>(&key) {
                 let duplicate = match name.as_str() {
@@ -1584,8 +1598,11 @@ impl<R: std::io::Read> CensusRead<R> {
                     }
                     "reread_guard" => {
                         self.shadow_key = true;
-                        self.retired_guard = true;
-                        return Ok(b"\"_ignored_retired_reread_guard\"".to_vec());
+                        self.upgrade_guard = true;
+                        let duplicate = self.seen_upgrade;
+                        self.seen_upgrade = true;
+                        self.duplicate_upgrade |= duplicate;
+                        duplicate
                     }
                     _ => false,
                 };
@@ -1623,7 +1640,7 @@ impl<R: std::io::Read> CensusRead<R> {
         // Original admitted evidence was grammar-checked by the lexical
         // boundary. The syntax-only pass substitutes null without buffering
         // or interpreting census records, even before header controls run.
-        let mut overflow = self.syntax_only || self.retired_guard;
+        let mut overflow = self.syntax_only;
         while let Some(byte) = self.byte()? {
             if !quoted && depth == 0 && matches!(byte, b',' | b'}' | b']') {
                 self.replay = Some(byte);
@@ -1666,7 +1683,12 @@ impl<R: std::io::Read> CensusRead<R> {
         // Parsing is isolated from the enclosing index, including numeric
         // conversion and wrong-token errors. Only canonical, finite tokens
         // leave this reader. JSON syntax outside the optional field is intact.
-        Ok(if self.shadow_state {
+        Ok(if self.upgrade_guard {
+            let state = serde_json::from_slice::<super::upgrade_replay::State>(&bytes)
+                .unwrap_or_else(|_| super::upgrade_replay::State::refused());
+            drop(bytes);
+            serde_json::to_vec(&state).expect("O3 spend serialization")
+        } else if self.shadow_state {
             let state = serde_json::from_slice::<ClaudeRequestCensusShadowState>(&bytes)
                 .unwrap_or_default();
             drop(bytes);
@@ -1710,7 +1732,7 @@ impl<R: std::io::Read> CensusRead<R> {
                 || self.array_index == self.sequence_fields.2)
         {
             self.shadow_state = self.array_index == self.sequence_fields.1;
-            self.retired_guard = self.array_index == self.sequence_fields.2;
+            self.upgrade_guard = self.array_index == self.sequence_fields.2;
             self.replay = Some(byte);
             self.output = std::io::Cursor::new(self.evidence()?);
             return self.next();
