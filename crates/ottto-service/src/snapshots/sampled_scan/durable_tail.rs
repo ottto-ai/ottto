@@ -589,16 +589,14 @@ impl SharedCache {
         }
     }
 
-    /// A grouped member's `durable_full_hold` at job start (`start`), also
-    /// taking its once-clamped live-context missing-carrier deadline
-    /// (Addendum 6); settlement re-probes without `start` (R1). The group
-    /// settlement counts it once per member that publishes.
+    /// A grouped member's `durable_full_hold` at job start, also taking its
+    /// once-clamped live-context missing-carrier deadline (Addendum 6). The
+    /// group settlement counts it once per member that publishes.
     pub(crate) fn durable_member_hold(
         &self,
         snapshot_source: SnapshotSource,
         key: &str,
         index: &ScanIndex,
-        start: bool,
         recovered_audit_due: &mut Option<u64>,
     ) -> Option<store::Refusal> {
         let source = durable_source(snapshot_source)?;
@@ -610,7 +608,7 @@ impl SharedCache {
         );
         match slot.store.full_guard(
             &store::key_digest(source, key),
-            start,
+            true,
             index.files.contains_key(key),
             &live_context,
         ) {
@@ -620,6 +618,28 @@ impl SharedCache {
             }
             Err(reason) => Some(reason),
         }
+    }
+
+    /// R1: an entry-less file whose parked paged job captured no deadline
+    /// takes the same live-context, once-clamped debt at settlement, read
+    /// only (`carrier_debt`): no hold, T14, breaker or RAM side effect.
+    pub(crate) fn durable_carrier_reprobe(
+        &self,
+        snapshot_source: SnapshotSource,
+        key: &str,
+        index: &ScanIndex,
+    ) -> Option<u64> {
+        let source = durable_source(snapshot_source)?;
+        let mut stores = self.durable()?;
+        let slot = stores.slot(source).as_mut()?;
+        let live_context = store::context_digest(
+            &slot.namespace.0,
+            index.active_upload_context_fingerprint.as_deref(),
+        );
+        let due = slot
+            .store
+            .carrier_debt(&store::key_digest(source, key), &live_context)?;
+        Some(due.min(super::now_seconds()))
     }
 
     pub(crate) fn durable_full_hold(

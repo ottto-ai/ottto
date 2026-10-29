@@ -22,7 +22,9 @@ existing `audits_completed` counter, which has no `audits_started` counterpart
 for groups. If a fresh index loaded while a paged group or singleton job was
 parked, a member or file with no captured deadline and no index entry
 re-probes the same live-context, clamped handoff at settlement before it is
-recorded; the parked job keeps its progress. `ineligible.audit_carrier` and
+recorded; the parked job keeps its progress. The re-probe is a read-only header
+classification with no hold, T14, breaker or RAM side effect; a re-probed
+singleton retired by a verified Full counts `audits_completed` once. `ineligible.audit_carrier` and
 `ineligible.audit_carrier_staged_unverified` advance once per settled member.
 Preflight hold checks and pauses neither capture nor count. No store, map,
 persisted field, Full cause or schedule is added; membership is never inferred
@@ -33,6 +35,6 @@ inventory + incomplete sidecar census, paged and unpaged: publication, a marker
 per member with its own deadline, save/post-save GC/restart, selection past the
 window and verified retirement. A grouped control proves a foreign-context
 alias contributes nothing and a future live-member deadline clamps once.
-A paged group parked across a fresh index load stages each member's marker
-from its record on resume; the singleton re-probe shares that settlement block.
+A paged group and a paged singleton parked across a fresh index load each
+stage the marker from the record at settlement.
 Exact-head CI and native qualification remain required.

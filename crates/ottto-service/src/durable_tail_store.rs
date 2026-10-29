@@ -723,6 +723,17 @@ impl DurableTailStore {
         self.full_guard(key, start, true, &[0; 32]).err()
     }
 
+    /// Settlement re-probe (R1): an entry-less key's validated same-context
+    /// debt, read only. No T14 breaker accounting, rebuild authorization or
+    /// hold; refusals and foreign contexts contribute nothing.
+    pub(crate) fn carrier_debt(&mut self, key: &Digest32, live_context: &Digest32) -> Option<u64> {
+        self.classify(key, "guard")
+            .ok()
+            .flatten()
+            .filter(|header| header.record.binding.context == *live_context)
+            .and_then(|header| header.audit_debt)
+    }
+
     /// `full_hold` exposing missing audit custody as `guard_with_carrier`.
     pub(crate) fn full_guard(
         &mut self,

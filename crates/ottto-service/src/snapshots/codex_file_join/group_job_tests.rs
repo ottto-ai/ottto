@@ -3357,7 +3357,11 @@ fn grouped_missing_carriers_mark_each_member_until_verified(paged: bool) {
     assert_eq!(
         rows.iter()
             .filter(|row| row["stage"] == "native_collection_page")
-            .filter_map(|row| row["counts"]["sampled_acquisition"]["audits_completed"].as_u64())
+            .map(|row| {
+                row["counts"]["sampled_acquisition"]["page_events"]["audits_completed"]
+                    .as_u64()
+                    .expect("production page_events exposes the completion counter")
+            })
             .sum::<u64>(),
         2,
         "the existing completion counter retires each member once"

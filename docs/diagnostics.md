@@ -215,7 +215,11 @@ member through `audits_completed`. Group retirements have no `audits_started`
 counterpart (groups never plan a sampled mode), so `audits_completed` may exceed
 `audits_started`. A paged group member or singleton that captured no deadline but
 has no index entry at settlement (a fresh index loaded while the job was parked)
-re-probes the same handoff before recording; the job is not invalidated. Both
+re-probes the same handoff before recording; the job is not invalidated. The
+re-probe only reads the record header: it applies the live-context gate and the
+once clamp, but takes no hold, T14 rebuild authorization, breaker accounting or
+RAM-corrupt count. A re-probed singleton retired by a verified Full counts
+`audits_completed` once, like a captured deadline. Both
 carrier counters advance once per settled member, never on preflight or pause.
 Post-save GC preserves same-context debt-bearing records whose key is absent
 from the index; fresh-index cleanup without a trusted context preserves their

@@ -27725,7 +27725,7 @@ impl OwnedSourceScan {
                     if let Some((member, reason)) = group_members.iter().find_map(|member| {
                         let mut due = None;
                         let key = local_index_key(&member.path);
-                        let held = cache.durable_member_hold(source, &key, index, true, &mut due);
+                        let held = cache.durable_member_hold(source, &key, index, &mut due);
                         if let Some(at) = group.members.iter().position(|m| m.path == member.path) {
                             group.recovered[at] = due;
                         }
@@ -29853,10 +29853,11 @@ impl OwnedSourceScan {
                 }
                 // R1: a paged job parked across a fresh index load captured
                 // no due for a file now without an entry. Re-probe the same
-                // live-context, clamped handoff before recording; no restart.
+                // live-context, clamped debt (read only) before recording;
+                // no restart. A re-probed singleton miss counts here.
                 #[cfg(unix)]
-                let (member_dues, recovered_audit_due) = {
-                    let mut dues = (member_dues, recovered_audit_due);
+                let (member_dues, recovered_audit_due, reprobed_due) = {
+                    let mut dues = (member_dues, recovered_audit_due, None);
                     if let Some(cache) = durable_guard
                         .as_ref()
                         .and_then(std::sync::Weak::upgrade)
@@ -29866,15 +29867,21 @@ impl OwnedSourceScan {
                         for (member, due) in aliases.iter().zip(dues.0.iter_mut()) {
                             let key = local_index_key(&member.path);
                             if due.is_none() && absent(&key) {
-                                cache.durable_member_hold(source, &key, index, false, due);
+                                *due = cache.durable_carrier_reprobe(source, &key, index);
                             }
                         }
                         if dues.0.is_empty() && dues.1.is_none() && absent(&index_key) {
-                            cache.durable_hold(source, &index_key, index, &mut dues.1);
+                            dues.2 = cache.durable_carrier_reprobe(source, &index_key, index);
+                            dues.1 = dues.2;
+                            if dues.2.is_some() {
+                                cache.durable_note_carrier("audit_carrier");
+                            }
                         }
                     }
                     dues
                 };
+                #[cfg(not(unix))]
+                let reprobed_due: Option<u64> = None;
                 if parse_complete && !aliases.is_empty() {
                     for alias in &aliases {
                         if alias.path == candidate.path {
@@ -30111,6 +30118,13 @@ impl OwnedSourceScan {
                         }
                     } else if source_verified {
                         index.complete_full_audit(&index_key, &source_file_fingerprint);
+                        // A re-probed singleton due retires like a captured one, once.
+                        if let Some((context, due)) = sampling
+                            .as_mut()
+                            .zip(reprobed_due.filter(|_| !sampled_audit_verified))
+                        {
+                            context.complete_audit(due);
+                        }
                     }
                     if source == SnapshotSource::ClaudeCode {
                         if claude_grown_prefix {
