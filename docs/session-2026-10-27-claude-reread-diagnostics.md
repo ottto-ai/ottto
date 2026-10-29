@@ -46,7 +46,7 @@ generation overflow under both gate states, checking one reported clear and the
 unchanged failure and durable progress.
 
 Desktop metadata uses the existing page `local_resources` counts carrier under
-`desktop_metadata`. All four fields are sparse, saturating integers, scoped to
+`desktop_metadata`. All fields are sparse, saturating integers, scoped to
 Claude work and merged across cooperative steps. There is no new emitter or
 wire field:
 
@@ -60,6 +60,10 @@ wire field:
   separate legacy identity adoption path. Both body counters count files per
   attempt, including attempts that later fail; selection or an unchanged native
   reduction reuse alone counts zero.
+- `recovered_hold_body_rereads`: first body bytes read after the metadata census
+  recovers a complete, unique Desktop proof for an existing account-held file.
+  Unchanged RAM reuse counts zero. This observes existing account-held retries;
+  it does not select or rearm any file or invalidate accepted bodies.
 - `lineage_window_read_attempts`: a selected-file finalization opens an uncached
   parent transcript to resolve an ambiguous Desktop id. Existing head/tail caps
   apply (256 KiB at each end); cached windows and metadata census work count zero.
@@ -75,3 +79,11 @@ parent metadata in its own store. Ambiguous parent windows resolve after an
 independently selected native read; census discovery never opens transcripts.
 A healthy spawned session adopts this metadata dependency revision once; unrelated
 profiles and later coverage loss/recovery do not select unchanged transcripts.
+
+A new legacy binding also defers when a Desktop account hash is present but its
+original proof is missing while the Desktop census is incomplete. A cached unique
+hash cannot win before an unseen sibling is read. Existing owners and independently
+qualified contract-5 requests keep their admission rules. Complete census recovery
+marks existing account-held retries with a now-complete Desktop proof for read
+accounting. Their existing retry/retention path remains authoritative. Recovery
+never clears source fingerprints, the accepted body ledger or the owner map.

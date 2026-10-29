@@ -228,6 +228,8 @@ pub(crate) struct DesktopMetadata {
     pub(crate) legacy_identity_body_rereads: u64,
     #[serde(skip_serializing_if = "super::is_zero")]
     pub(crate) lineage_window_read_attempts: u64,
+    #[serde(skip_serializing_if = "super::is_zero")]
+    pub(crate) recovered_hold_body_rereads: u64,
 }
 impl DesktopMetadata {
     fn is_empty(&self) -> bool {
@@ -246,6 +248,9 @@ impl DesktopMetadata {
         self.lineage_window_read_attempts = self
             .lineage_window_read_attempts
             .saturating_add(other.lineage_window_read_attempts);
+        self.recovered_hold_body_rereads = self
+            .recovered_hold_body_rereads
+            .saturating_add(other.recovered_hold_body_rereads);
     }
 }
 pub(crate) fn desktop_inventory_restart() {
@@ -267,6 +272,12 @@ pub(crate) fn desktop_revision_body_read(legacy: bool) {
 pub(crate) fn desktop_lineage_window_read() {
     update(|counts| {
         let n = &mut counts.desktop_metadata.lineage_window_read_attempts;
+        *n = n.saturating_add(1);
+    });
+}
+pub(crate) fn desktop_recovered_hold_body_read() {
+    update(|counts| {
+        let n = &mut counts.desktop_metadata.recovered_hold_body_rereads;
         *n = n.saturating_add(1);
     });
 }
@@ -536,6 +547,7 @@ mod tests {
         super::desktop_revision_body_read(false);
         super::desktop_revision_body_read(true);
         super::desktop_lineage_window_read();
+        super::desktop_recovered_hold_body_read();
         let mut counts = scope.finish();
         counts.desktop_metadata.inventory_restarts = u64::MAX;
         let scope = super::Scope::begin(true);
@@ -545,7 +557,8 @@ mod tests {
             serde_json::to_value(counts).unwrap()["desktop_metadata"],
             serde_json::json!({
                 "inventory_restarts":u64::MAX, "source_revision_body_rereads":1,
-                "legacy_identity_body_rereads":1, "lineage_window_read_attempts":1
+                "legacy_identity_body_rereads":1, "lineage_window_read_attempts":1,
+                "recovered_hold_body_rereads":1
             })
         );
         assert!(serde_json::to_value(super::Counts::default())
