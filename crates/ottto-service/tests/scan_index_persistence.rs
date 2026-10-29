@@ -65,6 +65,7 @@ fn opened(store: &LockedStore) -> (Value, LoadedRoot) {
         Opened::Sharded(reader, root) => (Box::new(reader), root),
         Opened::Legacy(file, root) => (Box::new(file), root),
         Opened::Missing(_) => panic!("missing"),
+        Opened::Partial(_, _) => panic!("unknown maps are not a complete index"),
     };
     let mut bytes = Vec::new();
     input.read_to_end(&mut bytes).unwrap();
@@ -157,7 +158,7 @@ fn corrupt_missing_shard_and_future_manifest_never_rebuild() {
             }
         }
         let before = fs::read(s.root()).unwrap();
-        assert!(store.open().is_err());
+        assert!(matches!(store.open(), Err(_) | Ok(Opened::Partial(_, _))));
         assert_eq!(fs::read(s.root()).unwrap(), before);
         assert!(fs::read_dir(&s.0).unwrap().all(|entry| !entry
             .unwrap()
@@ -222,7 +223,10 @@ fn fifo_shard_refuses_without_waiting_for_a_writer() {
     use std::os::unix::ffi::OsStrExt;
     let name = std::ffi::CString::new(object.as_os_str().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
-    assert!(s.store().open().is_err());
+    assert!(matches!(
+        s.store().open(),
+        Err(_) | Ok(Opened::Partial(_, _))
+    ));
 }
 
 #[test]
@@ -237,12 +241,24 @@ fn storage_tag_without_outer_fence_never_becomes_empty_legacy() {
             manifest.as_object_mut().unwrap().remove("schema_version");
         }
         fs::write(s.root(), serde_json::to_vec(&manifest).unwrap()).unwrap();
-        assert!(s.store().open().is_err());
+        assert!(matches!(
+            s.store().open(),
+            Err(_) | Ok(Opened::Partial(_, _))
+        ));
     }
     let s = Scratch::new();
     s.install();
+    let _ = opened(&s.store());
+    fs::write(
+        s.0.join("scan-index.corrupt.1.2.json"),
+        b"prior root witness",
+    )
+    .unwrap();
     fs::remove_file(s.root()).unwrap();
-    assert!(s.store().open().is_err());
+    assert!(matches!(
+        s.store().open(),
+        Err(_) | Ok(Opened::Partial(_, _))
+    ));
 }
 #[test]
 fn whitespace_padded_legacy_controls_keep_their_generation() {
@@ -274,8 +290,15 @@ fn syntax_failure_never_erases_an_observed_storage_fence() {
     ] {
         let s = Scratch::new();
         fs::write(s.root(), bytes).unwrap();
-        assert!(s.store().open().is_err());
+        assert!(matches!(
+            s.store().open(),
+            Err(_) | Ok(Opened::Partial(_, _))
+        ));
         assert_eq!(fs::read_to_string(s.root()).unwrap(), bytes);
-        assert_eq!(fs::read_dir(&s.0).unwrap().count(), 1);
+        assert!(s.0.join("scan-index.json.storage-prior").exists());
+        assert_eq!(fs::read_dir(&s.0).unwrap().count(), 2);
     }
 }
+
+#[path = "support/scan_index_r3.rs"]
+mod r3;

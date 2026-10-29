@@ -66,3 +66,35 @@ fn actual_decoder_missing_renamed_syntax_and_future_version_behaviour() {
     assert!(format!("{error:#}").contains("scan index refused: schema_version"));
     assert_eq!(fs::read(s.root()).unwrap(), bytes);
 }
+
+#[test]
+fn pinned_0202_also_refuses_schema3_without_inline_maps_before_defaults_can_escape() {
+    let frozen: Value = serde_json::from_str(include_str!(
+        "../fixtures/scan_index/v0.1.202-decisions.json"
+    ))
+    .unwrap();
+    assert_eq!(frozen["commit"], "79488a7297817edfe1eb5cfc34b779408d511726");
+    let source = include_str!("../../src/snapshots/lenient_decode.rs");
+    for snippet in frozen["snippets"].as_array().unwrap() {
+        assert!(source.contains(snippet["text"].as_str().unwrap()));
+    }
+    let s = Scratch::new();
+    s.install();
+    let root: Value = serde_json::from_slice(&fs::read(s.root()).unwrap()).unwrap();
+    for field in [
+        "claude_account_family_pending",
+        "claude_usage_family_pending",
+        "claude_request_census",
+    ] {
+        assert!(root.get(field).is_none());
+    }
+    let before = fs::read(s.root()).unwrap();
+    let error = ottto_service::snapshots::ScanIndex::load(&s.root()).unwrap_err();
+    assert!(format!("{error:#}").contains("scan index refused: schema_version"));
+    assert_eq!(fs::read(s.root()).unwrap(), before);
+    assert!(!fs::read_dir(&s.0).unwrap().any(|e| e
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .contains("corrupt")));
+}

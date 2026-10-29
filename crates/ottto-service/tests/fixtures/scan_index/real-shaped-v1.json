@@ -1,0 +1,108 @@
+{
+  "logical": {
+    "schema_version": 2,
+    "generation": 7,
+    "files": {
+      "synthetic-file": {
+        "size_bytes": 91,
+        "modified_unix_seconds": 17,
+        "source_file_fingerprint": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "last_snapshot_fingerprint": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "last_upload_body_witness": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "codex_captured_uncommitted": true
+      }
+    },
+    "upload_context_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "claude_desktop_identity_census_complete": true,
+    "claude_desktop_lineage_census_complete": true,
+    "traversal": {
+      "context_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "census_window_end": "2026-10-29T00:00:00Z",
+      "scan_roots": [],
+      "pending_directories": [],
+      "pending_candidates": [],
+      "observed_index_keys": [
+        "synthetic-file"
+      ],
+      "reconciliation_upper_bound": "synthetic-bound",
+      "reconciliation_after": null,
+      "reconciliation_started": true,
+      "counts": {
+        "discovered_file_count": 19
+      }
+    },
+    "accepted_snapshot_fingerprints": [
+      "synthetic-accepted"
+    ],
+    "file_snapshot_fingerprints": {
+      "synthetic-file": [
+        "synthetic-accepted"
+      ]
+    },
+    "claude_account_family_pending": {
+      "synthetic-family": {
+        "w": "2026-10-29T00:00:00Z",
+        "a": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "e": 23,
+        "i": false,
+        "members": {
+          "synthetic-file": 1
+        },
+        "previous_windows": [
+          {
+            "census_window_end": "2026-10-28T00:00:00Z",
+            "account_identifier_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "evidence_request_count": 17,
+            "members": {
+              "synthetic-file": 1
+            },
+            "invalid": false
+          }
+        ]
+      }
+    },
+    "claude_usage_family_pending": {
+      "synthetic-family": {
+        "census_window_end": "2026-10-29T00:00:00Z",
+        "member_request_id_hashes": {
+          "synthetic-file": [
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          ]
+        },
+        "member_occurrences": {
+          "synthetic-file": {
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb": {
+              "sequence": 11,
+              "input_tokens": 13,
+              "output_tokens": 17,
+              "cache_read_tokens": 0,
+              "cache_creation_5m_tokens": 0,
+              "cache_creation_1h_tokens": 0,
+              "reasoning_output_tokens": 0,
+              "model": null,
+              "speed_mode": null,
+              "reasoning_effort": null
+            }
+          }
+        },
+        "invalid": false
+      }
+    },
+    "claude_request_census": {
+      "synthetic-file": {
+        "v": 1,
+        "fp": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "w": 17,
+        "s": "exact",
+        "b": "AAAAAAAAAAE"
+      }
+    }
+  },
+  "root": "{\"schema_version\":3,\"files\":{},\"storage_format\":1,\"logical_schema_version\":2,\"generation\":7,\"binding\":{\"source\":\"claude\",\"namespace_hash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"padding_bytes\":0,\"maps\":[{\"field\":\"account_pending\",\"generation\":7,\"buckets\":[174]},{\"field\":\"usage_pending\",\"generation\":7,\"buckets\":[174]},{\"field\":\"request_census\",\"generation\":7,\"buckets\":[156]}],\"objects\":[{\"slot\":{\"kind\":\"metadata\"},\"generation\":7,\"bytes\":1100,\"digest\":\"a8bd1cebc41c123530f6a36f78bd32e5d4cc3fa285bf5b18cb1777a3983561b8\"},{\"slot\":{\"kind\":\"bucket\",\"field\":\"account_pending\",\"bucket\":174},\"generation\":7,\"bytes\":402,\"digest\":\"4452e54461c1c14972b641f5f12e4385fd7730a81dd10bb192e2bf109f245e83\"},{\"slot\":{\"kind\":\"bucket\",\"field\":\"usage_pending\",\"bucket\":174},\"generation\":7,\"bytes\":521,\"digest\":\"4b17c8256a0fb7454638eec3af9fd2e76e3adb8c0439df919f6b502dbe1ecd33\"},{\"slot\":{\"kind\":\"bucket\",\"field\":\"request_census\",\"bucket\":156},\"generation\":7,\"bytes\":135,\"digest\":\"2e7dc3d1840027984b11b5e1b9c8688902cf9e9ecfc45c42a4c2650eaba3cd89\"}]}",
+  "payloads": {
+    "metadata-a8bd1cebc41c123530f6a36f78bd32e5d4cc3fa285bf5b18cb1777a3983561b8.json": "{\"files\":{\"synthetic-file\":{\"size_bytes\":91,\"modified_unix_seconds\":17,\"source_file_fingerprint\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"last_snapshot_fingerprint\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"last_upload_body_witness\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"codex_captured_uncommitted\":true}},\"upload_context_fingerprint\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"claude_desktop_identity_census_complete\":true,\"claude_desktop_lineage_census_complete\":true,\"traversal\":{\"context_fingerprint\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"census_window_end\":\"2026-10-29T00:00:00Z\",\"scan_roots\":[],\"pending_directories\":[],\"pending_candidates\":[],\"observed_index_keys\":[\"synthetic-file\"],\"reconciliation_upper_bound\":\"synthetic-bound\",\"reconciliation_after\":null,\"reconciliation_started\":true,\"counts\":{\"discovered_file_count\":19}},\"accepted_snapshot_fingerprints\":[\"synthetic-accepted\"],\"file_snapshot_fingerprints\":{\"synthetic-file\":[\"synthetic-accepted\"]}}",
+    "account-ae-4452e54461c1c14972b641f5f12e4385fd7730a81dd10bb192e2bf109f245e83.json": "{\"synthetic-family\":{\"w\":\"2026-10-29T00:00:00Z\",\"a\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"e\":23,\"i\":false,\"members\":{\"synthetic-file\":1},\"previous_windows\":[{\"census_window_end\":\"2026-10-28T00:00:00Z\",\"account_identifier_hash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"evidence_request_count\":17,\"members\":{\"synthetic-file\":1},\"invalid\":false}]}}",
+    "usage-ae-4b17c8256a0fb7454638eec3af9fd2e76e3adb8c0439df919f6b502dbe1ecd33.json": "{\"synthetic-family\":{\"census_window_end\":\"2026-10-29T00:00:00Z\",\"member_request_id_hashes\":{\"synthetic-file\":[\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"]},\"member_occurrences\":{\"synthetic-file\":{\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\":{\"sequence\":11,\"input_tokens\":13,\"output_tokens\":17,\"cache_read_tokens\":0,\"cache_creation_5m_tokens\":0,\"cache_creation_1h_tokens\":0,\"reasoning_output_tokens\":0,\"model\":null,\"speed_mode\":null,\"reasoning_effort\":null}}},\"invalid\":false}}",
+    "census-9c-2e7dc3d1840027984b11b5e1b9c8688902cf9e9ecfc45c42a4c2650eaba3cd89.json": "{\"synthetic-file\":{\"v\":1,\"fp\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"w\":17,\"s\":\"exact\",\"b\":\"AAAAAAAAAAE\"}}"
+  }
+}

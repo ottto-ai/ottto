@@ -48,10 +48,15 @@ The strict, bounded manifest schema is:
   "generation": 1,
   "binding": {"source": "claude", "namespace_hash": "<existing 64 hex namespace>"},
   "padding_bytes": 0,
+  "maps": [
+    {"field":"account_pending","generation":1,"buckets":[7]},
+    {"field":"usage_pending","generation":1,"buckets":[]},
+    {"field":"request_census","generation":1,"buckets":[]}
+  ],
   "objects": [
-    {"slot": {"kind": "metadata"}, "bytes": 2, "digest": "<64 hex>"},
+    {"slot": {"kind": "metadata"}, "generation": 1, "bytes": 2, "digest": "<64 hex>"},
     {"slot": {"kind": "bucket", "field": "account_pending", "bucket": 7},
-     "bytes": 100, "digest": "<64 hex>"}
+     "generation": 1, "bytes": 100, "digest": "<64 hex>"}
   ]
 }
 ```
@@ -64,8 +69,7 @@ nonempty sentinel refuses. Actual files remain entirely in metadata.
 `source` admits `claude`, `codex`, `pi`; bucket field admits `account_pending`,
 `usage_pending`, `request_census`; bucket is u8. At most 769 ordered, unique
 objects (mandatory metadata plus 3×256 nonempty buckets) and 256 KiB root bytes.
-Unknown fields/tags/versions, invalid lengths and bindings refuse without
-quarantine, default-state substitution, fallback, repair or destructive GC.
+Unknown envelope fields/tags/versions and root bindings refuse without quarantine or reset. Unavailable map objects instead produce scoped Unknown as specified below.
 
 SHA-256 domains start with `ottto.scan-index.storage.v1\0`. Bucket assignment
 hashes `bucket\0` plus the complete existing key and uses the first byte.
@@ -93,7 +97,7 @@ downgrade start. Downgrade to N, allow a successful legacy save, then evaluate a
 older downgrade against the existing logical-schema contracts.**
 
 This is a hard release prerequisite: do not enable or publish the writer switch
-while N is unpublished, the version is unresolved, or those notes are missing.
+while N is unpublished, has not been installed on the M4 with at least one successful save cycle, the version is unresolved, or those notes are missing.
 The writer component remains draft until that prerequisite and the integration
 qualification are met. No arbitrary version number is invented here. There is
 no promise that forcibly running an unsupported pre-N binary is intercepted by
@@ -159,3 +163,63 @@ Process-SIGKILL qualification of shard publication belongs to the writer PR;
 no power-loss claim. Full typed production round-trip, hold/positional coverage,
 resource accounting, 12k/100k measurements and P1–P4/E4 emitted-money equivalence
 remain integration gates. This component changes no live daemon or state.
+
+## SOURCE and money conditions: scoped unknown state
+
+Outer schema 3 / storage 1 / logical 2, naming and digest domains are approved.
+The root now has an explicit `maps` inventory, three `{field,generation,buckets}`
+descriptors. Each object also records its reference `generation`. References
+must pair with this root's generation; immutable bytes from an earlier physical
+write can be reused under a new reference generation when their digest matches.
+Generation remains one increment per published root; no parser/scan identity
+changes. Empty inventories are explicitly known-empty. Absent inventories or
+missing, stale, corrupt or undecodable buckets make ONLY their map UNKNOWN.
+
+`Opened::Partial` carries metadata and independently known siblings, with typed
+`MapAvailability::Unknown` for unavailable maps. There is no iterator/default or
+complete legacy-JSON conversion for Unknown. It never authorizes retirement,
+release, fence opening, acquisition re-read, whole-index quarantine or reset.
+A partial generation cannot be saved/exported over its unavailable evidence.
+Root binding/format or metadata-integrity failures still refuse because their
+files/custody authority cannot be established. Known sibling data stays usable.
+The production adapter must supply the existing semantic map decoder through
+`open_with_map_validator`; semantic decoder failure becomes scoped Unknown,
+never a default empty census. Structural `open` is available only in tests; already-serialized publication reconciliation uses a private structural helper. Production load cannot use a public no-op validator.
+
+`ReadStats` exposes `index_shard_unavailable{map,cause}` and
+`scanindex_orphan_init_discarded` for the existing diagnostic registry. These are
+fixed map/cause axes, never keys or digests. Shared integration must drain these
+counts and carry Unknown state through semantic readers and Clone/subsets;
+these component PRs do not claim activated production diagnostic wiring.
+
+A new private `<index>.storage-prior` marker (`scan_index_prior_root_v1` plus
+newline, 0600) retains negative evidence after root recognition or successful publication. It grants
+no acceptance/acquisition/receipt authority. Missing root plus marker, legacy or
+quarantine sibling stays fail-closed. No-root recovery makes two directory walks:
+validate all owned names/binding/digests before unlinking owned fresh-init debris.
+No transcripts or durable-tail files are traversed or removed.
+
+The byte fixture runs the SAME real legacy ScanIndex serializer before and after
+a real-shaped shard round-trip, comparing complete serialized byte arrays and
+each moved map's bytes. A real #865 `DurableTailStore::write_after_save` fixture
+uses the committed root generation and restores its record after store restart.
+The writer fixture executes an actual shard commit before that durable write.
+An exhaustive metadata-complement assertion keeps every other serialized field
+in metadata, including files/custody, fingerprints, versions, traversal and census
+completion. This is a serializer round-trip, not a claim of identical physical
+fragment ordering/whitespace or full emitted-money/oracle qualification.
+
+Pinned downgrade fact, including absence of all three inline maps: 0.1.201
+`f174d111` has logical schema 2 (`snapshots.rs:542`), header pass plus controls
+(`lenient_decode.rs:922–923`), strict schema refusal (`:1037–1040`) and
+non-quarantine refusal classification (`:436–438`). Loader `snapshots.rs:46079`
+quarantines only Syntax/HoldBudget. 0.1.202 `79488a7` has schema 2 at
+`snapshots.rs:566`, the same header/control sequence at `lenient_decode.rs:924–925`,
+strict refusal at `:1039–1042`, non-quarantine classification at `:435–437`, and
+loader quarantine branch at `snapshots.rs:46403`. The schema-3 root includes the
+required `files:{}` sentinel, satisfying the historical required-files check
+(:1947 in 0.1.201; :1949 in 0.1.202), then refuses BEFORE full map decoding.
+Defaulted maps in the temporary header object never escape as a loaded index.
+Exact refusal: **scan index refused: schema_version**. Neither pinned binary
+resets, quarantines or loads the absent maps empty. No inline-map duplication is
+needed; the strict refusal fence is retained and frozen for both versions.

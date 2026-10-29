@@ -9796,3 +9796,6 @@ mod owned_heap;
 #[cfg(test)]
 mod retry_allocation_probe;
 mod retry_retention_bound;
+
+#[cfg(all(test, unix))]
+mod scan_index_persistence_contract_tests;
