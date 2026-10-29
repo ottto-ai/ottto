@@ -465,7 +465,7 @@ fn ordinary_open_keeps_other_slots_due(grown: bool) {
         &index.files,
     )
     .unwrap();
-    let (candidate, _) = open_and_identify_scan_candidate_with_rescue_at(
+    let (candidate, mut opened_file) = open_and_identify_scan_candidate_with_rescue_at(
         SnapshotSource::ClaudeCode,
         candidate,
         &mut ScanCensus::default(),
@@ -506,6 +506,24 @@ fn ordinary_open_keeps_other_slots_due(grown: bool) {
         index.candidate_decision_with_reason(&candidate),
         (CandidateDecision::Parse, Some(CandidateParseReason::Audit))
     );
+    let debt = debt_for_key(&index, &key, D + CAP).unwrap();
+    let plan = crate::transcript_acquisition::ReadPlan::prepare(
+        &mut opened_file,
+        None,
+        &crate::transcript_acquisition::Scope("ordinary-owed".into()),
+        Some(debt),
+        D + CAP,
+    )
+    .unwrap();
+    assert_eq!(
+        plan.mode(),
+        crate::transcript_acquisition::ReadMode::Full(
+            crate::transcript_acquisition::FullReason::AuditDue
+        )
+    );
+    assert_eq!(plan.metrics().audit_due, Some(D));
+    drop(plan); // An interrupted native verification cannot discharge D.
+    assert_eq!(failed_open_debt(&key, D + CAP), Some(D));
     // A held/incomplete native read can only stage the same D. Repeated
     // scheduling and a save/reload must never replace it with now+interval.
     let fingerprint = index.files[&key].source_file_fingerprint.clone();
