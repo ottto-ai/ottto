@@ -32735,7 +32735,10 @@ impl OwnedSourceScan {
                                 }
                                 context.admission.prepare_failed =
                                     context.admission.prepare_failed.saturating_add(1);
-                                migration_failure!(&candidate);
+                                #[cfg(unix)]
+                                if source == SnapshotSource::ClaudeCode {
+                                    context.cache.migration_failure(index, &candidate);
+                                }
                                 let refusal = match rejected.refusal {
                                     sampled_jsonl::PreparationRefusal::Transient => None,
                                     sampled_jsonl::PreparationRefusal::NonTransient(reason) => {
@@ -33209,6 +33212,7 @@ impl OwnedSourceScan {
                 if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
                     if source == SnapshotSource::ClaudeCode
                         && !paced_full_granted
+                        && !active_bound_degraded
                         && migration_floor.is_none()
                         && !cache.upgrade_full_allowed(
                             &local_index_key(&active.candidate.path),

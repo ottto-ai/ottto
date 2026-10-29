@@ -8,6 +8,7 @@ use std::io::Read;
 const INDEX_KEYS: usize = 20_000;
 
 thread_local! {
+    static BEFORE_WARM_TRANSFER: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static BEFORE_COLD_TRANSFER: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 pub(super) fn before_cold_transfer() {
@@ -52,8 +53,6 @@ impl Drop for ClearPreparationFault {
         sampled_jsonl::preparation_tests::refuse_heap(false);
         BEFORE_COLD_TRANSFER.with(|slot| slot.borrow_mut().take());
         BEFORE_WARM_TRANSFER.with(|slot| slot.borrow_mut().take());
-    }
-} BEFORE_WARM_TRANSFER.with(|slot| slot.borrow_mut().take());
     }
 }
 
@@ -6872,6 +6871,7 @@ fn q8_strict_v1_bridge_keeps_unknown_same_and_inode_reuse_conservative() {
         generation: 9,
         entry: record.record.binding.entry,
         strict: true,
+        verified_extent: None,
     };
     let (dev, ino, birth) = (r.device, r.inode, r.birth_nanos);
     assert_eq!(
@@ -9007,7 +9007,6 @@ fn a0h_scan(
     owner.scan(roots, root, index, 100, true, &BTreeMap::new(), &[])
 }
 
-
 #[test]
 fn a0h_pacing_is_funded_nonrenewing_and_evicts_oldest() {
     let root = crate::test_scratch::private_dir("a0h-pace");
@@ -9072,7 +9071,6 @@ fn a0h_pacing_is_funded_nonrenewing_and_evicts_oldest() {
     );
     let _ = std::fs::remove_dir_all(root);
 }
-
 
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
@@ -9203,7 +9201,9 @@ fn a0h_native_exhaustion_growth_pacing_reselection_and_restart_body() {
                 }
                 assert_eq!(
                     owner.cache.durable().unwrap().retail_spent
-                        [&store::key_digest(DurableSource::ClaudeCode, &key)],
+                        [&store::key_digest(DurableSource::ClaudeCode, &key)]
+                        .spent
+                        .unwrap(),
                     (high, now)
                 );
             }
@@ -9434,7 +9434,6 @@ fn a0h_native_exhaustion_growth_pacing_reselection_and_restart_body() {
     }
 }
 
-
 #[test]
 fn a0h_pace_evicted_alone_emits_one_alarm_without_a_full_delta() {
     let root = crate::test_scratch::private_dir("a0h-overflow-alarm");
@@ -9446,42 +9445,47 @@ fn a0h_pace_evicted_alone_emits_one_alarm_without_a_full_delta() {
         &Scope("alarm".into()),
         false,
     );
-    // Establish the exact prior report state, including any initial store observation.
     let _ = crate::local_resource_diagnostics::capture(|| cache.durable_alarm(source));
-    let before = cache.durable().unwrap().counters.clone();
-    cache.durable().unwrap().counters.retail_full[2] += 1;
-    let after = cache.durable().unwrap().counters.clone();
-    let mut only_overflow = before.clone();
-    only_overflow.retail_full[2] += 1;
+    let now = SystemTime::now();
+    {
+        let mut stores = cache.durable().unwrap();
+        for n in 0..2 * store::MAX_RECORDS {
+            stores.retail_full_at.insert(
+                full_pace_key(source, &n.to_string()),
+                FullPace {
+                    at: now,
+                    structural: false,
+                },
+            );
+        }
+    }
+    let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
+        assert!(cache.paced_admission(source, "overflow", now, true, false, true));
+        for _ in 0..2 {
+            cache.durable_alarm(source);
+        }
+    });
+    let evictions: Vec<_> = alarms
+        .iter()
+        .filter(|e| !e["counts"]["pace_evicted"].is_null())
+        .collect();
+    assert_eq!(evictions.len(), 1);
+    assert_eq!(evictions[0]["source"], source.api_slug());
+    assert_eq!(evictions[0]["stage"], "durable_tail_alarm");
     assert_eq!(
-        after, only_overflow,
-        "ONLY overflow changed, no growth/admission/hold"
-    );
-    let ((), alarms) = crate::local_resource_diagnostics::capture(|| cache.durable_alarm(source));
-    assert_eq!(alarms.len(), 1);
-    assert_eq!(alarms[0]["stage"], "durable_tail_alarm");
-    assert_eq!(
-        alarms[0]["counts"]["pace_evicted"],
+        evictions[0]["counts"]["pace_evicted"],
         serde_json::json!([1, 1])
     );
+    let counters = cache.durable().unwrap().counters.clone();
     assert_eq!(
-        alarms[0]["counts"]["retail_exhausted"],
-        serde_json::json!([0, 0])
+        counters.retail_full,
+        [0, 0, 1],
+        "structural eviction has no retail Full delta"
     );
-    assert_eq!(
-        alarms[0]["counts"]["retail_exhausted_paced"],
-        serde_json::json!([0, 0])
+    assert!(
+        cache.durable().unwrap().retail_spent.is_empty(),
+        "eviction cannot mint retail custody"
     );
-    for cause in [
-        "old_binding_no_match",
-        "context",
-        "restore_semantics",
-        "revision_adoption_required",
-    ] {
-        assert_eq!(alarms[0]["counts"][cause], serde_json::json!([0, 0]));
-    }
-    let ((), repeated) = crate::local_resource_diagnostics::capture(|| cache.durable_alarm(source));
-    assert!(repeated.is_empty());
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -10124,7 +10128,9 @@ fn stale_full_evicts_oldest_shared_stamp_and_paces_the_new_key() {
         .unwrap(),
     );
     let floor = AcceptedFloor::of(&index, "new").unwrap();
-    assert!(cache.stale_full("new", &file, Some(floor), "context"));
+    let ((), mut alarms) = crate::local_resource_diagnostics::capture(|| {
+        assert!(cache.stale_full("new", &file, Some(floor), "context"));
+    });
     {
         let stores = cache.durable().unwrap();
         assert_eq!(stores.counters.stale_full, [1, 0, 0]);
@@ -10137,13 +10143,26 @@ fn stale_full_evicts_oldest_shared_stamp_and_paces_the_new_key() {
             .retail_full_at
             .contains_key(&store::key_digest(DurableSource::ClaudeCode, "new")));
     }
-    let ((), alarms) = crate::local_resource_diagnostics::capture(|| cache.durable_alarm(source));
-    assert_eq!(alarms.len(), 1);
+    let ((), later) = crate::local_resource_diagnostics::capture(|| cache.durable_alarm(source));
+    alarms.extend(later);
+    assert_eq!(
+        alarms
+            .iter()
+            .filter(|e| !e["counts"]["pace_evicted"].is_null())
+            .count(),
+        1
+    );
     assert_eq!(
         alarms[0]["counts"]["pace_evicted"],
         serde_json::json!([1, 1])
     );
-    assert_eq!(alarms[0]["counts"]["context"], serde_json::json!([1, 1]));
+    assert_eq!(
+        alarms
+            .iter()
+            .find(|e| !e["counts"]["context"].is_null())
+            .unwrap()["counts"]["context"],
+        serde_json::json!([1, 1])
+    );
     assert!(!cache.stale_full("new", &file, Some(floor), "restore_semantics"));
     assert!(!cache.retail_full(
         "new",
@@ -12159,7 +12178,13 @@ fn o3_same_owner_shorter_growth_expires_pace_without_lowering_original_floor() {
             Some(floor)
         );
         stores.retail_full_now = Some(now);
-        stores.retail_full_at.insert(digest, now);
+        stores.retail_full_at.insert(
+            digest,
+            FullPace {
+                at: now,
+                structural: false,
+            },
+        );
     }
     let ((held, scan, mode), bytes) = observe_consumed(|| f.scan(&owner, &mut saved));
     assert_eq!(mode.0, 0);
@@ -12544,14 +12569,20 @@ fn o3_generation_ahead_survivor_reads_growth_without_mutation_authority() {
             for n in 0..2 * store::MAX_RECORDS {
                 stores.retail_full_at.insert(
                     store::key_digest(DurableSource::ClaudeCode, &format!("paced-other-{n}")),
-                    now,
+                    FullPace {
+                        at: now,
+                        structural: false,
+                    },
                 );
             }
         }
         let mut saved = ScanIndex::load(&f.index_path).unwrap();
         assert!(saved.generation < future_generation);
         let before = saved.clone();
-        let ((mut index, mut scan, modes), bytes) = observe_consumed(|| f.scan(&owner, &mut saved));
+        let (((mut index, mut scan, modes), bytes), mut pace_events) =
+            crate::local_resource_diagnostics::capture(|| {
+                observe_consumed(|| f.scan(&owner, &mut saved))
+            });
         assert_eq!(modes, (1, 0, 0));
         assert_eq!(bytes, std::fs::metadata(&f.path).unwrap().len());
         assert_eq!(scan.unreadable_path_count, 0);
@@ -12577,10 +12608,18 @@ fn o3_generation_ahead_survivor_reads_growth_without_mutation_authority() {
             owner.cache.durable_alarm(SnapshotSource::ClaudeCode)
         });
         assert_eq!(alarms.len(), 1);
-        assert_eq!(
-            alarms[0]["counts"]["pace_evicted"],
-            serde_json::json!([u64::from(overflow), u64::from(overflow)])
-        );
+        pace_events.extend(alarms.clone());
+        let evictions: Vec<_> = pace_events
+            .iter()
+            .filter(|e| !e["counts"]["pace_evicted"].is_null())
+            .collect();
+        assert_eq!(evictions.len(), usize::from(overflow));
+        if overflow {
+            assert_eq!(
+                evictions[0]["counts"]["pace_evicted"],
+                serde_json::json!([1, 1])
+            );
+        }
         assert_eq!(
             alarms[0]["counts"]["old_binding_no_match"],
             serde_json::json!([1, 1])
@@ -12608,7 +12647,13 @@ fn o3_paced_growth_survives_idle_past_window_until_real_native_catchup() {
     let now = std::time::SystemTime::now();
     {
         let mut stores = owner.cache.durable().unwrap();
-        stores.retail_full_at.insert(digest, now);
+        stores.retail_full_at.insert(
+            digest,
+            FullPace {
+                at: now,
+                structural: false,
+            },
+        );
         stores.retail_full_now = Some(now);
     }
     let mut saved = f.prior.clone();
@@ -12932,7 +12977,13 @@ fn pace_clock_anomaly_is_separate_from_overflow_and_never_refunds_q11() {
         now + std::time::Duration::from_secs(1),
         now - std::time::Duration::from_secs(PACE_SANITY_SECS + 1),
     ] {
-        cache.durable().unwrap().retail_full_at.insert(key, stamp);
+        cache.durable().unwrap().retail_full_at.insert(
+            key,
+            FullPace {
+                at: stamp,
+                structural: false,
+            },
+        );
         assert!(
             cache.retail_full("k", &file, 6, now),
             "future/backwards or implausibly old stamp expires"
@@ -12947,10 +12998,7 @@ fn pace_clock_anomaly_is_separate_from_overflow_and_never_refunds_q11() {
         alarms[0]["counts"]["pace_anomaly"],
         serde_json::json!([2, 2])
     );
-    assert_eq!(
-        alarms[0]["counts"]["pace_evicted"],
-        serde_json::json!([0, 0])
-    );
+    assert_eq!(alarms[0]["counts"]["pace_evicted"], serde_json::Value::Null);
     assert_eq!(cache.durable().unwrap().retail_spent[&key].spent, spent);
     let _ = std::fs::remove_dir_all(root);
 }
@@ -12960,10 +13008,9 @@ pub(crate) fn expire_full_pace(cache: &SharedCache, key: &str) {
     let mut stores = cache.durable().unwrap();
     let digest = store::key_digest(DurableSource::ClaudeCode, key);
     if let Some(at) = stores.retail_full_at.get(&digest).copied() {
-        stores.retail_full_now = Some(at + std::time::Duration::from_secs(PACE_SECS));
+        stores.retail_full_now = Some(at.at + std::time::Duration::from_secs(PACE_SECS));
     }
 }
-
 
 pub(super) fn before_warm_transfer() {
     let hook = BEFORE_WARM_TRANSFER.with(|slot| slot.borrow_mut().take());
@@ -13585,14 +13632,14 @@ fn b4_shared_pace_cross_cause_clock_anomalies_and_single_eviction_owner() {
         let _ = crate::local_resource_diagnostics::capture(|| cache.durable_alarm(source));
     }
     let now = std::time::SystemTime::now();
-    assert!(cache.paced_full(claude, "same", now, false, false, true));
-    assert!(!cache.paced_full(claude, "same", now, true, false, true));
-    assert!(cache.paced_full(codex, "same", now, true, false, true));
+    assert!(cache.paced_admission(claude, "same", now, false, false, true));
+    assert!(!cache.paced_admission(claude, "same", now, true, false, true));
+    assert!(cache.paced_admission(codex, "same", now, true, false, true));
     for n in 2..2 * store::MAX_RECORDS {
-        assert!(cache.paced_full(claude, &format!("fill-{n}"), now, false, false, true));
+        assert!(cache.paced_admission(claude, &format!("fill-{n}"), now, false, false, true));
     }
     let ((), events) = crate::local_resource_diagnostics::capture(|| {
-        assert!(cache.paced_full(
+        assert!(cache.paced_admission(
             codex,
             "overflow",
             now + std::time::Duration::from_secs(1),
@@ -13623,12 +13670,12 @@ fn b4_shared_pace_cross_cause_clock_anomalies_and_single_eviction_owner() {
         2 * store::MAX_RECORDS
     );
     assert!(
-        cache.paced_full(codex, "overflow", now, true, false, true),
+        cache.paced_admission(codex, "overflow", now, true, false, true),
         "backwards jump EXPIRES"
     );
-    assert!(!cache.paced_full(codex, "overflow", now, true, false, true));
+    assert!(!cache.paced_admission(codex, "overflow", now, true, false, true));
     assert!(
-        cache.paced_full(
+        cache.paced_admission(
             codex,
             "overflow",
             now + std::time::Duration::from_secs(PACE_SANITY_SECS + 1),
@@ -13639,7 +13686,7 @@ fn b4_shared_pace_cross_cause_clock_anomalies_and_single_eviction_owner() {
         "large forward jump EXPIRES"
     );
     assert!(
-        !cache.paced_full(
+        !cache.paced_admission(
             codex,
             "overflow",
             now + std::time::Duration::from_secs(PACE_SANITY_SECS + 2),
@@ -14053,7 +14100,7 @@ fn b4_structural_memo_does_not_hold_same_size_shrink_or_approved_replay() {
     let scope = Scope("memo-correction".into());
     let cache = SharedCache::default();
     cache.durable_begin_pass(source, &root.join("index.json"), &scope, false);
-    assert!(cache.paced_full(
+    assert!(cache.paced_admission(
         source,
         &key,
         std::time::SystemTime::now(),

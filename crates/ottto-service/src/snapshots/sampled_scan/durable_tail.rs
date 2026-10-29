@@ -192,7 +192,6 @@ impl Counters {
             self.upgrade_state_missing,
             self.active_bound,
             classes(&self.resource_full),
-            self.active_bound,
             self.rederive_head_bytes,
             self.rederive_named_lines,
             self.rederive_line_bytes,
@@ -1207,23 +1206,31 @@ impl SharedCache {
         near_cap: bool,
         start: bool,
     ) -> bool {
+        self.paced_with_cause(source, key, now, (active_bound, near_cap, start), None)
+    }
+
+    fn paced_with_cause(
+        &self,
+        source: SnapshotSource,
+        key: &str,
+        now: SystemTime,
+        (active_bound, near_cap, start): (bool, bool, bool),
+        cause: Option<usize>,
+    ) -> bool {
         let Some(mut stores) = self.durable() else {
             return false;
         };
         #[cfg(test)]
         let now = stores.retail_full_now.unwrap_or(now);
-        let mut anomalies = 0;
-        stores
-            .retail_full_at
-            .retain(|_, stamp| match now.duration_since(stamp.at) {
-                Ok(age) if age.as_secs() <= PACE_SANITY_SECS => age.as_secs() < PACE_SECS,
-                _ => {
-                    anomalies += 1;
-                    false
-                }
-            });
-        stores.counters.pace_anomaly += anomalies;
         let key = full_pace_key(source, key);
+        // Expiry releases the pace without losing structural classification.
+        // A no-record publication may already have changed the index binding.
+        if stores.retail_full_at.get(&key).is_some_and(|stamp| {
+            now.duration_since(stamp.at)
+                .map_or(true, |age| age.as_secs() > PACE_SANITY_SECS)
+        }) {
+            stores.counters.pace_anomaly += 1;
+        }
         let delayed = !near_cap
             && stores.retail_full_at.get(&key).is_some_and(|stamp| {
                 // Backwards and implausibly large forwards jumps both EXPIRE.
@@ -1280,10 +1287,12 @@ impl SharedCache {
         let total = if active_bound {
             stores.counters.active_bound[source_slot][usize::from(delayed)] += 1;
             stores.counters.active_bound[source_slot][usize::from(delayed)]
-        } else {
+        } else if cause.is_none() {
             stores.counters.retail_full[usize::from(delayed)] += 1;
             stores.counters.recovery_full[source_slot][usize::from(delayed)] += 1;
             stores.counters.recovery_full[source_slot][usize::from(delayed)]
+        } else {
+            0
         };
         let eviction_total = stores.counters.pace_evicted[source_slot];
         drop(stores);
@@ -1384,13 +1393,12 @@ impl SharedCache {
         if metadata.len() <= accepted_end {
             return false;
         }
-        let allowed = self.paced_admission(
+        let allowed = self.paced_with_cause(
             source,
             key,
             now,
-            false,
-            near_source_cap(source, metadata.len()),
-            true,
+            (false, near_source_cap(source, metadata.len()), true),
+            cause,
         );
         if let Some(mut stores) = self.durable() {
             if allowed {
@@ -1409,9 +1417,9 @@ impl SharedCache {
             } else if let Some(cause) = cause {
                 Counters::bump(
                     &mut stores.counters.ineligible,
-                    if cause == Some(4) {
+                    if cause == 4 {
                         "upgrade_state_missing.paced"
-                    } else if cause == Some(3) {
+                    } else if cause == 3 {
                         "old_binding_no_match.paced"
                     } else {
                         "stale_full.paced"
@@ -3372,8 +3380,6 @@ impl SharedCache {
             t14_rebuild: [u64; 2],
             t14_rebuild_full_started: u64,
             mode_repaired: [u64; 2],
-            retail_exhausted: [u64; 2],
-            retail_exhausted_paced: [u64; 2],
             #[serde(skip_serializing_if = "Option::is_none")]
             store_disabled: Option<&'static str>,
         }
@@ -3458,8 +3464,8 @@ impl SharedCache {
                     context: pair(10),
                     restore_semantics: pair(11),
                     revision_adoption_required: pair(12),
-                    retail_exhausted: pair(7),
-                    retail_exhausted_paced: pair(8),
+                    retail_exhausted: pair(20),
+                    retail_exhausted_paced: pair(21),
                     upgrade_state_missing: pair(5),
                     near_cap: pair(13),
                     upgrade_missing_full: pair(14),
@@ -3469,8 +3475,6 @@ impl SharedCache {
                     t14_rebuild: pair(1),
                     t14_rebuild_full_started: store.t14_rebuild_full_started,
                     mode_repaired: pair(2),
-                    retail_exhausted: pair(5),
-                    retail_exhausted_paced: pair(6),
                     store_disabled: disabled.filter(|_| last[3] == 0),
                 },
             );
