@@ -1,24 +1,21 @@
-# Archive backlog pacing and cached inventory
+# Archive backlog pacing and classification
 
-Archive work uses the existing scan queue behind plain work, newest archive
-first. Archive hints cannot request a fresh live page. Production discovery
-continues to admit only plain `.jsonl` at watcher, retained-roster and bounded
-walk entry points.
+Codex discovery recognizes exact `.jsonl.zst` paths. Other sources retain their
+plain `.jsonl` filters. Physical paths remain index and acknowledgement keys;
+logical locator comparisons strip only the archive suffix.
 
-The existing index carries RAM-only CPU and contention state from an ordinary
-page through its continuations and partial commits. The next ordinary pass
-resets that scheduling state. Same-cycle continuation inputs carry it across
-the native adapter's disk reload; a refused step exhausts further CPU credit.
-Unknown power denies acquisition; the temporary
-platform adapter does not detect AC power. Native power/continuation integration
-remains required before discovery can admit archives.
+Selected pages order live files before archive work, then order archives newest
+first. Preparation bounds inspected roster entries before filtering. A partial
+header inventory cannot certify owner absence. RAM scheduling state carries CPU
+and accumulated work through continuation pages and partial commits; archive
+admission shares continuation's contention threshold. Unknown power denies work.
 
-Ordinary inventory uses stamp-matching cached headers without decoding unseen
-archives. The full roster is available before filtering the read queue so the
-family safety guard can register all members. Typed header deferral, family
-custody and final acquisition integration remain separate prerequisites.
+Resolved archive families are held while plain members keep their existing
+publication behavior. Moves retain old evidence; oversized catch-up is held
+before decoding. A funded first read has a 1 GiB decoded limit in addition to the
+independent decoder ceiling. Held evidence never supplies an acknowledgement.
 
-Synthetic fixtures cover pacing, continuation carry, cached headers, queue order,
-denied backlog with healthy plain work, and discovery remaining plain-only.
-Only explicit-file formatting and whitespace validation were performed here;
-compilation, tests and CI remain unexecuted.
+This development checkpoint still requires native power, owner-wide custody,
+retention, accepted-state retry and consumer integration before activation can
+ship. An unsettled attempt currently defers rather than decoding again; retained
+body resending remains unfinished. Synthetic fixtures are present but unexecuted.
