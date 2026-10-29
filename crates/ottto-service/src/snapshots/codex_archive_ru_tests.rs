@@ -209,3 +209,77 @@ fn parser_errors_without_admission_yield_or_bodyless_pending_have_no_generic_ru(
     );
     assert_eq!(body_retained.unreadable_path_count, 0);
 }
+
+#[test]
+fn scoped_header_and_constructor_failures_survive_witness_without_terminal_archive_marker() {
+    for cause in [
+        CodexZstCause::HeaderInvalid,
+        CodexZstCause::ConstructorUnfunded,
+    ] {
+        let f = ArchiveFixture::new(b"witness-boundary-only");
+        let key = local_index_key(&f.0);
+        let mut index = ScanIndex::default();
+        if cause == CodexZstCause::HeaderInvalid {
+            // Inventory's failed first-line state; no Held/Refused marker exists.
+            let mut evidence =
+                ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, None).unwrap();
+            evidence.disposition = ArchiveDisposition::HeaderValidated;
+            evidence.header_attempted = true;
+            evidence.decode_attempts = 0;
+            assert!(evidence.terminal_cause().is_none());
+            index.files.entry(key.clone()).or_default().archive = Some(Box::new(evidence));
+        } else {
+            assert!(!index.files.contains_key(&key));
+        }
+        let mut scan = OwnedSourceScan::new(
+            SnapshotSource::Codex,
+            &[],
+            index,
+            NOW,
+            365,
+            10,
+            false,
+            None,
+            &[],
+            false,
+            false,
+        );
+        scan.codex_join_prepared = true;
+        scan.identified_candidates.clear();
+        archive_ru_healthy_sibling(&mut scan);
+        scan.census.observed_index_keys.insert(key.clone());
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            if cause == CodexZstCause::HeaderInvalid {
+                scan.census
+                    .archive_residue(&f.0, archive_evidence(&scan.index, &f).into(), cause);
+            } else {
+                scan.census.archive_parser_failure(
+                    SnapshotSource::Codex,
+                    &scan.index,
+                    &f.0,
+                    &anyhow::anyhow!("synthetic constructor failure"),
+                );
+            }
+        });
+        for step in 0..1000 {
+            scan = match scan.step(None) {
+                OwnedSourceScanStep::Pending(next) => next,
+                OwnedSourceScanStep::Complete {
+                    scan: result,
+                    index,
+                    ..
+                } => {
+                    assert_archive_ru_residue(&result, &rows, cause);
+                    assert!(index
+                        .scan_residue_witness
+                        .as_ref()
+                        .unwrap()
+                        .index_keys
+                        .contains(&key));
+                    break;
+                }
+            };
+            assert_ne!(step, 999, "witness census did not finish");
+        }
+    }
+}

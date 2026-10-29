@@ -3377,6 +3377,7 @@ impl SyncCounts {
             || self.zero_snapshot_usage_evidence_count > 0
             || self.dropped_usage_record_count > 0
             || self.census_residue_blocked_session_count > 0
+            || self.census_residue_index_key_count > 0
     }
 
     fn disclosed_loss(&self) -> DisclosedLoss {
@@ -24106,11 +24107,14 @@ crate::heap_layout_bound::fields!(PreparedClaudeLocalEvidence; sessions, api, ap
 #[cfg(test)]
 #[test]
 fn archive_residue_receipt_discloses_terminal_loss_without_retryable_error() {
-    let counts = SyncCounts {
-        census_complete: true,
-        census_residue_blocked_session_count: 1,
-        ..SyncCounts::default()
-    };
-    assert_eq!(counts.disclosed_loss(), DisclosedLoss::Terminal);
-    assert!(!counts.has_retryable_problems());
+    for (keys, sessions) in [(0, 1), (1, 0)] {
+        let counts = SyncCounts {
+            census_complete: true,
+            census_residue_index_key_count: keys,
+            census_residue_blocked_session_count: sessions,
+            ..SyncCounts::default()
+        };
+        assert_eq!(counts.disclosed_loss(), DisclosedLoss::Terminal);
+        assert!(!counts.has_retryable_problems());
+    }
 }

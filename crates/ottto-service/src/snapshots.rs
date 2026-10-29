@@ -44831,6 +44831,7 @@ impl ScanIndex {
                     .and_then(|e| e.archive.as_ref())
                     .is_some_and(|a| a.terminal_cause().is_some())
                     || codex_compressed_input::admission_starved_count(Some(key)) > 0
+                    || is_compressed_codex_rollout(Some(Path::new(key)), None)
             });
         let next = traversal
             .counts
