@@ -115,7 +115,10 @@ impl LineDelivery {
     pub(super) fn begin_armed(&mut self, active: &OwnedActiveFile, roots: &[std::path::PathBuf]) {
         if !std::mem::take(&mut self.armed)
             || !active.is_primary_for(active.parser.source)
-            || super::is_compressed_codex_rollout(Some(&active.candidate.path), Some(&active.parser.reader.reader))
+            || super::is_compressed_codex_rollout(
+                Some(&active.candidate.path),
+                Some(&active.parser.reader.reader),
+            )
         {
             return;
         }

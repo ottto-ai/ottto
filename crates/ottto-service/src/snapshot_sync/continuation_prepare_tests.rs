@@ -295,7 +295,7 @@ impl ContinuationFixture {
         let mut minted = self.preparation(true);
         let mut inputs = take_continuation_inputs(
             &mut minted,
-        &ScanIndex::default(),
+            &ScanIndex::default(),
             &std::sync::Arc::default(),
             std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
         );
@@ -804,7 +804,7 @@ fn a_prepared_continuation_page_keeps_the_ordinary_side_gate() {
         let mut minted = fixture.preparation(true);
         let mut inputs = take_continuation_inputs(
             &mut minted,
-        &ScanIndex::default(),
+            &ScanIndex::default(),
             &std::sync::Arc::default(),
             std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
         );
@@ -836,7 +836,12 @@ fn continuation_archive_cpu_survives_the_production_disk_reload() {
         0,
         "disk has no scheduling authority"
     );
-    let mut inputs = take_continuation_inputs(&mut minted, &index);
+    let mut inputs = take_continuation_inputs(
+        &mut minted,
+        &index,
+        &std::sync::Arc::default(),
+        std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
+    );
     let before = fixture.disk();
     let prepared = fixture.prepare(&mut inputs).unwrap();
     let restored = prepared.scan.as_ref().unwrap().native_comparison_inputs().0;

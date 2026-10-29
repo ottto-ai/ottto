@@ -299,6 +299,13 @@ impl ArchiveEvidence {
                 header_attempted: false,
                 header_bound_reached: false,
                 header_validated: None,
+                decode_attempts: 0,
+                terminal_failures: 0,
+                terminal_attempt: 0,
+                user_change: false,
+                user_context: None,
+                user_generation: 0,
+                user_change_spent: exhausted_archive_generation(),
                 disposition: ArchiveDisposition::HeaderValidated,
             },
         };
