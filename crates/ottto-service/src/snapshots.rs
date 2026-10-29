@@ -49065,7 +49065,12 @@ impl ScanIndex {
                 Some(CandidateParseReason::BodyWitnessAdoption),
             );
         }
-        if self.upload_context_fingerprint != self.active_upload_context_fingerprint {
+        // An unsettled page may preserve the previous global context too.
+        // CONTENT is scoped to the active context, so only its already-read
+        // local repair is deferred; a new activation still invalidates it.
+        if !withheld_unchanged
+            && self.upload_context_fingerprint != self.active_upload_context_fingerprint
+        {
             return (
                 CandidateDecision::Parse,
                 Some(CandidateParseReason::UploadContext),

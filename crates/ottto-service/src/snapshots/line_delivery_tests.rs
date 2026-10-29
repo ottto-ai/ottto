@@ -3229,6 +3229,9 @@ fn withheld_equal_fingerprint_recovers_for_reason(failure: &str, reason: Candida
     match reason {
         CandidateParseReason::UploadContext => {
             previous.upload_context_fingerprint = Some("retry-context".into());
+            // A real previously unsettled page prevents the finalizer from
+            // adopting the active global context before account settlement.
+            previous.bounded_sweep_had_unsettled_upload = true;
         }
         CandidateParseReason::BodyWitnessAdoption => {}
         CandidateParseReason::ActivityOrQuarantineRetry => {
@@ -3260,6 +3263,12 @@ fn withheld_equal_fingerprint_recovers_for_reason(failure: &str, reason: Candida
     let mut held = crate::snapshot_sync::settle_withheld_for_test(&previous, parsed, scan);
     assert_eq!(held.files[&key].source_file_fingerprint, fingerprint);
     assert!(held.claude_account_deferred_holds.contains_key(&key));
+    if reason == CandidateParseReason::UploadContext {
+        assert_ne!(
+            held.upload_context_fingerprint, held.active_upload_context_fingerprint,
+            "real Completed preserves the unsettled context debt"
+        );
+    }
     let checkpoint = root.0.join("equal-held.json");
     let reload = |index: &mut ScanIndex| {
         index.save(&checkpoint).unwrap();
