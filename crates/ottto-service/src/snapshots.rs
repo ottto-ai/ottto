@@ -33081,19 +33081,19 @@ fn append_codex_state_only_snapshots(
     });
     let protected_owners = protected
         .iter()
-        .filter_map(|entry| entry.codex_protected_owner.as_ref())
+        .filter_map(|entry| entry.codex_protected_owner.as_deref())
         .chain(
             index
                 .files
                 .iter()
                 .filter(|(key, entry)| codex_index_file_body_accepted(index, key, entry))
-                .filter_map(|(_, entry)| entry.codex_counting_owner.as_ref()),
+                .filter_map(|(_, entry)| entry.codex_counting_owner.as_deref()),
         )
         .collect::<BTreeSet<_>>();
     for (source_session_id, thread) in &metadata.state_threads {
         if thread.tokens_used == 0
             || unknown_protected_owner
-            || protected_owners.contains(&codex_protected_owner(source_session_id))
+            || protected_owners.contains(codex_protected_owner(source_session_id).as_str())
             || covered_session_ids.contains(source_session_id)
             || covered_in_prior_runs.contains(source_session_id)
             || blocked_session_ids.contains(source_session_id)
@@ -59830,7 +59830,7 @@ mod tests {
         );
         assert_eq!(
             index.files[&local_index_key(&path)].codex_counting_owner,
-            Some(codex_protected_owner(owner))
+            Some(codex_protected_owner(owner).into_boxed_str())
         );
         fs::remove_dir_all(dir).unwrap();
         (metadata, index, native)
@@ -59935,7 +59935,7 @@ mod tests {
                     .values_mut()
                     .next()
                     .unwrap()
-                    .codex_counting_owner = binding;
+                    .codex_counting_owner = binding.map(String::into_boxed_str);
                 let mut replacements = Vec::new();
                 let ((count, _), rows) = crate::local_resource_diagnostics::capture(|| {
                     append_codex_state_only_snapshots(
