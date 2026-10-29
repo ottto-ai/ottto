@@ -60558,6 +60558,7 @@ mod tests {
                         &mut index,
                         &BTreeSet::new(),
                     )
+                    .expect("state-only exclusion fits this fixture")
                 });
                 assert_eq!(count, 0);
                 assert!(replacements.is_empty());
@@ -60642,6 +60643,7 @@ mod tests {
                         &mut index,
                         &BTreeSet::new(),
                     )
+                    .expect("state-only exclusion fits this fixture")
                 });
                 assert_eq!(count, usize::from(!accepted));
                 assert_eq!(replacements.len(), usize::from(!accepted));
