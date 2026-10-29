@@ -712,6 +712,7 @@ type ApiReadHook = Box<dyn FnOnce(&Path)>;
 #[cfg(test)]
 thread_local! {
     // Actual API file opens and consumed bytes, isolated from parallel tests.
+    static API_REMOVE_BEFORE_OPEN: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
     static API_BEFORE_OPEN: std::cell::RefCell<Option<ApiReadHook>> = const { std::cell::RefCell::new(None) };
     static API_AFTER_READ: std::cell::RefCell<Option<ApiReadHook>> = const { std::cell::RefCell::new(None) };
     static TRACE_DURING_READ: std::cell::RefCell<Option<ApiReadHook>> = const { std::cell::RefCell::new(None) };
@@ -1175,6 +1176,13 @@ fn decode_api_sidecar(
     API_BEFORE_OPEN.with(|hook| {
         if let Some(hook) = hook.borrow_mut().take() {
             hook(&path);
+        }
+    });
+    #[cfg(test)]
+    API_REMOVE_BEFORE_OPEN.with(|slot| {
+        if slot.borrow().as_ref() == Some(&path) {
+            slot.borrow_mut().take();
+            fs::remove_file(&path).unwrap(); // actual stat/open race, scoped to this fixture path
         }
     });
     let mut options = OpenOptions::new();
@@ -1991,6 +1999,7 @@ pub(crate) struct TerminalGrowthHook;
 impl Drop for TerminalGrowthHook {
     fn drop(&mut self) {
         API_BEFORE_OPEN.with(|slot| slot.borrow_mut().take());
+        API_REMOVE_BEFORE_OPEN.with(|slot| slot.borrow_mut().take());
         TRACE_DURING_READ.with(|slot| slot.borrow_mut().take());
     }
 }
@@ -4080,4 +4089,30 @@ impl crate::heap_layout_bound::HeapLayoutBound for ClaudeIdentityAttributeOrigin
             }
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn terminal_off_page_open_failure_for_test(path: PathBuf) -> TerminalGrowthHook {
+    API_REMOVE_BEFORE_OPEN.with(|slot| *slot.borrow_mut() = Some(path));
+    TerminalGrowthHook
+}
+
+#[cfg(test)]
+pub(crate) struct UnknownApiGenerationForTest(bool);
+#[cfg(test)]
+impl Drop for UnknownApiGenerationForTest {
+    fn drop(&mut self) {
+        API_READ_RECEIPT.with(|slot| {
+            let (opens, bytes, _) = slot.get();
+            slot.set((opens, bytes, self.0));
+        });
+    }
+}
+#[cfg(test)]
+pub(crate) fn unknown_api_generation_for_test() -> UnknownApiGenerationForTest {
+    API_READ_RECEIPT.with(|slot| {
+        let (opens, bytes, old) = slot.get();
+        slot.set((opens, bytes, true));
+        UnknownApiGenerationForTest(old)
+    })
 }

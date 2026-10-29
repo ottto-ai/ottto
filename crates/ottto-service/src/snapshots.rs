@@ -4885,6 +4885,9 @@ struct ClaudeUsageAuthorityQuarantineRecord {
 include!("snapshots/authority_proof_correction.rs");
 include!("snapshots/load_containment.rs");
 include!("snapshots/terminal_containment.rs");
+include!("snapshots/parked_rewalk.rs");
+#[cfg(test)]
+pub(crate) use claude_history_upgrade::with_staged_births_for_test;
 #[cfg(test)]
 mod compact_index_tests;
 mod lenient_decode;
@@ -26177,6 +26180,14 @@ impl OwnedSourceScan {
         claude_request_identity_capture: bool,
         recovery_priority: &[PathBuf],
     ) -> Self {
+        #[cfg(test)]
+        let file_limit = if source == SnapshotSource::ClaudeCode {
+            PARKED_PAGE_LIMIT
+                .with(|value| value.get())
+                .map_or(file_limit, |limit| file_limit.min(limit))
+        } else {
+            file_limit
+        };
         let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(
             source == SnapshotSource::ClaudeCode,
         );
@@ -26254,12 +26265,20 @@ impl OwnedSourceScan {
             refresh_retained_codex_roster(source, traversal, backfill_window_days, &index.files);
             next_generation_hints =
                 enqueue_watcher_hints(source, traversal, hinted_paths, watcher_overflowed);
-            advance_bounded_directory_traversal(
-                source,
-                traversal,
-                backfill_window_days,
-                &index.files,
-            );
+            // A retained Claude terminal recovers missed paths by metadata
+            // only, inside this traversal. Never enter the start/re-arm path.
+            if source == SnapshotSource::ClaudeCode && progress == TraversalProgress::Resumed {
+                recover_parked_claude_metadata(index, watcher_overflowed);
+            }
+            let traversal = index.traversal.as_mut().expect("traversal initialized");
+            if !parked_rewalk_active(traversal) {
+                advance_bounded_directory_traversal(
+                    source,
+                    traversal,
+                    backfill_window_days,
+                    &index.files,
+                );
+            }
             release_codex_inventory_hold(source, traversal);
         }
         if source == SnapshotSource::Codex {
@@ -30432,6 +30451,11 @@ impl OwnedSourceScan {
                     && index.claude_stale_family_carry.replay.is_empty();
                 if terminal_candidate {
                     index.preflight_claude_terminal_fold(claude_effort_support_dir_ref, &snapshots);
+                    if index.claude_terminal_fold_deferred().is_some() {
+                        index.requeue_claude_removals(
+                            census.removed_index_keys.iter().map(String::as_str),
+                        );
+                    }
                 }
                 let terminal_admitted = index.claude_terminal_fold_deferred().is_none();
                 // Persist only ordinary traversal progress until the terminal
@@ -41010,7 +41034,8 @@ fn ensure_bounded_traversal(
             window.process != claude_full_rearm_process()
                 || window.context_fingerprint != context_fingerprint
         });
-    // An exhausted red non-window carry needs no mid-walk position repair.
+    // An exhausted non-window carry (including a healthy parked terminal or
+    // its metadata-only re-walk) needs no mid-walk position repair.
     // After a same-context restart, discard its process-local decision but
     // keep the committed fingerprints and durable retry checkpoint. The next
     // due start recomputes every family's eligibility from durable evidence.
@@ -41028,9 +41053,9 @@ fn ensure_bounded_traversal(
         })
         && index.traversal.as_ref().is_some_and(|traversal| {
             traversal.context_fingerprint == context_fingerprint
-                && traversal.pending_directories.is_empty()
-                && traversal.pending_candidates.is_empty()
-                && (traversal.counts.has_errors() || prior_admission.is_some())
+                && ((traversal.pending_directories.is_empty()
+                    && traversal.pending_candidates.is_empty())
+                    || parked_rewalk_active(traversal))
         });
     if source == SnapshotSource::ClaudeCode
         && (window_origin_invalid || (!carry.is_empty() && !carry_origin_valid))
@@ -42497,6 +42522,13 @@ fn missing_index_reconciliation_plan(index: &ScanIndex, limit: usize) -> (Vec<St
     let Some(snapshot) = index.traversal.as_ref() else {
         return (Vec::new(), false);
     };
+    if snapshot
+        .reconciliation_after
+        .as_deref()
+        .is_some_and(|after| after.starts_with(PARKED_REWALK_CURSOR))
+    {
+        return (Vec::new(), false);
+    }
     let Some(upper_bound) = snapshot.reconciliation_upper_bound.clone() else {
         return (Vec::new(), true);
     };
@@ -42904,6 +42936,10 @@ fn open_and_identify_scan_candidate_with_rescue(
     verification_rescue: bool,
     cache: Option<&sampled_scan::SharedCache>,
 ) -> Option<(CandidateFile, File)> {
+    #[cfg(test)]
+    if source == SnapshotSource::ClaudeCode {
+        PARKED_NATIVE_OPENS.with(|value| value.borrow_mut().push(candidate.path.clone()));
+    }
     let (mut opened_file, live) =
         match open_candidate_file_stat_retained(source, &mut candidate, cache) {
             Ok(opened) => opened,
@@ -47832,7 +47868,7 @@ impl ScanIndex {
         let placeholders =
             self.claude_terminal_member_placeholder_keys(previous, &held_keys, reparse_held);
         let mut result = self.clone();
-        result.retain_deferred_local_hold_retries(&held_keys);
+        result.retain_claude_local_hold_retries(&held_keys);
         result
             .claude_money_birth_store
             .preserve_missing_from(&previous.claude_money_birth_store);
@@ -47960,7 +47996,7 @@ impl ScanIndex {
         let held_keys = self.locally_held_keys(held);
         // A completed transport can still revert nonblocking local holds.
         // A parked terminal must retain their ordinary retry demand too.
-        self.retain_deferred_local_hold_retries(&held_keys);
+        self.retain_claude_local_hold_retries(&held_keys);
         self.note_claude_history_not_accepted(previous, &held_keys);
         let placeholders =
             self.claude_terminal_member_placeholder_keys(previous, &held_keys, reparse_held);
@@ -48497,7 +48533,7 @@ impl ScanIndex {
                 retained.carry_sampled_audit(working);
             }
         }
-        self.retain_deferred_page_retries(previous, &safe_keys, &mut result);
+        self.retain_claude_page_retries(previous, &safe_keys, &mut result);
         result.restore_claude_empty_map_advances(empty_advances);
         result.retain_quarantined_fingerprints(&retained_quarantine);
         result.reconcile_codex_recovery_settlement(previous, accepted);

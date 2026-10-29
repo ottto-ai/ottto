@@ -208,6 +208,7 @@ fn terminal_reader_growth_refuses_before_any_staged_completion_effect() {
 }
 
 #[test]
+#[serial_test::serial]
 fn terminal_containment_adds_no_persisted_fields() {
     let mut index = ScanIndex::default();
     index.preflight_claude_terminal_fold(None, &[]);

@@ -1839,3 +1839,8 @@ fn read_allowance_growth_demotes_terminal_and_uploads_and_settles_current_page()
             <= crate::snapshots::CLAUDE_TERMINAL_MAX_INPUT_BYTES);
     }
 }
+
+mod round7_parking_tests {
+    use super::*;
+    include!("round7_parking_tests.rs");
+}

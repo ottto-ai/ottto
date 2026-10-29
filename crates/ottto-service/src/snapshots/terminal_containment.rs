@@ -101,7 +101,9 @@ impl ScanIndex {
         });
         self.claude_full_rearm_progress.terminal_fold_deferred = deferred;
         if let Some(counts) = deferred {
-            self.claude_full_rearm_progress.terminal_effects = None;
+            if let Some(effects) = self.claude_full_rearm_progress.terminal_effects.take() {
+                self.requeue_claude_removals(effects.removals.iter().map(|(key, _)| key.as_str()));
+            }
             self.claude_full_rearm_progress.complete_rebuild_read = None;
             crate::local_resource_diagnostics::traversal_point(
                 "terminal_fold_deferred",
@@ -176,7 +178,9 @@ impl ScanIndex {
             sidecar_bytes: u64::MAX,
             stat_skipped: false,
         };
-        self.claude_full_rearm_progress.terminal_effects = None;
+        if let Some(effects) = self.claude_full_rearm_progress.terminal_effects.take() {
+            self.requeue_claude_removals(effects.removals.iter().map(|(key, _)| key.as_str()));
+        }
         self.claude_full_rearm_progress.complete_rebuild_read = None;
         self.claude_full_rearm_progress.terminal_fold_deferred = Some(counts);
         crate::local_resource_diagnostics::traversal_point("terminal_fold_deferred", "claude_code", &counts);
@@ -191,10 +195,49 @@ impl ScanIndex {
         scan: &mut SourceScanResult,
         comparison_active: bool,
     ) -> Option<Box<claude_native_comparison::TerminalTraversal>> {
-        let effects = self.claude_full_rearm_progress.terminal_effects.take()?;
+        let mut effects = self.claude_full_rearm_progress.terminal_effects.take()?;
+        // Revalidate even previously observed files: a parked generation may
+        // outlive a deletion or a lost watcher event. This metadata page uses
+        // the existing bounded reconciliation cursor and grants no fold proof.
+        let (presence_keys, _) = missing_index_reconciliation_plan(self, MAX_BACKFILL_FILES_PER_SOURCE);
+        for key in presence_keys {
+            match fs::symlink_metadata(&key) {
+                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {},
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if claude_absence_is_removal(SnapshotSource::ClaudeCode, Path::new(&key)).is_removal(Path::new(&key)) {
+                        effects.removals.push((key, true));
+                    } else if self.traversal.as_ref().is_some_and(|walk| walk.observed_index_keys.contains(&key)) {
+                        self.requeue_claude_removals(effects.removals.iter().map(|(key, _)| key.as_str()));
+                        self.requeue_claude_removals(std::iter::once(key.as_str()));
+                        scan.census_complete = false;
+                        scan.scan_cap_hit = true;
+                        return None;
+                    }
+                }
+                _ => {
+                    self.requeue_claude_removals(effects.removals.iter().map(|(key, _)| key.as_str()));
+                    self.requeue_claude_removals(std::iter::once(key.as_str()));
+                    scan.census_complete = false;
+                    scan.scan_cap_hit = true;
+                    return None;
+                }
+            }
+        }
+        effects.removals.sort_by(|left, right| left.0.cmp(&right.0));
+        effects.removals.dedup_by(|left, right| left.0 == right.0);
         // A caller may have lowered the provisional effective flag after scan
         // (for example a capacity/settlement gate). Raw commit cannot undo it.
         let completion_veto = effects.effective_complete && !scan.census_complete;
+        let unconfirmed = effects.removals.iter().filter(|(key, _)| {
+            !fs::symlink_metadata(key).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                || !claude_absence_is_removal(SnapshotSource::ClaudeCode, Path::new(key)).is_removal(Path::new(key))
+        }).map(|(key, _)| key.as_str()).collect::<Vec<_>>();
+        if !unconfirmed.is_empty() {
+            self.requeue_claude_removals(effects.removals.iter().map(|(key, _)| key.as_str()));
+            scan.census_complete = false;
+            scan.scan_cap_hit = true;
+            return None;
+        }
         for (key, vanished) in &effects.removals {
             if let Some(traversal) = self.traversal.as_mut() {
                 traversal.observed_index_keys.remove(key);
@@ -268,8 +311,8 @@ impl ScanIndex {
 }
 
 impl ScanIndex {
-    fn retain_deferred_page_retries(&self, previous: &ScanIndex, safe_keys: &BTreeSet<String>, selected: &mut ScanIndex) {
-        if self.claude_terminal_fold_deferred().is_none() { return; }
+    fn retain_claude_page_retries(&self, previous: &ScanIndex, safe_keys: &BTreeSet<String>, selected: &mut ScanIndex) {
+        if self.claude_request_identity_contract.is_none() && !self.claude_terminal_fold_checked() { return; }
         let Some(traversal) = selected.traversal.as_mut() else { return; };
         for (key, working) in &self.files {
             if safe_keys.contains(key) || self.decode_holds_file(key) { continue; }
@@ -299,9 +342,16 @@ fn enqueue_parked_claude_retry(traversal: &mut ScanTraversalCheckpoint, key: &st
 }
 
 impl ScanIndex {
-    fn retain_deferred_local_hold_retries(&mut self, held_keys: &BTreeSet<String>) {
-        if self.claude_terminal_fold_deferred().is_none() { return; }
+    fn retain_claude_local_hold_retries(&mut self, held_keys: &BTreeSet<String>) {
+        if self.claude_request_identity_contract.is_none() && !self.claude_terminal_fold_checked() { return; }
         let Some(traversal) = self.traversal.as_mut() else { return; };
         for key in held_keys { enqueue_parked_claude_retry(traversal, key); }
+    }
+}
+
+impl ScanIndex {
+    fn requeue_claude_removals<'a>(&mut self, keys: impl Iterator<Item = &'a str>) {
+        let Some(traversal) = self.traversal.as_mut() else { return; };
+        for key in keys { enqueue_parked_claude_retry(traversal, key); }
     }
 }
