@@ -31215,8 +31215,9 @@ impl OwnedSourceScan {
             #[cfg(unix)]
             if side_plan.is_none() {
                 if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
+                    let key = local_index_key(&candidate.path);
                     if let Some(reason) =
-                        cache.durable_hold(source, &local_index_key(&candidate.path))
+                        cache.durable_hold(source, &key, index.files.contains_key(&key))
                     {
                         cache.durable_hold_exit(source, reason, index, &candidate, &mut census);
                         pending!();

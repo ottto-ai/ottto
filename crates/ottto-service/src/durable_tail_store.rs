@@ -683,6 +683,12 @@ impl DurableTailStore {
 
     /// U holds. T14 permits one rebuild; the adapter checks RAM before holding.
     pub(crate) fn hold(&mut self, key: &Digest32) -> Option<Refusal> {
+        self.hold_with_carrier(key, true)
+    }
+
+    /// The common acquisition guard supplies current index membership. A
+    /// debt-bearing record without its carrier is U; no record remains a miss.
+    pub(crate) fn hold_with_carrier(&mut self, key: &Digest32, has_index: bool) -> Option<Refusal> {
         let result = self.classify(key, "guard");
         self.pass[0] += u64::from(!matches!(result, Ok(None)));
         match result {
@@ -699,6 +705,10 @@ impl DurableTailStore {
                 None
             }
             Err(Refusal::Corrupt) if self.rebuilt[key] == Rebuild::Authorized => None,
+            Ok(Some(header)) if !has_index && header.audit_debt.is_some() => {
+                self.counters.format_hold[Refusal::Unbindable as usize] += 1;
+                Some(Refusal::Unbindable)
+            }
             Ok(_) => None,
             Err(reason) => Some(reason),
         }

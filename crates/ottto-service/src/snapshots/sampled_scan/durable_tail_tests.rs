@@ -1181,7 +1181,7 @@ fn foreign_owned_store_alarms_once_and_holds_nothing() {
     let cache = SharedCache::default();
     cache.durable_begin_pass(source, &index_path, &namespace, false);
     assert!(
-        cache.durable_hold(source, key).is_some(),
+        cache.durable_hold(source, key, true).is_some(),
         "control: U holds"
     );
     let _own = OwnUid;
@@ -1191,7 +1191,7 @@ fn foreign_owned_store_alarms_once_and_holds_nothing() {
     let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
         for _ in 0..2 {
             fresh.durable_begin_pass(source, &index_path, &namespace, false);
-            assert_eq!(fresh.durable_hold(source, key), None);
+            assert_eq!(fresh.durable_hold(source, key, true), None);
             fresh.durable_alarm(source);
         }
     });
@@ -1337,7 +1337,7 @@ fn store_io_failures_emit_cold_production_body_without_holds() {
             let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
                 crate::snapshots::durable_after_save(&cache, &root, source, &index);
                 cache.durable_begin_pass(source, &index_path, &namespace, false);
-                assert_eq!(cache.durable_hold(source, &key), None);
+                assert_eq!(cache.durable_hold(source, &key, true), None);
                 cache.durable_alarm(source);
             });
             assert_eq!(alarms.len(), 1);
@@ -1434,7 +1434,7 @@ fn t14_without_retention_or_encodable_reduction_holds_on_later_passes() {
         std::fs::write(&record, &before).unwrap();
         let cache = SharedCache::default();
         cache.durable_begin_pass(source, &index_path, &namespace, false);
-        assert_eq!(cache.durable_hold(source, &key), None);
+        assert_eq!(cache.durable_hold(source, &key, true), None);
         assert_eq!(cache.durable_full_hold(source, &key, true), None);
         let admitted = cache.insert_admitted(
             key.clone(),
@@ -1467,7 +1467,7 @@ fn t14_without_retention_or_encodable_reduction_holds_on_later_passes() {
         for n in 1..=3 {
             cache.durable_begin_pass(source, &index_path, &namespace, false);
             assert_eq!(
-                cache.durable_hold(source, &key),
+                cache.durable_hold(source, &key, true),
                 (arm == "retention").then_some(store::Refusal::Corrupt)
             );
             let (counts, stats) = cache.durable_counters(source).unwrap();
@@ -1670,7 +1670,7 @@ fn known_corrupt_replacement_case(fail_replacement: bool) {
     assert_eq!(rebuilt.unreadable_path_count, 0);
     assert!(cache.retained().unwrap().peek(&key).is_some());
     assert_eq!(
-        cache.durable_hold(source, &key),
+        cache.durable_hold(source, &key, true),
         None,
         "fresh RAM in the SAME pass wins"
     );
@@ -1697,7 +1697,7 @@ fn known_corrupt_replacement_case(fail_replacement: bool) {
         assert!(matches!(disk.read(&digest), store::ReadOutcome::Found(_)));
         cache.retained().unwrap().remove(&key);
         assert_eq!(
-            cache.durable_hold(source, &key),
+            cache.durable_hold(source, &key, true),
             None,
             "repaired record never holds"
         );

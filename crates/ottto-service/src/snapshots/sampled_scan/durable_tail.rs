@@ -536,8 +536,9 @@ impl SharedCache {
         &self,
         snapshot_source: SnapshotSource,
         key: &str,
+        has_index: bool,
     ) -> Option<store::Refusal> {
-        self.durable_guard(snapshot_source, key, false)
+        self.durable_guard(snapshot_source, key, false, has_index)
     }
 
     fn durable_guard(
@@ -545,6 +546,7 @@ impl SharedCache {
         snapshot_source: SnapshotSource,
         key: &str,
         restore_recheck: bool,
+        has_index: bool,
     ) -> Option<store::Refusal> {
         let ram = !restore_recheck && self.retained().is_ok_and(|ram| ram.peek(key).is_some());
         let source = durable_source(snapshot_source)?;
@@ -553,7 +555,7 @@ impl SharedCache {
             .slot(source)
             .as_mut()?
             .store
-            .hold(&store::key_digest(source, key));
+            .hold_with_carrier(&store::key_digest(source, key), has_index);
         if held == Some(store::Refusal::Corrupt) && ram {
             Counters::bump(
                 &mut self.durable()?.counters.not_persisted,
@@ -646,7 +648,7 @@ impl SharedCache {
                 RestoreOutcome::Held(store::Refusal::Unbindable)
             }
             Err(class) => self
-                .durable_guard(snapshot_source, key, true)
+                .durable_guard(snapshot_source, key, true, index.files.contains_key(key))
                 .map_or(RestoreOutcome::Miss(class), RestoreOutcome::Held),
         }
     }

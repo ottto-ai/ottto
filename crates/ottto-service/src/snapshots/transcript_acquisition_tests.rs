@@ -3986,3 +3986,115 @@ fn completed_full_audit_before_durable_replacement_recovers_after_restart() {
         );
     }
 }
+
+/// Portable production path: missing index membership disables sampling, so
+/// the common guard must hold before that admission gate, not only in restore.
+#[cfg(unix)]
+#[test]
+fn missing_index_debt_carrier_holds_in_the_production_scanner_for_both_sources() {
+    use crate::durable_tail_store as store;
+    use crate::transcript_acquisition::ReadPlan;
+    use std::io::Read;
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let fixture = ScanFixture::new(source);
+        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+        let namespace = Scope("missing-carrier-common-guard".into());
+        let index_path = fixture.dir.join("index.json");
+        let lock = crate::locked_state_dir::test_locks::hold(&fixture.dir);
+        let key = local_index_key(&fixture.file.0);
+        let ds = sampled_scan::durable_tail::durable_source(source).unwrap();
+        let record_key = store::key_digest(ds, &key);
+        let now = unix_seconds(SystemTime::now()).unwrap();
+        let mut file = File::open(&fixture.file.0).unwrap();
+        let mut plan = ReadPlan::prepare(&mut file, None, &namespace, None, now).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        plan.observe_complete_records(&bytes).unwrap();
+        let checkpoint = plan
+            .commit_after_native_completion(&file, &namespace, now)
+            .unwrap();
+        let mut certificate = checkpoint.durable_certificate(0).unwrap();
+        certificate.audit_debt_unix_seconds = Some(now + 60);
+        let mut disk = store::DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+        let pending = store::PendingRecord {
+            binding: store::Binding {
+                source: ds,
+                key: record_key,
+                context: store::context_digest(&namespace.0, None),
+                scope: [0; 32],
+                entry: [0; 32],
+            },
+            certificate,
+            body: durable_store_fixture_body(source, 0, 0),
+            allowlist: sampled_jsonl::durable::allowlist_digest(source),
+        };
+        assert_eq!(
+            disk.write_after_save(lock, 1, vec![pending])
+                .unwrap()
+                .written,
+            1
+        );
+        let record_path = fs::read_dir(store::store_dir_for_index(&index_path))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let original = fs::read(&record_path).unwrap();
+        assert!(
+            matches!(disk.read(&record_key), store::ReadOutcome::Found(r) if r.envelope_audit_debt.is_some())
+        );
+        drop(disk);
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        cache.durable_begin_pass(
+            source,
+            &index_path,
+            &namespace,
+            source == SnapshotSource::ClaudeCode,
+        );
+        let (index, scan, modes) = production_scan(
+            &fixture,
+            source,
+            ScanIndex::default(),
+            Some(cache.clone()),
+            &namespace.0,
+        );
+        assert_eq!(modes, (0, 0, 0));
+        assert!(
+            !index.files.contains_key(&key),
+            "hold never recreates index membership"
+        );
+        assert!(scan.snapshots.is_empty());
+        assert!(!scan.census_complete);
+        let (counts, store) = cache.durable_counters(source).unwrap();
+        assert_eq!(counts.durable_held[store::Refusal::Unbindable as usize], 1);
+        assert_eq!(
+            counts.restore_attempts, 0,
+            "production admission never reaches restore"
+        );
+        assert!(store.format_hold[store::Refusal::Unbindable as usize] > 0);
+        assert_eq!(fs::read(&record_path).unwrap(), original);
+        // Discriminating no-record control: same real scanner now publishes.
+        fs::remove_file(&record_path).unwrap();
+        let control = Arc::new(sampled_scan::SharedCache::default());
+        control.durable_begin_pass(
+            source,
+            &index_path,
+            &namespace,
+            source == SnapshotSource::ClaudeCode,
+        );
+        let (index, scan, _) = production_scan(
+            &fixture,
+            source,
+            ScanIndex::default(),
+            Some(control.clone()),
+            &namespace.0,
+        );
+        assert!(index.files.contains_key(&key));
+        assert!(!scan.snapshots.is_empty());
+        assert_eq!(
+            control.durable_counters(source).unwrap().0.durable_held,
+            [0; 5]
+        );
+    }
+}

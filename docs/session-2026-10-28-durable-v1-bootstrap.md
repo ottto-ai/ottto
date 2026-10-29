@@ -9,8 +9,9 @@ bytes are checked and dropped on decode without changing their wire offsets.
 The v1 writer takes that field from the current committed index obligation,
 so a decoded checkpoint cannot erase debt needed by downgrade readers. Invalid
 debt tags or inconsistent flag/deadline pairs are preserved as Unbindable holds.
-A debt-bearing record with an absent index entry is held before transcript
-reads. An existing entry with a reset/postponed carrier re-arms an immediate
+A debt-bearing record with an absent index entry is held by the common
+pre-acquisition guard, before sampling admission can skip restore. This uses
+the existing classified header and performs no additional read. An existing entry with a reset/postponed carrier re-arms an immediate
 index audit, recovering the normal completed-audit/index-saved/record-old crash
 window through Full(AuditDue). The envelope never restores checkpoint debt;
 the index remains deadline authority and later offers cannot postpone it.

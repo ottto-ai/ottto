@@ -181,11 +181,14 @@ and the v1 writer takes compatibility debt from the current committed index at
 write time, including after a restore dropped the envelope field. Unknown debt
 tags, absent-with-nonzero deadlines and present-with-zero deadlines are
 `unbindable` holds, preserved byte for byte. A debt-bearing record whose index
-entry is absent is held before certificate/re-derivation reads, without
-inventing index membership. An existing entry with reset/postponed debt instead
+entry is absent is held by the common acquisition guard before sampling
+admission, including when sampling is disabled, without inventing membership.
+That guard uses the already classified store header, adds no read, and counts
+`format_hold.unbindable`; the normal held exit counts `durable_held.unbindable`.
+A direct restore refusal also counts `ineligible.audit_carrier`. An existing entry with reset/postponed debt instead
 re-arms an immediate index audit and plans Full(`audit_due`); this also recovers
 an index-new/record-old crash after a successful audit. `ineligible.audit_carrier`
-counts both restore refusals; only the missing-entry held exit increments the
+counts direct restore refusals; only the missing-entry held exit increments the
 `durable_held` unbindable slot and held-key alarm. Re-arming changes no accepted
 body, witness or ACK, and completion alone can clear the obligation. No record
 means no carrier hold.
