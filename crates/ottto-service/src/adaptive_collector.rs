@@ -81,17 +81,6 @@ struct ContinuationRequest {
     work: Duration,
 }
 
-/// The part of a source's cadence that an ordinary scan moves: the tier, the
-/// last scan and activity, the failure count and the full-sweep marker.
-#[derive(Debug, Clone)]
-pub struct OrdinaryClock {
-    state: LocalCollectorState,
-    last_activity_at: Option<Instant>,
-    last_scan_at: Option<Instant>,
-    last_full_sweep_at: Option<Instant>,
-    consecutive_failures: usize,
-}
-
 #[derive(Debug, Clone)]
 pub struct SourceCadence {
     config: CadenceConfig,
@@ -239,30 +228,6 @@ impl SourceCadence {
     pub fn request_continuation(&mut self, finished_at: Instant, work: Duration) -> bool {
         self.continuation = (!self.disabled).then_some(ContinuationRequest { finished_at, work });
         self.continuation.is_some()
-    }
-
-    /// The ordinary eligibility clock, to be put back with
-    /// [`SourceCadence::restore_ordinary_clock`] after work that must not count
-    /// as an ordinary scan (a continuation job's EOF completion upload).
-    pub fn ordinary_clock(&self) -> OrdinaryClock {
-        OrdinaryClock {
-            state: self.state.clone(),
-            last_activity_at: self.last_activity_at,
-            last_scan_at: self.last_scan_at,
-            last_full_sweep_at: self.last_full_sweep_at,
-            consecutive_failures: self.consecutive_failures,
-        }
-    }
-
-    /// Put back exactly what [`SourceCadence::ordinary_clock`] saved. The
-    /// directive, the disabled flag and any continuation request are not part
-    /// of the clock and are left as they are.
-    pub fn restore_ordinary_clock(&mut self, clock: OrdinaryClock) {
-        self.state = clock.state;
-        self.last_activity_at = clock.last_activity_at;
-        self.last_scan_at = clock.last_scan_at;
-        self.last_full_sweep_at = clock.last_full_sweep_at;
-        self.consecutive_failures = clock.consecutive_failures;
     }
 
     pub fn clear_continuation(&mut self) {
@@ -638,44 +603,6 @@ mod tests {
         assert!(!disabled.request_continuation(start, Duration::from_secs(1)));
         assert_eq!(disabled.continuation_work(), None);
         assert_eq!(disabled.continuation_due(PACING), None);
-    }
-
-    #[test]
-    fn a_restored_ordinary_clock_undoes_a_completion_upload() {
-        let start = Instant::now();
-        let floor = Duration::from_secs(5 * 60);
-        let mut idle = SourceCadence::new(CadenceConfig::cost_first(floor));
-        idle.record_scan_success(start, 0);
-        let mut hot = hot_scanned_at(start);
-        hot.set_server_min_interval(Some(Duration::from_secs(900)));
-        for ordinary in [idle, hot] {
-            // What the unchanged completion upload records: a success that
-            // re-stamps the sweep, or a retryable deferral.
-            for failed in [false, true] {
-                let mut eof = ordinary.clone();
-                assert!(eof.request_continuation(start, Duration::from_secs(3)));
-                let clock = eof.ordinary_clock();
-                let upload = start + Duration::from_secs(500);
-                if failed {
-                    eof.record_scan_failure(upload);
-                } else {
-                    eof.record_scan_success(upload, 0);
-                    eof.record_full_sweep(upload);
-                }
-                eof.restore_ordinary_clock(clock);
-                assert_eq!(eof.state(), ordinary.state());
-                for offset in [0u64, 299, 300, 600, 1100, 1800, 7200, 6 * 3600] {
-                    let now = start + Duration::from_secs(offset);
-                    assert_eq!(
-                        eof.next_scan_after(now),
-                        ordinary.next_scan_after(now),
-                        "failed={failed}: the ordinary cadence is where it was"
-                    );
-                }
-                assert_eq!(eof.ordinary_interval(), ordinary.ordinary_interval());
-                assert!(eof.continuation_work().is_some(), "not part of the clock");
-            }
-        }
     }
 
     #[test]

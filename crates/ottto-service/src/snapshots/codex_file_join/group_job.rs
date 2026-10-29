@@ -661,6 +661,7 @@ impl GroupBoot {
         parser.accumulator.codex_tier_replay = Some(replay);
         let index = inputs.index;
         Ok(Box::new(OwnedActiveFile {
+            recovered_audit_due: None,
             comparison_target: false,
             sampling: None,
             previous_snapshot_fingerprint: index.last_snapshot_fingerprint(&last),
@@ -684,6 +685,7 @@ impl GroupBoot {
                 key,
                 owner: group.owner,
                 home: group.home,
+                recovered: vec![None; members.len()],
                 members,
                 stamps,
                 digests,
@@ -781,6 +783,9 @@ pub(in crate::snapshots) struct GroupJob {
     pub(in crate::snapshots) home: PathBuf,
     /// Canonical order; the last member is the only one that can be live.
     pub(in crate::snapshots) members: Vec<CandidateFile>,
+    /// Each member's recovered missing-carrier deadline, taken once at job
+    /// start; runtime-only, sized at boot, settled per native entry.
+    pub(in crate::snapshots) recovered: Vec<Option<u64>>,
     /// Boot stamps of the members' opened objects, canonical order.
     pub(in crate::snapshots) stamps: Vec<OpenStamp>,
     digests: Vec<String>,
@@ -811,7 +816,7 @@ pub(in crate::snapshots) struct GroupJob {
     /// input cumulatively, so a member swap needs no walk (R2-L3).
     pub(in crate::snapshots) consumed_before: u64,
 }
-crate::heap_layout_bound::fields!(GroupJob; key, owner, home, members, stamps, digests, current,
+crate::heap_layout_bound::fields!(GroupJob; key, owner, home, members, recovered, stamps, digests, current,
     finished, previous_receipts, receipt_scope, legacy_expected, tee, legacy_baselines, lines,
     charge, probe_bound, probe_limit_bound, own_page, dependencies, memo_digest, scope, walked,
     consumed_before);
@@ -1010,6 +1015,9 @@ fn member_eof(
             Err(_) => return Err(GroupEnd::Strict),
         }
     }
+    #[cfg(test)]
+    crate::snapshots::sampled_scan::codex_cursor::tests::GROUP_EOF_APPLIED
+        .with(|v| v.set(v.get() + 1));
     if last && paged {
         apply_live_eof_record(active);
     }
