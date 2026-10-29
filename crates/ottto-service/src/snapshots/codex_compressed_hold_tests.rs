@@ -613,3 +613,75 @@ fn malformed_large_hold_streams_to_generic_custody() {
     );
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn custody_lexical_mask_precedes_reader_allocation_and_keeps_entry_evidence() {
+    let root = crate::test_scratch::private_dir("custody-lexical-bound");
+    let path = member(&root, "sessions", OWNER, false);
+    let key = local_index_key(&path);
+    let original = accepted(&root, &path);
+    let witness = original.files[&key].last_upload_body_witness.clone();
+    let incidence = original.file_snapshot_fingerprints.clone();
+    let names = [
+        "size_bytes",
+        "modified_unix_seconds",
+        "modified_unix_nanos",
+        "source_file_fingerprint",
+        "last_snapshot_fingerprint",
+        "last_upload_body_witness",
+        "effective_upload_body_witness_revision",
+        "scan_identity_version",
+        "codex_joined_member_set",
+        "codex_captured_joined_member_set",
+        "codex_protected_owner",
+        "codex_applied_tier_receipt",
+        "codex_applied_tier_receipt_required",
+        "codex_captured_tier_receipt",
+        "codex_captured_tier_receipt_required",
+        "codex_captured_uncommitted",
+        "codex_counting_v2",
+        "codex_counting_owner",
+        "opened_changed_nanos",
+        "archive",
+        "opened_birth_nanos",
+        "codex_compressed_hold",
+    ];
+    for positional in [false, true] {
+        let mut value = serde_json::to_value(&original).unwrap();
+        value["files"][&key]["codex_compressed_hold"] = json!("CUSTODY_PAYLOAD");
+        if positional {
+            let mut fields = json!([
+                0, 0, null, "", null, null, 0, null, null, null, null, null, false, null, false,
+                false, false, null, 0, null, 0, null
+            ]);
+            for (at, name) in names.iter().enumerate() {
+                if let Some(v) = value["files"][&key].get(*name) {
+                    fields[at] = v.clone();
+                }
+            }
+            value["files"][&key] = fields;
+        }
+        let template = serde_json::to_string(&value).unwrap();
+        let payload = "x".repeat(16 * 1024 * 1024);
+        for malformed in [
+            format!("\"{payload}\""),
+            format!("[\"{payload}\"]"),
+            format!("{{\"{payload}\":0}}"),
+        ] {
+            let saved = root.join("large.json");
+            fs::write(&saved, template.replace("\"CUSTODY_PAYLOAD\"", &malformed)).unwrap();
+            let (result, allocations) =
+                crate::retry_allocation_probe::measure(|| ScanIndex::load(&saved));
+            let loaded = result.unwrap();
+            assert_eq!(
+                loaded.files[&key].codex_compressed_hold,
+                Some(CodexZstCause::OwnerUnproven)
+            );
+            assert_eq!(loaded.files[&key].last_upload_body_witness, witness);
+            assert_eq!(loaded.file_snapshot_fingerprints, incidence);
+            assert!(allocations.requested_peak < 256 * 1024, "{allocations:?}");
+            assert!(allocations.usable_peak < 512 * 1024, "{allocations:?}");
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
+}

@@ -1264,7 +1264,18 @@ impl<R: BufRead + Seek> Decoder<R> {
     // span before Serde sees it: from_reader buffers malformed strings and map
     // keys even when a visitor discards them. Damage to this optional field
     // removes only carry eligibility, never the surrounding negative record.
-    fn damaged_idless_marker(&mut self, record: Span) -> std::result::Result<Option<Span>, Error> {
+    fn damaged_idless_marker(
+        &mut self,
+        record: Span,
+        custody: bool,
+    ) -> std::result::Result<Option<Span>, Error> {
+        // Custody is a closed optional scalar at ScanIndexEntry position21.
+        //512 wire bytes includes escaped supported labels without buffering damage.
+        let (name, slot, limit) = if custody {
+            ("codex_compressed_hold", 21, 512)
+        } else {
+            ("idless_revision", 4, 4096)
+        };
         self.reader.seek(SeekFrom::Start(record.start))?;
         let close = match self.ws()? {
             Some(b'{') => b'}',
@@ -1277,11 +1288,11 @@ impl<R: BufRead + Seek> Decoder<R> {
         while self.ws()? != Some(close) {
             let marker = if close == b']' {
                 // Derive accepts the struct's positional representation too.
-                position == 4
+                position == slot
             } else {
                 let key = self.span()?;
-                let marker = if key.len <= ("idless_revision".len() * 6 + 2) as u64 {
-                    self.typed::<String>(key)? == "idless_revision"
+                let marker = if key.len <= (name.len() * 6 + 2) as u64 {
+                    self.typed::<String>(key)? == name
                 } else {
                     false
                 };
@@ -1293,7 +1304,8 @@ impl<R: BufRead + Seek> Decoder<R> {
             // Includes ample space for our pretty-printed fixed array. Wider
             // spellings are damage, never permission to allocate a token.
             if marker
-                && (value.len > 4096 || self.typed::<Option<[u8; 32]>>(value).is_err())
+                && (value.len > limit
+                    || (!custody && self.typed::<Option<[u8; 32]>>(value).is_err()))
                 && damaged.replace(value).is_some()
             {
                 return Err(Error::Refused("duplicate idless marker"));
@@ -1311,8 +1323,9 @@ impl<R: BufRead + Seek> Decoder<R> {
     fn pending_typed<T: serde::de::DeserializeOwned>(
         &mut self,
         record: Span,
+        custody: bool,
     ) -> std::result::Result<T, Error> {
-        let Some(marker) = self.damaged_idless_marker(record)? else {
+        let Some(marker) = self.damaged_idless_marker(record, custody)? else {
             return self.typed(record);
         };
         self.reader.seek(SeekFrom::Start(record.start))?;
@@ -1321,9 +1334,16 @@ impl<R: BufRead + Seek> Decoder<R> {
             prefix: marker.start - record.start,
             marker_end: marker.start + marker.len,
             suffix: record.start + record.len - marker.start - marker.len,
-            replacement: b"null",
+            replacement: if custody {
+                b"\"CompressedOwnerUnproven\""
+            } else {
+                b"null"
+            },
             skipped: false,
         };
+        if custody {
+            crate::local_resource_diagnostics::codex_zst_held(CodexZstCause::OwnerUnproven);
+        }
         let result = serde_json::from_reader(masked).map_err(|_| Error::Refused("record type"));
         self.reader
             .seek(SeekFrom::Start(record.start + record.len))?;
@@ -1360,8 +1380,8 @@ impl<R: BufRead + Seek> Decoder<R> {
             let value = self.span()?;
             // Decode the value first: only actual opaque debt spends hold
             // admission. Its full charge is checked before allocating the key.
-            let decoded = if field == "claude_usage_family_pending" {
-                self.pending_typed(value)
+            let decoded = if field == "claude_usage_family_pending" || field == "files" {
+                self.pending_typed(value, field == "files")
             } else {
                 self.typed(value)
             };
