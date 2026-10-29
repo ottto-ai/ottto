@@ -41,7 +41,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime};
 
 /// Envelope format. Bump on any envelope or certificate layout change.
 pub(crate) const FORMAT_VERSION: u16 = 1;
@@ -426,9 +426,9 @@ pub(crate) struct DurableTailStore {
     rebuilt: BTreeMap<Digest32, Rebuild>,
     /// The last U-held growth Full start, by pace key (a file, or a group).
     /// RAM only; a restart forgets it.
-    u_full: BTreeMap<Digest32, Instant>,
+    u_full: BTreeMap<Digest32, SystemTime>,
     #[cfg(test)]
-    clock: Duration,
+    clock: SystemTime,
 }
 
 impl Refusal {
@@ -458,6 +458,8 @@ const REBUILT_BOUND: usize = 64;
 /// smallest discovery window (one day), so growth is read before it ages out.
 pub(crate) const U_GROWTH_PACE: Duration = Duration::from_secs(6 * 60 * 60);
 const _: () = assert!(U_GROWTH_PACE.as_secs() < 24 * 60 * 60);
+/// Treat implausible wall-clock changes as expiry, favoring a read.
+const U_GROWTH_MAX_ELAPSED: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const U_GROWTH_BOUND: usize = REBUILT_BOUND;
 // A memo entry stays within the 128 bytes per record `STORES_RESIDENT_BOUND` charges.
 const _: () = assert!(std::mem::size_of::<(Digest32, (Option<Digest32>, Stamp))>() <= 128);
@@ -475,7 +477,7 @@ impl DurableTailStore {
             rebuilt: BTreeMap::new(),
             u_full: BTreeMap::new(),
             #[cfg(test)]
-            clock: Duration::ZERO,
+            clock: SystemTime::now(),
         }
     }
 
@@ -747,7 +749,12 @@ impl DurableTailStore {
         }
         if first.is_some() {
             let now = self.now();
-            let fresh = |at: &Instant| now.saturating_duration_since(*at) < U_GROWTH_PACE;
+            // Wall time includes macOS sleep. Backwards or implausibly large
+            // jumps expire the pace instead of holding a growth read.
+            let fresh = |at: &SystemTime| {
+                now.duration_since(*at)
+                    .is_ok_and(|elapsed| elapsed <= U_GROWTH_MAX_ELAPSED && elapsed < U_GROWTH_PACE)
+            };
             if self.u_full.get(pace).is_some_and(fresh) {
                 self.counters.u_growth[2] += 1;
                 return first;
@@ -775,13 +782,13 @@ impl DurableTailStore {
     }
 
     #[cfg(not(test))]
-    fn now(&self) -> Instant {
-        Instant::now()
+    fn now(&self) -> SystemTime {
+        SystemTime::now()
     }
 
     #[cfg(test)]
-    fn now(&self) -> Instant {
-        Instant::now() + self.clock
+    fn now(&self) -> SystemTime {
+        self.clock
     }
 
     #[cfg(test)]

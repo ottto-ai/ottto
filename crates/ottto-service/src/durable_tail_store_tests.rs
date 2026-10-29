@@ -2257,3 +2257,58 @@ fn u_growth_full_start_is_paced_per_key_and_never_refused() {
         assert_eq!(&fs::read(record_file(&store, key)).unwrap(), bytes);
     }
 }
+
+/// A suspended monotonic clock cannot extend the wall-clock pace. Clock
+/// corrections fail toward a read, then start a fresh pace at the new time.
+#[test]
+fn u_growth_wall_clock_sleep_and_corrections_expire_the_pace() {
+    let scratch = Scratch::new();
+    let key = [0xAB; 32];
+    let record = record_file(&scratch.store(), &key);
+    put_record(&record, b"bad");
+    let start = SystemTime::UNIX_EPOCH + Duration::from_secs(30 * 24 * 60 * 60);
+    for (name, now, expired) in [
+        (
+            "before six hours",
+            start + U_GROWTH_PACE - Duration::from_secs(1),
+            false,
+        ),
+        ("normal six hours", start + U_GROWTH_PACE, true),
+        (
+            "sleep past six hours",
+            start + U_GROWTH_PACE + Duration::from_secs(1),
+            true,
+        ),
+        ("backwards", start - Duration::from_secs(1), true),
+        ("seven days", start + U_GROWTH_MAX_ELAPSED, true),
+        (
+            "implausible forward jump",
+            start + U_GROWTH_MAX_ELAPSED + Duration::from_secs(1),
+            true,
+        ),
+    ] {
+        let mut store = scratch.store();
+        store.clock = start;
+        assert_eq!(store.full_start(&[key], &key, true), None, "{name}");
+        let held = Some((0, Refusal::Undecodable));
+        assert_eq!(store.full_start(&[key], &key, true), held, "{name}");
+        // Only the wall clock moves; the fixture never waits or advances an Instant.
+        store.clock = now;
+        assert_eq!(
+            store.full_start(&[key], &key, true),
+            if expired { None } else { held },
+            "{name}"
+        );
+        assert_eq!(
+            store.full_start(&[key], &key, true),
+            held,
+            "{name}: new pace"
+        );
+        assert_eq!(
+            store.counters().u_growth,
+            if expired { [2, 0, 2, 0] } else { [1, 0, 3, 0] },
+            "{name}"
+        );
+        assert_eq!(fs::read(&record).unwrap(), b"bad", "{name}");
+    }
+}

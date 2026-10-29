@@ -182,7 +182,9 @@ only while the file is idle. Once the opened file is longer than its committed
 index end, it takes the ordinary read. A RAM copy tails it, unpaced and
 uncounted here. Otherwise the file gets one Full. A Codex group gets one Full
 of the whole group, admitted only when no member has any other hold. The Full
-is paced to at most one per file, or per group, per 6 h in this process. It is
+is paced to at most one per file, or per group, per 6 h in this process. The
+pace uses wall time, including system sleep; backwards or greater-than-seven-day
+clock jumps expire it so growth can read. It is
 counted when it starts, never when a guard passes, with one count per U
 member's reason. That count raises this alarm as `u_growth_full`. A Full held
 by the pace is a counted hold. If more paces are fresh than the bound allows,
