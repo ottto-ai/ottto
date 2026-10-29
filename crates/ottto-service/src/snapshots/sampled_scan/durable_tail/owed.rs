@@ -1,9 +1,10 @@
 //! Receipt debt owns acquisition facts, never parsed output or an ACK.
 //!
 //! One non-Clone debt per acquisition lives in the existing DurableCustody;
-//! the content-free per-key marker lives in the existing funded key custody
-//! node. A candidate-less debt deliberately cannot match any receipt.
-use super::write_ahead::FinishAcquisition;
+//! the content-free per-key marker and the D3 hold live in one bounded
+//! `KeyDebt` node, outside the A0-h custody node. A candidate-less debt
+//! deliberately cannot match any receipt.
+use super::write_ahead::{ClaudeHold, FinishAcquisition};
 use super::{
     durable_source, sampled_jsonl, store, AcquiredChain, CachedJsonlReduction, DurableSource,
     HeldCause, PreparedRecord, ReceiptProof, RecordIdentity, SharedCache, Stores, Taken,
@@ -21,6 +22,28 @@ pub(super) enum OwedMark {
     Owed(DurableSource),
     /// Candidate-less: only a later native acquisition's receipt clears it.
     Hold(DurableSource),
+}
+
+/// Per-key M3 state outside the prepaid A0-h custody node. Boxed so one map
+/// node stays within its 1024-byte charge (`KEY_RESERVE_BYTES`).
+#[derive(Default)]
+pub(super) struct KeyDebt {
+    owed: OwedMark,
+    /// D3: this Claude key's stale predecessor survived a failed write.
+    hold: Option<ClaudeHold>,
+}
+impl KeyDebt {
+    fn is_empty(&self) -> bool {
+        self.owed == OwedMark::None && self.hold.is_none()
+    }
+}
+/// Funded nodes per map: owed/hold keys need no more than the RAM cache's
+/// key count, and overflow already fails safe (conservative source bit,
+/// counted unfunded hold marker).
+const KEY_DEBT_KEYS: usize = store::MAX_RECORDS;
+pub(super) fn key_debt_node_bytes() -> Option<usize> {
+    crate::heap_layout_bound::tree_node_bytes::<store::Digest32, Box<KeyDebt>>()?
+        .checked_add(std::mem::size_of::<KeyDebt>())
 }
 
 pub(crate) struct ReceiptOwed {
@@ -96,6 +119,27 @@ pub(in crate::snapshots) enum OwedCompletionAdmission {
 }
 
 impl Stores {
+    /// Funds `digest`'s debt node; never evicts another key's debt or hold.
+    fn fund_debt(&mut self, digest: store::Digest32) -> Option<&mut KeyDebt> {
+        if key_debt_node_bytes().map_or(true, |n| n > 1024)
+            || (!self.key_debt.contains_key(&digest) && self.key_debt.len() >= KEY_DEBT_KEYS)
+        {
+            super::Counters::bump(&mut self.counters.ineligible, "key_debt_unfunded");
+            return None;
+        }
+        Some(self.key_debt.entry(digest).or_default().as_mut())
+    }
+    /// Frees an empty debt node, so a discharged key never pins a slot.
+    fn release_idle_debt(&mut self, digest: &store::Digest32) {
+        if self
+            .key_debt
+            .get(digest)
+            .is_some_and(|debt| debt.is_empty())
+        {
+            self.key_debt.remove(digest);
+        }
+    }
+
     /// Enroll before any eviction. An unfunded node sets the source-wide
     /// conservative class bit, so no owed key can read as debt-free.
     pub(super) fn set_owed(&mut self, digest: store::Digest32, mark: OwedMark) {
@@ -103,35 +147,72 @@ impl Stores {
             OwedMark::None => return self.clear_owed(digest),
             OwedMark::Owed(source) | OwedMark::Hold(source) => source,
         };
-        if !self.fund_key(digest) {
+        let Some(debt) = self.fund_debt(digest) else {
             self.owed_overflow[source.slot()] = true;
             return;
-        }
-        if let Some(custody) = self.retail_spent.get_mut(&digest) {
-            // A candidate-less hold is never downgraded by a weaker offer.
-            if !(matches!(custody.owed, OwedMark::Hold(_)) && matches!(mark, OwedMark::Owed(_))) {
-                custody.owed = mark;
-            }
+        };
+        // A candidate-less hold is never downgraded by a weaker offer.
+        if !(matches!(debt.owed, OwedMark::Hold(_)) && matches!(mark, OwedMark::Owed(_))) {
+            debt.owed = mark;
         }
     }
     pub(super) fn clear_owed(&mut self, digest: store::Digest32) {
-        if let Some(custody) = self.retail_spent.get_mut(&digest) {
-            custody.owed = OwedMark::None;
+        if let Some(debt) = self.key_debt.get_mut(&digest) {
+            debt.owed = OwedMark::None;
         }
+        self.release_idle_debt(&digest);
     }
     /// SOURCE condition 3: a disabled store leaves no orphan OwedMark.
     pub(super) fn clear_source_owed(&mut self, source: DurableSource) {
-        for custody in self.retail_spent.values_mut() {
-            if matches!(custody.owed, OwedMark::Owed(s) | OwedMark::Hold(s) if s == source) {
-                custody.owed = OwedMark::None;
+        for debt in self.key_debt.values_mut() {
+            if matches!(debt.owed, OwedMark::Owed(s) | OwedMark::Hold(s) if s == source) {
+                debt.owed = OwedMark::None;
             }
         }
+        self.key_debt.retain(|_, debt| !debt.is_empty());
         self.owed_overflow[source.slot()] = false;
     }
     pub(super) fn owed_mark(&self, digest: &store::Digest32) -> OwedMark {
-        self.retail_spent
+        self.key_debt
             .get(digest)
-            .map_or(OwedMark::None, |custody| custody.owed)
+            .map_or(OwedMark::None, |debt| debt.owed)
+    }
+
+    /// D3: `digest`'s hold, if any.
+    pub(super) fn hold(&self, digest: &store::Digest32) -> Option<&ClaudeHold> {
+        self.key_debt
+            .get(digest)
+            .and_then(|debt| debt.hold.as_ref())
+    }
+    pub(super) fn hold_mut(&mut self, digest: &store::Digest32) -> Option<&mut ClaudeHold> {
+        self.key_debt
+            .get_mut(digest)
+            .and_then(|debt| debt.hold.as_mut())
+    }
+    /// Places `hold` unless `digest` already has one; false when unfunded.
+    pub(super) fn place_hold(&mut self, digest: store::Digest32, hold: ClaudeHold) -> bool {
+        match self.fund_debt(digest) {
+            Some(debt) => {
+                if debt.hold.is_none() {
+                    debt.hold = Some(hold);
+                }
+                true
+            }
+            None => false,
+        }
+    }
+    /// Removes `digest`'s hold and frees an empty node.
+    pub(super) fn take_hold(&mut self, digest: &store::Digest32) -> Option<ClaudeHold> {
+        let hold = self
+            .key_debt
+            .get_mut(digest)
+            .and_then(|debt| debt.hold.take());
+        self.release_idle_debt(digest);
+        hold
+    }
+    /// Every current D3 hold: a walk of at most `KEY_DEBT_KEYS` nodes.
+    pub(super) fn holds(&self) -> impl Iterator<Item = &ClaudeHold> + '_ {
+        self.key_debt.values().filter_map(|debt| debt.hold.as_ref())
     }
 }
 
@@ -152,11 +233,7 @@ impl SharedCache {
             // Unknown custody fails toward holding, never toward Full.
             return OwedQuery::Hold(HeldCause::ReceiptPending);
         };
-        if stores
-            .retail_spent
-            .get(&digest)
-            .is_some_and(|custody| custody.hold.is_some())
-        {
+        if stores.hold(&digest).is_some() {
             return OwedQuery::Hold(HeldCause::StaleSurvivor);
         }
         let pending = stores.slot(ds).as_ref().is_some_and(|slot| {
@@ -299,7 +376,9 @@ impl SharedCache {
         chain.receipted(receipt.identity())?;
         // An index-held marker for this key is fulfilled by its exact receipt.
         if let (Some(ds), Some(mut stores)) = (durable_source(chain.source()), self.durable()) {
-            stores.clear_owed(store::key_digest(ds, chain.key()));
+            let digest = store::key_digest(ds, chain.key());
+            stores.clear_owed(digest);
+            stores.release_restore_pending(&digest, receipt.identity().certificate().length);
         }
         Ok(())
     }
@@ -378,6 +457,7 @@ impl SharedCache {
         }
         if let Some(mut stores) = self.durable() {
             stores.clear_owed(digest);
+            stores.release_restore_pending(&digest, receipt.identity().certificate().length);
         }
         Ok(chain)
     }
