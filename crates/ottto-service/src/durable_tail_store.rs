@@ -294,6 +294,8 @@ pub(crate) struct MutationWitness {
     key: Digest32,
     content: Digest32,
     stamp: Stamp,
+    format: u16,
+    generation: u64,
 }
 
 /// Preservation classes: unknown representations (U) precede known corruption (T14).
@@ -728,6 +730,8 @@ impl DurableTailStore {
             key,
             content: digest,
             stamp: *stamp,
+            format: record.format,
+            generation: record.index_generation,
         };
         (*content == digest && self.witness_current(&proof)).then_some(proof)
     }
@@ -746,6 +750,8 @@ impl DurableTailStore {
             || record.record.binding.entry != expected.binding.entry
             || record.index_generation > expected.committed_generation
             || proof.key != record.record.binding.key
+            || proof.format != record.format
+            || proof.generation != record.index_generation
             || proof.content != content_digest(&record.record)
             || !self.witness_current(proof)
         {

@@ -1832,6 +1832,8 @@ fn original_witness_survives_memo_turnover_but_never_a_different_record() {
         "budget",
         "entry",
         "generation",
+        "record_generation",
+        "format",
         "context",
         "scope",
         "replacement",
@@ -1847,7 +1849,7 @@ fn original_witness_survives_memo_turnover_but_never_a_different_record() {
             store.write_after_save(&lock, 1, vec![old]).unwrap().written,
             1
         );
-        let decoded = found(store.read(&b.key, &placeholder_allowlist()));
+        let mut decoded = found(store.read(&b.key, &placeholder_allowlist()));
         let mut expected = Expected {
             binding: b.clone(),
             committed_generation: 1,
@@ -1861,6 +1863,11 @@ fn original_witness_survives_memo_turnover_but_never_a_different_record() {
         match arm {
             "entry" => expected.binding.entry = entry_digest("changed", None),
             "generation" => expected.committed_generation = 0,
+            "record_generation" => {
+                decoded.index_generation = 2;
+                expected.committed_generation = 2;
+            }
+            "format" => decoded.format = 2,
             "context" => expected.binding.context = [11; 32],
             "scope" => expected.binding.scope = [12; 32],
             "replacement" => {
