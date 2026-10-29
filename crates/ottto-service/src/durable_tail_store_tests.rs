@@ -1541,7 +1541,6 @@ fn fresh_cleanup_is_bounded_preserves_unsafe_entries_and_only_reaps_dead_writer_
         record.binding.key = key_digest(DurableSource::ClaudeCode, &format!("unknown-{n}"));
         let mut bytes = encode(&DurableRecord {
             envelope_audit_debt: None,
-            format: FORMAT_VERSION,
             record: record.clone(),
             index_generation: 1,
         });
@@ -1556,7 +1555,6 @@ fn fresh_cleanup_is_bounded_preserves_unsafe_entries_and_only_reaps_dead_writer_
     let unsafe_path = store.dir().join(format!("{}.rec", hex(&[3; 32])));
     let mut unsafe_bytes = encode(&DurableRecord {
         envelope_audit_debt: None,
-        format: FORMAT_VERSION,
         record: base,
         index_generation: 1,
     });
@@ -1620,7 +1618,6 @@ fn inventory_overflow_replaces_existing_records_and_defers_new_keys() {
         record.binding.key = key_digest(DurableSource::ClaudeCode, &format!("kept-{n}"));
         let mut bytes = encode(&DurableRecord {
             envelope_audit_debt: None,
-            format: FORMAT_VERSION,
             record: record.clone(),
             index_generation: 1,
         });
@@ -1737,7 +1734,7 @@ fn pinned_v1_scope_replay_and_header_goldens() {
             )),
     ] {
         let allowlist = parse_hex_digest(pin).unwrap();
-        let scope = scope_digest_for(1, "golden-file", &allowlist, "identity:v1", "0:none");
+        let scope = scope_digest("golden-file", &allowlist, "identity:v1", "0:none");
         assert_eq!(hex(&scope), scope_hex);
         let replay = replay_scope_digest(&scope, 7, 5, 2, true);
         assert_eq!(hex(&replay), replay_hex);
@@ -1757,7 +1754,7 @@ fn pinned_v1_scope_replay_and_header_goldens() {
         assert_eq!(golden.len(), HEADER_BYTES);
         assert_eq!(&pinned_v1_bytes(&pending, 9)[..HEADER_BYTES], golden);
         assert_eq!(&encode(&DurableRecord {
-        envelope_audit_debt: None,record: pending.clone(), index_generation: 9, format: 1})[..HEADER_BYTES], golden);
+        envelope_audit_debt: None,record: pending.clone(), index_generation: 9})[..HEADER_BYTES], golden);
         let decoded = decode_header(&golden, &[1; 32], source).unwrap();
         assert_eq!(decoded.record.binding, pending.binding);
         assert_eq!(decoded.generation, 9);
@@ -2057,7 +2054,6 @@ fn process_rebuild_history_overflow_disables_without_forgetting_an_attempt() {
         b.key = key_digest(DurableSource::ClaudeCode, &format!("corrupt-{n}"));
         let mut bytes = encode(&DurableRecord {
             envelope_audit_debt: None,
-            format: FORMAT_VERSION,
             record: pending(b.clone(), certificate(&transcript), 1),
             index_generation: 1,
         });
@@ -2164,7 +2160,6 @@ fn scheduling_deferral_preserves_t14_allowance_until_full_actually_starts() {
     ensure_private_dir(store.dir()).unwrap();
     let mut bytes = encode(&DurableRecord {
         envelope_audit_debt: None,
-        format: FORMAT_VERSION,
         record: pending(b.clone(), certificate(&transcript), 1),
         index_generation: 1,
     });

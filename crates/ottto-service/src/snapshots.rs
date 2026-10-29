@@ -29849,6 +29849,10 @@ impl OwnedSourceScan {
                         {
                             if let Some(context) = sampling.as_mut() {
                                 context.audit_slots = context.audit_slots.saturating_sub(1);
+                                #[cfg(unix)]
+                                if recovered_audit_due.is_some() && !source_verified {
+                                    context.cache.durable_note_audit_staged();
+                                }
                             }
                         }
                     } else if source_verified {
@@ -31230,12 +31234,9 @@ impl OwnedSourceScan {
             if side_plan.is_none() {
                 if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
                     let key = local_index_key(&candidate.path);
-                    if let Some(reason) = cache.durable_hold(
-                        source,
-                        &key,
-                        index.files.contains_key(&key),
-                        &mut recovered_audit_due,
-                    ) {
+                    if let Some(reason) =
+                        cache.durable_hold(source, &key, index, &mut recovered_audit_due)
+                    {
                         cache.durable_hold_exit(source, reason, index, &candidate, &mut census);
                         pending!();
                     }

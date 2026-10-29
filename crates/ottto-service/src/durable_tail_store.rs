@@ -158,24 +158,7 @@ pub(crate) fn key_digest(source: DurableSource, index_key: &str) -> Digest32 {
 /// plus this store's format version, the codec's allowlist digest, the
 /// identity contract in force and the Codex counting view. A change to any of
 /// them refuses the record even when the file scope does not move.
-#[cfg(test)]
 pub(crate) fn scope_digest(
-    file_scope: &str,
-    allowlist: &Digest32,
-    identity_contract: &str,
-    counting_view: &str,
-) -> Digest32 {
-    scope_digest_for(
-        FORMAT_VERSION,
-        file_scope,
-        allowlist,
-        identity_contract,
-        counting_view,
-    )
-}
-
-pub(crate) fn scope_digest_for(
-    format: u16,
     file_scope: &str,
     allowlist: &Digest32,
     identity_contract: &str,
@@ -185,7 +168,7 @@ pub(crate) fn scope_digest_for(
         "ottto-dt-scope:v1",
         &[
             file_scope.as_bytes(),
-            format.to_le_bytes().as_slice(),
+            FORMAT_VERSION.to_le_bytes().as_slice(),
             allowlist.as_slice(),
             identity_contract.as_bytes(),
             counting_view.as_bytes(),
@@ -289,7 +272,6 @@ pub(crate) struct PendingRecord {
 pub(crate) struct DurableRecord {
     pub(crate) record: PendingRecord,
     pub(crate) index_generation: u64,
-    pub(crate) format: u16,
     /// Validated v1 compatibility debt; never checkpoint authority.
     pub(crate) envelope_audit_debt: Option<u64>,
 }
@@ -683,7 +665,7 @@ impl DurableTailStore {
 
     /// U holds. T14 permits one rebuild; the adapter checks RAM before holding.
     pub(crate) fn hold(&mut self, key: &Digest32) -> Option<Refusal> {
-        self.guard_with_carrier(key, true).err()
+        self.guard_with_carrier(key, true, &[0; 32]).err()
     }
 
     /// Ok(Some(due)) is missing audit custody: acquire Full, never restore clean.
@@ -692,6 +674,7 @@ impl DurableTailStore {
         &mut self,
         key: &Digest32,
         has_index: bool,
+        live_context: &Digest32,
     ) -> Result<Option<u64>, Refusal> {
         let result = self.classify(key, "guard");
         self.pass[0] += u64::from(!matches!(result, Ok(None)));
@@ -710,7 +693,7 @@ impl DurableTailStore {
             }
             Err(Refusal::Corrupt) if self.rebuilt[key] == Rebuild::Authorized => Ok(None),
             Ok(header) => Ok(header
-                .filter(|_| !has_index)
+                .filter(|header| !has_index && header.record.binding.context == *live_context)
                 .and_then(|header| header.audit_debt)),
             Err(reason) => Err(reason),
         }
@@ -884,7 +867,6 @@ impl DurableTailStore {
                 envelope_audit_debt: record.certificate.audit_debt_unix_seconds,
                 record,
                 index_generation: committed_generation,
-                format: FORMAT_VERSION,
             };
             let bytes = encode(&stored);
             self.note_codec(pending_bytes + bytes.capacity());
@@ -1520,7 +1502,6 @@ fn decode(bytes: &[u8]) -> Result<DurableRecord, Refusal> {
     Ok(DurableRecord {
         record: h.record,
         index_generation: h.generation,
-        format: h.format,
         envelope_audit_debt: h.audit_debt,
     })
 }

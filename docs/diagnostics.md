@@ -187,13 +187,22 @@ It does not increment `durable_held` or the held-key alarm. The guard uses the
 already classified store header and adds no read. The old reduction is never
 restored as audit-clean: normal acquisition reads Full. The validated envelope
 deadline travels with that acquisition independently of sampling admission.
+Import requires the record's binding context to equal the live namespace/account
+digest and clamps the deadline once to min(envelope due, recovery time). Foreign
+contexts and malformed/unknown records supply no deadline. A direct restore
+carrier check likewise cannot import a foreign context's scheduling authority.
 Native parsing creates the index entry; only source-verified Full completion
 satisfies the audit and supplies the post-save replacement. Terminal row loss
 may publish without verification: the native-created entry then receives the
 existing unverified-source marker with the recovered deadline. That marker
 survives save/restart and keeps discovery eligible beyond the age window until
 a verified Full retires the obligation. No index membership is inferred from a
-record, and no new deadline, persisted field or acquisition cause is introduced.
+record, and no persisted field or acquisition cause is introduced.
+`ineligible.audit_carrier_staged_unverified` counts only the successful transition
+to the native-created entry's unverified marker; the earlier
+`ineligible.audit_carrier` counts recovery misses. A verified-first Full has zero
+staged transitions and uses the existing `audits_completed` counter. Later retries
+and later deadline offers cannot renew the recovered obligation.
 Post-save GC preserves same-context debt-bearing records whose key is absent
 from the index; fresh-index cleanup without a trusted context preserves their
 debt evidence too, until acquisition establishes custody. These preservation
@@ -875,3 +884,11 @@ counts. Callers close the decoder and explicitly release after Stores drops.
 Fallback Drop release counts `codex_zst_owner.counts.leaked_release`; it is a
 cancellation/unwind safety net. Stores-held debug assertions guard admission and
 explicit release, including real durable I/O paths.
+
+
+The tag-1 audit-safe bootstrap core is a hard release pair with the grouped
+custody and stored-representation binding completion. The first part preserves
+main's narrower current-representation binding formula. Grouped Codex members
+still have main's index-reset recovery gap there; the paired completion closes
+it for every member/alias. Both parts must ship in the same release, in order;
+the first is not a standalone recovery-complete release.

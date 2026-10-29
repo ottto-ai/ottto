@@ -136,7 +136,6 @@ fn replay_revisions_and_applied_markers_bind_without_changing_the_allowlist() {
             &scope,
             index,
             &interpretation,
-            None,
         )
         .unwrap()
         .binding
@@ -282,7 +281,6 @@ fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
             &scope,
             &index,
             &interpretation,
-            None,
         )
         .unwrap()
         .binding;
@@ -434,7 +432,6 @@ fn attribution_capture_toggle_refuses_the_previous_claude_record() {
             &scope,
             &index,
             &interpretation,
-            None,
         )
         .unwrap()
         .binding;
@@ -468,7 +465,6 @@ fn attribution_capture_toggle_refuses_the_previous_claude_record() {
             &scope,
             &index,
             &after,
-            None,
         )
         .unwrap()
         .binding;
@@ -1181,7 +1177,9 @@ fn foreign_owned_store_alarms_once_and_holds_nothing() {
     let cache = SharedCache::default();
     cache.durable_begin_pass(source, &index_path, &namespace, false);
     assert!(
-        cache.durable_hold(source, key, true, &mut None).is_some(),
+        cache
+            .durable_hold(source, key, &ScanIndex::default(), &mut None)
+            .is_some(),
         "control: U holds"
     );
     let _own = OwnUid;
@@ -1191,7 +1189,10 @@ fn foreign_owned_store_alarms_once_and_holds_nothing() {
     let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
         for _ in 0..2 {
             fresh.durable_begin_pass(source, &index_path, &namespace, false);
-            assert_eq!(fresh.durable_hold(source, key, true, &mut None), None);
+            assert_eq!(
+                fresh.durable_hold(source, key, &ScanIndex::default(), &mut None),
+                None
+            );
             fresh.durable_alarm(source);
         }
     });
@@ -1337,7 +1338,10 @@ fn store_io_failures_emit_cold_production_body_without_holds() {
             let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
                 crate::snapshots::durable_after_save(&cache, &root, source, &index);
                 cache.durable_begin_pass(source, &index_path, &namespace, false);
-                assert_eq!(cache.durable_hold(source, &key, true, &mut None), None);
+                assert_eq!(
+                    cache.durable_hold(source, &key, &ScanIndex::default(), &mut None),
+                    None
+                );
                 cache.durable_alarm(source);
             });
             assert_eq!(alarms.len(), 1);
@@ -1434,7 +1438,10 @@ fn t14_without_retention_or_encodable_reduction_holds_on_later_passes() {
         std::fs::write(&record, &before).unwrap();
         let cache = SharedCache::default();
         cache.durable_begin_pass(source, &index_path, &namespace, false);
-        assert_eq!(cache.durable_hold(source, &key, true, &mut None), None);
+        assert_eq!(
+            cache.durable_hold(source, &key, &ScanIndex::default(), &mut None),
+            None
+        );
         assert_eq!(cache.durable_full_hold(source, &key, true), None);
         let admitted = cache.insert_admitted(
             key.clone(),
@@ -1467,7 +1474,7 @@ fn t14_without_retention_or_encodable_reduction_holds_on_later_passes() {
         for n in 1..=3 {
             cache.durable_begin_pass(source, &index_path, &namespace, false);
             assert_eq!(
-                cache.durable_hold(source, &key, true, &mut None),
+                cache.durable_hold(source, &key, &ScanIndex::default(), &mut None),
                 (arm == "retention").then_some(store::Refusal::Corrupt)
             );
             let (counts, stats) = cache.durable_counters(source).unwrap();
@@ -1670,7 +1677,7 @@ fn known_corrupt_replacement_case(fail_replacement: bool) {
     assert_eq!(rebuilt.unreadable_path_count, 0);
     assert!(cache.retained().unwrap().peek(&key).is_some());
     assert_eq!(
-        cache.durable_hold(source, &key, true, &mut None),
+        cache.durable_hold(source, &key, &ScanIndex::default(), &mut None),
         None,
         "fresh RAM in the SAME pass wins"
     );
@@ -1697,7 +1704,7 @@ fn known_corrupt_replacement_case(fail_replacement: bool) {
         assert!(matches!(disk.read(&digest), store::ReadOutcome::Found(_)));
         cache.retained().unwrap().remove(&key);
         assert_eq!(
-            cache.durable_hold(source, &key, true, &mut None),
+            cache.durable_hold(source, &key, &ScanIndex::default(), &mut None),
             None,
             "repaired record never holds"
         );
@@ -1982,7 +1989,7 @@ fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites(
             index.save(&index_path).unwrap();
             let interp = Interpretation::of(source, &key, &index, false, &namespace);
             let ds = durable_source(source).unwrap();
-            let mut binding = expected(ds, source, &key, &scope, &index, &interp, None)
+            let mut binding = expected(ds, source, &key, &scope, &index, &interp)
                 .unwrap()
                 .binding;
             binding.scope = scope_for(
@@ -2071,7 +2078,7 @@ fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites(
                     Err(std::io::Error::other("injected"))
                 })));
                 let mut v2 = pending.clone();
-                v2.binding = expected(ds, source, &key, &scope, &index, &interp, None)
+                v2.binding = expected(ds, source, &key, &scope, &index, &interp)
                     .unwrap()
                     .binding;
                 let mut disk_store = DurableTailStore::new(dir.clone(), ds);
@@ -2085,7 +2092,7 @@ fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites(
                 // An ordinary replacement may exceed an unchanged record/store
                 // budget. It must not delete the still-authoritative v1 image.
                 let mut over_budget = pending.clone();
-                over_budget.binding = expected(ds, source, &key, &scope, &index, &interp, None)
+                over_budget.binding = expected(ds, source, &key, &scope, &index, &interp)
                     .unwrap()
                     .binding;
                 over_budget.body.resize(store::RECORD_BYTES, 0);
@@ -2185,7 +2192,6 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
                 &scope,
                 &index,
                 &interpretation,
-                Some((1, codec::allowlist_digest(source))),
             )
             .unwrap()
             .binding,
@@ -2214,7 +2220,7 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
             ReadOutcome::Found(r) => r,
             other => panic!("{other:?}"),
         };
-        assert_eq!(old.format, 1);
+        assert_eq!(store.representation(&pending.binding.key).unwrap().0, 1);
         let fact = codec::decode(&old.record.body, source)
             .unwrap()
             .counting()
@@ -2260,7 +2266,10 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
                 ReadOutcome::Found(r) => r,
                 other => panic!("{other:?}"),
             };
-            assert_eq!(next.format, store::FORMAT_VERSION);
+            assert_eq!(
+                store.representation(&next.record.binding.key).unwrap().0,
+                store::FORMAT_VERSION
+            );
             let restart = SharedCache::default();
             restart.durable_begin_pass(source, &index_path, &namespace, false);
             let second = restart
@@ -2281,17 +2290,10 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
             let _new_cutover = TestCutover::set(1);
             let changed = Interpretation::of(source, &key, &index, false, &namespace);
             let mut disagreement = pending.clone();
-            disagreement.binding = expected(
-                DurableSource::Codex,
-                source,
-                &key,
-                &scope,
-                &index,
-                &changed,
-                Some((1, pending.allowlist)),
-            )
-            .unwrap()
-            .binding;
+            disagreement.binding =
+                expected(DurableSource::Codex, source, &key, &scope, &index, &changed)
+                    .unwrap()
+                    .binding;
             std::fs::write(
                 &disk,
                 store::tests::pinned_v1_bytes(&disagreement, index.generation),
@@ -2682,7 +2684,6 @@ fn compressed_record_refuses_before_certificate_restore_or_body_decode() {
     };
     let record = store::DurableRecord {
         envelope_audit_debt: None,
-        format: store::FORMAT_VERSION,
         record: PendingRecord {
             binding,
             certificate: certificate(&plain, &scope),
@@ -2767,9 +2768,9 @@ fn scope_for(
     format: u16,
     allowlist: &store::Digest32,
 ) -> store::Digest32 {
+    assert_eq!(format, 1);
     store::replay_scope_digest(
-        &store::scope_digest_for(
-            format,
+        &store::scope_digest(
             &scope.0,
             allowlist,
             &interpretation.identity_contract,
@@ -3123,7 +3124,6 @@ fn a_permit_era_record_restores_under_the_always_on_capture() {
         &scope,
         &index,
         &before,
-        None,
     )
     .unwrap()
     .binding;
