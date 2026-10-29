@@ -160,6 +160,7 @@ mod stale_carry_diagnostics;
 mod transcript_acquisition_tests;
 mod traversal_transition;
 mod usage_pending_membership;
+mod usage_pending_retention;
 use stale_carry_diagnostics::{
     Counts as StaleCarryRejectionCounts, Rejection as StaleCarryRejection,
 };
@@ -47731,6 +47732,7 @@ impl ScanIndex {
             ));
         }
         self.retire_committed_claude_account_pending_windows();
+        self.measure_claude_usage_pending_settlement();
         let previous_generation = self.generation;
         self.schema_version = SCAN_INDEX_SCHEMA_VERSION;
         self.generation = self
