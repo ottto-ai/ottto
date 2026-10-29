@@ -152,10 +152,34 @@ impl Fixture {
     }
 
     fn assert_quiet(&mut self) {
+        // Freeze the ceiling before any quiet walk can enlarge the index.
+        let settled_group_members = self
+            .index
+            .files
+            .values()
+            .filter(|entry| {
+                entry.codex_joined_member_set.is_some()
+                    && entry
+                        .upload_context_receipt
+                        .as_ref()
+                        .is_some_and(|receipt| {
+                            self.index.active_upload_context_fingerprint.as_ref()
+                                == Some(&receipt.context_fingerprint)
+                                && receipt.replay_generation
+                                    == self.index.context_curve_replay_epoch
+                                && receipt.source_witness == entry.source_file_fingerprint
+                                && entry.last_upload_body_witness.as_ref()
+                                    == Some(&receipt.body_witness)
+                        })
+            })
+            .count();
+        let mut metadata_count = None;
         for _ in 0..3 {
             let previous = self.index.clone();
-            let ((scan, bytes), parses) =
-                terminal_contract_retry::source_acquisitions(|| self.walk(true));
+            let (((scan, bytes), parses), group_bytes) =
+                terminal_contract_retry::group_body_bytes(|| {
+                    terminal_contract_retry::source_acquisitions(|| self.walk(true))
+                });
             // GroupBoot::Unchanged counts identified alias members as scanned
             // and semantic no-ops, but constructs no body parser. Count real
             // parser acquisitions rather than mistaking metadata checks for parses.
@@ -164,6 +188,22 @@ impl Fixture {
                 "no body parser is constructed after adoption"
             );
             assert_eq!(bytes, 0);
+            assert_eq!(
+                group_bytes, 0,
+                "no physical group body bytes after adoption"
+            );
+            assert!(
+                scan.scanned_file_count <= settled_group_members,
+                "quiet metadata work cannot exceed the settled alias population"
+            );
+            if let Some(expected) = metadata_count {
+                assert_eq!(
+                    scan.scanned_file_count, expected,
+                    "quiet metadata work stays constant over all three walks"
+                );
+            } else {
+                metadata_count = Some(scan.scanned_file_count);
+            }
             self.uploader.activate(
                 self.source,
                 self.index
@@ -1227,7 +1267,11 @@ fn real_scan_joined_codex_context_catchup_admits_the_whole_alias_unit() {
         .activate_file_upload_context(f.source, "e".repeat(64));
     f.cache = Arc::default();
     let previous = f.index.clone();
-    let (scan, _) = f.walk(true);
+    let ((scan, _), group_bytes) = terminal_contract_retry::group_body_bytes(|| f.walk(true));
+    assert!(
+        group_bytes > 0,
+        "the physical group-read probe observes real replay before adoption"
+    );
     assert_eq!(scan.scanned_file_count, 2, "joined aliases are admitted atomically, not permanently deferred after the first reservation");
     f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
     let received_before = f.uploader.received_item_bytes;
@@ -1242,6 +1286,18 @@ fn real_scan_joined_codex_context_catchup_admits_the_whole_alias_unit() {
         rearm_bytes, wire_bytes,
         "joined aliases do not double-count wire bodies"
     );
+    for name in ["a", "b"] {
+        let key = local_index_key(&f.root.join(format!("{name}.jsonl")));
+        let receipt = f.index.files[&key]
+            .upload_context_receipt
+            .as_ref()
+            .expect("every physical alias earned its current-context receipt");
+        assert_eq!(
+            Some(&receipt.context_fingerprint),
+            f.index.active_upload_context_fingerprint.as_ref()
+        );
+        assert!(!f.index.file_upload_context_requires_adoption(&key));
+    }
     f.assert_quiet();
 }
 
@@ -1574,6 +1630,18 @@ fn ordinary_singleton_precedes_context_group(same_size_rewrite: bool) {
                 .0,
             members
         );
+        for name in &names {
+            let key = local_index_key(&f.root.join(format!("{name}.jsonl")));
+            let receipt = f.index.files[&key]
+                .upload_context_receipt
+                .as_ref()
+                .expect("every physical alias earned a receipt from this ACK");
+            assert_eq!(
+                Some(&receipt.context_fingerprint),
+                f.index.active_upload_context_fingerprint.as_ref()
+            );
+            assert!(!f.index.file_upload_context_requires_adoption(&key));
+        }
         f.assert_quiet();
     }
 }
@@ -1625,9 +1693,30 @@ fn real_scan_settled_alias_cannot_evict_an_ordinary_singleton_beside_ordinary_gr
     // A remains receipt-settled. B has ordinary physical work; z is new.
     fs::write(&singleton, body).unwrap();
     let d = f.root.join("d.jsonl");
-    let mut body = fs::read(&d).unwrap();
-    body.push(b' ');
-    fs::write(d, body).unwrap();
+    let prior_modified = fs::metadata(&d).unwrap().modified().unwrap();
+    let body = fs::read(&d).unwrap();
+    fs::write(&d, &body).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&d)
+        .unwrap()
+        .set_times(
+            fs::FileTimes::new().set_modified(prior_modified + std::time::Duration::from_secs(2)),
+        )
+        .unwrap();
+    assert_eq!(fs::metadata(&d).unwrap().len(), body.len() as u64);
+    // Growing this ORDINARY group would give it a dedicated freshness page
+    // before unhinted z. Ordinary-vs-ordinary scheduling is allowed; a context
+    // group may never do that. Keep size fixed to exercise normal file slots.
+    assert!(!codex_fresh_data_pending(
+        &ScanTraversalPath {
+            scan_root: f.root.clone(),
+            path: d,
+            census_member: true,
+            watcher_hint: false,
+        },
+        &f.index.files
+    ));
     f.index.traversal = None;
     ensure_bounded_traversal(
         f.source,
@@ -1660,13 +1749,63 @@ fn real_scan_settled_alias_cannot_evict_an_ordinary_singleton_beside_ordinary_gr
         // other ordinary group waits. Those slots still cannot evict z.
         BTreeMap::from([(singleton.clone(), 1)])
     );
+    for name in ["c", "d"] {
+        let key = local_index_key(&f.root.join(format!("{name}.jsonl")));
+        let pending = f
+            .index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .pending_candidates
+            .iter()
+            .find(|pending| local_index_key(&pending.path) == key)
+            .expect("the waiting ordinary group is still owed in traversal");
+        assert!(pending.census_member);
+        assert_eq!(
+            f.index.files[&key].source_file_fingerprint,
+            previous.files[&key].source_file_fingerprint
+        );
+        assert_eq!(
+            f.index.files[&key].last_upload_body_witness,
+            previous.files[&key].last_upload_body_witness
+        );
+        assert_eq!(
+            f.index.files[&key].upload_context_receipt, previous.files[&key].upload_context_receipt,
+            "deferred group receives no new receipt/credit on page one"
+        );
+    }
     f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
     let first = f.uploader.posts.len();
     f.uploader
         .send(f.source, &mut f.index, &previous, &scan.snapshots)
         .unwrap();
+    assert!(!f.uploader.posts[first..].is_empty());
     assert!(f.uploader.posts[first..]
         .iter()
         .flatten()
-        .any(|item| item["source_session_id"] == SESSION));
+        .all(|item| item["source_session_id"] == SESSION));
+    let mut waiting_group_parsed = false;
+    for _ in 0..2 {
+        f.cache = Arc::default();
+        let previous = f.index.clone();
+        let ((scan, _), reads) =
+            terminal_contract_retry::source_acquisitions(|| f.walk_with_file_limit(true, 3));
+        waiting_group_parsed |= reads.iter().any(|(path, count)| {
+            *count == 1
+                && ["c", "d"]
+                    .iter()
+                    .any(|name| *path == f.root.join(format!("{name}.jsonl")))
+        });
+        f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
+        f.uploader
+            .send(f.source, &mut f.index, &previous, &scan.snapshots)
+            .unwrap();
+        if waiting_group_parsed {
+            break;
+        }
+    }
+    assert!(
+        waiting_group_parsed,
+        "waiting ordinary group is parsed within the next two pages"
+    );
 }

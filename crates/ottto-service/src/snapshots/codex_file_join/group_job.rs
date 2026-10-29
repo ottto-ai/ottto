@@ -944,6 +944,8 @@ pub(in crate::snapshots) fn step_group(
     {
         join.set_record_start(offset);
     }
+    #[cfg(test)]
+    let before_body_read = active.parser.reader.consumed_bytes();
     let stepped = {
         let OwnedActiveFile { parser, group, .. } = &mut *active;
         match group.as_mut().and_then(|group| group.tee.as_deref_mut()) {
@@ -951,6 +953,14 @@ pub(in crate::snapshots) fn step_group(
             None => parser.step(),
         }
     };
+    #[cfg(test)]
+    terminal_contract_retry::record_group_body_bytes(
+        active
+            .parser
+            .reader
+            .consumed_bytes()
+            .saturating_sub(before_body_read),
+    );
     let complete = match stepped {
         Ok(complete) => complete,
         Err(error) => return GroupStep::Read(Err(error)),

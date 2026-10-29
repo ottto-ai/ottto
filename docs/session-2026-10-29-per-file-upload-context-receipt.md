@@ -254,3 +254,21 @@ compete for slots; unchanged groups retain baseline metadata-witness admission.
 An attempted early receipt-group shortcut was removed after CI demonstrated its
 header candidates lack final opened-object identity. Existing GroupBoot owns
 that validation, and quietness is checked through the actual parser/transport.
+
+E3 follow-up retains a frozen quiet metadata ceiling: selected/identified files
+cannot exceed the already settled physical group-member count, and that count
+must stay equal over three walks. Actual parsers, native body bytes and POSTs
+remain zero, with the source-wide context still unadopted. Joined-job fixtures
+also check each physical alias has a receipt for the active context. The extra
+settled-alias fixture now uses a same-size mtime-only rewrite; its waiting ordinary
+group keeps its queue membership and old evidence on page one and must parse
+within two later pages. A growing ordinary group may legitimately take a separate
+freshness page before another ordinary file; context groups receive no such
+priority. No read-budget or protected census change is introduced.
+
+Quietness also checks a separate test-only group physical-byte probe, charged
+immediately after reading and before a group member's reader can be swapped.
+The sampled-acquisition counter alone does not cover those reads. A cold group
+replay provides a positive control for this probe; all three quiet walks require
+it to stay zero. Production read ledgers and the shared-parser contract are
+unchanged.
