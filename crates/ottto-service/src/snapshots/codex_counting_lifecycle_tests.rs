@@ -338,6 +338,7 @@ fn moved_evidence_is_shared_by_group_cursor_and_retained_restore() {
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
+        withheld_content_stamp: None,
     };
     let key = local_index_key(&path);
     let old_key = format!("/synthetic/sessions/rollout-2026-10-01T10-00-00-{SESSION}.jsonl");
@@ -418,6 +419,7 @@ fn archived_candidate() -> CandidateFile {
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
+        withheld_content_stamp: None,
     }
 }
 

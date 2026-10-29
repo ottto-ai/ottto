@@ -1115,7 +1115,7 @@ fn claude_account_deferred_holds_are_durable_bounded_and_pruned_by_proof() {
         .record_claude_account_deferred_holds([(held_key, "deferred-source")], &BTreeMap::new(),));
     assert_eq!(resolved.claude_account_deferred_hold_count(), 0);
     // W4: a release on resolution is counted apart from a deletion.
-    let [released, _] = crate::local_resource_diagnostics::take_withheld_for_test();
+    let [released, _, _] = crate::local_resource_diagnostics::take_withheld_for_test();
     assert_eq!(released, BTreeMap::from([("resolved", 1)]));
 
     // A complete traversal proves absence only for keys neither indexed nor
@@ -1151,7 +1151,7 @@ fn claude_account_deferred_holds_are_durable_bounded_and_pruned_by_proof() {
     assert!(!full.record_claude_account_deferred_holds([(other_key, "other-source")], &deferred));
     assert!(!full.claude_account_deferred_holds.contains_key(other_key));
     // W3: the unrecorded key's withheld tokens are disclosed on the page line.
-    let [_, unrecorded] = crate::local_resource_diagnostics::take_withheld_for_test();
+    let [_, _, unrecorded] = crate::local_resource_diagnostics::take_withheld_for_test();
     assert_eq!(unrecorded, BTreeMap::from([("events", 1), ("tokens", 7)]));
     assert!(full.record_claude_account_deferred_holds([(held_key, "next-source")], &deferred));
     assert_eq!(
