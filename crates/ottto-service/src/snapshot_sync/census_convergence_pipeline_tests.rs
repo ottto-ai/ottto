@@ -827,7 +827,6 @@ fn transition_row(rows: &[serde_json::Value], event: &str) -> Option<serde_json:
         .cloned()
 }
 
-
 /// Diagnostics only: the page that leaves a Claude sweep unsettled names its
 /// path; the terminal's retiring line names it beside the withheld census;
 /// the clean follow-up's starting line names it as prior, and that start
