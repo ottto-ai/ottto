@@ -125,7 +125,13 @@ impl codex_file_join::HeaderInventory {
                     self.custody_unknown = true;
                     // Path ids are negative scope only, never ownership proof.
                     // Truly unlocated custody still cannot fence plain work.
-                    for owner in codex_session_id_candidates_from_path(Path::new(key)) {
+                    let path = Path::new(key);
+                    let logical = if is_compressed_codex_rollout(Some(path), None) {
+                        path.with_extension("")
+                    } else {
+                        path.to_owned()
+                    };
+                    for owner in codex_session_id_candidates_from_path(&logical) {
                         self.mark_custody_owner(&owner, cause);
                     }
                 }
