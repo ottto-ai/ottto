@@ -2058,6 +2058,87 @@ fn withheld_account_reparses_only_on_start_evidence_or_growth() {
     }
     assert_eq!(reparses(), BTreeMap::new(), "a touch is no re-parse");
 
+    // Explicit forward touch after the completed memo: neither a parse nor
+    // a clamp transition, on native metadata as well as the portable path.
+    touch(SystemTime::now());
+    assert_eq!(
+        page(committed.clone(), &cache).2,
+        Vec::new(),
+        "forward touch after memo"
+    );
+    assert_eq!(
+        clamp_events.get(),
+        0,
+        "forward touch never accepts a birth clamp"
+    );
+    assert_eq!(
+        last_page.borrow()["counts"]["sampled_acquisition"]["full_selections"],
+        0
+    );
+    assert_eq!(reparses(), BTreeMap::new());
+
+    // cp -p style: truncate the EXISTING object, restore the identical bytes,
+    // then backdate mtime below the memo's recorded birth, without unlinking.
+    let identical = fs::read(&path).unwrap();
+    let before_overwrite = fs::metadata(&path).unwrap();
+    let object = physical_identity(&before_overwrite).unwrap();
+    let preserved_time = UNIX_EPOCH + std::time::Duration::from_secs(75);
+    {
+        let mut file = File::options()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        assert_eq!(physical_identity(&file.metadata().unwrap()), Some(object));
+        file.write_all(&identical).unwrap();
+        file.set_times(fs::FileTimes::new().set_modified(preserved_time))
+            .unwrap();
+    }
+    let after_overwrite = fs::metadata(&path).unwrap();
+    assert_eq!(
+        physical_identity(&after_overwrite),
+        Some(object),
+        "overwrite preserves device and inode"
+    );
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        identical,
+        "the entire body is identical"
+    );
+    #[cfg(target_os = "macos")]
+    {
+        assert!(before_overwrite.created().unwrap() > preserved_time);
+        assert_eq!(after_overwrite.created().unwrap(), preserved_time);
+    }
+    #[cfg(not(target_os = "macos"))]
+    assert_eq!(
+        after_overwrite.created().ok(),
+        before_overwrite.created().ok()
+    );
+    for pass in 0..3 {
+        assert_eq!(
+            page(committed.clone(), &cache).2,
+            Vec::new(),
+            "same-content overwrite pass {pass}: no acquisition or delivery"
+        );
+        assert_eq!(
+            last_page.borrow()["counts"]["sampled_acquisition"]["full_selections"],
+            0
+        );
+    }
+    assert_eq!(
+        clamp_events.get(),
+        u64::from(cfg!(target_os = "macos")),
+        "overwrite accepts exactly one clamp on macOS"
+    );
+    assert_eq!(
+        reparses(),
+        BTreeMap::new(),
+        "identical overwrite never re-parses"
+    );
+    // Isolate the next existing case's event delta; do not reset its memo.
+    clamp_events.set(0);
+
     // The original r24 failure: move mtime BELOW birth AFTER CONTENT exists.
     // On APFS this also clamps birth; Linux retains its original birth.
     let before = fs::metadata(&path).unwrap();
