@@ -23904,7 +23904,7 @@ mod tests {
         )
         .unwrap();
         let mut index = ScanIndex::default();
-        let scan = |index: &mut ScanIndex, at| {
+        let scan = |index: &mut ScanIndex, at: &str| {
             crate::snapshots::scan_source_roots_with_test_limit(
                 SnapshotSource::ClaudeCode,
                 std::slice::from_ref(&projects),
