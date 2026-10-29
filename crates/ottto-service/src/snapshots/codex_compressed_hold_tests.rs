@@ -1533,3 +1533,156 @@ fn state_only_exclusion_refusal_keeps_prior_fingerprint_activity_and_manifest() 
     }
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn parser_bound_fork_latches_but_spawn_edge_alone_does_not() {
+    for fork in [false, true] {
+        let root = crate::test_scratch::private_dir("custody-fork-only");
+        let child = member(&root, "sessions", OWNER, false);
+        let parent = member(&root, "sessions", PARENT, true);
+        if fork {
+            let mut rows = codex_file_join::tests::member(OWNER, "response", 100, 100);
+            rows[0]["payload"]["forked_from_id"] = json!(PARENT);
+            fs::write(
+                &child,
+                rows.iter()
+                    .map(|v| v.to_string() + "\n")
+                    .collect::<String>(),
+            )
+            .unwrap();
+        }
+        let mut index = ScanIndex::default();
+        seed_archive(&mut index, &parent, PARENT);
+        let paths = [child.clone(), parent.clone()];
+        let inv = inventory(&root, &paths, &mut index);
+        let mut scan = staged(&root, index, std::slice::from_ref(&child));
+        scan.index
+            .traversal
+            .as_mut()
+            .unwrap()
+            .codex_rollout_paths
+            .insert(local_index_key(&parent));
+        scan.codex_join_inventory = Some(inv);
+        scan.codex_title_metadata
+            .spawn_parents
+            .insert(OWNER.into(), PARENT.into());
+        let ((index, result), rows) = capture(|| run(scan));
+        assert_eq!(result.scanned_file_count, 1);
+        if fork {
+            assert_no_red(&result, &rows);
+            assert_eq!(
+                index.files[&local_index_key(&child)].codex_compressed_hold,
+                Some(CodexZstCause::ParentLedgerUnbound)
+            );
+        } else {
+            assert_eq!(result.snapshots.len(), 1);
+            assert!(result.snapshots[0].input_tokens > 0);
+            assert!(index.files[&local_index_key(&child)]
+                .codex_compressed_hold
+                .is_none());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn side_parse_of_fork_finishes_its_guard_without_main_custody() {
+    let root = crate::test_scratch::private_dir("custody-side-exit");
+    let child = member(&root, "sessions", OWNER, false);
+    let parent = member(&root, "sessions", PARENT, true);
+    let mut rows = codex_file_join::tests::member(OWNER, "response", 100, 100);
+    rows[0]["payload"]["forked_from_id"] = json!(PARENT);
+    fs::write(
+        &child,
+        rows.iter()
+            .map(|v| v.to_string() + "\n")
+            .collect::<String>(),
+    )
+    .unwrap();
+    let mut index = ScanIndex::default();
+    seed_archive(&mut index, &parent, PARENT);
+    let inv = inventory(&root, &[child.clone(), parent.clone()], &mut index);
+    let mut scan = staged(&root, index, std::slice::from_ref(&child));
+    scan.index
+        .traversal
+        .as_mut()
+        .unwrap()
+        .codex_rollout_paths
+        .insert(local_index_key(&parent));
+    scan.codex_join_inventory = Some(inv);
+    let mut reached = false;
+    for _ in 0..100 {
+        scan = match scan.step(None) {
+            OwnedSourceScanStep::Pending(next) => next,
+            _ => panic!("must reach staged parser"),
+        };
+        if scan.active_file.is_some() {
+            reached = true;
+            break;
+        }
+    }
+    assert!(reached);
+    let stat = fs::metadata(&child).unwrap();
+    let ((index, result), rows) = capture(|| {
+        scan.active_file.as_mut().unwrap().side_origin = Some(SideOrigin {
+            guard: crate::local_resource_diagnostics::codex_side_lifecycle::SideReadGuard::start(1),
+            dev_ino: (stat.dev(), stat.ino()),
+        });
+        run(scan)
+    });
+    assert!(index
+        .files
+        .get(&local_index_key(&child))
+        .map_or(true, |e| e.codex_compressed_hold.is_none()));
+    assert!(result.snapshots.is_empty());
+    let ends = rows
+        .iter()
+        .filter(|r| r["stage"] == "side_read_end")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ends.len(),
+        1,
+        "production side finish must end exactly once"
+    );
+    assert_ne!(ends[0]["counts"]["abandoned"], true);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn custodied_owner_sibling_is_non_red_without_becoming_a_header_witness() {
+    let root = crate::test_scratch::private_dir("custody-sibling");
+    let a = member(&root, "sessions", OWNER, false);
+    let b = member(&root, "copy/sessions", OWNER, false);
+    let mut index = ScanIndex::default();
+    latch(&mut index, &a);
+    let inv = inventory(&root, &[a.clone(), b.clone()], &mut index);
+    assert_eq!(inv.headers.len(), 1, "custody grants no header authority");
+    let mut scan = staged(&root, index, &[a.clone(), b.clone()]);
+    scan.codex_join_inventory = Some(inv);
+    let ((index, result), rows) = capture(|| run(scan));
+    assert_no_red(&result, &rows);
+    assert_eq!(
+        index.files[&local_index_key(&b)].codex_compressed_hold,
+        Some(CodexZstCause::ParentLedgerUnbound)
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn missing_held_path_still_blocks_new_same_owner_member() {
+    let root = crate::test_scratch::private_dir("custody-absent-owner");
+    let a = member(&root, "sessions", OWNER, false);
+    let mut index = accepted(&root, &a);
+    latch(&mut index, &a);
+    fs::remove_file(&a).unwrap();
+    let b = member(&root, "copy/sessions", OWNER, false);
+    let inv = inventory(&root, std::slice::from_ref(&b), &mut index);
+    let mut scan = staged(&root, index, std::slice::from_ref(&b));
+    scan.codex_join_inventory = Some(inv);
+    let ((index, result), rows) = capture(|| run(scan));
+    assert_no_red(&result, &rows);
+    assert!(index.files[&local_index_key(&b)]
+        .codex_compressed_hold
+        .is_some());
+    fs::remove_dir_all(root).unwrap();
+}
