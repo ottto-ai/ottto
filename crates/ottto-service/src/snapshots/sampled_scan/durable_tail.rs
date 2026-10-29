@@ -61,6 +61,15 @@ pub(crate) const STORES_RESIDENT_BOUND: usize =
 /// Existing class-X re-derivation is bounded at `HEAD_BOUND`, on a RAM
 /// miss only, so the census pass line reports it beside the guard's own
 /// counters (SOURCE N1).
+#[cfg(test)]
+thread_local! {
+    static BEFORE_CARRIER_PROBE: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(in crate::snapshots) fn set_before_carrier_probe(hook: Option<Box<dyn FnMut()>>) {
+    BEFORE_CARRIER_PROBE.with(|slot| *slot.borrow_mut() = hook);
+}
+
 const RECOVERY_PACE_SECONDS: u64 = 6 * 3600;
 const _: () = assert!(RECOVERY_PACE_SECONDS < 24 * 3600);
 
@@ -1020,6 +1029,7 @@ impl SharedCache {
     /// A grouped member's `durable_full_hold` at job start, also taking its
     /// once-clamped live-context missing-carrier deadline (Addendum 6). The
     /// group settlement counts it once per member that publishes.
+    #[cfg(test)]
     pub(crate) fn durable_member_hold(
         &self,
         source: SnapshotSource,
@@ -1032,7 +1042,7 @@ impl SharedCache {
         })
     }
 
-    fn durable_member_hold_active(
+    pub(in crate::snapshots) fn durable_member_hold_active(
         &self,
         snapshot_source: SnapshotSource,
         key: &str,
@@ -1069,6 +1079,12 @@ impl SharedCache {
         key: &str,
         index: &ScanIndex,
     ) -> Result<Option<u64>, store::ActiveOverBudget> {
+        #[cfg(test)]
+        BEFORE_CARRIER_PROBE.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().as_mut() {
+                hook();
+            }
+        });
         // Settlement stays read-only: no pending reconciliation, T14 grant,
         // rebuild count or Full-start effect is imported to obtain credit.
         self.durable_funded_probe(source, |cache| {
@@ -1169,7 +1185,7 @@ impl SharedCache {
         self.durable_funded_probe(source, guard)
     }
 
-    fn durable_funded_probe<T>(
+    pub(in crate::snapshots) fn durable_funded_probe<T>(
         &self,
         source: SnapshotSource,
         probe: impl FnOnce(&Self) -> T,

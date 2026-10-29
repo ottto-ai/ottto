@@ -3248,8 +3248,15 @@ fn delayed_t14_receipt_allows_clean_then_changed_offer_without_second_rebuild() 
         };
         let item = |n| {
             let mut record = pending(b.clone(), certificate(&transcript), n);
-            record.allowlist = crate::snapshots::sampled_jsonl::durable::allowlist_digest(
+            // Existing source-tag2 v1 pin; no private codec module access.
+            record.allowlist = parse_hex_digest(
+                "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1",
+            )
+            .unwrap();
+            record.body = crate::snapshots::durable_store_fixture_body(
                 crate::snapshots::SnapshotSource::Codex,
+                n,
+                n * 7,
             );
             record
         };

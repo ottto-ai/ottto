@@ -27742,24 +27742,34 @@ impl OwnedSourceScan {
                 ) {
                     // Each member's missing-carrier deadline rides with the
                     // job across pause and defer to its own native entry.
-                    let mut refused = false;
-                    for member in &group_members {
-                        let mut due = None;
-                        let key = local_index_key(&member.path);
-                        match cache.durable_member_hold(source, &key, index, &mut due) {
-                            Ok(None) => {
-                                if let Some(at) =
-                                    group.members.iter().position(|m| m.path == member.path)
-                                {
-                                    group.recovered[at] = due;
-                                }
+                    // One admission BEFORE any member consumes a T14 start.
+                    // No later per-member credit failure can strand earlier grants.
+                    let checked = cache.durable_funded_probe(source, |cache| {
+                        let mut refused = false;
+                        for member in &group_members {
+                            let mut due = None;
+                            let key = local_index_key(&member.path);
+                            let held =
+                                cache.durable_member_hold_active(source, &key, index, &mut due);
+                            if let Some(at) =
+                                group.members.iter().position(|m| m.path == member.path)
+                            {
+                                group.recovered[at] = due;
                             }
-                            Ok(Some(reason)) => {
+                            if let Some(reason) = held {
                                 refused = true;
                                 cache.durable_hold_exit(source, reason, index, member, &mut census);
                             }
-                            Err(_) => {
-                                refused = true;
+                        }
+                        refused
+                    });
+                    match checked {
+                        Ok(false) => {}
+                        Ok(true) => {
+                            pending!();
+                        }
+                        Err(_) => {
+                            for member in &group_members {
                                 cache.durable_custody_hold(
                                     source,
                                     "member_input_pending",
@@ -27767,10 +27777,8 @@ impl OwnedSourceScan {
                                     member,
                                 );
                             }
+                            pending!();
                         }
-                    }
-                    if refused {
-                        pending!();
                     }
                 }
                 active_file = Some(job);
@@ -28403,6 +28411,44 @@ impl OwnedSourceScan {
                 // `finish_job` consumes the acquisition's start offset. An
                 // exact-stamp memo below must not cover anything past them.
                 let attempt_read_end = sampled_scan::codex_cursor::read_end(&active);
+                // R1 funding admission precedes finish_job/rotation.complete.
+                // A busy probe parks the exact EOF job with its cursor lease;
+                // retry cannot be fenced out before settlement exists.
+                #[cfg(unix)]
+                let mut settlement_reprobed_due = None;
+                #[cfg(unix)]
+                if active.cursor.is_some() && active.side_origin.is_none() {
+                    if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
+                        let checked =
+                            (|| -> Result<(), crate::durable_tail_store::ActiveOverBudget> {
+                                if let Some(group) = active.group.as_mut() {
+                                    for (member, due) in
+                                        group.members.iter().zip(group.recovered.iter_mut())
+                                    {
+                                        let key = local_index_key(&member.path);
+                                        if due.is_none() && !index.files.contains_key(&key) {
+                                            *due = cache
+                                                .durable_carrier_reprobe(source, &key, index)?;
+                                        }
+                                    }
+                                } else {
+                                    let key = local_index_key(&active.candidate.path);
+                                    if active.recovered_audit_due.is_none()
+                                        && !index.files.contains_key(&key)
+                                    {
+                                        settlement_reprobed_due =
+                                            cache.durable_carrier_reprobe(source, &key, index)?;
+                                        active.recovered_audit_due = settlement_reprobed_due;
+                                    }
+                                }
+                                Ok(())
+                            })();
+                        if checked.is_err() {
+                            active_file = Some(active);
+                            pending!();
+                        }
+                    }
+                }
                 // S6: a cursor job commits only through its sealed-prefix
                 // certificate; an invalidated attempt publishes nothing.
                 let mut cursor_certificate = None;
@@ -28657,8 +28703,6 @@ impl OwnedSourceScan {
                     codex_legacy_join_baselines.extend(group.take_legacy_baselines());
                     std::mem::take(&mut group.recovered)
                 });
-                #[cfg(unix)]
-                let paged = cursor_certificate.is_some();
                 let mut parser = parser;
                 // The repository identity X_out measured, if any (#665 U3).
                 let mut measured_repository_identity = None;
@@ -29942,47 +29986,14 @@ impl OwnedSourceScan {
                         }
                     }
                 }
-                // R1: a paged job parked across a fresh index load captured
-                // no due for a file now without an entry. Re-probe the same
-                // live-context, clamped debt (read only) before recording;
-                // no restart. A re-probed singleton miss counts here.
                 #[cfg(unix)]
-                let (member_dues, recovered_audit_due, reprobed_due) = {
-                    let mut dues = (member_dues, recovered_audit_due, None);
-                    if let Some(cache) = durable_guard
-                        .as_ref()
-                        .and_then(std::sync::Weak::upgrade)
-                        .filter(|_| paged && parse_complete)
-                    {
-                        let absent = |key: &str| !index.files.contains_key(key);
-                        for (member, due) in aliases.iter().zip(dues.0.iter_mut()) {
-                            let key = local_index_key(&member.path);
-                            if due.is_none() && absent(&key) {
-                                *due = cache.durable_carrier_reprobe(source, &key, index).map_err(
-                                    |_| {
-                                        crate::source_rotation::LocalRefusal(
-                                            "durable settlement funding pending",
-                                        )
-                                    },
-                                )?;
-                            }
-                        }
-                        if dues.0.is_empty() && dues.1.is_none() && absent(&index_key) {
-                            dues.2 = cache
-                                .durable_carrier_reprobe(source, &index_key, index)
-                                .map_err(|_| {
-                                    crate::source_rotation::LocalRefusal(
-                                        "durable settlement funding pending",
-                                    )
-                                })?;
-                            dues.1 = dues.2;
-                            if dues.2.is_some() {
-                                cache.durable_note_carrier("audit_carrier");
-                            }
-                        }
+                let reprobed_due = settlement_reprobed_due.filter(|_| parse_complete);
+                #[cfg(unix)]
+                if reprobed_due.is_some() {
+                    if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
+                        cache.durable_note_carrier("audit_carrier");
                     }
-                    dues
-                };
+                }
                 #[cfg(not(unix))]
                 let reprobed_due: Option<u64> = None;
                 if parse_complete && !aliases.is_empty() {

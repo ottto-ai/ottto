@@ -13942,6 +13942,47 @@ fn parked_singleton_across_fresh_index_reprobes_record_debt() {
     index.traversal = None;
     let cache = Arc::new(SharedCache::default());
     cache.durable_begin_pass(SnapshotSource::Codex, &index_path, &scope, false);
+    struct ResetProbe;
+    impl Drop for ResetProbe {
+        fn drop(&mut self) {
+            super::durable_tail::set_before_carrier_probe(None);
+            store::active::set_active_budget_for_test(None);
+        }
+    }
+    let _reset = ResetProbe;
+    let probes = std::rc::Rc::new(std::cell::Cell::new(0));
+    let seen = probes.clone();
+    let observer = cache.clone();
+    let before = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let previous = before.clone();
+    super::durable_tail::set_before_carrier_probe(Some(Box::new(move || {
+        seen.set(seen.get() + 1);
+        if seen.get() == 1 {
+            // Real resumed EOF, missing index membership. Refuse classifier
+            // credit ONCE, before the cursor can complete/fence this import.
+            assert_eq!(
+                counter(&observer, |c| c.jobs_certified)
+                    + counter(&observer, |c| c.jobs_uncertified),
+                0
+            );
+            *previous.borrow_mut() =
+                Some(observer.durable_counters(SnapshotSource::Codex).unwrap().1);
+            store::active::set_active_budget_for_test(Some(0));
+        } else if seen.get() == 2 {
+            assert_eq!(
+                counter(&observer, |c| c.jobs_certified)
+                    + counter(&observer, |c| c.jobs_uncertified),
+                0,
+                "failed settlement admission never fences the attempt"
+            );
+            assert_eq!(
+                observer.durable_counters(SnapshotSource::Codex).unwrap().1,
+                previous.borrow().as_ref().copied().unwrap(),
+                "no classifier I/O before credit"
+            );
+            store::active::set_active_budget_for_test(None);
+        }
+    })));
     let index = with_test_limits(2048, 1024, 64, || {
         let mut index = index;
         let mut cleared = false;
@@ -13975,6 +14016,12 @@ fn parked_singleton_across_fresh_index_reprobes_record_debt() {
         );
         index
     });
+    assert_eq!(
+        probes.get(),
+        2,
+        "exact EOF job retries funding and settles without reparse/fence loss"
+    );
+    super::durable_tail::set_before_carrier_probe(None);
     assert_eq!(
         index.files[&key].unverified_deadline(),
         Some(due),

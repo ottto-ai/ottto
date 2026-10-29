@@ -6704,8 +6704,8 @@ fn accepted_floor_missing_record_is_neutral_and_freezes_before_mutation() {
         3
     ));
     assert!(
-        !sampled_audit::path_requires_recovery(source, &index.files, &path, 7),
-        "growth rescue belongs to E3 #876 through main"
+        sampled_audit::path_requires_recovery(source, &index.files, &path, 7),
+        "retain partial safeguard until E3 #876 supplies old-directory rescue"
     );
     assert!(!sampled_audit::path_requires_recovery(
         source,
@@ -7423,10 +7423,23 @@ fn content_v1_resource_refusal_cannot_hide_equal_edit_or_truncate_then_restart()
         let (changed, idle, modes) = run(cache.clone(), changed, "2026-10-29T12:00:00Z");
         assert!(idle.snapshots.is_empty());
         assert_eq!(modes, (0, 0, 0));
+        assert_eq!(
+            changed.claude_request_census.get(&key).unwrap().retired(),
+            None
+        );
         // Forty days crosses35-day census retirement and >one-year crosses W.
         let (retired, idle, modes) = run(cache.clone(), changed, "2026-12-15T12:00:00Z");
         assert!(idle.snapshots.is_empty());
         assert_eq!(modes, (0, 0, 0));
+        assert!(
+            retired
+                .claude_request_census
+                .get(&key)
+                .unwrap()
+                .retired()
+                .is_some(),
+            "actual35-day retirement premise"
+        );
         let (mut aged, idle, modes) = run(cache, retired, "2028-12-15T12:00:00Z");
         assert!(idle.snapshots.is_empty());
         assert_eq!(modes, (0, 0, 0));

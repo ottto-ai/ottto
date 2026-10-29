@@ -219,8 +219,9 @@ pub(super) fn path_requires_verification(
         .is_some_and(ScanIndexEntry::has_unverified_source)
 }
 
-/// S2 retains shorter extents and future accepted revisions so pruning cannot
-/// erase their floor. Growth rescue is owned by E3 #876 and joins through main.
+/// Retain the existing partial growth safeguard and S2 shorter/future floors
+/// until E3 #876 joins through main with its bounded old-directory rescue.
+/// This predicate alone does NOT implement or qualify that dependency.
 /// Discovery grants no ACK, census proof or independent read permission.
 pub(super) fn path_requires_recovery(
     source: SnapshotSource,
@@ -230,7 +231,7 @@ pub(super) fn path_requires_recovery(
 ) -> bool {
     path_requires_verification(files, path)
         || files.get(&local_index_key(path)).is_some_and(|entry| {
-            length < entry.size_bytes
+            length != entry.size_bytes
                 || entry.effective_upload_body_witness_revision
                     > crate::snapshot_sync::effective_upload_body_witness_revision(source)
         })

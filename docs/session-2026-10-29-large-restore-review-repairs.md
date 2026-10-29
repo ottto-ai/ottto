@@ -11,9 +11,9 @@ reconciliation failures before disabled-store recovery.
 
 Every retained member-start, read-only settlement and final Full classifier
 probe reserves active input credit before taking the store lock. A preflight
-lease that already ended is insufficient. Missing settlement credit aborts the
-unaccepted collection with a retryable local refusal; it cannot silently discard
-a recovered deadline and publish. Settlement does not reconcile pending state,
+lease that already ended is insufficient. Member probes reserve once for the whole batch before any rebuild start.
+Missing settlement credit parks the exact EOF job before its cursor fence; it
+cannot discard a recovered deadline or complete an unaccepted import. Settlement does not reconcile pending state,
 grant a corruption rebuild or count a Full start merely to obtain funding.
 
 The existing certificate metadata edits and bounded head/boundary checks now
@@ -34,8 +34,10 @@ component; this repair does not implement another planner or pace map.
 
 Generic growth discovery, including bounded index-driven rescue from old
 directories, remains owned by the separate discovery change and must join via
-main. The partial copied growth age exemption is removed here; the local
-shorter-extent/future-revision correctness-floor rescue remains. The isolated
+main. The existing partial growth safeguard stays until that join replaces it;
+no parallel index-driven rescue is introduced here. It is insufficient by itself
+and is not claimed as the integrated dependency. The local shorter-extent/future
+revision correctness-floor rescue remains. The isolated
 retail fixture now keeps growth inside the window and does not claim to prove
 the old-directory dependency. Oversize and census-retirement qualifications
 remain separate owner gates; no source cap or persisted format changes.
