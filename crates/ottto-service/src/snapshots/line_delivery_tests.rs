@@ -1040,7 +1040,7 @@ fn walk_gate_counts_age_and_size_skips_without_changing_selection() {
                 SnapshotSource::ClaudeCode,
                 index.traversal.as_mut().unwrap(),
                 30,
-                &index.files,
+                discovery_retention!(index),
             );
         }
         let counts = &index.traversal.as_ref().unwrap().counts;
@@ -1089,7 +1089,7 @@ fn roster_gate_counts_age_and_size_skips_without_changing_selection() {
             SnapshotSource::Codex,
             index.traversal.as_mut().unwrap(),
             30,
-            &index.files,
+            discovery_retention!(index),
         );
     }
     unselected_page("codex");
@@ -1110,7 +1110,7 @@ fn roster_gate_counts_age_and_size_skips_without_changing_selection() {
             SnapshotSource::Codex,
             index.traversal.as_mut().unwrap(),
             30,
-            &index.files,
+            discovery_retention!(index),
         );
         let counts = &index.traversal.as_ref().unwrap().counts;
         let decided = (
@@ -1128,6 +1128,394 @@ fn roster_gate_counts_age_and_size_skips_without_changing_selection() {
     assert_eq!(first, (selected, 4, 1));
     assert_eq!(counted, json!({"age": 1, "size": 1}));
     assert_eq!(recounted, counted);
+}
+
+// ---- E3: withheld-account holds stay discoverable until they resolve ----
+
+/// The key holds a parsed revision withheld for an unresolved account.
+fn withhold(index: &mut ScanIndex, path: &Path) {
+    index
+        .claude_account_deferred_holds
+        .insert(local_index_key(path), "held-source".into());
+}
+
+fn walk_all(index: &mut ScanIndex, days: u64) {
+    while !index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .pending_directories
+        .is_empty()
+    {
+        advance_bounded_directory_traversal(
+            SnapshotSource::ClaudeCode,
+            index.traversal.as_mut().unwrap(),
+            days,
+            discovery_retention!(index),
+        );
+    }
+}
+
+/// Gate 1 with a 7-day request: an aged withheld key is still discovered and
+/// observed, an oversized one is observed, kept unread and counted, and once
+/// the holds resolve the ordinary window and size skips apply again.
+#[test]
+fn walk_gate_keeps_withheld_account_keys_until_their_hold_resolves() {
+    let root = Root::new("ld-withheld-walk");
+    let project = root.projects().join("p");
+    fs::create_dir_all(&project).unwrap();
+    let file = |name: &str| project.join(format!("{name}.jsonl"));
+    for name in ["held", "old"] {
+        append(&file(name), b"{}\n");
+        set_old(&file(name));
+    }
+    fs::File::create(file("big"))
+        .unwrap()
+        .set_len(MAX_CLAUDE_JSONL_FILE_BYTES + 1)
+        .unwrap();
+    let mut held = ScanIndex::default();
+    withhold(&mut held, &file("held"));
+    withhold(&mut held, &file("big"));
+    let resolved = ScanIndex::default();
+    let walk = |prepared: &ScanIndex| {
+        let mut index = prepared.clone();
+        ensure_bounded_traversal(
+            SnapshotSource::ClaudeCode,
+            &[root.projects()],
+            &mut index,
+            NOW,
+            7,
+        );
+        walk_all(&mut index, 7);
+        let traversal = index.traversal.as_ref().unwrap();
+        let observed = ["held", "old", "big"]
+            .into_iter()
+            .filter(|name| {
+                traversal
+                    .observed_index_keys
+                    .contains(&local_index_key(&file(name)))
+            })
+            .collect::<Vec<_>>();
+        (
+            candidates(&index),
+            observed,
+            traversal.counts.oversized_file_count,
+            unselected_page("claude_code"),
+        )
+    };
+    // Before the exemption the aged held key was skipped for age: no
+    // candidate, not observed, and `age: 2` with no withheld count.
+    assert_eq!(
+        walk(&held),
+        (
+            vec![file("held")],
+            vec!["held", "big"],
+            1,
+            json!({"age": 1, "size": 1, "withheld_oversized": 1})
+        )
+    );
+    assert_eq!(
+        walk(&resolved),
+        (Vec::new(), vec!["big"], 1, json!({"age": 2, "size": 1}))
+    );
+}
+
+/// Gates 3 and 4 (candidate revalidation, opened-object recheck): an aged
+/// withheld key opens and stays observed; unheld, the same file is removed
+/// from the census as out of window. An oversized withheld key is observed,
+/// never opened, and counted.
+#[test]
+fn candidate_and_open_gates_keep_withheld_account_keys() {
+    let root = Root::new("ld-withheld-open");
+    let aged = root.file(SESSION);
+    append(&aged, b"{}\n");
+    set_old(&aged);
+    let big = root.file("big");
+    fs::File::create(&big)
+        .unwrap()
+        .set_len(MAX_CLAUDE_JSONL_FILE_BYTES + 1)
+        .unwrap();
+    let census_at = rfc3339_unix_seconds(NOW);
+    assert!(census_at.is_some(), "the window is applied");
+    let gates = |path: &Path, holds: &BTreeMap<String, String>| {
+        let key = local_index_key(path);
+        let mut census = ScanCensus::default();
+        let opened = candidate_from_traversal_path(
+            SnapshotSource::ClaudeCode,
+            ScanTraversalPath {
+                scan_root: root.projects(),
+                path: path.to_path_buf(),
+                census_member: true,
+                watcher_hint: false,
+            },
+            &mut census,
+            census_at,
+            7,
+            crate::snapshots::DiscoveryRetention {
+                files: &BTreeMap::new(),
+                account_holds: holds,
+            },
+        )
+        .map(|candidate| {
+            open_and_identify_scan_candidate(
+                SnapshotSource::ClaudeCode,
+                candidate,
+                &mut census,
+                census_at,
+                7,
+                crate::snapshots::DiscoveryRetention {
+                    files: &BTreeMap::new(),
+                    account_holds: holds,
+                },
+            )
+            .is_some()
+        });
+        (
+            opened,
+            census.observed_index_keys.contains(&key),
+            census.removed_index_keys.contains(&key),
+            unselected_page("claude_code"),
+        )
+    };
+    let held = |path: &Path| BTreeMap::from([(local_index_key(path), "held-source".to_string())]);
+    // Before the exemption: (None, false, true): removed as out of window.
+    assert_eq!(
+        gates(&aged, &held(&aged)),
+        (Some(true), true, false, Value::Null)
+    );
+    assert_eq!(
+        gates(&aged, &BTreeMap::new()),
+        (None, false, true, Value::Null)
+    );
+    assert_eq!(
+        gates(&big, &held(&big)),
+        (None, true, false, json!({"withheld_oversized": 1}))
+    );
+    assert_eq!(
+        gates(&big, &BTreeMap::new()),
+        (None, true, false, Value::Null)
+    );
+}
+
+/// A Tail needs the retained reduction, which the RAM cache admits only where
+/// `heap_layout_bound::layout_supported()` holds (macOS on the pinned rustc).
+/// Elsewhere (Linux CI) the cache refuses retention (`retention_bound_refused`),
+/// so every read is `Full(StateMissing)`, as for the other sampled-mode tests.
+/// Never pin macOS to Full: a macOS Full here is E1's acquisition binding (W1).
+fn held_growth_mode() -> DeliveryMode {
+    if crate::heap_layout_bound::layout_supported() {
+        DeliveryMode::Tail
+    } else {
+        DeliveryMode::Full
+    }
+}
+
+/// F-INDEX and census completion: a present aged withheld key is observed, so
+/// reconciliation and the raw-census prune keep its entry and hold. A held key
+/// whose file is gone is still proved absent and retired with its hold, so a
+/// deleted file cannot pin the hold (and the unsettled receipt) forever.
+#[test]
+fn reconciliation_keeps_present_withheld_keys_and_retires_absent_ones() {
+    let root = Root::new("ld-withheld-reconcile");
+    let project = root.projects().join("p");
+    fs::create_dir_all(&project).unwrap();
+    let file = |name: &str| project.join(format!("{name}.jsonl"));
+    for name in ["held", "old"] {
+        append(&file(name), b"{}\n");
+        set_old(&file(name));
+    }
+    let mut index = ScanIndex::default();
+    for name in ["held", "old", "gone"] {
+        index.files.insert(
+            local_index_key(&file(name)),
+            super::tests::manifest_index_entry(Some(name)),
+        );
+    }
+    withhold(&mut index, &file("held"));
+    withhold(&mut index, &file("gone"));
+    ensure_bounded_traversal(
+        SnapshotSource::ClaudeCode,
+        &[root.projects()],
+        &mut index,
+        NOW,
+        7,
+    );
+    walk_all(&mut index, 7);
+    assert!(reconcile_missing_index_entries_with_limit(
+        &mut index,
+        usize::MAX
+    ));
+    // The gone key is never a candidate: its release reads nothing.
+    assert_eq!(candidates(&index), vec![file("held")]);
+    let observed = index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .observed_index_keys
+        .clone();
+    index.retain_observed_claude_account_deferred_holds(&observed);
+    // Lead A round 2: "deleted held file: hold released, counted".
+    assert_eq!(
+        crate::local_resource_diagnostics::take_withheld_for_test()[0],
+        BTreeMap::from([("deleted", 1)])
+    );
+    let held = BTreeSet::from([local_index_key(&file("held"))]);
+    // Before the exemption both sets were empty: the aged held key was not
+    // observed, so reconciliation dropped its entry and hold.
+    assert_eq!(index.files.keys().cloned().collect::<BTreeSet<_>>(), held);
+    assert_eq!(
+        index
+            .claude_account_deferred_holds
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        held
+    );
+}
+
+/// RFC 3339 for the real clock plus `days`: transcript mtimes are real.
+fn days_from_now(days: u64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    OffsetDateTime::from_unix_timestamp((now + days * 86_400) as i64)
+        .unwrap()
+        .format(&Rfc3339)
+        .unwrap()
+}
+
+fn assistant_line(uuid: &str) -> Vec<u8> {
+    let value = json!({"type": "assistant", "sessionId": SESSION, "uuid": uuid,
+        "cwd": "/w/one", "timestamp": "2026-10-06T10:00:00.000Z",
+        "requestId": format!("req_{uuid}"),
+        "message": {"id": format!("msg_{uuid}"), "model": "claude-opus-4-8",
+            "role": "assistant", "usage": {"input_tokens": 10, "output_tokens": 20}}});
+    [raw(&value), b"\n".to_vec()].concat()
+}
+
+/// HOLD RULE fixture (GUARDRAILS "No hold may drop a growing file"): a key
+/// whose account stays unresolved grows over held passes, grows again and then
+/// idles past a 7-day window. The next page still discovers it, reads only the
+/// unread growth as a Tail, emits the session once, and keeps the entry and
+/// hold through census completion. After the hold resolves, the next aged page
+/// neither reads nor keeps the key: normal aging resumes.
+#[test]
+fn withheld_account_growth_is_read_after_idling_past_the_window() {
+    let root = Root::new("ld-withheld-aged");
+    let path = root.file(SESSION);
+    let key = local_index_key(&path);
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let page = |index: ScanIndex, collected_at: &str| {
+        let recorder = Recorder::default();
+        let ((index, result, _), _) = capture(|| {
+            finish(
+                OwnedSourceScan::new(
+                    SnapshotSource::ClaudeCode,
+                    &[root.projects()],
+                    index,
+                    collected_at,
+                    7,
+                    10,
+                    false,
+                    None,
+                    &[],
+                    false,
+                    true,
+                )
+                .with_sampled_acquisition(
+                    cache.clone(),
+                    crate::transcript_acquisition::Scope("ld-withheld-aged".into()),
+                )
+                .with_line_observer("test", Box::new(recorder.clone())),
+            )
+        });
+        (index, result, recorder)
+    };
+    let today = days_from_now(0);
+    append(&path, &assistant_line("u1"));
+    let (committed, first, _) = page(ScanIndex::default(), &today);
+    assert_eq!(first.scanned_file_count, 1);
+    // Held passes: each parse is withheld, so the key keeps its committed
+    // revision and the hold names the parsed one.
+    let mut held = committed;
+    for uuid in ["u2", "u3"] {
+        append(&path, &assistant_line(uuid));
+        let (parsed, result, _) = page(held.clone(), &today);
+        assert_eq!(result.scanned_file_count, 1, "growth while held is read");
+        held.claude_account_deferred_holds.insert(
+            key.clone(),
+            parsed.files[&key].source_file_fingerprint.clone(),
+        );
+    }
+    // Unread growth, then the file idles past the window.
+    append(&path, &assistant_line("u4"));
+    let aged = days_from_now(8);
+    let (parsed, result, recorder) = page(held, &aged);
+    let begins = recorder
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::Begin(view) => Some(view),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    // Before the exemption: no read at all, and reconciliation dropped the
+    // entry and hold, so u4 was never uploaded.
+    assert_eq!(begins.len(), 1, "the aged held key is discovered once");
+    assert_eq!(
+        begins[0].mode,
+        held_growth_mode(),
+        "held growth reads as a counted Tail, never a Full"
+    );
+    // A Tail delivers only the unread u4 line; a Full (no retained reduction)
+    // all four. Either way u4 is read: no drop.
+    let delivered = if held_growth_mode() == DeliveryMode::Tail {
+        1
+    } else {
+        4
+    };
+    assert_eq!(
+        recorder.lines().len(),
+        delivered,
+        "the unread u4 line is read"
+    );
+    assert_eq!(
+        result
+            .snapshots
+            .iter()
+            .filter(|snapshot| snapshot.source_session_id == SESSION)
+            .count(),
+        1
+    );
+    assert!(parsed.files.contains_key(&key), "census completion kept it");
+    assert!(parsed.claude_account_deferred_holds.contains_key(&key));
+    // The account binds: the next parse resolves the hold.
+    let mut resolved = parsed;
+    assert!(
+        resolved.record_claude_account_deferred_holds(result.completed_parses(), &BTreeMap::new())
+    );
+    assert!(resolved.claude_account_deferred_holds.is_empty());
+    // The u4 Tail (supported layouts only) is an accepted sampled generation:
+    // `sampled_audit` stages its pre-existing audit debt, which keeps the key
+    // owed until a Full audit, held or not. A Full (Linux) stages none. Clear
+    // it as a completed audit would, so only the hold arm is under test.
+    let entry = &resolved.files[&key];
+    assert_eq!(
+        entry.has_unverified_source(),
+        held_growth_mode() == DeliveryMode::Tail,
+        "only a Tail stages audit debt"
+    );
+    let fingerprint = entry.source_file_fingerprint.clone();
+    if entry.has_unverified_source() {
+        assert!(resolved.complete_full_audit(&key, &fingerprint));
+    }
+    // The exemption ends at resolution: nothing owes the resolved key.
+    assert!(!discovery_retention!(resolved).owes(&path));
+    let (after, again, recorder) = page(resolved, &days_from_now(9));
+    assert_eq!(recorder.events(), Vec::new(), "aged and no longer held");
+    assert_eq!(again.scanned_file_count, 0);
+    assert!(!after.files.contains_key(&key), "ordinary aging retires it");
 }
 
 /// An unplanned reader from zero includes malformed, invalid and paused-overlong
