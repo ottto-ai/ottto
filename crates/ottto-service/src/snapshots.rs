@@ -26473,6 +26473,21 @@ impl OwnedSourceScan {
             .saturating_sub(pending_paths.len())
             .min(carry_replay.len());
         pending_paths.extend(carry_replay.drain(..replayed));
+        // Context catch-up consumes ordinary page slots only after queued new
+        // or grown native files. Keep recovery/deadline reservations above.
+        while matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex)
+            && pending_paths.len() < selection_limit
+        {
+            let Some(position) = traversal.pending_candidates.iter().position(|candidate| {
+                !index.files.contains_key(&local_index_key(&candidate.path))
+                    || codex_fresh_data_pending(candidate, &index.files)
+            }) else {
+                break;
+            };
+            if let Some(candidate) = traversal.pending_candidates.remove(position) {
+                pending_paths.push(candidate);
+            }
+        }
         while pending_paths.len() < selection_limit {
             let Some(position) = traversal
                 .pending_candidates

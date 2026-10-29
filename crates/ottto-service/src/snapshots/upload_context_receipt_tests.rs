@@ -12,6 +12,7 @@ struct Fixture {
     source: SnapshotSource,
     index: ScanIndex,
     cache: Arc<sampled_scan::SharedCache>,
+    uploader: crate::snapshot_sync::upload_context_receipt_tests::Uploader,
 }
 impl Fixture {
     fn new(source: SnapshotSource) -> Self {
@@ -54,6 +55,7 @@ impl Fixture {
             source,
             index,
             cache: Arc::default(),
+            uploader: crate::snapshot_sync::upload_context_receipt_tests::Uploader::new(source),
         }
     }
     fn key(&self) -> String {
@@ -122,15 +124,20 @@ impl Fixture {
     }
     fn adopt(&mut self) -> RearmCounts {
         let committed = self.index.clone();
-        let (candidates, items) = self.pending();
-        let exact =
-            crate::snapshot_sync::upload_context_receipt_tests::exact_acks(self.source, &items);
-        let accepted = exact.keys().cloned().collect();
-        self.index
-            .reconcile_codex_recovery_settlement(&committed, &accepted);
-        self.index.record_accepted_snapshot_fingerprints(&accepted);
-        self.index
-            .accept_file_upload_context_acks(&candidates, &exact)
+        let (_, items) = self.pending();
+        self.uploader.activate(
+            self.source,
+            self.index
+                .active_upload_context_fingerprint
+                .clone()
+                .unwrap(),
+            &mut self.index,
+        );
+        let (files, bytes) = self
+            .uploader
+            .send(self.source, &mut self.index, &committed, &items)
+            .unwrap();
+        RearmCounts { files, bytes }
     }
 
     fn assert_quiet(&mut self) {
@@ -373,6 +380,8 @@ fn upload_context_receipt_restart_and_generation_rearm_once() {
         .activate_file_upload_context(f.source, "d".repeat(64));
     f.assert_quiet();
     f.index.context_curve_replay_epoch += 1;
+    // The real prepare resets both index and upload progress for a new replay.
+    f.uploader.replay("synthetic-curve-epoch-1");
     assert_eq!(
         f.adopt(),
         RearmCounts {
@@ -389,6 +398,7 @@ fn upload_context_receipt_historical_replay_rearms_retained_entry() {
     let key = f.key();
     f.index.files.get_mut(&key).unwrap().codex_protected_owner = Some("f".repeat(64));
     assert!(f.index.prepare_historical_replay("synthetic-replay".into()));
+    f.uploader.replay("synthetic-replay");
     assert!(f.index.files[&key].upload_context_receipt.is_none());
     assert_eq!(f.adopt().files, 1);
     assert!(!f.index.prepare_historical_replay("synthetic-replay".into()));
@@ -415,6 +425,8 @@ fn legacy_round_trip(version: &str) {
     }
     fs::write(&saved_path, serde_json::to_vec(&old).unwrap()).unwrap();
     f.index = ScanIndex::load(&saved_path).unwrap();
+    // Downgrade saves also pass progress through the old unknown-field codec.
+    f.uploader.forget_stamps();
     f.index
         .activate_file_upload_context(f.source, "d".repeat(64));
     assert!(f.entry().upload_context_receipt.is_none());
@@ -602,4 +614,298 @@ fn upload_context_policy_suppressed_file_rearms_on_context_change() {
         .activate_file_upload_context(f.source, "d".repeat(64));
     assert!(f.index.file_upload_context_requires_adoption(&key));
     assert_eq!(f.walk(true).0.scanned_file_count, 1);
+}
+
+#[test]
+fn real_uploader_identical_context_change_resends_once_then_three_quiet_relists() {
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let mut f = Fixture::new(source);
+        f.adopt();
+        let accepted = f.uploader.posts.last().unwrap().clone();
+        f.index.activate_file_upload_context(source, "e".repeat(64));
+        assert_eq!(f.adopt().files, 1);
+        assert_eq!(f.uploader.posts.len(), 2);
+        assert_eq!(
+            *f.uploader.posts.last().unwrap(),
+            accepted,
+            "all sent bytes, tokens, cost and request fields unchanged"
+        );
+        let counts = f.uploader.counts();
+        assert_eq!((counts.0, counts.2, counts.3), (1, 1, 0));
+        assert!(counts.1 > 0);
+        for _ in 0..3 {
+            let previous = f.index.clone();
+            let (scan, bytes) = f.walk(true);
+            assert_eq!((scan.scanned_file_count, bytes), (0, 0));
+            f.uploader.activate(source, "e".repeat(64), &mut f.index);
+            f.uploader
+                .send(source, &mut f.index, &previous, &scan.snapshots)
+                .unwrap();
+            assert_eq!(f.uploader.posts.len(), 2);
+            assert_eq!(f.uploader.counts(), (0, 0, 0, 0));
+        }
+    }
+}
+
+fn uploader_group(f: &mut Fixture, count: usize) -> Vec<SnapshotItem> {
+    let (mut scan, _) = f.walk(false);
+    let template = scan.snapshots[0].clone();
+    scan.snapshots = (0..count)
+        .map(|n| {
+            let mut item = template.clone();
+            item.source_session_id = format!("context-group-{n:04}");
+            item
+        })
+        .collect();
+    finalize_scan_after_policy(f.source, &mut scan, &mut f.index);
+    scan.snapshots
+}
+#[test]
+fn real_uploader_restart_mid_context_catchup_never_resends_reacked_entities() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    let empty = f.index.clone();
+    let items = uploader_group(&mut f, 51);
+    f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
+    assert_eq!(
+        f.uploader
+            .send(f.source, &mut f.index, &empty, &items)
+            .unwrap()
+            .0,
+        1
+    );
+    let committed = f.index.clone();
+    f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
+    f.uploader.fail_after = Some(f.uploader.posts.len() + 1);
+    assert!(f
+        .uploader
+        .send(f.source, &mut f.index, &committed, &items)
+        .is_err());
+    let reacked = f
+        .uploader
+        .posts
+        .last()
+        .unwrap()
+        .iter()
+        .map(|v| v["snapshot_fingerprint"].clone())
+        .collect::<Vec<_>>();
+    assert!(!reacked.is_empty() && reacked.len() < items.len());
+    f.uploader.restart(f.source, &"e".repeat(64));
+    f.uploader.fail_after = None;
+    f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
+    let before = f.uploader.posts.len();
+    f.uploader
+        .send(f.source, &mut f.index, &committed, &items)
+        .unwrap();
+    let resumed = f.uploader.posts[before..]
+        .iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    assert_eq!(resumed.len(), items.len() - reacked.len());
+    assert!(resumed
+        .iter()
+        .all(|v| !reacked.contains(&v["snapshot_fingerprint"])));
+    assert_eq!(f.uploader.counts().0 as usize, resumed.len());
+    f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
+    f.uploader
+        .send(f.source, &mut f.index, &committed, &items)
+        .unwrap();
+    assert_eq!(f.uploader.posts.len(), before + 1);
+    assert_eq!(f.uploader.counts(), (0, 0, 0, 0));
+}
+#[test]
+fn real_uploader_same_context_transport_retry_has_zero_context_resends() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    let previous = f.index.clone();
+    let items = uploader_group(&mut f, 51);
+    f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
+    f.uploader.fail_after = Some(1);
+    assert!(f
+        .uploader
+        .send(f.source, &mut f.index, &previous, &items)
+        .is_err());
+    let first = f.uploader.posts[0].len();
+    f.uploader.restart(f.source, &"d".repeat(64));
+    f.uploader.fail_after = None;
+    f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
+    f.uploader
+        .send(f.source, &mut f.index, &previous, &items)
+        .unwrap();
+    assert_eq!(f.uploader.posts[1].len(), items.len() - first);
+    assert_eq!(f.uploader.counts(), (0, 0, 0, 0));
+    f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
+    f.uploader
+        .send(f.source, &mut f.index, &previous, &items)
+        .unwrap();
+    assert_eq!(f.uploader.posts.len(), 2);
+    assert_eq!(f.uploader.counts(), (0, 0, 0, 0));
+}
+#[test]
+fn real_uploader_old_unstamped_progress_with_equal_source_context_resends_nothing() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    let previous = f.index.clone();
+    let (_, items) = f.pending();
+    f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
+    f.uploader
+        .send(f.source, &mut f.index, &previous, &items)
+        .unwrap();
+    f.uploader.forget_stamps();
+    let key = f.key();
+    f.index.files.get_mut(&key).unwrap().upload_context_receipt = None;
+    f.index.upload_context_fingerprint = Some("d".repeat(64));
+    let previous = f.index.clone();
+    f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
+    assert_eq!(
+        f.uploader
+            .send(f.source, &mut f.index, &previous, &items)
+            .unwrap()
+            .0,
+        0
+    );
+    assert_eq!(f.uploader.posts.len(), 1);
+    assert_eq!(f.uploader.counts(), (0, 0, 0, 0));
+    for _ in 0..3 {
+        let (scan, bytes) = f.walk(true);
+        assert_eq!((scan.scanned_file_count, bytes), (0, 0));
+    }
+}
+#[test]
+fn real_uploader_new_usage_precedes_pending_context_catchup() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    f.adopt();
+    let previous = f.index.clone();
+    f.index
+        .activate_file_upload_context(f.source, "e".repeat(64));
+    let (mut scan, _) = f.walk(false);
+    let mut new_usage = scan.snapshots[0].clone();
+    new_usage.source_session_id = "zz-new-usage".into();
+    scan.snapshots.push(new_usage);
+    finalize_scan_after_policy(f.source, &mut scan, &mut f.index);
+    f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
+    f.uploader
+        .send(f.source, &mut f.index, &previous, &scan.snapshots)
+        .unwrap();
+    let post = f.uploader.posts.last().unwrap();
+    assert_eq!(post[0]["source_session_id"], "zz-new-usage");
+    assert_eq!(post.len(), 2);
+    assert!(serde_json::to_vec(post).unwrap().len() <= 2 * 1024 * 1024);
+}
+#[test]
+fn real_uploader_not_stored_backs_off_but_growth_earns_receipt() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    f.adopt();
+    f.index
+        .activate_file_upload_context(f.source, "e".repeat(64));
+    let previous = f.index.clone();
+    let (_, items) = f.pending();
+    f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
+    f.uploader.not_stored = true;
+    assert_eq!(
+        f.uploader
+            .send(f.source, &mut f.index, &previous, &items)
+            .unwrap()
+            .0,
+        0
+    );
+    assert_eq!(f.uploader.fresh_count(), 0);
+    assert_eq!(f.uploader.not_stored_files(), 1);
+    assert_ne!(
+        f.entry()
+            .upload_context_receipt
+            .as_ref()
+            .unwrap()
+            .context_fingerprint,
+        "e".repeat(64)
+    );
+    let posts = f.uploader.posts.len();
+    for _ in 0..3 {
+        let (scan, bytes) = f.walk(true);
+        assert_eq!((scan.scanned_file_count, bytes), (0, 0));
+        assert_eq!(f.uploader.posts.len(), posts);
+    }
+    let mut body = fs::read_to_string(&f.path).unwrap();
+    body.push_str(&format!("{}\n",json!({"type":"assistant","sessionId":SESSION,"timestamp":"2026-10-29T10:02:01Z","requestId":"grown-request","message":{"id":"grown-message","model":"claude-sonnet-4-6","usage":{"input_tokens":30,"output_tokens":10}}})));
+    fs::write(&f.path, body).unwrap();
+    f.uploader.not_stored = false;
+    assert_eq!(f.adopt().files, 1);
+    assert_eq!(f.uploader.posts.len(), posts + 1);
+    assert_eq!(
+        f.entry()
+            .upload_context_receipt
+            .as_ref()
+            .unwrap()
+            .context_fingerprint,
+        "e".repeat(64)
+    );
+}
+#[test]
+fn real_uploader_duplicate_refusal_mints_nothing_and_does_not_loop() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    f.adopt();
+    f.index
+        .activate_file_upload_context(f.source, "e".repeat(64));
+    let previous = f.index.clone();
+    let (_, items) = f.pending();
+    f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
+    f.uploader.refuse = true;
+    f.uploader
+        .send(f.source, &mut f.index, &previous, &items)
+        .unwrap();
+    assert_eq!(f.uploader.fresh_count(), 0);
+    assert_ne!(
+        f.entry()
+            .upload_context_receipt
+            .as_ref()
+            .unwrap()
+            .context_fingerprint,
+        "e".repeat(64)
+    );
+    let posts = f.uploader.posts.len();
+    for _ in 0..3 {
+        let (scan, bytes) = f.walk(true);
+        assert_eq!((scan.scanned_file_count, bytes), (0, 0));
+        assert_eq!(f.uploader.posts.len(), posts);
+    }
+}
+#[test]
+fn real_uploader_privacy_reducing_context_uses_destination_policy() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    let previous = f.index.clone();
+    let (mut scan, _) = f.walk(false);
+    scan.snapshots[0].session_display_name = Some("synthetic title".into());
+    scan.snapshots[0].session_display_name_source = Some("synthetic".into());
+    let on = SnapshotUploadPolicy {
+        session_titles_enabled: true,
+        ..SnapshotUploadPolicy::default()
+    };
+    apply_upload_policy(f.source, &mut scan.snapshots, on);
+    finalize_scan_after_policy(f.source, &mut scan, &mut f.index);
+    f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
+    f.uploader
+        .send(f.source, &mut f.index, &previous, &scan.snapshots)
+        .unwrap();
+    let previous = f.index.clone();
+    f.index
+        .activate_file_upload_context(f.source, "e".repeat(64));
+    let off = SnapshotUploadPolicy {
+        session_titles_enabled: false,
+        ..SnapshotUploadPolicy::default()
+    };
+    apply_upload_policy(f.source, &mut scan.snapshots, off);
+    finalize_scan_after_policy(f.source, &mut scan, &mut f.index);
+    f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
+    assert_eq!(
+        f.uploader
+            .send(f.source, &mut f.index, &previous, &scan.snapshots)
+            .unwrap()
+            .0,
+        1
+    );
+    assert_eq!(
+        f.uploader.counts().3,
+        1,
+        "D-policy projection is a changed ordinary revision"
+    );
+    assert!(f.uploader.posts.last().unwrap()[0]
+        .get("session_display_name")
+        .map_or(true, serde_json::Value::is_null));
 }

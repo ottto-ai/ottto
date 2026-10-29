@@ -21,6 +21,39 @@ pub(crate) struct Candidate {
     bodies: BTreeMap<String, String>,
 }
 
+impl Candidate {
+    pub(crate) fn entities(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.bodies.iter()
+    }
+    pub(crate) fn previous_body_matches(&self, previous: &ScanIndex) -> bool {
+        previous
+            .files
+            .get(&self.key)
+            .and_then(|entry| entry.last_upload_body_witness.as_ref())
+            == Some(&self.receipt.body_witness)
+    }
+    pub(crate) fn has_accepted_predecessor(&self, previous: &ScanIndex) -> bool {
+        previous
+            .files
+            .get(&self.key)
+            .is_some_and(|entry| entry.source_file_fingerprint == self.receipt.source_witness)
+            && previous
+                .file_snapshot_fingerprints
+                .get(&self.key)
+                .is_some_and(|entities| {
+                    entities
+                        .iter()
+                        .any(|fp| previous.accepted_snapshot_fingerprints.contains(fp))
+                })
+    }
+    pub(crate) fn file_bytes(&self, index: &ScanIndex) -> u64 {
+        index
+            .files
+            .get(&self.key)
+            .map_or(0, |entry| entry.size_bytes)
+    }
+}
+
 #[derive(Default, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct RearmCounts {
     pub files: u64,
@@ -39,6 +72,9 @@ impl RearmCounts {
 }
 
 impl ScanIndex {
+    pub(crate) fn source_upload_context_matches(&self) -> bool {
+        self.upload_context_fingerprint == self.active_upload_context_fingerprint
+    }
     pub(crate) fn activate_file_upload_context(&mut self, source: SnapshotSource, context: String) {
         self.activate_upload_context(context);
         self.file_upload_context_enabled =
@@ -92,13 +128,18 @@ impl ScanIndex {
             .get(&key)
             .is_some_and(|entities| {
                 !entities.is_empty()
+                    && entities
+                        .iter()
+                        .any(|entity| self.quarantined_snapshot_fingerprints.contains_key(entity))
                     && entities.iter().all(|entity| {
-                        self.quarantined_snapshot_fingerprints
-                            .get(entity)
-                            .is_some_and(|record| {
-                                self.active_quarantine_witness.as_ref() == Some(&record.witness)
-                                    && !self.quarantine_retry_selects_file(entity, &key)
-                            })
+                        self.accepted_snapshot_fingerprints.contains(entity)
+                            || self
+                                .quarantined_snapshot_fingerprints
+                                .get(entity)
+                                .is_some_and(|record| {
+                                    self.active_quarantine_witness.as_ref() == Some(&record.witness)
+                                        && !self.quarantine_retry_selects_file(entity, &key)
+                                })
                     })
             })
     }

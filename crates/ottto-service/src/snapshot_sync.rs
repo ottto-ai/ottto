@@ -1187,6 +1187,7 @@ struct PermanentSnapshotRejection {
 }
 
 mod ack_retention;
+mod upload_context_resend;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SnapshotUploadProgress {
@@ -1207,6 +1208,11 @@ struct SnapshotUploadProgress {
     /// fingerprint.
     #[serde(default)]
     accepted_body_witnesses: BTreeMap<String, String>,
+    /// Exact context of each durable stored-body ACK; absent means unknown.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    accepted_body_contexts: BTreeMap<String, String>,
+    #[serde(skip)]
+    context_resend: upload_context_resend::Cycle,
     /// Admission only: current live incidence plus bounded unsettled ACK debt.
     #[serde(skip, default = "ack_retention::default_ack_capacity")]
     ack_capacity: usize,
@@ -1276,6 +1282,8 @@ impl SnapshotUploadProgress {
             historical_replay_generation: None,
             accepted_fingerprints: BTreeSet::new(),
             accepted_body_witnesses: BTreeMap::new(),
+            accepted_body_contexts: BTreeMap::new(),
+            context_resend: upload_context_resend::Cycle::default(),
             ack_capacity: ack_retention::default_ack_capacity(),
             retained_stale_ack_count: 0,
             accepted_cache_states: BTreeMap::new(),
@@ -1332,6 +1340,13 @@ impl SnapshotUploadProgress {
                         .accepted_body_witnesses
                         .values()
                         .all(|value| is_snapshot_fingerprint(value))
+                    && progress
+                        .accepted_body_contexts
+                        .iter()
+                        .all(|(key, context)| {
+                            progress.accepted_body_witnesses.contains_key(key)
+                                && is_snapshot_fingerprint(context)
+                        })
                     && progress.accepted_cache_heads.iter().all(|(key, head)| {
                         is_snapshot_fingerprint(key) && is_snapshot_fingerprint(head)
                     })
@@ -1835,6 +1850,7 @@ impl SnapshotUploadProgress {
         shed: bool,
         source: &str,
     ) {
+        self.context_resend.emit(source);
         let counts = &mut self.reason_reoffer_counts;
         for fingerprint in attempted.keys() {
             if !self.attempted_reason_reoffers.contains(fingerprint) {
@@ -1872,6 +1888,7 @@ impl SnapshotUploadProgress {
         self.historical_replay_generation = Some(generation.to_string());
         self.accepted_fingerprints.clear();
         self.accepted_body_witnesses.clear();
+        self.accepted_body_contexts.clear();
         self.quarantined_fingerprints.clear();
         for pending in self.pending_cache_heads.values_mut() {
             pending.settled_entities.clear();
@@ -1909,7 +1926,10 @@ impl SnapshotUploadProgress {
         (self
             .accepted_body_witnesses
             .get(fingerprint)
-            .is_some_and(|accepted| accepted == body_witness))
+            .is_some_and(|accepted| accepted == body_witness)
+            && !self
+                .context_resend
+                .requires_resend(fingerprint, &self.accepted_body_contexts))
             || self
                 .quarantined_fingerprints
                 .get(fingerprint)
@@ -1946,6 +1966,7 @@ impl SnapshotUploadProgress {
     }
 
     fn record_body(&mut self, fingerprint: &str, body_witness: &str) {
+        self.accepted_body_contexts.remove(fingerprint);
         if self
             .active_reason_reoffers
             .get(fingerprint)
@@ -2131,9 +2152,21 @@ impl SnapshotUploadProgress {
             .quarantined_fingerprints
             .get_mut(fingerprint)
             .expect("quarantine just recorded");
-        record.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
-        record.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
-        record.retry_after_unix_seconds = 0;
+        if self.context_resend.is_candidate(fingerprint) {
+            // Current-context not_stored re-offers retain ordinary retry custody.
+            // Exponential 6h/12h, capped by the existing 12h decoder bound.
+            if record.disposition == SnapshotQuarantineDisposition::RetryPending {
+                let delay = SNAPSHOT_QUARANTINE_RETRY_SECONDS.saturating_mul(
+                    1u64 << record.failed_reconstruction_count.saturating_sub(1).min(1),
+                );
+                record.retry_after_unix_seconds =
+                    reason_reoffer::now_unix_seconds().saturating_add(delay);
+            }
+        } else {
+            record.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
+            record.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
+            record.retry_after_unix_seconds = 0;
+        }
     }
 
     fn quarantine_retryable_body(&mut self, fingerprint: &str, body_witness: &str) {
@@ -2198,6 +2231,8 @@ impl SnapshotUploadProgress {
     }
 
     fn save(&mut self, path: &Path) -> Result<()> {
+        self.accepted_body_contexts
+            .retain(|fp, _| self.accepted_body_witnesses.contains_key(fp));
         self.save_with_read_limit(path, None)
     }
     fn save_with_read_limit(&mut self, path: &Path, read_limit: Option<usize>) -> Result<()> {
@@ -2937,6 +2972,7 @@ fn checkpoint_partial_snapshot_index_with_comparison(
     durable.retained_stale_ack_count = progress.retained_stale_ack_count;
     durable.fresh_context_body_acks = progress.fresh_context_body_acks.clone();
     durable.context_receipt_candidates = progress.context_receipt_candidates.clone();
+    durable.context_resend = progress.context_resend.clone();
     if durable != *progress || durable.schema_version != SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION {
         return Err(anyhow!(
             "snapshot progress changed before partial checkpoint"
@@ -7332,6 +7368,16 @@ fn finish_sync_source(
         upload_progress.complete_census_ack_retirements(&index, scan_result.census_complete);
     // Current scanner incidence grants live slots on a first install, too.
     // No absent ACK or unrelated entity borrows those slots.
+    upload_progress.prepare_context_receipt_candidates(
+        &index,
+        &committed_index,
+        &scan_result.snapshots,
+    );
+    scan_result.snapshots.sort_by_key(|item| {
+        upload_progress
+            .context_resend
+            .is_catchup(&item.snapshot_fingerprint)
+    });
     let ack_admission_limited =
         upload_progress.admit_upload_input(&mut scan_result.snapshots, &index);
     if matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex)
@@ -7341,6 +7387,9 @@ fn finish_sync_source(
     }
     upload_progress.context_receipt_candidates =
         index.file_upload_context_ack_candidates(&scan_result.snapshots);
+    upload_progress
+        .context_resend
+        .retain_candidates(&upload_progress.context_receipt_candidates);
     let probes = scan_result
         .snapshots
         .iter()
@@ -8363,9 +8412,15 @@ fn activate_source_upload_context(
     progress.active_quarantine_witness = Some(
         crate::snapshots::snapshot_quarantine_witness_for_context(source, &context),
     );
-    index.activate_file_upload_context(source, context);
+    index.activate_file_upload_context(source, context.clone());
     progress.fresh_context_body_acks.clear();
     progress.context_receipt_candidates.clear();
+    progress.context_resend =
+        if matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex) {
+            upload_context_resend::Cycle::new(context, index.source_upload_context_matches())
+        } else {
+            upload_context_resend::Cycle::default()
+        };
 }
 
 /// Production form of the above: outside a historical replay, due refusal
@@ -9791,6 +9846,13 @@ where
                 .saturating_add(snapshot_packing_json_length(item)?);
         }
     }
+    for index in indices {
+        let item = &items[*index];
+        progress.context_resend.note_attempt(
+            fingerprint(item),
+            snapshot_packing_json_length(item)? as u64,
+        );
+    }
     let response = upload(batch)?;
     if response.disabled {
         return Ok(SnapshotPageOutcome::Disabled(response.disabled_reason));
@@ -9857,12 +9919,21 @@ where
             if settled.contains(item_fingerprint) {
                 let body = body_witness(item);
                 progress.record_body(item_fingerprint, &body);
+                if let Some(context) = &progress.context_resend.active {
+                    progress
+                        .accepted_body_contexts
+                        .insert(item_fingerprint.to_string(), context.clone());
+                }
                 progress
                     .fresh_context_body_acks
                     .insert(item_fingerprint.to_string(), body);
                 progress.record_cache_state(item, false)?;
             } else if not_stored.contains(item_fingerprint) {
                 progress.hold_unstored_body(item_fingerprint, &body_witness(item));
+                progress
+                    .context_resend
+                    .not_stored
+                    .insert(item_fingerprint.to_string());
             }
         }
         if !not_stored.is_empty() {
@@ -10224,6 +10295,25 @@ where
             order.extend(group);
             unit_ends.push(order.len());
         }
+    }
+    let mut units = Vec::with_capacity(unit_ends.len());
+    let mut start = 0;
+    for end in unit_ends {
+        units.push(order[start..end].to_vec());
+        start = end;
+    }
+    units.sort_by_key(|unit| {
+        unit.iter().all(|(index, _, _)| {
+            progress
+                .context_resend
+                .is_catchup(fingerprint(&items[*index]))
+        })
+    });
+    let mut unit_ends = Vec::with_capacity(units.len());
+    order.clear();
+    for unit in units {
+        order.extend(unit);
+        unit_ends.push(order.len());
     }
     let mut batch = Vec::new();
     let mut batch_bytes = 2usize;
@@ -24170,7 +24260,7 @@ mod tests {
 
 crate::heap_layout_bound::fields!(SourcePreparation; native_comparison_reservation, native_comparison_lease, prepared_claude_evidence, terminal_native_traversal, native_comparison_controller, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
 
-crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save, fresh_context_body_acks, context_receipt_candidates);
+crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_body_contexts, context_resend, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save, fresh_context_body_acks, context_receipt_candidates);
 
 crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint, group_fingerprint, entities, reselected_heads, settled_entities);
 

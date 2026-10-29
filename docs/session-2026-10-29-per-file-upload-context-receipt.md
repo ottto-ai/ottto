@@ -88,3 +88,44 @@ parse/finalize/quarantine/prior-context refusals, stale witnesses and old decode
 Validation for this change is local all-target Clippy compilation and formatting;
 no Rust tests or production daemon operations were executed. Runtime fixture
 execution and post-release live before/after measurements remain unverified.
+
+
+Context-stamped progress ACKs make that fresh receipt reachable for identical
+bodies. `accepted_body_contexts` is an optional map parallel to the durable body
+witness map. A stamp is written only from a live stored-body entity ACK, under
+the active context; a count-only ACK leaves it unknown. Only current receipt
+candidates can bypass body suppression for a differing stamp. Unknown stamps
+bypass only while the source-wide context also differs; upgraded quiet sources
+remain quiet. Same-context page ACKs survive restart and are never re-sent merely
+because the whole-file receipt is still absent. Stamps alone never mint receipts.
+
+New/grown native files and new upload revisions precede identical catch-up in
+the existing page slots and bounded batch packing. Catch-up uses normal ACK
+admission, byte limits, retries and pacing. Current destination policy always
+projects re-sent bodies. `upload_context_resend{entities,bytes,identical,changed}`
+counts each logical entity attempt once in the cycle; bytes are serialized item
+bytes, excluding request envelope. Stamped accepted entities do not count again
+after restart. Not-stored/duplicate-refused responses mint nothing. Not-stored
+context candidates retain quarantine retry custody (6h then12h, capped at12h,
+then existing terminal attempt cap); unchanged mixed files wait with accepted
+siblings. Growth bypasses this unchanged-file hold and can earn a receipt on an
+accepted new body. `upload_context_not_stored{files,bytes}` shares the diagnostics
+line; bytes are indexed source sizes. Neither hold grants acceptance.
+
+Each stamp carries a64-byte context H. A separate compact-JSON map costs134 bytes
+per body plus27 bytes per nonempty map, because it also repeats the64-byte entity
+key. Current aggregate M4 progress snapshots held zero accepted body entries in
+both sources, so their immediate stamp growth is0. The read-only index cohort at
+2026-10-29 17:36UTC was4326 Codex entities (14,069,232,523 native source bytes) and
+12249 Claude entities in12255 nonempty files (20,873,860,321 source bytes).
+These are full-catch-up cohort/native-size proxies, not measured wire sizes or
+per-day savings; wire body lengths are not retained in these metadata files.
+The earlier approximately14.5k Claude-file capacity/20.49GB source-scale estimate
+remains useful for #899's historical scope. Already matched source-wide contexts
+have no upgrade catch-up. Actual resend/not-stored counts and Codex daily reread
+bytes before/after are reported after release, using demo account and M4 logs.
+
+Frozen complete progress codecs at0.1.201,0.1.202 and0.1.203 ignore the stamp map;
+missing maps load as unknown. All receipt-adoption quietness fixtures now drive
+the production resumable uploader with retained progress and validated fake
+transport. Direct `exact_acks` helpers remain mint-refusal unit seams only.
