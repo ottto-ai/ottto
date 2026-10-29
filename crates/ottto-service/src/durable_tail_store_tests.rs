@@ -458,9 +458,31 @@ fn retained_completion_rejects_wrong_candidate_and_final_path_swap() {
     let wrong_candidate = store
         .write_after_save(&lock, 3, 0, vec![wrong.clone()])
         .unwrap();
-    assert!(wrong_candidate.completed.is_empty());
+    assert_eq!(
+        wrong_candidate.completed.len(),
+        1,
+        "deliver B, never the offered C"
+    );
+    assert_eq!(wrong_candidate.completed[0].identity.generation, 2);
+    assert_ne!(wrong_candidate.completed[0].content, content_digest(&wrong));
     assert_eq!(wrong_candidate.deferred_keys, vec![b.key]);
-    assert_eq!(pending_snapshot(&store), debt);
+    assert!(!store.has_pending());
+    assert!(matches!(
+        store.reconcile_pending(&lock, &b.key).unwrap(),
+        ReconcileOutcome::NoPending
+    ));
+    // Independently retain C for the final-path-swap negative control.
+    test_hooks::set_before_dir_sync(Some(Box::new(|_| Err(io::Error::other("sync EIO")))));
+    let failed_c = store
+        .write_after_save(&lock, 4, 0, vec![wrong.clone()])
+        .unwrap();
+    test_hooks::set_before_dir_sync(None);
+    assert!(failed_c.completed.is_empty());
+    let ReconcileOutcome::Receipted(proof) = store.reconcile_pending(&lock, &b.key).unwrap() else {
+        panic!("C survived");
+    };
+    store.retain_receipt(proof).unwrap();
+    let debt = pending_snapshot(&store);
     let ReconcileOutcome::Receipted(proof) = store.reconcile_pending(&lock, &b.key).unwrap() else {
         panic!("retained completion");
     };
@@ -475,8 +497,8 @@ fn retained_completion_rejects_wrong_candidate_and_final_path_swap() {
         &encode(&DurableRecord {
             wire: None,
             envelope_audit_debt: None,
-            record: wrong,
-            index_generation: 2,
+            record: pending(b.clone(), certificate(&path), 4),
+            index_generation: 4,
             format: FORMAT_VERSION,
         }),
     );
@@ -4315,6 +4337,14 @@ fn retained_completion_delivers_b_and_requeues_newer_c_without_b_body() {
             },
         )
         .unwrap();
+    store.authorize_witness(
+        &original,
+        &Expected {
+            binding: binding.clone(),
+            committed_generation: 1,
+        },
+        &original_witness,
+    );
     let target = store.dir().to_owned();
     test_hooks::set_before_dir_sync(Some(Box::new(move |dir| {
         if dir == target {
