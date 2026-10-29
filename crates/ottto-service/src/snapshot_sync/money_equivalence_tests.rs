@@ -238,7 +238,13 @@ impl Disk {
         index: &mut ScanIndex,
     ) -> ScanIndex {
         index.save(&self.index).unwrap();
-        crate::snapshots::durable_after_save(cache, &self.dir, source, index);
+        crate::snapshots::durable_after_save_and_retire(
+            cache,
+            &self.dir,
+            source,
+            index,
+            &self.index,
+        );
         ScanIndex::load(&self.index).unwrap()
     }
     fn records(&self) -> usize {

@@ -60,6 +60,20 @@ pub(crate) fn codex_zst_refused(cause: CodexZstCause) {
     );
 }
 
+/// Per-pass observations, not distinct entries/files or a lifetime counter.
+pub(crate) fn codex_state_only_ambiguous_identity(observations: u64, tokens: u64) {
+    if observations > 0 {
+        traversal_point(
+            "codex_state_only_ambiguous_identity",
+            "codex",
+            &BTreeMap::from([
+                ("codex_state_only_ambiguous_identity", observations),
+                ("codex_state_only_ambiguous_identity_tokens", tokens),
+            ]),
+        );
+    }
+}
+
 /// Nonzero-only counters on the existing native_collection_page line.
 #[derive(Default, Serialize)]
 struct ClaudeRecordCaps {
@@ -158,6 +172,16 @@ fn line_unselected(source: &str, reason: usize, f: impl FnOnce(&AtomicU64) -> u6
 /// One skip decision, recorded after the gate decided; never a gate input.
 pub(crate) fn line_delivery_unselected(source: &str, reason: UnselectedReason) {
     line_unselected(source, reason as usize, |slot| slot.fetch_add(1, Relaxed));
+}
+
+// Same public seam as E3/#876. Its merged withheld carrier can keep this
+// signature; this branch emits the count on the existing diagnostics carrier.
+pub(crate) fn audit_retired_absent(source: &str) {
+    traversal_point(
+        "audit_retired_absent",
+        source,
+        &serde_json::json!({"audit_retired_absent": 1}),
+    );
 }
 
 const SCHEMA_VERSION: u8 = 2;
@@ -490,6 +514,8 @@ pub(crate) struct ClaudeAccountRetainedPending {
     pub(crate) claude_account_retained_pending_families: usize,
     /// Pretty JSON bytes of the retained field, including its field wrapper.
     pub(crate) claude_account_retained_pending_bytes: u64,
+    #[serde(flatten)]
+    pub(crate) retention: crate::snapshots::account_pending_retention::Counts,
 }
 impl crate::heap_layout_bound::HeapLayoutBound for Probe {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
@@ -1151,6 +1177,10 @@ pub(crate) struct PageEvents {
 }
 #[derive(Debug, Serialize)]
 pub(crate) struct IndexState {
+    pub(crate) audit_quiet_retired: usize,
+    pub(crate) audit_cap_full: usize,
+    pub(crate) audit_cap_delay: usize,
+    pub(crate) pace_evicted: usize,
     pub(crate) pending_audits: usize,
     pub(crate) overdue_audits: usize,
     pub(crate) oldest_due_age_seconds: u64,
@@ -1566,6 +1596,10 @@ mod tests {
                 max_completion_overdue_seconds: u64::MAX,
             },
             index_state_at_page_end: IndexState {
+                audit_quiet_retired: usize::MAX,
+                audit_cap_full: usize::MAX,
+                audit_cap_delay: usize::MAX,
+                pace_evicted: usize::MAX,
                 pending_audits: usize::MAX,
                 overdue_audits: usize::MAX,
                 oldest_due_age_seconds: u64::MAX,

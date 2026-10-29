@@ -12,35 +12,19 @@
 
 use crate::agent_status::{ClaudeLiveLogin, ClaudeLocalLoginState, ClaudeOAuthCredentialMetadata};
 use crate::claude_refresher::RefreshDecision;
-use ottto_core::{default_support_dir, write_owner_only_file_atomic};
 #[cfg(test)]
 use ottto_core::{ClaudeConfigDirSlot, FileClaudeConfigSlotSettingsStore};
 use ottto_protocol::{
     ClaudeAccountUpkeepConsentState, ClaudeConfigSlotDescriptorV1, ClaudeConfigSlotUpkeepResultV1,
     ClaudeConfigSlotUpkeepStatusV1,
 };
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::fs::{self, File};
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
-#[cfg(test)]
-use std::thread;
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 
-const UPKEEP_STATE_SCHEMA_VERSION: u16 = 1;
-const UPKEEP_STATE_FILE: &str = "claude-background-upkeep-state.json";
-const UPKEEP_STATE_LOCK_FILE: &str = ".claude-background-upkeep-state.lock";
 /// Operational stop: absent means normal consent/network-gated GA behavior.
 pub(crate) const UPKEEP_DISABLED_FILE: &str = "claude-background-upkeep-disabled";
 
 const RELLOGIN_APPROACHING_SECONDS: i64 = 72 * 60 * 60;
-#[cfg(test)]
-const INITIAL_BACKOFF_SECONDS: i64 = 5 * 60;
-#[cfg(test)]
-const MAX_BACKOFF_SECONDS: i64 = 6 * 60 * 60;
-
-static UPKEEP_STATE_TRANSACTION: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ClaudeUpkeepObservation {
@@ -51,130 +35,6 @@ pub(crate) struct ClaudeUpkeepObservation {
     /// The access login lapsed while its refresh grant is alive: only Claude
     /// Code may refresh it, so collection waits (presented as paused).
     pub(crate) paused_awaiting_claude_refresh: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct PersistedUpkeepStateV1 {
-    schema_version: u16,
-    #[serde(default)]
-    slots: BTreeMap<String, PersistedUpkeepWitnessV1>,
-}
-
-impl Default for PersistedUpkeepStateV1 {
-    fn default() -> Self {
-        Self {
-            schema_version: UPKEEP_STATE_SCHEMA_VERSION,
-            slots: BTreeMap::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct PersistedUpkeepWitnessV1 {
-    due_access_expires_at: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    refresh_token_expires_at: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    attempted_at: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    result_observed_at: Option<String>,
-    /// Registration and strong binding at a preclaim observation; no secrets.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    preclaim_descriptor: Option<ClaudeConfigSlotDescriptorV1>,
-    next_allowed_attempt_at: String,
-    result: ClaudeConfigSlotUpkeepResultV1,
-    consecutive_failures: u32,
-}
-
-#[cfg(test)]
-impl PersistedUpkeepWitnessV1 {
-    fn local_status(&self) -> ClaudeConfigSlotUpkeepStatusV1 {
-        ClaudeConfigSlotUpkeepStatusV1 {
-            result: self.result,
-            due_access_expires_at: Some(self.due_access_expires_at.clone()),
-            refresh_token_expires_at: self.refresh_token_expires_at.clone(),
-            attempted_at: self.attempted_at.clone(),
-            next_allowed_attempt_at: Some(self.next_allowed_attempt_at.clone()),
-            consecutive_failures: self.consecutive_failures,
-        }
-    }
-}
-
-struct UpkeepStateGuard {
-    _process: std::sync::MutexGuard<'static, ()>,
-    file: File,
-}
-
-impl Drop for UpkeepStateGuard {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
-        }
-    }
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ClaimOutcome {
-    Claimed(ClaudeConfigSlotUpkeepStatusV1),
-    Deferred(ClaudeConfigSlotUpkeepStatusV1),
-}
-
-// Legacy algorithm fixtures only; removed with the remaining DC2/DC3 tests.
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DoctorProcessResult {
-    ExitZero,
-}
-
-#[cfg(test)]
-trait CredentialMetadataReader {
-    fn read(&self, slot: &ClaudeConfigDirSlot) -> Option<ClaudeOAuthCredentialMetadata>;
-}
-
-#[cfg(test)]
-trait DoctorProcessRunner {
-    fn run(&self, config_dir: &str) -> DoctorProcessResult;
-}
-
-#[cfg(test)]
-struct ProductionFinalSpawnGate;
-
-#[cfg(test)]
-impl ProductionFinalSpawnGate {
-    fn start_if_allowed(
-        &self,
-        descriptor: &ClaudeConfigSlotDescriptorV1,
-        process: &dyn DoctorProcessRunner,
-        config_dir: &str,
-    ) -> Result<DoctorProcessResult, ClaudeConfigSlotUpkeepResultV1> {
-        FileClaudeConfigSlotSettingsStore::default()
-            .with_locked_status(|status| {
-                if status.consent != ClaudeAccountUpkeepConsentState::Granted {
-                    return Err(ClaudeConfigSlotUpkeepResultV1::UpkeepNotConsented);
-                }
-                if !slot_is_still_registered(status, descriptor) {
-                    return Err(ClaudeConfigSlotUpkeepResultV1::NeedsLogin);
-                }
-                if crate::claude_browser_auth::collection_suppression(&descriptor.slot_id).is_some()
-                    || crate::agent_status::claude_slot_login_unapproved(descriptor)
-                {
-                    // Never refresh another or an unknown login on a bound slot.
-                    return Err(ClaudeConfigSlotUpkeepResultV1::NeedsLogin);
-                }
-                if crate::agent_status::claude_oauth_usage_network_disabled() {
-                    return Err(ClaudeConfigSlotUpkeepResultV1::CollectionPaused);
-                }
-                if default_support_dir().join(UPKEEP_DISABLED_FILE).is_file() {
-                    return Err(ClaudeConfigSlotUpkeepResultV1::UpkeepDisabled);
-                }
-                // The fixture process runs synchronously under the final fence.
-                Ok(process.run(config_dir))
-            })
-            .unwrap_or(Err(ClaudeConfigSlotUpkeepResultV1::ProbeFailed))
-    }
 }
 
 /// Whether the settings registry still holds this exact slot.
@@ -219,8 +79,7 @@ pub(crate) fn registered_slot_publication_allowed(
 }
 
 /// Foreground upkeep decision for one registered slot, from the live local
-/// read the caller made this pass (`live`). Never spawns anything and never
-/// enqueues the background worker.
+/// read the caller made this pass (`live`). Never spawns anything.
 pub(crate) fn observe_registered_slot_upkeep(
     descriptor: &ClaudeConfigSlotDescriptorV1,
     consent: bool,
@@ -335,214 +194,6 @@ fn observe_registered_slot_upkeep_reading(
     }
 }
 
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-fn observe_registered_slot_upkeep_with_gate(
-    descriptor: &ClaudeConfigSlotDescriptorV1,
-    consent: bool,
-    network_enabled: bool,
-    support_dir: &Path,
-    now: OffsetDateTime,
-    credentials: &dyn CredentialMetadataReader,
-    process: &dyn DoctorProcessRunner,
-    final_gate: &ProductionFinalSpawnGate,
-) -> ClaudeUpkeepObservation {
-    let Some(config_dir) = descriptor.config_dir.as_deref() else {
-        // The default slot is intentionally never eligible.
-        return observation(true, ClaudeConfigSlotUpkeepResultV1::NotRequired, None);
-    };
-    if !network_enabled {
-        return observation(
-            false,
-            ClaudeConfigSlotUpkeepResultV1::CollectionPaused,
-            None,
-        );
-    }
-    let Some(before) = credentials.read(
-        &ClaudeConfigDirSlot::registered(config_dir.to_string())
-            .expect("registered descriptor must retain a valid exact path"),
-    ) else {
-        return observation(
-            true,
-            ClaudeConfigSlotUpkeepResultV1::CredentialUnreadable,
-            None,
-        );
-    };
-    let Some(access_expiry) = parse_timestamp(before.access_expires_at.as_deref()) else {
-        return observation_with_metadata(
-            true,
-            ClaudeConfigSlotUpkeepResultV1::CredentialUnreadable,
-            &before,
-        );
-    };
-    let refresh_expiry = parse_timestamp(before.refresh_token_expires_at.as_deref());
-    let approaching = refresh_expiry.is_some_and(|expiry| {
-        expiry > now && expiry - now <= TimeDuration::seconds(RELLOGIN_APPROACHING_SECONDS)
-    });
-
-    if access_expiry > now {
-        let result = if approaching {
-            ClaudeConfigSlotUpkeepResultV1::ReloginApproaching
-        } else if consent {
-            ClaudeConfigSlotUpkeepResultV1::NotRequired
-        } else {
-            ClaudeConfigSlotUpkeepResultV1::UpkeepNotConsented
-        };
-        return observation_with_metadata(true, result, &before);
-    }
-    // Claude Code can leave the old refresh deadline behind after signing out
-    // while clearing both token strings. The deadline alone is therefore not
-    // proof that `claude doctor` can refresh the credential. Fail directly to
-    // the official-login state instead of spending the durable retry budget on
-    // a command that cannot recover a missing refresh grant.
-    if !before.has_refresh_token {
-        return observation_with_metadata(
-            false,
-            ClaudeConfigSlotUpkeepResultV1::NeedsLogin,
-            &before,
-        );
-    }
-    let Some(refresh_expiry) = refresh_expiry else {
-        return observation_with_metadata(
-            false,
-            ClaudeConfigSlotUpkeepResultV1::NeedsLogin,
-            &before,
-        );
-    };
-    if refresh_expiry <= now {
-        return observation_with_metadata(
-            false,
-            ClaudeConfigSlotUpkeepResultV1::NeedsLogin,
-            &before,
-        );
-    }
-    if !consent {
-        return observation_with_metadata(
-            false,
-            ClaudeConfigSlotUpkeepResultV1::UpkeepNotConsented,
-            &before,
-        );
-    }
-    if support_dir.join(UPKEEP_DISABLED_FILE).is_file() {
-        return observation_with_metadata(
-            false,
-            ClaudeConfigSlotUpkeepResultV1::UpkeepDisabled,
-            &before,
-        );
-    }
-
-    let due_access_expires_at = before
-        .access_expires_at
-        .clone()
-        .expect("parsed access expiry must retain its source");
-    let claim = match claim_attempt(
-        support_dir,
-        &descriptor.slot_id,
-        &due_access_expires_at,
-        before.refresh_token_expires_at.clone(),
-        now,
-    ) {
-        Ok(claim) => claim,
-        Err(()) => {
-            return observation_with_metadata(
-                false,
-                ClaudeConfigSlotUpkeepResultV1::ProbeFailed,
-                &before,
-            )
-        }
-    };
-    let in_progress = match claim {
-        ClaimOutcome::Deferred(status) => {
-            let result = if status.result == ClaudeConfigSlotUpkeepResultV1::InProgress {
-                ClaudeConfigSlotUpkeepResultV1::InProgress
-            } else {
-                ClaudeConfigSlotUpkeepResultV1::Backoff
-            };
-            return ClaudeUpkeepObservation {
-                paused_awaiting_claude_refresh: false,
-                proceed_with_collection: false,
-                status: ClaudeConfigSlotUpkeepStatusV1 { result, ..status },
-                result_observed_at: None,
-            };
-        }
-        ClaimOutcome::Claimed(status) => status,
-    };
-
-    let process_result = match final_gate.start_if_allowed(descriptor, process, config_dir) {
-        Ok(result) => result,
-        Err(result) => {
-            let completed =
-                complete_attempt(support_dir, &descriptor.slot_id, &in_progress, result, now)
-                    .unwrap_or(ClaudeConfigSlotUpkeepStatusV1 {
-                        result: ClaudeConfigSlotUpkeepResultV1::ProbeFailed,
-                        ..in_progress
-                    });
-            if result == ClaudeConfigSlotUpkeepResultV1::NeedsLogin {
-                // A removal may commit after the initial descriptor snapshot
-                // but before the final gate. Do not recreate its stale
-                // per-slot witness after the control path pruned it.
-                let _ = prune_slot_upkeep_state_at(support_dir, &descriptor.slot_id);
-            }
-            return ClaudeUpkeepObservation {
-                paused_awaiting_claude_refresh: false,
-                proceed_with_collection: false,
-                status: completed,
-                result_observed_at: format_timestamp(now).ok(),
-            };
-        }
-    };
-    let (result, proceed) = match process_result {
-        DoctorProcessResult::ExitZero => match credentials.read(
-            &ClaudeConfigDirSlot::registered(config_dir.to_string())
-                .expect("registered descriptor must retain a valid exact path"),
-        ) {
-            Some(after)
-                if parse_timestamp(after.access_expires_at.as_deref())
-                    .is_some_and(|expiry| expiry > access_expiry && expiry > now) =>
-            {
-                (ClaudeConfigSlotUpkeepResultV1::Refreshed, true)
-            }
-            Some(_) => (ClaudeConfigSlotUpkeepResultV1::ExpiryUnchanged, false),
-            None => (ClaudeConfigSlotUpkeepResultV1::CredentialUnreadable, false),
-        },
-    };
-    let completed = complete_attempt(support_dir, &descriptor.slot_id, &in_progress, result, now)
-        .unwrap_or(ClaudeConfigSlotUpkeepStatusV1 {
-            result: ClaudeConfigSlotUpkeepResultV1::ProbeFailed,
-            ..in_progress
-        });
-    ClaudeUpkeepObservation {
-        paused_awaiting_claude_refresh: false,
-        proceed_with_collection: proceed,
-        status: completed,
-        result_observed_at: format_timestamp(now).ok(),
-    }
-}
-
-#[cfg(test)]
-fn observation(
-    proceed_with_collection: bool,
-    result: ClaudeConfigSlotUpkeepResultV1,
-    witness: Option<&PersistedUpkeepWitnessV1>,
-) -> ClaudeUpkeepObservation {
-    ClaudeUpkeepObservation {
-        proceed_with_collection,
-        paused_awaiting_claude_refresh: false,
-        result_observed_at: witness.and_then(|witness| witness.result_observed_at.clone()),
-        status: witness.map_or(
-            ClaudeConfigSlotUpkeepStatusV1 {
-                result,
-                due_access_expires_at: None,
-                refresh_token_expires_at: None,
-                attempted_at: None,
-                next_allowed_attempt_at: None,
-                consecutive_failures: 0,
-            },
-            PersistedUpkeepWitnessV1::local_status,
-        ),
-    }
-}
-
 fn observation_with_metadata(
     proceed_with_collection: bool,
     result: ClaudeConfigSlotUpkeepResultV1,
@@ -561,121 +212,6 @@ fn observation_with_metadata(
             consecutive_failures: 0,
         },
     }
-}
-
-#[cfg(test)]
-fn claim_attempt(
-    support_dir: &Path,
-    slot_id: &str,
-    due_access_expires_at: &str,
-    refresh_token_expires_at: Option<String>,
-    now: OffsetDateTime,
-) -> Result<ClaimOutcome, ()> {
-    let _guard = upkeep_state_guard(support_dir).map_err(|_| ())?;
-    let mut state = load_state(support_dir)?;
-    let now_text = format_timestamp(now)?;
-    let previous = state.slots.get(slot_id).cloned();
-    if let Some(existing) = previous.as_ref().filter(|witness| {
-        witness.due_access_expires_at == due_access_expires_at
-            && parse_timestamp(Some(&witness.next_allowed_attempt_at))
-                .is_some_and(|next| now < next)
-    }) {
-        return Ok(ClaimOutcome::Deferred(existing.local_status()));
-    }
-    let previous_failures = previous
-        .as_ref()
-        .filter(|witness| witness.due_access_expires_at == due_access_expires_at)
-        .map_or(0, |witness| {
-            if witness.result == ClaudeConfigSlotUpkeepResultV1::InProgress {
-                // Reaching this point means the persisted claim's deadline
-                // elapsed without completion (process/daemon crash). Count
-                // that abandoned attempt so repeated crashes back off
-                // exponentially instead of retrying forever every five
-                // minutes.
-                witness.consecutive_failures.saturating_add(1)
-            } else {
-                witness.consecutive_failures
-            }
-        });
-    let next_allowed = now + backoff_duration(previous_failures.saturating_add(1));
-    let witness = PersistedUpkeepWitnessV1 {
-        due_access_expires_at: due_access_expires_at.to_string(),
-        refresh_token_expires_at,
-        attempted_at: Some(now_text),
-        result_observed_at: None,
-        preclaim_descriptor: None,
-        next_allowed_attempt_at: format_timestamp(next_allowed)?,
-        result: ClaudeConfigSlotUpkeepResultV1::InProgress,
-        consecutive_failures: previous_failures,
-    };
-    let status = witness.local_status();
-    state.slots.insert(slot_id.to_string(), witness);
-    write_state(support_dir, &state)?;
-    Ok(ClaimOutcome::Claimed(status))
-}
-
-#[cfg(test)]
-fn complete_attempt(
-    support_dir: &Path,
-    slot_id: &str,
-    claimed: &ClaudeConfigSlotUpkeepStatusV1,
-    result: ClaudeConfigSlotUpkeepResultV1,
-    now: OffsetDateTime,
-) -> Result<ClaudeConfigSlotUpkeepStatusV1, ()> {
-    let _guard = upkeep_state_guard(support_dir).map_err(|_| ())?;
-    let mut state = load_state(support_dir)?;
-    let witness = state.slots.get_mut(slot_id).ok_or(())?;
-    if Some(witness.due_access_expires_at.as_str()) != claimed.due_access_expires_at.as_deref()
-        || witness.attempted_at != claimed.attempted_at
-        || witness.result != ClaudeConfigSlotUpkeepResultV1::InProgress
-    {
-        return Err(());
-    }
-    let success = result == ClaudeConfigSlotUpkeepResultV1::Refreshed;
-    let neutral = matches!(
-        result,
-        ClaudeConfigSlotUpkeepResultV1::CollectionPaused
-            | ClaudeConfigSlotUpkeepResultV1::UpkeepNotConsented
-            | ClaudeConfigSlotUpkeepResultV1::UpkeepDisabled
-            | ClaudeConfigSlotUpkeepResultV1::NeedsLogin
-    );
-    witness.result = result;
-    witness.result_observed_at = Some(format_timestamp(now)?);
-    witness.consecutive_failures = if success {
-        0
-    } else if neutral {
-        claimed.consecutive_failures
-    } else {
-        claimed.consecutive_failures.saturating_add(1)
-    };
-    witness.next_allowed_attempt_at = if neutral {
-        format_timestamp(now)?
-    } else {
-        format_timestamp(now + backoff_duration(witness.consecutive_failures.max(1)))?
-    };
-    let status = witness.local_status();
-    write_state(support_dir, &state)?;
-    Ok(status)
-}
-
-#[cfg(test)]
-fn backoff_duration(failures: u32) -> TimeDuration {
-    let exponent = failures.saturating_sub(1).min(16);
-    let factor = 1_i64.checked_shl(exponent).unwrap_or(i64::MAX);
-    TimeDuration::seconds(
-        INITIAL_BACKOFF_SECONDS
-            .saturating_mul(factor)
-            .min(MAX_BACKOFF_SECONDS),
-    )
-}
-
-fn preclaim_failure_result(result: ClaudeConfigSlotUpkeepResultV1) -> bool {
-    matches!(
-        result,
-        ClaudeConfigSlotUpkeepResultV1::CredentialUnreadable
-            | ClaudeConfigSlotUpkeepResultV1::ProbeFailed
-            | ClaudeConfigSlotUpkeepResultV1::SpawnFailed
-    )
 }
 
 pub(crate) fn preclaim_descriptor(
@@ -701,113 +237,14 @@ pub(crate) fn preclaim_descriptor(
     Some(fence)
 }
 
-fn load_state(support_dir: &Path) -> Result<PersistedUpkeepStateV1, ()> {
-    let path = support_dir.join(UPKEEP_STATE_FILE);
-    if !path.exists() {
-        return Ok(PersistedUpkeepStateV1::default());
-    }
-    let body = fs::read(&path).map_err(|_| ())?;
-    let state = serde_json::from_slice::<PersistedUpkeepStateV1>(&body).map_err(|_| ())?;
-    validate_state(&state)?;
-    Ok(state)
-}
-
-fn validate_state(state: &PersistedUpkeepStateV1) -> Result<(), ()> {
-    if state.schema_version != UPKEEP_STATE_SCHEMA_VERSION {
-        return Err(());
-    }
-    for (slot_id, witness) in &state.slots {
-        if slot_id.is_empty()
-            || parse_timestamp(Some(&witness.due_access_expires_at)).is_none()
-            || witness
-                .attempted_at
-                .as_deref()
-                .is_some_and(|at| parse_timestamp(Some(at)).is_none())
-            || (witness.attempted_at.is_none()
-                && (witness.preclaim_descriptor.is_none()
-                    || !preclaim_failure_result(witness.result)))
-            || witness
-                .result_observed_at
-                .as_deref()
-                .is_some_and(|at| parse_timestamp(Some(at)).is_none())
-            || parse_timestamp(Some(&witness.next_allowed_attempt_at)).is_none()
-            || witness
-                .refresh_token_expires_at
-                .as_deref()
-                .is_some_and(|value| parse_timestamp(Some(value)).is_none())
-        {
-            return Err(());
-        }
-    }
+/// Compatibility hook for registration-removal callers. The retired worker has
+/// no live state readers or writers, so leave any stale files untouched.
+pub(crate) fn prune_slot_upkeep_state(_slot_id: &str) -> std::io::Result<()> {
     Ok(())
-}
-
-fn write_state(support_dir: &Path, state: &PersistedUpkeepStateV1) -> Result<(), ()> {
-    let body = serde_json::to_vec_pretty(state).map_err(|_| ())?;
-    write_owner_only_file_atomic(&support_dir.join(UPKEEP_STATE_FILE), &body).map_err(|_| ())
-}
-
-pub(crate) fn prune_slot_upkeep_state(slot_id: &str) -> std::io::Result<()> {
-    let support_dir = default_support_dir();
-    prune_slot_upkeep_state_at(&support_dir, slot_id)
-}
-
-fn prune_slot_upkeep_state_at(support_dir: &Path, slot_id: &str) -> std::io::Result<()> {
-    let _guard = upkeep_state_guard(support_dir)?;
-    let mut state = load_state(support_dir).map_err(|()| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "Claude upkeep state is invalid",
-        )
-    })?;
-    if state.slots.remove(slot_id).is_some() {
-        write_state(support_dir, &state)
-            .map_err(|()| std::io::Error::other("write Claude upkeep state"))?;
-    }
-    Ok(())
-}
-
-fn upkeep_state_guard(support_dir: &Path) -> std::io::Result<UpkeepStateGuard> {
-    let process = UPKEEP_STATE_TRANSACTION
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    fs::create_dir_all(support_dir)?;
-    #[cfg(unix)]
-    let file = {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::fs::OpenOptionsExt;
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(support_dir.join(UPKEEP_STATE_LOCK_FILE))?;
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        file
-    };
-    #[cfg(not(unix))]
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(support_dir.join(UPKEEP_STATE_LOCK_FILE))?;
-    Ok(UpkeepStateGuard {
-        _process: process,
-        file,
-    })
 }
 
 fn parse_timestamp(value: Option<&str>) -> Option<OffsetDateTime> {
     OffsetDateTime::parse(value?, &Rfc3339).ok()
-}
-
-#[cfg(test)]
-fn format_timestamp(value: OffsetDateTime) -> Result<String, ()> {
-    value.format(&Rfc3339).map_err(|_| ())
 }
 
 #[cfg(test)]
@@ -816,36 +253,10 @@ mod tests {
     use ottto_protocol::{ClaudeConfigSlotOwnership, CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION};
     use serial_test::serial;
     use std::ffi::OsString;
-    use std::io::Write;
+    use std::fs;
     use std::path::PathBuf;
-    use std::process::Stdio;
-    use std::sync::{Arc, Barrier};
 
-    struct SequenceCredentials {
-        values: Mutex<Vec<Option<ClaudeOAuthCredentialMetadata>>>,
-    }
-
-    impl SequenceCredentials {
-        fn new(values: Vec<Option<ClaudeOAuthCredentialMetadata>>) -> Self {
-            Self {
-                values: Mutex::new(values.into_iter().rev().collect()),
-            }
-        }
-    }
-
-    impl CredentialMetadataReader for SequenceCredentials {
-        fn read(&self, _slot: &ClaudeConfigDirSlot) -> Option<ClaudeOAuthCredentialMetadata> {
-            self.values.lock().expect("credential sequence").pop()?
-        }
-    }
-
-    struct FixedProcess(DoctorProcessResult);
-
-    impl DoctorProcessRunner for FixedProcess {
-        fn run(&self, _config_dir: &str) -> DoctorProcessResult {
-            self.0
-        }
-    }
+    const UPKEEP_STATE_FILE: &str = "claude-background-upkeep-state.json";
 
     struct EnvGuard {
         key: &'static str,
@@ -1068,61 +479,6 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]
-    #[serial]
-    fn missing_refresh_grant_needs_login_without_claiming() {
-        let root = temp_dir("missing-refresh-no-claim");
-        let _support_guard = EnvGuard::set(
-            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
-            root.as_os_str().to_os_string(),
-        );
-        let config_dir = root.join("account");
-        fs::create_dir_all(&config_dir).expect("config dir");
-        let store = FileClaudeConfigSlotSettingsStore::default();
-        let registered = store
-            .register_path(
-                CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
-                config_dir.to_string_lossy().into_owned(),
-            )
-            .expect("register slot");
-        store
-            .set_upkeep_consent(CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION, true)
-            .expect("grant upkeep consent");
-        let descriptor = registered
-            .external_slots
-            .first()
-            .expect("registered descriptor")
-            .clone();
-        let observation = observe_registered_slot_upkeep_with_gate(
-            &descriptor,
-            true,
-            true,
-            &root,
-            at("2026-08-04T10:00:01Z"),
-            &SequenceCredentials::new(vec![Some(ClaudeOAuthCredentialMetadata {
-                access_expires_at: Some("2026-08-04T10:00:00Z".to_string()),
-                refresh_token_expires_at: Some("2026-09-01T00:00:00Z".to_string()),
-                has_refresh_token: false,
-                cleared_by_cli: false,
-                has_profile_scope: false,
-            })]),
-            &FixedProcess(DoctorProcessResult::ExitZero),
-            &ProductionFinalSpawnGate,
-        );
-        assert_eq!(
-            observation.status.result,
-            ClaudeConfigSlotUpkeepResultV1::NeedsLogin
-        );
-        assert!(!observation.proceed_with_collection);
-        assert!(observation.status.attempted_at.is_none());
-        assert!(
-            !root.join(UPKEEP_STATE_FILE).exists(),
-            "a missing refresh grant must not create a claim witness"
-        );
-
-        let _ = fs::remove_dir_all(root);
-    }
-
     fn at(value: &str) -> OffsetDateTime {
         OffsetDateTime::parse(value, &Rfc3339).expect("timestamp")
     }
@@ -1189,163 +545,41 @@ mod tests {
     }
 
     #[test]
-    fn same_expiry_threads_claim_once_and_restart_obeys_backoff() {
-        let dir = Arc::new(temp_dir("threads"));
-        let barrier = Arc::new(Barrier::new(9));
-        let mut joins = Vec::new();
-        for _ in 0..8 {
-            let dir = Arc::clone(&dir);
-            let barrier = Arc::clone(&barrier);
-            joins.push(thread::spawn(move || {
-                barrier.wait();
-                claim_attempt(
-                    &dir,
-                    "claude_slot_0123456789abcdef0123456789abcdef",
-                    "2026-08-04T10:00:00Z",
-                    Some("2026-08-20T00:00:00Z".to_string()),
-                    at("2026-08-04T10:00:00Z"),
-                )
-                .expect("claim")
-            }));
-        }
-        barrier.wait();
-        let claims = joins
-            .into_iter()
-            .map(|join| join.join().expect("join"))
-            .filter(|outcome| matches!(outcome, ClaimOutcome::Claimed(..)))
-            .count();
-        assert_eq!(claims, 1);
-        assert!(matches!(
-            claim_attempt(
-                &dir,
-                "claude_slot_0123456789abcdef0123456789abcdef",
-                "2026-08-04T10:00:00Z",
-                Some("2026-08-20T00:00:00Z".to_string()),
-                at("2026-08-04T10:04:59Z"),
-            )
-            .expect("restart backoff"),
-            ClaimOutcome::Deferred(_)
-        ));
-        let second = claim_attempt(
-            &dir,
-            "claude_slot_0123456789abcdef0123456789abcdef",
-            "2026-08-04T10:00:00Z",
-            Some("2026-08-20T00:00:00Z".to_string()),
-            at("2026-08-04T10:05:00Z"),
-        )
-        .expect("backoff elapsed");
-        let ClaimOutcome::Claimed(second_status) = second else {
-            panic!("second crash retry must claim");
-        };
-        assert_eq!(second_status.consecutive_failures, 1);
-        assert_eq!(
-            second_status.next_allowed_attempt_at.as_deref(),
-            Some("2026-08-04T10:15:00Z")
+    #[serial]
+    fn retired_prune_never_creates_or_changes_files() {
+        let root = temp_dir("retired-prune");
+        let support = root.join("missing-support");
+        let _support_guard = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", support.as_os_str());
+        prune_slot_upkeep_state("removed-slot").expect("absent state is harmless");
+        assert!(
+            !support.exists(),
+            "prune must not create its support directory"
         );
-        assert!(matches!(
-            claim_attempt(
-                &dir,
-                "claude_slot_0123456789abcdef0123456789abcdef",
-                "2026-08-04T10:00:00Z",
-                Some("2026-08-20T00:00:00Z".to_string()),
-                at("2026-08-04T10:14:59Z"),
-            )
-            .expect("second crash backoff"),
-            ClaimOutcome::Deferred(_)
-        ));
-        let third = claim_attempt(
-            &dir,
-            "claude_slot_0123456789abcdef0123456789abcdef",
-            "2026-08-04T10:00:00Z",
-            Some("2026-08-20T00:00:00Z".to_string()),
-            at("2026-08-04T10:15:00Z"),
-        )
-        .expect("second backoff elapsed");
-        let ClaimOutcome::Claimed(third_status) = third else {
-            panic!("third crash retry must claim");
-        };
-        assert_eq!(third_status.consecutive_failures, 2);
-        assert_eq!(
-            third_status.next_allowed_attempt_at.as_deref(),
-            Some("2026-08-04T10:35:00Z")
-        );
-        assert_eq!(backoff_duration(100), TimeDuration::hours(6));
-    }
 
-    #[test]
-    fn persisted_witness_contains_only_safe_timestamps_slot_id_and_result() {
-        let dir = temp_dir("secrecy");
-        let _ = claim_attempt(
-            &dir,
-            "claude_slot_0123456789abcdef0123456789abcdef",
-            "2026-08-04T10:00:00Z",
-            Some("2026-08-20T00:00:00Z".to_string()),
-            at("2026-08-04T10:00:00Z"),
-        )
-        .expect("claim");
-        let body = fs::read_to_string(dir.join(UPKEEP_STATE_FILE)).expect("state");
-        assert!(!body.contains("accessToken"));
-        assert!(!body.contains("refreshToken"));
-        assert!(!body.contains("CLAUDE_CONFIG_DIR"));
-        assert!(!body.contains("/tmp/exact-claude-slot"));
-        assert!(body.contains("due_access_expires_at"));
-        assert!(body.contains("refresh_token_expires_at"));
-        assert!(body.contains("in_progress"));
-    }
-
-    #[test]
-    fn multiprocess_claim_worker() {
-        let Some(dir) = std::env::var_os("OTTTO_UPKEEP_MP_DIR") else {
-            return;
-        };
-        if matches!(
-            claim_attempt(
-                Path::new(&dir),
-                "claude_slot_0123456789abcdef0123456789abcdef",
-                "2026-08-04T10:00:00Z",
-                Some("2026-08-20T00:00:00Z".to_string()),
-                at("2026-08-04T10:00:00Z"),
-            )
-            .expect("multiprocess claim"),
-            ClaimOutcome::Claimed(..)
-        ) {
-            let mut claims = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(Path::new(&dir).join("claims.txt"))
-                .expect("open claims");
-            claims.write_all(b"claimed\n").expect("append claim");
+        fs::create_dir(&support).expect("fixture directory");
+        let lock = support.join(".claude-background-upkeep-state.lock");
+        let unrelated = support.join("unrelated");
+        fs::write(&lock, b"old lock bytes").expect("old lock");
+        fs::write(&unrelated, b"keep me").expect("unrelated file");
+        for state in [
+            b"{\"schema_version\":1,\"slots\":{}}".as_slice(),
+            b"{corrupt",
+        ] {
+            fs::write(support.join(UPKEEP_STATE_FILE), state).expect("stale state");
+            prune_slot_upkeep_state("removed-slot").expect("stale state is harmless");
+            prune_slot_upkeep_state("other-slot").expect("repeated prune is harmless");
+            assert_eq!(fs::read(support.join(UPKEEP_STATE_FILE)).unwrap(), state);
+            assert_eq!(fs::read(&lock).unwrap(), b"old lock bytes");
+            assert_eq!(fs::read(&unrelated).unwrap(), b"keep me");
+            assert_eq!(fs::read_dir(&support).unwrap().count(), 3);
         }
-    }
-
-    #[test]
-    fn true_multiprocess_same_expiry_has_one_claim() {
-        let dir = temp_dir("multiprocess");
-        let executable = std::env::current_exe().expect("test binary");
-        let mut children = (0..4)
-            .map(|_| {
-                std::process::Command::new(&executable)
-                    .args([
-                        "--exact",
-                        "claude_upkeep::tests::multiprocess_claim_worker",
-                        "--test-threads=1",
-                    ])
-                    .env("OTTTO_UPKEEP_MP_DIR", &dir)
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()
-                    .expect("spawn worker")
-            })
-            .collect::<Vec<_>>();
-        for child in &mut children {
-            assert!(child.wait().expect("wait worker").success());
-        }
-        let claims = fs::read_to_string(dir.join("claims.txt")).expect("one claim");
-        assert_eq!(claims.lines().count(), 1);
+        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     fn rfc3339_from_now(offset: TimeDuration) -> String {
-        format_timestamp(OffsetDateTime::now_utc() + offset).expect("format timestamp")
+        (OffsetDateTime::now_utc() + offset)
+            .format(&Rfc3339)
+            .expect("format timestamp")
     }
 
     /// A collection status persisted by a failed probe, with no deadlines:
@@ -1537,29 +771,34 @@ mod tests {
         );
         let access = rfc3339_from_now(-TimeDuration::hours(2));
         let refresh = rfc3339_from_now(TimeDuration::days(20));
-        let mut state = PersistedUpkeepStateV1::default();
+        let mut slots = serde_json::Map::new();
         let mut descriptors = Vec::new();
         for index in 0..5 {
             let mut descriptor = descriptor();
             descriptor.slot_id = format!("claude_slot_0123456789abcdef0123456789abcd{index:02}");
             descriptor.collection.access_expires_at = Some(access.clone());
             descriptor.collection.relogin_required_at = Some(refresh.clone());
-            state.slots.insert(
+            slots.insert(
                 descriptor.slot_id.clone(),
-                PersistedUpkeepWitnessV1 {
-                    due_access_expires_at: access.clone(),
-                    refresh_token_expires_at: Some(refresh.clone()),
-                    attempted_at: Some(rfc3339_from_now(-TimeDuration::minutes(30))),
-                    result_observed_at: Some(rfc3339_from_now(-TimeDuration::minutes(29))),
-                    preclaim_descriptor: None,
-                    next_allowed_attempt_at: rfc3339_from_now(TimeDuration::hours(5)),
-                    result: ClaudeConfigSlotUpkeepResultV1::Backoff,
-                    consecutive_failures: 3,
-                },
+                serde_json::json!({
+                    "due_access_expires_at": access,
+                    "refresh_token_expires_at": refresh,
+                    "attempted_at": rfc3339_from_now(-TimeDuration::minutes(30)),
+                    "result_observed_at": rfc3339_from_now(-TimeDuration::minutes(29)),
+                    "next_allowed_attempt_at": rfc3339_from_now(TimeDuration::hours(5)),
+                    "result": "backoff",
+                    "consecutive_failures": 3
+                }),
             );
             descriptors.push(descriptor);
         }
-        write_state(&root, &state).expect("old worker witnesses");
+        // Freeze the retired wire shape independently of any production codec.
+        let state = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "slots": slots
+        }))
+        .expect("old worker fixture");
+        fs::write(root.join(UPKEEP_STATE_FILE), &state).expect("old worker witnesses");
 
         for descriptor in &descriptors {
             let observation = observe_registered_slot_upkeep(
@@ -1580,7 +819,7 @@ mod tests {
             assert_eq!(observation.status.next_allowed_attempt_at, None);
         }
         assert_eq!(
-            load_state(&root).expect("state"),
+            fs::read(root.join(UPKEEP_STATE_FILE)).expect("state bytes"),
             state,
             "the foreground never rewrites the old upkeep state"
         );

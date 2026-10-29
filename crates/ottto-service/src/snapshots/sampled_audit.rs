@@ -130,6 +130,33 @@ impl ScanIndexEntry {
     }
 }
 impl ScanIndex {
+    /// Existing obligations are never evicted. Imported over-cap populations
+    /// must drain before any new marker can be admitted.
+    pub(super) fn can_stage_sampled_audit(&self, key: &str) -> bool {
+        self.files
+            .get(key)
+            .is_some_and(ScanIndexEntry::has_unverified_source)
+            || self
+                .files
+                .values()
+                .filter(|entry| entry.has_unverified_source())
+                .take(CACHE_ENTRIES)
+                .count()
+                < CACHE_ENTRIES
+    }
+
+    pub(super) fn retire_quiet_audit(&mut self, key: &str, fingerprint: &str) -> bool {
+        let Some(entry) = self.files.get_mut(key).filter(|entry| {
+            entry.source_file_fingerprint == fingerprint
+                && entry.has_unverified_source()
+                && !entry.has_prefix_provenance()
+        }) else {
+            return false;
+        };
+        entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
+        true
+    }
+
     /// Called only by a current validated native source completion. Entry/source
     /// equality fences an older completion; the existing writer owns lock/CAS.
     /// A delivery ACK never calls this method as source-verification authority.
@@ -139,6 +166,9 @@ impl ScanIndex {
         source_fingerprint: &str,
         debt: AuditDebt,
     ) -> bool {
+        if !self.can_stage_sampled_audit(key) {
+            return false;
+        }
         let Some(entry) = self
             .files
             .get_mut(key)
@@ -182,6 +212,9 @@ impl ScanIndex {
         true
     }
     pub(super) fn mark_sealed_prefix(&mut self, key: &str, source_fingerprint: &str) -> bool {
+        if !self.can_stage_sampled_audit(key) {
+            return false;
+        }
         let Some(entry) = self
             .files
             .get_mut(key)
@@ -214,9 +247,9 @@ pub(super) fn path_requires_verification(
     files: &BTreeMap<String, ScanIndexEntry>,
     path: &Path,
 ) -> bool {
-    files
-        .get(&local_index_key(path))
-        .is_some_and(ScanIndexEntry::has_unverified_source)
+    files.get(&local_index_key(path)).is_some_and(|entry| {
+        entry.has_unverified_source() || entry.source_file_fingerprint.is_empty()
+    })
 }
 
 pub(super) fn normalize_marker_storage(index: &mut ScanIndex) {
@@ -437,6 +470,107 @@ impl OwnedSourceScan {
     }
 }
 
+impl SourceScanResult {
+    /// Transfer a released account hold's acquisition debt before upload/save.
+    /// Working retirements never refund their committed marker reservation.
+    pub(crate) fn preserve_released_account_audits(
+        &self,
+        index: &mut ScanIndex,
+        previous: &ScanIndex,
+        cache: &sampled_scan::SharedCache,
+        roots: &[PathBuf],
+        backfill_window_days: u64,
+    ) {
+        let mut reserved = previous
+            .files
+            .values()
+            .filter(|entry| entry.has_unverified_source())
+            .count()
+            .saturating_add(
+                index
+                    .files
+                    .iter()
+                    .filter(|(key, entry)| {
+                        entry.has_unverified_source()
+                            && !previous
+                                .files
+                                .get(*key)
+                                .is_some_and(ScanIndexEntry::has_unverified_source)
+                    })
+                    .count(),
+            );
+        let mut staged = 0_u64;
+        let mut queued = 0_u64;
+        for (key, fingerprint) in self.completed_parses() {
+            if !previous.claude_account_deferred_holds.contains_key(key)
+                || index.claude_account_deferred_holds.contains_key(key)
+                || !index
+                    .files
+                    .get(key)
+                    .is_some_and(|entry| !entry.has_unverified_source())
+            {
+                continue;
+            }
+            // None is unknown/missing retained custody; keep a discoverable
+            // retry rather than assuming that a missing copy discharged debt.
+            let debt = cache.retained().ok().and_then(|retained| {
+                retained
+                    .peek(key)
+                    .map(|entry| entry.checkpoint.audit_debt())
+            });
+            if debt == Some(None) {
+                continue;
+            }
+            if let Some(Some(debt)) = debt {
+                if reserved < CACHE_ENTRIES
+                    && index
+                        .files
+                        .get(key)
+                        .is_some_and(|entry| entry.source_file_fingerprint == fingerprint)
+                    && index.stage_sampled_audit(key, fingerprint, debt)
+                {
+                    reserved += 1;
+                    staged += 1;
+                    continue;
+                }
+            }
+            // This existing explicit-reparse witness survives traversal resets
+            // and ages. It never labels an audit/clock Full or grants credit.
+            index
+                .files
+                .get_mut(key)
+                .expect("current parsed entry")
+                .source_file_fingerprint
+                .clear();
+            if index.traversal.is_none() {
+                ensure_bounded_traversal(
+                    SnapshotSource::ClaudeCode,
+                    roots,
+                    index,
+                    &self.census_window_end,
+                    backfill_window_days,
+                );
+            }
+            if let Some(traversal) = index.traversal.as_mut() {
+                enqueue_watcher_hints(
+                    SnapshotSource::ClaudeCode,
+                    traversal,
+                    &[PathBuf::from(key)],
+                    false,
+                );
+            }
+            queued += 1;
+        }
+        if staged + queued > 0 {
+            crate::local_resource_diagnostics::traversal_point(
+                "sampled_audit_account_release",
+                "claude_code",
+                &serde_json::json!({"marker_staged": staged, "retry_queued": queued}),
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,6 +607,61 @@ mod tests {
         index.confirmed_empty_files.insert(key);
         index
     }
+    #[test]
+    fn marked_population_admission_and_quiet_retirement_share_the_cap() {
+        let mut index = index();
+        for n in 0..CACHE_ENTRIES {
+            let key = format!("missing-{n}");
+            index.files.insert(key.clone(), entry());
+            assert!(index.stage_sampled_audit(
+                &key,
+                "source",
+                AuditDebt {
+                    due_unix_seconds: 200
+                }
+            ));
+        }
+        let key = local_index_key(&candidate().path);
+        assert!(!index.stage_sampled_audit(
+            &key,
+            "source",
+            AuditDebt {
+                due_unix_seconds: 200
+            }
+        ));
+        assert!(!index.mark_sealed_prefix(&key, "source"));
+        assert!(index.stage_sampled_audit(
+            "missing-0",
+            "source",
+            AuditDebt {
+                due_unix_seconds: 100
+            }
+        ));
+        assert!(index.mark_sealed_prefix("missing-0", "source"));
+        assert!(
+            !index.retire_quiet_audit("missing-0", "source"),
+            "prefix cannot retire"
+        );
+        assert!(!index.retire_quiet_audit("missing-1", "stale"));
+        assert!(index.retire_quiet_audit("missing-1", "source"));
+        assert!(index.stage_sampled_audit(
+            &key,
+            "source",
+            AuditDebt {
+                due_unix_seconds: 200
+            }
+        ));
+        assert_eq!(
+            index
+                .files
+                .values()
+                .filter(|entry| entry.has_unverified_source())
+                .count(),
+            CACHE_ENTRIES
+        );
+        assert!(index.files["missing-0"].has_unverified_source());
+    }
+
     #[test]
     fn sampled_audit_oldest_deadline_not_ack_or_tail_controls_idle_selection() {
         let mut index = index();
@@ -903,4 +1092,39 @@ mod provenance_tests {
             assert!(marked.files[&key].has_prefix_provenance(), "{reset:?}");
         }
     }
+}
+
+/// A cap delay is still owed: persist an age-bypassing retry without advancing
+/// the committed file size or claiming source/census completion.
+pub(super) fn queue_cap_retry(index: &mut ScanIndex, candidate: &CandidateFile) {
+    if let Some(traversal) = index.traversal.as_mut() {
+        if !traversal
+            .pending_candidates
+            .iter()
+            .any(|path| path.path == candidate.path)
+        {
+            traversal.pending_candidates.push_back(ScanTraversalPath {
+                scan_root: candidate.scan_root.clone(),
+                path: candidate.path.clone(),
+                census_member: true,
+                watcher_hint: true,
+            });
+        }
+    }
+}
+
+/// Positive removal only: the path is NotFound beneath a present readable
+/// parent AND a configured, readable root. Missing mounts/parents, symlinks,
+/// permission errors and unreadable roots keep the audit and account debt.
+/// This is absence authority, never source verification or census credit.
+pub(super) fn proven_absent(path: &Path, roots: &[PathBuf]) -> bool {
+    fn readable_directory(path: &Path) -> bool {
+        fs::symlink_metadata(path).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+            && fs::read_dir(path).is_ok()
+    }
+    matches!(fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        && path.parent().is_some_and(readable_directory)
+        && roots
+            .iter()
+            .any(|root| path.starts_with(root) && readable_directory(root))
 }

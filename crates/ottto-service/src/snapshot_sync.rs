@@ -725,6 +725,13 @@ struct LocalHoldSettlement {
     held_family_roots: Option<BTreeSet<String>>,
 }
 
+struct AccountAuditRelease<'a> {
+    previous: &'a ScanIndex,
+    cache: &'a crate::snapshots::sampled_scan::SharedCache,
+    roots: &'a [PathBuf],
+    backfill_window_days: u64,
+}
+
 impl LocalHoldSettlement {
     /// Record the durable account-hold disclosure, classify which holds a
     /// later page could still change, and remove every held entity from the
@@ -827,6 +834,109 @@ fn settle_completed_upload(
         index,
         fully_settled: false,
     }
+}
+
+#[cfg(test)]
+fn classify_account_release_for_test(
+    index: &mut ScanIndex,
+    scan: &mut SourceScanResult,
+) -> (LocalHoldSettlement, SnapshotUploadProgress) {
+    let source = SnapshotSource::ClaudeCode;
+    let holds = LocalHoldSettlement::classify(
+        source,
+        index,
+        scan,
+        &crate::snapshots::ClaudeUsageAuthorityDisposition::default(),
+    );
+    assert!(!holds.page_held());
+    let mut progress =
+        SnapshotUploadProgress::new(format!("{:064x}", 99), snapshot_quarantine_witness(source));
+    let groups = cache_head_file_groups(index);
+    for item in &scan.snapshots {
+        progress
+            .record_pending_cache_head_identity(
+                item.source_file_fingerprint.as_ref(),
+                &item.snapshot_fingerprint,
+                &cache_session_key(&item.source_session_id),
+                &groups,
+                true,
+            )
+            .unwrap();
+    }
+    assert!(
+        !progress.pending_cache_heads.is_empty(),
+        "required head bindings recorded"
+    );
+    (holds, progress)
+}
+
+#[cfg(test)]
+pub(crate) fn accept_account_release_for_test(
+    mut index: ScanIndex,
+    previous: &ScanIndex,
+    scan: &mut SourceScanResult,
+    cache: &crate::snapshots::sampled_scan::SharedCache,
+    roots: &[PathBuf],
+    fallback: Option<&mut crate::snapshots::claude_native_comparison::SelectedFallback>,
+) -> ScanIndex {
+    let (holds, mut progress) = classify_account_release_for_test(&mut index, scan);
+    progress.accepted_fingerprints.extend(
+        scan.snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone()),
+    );
+    index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+    let mut settled = settle_completed_upload(index, previous, &progress, &holds);
+    assert!(settled.fully_settled);
+    if let Some(fallback) = fallback {
+        fallback
+            .restore_selected(&mut settled.index, previous)
+            .unwrap();
+    }
+    scan.preserve_released_account_audits(
+        &mut settled.index,
+        previous,
+        cache,
+        roots,
+        crate::snapshots::BACKFILL_WINDOW_DAYS,
+    );
+    settled.index
+}
+
+#[cfg(test)]
+pub(crate) fn checkpoint_account_release_for_test(
+    mut index: ScanIndex,
+    previous: &ScanIndex,
+    scan: &mut SourceScanResult,
+    cache: &crate::snapshots::sampled_scan::SharedCache,
+    roots: &[PathBuf],
+    fallback: &mut crate::snapshots::claude_native_comparison::SelectedFallback,
+    paths: (&Path, &Path),
+) -> Result<ScanIndex> {
+    let (holds, mut progress) = classify_account_release_for_test(&mut index, scan);
+    // Actual no-ACK partial save restores the prior accepted entry before
+    // transferring retry custody. Head binding above still had to succeed.
+    progress.save(paths.1)?;
+    checkpoint_partial_snapshot_index_with_audit_release(
+        &index,
+        previous,
+        &progress,
+        &scan.snapshots,
+        Some(scan),
+        &holds.held_fingerprints,
+        paths.0,
+        paths.1,
+        || Ok(()),
+        None,
+        Some(NativeSelectedRestore::Logical(fallback)),
+        Some(UnsettledUploadCause::UploadError),
+        Some(AccountAuditRelease {
+            previous,
+            cache,
+            roots,
+            backfill_window_days: crate::snapshots::BACKFILL_WINDOW_DAYS,
+        }),
+    )
 }
 
 /// Process-local, content-free count of `Rejected` pages whose local holds
@@ -2857,6 +2967,39 @@ fn checkpoint_partial_snapshot_index_with_comparison(
     fallback: Option<NativeSelectedRestore<'_>>,
     cause: Option<UnsettledUploadCause>,
 ) -> Result<ScanIndex> {
+    checkpoint_partial_snapshot_index_with_audit_release(
+        index,
+        committed_index,
+        progress,
+        snapshots,
+        correction_scan,
+        locally_held,
+        index_path,
+        progress_path,
+        validate_destination,
+        read_limit,
+        fallback,
+        cause,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn checkpoint_partial_snapshot_index_with_audit_release(
+    index: &ScanIndex,
+    committed_index: &ScanIndex,
+    progress: &SnapshotUploadProgress,
+    snapshots: &[SnapshotItem],
+    correction_scan: Option<&SourceScanResult>,
+    locally_held: &BTreeSet<String>,
+    index_path: &Path,
+    progress_path: &Path,
+    validate_destination: impl FnOnce() -> Result<()>,
+    read_limit: Option<usize>,
+    fallback: Option<NativeSelectedRestore<'_>>,
+    cause: Option<UnsettledUploadCause>,
+    audit_release: Option<AccountAuditRelease<'_>>,
+) -> Result<ScanIndex> {
     let _lock = SnapshotProgressLock::acquire(progress_path)?;
     let mut durable: SnapshotUploadProgress = match match read_limit {
         Some(cap) => crate::snapshot_retry::read_state(progress_path, cap),
@@ -2943,6 +3086,15 @@ fn checkpoint_partial_snapshot_index_with_comparison(
     );
     if let Some(fallback) = fallback {
         fallback.restore(&mut committable, committed_index)?;
+    }
+    if let (Some(scan), Some(release)) = (correction_scan, audit_release) {
+        scan.preserve_released_account_audits(
+            &mut committable,
+            release.previous,
+            release.cache,
+            release.roots,
+            release.backfill_window_days,
+        );
     }
     match cause {
         Some(cause) => committable.mark_bounded_sweep_unsettled_by(cause),
@@ -7560,7 +7712,7 @@ fn finish_sync_source(
             defer_source_uploads(source, retry_after);
             let mut checkpoint_succeeded = true;
             let side_mark = codex_side_save_mark(daemon, source, &index_path);
-            let committable = match checkpoint_partial_snapshot_index_with_comparison(
+            let committable = match checkpoint_partial_snapshot_index_with_audit_release(
                 &index,
                 &committed_index,
                 &upload_progress,
@@ -7578,6 +7730,12 @@ fn finish_sync_source(
                     .as_mut()
                     .map(NativeSelectedRestore::Paid),
                 Some(UnsettledUploadCause::Shed),
+                (source == SnapshotSource::ClaudeCode).then_some(AccountAuditRelease {
+                    previous: &committed_index,
+                    cache: &daemon.transcript_cache,
+                    roots: claude_scan_roots.as_deref().unwrap_or_default(),
+                    backfill_window_days: receipt_window_days,
+                }),
             ) {
                 Ok(committable) => {
                     note_codex_side_saved(daemon, &index_path, false, side_mark);
@@ -7688,7 +7846,7 @@ fn finish_sync_source(
             // uncertain and must not certify an in-memory mutated ledger.
             if snapshot_upload_error_class(&error) != Some(SnapshotUploadErrorClass::LocalState) {
                 let side_mark = codex_side_save_mark(daemon, source, &index_path);
-                match checkpoint_partial_snapshot_index_with_comparison(
+                match checkpoint_partial_snapshot_index_with_audit_release(
                     &index,
                     &committed_index,
                     &upload_progress,
@@ -7706,6 +7864,12 @@ fn finish_sync_source(
                         .as_mut()
                         .map(NativeSelectedRestore::Paid),
                     Some(UnsettledUploadCause::UploadError),
+                    (source == SnapshotSource::ClaudeCode).then_some(AccountAuditRelease {
+                        previous: &committed_index,
+                        cache: &daemon.transcript_cache,
+                        roots: claude_scan_roots.as_deref().unwrap_or_default(),
+                        backfill_window_days: receipt_window_days,
+                    }),
                 ) {
                     Ok(committable) => {
                         note_codex_side_saved(daemon, &index_path, false, side_mark);
@@ -7904,6 +8068,15 @@ fn finish_sync_source(
             upload_fully_settled = false;
         }
     }
+    if source == SnapshotSource::ClaudeCode {
+        scan_result.preserve_released_account_audits(
+            &mut index,
+            &committed_index,
+            &daemon.transcript_cache,
+            claude_scan_roots.as_deref().unwrap_or_default(),
+            receipt_window_days,
+        );
+    }
     let mut retired_upload_acks = upload_progress.stage_selected_ack_retirement(
         &committed_index,
         &mut index,
@@ -7975,7 +8148,13 @@ fn finish_sync_source(
     )?;
     note_codex_side_saved(daemon, &index_path, true, side_mark);
     #[cfg(unix)]
-    crate::snapshots::durable_after_save(&daemon.transcript_cache, support_dir, source, &index);
+    crate::snapshots::durable_after_save_and_retire(
+        &daemon.transcript_cache,
+        support_dir,
+        source,
+        &mut index,
+        &index_path,
+    );
     #[cfg(test)]
     tests::permanent_finish_pipeline_tests::ack_post_save_failure("native_receipt")?;
     if upload_fully_settled

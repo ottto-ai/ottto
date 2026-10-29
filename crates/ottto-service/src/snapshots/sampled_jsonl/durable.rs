@@ -193,7 +193,29 @@ pub(crate) struct RederiveReceipt {
     pub(crate) line_bytes: u64,
 }
 
+impl CachedJsonlReduction {
+    #[cfg(test)]
+    pub(in crate::snapshots) fn durable_counting(&self) -> Option<(Option<i64>, u8, u8)> {
+        self.accumulator
+            .codex_counting
+            .as_deref()
+            .map(|c| c.durable_contract())
+    }
+}
 impl Decoded {
+    pub(crate) fn cutover(&self) -> Option<Option<i64>> {
+        self.reduction
+            .accumulator
+            .codex_counting
+            .as_deref()
+            .map(|c| c.durable_cutover())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn counting(&self) -> Option<(Option<i64>, u8, u8)> {
+        self.reduction.durable_counting()
+    }
+
     /// How far the head re-parse must read: the latest mark of a field to
     /// re-derive. 0 when nothing needs the head.
     pub(crate) fn head_end(&self) -> Result<u64, Refuse> {
