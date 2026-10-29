@@ -33833,8 +33833,12 @@ fn append_codex_state_only_snapshots(
         // durable state and semantic no-op suppression.
         snapshots.push(snapshot);
     }
+    crate::local_resource_diagnostics::codex_state_only(
+        scanned_session_count,
+        snapshots.len().saturating_sub(snapshots_before),
+        0, // Semantic no-op suppression remains in finalize_scan_after_policy.
+    );
     Some((scanned_session_count, 0))
-    let snapshots_before = snapshots.len();
 }
 
 fn codex_state_only_snapshot(
