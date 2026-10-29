@@ -3566,7 +3566,8 @@ fn child_pair_repair_group_checks_identified_members_and_honors_backoff_and_grow
         let b = root.join("sessions/b.jsonl");
         write_rows(&a, &chain_rows(OWNER, "a", "2026-10-01T10:00:00Z", 0, 1));
         write_rows(&b, &chain_rows(OWNER, "b", "2026-10-01T10:30:00Z", 10, 1));
-        let (mut index, initial) = scan(&root, ScanIndex::default(), 10);
+        let cache = Arc::new(SharedCache::default());
+        let (mut index, initial) = sampled(&root, ScanIndex::default(), 10, &cache);
         assert_eq!(initial.snapshots.len(), 2, "settled native group premise");
         for path in std::iter::once(&a).chain(both_pending.then_some(&b)) {
             let key = local_index_key(path);
