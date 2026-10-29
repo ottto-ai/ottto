@@ -8226,7 +8226,11 @@ fn record_lineage_parentless_while_incomplete(
     }
     let mut parentless: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     for snapshot in snapshots {
-        if snapshot.origin.parent_session_ref.is_none()
+        if snapshot
+            .origin
+            .as_ref()
+            .and_then(|origin| origin.parent_session_ref.as_deref())
+            .is_none()
             && !snapshot
                 .attribution_facts
                 .iter()
@@ -77771,14 +77775,17 @@ mod tests {
                     1
                 );
                 result.snapshots.truncate(1);
-                result.snapshots[0].origin.parent_session_ref = Some(parent.clone());
+                result.snapshots[0]
+                    .origin
+                    .get_or_insert_with(SnapshotOrigin::default)
+                    .parent_session_ref = Some(parent.clone());
                 let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
                 finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut index);
                 assert!(serde_json::to_value(scope.finish())
                     .unwrap()
                     .get("lineage_parentless_while_incomplete")
                     .is_none());
-                result.snapshots[0].origin.parent_session_ref = None;
+                result.snapshots[0].origin = None;
                 result.snapshots[0].source_session_id = "ordinary".into();
                 result.snapshots.truncate(1);
                 let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
