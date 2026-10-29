@@ -109,7 +109,7 @@ impl Counters {
         };
         format!(
             "ottto-service: durable_tail source={} restore_attempts={} restored={} missing={} \
-             retail_attempts={} retail_keys={} retail_exhausted[full,paced,overflow]={:?} tail_read_bytes={} budget_refused_retail_old_bytes={} repeated_physical_old_bytes={} refused_record={} upgrade_state_missing={} ineligible={{{}}} certificate_refused={{{}}} corrupt_body={} \
+             retail_attempts={} retail_keys={} retail_exhausted[full,paced,pace_evicted]={:?} tail_read_bytes={} budget_refused_retail_old_bytes={} repeated_physical_old_bytes={} refused_record={} upgrade_state_missing={} ineligible={{{}}} certificate_refused={{{}}} corrupt_body={} \
              not_rederived={{{}}} budget_refused={} rederive_head_bytes={} \
              rederive_named_lines={} rederive_line_bytes={} not_persisted={{{}}} \
              write_deferred={} write_unlocked={} peak_body_bytes={} disk_records={} disk_bytes={} \
@@ -661,14 +661,18 @@ impl SharedCache {
             stores.counters.retail_full[1] += 1;
             return false;
         }
-        if stores.retail_full_at.len() < 2 * store::MAX_RECORDS
-            && crate::heap_layout_bound::tree_node_bytes::<store::Digest32, std::time::Instant>()
-                .is_some_and(|n| n <= 1024)
-        {
-            stores.retail_full_at.insert(key, now);
-        } else {
-            stores.counters.retail_full[2] += 1;
+        if stores.retail_full_at.len() >= 2 * store::MAX_RECORDS {
+            let oldest = stores
+                .retail_full_at
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(key, _)| *key);
+            if let Some(oldest) = oldest {
+                stores.retail_full_at.remove(&oldest);
+                stores.counters.retail_full[2] += 1;
+            }
         }
+        stores.retail_full_at.insert(key, now);
         stores.counters.retail_full[0] += 1;
         true
     }
@@ -1346,7 +1350,7 @@ impl SharedCache {
             held_keys: [u64; 2],
             retail_exhausted: [u64; 2],
             retail_exhausted_paced: [u64; 2],
-            retail_pacing_overflow: [u64; 2],
+            pace_evicted: [u64; 2],
             upgrade_state_missing: [u64; 2],
             t14_rebuild: [u64; 2],
             mode_repaired: [u64; 2],
@@ -1389,7 +1393,7 @@ impl SharedCache {
                     held_keys: pair(0),
                     retail_exhausted: pair(5),
                     retail_exhausted_paced: pair(6),
-                    retail_pacing_overflow: pair(7),
+                    pace_evicted: pair(7),
                     upgrade_state_missing: pair(4),
                     t14_rebuild: pair(1),
                     mode_repaired: pair(2),
