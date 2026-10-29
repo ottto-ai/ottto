@@ -469,8 +469,24 @@ impl HeaderInventory {
         } else {
             self.decode_unknown = true;
             self.complete = false;
-            self.refused
-                .insert(key.to_owned(), path_witness(Path::new(key)));
+            if !self.refused.contains_key(key) {
+                let cost = crate::heap_layout_bound::tree_node_bytes::<String, Option<String>>()
+                    .and_then(|node| node.checked_add(key.len()))
+                    .and_then(|node| node.checked_add(256)) // bounded metadata witness
+                    .and_then(|node| self.decode_peak.checked_add(node))
+                    .filter(|cost| {
+                        self.feed_peak
+                            .checked_add(*cost)
+                            .is_some_and(|total| total <= crate::source_rotation::PARKED_BUDGET / 2)
+                    });
+                if let Some(cost) = cost {
+                    self.decode_peak = cost;
+                    self.refused
+                        .insert(key.to_owned(), path_witness(Path::new(key)));
+                } else {
+                    self.bounded_out = true;
+                }
+            }
             if codex_archive_path(Path::new(key)) {
                 crate::local_resource_diagnostics::traversal_point(
                     "codex_archive_unknown_owner_hold",

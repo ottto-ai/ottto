@@ -3183,7 +3183,7 @@ fn activated_selector_reaches_inherited_header_claim_starvation_and_resets_on_pr
         );
         let ((index, result), rows) =
             crate::local_resource_diagnostics::capture(|| finish_selector(scan));
-        assert!(index.files.get(&key).is_none());
+        assert!(!index.files.contains_key(&key));
         assert!(result.snapshots.is_empty());
         assert_eq!(decoded_archive_bytes(&rows), 0);
         assert_eq!(

@@ -16780,7 +16780,7 @@ fn omitted_raw_archive_fences_paused_singleton_and_group_across_reload() {
                     index.save(&saved).unwrap();
                     index = ScanIndex::load(&saved).unwrap();
                     assert!(index.decode_holds_file(&key));
-                    assert!(index.files.get(&key).is_none());
+                    assert!(!index.files.contains_key(&key));
                     if control == "changed" {
                         fs::write(&archive, b"changed bytes").unwrap();
                     }
