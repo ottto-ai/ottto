@@ -2963,7 +2963,7 @@ fn a0h_scan(
 }
 
 #[test]
-fn a0h_pacing_is_funded_nonrenewing_and_overflow_reads() {
+fn a0h_pacing_is_funded_nonrenewing_and_evicts_oldest() {
     let root = crate::test_scratch::private_dir("a0h-pace");
     let path = root.join("t.jsonl");
     std::fs::write(&path, b"{}\n{}\n").unwrap();
@@ -2980,7 +2980,7 @@ fn a0h_pacing_is_funded_nonrenewing_and_overflow_reads() {
     }
     assert!(!cache.retail_full("k", &file, 3, now - std::time::Duration::from_secs(1)));
     assert!(cache.retail_full("k", &file, 3, now + std::time::Duration::from_secs(21600)));
-    let later = now + std::time::Duration::from_secs(21600);
+    let later = now + std::time::Duration::from_secs(21601);
     for n in 1..2 * store::MAX_RECORDS {
         assert!(cache.retail_full(&format!("k{n}"), &file, 3, later));
     }
@@ -2993,10 +2993,20 @@ fn a0h_pacing_is_funded_nonrenewing_and_overflow_reads() {
         "full pace map reads safely"
     );
     assert!(
-        cache.retail_full("overflow", &file, 3, later),
-        "explicit unpaced overflow exception"
+        !cache.retail_full("overflow", &file, 3, later),
+        "the newly admitted key is tracked and paced"
     );
-    assert_eq!(cache.durable().unwrap().counters.retail_full[2], 2);
+    let stores = cache.durable().unwrap();
+    assert_eq!(stores.counters.retail_full[2], 1);
+    assert_eq!(stores.retail_full_at.len(), 2 * store::MAX_RECORDS);
+    assert!(!stores
+        .retail_full_at
+        .contains_key(&store::key_digest(DurableSource::ClaudeCode, "k")));
+    assert_eq!(
+        stores.retail_full_at[&store::key_digest(DurableSource::ClaudeCode, "overflow")],
+        later
+    );
+    drop(stores);
     assert!(
         SharedCache::default().retail_full("k", &file, 3, later),
         "RAM pacing resets on restart"
@@ -3307,7 +3317,7 @@ fn a0h_native_exhaustion_growth_pacing_reselection_and_restart_body() {
 }
 
 #[test]
-fn a0h_pacing_overflow_alone_emits_one_alarm_without_a_full_delta() {
+fn a0h_pace_evicted_alone_emits_one_alarm_without_a_full_delta() {
     let root = crate::test_scratch::private_dir("a0h-overflow-alarm");
     let cache = SharedCache::default();
     let source = SnapshotSource::ClaudeCode;
@@ -3332,7 +3342,7 @@ fn a0h_pacing_overflow_alone_emits_one_alarm_without_a_full_delta() {
     assert_eq!(alarms.len(), 1);
     assert_eq!(alarms[0]["stage"], "durable_tail_alarm");
     assert_eq!(
-        alarms[0]["counts"]["retail_pacing_overflow"],
+        alarms[0]["counts"]["pace_evicted"],
         serde_json::json!([1, 1])
     );
     assert_eq!(
