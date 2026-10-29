@@ -43227,11 +43227,15 @@ fn release_codex_inventory_hold(source: SnapshotSource, traversal: &mut ScanTrav
             // Admission exclusion is not a changed-file witness. Keep the
             // saved debt quiet until admitted evidence actually moves.
             transcript_path_admitted(source, Path::new(key))
-                && (!traversal.codex_rollout_paths.contains(key) || moved(key, witness))
+                && (moved(key, witness)
+                    || (!codex_archive_path(Path::new(key))
+                        && !traversal.codex_rollout_paths.contains(key)))
         })
         || hold.outside_roster.iter().any(|(key, witness)| {
             transcript_path_admitted(source, Path::new(key))
-                && (traversal.codex_rollout_paths.contains(key) || moved(key, witness))
+                && (moved(key, witness)
+                    || (!codex_archive_path(Path::new(key))
+                        && traversal.codex_rollout_paths.contains(key)))
         });
     if !released {
         return;

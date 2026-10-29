@@ -2785,3 +2785,46 @@ fn denied_archive_inventory_debt_releases_once_and_paces_without_plain_body_rere
         ));
     }
 }
+
+#[test]
+fn activation_does_not_release_unchanged_nonregular_archive_inventory_witness() {
+    let f = ArchiveFixture::new(b"metadata-only fixture");
+    let root = f.0.parent().unwrap().to_owned();
+    let directory = root.join("rollout-nonregular.jsonl.zst");
+    fs::create_dir(&directory).unwrap();
+    let key = local_index_key(&directory);
+    let mut index = ScanIndex::default();
+    ensure_bounded_traversal(
+        SnapshotSource::Codex,
+        std::slice::from_ref(&root),
+        &mut index,
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+    );
+    for listed in [false, true] {
+        let traversal = index.traversal.as_mut().unwrap();
+        traversal.pending_directories.clear();
+        traversal.pending_candidates.clear();
+        traversal.codex_rollout_paths.clear();
+        if listed {
+            traversal.codex_rollout_paths.insert(key.clone());
+        }
+        let witness = codex_file_join::path_witness(&directory);
+        let hold = CodexInventoryHold {
+            owed: BTreeSet::from([key.clone()]),
+            refused_headers: BTreeMap::from([(key.clone(), witness.clone())]),
+            outside_roster: BTreeMap::from([(key.clone(), witness)]),
+            awaiting_directories: false,
+        };
+        traversal.residue.codex_inventory_hold = Some(hold.clone());
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            release_codex_inventory_hold(SnapshotSource::Codex, traversal)
+        });
+        assert_eq!(
+            archive_event_count(&rows, "codex_archive_inventory_debt_released"),
+            0
+        );
+        assert_eq!(traversal.residue.codex_inventory_hold.as_ref(), Some(&hold));
+        assert!(traversal.pending_candidates.is_empty());
+    }
+}
