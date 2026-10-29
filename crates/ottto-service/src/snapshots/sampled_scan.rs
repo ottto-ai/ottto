@@ -513,6 +513,14 @@ impl OwnedSourceScan {
             self.source,
             SnapshotSource::ClaudeCode | SnapshotSource::Codex
         ) {
+            #[cfg(unix)]
+            if self.source == SnapshotSource::Codex {
+                codex_child_pair_rederive::stage(
+                    &mut self.index,
+                    &cache,
+                    &self.codex_title_metadata,
+                );
+            }
             sampled_audit::normalize_marker_storage(&mut self.index);
             if self.source == SnapshotSource::ClaudeCode {
                 sampled_audit::restore_held_audit_deadlines(&mut self.index, now_seconds());

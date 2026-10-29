@@ -146,6 +146,7 @@ impl ScanIndex {
         else {
             return false;
         };
+        codex_child_pair_rederive::independent_debt(entry, debt.due_unix_seconds);
         let due = entry
             .unverified_deadline()
             .map_or(debt.due_unix_seconds, |old| old.min(debt.due_unix_seconds));

@@ -203,6 +203,9 @@ impl CachedJsonlReduction {
     }
 }
 impl Decoded {
+    pub(in crate::snapshots) fn child_pair_candidate(&self, metadata: &CodexTitleMetadata) -> bool {
+        self.reduction.child_pair_candidate(metadata)
+    }
     pub(crate) fn cutover(&self) -> Option<Option<i64>> {
         self.reduction
             .accumulator

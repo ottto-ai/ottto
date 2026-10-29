@@ -77,6 +77,7 @@ mod compaction_events;
 pub(crate) use compaction_events::bounded_compaction_events;
 pub use compaction_events::SnapshotCompactionEvent;
 use compaction_events::{ClaudeCompactionTrigger, CodexCompactionSizes};
+mod codex_child_pair_rederive;
 #[cfg(test)]
 mod codex_context_window_tests;
 #[cfg(test)]
@@ -4394,6 +4395,14 @@ pub struct ScanIndexEntry {
     /// stored ctime belongs to. Zero (unavailable) never adopts the ctime.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub(crate) opened_birth_nanos: u64,
+    /// SOURCE class L: optional one-time child validation outcome/scheduling.
+    /// Older writers may drop it; no parser or durable interpretation changes.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "codex_child_pair_rederive::deserialize_stamp"
+    )]
+    pub(crate) codex_child_pair_rederive: Option<codex_child_pair_rederive::Stamp>,
 }
 impl ScanIndexEntry {
     fn codex_recovery_is_pending(&self) -> bool {
@@ -26826,14 +26835,66 @@ impl OwnedSourceScan {
     }
 
     fn step_with_capture_credit(
-        self,
+        mut self,
         attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
         capture_credit: Option<&mut Option<crate::source_rotation::PaidReservation>>,
     ) -> Result<OwnedSourceScanStep, crate::source_rotation::LocalRefusal> {
         let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(
             self.source == SnapshotSource::ClaudeCode,
         );
+        let repair_keys = self
+            .active_file
+            .as_deref()
+            .filter(|_| self.source == SnapshotSource::Codex)
+            .map(|active| {
+                active.group.as_ref().map_or_else(
+                    || vec![local_index_key(&active.candidate.path)],
+                    |group| {
+                        group
+                            .members
+                            .iter()
+                            .map(|member| local_index_key(&member.path))
+                            .collect()
+                    },
+                )
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|key| {
+                codex_child_pair_rederive::begin(&mut self.index, key, sampled_scan::now_seconds())
+            })
+            .collect::<Vec<_>>();
         let mut result = self.step_with_capture_credit_inner(attribution_context, capture_credit);
+        if let Ok(OwnedSourceScanStep::Pending(scan)) = &mut result {
+            for key in repair_keys {
+                let active = scan.active_file.as_deref().is_some_and(|active| {
+                    local_index_key(&active.candidate.path) == key
+                        || active.group.as_ref().is_some_and(|group| {
+                            group
+                                .members
+                                .iter()
+                                .any(|member| local_index_key(&member.path) == key)
+                        })
+                });
+                let parked = scan
+                    .sampling
+                    .as_ref()
+                    .is_some_and(|context| context.cache.cursor_job_owns(&key));
+                if !active
+                    && !parked
+                    && codex_child_pair_rederive::failed(
+                        &mut scan.index,
+                        &key,
+                        sampled_scan::now_seconds(),
+                    )
+                {
+                    #[cfg(unix)]
+                    if let Some(context) = scan.sampling.as_ref() {
+                        context.cache.durable_child_pair_count(5, 1);
+                    }
+                }
+            }
+        }
         let counts = diagnostics.finish();
         if let Ok(OwnedSourceScanStep::Pending(scan)) = &mut result {
             scan.resource_probe.page_events.merge(counts);
@@ -27180,6 +27241,13 @@ impl OwnedSourceScan {
                                 .iter()
                                 .map(|member| local_index_key(&member.path)),
                         );
+                        // A repair grant is per physical key, never a grant
+                        // to read quiet excluded siblings. Keep its debt if
+                        // native joined settlement needs an ungranted member.
+                        if !codex_child_pair_rederive::group_allowed(index, &group.members) {
+                            index.mark_bounded_sweep_unsettled();
+                            continue;
+                        }
                         // §d.1.2 c: a paused or active cursor job owns a
                         // member. Its selected members stay pending (holding
                         // the census) and are not read again while it lives.
@@ -29077,6 +29145,7 @@ impl OwnedSourceScan {
                 };
                 let claude_grown_prefix =
                     source == SnapshotSource::ClaudeCode && parser.reader.sealed_prefix.is_some();
+                let repair_conflicted = parser.accumulator.codex_creator_evidence_conflicted;
                 let parsed_file = parser.finish_with_repository_identity(
                     &candidate.opened_object_identity,
                     &candidate.path,
@@ -29404,6 +29473,31 @@ impl OwnedSourceScan {
                     pending!();
                 }
                 if !aliases.is_empty() && !parse_complete {
+                    for member in std::iter::once(&candidate).chain(
+                        aliases
+                            .iter()
+                            .filter(|member| member.path != candidate.path),
+                    ) {
+                        let key = local_index_key(&member.path);
+                        if matches!(
+                            index
+                                .files
+                                .get(&key)
+                                .and_then(|entry| entry.codex_child_pair_rederive),
+                            Some(codex_child_pair_rederive::Stamp::Pending { .. })
+                        ) {
+                            codex_child_pair_rederive::finish(
+                                index,
+                                &key,
+                                codex_child_pair_rederive::Stamp::Incomplete,
+                                false,
+                            );
+                            #[cfg(unix)]
+                            if let Some(context) = sampling.as_ref() {
+                                context.cache.durable_child_pair_count(4, 1);
+                            }
+                        }
+                    }
                     // Joining authorizes a complete replacement only. Native
                     // ownership/parser loss cannot publish a partial union body.
                     census.ownership_incomplete_file_count += aliases.len();
@@ -29450,6 +29544,45 @@ impl OwnedSourceScan {
                 {
                     census.parent_unresolvable.record(cause.index(), 1);
                     cause.log_held_once();
+                }
+                let repair_stamp = codex_child_pair_rederive::outcome(
+                    index,
+                    &local_index_key(&candidate.path),
+                    &parsed_file.snapshots,
+                    parse_complete,
+                    repair_conflicted,
+                );
+                let repair_alias_stamps = aliases
+                    .iter()
+                    .filter(|member| member.path != candidate.path)
+                    .filter_map(|member| {
+                        let key = local_index_key(&member.path);
+                        codex_child_pair_rederive::outcome(
+                            index,
+                            &key,
+                            &parsed_file.snapshots,
+                            parse_complete,
+                            repair_conflicted,
+                        )
+                        .map(|stamp| (key, stamp))
+                    })
+                    .collect::<Vec<_>>();
+                if repair_stamp == Some(codex_child_pair_rederive::Stamp::Conflict)
+                    || repair_alias_stamps
+                        .iter()
+                        .any(|(_, stamp)| *stamp == codex_child_pair_rederive::Stamp::Conflict)
+                {
+                    for item in &mut parsed_file.snapshots {
+                        item.session_account_evidence = Some(SessionAccountEvidence {
+                            provider: "openai",
+                            account_identifier_hash: None,
+                            provider_workspace_hash: None,
+                            identity_hash_scheme: "provider-sha256:v1",
+                            evidence_source: "codex_creator_header:v1",
+                            identity_disposition: Some("conflict"),
+                            source_created_at: None,
+                        });
+                    }
                 }
                 let terminal_loss = parsed_file.terminal_loss();
                 if let Some(parent_session_ref) = parsed_file
@@ -29962,8 +30095,16 @@ impl OwnedSourceScan {
                                 .is_some_and(ScanIndexEntry::codex_recovery_is_pending),
                             index_key: local_index_key(&alias.path),
                             source_file_fingerprint: alias_fingerprint.clone(),
-                            previous_snapshot_fingerprint: index.last_snapshot_fingerprint(alias),
-                            previous_upload_body_witness: index.last_upload_body_witness(alias),
+                            previous_snapshot_fingerprint: (!repair_alias_stamps
+                                .iter()
+                                .any(|(key, _)| key == &local_index_key(&alias.path)))
+                            .then(|| index.last_snapshot_fingerprint(alias))
+                            .flatten(),
+                            previous_upload_body_witness: (!repair_alias_stamps
+                                .iter()
+                                .any(|(key, _)| key == &local_index_key(&alias.path)))
+                            .then(|| index.last_upload_body_witness(alias))
+                            .flatten(),
                             parse_complete,
                             diagnostic_reason,
                             parsed_snapshot_count: parsed.len(),
@@ -30024,13 +30165,15 @@ impl OwnedSourceScan {
                     index_key: index_key.clone(),
                     source_file_fingerprint: source_file_fingerprint.clone(),
                     previous_snapshot_fingerprint: (decision != CandidateDecision::ReconcileLegacy
-                        && !projection_adoption_required)
-                        .then_some(previous_snapshot_fingerprint)
-                        .flatten(),
+                        && !projection_adoption_required
+                        && repair_stamp.is_none())
+                    .then_some(previous_snapshot_fingerprint)
+                    .flatten(),
                     previous_upload_body_witness: (decision != CandidateDecision::ReconcileLegacy
-                        && !projection_adoption_required)
-                        .then_some(previous_upload_body_witness)
-                        .flatten(),
+                        && !projection_adoption_required
+                        && repair_stamp.is_none())
+                    .then_some(previous_upload_body_witness)
+                    .flatten(),
                     parse_complete,
                     diagnostic_reason,
                     parsed_snapshot_count,
@@ -30164,7 +30307,7 @@ impl OwnedSourceScan {
                                 due_unix_seconds,
                             },
                         ));
-                    if let Some(debt) = obligation {
+                    if let Some(debt) = obligation.filter(|_| repair_stamp.is_none()) {
                         let was_pending = index
                             .files
                             .get(&index_key)
@@ -30274,6 +30417,24 @@ impl OwnedSourceScan {
                             }
                             entry.codex_applied_tier_receipt_required = receipt.is_some();
                             entry.codex_applied_tier_receipt = receipt;
+                        }
+                    }
+                }
+                if let Some(stamp) = repair_stamp {
+                    codex_child_pair_rederive::finish(index, &index_key, stamp, source_verified);
+                    #[cfg(unix)]
+                    if let Some(context) = sampling.as_ref() {
+                        if let Some(slot) = codex_child_pair_rederive::outcome_slot(stamp) {
+                            context.cache.durable_child_pair_count(slot, 1);
+                        }
+                    }
+                }
+                for (key, stamp) in repair_alias_stamps {
+                    codex_child_pair_rederive::finish(index, &key, stamp, source_verified);
+                    #[cfg(unix)]
+                    if let Some(context) = sampling.as_ref() {
+                        if let Some(slot) = codex_child_pair_rederive::outcome_slot(stamp) {
+                            context.cache.durable_child_pair_count(slot, 1);
                         }
                     }
                 }
@@ -31242,6 +31403,7 @@ impl OwnedSourceScan {
                 &claude_title_metadata,
                 claude_effort_support_dir_ref,
             );
+            let repair_key = local_index_key(&candidate.path);
             let verification_rescue = sampled_audit::progress_debt(
                 index,
                 &local_index_key(&candidate.path),
@@ -31258,6 +31420,23 @@ impl OwnedSourceScan {
                 verification_rescue,
                 sampling.as_ref().map(|context| context.cache.as_ref()),
             ) else {
+                if source == SnapshotSource::Codex
+                    && codex_child_pair_rederive::begin(
+                        index,
+                        &repair_key,
+                        sampled_scan::now_seconds(),
+                    )
+                    && codex_child_pair_rederive::failed(
+                        index,
+                        &repair_key,
+                        sampled_scan::now_seconds(),
+                    )
+                {
+                    #[cfg(unix)]
+                    if let Some(context) = sampling.as_ref() {
+                        context.cache.durable_child_pair_count(5, 1);
+                    }
+                }
                 pending!();
             };
             if preflight_source_file_fingerprint
@@ -31310,6 +31489,15 @@ impl OwnedSourceScan {
             }
             if index.decode_holds_file(&local_index_key(&candidate.path)) {
                 index.mark_bounded_sweep_unsettled();
+                pending!();
+            }
+            if source == SnapshotSource::Codex
+                && codex_child_pair_rederive::delay_only_repair(
+                    index,
+                    &candidate,
+                    sampled_scan::now_seconds(),
+                )
+            {
                 pending!();
             }
             let (mut decision, parse_reason) =
@@ -31658,7 +31846,14 @@ impl OwnedSourceScan {
                 // PR-P widens PR-1's `has_own_ledger()` condition to every
                 // entry: a held parent without its own ledger must also fire
                 // event (b).
-                let bypass = owed_parent && entry.is_some();
+                let repair_due = matches!(
+                    index
+                        .files
+                        .get(&key)
+                        .and_then(|entry| entry.codex_child_pair_rederive),
+                    Some(codex_child_pair_rederive::Stamp::Pending { .. })
+                );
+                let bypass = (owed_parent || repair_due) && entry.is_some();
                 if bypass {
                     codex_memo_lifecycle::record(codex_memo_lifecycle::Event::MissOther);
                 }
@@ -32010,6 +32205,20 @@ impl OwnedSourceScan {
                             &candidate.path,
                         );
                     }
+                    if codex_child_pair_rederive::begin(
+                        index,
+                        &repair_key,
+                        sampled_scan::now_seconds(),
+                    ) && codex_child_pair_rederive::failed(
+                        index,
+                        &repair_key,
+                        sampled_scan::now_seconds(),
+                    ) {
+                        #[cfg(unix)]
+                        if let Some(context) = sampling.as_ref() {
+                            context.cache.durable_child_pair_count(5, 1);
+                        }
+                    }
                     census.record_unreadable(UnreadableCause::Reduction, 1);
                     pending!();
                 }
@@ -32287,6 +32496,18 @@ impl OwnedSourceScan {
                                         &candidate.path,
                                     );
                                 }
+                                if codex_child_pair_rederive::begin(
+                                    index,
+                                    &repair_key,
+                                    sampled_scan::now_seconds(),
+                                ) && codex_child_pair_rederive::failed(
+                                    index,
+                                    &repair_key,
+                                    sampled_scan::now_seconds(),
+                                ) {
+                                    #[cfg(unix)]
+                                    context.cache.durable_child_pair_count(5, 1);
+                                }
                                 census.record_unreadable(UnreadableCause::Reduction, 1);
                                 pending!();
                             }
@@ -32406,6 +32627,18 @@ impl OwnedSourceScan {
                             Err(_) => {
                                 context.admission.prepare_failed =
                                     context.admission.prepare_failed.saturating_add(1);
+                                if codex_child_pair_rederive::begin(
+                                    index,
+                                    &repair_key,
+                                    sampled_scan::now_seconds(),
+                                ) && codex_child_pair_rederive::failed(
+                                    index,
+                                    &repair_key,
+                                    sampled_scan::now_seconds(),
+                                ) {
+                                    #[cfg(unix)]
+                                    context.cache.durable_child_pair_count(5, 1);
+                                }
                                 census.record_unreadable(UnreadableCause::Reduction, 1);
                                 pending!();
                             }
@@ -48365,6 +48598,9 @@ impl ScanIndex {
             }
             if let Some(retained) = result.files.get_mut(key) {
                 retained.carry_sampled_audit(working);
+                // Validation is acquisition credit, not an upload ACK. Keep it
+                // even when the body falls back after a failed upload.
+                codex_child_pair_rederive::carry(retained, working);
             }
         }
         result.restore_claude_empty_map_advances(empty_advances);
@@ -49116,6 +49352,10 @@ impl ScanIndex {
         self.files.insert(
             key.clone(),
             ScanIndexEntry {
+                codex_child_pair_rederive: self
+                    .files
+                    .get(&key)
+                    .and_then(|entry| entry.codex_child_pair_rederive),
                 size_bytes: candidate.size_bytes,
                 modified_unix_seconds: candidate.modified_unix_seconds,
                 modified_unix_nanos: Some(candidate.modified_unix_nanos),
@@ -49172,6 +49412,10 @@ impl ScanIndex {
         self.files.insert(
             key.clone(),
             ScanIndexEntry {
+                codex_child_pair_rederive: self
+                    .files
+                    .get(&key)
+                    .and_then(|entry| entry.codex_child_pair_rederive),
                 size_bytes: candidate.size_bytes,
                 modified_unix_seconds: candidate.modified_unix_seconds,
                 modified_unix_nanos: Some(candidate.modified_unix_nanos),
@@ -52343,6 +52587,7 @@ mod tests {
             files: BTreeMap::from([(
                 "content-free-key".to_string(),
                 ScanIndexEntry {
+                    codex_child_pair_rederive: None,
                     size_bytes: 42,
                     modified_unix_seconds: 1_700_000_000,
                     modified_unix_nanos: Some(1_700_000_000_000_000_000),
@@ -53730,6 +53975,7 @@ mod tests {
             files: BTreeMap::from([(
                 local_index_key(&path),
                 ScanIndexEntry {
+                    codex_child_pair_rederive: None,
                     size_bytes: candidate.size_bytes,
                     modified_unix_seconds: candidate.modified_unix_seconds,
                     modified_unix_nanos: Some(candidate.modified_unix_nanos),
@@ -54182,6 +54428,7 @@ mod tests {
             files: BTreeMap::from([(
                 local_index_key(&path),
                 ScanIndexEntry {
+                    codex_child_pair_rederive: None,
                     size_bytes: metadata.len(),
                     modified_unix_seconds,
                     modified_unix_nanos: None,
@@ -54279,6 +54526,7 @@ mod tests {
             files: BTreeMap::from([(
                 local_index_key(&path),
                 ScanIndexEntry {
+                    codex_child_pair_rederive: None,
                     size_bytes: file_metadata.len(),
                     modified_unix_seconds,
                     modified_unix_nanos: None,
@@ -54346,6 +54594,7 @@ mod tests {
             files: BTreeMap::from([(
                 local_index_key(&path),
                 ScanIndexEntry {
+                    codex_child_pair_rederive: None,
                     size_bytes: 42,
                     modified_unix_seconds: 1_777_777_777,
                     modified_unix_nanos: Some(1_777_777_777_000_000_001),
@@ -54400,6 +54649,7 @@ mod tests {
             files: BTreeMap::from([(
                 local_index_key(&path),
                 ScanIndexEntry {
+                    codex_child_pair_rederive: None,
                     size_bytes: 42,
                     modified_unix_seconds: 1_777_777_777,
                     modified_unix_nanos: None,
@@ -54451,6 +54701,7 @@ mod tests {
             files: BTreeMap::from([(
                 local_index_key(&path),
                 ScanIndexEntry {
+                    codex_child_pair_rederive: None,
                     size_bytes: 42,
                     modified_unix_seconds: 1_777_777_777,
                     modified_unix_nanos: None,
@@ -60659,6 +60910,7 @@ mod tests {
         let v6_key =
             source_file_fingerprint(&path, size_bytes, modified_unix_seconds, "pi_jsonl:v6");
         let legacy_entry = ScanIndexEntry {
+            codex_child_pair_rederive: None,
             size_bytes,
             modified_unix_seconds,
             modified_unix_nanos: None,
@@ -84811,6 +85063,7 @@ mod tests {
         index.files.insert(
             local_index_key(&parent_path),
             ScanIndexEntry {
+                codex_child_pair_rederive: None,
                 size_bytes: metadata.len(),
                 modified_unix_seconds,
                 modified_unix_nanos: Some(modified_unix_nanos),
@@ -86433,6 +86686,7 @@ mod tests {
                 .display()
                 .to_string(),
             ScanIndexEntry {
+                codex_child_pair_rederive: None,
                 size_bytes: 1,
                 modified_unix_seconds: 1,
                 modified_unix_nanos: None,
@@ -88270,6 +88524,7 @@ mod tests {
 
     pub(super) fn manifest_index_entry(fingerprint: Option<&str>) -> ScanIndexEntry {
         ScanIndexEntry {
+            codex_child_pair_rederive: None,
             size_bytes: 1,
             modified_unix_seconds: 2,
             modified_unix_nanos: Some(3),
@@ -88435,6 +88690,7 @@ mod tests {
         scanned.files.insert(
             "unchanged.jsonl".to_string(),
             ScanIndexEntry {
+                codex_child_pair_rederive: None,
                 size_bytes: 42,
                 ..manifest_index_entry(Some("aa"))
             },
@@ -89360,6 +89616,7 @@ mod tests {
         index.files.insert(
             "old-file-modified-now.jsonl".to_string(),
             ScanIndexEntry {
+                codex_child_pair_rederive: None,
                 size_bytes: 1,
                 modified_unix_seconds: u64::MAX,
                 modified_unix_nanos: Some(u64::MAX),
@@ -90441,7 +90698,7 @@ crate::durable_tail_codec::durable_struct!(key RowKey {
 });
 crate::heap_layout_bound::fields!(ScanCensus; causes, oversized_discovery, #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, parse_reasons, codex_selections, codex_counting_v2, claude_compaction_unlinked_parent_count);
 crate::heap_layout_bound::fields!(ScanIndex; decode_holds, claude_account_window_retention, schema_version, generation, upload_ack_retirement_handoff, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_retired_family_tombstones, claude_retired_family_tombstones_initialized, claude_retired_family_tombstones_uncertain, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_full_rearm_progress, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, codex_counting_moved_evidence, codex_counting_tombstones, codex_counting_evicted_legacy, codex_counting_evictions, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_move_not_full, claude_history_move_released, accepted_incidence_pending_census, accepted_rebuild_incidence, accepted_rebuild_pending_since_unix_seconds, accepted_rebuild_last_alarm_unix_seconds, claude_no_list_policy, claude_history_emission, reason_reoffer_retries, terminal_contract_retries, claude_history_unverified_in_process, claude_rebuild_read_load_eligible, reason_reoffer_cooldowns, retired_reread_guard, held_audit_progress, claude_money_birth_store);
-crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos);
+crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos, codex_child_pair_rederive);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);
 crate::heap_layout_bound::fields!(ScanTraversalCounts; causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count);

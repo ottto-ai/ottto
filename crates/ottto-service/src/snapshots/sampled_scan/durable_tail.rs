@@ -62,6 +62,8 @@ pub(crate) fn rederive_head_bytes_total(source: SnapshotSource) -> u64 {
 /// id, path or value is ever counted.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Counters {
+    /// children, indexed bytes, named, conflict, incomplete, unreadable.
+    pub(crate) codex_child_pair_rederive: [u64; 6],
     pub(crate) restore_attempts: u64,
     pub(crate) restored: u64,
     pub(crate) missing: u64,
@@ -111,7 +113,7 @@ impl Counters {
              guard_header_bytes={} guard_verify_bytes={} delete_verify_bytes={} overwrite_verify_bytes={} \
              uninventoried_records={} store_write_skipped[unknown,inventory_overflow]={:?} \
              gc_records_deleted={} gc_records_read={} gc_bytes_read={} gc_keep_peak={} \
-             records_invalidated={} peak_codec_bytes={} t14_rebuild_full_started={}",
+             records_invalidated={} peak_codec_bytes={} t14_rebuild_full_started={} codex_child_pair_rederive[children,bytes,named,conflict,incomplete,unreadable]={:?}",
             source.api_slug(),
             self.rederive_head_bytes,
             self.rederive_named_lines,
@@ -144,6 +146,7 @@ impl Counters {
             store.records_invalidated,
             store.peak_codec_bytes,
             store.t14_rebuild_full_started,
+            self.codex_child_pair_rederive,
         )
     }
 }
@@ -492,6 +495,82 @@ impl Drop for StoresGuard<'_> {
 }
 
 impl SharedCache {
+    pub(in crate::snapshots) fn durable_child_pair_count(&self, slot: usize, count: u64) {
+        if let Some(mut stores) = self.durable() {
+            stores.counters.codex_child_pair_rederive[slot] =
+                stores.counters.codex_child_pair_rederive[slot].saturating_add(count);
+        }
+    }
+
+    pub(in crate::snapshots) fn durable_child_pair_budget_stopped(&self) -> bool {
+        self.durable().is_some_and(|stores| {
+            stores.counters.codex_child_pair_rederive[1] > codex_child_pair_rederive::MAX_BYTES
+        })
+    }
+
+    /// Metadata-only selection. No certificate restore, transcript sample or
+    /// content re-derivation, and no checkpoint/account authority is produced.
+    pub(in crate::snapshots) fn durable_child_pair_candidate(
+        &self,
+        key: &str,
+        index: &ScanIndex,
+        metadata: &CodexTitleMetadata,
+    ) -> bool {
+        // A pre-fix RAM copy cannot survive the binary upgrade. Only the
+        // persisted predecessor can introduce old state into this process;
+        // read its binding even if a copy has since been restored into RAM.
+        let record = {
+            let Some(mut stores) = self.durable() else {
+                return false;
+            };
+            let Some(slot) = stores.slot(DurableSource::Codex).as_mut() else {
+                return false;
+            };
+            let ReadOutcome::Found(record) = slot
+                .store
+                .read(&store::key_digest(DurableSource::Codex, key))
+            else {
+                return false;
+            };
+            let Some(entry) = index.files.get(key) else {
+                return false;
+            };
+            let binding = &record.record.binding;
+            // Metadata selection is intentionally not checkpoint reuse. A
+            // current reduction scope requires transcript header witnesses;
+            // do not open those here or pretend the saved scope is current.
+            // Known representation + exact committed entry/context bind the
+            // old native facts. Only the ordinary reader proves live scope.
+            let entry_binding = store::replay_entry_digest(
+                &store::entry_digest(
+                    &entry.source_file_fingerprint,
+                    entry.last_upload_body_witness.as_deref(),
+                ),
+                entry.effective_upload_body_witness_revision,
+                0,
+            );
+            if binding.source != DurableSource::Codex
+                || binding.key != store::key_digest(DurableSource::Codex, key)
+                || binding.context
+                    != store::context_digest(
+                        &slot.namespace.0,
+                        index.active_upload_context_fingerprint.as_deref(),
+                    )
+                || binding.entry != entry_binding
+                || record.index_generation > index.generation
+                || record.record.allowlist != codec::allowlist_digest(SnapshotSource::Codex)
+            {
+                return false;
+            }
+            record
+        };
+        codec::decode(&record.record.body, SnapshotSource::Codex).is_ok_and(|decoded| {
+            decoded.cutover().map_or(true, |cutover| {
+                cutover == codex_counting_version::cutover_unix_ms()
+            }) && decoded.child_pair_candidate(metadata)
+        })
+    }
+
     pub(super) fn durable(&self) -> Option<StoresGuard<'_>> {
         debug_assert!(!stores_held(), "Stores cannot be nested");
         let guard = self.durable.lock().ok()?;

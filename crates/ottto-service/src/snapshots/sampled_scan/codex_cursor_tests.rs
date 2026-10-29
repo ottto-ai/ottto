@@ -7440,6 +7440,7 @@ fn memo_digest_fences_receipt_contents_context_census_flags_and_members() {
         index.files.insert(
             local_index_key(&candidate.path),
             ScanIndexEntry {
+                codex_child_pair_rederive: None,
                 size_bytes: 8,
                 modified_unix_seconds: 0,
                 modified_unix_nanos: None,

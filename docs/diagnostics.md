@@ -1100,3 +1100,36 @@ values.
 A later complete native parse still emits its exclusive body for a session with
 an earlier state-only row. An emitted total alone does not prove a server-side
 overwrite; backend authority rules independently govern successor acceptance.
+
+The existing `durable_tail` summary also carries
+`codex_child_pair_rederive[children,bytes,named,conflict,incomplete,unreadable]`.
+`children` and `bytes` count newly considered unstamped repair candidates and
+their summed **index-recorded source size in bytes**, measured before staging
+any reads. They are process-lifetime totals; persisted pending/terminal markers
+prevent recounting admitted entries. They are not actual I/O bytes. If the
+population or its accumulated budget exceeds 5,000,000,000 bytes, that cohort
+stages no repair audits and repair admission stops for the process, requiring
+an operator decision. Actual transcript bytes and Full(AuditDue)
+attempts remain in the existing acquisition counters. The four outcome columns
+are process-lifetime terminal-entry counts. Retries do not increment outcomes;
+I/O failures get at most three delayed retries after the initial attempt.
+
+This one-time state fix selects only cached native Codex forks with old creator
+conflict, or native depth-2 children with old conflict/absent creator pair, and
+no existing per-entry validation marker. Depth-2 selection combines cached raw
+subagent/direct-parent evidence with the already-loaded provider spawn graph;
+it does not inspect a transcript header to select the file. Plain depth-1
+children and parent sessions are excluded. Terminal markers survive normal
+save, upload failure and restart. Older writers tolerate the optional field;
+an old writer dropping it may cause one additional counted validation per
+subsequent downgrade/upgrade cycle. Markers grant no account or money authority.
+A proven native pair may correct the displayed account; genuine conflict stays
+Unknown. Real population/byte totals are reported from these counters after
+release; the supplied local estimate is not a runtime measurement.
+The selector inspects persisted predecessors: RAM from the old binary cannot
+survive an upgrade. It validates the known codec/allowlist, source, key,
+context, entry and committed generation without pretending to validate current
+acquisition scope (which requires header witnesses). A joined repair cannot
+pull in an otherwise quiet, excluded member: its audit remains pending until
+that member has ordinary read work or a separate grant. It publishes no partial
+joined replacement.
