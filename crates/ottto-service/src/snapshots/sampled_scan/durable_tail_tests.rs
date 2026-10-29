@@ -870,6 +870,9 @@ fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
                     )
                     .unwrap()
                     .finish();
+                // A recovery Full was granted but interrupted before settlement.
+                // This row exercises its bounded pace hold; expiry is covered below.
+                assert!(cache.retail_full(&key, &File::open(&path).unwrap(), record_end));
             }
             let before = (retail_bytes(source, 0), retail_bytes(source, 1));
             let census = index.claude_request_census.get(&key).unwrap().clone();
@@ -1174,6 +1177,8 @@ fn production_cold_pending_and_prepare_error_next_pass_tail_obeys_q11() {
             let mut old = cache.take(&key).expect("returned original");
             old.durable.take_retail().expect("one grant").finish();
             drop(old); // Model cancellation: never reinsert an explicitly ended guard.
+                       // Keep the five passes inside a granted recovery's pacing window.
+            assert!(cache.retail_full(&key, &File::open(&path).unwrap(), record_end));
             let mut index = index;
             for _ in 0..5 {
                 let (next, result, modes) = finish(start(index));
@@ -5823,8 +5828,10 @@ fn q11_complete_map_is_paid_before_the_first_key() {
         crate::heap_layout_bound::tree_node_bytes::<store::Digest32, (u64, std::time::Instant)>()
             .unwrap();
     let reserve = super::super::RETAIL_RESERVE_BYTES;
-    assert!((2 * store::MAX_RECORDS + 1) * nodes <= reserve);
-    assert_eq!(STORES_RESIDENT_BOUND, 926_720);
+    let pace_nodes =
+        crate::heap_layout_bound::tree_node_bytes::<store::Digest32, SystemTime>().unwrap();
+    assert!((2 * store::MAX_RECORDS + 1) * (nodes + pace_nodes) <= reserve);
+    assert_eq!(STORES_RESIDENT_BOUND, 1_452_032);
     assert_eq!(
         super::super::STATE_BYTES
             + reserve
@@ -5841,6 +5848,10 @@ fn q11_complete_map_is_paid_before_the_first_key() {
 /// Real guard + native scan: repeated receipt failure cannot outlive a quiet
 /// sampled obligation. Existing audit debt keeps this file discoverable past W.
 #[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "requires the qualified native heap layout"
+)]
 fn receipt_retry_bound_reads_growth_after_quiet_window_and_restart_is_idle() {
     use std::io::Write;
     assert!(crate::heap_layout_bound::layout_supported());
@@ -6634,4 +6645,348 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
                 .map_or(true, |entry| entry.size_bytes == original_len));
         }
     }
+}
+
+/// S2 applies even to a missing record/resource refusal: never publish a
+/// smaller body just because this daemon lacks the old optional copy.
+#[test]
+fn accepted_floor_missing_record_is_neutral_and_freezes_before_mutation() {
+    let root = crate::test_scratch::ScratchDir::new("p3-s2-missing");
+    let path = root.join("t.jsonl");
+    std::fs::write(&path, b"{}\n").unwrap();
+    let source = SnapshotSource::ClaudeCode;
+    let key = local_index_key(&path);
+    let namespace = Scope("s2".into());
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        key.clone(),
+        serde_json::from_value(serde_json::json!({
+            "size_bytes":6,"modified_unix_seconds":1,"source_file_fingerprint":"accepted"
+        }))
+        .unwrap(),
+    );
+    let frozen = AcceptedFloor::of(&index, &key).unwrap();
+    let mut interpretation = Interpretation::of(source, &key, &index, false, &namespace);
+    index.files.get_mut(&key).unwrap().size_bytes = 0;
+    interpretation.accepted = Some(frozen);
+    let cache = SharedCache::default();
+    cache.durable_begin_pass(source, &root.join("index.json"), &namespace, false);
+    let outcome = cache.durable_restore(
+        source,
+        &key,
+        &path,
+        &namespace,
+        &mut File::open(&path).unwrap(),
+        &index,
+        &interpretation,
+    );
+    assert!(matches!(outcome, RestoreOutcome::FloorHeld));
+    assert!(cache.retained().unwrap().peek(&key).is_none());
+    let (counts, _) = cache.durable_counters(source).unwrap();
+    assert_eq!(counts.restored, 0);
+    assert_eq!(
+        counts.durable_held, [0; 7],
+        "known floor is not U/UpgradeMissing"
+    );
+    let mut diagnostics = crate::local_resource_diagnostics::RestoreCounts::default();
+    diagnostics.record(&outcome);
+    assert_eq!(serde_json::to_value(diagnostics).unwrap()["held"], 1);
+    assert!(frozen.behind(3));
+    assert!(!frozen.behind(6), "equal accepted end remains eligible");
+}
+
+#[test]
+fn shared_recovery_pace_uses_wall_clock_and_overflow_fails_toward_reading() {
+    let root = crate::test_scratch::ScratchDir::new("p3-wall-pace");
+    let path = root.join("t.jsonl");
+    std::fs::write(&path, b"{}\n{}\n").unwrap();
+    let file = File::open(&path).unwrap();
+    let source = SnapshotSource::ClaudeCode;
+    let ds = DurableSource::ClaudeCode;
+    let cache = SharedCache::default();
+    let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+    let pace = |key: &str, now| cache.paced_growth_full(source, key, &file, 3, now);
+    assert!(pace("key", at));
+    assert!(!pace("key", at + std::time::Duration::from_secs(1)));
+    assert!(
+        pace("key", at + std::time::Duration::from_secs(6 * 3600)),
+        "sleep advances wall time"
+    );
+    assert!(pace("key", at), "backwards clock expires toward reading");
+    assert!(
+        pace("key", at + std::time::Duration::from_secs(30 * 24 * 3600)),
+        "absurd forward jump expires"
+    );
+    assert!(
+        !cache.paced_growth_full(source, "quiet", &file, 6, at),
+        "quiet files gain no Full"
+    );
+    cache.durable().unwrap().retail_full_at.clear();
+    let oldest = store::key_digest(ds, "oldest");
+    for n in 0..2 * store::MAX_RECORDS {
+        let key = if n == 0 {
+            oldest
+        } else {
+            store::key_digest(ds, &n.to_string())
+        };
+        cache
+            .durable()
+            .unwrap()
+            .retail_full_at
+            .insert(key, at + std::time::Duration::from_secs(u64::from(n != 0)));
+    }
+    let (allowed, events) = crate::local_resource_diagnostics::capture(|| {
+        pace("overflow", at + std::time::Duration::from_secs(2))
+    });
+    assert!(allowed);
+    let stores = cache.durable().unwrap();
+    assert_eq!(stores.retail_full_at.len(), 2 * store::MAX_RECORDS);
+    assert!(!stores.retail_full_at.contains_key(&oldest));
+    assert_eq!(stores.counters.retail_full[2], 1);
+    assert!(
+        stores.retail_spent.is_empty(),
+        "pacing never manufactures spend custody"
+    );
+    assert!(
+        events.iter().any(|e| e["counts"]["pace_evicted"] == 1),
+        "separate overflow alarm"
+    );
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "requires qualified native heap layout"
+)]
+fn growth_hold_wall_expiry_restart_recovers_exact_body_without_prefix_duplication() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    use std::io::Write;
+    assert!(crate::heap_layout_bound::layout_supported());
+    let _gate = claude_request_money::e2::GateForTest::set(true);
+    let root = crate::test_scratch::ScratchDir::new("p3-growth-recovery");
+    let lock = test_locks::hold(&root);
+    let source = SnapshotSource::ClaudeCode;
+    let ds = DurableSource::ClaudeCode;
+    let namespace = Scope("p3-recovery".into());
+    let sessions = root.join("sessions");
+    std::fs::create_dir(&sessions).unwrap();
+    let path = sessions.join("11111111-2222-4333-8444-555555555555.jsonl");
+    native_fixture(&path);
+    let key = local_index_key(&path);
+    let index_path = root.join("index.json");
+    let cache = Arc::new(SharedCache::default());
+    cache.durable_begin_pass(source, &index_path, &namespace, true);
+    let run = |cache: Arc<SharedCache>, index| {
+        let mut scan = OwnedSourceScan::new_with_identity_capture(
+            source,
+            std::slice::from_ref(&sessions),
+            index,
+            "2028-10-29T12:00:00Z",
+            1,
+            100,
+            false,
+            None,
+            &[],
+            false,
+            true,
+            true,
+        )
+        .with_sampled_acquisition(cache, namespace.clone());
+        let mut modes = (0, 0, 0);
+        for _ in 0..10_000 {
+            if let Some(context) = scan.sampling.as_ref() {
+                modes = (context.full_files, context.tail_files, context.native_bytes);
+            }
+            match scan.step(None) {
+                OwnedSourceScanStep::Pending(next) => scan = next,
+                OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan, modes),
+            }
+        }
+        panic!("native recovery did not finish");
+    };
+    // Initial fixture is intentionally old; allow the initial discovery, then
+    // restore its mtime behind W once the accepted body exists.
+    File::open(&path)
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new().set_modified(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_856_433_600),
+            ),
+        )
+        .unwrap();
+    let (mut index, first, _) = run(cache.clone(), ScanIndex::default());
+    assert_eq!(first.snapshots.len(), 1);
+    assert_eq!(first.snapshots[0].input_tokens, 100);
+    index.save(&index_path).unwrap();
+    assert_eq!(
+        cache
+            .durable_write_after_save(lock, source, &index)
+            .unwrap()
+            .written,
+        1
+    );
+    let accepted = index.files[&key].size_bytes;
+    let checkpoint = cache
+        .retained()
+        .unwrap()
+        .peek(&key)
+        .unwrap()
+        .checkpoint
+        .clone();
+    cache.retained().unwrap().clear();
+    let suffix = serde_json::json!({"type":"assistant","sessionId":"11111111-2222-4333-8444-555555555555",
+        "timestamp":"2026-10-07T10:01:00Z","requestId":"req-p3-growth",
+        "message":{"id":"msg-p3-growth","model":"fixture-model","usage":{"input_tokens":25,"output_tokens":3}}}).to_string()+"\n";
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(suffix.as_bytes())
+        .unwrap();
+    File::open(&path)
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)),
+        )
+        .unwrap();
+    let file = File::open(&path).unwrap();
+    // An interrupted Tail spends its entire frozen grant, without settling.
+    cache
+        .begin_retail(
+            source,
+            &key,
+            &checkpoint,
+            &file,
+            accepted,
+            std::time::Instant::now(),
+        )
+        .unwrap()
+        .finish();
+    let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000);
+    cache.durable().unwrap().retail_full_now = Some(at);
+    assert!(cache.retail_full(&key, &file, accepted)); // Earlier interrupted Full attempt.
+    let accepted_entry = serde_json::to_value(&index.files[&key]).unwrap();
+    let accepted_census = index.claude_request_census.get(&key).unwrap().clone();
+    let (held, result, modes) = run(cache.clone(), index);
+    assert!(result.snapshots.is_empty());
+    assert_eq!(modes, (0, 0, 0));
+    assert_eq!(result.unreadable_path_count, 0);
+    assert_eq!(
+        serde_json::to_value(&held.files[&key]).unwrap(),
+        accepted_entry
+    );
+    assert_eq!(held.claude_request_census.get(&key), Some(&accepted_census));
+    assert_eq!(cache.durable().unwrap().counters.retail_full, [1, 1, 0]);
+    // Independent cold Full under the same accepted entry; discovery is rescued
+    // by length > committed end (#876), never by a fabricated audit/ACK marker.
+    let (_, oracle, _) = run(Arc::new(SharedCache::default()), held.clone());
+    assert_eq!(oracle.snapshots.len(), 1);
+    cache.durable().unwrap().retail_full_now =
+        Some(at + std::time::Duration::from_secs(6 * 3600 + 1));
+    let (mut recovered, body, modes) = run(cache.clone(), held);
+    assert_eq!(modes, (1, 0, file.metadata().unwrap().len()));
+    assert_eq!(body.snapshots[0].input_tokens, 125);
+    assert_eq!(body.snapshots[0].output_tokens, 13);
+    assert_eq!(
+        serde_json::to_value(&body.snapshots).unwrap(),
+        serde_json::to_value(&oracle.snapshots).unwrap()
+    );
+    assert_eq!(
+        cache.durable().unwrap().retail_spent.len(),
+        1,
+        "no refund of interrupted grant"
+    );
+    recovered.save(&index_path).unwrap();
+    cache
+        .durable_write_after_save(lock, source, &recovered)
+        .unwrap();
+    // Restart from the saved accepted entry: no repeated body after recovery.
+    let restarted = Arc::new(SharedCache::default());
+    restarted.durable_begin_pass(source, &index_path, &namespace, true);
+    let (_, quiet, modes) = run(restarted.clone(), ScanIndex::load(&index_path).unwrap());
+    assert!(quiet.snapshots.is_empty());
+    assert_eq!(modes, (0, 0, 0));
+    assert_eq!(restarted.durable().unwrap().counters.retail_full, [0; 3]);
+    assert_eq!(
+        cache
+            .durable()
+            .unwrap()
+            .retail_spent
+            .get(&store::key_digest(ds, &key))
+            .unwrap()
+            .0,
+        file.metadata().unwrap().len()
+    );
+}
+
+#[test]
+fn s2_unknown_is_same_and_only_independent_replacement_skips_floor() {
+    let root = crate::test_scratch::ScratchDir::new("p3-s2-proof");
+    let path = root.join("t.jsonl");
+    std::fs::write(&path, b"{}\n").unwrap();
+    let binding = store::tests::binding("account", "scope", ("accepted", None));
+    let entry = binding.entry;
+    let mut cert = store::tests::certificate(&path);
+    cert.device = 1;
+    cert.inode = 2;
+    cert.birth_nanos = 100;
+    let record = store::DurableRecord {
+        record: store::tests::pending(binding, cert, 1),
+        index_generation: 1,
+        format: 1,
+        envelope_audit_debt: None,
+    };
+    let a = AcceptedFloor {
+        end: 6,
+        revision: 0,
+        birth: 100,
+        generation: 1,
+        entry,
+        strict: true,
+    };
+    assert!(
+        !accepted_object_changed(&record, a, 1, 2, 100),
+        "same object"
+    );
+    assert!(
+        !accepted_object_changed(&record, a, 1, 3, 0),
+        "unknown birth"
+    );
+    assert!(
+        !accepted_object_changed(&record, a, 1, 3, 100),
+        "copied/ambiguous birth"
+    );
+    assert!(
+        !accepted_object_changed(&record, a, 1, 2, 101),
+        "same inode is not replacement proof"
+    );
+    assert!(
+        accepted_object_changed(&record, a, 1, 3, 101),
+        "independent replacement"
+    );
+    assert!(!accepted_object_changed(
+        &record,
+        AcceptedFloor { strict: false, ..a },
+        1,
+        3,
+        101
+    ));
+    assert!(!accepted_object_changed(
+        &record,
+        AcceptedFloor {
+            entry: [9; 32],
+            ..a
+        },
+        1,
+        3,
+        101
+    ));
+    assert!(AcceptedFloor {
+        revision: effective_revision(SnapshotSource::ClaudeCode) + 1,
+        ..a
+    }
+    .behind(100));
 }

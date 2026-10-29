@@ -3022,7 +3022,8 @@ fn spent_known_corrupt_group_keeps_census_healthy_and_peer_progresses() {
 fn durable_hold_on_one_member_holds_the_joined_group() {
     use crate::durable_tail_store as store;
     let mut scanned = Vec::new();
-    for held in [false, true] {
+    for refused_members in 0..=2 {
+        let held = refused_members > 0;
         let (root, _) = fixture();
         let cache = Arc::new(SharedCache::default());
         let index_path = root.join("index.json");
@@ -3044,6 +3045,14 @@ fn durable_hold_on_one_member_holds_the_joined_group() {
         if held {
             fs::create_dir_all(&dir).unwrap();
             fs::write(&record, &bytes).unwrap();
+            if refused_members == 2 {
+                let peer = store::key_digest(
+                    store::DurableSource::Codex,
+                    &local_index_key(&root.join("sessions/b.jsonl")),
+                );
+                let peer = peer.iter().map(|b| format!("{b:02x}")).collect::<String>();
+                fs::write(dir.join(format!("{peer}.rec")), &bytes).unwrap();
+            }
         }
         let (_, result) = sampled(&root, ScanIndex::default(), 10, &cache);
         let (durable, _) = cache.durable_counters(SnapshotSource::Codex).unwrap();
@@ -3051,7 +3060,11 @@ fn durable_hold_on_one_member_holds_the_joined_group() {
         if held {
             assert!(result.snapshots.is_empty(), "held group emits nothing");
             assert_eq!(fs::read(&record).unwrap(), bytes);
-            assert!(durable.durable_held[store::Refusal::NewerFormat as usize] >= 1);
+            assert_eq!(
+                durable.durable_held[store::Refusal::NewerFormat as usize],
+                refused_members,
+                "C9: every refused group member counted, not only the first"
+            );
         } else {
             assert_eq!(durable.durable_held, [0; 7]);
         }
@@ -3059,7 +3072,7 @@ fn durable_hold_on_one_member_holds_the_joined_group() {
         fs::remove_dir_all(root).unwrap();
     }
     assert!(
-        scanned[1] + 2 <= scanned[0],
+        scanned[1] + 2 <= scanned[0] && scanned[2] + 2 <= scanned[0],
         "control acquires both members; the held group acquires neither: {scanned:?}"
     );
 }

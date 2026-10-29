@@ -219,6 +219,20 @@ pub(super) fn path_requires_verification(
         .is_some_and(ScanIndexEntry::has_unverified_source)
 }
 
+/// E3 #876 backstop: old mtime never hides bytes beyond the accepted end.
+/// This grants discovery/retention only, no ACK, census proof or read permission.
+/// Recovery still requires the shared bounded pacer at its refusing owner.
+pub(super) fn path_requires_recovery(
+    files: &BTreeMap<String, ScanIndexEntry>,
+    path: &Path,
+    length: u64,
+) -> bool {
+    path_requires_verification(files, path)
+        || files
+            .get(&local_index_key(path))
+            .is_some_and(|entry| length > entry.size_bytes)
+}
+
 pub(super) fn normalize_marker_storage(index: &mut ScanIndex) {
     for entry in index
         .files

@@ -34,6 +34,7 @@ use crate::durable_tail_store::{
     self as store, Binding, DurableSource, DurableTailStore, Expected, PendingRecord, ReadOutcome,
     SingleWriter,
 };
+use crate::snapshot_sync::effective_upload_body_witness_revision as effective_revision;
 use crate::transcript_acquisition::{
     birth_unix_nanos, CertificateRefusal, Checkpoint, DurableCertificate, FullReason, Scope,
 };
@@ -48,7 +49,8 @@ pub(crate) const WRITE_PASS_BYTES: usize = 8 * 1024 * 1024;
 /// Upper bound of both stores' resident digest maps (two sources).
 /// Pin history: Lead A approved 65,536 -> 401,408 bytes on 2026-10-29:
 /// memo 2*256*256 = 131,072; pending 2*(32+1)*4096 = 270,336 bytes.
-/// Total also includes A0's 525,312-byte retail reserve: 926,720 bytes.
+/// The spent ledger and shared recovery pacer each reserve 525,312 bytes,
+/// carved from the existing cache budget: total 1,452,032 bytes.
 /// Any further growth requires a new owner decision. Native/container evidence
 /// remains required; this pin is not enforcement by the cache's heap walk.
 #[cfg(test)]
@@ -59,6 +61,9 @@ pub(crate) const STORES_RESIDENT_BOUND: usize =
 /// Existing class-X re-derivation is bounded at `HEAD_BOUND`, on a RAM
 /// miss only, so the census pass line reports it beside the guard's own
 /// counters (SOURCE N1).
+const RECOVERY_PACE_SECONDS: u64 = 6 * 3600;
+const _: () = assert!(RECOVERY_PACE_SECONDS < 24 * 3600);
+
 static REDERIVE_HEAD_BYTES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
 pub(crate) fn rederive_head_bytes_total(source: SnapshotSource) -> u64 {
@@ -75,6 +80,8 @@ pub(crate) struct Counters {
     pub(crate) restored: u64,
     pub(crate) retail_attempts: u64,
     pub(crate) retail_keys: u64,
+    /// Shared recovery pacing: [Full, held by pace, oldest stamp evicted].
+    pub(crate) retail_full: [u64; 3],
     pub(crate) missing: u64,
     pub(crate) refused_record: u64,
     pub(crate) durable_held: [u64; 7],
@@ -117,7 +124,7 @@ impl Counters {
         };
         format!(
             "ottto-service: durable_tail source={} retail_attempts={} retail_keys={} tail_read_bytes={} \
-             budget_refused_retail_old_bytes={} repeated_physical_old_bytes={} resource_full={{{}}} rederive_head_bytes={} \
+             budget_refused_retail_old_bytes={} repeated_physical_old_bytes={} retail_full[full,paced,pace_evicted]={:?} resource_full={{{}}} rederive_head_bytes={} \
              rederive_named_lines={} rederive_line_bytes={} not_persisted={{{}}} ineligible={{{}}} \
              write_deferred={} write_unlocked={} peak_body_bytes={} store_write_failed[setup,inventory,statvfs]={:?} disk_records={} disk_bytes={} \
              bytes_written={} records_written={} records_clean={} store_budget_refused={} \
@@ -132,6 +139,7 @@ impl Counters {
             retail_bytes(source, 0),
             retail_bytes(source, 1),
             retail_bytes(source, 1),
+            self.retail_full,
             classes(&self.resource_full),
             self.rederive_head_bytes,
             self.rederive_named_lines,
@@ -201,6 +209,10 @@ pub(crate) struct Stores {
     counters: Counters,
     // Source+key only: never clear on passes, scope changes or cache eviction.
     retail_spent: BTreeMap<store::Digest32, (u64, std::time::Instant)>,
+    // One source+key recovery pace, separate from irrevocable spend custody.
+    retail_full_at: BTreeMap<store::Digest32, SystemTime>,
+    #[cfg(test)]
+    retail_full_now: Option<SystemTime>,
 }
 
 impl Stores {
@@ -241,8 +253,67 @@ pub(crate) fn durable_source(source: SnapshotSource) -> Option<DurableSource> {
     }
 }
 
+/// S2: freeze accepted facts before working-index mutation. Unknown object
+/// identity keeps this floor; only independently proved replacement may skip it.
+#[derive(Clone, Copy)]
+pub(crate) struct AcceptedFloor {
+    pub(crate) end: u64,
+    revision: u64,
+    birth: u64,
+    generation: u64,
+    entry: store::Digest32,
+    strict: bool,
+}
+impl AcceptedFloor {
+    pub(crate) fn of(index: &ScanIndex, key: &str) -> Option<Self> {
+        let e = index.files.get(key)?;
+        Some(Self {
+            end: e.size_bytes,
+            revision: e.effective_upload_body_witness_revision,
+            birth: e.opened_birth_nanos,
+            generation: index.generation,
+            strict: !e.source_file_fingerprint.is_empty(),
+            entry: store::replay_entry_digest(
+                &store::entry_digest(
+                    &e.source_file_fingerprint,
+                    e.last_upload_body_witness.as_deref(),
+                ),
+                e.effective_upload_body_witness_revision,
+                index
+                    .claude_money_birth_store
+                    .money_marks(claude_money_birth_store::location_key(key)),
+            ),
+        })
+    }
+    pub(crate) fn behind(self, length: u64) -> bool {
+        length < self.end || effective_revision(SnapshotSource::ClaudeCode) < self.revision
+    }
+}
+
+/// A different inode alone is ambiguous (copies/hard links/reuse). Births
+/// must independently disagree, and the original must bind the frozen entry.
+fn accepted_object_changed(
+    record: &store::DurableRecord,
+    a: AcceptedFloor,
+    device: u64,
+    inode: u64,
+    birth: u64,
+) -> bool {
+    let c = &record.record.certificate;
+    record.format == 1
+        && a.strict
+        && record.record.binding.entry == a.entry
+        && record.index_generation <= a.generation
+        && a.birth != 0
+        && a.birth == c.birth_nanos
+        && birth != 0
+        && birth != a.birth
+        && (c.device, c.inode) != (device, inode)
+}
+
 /// The interpretation inputs a record binds to beyond the file scope.
 pub(crate) struct Interpretation<'a> {
+    pub(crate) accepted: Option<AcceptedFloor>,
     /// The Claude request-identity contract and identity/attribution parse modes.
     pub(crate) identity_contract: String,
     /// The Codex counting view (`codex_counting_version::singleton_view`).
@@ -270,6 +341,9 @@ impl<'a> Interpretation<'a> {
             identity_contract.push_str(&format!("|attr={}", claude_attribution_capture_enabled()));
         }
         Self {
+            accepted: (source == SnapshotSource::ClaudeCode)
+                .then(|| AcceptedFloor::of(index, key))
+                .flatten(),
             identity_contract,
             counting_view: if source == SnapshotSource::Codex {
                 codex_counting_version::singleton_view_of_key(key, index)
@@ -755,6 +829,87 @@ impl SharedCache {
             old_end: accepted_end,
         })
     }
+    /// A0-h/N10: one recovery Full per source+key per six wall-clock hours.
+    /// This map never refunds/evicts retail_spent. Restart, rollback and an
+    /// implausible wall-clock jump expire permission toward reading.
+    pub(crate) fn retail_full(&self, key: &str, file: &File, accepted_end: u64) -> bool {
+        self.paced_growth_full(
+            SnapshotSource::ClaudeCode,
+            key,
+            file,
+            accepted_end,
+            SystemTime::now(),
+        )
+    }
+
+    fn paced_growth_full(
+        &self,
+        source: SnapshotSource,
+        key: &str,
+        file: &File,
+        accepted_end: u64,
+        now: SystemTime,
+    ) -> bool {
+        if !file.metadata().is_ok_and(|m| m.len() > accepted_end) {
+            return false;
+        }
+        let Some(ds) = durable_source(source) else {
+            return true;
+        };
+        let digest = store::key_digest(ds, key);
+        let Some(mut stores) = self.durable() else {
+            return true;
+        };
+        #[cfg(test)]
+        let now = stores.retail_full_now.unwrap_or(now);
+        const PACE: std::time::Duration = std::time::Duration::from_secs(RECOVERY_PACE_SECONDS);
+        const SANITY: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+        stores
+            .retail_full_at
+            .retain(|_, stamp| match now.duration_since(*stamp) {
+                Ok(age) if age <= SANITY => age < PACE,
+                _ => false,
+            });
+        if stores.retail_full_at.contains_key(&digest) {
+            stores.counters.retail_full[1] += 1;
+            return false;
+        }
+        let mut evicted = false;
+        // Reserve includes a temporary insertion node, but unsupported layouts
+        // cannot allocate an unbounded map. They fail toward a fresh read.
+        let funded = crate::heap_layout_bound::tree_node_bytes::<store::Digest32, SystemTime>()
+            .is_some_and(|n| n <= 1024);
+        if funded {
+            if stores.retail_full_at.len() >= 2 * store::MAX_RECORDS {
+                if let Some(oldest) = stores
+                    .retail_full_at
+                    .iter()
+                    .min_by_key(|(_, at)| **at)
+                    .map(|(key, _)| *key)
+                {
+                    stores.retail_full_at.remove(&oldest);
+                    stores.counters.retail_full[2] += 1;
+                    evicted = true;
+                }
+            }
+            stores.retail_full_at.insert(digest, now);
+        }
+        stores.counters.retail_full[0] += 1;
+        drop(stores);
+        crate::local_resource_diagnostics::durable_tail_alarm(
+            source.api_slug(),
+            &serde_json::json!({"retail_exhausted_full":1}),
+        );
+        if evicted {
+            // Separate alarm: capacity pressure is not ordinary source growth.
+            crate::local_resource_diagnostics::durable_tail_alarm(
+                source.api_slug(),
+                &serde_json::json!({"pace_evicted":1}),
+            );
+        }
+        true
+    }
+
     pub(super) fn durable(&self) -> Option<StoresGuard<'_>> {
         debug_assert!(!stores_held(), "Stores cannot be nested");
         let guard = self.durable.lock().ok()?;
@@ -1090,6 +1245,9 @@ impl SharedCache {
         index: &ScanIndex,
         interpretation: &Interpretation<'_>,
     ) -> RestoreOutcome {
+        let floor_behind = interpretation
+            .accepted
+            .is_some_and(|a| held.metadata().map_or(true, |m| a.behind(m.len())));
         if snapshot_source == SnapshotSource::Codex
             && refuse_compressed_codex(Some(path), None, CodexZstCause::DurableTailUnsupported)
                 .is_err()
@@ -1116,6 +1274,9 @@ impl SharedCache {
             .map_or(true, |bytes| lease.charge(bytes).is_err())
         {
             lease.release();
+            if floor_behind {
+                return RestoreOutcome::FloorHeld;
+            }
             return self.restore_resource_pending(
                 snapshot_source,
                 "cache_key",
@@ -1156,7 +1317,22 @@ impl SharedCache {
             }
             Ok(Err(phase)) => {
                 lease.release();
+                if floor_behind {
+                    return RestoreOutcome::FloorHeld;
+                }
                 self.restore_resource_pending(snapshot_source, phase, grown(held, index, key))
+            }
+            Err(MissClass::AcceptedFloor) => {
+                lease.release();
+                RestoreOutcome::FloorHeld
+            }
+            Err(class @ MissClass::RealEdit) => {
+                lease.release();
+                RestoreOutcome::Miss(class)
+            }
+            Err(_) if floor_behind => {
+                lease.release();
+                RestoreOutcome::FloorHeld
             }
             Err(class @ MissClass::AuditCarrier) => {
                 lease.release();
@@ -1277,6 +1453,39 @@ impl SharedCache {
                 }
             }
         };
+        if let Some(a) = interpretation.accepted {
+            let metadata = held.metadata().map_err(|_| MissClass::AcceptedFloor)?;
+            if a.revision <= effective_revision(SnapshotSource::ClaudeCode)
+                && record.record.binding.source == source
+                && record.record.binding.key == store_key
+                && record.record.binding.context
+                    == store::context_digest(
+                        &interpretation.namespace.0,
+                        index.active_upload_context_fingerprint.as_deref(),
+                    )
+                && accepted_object_changed(
+                    &record,
+                    a,
+                    metadata.dev(),
+                    metadata.ino(),
+                    birth_unix_nanos(&metadata),
+                )
+            {
+                if let Some(mut stores) = self.durable() {
+                    Counters::bump(
+                        &mut stores.counters.ineligible,
+                        "s2_skipped_real_edit.replaced",
+                    );
+                }
+                return Err(MissClass::RealEdit);
+            }
+            if a.behind(metadata.len()) {
+                if let Some(mut stores) = self.durable() {
+                    Counters::bump(&mut stores.counters.ineligible, "accepted_body_floor");
+                }
+                return Err(MissClass::AcceptedFloor);
+            }
+        }
         if record.record.binding.context
             == store::context_digest(
                 &interpretation.namespace.0,
@@ -1361,6 +1570,13 @@ impl SharedCache {
                 return Err(MissClass::Failure(class));
             }
         };
+        if interpretation
+            .accepted
+            .is_some_and(|a| held.metadata().map_or(true, |m| a.behind(m.len())))
+        {
+            Counters::bump(&mut stores.counters.ineligible, "accepted_body_floor");
+            return Err(MissClass::AcceptedFloor);
+        }
         if let Some(slot) = stores.slot(source).as_mut() {
             slot.store.authorize(&record, &expected);
         }
@@ -1888,6 +2104,8 @@ impl SharedCache {
 /// The class returned by the attempted restore, never reconstructed from totals.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum MissClass {
+    AcceptedFloor,
+    RealEdit,
     Unavailable,
     NoEntry,
     AuditCarrier,
@@ -1937,6 +2155,8 @@ impl MissClass {
             };
         }
         match self {
+            Self::AcceptedFloor => "accepted_body_floor",
+            Self::RealEdit => "s2_skipped_real_edit.replaced",
             Self::Unavailable => "unavailable",
             Self::NoEntry => "no_entry",
             Self::AuditCarrier => "ineligible.audit_carrier",
@@ -2019,6 +2239,8 @@ pub(crate) enum RestoreOutcome {
     Restored(Box<Taken<CachedJsonlReduction>>, store::ActiveLease),
     Pending,
     Miss(MissClass),
+    /// Known correctness hold, census-neutral; never a Full fallback.
+    FloorHeld,
     Held(store::Refusal),
 }
 
@@ -2060,6 +2282,7 @@ mod restore_test {
                     lease: Some(lease),
                 }),
                 Self::Miss(_) => None,
+                Self::FloorHeld => panic!("ordinary restore unexpectedly behind accepted body"),
                 Self::Pending if !crate::heap_layout_bound::layout_supported() => None,
                 Self::Pending => panic!("ordinary restore unexpectedly Pending"),
                 Self::Held(reason) => panic!("ordinary restore unexpectedly Held: {reason:?}"),

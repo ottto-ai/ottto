@@ -27868,31 +27868,37 @@ impl OwnedSourceScan {
                     // Grouped members bypass the per-candidate guard: one held member holds the group.
                     #[cfg(unix)]
                     if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
-                        if let Some((member, reason)) = group.members.iter().find_map(|member| {
+                        let mut refused = false;
+                        // C9: inspect and account for EVERY member before holding
+                        // the group; short-circuiting loses refused-member evidence.
+                        for member in &group.members {
                             let key = local_index_key(&member.path);
                             match cache.durable_funded_guard(source, &key, |cache| {
                                 cache.durable_full_hold(source, &key, false)
                             }) {
-                                Ok(None) => None,
-                                result => Some((member, result)),
+                                Ok(None) => {}
+                                Ok(Some(reason)) => {
+                                    refused = true;
+                                    cache.durable_hold_exit(
+                                        source,
+                                        reason,
+                                        index,
+                                        member,
+                                        &mut census,
+                                    );
+                                }
+                                Err(_) => {
+                                    refused = true;
+                                    cache.durable_custody_hold(
+                                        source,
+                                        "active_input_pending",
+                                        index,
+                                        member,
+                                    );
+                                }
                             }
-                        }) {
-                            match reason {
-                                Ok(Some(reason)) => cache.durable_hold_exit(
-                                    source,
-                                    reason,
-                                    index,
-                                    member,
-                                    &mut census,
-                                ),
-                                Err(_) => cache.durable_custody_hold(
-                                    source,
-                                    "active_input_pending",
-                                    index,
-                                    member,
-                                ),
-                                Ok(None) => unreachable!(),
-                            }
+                        }
+                        if refused {
                             pending!();
                         }
                     }
@@ -31176,6 +31182,16 @@ impl OwnedSourceScan {
                     counters.tombstone_hits = counters.tombstone_hits.saturating_add(1);
                 });
             }
+            // S2: preserve accepted facts before candidate/working-entry changes.
+            #[cfg(unix)]
+            let accepted_floor = (source == SnapshotSource::ClaudeCode)
+                .then(|| {
+                    sampled_scan::durable_tail::AcceptedFloor::of(
+                        index,
+                        &local_index_key(&candidate.path),
+                    )
+                })
+                .flatten();
             let preflight_source_file_fingerprint =
                 claude_authority_preflight_fingerprint(index, &candidate);
             if let Some(context) = attribution_context {
@@ -32265,15 +32281,20 @@ impl OwnedSourceScan {
                         #[cfg(unix)]
                         context.cache.durable_note_scope(source, &key, &scope);
                         #[cfg(unix)]
+                        let mut restore_floor = None;
+                        #[cfg(unix)]
                         let (mut retained, taken_admission, debt) = match retained {
                             None if allow_sample && !parser.reader.reader.is_compressed() => {
-                                let interpretation = sampled_scan::durable_tail::Interpretation::of(
-                                    source,
-                                    &key,
-                                    index,
-                                    claude_request_identity_capture,
-                                    &context.namespace,
-                                );
+                                let mut interpretation =
+                                    sampled_scan::durable_tail::Interpretation::of(
+                                        source,
+                                        &key,
+                                        index,
+                                        claude_request_identity_capture,
+                                        &context.namespace,
+                                    );
+                                interpretation.accepted = accepted_floor;
+                                restore_floor = accepted_floor;
                                 let restore = context.cache.durable_restore(
                                     source,
                                     &key,
@@ -32288,11 +32309,15 @@ impl OwnedSourceScan {
                                     sampled_scan::durable_tail::RestoreOutcome::Restored(
                                         mut taken,
                                         lease,
-                                    ) => {
+                                    ) => 'restored: {
                                         preparation_lease = Some(lease);
                                         if source == SnapshotSource::ClaudeCode {
-                                            let accepted_end =
-                                                index.files.get(&key).map_or(0, |e| e.size_bytes);
+                                            let Some(accepted_end) = interpretation.accepted.map(|a| a.end) else {
+                                                context.cache.durable_custody_hold(source, "accepted_floor_missing", index, &candidate);
+                                                drop(taken);
+                                                if let Some(lease) = preparation_lease.take() { lease.release(); }
+                                                pending!();
+                                            };
                                             match context.cache.begin_retail(
                                                 source,
                                                 &key,
@@ -32303,15 +32328,18 @@ impl OwnedSourceScan {
                                             ) {
                                                 Ok(attempt) => taken.durable.put_retail(attempt),
                                                 Err(reason) => {
-                                                    context.cache.durable_retail_hold(
-                                                        source, reason, index, &candidate,
-                                                    );
-                                                    // No grant/custody was acquired: discard only this
-                                                    // optional cold copy, never cache a guardless old A.
+                                                    let full = matches!(reason,
+                                                        sampled_scan::durable_tail::RetailHold::Exhausted
+                                                        | sampled_scan::durable_tail::RetailHold::AccountingLost)
+                                                        && context.cache.retail_full(&key, parser.reader.reader.get_ref(), accepted_end);
+                                                    // Drop optional graph before its lease; never refund
+                                                    // retail_spent or expose guardless old custody.
                                                     drop(taken);
-                                                    if let Some(lease) = preparation_lease.take() {
-                                                        lease.release();
+                                                    if let Some(lease) = preparation_lease.take() { lease.release(); }
+                                                    if full {
+                                                        break 'restored (None, taken_admission, debt);
                                                     }
+                                                    context.cache.durable_retail_hold(source, reason, index, &candidate);
                                                     pending!();
                                                 }
                                             }
@@ -32325,6 +32353,10 @@ impl OwnedSourceScan {
                                         );
                                         (Some(taken), Some(admission), debt)
                                     }
+                                    sampled_scan::durable_tail::RestoreOutcome::FloorHeld => {
+                                        context.cache.durable_custody_hold(source, "accepted_body_floor", index, &candidate);
+                                        pending!();
+                                    }
                                     sampled_scan::durable_tail::RestoreOutcome::Pending => {
                                         context.cache.durable_custody_hold(
                                             source,
@@ -32335,6 +32367,9 @@ impl OwnedSourceScan {
                                         pending!();
                                     }
                                     sampled_scan::durable_tail::RestoreOutcome::Miss(class) => {
+                                        if matches!(class, sampled_scan::durable_tail::MissClass::RealEdit) {
+                                            restore_floor = None;
+                                        }
                                         let rearmed = class.rearm_audit(
                                             index,
                                             &key,
@@ -32425,6 +32460,24 @@ impl OwnedSourceScan {
                         #[cfg(unix)]
                         if let Some(lease) = preparation_lease.take() {
                             lease.release();
+                        }
+                        // S2 again against the actual native plan, after preparation
+                        // but before body I/O/output. Preparing may race a truncate.
+                        #[cfg(unix)]
+                        if restore_floor.is_some_and(|a| {
+                            parser
+                                .reader
+                                .acquisition
+                                .as_ref()
+                                .map_or(true, |plan| a.behind(plan.frozen_length()))
+                        }) {
+                            context.cache.durable_custody_hold(
+                                source,
+                                "accepted_body_floor",
+                                index,
+                                &candidate,
+                            );
+                            pending!();
                         }
                         // H1c: the plan uses absolute offsets; the reader's
                         // extent is relative to its Full/Tail start.
@@ -41946,7 +41999,7 @@ fn refresh_retained_codex_roster(
                 .ok()
                 .and_then(unix_seconds)
                 .unwrap_or_default();
-            if !sampled_audit::path_requires_verification(files, &path)
+            if !sampled_audit::path_requires_recovery(files, &path, metadata.len())
                 && census_unix_seconds.is_some_and(|now| {
                     !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
                 })
@@ -42281,7 +42334,7 @@ fn advance_bounded_directory_traversal_with_budget(
                 .ok()
                 .and_then(unix_seconds)
                 .unwrap_or_default();
-            if !sampled_audit::path_requires_verification(files, &path)
+            if !sampled_audit::path_requires_recovery(files, &path, metadata.len())
                 && census_unix_seconds.is_some_and(|now| {
                     !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
                 })
@@ -42436,7 +42489,7 @@ fn candidate_from_traversal_path_at(
         .ok()
         .and_then(unix_seconds)
         .unwrap_or_default();
-    if !sampled_audit::path_requires_verification(files, &pending.path)
+    if !sampled_audit::path_requires_recovery(files, &pending.path, metadata.len())
         && census_unix_seconds.is_some_and(|now| {
             !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
         })
@@ -42708,15 +42761,18 @@ fn codex_parent_outside_window(
     census_unix_seconds: Option<u64>,
     backfill_window_days: u64,
 ) -> bool {
-    let modified = file
-        .metadata()
-        .ok()
+    let metadata = file.metadata().ok();
+    let modified = metadata
+        .as_ref()
         .and_then(|metadata| metadata.modified().ok())
         .and_then(unix_seconds)
         .unwrap_or_default();
-    !sampled_audit::path_requires_verification(files, path)
-        && census_unix_seconds
-            .is_some_and(|now| !is_recent_enough_at(modified, now, backfill_window_days))
+    !sampled_audit::path_requires_recovery(
+        files,
+        path,
+        metadata.as_ref().map_or(u64::MAX, std::fs::Metadata::len),
+    ) && census_unix_seconds
+        .is_some_and(|now| !is_recent_enough_at(modified, now, backfill_window_days))
 }
 
 fn effective_backfill_window_days(requested_backfill_window_days: u64) -> u64 {
@@ -42941,7 +42997,7 @@ fn open_and_identify_scan_candidate_with_rescue(
             }
         };
     if !verification_rescue
-        && !sampled_audit::path_requires_verification(files, &candidate.path)
+        && !sampled_audit::path_requires_recovery(files, &candidate.path, candidate.size_bytes)
         && !opened_candidate_is_within_frozen_window(
             &candidate,
             census_unix_seconds,
