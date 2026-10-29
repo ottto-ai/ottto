@@ -127,3 +127,40 @@ branch adds no receipt/context field or unconditional mixed skip. After that
 state merges, implement the mixed backoff, immediate privacy reduction,
 terminal exit, counters and all three real-flow fixtures; preserve confirmed
 empty Claude/Codex context-loop disclosure until measured and contained.
+
+
+Round 14 keeps current cohorts unproven and preserves old-reader proof/owed
+correction inputs explicitly for independent ACK, refusal, hold, crash and
+correction-drain coverage. Those controlled inputs are not evidence that this
+release grants authority. New production-default fixtures cover full token/cost
+upload with Unknown account, a two-member copy sharing one request, and durable
+unproven correction evidence. The completion override remains absent from all
+money/upload/history/correction pipelines. The identity/fence latch fix is also
+available as the isolated commit dc167792b, without rewriting published history.
+
+The adoption-budget investigation preserves its one-byte limit and exact money
+checks. Its old completing baseline implicitly adopted the source context;
+that precondition is now an explicit historical adopted-context input, keeping
+this test independent of the separately owned receipt change. The family-retry
+case supplies bounded metadata rediscovery at its fixed fixture clock and
+retains its two-read, zero-adoption-budget checks.
+
+Resource retention requires owner review before merge: RetryPending family
+count and retained file/accepted-index incidence have no per-index admission
+cap. Transport ACKs admit at most 4096 unsettled entries plus live indexed
+incidence, which can itself grow when absent files are retained. Carried rebuild
+history is admitted under 4096 entries and 8 MiB; ordinary indexed history has
+no independent count cap. Tombstones remain capped at 1024. Manifest authority
+is withheld per source/context with no queued manifest backlog; its underlying
+unproven family/file state has the bounds just described.
+
+The existing local census diagnostics line includes read-only retention gauges
+and oldest retained-evidence ages for families, file entries, accepted-index
+ACKs, held history, tombstones, manifest withholding and delayed proof/correction
+debt. Legacy records without a durable clock disclose unknown age; no timestamp
+or persisted field is invented. The finish diagnostics also report transport
+ACK gauge/unsettled count and unknown age. Gauges grant no ACK, settlement,
+proof, tombstone or retirement credit. Unbounded semantic retention must be
+reviewed by E1, Lead A and Lead B before merge; a finite per-pass allowance is
+not a lifetime storage cap. The context receipt and mixed-file hold remain
+separate work until the receipt PR merges.

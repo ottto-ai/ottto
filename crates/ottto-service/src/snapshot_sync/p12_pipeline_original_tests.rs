@@ -957,7 +957,8 @@ impl RearmFixture {
                 &format!("2026-08-02T{hour:02}:{number:02}:00Z"),
                 RearmUpload::Accept,
             );
-            let ended = !page.index.scan_traversal_in_progress_for_test();
+            let ended = !page.index.scan_traversal_in_progress_for_test()
+                || page.index.scan_traversal_exhausted_for_test();
             pages.push(page);
             if ended {
                 return;
@@ -1322,7 +1323,23 @@ fn observe_base_prelude(experimental_base_exit: bool) {
         .then(crate::snapshots::envelope_selection_experiment::Scope::restart);
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = RearmFixture::new("p12-novel-import-prelude");
-    let established = fixture.establish();
+    let first = fixture.generation(8);
+    let last = first.last().unwrap();
+    assert!(!last.scan.census_complete);
+    assert!(last
+        .index
+        .claude_usage_family_witness_digest_for_test(REARM_ROOT)
+        .is_none());
+    for page in &first {
+        assert!(page.held.is_disjoint(&page.uploaded));
+        assert!(!page.duplicate_census.full_rearm);
+        for fp in &page.uploaded {
+            assert!(page.index.accepted_snapshot_fingerprint_recorded(fp));
+        }
+    }
+    let established = RearmEstablished {
+        heads: RearmFixture::family_heads(&last.index),
+    };
     let quiet = fixture.generation(10);
     assert_eq!(
         rearm_reads(&quiet),

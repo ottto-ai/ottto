@@ -288,6 +288,19 @@ pub(crate) fn claude_request_account_mixed_fixture(
             true,
             "2026-08-02T07:10:00Z",
         );
+        if claude_terminal_off() {
+            assert!(items[0].usage_accounting_contract.is_none());
+            let root = claude_snapshot_family_root(&items[0]);
+            index.restore_historical_claude_family_for_test(&root, &api, &trace, false);
+            apply_claude_reported_usage_with_index(
+                &mut items,
+                &api,
+                &trace,
+                &mut index,
+                false,
+                "2026-08-02T07:10:00Z",
+            );
+        }
         assert_eq!(
             items[0].usage_accounting_contract.as_deref(),
             Some("session_exclusive_reported_usage:v1")
@@ -718,32 +731,109 @@ fn claude_h296_root_production_enrichment_keeps_child_separate() {
     let support = dir.join("support");
     let digest = format!("{:x}", Sha256::digest(root.source_session_id.as_bytes()));
     for (kind, rows) in [
-        ("claude-code-effort", api.evidence[&root.source_session_id].iter().map(|row| serde_json::to_value(row).unwrap()).collect::<Vec<_>>()),
-        ("claude-code-trace-ownership", trace.evidence[&root.source_session_id].iter().map(|row| serde_json::to_value(row).unwrap()).collect::<Vec<_>>()),
+        (
+            "claude-code-effort",
+            api.evidence[&root.source_session_id]
+                .iter()
+                .map(|row| serde_json::to_value(row).unwrap())
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "claude-code-trace-ownership",
+            trace.evidence[&root.source_session_id]
+                .iter()
+                .map(|row| serde_json::to_value(row).unwrap())
+                .collect::<Vec<_>>(),
+        ),
     ] {
-        let path = support.join("local-otel").join(kind).join(format!("{digest}.jsonl"));
+        let path = support
+            .join("local-otel")
+            .join(kind)
+            .join(format!("{digest}.jsonl"));
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, rows.iter().map(|row| row.to_string()+"\n").collect::<String>()).unwrap();
+        fs::write(
+            path,
+            rows.iter()
+                .map(|row| row.to_string() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
     }
     let mut index = ScanIndex::default();
-    let mut scan = scan_source_roots_with_test_limit(SnapshotSource::ClaudeCode, std::slice::from_ref(&dir), &mut index, "2026-08-02T07:10:00Z", 7, 100, false).unwrap();
-    assert!(scan.census_complete);
-    let creator = scan.snapshots.iter().find(|item| item.source_session_id == root.source_session_id).unwrap().session_account_evidence.clone();
-    let (_, withheld, stats) = crate::snapshot_sync::apply_claude_local_evidence_to_scan(&support, &mut scan, &mut index);
+    let mut scan = scan_source_roots_with_test_limit(
+        SnapshotSource::ClaudeCode,
+        std::slice::from_ref(&dir),
+        &mut index,
+        "2026-08-02T07:10:00Z",
+        7,
+        100,
+        false,
+    )
+    .unwrap();
+    assert!(!scan.census_complete);
+    let creator = scan
+        .snapshots
+        .iter()
+        .find(|item| item.source_session_id == root.source_session_id)
+        .unwrap()
+        .session_account_evidence
+        .clone();
+    // Current cohort cannot mint the legacy reported proof. Restore a
+    // controlled historical proof for the independent enrichment/ACK contract.
+    apply_claude_reported_usage_with_index(
+        &mut scan.snapshots,
+        &api,
+        &trace,
+        &mut index,
+        false,
+        "2026-08-02T07:10:00Z",
+    );
+    index.restore_historical_claude_family_for_test(&root.source_session_id, &api, &trace, false);
+    let (_, withheld, stats) =
+        crate::snapshot_sync::apply_claude_local_evidence_to_scan(&support, &mut scan, &mut index);
     assert!(!withheld);
     assert_eq!(stats.own_request_complete_root_count, 1);
     assert_eq!(stats.own_request_unknown_root_count, 0);
-    let qualified = scan.snapshots.iter().find(|item| item.source_session_id == root.source_session_id).unwrap();
-    assert_eq!(qualified.provenance.collector, claude_request_accounts::COMPLETE);
+    let qualified = scan
+        .snapshots
+        .iter()
+        .find(|item| item.source_session_id == root.source_session_id)
+        .unwrap();
+    assert_eq!(
+        qualified.provenance.collector,
+        claude_request_accounts::COMPLETE
+    );
     assert_eq!(qualified.request_count, 4);
     assert_eq!(qualified.claude_usage_request_ids.len(), 4);
     assert!(!qualified.claude_usage_request_ids.contains("req_5"));
     assert_eq!(qualified.session_account_evidence, creator);
-    assert!(qualified.session_account_evidence.as_ref().is_some_and(|original| original.identity_disposition == Some("missing")), "request account never manufactures original creator");
-    assert_eq!(qualified.usage_accounting_contract.as_deref(), Some("session_exclusive_reported_usage:v1"));
-    assert_eq!(qualified.cost.as_ref().unwrap().total_cost_usd.as_deref(), Some("0.0004"));
-    assert_eq!(scan.snapshots.iter().find(|item| item.source_session_id != root.source_session_id).unwrap().request_count, 1);
-    assert!(index.accepted_snapshot_fingerprints.is_empty(), "qualification is not an ACK");
+    assert!(
+        qualified
+            .session_account_evidence
+            .as_ref()
+            .is_some_and(|original| original.identity_disposition == Some("missing")),
+        "request account never manufactures original creator"
+    );
+    assert_eq!(
+        qualified.usage_accounting_contract.as_deref(),
+        Some("session_exclusive_reported_usage:v1")
+    );
+    assert_eq!(
+        qualified.cost.as_ref().unwrap().total_cost_usd.as_deref(),
+        Some("0.0004")
+    );
+    assert_eq!(
+        scan.snapshots
+            .iter()
+            .find(|item| item.source_session_id != root.source_session_id)
+            .unwrap()
+            .request_count,
+        1
+    );
+    assert!(
+        index.accepted_snapshot_fingerprints.is_empty(),
+        "qualification is not an ACK"
+    );
     output("native-root-production.json", qualified);
     fs::remove_dir_all(dir).unwrap();
 }

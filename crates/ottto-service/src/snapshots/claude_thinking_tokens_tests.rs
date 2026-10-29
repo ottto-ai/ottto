@@ -314,6 +314,16 @@ fn family_proven_before_thinking_reader_reproves_after_upgrade() {
         true,
         "2026-08-02T07:10:00Z",
     );
+    assert!(index.claude_usage_family_witnesses.is_empty());
+    index.restore_historical_claude_family_for_test(FAMILY_ROOT, &api_report, &trace_report, false);
+    apply_claude_reported_usage_with_index(
+        &mut items,
+        &api_report,
+        &trace_report,
+        &mut index,
+        false,
+        "2026-08-02T07:10:00Z",
+    );
     assert!(items
         .iter()
         .all(|item| item.usage_accounting_contract.as_deref() == exclusive));
@@ -369,22 +379,25 @@ fn family_proven_before_thinking_reader_reproves_after_upgrade() {
         "2026-08-02T07:12:00Z",
     );
     never_terminal(&index);
-    assert_eq!(disposition.quarantined_entity_count(), 0);
+    assert!(disposition.quarantined_entity_count() > 0);
     assert!(census
         .iter()
-        .all(|item| item.usage_accounting_contract.as_deref() == exclusive));
+        .all(|item| item.usage_accounting_contract.is_none()));
     assert_eq!(census[0].reasoning_output_tokens, 8);
     assert_eq!(census[0].output_tokens, 20);
     let mut uploadable = census;
     disposition.retain_uploadable(&mut uploadable);
-    assert_eq!(uploadable.len(), 2, "re-proven revisions reach upload");
-    assert!(!index
+    assert!(
+        uploadable.is_empty(),
+        "changed proof stays owed, never uploads an unproven authority replacement"
+    );
+    assert!(index
         .claude_usage_authority_quarantine
         .contains_key(FAMILY_ROOT));
-    assert_ne!(
+    assert_eq!(
         index.claude_usage_family_witnesses.get(FAMILY_ROOT),
         Some(&proven_before),
-        "the new witness hashes the thinking count"
+        "terminal-off retains the old witness until paging can reprove thinking"
     );
     let _ = fs::remove_dir_all(dir);
 }

@@ -33,7 +33,10 @@ fn off_line(member: &str, request: &str) -> String {
 }
 
 fn off_scan(index: &mut ScanIndex, root: &Path, at: &str, limit: usize) -> SourceScanResult {
-    assert!(claude_terminal_off(), "containment receipts require production policy");
+    assert!(
+        claude_terminal_off(),
+        "containment receipts require production policy"
+    );
     // The production prepare activates context after every reload.
     if index.active_upload_context_fingerprint.is_none() {
         index.activate_upload_context("settled-destination".into());
@@ -147,23 +150,69 @@ fn terminal_off_w1_w2_open_fence_skipped_duplicate_never_verifies() {
                 let mut guarded = index.clone();
                 let mut guarded_page = page.clone();
                 guarded_page.census_complete = offered_terminal;
-                apply_claude_effort_evidence_with_index(&mut guarded_page.snapshots, &BTreeMap::new(), &mut guarded, offered_terminal, &page.census_window_end);
+                apply_claude_effort_evidence_with_index(
+                    &mut guarded_page.snapshots,
+                    &BTreeMap::new(),
+                    &mut guarded,
+                    offered_terminal,
+                    &page.census_window_end,
+                );
                 let api = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
                 let trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
                 let verdict = match route {
-                    "direct" => apply_claude_reported_usage_with_index(&mut guarded_page.snapshots, &api, &trace, &mut guarded, offered_terminal, &page.census_window_end),
-                    "scan" => apply_claude_reported_usage_to_scan_with_identity(&mut guarded_page, &api, &trace, &mut guarded, None),
+                    "direct" => apply_claude_reported_usage_with_index(
+                        &mut guarded_page.snapshots,
+                        &api,
+                        &trace,
+                        &mut guarded,
+                        offered_terminal,
+                        &page.census_window_end,
+                    ),
+                    "scan" => apply_claude_reported_usage_to_scan_with_identity(
+                        &mut guarded_page,
+                        &api,
+                        &trace,
+                        &mut guarded,
+                        None,
+                    ),
                     _ => {
-                        let observations = record_claude_native_observations(&guarded_page, &mut guarded);
-                        apply_claude_reported_usage_to_scan_with_observations(&mut guarded_page, &api, &trace, &mut guarded, None, Some(observations))
+                        let observations =
+                            record_claude_native_observations(&guarded_page, &mut guarded);
+                        apply_claude_reported_usage_to_scan_with_observations(
+                            &mut guarded_page,
+                            &api,
+                            &trace,
+                            &mut guarded,
+                            None,
+                            Some(observations),
+                        )
                     }
                 };
                 assert!(!verdict.duplicate_census.census_complete, "{route}");
                 assert!(verdict.duplicate_census.fence_after, "{route}");
                 assert!(guarded.claude_usage_family_witnesses.is_empty(), "{route}");
-                assert!(guarded.claude_account_family_witnesses.is_empty(), "{route}");
-                assert!(guarded.claude_owned_start_census.values().all(|w| w.verified_source_file_fingerprint.is_none()), "{route}");
-                assert!(guarded_page.snapshots.iter().all(|item| item.cache_observations.is_none() && item.context_curve.as_ref().map_or(true, |curve| !matches!(curve.coverage.as_str(), "complete" | "sampled"))), "{route}");
+                assert!(
+                    guarded.claude_account_family_witnesses.is_empty(),
+                    "{route}"
+                );
+                assert!(
+                    guarded
+                        .claude_owned_start_census
+                        .values()
+                        .all(|w| w.verified_source_file_fingerprint.is_none()),
+                    "{route}"
+                );
+                assert!(
+                    guarded_page
+                        .snapshots
+                        .iter()
+                        .all(|item| item.cache_observations.is_none()
+                            && item.context_curve.as_ref().map_or(true, |curve| !matches!(
+                                curve.coverage.as_str(),
+                                "complete" | "sampled"
+                            ))),
+                    "{route}"
+                );
             }
         }
 
@@ -415,8 +464,10 @@ fn terminal_off_delete_defers_all_raw_effects_and_full_rearm() {
         "exact removal withheld before raw effects"
     );
     assert!(claude_effective_duplicate_fence_closed(&index));
-    assert!(!index.claude_duplicate_request_witness_overflowed,
-        "containment does not mutate the persisted fence");
+    assert!(
+        !index.claude_duplicate_request_witness_overflowed,
+        "containment does not mutate the persisted fence"
+    );
     let api = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
     let trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
     let d = apply_claude_reported_usage_with_index(&mut [], &api, &trace, &mut index, true, W2);
@@ -612,14 +663,21 @@ fn terminal_off_fresh_context_reselection_is_disclosed_until_adoption() {
 fn terminal_off_save_preserves_persisted_fence_and_closes_effective_fence() {
     for closed in [false, true] {
         let scratch = crate::test_scratch::ScratchDir::new("terminal-off-fence-save");
-        fs::write(scratch.join(format!("{OFF_ROOT}.jsonl")), off_line(OFF_ROOT, "X")).unwrap();
+        fs::write(
+            scratch.join(format!("{OFF_ROOT}.jsonl")),
+            off_line(OFF_ROOT, "X"),
+        )
+        .unwrap();
         let mut index = off_index();
         index.claude_duplicate_request_witness_overflowed = closed;
         let page = off_scan(&mut index, &scratch, W1, 1);
         assert!(!page.census_complete);
         assert!(claude_effective_duplicate_fence_closed(&index));
         let encoded = serde_json::to_value(&index).unwrap();
-        assert_eq!(encoded["claude_duplicate_request_witness_overflowed"], closed);
+        assert_eq!(
+            encoded["claude_duplicate_request_witness_overflowed"],
+            closed
+        );
         let loaded: ScanIndex = serde_json::from_value(encoded).unwrap();
         assert_eq!(loaded.claude_duplicate_request_witness_overflowed, closed);
         assert!(claude_effective_duplicate_fence_closed(&loaded));
@@ -642,7 +700,12 @@ fn terminal_off_old_reader_owned_start_correction_quiesces_with_custody() {
     witness.emitted_source_file_fingerprint = None;
     // The old emitter already owed one defensive re-read. Preserve that debt;
     // only avoid issuing it again after the ordinary read has discharged it.
-    index.files.get_mut(&key).unwrap().source_file_fingerprint.clear();
+    index
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .source_file_fingerprint
+        .clear();
     let old = serde_json::to_value(&index).unwrap();
     index = serde_json::from_value(old).unwrap();
     index.active_upload_context_fingerprint = Some("settled-destination".into());
@@ -654,11 +717,17 @@ fn terminal_off_old_reader_owned_start_correction_quiesces_with_custody() {
         let scan = off_scan(&mut index, &scratch, W2, 1);
         assert_eq!(scan.scanned_file_count, usize::from(pass == 0));
         if pass > 0 {
-            assert_eq!(TERMINAL_OFF_BODY_BYTES_FOR_TEST.with(std::cell::Cell::get), bytes_before);
+            assert_eq!(
+                TERMINAL_OFF_BODY_BYTES_FOR_TEST.with(std::cell::Cell::get),
+                bytes_before
+            );
         }
         off_accept(&mut index, &scan);
         let witness = &index.claude_owned_start_census[OFF_ROOT];
-        assert_eq!(witness.verified_source_file_fingerprint.as_ref(), Some(&fingerprint));
+        assert_eq!(
+            witness.verified_source_file_fingerprint.as_ref(),
+            Some(&fingerprint)
+        );
         assert!(witness.emitted_source_file_fingerprint.is_none());
         assert_eq!(index.files[&key].source_file_fingerprint, fingerprint);
         assert!(!scan.census_complete);
@@ -676,7 +745,10 @@ fn terminal_off_ctime_only_counts_one_file_two_observations_per_walk() {
     let path = scratch.join(format!("{OFF_ROOT}.jsonl"));
     // Both head and tail are paid, including the second ctime validation.
     let mut contents = off_line(OFF_ROOT, "X");
-    contents.push_str(&format!("{{\"type\":\"user\",\"padding\":\"{}\"}}\n", "x".repeat(20_000)));
+    contents.push_str(&format!(
+        "{{\"type\":\"user\",\"padding\":\"{}\"}}\n",
+        "x".repeat(20_000)
+    ));
     fs::write(&path, contents).unwrap();
     let mut index = off_index();
     let first = off_scan(&mut index, &scratch, W1, 1);
@@ -684,16 +756,28 @@ fn terminal_off_ctime_only_counts_one_file_two_observations_per_walk() {
     let key = local_index_key(&path);
     assert_ne!(index.files[&key].opened_birth_nanos, 0);
     let metadata = fs::metadata(&path).unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(metadata.permissions().mode() ^ 0o100)).unwrap();
+    fs::set_permissions(
+        &path,
+        fs::Permissions::from_mode(metadata.permissions().mode() ^ 0o100),
+    )
+    .unwrap();
     let live = fs::metadata(&path).unwrap();
-    let changed = (live.ctime() as u64).saturating_mul(1_000_000_000).saturating_add(live.ctime_nsec() as u64);
-    assert_ne!(changed, index.files[&key].opened_changed_nanos, "fixture must move ctime");
+    let changed = (live.ctime() as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(live.ctime_nsec() as u64);
+    assert_ne!(
+        changed, index.files[&key].opened_changed_nanos,
+        "fixture must move ctime"
+    );
     off_suppression_preconditions(&index);
     index.traversal = None;
     let body_before = TERMINAL_OFF_BODY_BYTES_FOR_TEST.with(std::cell::Cell::get);
     let quiet = off_scan(&mut index, &scratch, W2, 1);
     assert_eq!(quiet.scanned_file_count, 0);
-    assert_eq!(TERMINAL_OFF_BODY_BYTES_FOR_TEST.with(std::cell::Cell::get), body_before);
+    assert_eq!(
+        TERMINAL_OFF_BODY_BYTES_FOR_TEST.with(std::cell::Cell::get),
+        body_before
+    );
     START_IDENTITY_SAMPLES.with(|counts| {
         let counts = counts.borrow();
         assert_eq!(counts.files.len(), 1);
@@ -702,4 +786,57 @@ fn terminal_off_ctime_only_counts_one_file_two_observations_per_walk() {
     });
     reset_start_identity_samples();
     START_IDENTITY_SAMPLES.with(|counts| assert_eq!(counts.borrow().observations, 0));
+}
+
+#[test]
+fn terminal_off_retention_gauges_never_grant_custody_credit() {
+    let mut index = off_index();
+    let clock = rfc3339_unix_seconds(W1).unwrap();
+    index
+        .snapshot_activity_at
+        .insert("f".repeat(64), Some(W1.into()));
+    index.accepted_snapshot_fingerprints.insert("f".repeat(64));
+    let before = serde_json::to_value(&index).unwrap();
+    let debt = index.terminal_off_retention(clock + 100);
+    assert_eq!(debt.accepted_index_acks.items, 1);
+    assert_eq!(debt.accepted_index_acks.oldest_age_seconds, Some(100));
+    assert_eq!(debt.manifest_withheld.items, 1);
+    assert_eq!(debt.manifest_withheld.unknown_age, 1);
+    assert_eq!(
+        serde_json::to_value(&index).unwrap(),
+        before,
+        "diagnostics cannot create ACK, settlement, proof or tombstone authority"
+    );
+    assert!(!claude_terminal_authority(&index, true, W2));
+    assert!(index.claude_usage_family_witnesses.is_empty());
+}
+
+#[test]
+fn terminal_off_unproven_pending_is_counted_without_settlement_or_proof() {
+    let scratch = crate::test_scratch::ScratchDir::new("terminal-off-pending-gauge");
+    let root = scratch.join("projects");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join(format!("{OFF_ROOT}.jsonl")),
+        off_line(OFF_ROOT, "X"),
+    )
+    .unwrap();
+    let mut index = off_index();
+    let scan = off_scan(&mut index, &root, W1, 8);
+    assert!(!scan.census_complete);
+    let debt = index.terminal_off_retention(rfc3339_unix_seconds(W2).unwrap());
+    assert!(debt.delayed_proof_families.items > 0);
+    assert!(debt.delayed_proof_families.oldest_age_seconds.is_some());
+    assert_eq!(
+        debt.owed_correction_members.items, 0,
+        "pending evidence never invents a grant"
+    );
+    assert_eq!(
+        debt.accepted_index_acks.items, 0,
+        "retention never invents an ACK"
+    );
+    assert!(index.claude_usage_family_witnesses.is_empty());
+    let before = serde_json::to_value(&index).unwrap();
+    let _ = index.terminal_off_retention(rfc3339_unix_seconds(W2).unwrap() + 100);
+    assert_eq!(serde_json::to_value(&index).unwrap(), before);
 }

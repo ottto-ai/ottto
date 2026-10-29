@@ -141,7 +141,10 @@ impl Corpus {
         sampled: bool,
         hints: &[PathBuf],
     ) -> Page {
-        assert!(crate::snapshots::claude_terminal_off(), "money pipeline requires production policy");
+        assert!(
+            crate::snapshots::claude_terminal_off(),
+            "money pipeline requires production policy"
+        );
         index.activate_upload_context("e2-synthetic-destination".into());
         index.activate_effective_upload_body_witness_revision(if e2::enabled() {
             3
@@ -1803,6 +1806,13 @@ fn e2_pipeline_twin_byte_budget_hold_preserves_accepted_complete_history() {
             1,
             "hold starts from one complete accepted family body"
         );
+        // Main's completing prelude adopted this context. In containment that
+        // prelude is unavailable; restore the explicit historical input so this
+        // remains the ADOPTION-ONLY byte-budget control, independent of #901.
+        let mut value = serde_json::to_value(&prior).unwrap();
+        value["upload_context_fingerprint"] = json!("e2-synthetic-destination");
+        prior = serde_json::from_value(value).unwrap();
+        prior.activate_upload_context("e2-synthetic-destination".into());
         prior.activate_effective_upload_body_witness_revision(3);
         for key in prior.files.keys().cloned().collect::<Vec<_>>() {
             assert!(
@@ -2785,4 +2795,111 @@ fn e2_pipeline_held_new_file_lifetime_losses_preserve_main_body() {
     for loss in 1..=3 {
         withheld_new_file_retries_from_retained_read(false, false, loss);
     }
+}
+
+#[test]
+fn terminal_off_unproven_cohort_uploads_full_tokens_and_cost_with_unknown_account() {
+    with_e2(|| {
+        let mut c = Corpus::new("terminal-off-unproven-full-money");
+        c.root(ROOT, &line(ROOT, "X", AT, 37));
+        c.evidence(&[api("X", 37, 123)], &[trace("X", "")]);
+        let mut page = ready(
+            &c,
+            &E2ScanFixture::default(),
+            ScanIndex::default(),
+            100,
+            false,
+        );
+        assert!(!page.scan.census_complete);
+        assert_eq!(total(&page), 1);
+        assert_eq!(
+            page.scan
+                .snapshots
+                .iter()
+                .map(|s| s.input_tokens)
+                .sum::<u64>(),
+            37
+        );
+        assert_eq!(
+            page.scan
+                .snapshots
+                .iter()
+                .map(|s| s.output_tokens)
+                .sum::<u64>(),
+            37
+        );
+        let item = &page.scan.snapshots[0];
+        assert_eq!(
+            item.cost.as_ref().unwrap().total_cost_usd.as_deref(),
+            Some("0.000123")
+        );
+        assert!(item
+            .model_usage
+            .iter()
+            .all(|row| row.account_identifier_hash.is_none()));
+        assert_eq!(
+            item.provenance.collector,
+            crate::snapshots::claude_request_accounts::UNKNOWN
+        );
+        page.finish();
+        let mut progress = e2_progress();
+        let (result, sent, _) = upload(&page.scan.snapshots, &mut progress, ack);
+        assert!(matches!(result.unwrap(), ResumableUploadResult::Completed));
+        assert_eq!(sent.len(), 1);
+        for item in &page.scan.snapshots {
+            assert!(progress.contains_body(
+                &item.snapshot_fingerprint,
+                &snapshot_upload_body_witness(item)
+            ));
+        }
+    });
+}
+
+#[test]
+fn terminal_off_two_member_new_copy_cohort_emits_shared_request_once() {
+    with_e2(|| {
+        let mut c = Corpus::new("terminal-off-new-copy-shared-request");
+        c.root(ROOT, &line(ROOT, "X", AT, 37));
+        let mut copy: serde_json::Value = serde_json::from_str(&line(ROOT, "X", AT, 37)).unwrap();
+        copy["sessionId"] = json!(COPY);
+        copy["forkedFrom"] = json!({"sessionId":ROOT,"messageUuid":"msg-X"});
+        c.root(COPY, &(copy.to_string() + "\n"));
+        c.evidence(&[api("X", 37, 123)], &[trace("X", "")]);
+        let page = ready(
+            &c,
+            &E2ScanFixture::default(),
+            ScanIndex::default(),
+            100,
+            false,
+        );
+        assert!(!page.scan.census_complete);
+        assert_eq!(
+            total(&page),
+            1,
+            "new /resume or /branch cannot duplicate shared request X"
+        );
+        assert_eq!(
+            page.scan
+                .snapshots
+                .iter()
+                .map(|s| s.input_tokens)
+                .sum::<u64>(),
+            37
+        );
+        assert_eq!(
+            page.scan
+                .snapshots
+                .iter()
+                .map(|s| s.output_tokens)
+                .sum::<u64>(),
+            37
+        );
+        assert!(
+            page.scan
+                .snapshots
+                .iter()
+                .all(|s| s.source_session_id != COPY),
+            "copied prefix is held or excluded instead of minted as new money"
+        );
+    });
 }

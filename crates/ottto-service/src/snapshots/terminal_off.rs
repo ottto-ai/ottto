@@ -54,16 +54,43 @@ mod completion_policy_tests {
     #[test]
     fn money_upload_and_history_suites_have_no_completion_override() {
         for (suite, source) in [
-            ("release-cut money receipts", include_str!("../snapshot_sync/money_equivalence_tests.rs")),
-            ("E2 money pipeline", include_str!("../snapshot_sync/claude_money_e2_pipeline_tests.rs")),
-            ("real finish", include_str!("../snapshot_sync/permanent_finish_pipeline_tests.rs")),
-            ("prior-index finish", include_str!("../snapshot_sync/prior_index_lifetime_tests.rs")),
-            ("history upgrade", include_str!("../snapshot_sync/history_upgrade_pipeline_tests.rs")),
-            ("authority correction upload", include_str!("../snapshot_sync/authority_proof_correction_pipeline_tests.rs")),
-            ("upload batching", include_str!("../snapshot_sync/e2_upload_tests.rs")),
-            ("census pipeline", include_str!("../snapshot_sync/census_convergence_pipeline_tests.rs")),
+            (
+                "release-cut money receipts",
+                include_str!("../snapshot_sync/money_equivalence_tests.rs"),
+            ),
+            (
+                "E2 money pipeline",
+                include_str!("../snapshot_sync/claude_money_e2_pipeline_tests.rs"),
+            ),
+            (
+                "real finish",
+                include_str!("../snapshot_sync/permanent_finish_pipeline_tests.rs"),
+            ),
+            (
+                "prior-index finish",
+                include_str!("../snapshot_sync/prior_index_lifetime_tests.rs"),
+            ),
+            (
+                "history upgrade",
+                include_str!("../snapshot_sync/history_upgrade_pipeline_tests.rs"),
+            ),
+            (
+                "authority correction upload",
+                include_str!("../snapshot_sync/authority_proof_correction_pipeline_tests.rs"),
+            ),
+            (
+                "upload batching",
+                include_str!("../snapshot_sync/e2_upload_tests.rs"),
+            ),
+            (
+                "census pipeline",
+                include_str!("../snapshot_sync/census_convergence_pipeline_tests.rs"),
+            ),
         ] {
-            assert!(!source.contains("ClaudeCompletionPathsForTest"), "{suite} must exercise production containment");
+            assert!(
+                !source.contains("ClaudeCompletionPathsForTest"),
+                "{suite} must exercise production containment"
+            );
         }
         assert!(claude_terminal_off());
     }
@@ -546,5 +573,104 @@ impl ScanIndex {
             }
             enqueue_terminal_off_retry(traversal, key);
         }
+    }
+}
+
+/// Gauges only; clocks are the oldest retained durable evidence, not an
+/// invented time of absence. Old records with no clock report unknown_age.
+/// This read-only view cannot retire debt, settle an ACK or grant proof.
+#[derive(Default, Debug, Serialize)]
+struct RetentionGauge {
+    items: usize,
+    oldest_age_seconds: Option<u64>,
+    unknown_age: usize,
+}
+impl RetentionGauge {
+    fn observe(&mut self, count: usize, clock: Option<u64>, now: u64) {
+        self.items = self.items.saturating_add(count);
+        match clock {
+            Some(clock) => {
+                self.oldest_age_seconds = Some(
+                    self.oldest_age_seconds
+                        .unwrap_or(0)
+                        .max(now.saturating_sub(clock)),
+                )
+            }
+            None => self.unknown_age = self.unknown_age.saturating_add(count),
+        }
+    }
+}
+#[derive(Default, Debug, Serialize)]
+struct TerminalRetention {
+    retry_pending_families: RetentionGauge,
+    file_entries: RetentionGauge,
+    accepted_index_acks: RetentionGauge,
+    held_history_files: RetentionGauge,
+    tombstones: RetentionGauge,
+    manifest_withheld: RetentionGauge,
+    delayed_proof_families: RetentionGauge,
+    owed_correction_members: RetentionGauge,
+}
+impl ScanIndex {
+    fn terminal_off_retention(&self, now: u64) -> TerminalRetention {
+        let mut debt = TerminalRetention::default();
+        if !claude_terminal_off() {
+            return debt;
+        }
+        for (root, record) in &self.claude_usage_authority_quarantine {
+            let clock = self
+                .claude_usage_family_pending
+                .get(root)
+                .and_then(|p| rfc3339_unix_seconds(&p.census_window_end));
+            if record.disposition == ClaudeUsageAuthorityQuarantineDisposition::RetryPending {
+                // Presence/absence remains UNPROVEN; count every retained owner,
+                // including possible absence, rather than stat the corpus here.
+                debt.retry_pending_families.observe(1, clock, now);
+            }
+            if let Some(correction) = &record.proof_correction {
+                debt.owed_correction_members
+                    .observe(correction.owed_member_ids.len(), clock, now);
+            }
+        }
+        for (root, pending) in &self.claude_usage_family_pending {
+            if !self.claude_usage_family_witnesses.contains_key(root) {
+                debt.delayed_proof_families.observe(
+                    1,
+                    rfc3339_unix_seconds(&pending.census_window_end),
+                    now,
+                );
+            }
+        }
+        for entry in self.files.values() {
+            let clock = (entry.modified_unix_seconds > 0).then_some(entry.modified_unix_seconds);
+            debt.file_entries.observe(1, clock, now);
+            if self
+                .claude_history_emission_held(&entry.source_file_fingerprint)
+                .is_some()
+            {
+                debt.held_history_files.observe(1, clock, now);
+            }
+        }
+        for fp in &self.accepted_snapshot_fingerprints {
+            debt.accepted_index_acks.observe(
+                1,
+                self.snapshot_activity_at
+                    .get(fp)
+                    .and_then(|at| at.as_deref())
+                    .and_then(rfc3339_unix_seconds),
+                now,
+            );
+        }
+        for clock in self.claude_retired_family_tombstones.values() {
+            debt.tombstones.observe(1, Some(*clock), now);
+        }
+        debt.manifest_withheld.observe(
+            1,
+            self.traversal
+                .as_ref()
+                .and_then(|t| rfc3339_unix_seconds(&t.census_window_end)),
+            now,
+        );
+        debt
     }
 }

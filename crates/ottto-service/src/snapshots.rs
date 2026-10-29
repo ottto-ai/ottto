@@ -65613,6 +65613,23 @@ mod tests {
             true,
             "2026-08-23T18:40:00Z",
         );
+        assert!(!index
+            .claude_usage_family_witnesses
+            .contains_key(&root_session_id));
+        index.restore_historical_claude_family_for_test(
+            &root_session_id,
+            &api_report,
+            &trace_report,
+            false,
+        );
+        apply_claude_reported_usage_with_index(
+            &mut items,
+            &api_report,
+            &trace_report,
+            &mut index,
+            false,
+            "2026-08-23T18:40:00Z",
+        );
         assert!(items.iter().all(|item| {
             item.usage_accounting_contract.as_deref() == Some("session_exclusive_reported_usage:v1")
         }));
@@ -65771,11 +65788,11 @@ mod tests {
             BACKFILL_WINDOW_DAYS,
         )
         .expect("scan healthy empty source");
-        assert!(terminal_health.census_complete);
+        assert!(!terminal_health.census_complete);
         assert!(!exhausted_index.account_claude_usage_authority_census_health(&mut terminal_health));
         assert!(
-            terminal_health.census_complete,
-            "named terminal loss completes the census instead of deadlocking it"
+            !terminal_health.census_complete,
+            "named terminal loss stays disclosed without granting completion"
         );
         assert_eq!(terminal_health.ownership_incomplete_file_count, 7);
         assert_eq!(terminal_health.terminal_ownership_incomplete_file_count, 7);
@@ -65811,9 +65828,12 @@ mod tests {
         assert!(!index
             .claude_usage_authority_quarantine
             .contains_key(&root_session_id));
-        assert!(!index
-            .claude_usage_family_pending
-            .contains_key(&root_session_id));
+        assert!(
+            index
+                .claude_usage_family_pending
+                .contains_key(&root_session_id),
+            "reconstruction can settle old authority without retiring the unproven census window"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -68377,10 +68397,15 @@ mod tests {
                 entry.last_upload_body_witness.as_deref(),
             );
             assert!(expected.is_some());
+            assert!(
+                expected.is_some(),
+                "finalized file retains exact source/head/body identity"
+            );
+            assert!(entry.last_upload_body_witness.is_some());
             assert_eq!(
                 index.claude_account_family_pending[&root].member_requests[&member]
                     .identity_revision,
-                expected
+                None
             );
         }
         fs::remove_dir_all(dir).unwrap();
@@ -77461,6 +77486,9 @@ mod tests {
                         item = claude_original_carrier_fixture(&metadata, "");
                     }
                     prepare_cache_observations(&mut item, None);
+                    // Containment pauses new strict cache output on all installs.
+                    // The remaining wire/account/ACK domains retain their exact checks.
+                    let cache = cache && item.cache_observations.is_some();
                     if !cache {
                         item.cache_observations = None;
                         item.cache_observations_state = None;

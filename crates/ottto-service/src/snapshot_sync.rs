@@ -6798,6 +6798,18 @@ fn finish_sync_source(
         preparation.source == SnapshotSource::ClaudeCode,
         preparation.native_comparison_lease.is_some(),
     );
+    if preparation.source == SnapshotSource::ClaudeCode && crate::snapshots::claude_terminal_off() {
+        // The legacy ACK ledger has no age clock. Unknown is disclosed rather
+        // than invented; current-context stamps remain owned by the receipt PR.
+        crate::local_resource_diagnostics::traversal_point(
+            "terminal_off_retained_acks",
+            "claude_code",
+            &serde_json::json!({"gauge": preparation.upload_progress.accepted_fingerprints.len(),
+                "unsettled": preparation.upload_progress.retained_stale_ack_count,
+                "oldest_age_seconds": null,
+                "unknown_age": preparation.upload_progress.accepted_fingerprints.len()}),
+        );
+    }
     let SourcePreparation {
         mut native_comparison_reservation,
         mut native_comparison_lease,
@@ -23854,7 +23866,7 @@ mod tests {
         )
         .unwrap();
         scan.snapshots = vec![raw.clone()];
-        assert!(scan.census_complete);
+        assert!(!scan.census_complete);
         let support = dir.join("support");
         let digest = format!("{:x}", Sha256::digest(raw.source_session_id.as_bytes()));
         let write = |kind: &str, rows: Vec<serde_json::Value>| {
@@ -23871,6 +23883,22 @@ mod tests {
             )
             .unwrap();
         };
+        // Historical reported authority is fixture INPUT, never earned by
+        // this fresh terminal-off scan. All mixed-body money/ACK checks stay.
+        crate::snapshots::apply_claude_reported_usage_with_index(
+            &mut scan.snapshots,
+            &api,
+            &trace,
+            &mut index,
+            false,
+            "2026-08-02T07:10:00Z",
+        );
+        index.restore_historical_claude_family_for_test(
+            &raw.source_session_id,
+            &api,
+            &trace,
+            false,
+        );
         let base = scan.clone();
         let before = raw.session_account_evidence.clone();
         for case in [
