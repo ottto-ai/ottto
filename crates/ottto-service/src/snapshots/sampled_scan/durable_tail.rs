@@ -733,7 +733,13 @@ impl SharedCache {
         let mut stores = self.durable()?;
         let slot = stores.slot(source).as_mut()?;
         if let Some(writer) = crate::locked_state_dir::held_for(slot.store.dir()) {
-            let _ = slot.store.reconcile_pending(writer, &key);
+            if let Ok(store::ReconcileOutcome::Receipted(proof)) =
+                slot.store.reconcile_pending(writer, &key)
+            {
+                if slot.store.retain_receipt(proof).is_err() {
+                    return Some(store::Refusal::ReceiptPending);
+                }
+            }
         }
         slot.store.hold(&key)
     }

@@ -73,7 +73,16 @@ impl Drop for Scratch {
 /// Exact in-memory custody oracle; no new production representation/hash.
 pub(crate) fn pending_snapshot(store: &DurableTailStore) -> Vec<u8> {
     let mut out = Vec::new();
-    for (key, PendingWrite { prior, candidate }) in &store.pending {
+    for (
+        key,
+        PendingWrite {
+            prior,
+            candidate,
+            content,
+            completed,
+        },
+    ) in &store.pending
+    {
         out.extend_from_slice(key);
         out.push(u8::from(prior.is_some()));
         if let Some(stamp) = prior {
@@ -90,6 +99,16 @@ pub(crate) fn pending_snapshot(store: &DurableTailStore) -> Vec<u8> {
         out.extend_from_slice(&candidate.key);
         out.extend_from_slice(&candidate.trailer);
         out.extend_from_slice(&candidate.allowlist);
+        out.extend_from_slice(content);
+        out.push(u8::from(completed.is_some()));
+        if let Some(stamp) = completed {
+            for word in stamp.0 {
+                out.extend_from_slice(&word.to_le_bytes());
+            }
+            for word in stamp.1 {
+                out.extend_from_slice(&word.to_le_bytes());
+            }
+        }
     }
     out
 }
@@ -262,10 +281,11 @@ fn equal_generation_impostor_never_elects_receipt_and_unknown_swap_is_protected(
                 format: FORMAT_VERSION,
             }),
         );
-        assert!(matches!(
-            store.reconcile_pending(&lock, &b.key).unwrap(),
-            ReconcileOutcome::Receipted(_)
-        ));
+        let ReconcileOutcome::Receipted(proof) = store.reconcile_pending(&lock, &b.key).unwrap()
+        else {
+            panic!("exact completion");
+        };
+        store.retain_receipt(proof).unwrap();
         assert_eq!(store.counters().receipt_reconciled, 1);
         assert_eq!(store.counters().durable_write_failed_published, 0);
     }
@@ -317,6 +337,7 @@ fn exact_survivor_uses_original_trailer_not_canonicalized_retired_fields() {
     );
     assert_eq!(proof.identity.encoded_len, original.len() as u64);
     assert!(Some(proof.stamp) == stamp_at(&disk).unwrap());
+    store.retain_receipt(proof).unwrap();
 }
 
 #[test]
@@ -355,6 +376,69 @@ fn replacement_during_successful_directory_sync_cannot_receipt_an_impostor() {
     assert!(store.receipt_pending(&b.key));
     assert_eq!(fs::read(&disk).unwrap(), impostor);
     assert_eq!(store.hold(&b.key), Some(Refusal::ReceiptPending));
+}
+
+#[test]
+fn retained_completion_rejects_wrong_candidate_and_final_path_swap() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let path = scratch.transcript("source.jsonl", b"{}\n");
+    let b = binding("account", "scope", ("fp-a", None));
+    let mut store = scratch.store();
+    let a = pending(b.clone(), certificate(&path), 1);
+    let next = pending(b.clone(), certificate(&path), 2);
+    let mut other = a.clone();
+    other.binding.key = key_digest(DurableSource::ClaudeCode, "other");
+    store
+        .write_after_save(&lock, 1, 0, vec![a, other.clone()])
+        .unwrap();
+    test_hooks::set_before_dir_sync(Some(Box::new(|_| Err(io::Error::other("sync EIO")))));
+    let failed = store
+        .write_after_save(&lock, 2, 0, vec![next.clone()])
+        .unwrap();
+    test_hooks::set_before_dir_sync(None);
+    assert!(failed.completed.is_empty());
+    let ReconcileOutcome::Receipted(proof) = store.reconcile_pending(&lock, &b.key).unwrap() else {
+        panic!("exact survivor");
+    };
+    store.retain_receipt(proof).unwrap();
+    let debt = pending_snapshot(&store);
+    let wrong_key = store.write_after_save(&lock, 3, 0, vec![other]).unwrap();
+    assert_eq!(wrong_key.clean, 1);
+    assert!(wrong_key.completed.is_empty());
+    assert_eq!(pending_snapshot(&store), debt);
+    let wrong = pending(b.clone(), certificate(&path), 3);
+    let wrong_candidate = store
+        .write_after_save(&lock, 3, 0, vec![wrong.clone()])
+        .unwrap();
+    assert!(wrong_candidate.completed.is_empty());
+    assert_eq!(wrong_candidate.deferred_keys, vec![b.key]);
+    assert_eq!(pending_snapshot(&store), debt);
+    let ReconcileOutcome::Receipted(proof) = store.reconcile_pending(&lock, &b.key).unwrap() else {
+        panic!("retained completion");
+    };
+    let receipt = BatchReceipt {
+        written: 1,
+        bytes_written: proof.identity.encoded_len,
+        completed: vec![proof],
+        ..Default::default()
+    };
+    put_record(
+        &record_file(&store, &b.key),
+        &encode(&DurableRecord {
+            record: wrong,
+            index_generation: 2,
+            format: FORMAT_VERSION,
+        }),
+    );
+    assert!(store.finish_batch(receipt).is_err());
+    assert_eq!(
+        pending_snapshot(&store),
+        debt,
+        "failed delivery retains exact custody"
+    );
+    assert!(store.receipt_pending(&b.key));
+    assert!(store.reconcile_pending(&lock, &b.key).is_err());
 }
 
 #[test]
@@ -563,12 +647,13 @@ fn post_rename_sync_failure_keeps_b_pending_until_its_exact_receipt() {
         test_hooks::set_before_dir_sync(None);
         assert_eq!(reached.get(), 2, "write then reconcile both reached fsync");
         assert_eq!(receipt.written, 0);
+        assert!(receipt.completed.is_empty());
         assert_eq!(receipt.deferred_keys, vec![b.key]);
         assert_eq!(store.hold(&b.key), Some(Refusal::ReceiptPending));
         assert_eq!(
             fs::read(record_file(&store, &b.key)).unwrap(),
             encode(&DurableRecord {
-                record: replacement,
+                record: replacement.clone(),
                 index_generation: 2,
                 format: FORMAT_VERSION
             })
@@ -576,12 +661,34 @@ fn post_rename_sync_failure_keeps_b_pending_until_its_exact_receipt() {
         assert_eq!(store.counters().t14_rebuild, 0);
         let candidate = store.pending[&b.key].candidate;
         let expected_stamp = stamp_at(&record_file(&store, &b.key)).unwrap();
-        let ReconcileOutcome::Receipted(proof) = store.reconcile_pending(&lock, &b.key).unwrap()
-        else {
-            panic!("exact survivor must yield an acquisition proof");
-        };
-        assert_eq!(proof.identity, candidate);
-        assert!(Some(proof.stamp) == expected_stamp);
+        if parent {
+            let ReconcileOutcome::Receipted(proof) =
+                store.reconcile_pending(&lock, &b.key).unwrap()
+            else {
+                panic!("exact survivor");
+            };
+            assert_eq!(proof.identity, candidate);
+            assert!(Some(proof.stamp) == expected_stamp);
+            store.retain_receipt(proof).unwrap();
+            assert!(!store.receipt_pending(&b.key));
+            assert!(
+                store.has_pending(),
+                "delivery custody survives reconciliation"
+            );
+        } // Otherwise the next batch's initial scan performs the full reconciliation.
+        let delivered = store
+            .write_after_save(&lock, 3, 0, vec![replacement.clone(), replacement.clone()])
+            .unwrap();
+        assert_eq!(delivered.written, 1);
+        assert_eq!(delivered.completed.len(), 1);
+        assert_eq!(delivered.completed[0].identity, candidate);
+        assert!(Some(delivered.completed[0].stamp) == expected_stamp);
+        let clean = store
+            .write_after_save(&lock, 4, 0, vec![replacement])
+            .unwrap();
+        assert_eq!(clean.clean, 1);
+        assert_eq!(clean.written, 0);
+        assert!(clean.completed.is_empty());
         assert!(matches!(
             store.reconcile_pending(&lock, &b.key).unwrap(),
             ReconcileOutcome::NoPending

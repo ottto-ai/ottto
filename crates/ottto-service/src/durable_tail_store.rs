@@ -326,15 +326,20 @@ struct VerifiedRecord {
 struct PendingWrite {
     prior: Option<Stamp>,
     candidate: RecordIdentity,
+    content: Digest32,
+    completed: Option<Stamp>,
 }
 // Existing per-source pending reservation allows 4096 bytes per tree node.
-const _: () = assert!(std::mem::size_of::<(Digest32, PendingWrite)>() <= 256);
+const _: () = assert!(std::mem::size_of::<(Digest32, PendingWrite)>() <= 320);
 
 /// Acquisition durability only; never accepted-money or replacement ACK credit.
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ReceiptProof {
     identity: RecordIdentity,
     stamp: Stamp,
+    content: Digest32,
 }
+const _: () = assert!(std::mem::size_of::<ReceiptProof>() <= 256);
 /// Verified absence (including ordinary retirement), after directory sync.
 pub(crate) struct RetirementProof {
     candidate: RecordIdentity,
@@ -477,7 +482,7 @@ pub(crate) struct StoreCounters {
 }
 
 /// What one post-save batch did.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct BatchReceipt {
     pub(crate) written: usize,
     pub(crate) clean: usize,
@@ -487,6 +492,8 @@ pub(crate) struct BatchReceipt {
     pub(crate) deferred_keys: Vec<Digest32>,
     pub(crate) budget_refused: usize,
     pub(crate) bytes_written: u64,
+    /// Actual exact completions only; ordinary clean retries carry none.
+    pub(crate) completed: Vec<ReceiptProof>,
 }
 
 /// One store directory. The in-RAM map of last durable content digests
@@ -747,7 +754,7 @@ impl DurableTailStore {
         if self.disabled.is_some() {
             return None; // D-DISABLED: keep debt, publish valid RAM under native fences.
         }
-        if self.pending.contains_key(key) {
+        if self.receipt_pending(key) {
             return Some(Refusal::ReceiptPending);
         }
         let result = self.classify(key, "guard", None);
@@ -774,7 +781,7 @@ impl DurableTailStore {
         if self.disabled.is_some() {
             return ReadOutcome::Missing; // Never reuse ambiguous disabled-store bytes.
         }
-        if self.pending.contains_key(key) {
+        if self.receipt_pending(key) {
             return ReadOutcome::Refused(Refusal::ReceiptPending);
         }
         match self.read_known(key, allowlist, None) {
@@ -824,7 +831,61 @@ impl DurableTailStore {
         !self.pending.is_empty()
     }
     pub(crate) fn receipt_pending(&self, key: &Digest32) -> bool {
-        self.pending.contains_key(key)
+        self.pending.get(key).is_some_and(|pending| {
+            pending
+                .completed
+                .is_none_or(|stamp| stamp_at(&self.record_path(key)).ok() != Some(Some(stamp)))
+        })
+    }
+
+    /// Retain a real reconciliation completion in the existing bounded owner.
+    /// It remains available until a successful batch delivers the exact proof.
+    pub(crate) fn retain_receipt(&mut self, proof: ReceiptProof) -> io::Result<()> {
+        if stamp_at(&self.record_path(&proof.identity.key))? != Some(proof.stamp) {
+            return Err(io::Error::other("completion changed"));
+        }
+        let pending = self
+            .pending
+            .get_mut(&proof.identity.key)
+            .filter(|pending| {
+                pending.candidate == proof.identity && pending.content == proof.content
+            })
+            .ok_or_else(|| io::Error::other("completion candidate changed"))?;
+        pending.completed = Some(proof.stamp);
+        Ok(())
+    }
+
+    /// Validate the entire delivery before releasing any completion custody.
+    fn finish_batch(&mut self, receipt: BatchReceipt) -> io::Result<BatchReceipt> {
+        for proof in &receipt.completed {
+            if stamp_at(&self.record_path(&proof.identity.key))? != Some(proof.stamp)
+                || !self
+                    .pending
+                    .get(&proof.identity.key)
+                    .is_some_and(|pending| {
+                        pending.candidate == proof.identity
+                            && pending.content == proof.content
+                            && pending.completed == Some(proof.stamp)
+                    })
+            {
+                return Err(io::Error::other("batch completion changed"));
+            }
+        }
+        for proof in &receipt.completed {
+            let key = proof.identity.key;
+            if self.durable.len() < MAX_RECORDS || self.durable.contains_key(&key) {
+                self.durable
+                    .insert(key, (Some(proof.content), proof.stamp, true));
+            }
+            self.pending.remove(&key);
+            self.counters.max_record_bytes = self
+                .counters
+                .max_record_bytes
+                .max(proof.identity.encoded_len);
+        }
+        self.counters.records_written += receipt.written as u64;
+        self.counters.bytes_written += receipt.bytes_written;
+        Ok(receipt)
     }
 
     pub(crate) fn reconcile_pending(
@@ -836,11 +897,28 @@ impl DurableTailStore {
         if !self.usable(Some(writer)) {
             return Err(io::Error::other("store disabled"));
         }
-        let Some(PendingWrite { prior, candidate }) = self.pending.get(key).copied() else {
+        let Some(PendingWrite {
+            prior,
+            candidate,
+            content,
+            completed,
+        }) = self.pending.get(key).copied()
+        else {
             return Ok(ReconcileOutcome::NoPending);
         };
         let path = self.record_path(key);
         let before = stamp_at(&path)?;
+        if let Some(stamp) = completed {
+            return if before == Some(stamp) {
+                Ok(ReconcileOutcome::Receipted(ReceiptProof {
+                    identity: candidate,
+                    stamp,
+                    content,
+                }))
+            } else {
+                Err(io::Error::other("retained completion changed"))
+            };
+        }
         self.durable.remove(key); // Reconcile fully verifies, even a memo hit.
         let receipted = match self.read_known(key, &candidate.allowlist, Some(writer)) {
             Ok(Some(verified)) if before == stamp_at(&path)? => {
@@ -875,14 +953,15 @@ impl DurableTailStore {
         if (receipted && after != before) || (!receipted && after.is_some()) {
             return Err(io::Error::other("survivor changed"));
         }
-        self.pending.remove(key);
         if receipted {
             self.counters.receipt_reconciled += 1;
             Ok(ReconcileOutcome::Receipted(ReceiptProof {
                 identity: candidate,
                 stamp: after.expect("verified survivor"),
+                content,
             }))
         } else {
+            self.pending.remove(key);
             self.durable.remove(key);
             self.counters.durable_write_failed_published += 1;
             Ok(ReconcileOutcome::Retired(RetirementProof { candidate }))
@@ -936,25 +1015,58 @@ impl DurableTailStore {
             .map(|record| record.body.len())
             .sum::<usize>();
         for record in pending {
-            if self.pending.contains_key(&record.binding.key)
-                && self.reconcile_pending(writer, &record.binding.key).is_err()
+            let key = record.binding.key;
+            if receipt
+                .completed
+                .iter()
+                .any(|proof| proof.identity.key == key)
             {
-                let stamp = fs::symlink_metadata(self.record_path(&record.binding.key))
-                    .ok()
-                    .map(|m| Stamp::of(&m));
-                let same = self
-                    .pending
-                    .get(&record.binding.key)
-                    .is_some_and(|pending| pending.prior.is_some() && pending.prior == stamp);
+                continue;
+            }
+            let content = content_digest(&record);
+            let reconciliation = if self.pending.contains_key(&key) {
+                match self.reconcile_pending(writer, &key) {
+                    Ok(ReconcileOutcome::Receipted(proof)) => self.retain_receipt(proof),
+                    Ok(_) => Ok(()),
+                    Err(error) => Err(error),
+                }
+            } else {
+                Ok(())
+            };
+            if reconciliation.is_err() {
+                let stamp = stamp_at(&self.record_path(&key))?;
+                let same = self.pending.get(&key).is_some_and(|pending| {
+                    pending.completed.is_none() && pending.prior.is_some() && pending.prior == stamp
+                });
                 if !(same
                     && matches!(
-                        self.classify(&record.binding.key, "overwrite", Some(writer)),
+                        self.classify(&key, "overwrite", Some(writer)),
                         Err(Refusal::Corrupt)
                     ))
                 {
-                    receipt.deferred_keys.push(record.binding.key);
+                    receipt.deferred_keys.push(key);
                     continue;
                 }
+            }
+            if let Some(PendingWrite {
+                candidate,
+                content: completed_content,
+                completed: Some(stamp),
+                ..
+            }) = self.pending.get(&key).copied()
+            {
+                if completed_content != content || receipt.completed.len() >= MAX_BATCH {
+                    receipt.deferred_keys.push(key);
+                    continue;
+                }
+                receipt.written += 1;
+                receipt.bytes_written += candidate.encoded_len;
+                receipt.completed.push(ReceiptProof {
+                    identity: candidate,
+                    stamp,
+                    content,
+                });
+                continue; // Exact completed B, before stale-A authorization or clean handling.
             }
             // A T14 predecessor is the rebuild's to replace.
             let (prior, previous_content) =
@@ -974,7 +1086,6 @@ impl DurableTailStore {
                     Ok(Some(old)) => (old.stamp, old.content),
                     Ok(None) => (None, None),
                 };
-            let content = content_digest(&record);
             if previous_content == Some(content) {
                 receipt.clean += 1;
             } else {
@@ -986,17 +1097,17 @@ impl DurableTailStore {
         }
         if dirty.is_empty() {
             self.counters.records_clean += receipt.clean as u64;
-            return Ok(receipt);
+            return self.finish_batch(receipt);
         }
         ensure_private_dir(&self.dir).inspect_err(|_| self.counters.store_write_failed[0] += 1)?;
         self.checked = false;
         if !self.usable(Some(writer)) {
-            return Ok(receipt);
+            return Ok(BatchReceipt::default()); // Keep completion custody; no unchecked delivery.
         }
         let (mut on_disk, mut unlisted) = self
             .scan_disk()
             .inspect_err(|_| self.counters.store_write_failed[1] += 1)?;
-        let mut attempted = 0;
+        let mut attempted = receipt.completed.len();
         for (record, content, prior) in dirty {
             if attempted >= MAX_BATCH {
                 receipt.deferred += 1;
@@ -1050,7 +1161,15 @@ impl DurableTailStore {
             }
             attempted += 1;
             let candidate = RecordIdentity::verified(&stored, &bytes);
-            self.pending.insert(key, PendingWrite { prior, candidate });
+            self.pending.insert(
+                key,
+                PendingWrite {
+                    prior,
+                    candidate,
+                    content,
+                    completed: None,
+                },
+            );
             let attempt = write_atomic(&self.dir, &path, &bytes, prior, &mut self.counters)
                 .and_then(|stamp| {
                     self.sync_store()?;
@@ -1060,6 +1179,7 @@ impl DurableTailStore {
                     Ok(ReconcileOutcome::Receipted(ReceiptProof {
                         identity: candidate,
                         stamp,
+                        content,
                     }))
                 });
             let outcome = attempt.or_else(|_| self.reconcile_pending(writer, &key));
@@ -1075,24 +1195,24 @@ impl DurableTailStore {
                     continue;
                 }
             };
-            self.pending.remove(&key);
-            on_disk.insert(key, proof.identity.encoded_len);
-            let stamp = proof.stamp;
-            if self.durable.len() < MAX_RECORDS || self.durable.contains_key(&key) {
-                self.durable.insert(key, (Some(content), stamp, true));
-            }
+            let encoded_len = proof.identity.encoded_len;
+            self.retain_receipt(proof)?;
+            let pending = self.pending.get(&key).expect("retained completion");
+            receipt.completed.push(ReceiptProof {
+                identity: pending.candidate,
+                stamp: pending.completed.expect("completed stamp"),
+                content: pending.content,
+            });
+            on_disk.insert(key, encoded_len);
             receipt.written += 1;
-            receipt.bytes_written += bytes.len() as u64;
-            self.counters.max_record_bytes = self.counters.max_record_bytes.max(bytes.len() as u64);
+            receipt.bytes_written += encoded_len;
         }
         self.counters.batches += 1;
-        self.counters.records_written += receipt.written as u64;
         self.counters.records_clean += receipt.clean as u64;
         self.counters.records_deferred += receipt.deferred as u64;
         self.counters.budget_refused += receipt.budget_refused as u64;
-        self.counters.bytes_written += receipt.bytes_written;
         self.set_disk_level(&on_disk, unlisted);
-        Ok(receipt)
+        self.finish_batch(receipt)
     }
 
     /// Garbage collection after a successful save: delete stale temp files,
@@ -1415,7 +1535,7 @@ fn read_private(path: &Path) -> io::Result<Option<Vec<u8>>> {
     Ok(Some(bytes))
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Stamp([u64; 3], [i64; 4]);
 impl Stamp {
     /// Exact process-local (dev, ino, size, mtime, ctime) verification stamp.
