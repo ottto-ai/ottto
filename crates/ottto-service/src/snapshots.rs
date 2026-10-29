@@ -26989,7 +26989,7 @@ impl OwnedSourceScan {
             files
                 .into_iter()
                 .filter_map(|candidate| {
-                    open_and_identify_scan_candidate(
+                    open_and_identify_scan_candidate_at(
                         source,
                         candidate,
                         &mut census,
@@ -27089,7 +27089,7 @@ impl OwnedSourceScan {
                 .filter(|candidate| {
                     let mut twin = (*candidate).clone();
                     prepare_candidate_context(&mut twin);
-                    match open_and_identify_scan_candidate(
+                    match open_and_identify_scan_candidate_at(
                         source,
                         twin,
                         &mut ScanCensus::default(),
@@ -27179,7 +27179,7 @@ impl OwnedSourceScan {
                     continue;
                 };
                 prepare_candidate_context(&mut candidate);
-                if let Some(opened) = open_and_identify_scan_candidate(
+                if let Some(opened) = open_and_identify_scan_candidate_at(
                     source,
                     candidate,
                     &mut census,
@@ -31825,17 +31825,19 @@ impl OwnedSourceScan {
             let verification_rescue = sampled_audit::progress_debt(index, &rescue_key, audit_now)
                 .is_some()
                 || failed_open_retry;
-            let Some((mut candidate, opened_file)) = open_and_identify_scan_candidate_with_rescue(
-                source,
-                candidate,
-                &mut census,
-                census_unix_seconds,
-                backfill_window_days,
-                &index.files,
-                verification_rescue,
-                audit_now,
-                sampling.as_ref().map(|context| context.cache.as_ref()),
-            ) else {
+            let Some((mut candidate, opened_file)) =
+                open_and_identify_scan_candidate_with_rescue_at(
+                    source,
+                    candidate,
+                    &mut census,
+                    census_unix_seconds,
+                    backfill_window_days,
+                    &index.files,
+                    verification_rescue,
+                    audit_now,
+                    sampling.as_ref().map(|context| context.cache.as_ref()),
+                )
+            else {
                 if verification_rescue && !failed_open_retry && !open_parked {
                     sampled_audit::progress_open_failed(index, &rescue_key, audit_now);
                 }
@@ -43434,7 +43436,52 @@ fn open_candidate_file_stat_retained(
     Ok((file, stat))
 }
 
+// Standalone readers (including Codex join preparation) have no retained
+// Claude page clock. The selecting/continuation path calls the explicit _at
+// variants, preserving one clock without changing existing helper contracts.
 fn open_and_identify_scan_candidate(
+    source: SnapshotSource,
+    candidate: CandidateFile,
+    census: &mut ScanCensus,
+    census_unix_seconds: Option<u64>,
+    backfill_window_days: u64,
+    files: &BTreeMap<String, ScanIndexEntry>,
+) -> Option<(CandidateFile, File)> {
+    open_and_identify_scan_candidate_at(
+        source,
+        candidate,
+        census,
+        census_unix_seconds,
+        backfill_window_days,
+        files,
+        sampled_scan::now_seconds(),
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn open_and_identify_scan_candidate_with_rescue(
+    source: SnapshotSource,
+    candidate: CandidateFile,
+    census: &mut ScanCensus,
+    census_unix_seconds: Option<u64>,
+    backfill_window_days: u64,
+    files: &BTreeMap<String, ScanIndexEntry>,
+    verification_rescue: bool,
+    cache: Option<&sampled_scan::SharedCache>,
+) -> Option<(CandidateFile, File)> {
+    open_and_identify_scan_candidate_with_rescue_at(
+        source,
+        candidate,
+        census,
+        census_unix_seconds,
+        backfill_window_days,
+        files,
+        verification_rescue,
+        sampled_scan::now_seconds(),
+        cache,
+    )
+}
+
+fn open_and_identify_scan_candidate_at(
     source: SnapshotSource,
     candidate: CandidateFile,
     census: &mut ScanCensus,
@@ -43443,7 +43490,7 @@ fn open_and_identify_scan_candidate(
     files: &BTreeMap<String, ScanIndexEntry>,
     audit_now: u64,
 ) -> Option<(CandidateFile, File)> {
-    open_and_identify_scan_candidate_with_rescue(
+    open_and_identify_scan_candidate_with_rescue_at(
         source,
         candidate,
         census,
@@ -43457,7 +43504,7 @@ fn open_and_identify_scan_candidate(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn open_and_identify_scan_candidate_with_rescue(
+fn open_and_identify_scan_candidate_with_rescue_at(
     source: SnapshotSource,
     mut candidate: CandidateFile,
     census: &mut ScanCensus,
@@ -92643,7 +92690,7 @@ mod census_unreadable_tests {
         )
         .unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
-        assert!(open_and_identify_scan_candidate(
+        assert!(open_and_identify_scan_candidate_at(
             SnapshotSource::Codex,
             candidate,
             &mut census,

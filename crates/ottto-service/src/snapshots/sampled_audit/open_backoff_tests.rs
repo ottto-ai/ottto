@@ -358,7 +358,7 @@ fn parked_open_is_blocked_at_common_boundary_for_all_candidate_routes_and_stat_w
         // Directory rediscovery / retained retry / grown-file admission all
         // enter this same boundary. Even a forced verification rescue cannot
         // bypass the park, nor count a skipped open as another failure.
-        assert!(open_and_identify_scan_candidate(
+        assert!(open_and_identify_scan_candidate_at(
             SnapshotSource::ClaudeCode,
             candidate.clone(),
             &mut ScanCensus::default(),
@@ -368,7 +368,7 @@ fn parked_open_is_blocked_at_common_boundary_for_all_candidate_routes_and_stat_w
             now
         )
         .is_none());
-        assert!(open_and_identify_scan_candidate_with_rescue(
+        assert!(open_and_identify_scan_candidate_with_rescue_at(
             SnapshotSource::ClaudeCode,
             candidate.clone(),
             &mut ScanCensus::default(),
@@ -393,7 +393,7 @@ fn parked_open_is_blocked_at_common_boundary_for_all_candidate_routes_and_stat_w
     // A real stat change wakes ordinary and rescue admissions immediately.
     std::fs::write(&path, "{ }\n").unwrap();
     assert!(!candidate_open_blocked(&key, now));
-    assert!(open_and_identify_scan_candidate_with_rescue(
+    assert!(open_and_identify_scan_candidate_with_rescue_at(
         SnapshotSource::ClaudeCode,
         candidate,
         &mut ScanCensus::default(),
