@@ -1015,6 +1015,9 @@ fn member_eof(
             Err(_) => return Err(GroupEnd::Strict),
         }
     }
+    #[cfg(test)]
+    crate::snapshots::sampled_scan::codex_cursor::tests::GROUP_EOF_APPLIED
+        .with(|v| v.set(v.get() + 1));
     if last && paged {
         apply_live_eof_record(active);
     }

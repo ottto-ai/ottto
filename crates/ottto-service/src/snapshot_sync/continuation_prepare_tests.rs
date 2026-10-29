@@ -264,7 +264,6 @@ impl ContinuationFixture {
             &self.support_dir,
             cache,
             inputs,
-            &BTreeSet::new(),
             Some(Duration::from_secs(300)),
             Instant::now() + Duration::from_secs(20),
         )
@@ -305,6 +304,11 @@ impl ContinuationFixture {
         assert!(inputs.holds_attribution(), "a refusal keeps it cached");
         assert!(self.ordinary_side_pass(&cache, true), "no gate reset");
     }
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn continuation_preparation_for_test() -> SourcePreparation {
+    ContinuationFixture::quiescent("continuation-mint-finish").preparation(true)
 }
 
 /// K2: cached inputs for the continuation tests, with a drop sentinel (the
@@ -443,7 +447,6 @@ fn the_continuation_prepare_matches_the_ordinary_tail_on_a_quiescent_fixture() {
         checkpoint.as_deref(),
         false,
     ));
-    index.mark_context_curve_capability_disabled();
     let generation = cycle_replay_generation(source, false, &index, CONTINUATION_NAMESPACE);
     assert_eq!(prepared.replay_generation, generation);
     let now = reason_reoffer::now_unix_seconds();
