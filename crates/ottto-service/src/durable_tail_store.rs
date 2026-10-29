@@ -290,6 +290,8 @@ pub(crate) struct DurableRecord {
     pub(crate) record: PendingRecord,
     pub(crate) index_generation: u64,
     pub(crate) format: u16,
+    /// Validated v1 compatibility debt; never checkpoint authority.
+    pub(crate) envelope_audit_debt: Option<u64>,
 }
 
 /// Preservation classes: unknown representations (U) precede known corruption (T14).
@@ -859,6 +861,7 @@ impl DurableTailStore {
                 continue;
             }
             let stored = DurableRecord {
+                envelope_audit_debt: record.certificate.audit_debt_unix_seconds,
                 record,
                 index_generation: committed_generation,
                 format: FORMAT_VERSION,
@@ -1242,6 +1245,7 @@ struct Header {
     generation: u64,
     format: u16,
     body_len: usize,
+    audit_debt: Option<u64>,
 }
 fn decode_header(bytes: &[u8], key: &Digest32, source: DurableSource) -> Result<Header, Refusal> {
     let mut c = Cursor(bytes);
@@ -1276,6 +1280,7 @@ fn decode_header(bytes: &[u8], key: &Digest32, source: DurableSource) -> Result<
     if binding.key != *key || binding.source != source {
         return Err(Refusal::Unbindable);
     }
+    let mut debt_valid = true;
     let parsed = (|| {
         let generation = c.u64()?;
         let certificate = DurableCertificate {
@@ -1293,10 +1298,8 @@ fn decode_header(bytes: &[u8], key: &Digest32, source: DurableSource) -> Result<
             audit_debt_unix_seconds: {
                 let tag = c.u8()?;
                 let due = c.u64()?;
-                if tag > 1 || tag == 0 && due != 0 {
-                    return None;
-                }
-                None
+                debt_valid = matches!((tag, due), (0, 0) | (1, 1..));
+                (tag == 1).then_some(due)
             },
         };
         Some(Header {
@@ -1309,9 +1312,15 @@ fn decode_header(bytes: &[u8], key: &Digest32, source: DurableSource) -> Result<
             generation,
             format,
             body_len: c.u32()? as usize,
+            audit_debt: None,
         })
     })();
-    parsed.ok_or(Refusal::Corrupt)
+    let mut header = parsed.ok_or(Refusal::Corrupt)?;
+    if !debt_valid {
+        return Err(Refusal::Unbindable);
+    }
+    header.audit_debt = header.record.certificate.audit_debt_unix_seconds.take();
+    Ok(header)
 }
 
 fn verify(bytes: &[u8], source: DurableSource) -> Result<(), Refusal> {
@@ -1480,6 +1489,7 @@ fn decode(bytes: &[u8]) -> Result<DurableRecord, Refusal> {
         record: h.record,
         index_generation: h.generation,
         format: h.format,
+        envelope_audit_debt: h.audit_debt,
     })
 }
 

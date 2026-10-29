@@ -2681,6 +2681,7 @@ fn compressed_record_refuses_before_certificate_restore_or_body_decode() {
         committed_generation: 1,
     };
     let record = store::DurableRecord {
+        envelope_audit_debt: None,
         format: store::FORMAT_VERSION,
         record: PendingRecord {
             binding,
@@ -2885,6 +2886,31 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
             .restore(&mut held, scope.clone())
             .unwrap();
         assert_eq!(checkpoint.audit_debt(), None, "no envelope fallback");
+        assert_eq!(record.envelope_audit_debt, Some(due));
+        assert!(audit_carrier_matches(&record, &index, &key, now + pass));
+        // A decoded checkpoint has no debt, but the CURRENT index must write it.
+        let current = certificate_at(&key, &checkpoint, &index, now + pass).unwrap();
+        assert_eq!(current.audit_debt_unix_seconds, Some(due));
+        let mut rewritten = record.record.clone();
+        rewritten.certificate = current;
+        let old_wire = store::tests::pinned_v1_bytes(&rewritten, index.generation);
+        DurableTailStore::new(dir.clone(), source)
+            .write_after_save(lock, index.generation, vec![rewritten])
+            .unwrap();
+        let record_path = dir.join(format!(
+            "{}.rec",
+            record_key
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        ));
+        assert_eq!(std::fs::read(&record_path).unwrap(), old_wire);
+        assert_eq!(
+            u64::from_le_bytes(old_wire[312..320].try_into().unwrap()),
+            due,
+            "downgrade reader sees original obligation"
+        );
+
         let debt = sampled_audit::debt_for_key(&index, &key, now + pass).unwrap();
         assert_eq!(debt.due_unix_seconds, due);
         let before =
@@ -2911,6 +2937,65 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
             ReadMode::Full(FullReason::AuditDue)
         );
     }
+    // Third case: a surviving debt-bearing record with a missing/reset carrier
+    // is held through the production restore entry, before any certificate I/O.
+    let saved = ScanIndex::load(&index_path).unwrap();
+    for reset in [false, true] {
+        let mut missing = saved.clone();
+        if reset {
+            missing.files.get_mut(&key).unwrap().scan_identity_version = None;
+        } else {
+            missing.files.remove(&key);
+        }
+        let cache = SharedCache::default();
+        cache.durable_begin_pass(SnapshotSource::ClaudeCode, &index_path, &scope, true);
+        let interpretation =
+            Interpretation::of(SnapshotSource::ClaudeCode, &key, &missing, true, &scope);
+        // A write-only FD fails any attempted transcript read.
+        let mut held = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        assert!(
+            matches!(
+                cache.durable_restore(
+                    SnapshotSource::ClaudeCode,
+                    &key,
+                    &path,
+                    &scope,
+                    &mut held,
+                    &missing,
+                    &interpretation
+                ),
+                RestoreOutcome::Held(store::Refusal::Unbindable)
+            ),
+            "reset={reset}"
+        );
+        assert_eq!(
+            cache
+                .durable_counters(SnapshotSource::ClaudeCode)
+                .unwrap()
+                .0
+                .ineligible
+                .get("audit_carrier"),
+            Some(&1)
+        );
+        assert!(
+            std::fs::read_dir(&dir).unwrap().next().is_some(),
+            "record remains in custody"
+        );
+    }
+    // A current clean index clears stale RAM debt on write, never the reverse.
+    let mut held = File::open(&path).unwrap();
+    let mut stale = certificate(&path, &scope);
+    stale.audit_debt_unix_seconds = Some(due);
+    let (checkpoint, _) = stale.restore(&mut held, scope.clone()).unwrap();
+    assert_eq!(checkpoint.audit_debt().unwrap().due_unix_seconds, due);
+    let mut clean = saved;
+    clean.files.get_mut(&key).unwrap().scan_identity_version = None;
+    assert_eq!(
+        certificate_at(&key, &checkpoint, &clean, now)
+            .unwrap()
+            .audit_debt_unix_seconds,
+        None
+    );
     std::fs::remove_dir_all(root).unwrap();
 }
 

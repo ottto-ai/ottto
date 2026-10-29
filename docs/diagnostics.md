@@ -177,7 +177,14 @@ disclosed residue.
 An absent record is a restore `missing` outcome and keeps the existing Full
 admission; it is not a held key. There is no `upgrade_state_missing` counter or
 alarm in this format-1 bootstrap. Audit deadlines remain owned by the index,
-even though the v1 envelope's old debt field is structurally consumed and dropped.
+and the v1 writer takes compatibility debt from the current committed index at
+write time, including after a restore dropped the envelope field. Unknown debt
+tags, absent-with-nonzero deadlines and present-with-zero deadlines are
+`unbindable` holds, preserved byte for byte. A debt-bearing record whose index
+carrier is absent, reset or later than its recorded deadline is held before
+certificate/re-derivation reads; `ineligible.audit_carrier` counts these restore
+refusals. It is also included in the existing `durable_held` unbindable slot and
+held-key alarm when the acquisition exits held. No record means no carrier hold.
 The `format_hold` and `durable_held` arrays keep five slots:
 `newer,unknown,undecodable,unbindable,known_corrupt`.
 
@@ -185,7 +192,11 @@ Store header reads for GC (including representation lookup for a decided key)
 are counted in `gc_records_read` / `gc_bytes_read`, using actual bytes read;
 GC trailer/body verification uses `delete_verify_bytes`. They do not inflate
 `guard_header_bytes` / `guard_verify_bytes`. A decided key currently needs two
-bounded header reads; the verification memo avoids a second full verification.
+bounded header reads (each at most 324 bytes); the verification memo avoids a
+second full verification. Representation lookup opens only the durable record,
+never a transcript. A direct fixture removes the synthetic transcript, rejects
+body reads after verification, observes both header accesses and asserts exactly
+648 additional GC bytes, no guard/verification bytes and an unchanged record.
 These are store bytes, separate from transcript re-derivation bytes. Counters
 on the durable pass summary are process totals; `take_pass` store receipts reset
 their flows while retaining disk levels. Alarm counts retain the delta/total

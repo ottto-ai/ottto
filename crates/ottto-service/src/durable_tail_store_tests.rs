@@ -1352,6 +1352,8 @@ fn every_mutation_preserves_unknown_and_known_corrupt_predecessors_unprimed() {
         "foreign_source",
         "bad_length",
         "debt_tag",
+        "debt_absent_nonzero",
+        "debt_present_zero",
         "unbindable",
         "undecodable",
         "oversized_newer",
@@ -1419,10 +1421,17 @@ fn every_mutation_preserves_unknown_and_known_corrupt_predecessors_unprimed() {
                     set_version(&mut bytes, FORMAT_VERSION);
                     Refusal::Corrupt
                 }
+                "debt_absent_nonzero" | "debt_present_zero" => {
+                    bytes[HEADER_BYTES - 13] = u8::from(kind == "debt_present_zero");
+                    bytes[HEADER_BYTES - 12..HEADER_BYTES - 4]
+                        .copy_from_slice(&u64::from(kind == "debt_absent_nonzero").to_le_bytes());
+                    set_version(&mut bytes, FORMAT_VERSION);
+                    Refusal::Unbindable
+                }
                 "debt_tag" => {
                     bytes[HEADER_BYTES - 13] = 2;
                     set_version(&mut bytes, FORMAT_VERSION);
-                    Refusal::Corrupt
+                    Refusal::Unbindable
                 }
                 _ => {
                     let end = bytes.len() - 1;
@@ -1528,6 +1537,7 @@ fn fresh_cleanup_is_bounded_preserves_unsafe_entries_and_only_reaps_dead_writer_
         let mut record = base.clone();
         record.binding.key = key_digest(DurableSource::ClaudeCode, &format!("unknown-{n}"));
         let mut bytes = encode(&DurableRecord {
+            envelope_audit_debt: None,
             format: FORMAT_VERSION,
             record: record.clone(),
             index_generation: 1,
@@ -1542,6 +1552,7 @@ fn fresh_cleanup_is_bounded_preserves_unsafe_entries_and_only_reaps_dead_writer_
     // A group-readable U record: header dispatch precedes the mode repair.
     let unsafe_path = store.dir().join(format!("{}.rec", hex(&[3; 32])));
     let mut unsafe_bytes = encode(&DurableRecord {
+        envelope_audit_debt: None,
         format: FORMAT_VERSION,
         record: base,
         index_generation: 1,
@@ -1605,6 +1616,7 @@ fn inventory_overflow_replaces_existing_records_and_defers_new_keys() {
         let mut record = pending(b.clone(), certificate(&transcript), 1);
         record.binding.key = key_digest(DurableSource::ClaudeCode, &format!("kept-{n}"));
         let mut bytes = encode(&DurableRecord {
+            envelope_audit_debt: None,
             format: FORMAT_VERSION,
             record: record.clone(),
             index_generation: 1,
@@ -1741,7 +1753,8 @@ fn pinned_v1_scope_replay_and_header_goldens() {
         };
         assert_eq!(golden.len(), HEADER_BYTES);
         assert_eq!(&pinned_v1_bytes(&pending, 9)[..HEADER_BYTES], golden);
-        assert_eq!(&encode(&DurableRecord {record: pending.clone(), index_generation: 9, format: 1})[..HEADER_BYTES], golden);
+        assert_eq!(&encode(&DurableRecord {
+        envelope_audit_debt: None,record: pending.clone(), index_generation: 9, format: 1})[..HEADER_BYTES], golden);
         let decoded = decode_header(&golden, &[1; 32], source).unwrap();
         assert_eq!(decoded.record.binding, pending.binding);
         assert_eq!(decoded.generation, 9);
@@ -2040,6 +2053,7 @@ fn process_rebuild_history_overflow_disables_without_forgetting_an_attempt() {
         let mut b = binding("acct", "scope", ("fp", None));
         b.key = key_digest(DurableSource::ClaudeCode, &format!("corrupt-{n}"));
         let mut bytes = encode(&DurableRecord {
+            envelope_audit_debt: None,
             format: FORMAT_VERSION,
             record: pending(b.clone(), certificate(&transcript), 1),
             index_generation: 1,
@@ -2146,6 +2160,7 @@ fn scheduling_deferral_preserves_t14_allowance_until_full_actually_starts() {
     let mut store = scratch.store();
     ensure_private_dir(store.dir()).unwrap();
     let mut bytes = encode(&DurableRecord {
+        envelope_audit_debt: None,
         format: FORMAT_VERSION,
         record: pending(b.clone(), certificate(&transcript), 1),
         index_generation: 1,
@@ -2210,4 +2225,146 @@ fn unoffered_started_rebuild_survives_save_until_its_replacement_is_offered() {
     assert_eq!(store.hold(&b.key), None);
     assert!(store.rebuilt.is_empty());
     assert_eq!(store.counters().t14_rebuild_full_started, 1);
+}
+
+/// Full v1 writer bytes, not just a header/hash. The store treats body bytes as
+/// opaque on write; restore/body validity is exercised by the production fixtures.
+/// Fixed inputs and literals pin both historical serializers including debt=0.
+#[test]
+fn full_v1_writer_goldens_preserve_zero_and_nonzero_debt() {
+    for (source, debt, golden_hex) in [
+        (DurableSource::ClaudeCode, Some(23), concat!(
+            "6f7474746f2d647401008d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c010101010101",
+            "010101010101010101010101010101010101010101010101010101020202020202020202020202020202020202020202",
+            "0202020202020202020202228abf0ecdfed7a01435a16724305eba6e1f2dcc6a2722489869f2b1c391da840404040404",
+            "04040404040404040404040404040404040404040404040404040409000000000000000b000000000000000c00000000",
+            "0000000d000000000000000e000000000000000f0000000000000010000000000000000d000000000000000d00000011",
+            "111111111111111111111111111111111111111111111111111111111111111212121212121212121212121212121212",
+            "12121212121212121212121212121213000000000000000117000000000000000e0000006f70617175652d76312d626f",
+            "6479707a28e1469da460d67939716da2859b92f17fb86560d549db9103033f8b2e47",
+        )),
+        (DurableSource::ClaudeCode, None, concat!(
+            "6f7474746f2d647401008d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c010101010101",
+            "010101010101010101010101010101010101010101010101010101020202020202020202020202020202020202020202",
+            "0202020202020202020202228abf0ecdfed7a01435a16724305eba6e1f2dcc6a2722489869f2b1c391da840404040404",
+            "04040404040404040404040404040404040404040404040404040409000000000000000b000000000000000c00000000",
+            "0000000d000000000000000e000000000000000f0000000000000010000000000000000d000000000000000d00000011",
+            "111111111111111111111111111111111111111111111111111111111111111212121212121212121212121212121212",
+            "12121212121212121212121212121213000000000000000000000000000000000e0000006f70617175652d76312d626f",
+            "6479fbc447e4bf44906e1fb96bbd5df2ce9df04970feac39187d52bda7fa482eb7d0",
+        )),
+        (DurableSource::Codex, Some(23), concat!(
+            "6f7474746f2d6474010002206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1020101010101",
+            "010101010101010101010101010101010101010101010101010101020202020202020202020202020202020202020202",
+            "0202020202020202020202dda7edd695d91e9829d2937b7a29b89e14710453cde5dc8e42342ae2bb30e8890404040404",
+            "04040404040404040404040404040404040404040404040404040409000000000000000b000000000000000c00000000",
+            "0000000d000000000000000e000000000000000f0000000000000010000000000000000d000000000000000d00000011",
+            "111111111111111111111111111111111111111111111111111111111111111212121212121212121212121212121212",
+            "12121212121212121212121212121213000000000000000117000000000000000e0000006f70617175652d76312d626f",
+            "6479473cde7f01f33061b20bb07d5a559796576e28935245a9baf21b25b2cf92d1be",
+        )),
+        (DurableSource::Codex, None, concat!(
+            "6f7474746f2d6474010002206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1020101010101",
+            "010101010101010101010101010101010101010101010101010101020202020202020202020202020202020202020202",
+            "0202020202020202020202dda7edd695d91e9829d2937b7a29b89e14710453cde5dc8e42342ae2bb30e8890404040404",
+            "04040404040404040404040404040404040404040404040404040409000000000000000b000000000000000c00000000",
+            "0000000d000000000000000e000000000000000f0000000000000010000000000000000d000000000000000d00000011",
+            "111111111111111111111111111111111111111111111111111111111111111212121212121212121212121212121212",
+            "12121212121212121212121212121213000000000000000000000000000000000e0000006f70617175652d76312d626f",
+            "647909674aab5e763d260115ec23bba8b18f698be4e4a1111bf15df7268ee254e00a",
+        )),
+    ] {
+        let golden = golden_hex.as_bytes().chunks_exact(2).map(|pair| {
+            u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()
+        }).collect::<Vec<_>>();
+        let pending = PendingRecord {
+            binding: Binding {
+                source, key: [1; 32], context: [2; 32], scope: golden[107..139].try_into().unwrap(), entry: [4; 32],
+            },
+            allowlist: golden[10..42].try_into().unwrap(),
+            certificate: DurableCertificate {
+                device: 11, inode: 12, length: 13, modified: (14, 15), birth_nanos: 16,
+                sealed_offset: 13, sample_len: 13, head_sha256: [17; 32], boundary_sha256: [18; 32],
+                verified_unix_seconds: 19, audit_debt_unix_seconds: debt,
+            },
+            body: b"opaque-v1-body".to_vec(),
+        };
+        assert_eq!(pinned_v1_bytes(&pending, 9), golden, "historical writer");
+        let scratch = Scratch::new();
+        let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+        let mut store = DurableTailStore::new(store_dir_for_index(&scratch.index_path()), source);
+        assert_eq!(store.write_after_save(&lock, 9, vec![pending]).unwrap().written, 1);
+        assert_eq!(fs::read(record_file(&store, &[1; 32])).unwrap(), golden, "complete current writer output");
+    }
+}
+
+#[test]
+fn gc_representation_reads_only_bounded_store_headers_and_charges_gc() {
+    let _reset = ResetFaults;
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let transcript = scratch.transcript("unavailable-during-gc.jsonl", b"{}\n");
+    let binding = binding("acct", "scope", ("fp", None));
+    let mut store = scratch.store();
+    store
+        .write_after_save(
+            &lock,
+            1,
+            vec![pending(binding.clone(), certificate(&transcript), 1)],
+        )
+        .unwrap();
+    assert!(matches!(store.read(&binding.key), ReadOutcome::Found(_)));
+    fs::remove_file(&transcript).unwrap();
+    let path = record_file(&store, &binding.key);
+    let expected_path = path.clone();
+    let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+    let observed = std::rc::Rc::clone(&reads);
+    test_hooks::set_before_access(Some(Box::new(move |path, operation| {
+        if matches!(operation, "open" | "header" | "body") {
+            assert_eq!(
+                path, expected_path,
+                "only the durable record is opened/read"
+            );
+        } else {
+            assert!(
+                path.starts_with(expected_path.parent().unwrap()),
+                "store metadata only"
+            );
+        }
+        assert_ne!(
+            operation, "body",
+            "verified representation needs header only"
+        );
+        if operation == "header" {
+            observed.set(observed.get() + 1);
+        }
+        Ok(())
+    })));
+    let before = store.counters();
+    assert_eq!(
+        store.representation(&binding.key),
+        Some((1, placeholder_allowlist()))
+    );
+    store
+        .gc(
+            &lock,
+            &binding.context,
+            &BTreeMap::from([(binding.key, Some(binding.scope))]),
+        )
+        .unwrap();
+    let after = store.counters();
+    assert_eq!(reads.get(), 2);
+    assert_eq!(after.gc_records_read - before.gc_records_read, 2);
+    assert_eq!(
+        after.gc_bytes_read - before.gc_bytes_read,
+        (2 * HEADER_BYTES) as u64
+    );
+    assert_eq!(after.delete_verify_bytes, before.delete_verify_bytes);
+    assert_eq!(after.guard_header_bytes, before.guard_header_bytes);
+    assert_eq!(after.guard_verify_bytes, before.guard_verify_bytes);
+    assert!(path.exists());
+    assert!(
+        !transcript.exists(),
+        "no transcript can supply bytes during GC"
+    );
 }

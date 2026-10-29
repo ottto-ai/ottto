@@ -428,14 +428,35 @@ fn full_reason_class(reason: FullReason) -> &'static str {
 /// The retained checkpoint's certificate with the birth of the object now
 /// at `key`'s path, or `None` when that object is not the checkpoint's (it
 /// was replaced since the read: nothing is persisted for it).
-fn certificate_at(key: &str, checkpoint: &Checkpoint) -> Option<DurableCertificate> {
+fn certificate_at(
+    key: &str,
+    checkpoint: &Checkpoint,
+    index: &ScanIndex,
+    now: u64,
+) -> Option<DurableCertificate> {
     let mut certificate = checkpoint.durable_certificate(0)?;
     let metadata = std::fs::metadata(key).ok()?;
     if metadata.dev() != certificate.device || metadata.ino() != certificate.inode {
         return None;
     }
     certificate.birth_nanos = birth_unix_nanos(&metadata);
+    // Downgrade readers still consume these bytes. A decoded checkpoint has
+    // dropped them; only the current committed index supplies write truth.
+    certificate.audit_debt_unix_seconds =
+        sampled_audit::debt_for_key(index, key, now).map(|debt| debt.due_unix_seconds);
     Some(certificate)
+}
+
+fn audit_carrier_matches(
+    record: &store::DurableRecord,
+    index: &ScanIndex,
+    key: &str,
+    now: u64,
+) -> bool {
+    record.envelope_audit_debt.map_or(true, |due| {
+        sampled_audit::debt_for_key(index, key, now)
+            .is_some_and(|debt| debt.due_unix_seconds <= due)
+    })
 }
 
 fn refuse_class(refuse: Refuse) -> &'static str {
@@ -621,6 +642,7 @@ impl SharedCache {
             interpretation,
         ) {
             Ok(taken) => RestoreOutcome::Restored(Box::new(taken)),
+            Err(MissClass::AuditCarrier) => RestoreOutcome::Held(store::Refusal::Unbindable),
             Err(class) => self
                 .durable_guard(snapshot_source, key, true)
                 .map_or(RestoreOutcome::Miss(class), RestoreOutcome::Held),
@@ -639,10 +661,12 @@ impl SharedCache {
         interpretation: &Interpretation<'_>,
     ) -> Result<Taken<CachedJsonlReduction>, MissClass> {
         let source = durable_source(snapshot_source).ok_or(MissClass::Unavailable)?;
-        index.files.get(key).ok_or(MissClass::NoEntry)?;
         let store_key = store::key_digest(source, key);
         let record = {
             let mut stores = self.durable().ok_or(MissClass::Unavailable)?;
+            if !index.files.contains_key(key) && stores.slot(source).is_none() {
+                return Err(MissClass::NoEntry);
+            }
             stores.counters.restore_attempts += 1;
             // A cleared fingerprint is reparse debt (a held or reverted
             // selection): it always reads Full.
@@ -663,7 +687,13 @@ impl SharedCache {
             }
             let (outcome, disabled) = match stores.slot(source).as_mut() {
                 Some(slot) => (slot.store.read(&store_key), slot.store.disabled().is_some()),
-                None => return Err(MissClass::Unavailable),
+                None => {
+                    return Err(if index.files.contains_key(key) {
+                        MissClass::Unavailable
+                    } else {
+                        MissClass::NoEntry
+                    })
+                }
             };
             match outcome {
                 ReadOutcome::Found(record) => record,
@@ -671,6 +701,8 @@ impl SharedCache {
                     stores.counters.missing += 1;
                     return Err(if disabled {
                         MissClass::Unavailable
+                    } else if !index.files.contains_key(key) {
+                        MissClass::NoEntry
                     } else {
                         MissClass::Missing
                     });
@@ -681,6 +713,23 @@ impl SharedCache {
                 }
             }
         };
+        if !audit_carrier_matches(
+            &record,
+            index,
+            key,
+            unix_seconds(SystemTime::now()).unwrap_or(0),
+        ) {
+            Counters::bump(
+                &mut self
+                    .durable()
+                    .ok_or(MissClass::Unavailable)?
+                    .counters
+                    .ineligible,
+                "audit_carrier",
+            );
+            return Err(MissClass::AuditCarrier);
+        }
+        index.files.get(key).ok_or(MissClass::NoEntry)?;
         let expected = expected(
             source,
             snapshot_source,
@@ -916,7 +965,12 @@ impl SharedCache {
                 ) else {
                     continue;
                 };
-                let Some(certificate) = certificate_at(&key, &retained.checkpoint) else {
+                let Some(certificate) = certificate_at(
+                    &key,
+                    &retained.checkpoint,
+                    index,
+                    unix_seconds(SystemTime::now()).unwrap_or(0),
+                ) else {
                     not_persisted.push("certificate");
                     continue;
                 };
@@ -1148,6 +1202,7 @@ impl SharedCache {
 pub(crate) enum MissClass {
     Unavailable,
     NoEntry,
+    AuditCarrier,
     SelectionCleared,
     HistoryOwed,
     Missing,
@@ -1173,6 +1228,7 @@ impl MissClass {
         match self {
             Self::Unavailable => "unavailable",
             Self::NoEntry => "no_entry",
+            Self::AuditCarrier => "ineligible.audit_carrier",
             Self::SelectionCleared => "ineligible.selection_cleared",
             Self::HistoryOwed => "ineligible.history_owed",
             Self::Missing => "missing",

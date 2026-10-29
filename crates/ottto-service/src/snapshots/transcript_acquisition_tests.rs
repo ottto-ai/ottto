@@ -3671,6 +3671,18 @@ fn pinned_v1_bootstrap_ordinary_save_then_second_restart_tails_without_a_full() 
             cold.files[&key].codex_counting_v2
         );
         assert_eq!(fs::read(&record_path).unwrap(), old, "no eager migration");
+        let due = unix_seconds(SystemTime::now()).unwrap() + 120;
+        let fingerprint = warm.files[&key].source_file_fingerprint.clone();
+        assert!(warm.stage_sampled_audit(
+            &key,
+            &fingerprint,
+            crate::transcript_acquisition::AuditDebt {
+                due_unix_seconds: due
+            }
+        ));
+        let written_due = sampled_audit::debt_for_key(&warm, &key, due - 120)
+            .unwrap()
+            .due_unix_seconds;
         warm.save(&index_path).unwrap();
         assert_eq!(
             second
@@ -3696,6 +3708,12 @@ fn pinned_v1_bootstrap_ordinary_save_then_second_restart_tails_without_a_full() 
             store::ReadOutcome::Found(r) => r,
             other => panic!("{other:?}"),
         };
+        assert_eq!(
+            record.envelope_audit_debt,
+            Some(written_due),
+            "actual post-save adapter takes CURRENT index debt"
+        );
+        assert_eq!(record.record.certificate.audit_debt_unix_seconds, None);
         assert_eq!(record.format, crate::durable_tail_store::FORMAT_VERSION);
         drop(second);
         fixture.file.append(&usage(source, 160, 2, "fixture-model"));

@@ -6,8 +6,12 @@ Formats 2 and 3 remain newer-format holds: this change allocates no new tag.
 Decoded Codex counting state must agree with the configured cutover; its
 interpretation and evidence remain the reduction's decision. V1 audit-debt
 bytes are checked and dropped on decode without changing their wire offsets.
-The v1 writer still emits that field. The index-owned audit obligation remains
-the deadline authority: restore and later offers cannot postpone its deadline.
+The v1 writer takes that field from the current committed index obligation,
+so a decoded checkpoint cannot erase debt needed by downgrade readers. Invalid
+debt tags or inconsistent flag/deadline pairs are preserved as Unbindable holds.
+A debt-bearing record with an absent/reset index carrier or a postponed deadline
+is held before transcript reads. The envelope never restores checkpoint debt;
+the index remains deadline authority and later offers cannot postpone it.
 Ordinary replacement failure or budget refusal retains valid v1 authority.
 
 No migration occurs in this slice: tag 1 and its scope formula are unchanged.
@@ -19,8 +23,13 @@ counted A5 on real new content, excluding keys with no record by design. That
 later slice must supply its durable cause binding; this change grants none.
 GD's retired reservation ledger and positional fields remain retired.
 
-Fixed v1 scope/replay digests and header bytes pin the two historical writers
-and both sources independently of current helpers. Native restart fixtures
+Fixed v1 scope/replay digests, headers and complete writer-output literals
+(nonzero and zero audit debt, both sources) pin the historical serializers.
+The full writer goldens use an opaque fixed body; production body decoding and
+restoration are covered separately. A two-reload debt fixture rewrites from the
+current index, checks downgrade-visible bytes and holds missing/reset carriers.
+GC representation lookup is bounded to store-header bytes, charged to GC, and
+has a direct header-only fixture with the synthetic transcript unavailable. Native restart fixtures
 cover old restore, Tail, ordinary save/GC and a second restore with zero Fulls;
 existing bounded class-X re-derivation still prevents a zero-byte claim.
 No flags, parser/scan-identity bump, Pi source or tag reinterpretation.
