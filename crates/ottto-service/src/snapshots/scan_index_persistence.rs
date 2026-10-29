@@ -1,5 +1,5 @@
 //! Private ScanIndex storage component. The caller holds the existing checkpoint
-//! flock throughout open, logical decode and legacy replacement. No acquisition authority
+//! flock throughout open, logical decode, commit and GC. No acquisition authority
 //! is conveyed by a storage digest or generation. Integration supplies the SAME
 //! semantic serializer/lenient decoder and retains its baseline control view.
 //!
@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, ensure, Context, Result};
 use serde::de::{DeserializeSeed, Deserializer as _, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -197,7 +198,7 @@ pub(crate) enum Opened {
 }
 
 /// Existing checkpoint flock is a caller precondition. Directory handles and
-/// openat/renameat/unlinkat constrain legacy replacement to this index root.
+/// openat/renameat/unlinkat constrain all mutations to this index's own tree.
 /// Ancestors are the existing trusted owned state tree, not provider paths.
 pub(crate) struct LockedStore {
     parent: File,
@@ -276,6 +277,101 @@ pub(crate) fn bucket_for(key: &str) -> u8 {
     hash.update(b"bucket\0");
     hash.update(key.as_bytes());
     hash.finalize()[0]
+}
+
+/// A charged borrowed index: O(N) enumeration, in-place sort, no cloned values
+/// or corpus-sized encoded allocation. Caller aggregates this charge across maps.
+pub(crate) struct BucketMap<'a, T> {
+    entries: Vec<(u8, &'a str, T)>,
+    ranges: [(usize, usize); 256],
+}
+impl<'a, T: Serialize> BucketMap<'a, T> {
+    pub(crate) fn new(
+        entries: impl ExactSizeIterator<Item = (&'a str, T)>,
+        remaining_bytes: &mut usize,
+    ) -> Result<Self> {
+        let count = entries.len();
+        Self::new_bounded(entries, count, remaining_bytes)
+    }
+    pub(crate) fn new_bounded(
+        entries: impl Iterator<Item = (&'a str, T)>,
+        count: usize,
+        remaining_bytes: &mut usize,
+    ) -> Result<Self> {
+        let charge = count
+            .checked_mul(std::mem::size_of::<(u8, &str, T)>())
+            .context("scan_index_bucket_charge_overflow")?;
+        ensure!(charge <= *remaining_bytes, "scan_index_bucket_budget");
+        let mut indexed = Vec::new();
+        indexed.try_reserve_exact(count)?;
+        for (key, value) in entries {
+            ensure!(key.len() <= MAX_KEY_BYTES, "scan_index_key_size");
+            ensure!(indexed.len() < count, "scan_index_iterator_length");
+            indexed.push((bucket_for(key), key, value));
+        }
+
+        indexed.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        ensure!(
+            indexed
+                .windows(2)
+                .all(|p| (p[0].0, p[0].1) != (p[1].0, p[1].1)),
+            "scan_index_duplicate_key"
+        );
+        let mut ranges = [(0, 0); 256];
+        for (i, (bucket, _, _)) in indexed.iter().enumerate() {
+            let range = &mut ranges[*bucket as usize];
+            if range.0 == range.1 {
+                range.0 = i;
+            }
+            range.1 = i + 1;
+        }
+        *remaining_bytes -= charge;
+        Ok(Self {
+            entries: indexed,
+            ranges,
+        })
+    }
+    pub(crate) fn buckets(&self) -> impl Iterator<Item = u8> + '_ {
+        self.ranges
+            .iter()
+            .enumerate()
+            .filter_map(|(b, (a, z))| (a != z).then_some(b as u8))
+    }
+    pub(crate) fn write(&self, bucket: u8, pretty: bool, output: &mut dyn Write) -> Result<()> {
+        struct Members<'a, T>(&'a [(u8, &'a str, T)]);
+        impl<T: Serialize> Serialize for Members<'_, T> {
+            fn serialize<S: serde::Serializer>(
+                &self,
+                serializer: S,
+            ) -> std::result::Result<S::Ok, S::Error> {
+                let mut map = serializer.serialize_map(Some(self.0.len()))?;
+                for (_, key, value) in self.0 {
+                    map.serialize_entry(key, value)?;
+                }
+                map.end()
+            }
+        }
+        let (start, end) = self.ranges[bucket as usize];
+        let value = Members(&self.entries[start..end]);
+        if pretty {
+            serde_json::to_writer_pretty(output, &value)?;
+        } else {
+            serde_json::to_writer(output, &value)?;
+        }
+        Ok(())
+    }
+}
+
+/// Adapter from the shared field table. Metadata excludes schema/generation and
+/// the three sharded fields. HeldRaw must pass through unchanged; `pretty` is
+/// the original hold-funding layout choice, applied to EVERY fragment.
+pub(crate) trait Fragments {
+    fn slots(&self) -> Vec<Slot>;
+    fn write(&self, slot: Slot, output: &mut dyn Write) -> Result<()>;
+    /// Original pretty serializer length when raw holds need whitespace funding.
+    fn minimum_logical_bytes(&self, _generation: u64) -> Result<u64> {
+        Ok(0)
+    }
 }
 
 struct HashWriter<W> {
@@ -587,7 +683,16 @@ impl LockedStore {
             metadata_fields,
         })
     }
-    fn directory(&self) -> Result<File> {
+    fn directory(&self, create: bool) -> Result<File> {
+        if create {
+            let rc = unsafe {
+                libc::mkdirat(self.parent.as_raw_fd(), self.objects_name.as_ptr(), 0o700)
+            };
+            if rc < 0 && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists {
+                return Err(io::Error::last_os_error().into());
+            }
+            self.parent.sync_all()?;
+        }
         let dir = open_at(
             &self.parent,
             &self.objects_name,
@@ -600,7 +705,7 @@ impl LockedStore {
         let mut file = match open_at(&self.parent, &self.root_name, libc::O_RDONLY) {
             Ok(file) => file,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                match self.directory() {
+                match self.directory(false) {
                     Ok(_) => bail!("scan_index_root_missing_with_shards"),
                     Err(e)
                         if e.downcast_ref::<io::Error>()
@@ -609,6 +714,7 @@ impl LockedStore {
                 }
                 return Ok((None, Root::Missing));
             }
+
             Err(e) => return Err(e.into()),
         };
         let before = Stamp::capture(&file, false)?;
@@ -623,7 +729,7 @@ impl LockedStore {
                 // Preserve the original legacy decoder's Syntax/HoldBudget
                 // quarantine decision. Existing shard state instead fails
                 // closed: a damaged envelope must never become a fresh index.
-                match self.directory() {
+                match self.directory(false) {
                     Ok(_) => bail!("scan_index_manifest_refused"),
                     Err(e)
                         if e.downcast_ref::<io::Error>()
@@ -777,7 +883,7 @@ impl LockedStore {
             Root::Sharded {
                 manifest, stamps, ..
             } => {
-                let dir = self.directory()?;
+                let dir = self.directory(false)?;
                 for object in &manifest.objects {
                     stamps.push(self.validate_object(&dir, object)?);
                 }
@@ -811,59 +917,467 @@ impl LockedStore {
         Ok(())
     }
 
-    /// Release N always writes the existing legacy format, including after a
-    /// sharded load. Caller retains the existing normalization, semantic CAS,
-    /// retry-claim merge and held-output checks. No new logical field table.
-    pub(crate) fn write_legacy(
+    /// Caller has normalized, merged exact baseline retry maxima, checked
+    /// hold/repair provenance, retired committed windows and funded held output.
+    /// `generation` is the intended NEXT logical generation (even for a no-op).
+    pub(crate) fn commit(
         &self,
         expected: &LoadedRoot,
         generation: u64,
-        encode: impl FnOnce(&mut dyn Write) -> Result<()>,
-    ) -> Result<LoadedRoot> {
+        fragments: &impl Fragments,
+    ) -> Result<Committed> {
+        self.commit_observed(expected, generation, fragments, &mut |_| Ok(()))
+    }
+    pub(crate) fn commit_observed(
+        &self,
+        expected: &LoadedRoot,
+        generation: u64,
+        fragments: &impl Fragments,
+        observe: &mut impl FnMut(Edge) -> io::Result<()>,
+    ) -> Result<Committed> {
         self.compare(expected)?;
+        if let Some(previous) = expected.generation() {
+            ensure!(
+                previous.checked_add(1) == Some(generation),
+                "scan_index_generation"
+            );
+        } else {
+            ensure!(generation > 0, "scan_index_generation");
+            if matches!(&*expected.0, Root::Missing) {
+                ensure!(generation == 1, "scan_index_generation");
+            }
+        }
+        let mut slots = fragments.slots();
+        slots.sort_unstable();
         ensure!(
-            expected.generation().unwrap_or(0).checked_add(1) == Some(generation),
-            "scan_index_generation"
+            !slots.is_empty()
+                && slots.len() <= MAX_OBJECTS
+                && slots[0] == Slot::Metadata
+                && slots.windows(2).all(|p| p[0] < p[1]),
+            "scan_index_fragment_slots"
         );
+        let dir = self.directory(true)?;
+        let mut planned = Vec::with_capacity(slots.len());
+        let mut required = MAX_ROOT_BYTES as u128;
+        for slot in slots {
+            let mut hash = HashWriter::new(io::sink(), &self.binding, slot)?;
+            fragments.write(slot, &mut hash)?;
+            let object = hash.finish(slot);
+            let unchanged = matches!(&*expected.0, Root::Sharded { manifest, .. }
+                if manifest.objects.contains(&object));
+            if !unchanged {
+                required += u128::from(object.bytes);
+            }
+            planned.push(object);
+        }
+        let mut space = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        ensure!(
+            unsafe { libc::fstatvfs(dir.as_raw_fd(), space.as_mut_ptr()) } == 0,
+            "scan_index_space_probe"
+        );
+        let space = unsafe { space.assume_init() };
+        let available = u128::from(space.f_bavail) * u128::from(space.f_frsize);
+        ensure!(required <= available, "scan_index_insufficient_space");
+        let mut objects = Vec::with_capacity(planned.len());
+        let mut stamps = Vec::with_capacity(planned.len());
+        let mut stats = WriteStats::default();
+        for object in planned {
+            let old = match &*expected.0 {
+                Root::Sharded {
+                    manifest, stamps, ..
+                } => manifest
+                    .objects
+                    .iter()
+                    .position(|o| *o == object)
+                    .map(|i| &stamps[i]),
+                _ => None,
+            };
+            let stamp = if let Some(old) = old {
+                let file = open_at(
+                    &dir,
+                    &cstring(object.filename().as_bytes())?,
+                    libc::O_RDONLY,
+                )?;
+                let stamp = Stamp::capture(&file, true)?;
+                ensure!(&stamp == old, "scan_index_reused_object_changed");
+                stats.unchanged_objects += 1;
+                stamp
+            } else {
+                let (stamp, written) = self.install_object(&dir, &object, fragments, observe)?;
+                if written {
+                    stats.written_bytes = stats
+                        .written_bytes
+                        .checked_add(object.bytes)
+                        .context("scan_index_length_overflow")?;
+                    stats.written_objects += 1;
+                } else {
+                    // A complete orphan from a failed predecessor attempt is
+                    // verified and reused; no new payload bytes were written.
+                    stats.unchanged_objects += 1;
+                }
+                stamp
+            };
+            objects.push(object);
+            stamps.push(stamp);
+        }
+        // The payload directory fsync precedes root publication; parent fsync
+        // below retains existing durability strength. SIGKILL, not power-loss
+        // qualification. No cleanup of predecessor objects before publication.
+        dir.sync_all()?;
+        observe(Edge::PayloadDirectorySync)?;
+        let mut manifest = Manifest {
+            schema_version: OUTER_SCHEMA,
+            files: BTreeMap::new(),
+            storage_format: STORAGE_FORMAT,
+            logical_schema_version: LOGICAL_SCHEMA,
+            generation,
+            binding: self.binding.clone(),
+            padding_bytes: 0,
+            objects,
+        };
+        let logical_len = LogicalReader::new(dir.try_clone()?, &manifest, &stamps)?.length;
+        manifest.padding_bytes = fragments
+            .minimum_logical_bytes(generation)?
+            .saturating_sub(logical_len);
+        self.validate_manifest(&manifest)?;
+        let bytes = serde_json::to_vec(&manifest)?;
+        ensure!(bytes.len() <= MAX_ROOT_BYTES, "scan_index_root_size");
+        if matches!(&*expected.0, Root::Missing) {
+            // The initial compare above established a genuinely fresh store
+            // before this call created its shard directory. Under the same
+            // checkpoint flock, allow ONLY this pending first publication.
+            // A later open/retry cannot infer freshness from orphan payloads.
+            match open_at(&self.parent, &self.root_name, libc::O_RDONLY) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                _ => bail!("local snapshot scan index changed concurrently"),
+            }
+            let current_dir = self.directory(false)?;
+            let a = current_dir.metadata()?;
+            let b = dir.metadata()?;
+            ensure!(
+                a.dev() == b.dev() && a.ino() == b.ino(),
+                "scan_index_directory_changed"
+            );
+        } else {
+            self.compare(expected)?;
+        }
         let mut prefix = self.root_name.to_bytes().to_vec();
         prefix.extend_from_slice(b".storage-tmp-");
         let temp = Temp::with_prefix(&self.parent, &prefix)?;
-        {
-            let mut output = BufWriter::with_capacity(BUFFER_BYTES, &temp.file);
-            encode(&mut output)?;
-            output.flush()?;
-        }
-        temp.file.sync_all()?;
-        // The encoder's output must be legacy JSON at the promised generation.
-        // Validate the control header using a temporary read handle; semantic
-        // field/hold checks remain the existing serializer's responsibility.
-        let mut candidate = open_at(&self.parent, &temp.name, libc::O_RDONLY)?;
-        let header = serde_json::Deserializer::from_reader(BufReader::new(KeyGuard::headers(
-            &mut candidate,
-        )))
-        .deserialize_any(Probe(&std::cell::Cell::new(false)))
-        .map_err(|_| anyhow::anyhow!("scan_index_legacy_output_refused"))?;
-        ensure!(
-            header == (LOGICAL_SCHEMA, generation),
-            "scan_index_legacy_output_refused"
-        );
-        self.compare(expected)?;
+        observe(Edge::RootTempCreated)?;
+        let mut output = temp.file.try_clone()?;
+        let half = bytes.len() / 2;
+        output.write_all(&bytes[..half])?;
+        observe(Edge::RootPartialWrite)?;
+        output.write_all(&bytes[half..])?;
+        output.flush()?;
+        observe(Edge::RootFlush)?;
+        output.sync_all()?;
+        observe(Edge::RootSync)?;
         rename_at(&self.parent, &temp.name, &self.parent, &self.root_name)?;
-        let result = (|| -> Result<LoadedRoot> {
+        // From here on an error MUST carry the candidate generation. Never
+        // return an ordinary precommit error that rolls RAM generation back.
+        let publication = (|| -> Result<()> {
+            observe(Edge::RootRename)?;
             self.parent.sync_all()?;
-            match self.open()? {
-                Opened::Legacy(_, root) if root.generation() == Some(generation) => Ok(root),
-                _ => bail!("scan_index_legacy_output_refused"),
-            }
+            observe(Edge::ParentSync)?;
+            observe(Edge::BeforeReturn)?;
+            Ok(())
         })();
-        result.map_err(|_| {
-            CommitPublished {
+        if publication.is_err() {
+            // Verify exact candidate bytes and every payload. An immutable root
+            // with complete objects can reconcile process death/error, but a
+            // persistent directory-sync failure stays an explicit committed
+            // error. Caller updates RAM generation and pauses before effects.
+            let reconcile = self.open();
+            let exact = matches!(reconcile, Ok(Opened::Sharded(_, ref loaded))
+                if matches!(&*loaded.0, Root::Sharded { digest, .. } if *digest == root_digest(&bytes)));
+            return Err(CommitPublished {
                 generation,
-                verified: false,
+                verified: exact,
             }
-            .into()
+            .into());
+        }
+        stats.root_bytes = bytes.len() as u64;
+        Ok(Committed {
+            root: LoadedRoot(Arc::new(Root::Sharded {
+                digest: root_digest(&bytes),
+                manifest,
+                stamps,
+            })),
+            stats,
         })
     }
+    fn install_object(
+        &self,
+        dir: &File,
+        object: &Object,
+        fragments: &impl Fragments,
+        observe: &mut impl FnMut(Edge) -> io::Result<()>,
+    ) -> Result<(Stamp, bool)> {
+        let name = cstring(object.filename().as_bytes())?;
+        match open_at(dir, &name, libc::O_RDONLY) {
+            Ok(_) => return Ok((self.validate_object(dir, object)?, false)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        let temp = Temp::new(dir)?;
+        observe(Edge::PayloadTempCreated)?;
+        let mut hash = HashWriter::new(
+            BufWriter::with_capacity(
+                BUFFER_BYTES,
+                ObservedWriter {
+                    file: &temp.file,
+                    observe,
+                    first: true,
+                },
+            ),
+            &self.binding,
+            object.slot,
+        )?;
+        fragments.write(object.slot, &mut hash)?;
+        hash.flush()?;
+        ensure!(
+            hash.finish(object.slot) == *object,
+            "scan_index_fragment_changed"
+        );
+        observe(Edge::PayloadFlush)?;
+        temp.file.sync_all()?;
+        observe(Edge::PayloadSync)?;
+        // Same checkpoint flock excludes a competing installer. No replacement
+        // occurs except our own create_new temp -> absent immutable name.
+        rename_at(dir, &temp.name, dir, &name)?;
+        observe(Edge::PayloadRename)?;
+        Ok((self.validate_object(dir, object)?, true))
+    }
+
+    /// Strictly current-generation reachability; never traverses any other store.
+    /// Unknown/future/corrupt roots or payloads stop GC before the first unlink.
+    /// Caller runs repeatedly with explicit bounded work; incomplete cleanup is
+    /// reported and must participate in disk-space admission at integration.
+    pub(crate) fn collect(
+        &self,
+        expected: &LoadedRoot,
+        budget: GcBudget,
+        cursor: &mut GcCursor,
+    ) -> Result<GcCounts> {
+        let result = self.collect_checked(expected, budget, cursor);
+        // readdir advances before validation/unlink. An error must never let a
+        // retry skip that unprocessed name and later report a complete sweep.
+        if result.is_err() {
+            *cursor = GcCursor::default();
+        }
+        result
+    }
+    fn collect_checked(
+        &self,
+        expected: &LoadedRoot,
+        budget: GcBudget,
+        cursor: &mut GcCursor,
+    ) -> Result<GcCounts> {
+        self.compare(expected)?;
+        let (manifest, stamps, digest) = match &*expected.0 {
+            Root::Sharded {
+                manifest,
+                stamps,
+                digest,
+            } => (manifest, stamps, digest),
+            _ => bail!("scan_index_gc_requires_sharded_root"),
+        };
+        if cursor.root != *digest {
+            *cursor = GcCursor {
+                root: digest.clone(),
+                ..GcCursor::default()
+            };
+        }
+        let verified_dir = self.directory(false)?;
+        for (object, stamp) in manifest.objects.iter().zip(stamps) {
+            let file = open_at(
+                &verified_dir,
+                &cstring(object.filename().as_bytes())?,
+                libc::O_RDONLY,
+            )?;
+            ensure!(
+                Stamp::capture(&file, true)? == *stamp,
+                "scan_index_gc_object_changed"
+            );
+        }
+        let reachable: BTreeSet<_> = manifest.objects.iter().map(Object::filename).collect();
+        let dir = self.directory(false)?;
+        let mut counts = GcCounts::default();
+        if cursor.phase == 0 {
+            if !collect_directory(
+                &dir,
+                &reachable,
+                owned_filename,
+                budget,
+                &mut counts,
+                &mut cursor.scan,
+                &mut cursor.deferred,
+            )? {
+                counts.incomplete = true;
+                return Ok(counts);
+            }
+            cursor.phase = 1;
+            cursor.scan = None;
+        }
+        let mut prefix = self.root_name.to_bytes().to_vec();
+        prefix.extend_from_slice(b".storage-tmp-");
+        if collect_directory(
+            &self.parent,
+            &BTreeSet::new(),
+            |name| {
+                name.as_bytes()
+                    .strip_prefix(prefix.as_slice())
+                    .is_some_and(|s| s.len() == 32 && s.iter().all(u8::is_ascii_hexdigit))
+            },
+            budget,
+            &mut counts,
+            &mut cursor.scan,
+            &mut cursor.deferred,
+        )? {
+            cursor.phase = 0;
+            cursor.scan = None;
+            if cursor.deferred {
+                counts.incomplete = true;
+                cursor.deferred = false;
+            }
+        } else {
+            counts.incomplete = true;
+        }
+
+        Ok(counts)
+    }
+}
+
+/// RAM-only continuation retained by the integration owner across bounded GC
+/// calls. One directory FD; no names/corpus list or persistent GC authority.
+#[derive(Default)]
+pub(crate) struct GcCursor {
+    root: String,
+    phase: u8,
+    scan: Option<DirectoryScan>,
+    deferred: bool,
+}
+struct DirectoryScan {
+    pointer: *mut libc::DIR,
+    dev: u64,
+    ino: u64,
+}
+impl DirectoryScan {
+    fn new(dir: &File) -> Result<Self> {
+        let file = open_at(
+            dir,
+            cstring(b".")?.as_c_str(),
+            libc::O_RDONLY | libc::O_DIRECTORY,
+        )?;
+        let m = file.metadata()?;
+        let fd = std::os::fd::IntoRawFd::into_raw_fd(file);
+        let pointer = unsafe { libc::fdopendir(fd) };
+        if pointer.is_null() {
+            unsafe { libc::close(fd) };
+            bail!("scan_index_gc_open");
+        }
+        Ok(Self {
+            pointer,
+            dev: m.dev(),
+            ino: m.ino(),
+        })
+    }
+}
+impl Drop for DirectoryScan {
+    fn drop(&mut self) {
+        unsafe { libc::closedir(self.pointer) };
+    }
+}
+fn gc_errno() -> *mut libc::c_int {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe { libc::__error() }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        unsafe { libc::__errno_location() }
+    }
+}
+fn collect_directory(
+    dir: &File,
+    reachable: &BTreeSet<String>,
+    owned: impl Fn(&str) -> bool,
+    budget: GcBudget,
+    counts: &mut GcCounts,
+    continuation: &mut Option<DirectoryScan>,
+    deferred: &mut bool,
+) -> Result<bool> {
+    let m = dir.metadata()?;
+    if !continuation
+        .as_ref()
+        .is_some_and(|s| s.dev == m.dev() && s.ino == m.ino())
+    {
+        *continuation = Some(DirectoryScan::new(dir)?);
+    }
+    let scan = continuation.as_ref().expect("GC stream opened");
+    let removed_before = counts.removed;
+    let complete = loop {
+        if counts.scanned >= budget.entries {
+            break false;
+        }
+        unsafe {
+            *gc_errno() = 0;
+        }
+        let entry = unsafe { libc::readdir(scan.pointer) };
+        if entry.is_null() {
+            ensure!(unsafe { *gc_errno() } == 0, "scan_index_gc_read");
+            break true;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        counts.scanned += 1;
+        let Ok(text) = name.to_str() else { continue };
+        if reachable.contains(text) || !owned(text) {
+            continue;
+        }
+        let file = open_at(dir, name, libc::O_RDONLY)?;
+        let stamp = Stamp::capture(&file, true)?;
+        if counts
+            .bytes
+            .checked_add(stamp.bytes)
+            .map_or(true, |n| n > budget.bytes)
+        {
+            counts.incomplete = true;
+            *deferred = true;
+            continue;
+        }
+        unlink_at(dir, name)?;
+        counts.removed += 1;
+        counts.bytes += stamp.bytes;
+    };
+    if counts.removed > removed_before {
+        dir.sync_all()?;
+    }
+    Ok(complete)
+}
+
+fn owned_filename(text: &str) -> bool {
+    if let Some(suffix) = text.strip_prefix(".tmp-") {
+        return suffix.len() == 32 && suffix.bytes().all(|b| b.is_ascii_hexdigit());
+    }
+    let Some(stem) = text.strip_suffix(".json") else {
+        return false;
+    };
+    let Some((label, digest)) = stem.rsplit_once('-') else {
+        return false;
+    };
+    valid_digest(digest)
+        && (label == "metadata"
+            || Field::all().iter().any(|f| {
+                label
+                    .strip_prefix(f.tag())
+                    .and_then(|s| s.strip_prefix('-'))
+                    .is_some_and(|s| s.len() == 2 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            }))
 }
 
 struct Temp<'a> {
@@ -872,6 +1386,9 @@ struct Temp<'a> {
     file: File,
 }
 impl<'a> Temp<'a> {
+    fn new(directory: &'a File) -> Result<Self> {
+        Self::with_prefix(directory, b".tmp-")
+    }
     fn with_prefix(directory: &'a File, prefix: &[u8]) -> Result<Self> {
         let mut random = [0; 16];
         getrandom::fill(&mut random).map_err(|_| anyhow::anyhow!("scan_index_temp_random"))?;
@@ -896,12 +1413,81 @@ impl Drop for Temp<'_> {
     }
 }
 
+struct ObservedWriter<'a, F> {
+    file: &'a File,
+    observe: &'a mut F,
+    first: bool,
+}
+impl<F: FnMut(Edge) -> io::Result<()>> Write for ObservedWriter<'_, F> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        // Force a real partial first physical write even for a tiny buffered
+        // fragment, so the SIGKILL edge cannot merely mean a completed object.
+        let part = if self.first && bytes.len() > 1 {
+            bytes.len() / 2
+        } else {
+            bytes.len()
+        };
+        let n = self.file.write(&bytes[..part])?;
+        if self.first && n > 0 {
+            self.first = false;
+            (self.observe)(Edge::PayloadPartialWrite)?;
+        }
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("scan_index_commit_published generation={generation} verified={verified}; reload before effects")]
 pub(crate) struct CommitPublished {
     pub generation: u64,
     pub verified: bool,
 }
+pub(crate) struct Committed {
+    pub root: LoadedRoot,
+    pub stats: WriteStats,
+}
+#[derive(Default, Debug)]
+pub(crate) struct WriteStats {
+    pub written_bytes: u64,
+    pub root_bytes: u64,
+    pub written_objects: usize,
+    pub unchanged_objects: usize,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Edge {
+    PayloadTempCreated,
+    PayloadPartialWrite,
+    PayloadFlush,
+    PayloadSync,
+    PayloadRename,
+    PayloadDirectorySync,
+    RootTempCreated,
+    RootPartialWrite,
+    RootFlush,
+    RootSync,
+    RootRename,
+    ParentSync,
+    BeforeReturn,
+}
+#[derive(Clone, Copy)]
+pub(crate) struct GcBudget {
+    pub entries: usize,
+    pub bytes: u64,
+}
+#[derive(Default, Debug)]
+pub(crate) struct GcCounts {
+    pub scanned: usize,
+    pub removed: usize,
+    pub bytes: u64,
+    pub incomplete: bool,
+}
+
+/// Bound key-token scratch BEFORE serde's reader decoder can allocate it.
+/// Values (including very large held records) remain streamed without a new
+/// entry-byte exclusion. Serde supplies syntax validation; this guard only
 /// tracks JSON punctuation and string escapes for resource admission.
 struct KeyGuard<R> {
     inner: R,
@@ -1253,5 +1839,61 @@ impl Seek for LogicalReader {
         self.position = u64::try_from(position)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "scan_index_seek"))?;
         Ok(self.position)
+    }
+}
+
+impl LockedStore {
+    /// Release N always writes the existing legacy format, including after a
+    /// sharded load. Caller retains the existing normalization, semantic CAS,
+    /// retry-claim merge and held-output checks. No new logical field table.
+    pub(crate) fn write_legacy(
+        &self,
+        expected: &LoadedRoot,
+        generation: u64,
+        encode: impl FnOnce(&mut dyn Write) -> Result<()>,
+    ) -> Result<LoadedRoot> {
+        self.compare(expected)?;
+        ensure!(
+            expected.generation().unwrap_or(0).checked_add(1) == Some(generation),
+            "scan_index_generation"
+        );
+        let mut prefix = self.root_name.to_bytes().to_vec();
+        prefix.extend_from_slice(b".storage-tmp-");
+        let temp = Temp::with_prefix(&self.parent, &prefix)?;
+        {
+            let mut output = BufWriter::with_capacity(BUFFER_BYTES, &temp.file);
+            encode(&mut output)?;
+            output.flush()?;
+        }
+        temp.file.sync_all()?;
+        // The encoder's output must be legacy JSON at the promised generation.
+        // Validate the control header using a temporary read handle; semantic
+        // field/hold checks remain the existing serializer's responsibility.
+        let mut candidate = open_at(&self.parent, &temp.name, libc::O_RDONLY)?;
+        let header = serde_json::Deserializer::from_reader(BufReader::new(KeyGuard::headers(
+            &mut candidate,
+        )))
+        .deserialize_any(Probe(&std::cell::Cell::new(false)))
+        .map_err(|_| anyhow::anyhow!("scan_index_legacy_output_refused"))?;
+        ensure!(
+            header == (LOGICAL_SCHEMA, generation),
+            "scan_index_legacy_output_refused"
+        );
+        self.compare(expected)?;
+        rename_at(&self.parent, &temp.name, &self.parent, &self.root_name)?;
+        let result = (|| -> Result<LoadedRoot> {
+            self.parent.sync_all()?;
+            match self.open()? {
+                Opened::Legacy(_, root) if root.generation() == Some(generation) => Ok(root),
+                _ => bail!("scan_index_legacy_output_refused"),
+            }
+        })();
+        result.map_err(|_| {
+            CommitPublished {
+                generation,
+                verified: false,
+            }
+            .into()
+        })
     }
 }

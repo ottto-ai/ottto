@@ -1,15 +1,15 @@
-# ScanIndex staged persistence: reader release N
+# ScanIndex staged persistence: writer release N+1
 
-This is the reader component. It reads legacy logical-schema-2 JSON and storage
-format 1, and always writes legacy JSON with the existing semantic serializer.
-After a sharded load, the next synchronous save atomically replaces the manifest
-with a complete legacy index. It does not create, modify or collect shard files.
-The shard encoder, migration switch and shard GC belong to a separate writer PR.
+This writer component folds the reader branch through a merge, retaining a
+main-based PR while the reader is unmerged. Release N reads both layouts and
+writes legacy. N+1 adds immutable shard writes and migration on the first
+existing synchronous save. Downgrade N+1 to N loads shards and the next successful
+save rewrites legacy. The writer does not lengthen a durability interval.
 
-Shared production module registration, semantic load/save integration, witness
-heap charging and diagnostics are delivered to the integration owner separately.
-The isolated test target compiles this module; this component alone does not
-activate production readers or change the installed daemon.
+Production registration, load/save/field-table routing, baseline-control custody,
+heap admission and diagnostics remain separate integration-owner patches. This
+component alone does not activate shard writes in the installed daemon. Keep the
+writer draft until reader N is published and integration qualification is green.
 
 ## SOURCE packet: candidate representation
 
@@ -159,3 +159,45 @@ Process-SIGKILL qualification of shard publication belongs to the writer PR;
 no power-loss claim. Full typed production round-trip, hold/positional coverage,
 resource accounting, 12k/100k measurements and P1–P4/E4 emitted-money equivalence
 remain integration gates. This component changes no live daemon or state.
+
+## Writer publication and collection
+
+The three dominant maps use 256 hash buckets each. A borrowed, charged key index
+is built once per map, sorted in place and partitioned into bucket ranges. Each
+fragment is streamed into a digest/length sink; only changed objects are encoded
+again to immutable payload files. Other fields stay in one metadata object.
+No mutator dirty flags, delta log, debounce or semantic-field deletion is added.
+A no-op generation still increments and atomically publishes its root while
+reusing every payload. Existing serializer/held-output rules remain authoritative.
+
+The writer's sharded CAS reads the bounded root and exact loaded identity rather
+than decoding the old semantic index again. Integration must retain a charged,
+immutable baseline containing the actual retry-claim maxima and hold/repair
+provenance through every Clone/subset/reset path. A hash alone cannot reconstruct
+those controls. Legacy first-save CAS retains the existing full decoder and merge.
+
+An available-space probe precedes writes. Changed payload temp creation, buffered
+write, flush, sync, rename and payload-directory sync precede the root temp
+write/flush/sync/rename and parent-directory sync. Root rename publishes exactly
+one generation. Post-publication failures return typed `CommitPublished` errors;
+callers retain the candidate generation, pause effects and reload. No power-loss
+claim: child tests exercise process SIGKILL and restart twice at all 13 edges.
+
+Bounded GC validates the current root and immutable stamps, retains a RAM cursor
+across quanta, and deletes only owned unreachable objects and temp names. It
+never opens transcripts or durable-tail records. Missing or legacy roots cannot
+authorize destructive shard GC. Integration owns incomplete-cleanup space admission.
+
+The writer fixture retains sparse/no-op/dense/empty saves, corrupted/future roots
+and payloads, stale/equal-generation comparisons, held depth, partial-write death,
+ENOSPC/EIO and GC continuation/error cases. It adds N+1 -> N legacy export ->
+N+1 migration for two cycles, using the exact reader-branch legacy exporter.
+These are generic storage fixtures; full typed semantic and emitted-money parity,
+real-data performance and resource evidence remain integration gates.
+
+Fresh initialization validates absence before creating payloads and checks absence
+again under the same checkpoint flock before publishing. Only that active commit
+can recognize its own pending initialization. An interrupted first save with
+orphan shards and no root fails closed on reopen; it never silently starts a
+fresh scan. Reviewed repair is required in that case. GC continuation records the
+exact root identity and restarts its payload sweep after any root change.
