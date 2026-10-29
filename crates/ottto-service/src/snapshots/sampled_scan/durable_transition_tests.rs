@@ -173,6 +173,7 @@ impl TransitionDriver for M1 {
             rederive_head: after.rederive_head_bytes - before.rederive_head_bytes,
             rederive_named: after.rederive_line_bytes - before.rederive_line_bytes,
             cheap_checks: None,
+            anchor_reads: None,
             other_reads: None,
         };
         result.modes = page.modes;

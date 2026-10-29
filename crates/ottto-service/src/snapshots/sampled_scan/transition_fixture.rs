@@ -198,6 +198,10 @@ pub(crate) struct IoBytes {
     /// None is UNMEASURED, never a zero-byte receipt. Future acquisition seams
     /// must measure cheap checks/raw reads before claiming DoD 6/12 complete.
     pub(crate) cheap_checks: Option<u64>,
+    /// Head/boundary identity hashes detect mtime-restored replacement. These
+    /// are separate from body/fragment re-derivation and other cheap/raw reads;
+    /// None is unmeasured, not zero. Quiet callers must supply the exact window.
+    pub(crate) anchor_reads: Option<u64>,
     pub(crate) other_reads: Option<u64>,
 }
 
@@ -506,6 +510,17 @@ pub(crate) mod money_oracle {
     }
 
     pub(crate) fn assert_quiet_restart_zero_bytes(result: &RouteResult) {
+        assert_quiet_restart_with_anchor_window(result, 0);
+    }
+
+    /// Identity head/boundary hashes are required to detect mtime-restored
+    /// replacement, not a body/fragment read leak. Permit exactly the caller's
+    /// computed anchor window for this assertion only; all body/other bytes
+    /// remain forbidden. The default zero-byte assertion passes a zero window.
+    pub(crate) fn assert_quiet_restart_with_anchor_window(
+        result: &RouteResult,
+        anchor_window: u64,
+    ) {
         assert!(matches!(
             result.mode,
             Mode::DiskRestore | Mode::Restart | Mode::EvictRetry
@@ -523,6 +538,11 @@ pub(crate) mod money_oracle {
             "cheap checks unmeasured/nonzero"
         );
         assert_eq!(
+            result.io.anchor_reads,
+            Some(anchor_window),
+            "identity anchor I/O unmeasured or outside exact window"
+        );
+        assert_eq!(
             result.io.other_reads,
             Some(0),
             "other I/O unmeasured/nonzero"
@@ -531,6 +551,103 @@ pub(crate) mod money_oracle {
             result.batches.is_empty(),
             "quiet restart emitted a new body"
         );
+    }
+
+    #[cfg(test)]
+    mod quiet_tests {
+        use super::*;
+
+        // Synthetic measured I/O premises exercise the shared assertion; these
+        // unit controls do not claim that a native scan measured these bytes.
+        const ANCHOR_WINDOW: u64 = 8192;
+
+        fn quiet_result(anchor_reads: u64) -> RouteResult {
+            let mut result =
+                RouteResult::emitted(Mode::Restart, SnapshotSource::ClaudeCode, Vec::new(), &[]);
+            result.io = IoBytes {
+                cheap_checks: Some(0),
+                anchor_reads: Some(anchor_reads),
+                other_reads: Some(0),
+                ..IoBytes::default()
+            };
+            result
+        }
+
+        #[test]
+        fn quiet_default_accepts_zero_anchor_reads() {
+            assert_quiet_restart_zero_bytes(&quiet_result(0));
+        }
+
+        #[test]
+        #[should_panic(expected = "identity anchor I/O unmeasured or outside exact window")]
+        fn quiet_default_rejects_anchor_reads() {
+            assert_quiet_restart_zero_bytes(&quiet_result(ANCHOR_WINDOW));
+        }
+
+        #[test]
+        fn quiet_anchor_window_accepts_exact_count() {
+            assert_quiet_restart_with_anchor_window(&quiet_result(ANCHOR_WINDOW), ANCHOR_WINDOW);
+        }
+
+        #[test]
+        #[should_panic(expected = "identity anchor I/O unmeasured or outside exact window")]
+        fn quiet_anchor_window_rejects_short_count() {
+            assert_quiet_restart_with_anchor_window(
+                &quiet_result(ANCHOR_WINDOW - 1),
+                ANCHOR_WINDOW,
+            );
+        }
+
+        #[test]
+        #[should_panic(expected = "identity anchor I/O unmeasured or outside exact window")]
+        fn quiet_anchor_window_rejects_excess_count() {
+            assert_quiet_restart_with_anchor_window(
+                &quiet_result(ANCHOR_WINDOW + 1),
+                ANCHOR_WINDOW,
+            );
+        }
+
+        #[test]
+        fn quiet_anchor_window_rejects_body_bytes() {
+            let baseline = quiet_result(ANCHOR_WINDOW);
+            for io in [
+                IoBytes {
+                    consumed: 1,
+                    ..baseline.io.clone()
+                },
+                IoBytes {
+                    rederive_head: 1,
+                    ..baseline.io.clone()
+                },
+                IoBytes {
+                    rederive_named: 1,
+                    ..baseline.io.clone()
+                },
+            ] {
+                let mut changed = baseline.clone();
+                changed.io = io;
+                assert!(std::panic::catch_unwind(|| {
+                    assert_quiet_restart_with_anchor_window(&changed, ANCHOR_WINDOW);
+                })
+                .is_err());
+            }
+        }
+
+        #[test]
+        #[should_panic(expected = "other I/O unmeasured/nonzero")]
+        fn quiet_anchor_window_rejects_other_reads() {
+            let mut result = quiet_result(ANCHOR_WINDOW);
+            result.io.other_reads = Some(1);
+            assert_quiet_restart_with_anchor_window(&result, ANCHOR_WINDOW);
+        }
+
+        #[test]
+        #[should_panic(expected = "identity anchor I/O unmeasured or outside exact window")]
+        fn quiet_anchor_window_rejects_unmeasured_anchors() {
+            let mut result = quiet_result(ANCHOR_WINDOW);
+            result.io.anchor_reads = None;
+            assert_quiet_restart_with_anchor_window(&result, ANCHOR_WINDOW);
+        }
     }
 }
 
