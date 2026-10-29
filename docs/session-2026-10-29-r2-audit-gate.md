@@ -322,3 +322,20 @@ quiet visit skip without body reads. This queue entry is not a census member
 and grants no census credit. The original multi-pass partial-save fixture and
 its order assertions remain byte-identical. Exact-head native execution and a
 fresh money delta review are required; all-target Clippy is compilation only.
+
+
+Round19 passes the captured page clock into held-deadline restoration,
+held-slot preparation and grown-prefix held-debt classification. Constructor
+and attachment can straddle the due edge without spending a pre-due slot or
+postponing its original deadline. A native fixture crosses that edge before
+attachment in both directions, checks save/reload preserves the unspent turn,
+and checks free-slot restoration uses the captured time too. Certificate
+verification timestamps, cap pacing and frozen census age time stay separate.
+
+Integration must retain the age-aware selection API with the captured audit
+argument and the separate census clock/window. Held due-carry integration must
+keep the rescue key, both secure-open callbacks, the earliest due deadline and
+attempted only after successful open, while using the captured audit time in
+rescue and attachment. These are later-integrator obligations; the corresponding
+unmerged implementation is not imported here. The exact-root quiet retry and
+its original partial-save assertions remain unchanged.
