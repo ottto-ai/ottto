@@ -29,6 +29,8 @@ pub struct ClaudeTerminalFoldDeferred {
     pub roots: usize,
     pub est_bytes: u64,
     pub sidecar_bytes: u64,
+    /// Root refusal skips all stats; byte fields are unknown (u64::MAX).
+    pub stat_skipped: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -39,7 +41,7 @@ pub struct ClaudeScopedRearmCounts {
     pub deferred: usize,
 }
 
-crate::heap_layout_bound::fields!(ClaudeTerminalFoldDeferred; roots, est_bytes, sidecar_bytes);
+crate::heap_layout_bound::fields!(ClaudeTerminalFoldDeferred; roots, est_bytes, sidecar_bytes, stat_skipped);
 crate::heap_layout_bound::fields!(ClaudeScopedRearmCounts; families, files, bytes, deferred);
 
 fn claude_terminal_cohort(index: &ScanIndex, snapshots: &[SnapshotItem]) -> BTreeSet<String> {
@@ -79,6 +81,7 @@ fn claude_terminal_budget(roots: usize, sidecar_bytes: u64) -> Option<ClaudeTerm
             roots,
             est_bytes,
             sidecar_bytes,
+            stat_skipped: false,
         })
 }
 
@@ -117,8 +120,12 @@ impl ScanIndex {
     ) {
         self.claude_full_rearm_progress.terminal_fold_checked = support.is_some();
         let roots = claude_terminal_cohort(self, snapshots);
-        let bytes = roots
-            .iter()
+        // Root admission is independent: never stat thousands of sidecars
+        // when cardinality alone already refuses the whole offer.
+        let bytes = if roots.len() > CLAUDE_TERMINAL_MAX_ROOTS {
+            u64::MAX // Unknown, not zero or a measured byte estimate.
+        } else {
+            roots.iter()
             .try_fold(0_u64, |bytes, root| {
                 let size = match support {
                     Some(support) => {
@@ -128,8 +135,12 @@ impl ScanIndex {
                 };
                 bytes.checked_add(size)
             })
-            .unwrap_or(u64::MAX); // Unknown stat/overflow fails closed, never absent.
-        let deferred = claude_terminal_budget(roots.len(), bytes);
+            .unwrap_or(u64::MAX) // Unknown stat/overflow fails closed, never absent.
+        };
+        let deferred = claude_terminal_budget(roots.len(), bytes).map(|mut counts| {
+            counts.stat_skipped = roots.len() > CLAUDE_TERMINAL_MAX_ROOTS;
+            counts
+        });
         self.claude_full_rearm_progress.terminal_fold_deferred = deferred;
         if let Some(counts) = deferred {
             crate::local_resource_diagnostics::traversal_point(
@@ -138,6 +149,40 @@ impl ScanIndex {
                 &counts,
             );
             eprintln!("ALARM terminal_fold_deferred roots={} est_bytes={} sidecar_bytes={}: terminal offer incomplete; all witnesses retained", counts.roots, counts.est_bytes, counts.sidecar_bytes);
+        }
+    }
+
+    pub(crate) fn note_claude_terminal_fold_offer(&mut self, deferred: bool) {
+        // Process-local diagnostic only: reload/downgrade adds no state field.
+        #[cfg(not(test))]
+        static PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        #[cfg(test)]
+        thread_local! {
+            static PASSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        }
+        #[cfg(not(test))]
+        let passes = {
+            use std::sync::atomic::Ordering;
+            PASSES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(if deferred { value.saturating_add(1) } else { 0 })
+            }).unwrap_or_else(|value| value)
+                .saturating_add(u64::from(deferred))
+        };
+        #[cfg(test)]
+        let passes = PASSES.with(|counter| {
+            let passes = if deferred { counter.get().saturating_add(1) } else { 0 };
+            counter.set(passes);
+            passes
+        });
+        if deferred {
+            crate::local_resource_diagnostics::traversal_point(
+                "terminal_fold_deferred_consecutive",
+                "claude_code",
+                &serde_json::json!({"passes": passes}),
+            );
+            if passes >= 3 {
+                eprintln!("ALARM terminal_fold_deferred_consecutive passes={passes}: ordinary uploads continue; terminal census remains parked pending paged fold");
+            }
         }
     }
 

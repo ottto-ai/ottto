@@ -1615,3 +1615,130 @@ fn ack_huge_file_real_finish_converges_after_transport_failure_with_full_debt() 
         "only the unrelated debt remains"
     );
 }
+
+/// B1: the real finish boundary must keep healthy uploads moving while a
+/// terminal fold is deferred. All input, ACKs and server responses are local.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn deferred_terminal_uploads_and_saves_parked_traversal_across_passes() {
+    let server = AckScriptedServer::new();
+    let mut home = AckFinishHome::new(&server);
+    let source = SnapshotSource::ClaudeCode;
+    let namespace = snapshot_upload_destination_namespace(&home.device, "device-secret");
+    let index_path = snapshot_v3_index_path(&snapshot_destination_scoped_index_path(
+        &snapshot_index_path(&home.support, source),
+        &namespace,
+    ));
+    let mut seed = serde_json::to_value(ScanIndex::default()).unwrap();
+    let pending = (0..65)
+        .map(|n| {
+            (
+                format!("20000000-0000-4000-8000-{n:012}"),
+                serde_json::json!({
+                    "census_window_end": "2026-01-01T00:00:00Z",
+                    "member_request_id_hashes": {}, "member_occurrences": {}, "invalid": false
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    seed["claude_usage_family_pending"] = pending.clone().into();
+    seed["claude_retired_family_tombstones_uncertain"] = true.into();
+    let mut index: ScanIndex = serde_json::from_value(seed).unwrap();
+    index.save(&index_path).unwrap();
+    let pending = serde_json::to_value(ScanIndex::load(&index_path).unwrap()).unwrap()
+        ["claude_usage_family_pending"]
+        .as_object()
+        .unwrap()
+        .clone();
+    let mut window = None;
+    for pass in 1..=3 {
+        home.cadence.next_due_cycle();
+        if pass > 1 {
+            use std::io::Write;
+            let path = home
+                .fixture
+                .home
+                .join(".claude/projects/-synthetic-repo")
+                .join(format!("{IDENTITY_PIPELINE_ROOT}.jsonl"));
+            let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+            writeln!(file, "{}", serde_json::json!({
+                "timestamp": current_rfc3339(), "type": "assistant", "sessionId": IDENTITY_PIPELINE_ROOT,
+                "requestId": format!("req_deferred_{pass}"), "message": {
+                    "id": format!("m_deferred_{pass}"), "model": "claude-haiku-4-5",
+                    "usage": {"input_tokens": 10, "output_tokens": pass}
+                }
+            })).unwrap();
+        }
+        let frame =
+            crate::agent_status_refresh::with_test_collection(AckFinishHome::collection(), || {
+                prepare_sync_source(
+                    &home.client,
+                    &home.device,
+                    "device-secret",
+                    source,
+                    "otm_test",
+                    &home.fixture.home,
+                    &home.support,
+                    &home.daemon,
+                    &mut home.transport,
+                    home.daemon.snapshot_scan_account_witness().unwrap(),
+                    false,
+                )
+            })
+            .unwrap()
+            .expect("due ordinary preparation");
+        let (preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
+        assert!(!scan.census_complete);
+        assert!(scan.scan_cap_hit);
+        assert!(index.claude_terminal_fold_deferred().unwrap().stat_skipped);
+        let previous_offers = server.offered.lock().unwrap().len();
+        let progress_path = preparation.upload_progress_path.clone();
+        let (result, lines) =
+            crate::local_resource_diagnostics::capture(|| home.finish(preparation, index, scan));
+        result.expect("deferred terminal is an ordinary successful page");
+        let offered = server.offered.lock().unwrap();
+        assert!(
+            offered.len() > previous_offers,
+            "pass {pass}: healthy changed body uploaded"
+        );
+        let fingerprint = offered.last().unwrap()["snapshot_fingerprint"]
+            .as_str()
+            .unwrap();
+        let saved = ScanIndex::load(&index_path).unwrap();
+        assert!(saved.accepted_snapshot_fingerprint_recorded(fingerprint));
+        let progress = SnapshotUploadProgress::load(
+            &progress_path,
+            &namespace,
+            snapshot_quarantine_witness(source),
+        )
+        .unwrap();
+        assert!(progress.accepted_body_witnesses.contains_key(fingerprint));
+        let value = serde_json::to_value(&saved).unwrap();
+        let traversal = &value["traversal"];
+        assert!(traversal.is_object(), "parked traversal saved");
+        let current_window = traversal["census_window_end"].clone();
+        assert_eq!(
+            window.get_or_insert_with(|| current_window.clone()),
+            &current_window,
+            "no traversal restart/re-arm across deferred passes"
+        );
+        for (root, record) in &pending {
+            assert_eq!(
+                &value["claude_usage_family_pending"][root], record,
+                "unread retained family cannot retire or change"
+            );
+        }
+        assert_eq!(value["claude_retired_family_tombstones_uncertain"], true);
+        assert!(value
+            .get("claude_retired_family_tombstones")
+            .is_none_or(|v| v.as_object().unwrap().is_empty()));
+        assert!(cached_source_manifest(&namespace, source).is_none());
+        if pass == 3 {
+            assert!(lines
+                .iter()
+                .any(|line| line["stage"] == "terminal_fold_deferred_consecutive"
+                    && line["counts"]["passes"].as_u64().is_some_and(|n| n >= 3)));
+        }
+    }
+}

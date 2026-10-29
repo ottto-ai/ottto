@@ -7941,7 +7941,6 @@ pub fn finalize_scan_after_policy_with_body_witness(
     if index.claude_terminal_fold_deferred().is_some() {
         result.census_complete = false;
         result.scan_cap_hit = true;
-        return;
     }
     // Backstop of the one emission seam: no held history body is finalized.
     index.veto_claude_history_emission(source, &mut result.snapshots);
@@ -8299,6 +8298,15 @@ pub fn apply_claude_effort_evidence_with_index(
     census_window_end: &str,
 ) {
     if index.claude_terminal_fold_deferred().is_some() {
+        // Ordinary page enrichment may use exact retained witnesses, but a
+        // deferred terminal cannot upgrade/prune durable family proof.
+        let mut witnesses = index.claude_account_family_witnesses.clone();
+        apply_claude_effort_evidence_with_families(
+            snapshots,
+            evidence_by_session,
+            &mut witnesses,
+            &BTreeMap::new(),
+        );
         return;
     }
     // A fingerprint version mismatch is missing proof, never an observed
@@ -8714,15 +8722,15 @@ pub(crate) fn apply_claude_reported_usage_to_scan_with_comparison(
     if index.claude_terminal_fold_deferred().is_some() {
         scan.census_complete = false;
         scan.scan_cap_hit = true;
-        return ClaudeUsageAuthorityDisposition::default();
     }
     // A previous unsettled upload requires a clean followup before manifest /
     // replay settlement, but cannot erase the actual healthy terminal native
     // window. Fold those observations once before any recovered body can leave.
-    let native_census_complete = scan.census_complete
-        || comparison
-            .as_ref()
-            .is_some_and(|view| view.native_census_complete(scan));
+    let native_census_complete = index.claude_terminal_fold_deferred().is_none()
+        && (scan.census_complete
+            || comparison
+                .as_ref()
+                .is_some_and(|view| view.native_census_complete(scan)));
     let current_files = if index.claude_usage_authority_quarantine.is_empty() {
         BTreeSet::new()
     } else {
@@ -31189,7 +31197,7 @@ impl OwnedSourceScan {
                     backfill_file_limit: file_limit,
                     discovered_file_count,
                     skipped_file_count_due_to_limit,
-                    scan_cap_hit: pending_work_count > 0,
+                    scan_cap_hit: pending_work_count > 0 || !terminal_admitted,
                     scanned_file_count,
                     scanned_session_count,
                     semantic_noop_count,

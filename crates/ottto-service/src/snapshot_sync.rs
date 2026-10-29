@@ -6944,12 +6944,9 @@ fn finish_sync_source(
                 stats.full_rearm_suppression.full_rearm_skipped_invalid_unchanged
             );
         }
-        if stats.terminal_fold_deferred.is_some() {
-            // No settlement/checkpoint/upload of a rejected terminal offer.
-            // The last durable page (including pending/ACK/body/holds) stands.
-            // Current-page collection ran, and its uncommitted rows stay owed.
-            return Err(anyhow!("terminal_fold_deferred: terminal offer incomplete"));
-        }
+        // Deferral demotes only terminal authority. Healthy current-page
+        // bodies still finalize, upload, settle and save the parked traversal.
+        index.note_claude_terminal_fold_offer(stats.terminal_fold_deferred.is_some());
         if let Ok(counts) = serde_json::to_string(&stats.context_file_birth) {
             eprintln!("local snapshot sync: claude context basis counts={counts}");
         }
@@ -8843,17 +8840,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     if scan_result.census_complete && !index.claude_terminal_fold_checked() {
         index.preflight_claude_terminal_fold(Some(support_dir), &scan_result.snapshots);
     }
-    if let Some(deferred) = index.claude_terminal_fold_deferred() {
+    let terminal_fold_deferred = index.claude_terminal_fold_deferred();
+    if terminal_fold_deferred.is_some() {
         scan_result.census_complete = false;
         scan_result.scan_cap_hit = true;
-        return Ok((
-            Default::default(),
-            true,
-            ClaudeLocalEvidenceStats {
-                terminal_fold_deferred: Some(deferred),
-                ..Default::default()
-            },
-        ));
     }
     // Actual native occurrences are recorded once BEFORE emission filtering.
     // The authoritative fold still sees the actual terminal census decision.
@@ -8891,6 +8881,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         session_ids.extend(crate::snapshots::claude_pending_family_session_ids(index));
     }
     let mut stats = ClaudeLocalEvidenceStats {
+        terminal_fold_deferred,
         requested_session_count: session_ids.len(),
         ..Default::default()
     };
@@ -8936,7 +8927,11 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     let telemetry_read_failed = stats.effort_evidence_load_failed;
     let usage_roots = claude_evidence_root_session_ids(&scan_result.snapshots)
         .into_iter()
-        .chain(crate::snapshots::claude_pending_family_session_ids(index))
+        .chain(
+            crate::snapshots::claude_pending_family_session_ids(index)
+                .into_iter()
+                .filter(|_| terminal_fold_deferred.is_none()),
+        )
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
@@ -9275,7 +9270,8 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     stats.duplicate_census = disposition.duplicate_census;
     stats.full_rearm_suppression = disposition.full_rearm_suppression;
     stats.context_file_birth = disposition.context_file_birth.clone();
-    let census_withheld = index.account_claude_usage_authority_census_health(scan_result);
+    let census_withheld = index.account_claude_usage_authority_census_health(scan_result)
+        || terminal_fold_deferred.is_some();
     stats.returning_family_grown_held = index.claude_returning_family_grown_held_count();
     stats.first_proof_hold = crate::snapshots::ClaudeFirstProofHoldCounts {
         census_withheld_retry_pending_family_count: index.claude_usage_authority_pending_count(),

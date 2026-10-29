@@ -14,10 +14,14 @@ absence under the existing proof rules. No content is read to decide admission.
 
 Admission precedes page-end reconciliation and raw-completion absence retirement,
 tombstone-fence draining and request-census pruning. A rejected offer remains
-incomplete and stops before evidence folding, finalization, ACK bookkeeping,
-upload and selected saves. Previously durable pending, account, usage, body,
-ACK and hold witnesses stand. Current-page collection still runs; its uncommitted
-rows remain owed. Ordinary nonterminal pages keep their collection path.
+incomplete and becomes an ordinary page: current-page evidence, finalization,
+upload, ACK settlement and index save continue. The existing traversal remains
+parked at its terminal; no restart or traversal-start re-arm is introduced.
+Completion-only retirement, folding, ACK carry and upload-context adoption stay
+off. Unread pending/ACK/body/hold witnesses remain owed. Root-count refusal
+skips the stat walk entirely; unknown byte counts are reported as u64::MAX with
+stat_skipped=true. An in-process terminal_fold_deferred_consecutive counter
+alarms at three consecutive deferred passes; restart resets the diagnostic.
 
 `terminal_fold_deferred` reports roots, estimated decoded bytes and sidecar
 bytes, with a local alarm. This stopgap can stall completion indefinitely for
