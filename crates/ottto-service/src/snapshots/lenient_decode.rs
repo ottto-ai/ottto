@@ -926,6 +926,14 @@ fn read_persistence_mode<R: BufRead + Seek>(
     let input_len = reader.seek(SeekFrom::End(0))?;
     reader.seek(SeekFrom::Start(0))?;
     let census_resources = validate_original(&mut reader)?;
+    // Missing maps cannot defund already-held negative metadata. A Partial
+    // index has no publication/acquisition authority. Keep the existing absolute
+    // hold/count ceilings, then charge its retained custody in the adapter.
+    let input_len = if partial.is_some() {
+        input_len.max(HOLD_BYTES_MAX * 8)
+    } else {
+        input_len
+    };
     let mut decoder = Decoder {
         reader,
         input_len,
@@ -2738,15 +2746,22 @@ pub(super) fn persistence_controls(
                 + std::mem::align_of::<PersistenceControls>()
                 + 2 * std::mem::size_of::<usize>(),
         )?;
-        index.decode_holds.heap_bound(&mut c)?;
+        index.decode_holds.completed_heap_bound(&mut c)?;
         crate::heap_layout_bound::tree_nodes::<String, SnapshotQuarantineRecord>(
             claims.clone().count(),
             &mut c,
         )?;
+        // Completion boundary: each claim gets its ordinary recursive visit
+        // budget, while every child spends the SAME diminishing byte budget.
+        let mut claim_bytes = 0usize;
         for (key, record) in claims.clone() {
-            key.heap_bound(&mut c)?;
-            record.heap_bound(&mut c)?;
+            let remaining = budget.checked_sub(c.bytes)?.checked_sub(claim_bytes)?;
+            let mut child = Counter::new(remaining);
+            key.completed_heap_bound(&mut child)?;
+            record.completed_heap_bound(&mut child)?;
+            claim_bytes = claim_bytes.checked_add(child.bytes)?;
         }
+        c.add(claim_bytes)?;
         Some(())
     })();
     anyhow::ensure!(admitted.is_some(), "scan_index_storage_admission");

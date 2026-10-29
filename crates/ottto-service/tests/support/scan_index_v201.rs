@@ -2,7 +2,7 @@
 //! This is not a claim that all historical record types are interchangeable.
 use super::*;
 #[test]
-fn historical_decisions_are_verbatim_in_the_executed_production_decoder() {
+fn historical_decisions_remain_guarded_in_the_integrated_production_decoder() {
     let frozen: Value = serde_json::from_str(include_str!(
         "../fixtures/scan_index/v0.1.201-decisions.json"
     ))
@@ -19,12 +19,7 @@ fn historical_decisions_are_verbatim_in_the_executed_production_decoder() {
             }
             _ => panic!("unrecognized frozen source"),
         };
-        assert!(
-            source.contains(snippet["text"].as_str().unwrap()),
-            "historical decision changed: {}:{}",
-            snippet["file"],
-            snippet["start_line"]
-        );
+        assert_integrated_decision(source, snippet["text"].as_str().unwrap());
     }
 }
 #[test]
@@ -76,7 +71,7 @@ fn pinned_0202_also_refuses_schema3_without_inline_maps_before_defaults_can_esca
     assert_eq!(frozen["commit"], "79488a7297817edfe1eb5cfc34b779408d511726");
     let source = include_str!("../../src/snapshots/lenient_decode.rs");
     for snippet in frozen["snippets"].as_array().unwrap() {
-        assert!(source.contains(snippet["text"].as_str().unwrap()));
+        assert_integrated_decision(source, snippet["text"].as_str().unwrap());
     }
     let s = Scratch::new();
     s.install();
@@ -97,4 +92,45 @@ fn pinned_0202_also_refuses_schema3_without_inline_maps_before_defaults_can_esca
         .file_name()
         .to_string_lossy()
         .contains("corrupt")));
+}
+
+// Frozen historical source stays immutable. Integration changes the structural
+// contexts, so pin unchanged controls verbatim and check the new guarded
+// dispatch for rewritten contexts; executable legacy behavior is tested above.
+fn assert_integrated_decision(source: &str, frozen: &str) {
+    if source.contains(frozen) {
+        return;
+    }
+    if frozen.contains("let headers = decoder.index(Pass::Headers)?;") {
+        let mode = source
+            .split("fn read_persistence_mode<")
+            .nth(1)
+            .unwrap()
+            .split("pub(super) fn read_file")
+            .next()
+            .unwrap();
+        let headers = mode
+            .find("let mut headers = decoder.index(Pass::Headers)?;")
+            .unwrap();
+        let controls = mode.find("controls(&headers, source)?;").unwrap();
+        let full = mode
+            .find("let result = decoder.index(Pass::Full);")
+            .unwrap();
+        assert!(headers < controls && controls < full);
+        assert!(source.contains("read_persistence_mode(reader, stage, source, false, None)"));
+    } else if frozen.contains("if !seen.contains(\"files\")") {
+        assert!(source.contains("if !self.persistence_map && !seen.contains(\"files\")"));
+        assert!(source.contains("return Err(Error::Refused(\"missing files\"));"));
+    } else if frozen.contains("if !path.exists()") {
+        assert!(source.contains(
+            "scan_index_integration::check_missing(path, scan_index_source_label(source))?;"
+        ));
+        assert!(source.contains("return Ok((Self::default(), LoadOrigin::Missing));"));
+    } else if frozen.contains("let quarantine_path = unique_checkpoint_sibling") {
+        assert!(source.contains("fs::rename(path, &quarantine_path).context(\"quarantine invalid local snapshot scan index\")?;"));
+        assert!(source.contains("persistence_legacy_recovery: persistence_recovery,"));
+        assert!(source.contains("..ScanIndex::default()"));
+    } else {
+        panic!("unchanged historical control drifted: {frozen}");
+    }
 }

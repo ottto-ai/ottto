@@ -293,3 +293,17 @@ Clone/subset/recovery, no retirement/release/fence/re-read/export, fresh orphans
 error-path stats draining, legacy rewrite/generation and admission/heap custody.
 Runtime and macOS layout results are CI evidence, not inferred from compilation.
 The N+1 release pairing and actual downgrade-stall release notes remain required.
+
+An upload-progress lock alone is permitted during fresh initialization; an
+actual progress file remains evidence of prior state. Existing authorized legacy
+quarantine keeps an opaque, ephemeral recovery token bound to the exact preserved
+legacy file and destination. The first replacement save verifies that custody
+and that the root is still absent before publishing legacy; it consumes the
+token. No sharded/Partial/missing-root load can mint it. Crash/restart without the
+token retains strict refusal. Token hashes are CAS custody, never P4 receipts.
+
+Partial metadata retains the existing absolute hold ceiling (8 MiB / 4,096
+records) under shared admission: losing an unrelated map cannot defund negative
+metadata holds by shrinking the proportional input denominator. Original logical
+padding is retained once. Map validation keeps its existing admission policy;
+this negative-only custody exception grants no acquisition or publication.

@@ -241,6 +241,13 @@ pub(super) fn publish_at(
     );
     let store =
         scan_index_persistence::LockedStore::new(path, binding.clone(), lenient_decode::FIELDS)?;
+    if let Some(recovery) = &index.persistence_legacy_recovery {
+        let result = store.write_recovered_legacy(recovery, index.generation, |out| {
+            lenient_decode::write_index(out, index).map_err(Into::into)
+        });
+        drain_stats(&store, "unattributed");
+        return result.map(|root| Some((binding, root)));
+    }
     let expected = if let Some((_, expected)) = &index.persistence_root {
         expected.clone()
     } else {
@@ -251,4 +258,30 @@ pub(super) fn publish_at(
         }
     };
     publish(&store, &expected, index).map(|root| Some((binding, root)))
+}
+
+pub(super) fn prepare_legacy_recovery(
+    path: &Path,
+    quarantine: &Path,
+) -> Result<Option<Arc<scan_index_persistence::LegacyRecovery>>> {
+    let Some(binding) = scan_index_storage_binding(path) else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        path.parent() == quarantine.parent(),
+        "scan_index_legacy_recovery_refused"
+    );
+    let name = quarantine
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow::anyhow!("scan_index_legacy_recovery_refused"))?;
+    scan_index_persistence::LockedStore::new(path, binding, lenient_decode::FIELDS)?
+        .legacy_recovery(name)
+        .map(Some)
+}
+impl crate::heap_layout_bound::HeapLayoutBound for scan_index_persistence::LegacyRecovery {
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(self.retained_bytes())
+    }
 }

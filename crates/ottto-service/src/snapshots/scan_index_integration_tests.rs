@@ -332,3 +332,113 @@ fn integrated_storage_controls_admission_and_native_heap_layout_keep_entry_pin()
         with - base
     );
 }
+
+#[test]
+fn fresh_init_allows_the_real_progress_lock_but_never_prior_progress_state() {
+    let fixture = Fixture::new();
+    fs::remove_file(&fixture.root).unwrap();
+    fs::remove_dir_all(&fixture.shards).unwrap();
+    let progress_lock = fixture
+        .root
+        .with_file_name("claude_code-scan-index-v3-upload-progress.lock");
+    fs::write(&progress_lock, []).unwrap();
+    fs::set_permissions(&progress_lock, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(fixture.load().generation, 0);
+    let progress_state = fixture
+        .root
+        .with_file_name("claude_code-scan-index-v3-upload-progress.json");
+    fs::write(progress_state, b"{}").unwrap();
+    assert!(ScanIndex::load(&fixture.root).is_err());
+}
+
+#[test]
+fn authorized_legacy_quarantine_rebuild_keeps_opaque_custody_until_replacement() {
+    let fixture = Fixture::new();
+    fs::remove_dir_all(&fixture.shards).unwrap();
+    fs::write(
+        &fixture.root,
+        b"{\"schema_version\":2,\"files\":{},\"generation\":\"broken",
+    )
+    .unwrap();
+    let mut rebuilt = fixture.load();
+    assert_eq!(rebuilt.generation, 0);
+    assert!(rebuilt.persistence_legacy_recovery.is_some());
+    assert!(!fixture.root.exists());
+    let mut clone = rebuilt.clone();
+    clone.retain_persistence_baseline_from(&rebuilt);
+    assert!(clone.persistence_legacy_recovery.is_some());
+    // Arbitrary missing-root loads cannot manufacture the authorized token.
+    assert!(ScanIndex::load(&fixture.root).is_err());
+    rebuilt.save(&fixture.root).unwrap();
+    assert_eq!(rebuilt.generation, 1);
+    assert!(rebuilt.persistence_legacy_recovery.is_none());
+    assert_eq!(fixture.load().generation, 1);
+    // A stale clone cannot re-use the spent recovery grant.
+    assert!(clone.save(&fixture.root).is_err());
+    fs::remove_file(&fixture.root).unwrap();
+    assert!(clone.save(&fixture.root).is_err());
+    assert!(
+        !fixture.root.exists(),
+        "spent Arc custody never resets a lost root"
+    );
+}
+
+#[test]
+fn partial_negative_metadata_holds_keep_their_fund_when_a_map_is_missing() {
+    let mut fixture = Fixture::new();
+    let metadata = &fixture.manifest["objects"][0];
+    let old = fixture.shards.join(format!(
+        "metadata-{}.json",
+        metadata["digest"].as_str().unwrap()
+    ));
+    let mut payload: Value = serde_json::from_slice(&fs::read(&old).unwrap()).unwrap();
+    payload["files"]["held-negative-file"] = json!({"size_bytes": "x".repeat(2 * 1024 * 1024)});
+    let bytes = serde_json::to_vec(&payload).unwrap();
+    let binding: scan_index_persistence::Binding =
+        serde_json::from_value(fixture.manifest["binding"].clone()).unwrap();
+    let slot = scan_index_persistence::Slot::Metadata;
+    let mut hash = Sha256::new();
+    hash.update(b"ottto.scan-index.storage.v1\0object\0");
+    hash.update(serde_json::to_vec(&(binding, slot)).unwrap());
+    hash.update([0]);
+    hash.update(&bytes);
+    hash.update((bytes.len() as u64).to_le_bytes());
+    fixture.manifest["objects"][0]["digest"] = json!(format!("{:x}", hash.finalize()));
+    fixture.manifest["objects"][0]["bytes"] = json!(bytes.len());
+    let new = fixture.shards.join(format!(
+        "metadata-{}.json",
+        fixture.manifest["objects"][0]["digest"].as_str().unwrap()
+    ));
+    fs::rename(old, &new).unwrap();
+    fs::write(new, bytes).unwrap();
+    fs::remove_file(fixture.bucket_path(0)).unwrap();
+    fixture.write_root();
+    let index = fixture.load();
+    assert!(!index.persistence_available());
+    assert!(index.decode_holds.contains("files", "held-negative-file"));
+    assert!(index.decode_holds.held_bytes() > 2 * 1024 * 1024);
+    assert!(index.decode_holds.held_bytes() <= 8 * 1024 * 1024);
+}
+
+#[test]
+fn completed_storage_controls_keep_many_small_negative_holds_with_one_byte_budget() {
+    let files = (0..1500)
+        .map(|i| (format!("held-{i}"), json!({"size_bytes": "invalid"})))
+        .collect::<serde_json::Map<_, _>>();
+    let bytes = serde_json::to_vec(&json!({
+        "schema_version": 2,
+        "generation": 1,
+        "files": files,
+        "fixture_padding": " ".repeat(4 * 1024 * 1024),
+    }))
+    .unwrap();
+    let index = lenient_decode::read(
+        std::io::Cursor::new(bytes),
+        "many-small-held-controls",
+        "claude_code",
+    )
+    .unwrap();
+    assert_eq!(index.decode_holds.file_keys().count(), 1500);
+    assert!(lenient_decode::persistence_controls(&index, 8 * 1024 * 1024).is_ok());
+    assert!(lenient_decode::persistence_controls(&index, 1).is_err());
+}

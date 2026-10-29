@@ -185,6 +185,27 @@ enum Root {
 /// immutable baseline retry maxima and hold/repair provenance alongside this.
 #[derive(Clone, Debug)]
 pub(crate) struct LoadedRoot(Arc<Root>);
+/// Opaque, in-process custody for a rebuild already authorized by the existing
+/// LEGACY quarantine policy. Never minted for sharded/partial state or on load
+/// of a missing root. Not a receipt and never persisted or inferred from names.
+#[derive(Debug)]
+pub(crate) struct LegacyRecovery {
+    binding: Binding,
+    root: String,
+    quarantine: String,
+    digest: String,
+    spent: std::sync::atomic::AtomicBool,
+}
+impl LegacyRecovery {
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.binding.namespace_hash.capacity()
+            + self.root.capacity()
+            + self.quarantine.capacity()
+            + self.digest.capacity()
+    }
+}
+
 impl LoadedRoot {
     pub(crate) fn generation(&self) -> Option<u64> {
         match &*self.0 {
@@ -307,8 +328,9 @@ impl PartialIndex {
     pub(crate) fn into_reader(self) -> Result<(LogicalReader, [Option<MapUnavailable>; 3])> {
         let mut reader = self.metadata;
         reader.spans.pop(); // final root brace
+        let mut padding = 0;
         while matches!(reader.spans.last().map(|s| &s.piece), Some(Piece::Spaces)) {
-            reader.spans.pop();
+            padding += reader.spans.pop().expect("padding span").len;
         }
         reader.length = reader.spans.iter().map(|s| s.len).sum();
         let mut unavailable = [None; 3];
@@ -326,6 +348,7 @@ impl PartialIndex {
                 }
             }
         }
+        reader.push(padding, Piece::Spaces)?;
         reader.push_bytes(b"}".to_vec())?;
         Ok((reader, unavailable))
     }
@@ -354,6 +377,7 @@ pub(crate) struct LockedStore {
     binding: Binding,
     metadata_fields: &'static [&'static str],
     prior_root_seen: std::cell::Cell<bool>,
+    authorized_legacy_replacement: std::cell::Cell<bool>,
     read_stats: std::cell::Cell<ReadStats>,
 }
 
@@ -743,6 +767,7 @@ impl LockedStore {
             binding,
             metadata_fields,
             prior_root_seen: std::cell::Cell::new(false),
+            authorized_legacy_replacement: std::cell::Cell::new(false),
             read_stats: std::cell::Cell::new(ReadStats::default()),
         })
     }
@@ -765,6 +790,9 @@ impl LockedStore {
                 file
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if self.authorized_legacy_replacement.get() {
+                    return Ok((None, Root::Missing));
+                }
                 match self.directory() {
                     Ok(_) => bail!("scan_index_root_missing_with_shards"),
                     Err(e)
@@ -1141,6 +1169,96 @@ impl LockedStore {
         };
         ensure!(same, "local snapshot scan index changed concurrently");
         Ok(())
+    }
+
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn legacy_recovery(&self, quarantine: &str) -> Result<Arc<LegacyRecovery>> {
+        ensure!(
+            quarantine.len() <= MAX_KEY_BYTES
+                && !quarantine.contains('/')
+                && quarantine != "."
+                && quarantine != "..",
+            "scan_index_legacy_recovery_refused"
+        );
+        let (_, root) = self.current()?;
+        let Root::Legacy { digest, .. } = root else {
+            bail!("scan_index_legacy_recovery_refused");
+        };
+        Ok(Arc::new(LegacyRecovery {
+            binding: self.binding.clone(),
+            root: self.root_name.to_str()?.into(),
+            quarantine: quarantine.into(),
+            digest,
+            spent: std::sync::atomic::AtomicBool::new(false),
+        }))
+    }
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn write_recovered_legacy(
+        &self,
+        recovery: &LegacyRecovery,
+        generation: u64,
+        encode: impl FnOnce(&mut dyn Write) -> Result<()>,
+    ) -> Result<LoadedRoot> {
+        ensure!(
+            recovery.binding == self.binding
+                && recovery.root.as_bytes() == self.root_name.to_bytes(),
+            "scan_index_legacy_recovery_refused"
+        );
+        // Verify the exact preserved legacy witness, not merely a sibling name
+        // or matching generation, before granting the missing-root replacement.
+        let mut file = open_at(
+            &self.parent,
+            &cstring(recovery.quarantine.as_bytes())?,
+            libc::O_RDONLY,
+        )?;
+        let before = Stamp::capture(&file, false)?;
+        let mut hash = Sha256::new();
+        hash.update(DOMAIN);
+        hash.update(b"legacy\0");
+        let mut scratch = [0; BUFFER_BYTES];
+        loop {
+            let n = file.read(&mut scratch)?;
+            if n == 0 {
+                break;
+            }
+            hash.update(&scratch[..n]);
+        }
+        ensure!(
+            before == Stamp::capture(&file, false)? && hex(hash.finalize()) == recovery.digest,
+            "scan_index_legacy_recovery_refused"
+        );
+        struct Reset<'a>(&'a std::cell::Cell<bool>);
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.0.set(false);
+            }
+        }
+        ensure!(
+            recovery
+                .spent
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire
+                )
+                .is_ok(),
+            "scan_index_legacy_recovery_spent"
+        );
+        self.authorized_legacy_replacement.set(true);
+        let _reset = Reset(&self.authorized_legacy_replacement);
+        let result = self.write_legacy(&LoadedRoot(Arc::new(Root::Missing)), generation, encode);
+        if result
+            .as_ref()
+            .is_err_and(|error| error.downcast_ref::<CommitPublished>().is_none())
+            && !self.prior_root_seen.get()
+            && matches!(open_at(&self.parent, &self.root_name, libc::O_RDONLY), Err(error) if error.kind() == io::ErrorKind::NotFound)
+        {
+            recovery
+                .spent
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+        result
     }
 
     /// Release N always writes the existing legacy format, including after a
@@ -1741,6 +1859,8 @@ impl LockedStore {
             if own_temp(text) {
                 Stamp::capture(&open_at(&self.parent, name, libc::O_RDONLY)?, true)?;
                 temps = true;
+            } else if text == format!("{stem}-upload-progress.lock") {
+                Stamp::capture(&open_at(&self.parent, name, libc::O_RDONLY)?, false)?;
             } else if text.starts_with(family)
                 && text != self.objects_name.to_str()?
                 && text != format!("{root}.lock")
