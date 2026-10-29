@@ -32290,9 +32290,10 @@ impl OwnedSourceScan {
                     && planned_mode.map_or(true, |(mode, _)| {
                         matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
                     })
-                    && index
-                        .reread_guard
-                        .upgrade_claimed(&local_index_key(&active.candidate.path))
+                    && (index.reread_guard.upgrade_claimed(&local_index_key(&active.candidate.path))
+                        || index.files.get(&local_index_key(&active.candidate.path))
+                            .is_some_and(|e| !e.source_file_fingerprint.is_empty()
+                                && active.candidate.size_bytes > e.size_bytes))
                 {
                     match context.cache.upgrade_read(
                         &local_index_key(&active.candidate.path),
@@ -32300,12 +32301,7 @@ impl OwnedSourceScan {
                     ) {
                         Ok(Some(read)) => active.parser.reader.reader.put_upgrade(read),
                         Ok(None) => {}
-                        Err(_) => {
-                            context
-                                .cache
-                                .durable_stale_hold(source, index, &active.candidate);
-                            pending!();
-                        }
+                        Err(_) => {} // Observation refusal cannot hold an authorized absent-record Full.
                     }
                 }
                 if let Some((mode, audit_due)) = planned_mode {
