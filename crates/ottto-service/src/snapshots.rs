@@ -26740,7 +26740,7 @@ impl OwnedSourceScan {
                 backfill_window_days,
                 discovery_retention!(index),
             );
-            release_codex_inventory_hold(source, traversal);
+            release_codex_inventory_hold(source, traversal, &index.decode_holds);
             if source == SnapshotSource::Codex {
                 codex_archive_catchup::order_pending(&mut traversal.pending_candidates);
             }
@@ -27842,10 +27842,10 @@ impl OwnedSourceScan {
                     let mut repurposed_protected_paths = BTreeSet::new();
                     let mut missing_protected_owners = BTreeSet::new();
                     let mut missing_unknown_owner = false;
-                    for owner in index.decode_held_codex_owners() {
-                        match owner {
+                    for key in index.decode_held_file_keys() {
+                        match index.decode_held_codex_owner(key) {
                             Some(owner) => {
-                                missing_protected_owners.insert(owner.to_owned());
+                                missing_protected_owners.insert(owner);
                             }
                             None => missing_unknown_owner = true,
                         }
@@ -43199,7 +43199,11 @@ fn record_codex_inventory_hold(
 /// after any watcher hints, and they meet the same inventory, ownership,
 /// capture, send and checkpoint gates as any candidate. If the evidence still
 /// does not prove the page, it is held and recorded again.
-fn release_codex_inventory_hold(source: SnapshotSource, traversal: &mut ScanTraversalCheckpoint) {
+fn release_codex_inventory_hold(
+    source: SnapshotSource,
+    traversal: &mut ScanTraversalCheckpoint,
+    decode_holds: &lenient_decode::Holds,
+) {
     if source != SnapshotSource::Codex || !traversal.pending_directories.is_empty() {
         return;
     }
@@ -43217,6 +43221,10 @@ fn release_codex_inventory_hold(source: SnapshotSource, traversal: &mut ScanTrav
     let activated_archive = |key: &String| {
         let path = Path::new(key);
         codex_archive_path(path)
+            // An opaque archive is current decode custody, not old intake debt.
+            // Leave an unchanged unknown-owner hold on its bounded retry rather
+            // than repeatedly treating it as a newly activated archive.
+            && !decode_holds.contains("files", key)
             && transcript_path_admitted(source, path)
             && traversal.codex_rollout_paths.contains(key)
             && fs::symlink_metadata(path)

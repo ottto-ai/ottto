@@ -2684,7 +2684,7 @@ fn denied_archive_inventory_debt_releases_once_and_paces_without_plain_body_rere
         traversal.unhealthy_retry_not_before_unix_seconds =
             Some(rfc3339_unix_seconds(NOW).unwrap() + 1800);
         let (_, rows) = crate::local_resource_diagnostics::capture(|| {
-            release_codex_inventory_hold(SnapshotSource::Codex, traversal)
+            release_codex_inventory_hold(SnapshotSource::Codex, traversal, &index.decode_holds)
         });
         assert_eq!(
             archive_event_count(&rows, "codex_archive_inventory_debt_released"),
@@ -2852,7 +2852,7 @@ fn activation_does_not_release_unchanged_nonregular_archive_inventory_witness() 
         };
         traversal.residue.codex_inventory_hold = Some(hold.clone());
         let (_, rows) = crate::local_resource_diagnostics::capture(|| {
-            release_codex_inventory_hold(SnapshotSource::Codex, traversal)
+            release_codex_inventory_hold(SnapshotSource::Codex, traversal, &index.decode_holds)
         });
         assert_eq!(
             archive_event_count(&rows, "codex_archive_inventory_debt_released"),

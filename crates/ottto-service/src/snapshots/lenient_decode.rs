@@ -2258,6 +2258,57 @@ impl ScanIndex {
     pub(super) fn decode_holds_indexed_entity(&self, key: &str, fingerprint: &str) -> bool {
         self.decode_holds_file(key) || self.decode_holds_entity(fingerprint)
     }
+    /// Negative scope only. A damaged file record remains raw; neither this
+    /// projection nor its owner can authorize a read, membership or settlement.
+    pub(super) fn decode_held_codex_owner(&self, key: &str) -> Option<String> {
+        let raw = self.decode_holds.0.get("files")?.get(key)?;
+        if let Some(owner) = raw.owner() {
+            return Some(owner.to_owned());
+        }
+        let path = Path::new(key);
+        if !codex_archive_path(path) {
+            return None;
+        }
+        // Borrow only the existing header/owner and fixed-size stamp from the
+        // already admitted raw slot. Do not decode an archive to learn scope,
+        // rebuild a typed file entry, or consult the plain header fact cache.
+        #[derive(Deserialize)]
+        struct Header<'a> {
+            #[serde(borrow)]
+            owner: &'a str,
+        }
+        #[derive(Deserialize)]
+        struct Archive<'a> {
+            stamp: crate::transcript_acquisition::FileStamp,
+            #[serde(default, borrow)]
+            owner: Option<&'a str>,
+            #[serde(borrow)]
+            header_validated: Header<'a>,
+        }
+        #[derive(Deserialize)]
+        struct Entry<'a> {
+            #[serde(borrow)]
+            archive: Archive<'a>,
+        }
+        let entry: Entry<'_> = serde_json::from_str(raw.get()).ok()?;
+        let archive = entry.archive;
+        let owner = archive.header_validated.owner;
+        if archive.owner.is_some_and(|accepted| accepted != owner)
+            || !codex_session_id_candidates_from_path(&path.with_extension(""))
+                .iter()
+                .any(|id| id == owner)
+        {
+            return None;
+        }
+        let metadata = fs::symlink_metadata(path).ok()?;
+        if metadata.file_type().is_symlink() {
+            return None;
+        }
+        let current = crate::transcript_acquisition::FileStamp::capture(metadata).ok()?;
+        (archive.stamp.same_object(&current) && archive.stamp.same_content(&current))
+            .then(|| codex_protected_owner(owner))
+    }
+    #[cfg(test)]
     pub(super) fn decode_held_codex_owners(&self) -> impl Iterator<Item = Option<&str>> {
         self.decode_holds
             .0
