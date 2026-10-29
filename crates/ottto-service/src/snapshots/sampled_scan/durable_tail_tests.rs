@@ -489,6 +489,380 @@ fn receipt_pending_guard_keeps_accepted_witness_and_census_without_unreadable() 
     assert_eq!(slot.store.disabled(), Some("namespace_pending"));
 }
 
+/// Includes the directory itself, all names/bytes, identity, mode and mutation times.
+fn store_snapshot(dir: &Path) -> BTreeMap<PathBuf, (Vec<u8>, Vec<i128>)> {
+    use std::os::unix::fs::MetadataExt;
+    let mut paths = vec![dir.to_path_buf()];
+    paths.extend(std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()));
+    paths
+        .into_iter()
+        .map(|path| {
+            let m = std::fs::symlink_metadata(&path).unwrap();
+            let bytes = if m.is_file() {
+                std::fs::read(&path).unwrap()
+            } else {
+                Vec::new()
+            };
+            let stamp = vec![
+                m.dev() as i128,
+                m.ino() as i128,
+                m.len() as i128,
+                m.mode() as i128,
+                m.mtime() as i128,
+                m.mtime_nsec() as i128,
+                m.ctime() as i128,
+                m.ctime_nsec() as i128,
+            ];
+            (path, (bytes, stamp))
+        })
+        .collect()
+}
+
+struct ClearWriteFaults;
+impl Drop for ClearWriteFaults {
+    fn drop(&mut self) {
+        store::test_hooks::set_write_failure(None);
+        store::test_hooks::set_before_rename(None);
+        store::test_hooks::set_before_unlink(None);
+        store::test_hooks::set_before_dir_sync(None);
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "needs native cache admission layout"
+)]
+fn disabled_pending_store_publishes_valid_ram_through_production_scan_without_mutation() {
+    assert!(crate::heap_layout_bound::layout_supported());
+    let _gate = claude_request_money::e2::GateForTest::set(true);
+    for cause in ["obligation_overflow", "namespace_pending"] {
+        let root = crate::test_scratch::ScratchDir::new("dt-disabled-native");
+        let lock = test_locks::hold(&root);
+        let _clear = ClearWriteFaults;
+        let source = SnapshotSource::ClaudeCode;
+        let ds = DurableSource::ClaudeCode;
+        let namespace = Scope("disabled-native".into());
+        let index_path = root.join("index.json");
+        let sessions = root.join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let path = sessions.join("11111111-2222-4333-8444-555555555555.jsonl");
+        native_fixture(&path);
+        let key = local_index_key(&path);
+        let cache = Arc::new(SharedCache::default());
+        cache.durable_begin_pass(source, &index_path, &namespace, true);
+        let run = |index| {
+            let mut scan = OwnedSourceScan::new(
+                source,
+                std::slice::from_ref(&sessions),
+                index,
+                "2026-10-20T12:00:00Z",
+                365,
+                100,
+                false,
+                None,
+                &[],
+                false,
+                true,
+            )
+            .with_sampled_acquisition(cache.clone(), namespace.clone());
+            for _ in 0..10_000 {
+                match scan.step(None) {
+                    OwnedSourceScanStep::Pending(next) => scan = next,
+                    OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan),
+                }
+            }
+            panic!("production scan did not complete");
+        };
+        let (mut index, first) = run(ScanIndex::default());
+        assert_eq!(first.snapshots.len(), 1, "real native output premise");
+        assert_eq!(first.snapshots[0].input_tokens, 100);
+        assert_eq!(first.snapshots[0].output_tokens, 10);
+        assert!(
+            cache.retained().unwrap().peek(&key).is_some(),
+            "funded native RAM premise"
+        );
+        let expected_body = snapshot_upload_body_witness(&first.snapshots[0]);
+        // Retry the same valid body through ordinary gates; keep its accepted witness/census.
+        index.files.get_mut(&key).unwrap().last_snapshot_fingerprint = None;
+        let witness = index.files[&key]
+            .last_upload_body_witness
+            .clone()
+            .expect("accepted witness");
+        let census = index
+            .claude_request_census
+            .get(&key)
+            .cloned()
+            .expect("native census");
+        let records = (0..=store::MAX_BATCH)
+            .map(|n| {
+                let mut b = store::tests::binding("account", "scope", ("fp-a", None));
+                b.key = store::key_digest(ds, if n == 0 { &key } else { "unused" });
+                if n > 0 {
+                    b.key = store::key_digest(ds, &format!("pending-{n}"));
+                }
+                store::tests::pending(b, store::tests::certificate(&path), 1)
+            })
+            .collect::<Vec<_>>();
+        {
+            let mut stores = cache.durable().unwrap();
+            let slot = stores.slot(ds).as_mut().unwrap();
+            for record in &records {
+                assert_eq!(
+                    slot.store
+                        .write_after_save(lock, 1, 0, vec![record.clone()])
+                        .unwrap()
+                        .written,
+                    1
+                );
+            }
+            store::test_hooks::set_before_rename(Some(Box::new(|_, _| {
+                Err(std::io::Error::other("rename EIO"))
+            })));
+            store::test_hooks::set_before_unlink(Some(Box::new(|_| {
+                Err(std::io::Error::other("unlink EIO"))
+            })));
+            for record in &records[..store::MAX_BATCH] {
+                let mut next = record.clone();
+                next.body =
+                    store::tests::pending(next.binding.clone(), next.certificate.clone(), 2).body;
+                assert_eq!(
+                    slot.store
+                        .write_after_save(lock, 2, 0, vec![next])
+                        .unwrap()
+                        .written,
+                    0
+                );
+            }
+            assert_eq!(
+                slot.store.counters().receipt_pending_records,
+                store::MAX_BATCH as u64
+            );
+            assert_eq!(slot.store.disabled(), None, "fill table before disabling");
+            if cause == "obligation_overflow" {
+                let mut next = records[store::MAX_BATCH].clone();
+                next.body =
+                    store::tests::pending(next.binding.clone(), next.certificate.clone(), 2).body;
+                assert_eq!(
+                    slot.store
+                        .write_after_save(lock, 2, 0, vec![next])
+                        .unwrap()
+                        .written,
+                    0
+                );
+            }
+        }
+        // Remove the injected failure: no retirement/reconciliation may erase custody.
+        store::test_hooks::set_before_rename(None);
+        store::test_hooks::set_before_unlink(None);
+        if cause == "namespace_pending" {
+            cache.durable_begin_pass(
+                source,
+                &root.join("other-index.json"),
+                &Scope("other".into()),
+                true,
+            );
+        }
+        let dir = store::store_dir_for_index(&index_path);
+        let before = store_snapshot(&dir);
+        let (debt, counters) = {
+            let mut stores = cache.durable().unwrap();
+            let slot = stores.slot(ds).as_mut().unwrap();
+            assert_eq!(slot.store.disabled(), Some(cause));
+            assert!(slot.store.receipt_pending(&store::key_digest(ds, &key)));
+            (
+                store::tests::pending_snapshot(&slot.store),
+                slot.store.counters(),
+            )
+        };
+        // These hooks prove no write/unlink/sync, in addition to full disk equality.
+        store::test_hooks::set_before_rename(Some(Box::new(|_, _| panic!("disabled rename"))));
+        store::test_hooks::set_before_unlink(Some(Box::new(|_| panic!("disabled unlink"))));
+        store::test_hooks::set_before_dir_sync(Some(Box::new(|_| panic!("disabled sync"))));
+        assert_eq!(cache.reconcile_pending_key(source, &key), None);
+        assert_eq!(cache.durable_hold(source, &key), None);
+        let ((mut index, degraded), events) =
+            crate::local_resource_diagnostics::capture(|| run(index));
+        assert_eq!(
+            degraded.snapshots.len(),
+            1,
+            "disabled capacity must publish"
+        );
+        assert_eq!(
+            snapshot_upload_body_witness(&degraded.snapshots[0]),
+            expected_body
+        );
+        assert_eq!(degraded.unreadable_path_count, 0);
+        assert!(events
+            .iter()
+            .any(|e| e["counts"]["store_disabled"] == cause));
+        assert_eq!(
+            index.files[&key].last_upload_body_witness.as_ref(),
+            Some(&witness)
+        );
+        assert_eq!(index.claude_request_census.get(&key), Some(&census));
+        let reads = events
+            .iter()
+            .filter_map(|e| e["counts"].get("sampled_acquisition"))
+            .filter(|r| r.is_object())
+            .collect::<Vec<_>>();
+        assert!(!reads.is_empty(), "real acquisition diagnostics reached");
+        assert!(reads.iter().all(|r| r["full_selections"] == 0));
+        assert!(reads
+            .iter()
+            .any(|r| r["unchanged_selections"].as_u64().unwrap() > 0));
+        assert!(reads.iter().all(|r| r["completed_native_bytes"] == 0));
+        let (counts, _) = cache.durable_counters(source).unwrap();
+        assert_eq!(counts.restored, 0);
+        assert_eq!(counts.durable_held, [0; 7]);
+        {
+            let mut stores = cache.durable().unwrap();
+            let slot = stores.slot(ds).as_mut().unwrap();
+            assert_eq!(store::tests::pending_snapshot(&slot.store), debt);
+            assert_eq!(
+                slot.store.read(
+                    &store::key_digest(ds, &key),
+                    &codec::allowlist_digest(source)
+                ),
+                ReadOutcome::Missing
+            );
+            assert_eq!(
+                slot.store.counters(),
+                counters,
+                "disabled store performs no work"
+            );
+        }
+        index.save(&index_path).unwrap();
+        assert_eq!(
+            cache
+                .durable_write_after_save(lock, source, &index)
+                .unwrap()
+                .written,
+            0
+        );
+        cache.durable_gc(lock, source, &index).unwrap();
+        assert_eq!(store_snapshot(&dir), before);
+        let mut stores = cache.durable().unwrap();
+        assert_eq!(
+            store::tests::pending_snapshot(&stores.slot(ds).as_ref().unwrap().store),
+            debt
+        );
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "needs native cache admission layout"
+)]
+fn m1_setup_inventory_and_statvfs_failures_are_counted_and_retry_with_original_provenance() {
+    assert!(crate::heap_layout_bound::layout_supported());
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        for (stage_index, stage) in ["setup", "inventory", "statvfs"].into_iter().enumerate() {
+            let root = crate::test_scratch::ScratchDir::new("dt-write-attempt-failure");
+            let lock = test_locks::hold(&root);
+            let _clear = ClearWriteFaults;
+            let path = root.join("source.jsonl");
+            if source == SnapshotSource::Codex {
+                codex_budget_fixture(&path, "019fa111-2222-7333-8444-555555555555", None);
+            } else {
+                native_fixture(&path);
+            }
+            let scope = Scope("failure-file".into());
+            let namespace = Scope("failure-attempt".into());
+            let index_path = root.join("index.json");
+            let key = local_index_key(&path);
+            let cache = SharedCache::default();
+            cache.durable_begin_pass(source, &index_path, &namespace, false);
+            let (reduction, checkpoint) = native_record_of(&path, &scope, source);
+            let expected_body =
+                codec::encode(&reduction, store::BODY_BYTES, jsonl_line_cap() as u64).unwrap();
+            assert!(cache.insert_admitted(
+                key.clone(),
+                sampled_jsonl::CompletedNativeAcquisition {
+                    checkpoint,
+                    reduction: Some(reduction),
+                    released: None,
+                    unsealed: false,
+                },
+                0
+            ));
+            cache.durable_note_selection(&key, "original-fingerprint");
+            let mut index = ScanIndex::default();
+            index.files.insert(
+                key.clone(),
+                serde_json::from_value(serde_json::json!({
+                    "size_bytes":std::fs::metadata(&path).unwrap().len(),
+                    "modified_unix_seconds":1,"source_file_fingerprint":"original-fingerprint"
+                }))
+                .unwrap(),
+            );
+            index.save(&index_path).unwrap();
+            store::test_hooks::set_write_failure(Some(stage));
+            let (failed, events) = crate::local_resource_diagnostics::capture(|| {
+                cache.durable_write_after_save(lock, source, &index)
+            });
+            store::test_hooks::set_write_failure(None);
+            assert!(
+                failed.is_none(),
+                "no false batch receipt: {source:?}/{stage}"
+            );
+            let (counts, disk) = cache.durable_counters(source).unwrap();
+            assert_eq!(counts.not_persisted.get(stage), Some(&1));
+            assert_eq!(
+                disk.store_write_failed,
+                std::array::from_fn(|i| u64::from(i == stage_index))
+            );
+            assert_eq!(disk.records_written, 0);
+            assert_eq!(disk.receipt_pending_records, 0);
+            assert_eq!(disk.receipt_reconciled, 0);
+            assert!(events
+                .iter()
+                .any(|e| e["counts"]["store_write_failed"][stage] == 1
+                    && e["counts"]["not_persisted"][stage] == 1
+                    && e["source"] == source.api_slug()));
+            {
+                let stores = cache.durable().unwrap();
+                assert!(stores.touched.contains(&key));
+                assert_eq!(
+                    stores.selected.get(&key).map(String::as_str),
+                    Some("original-fingerprint")
+                );
+            }
+            let ds = durable_source(source).unwrap();
+            {
+                let mut stores = cache.durable().unwrap();
+                assert_eq!(
+                    stores.slot(ds).as_mut().unwrap().store.read(
+                        &store::key_digest(ds, &key),
+                        &codec::allowlist_digest(source)
+                    ),
+                    ReadOutcome::Missing
+                );
+            }
+            // No new selection/admission/acquisition: next save retries the same provenance.
+            cache.durable_begin_pass(source, &index_path, &namespace, false);
+            index.save(&index_path).unwrap();
+            assert_eq!(
+                cache
+                    .durable_write_after_save(lock, source, &index)
+                    .unwrap()
+                    .written,
+                1
+            );
+            let mut stores = cache.durable().unwrap();
+            assert!(!stores.touched.contains(&key));
+            assert!(!stores.selected.contains_key(&key));
+            let record = store::tests::found(stores.slot(ds).as_mut().unwrap().store.read(
+                &store::key_digest(ds, &key),
+                &codec::allowlist_digest(source),
+            ));
+            assert_eq!(record.record.body, expected_body);
+            assert_eq!(record.index_generation, index.generation);
+        }
+    }
+}
+
 #[test]
 fn oversized_active_request_refuses_without_waiting_or_opening_a_store() {
     let cache = SharedCache::default();
