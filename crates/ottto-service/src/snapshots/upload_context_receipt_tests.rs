@@ -935,7 +935,7 @@ fn context_catchup_fresh_priority_classifies_backlog_once_and_preserves_fifo() {
 }
 #[test]
 fn context_catchup_fresh_priority_cannot_spend_single_reserved_census_slot() {
-    let path = |name: &str, hinted| ScanTraversalPath {
+    let path = |name: &str, hinted: bool| ScanTraversalPath {
         scan_root: PathBuf::from("synthetic"),
         path: PathBuf::from(name),
         census_member: !hinted,
