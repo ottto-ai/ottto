@@ -32305,7 +32305,13 @@ impl OwnedSourceScan {
                     ) {
                         Ok(Some(read)) => active.parser.reader.reader.put_upgrade(read),
                         Ok(None) => {}
-                        Err(_) => {} // Observation refusal cannot hold an authorized absent-record Full.
+                        Err(sampled_scan::durable_tail::RetailHold::Ineligible) => {
+                            context
+                                .cache
+                                .durable_stale_hold(source, index, &active.candidate);
+                            pending!(); // Transient held-FD metadata failure retains its existing hold.
+                        }
+                        Err(_) => {} // Accounting loss cannot hold an authorized absent-record Full.
                     }
                 }
                 if let Some((mode, audit_due)) = planned_mode {
