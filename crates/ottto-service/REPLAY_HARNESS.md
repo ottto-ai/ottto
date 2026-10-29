@@ -91,9 +91,11 @@ session and body domains remain `replay-session-v1\0` and
 `replay-emitted-body-v1\0`. All commitments use the same supplied key.
 
 The feature-enabled synthetic integration target declares `required-features`.
-The Linux job's final `Replay harness (feature)` step runs it and the oracle unit
-tests explicitly, without enabling the feature for release builds or the full
-workspace. Both commands run even if one fails, and either failure fails the step:
+The separate, path-filtered `Replay harness (feature)` Linux job runs it and the
+oracle unit tests explicitly, in parallel with default tests. This advisory job
+is non-required and pending the CI-speed owner's OK. It uses the existing Linux
+cache scheme and enables the feature only for these targets. Both commands run
+even if one fails, and either failure fails the step:
 
 ```
 cargo test -p ottto-service --test replay_harness --features replay-harness --locked -- --nocapture
