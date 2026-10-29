@@ -50,7 +50,7 @@ pub(crate) fn durable_sidecar_prepared_fixture(
 /// Consumer S2 guard, active only in the synthetic durable-route harness.
 /// Native accepted ledger + witness remain the authority; no money in slots.
 #[cfg(all(test, unix))]
-pub(crate) fn durable_sidecar_held_roots(
+pub(crate) fn durable_sidecar_held_entities(
     support: &Path,
     index: &crate::snapshots::ScanIndex,
     items: &[crate::snapshots::SnapshotItem],
@@ -69,7 +69,7 @@ pub(crate) fn durable_sidecar_held_roots(
             if complete || !crate::snapshots::durable_sidecar_has_accepted_body(index, root) {
                 None
             } else {
-                Some(root.to_owned())
+                Some(item.source_session_id.clone())
             }
         })
         .collect();

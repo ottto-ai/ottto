@@ -448,3 +448,85 @@ fn durable_sidecar_money_cohort_refusal_cannot_downgrade_healthy_strict_root() {
         assert_reported(&recovered, 2);
     });
 }
+
+#[test]
+fn durable_sidecar_money_refusal_holds_accepted_root_and_agent_entities() {
+    with_e2(|| {
+        let agent_session = format!("{ROOT}_agent-000");
+        let mut c = Corpus::new("sidecar-money-agent-floor");
+        let root_path = c.root(ROOT, &line(ROOT, "r1", AT, 10));
+        let agent_path = c.agent(0, &line(ROOT, "a1", AT, 20));
+        c.evidence(
+            &[api("r1", 10, 100), api("a1", 20, 200)],
+            &[trace("a1", "agent-000")],
+        );
+        let expected = cold(&c);
+        assert_reported(&expected, 1);
+        assert_eq!(
+            expected.snapshots[&agent_session]["telemetry_owned_complete"],
+            true
+        );
+        assert!(expected.snapshots[&agent_session]["cost"]["total_cost_usd"].is_string());
+        let mut slots = Slots::new(&c);
+        let (mut reader, (page, prior, holds)) =
+            with_durable_sidecar_reader(slots.reader(&c), || {
+                render(&c, ScanIndex::default(), Mode::Ram)
+            });
+        money_oracle::assert_equivalent(&expected, &prior);
+        let mut progress = e2_progress();
+        let accepted = settle_route(&c, &ScanIndex::default(), page, &mut progress, holds);
+        let before = stored_bodies(&accepted);
+        assert_eq!(
+            before.len(),
+            2,
+            "root and agent have accepted native tuples"
+        );
+        assert_eq!(progress.accepted_fingerprints.len(), 2);
+        slots.save(&mut reader);
+        append(&root_path, &line(ROOT, "r2", "2026-08-02T07:01:00Z", 30));
+        append(&agent_path, &line(ROOT, "a2", "2026-08-02T07:01:00Z", 40));
+        let api_path = sidecar_path(&c, false);
+        let parked = api_path.with_extension("refused");
+        std::fs::rename(&api_path, &parked).unwrap();
+        reader.begin_pass();
+        let (mut reader, (page, held, holds)) =
+            with_durable_sidecar_reader(reader, || render(&c, accepted.clone(), Mode::Ram));
+        assert!(
+            held.snapshots.is_empty(),
+            "both exact entity IDs hold; no agent estimate may escape"
+        );
+        assert!(held.batches.is_empty());
+        assert_eq!(holds.held_entity_count, 2);
+        assert!(!holds.held_fingerprints.is_empty());
+        let held_index = settle_route(&c, &accepted, page, &mut progress, holds);
+        assert_eq!(
+            stored_bodies(&held_index),
+            before,
+            "both accepted bodies/witnesses survive"
+        );
+        assert_eq!(
+            progress.accepted_fingerprints.len(),
+            2,
+            "refusal grants no new ACK"
+        );
+        std::fs::rename(parked, &api_path).unwrap();
+        for row in [api("r2", 30, 300), api("a2", 40, 400)] {
+            append(&api_path, &(serde_json::to_string(&row).unwrap() + "\n"));
+        }
+        append(
+            &sidecar_path(&c, true),
+            &(serde_json::to_string(&trace("a2", "agent-000")).unwrap() + "\n"),
+        );
+        let expected = cold(&c);
+        reader.begin_pass();
+        let (_, (_, recovery, _)) =
+            with_durable_sidecar_reader(reader, || render(&c, held_index, Mode::Ram));
+        money_oracle::assert_equivalent(&expected, &recovery);
+        assert_reported(&recovery, 2);
+        assert_eq!(recovery.snapshots[&agent_session]["request_count"], 2);
+        assert_eq!(
+            recovery.snapshots[&agent_session]["telemetry_owned_complete"],
+            true
+        );
+    });
+}

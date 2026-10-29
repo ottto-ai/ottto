@@ -9151,7 +9151,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     // an estimate. Keep the native body/witness and retry the whole join.
     // Activation stays dark; wire this same consumer guard with the reader.
     #[cfg(all(test, unix))]
-    disposition.hold_request_owned(crate::claude_local_otel::durable_sidecar_held_roots(
+    disposition.hold_request_owned(crate::claude_local_otel::durable_sidecar_held_entities(
         support_dir,
         index,
         &scan_result.snapshots,
