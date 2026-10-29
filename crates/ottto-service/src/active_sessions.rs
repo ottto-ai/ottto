@@ -3087,6 +3087,7 @@ mod tests {
             cache_observations: None,
             cache_observations_state: None,
             cache_base_head_etag: None,
+            cache_conflict_answer: None,
             cache_requests: Vec::new(),
             cache_requests_complete: true,
             avg_duration_ms: None,

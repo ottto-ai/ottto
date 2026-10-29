@@ -750,6 +750,18 @@ pub struct SnapshotBatchResponse {
     pub rejected_entities: Vec<SnapshotEntityRejection>,
     #[serde(default)]
     pub conflict_entities: Vec<SnapshotEntityRef>,
+    /// Local-only, keyed by conflicted snapshot fingerprint. Bound from the
+    /// request at the network boundary; never read from the response wire.
+    #[serde(skip)]
+    pub(crate) conflict_rescans: std::collections::BTreeMap<String, SnapshotConflictRescan>,
+}
+
+/// The exact refused request body a head-CAS challenge was minted over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SnapshotConflictRescan {
+    pub(crate) revision_v2_hash: String,
+    /// The refused body already carried an answer to an earlier challenge.
+    pub(crate) answered: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -872,6 +884,36 @@ pub(crate) fn snapshot_ack_body_witness_version(
 }
 
 impl SnapshotBatchResponse {
+    /// Bind each challenged head-CAS conflict to the revision v2 hash its
+    /// request body carried, recomputed with the same envelope function the
+    /// serializer used. A later upload answers the challenge through the
+    /// backend's existing rescan handshake. Call after ACK validation.
+    pub(crate) fn bind_conflict_rescans(&mut self, request: &SnapshotBatchRequest) {
+        let Some(source) = crate::snapshots::snapshot_source_from_api_slug(&request.source) else {
+            return;
+        };
+        for reference in &self.conflict_entities {
+            if !valid_snapshot_head_token(reference.head_challenge.as_deref()) {
+                continue;
+            }
+            let Some(item) = request.snapshots.iter().find(|item| {
+                item.source_session_id == reference.source_session_id
+                    && item.snapshot_fingerprint == reference.snapshot_fingerprint
+            }) else {
+                continue;
+            };
+            let envelope =
+                crate::snapshots::snapshot_semantic_envelope(source, item, request.upload_policy);
+            self.conflict_rescans.insert(
+                reference.snapshot_fingerprint.clone(),
+                SnapshotConflictRescan {
+                    revision_v2_hash: envelope.revision_v2_hash,
+                    answered: envelope.conflict_head_challenge.is_some(),
+                },
+            );
+        }
+    }
+
     /// Reject malformed, short, duplicated, foreign, overlapping, or partial
     /// ACKs before any local checkpoint can advance.
     pub fn validate_entity_ack(&self, request: &SnapshotBatchRequest) -> Result<()> {
@@ -4581,6 +4623,7 @@ mod tests {
         accepted_entities: Vec<SnapshotEntityRef>,
     ) -> SnapshotBatchResponse {
         SnapshotBatchResponse {
+            conflict_rescans: Default::default(),
             accepted,
             sessions_reconciled: 0,
             session_ids: Vec::new(),

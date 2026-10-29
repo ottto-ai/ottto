@@ -686,6 +686,7 @@ impl ApcFixture {
                     })),
                     ApcUpload::PermanentRejection | ApcUpload::RetryableRejection => {
                         let response = crate::snapshot_client::SnapshotBatchResponse {
+                            conflict_rescans: Default::default(),
                             accepted: 0,
                             sessions_reconciled: 0,
                             session_ids: Vec::new(),

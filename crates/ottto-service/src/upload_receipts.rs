@@ -1115,6 +1115,7 @@ mod tests {
 
     fn response(raw_id: &str) -> SnapshotBatchResponse {
         SnapshotBatchResponse {
+            conflict_rescans: Default::default(),
             accepted: 1,
             sessions_reconciled: 1,
             session_ids: Vec::new(),
