@@ -598,8 +598,10 @@ mod ignored_tests {
             serde_json::json!({"rearm_structural_native_duplicate": 1})
         );
         native.rearm_structural_native_duplicate = u64::MAX;
-        let mut extra = Counts::default();
-        extra.rearm_structural_native_duplicate = 1;
+        let extra = Counts {
+            rearm_structural_native_duplicate: 1,
+            ..Counts::default()
+        };
         native.merge(extra);
         assert_eq!(native.rearm_structural_native_duplicate, u64::MAX);
     }
