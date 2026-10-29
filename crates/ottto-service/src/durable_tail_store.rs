@@ -449,7 +449,7 @@ pub(crate) struct DurableTailStore {
     pass: [u64; 2],
     rebuilt: BTreeSet<Digest32>,
     startup_synced: bool,
-    pending: BTreeMap<Digest32, (Option<Stamp>, u64, Digest32, Digest32)>,
+    pending: BTreeMap<Digest32, (Option<Stamp>, u64, Digest32, Digest32, u8)>,
 }
 
 /// The most record files one GC or inventory pass looks at. Twice the
@@ -460,6 +460,8 @@ pub(crate) const INVENTORY_BOUND: usize = 2 * MAX_RECORDS;
 /// `max(T14_BREAKER, 2% of the records loaded)`.
 pub(crate) const T14_BREAKER: u64 = 20;
 const REBUILT_BOUND: usize = 64;
+// Three actual failures for one receipt bound this hold; lease waits do not count.
+const RECEIPT_RECONCILE_FAILURES: u8 = 3;
 // A memo entry stays within the 128 bytes per record `STORES_RESIDENT_BOUND` charges.
 const _: () = assert!(std::mem::size_of::<(Digest32, (Option<Digest32>, Stamp, bool))>() <= 128);
 
@@ -782,10 +784,31 @@ impl DurableTailStore {
         key: &Digest32,
     ) -> io::Result<bool> {
         self.check_writer(writer)?;
+        if self.disabled.is_some() {
+            return Err(io::Error::other("store disabled"));
+        }
+        let result = self.reconcile_pending_inner(writer, key);
+        if result.is_err() {
+            if let Some(pending) = self.pending.get_mut(key) {
+                pending.4 = pending.4.saturating_add(1);
+                if pending.4 >= RECEIPT_RECONCILE_FAILURES {
+                    self.disable("receipt_unreconciled");
+                }
+            }
+        }
+        result
+    }
+
+    fn reconcile_pending_inner(
+        &mut self,
+        writer: &dyn SingleWriter,
+        key: &Digest32,
+    ) -> io::Result<bool> {
         if !self.usable(Some(writer)) {
             return Err(io::Error::other("store disabled"));
         }
-        let Some((prior, generation, content, allowlist)) = self.pending.get(key).copied() else {
+        let Some((prior, generation, content, allowlist, _)) = self.pending.get(key).copied()
+        else {
             return Ok(true);
         };
         let path = self.record_path(key);
@@ -1002,6 +1025,7 @@ impl DurableTailStore {
                     committed_generation,
                     content,
                     stored.record.allowlist,
+                    0,
                 ),
             );
             if write_atomic(&self.dir, &path, &bytes, prior)

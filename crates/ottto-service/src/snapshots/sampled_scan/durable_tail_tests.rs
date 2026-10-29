@@ -1371,7 +1371,11 @@ impl Drop for ClearWriteFaults {
 fn disabled_pending_store_publishes_valid_ram_through_production_scan_without_mutation() {
     assert!(crate::heap_layout_bound::layout_supported());
     let _gate = claude_request_money::e2::GateForTest::set(true);
-    for cause in ["obligation_overflow", "namespace_pending"] {
+    for cause in [
+        "obligation_overflow",
+        "namespace_pending",
+        "receipt_unreconciled",
+    ] {
         let root = crate::test_scratch::ScratchDir::new("dt-disabled-native");
         let lock = test_locks::hold(&root);
         let _clear = ClearWriteFaults;
@@ -1474,6 +1478,14 @@ fn disabled_pending_store_publishes_valid_ram_through_production_scan_without_mu
                 store::MAX_BATCH as u64
             );
             assert_eq!(slot.store.disabled(), None, "fill table before disabling");
+            if cause == "receipt_unreconciled" {
+                for _ in 0..2 {
+                    assert!(slot
+                        .store
+                        .reconcile_pending(lock, &records[0].binding.key)
+                        .is_err());
+                }
+            }
             if cause == "obligation_overflow" {
                 let mut next = records[store::MAX_BATCH].clone();
                 next.body =
@@ -3915,4 +3927,231 @@ fn q11_complete_map_is_paid_before_the_first_key() {
         SharedCache::default().durable().unwrap().retail_spent.len(),
         0
     );
+}
+
+/// Real guard + native scan: repeated receipt failure cannot outlive a quiet
+/// sampled obligation. Existing audit debt keeps this file discoverable past W.
+#[test]
+fn receipt_retry_bound_reads_growth_after_quiet_window_and_restart_is_idle() {
+    use std::io::Write;
+    assert!(crate::heap_layout_bound::layout_supported());
+    let _gate = claude_request_money::e2::GateForTest::set(true);
+    let root = crate::test_scratch::ScratchDir::new("receipt-growth-quiet");
+    let lock = test_locks::hold(&root);
+    let _clear = ClearWriteFaults;
+    let source = SnapshotSource::ClaudeCode;
+    let ds = DurableSource::ClaudeCode;
+    let namespace = Scope("receipt-growth".into());
+    let index_path = root.join("index.json");
+    let sessions = root.join("sessions");
+    std::fs::create_dir(&sessions).unwrap();
+    let path = sessions.join("11111111-2222-4333-8444-555555555555.jsonl");
+    native_fixture(&path);
+    let key = local_index_key(&path);
+    let cache = Arc::new(SharedCache::default());
+    cache.durable_begin_pass(source, &index_path, &namespace, true);
+    let run = |cache: Arc<SharedCache>, index, at: &str| {
+        let mut scan = OwnedSourceScan::new(
+            source,
+            std::slice::from_ref(&sessions),
+            index,
+            at,
+            365,
+            100,
+            false,
+            None,
+            &[],
+            false,
+            true,
+        )
+        .with_sampled_acquisition(cache, namespace.clone());
+        for _ in 0..10000 {
+            match scan.step(None) {
+                OwnedSourceScanStep::Pending(next) => scan = next,
+                OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan),
+            }
+        }
+        panic!("native scan did not complete")
+    };
+    let (index, first) = run(cache.clone(), ScanIndex::default(), "2026-10-29T12:00:00Z");
+    assert_eq!(first.snapshots.len(), 1);
+    let append = |n| {
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .replace("req-dt-owed", &format!("req-growth-{n}"))
+            .replace("msg-dt-owed", &format!("msg-growth-{n}"));
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+            "{text}"
+        )
+        .unwrap();
+    };
+    append(1);
+    let (mut index, tail) = run(cache.clone(), index, "2026-10-29T12:00:00Z");
+    assert_eq!(
+        tail.snapshots[0].input_tokens, 200,
+        "no prefix duplication on real Tail"
+    );
+    assert!(
+        index.files[&key].has_unverified_source(),
+        "real sampled discoverability premise"
+    );
+    let mut binding = store::tests::binding("account", "scope", ("fp-a", None));
+    binding.key = store::key_digest(ds, &key);
+    {
+        let mut stores = cache.durable().unwrap();
+        let slot = stores.slot(ds).as_mut().unwrap();
+        let cert = store::tests::certificate(&path);
+        slot.store
+            .write_after_save(
+                lock,
+                1,
+                0,
+                vec![store::tests::pending(binding.clone(), cert.clone(), 1)],
+            )
+            .unwrap();
+        store::test_hooks::set_before_rename(Some(Box::new(|_, _| {
+            Err(std::io::Error::other("rename EIO"))
+        })));
+        store::test_hooks::set_before_unlink(Some(Box::new(|_| {
+            Err(std::io::Error::other("unlink EIO"))
+        })));
+        slot.store
+            .write_after_save(
+                lock,
+                2,
+                0,
+                vec![store::tests::pending(binding.clone(), cert, 2)],
+            )
+            .unwrap();
+        assert!(slot.store.receipt_pending(&binding.key));
+    }
+    append(2);
+    let before_disk = store_snapshot(&store::store_dir_for_index(&index_path));
+    let ((held, scan), events) = crate::local_resource_diagnostics::capture(|| {
+        run(cache.clone(), index, "2026-10-29T12:00:00Z")
+    });
+    assert!(scan.snapshots.is_empty());
+    assert!(events.iter().all(
+        |e| e["counts"]["sampled_acquisition"]["completed_native_bytes"]
+            .as_u64()
+            .unwrap_or(0)
+            == 0
+    ));
+    assert_eq!(
+        cache
+            .durable()
+            .unwrap()
+            .slot(ds)
+            .as_ref()
+            .unwrap()
+            .store
+            .disabled(),
+        None
+    );
+    index = held;
+    // Preserve genuine sampled debt; move its existing deadline past due as in
+    // the native audit fixtures. The source mtime is now more than W old.
+    index
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .set_unverified_deadline(1);
+    std::fs::File::open(&path)
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1791370000)),
+        )
+        .unwrap();
+    let (_, oracle) = run(
+        Arc::new(SharedCache::default()),
+        index.clone(),
+        "2028-10-29T12:00:00Z",
+    );
+    assert_eq!(
+        oracle.snapshots.len(),
+        1,
+        "independent real Full under the same persisted audit obligation"
+    );
+    let expected_body = serde_json::to_value(&oracle.snapshots).unwrap();
+    let ((mut index, caught), events) = crate::local_resource_diagnostics::capture(|| {
+        run(cache.clone(), index, "2028-10-29T12:00:00Z")
+    });
+    assert_eq!(
+        cache
+            .durable()
+            .unwrap()
+            .slot(ds)
+            .as_ref()
+            .unwrap()
+            .store
+            .disabled(),
+        Some("receipt_unreconciled")
+    );
+    assert_eq!(caught.snapshots.len(), 1);
+    assert_eq!(caught.snapshots[0].input_tokens, 300);
+    assert_eq!(caught.snapshots[0].output_tokens, 30);
+    let reads = events
+        .iter()
+        .filter_map(|e| e["counts"].get("sampled_acquisition"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reads
+            .iter()
+            .filter_map(|r| r["full_selections"].as_u64())
+            .sum::<u64>(),
+        1
+    );
+    assert_eq!(
+        reads
+            .iter()
+            .filter_map(|r| r["completed_native_bytes"].as_u64())
+            .sum::<u64>(),
+        std::fs::metadata(&path).unwrap().len()
+    );
+    let witness = snapshot_upload_body_witness(&caught.snapshots[0]);
+    assert_eq!(
+        serde_json::to_value(&caught.snapshots).unwrap(),
+        expected_body,
+        "exact independent Full body, no repeated prefix"
+    );
+    assert_eq!(witness, snapshot_upload_body_witness(&oracle.snapshots[0]));
+    assert_eq!(
+        store_snapshot(&store::store_dir_for_index(&index_path)),
+        before_disk
+    );
+    store::test_hooks::set_before_rename(None);
+    store::test_hooks::set_before_unlink(None);
+    index.save(&index_path).unwrap();
+    drop(cache);
+    let restarted = Arc::new(SharedCache::default());
+    restarted.durable_begin_pass(source, &index_path, &namespace, true);
+    let ((index, idle), events) = crate::local_resource_diagnostics::capture(|| {
+        run(
+            restarted,
+            ScanIndex::load(&index_path).unwrap(),
+            "2028-10-29T12:00:00Z",
+        )
+    });
+    assert!(
+        idle.snapshots.is_empty(),
+        "quiet restart publishes no duplicate prefix"
+    );
+    assert!(events.iter().all(
+        |e| e["counts"]["sampled_acquisition"]["completed_native_bytes"]
+            .as_u64()
+            .unwrap_or(0)
+            == 0
+    ));
+    assert!(!index
+        .files
+        .get(&key)
+        .is_some_and(ScanIndexEntry::has_unverified_source));
 }
