@@ -6,8 +6,8 @@ pub(crate) const LABEL: &str = "Not collecting: update Ottto";
 pub(crate) const DETAIL: &str = "This source is not collecting because its local index needs a newer Ottto. Update Ottto; collection resumes after a compatible index loads. Keep the local index.";
 
 pub(crate) const SHARD_CODE: &str = "index_shard_unavailable";
-pub(crate) const SHARD_LABEL: &str = "Not collecting: index needs repair";
-pub(crate) const SHARD_DETAIL: &str = "Collection is paused because saved evidence is unavailable. Keep the local index and contact Ottto support to restore it; collection resumes when the index is complete.";
+pub(crate) const SHARD_LABEL: &str = "Not collecting: local data needs repair";
+pub(crate) const SHARD_DETAIL: &str = "Ottto paused collection for this app because some saved local data is missing or damaged. Don't delete Ottto's data folder. Contact Ottto support to restore it; collection resumes once it's complete.";
 
 #[derive(Clone, Copy)]
 pub(crate) enum Reason {

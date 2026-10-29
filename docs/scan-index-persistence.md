@@ -324,14 +324,20 @@ changes emit health events, and the first unavailable load of each episode emits
 continue on every load. Payload dimensions contain only source, fixed reasons
 and counts, never IDs, paths or digests.
 
-Proposed presentation copy is centralized in `scan_index_health.rs` for wording
-approval: **Not collecting: index needs repair**. Hover: "Collection is paused
-because saved evidence is unavailable. Keep the local index and contact Ottto
-support to restore it; collection resumes when the index is complete."
-The action is `contact_support`; this warning does not authorize deletion,
-quarantine, automatic repair or new acquisition. Consumer label mappings are a
-separate presentation change; the open-string reason and known degraded/warning
-states preserve compatibility without a new protocol enum tag.
+Approved presentation copy is centralized in `scan_index_health.rs`
+(`SHARD_LABEL` and `SHARD_DETAIL`). Consumer label mappings are a separate
+presentation change; the open-string reason and known degraded/warning states
+preserve compatibility without a new protocol enum tag.
+
+The action remains `contact_support`. The existing interactive user Repair
+route handles a whole-index rebuild-loop pause, not UNKNOWN maps: successful
+partial loads clear that separate pause; arming returns `NotPaused`. Its override
+reads identity from a legacy root and replaces the whole index from a carried
+rebuild, whereas schema-3 metadata and healthy siblings must survive. It cannot
+be presented as map repair. No shard quarantine, automatic repair, new
+acquisition or recovery bypass is enabled here. A separately reviewed map-scoped
+repair/restore route is an open release blocker; its rebuild cause and custody
+rules require approval before implementation.
 
 Per-map recovery fixtures corrupt a real shard, retain a previously prepared E2
 page while UNKNOWN, restore the original bytes, then reload a complete view.

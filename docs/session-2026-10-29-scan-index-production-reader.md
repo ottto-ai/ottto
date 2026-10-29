@@ -25,3 +25,19 @@ an undamaged nonzero-money control with zero transcript reads. Projection
 fixtures cover repeated loads, recovery, captured state, sibling sources and
 set/clear events between status reads. Proposed label/hover strings are constants
 pending wording approval; companion/web presentation remains separate.
+
+
+Round 10 applies the approved plain-language copy in the existing constants.
+The existing user Repair override cannot exit an UNKNOWN-map hold without new
+behavior: it only arms for a whole-index rebuild-loop pause and carries identity
+into a replacement index. Partial load succeeds, retains metadata and clears
+that separate pause. Keep `contact_support`; map-scoped recovery remains a
+release blocker pending review, with no repair bypass enabled.
+
+Round 9 Linux failed in the healthy control before damage: finalization dropped
+E2's request-owned literal because the fixture left active body revision 0.
+Production preparation activates the compiled revision before scanning. The
+fixture now does the same, stamps that revision, and reproduces the revision-0
+veto on the same emitted body as a negative witness. All exact nonzero money,
+body/manifest equality and zero-transcript-read assertions remain. Runtime
+qualification must use final-head CI; no tests were run locally.

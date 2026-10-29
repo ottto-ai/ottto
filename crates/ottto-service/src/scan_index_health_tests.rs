@@ -305,6 +305,13 @@ fn unavailable_shards_project_source_health_alarm_once_and_clear_after_restorati
         assert_eq!(row.state, LocalHealthSourceState::Unknown);
         assert_eq!(row.blocking_reason.as_deref(), Some(health::SHARD_CODE));
         assert_eq!(row.next_action.as_deref(), Some("contact_support"));
+        // UNKNOWN is a successful partial load, not the whole-index rebuild
+        // loop. Do not offer a Repair action that cannot recover this state.
+        assert!(!snapshots::scan_index_rebuild_paused(source));
+        assert!(matches!(
+            snapshots::arm_scan_index_rebuild_manual_override(source, std::time::SystemTime::now()),
+            snapshots::ScanIndexRebuildOverride::NotPaused
+        ));
         let blocker = projection.blockers.iter().find(|b| b.code == health::SHARD_CODE).unwrap();
         assert_eq!(blocker.source, "claude_code");
         assert_eq!(blocker.severity, LocalHealthSeverity::Warning);
