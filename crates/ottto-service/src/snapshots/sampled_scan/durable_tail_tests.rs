@@ -8201,13 +8201,12 @@ fn c_strict_writer_retires_only_a_successfully_acknowledged_replacement() {
                     .original
                     .as_ref()
                     .expect("original custody on error");
-                assert_eq!(
-                    stores.slots[DurableSource::ClaudeCode.slot()]
+                assert!(
+                    !stores.slots[DurableSource::ClaudeCode.slot()]
                         .as_ref()
                         .unwrap()
                         .store
                         .witness_current(proof),
-                    false,
                     "retirement or replacement invalidates the original filesystem stamp"
                 );
                 assert_eq!(stores.retail_spent[&digest].spent, Some(spent));
