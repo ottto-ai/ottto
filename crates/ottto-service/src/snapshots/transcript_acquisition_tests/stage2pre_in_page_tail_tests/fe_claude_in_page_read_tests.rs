@@ -1329,8 +1329,15 @@ fn fe_claude_full_without_audit_capacity_keeps_main_failure_and_marker_count() {
             &base.key,
             &result,
             &seen,
-            OPEN_READ,
+            SCOPE_OBJECT,
             "FE capacity",
+        );
+        // H1c freezes the admitted extent independently of audit capacity.
+        // With no H3c audit marker, completion revalidates the selected object.
+        assert_eq!(
+            seen.causes,
+            [0, 0, 0, 1, 0, 0, 0, 0],
+            "only scope/object refusal"
         );
         assert!(!index
             .files

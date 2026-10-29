@@ -1119,6 +1119,37 @@ fn production_scan_at_with_setup(
     (usize, usize, usize),
     (u64, u64),
 ) {
+    let (index, raw, _, modes, metrics) = production_scan_page_at_with_setup(
+        fixture,
+        source,
+        index,
+        cache,
+        namespace,
+        collected_at,
+        setup,
+    );
+    (index, raw, modes, metrics)
+}
+
+// Keep native output and the finalized upload candidates distinct. Production
+// applies policy and body-witness no-op suppression before offering a POST.
+type ProductionScanPage = (
+    ScanIndex,
+    SourceScanResult,
+    SourceScanResult,
+    (usize, usize, usize),
+    (u64, u64),
+);
+
+fn production_scan_page_at_with_setup(
+    fixture: &ScanFixture,
+    source: SnapshotSource,
+    index: ScanIndex,
+    cache: Option<Arc<sampled_scan::SharedCache>>,
+    namespace: &str,
+    collected_at: &str,
+    setup: impl FnOnce(&mut OwnedSourceScan),
+) -> ProductionScanPage {
     let mut scan = OwnedSourceScan::new(
         source,
         std::slice::from_ref(&fixture.root),
@@ -1168,7 +1199,7 @@ fn production_scan_at_with_setup(
                     .map(|snapshot| snapshot.snapshot_fingerprint.clone())
                     .collect();
                 index.record_accepted_snapshot_fingerprints(&accepted);
-                return (index, scan, modes, metrics);
+                return (index, scan, projected, modes, metrics);
             }
         }
     }
@@ -1667,6 +1698,7 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
     impl Drop for ResetClock {
         fn drop(&mut self) {
             sampled_scan::set_test_now(None);
+            sampled_scan::test_hooks::clear();
         }
     }
     let _clock = ResetClock;
@@ -1682,6 +1714,7 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
             ("due_quiet", 0),
             ("slots_256", 256),
             ("slots_300", 300),
+            ("slots_1024", 1024),
             ("clock_append", 0),
             ("real_edit", 0),
         ] {
@@ -1808,6 +1841,7 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
                 // admission refuses it: exercise DT's budget-refused Miss.
                 *second.retained().unwrap() = TranscriptCache::with_byte_limit(0);
             }
+            sampled_scan::test_hooks::clear();
             let (((warm, result, modes, bytes), diagnostics), sample_reads) =
                 crate::transcript_acquisition::capture_sample_reads(|| {
                     crate::local_resource_diagnostics::capture(|| {
@@ -1823,7 +1857,7 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
                                 if pending > 0 {
                                     assert_eq!(context.audit_slots, 0);
                                     assert_eq!(context.audit_metadata_supported, pending <= 256);
-                                    let (budget, _) = sampled_scan::copy_budget_step(
+                                    let (budget, step) = sampled_scan::copy_budget_step(
                                         scan.sampling.as_ref(),
                                         None,
                                         false,
@@ -1832,11 +1866,19 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
                                         budget > 0,
                                         "audit population cannot zero the bounded copy budget"
                                     );
+                                    let resident = step.resident.expect("measured residents");
+                                    assert!(resident > 0);
+                                    assert!(
+                                        resident + 2 * budget
+                                            <= crate::transcript_cache::CACHE_BYTES,
+                                        "residents plus both copy shares stay within the cache cap"
+                                    );
                                 }
                             },
                         )
                     })
                 });
+            let copy_decisions = sampled_scan::test_hooks::decisions();
             let pages = diagnostics
                 .iter()
                 .filter(|record| record["stage"] == "native_collection_page")
@@ -1931,8 +1973,285 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
                 !full,
                 "only an actual native Full verifies the source"
             );
+            if pending > 0 {
+                // E3 C2: index debt population is not resident-cache capacity.
+                // Inspect the actual retained copy and the real retention
+                // call's allowance; no fabricated budget or copy is injected.
+                use sampled_scan::test_hooks::Decision;
+                let cache = second.retained().unwrap();
+                let resident = cache.resident_bound().expect("cache admission bound");
+                assert!(resident > 0 && resident <= crate::transcript_cache::CACHE_BYTES);
+                assert!(cache.victims().len() <= crate::transcript_cache::CACHE_ENTRIES);
+                let copy = cache.peek(&key).expect("restored Tail copy was retained");
+                let budget = match copy_decisions.as_slice() {
+                    [Decision::Granted {
+                        budget,
+                        resident_measured: true,
+                        active_measured: true,
+                    }] => *budget,
+                    [Decision::Deferred { budget_after, .. }] => *budget_after,
+                    other => panic!("one measured retention allowance: {other:?}"),
+                };
+                assert!(budget > 0);
+                let bytes = crate::heap_layout_bound::bound(
+                    copy,
+                    budget.min(crate::transcript_cache::ENTRY_BYTES),
+                )
+                .expect("actual copy fits both its allowance and per-entry bound");
+                assert!(bytes > 0 && bytes <= budget);
+                drop(cache);
+                assert!(
+                    crate::heap_layout_bound::bound(
+                        second.as_ref(),
+                        crate::transcript_cache::CACHE_BYTES,
+                    )
+                    .is_some(),
+                    "all shared resident state remains bounded"
+                );
+            }
         }
     }
+}
+
+/// P1: an overdue restored checkpoint must finish through the real cursor
+/// seal, publish, replace its disk binding, then restore without rereading.
+/// At 57ffaa32 Codex increments jobs_audit_restarted, never jobs_certified.
+/// Claude is the already-working ordinary-Tail negative regression control.
+#[cfg(unix)]
+#[test]
+fn overdue_durable_cursor_tail_publishes_and_next_restart_reads_no_suffix() {
+    use crate::durable_tail_store as store;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    struct ResetClock;
+    impl Drop for ResetClock {
+        fn drop(&mut self) {
+            sampled_scan::set_test_now(None);
+        }
+    }
+    let _clock = ResetClock;
+    const START: u64 = 1_800_000_000;
+    const PAGE_BYTES: u64 = 1024;
+    let due = START + crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS;
+    sampled_scan::codex_cursor::with_test_limits(PAGE_BYTES, PAGE_BYTES, 128, || {
+        for source in [SnapshotSource::Codex, SnapshotSource::ClaudeCode] {
+            sampled_scan::set_test_now(Some(START));
+            let fixture = ScanFixture::new(source);
+            fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+            let before = fs::metadata(&fixture.file.0).unwrap().len();
+            assert!(before < PAGE_BYTES, "seed is an ordinary read");
+            let namespace = Scope("overdue-cursor-restart".into());
+            let state = fixture.dir.join("state");
+            fs::create_dir_all(&state).unwrap();
+            let lock = crate::locked_state_dir::test_locks::hold(&state);
+            let index_path = state.join("index.json");
+            let key = local_index_key(&fixture.file.0);
+            let first = Arc::new(sampled_scan::SharedCache::default());
+            first.durable_begin_pass(source, &index_path, &namespace, true);
+            let (mut index, seed, modes) = production_scan(
+                &fixture,
+                source,
+                ScanIndex::default(),
+                Some(first.clone()),
+                &namespace.0,
+            );
+            assert_eq!(modes, (1, 0, 0));
+            assert!(!seed.snapshots.is_empty());
+            let old_fingerprint = index.files[&key].source_file_fingerprint.clone();
+            assert!(index.stage_sampled_audit(
+                &key,
+                &old_fingerprint,
+                crate::transcript_acquisition::AuditDebt {
+                    due_unix_seconds: due
+                },
+            ));
+            index.save(&index_path).unwrap();
+            assert_eq!(
+                first
+                    .durable_write_after_save(lock, source, &index)
+                    .unwrap()
+                    .written,
+                1
+            );
+            let durable_source = sampled_scan::durable_tail::durable_source(source).unwrap();
+            let allowlist = sampled_jsonl::durable::allowlist_digest(source);
+            let read_record = || {
+                let mut disk = store::DurableTailStore::new(
+                    store::store_dir_for_index(&index_path),
+                    durable_source,
+                );
+                match disk.read(&store::key_digest(durable_source, &key), &allowlist) {
+                    store::ReadOutcome::Found(record) => record,
+                    other => panic!("{other:?}"),
+                }
+            };
+            let old_record = read_record();
+            drop(first);
+            for id in 1..=12 {
+                fixture
+                    .file
+                    .append(&usage(source, 100 + id as u64 * 30, id, "fixture-model"));
+            }
+            let length = fs::metadata(&fixture.file.0).unwrap().len();
+            assert!(
+                length - before > PAGE_BYTES,
+                "append exceeds the scaled real cursor budget"
+            );
+            sampled_scan::set_test_now(Some(due + 3600));
+            let second = Arc::new(sampled_scan::SharedCache::default());
+            second.durable_begin_pass(source, &index_path, &namespace, true);
+            assert!(second.retained_checkpoint(&key).is_none());
+            index = ScanIndex::load(&index_path).unwrap();
+            let cold_index = index.clone();
+            let mut published = None;
+            for page in 1..=32 {
+                let collected_at = format!("2026-10-07T12:00:{page:02}Z");
+                let (next, raw_tail, result, modes, _) = production_scan_page_at_with_setup(
+                    &fixture,
+                    source,
+                    index,
+                    Some(second.clone()),
+                    &namespace.0,
+                    &collected_at,
+                    |_| {},
+                );
+                index = next;
+                assert_eq!(modes.0, 0, "no forced Full");
+                assert_eq!(
+                    second.counters_for_test().jobs_audit_restarted,
+                    0,
+                    "never Restart for audit age"
+                );
+                if !result.snapshots.is_empty() {
+                    published = Some((raw_tail, result, collected_at));
+                    break;
+                }
+            }
+            let (raw_tail, published, published_at) =
+                published.expect("overdue Tail completes and publishes");
+            let counters = second.counters_for_test();
+            if source == SnapshotSource::Codex {
+                assert_eq!(counters.jobs_started, 1);
+                assert!(
+                    counters.jobs_resumed > 0,
+                    "real multi-page cursor completion"
+                );
+                assert_eq!(counters.jobs_certified, 1);
+                assert_eq!(counters.jobs_finish_failed, 0);
+            } else {
+                assert_eq!(counters.jobs_started, 0, "Claude uses ordinary Tail");
+            }
+            assert_eq!(second.durable_counters(source).unwrap().0.restored, 1);
+            assert_ne!(index.files[&key].source_file_fingerprint, old_fingerprint);
+            assert_eq!(index.files[&key].size_bytes, length);
+            assert_eq!(index.files[&key].unverified_deadline(), Some(due));
+            let checkpoint = second
+                .retained_checkpoint(&key)
+                .expect("completed Tail retained");
+            assert_eq!(checkpoint.sealed_offset(), length);
+            assert_eq!(checkpoint.last_full_verified(), START);
+            assert_eq!(checkpoint.audit_debt().unwrap().due_unix_seconds, due);
+            let (_, raw_cold, cold, _, _) = production_scan_page_at_with_setup(
+                &fixture,
+                source,
+                cold_index,
+                None,
+                &namespace.0,
+                &published_at,
+                |_| {},
+            );
+            let published_fingerprints = published
+                .snapshots
+                .iter()
+                .map(|snapshot| snapshot.snapshot_fingerprint.clone())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                production_body(source, raw_tail),
+                production_body(source, raw_cold)
+            );
+            assert_eq!(
+                production_body(source, published),
+                production_body(source, cold)
+            );
+            let accepted = index.accepted_snapshot_fingerprints.clone();
+            let group = index.files[&key].last_snapshot_fingerprint.clone();
+            let witness = index.files[&key].last_upload_body_witness.clone();
+            assert!(!published_fingerprints.is_empty());
+            assert!(
+                published_fingerprints.is_subset(&accepted),
+                "Tail publication was acknowledged"
+            );
+            assert!(
+                group.is_some() && witness.is_some(),
+                "accepted body is bound"
+            );
+            index.save(&index_path).unwrap();
+            assert_eq!(
+                second
+                    .durable_write_after_save(lock, source, &index)
+                    .unwrap()
+                    .written,
+                1
+            );
+            let new_record = read_record();
+            assert_ne!(
+                new_record.record.binding.entry, old_record.record.binding.entry,
+                "disk binding replaced"
+            );
+            drop(second);
+            let third = Arc::new(sampled_scan::SharedCache::default());
+            third.durable_begin_pass(source, &index_path, &namespace, true);
+            let restart_index = ScanIndex::load(&index_path).unwrap();
+            let mut correction_index = restart_index.clone();
+            let (next, raw, result, modes, bytes) = production_scan_page_at_with_setup(
+                &fixture,
+                source,
+                restart_index,
+                Some(third.clone()),
+                &namespace.0,
+                NOW,
+                |_| {},
+            );
+            assert_eq!(third.durable_counters(source).unwrap().0.restored, 1);
+            assert_eq!(modes, (0, 0, 1));
+            assert_eq!(bytes.0, 0, "second restart reads zero native suffix bytes");
+            assert!(
+                !raw.snapshots.is_empty(),
+                "retained native body is replayed"
+            );
+            assert!(result.snapshots.is_empty(), "no duplicate publication");
+            assert_eq!(result.semantic_noop_count, raw.snapshots.len());
+            assert_eq!(next.accepted_snapshot_fingerprints, accepted);
+            assert_eq!(next.files[&key].last_snapshot_fingerprint, group);
+            assert_eq!(next.files[&key].last_upload_body_witness, witness);
+            // Negative control: a changed additive body at this same boundary
+            // must still be offered, even when semantic identity is unchanged.
+            let mut correction = raw.clone();
+            apply_upload_policy(
+                source,
+                &mut correction.snapshots,
+                SnapshotUploadPolicy::default(),
+            );
+            let item = &mut correction.snapshots[0];
+            let fingerprint = snapshot_fingerprint(source, item);
+            let prior_witness = snapshot_upload_body_witness(item);
+            item.tool_usage_truncated = !item.tool_usage_truncated;
+            assert_ne!(snapshot_upload_body_witness(item), prior_witness);
+            assert_eq!(snapshot_fingerprint(source, item), fingerprint);
+            finalize_scan_after_policy(source, &mut correction, &mut correction_index);
+            assert!(
+                !correction.snapshots.is_empty(),
+                "changed body still publishes"
+            );
+            assert_eq!(correction.snapshots[0].snapshot_fingerprint, fingerprint);
+            assert_eq!(third.counters_for_test().jobs_started, 0);
+            assert_eq!(next.files[&key].unverified_deadline(), Some(due));
+            let reused = third.retained_checkpoint(&key).unwrap();
+            assert_eq!(reused.last_full_verified(), START);
+            assert_eq!(reused.audit_debt(), checkpoint.audit_debt());
+        }
+    });
 }
 
 /// Review F1: more kept opaque records than the store's inventory bound

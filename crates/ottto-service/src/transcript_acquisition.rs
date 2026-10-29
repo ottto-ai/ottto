@@ -271,11 +271,14 @@ impl Checkpoint {
         self.last_full_verified_unix_seconds
     }
 
+    // Admission and completion use the same ordinary-certificate policy.
+    const EXACT_STAMP: bool = false;
+
     /// The parts of this certificate `select_mode` reads.
     fn view(&self) -> CertificateView<'_> {
         CertificateView {
             stamp: &self.stamp,
-            exact_stamp: false,
+            exact_stamp: Self::EXACT_STAMP,
             scope: &self.scope.0,
             sealed_offset: self.samples.sealed_offset,
             samples_valid: self.samples.valid_for(self.stamp.length),
@@ -520,9 +523,8 @@ pub(crate) enum PrefixRefusal {
     Invalidated(FullReason),
     /// The interpretation scope or another dependency changed: invalidates.
     Dependency,
-    /// A tail reached its audit deadline before commit. Like
-    /// `commit_after_native_completion`, a tail never certifies past it;
-    /// the next read is the full audit. Not an invalidation.
+    /// Audit expiry outside ordinary checkpoint reuse. The exact-stamp
+    /// proof horizon remains separate from acquisition completion.
     AuditDue,
     /// Every object check holds but the native read was lossy. The result
     /// publishes uncertified, exactly like a lossy full read.
@@ -687,6 +689,10 @@ enum SampleAt {
     Boundary,
 }
 
+fn audit_due(exact_stamp: bool, debt: Option<AuditDebt>, now: u64) -> bool {
+    exact_stamp && debt.is_some_and(|debt| now >= debt.due_unix_seconds)
+}
+
 /// `prepare`'s mode decision. `sample_eq` compares one sample window of the
 /// held FD with the certificate's; it is called only when the decision needs
 /// that window, in the order head then boundary.
@@ -713,7 +719,7 @@ fn select_mode(
             }));
     Ok(if clock_changed {
         ReadMode::Full(FullReason::ClockChanged)
-    } else if proof_horizon && debt.is_some_and(|d| now >= d.due_unix_seconds) {
+    } else if audit_due(proof_horizon, debt, now) {
         ReadMode::Full(FullReason::AuditDue)
     } else if let Some(old) = old {
         if !old.samples_valid {
@@ -1094,10 +1100,11 @@ impl ReadPlan {
         if current_scope != &self.scope {
             return Err(PrefixRefusal::Dependency);
         }
-        if let (ReadMode::Tail, Some(debt)) = (self.mode, self.debt) {
-            if now >= debt.due_unix_seconds {
-                return Err(PrefixRefusal::AuditDue);
-            }
+        // ReadPlan::prepare accepts Checkpoint::view, never PrefixSeal's
+        // exact-stamp view. Use the selector's identical horizon predicate;
+        // overdue ordinary Tail still carries its prior verification/debt.
+        if self.mode == ReadMode::Tail && audit_due(Checkpoint::EXACT_STAMP, self.debt, now) {
+            return Err(PrefixRefusal::AuditDue);
         }
         if lossy {
             return Err(PrefixRefusal::Lossy);
@@ -1871,6 +1878,13 @@ mod tests {
     /// is dropped; actual FD reads below prove only the appended suffix runs.
     #[test]
     fn durable_checkpoint_ignores_audit_age_and_clock_without_full_credit() {
+        use crate::durable_tail_store as store;
+        struct StoreDir(PathBuf);
+        impl Drop for StoreDir {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
         for (now, due, append) in [
             (8_000, None, true),
             (8_000, Some(1_100), true),
@@ -1881,12 +1895,54 @@ mod tests {
             let f = Fixture::new(b"one\n");
             let mut cp = initial(&f, 1_000);
             cp.audit_debt = due.map(|due_unix_seconds| AuditDebt { due_unix_seconds });
-            let saved = serde_json::to_vec(&cp.durable_certificate(0).unwrap()).unwrap();
+            // Main persists this certificate in the binary store envelope;
+            // Serde derives exist only on the excluded bootstrap branch.
+            let state = StoreDir(f.0.with_extension("certificate-state"));
+            fs::create_dir_all(&state.0).unwrap();
+            let lock = crate::locked_state_dir::LockedStateDir::acquire(&state.0).unwrap();
+            crate::snapshots::ScanIndex::default()
+                .save(&state.0.join("index.json"))
+                .unwrap();
+            let source = store::DurableSource::Codex;
+            let key = store::key_digest(source, "certificate-roundtrip");
+            // The store preserves unknown shapes, so use the shipped v1
+            // Codex allowlist and its existing real-codec fixture body.
+            let pin = "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1";
+            let allowlist =
+                std::array::from_fn(|i| u8::from_str_radix(&pin[2 * i..2 * i + 2], 16).unwrap());
+            let mut disk = store::DurableTailStore::new(state.0.join("cache"), source);
+            let saved = store::PendingRecord {
+                binding: store::Binding {
+                    source,
+                    key,
+                    context: store::context_digest("certificate-fixture", None),
+                    scope: store::scope_digest(&scope().0, &allowlist, "", ""),
+                    entry: store::entry_digest("certificate-fixture", None),
+                },
+                certificate: cp.durable_certificate(0).unwrap(),
+                body: crate::snapshots::durable_store_fixture_body(
+                    crate::snapshots::SnapshotSource::Codex,
+                    1,
+                    7,
+                ),
+                allowlist,
+            };
+            assert_eq!(
+                disk.write_after_save(&lock, 1, vec![saved])
+                    .unwrap()
+                    .written,
+                1
+            );
+            drop(disk);
             drop(cp);
             if append {
                 f.append(b"two\n");
             }
-            let certificate: DurableCertificate = serde_json::from_slice(&saved).unwrap();
+            let mut disk = store::DurableTailStore::new(state.0.join("cache"), source);
+            let certificate = match disk.read(&key, &allowlist) {
+                store::ReadOutcome::Found(record) => record.record.certificate,
+                other => panic!("{other:?}"),
+            };
             let mut file = f.open();
             let (result, reads) = capture_sample_reads(|| certificate.restore(&mut file, scope()));
             let (restored, admission) = result.unwrap();
@@ -2443,11 +2499,11 @@ mod tests {
         }
     }
 
-    /// M1: a multi-page tail that reaches its audit deadline before commit is
-    /// refused by the legacy cursor-prefix path; ordinary acquisition can
-    /// now continue past the deadline. Cursor migration belongs to full S1.
+    /// Ordinary checkpoint completion shares admission's audit predicate;
+    /// the exact-stamp proof seal still refuses elapsed debt. At 57ffaa32,
+    /// the overdue ordinary seal below returns PrefixRefusal::AuditDue.
     #[test]
-    fn tail_prefix_reaching_its_audit_deadline_is_refused_for_the_audit() {
+    fn overdue_tail_seals_with_identical_debt_but_proof_horizon_still_refuses() {
         let f = Fixture::new(b"one\n");
         let cp = initial(&f, 1000);
         f.append(b"two\n");
@@ -2462,14 +2518,24 @@ mod tests {
             file.read_to_end(&mut bytes).unwrap();
             plan.observe_complete_records(&bytes).unwrap();
             let consumed = plan.frozen_length();
-            plan.commit_sealed_prefix(&mut file, true, &scope(), 1100, commit_at, false, consumed)
+            let before = (plan.last_full_verified_unix_seconds, plan.debt);
+            let next = plan
+                .commit_sealed_prefix(&mut file, true, &scope(), 1100, commit_at, false, consumed)
+                .unwrap();
+            assert_eq!((next.last_full_verified(), next.audit_debt()), before);
+            next
         };
-        assert_eq!(tail(1500).unwrap_err(), PrefixRefusal::AuditDue);
-        let certified = tail(1499).unwrap();
-        assert_eq!(certified.sealed_offset(), 8);
+        for now in [1499, 1500, 181_000] {
+            let certified = tail(now);
+            assert_eq!(certified.sealed_offset(), 8);
+            assert_eq!(certified.last_full_verified(), 1000);
+            assert_eq!(certified.audit_debt(), debt);
+        }
+        let nongated = tail(1499).seal(1499);
+        assert_eq!(nongated.admits(&mut f.open(), &scope(), 1499, false), Ok(0));
         assert_eq!(
-            certified.audit_debt().map(|debt| debt.due_unix_seconds),
-            Some(1500)
+            nongated.admits(&mut f.open(), &scope(), 1500, false),
+            Err(FullReason::AuditDue)
         );
     }
 
@@ -3018,7 +3084,7 @@ mod tests {
 
     /// U-T30: staged debt. A tail checkpoint's debt is carried by its seal;
     /// an outlived seal's one publication use has no debt yet and measures
-    /// the horizon from minting, and every later use refuses as `prepare` does.
+    /// the horizon from minting; later proof use retains its own expiry.
     /// A seal that is not outlived ignores `publication`, so it cannot push
     /// its deadline back.
     #[test]
@@ -3031,7 +3097,12 @@ mod tests {
         let seal = tail.seal(1100);
         assert!(seal.has_debt() && !seal.outlived());
         for now in [due - 1, due] {
-            let expected = prepared(&f, &tail, &scope(), now);
+            assert_eq!(prepared(&f, &tail, &scope(), now), Ok(0));
+            let expected = if now < due {
+                Ok(0)
+            } else {
+                Err(FullReason::AuditDue)
+            };
             for publication in [false, true] {
                 assert_eq!(
                     seal.admits(&mut f.open(), &scope(), now, publication),
@@ -3050,7 +3121,7 @@ mod tests {
         let horizon = 1000 + AUDIT_INTERVAL_SECONDS;
         assert_eq!(
             prepared(&f, &cp, &scope(), horizon),
-            Err(FullReason::AuditDue)
+            Ok(cp.samples.head.len() + cp.samples.boundary.len())
         );
         assert_eq!(
             late_minted.admits(&mut f.open(), &scope(), horizon, true),
