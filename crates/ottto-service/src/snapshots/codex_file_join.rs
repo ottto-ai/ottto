@@ -2625,11 +2625,19 @@ pub(super) mod tests {
         index: ScanIndex,
         limit: usize,
     ) -> (ScanIndex, SourceScanResult) {
+        scan_at(root, index, limit, "2026-10-06T23:00:00Z")
+    }
+    pub(crate) fn scan_at(
+        root: &Path,
+        index: ScanIndex,
+        limit: usize,
+        collected_at: &str,
+    ) -> (ScanIndex, SourceScanResult) {
         let mut owned = OwnedSourceScan::new(
             SnapshotSource::Codex,
             &[root.join("sessions")],
             index,
-            "2026-10-06T23:00:00Z",
+            collected_at,
             7,
             limit,
             false,
@@ -5537,8 +5545,6 @@ pub(in crate::snapshots) mod header_cache_tests {
         use codex_compressed_input::{ArchiveEvidence, ValidatedHeader};
         let (root, fixture) = tests::fixture();
         let owner = fixture.headers[0].owner.clone();
-        let (_, control) = tests::scan(&root, ScanIndex::default(), 100);
-        let expected = serde_json::to_value(&control.snapshots).unwrap();
         let archive = root
             .join("sessions")
             .join(format!("rollout-{owner}.jsonl.zst"));
@@ -5567,11 +5573,28 @@ pub(in crate::snapshots) mod header_cache_tests {
         let mut repaired = serde_json::to_value(&held).unwrap();
         repaired["files"][&key]["size_bytes"] =
             serde_json::json!(fs::metadata(&archive).unwrap().len());
-        let mut repaired =
+        let repaired =
             lenient_decode::read_bounded(&serde_json::to_vec(&repaired).unwrap()).unwrap();
         assert!(!repaired.decode_holds_file(&key));
-        repaired.traversal = None;
-        let (mut index, mut scan) = tests::scan(&root, repaired, 100);
+        let deadline = repaired
+            .traversal
+            .as_ref()
+            .unwrap()
+            .unhealthy_retry_not_before_unix_seconds
+            .unwrap();
+        let observed_at = OffsetDateTime::from_unix_timestamp((deadline + 1) as i64)
+            .unwrap()
+            .format(&Rfc3339)
+            .unwrap();
+        // Use the production retry clock, preserving the held traversal. The
+        // no-archive control has exactly the same timestamp and plain files.
+        let hidden = archive.with_extension("held-out");
+        fs::rename(&archive, &hidden).unwrap();
+        let (_, control) = tests::scan_at(&root, ScanIndex::default(), 100, &observed_at);
+        let expected = serde_json::to_value(&control.snapshots).unwrap();
+        assert!(!control.snapshots.is_empty());
+        fs::rename(&hidden, &archive).unwrap();
+        let (mut index, mut scan) = tests::scan_at(&root, repaired, 100, &observed_at);
         assert_eq!(
             serde_json::to_value(&scan.snapshots).unwrap(),
             expected,
@@ -5592,7 +5615,7 @@ pub(in crate::snapshots) mod header_cache_tests {
             index.committable_subset(&ScanIndex::default(), &accepted, &BTreeMap::new());
         for _ in 0..3 {
             index = lenient_decode::read_bounded(&serde_json::to_vec(&index).unwrap()).unwrap();
-            let (next, scan) = tests::scan(&root, index, 100);
+            let (next, scan) = tests::scan_at(&root, index, 100, &observed_at);
             index = next;
             assert!(
                 scan.snapshots.is_empty(),
