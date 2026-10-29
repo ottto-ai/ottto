@@ -1,5 +1,5 @@
 use super::*;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -203,36 +203,52 @@ fn symlink_lock_is_refused_without_touching_target() {
     assert_eq!(fs::read(target).unwrap(), b"keep");
 }
 
+// This harness entry is invoked only in a separate process by the test below.
+// Acquiring and spawning in Rust avoids shell redirection machinery reusing
+// arbitrary inherited descriptor numbers before the fake command starts.
+#[test]
+fn bootstrap_owner_fixture() {
+    let Some(directory) = std::env::var_os("OTTTO_BOOTSTRAP_TEST_OWNER_DIR") else {
+        return;
+    };
+    let lock = TransactionLock::acquire(
+        &PathBuf::from(directory).join("lock"),
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let mut command = Command::new("/bin/sh");
+    command.args(["-c", "printf 'ottto-child-ready\\n'; read release"]);
+    let mut child = lock.spawn(&mut command).unwrap();
+    child.wait().unwrap();
+}
+
 #[test]
 fn abrupt_helper_death_leaves_child_owning_transaction() {
     let fixture = Fixture::new();
-    let lock = fixture.lock();
-    let mut command = Command::new("/bin/sh");
-    // The outer shell models the helper, the inner shell a launchctl child.
-    // Both inherit the lock; only the helper is killed. read is a builtin,
-    // and closing the gate on any assertion failure makes the child exit.
-    // The gate descriptor must not overwrite the inherited lock descriptor:
-    // its number varies with parallel test activity.
-    let gate_fd = if lock.0.as_raw_fd() == 9 { 8 } else { 9 };
-    let script =
-        format!("exec {gate_fd}<&0; /bin/sh -c 'printf ready; read release' <&{gate_fd} & wait");
+    let mut command = Command::new(std::env::current_exe().unwrap());
     command
-        .args(["-c", &script])
+        .args([
+            "--exact",
+            "service_bootstrap::tests::bootstrap_owner_fixture",
+            "--nocapture",
+        ])
+        .env("OTTTO_BOOTSTRAP_TEST_OWNER_DIR", &fixture.0)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped());
-    let mut owner = Reap(lock.spawn(&mut command).unwrap());
-    let mut ready = [0; 5];
-    owner
-        .0
-        .stdout
-        .as_mut()
-        .unwrap()
-        .read_exact(&mut ready)
-        .unwrap();
-    assert_eq!(&ready, b"ready");
+    let mut owner = Reap(command.spawn().unwrap());
+    let mut output = BufReader::new(owner.0.stdout.take().unwrap());
+    loop {
+        let mut line = String::new();
+        assert!(
+            output.read_line(&mut line).unwrap() > 0,
+            "helper exited before child readiness"
+        );
+        if line.contains("ottto-child-ready") {
+            break;
+        }
+    }
     owner.0.kill().unwrap();
     owner.0.wait().unwrap();
-    drop(lock);
     assert!(TransactionLock::acquire(&fixture.0.join("lock"), Duration::from_millis(50)).is_err());
     owner
         .0
