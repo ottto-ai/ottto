@@ -27294,6 +27294,7 @@ impl OwnedSourceScan {
                 // Ordinary inventory must never acquire an unseen archive header.
                 // Cached-feed filtering follows the paged owner-wide custody scan.
                 inventory.feed_prepared = false;
+                inventory.cached_archives_only = true;
                 inventory.complete &= traversal.pending_directories.is_empty();
                 inventory
             });

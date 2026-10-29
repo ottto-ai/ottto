@@ -393,6 +393,8 @@ pub(super) struct HeaderInventory {
     pub(super) complete: bool,
     /// Negative owner scope is collected one retained entry per step, before F3.
     pub(super) feed_prepared: bool,
+    /// Normal inventory uses only same-stamp archive facts, never a decoder.
+    pub(super) cached_archives_only: bool,
     pub(super) feed_after: Option<String>,
     pub(super) feed_peak: usize,
     pub(super) custody_next: usize,
@@ -556,6 +558,7 @@ impl HeaderInventory {
                 && directories.is_some_and(|value| value.stable),
             read_bytes: 0,
             feed_prepared: true,
+            cached_archives_only: false,
             feed_after: None,
             feed_peak: 0,
             custody_next: 0,
@@ -821,11 +824,18 @@ impl HeaderInventory {
                 // Archives have their own FD-bound evidence and never consult
                 // or populate the optional plain header fact cache.
                 let before = self.archive_work.physical_bytes;
-                let result = index.inventory_archive_header(
-                    &candidate,
-                    archive_cache,
-                    &mut self.archive_work,
-                );
+                let result = if self.cached_archives_only {
+                    // Metadata-only accessor: permission to decode is separate.
+                    // In particular a rewrite after F3 cannot turn a cache miss
+                    // into an unselected header decode (#878 composition).
+                    Ok(index
+                        .archive_header(&candidate.path)
+                        .cloned()
+                        .map(codex_compressed_input::HeaderRead::Validated)
+                        .unwrap_or(codex_compressed_input::HeaderRead::Deferred))
+                } else {
+                    index.inventory_archive_header(&candidate, archive_cache, &mut self.archive_work)
+                };
                 excluded = index
                     .files
                     .get(&key)
@@ -1029,7 +1039,8 @@ impl HeaderInventory {
 }
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
 crate::heap_layout_bound::fields!(HeaderWitness; plain_twin, custody_cause, candidate, owner, home, created_unix_ms, metadata, stamp);
-crate::heap_layout_bound::fields!(HeaderInventory; feed_prepared, feed_after, feed_peak, custody_next, absence_held, custody_unknown, custody_after, custody_done, custody_peak, custody_refused, roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, archive_work, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, bounded_out, first_read_archives, deferred_archives, family_held);
+crate::heap_layout_bound::fields!(HeaderInventory; cached_archives_only, feed_prepared, feed_after, feed_peak, custody_next, absence_held, custody_unknown, custody_after, custody_done, custody_peak, custody_refused, roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, archive_work, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, bounded_out, first_read_archives, deferred_archives, family_held);
+
 
 
 

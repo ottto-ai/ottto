@@ -2497,3 +2497,44 @@ fn missing_or_malformed_header_bound_loads_false_and_reads_at_most_one_prefix() 
         assert_eq!(work.decoded_bytes, codex_file_join::MAX_HEADER_BYTES as u64);
     }
 }
+
+#[test]
+fn warm_archive_evidence_changed_stamp_defers_without_unselected_header_read() {
+    let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+    let key = local_index_key(&f.0);
+    let mut index = ScanIndex::default();
+    let mut evidence = ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, None).unwrap();
+    evidence.header_validated = Some(
+        ValidatedHeader::from_line(
+            synthetic_rollout()
+                .split(|byte| *byte == b'\n')
+                .next()
+                .unwrap(),
+        )
+        .unwrap(),
+    );
+    index.files.entry(key.clone()).or_default().archive = Some(Box::new(evidence));
+    let paths = BTreeSet::from([key.clone()]);
+    let root = f.0.parent().unwrap().to_owned();
+    let mut directories = codex_file_join::DirectoryCensus::new();
+    directories.observe(&root, &fs::metadata(&root).unwrap());
+    let mut inventory = codex_file_join::HeaderInventory::new(&[root], &paths, Some(&directories));
+    inventory.cached_archives_only = true;
+    assert!(inventory.retain_cached_archives(&index, &paths).is_none());
+    let before = serde_json::to_value(&index.files[&key]).unwrap();
+    // Warm fact selected by F3, then object changes before inventory consumes it.
+    File::options()
+        .append(true)
+        .open(&f.0)
+        .unwrap()
+        .write_all(b"changed stamp")
+        .unwrap();
+    let (step, rows) = crate::local_resource_diagnostics::capture(|| {
+        inventory.step_with_archive(&CodexTitleMetadata::default(), &mut index, None)
+    });
+    assert_eq!(step, codex_file_join::HeaderStep::Deferred);
+    assert!(inventory.deferred_archives.contains(&key));
+    assert_eq!(decodes(&rows), 0);
+    assert_eq!(decoded_archive_bytes(&rows), 0);
+    assert_eq!(serde_json::to_value(&index.files[&key]).unwrap(), before);
+}
