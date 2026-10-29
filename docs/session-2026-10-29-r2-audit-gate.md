@@ -339,3 +339,19 @@ attempted only after successful open, while using the captured audit time in
 rescue and attachment. These are later-integrator obligations; the corresponding
 unmerged implementation is not imported here. The exact-root quiet retry and
 its original partial-save assertions remain unchanged.
+
+
+Round20 composes the merged held-audit due-carry and failed-open backoff with
+this page's captured clock. Rescue keeps its key and both secure-open callbacks;
+rescue classification and failed-open handling use the same audit_now as held
+preparation and selection. Earliest-due transfer, parking/eviction policy and
+attempted only after successful open remain unchanged. Diagnostic ages can use
+current time; they do not judge when a turn is due.
+
+A separate native fixture captures exactly at D, then rolls the live clock
+before D ahead of rescue: the owed native read still runs. Its failed-open arm
+jumps the live clock forward, dates backoff by captured D, saves/reloads the
+original unattempted D and retries successfully with another post-capture
+rollback. Earlier audit-gate fixture bodies and the exact-root quiet retry are
+unchanged. Future age-aware selection integration must still preserve its frozen
+census clock separately from captured audit time.

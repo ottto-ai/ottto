@@ -31844,8 +31844,7 @@ impl OwnedSourceScan {
             );
             let rescue_key = local_index_key(&candidate.path);
             let verification_rescue =
-                sampled_audit::progress_debt(index, &rescue_key, sampled_scan::now_seconds())
-                    .is_some();
+                sampled_audit::progress_debt(index, &rescue_key, audit_now).is_some();
             let Some((mut candidate, opened_file)) = open_and_identify_scan_candidate_with_rescue(
                 source,
                 candidate,
@@ -31857,11 +31856,7 @@ impl OwnedSourceScan {
                 sampling.as_ref().map(|context| context.cache.as_ref()),
             ) else {
                 if verification_rescue {
-                    sampled_audit::progress_open_failed(
-                        index,
-                        &rescue_key,
-                        sampled_scan::now_seconds(),
-                    );
+                    sampled_audit::progress_open_failed(index, &rescue_key, audit_now);
                 }
                 pending!();
             };
