@@ -25873,6 +25873,8 @@ pub(crate) struct OwnedSourceScan {
     roots: Vec<PathBuf>,
     index: ScanIndex,
     collected_at: String,
+    /// One clock sample for this page's audit selection and retirement decisions.
+    audit_now: u64,
     backfill_window_days: u64,
     file_limit: usize,
     artifacts_enabled: bool,
@@ -26423,6 +26425,7 @@ impl OwnedSourceScan {
             roots: roots.to_vec(),
             index: owned_index,
             collected_at: collected_at.to_owned(),
+            audit_now: sampled_scan::now_seconds(),
             backfill_window_days: effective_backfill_window_days(requested_backfill_window_days),
             file_limit,
             artifacts_enabled,
@@ -26495,6 +26498,7 @@ impl OwnedSourceScan {
         claude_request_identity_capture: bool,
         recovery_priority: &[PathBuf],
     ) -> Self {
+        let audit_now = sampled_scan::now_seconds();
         let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(
             source == SnapshotSource::ClaudeCode,
         );
@@ -26764,7 +26768,6 @@ impl OwnedSourceScan {
             }
         }
         let retry_service_end = pending_paths.len();
-        let audit_now = sampled_scan::now_seconds();
         while pending_paths.len() < selection_limit {
             let Some(position) = traversal.pending_candidates.iter().position(|candidate| {
                 index
@@ -27010,7 +27013,8 @@ impl OwnedSourceScan {
                         &index.files,
                     ) {
                         Some((twin, _)) => {
-                            index.candidate_decision(&twin) == CandidateDecision::Parse
+                            index.candidate_decision_with_reason_at(&twin, audit_now).0
+                                == CandidateDecision::Parse
                         }
                         None => true,
                     }
@@ -27127,6 +27131,7 @@ impl OwnedSourceScan {
             roots: roots.to_vec(),
             index: owned_index,
             collected_at: collected_at.to_owned(),
+            audit_now,
             backfill_window_days,
             file_limit,
             artifacts_enabled,
@@ -27316,6 +27321,7 @@ impl OwnedSourceScan {
             source,
             roots,
             collected_at,
+            audit_now,
             backfill_window_days,
             file_limit,
             artifacts_enabled,
@@ -28391,7 +28397,7 @@ impl OwnedSourceScan {
                     {
                         crate::local_resource_diagnostics::claude_reread::desktop_recovered_hold_body_read();
                     } else {
-                        match index.candidate_decision_with_reason(&active.candidate).1 {
+                        match index.candidate_decision_with_reason_at(&active.candidate, audit_now).1 {
                             Some(CandidateParseReason::LegacyIdentity) => {
                                 crate::local_resource_diagnostics::claude_reread::desktop_revision_body_read(true);
                             }
@@ -29395,7 +29401,7 @@ impl OwnedSourceScan {
                         // Withheld bodies retain their obligation until release.
                         && !index.claude_account_deferred_holds.contains_key(&active.key)
                         && index.files.get(&active.key).is_some_and(|entry| {
-                            entry.audit_requires_full(sampled_scan::now_seconds())
+                            entry.audit_requires_full(audit_now)
                                 && !entry.has_prefix_provenance()
                         })
                         && !index.claude_request_census.get(&active.key).is_some_and(
@@ -30255,8 +30261,7 @@ impl OwnedSourceScan {
                 }
                 // N2: a withheld final record is owed, never verified.
                 let held_progress_audit =
-                    sampled_audit::progress_debt(index, &index_key, sampled_scan::now_seconds())
-                        .is_some();
+                    sampled_audit::progress_debt(index, &index_key, audit_now).is_some();
                 // A new prefix/lossy obligation without a slot cannot publish
                 // or mutate its index entry. Existing marked files keep custody.
                 let needs_marker = cursor_fragment.is_some()
@@ -30588,6 +30593,11 @@ impl OwnedSourceScan {
                     }) {
                         recorded.size_bytes = fragment.offset;
                     }
+                    // record consumes the candidate but does not use its root.
+                    // Move that existing allocation into the commit-sensitive
+                    // retry instead of cloning it or guessing a nested root.
+                    let quiet_scan_root =
+                        quiet_audit_checked.then(|| std::mem::take(&mut recorded.scan_root));
                     index.record(recorded, last_snapshot_fingerprint, outcome);
                     // The counting version travels in the same entry as the
                     // fingerprint it describes; no separate save can split them.
@@ -30764,6 +30774,16 @@ impl OwnedSourceScan {
                                 finalization_charge.unwrap_or(0),
                             );
                             if admitted {
+                                if quiet_retired {
+                                    // A partial save may restore the old marker.
+                                    // Preserve this path AND its exact scope root
+                                    // until a committed retirement makes it skip.
+                                    sampled_audit::queue_quiet_retirement(
+                                        index,
+                                        &index_key,
+                                        quiet_scan_root.expect("checked quiet retirement root"),
+                                    );
+                                }
                                 #[cfg(unix)]
                                 let durable_pending = quiet_retired
                                     && context.cache.durable_stage_quiet_retirement(
@@ -31817,12 +31837,9 @@ impl OwnedSourceScan {
                 &claude_title_metadata,
                 claude_effort_support_dir_ref,
             );
-            let verification_rescue = sampled_audit::progress_debt(
-                index,
-                &local_index_key(&candidate.path),
-                sampled_scan::now_seconds(),
-            )
-            .is_some();
+            let verification_rescue =
+                sampled_audit::progress_debt(index, &local_index_key(&candidate.path), audit_now)
+                    .is_some();
             let Some((mut candidate, opened_file)) = open_and_identify_scan_candidate_with_rescue(
                 source,
                 candidate,
@@ -31895,7 +31912,7 @@ impl OwnedSourceScan {
                     // reason, so the history gate can hold the whole twin group.
                     Some((root_session_id, _))
                         if claude_twin_only_family_reparses.contains(&root_session_id)
-                            && index.candidate_decision_with_reason(&candidate)
+                            && index.candidate_decision_with_reason_at(&candidate, audit_now)
                                 == (
                                     CandidateDecision::Parse,
                                     Some(CandidateParseReason::BodyWitnessAdoption),
@@ -31910,7 +31927,7 @@ impl OwnedSourceScan {
                         CandidateDecision::Parse,
                         Some(CandidateParseReason::ForcedFamily),
                     ),
-                    None => index.candidate_decision_with_reason(&candidate),
+                    None => index.candidate_decision_with_reason_at(&candidate, audit_now),
                 };
             let target_match = native_comparison
                 .as_ref()
@@ -31944,7 +31961,7 @@ impl OwnedSourceScan {
             // keep the adoption-only page budget.
             if decision == CandidateDecision::Parse {
                 let adoption_only = parse_reason == Some(CandidateParseReason::BodyWitnessAdoption)
-                    && index.candidate_requires_only_body_witness_adoption(&candidate);
+                    && index.candidate_requires_only_body_witness_adoption(&candidate, audit_now);
                 let history = if source == SnapshotSource::ClaudeCode {
                     index.claude_history_upgrade_decision(
                         &candidate,
@@ -32733,11 +32750,11 @@ impl OwnedSourceScan {
                         .reduction_dependencies_available
                         .observe(reduction_sidecar.is_some());
                     if let Some(reduction_sidecar) = reduction_sidecar {
-                        let debt =
-                            sampled_audit::debt_for_key(index, &key, sampled_scan::now_seconds())
-                                .or(recovered_audit_due.map(|due_unix_seconds| {
-                                    crate::transcript_acquisition::AuditDebt { due_unix_seconds }
-                                }));
+                        let debt = sampled_audit::debt_for_key(index, &key, audit_now).or(
+                            recovered_audit_due.map(|due_unix_seconds| {
+                                crate::transcript_acquisition::AuditDebt { due_unix_seconds }
+                            }),
+                        );
                         let protected_entry = index.files.get(&key);
                         context
                             .admission
@@ -33256,6 +33273,7 @@ impl OwnedSourceScan {
             roots,
             index: index_storage,
             collected_at,
+            audit_now,
             backfill_window_days,
             file_limit,
             artifacts_enabled,
@@ -49488,11 +49506,7 @@ impl ScanIndex {
         &self,
         candidate: &CandidateFile,
     ) -> (CandidateDecision, Option<CandidateParseReason>) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_secs())
-            .unwrap_or_default();
-        self.candidate_decision_with_reason_at(candidate, now)
+        self.candidate_decision_with_reason_at(candidate, sampled_scan::now_seconds())
     }
 
     #[cfg(test)]
@@ -49520,11 +49534,11 @@ impl ScanIndex {
 
     /// True when only the body-witness revision selects this candidate: the
     /// same decision without that gate skips the file.
-    fn candidate_requires_only_body_witness_adoption(&self, candidate: &CandidateFile) -> bool {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_secs())
-            .unwrap_or_default();
+    fn candidate_requires_only_body_witness_adoption(
+        &self,
+        candidate: &CandidateFile,
+        now: u64,
+    ) -> bool {
         self.effective_upload_body_witness_revision_requires_adoption(&local_index_key(
             &candidate.path,
         )) && self
@@ -91905,7 +91919,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, recovered_audit_due, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
-crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery; shared codex_versions);
+crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, audit_now, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery; shared codex_versions);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
