@@ -66959,6 +66959,15 @@ mod tests {
         api: &[crate::claude_local_otel::ClaudeLocalOtelEvidence],
         trace: &[crate::claude_local_otel::ClaudeTraceOwnershipEvidence],
     ) -> bool {
+        d1_subagent_account_qualification(item, api, trace).coverage
+            == [claude_request_accounts::Coverage::Complete]
+    }
+
+    fn d1_subagent_account_qualification(
+        item: &mut SnapshotItem,
+        api: &[crate::claude_local_otel::ClaudeLocalOtelEvidence],
+        trace: &[crate::claude_local_otel::ClaudeTraceOwnershipEvidence],
+    ) -> claude_request_accounts::Qualification {
         let root = claude_snapshot_family_root(item);
         let api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
             evidence: BTreeMap::from([(root.clone(), api.to_vec())]),
@@ -66969,8 +66978,6 @@ mod tests {
             ..Default::default()
         };
         claude_request_accounts::apply(std::slice::from_mut(item), &api_report, &trace_report)
-            .coverage
-            == [claude_request_accounts::Coverage::Complete]
     }
 
     #[test]
@@ -67393,16 +67400,22 @@ mod tests {
         let api = vec![complete_api_row(&root, "req_5", 5, 10, 1, 0)];
         let trace = vec![complete_trace_row(&root, "req_5", "a4d1585d310070d0f")];
         let mut proved = items[1].clone();
-        assert!(d1_subagent_account_specimen(&mut proved, &api, &trace));
+        let qualification = d1_subagent_account_qualification(&mut proved, &api, &trace);
+        assert_eq!(
+            qualification.coverage,
+            [claude_request_accounts::Coverage::Complete]
+        );
         let mut index = ScanIndex::default();
         assert!(index
-            .bind_session_accounts(
+            .bind_session_accounts_with_mixed(
                 SnapshotSource::ClaudeCode,
                 "machine-a",
                 std::slice::from_mut(&mut proved),
-                &[]
+                &[],
+                &qualification.mixed,
             )
             .is_empty());
+        assert_eq!(index.session_account_bindings.len(), 1);
         let index_path = dir.join("account-index.json");
         index.save(&index_path).unwrap();
         let mut restarted = ScanIndex::load(&index_path).unwrap();
