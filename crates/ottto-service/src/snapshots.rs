@@ -27459,7 +27459,7 @@ impl OwnedSourceScan {
             claude_effort_support_dir,
             codex_title_metadata,
             mut claude_title_metadata,
-            state_census_complete,
+            mut state_census_complete,
             sidecar_census_complete,
             codex_turn_traces,
             mut codex_parent_identities,
@@ -27559,26 +27559,34 @@ impl OwnedSourceScan {
                     if !done {
                         pending!();
                     }
-                    inventory.refresh_custody(index);
-                    if inventory.custody_incomplete
-                        || index
-                            .files
-                            .values()
-                            .any(|entry| entry.codex_compressed_hold.is_some())
-                    {
-                        inventory.complete = false;
-                        if let Some(traversal) = index.traversal.as_mut() {
-                            for candidate in identified_candidates.drain(..) {
-                                traversal.pending_candidates.push_back(ScanTraversalPath {
-                                    scan_root: candidate.scan_root,
-                                    path: candidate.path,
-                                    census_member: true,
-                                    watcher_hint: false,
-                                });
-                            }
-                        }
-                        codex_join_prepared = true;
+                    if !inventory.prepare_custody(index) {
                         pending!();
+                    }
+                    if !inventory.hold_custodied_siblings(index) {
+                        pending!();
+                    }
+                    let selected_count = identified_candidates.len();
+                    for _ in 0..selected_count {
+                        let candidate = identified_candidates.pop_front().expect("selected count");
+                        if inventory.member_held(&candidate.path) {
+                            if !index
+                                .files
+                                .get(&local_index_key(&candidate.path))
+                                .is_some_and(|e| e.codex_compressed_hold.is_some())
+                            {
+                                if let Some(traversal) = index.traversal.as_mut() {
+                                    traversal.pending_candidates.push_back(ScanTraversalPath {
+                                        scan_root: candidate.scan_root,
+                                        path: candidate.path,
+                                        census_member: true,
+                                        watcher_hint: false,
+                                    });
+                                }
+                                index.mark_bounded_sweep_unsettled();
+                            }
+                        } else {
+                            identified_candidates.push_back(candidate);
+                        }
                     }
 
                     let unresolved = &inventory.held_owners;
@@ -27616,7 +27624,11 @@ impl OwnedSourceScan {
                         .collect::<BTreeSet<_>>();
                     inventory.complete &= selected.is_subset(&inventoried);
                     let mut owners = BTreeMap::<String, BTreeSet<PathBuf>>::new();
-                    for header in &inventory.headers {
+                    for header in inventory
+                        .headers
+                        .iter()
+                        .filter(|h| !inventory.member_held(&h.candidate.path))
+                    {
                         owners
                             .entry(header.owner.clone())
                             .or_default()
@@ -31403,15 +31415,20 @@ impl OwnedSourceScan {
                     // remains "covered" for this whole generation, the state-only fallback
                     // is delayed one cycle, and a complete terminal manifest can briefly
                     // omit a thread the local state database still proves exists.
-                    let (state_only_scanned, state_only_noops) = append_codex_state_only_snapshots(
+                    let state_only = append_codex_state_only_snapshots(
                         &mut snapshots,
                         &codex_title_metadata,
                         collected_at.as_str(),
                         index,
                         &codex_state_only_blocked_session_ids,
                     );
-                    scanned_session_count += state_only_scanned;
-                    semantic_noop_count += state_only_noops;
+                    if let Some((state_only_scanned, state_only_noops)) = state_only {
+                        scanned_session_count += state_only_scanned;
+                        semantic_noop_count += state_only_noops;
+                    } else {
+                        state_census_complete = false;
+                        index.mark_bounded_sweep_unsettled();
+                    }
                 }
                 // G1: pending re-reads do not hold the restart either.
                 let parent_resolution_restart = traversal_discovery_done
@@ -33614,7 +33631,7 @@ fn append_codex_state_only_snapshots(
     collected_at: &str,
     index: &mut ScanIndex,
     blocked_session_ids: &BTreeSet<String>,
-) -> (usize, usize) {
+) -> Option<(usize, usize)> {
     let snapshots_before = snapshots.len();
     let blocked_session_ids = blocked_session_ids
         .union(&index.codex_state_only_blocked_session_ids)
@@ -33673,20 +33690,61 @@ fn append_codex_state_only_snapshots(
         ambiguous_tokens,
     );
     let mut scanned_session_count = 0;
+    // This collection only vetoes state totals, never grants history proof.
+    let negative_scope = |entry: &ScanIndexEntry| {
+        entry.codex_history_is_protected()
+            || (entry.codex_compressed_hold.is_some() && entry.codex_counting_owner.is_some())
+    };
+    if index
+        .files
+        .values()
+        .any(|entry| entry.codex_compressed_hold.is_some() && entry.codex_counting_owner.is_some())
+    {
+        use crate::heap_layout_bound::HeapLayoutBound;
+        let count = index
+            .files
+            .values()
+            .filter(|entry| negative_scope(entry))
+            .count();
+        let mut peak =
+            crate::heap_layout_bound::Counter::new(crate::source_rotation::PARKED_BUDGET);
+        let funded = (|| {
+            // Include the sets already resident while adding the borrowed refs.
+            blocked_session_ids.heap_bound(&mut peak)?;
+            covered_session_ids.heap_bound(&mut peak)?;
+            covered_in_prior_runs.heap_bound(&mut peak)?;
+            crate::heap_layout_bound::tree_nodes::<&String, ()>(count, &mut peak)?;
+            peak.add(count.saturating_mul(4 * std::mem::size_of::<&ScanIndexEntry>()))
+        })();
+        if funded.is_none() {
+            crate::local_resource_diagnostics::codex_zst_held(CodexZstCause::AdmissionRefused);
+            crate::local_resource_diagnostics::custody_overflow();
+            return None;
+        }
+    }
     let protected = index
         .files
         .values()
-        .filter(|entry| entry.codex_history_is_protected())
+        .filter(|entry| negative_scope(entry))
         .collect::<Vec<_>>();
-    let unknown_protected_owner = protected.iter().any(|entry| {
-        entry
-            .codex_protected_owner
-            .as_ref()
-            .map_or(true, |owner| !valid_codex_protected_owner(owner))
-    });
+    let unknown_protected_owner = protected
+        .iter()
+        .filter(|entry| entry.codex_history_is_protected())
+        .any(|entry| {
+            entry
+                .codex_protected_owner
+                .as_ref()
+                .map_or(true, |owner| !valid_codex_protected_owner(owner))
+        });
     let protected_owners = protected
         .iter()
-        .filter_map(|entry| entry.codex_protected_owner.as_ref())
+        .filter_map(|entry| {
+            if entry.codex_history_is_protected() {
+                entry.codex_protected_owner.as_ref()
+            } else {
+                entry.codex_counting_owner.as_ref()
+            }
+        })
         .chain(
             index
                 .files
@@ -33716,12 +33774,8 @@ fn append_codex_state_only_snapshots(
         // durable state and semantic no-op suppression.
         snapshots.push(snapshot);
     }
-    crate::local_resource_diagnostics::codex_state_only(
-        scanned_session_count,
-        snapshots.len().saturating_sub(snapshots_before),
-        0, // Semantic no-op suppression remains in finalize_scan_after_policy.
-    );
-    (scanned_session_count, 0)
+    Some((scanned_session_count, 0))
+    let snapshots_before = snapshots.len();
 }
 
 fn codex_state_only_snapshot(

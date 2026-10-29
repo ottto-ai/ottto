@@ -15648,3 +15648,368 @@ fn deferred_custody_tail_priority_eof_never_reopens_as_full() {
         assert_eq!(counter(&cold, |c| c.jobs_started), 0);
     });
 }
+
+#[test]
+fn shared_refused_file_obligation_survives_growth_age_cap_and_reloads_then_tails() {
+    use crate::snapshots::sampled_scan::durable_tail::{Interpretation, RestoreOutcome};
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let clock = TestClock;
+    clock.set(1_900_000_000);
+    for over_cap in [false, true] {
+        let fixture = ScanRoot::new(1);
+        let path = fixture.file(SESSION);
+        let key = local_index_key(&path);
+        let state = fixture._dir.0.join("state");
+        fs::create_dir_all(&state).unwrap();
+        let index_path = state.join("index.json");
+        let lock = crate::locked_state_dir::test_locks::hold(&state);
+        let cache = Arc::new(SharedCache::default());
+        let namespace = Scope("cursor-fixture".into());
+        let capture = true; // OwnedSourceScan::new captures in parser fixtures.
+        cache.durable_begin_pass(SnapshotSource::Codex, &index_path, &namespace, capture);
+        let (mut index, seed) = page(&fixture, ScanIndex::default(), Some(Arc::clone(&cache)));
+        assert!(!seed.snapshots.is_empty());
+        let prefix = cache.retained_checkpoint(&key).expect("real checkpoint");
+        let scope = prefix.scope().clone();
+        let prefix_len = prefix.sealed_offset();
+        assert_eq!(prefix_len, fixture.len(SESSION));
+        let witness = index.files[&key].last_upload_body_witness.clone();
+        assert!(witness.is_some());
+        index.save(&index_path).unwrap();
+        cache.durable_write_after_save(lock, SnapshotSource::Codex, &index);
+        // Cap is based on the future length; latch before the append below.
+        let cap = over_cap.then_some(fixture.len(SESSION) + token_line(2).len() as u64 - 1);
+        codex_compressed_hold_tests::with_file_cap(cap, || {
+            // A real current-header sibling inherits known-owner custody;
+            // optional owner scratch refuses before file-owned admission.
+            let retained_parent = fixture._dir.0.join("z-retained-parent.jsonl");
+            index.hold_compressed(
+                &retained_parent,
+                BTreeSet::from([SESSION.to_owned()]),
+                CodexZstCause::ParentLedgerUnbound,
+            );
+            let mut directories = codex_file_join::DirectoryCensus::new();
+            directories.observe(&fixture.root, &fs::metadata(&fixture.root).unwrap());
+            let mut inv = codex_file_join::HeaderInventory::new(
+                std::slice::from_ref(&fixture.root),
+                &BTreeSet::from([key.clone()]),
+                Some(&directories),
+            );
+            while !inv.step_with_archive(&CodexTitleMetadata::default(), &mut index, None) {}
+            assert_eq!(inv.headers.len(), 1);
+            assert!(inv.headers[0].custody_cause.is_none());
+            // The first retained key is the ordinary P entry. The later held
+            // parent matches its real header owner after this fixed precharge.
+            assert!(!inv.prepare_custody(&index));
+            inv.custody_peak = crate::source_rotation::PARKED_BUDGET;
+            while !inv.prepare_custody(&index) {}
+            assert!(inv.custody_refused);
+            assert_eq!(
+                inv.headers[0].custody_cause,
+                Some(CodexZstCause::ParentLedgerUnbound)
+            );
+            while !inv.hold_custodied_siblings(&mut index) {}
+            assert_eq!(
+                index.files[&key].codex_compressed_hold,
+                Some(CodexZstCause::ParentLedgerUnbound)
+            );
+            fixture.append(SESSION, &token_line(2));
+            let length = fixture.len(SESSION);
+            assert!(length > prefix_len);
+            let owner = codex_protected_owner(SESSION);
+            index.codex_counting_tombstones.insert(
+                owner.clone(),
+                codex_counting_version::CountingTombstone {
+                    evidence: codex_counting_version::AckEvidence::LegacyAcked,
+                    retired_in: "old-window".into(),
+                    created_unix_ms: None,
+                },
+            );
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1000))
+                .unwrap();
+            assert!(!is_recent_enough_at(1000, 1_900_000_000, 7));
+            assert!(!is_recent_enough_at(1000, 1_900_000_000, 730));
+            assert_eq!(
+                length > max_jsonl_file_bytes(SnapshotSource::Codex),
+                over_cap
+            );
+            // The bounded producer cut admits unrelated ordinary plain work.
+            let other = fs::read(fixture.file(SESSION)).unwrap();
+            let other = String::from_utf8(other)
+                .unwrap()
+                .replace(SESSION, SESSION_B);
+            fs::write(
+                fixture.file(SESSION_B),
+                &other[..other.find('\n').unwrap() + 1],
+            )
+            .unwrap();
+            fixture.append(SESSION_B, &token_line(1));
+            for _ in 0..5 {
+                index.traversal = None;
+                index.save(&index_path).unwrap();
+                index = ScanIndex::load(&index_path).unwrap();
+                let ((next, result), rows) = crate::local_resource_diagnostics::capture(|| {
+                    codex_compressed_hold_tests::no_open(&path, || {
+                        page(&fixture, index, Some(Arc::clone(&cache)))
+                    })
+                });
+                index = next;
+                assert_eq!(result.unreadable_path_count, 0);
+                assert!(index.files.contains_key(&key));
+                assert_eq!(index.files[&key].size_bytes, prefix_len);
+                assert_eq!(index.files[&key].last_upload_body_witness, witness);
+                assert!(index.codex_counting_tombstones.contains_key(&owner));
+                let traversal = index.traversal.as_ref().expect("census checkpoint");
+                assert!(traversal.codex_rollout_paths.contains(&key));
+                assert!(traversal.observed_index_keys.contains(&key));
+                assert!(rows.iter().any(|r| r["stage"] == "codex_held_growth"
+                    && r["counts"]["held_growth_bytes"] == length - prefix_len
+                    && r["counts"]["held_growth_files"] == 1
+                    && r["counts"]["held_over_cap"] == u64::from(over_cap)));
+                assert!(result
+                    .snapshots
+                    .iter()
+                    .all(|s| s.source_session_id != SESSION));
+            }
+            assert!(
+                index.files[&local_index_key(&fixture.file(SESSION_B))]
+                    .last_snapshot_fingerprint
+                    .is_some(),
+                "unrelated plain progresses"
+            );
+            // Synthetic 11c handoff: the fixture owns the obligation while
+            // admitting its aged/over-cap FD directly to the existing Tail
+            // engine. Production release/admission remains unimplemented.
+            let obligation = index
+                .files
+                .get_mut(&key)
+                .unwrap()
+                .codex_compressed_hold
+                .take();
+            assert_eq!(obligation, Some(CodexZstCause::ParentLedgerUnbound));
+            cache.clear();
+            cache.durable_begin_pass(SnapshotSource::Codex, &index_path, &namespace, capture);
+            let mut file = File::open(&path).unwrap();
+            let interpretation =
+                Interpretation::of(SnapshotSource::Codex, &key, &index, capture, &namespace);
+            let RestoreOutcome::Restored(old) = cache.durable_restore(
+                SnapshotSource::Codex,
+                &key,
+                &path,
+                &scope,
+                &mut file,
+                &index,
+                &interpretation,
+            ) else {
+                panic!("real disk checkpoint must restore");
+            };
+            assert_eq!(old.retained.checkpoint.sealed_offset(), prefix_len);
+            let identity = opened_object_identity(SnapshotSource::Codex, &mut file).unwrap();
+            let mut parser = OwnedJsonlParser::new(
+                file,
+                &path,
+                SnapshotSource::Codex,
+                apply_codex_line,
+                None,
+                None,
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+            let mode = parser
+                .prepare_acquisition(Some(old.retained), &scope, None, 1_900_000_000)
+                .unwrap();
+            assert_eq!(mode, crate::transcript_acquisition::ReadMode::Tail);
+            assert_eq!(
+                parser.reader.acquisition.as_ref().unwrap().start_offset(),
+                prefix_len
+            );
+            let mut recorder = codex_scan(&fixture, index.clone(), NOW)
+                .with_sampled_acquisition(Arc::clone(&cache), namespace.clone())
+                .sampling
+                .take()
+                .unwrap();
+            recorder.record_mode(mode, None);
+            assert_eq!((recorder.full_files, recorder.tail_files), (0, 1));
+            while !parser.step().unwrap() {}
+            assert_eq!(parser.reader.consumed_bytes(), length - prefix_len);
+            let recovered = parser
+                .finish(
+                    &identity,
+                    &path,
+                    NOW,
+                    "recovered-source".into(),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+            let mut file = File::open(&path).unwrap();
+            let identity = opened_object_identity(SnapshotSource::Codex, &mut file).unwrap();
+            let mut full = OwnedJsonlParser::new(
+                file,
+                &path,
+                SnapshotSource::Codex,
+                apply_codex_line,
+                None,
+                None,
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+            while !full.step().unwrap() {}
+            let control = full
+                .finish(
+                    &identity,
+                    &path,
+                    NOW,
+                    "recovered-source".into(),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+            assert!(!control.snapshots.is_empty());
+            assert_eq!(
+                serde_json::to_vec(&recovered.snapshots).unwrap(),
+                serde_json::to_vec(&control.snapshots).unwrap(),
+                "exact cumulative body, no duplicated prefix"
+            );
+            assert_eq!(index.files[&key].last_upload_body_witness, witness);
+        });
+    }
+}
+
+#[test]
+fn complete_negative_transaction_fences_custom_named_owner_before_publication_after_restart() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    with_test_limits(2048, 1024, 64, || {
+        for failure in 0..3 {
+            let (fixture, mut index, cache, held) = deferred_group_fixture(true);
+            let key = local_index_key(&held);
+            let plain = local_index_key(&fixture.file(SESSION));
+            assert!(codex_session_id_candidates_from_path(&held).is_empty());
+            let entry = index.files.get_mut(&plain).unwrap();
+            entry.codex_protected_owner = None;
+            entry.codex_counting_owner = None;
+            entry.codex_joined_member_set = None;
+            let old = entry.clone();
+            assert!(old.last_upload_body_witness.is_some());
+            let incidence = index.file_snapshot_fingerprints[&plain].clone();
+            assert!(old.last_snapshot_fingerprint.is_some());
+            let saved = fixture._dir.0.join("transaction.json");
+            index.save(&saved).unwrap();
+            let mut committed = index.clone();
+            index.hold_compressed(
+                &held,
+                BTreeSet::from([SESSION.into()]),
+                CodexZstCause::ParentLedgerUnbound,
+            );
+            let mut working = codex_scan(&fixture, index, NOW)
+                .with_sampled_acquisition(Arc::clone(&cache), Scope("cursor-fixture".into()));
+            let mut stale = committed.clone();
+            if failure == 1 {
+                stale.generation += 1;
+            }
+            if failure == 2 {
+                cache.with_cursor(|c| c.reserved = STATE_BYTES);
+            }
+            let result = working.persist_custody_decisions(
+                if failure == 1 {
+                    &mut stale
+                } else {
+                    &mut committed
+                },
+                &saved,
+            );
+            if failure == 0 {
+                result.unwrap();
+            } else {
+                assert!(result.is_err());
+            }
+            drop(working);
+            if failure == 2 {
+                cache.with_cursor(|c| c.reserved = 0);
+            }
+            if failure != 0 {
+                let retry = codex_scan(&fixture, ScanIndex::load(&saved).unwrap(), NOW)
+                    .with_sampled_acquisition(
+                        Arc::clone(&cache),
+                        Scope("different-context".into()),
+                    );
+                let OwnedSourceScanStep::Pending(mut retry) =
+                    codex_compressed_hold_tests::no_open(&held, || retry.step(None))
+                else {
+                    panic!("no reads before durable negative transaction");
+                };
+                retry
+                    .persist_custody_decisions(&mut committed, &saved)
+                    .unwrap();
+            }
+            drop(cache); // Crash: no job, pending intent or RAM proof survives.
+            let mut loaded = ScanIndex::load(&saved).unwrap();
+            loaded.traversal = None;
+            assert!(loaded.codex_state_only_blocked_by_file[&key].contains(SESSION));
+            assert!(loaded
+                .codex_state_only_blocked_session_ids
+                .contains(SESSION));
+            let mut bytes = codex_line(
+                json!({"type":"session_meta","timestamp":NOW,"payload":{"id":SESSION_B}}),
+            );
+            bytes.extend(token_line(1));
+            fs::write(fixture.file(SESSION_B), bytes).unwrap();
+            let (next, result, _) = codex_compressed_hold_tests::no_open(&held, || {
+                page_with(&fixture, loaded, None, "restart", NOW, |scan| {
+                    scan.state_census_complete = true;
+                    scan.sidecar_census_complete = true;
+                    scan.codex_title_metadata.state_threads.insert(
+                        SESSION.into(),
+                        CodexStateThread {
+                            tokens_used: 999999,
+                            updated_at: Some(NOW.into()),
+                            ..Default::default()
+                        },
+                    );
+                })
+            });
+            assert!(result
+                .snapshots
+                .iter()
+                .any(|s| s.source_session_id == SESSION_B));
+            assert!(
+                result
+                    .snapshots
+                    .iter()
+                    .all(|s| s.source_session_id != SESSION),
+                "neither sibling nor state-only replacement publishes A"
+            );
+            assert_eq!(result.unreadable_path_count, 0);
+            assert!(
+                next.files[&plain].codex_compressed_hold.is_some(),
+                "selective fence persists P's obligation"
+            );
+            assert_eq!(
+                next.files[&plain].last_snapshot_fingerprint,
+                old.last_snapshot_fingerprint
+            );
+            assert_eq!(
+                next.files[&plain].last_upload_body_witness,
+                old.last_upload_body_witness
+            );
+            assert_eq!(next.file_snapshot_fingerprints[&plain], incidence);
+            assert!(!next
+                .codex_state_only_snapshot_fingerprints
+                .contains_key(SESSION));
+        }
+    });
+}

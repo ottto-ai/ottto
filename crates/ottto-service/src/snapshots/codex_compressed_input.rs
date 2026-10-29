@@ -2621,7 +2621,8 @@ pub(in crate::snapshots) mod tests {
                     NOW,
                     &mut ScanIndex::default(),
                     &BTreeSet::new(),
-                );
+                )
+                .expect("funded state-only exclusion");
                 assert_eq!(control.len(), 1, "trusted state fallback is reachable");
                 let (mut index, first, _, _) =
                     archive_pass_with(&f, ScanIndex::default(), true, None, &[], |scan| {
@@ -2679,7 +2680,8 @@ pub(in crate::snapshots) mod tests {
                         NOW,
                         &mut index,
                         &BTreeSet::new(),
-                    );
+                    )
+                    .expect("funded state-only exclusion");
                     assert!(pending.is_empty());
                 }
                 if modern {
@@ -2696,7 +2698,8 @@ pub(in crate::snapshots) mod tests {
                         NOW,
                         &mut index,
                         &BTreeSet::new(),
-                    );
+                    )
+                    .expect("funded state-only exclusion");
                     let replacement = ambiguous.iter().find(|s| s.source_session_id == id);
                     assert_eq!(replacement.is_some(), !archive);
                     if let Some(replacement) = replacement {

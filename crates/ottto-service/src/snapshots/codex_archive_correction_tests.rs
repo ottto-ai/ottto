@@ -305,7 +305,8 @@ fn terminal_archive_residue_skips_only_affected_session_and_pending_still_reduce
         NOW,
         &mut index,
         &census.archive_terminal_sessions,
-    );
+    )
+    .expect("funded state-only exclusion");
     assert_eq!(
         items
             .iter()

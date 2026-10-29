@@ -105,6 +105,13 @@ pub(crate) fn custody_latch_deferred(events: u64, pages: u64, age_seconds: u64) 
     );
 }
 
+pub(crate) fn custody_overflow() {
+    durable_tail_alarm(
+        "codex",
+        &serde_json::json!({"custody_overflow": {"events": 1}}),
+    );
+}
+
 pub(crate) fn codex_zst_refused(cause: CodexZstCause) {
     let counter = &CODEX_ZST_REFUSED[cause as usize];
     let previous = counter

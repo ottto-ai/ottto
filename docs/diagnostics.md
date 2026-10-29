@@ -1355,5 +1355,17 @@ no further read. Unavailable group evidence ends after three ordinary resume
 pages; group jobs are never accelerated. Catch-up/release remains owner work.
 No cleanup drops consumed progress and no custody restart-Full exception exists.
 
+Correctness custody capacity refusal additionally emits
+`durable_tail_alarm.counts.custody_overflow.events = 1`. Units are refused
+inventory passes (owner/file fanout), receipt admission attempts, or state-only
+exclusion attempts; the
+inventory latch resets with a new inventory, exclusion is attempted once at
+completion. This is separate from held growth and decoder refusal. Keep the
+original cause and durable obligation; no Full, clear or cap increase follows.
+A refused state-only exclusion makes the whole Codex census incomplete until
+the held set fits (expected never on a normal machine); it alarms per pass.
+Census-gated retirement and carried-ACK completion wait while prior state-only
+fingerprints, activity and manifest coverage are retained.
+
 Post-release counts: `custody_latch_deferred.events`; observe its `pages` and
 `age_seconds` lifetime gauges alongside existing held-growth and native read counts.

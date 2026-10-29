@@ -10,6 +10,9 @@ pub(super) fn decoder_construction_count() -> usize {
     ACTIVITY.with(|counts| counts.get().0)
 }
 
+pub(super) fn activity() -> (usize, usize) {
+    ACTIVITY.with(std::cell::Cell::get)
+}
 pub(super) fn decoder_constructed() {
     ACTIVITY.with(|counts| {
         let (d, p) = counts.get();

@@ -152,6 +152,20 @@ pub(super) struct HeaderWitness {
     metadata: String,
     stamp: crate::transcript_acquisition::FileStamp,
 }
+impl HeaderWitness {
+    pub(super) fn custody_current(&self) -> bool {
+        fs::symlink_metadata(&self.candidate.path).is_ok_and(|stat| {
+            stat.is_file()
+                && !stat.file_type().is_symlink()
+                && (metadata_witness(&stat) == self.metadata
+                    || { let old = &self.stamp;
+                        crate::transcript_acquisition::FileStamp::capture(stat)
+                            .is_ok_and(|now| old.same_content(&now))
+                    })
+        })
+    }
+}
+
 pub(super) fn member_home(root: &Path) -> PathBuf {
     root.ancestors()
         .find(|path| {
@@ -376,7 +390,12 @@ pub(super) struct HeaderInventory {
     pub(super) headers: Vec<HeaderWitness>,
     pub(super) directories: DirectoryCensus,
     pub(super) complete: bool,
-    pub(super) custody_incomplete: bool,
+    pub(super) custody_next: usize,
+    pub(super) custody_after: Option<String>,
+    pub(super) custody_done: bool,
+    pub(super) custody_peak: usize,
+    pub(super) custody_refused: bool,
+    pub(super) custody_unknown: bool,
     pub(super) read_bytes: usize,
     pub(super) held_archives: BTreeSet<String>,
     pub(super) held_owners: BTreeSet<String>,
@@ -413,12 +432,18 @@ impl HeaderInventory {
             }
         }
     }
-    pub(super) fn member_held(&self, path: &Path) -> bool {
-        self.headers
-            .binary_search_by(|h| h.candidate.path.as_os_str().cmp(path.as_os_str()))
-            .is_ok_and(|at| self.headers[at].custody_cause.is_some())
+    pub(super) fn retry_custody_header(&mut self, at: usize) {
+        let header = self.headers.remove(at);
+        self.pending.push_front(header.candidate.path);
+        for header in &mut self.headers {
+            header.custody_cause = None;
+        }
+        self.custody_after = None;
+        self.custody_next = 0;
+        self.custody_done = false;
+        // read_bytes is NOT reset: repeated real edits reach the existing bound.
+        crate::local_resource_diagnostics::codex_zst_held(CodexZstCause::OwnerUnproven);
     }
-
     pub(super) fn complete_for(&self, owner: Option<&String>) -> bool {
         self.complete
             && !owner.is_some_and(|owner| {
@@ -446,7 +471,12 @@ impl HeaderInventory {
             complete: paths.len() <= MAX_HEADER_FILES
                 && directories.is_some_and(|value| value.stable),
             read_bytes: 0,
-            custody_incomplete: false,
+            custody_next: 0,
+            custody_after: None,
+            custody_done: false,
+            custody_peak: 0,
+            custody_refused: false,
+            custody_unknown: false,
             held_archives: BTreeSet::new(),
             held_owners: BTreeSet::new(),
             archive_work: codex_compressed_input::HeaderWork::default(),
@@ -547,8 +577,6 @@ impl HeaderInventory {
             .get(&key)
             .is_some_and(|entry| entry.codex_compressed_hold.is_some())
         {
-            self.custody_incomplete = true;
-            self.complete = false;
             return false;
         }
         if self.held_archives.contains(&key) {
@@ -622,6 +650,7 @@ impl HeaderInventory {
                     .stamp
                     .clone();
                 return Ok(HeaderWitness {
+                    custody_cause: None,
                     home: member_home(&candidate.scan_root),
                     candidate,
                     owner: header.owner,
@@ -779,9 +808,7 @@ impl HeaderInventory {
 }
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
 crate::heap_layout_bound::fields!(HeaderWitness; custody_cause, candidate, owner, home, created_unix_ms, metadata, stamp);
-crate::heap_layout_bound::fields!(HeaderInventory; custody_incomplete, roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, archive_work, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, bounded_out);
-
-
+crate::heap_layout_bound::fields!(HeaderInventory; custody_next, custody_unknown, custody_after, custody_done, custody_peak, custody_refused, roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, archive_work, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, bounded_out);
 
 #[derive(Clone, Debug)]
 pub(super) struct Group {
@@ -3517,7 +3544,7 @@ pub(super) mod tests {
                 &mut index,
                 &BTreeSet::new()
             ),
-            (1, 0)
+            Some((1, 0))
         );
         assert_eq!(items[0].source_session_id, healthy);
         // Malformed/future owner metadata cannot reset the surrounding index
@@ -3536,7 +3563,7 @@ pub(super) mod tests {
                 &mut malformed,
                 &BTreeSet::new()
             ),
-            (0, 0)
+            Some((0, 0))
         );
         assert!(items.is_empty());
         fs::remove_dir_all(root).unwrap();
