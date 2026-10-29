@@ -558,6 +558,8 @@ pub(crate) fn bind_replacement_local_relay_listener(
     bind_local_relay_listener(Some(old_port))
 }
 
+pub(crate) const RELAY_ENDPOINT_MISMATCH_CODE: &str = "claude_relay_endpoint_mismatch";
+
 pub(crate) fn approved_endpoint_mismatch(relay: &RelayState) -> Option<StableMessage> {
     if relay.state != RelayRuntimeState::Connected {
         return None;
@@ -570,7 +572,7 @@ pub(crate) fn approved_endpoint_mismatch(relay: &RelayState) -> Option<StableMes
     let approved_port = crate::control::approved_managed_claude_relay_endpoint().ok()??;
     let approved_port = local_relay_port_from_endpoint(&approved_port)?;
     (approved_port != live_port).then(|| StableMessage {
-        code: "claude_relay_endpoint_mismatch".to_string(),
+        code: RELAY_ENDPOINT_MISMATCH_CODE.to_string(),
         text: format!(
             "Relay connected (127.0.0.1:{live_port}) but Claude settings point at 127.0.0.1:{approved_port}."
         ),

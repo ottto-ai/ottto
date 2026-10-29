@@ -32127,6 +32127,30 @@ X-API-Key = "otel_redacted"
             finding.text,
             "Relay connected (127.0.0.1:43119) but Claude settings point at 127.0.0.1:48123."
         );
+        let mismatch_blockers = |status: &ottto_protocol::DaemonStatus| {
+            let health = status.canonical_health.as_ref().unwrap();
+            let codes = health
+                .blockers
+                .iter()
+                .filter(|blocker| blocker.code == finding.code)
+                .map(|blocker| (blocker.severity.clone(), blocker.owner.clone()))
+                .collect::<Vec<_>>();
+            (codes, health.overall.state.clone())
+        };
+        // The uploaded projection re-reads status, then re-projects it.
+        let mut uploaded = daemon.status_for_trusted_client().unwrap();
+        crate::refresh_canonical_local_health(&mut uploaded);
+        for status in [daemon.status_for_trusted_client().unwrap(), uploaded] {
+            let (codes, overall) = mismatch_blockers(&status);
+            assert_eq!(
+                codes,
+                vec![(
+                    ottto_protocol::LocalHealthSeverity::Warning,
+                    "source".to_string()
+                )]
+            );
+            assert_ne!(overall, ottto_protocol::LocalHealthOverallState::Healthy);
+        }
         let diagnostics = crate::claude_local_otel::support_health::diagnostics_items(
             &root.join("support"),
             &live,
@@ -32161,12 +32185,12 @@ X-API-Key = "otel_redacted"
         assert_eq!(daemon.state().unwrap().relay, live);
 
         write_startup_relay_settings(&root, "http://127.0.0.1:43119");
-        assert!(daemon
-            .status_for_trusted_client()
-            .unwrap()
-            .relay
-            .last_error
-            .is_none());
+        let cleared = daemon.status_for_trusted_client().unwrap();
+        assert!(cleared.relay.last_error.is_none());
+        assert!(
+            mismatch_blockers(&cleared).0.is_empty(),
+            "blocker clears on match"
+        );
         assert!(
             !crate::claude_local_otel::support_health::diagnostics_items(
                 &root.join("support"),

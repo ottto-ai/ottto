@@ -645,6 +645,11 @@ impl LocalDaemon {
         // perform settings I/O while holding the daemon state lock.
         if status.relay.last_error.is_none() {
             status.relay.last_error = otlp_relay::approved_endpoint_mismatch(&status.relay);
+            if status.relay.last_error.is_some() {
+                // Project the finding into canonical health, so status and the
+                // uploaded machine-health heartbeat both carry its blocker.
+                refresh_canonical_local_health(&mut status);
+            }
         }
         Ok(status)
     }
@@ -3053,6 +3058,23 @@ fn local_health_blockers_for_status(
             LocalHealthAuthority::Runtime,
             &observed_at,
             "restart ottto-service (or restore its DNS resolution); usage snapshot sync is stalled while other uploads succeed",
+        ));
+    }
+    // New Claude Code processes export to a port nobody binds: their usage
+    // loses its telemetry login. Pure: reads status()'s response-only finding.
+    if status
+        .relay
+        .last_error
+        .as_ref()
+        .is_some_and(|error| error.code == otlp_relay::RELAY_ENDPOINT_MISMATCH_CODE)
+    {
+        blockers.push(blocker(
+            otlp_relay::RELAY_ENDPOINT_MISMATCH_CODE,
+            LocalHealthSeverity::Warning,
+            "source",
+            LocalHealthAuthority::Runtime,
+            &status.generated_at,
+            "restart ottto-service so the relay binds the port Claude settings name, or re-approve Claude telemetry setup",
         ));
     }
     if account.state == LocalHealthAccountState::Connected {

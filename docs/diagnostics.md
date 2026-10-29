@@ -593,6 +593,9 @@ different loopback port, `ottto doctor` reports both ports. `ottto status --json
 and `ottto doctor --json` expose `relay.last_error.code` as
 `claude_relay_endpoint_mismatch`; `relay.state` remains `connected`. The
 `claude_local_evidence` diagnostics section includes the same finding.
+Canonical local health carries it as a `Warning` blocker with the same code
+(owner `source`), so the machine reads `degraded` and the existing machine-health
+upload reports it to Ottto the same day. The blocker clears with the finding.
 
 This compares current approved settings with the daemon's listener state; it
 does not probe exporters or prove that a running Claude process reloaded its
