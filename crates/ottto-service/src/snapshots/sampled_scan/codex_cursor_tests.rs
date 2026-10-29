@@ -15918,7 +15918,7 @@ fn plain_cursor_resumes_unchanged_when_its_archive_sibling_is_family_held() {
     let expected = serde_json::to_vec(&control.snapshots[0]).unwrap();
     let cache = Arc::new(SharedCache::default());
     with_test_limits(2048, 1024, 64, || {
-        let (mut index, members) = paused_singleton(&fixture, &cache);
+        let (mut index, _) = paused_singleton(&fixture, &cache);
         let archive = fixture
             .root
             .join(format!("rollout-2026-10-07T11-00-00-{SESSION}.jsonl.zst"));
@@ -16203,6 +16203,12 @@ fn deferred_custody_group_money_main_pass_and_withhold_then_quiet_restart() {
             assert!(inventory.complete);
             let before = index.files[&plain].clone();
             let mut committed = index.clone();
+            let credit_before_mint = json!({
+                "acks": committed.accepted_snapshot_fingerprints,
+                "incidence": committed.file_snapshot_fingerprints,
+                "proofs": committed.codex_parent_prefix_proofs,
+                "side": committed.codex_parent_side,
+            });
             // The current decision includes its validated owner/veto, not a fake owner.
             index.hold_compressed(
                 &held,
@@ -16227,6 +16233,16 @@ fn deferred_custody_group_money_main_pass_and_withhold_then_quiet_restart() {
             assert_eq!(
                 committed.files[&plain].last_upload_body_witness,
                 before.last_upload_body_witness
+            );
+            assert_eq!(
+                json!({
+                    "acks": committed.accepted_snapshot_fingerprints,
+                    "incidence": committed.file_snapshot_fingerprints,
+                    "proofs": committed.codex_parent_prefix_proofs,
+                    "side": committed.codex_parent_side,
+                }),
+                credit_before_mint,
+                "mint gives no ACK/proof/fingerprint credit"
             );
             let crash_index = ScanIndex::load(&saved).unwrap();
             let cold_cache = Arc::new(SharedCache::default());
