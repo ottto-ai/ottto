@@ -921,7 +921,8 @@ fn codex_24b_old_writer_row(require_zero_old_bytes: bool) {
         assert_eq!(quiet.restored, 1);
         assert_eq!(quiet.io.rederive_named, 0);
         assert_eq!(quiet.io.consumed, quiet.io.rederive_head);
-        assert!(quiet.io.rederive_head <= old_size);
+        // The successor's opening-window mark can advance into this suffix.
+        assert!(quiet.io.rederive_head <= old_size + suffix.len() as u64);
         if require_zero_old_bytes {
             assert_eq!(quiet.io.consumed, 0);
         }
