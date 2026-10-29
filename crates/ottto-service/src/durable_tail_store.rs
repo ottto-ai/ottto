@@ -1968,6 +1968,7 @@ impl DurableTailStore {
                 continue;
             }
             let mut layout_retirement = None;
+            let mut class_retirement = None;
             let verdict = match self.classify(&key, "delete", Some(writer)) {
                 Ok(Some(header))
                     if header.format == FORMAT_V3
@@ -2009,9 +2010,11 @@ impl DurableTailStore {
                     }) {
                         self.counters.native_class_parked += 1;
                         Some(len)
-                    } else {
-                        self.counters.native_class_retired += 1;
+                    } else if let Some(stamp) = header.stamp {
+                        class_retirement = Some(stamp);
                         None
+                    } else {
+                        Some(len)
                     }
                 }
                 Ok(Some(header)) if !self.authorized(&key, header.format) => Some(len),
@@ -2049,7 +2052,7 @@ impl DurableTailStore {
                     on_disk.insert(key, len);
                 }
                 None => {
-                    if let Some(stamp) = layout_retirement {
+                    if let Some(stamp) = layout_retirement.or(class_retirement) {
                         if stamp_at(&path)? != Some(stamp) {
                             on_disk.insert(key, len);
                             continue; // Replaced since verification: never unlink the new record.
@@ -2058,6 +2061,7 @@ impl DurableTailStore {
                     remove_if_present(&path)?;
                     self.counters.restore_unavailable_layout_gc +=
                         u64::from(layout_retirement.is_some());
+                    self.counters.native_class_retired += u64::from(class_retirement.is_some());
                     self.durable.remove(&key);
                     self.counters.gc_records_deleted += 1;
                     deleted = true;

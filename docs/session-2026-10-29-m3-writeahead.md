@@ -82,7 +82,9 @@ Codex group inventory records a class exclusion before member acquisition.
 Completed excluded classes also record it for same-pass restore refusal and GC.
 GC retires only verified native format-3 write-ahead records in the live context;
 #865 envelope debt must already have an equal-or-earlier index carrier, otherwise
-the record stays parked. Side reads alone do not change a singleton's class.
+the record stays parked. Retirement rechecks the classified record's stamp and
+counts only a successful unlink; a failed unlink leaves A available for the
+existing committed-class refusal across restart. Side reads alone do not change a singleton's class.
 Post-read proof/compatibility transitions remain unqualified across passes when
 GC has not retired the old record. Class changes never clear pending or owed
 claims by themselves. Overflow retains discovery conservatively and does not
@@ -97,6 +99,14 @@ before that seed expects v1. E4 chose an exact hash-pinned archived v1 producer 
 merge it forward and add a separately versioned native-M3 seed. The extractor
 and frozen old-writer pins remain unchanged; a format-3 record is never an old
 writer artifact.
+
+Qualification fixtures settle the real policy-finalized index before saving,
+so an unchanged file with no remaining selection reads zero bytes. Native D3
+cold comparisons include the production semantic fingerprint (usage, pricing
+selectors and costs) alongside the additive upload-body witness; additive
+evidence alone cannot qualify money equivalence. A post-read priority transition
+fixture covers failed GC and restart with the actual protected-tier receipt.
+Execution of the supported-layout fixture remains a macOS CI requirement.
 
 For native-M3, `FileSynced` is explicitly N/A: **plain-flush engine: no fsync
 boundary**. The M1/old-writer matrix retains its historical row. A portable

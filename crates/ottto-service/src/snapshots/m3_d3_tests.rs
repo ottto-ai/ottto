@@ -78,11 +78,21 @@ fn now_unix() -> u64 {
         .as_secs()
 }
 
-fn witness_of(snapshots: &[SnapshotItem], session: &str) -> Option<String> {
+fn witness_of(
+    source: SnapshotSource,
+    snapshots: &[SnapshotItem],
+    session: &str,
+) -> Option<(String, String)> {
     snapshots
         .iter()
         .find(|item| item.source_session_id == session)
-        .map(snapshot_upload_body_witness)
+        .map(|item| {
+            // Additive evidence alone does not include usage, tiers or costs.
+            (
+                snapshot_fingerprint(source, item),
+                snapshot_upload_body_witness(item),
+            )
+        })
 }
 
 /// One production scan to completion over the real sampled acquisition.
@@ -110,7 +120,19 @@ fn scan(
     for _ in 0..10_000 {
         match scan.step(None) {
             OwnedSourceScanStep::Pending(next) => scan = next,
-            OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan.snapshots),
+            OwnedSourceScanStep::Complete {
+                mut index,
+                mut scan,
+                ..
+            } => {
+                finalize_scan_after_policy_with_body_witness(
+                    source,
+                    &mut scan,
+                    &mut index,
+                    snapshot_upload_body_witness,
+                );
+                return (index, scan.snapshots);
+            }
         }
     }
     panic!("production scan did not complete");
@@ -118,6 +140,7 @@ fn scan(
 
 /// What one pass published and reported.
 struct Pass {
+    source: SnapshotSource,
     snapshots: Vec<SnapshotItem>,
     events: Vec<Value>,
 }
@@ -128,8 +151,8 @@ impl Pass {
             .filter(|item| item.source_session_id == session)
             .count()
     }
-    fn witness(&self, session: &str) -> Option<String> {
-        witness_of(&self.snapshots, session)
+    fn witness(&self, session: &str) -> Option<(String, String)> {
+        witness_of(self.source, &self.snapshots, session)
     }
     /// One completed page per pass at these sizes; summed to stay exact.
     fn selections(&self, field: &str) -> u64 {
@@ -228,10 +251,14 @@ impl Rig {
             (index, snapshots)
         });
         self.index = index;
-        Pass { snapshots, events }
+        Pass {
+            source: self.source,
+            snapshots,
+            events,
+        }
     }
     /// The cold Full oracle: a fresh cache, no store slot, no index.
-    fn cold(&self, session: &str) -> String {
+    fn cold(&self, session: &str) -> (String, String) {
         let fresh = Arc::new(SharedCache::default());
         let (_, snapshots) = scan(
             self.source,
@@ -240,7 +267,7 @@ impl Rig {
             fresh,
             &self.namespace,
         );
-        witness_of(&snapshots, session).expect("cold Full publishes the session")
+        witness_of(self.source, &snapshots, session).expect("cold Full publishes the session")
     }
     fn path(&self, session: &str) -> PathBuf {
         self.sessions.join(format!("{session}.jsonl"))
@@ -1291,4 +1318,115 @@ fn m3_codex_singleton_to_group_refuses_native_restore_and_retires_record() {
     let (_, after) = rig.counters();
     assert_eq!(after.bytes_read, before.bytes_read, "zero wrong bytes");
     assert_eq!(after.records_read, before.records_read);
+}
+
+/// A priority contribution is discovered only after reading the appended
+/// suffix. Its existing Full replay must match cold money, and the committed
+/// receipt must refuse A across restart even when the first GC unlink fails.
+#[test]
+fn m3_codex_post_read_tier_transition_refuses_a_across_failed_gc_and_restart() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    let _clear = ClearFaults;
+    let mut rig = Rig::new(SnapshotSource::Codex, "m3-post-read-tier");
+    rig.create(CODEX_SESSION, 2);
+    assert_eq!(rig.pass().published(CODEX_SESSION), 1);
+    rig.assert_native_record(CODEX_SESSION);
+    let record = rig.record(CODEX_SESSION);
+    let a = fs::read(&record).unwrap();
+    let mut priority: Value = serde_json::from_str(&codex_line(3)).unwrap();
+    priority["payload"]["service_tier"] = json!("priority");
+    File::options()
+        .append(true)
+        .open(rig.path(CODEX_SESSION))
+        .unwrap()
+        .write_all((priority.to_string() + "\n").as_bytes())
+        .unwrap();
+    rig.restart();
+    fail_cleanup(Cleanup::Unlink, record.clone());
+    let transition = rig.pass();
+    assert_eq!(
+        transition.witness(CODEX_SESSION),
+        Some(rig.cold(CODEX_SESSION))
+    );
+    let actual = transition
+        .snapshots
+        .iter()
+        .find(|item| item.source_session_id == CODEX_SESSION)
+        .unwrap();
+    assert!(
+        actual.input_tokens > 0,
+        "the cold comparison must contain real usage"
+    );
+    let mut wrong_money = actual.clone();
+    wrong_money.input_tokens += 1;
+    assert_eq!(
+        snapshot_upload_body_witness(actual),
+        snapshot_upload_body_witness(&wrong_money)
+    );
+    assert_ne!(
+        witness_of(rig.source, std::slice::from_ref(actual), CODEX_SESSION),
+        witness_of(rig.source, &[wrong_money], CODEX_SESSION),
+        "a wrong money field must fail even with an identical additive witness"
+    );
+    let key = rig.key(CODEX_SESSION);
+    assert!(rig.index.files[&key].codex_applied_tier_receipt_required);
+    assert!(rig.index.files[&key].codex_applied_tier_receipt.is_some());
+    assert_eq!(fs::read(&record).unwrap(), a, "failed unlink preserves A");
+    assert_eq!(
+        rig.counters().1.native_class_retired,
+        0,
+        "a failed unlink is not retirement"
+    );
+
+    rig.restart();
+    rig.cache
+        .durable_begin_pass(rig.source, &rig.index_path, &rig.namespace, true);
+    let interpretation = sampled_scan::durable_tail::Interpretation::of(
+        rig.source,
+        &key,
+        &rig.index,
+        true,
+        &rig.namespace,
+    );
+    let before = rig.counters().1;
+    assert!(matches!(
+        rig.cache.durable_restore(
+            rig.source,
+            &key,
+            &rig.path(CODEX_SESSION),
+            &Scope("excluded".into()),
+            &mut File::open(rig.path(CODEX_SESSION)).unwrap(),
+            &rig.index,
+            &interpretation,
+        ),
+        sampled_scan::durable_tail::RestoreOutcome::Miss(
+            sampled_scan::durable_tail::MissClass::ExcludedClass
+        )
+    ));
+    let after = rig.counters().1;
+    assert_eq!(
+        after.bytes_read, before.bytes_read,
+        "no stale-A bytes after the class is committed"
+    );
+    assert_eq!(after.records_read, before.records_read);
+    clear_store_faults();
+    durable_after_save(&rig.cache, &rig.root, rig.source, &rig.index);
+    assert!(!record.exists());
+    assert_eq!(
+        rig.counters().1.native_class_retired,
+        1,
+        "only successful retirement is counted"
+    );
+
+    rig.restart();
+    rig.append(CODEX_SESSION, 1);
+    let grown = rig.pass();
+    assert_eq!(grown.witness(CODEX_SESSION), Some(rig.cold(CODEX_SESSION)));
+    assert_eq!(rig.counters().0.restored, 0);
+    assert!(
+        !record.exists(),
+        "the excluded owner never stages another singleton A"
+    );
 }

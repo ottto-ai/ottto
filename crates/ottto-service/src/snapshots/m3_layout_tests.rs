@@ -98,6 +98,14 @@ impl Fixture {
         panic!("layout fixture did not finish");
     }
     fn settle(&self, cache: &SharedCache, read: &mut Read) {
+        // The daemon finalizes the post-policy body tuple before saving.
+        // Saving the raw scan leaves adoption owed and selects a quiet file.
+        finalize_scan_after_policy_with_body_witness(
+            SOURCE,
+            &mut read.scan,
+            &mut read.index,
+            snapshot_upload_body_witness,
+        );
         read.index.save(&self.index_path()).unwrap();
         cache.durable_write_after_save(self.writer, SOURCE, &read.index);
         cache.durable_gc(self.writer, SOURCE, &read.index).unwrap();
@@ -181,6 +189,12 @@ fn unsupported_native_finish_keeps_legacy_path_without_a_v3_record() {
             snapshot_upload_body_witness(&read.scan.snapshots[0]),
             snapshot_upload_body_witness(&cold.scan.snapshots[0])
         );
+        assert!(read.scan.snapshots[0].input_tokens > 0);
+        assert_eq!(
+            snapshot_fingerprint(SOURCE, &read.scan.snapshots[0]),
+            snapshot_fingerprint(SOURCE, &cold.scan.snapshots[0]),
+            "usage, tier selectors and costs must match cold Full as well as additive evidence"
+        );
         f.settle(&cache, &mut read);
         let (counts, disk) = cache.durable_counters(SOURCE).unwrap();
         assert_eq!(
@@ -236,12 +250,29 @@ fn preexisting_v3_on_unsupported_layout_reads_only_selected_key_then_retires_aft
             snapshot_upload_body_witness(&read.scan.snapshots[0]),
             snapshot_upload_body_witness(&cold.scan.snapshots[0])
         );
+        assert!(read.scan.snapshots[0].input_tokens > 0);
+        assert_eq!(
+            snapshot_fingerprint(SOURCE, &read.scan.snapshots[0]),
+            snapshot_fingerprint(SOURCE, &cold.scan.snapshots[0]),
+            "usage, tier selectors and costs must match cold Full as well as additive evidence"
+        );
         f.settle(&cache, &mut read);
         assert!(!record.exists());
         let (counts, disk) = cache.durable_counters(SOURCE).unwrap();
         assert_eq!(counts.ineligible["restore_unavailable.layout"], 1);
         assert_eq!(disk.restore_unavailable_layout_gc, 1);
+        assert!(read.index.files[&f.key()]
+            .last_upload_body_witness
+            .is_some());
+        assert!(!read
+            .index
+            .effective_upload_body_witness_revision_requires_adoption(&f.key()));
         let quiet = f.scan(read.index.clone(), Some(cache.clone()));
+        assert_eq!(
+            quiet.modes,
+            (0, 0, 0),
+            "the settled quiet key is not selected"
+        );
         assert_eq!(quiet.bytes, 0, "unselected quiet key reads nothing");
         f.select_audit(&mut read.index);
         let mut next = f.scan(read.index, Some(cache.clone()));
@@ -324,6 +355,11 @@ fn supported_native_layout_still_restores_a_grown_key() {
     assert_eq!(
         snapshot_upload_body_witness(&read.scan.snapshots[0]),
         snapshot_upload_body_witness(&cold.scan.snapshots[0])
+    );
+    assert!(read.scan.snapshots[0].input_tokens > 0);
+    assert_eq!(
+        snapshot_fingerprint(SOURCE, &read.scan.snapshots[0]),
+        snapshot_fingerprint(SOURCE, &cold.scan.snapshots[0]),
     );
 }
 
