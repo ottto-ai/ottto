@@ -2552,3 +2552,22 @@ fn pi_insertion_counts_claude_and_codex_cache_victims_only() {
     assert_eq!(counts.cache_evicted_by_pi_codex, 0);
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// The Pi ledger cap counter is defined and printed for Pi only; P4b's live
+/// receipt is its first writer.
+#[test]
+fn pi_ledger_cap_counter_prints_in_the_pi_summary_only() {
+    let counts = Counters {
+        retained_refused_pi_ledger_cap: 2,
+        ..Counters::default()
+    };
+    let disk = store::StoreCounters::default();
+    assert!(counts
+        .summary(SnapshotSource::Pi, &disk)
+        .contains(" peak_body_bytes=0 retained_refused_pi_ledger_cap=2 disk_records=0 "));
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        assert!(!counts
+            .summary(source, &disk)
+            .contains("retained_refused_pi_ledger_cap"));
+    }
+}

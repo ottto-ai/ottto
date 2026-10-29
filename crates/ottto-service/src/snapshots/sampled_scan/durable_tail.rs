@@ -83,6 +83,11 @@ pub(crate) struct Counters {
     /// state-directory lock (not the daemon).
     pub(crate) write_unlocked: u64,
     pub(crate) peak_body_bytes: u64,
+    // E5-PI-B2-SEAM: P4b live receipt bumps this on
+    // `PrepareOutcome::NotPersisted(Codec)` with class `PI_LEDGER_CAP`.
+    /// Pi ledgers over `PI_LEDGER_MAX_KEYS`, refused at prepare; printed in
+    /// the Pi summary only.
+    pub(crate) retained_refused_pi_ledger_cap: u64,
     /// GC's largest keep map: index keys with a record on disk, at most the
     /// store's `INVENTORY_BOUND`, whatever the index size.
     pub(crate) gc_keep_peak: u64,
@@ -102,10 +107,18 @@ impl Counters {
                 .collect::<Vec<_>>()
                 .join(",")
         };
+        let pi = if source == SnapshotSource::Pi {
+            format!(
+                " retained_refused_pi_ledger_cap={}",
+                self.retained_refused_pi_ledger_cap
+            )
+        } else {
+            String::new()
+        };
         format!(
             "ottto-service: durable_tail source={} rederive_head_bytes={} \
              rederive_named_lines={} rederive_line_bytes={} not_persisted={{{}}} \
-             write_deferred={} write_unlocked={} peak_body_bytes={} disk_records={} disk_bytes={} \
+             write_deferred={} write_unlocked={} peak_body_bytes={}{pi} disk_records={} disk_bytes={} \
              bytes_written={} records_written={} records_clean={} store_budget_refused={} \
              bytes_read={} format_hold[newer,unknown,undecodable,unbindable,known_corrupt]={:?} durable_held={:?} held_census[kept,invalidated]={:?} \
              guard_header_bytes={} guard_verify_bytes={} delete_verify_bytes={} overwrite_verify_bytes={} \

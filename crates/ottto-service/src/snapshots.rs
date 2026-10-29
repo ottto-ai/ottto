@@ -37983,6 +37983,12 @@ struct PiUsageDedupState {
     paired_digests: BTreeSet<String>,
 }
 
+crate::durable_tail_codec::durable_struct!(PiUsageDedupState {
+    H message: BTreeMap<String, usize>,
+    H message_end: BTreeMap<String, usize>,
+    H paired_digests: BTreeSet<String>,
+});
+
 impl PiUsageDedupState {
     /// Returns true when this record is a new billable occurrence. An exact
     /// opposite-shape occurrence consumes one unmatched digest and is the

@@ -85,6 +85,9 @@ pub(crate) fn allowlist_digest(source: SnapshotSource) -> [u8; 32] {
     ));
     CachedJsonlReduction::shape(&mut shape);
     Rederive::shape(&mut shape);
+    if source == SnapshotSource::Pi {
+        pi::shape_extension(&mut shape);
+    }
     shape.digest()
 }
 
@@ -93,6 +96,7 @@ pub(crate) fn shape_text() -> String {
     let mut shape = Shape::default();
     CachedJsonlReduction::shape(&mut shape);
     Rederive::shape(&mut shape);
+    pi::shape_extension(&mut shape);
     shape.text().to_string()
 }
 
@@ -376,6 +380,12 @@ pub(crate) fn rederive_parser(
 #[cfg(test)]
 #[path = "durable_tests.rs"]
 mod tests;
+
+// E5-PI-B2-SEAM: format-3 codec table `(3, 3) => A_P` row (P4a) and the P4b
+// live receipt call this module; this allow goes at that wiring.
+#[cfg_attr(not(test), allow(dead_code))]
+#[path = "durable_pi.rs"]
+pub(in crate::snapshots) mod pi;
 
 #[cfg(test)]
 pub(crate) fn store_fixture_body(source: SnapshotSource, count: u64, sum: u64) -> Vec<u8> {

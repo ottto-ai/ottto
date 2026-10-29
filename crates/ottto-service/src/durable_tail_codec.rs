@@ -53,8 +53,16 @@ pub(crate) enum Refuse {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Corrupt;
 
+/// Resource refusal never authorizes corrupt-record recovery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DecodeFailure {
+    Integrity,
+    Budget,
+}
+
 enum Sink {
     Bytes { out: Vec<u8>, limit: usize },
+    Count { limit: usize },
     Hash(Box<Sha256>),
 }
 
@@ -62,15 +70,32 @@ enum Sink {
 /// be checked against the digest without storing it.
 pub(crate) struct Enc {
     sink: Sink,
+    written: usize,
+    moved_field: Option<&'static str>,
 }
 
 impl Enc {
     pub(crate) fn bytes(limit: usize) -> Self {
         Self {
+            written: 0,
+            moved_field: None,
             sink: Sink::Bytes {
                 out: Vec::new(),
                 limit,
             },
+        }
+    }
+    pub(crate) fn count(limit: usize) -> Self {
+        Self {
+            sink: Sink::Count { limit },
+            written: 0,
+            moved_field: None,
+        }
+    }
+    pub(crate) fn counted(&self) -> usize {
+        match &self.sink {
+            Sink::Count { .. } => self.written,
+            _ => unreachable!("only a count sink has a counted length"),
         }
     }
     pub(crate) fn hash(domain: &str) -> Self {
@@ -79,20 +104,63 @@ impl Enc {
         hasher.update(domain.as_bytes());
         Self {
             sink: Sink::Hash(Box::new(hasher)),
+            written: 0,
+            moved_field: None,
         }
+    }
+    /// One record's Pi body may omit exactly this E field. Drop clears the
+    /// allowance on success, refusal and unwind, including a reused encoder.
+    pub(crate) fn with_pi_ledger<T>(
+        &mut self,
+        put: impl FnOnce(&mut Enc) -> Result<T, Refuse>,
+    ) -> Result<T, Refuse> {
+        struct Guard<'a>(&'a mut Enc);
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                self.0.moved_field = None;
+            }
+        }
+        self.moved_field = Some("SnapshotAccumulator.seen_pi_usage_keys");
+        let guard = Guard(self);
+        put(guard.0)
+    }
+    pub(crate) fn field_moved(&self, path: &str) -> bool {
+        self.moved_field == Some(path)
+    }
+    /// Tagged section, `varint tag ‖ u64 LE length ‖ bytes`. The length comes
+    /// from a count pass of the same walk, so no sink is ever back-patched.
+    pub(crate) fn section(
+        &mut self,
+        tag: u64,
+        put: impl Fn(&mut Enc) -> Result<(), Refuse>,
+    ) -> Result<(), Refuse> {
+        let mut count = Enc::count(usize::MAX);
+        put(&mut count)?;
+        self.varint(tag)?;
+        self.raw(&(count.counted() as u64).to_le_bytes())?;
+        let start = self.written;
+        put(self)?;
+        // A changed walk cannot leave a successfully prepared malformed body.
+        (self.written - start == count.counted())
+            .then_some(())
+            .ok_or(Refuse::TooLarge)
     }
     pub(crate) fn hashing(&self) -> bool {
         matches!(self.sink, Sink::Hash(_))
     }
-    /// Bytes written so far; `None` in hash mode. Tests only.
+    /// Byte-output position; counting and hashing never record `L` spans.
     #[cfg(test)]
     pub(crate) fn position(&self) -> Option<usize> {
         match &self.sink {
             Sink::Bytes { out, .. } => Some(out.len()),
-            Sink::Hash(_) => None,
+            Sink::Hash(_) | Sink::Count { .. } => None,
         }
     }
     pub(crate) fn raw(&mut self, bytes: &[u8]) -> Result<(), Refuse> {
+        let written = self
+            .written
+            .checked_add(bytes.len())
+            .ok_or(Refuse::TooLarge)?;
         match &mut self.sink {
             Sink::Bytes { out, limit } => {
                 if out.len().saturating_add(bytes.len()) > *limit {
@@ -101,7 +169,13 @@ impl Enc {
                 out.extend_from_slice(bytes);
             }
             Sink::Hash(hasher) => hasher.update(bytes),
+            Sink::Count { limit } => {
+                if written > *limit {
+                    return Err(Refuse::TooLarge);
+                }
+            }
         }
+        self.written = written;
         Ok(())
     }
     pub(crate) fn varint(&mut self, mut value: u64) -> Result<(), Refuse> {
@@ -128,7 +202,7 @@ impl Enc {
     pub(crate) fn into_bytes(self) -> Vec<u8> {
         match self.sink {
             Sink::Bytes { out, .. } => out,
-            Sink::Hash(_) => Vec::new(),
+            Sink::Hash(_) | Sink::Count { .. } => Vec::new(),
         }
     }
     /// Hash mode: the digest.
@@ -136,6 +210,7 @@ impl Enc {
         match self.sink {
             Sink::Hash(hasher) => hasher.finalize().into(),
             Sink::Bytes { out, .. } => Sha256::digest(out).into(),
+            Sink::Count { .. } => unreachable!("counting is not hashing"),
         }
     }
 }
@@ -144,11 +219,60 @@ impl Enc {
 pub(crate) struct Dec<'a> {
     bytes: &'a [u8],
     at: usize,
+    allowance: Option<&'a mut dyn FnMut(u64) -> bool>,
+    refused: bool,
+    /// A section the body must carry: `Some(false)` until it is read.
+    required_section: Option<bool>,
 }
 
 impl<'a> Dec<'a> {
     pub(crate) fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, at: 0 }
+        Self {
+            bytes,
+            at: 0,
+            allowance: None,
+            refused: false,
+            required_section: None,
+        }
+    }
+    // E5-PI-B2-SEAM: reuse the bounded Dec allowance from the active restore
+    // owner (r2-interfaces G1 `ActiveLease::charge`); it is not a second lease.
+    pub(crate) fn bounded(bytes: &'a [u8], allowance: &'a mut dyn FnMut(u64) -> bool) -> Self {
+        Self {
+            bytes,
+            at: 0,
+            allowance: Some(allowance),
+            refused: false,
+            required_section: None,
+        }
+    }
+    fn reserve(&mut self, bytes: Option<usize>) -> Result<(), Corrupt> {
+        if self.allowance.is_none() {
+            return Ok(());
+        }
+        let granted = bytes
+            .and_then(|n| u64::try_from(n).ok())
+            .is_some_and(|n| self.allowance.as_mut().is_some_and(|grant| grant(n)));
+        self.refused |= !granted;
+        granted.then_some(()).ok_or(Corrupt)
+    }
+    fn slots<T>(&mut self, len: usize) -> Result<(), Corrupt> {
+        self.reserve(len.checked_mul(std::mem::size_of::<T>()))
+    }
+    fn tree<K, V>(&mut self, len: usize) -> Result<(), Corrupt> {
+        self.reserve(
+            len.checked_add(1)
+                .and_then(|n| n.checked_mul(crate::heap_layout_bound::tree_node_bytes::<K, V>()?)),
+        )
+    }
+    pub(crate) fn outcome<T>(&self, value: Result<T, Corrupt>) -> Result<T, DecodeFailure> {
+        value.map_err(|_| {
+            if self.refused {
+                DecodeFailure::Budget
+            } else {
+                DecodeFailure::Integrity
+            }
+        })
     }
     pub(crate) fn raw(&mut self, len: usize) -> Result<&'a [u8], Corrupt> {
         let end = self.at.checked_add(len).ok_or(Corrupt)?;
@@ -189,8 +313,48 @@ impl<'a> Dec<'a> {
     pub(crate) fn remaining(&self) -> usize {
         self.bytes.len() - self.at
     }
+    /// The next length without consuming it, so a bound is checked before
+    /// any allocation.
+    pub(crate) fn peek_len(&self) -> Result<usize, Corrupt> {
+        Dec::new(&self.bytes[self.at..]).take_len()
+    }
+    /// A tagged section with a u64 LE length, decoded in place so it keeps
+    /// this decoder's allowance. `take` must consume exactly the section.
+    pub(crate) fn section<T>(
+        &mut self,
+        tag: u64,
+        take: impl FnOnce(&mut Self) -> Result<T, Corrupt>,
+    ) -> Result<T, Corrupt> {
+        if self.varint()? != tag {
+            return Err(Corrupt);
+        }
+        let len = u64::from_le_bytes(self.raw(8)?.try_into().map_err(|_| Corrupt)?);
+        let end = usize::try_from(len)
+            .ok()
+            .and_then(|len| self.at.checked_add(len))
+            .filter(|end| *end <= self.bytes.len())
+            .ok_or(Corrupt)?;
+        let body = self.bytes;
+        self.bytes = &body[..end];
+        let out = take(self);
+        self.bytes = body;
+        let out = out?;
+        (self.at == end).then_some(out).ok_or(Corrupt)
+    }
+    pub(crate) fn require_section(&mut self) {
+        self.required_section = Some(false);
+    }
+    pub(crate) fn refilled_section(&mut self) {
+        self.required_section = Some(true);
+    }
+    /// Every byte read and any required section refilled.
+    pub(crate) fn ended(&self) -> Result<(), Corrupt> {
+        (self.at == self.bytes.len() && self.required_section != Some(false))
+            .then_some(())
+            .ok_or(Corrupt)
+    }
     pub(crate) fn finish(self) -> Result<(), Corrupt> {
-        (self.at == self.bytes.len()).then_some(()).ok_or(Corrupt)
+        self.ended()
     }
 }
 
@@ -288,10 +452,15 @@ impl HDigest for String {
         e.raw(&bytes)
     }
     fn take_h(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
-        Ok(d.raw(32)?
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect())
+        let bytes = d.raw(32)?;
+        d.slots::<u8>(64)?;
+        let mut out = String::with_capacity(64);
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for byte in bytes {
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 15) as usize] as char);
+        }
+        Ok(out)
     }
     fn verify_h(d: &mut Dec<'_>) -> Result<(), Corrupt> {
         d.raw(32).map(|_| ())
@@ -343,6 +512,7 @@ impl<T: HDigestKey + Ord> HDigest for BTreeSet<T> {
     }
     fn take_h(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
         let len = d.take_len()?;
+        d.tree::<T, ()>(len)?;
         let mut out = BTreeSet::new();
         for _ in 0..len {
             if !out.insert(T::take_h(d)?) {
@@ -357,6 +527,39 @@ impl<T: HDigestKey + Ord> HDigest for BTreeSet<T> {
     fn shape_h(s: &mut Shape) {
         s.push("BTreeSet<");
         T::shape_h(s);
+        s.push(">");
+    }
+}
+
+/// H keys with N counts or D values; values retain their own field classes.
+/// Decode funds the whole tree before its first insert, like the shared maps.
+impl<K: HDigestKey + Ord, V: Durable> HDigest for BTreeMap<K, V> {
+    fn put_h(&self, e: &mut Enc, path: &'static str) -> Result<(), Refuse> {
+        e.varint(self.len() as u64)?;
+        for (key, value) in self {
+            key.put_h(e, path)?;
+            value.put(e)?;
+        }
+        Ok(())
+    }
+    fn take_h(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
+        let len = d.take_len()?;
+        d.tree::<K, V>(len)?;
+        let mut out = BTreeMap::new();
+        for _ in 0..len {
+            if out.insert(K::take_h(d)?, V::take(d)?).is_some() {
+                return Err(Corrupt);
+            }
+        }
+        Ok(out)
+    }
+    fn verify_h(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+        verify_entries(d, K::key_h, V::verify)
+    }
+    fn shape_h(s: &mut Shape) {
+        s.push("HKeyMap<");
+        K::shape_h(s);
+        V::shape(s);
         s.push(">");
     }
 }
@@ -497,10 +700,8 @@ fn verify_entries<'a, K: Ord>(
             sorted &= p < &current;
         }
         if !sorted {
-            let mut earlier = Dec {
-                bytes: d.bytes,
-                at: start,
-            };
+            let mut earlier = Dec::new(d.bytes);
+            earlier.at = start;
             for _ in 0..i {
                 if key(&mut earlier)? == current {
                     return Err(Corrupt);
@@ -1131,7 +1332,7 @@ macro_rules! durable_field {
     }};
     (put E, $e:ident, $f:ident, $ty:ty, $path:expr) => {{
         let value: &$ty = $f;
-        if !$crate::durable_tail_codec::DurableEmpty::durable_empty(value) {
+        if !$e.field_moved($path) && !$crate::durable_tail_codec::DurableEmpty::durable_empty(value) {
             return Err($crate::durable_tail_codec::Refuse::NonEmpty($path));
         }
     }};
@@ -1204,6 +1405,18 @@ pub(crate) use durable_field;
 /// struct `durable_struct!(T(N a: u64, H b: [u8; 32]))` with names chosen
 /// for the positions.
 macro_rules! durable_struct {
+    (borrowed $t:ident { $($c:ident $f:ident : $ty:ty),* $(,)? }) => {
+        $crate::durable_tail_codec::durable_struct!($t { $($c $f: $ty),* });
+        impl $t {
+            fn put_borrowed(e: &mut $crate::durable_tail_codec::Enc, $($f: &$ty),*)
+                -> Result<(), $crate::durable_tail_codec::Refuse> {
+                $($crate::durable_tail_codec::durable_field!(
+                    put $c, e, $f, $ty, concat!(stringify!($t), ".", stringify!($f))
+                );)*
+                Ok(())
+            }
+        }
+    };
     (key $t:ident $body:tt) => {
         $crate::durable_tail_codec::durable_struct!($t $body);
         $crate::durable_tail_codec::durable_struct!(@key $t $body);

@@ -1013,7 +1013,7 @@ fn edits_after_the_checkpoint_refuse_restore() {
 
 /// The allowlist digests, pinned: any field, class or type change in a
 /// persisted type moves them. Review the classes with SOURCE, then repin.
-const ALLOWLIST_PINS: [(SnapshotSource, &str); 2] = [
+const ALLOWLIST_PINS: [(SnapshotSource, &str); 3] = [
     (
         SnapshotSource::ClaudeCode,
         "8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c",
@@ -1021,6 +1021,10 @@ const ALLOWLIST_PINS: [(SnapshotSource, &str); 2] = [
     (
         SnapshotSource::Codex,
         "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1",
+    ),
+    (
+        SnapshotSource::Pi,
+        "bd43c3d6197e6a6dfe339a486b0bbf4aaa121fc40022fcc8418f9d900baac4f7",
     ),
 ];
 
@@ -1129,6 +1133,22 @@ const H_AUDIT: &[(&str, &str)] = &[
     (
         "OwnedRequest.configuration_witness",
         "SnapshotAccumulator.cache_configuration_witness, copied",
+    ),
+    (
+        "PiSection.usage_keys",
+        "H keys: pi_usage_hash(ottto-pi-usage-key:v1, response id); D values: PiUsageDedupState",
+    ),
+    (
+        "PiUsageDedupState.message",
+        "H keys: pi_usage_hash(ottto-pi-usage-occurrence:v1, normalized usage); N counts",
+    ),
+    (
+        "PiUsageDedupState.message_end",
+        "H keys: pi_usage_hash(ottto-pi-usage-occurrence:v1, normalized usage); N counts",
+    ),
+    (
+        "PiUsageDedupState.paired_digests",
+        "pi_usage_hash(ottto-pi-usage-occurrence:v1, normalized usage), copied",
     ),
     (
         "Rederive.agent_label",
