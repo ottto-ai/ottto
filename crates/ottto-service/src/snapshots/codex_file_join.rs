@@ -4819,7 +4819,8 @@ pub(in crate::snapshots) mod header_cache_tests {
                 &CodexTitleMetadata::default(),
                 &mut index,
                 Some(&cache),
-            ) != HeaderStep::Complete {}
+            ) != HeaderStep::Complete
+            {}
         });
 
         assert!(
@@ -4952,7 +4953,8 @@ pub(in crate::snapshots) mod header_cache_tests {
                                     &CodexTitleMetadata::default(),
                                     &mut owned.index,
                                     Some(&cache),
-                                ) != HeaderStep::Complete {}
+                                ) != HeaderStep::Complete
+                                {}
                             });
                             assert_eq!(serde_json::to_value(&owned.index).unwrap(), before);
                             assert!(inventory.complete);
