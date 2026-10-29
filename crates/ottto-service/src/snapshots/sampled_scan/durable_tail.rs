@@ -110,7 +110,7 @@ impl Counters {
              bytes_read={} format_hold[newer,unknown,undecodable,unbindable,known_corrupt]={:?} durable_held={:?} held_census[kept,invalidated]={:?} \
              guard_header_bytes={} guard_verify_bytes={} delete_verify_bytes={} overwrite_verify_bytes={} \
              uninventoried_records={} store_write_skipped[unknown,inventory_overflow]={:?} \
-             u_growth[undecodable,unbindable,paced]={:?} \
+             u_growth[full_undecodable,full_unbindable,paced,pace_evicted]={:?} \
              gc_records_deleted={} gc_records_read={} gc_bytes_read={} gc_keep_peak={} \
              records_invalidated={} peak_codec_bytes={} t14_rebuild_full_started={}",
             source.api_slug(),
@@ -159,9 +159,9 @@ struct Slot {
     namespace: Scope,
     identity_capture: bool,
     /// Keys held (U) by this source, and the totals the last alarm reported:
-    /// [held, t14_rebuild, mode_repaired, disabled, rebuild_full].
+    /// [held, t14_rebuild, mode_repaired, disabled, rebuild_full, u_growth_full].
     held: u64,
-    reported: [u64; 5],
+    reported: [u64; 6],
 }
 
 /// Process-lifetime durable state beside the RAM cache.
@@ -485,7 +485,7 @@ impl SharedCache {
                 namespace: namespace.clone(),
                 identity_capture,
                 held: 0,
-                reported: [0; 5],
+                reported: [0; 6],
             });
         }
     }
@@ -497,29 +497,24 @@ impl SharedCache {
         key: &str,
         grown: bool,
     ) -> Option<store::Refusal> {
-        self.durable_guard(snapshot_source, key, Some(grown))
+        self.durable_guard(snapshot_source, key, false, grown)
     }
 
-    /// `grown`: `None` is the restore recheck.
     fn durable_guard(
         &self,
         snapshot_source: SnapshotSource,
         key: &str,
-        grown: Option<bool>,
+        restore_recheck: bool,
+        grown: bool,
     ) -> Option<store::Refusal> {
-        let ram = grown.is_some() && self.retained().is_ok_and(|ram| ram.peek(key).is_some());
-        let growth = match grown {
-            None => store::Growth::Unknown,
-            Some(false) => store::Growth::Idle,
-            Some(true) => store::Growth::Grown { ram },
-        };
+        let ram = !restore_recheck && self.retained().is_ok_and(|ram| ram.peek(key).is_some());
         let source = durable_source(snapshot_source)?;
         let held = self
             .durable()?
             .slot(source)
             .as_mut()?
             .store
-            .hold_with(&store::key_digest(source, key), growth);
+            .hold_with(&store::key_digest(source, key), grown);
         if held == Some(store::Refusal::Corrupt) && ram {
             Counters::bump(
                 &mut self.durable()?.counters.not_persisted,
@@ -537,27 +532,46 @@ impl SharedCache {
         key: &str,
         grown: bool,
     ) -> Option<store::Refusal> {
-        let growth = if grown {
-            store::Growth::Grown { ram: false }
-        } else {
-            store::Growth::Idle
-        };
         let source = durable_source(source)?;
         self.durable()?
             .slot(source)
             .as_mut()?
             .store
-            .hold_with(&store::key_digest(source, key), growth)
+            .hold_with(&store::key_digest(source, key), grown)
+    }
+
+    /// The start of one Full of `keys` (a file, or a group paced as one
+    /// `pace`): `store::DurableTailStore::full_start`.
+    pub(crate) fn durable_full_start(
+        &self,
+        source: SnapshotSource,
+        keys: &[String],
+        pace: &str,
+        grown: bool,
+    ) -> Option<(usize, store::Refusal)> {
+        let source = durable_source(source)?;
+        let digests = keys
+            .iter()
+            .map(|key| store::key_digest(source, key))
+            .collect::<Vec<_>>();
+        self.durable()?.slot(source).as_mut()?.store.full_start(
+            &digests,
+            &store::key_digest(source, pace),
+            grown,
+        )
     }
 
     #[cfg(test)]
-    pub(crate) fn durable_advance_clock(&self, source: SnapshotSource, by: std::time::Duration) {
+    pub(crate) fn durable_test_store(
+        &self,
+        source: SnapshotSource,
+        f: impl FnOnce(&mut DurableTailStore),
+    ) {
         let source = durable_source(source).unwrap();
-        if let Some(slot) = self.durable().unwrap().slot(source).as_mut() {
-            slot.store.advance_clock(by);
-        }
+        f(&mut self.durable().unwrap().slot(source).as_mut().unwrap().store);
     }
 
+    #[cfg(test)]
     pub(crate) fn durable_full_hold(
         &self,
         source: SnapshotSource,
@@ -637,7 +651,14 @@ impl SharedCache {
         ) {
             Ok(taken) => RestoreOutcome::Restored(Box::new(taken)),
             Err(class) => self
-                .durable_guard(snapshot_source, key, None)
+                .durable_guard(
+                    snapshot_source,
+                    key,
+                    true,
+                    held.metadata().is_ok_and(|metadata| {
+                        metadata.len() > index.files.get(key).map_or(0, |entry| entry.size_bytes)
+                    }),
+                )
                 .map_or(RestoreOutcome::Miss(class), RestoreOutcome::Held),
         }
     }
@@ -1092,6 +1113,7 @@ impl SharedCache {
             t14_rebuild: [u64; 2],
             t14_rebuild_full_started: u64,
             mode_repaired: [u64; 2],
+            u_growth_full: [u64; 2],
             #[serde(skip_serializing_if = "Option::is_none")]
             store_disabled: Option<&'static str>,
         }
@@ -1111,6 +1133,7 @@ impl SharedCache {
             store.mode_repaired,
             u64::from(disabled.is_some()),
             store.t14_rebuild_full_started,
+            store.u_growth[0] + store.u_growth[1],
         ];
         let last = std::mem::replace(&mut slot.reported, now);
         drop(stores);
@@ -1123,6 +1146,7 @@ impl SharedCache {
                     t14_rebuild: pair(1),
                     t14_rebuild_full_started: store.t14_rebuild_full_started,
                     mode_repaired: pair(2),
+                    u_growth_full: pair(5),
                     store_disabled: disabled.filter(|_| last[3] == 0),
                 },
             );

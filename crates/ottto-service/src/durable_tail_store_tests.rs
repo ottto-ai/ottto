@@ -2142,12 +2142,14 @@ fn unoffered_started_rebuild_survives_save_until_its_replacement_is_offered() {
     assert_eq!(store.counters().t14_rebuild_full_started, 1);
 }
 
-/// R2-U: only an undecodable or unbindable record's growth reads: one grant
-/// per key until its Full starts, then none inside `U_GROWTH_PACE` (counted;
-/// a RAM copy still tails). Idle, newer/unknown and T14 are unchanged, the
-/// pace is RAM-only, the grants are bounded and no record is touched.
+/// R2-U: growth lets an undecodable or unbindable record's file pass the
+/// guard with no state (a Tail or a refused group keeps nothing).
+/// `full_start` admits one Full per pace key per `U_GROWTH_PACE`, counted at
+/// the start by member reason, a whole group at once. Newer/unknown and T14
+/// are unchanged; at the bound the oldest pace is forgotten and the read is
+/// never refused; no record is touched.
 #[test]
-fn u_growth_grant_is_paced_per_key_and_never_touches_the_record() {
+fn u_growth_full_start_is_paced_per_key_and_never_refused() {
     let scratch = Scratch::new();
     let lock = LockedStateDir::acquire(&scratch.root).unwrap();
     let transcript = scratch.transcript("t.jsonl", b"{}\n");
@@ -2176,69 +2178,81 @@ fn u_growth_grant_is_paced_per_key_and_never_touches_the_record() {
     for (key, bytes) in keys.iter().zip(&records) {
         put_record(&record_file(&store, key), bytes);
     }
-    let grown = Growth::Grown { ram: false };
     let mut cold = scratch.store();
-    for ((key, reason), read) in keys.iter().zip(reasons).zip([true, true, false, false]) {
-        let unread = (!read).then_some(reason);
-        assert_eq!(
-            cold.hold_with(key, Growth::Idle),
-            Some(reason),
-            "{reason:?}"
-        );
+    for ((key, reason), reads) in keys.iter().zip(reasons).zip([true, true, false, false]) {
+        let unread = (!reads).then_some(reason);
+        assert_eq!(cold.hold_with(key, false), Some(reason), "{reason:?}");
         assert_eq!(cold.hold(key), Some(reason));
-        assert_eq!(cold.hold_with(key, grown), unread, "{reason:?}: growth");
-        // The grant serves the restore recheck and the Full's start.
-        assert_eq!(cold.hold(key), unread);
-        assert_eq!(cold.full_hold(key, true), unread);
-        // Started: growth inside the pace holds; a RAM copy still tails.
+        for _ in 0..3 {
+            assert_eq!(cold.hold_with(key, true), unread, "{reason:?}: growth");
+        }
+        assert_eq!(cold.full_start(&[*key], key, false), Some((0, reason)));
         assert_eq!(
-            cold.hold_with(key, grown),
-            Some(reason),
-            "{reason:?}: paced"
+            cold.full_start(&[*key], key, true),
+            unread.map(|reason| (0, reason)),
+            "{reason:?}: admitted"
         );
-        assert_eq!(cold.hold_with(key, Growth::Grown { ram: true }), unread);
-        assert_eq!(cold.hold(key), Some(reason));
+        assert_eq!(cold.full_start(&[*key], key, true), Some((0, reason)));
+        assert_eq!(
+            cold.hold_with(key, true),
+            unread,
+            "{reason:?}: a Tail is not paced"
+        );
     }
-    assert_eq!(cold.counters().u_growth, [1, 1, 2]);
-    // Past the pace: one more grant. Idle clears a grant whose Full never started.
+    assert_eq!(cold.counters().u_growth, [1, 1, 2, 0]);
     cold.advance_clock(U_GROWTH_PACE);
-    assert_eq!(cold.hold_with(&keys[0], grown), None);
+    assert_eq!(cold.full_start(&[keys[0]], &keys[0], true), None);
+    assert_eq!(cold.counters().u_growth, [2, 1, 2, 0]);
+    // The pace is RAM-only: a restart admits again.
+    assert_eq!(scratch.store().full_start(&[keys[1]], &keys[1], true), None);
+
+    // A group is classified whole before anything is counted or started: a
+    // newer member holds it with nothing left behind; then one pace for all.
+    let pace = [0xAA; 32];
+    let mut group = scratch.store();
+    for _ in 0..3 {
+        assert_eq!(
+            group.full_start(&[keys[0], keys[2]], &pace, true),
+            Some((1, Refusal::NewerFormat))
+        );
+    }
+    assert_eq!(group.counters().u_growth, [0; 4]);
+    assert_eq!(group.full_start(&[keys[0], keys[1]], &pace, true), None);
+    assert_eq!(group.counters().u_growth, [1, 1, 0, 0]);
     assert_eq!(
-        cold.hold_with(&keys[0], Growth::Idle),
-        Some(Refusal::Undecodable)
+        group.full_start(&[keys[1], keys[0]], &pace, true),
+        Some((0, Refusal::Unbindable))
     );
-    assert_eq!(cold.hold(&keys[0]), Some(Refusal::Undecodable));
-    assert_eq!(cold.counters().u_growth, [2, 1, 2]);
-    // The pace is RAM-only: a restart grants again.
-    let mut restarted = scratch.store();
-    assert_eq!(restarted.hold_with(&keys[1], grown), None);
-    // T14 is unchanged by growth: one rebuild, no grant.
+
+    // A T14 member of a paced group keeps its unspent rebuild; it starts with
+    // the group's admitted Full.
     let mut corrupt = valid.clone();
     let end = corrupt.len() - 1;
     corrupt[end] ^= 1;
     put_record(&record_file(&store, &b.key), &corrupt);
     let mut t14 = scratch.store();
-    assert_eq!(t14.hold_with(&b.key, grown), None);
+    assert_eq!(t14.full_start(&[keys[0]], &pace, true), None);
+    assert_eq!(
+        t14.full_start(&[b.key, keys[0]], &pace, true),
+        Some((1, Refusal::Undecodable))
+    );
     assert_eq!(t14.counters().t14_rebuild, 1);
-    assert_eq!(t14.counters().u_growth, [0; 3]);
-    // Bound: past `U_GROWTH_BOUND` unspent grants a new key waits (counted)
-    // until a started grant is paced out.
+    assert_eq!(t14.counters().t14_rebuild_full_started, 0);
+    t14.advance_clock(U_GROWTH_PACE);
+    assert_eq!(t14.full_start(&[b.key, keys[0]], &pace, true), None);
+    assert_eq!(t14.counters().t14_rebuild_full_started, 1);
+    assert_eq!(t14.counters().u_growth, [2, 0, 1, 0]);
+
+    // At the bound of fresh paces the oldest is forgotten (counted): every
+    // new key's first Full is admitted.
     let mut bounded = scratch.store();
-    let many = (10..=10 + U_GROWTH_BOUND as u8)
-        .map(|n| [n; 32])
-        .collect::<Vec<_>>();
+    bounded.fill_paces();
+    let many = (100..=164_u8).map(|n| [n; 32]).collect::<Vec<_>>();
     for key in &many {
         put_record(&record_file(&store, key), b"bad");
+        assert_eq!(bounded.full_start(&[*key], key, true), None);
     }
-    for key in &many[..U_GROWTH_BOUND] {
-        assert_eq!(bounded.hold_with(key, grown), None);
-    }
-    let last = &many[U_GROWTH_BOUND];
-    assert_eq!(bounded.hold_with(last, grown), Some(Refusal::Undecodable));
-    assert_eq!(bounded.counters().u_growth[2], 1);
-    assert_eq!(bounded.full_hold(&many[0], true), None);
-    bounded.advance_clock(U_GROWTH_PACE);
-    assert_eq!(bounded.hold_with(last, grown), None);
+    assert_eq!(bounded.counters().u_growth, [65, 0, 0, 65]);
     for (key, bytes) in keys.iter().zip(&records) {
         assert_eq!(&fs::read(record_file(&store, key)).unwrap(), bytes);
     }
