@@ -11091,6 +11091,13 @@ fn shared_pace_near_cap_bypasses_cooldown_counts_and_alarms_without_tail_credit(
         &Scope("pace".into()),
         false,
     );
+    let ((), idle) = crate::local_resource_diagnostics::capture(|| cache.durable_alarm(source));
+    assert_eq!(
+        idle.len(),
+        1,
+        "idle store snapshot precedes cause-only totals"
+    );
+    assert_eq!(idle[0]["counts"]["records_read"], serde_json::json!(0));
     let now = std::time::SystemTime::now();
     let cap = max_jsonl_file_bytes(source);
     let threshold = cap - cap / 10;
@@ -11109,6 +11116,11 @@ fn shared_pace_near_cap_bypasses_cooldown_counts_and_alarms_without_tail_credit(
     let ((), alarms) = crate::local_resource_diagnostics::capture(|| cache.durable_alarm(source));
     assert_eq!(alarms.len(), 1);
     assert_eq!(alarms[0]["counts"]["near_cap"], serde_json::json!([2, 2]));
+    let ((), repeated) = crate::local_resource_diagnostics::capture(|| cache.durable_alarm(source));
+    assert!(
+        repeated.is_empty(),
+        "no duplicate cause-only alarm or blank snapshot"
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 

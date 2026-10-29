@@ -32,3 +32,11 @@ and unchanged predecessor bytes. Receipt-pending retains slot6 in the eight-slot
 composed diagnostics. New migration/resource fixtures supply required timestamp
 fields; the mixed protected/corrupt group fixture installs its durable store
 before exercising the production guard. No local runtime tests are executed.
+
+Round 4 narrows empty store-snapshot suppression to sources with cause-only
+totals. Idle sources retain their snapshots, and disabled stores retain each
+snapshot plus exactly one disabled-state transition alarm. Cause-only reports
+still emit once per delta without a blank snapshot on repeats. The near-cap
+control now checks the idle-to-cause transition and repeat behavior; existing
+common-hold and foreign-owner assertions remain unchanged. Custody accounting
+is unchanged from round 3.

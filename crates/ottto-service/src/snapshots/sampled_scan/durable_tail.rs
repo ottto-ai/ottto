@@ -3549,9 +3549,11 @@ impl SharedCache {
         ];
         let last = std::mem::replace(&mut slot.reported, now);
         drop(stores);
-        // Preserve the store's nonzero observations without emitting a second,
-        // empty alarm beside a cause-only pacing/near-cap report.
-        if store != store::StoreCounters::default() {
+        // Idle and disabled stores still publish their snapshots. Only a source
+        // with cause-only totals omits an empty snapshot, including on repeat
+        // calls after its delta has been reported.
+        let cause_only = now[..5] == [0; 5] && now[5..].iter().any(|&n| n != 0);
+        if store != store::StoreCounters::default() || !cause_only {
             crate::local_resource_diagnostics::durable_tail_alarm(
                 snapshot_source.api_slug(),
                 &store,
