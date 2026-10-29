@@ -816,6 +816,10 @@ pub(crate) fn claude_reemission_stop_latched(reminder: bool, counts: &impl Seria
 pub(crate) fn durable_tail_alarm(source: &str, counts: &impl Serialize) {
     traversal_point("durable_tail_alarm", source, counts);
 }
+/// At most once per 24 h while restart Fulls caused by a failed store write persist.
+pub(crate) fn durable_tail_restart_full_alarm(source: &str, counts: &impl Serialize) {
+    traversal_point("durable_tail_restart_full_alarm", source, counts);
+}
 pub(crate) fn codex_continuation(held: Option<&'static str>) {
     let counts = serde_json::json!({
         "continuation_pages_run": u8::from(held.is_none()),

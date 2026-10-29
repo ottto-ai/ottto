@@ -28624,6 +28624,12 @@ impl OwnedSourceScan {
                             plan.mode(),
                             plan.metrics().native_bytes,
                         );
+                        #[cfg(unix)]
+                        context.cache.durable_acquisition_completed(
+                            &local_index_key(&active.candidate.path),
+                            plan.mode(),
+                            plan.metrics().native_bytes,
+                        );
                     }
                 }
                 if active.sampling.as_ref().is_some_and(|acquisition| {

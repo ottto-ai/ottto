@@ -211,6 +211,18 @@ retryable (red) for the whole hold, so census close, retirement and
 account-family proof wait for that source; a held key is not yet terminal
 disclosed residue.
 
+The `durable_tail` line also carries `store_write_after_save_failed[files]`
+(records offered to a post-save batch that returned an error; the store keeps
+their predecessors) and `store_write_failed_restart_full[files,bytes]` (Fulls
+whose restore refused the record as `ineligible.entry_changed`, with the
+completed native bytes those Fulls read). Both are process totals. The second
+is the closest existing attribution of a restart Full to a failed write: it
+also counts a record that was never offered (deferred or evicted before the
+write). While `store_write_failed_restart_full` files stay above zero for more
+than 24 h, a `durable_tail_restart_full_alarm` record (`[files, bytes]`, the
+write-failure total and `pending_seconds`) is emitted at most once per 24 h.
+The mark and the alarm clock are RAM-only; nothing is persisted.
+
 An absent record is a restore `missing` outcome and keeps the existing Full
 admission; it is not a held key. There is no `upgrade_state_missing` counter or
 alarm in this format-1 bootstrap. Audit deadlines remain owned by the index,
