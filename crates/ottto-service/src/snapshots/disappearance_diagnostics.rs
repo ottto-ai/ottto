@@ -398,6 +398,7 @@ mod tests {
                     None,
                     BACKFILL_WINDOW_DAYS,
                     &BTreeMap::new(),
+                    &BTreeMap::new(),
                 )
             });
             assert!(candidate.is_none());
@@ -434,6 +435,7 @@ mod tests {
                 index.traversal.as_mut().unwrap(),
                 BACKFILL_WINDOW_DAYS,
                 &index.files,
+                &index.claude_account_deferred_holds,
             )
         });
         assert_eq!(events, [[0; 4], [0; 4], [1, 0, 0, 0]]);
@@ -541,6 +543,7 @@ mod tests {
                 None,
                 BACKFILL_WINDOW_DAYS,
                 &BTreeMap::new(),
+                &BTreeMap::new(),
             )
             .unwrap();
             assert!(census.observed_index_keys.contains(&key));
@@ -552,6 +555,7 @@ mod tests {
                     &mut census,
                     None,
                     BACKFILL_WINDOW_DAYS,
+                    &BTreeMap::new(),
                     &BTreeMap::new(),
                 )
             });
@@ -1150,6 +1154,7 @@ mod tests {
                     None,
                     BACKFILL_WINDOW_DAYS,
                     &BTreeMap::new(),
+                    &BTreeMap::new(),
                 )
             });
             assert!(candidate.is_none());
@@ -1175,6 +1180,7 @@ mod tests {
             None,
             BACKFILL_WINDOW_DAYS,
             &BTreeMap::new(),
+            &BTreeMap::new(),
         )
         .unwrap();
         fs::rename(&project, dir.join("project-renamed")).unwrap();
@@ -1185,6 +1191,7 @@ mod tests {
                 &mut census,
                 None,
                 BACKFILL_WINDOW_DAYS,
+                &BTreeMap::new(),
                 &BTreeMap::new(),
             )
         });
@@ -1224,6 +1231,7 @@ mod tests {
                 None,
                 BACKFILL_WINDOW_DAYS,
                 &BTreeMap::new(),
+                &BTreeMap::new(),
             )
         });
         fs::set_permissions(&project, fs::Permissions::from_mode(0o700)).unwrap();
@@ -1254,6 +1262,7 @@ mod tests {
                     None,
                     BACKFILL_WINDOW_DAYS,
                     &BTreeMap::new(),
+                    &BTreeMap::new(),
                 )
                 .is_none());
                 fs::write(&path, b"{}\n").unwrap();
@@ -1264,6 +1273,7 @@ mod tests {
                     None,
                     BACKFILL_WINDOW_DAYS,
                     &BTreeMap::new(),
+                    &BTreeMap::new(),
                 )
                 .unwrap();
                 fs::remove_file(&path).unwrap();
@@ -1273,6 +1283,7 @@ mod tests {
                     &mut census,
                     None,
                     BACKFILL_WINDOW_DAYS,
+                    &BTreeMap::new(),
                     &BTreeMap::new(),
                 )
                 .is_none());
@@ -1303,6 +1314,7 @@ mod tests {
                 index.traversal.as_mut().unwrap(),
                 BACKFILL_WINDOW_DAYS,
                 &index.files,
+                &index.claude_account_deferred_holds,
             )
         });
         let mut expected = [[[0; OUTCOMES]; SITES]; 3];
@@ -1635,6 +1647,7 @@ mod absence_parent_counts_tests {
                         None,
                         BACKFILL_WINDOW_DAYS,
                         &BTreeMap::new(),
+                        &BTreeMap::new(),
                     )
                 });
                 let removal = suffix.is_empty();
@@ -1699,6 +1712,7 @@ mod absence_parent_counts_tests {
                         None,
                         BACKFILL_WINDOW_DAYS,
                         &BTreeMap::new(),
+                        &BTreeMap::new(),
                     )
                 });
                 assert!(candidate.is_none());
@@ -1740,6 +1754,7 @@ mod absence_parent_counts_tests {
             None,
             BACKFILL_WINDOW_DAYS,
             &BTreeMap::new(),
+            &BTreeMap::new(),
         )
         .unwrap();
         fs::remove_file(&path).unwrap();
@@ -1752,6 +1767,7 @@ mod absence_parent_counts_tests {
                 &mut census,
                 None,
                 BACKFILL_WINDOW_DAYS,
+                &BTreeMap::new(),
                 &BTreeMap::new(),
             )
         });
@@ -1811,6 +1827,7 @@ mod absence_parent_counts_tests {
                 &mut census,
                 None,
                 BACKFILL_WINDOW_DAYS,
+                &BTreeMap::new(),
                 &BTreeMap::new(),
             );
             assert_eq!(counts(scope), serde_json::json!({}));

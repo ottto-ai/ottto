@@ -980,6 +980,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                         None,
                         365,
                         &BTreeMap::new(),
+                        &BTreeMap::new(),
                     )
                     .unwrap();
                     assert!(sampled_scan::reduction_dependencies(

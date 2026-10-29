@@ -2186,6 +2186,7 @@ fn fe_n1_option_b_age_rejections_keep_deferred_hold_through_settlement_and_reloa
             Some(due),
             BACKFILL_WINDOW_DAYS,
             &hold.index.files,
+            &hold.index.claude_account_deferred_holds,
         )
         .expect("retained while recent");
         File::open(&hold.fixture.file.0)
@@ -2200,6 +2201,7 @@ fn fe_n1_option_b_age_rejections_keep_deferred_hold_through_settlement_and_reloa
                 Some(due),
                 BACKFILL_WINDOW_DAYS,
                 &hold.index.files,
+                &hold.index.claude_account_deferred_holds,
             )
             .is_none());
         } else {
@@ -2210,6 +2212,7 @@ fn fe_n1_option_b_age_rejections_keep_deferred_hold_through_settlement_and_reloa
                 Some(due),
                 BACKFILL_WINDOW_DAYS,
                 &hold.index.files,
+                &hold.index.claude_account_deferred_holds,
             )
             .is_none());
         }

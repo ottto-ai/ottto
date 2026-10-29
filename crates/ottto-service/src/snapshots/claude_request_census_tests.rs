@@ -2352,6 +2352,7 @@ fn held_original_keeps_dependent_copy_proof_only_while_committed_entry_unchanged
         None,
         365,
         &BTreeMap::new(),
+        &BTreeMap::new(),
     )
     .unwrap();
     candidate.physical_identity = Some([metadata.dev(), metadata.ino()]);

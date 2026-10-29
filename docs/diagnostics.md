@@ -183,8 +183,12 @@ page events, not gauges, and are never summed across observers:
   counted. A later page can count the same file again.
 
 `counts.line_delivery_unselected` counts discovery skip decisions for the
-page's source: `age` (outside the backfill window and not held for
-verification) and `size` (over the source's file-size cap). They are recorded
+page's source: `age` (outside the backfill window, not held for verification
+and not withheld for an unresolved Claude account) and `size` (over the
+source's file-size cap). `withheld_oversized` counts the decisions, at the walk,
+candidate revalidation or open, that keep an over-cap key observed but unread
+while its parsed revision is withheld for an unresolved account: the entry and
+hold stay, and growth past the cap is not read. They are recorded
 after the existing decision, are drained by that source's next completed page,
 and count repeated decisions, not distinct files or bytes. They are recorded
 whether or not an observer is registered.
