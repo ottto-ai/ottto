@@ -1887,8 +1887,11 @@ fn gc_stops_before_orphan_cleanup_when_classification_disables_mid_loop() {
     ));
     fs::write(&temp, b"orphan").unwrap();
     test_hooks::set_gc_records_first(true);
-    test_hooks::set_before_access(Some(Box::new(|_, op| {
+    let open_attempts = std::rc::Rc::new(std::cell::Cell::new(0));
+    let observed_attempts = std::rc::Rc::clone(&open_attempts);
+    test_hooks::set_before_access(Some(Box::new(move |_, op| {
         if op == "open" {
+            observed_attempts.set(observed_attempts.get() + 1);
             Err(io::ErrorKind::PermissionDenied.into())
         } else {
             Ok(())
@@ -1898,11 +1901,13 @@ fn gc_stops_before_orphan_cleanup_when_classification_disables_mid_loop() {
     assert!(cold.disabled().is_none(), "GC starts enabled");
     cold.gc(&lock, &[0; 32], &BTreeMap::new()).unwrap();
     assert_eq!(cold.disabled(), Some("record_access"));
+    assert_eq!(open_attempts.get(), 2, "GC classified and retried access");
     assert_eq!(
         cold.counters().gc_records_read,
-        1,
-        "classification ran inside GC"
+        0,
+        "open refused before a header read"
     );
+    assert_eq!(cold.counters().gc_bytes_read, 0);
     assert_eq!(cold.counters().gc_records_deleted, 0);
     assert_eq!(cold.counters().gc_temps_deleted, 0);
     assert_eq!(fs::read(&record).unwrap(), before);
