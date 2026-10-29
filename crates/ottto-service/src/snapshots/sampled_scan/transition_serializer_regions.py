@@ -3,6 +3,8 @@
 The same extractor reads the complete src tree (or git show baseline tree),
 not an include_str! catalog that cannot notice newly added files. It strips
 cfg(test)-only items and external test modules before discovering serializers.
+Headers track generic angle depth and balanced const/type groups through where
+clauses. Unparseable impl/durable-macro headers raise instead of being skipped.
 Unknown cfg predicates stay included, so platform-specific codecs are covered.
 Every durable_struct!/durable_enum! invocation and Durable-family impl is a
 root. Referenced local constants/helpers are followed to a fixed point; explicit
@@ -27,6 +29,7 @@ classifications together; never copy current hashes merely to clear CI.
 """
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -92,10 +95,62 @@ def balanced(t):
 
 
 def body_start(t, ends, start):
-    at = start
-    while at < len(t) and t[at] not in ("{", ";"):
+    """Find an item body after all generic/where-clause bounds, or fail closed.
+
+    Balanced groups inside <...> are const arguments/type expressions, never
+    the item's body. Arrows in Fn bounds/return types do not close a generic.
+    This scans headers only; expressions inside groups are opaque token trees.
+    """
+    at, angle = start, 0
+    while at < len(t):
+        part = t[at]
+        if part == "<":
+            angle += 1
+        elif part == ">" and (at == start or t[at - 1] not in ("-", "=")):
+            if not angle:
+                raise ValueError("unsupported item header: unmatched >")
+            angle -= 1
+        elif part == "{" and not angle:
+            return at
+        elif part == ";" and not angle:
+            return at
+        elif part in (";", "}"):
+            raise ValueError("unsupported item header: unclosed generic bounds")
+        if at in ends:
+            at = ends[at]
+        else:
+            at += 1
+    raise ValueError("unsupported item header: missing body or declaration end")
+
+
+def impl_header(t, ends, start):
+    """Return the fully scanned item body and top-level implemented trait.
+
+    Skip generic parameters, const arguments and where predicates when locating
+    `Trait for Type`. Inherent impls have no trait. Unsupported item headers
+    raise; they must never silently turn into an empty serializer region set.
+    """
+    body = body_start(t, ends, start + 1)
+    if t[body] != "{":
+        raise ValueError("unsupported impl header: expected braced impl body")
+    angle, top = 0, []
+    at = start + 1
+    while at < body:
+        part = t[at]
+        if part == "<":
+            angle += 1
+        elif part == ">" and t[at - 1] not in ("-", "="):
+            angle -= 1
+        elif not angle:
+            top.append(part)
         at = ends.get(at, at + 1)
-    return at
+    if not top or any(part in top for part in ("=", ";", "!")):
+        raise ValueError("unsupported impl header: cannot classify implementation")
+    top = top[:top.index("where")] if "where" in top else top
+    fors = [n for n, part in enumerate(top) if part == "for"]
+    if len(fors) > 1 or (fors and (not fors[0] or fors[0] == len(top) - 1)):
+        raise ValueError("unsupported impl header: ambiguous trait/self type")
+    return body, {top[fors[0] - 1]} if fors else set()
 
 
 def definitions(t, ends):
@@ -120,8 +175,10 @@ def definitions(t, ends):
 
 def regions(path, t):
     ends = balanced(t)
-    if path == "durable_tail_codec.rs":
-        return t
+    signatures = []
+    for i, part in enumerate(t[:-1]):
+        if part == "fn" and re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*', t[i + 1]):
+            signatures.append((i, body_start(t, ends, i + 2)))
     chosen = set()
     for i, token in enumerate(t):
         if path == "snapshots/sampled_jsonl/durable.rs" and token == "struct" and t[i + 1:i + 2] == ["Rederive"]:
@@ -134,7 +191,9 @@ def regions(path, t):
                 attr_start = next(a for a, b in ends.items() if b == start)
                 start = attr_start - 1
             chosen.add((start, ends[body]))
-        if token in ("durable_struct", "durable_enum") and t[i + 1:i + 2] == ["!"] and t[i + 2:i + 3] in (["("], ["["], ["{"]):
+        if token in ("durable_struct", "durable_enum") and t[i + 1:i + 2] == ["!"]:
+            if t[i + 2:i + 3] not in (["("], ["["], ["{"]):
+                raise ValueError("unsupported durable macro header: missing token-tree delimiter")
             start = i
             while start >= 3 and t[start - 2:start] == [":", ":"] and re.fullmatch(
                 r'[A-Za-z_][A-Za-z_0-9]*', t[start - 3]
@@ -142,15 +201,18 @@ def regions(path, t):
                 start -= 3
             chosen.add((start, ends[i + 2]))
         elif token == "impl":
-            body = body_start(t, ends, i + 1)
+            # `impl Trait` in a function signature is a type, not an item.
+            if any(a < i < b for a, b in signatures):
+                continue
+            body, traits = impl_header(t, ends, i)
             header = t[i:body]
-            for_at = [n for n, part in enumerate(header) if part == "for"]
-            traits = {header[n - 1] for n in for_at if n}
             owned_deref = path == "owned_heap.rs" and traits & {"Deref", "Default", "From"} and any(
                 name in header for name in ("OwnedVec", "OwnedMap")
             )
             if body < len(t) and t[body] == "{" and (traits & TRAITS or owned_deref or ("Default" in traits and "Rederive" in header)):
                 chosen.add((i, ends[body]))
+    if path == "durable_tail_codec.rs":
+        return t
     # This array extent is referenced through a qualified path in a durable
     # declaration; pin its definition rather than exempting the external label.
     defs = definitions(t, ends)
@@ -219,7 +281,7 @@ def production_tokens(path, source):
     removed, test_modules = set(), set()
     items = []
     for i, part in enumerate(t):
-        if part in ("mod", "fn", "impl", "trait"):
+        if part in ("mod", "trait") or (part == "fn" and t[i + 1:i + 2] != ["("]):
             body = body_start(t, ends, i + 1)
             if t[body:body + 1] == ["{"]:
                 items.append((i, body, ends[body]))
@@ -283,7 +345,22 @@ def source_tree(root, baseline):
         return {path[len(prefix):]: subprocess.check_output([
             "git", "show", baseline + ":" + path
         ]).decode() for path in paths if path.endswith(".rs")}
-    return {str(path.relative_to(root)): path.read_text(encoding="utf-8") for path in sorted(root.rglob("*.rs"))}
+    if not root.is_dir():
+        raise ValueError("serializer source walk requires an existing src directory: " + str(root))
+    def walk_failed(error):
+        raise error
+    sources = {}
+    # Path.rglob can suppress directory-scan errors on some Python versions.
+    # os.walk(onerror=...) makes inaccessible directories a hard failure.
+    for directory, dirs, files in os.walk(root, onerror=walk_failed):
+        dirs.sort()
+        for name in sorted(files):
+            if name.endswith(".rs"):
+                path = Path(directory) / name
+                sources[str(path.relative_to(root))] = path.read_text(encoding="utf-8")
+    if not sources:
+        raise ValueError("serializer source walk found no Rust files: " + str(root))
+    return sources
 
 
 def reference_names(t):
@@ -342,7 +419,7 @@ STD_REFERENCES = set("""
 .extend_from_slice .filter .get .is_empty .is_none .is_some .iter .iter_mut
 .keys .len .map .map_err .ok_or .position .push_str .replace .saturating_add
 .set .step_by .then_some .to_le_bytes .try_for_each .try_into .unwrap_or .values
-.with .zip BTreeMap::new BTreeSet::new Box::new Err Fn FnMut FnOnce Ok Some
+.with .zip .try_fold BTreeMap::new BTreeSet::new Box::new Err Fn FnMut FnOnce Ok Some
 Self::from_le_bytes Self::try_from Vec Vec::new Vec::with_capacity VecDeque::from
 allow assert! cfg_attr compile_error! concat! default derive doc format! i64::from
 matches! not str::to_string stringify! try_from u64::from u64::try_from u8::from
@@ -366,7 +443,10 @@ def extract(sources):
     for path, t in parsed.items():
         if is_test(path):
             continue
-        selected = regions(path, t)
+        try:
+            selected = regions(path, t)
+        except ValueError as error:
+            raise ValueError(path + ": " + str(error)) from error
         if selected:
             hashes[path] = hashlib.sha256("\0".join(selected).encode()).hexdigest()
             refs.update(reference_names(selected))

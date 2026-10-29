@@ -14,6 +14,10 @@
 //! new non-catalog files; cfg(test)-only code is excluded. The adjacent JSON
 //! inventory enumerates helper references, pinned providers and exceptions;
 //! adding a reference requires an explicit inventory review.
+//! Python 3 and the source checkout are mandatory test prerequisites: missing
+//! python3, walk/parse failure or malformed extractor output panics, never skips.
+//! There is no environment opt-out. Tests inject an interpreter/root per call;
+//! they never change PATH or other process-global environment variables.
 use super::*;
 use sha2::{Digest, Sha256};
 
@@ -149,26 +153,38 @@ const PINNED_SOURCES: &[SourcePin] = &[
     SourcePin {
         path: "owned_heap.rs",
         text: include_str!("../../owned_heap.rs"),
-        sha256: "3c49ce9518959f9408a69a50b03d54ed2f480f27049a57d8c18eb593fc427f2c",
+        sha256: "da08d28cb9fed8b7074c5eef16502a307578a0d8dc0c3374f29f169b9152c802",
     },
 ];
 
-fn verify_pinned_sources(replacement: Option<(&str, &str)>) -> Result<(), &'static str> {
+#[derive(serde::Deserialize)]
+struct Extraction {
+    hashes: BTreeMap<String, String>,
+    references: BTreeSet<String>,
+}
+
+fn extract_sources(
+    replacement: Option<(&str, &str)>,
+    interpreter: &std::ffi::OsStr,
+    source_root: &std::path::Path,
+) -> Extraction {
     use std::io::Write;
     use std::process::{Command, Stdio};
     let sources = replacement.into_iter().collect::<BTreeMap<_, _>>();
-    let mut child = Command::new("python3")
+    let mut child = Command::new(interpreter)
         .args([
             "-c",
             include_str!("transition_serializer_regions.py"),
             "--source-root",
         ])
-        .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"))
+        .arg(source_root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("test serializer extractor requires Python 3");
+        .unwrap_or_else(|error| {
+            panic!("serializer extractor requires python3 interpreter {interpreter:?}: {error}")
+        });
     // Walking the checkout, rather than embedding a fixed file catalog, notices
     // future source files. CI and native fixture runs have the source tree.
     // Python drains the override request before emitting hashes/reference names;
@@ -176,20 +192,33 @@ fn verify_pinned_sources(replacement: Option<(&str, &str)>) -> Result<(), &'stat
     let mut input = child.stdin.take().unwrap();
     input
         .write_all(&serde_json::to_vec(&sources).unwrap())
-        .unwrap();
+        .expect("python3 serializer extractor request could not be written");
     drop(input);
-    let output = child.wait_with_output().unwrap();
+    let output = child
+        .wait_with_output()
+        .expect("python3 serializer extractor process must complete");
     assert!(
         output.status.success(),
-        "serializer extraction failed: {}",
+        "python3 serializer extraction failed (walk/parse): {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    #[derive(serde::Deserialize)]
-    struct Extraction {
-        hashes: BTreeMap<String, String>,
-        references: BTreeSet<String>,
-    }
-    let extraction: Extraction = serde_json::from_slice(&output.stdout).unwrap();
+    serde_json::from_slice(&output.stdout)
+        .expect("python3 serializer extractor returned invalid JSON")
+}
+
+fn extract_with_python(replacement: Option<(&str, &str)>) -> Extraction {
+    extract_sources(
+        replacement,
+        std::ffi::OsStr::new("python3"),
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+    )
+}
+
+fn verify_pinned_sources(replacement: Option<(&str, &str)>) -> Result<(), &'static str> {
+    verify_extraction(extract_with_python(replacement))
+}
+
+fn verify_extraction(extraction: Extraction) -> Result<(), &'static str> {
     let hashes = extraction.hashes;
     for pin in PINNED_SOURCES {
         if hashes.get(pin.path).map(String::as_str) != Some(pin.sha256) {
@@ -362,6 +391,115 @@ fn pinned_v1_accepts_test_only_serializers_outside_catalog() {
         verify_pinned_sources(Some(("snapshots/sampled_scan/transition_seed.rs", changed))),
         Ok(())
     );
+}
+
+const ADDED_DURABLE_METHODS: &str = r#"
+    fn put(&self, e: &mut Enc) -> Result<(), Refuse> { e.varint(9) }
+    fn take(_: &mut Dec<'_>) -> Result<Self, Corrupt> { Err(Corrupt) }
+    fn verify(_: &mut Dec<'_>) -> Result<(), Corrupt> { Ok(()) }
+    fn shape(s: &mut Shape) { s.push("added"); }
+"#;
+
+fn assert_added_impl_and_body_refused(header: &str) {
+    assert_added_source_and_body_refused(&format!("{header} {{ {ADDED_DURABLE_METHODS} }}"));
+}
+
+fn assert_added_source_and_body_refused(original: &str) {
+    let path = "fixture_added_source.rs";
+    assert_eq!(original.matches("e.varint(9)").count(), 1);
+    let changed = original.replacen("e.varint(9)", "e.varint(7)", 1);
+    assert_ne!(original, changed);
+    // Prove that put's changed byte affects a selected region, then run both
+    // extractions through exactly the verifier called by the genuine seed.
+    let before = extract_with_python(Some((path, original)));
+    let after = extract_with_python(Some((path, &changed)));
+    assert!(before.hashes.contains_key(path));
+    assert!(after.hashes.contains_key(path));
+    assert_ne!(before.hashes[path], after.hashes[path]);
+    for extraction in [before, after] {
+        assert_eq!(
+            verify_extraction(extraction),
+            Err("serializer regions outside baseline catalog")
+        );
+    }
+}
+
+#[test]
+fn pinned_v1_refuses_const_generic_impl_and_body_drift() {
+    assert_added_impl_and_body_refused("impl<T: Marker<{ 1 + 1 }>> Durable for Added<T>");
+}
+
+#[test]
+fn pinned_v1_refuses_where_clause_impl_and_body_drift() {
+    assert_added_impl_and_body_refused(
+        "impl<T> crate::durable_tail_codec::Durable for Added<T> where T: Marker<{ 1 + 1 }>",
+    );
+}
+
+#[test]
+fn pinned_v1_refuses_impl_with_opaque_header_tokens() {
+    // Each form must independently select the impl and its changed put body;
+    // a second serializer must not mask an omitted impl.
+    for header in [
+        "impl<T: Marker<{ /* { */ 2 }>> Durable for Added<T>",
+        r##"impl<T: Marker<{ { let _ = r#"{}"#; 2 } }>> Durable for Added<T>"##,
+        "#[cfg(unix)] impl<T> Durable for Added<T>",
+    ] {
+        assert_added_impl_and_body_refused(header);
+    }
+    assert_added_source_and_body_refused(&format!(
+        "macro_rules! nested {{ () => {{ impl<T: Marker<{{ 2 }}>> Durable for Added<T> {{ {ADDED_DURABLE_METHODS} }} }}; }}"
+    ));
+}
+
+#[test]
+#[should_panic(expected = "serializer extractor requires python3 interpreter")]
+fn pinned_v1_missing_python_fails_loudly() {
+    let missing = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src/snapshots/sampled_scan/nonexistent-python3-interpreter");
+    assert!(!missing.exists(), "missing-tool control premise");
+    extract_sources(
+        None,
+        missing.as_os_str(),
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+    );
+}
+
+#[test]
+#[should_panic(expected = "serializer source walk requires an existing src directory")]
+fn pinned_v1_missing_source_tree_fails_loudly() {
+    let missing =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("nonexistent-serializer-source-tree");
+    assert!(!missing.exists(), "missing-tree control premise");
+    extract_sources(None, std::ffi::OsStr::new("python3"), &missing);
+}
+
+#[test]
+fn pinned_v1_unparseable_headers_fail_loudly() {
+    for (source, expected) in [
+        (
+            "impl<T: Marker<{ 1 + 1 }> Durable for Added<T> {}",
+            "unsupported item header",
+        ),
+        ("impl Durable for Added;", "unsupported impl header"),
+        (
+            "crate::durable_tail_codec::durable_struct! Added;",
+            "unsupported durable macro header",
+        ),
+    ] {
+        let failure = std::panic::catch_unwind(|| {
+            verify_pinned_sources(Some(("fixture_added_source.rs", source)))
+        })
+        .expect_err("unsupported headers must panic, never produce an empty region set");
+        let message = failure
+            .downcast_ref::<String>()
+            .expect("diagnostic panic string");
+        assert!(
+            message.contains("python3 serializer extraction failed"),
+            "{message}"
+        );
+        assert!(message.contains(expected), "{message}");
+    }
 }
 
 fn pinned_header(out: &mut Vec<u8>, record: &PendingRecord, generation: u64) {

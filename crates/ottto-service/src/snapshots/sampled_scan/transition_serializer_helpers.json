@@ -184,5 +184,6 @@
   "verify_entries": "pinned: durable_tail_codec.rs primitive/trait/macro definitions and generated field dispatch",
   "verify_h": "pinned: codec macro-generated dispatch or callback; implementation and call sites in hashed codec/serializer regions",
   "verify_seq": "pinned: durable_tail_codec.rs primitive/trait/macro definitions and generated field dispatch",
-  "workspace_digest": "pinned: snapshots/sampled_jsonl/durable.rs helper bodies/constants, Rederive fields and derive(Default)"
+  "workspace_digest": "pinned: snapshots/sampled_jsonl/durable.rs helper bodies/constants, Rederive fields and derive(Default)",
+  "x": "pinned: owned_heap.rs From<Vec<T>> helper callback; body included in the owned-container serializer support regions"
 }
