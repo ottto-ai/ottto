@@ -1145,8 +1145,9 @@ attempts, including retries, rather than distinct sessions.
 
 Within the existing item caps, acknowledged tagged buckets have priority over
 never-acknowledged buckets. If those accepted buckets overflow, a fitting open
-current-hour accepted bucket has priority; settled buckets are dropped oldest
-first within the classifier's priority. Dropped usage goes out untagged with a
+current-hour accepted bucket has priority; settled buckets are considered newest first, preferring to drop the oldest
+within the classifier's priority. One unencodable bucket does not erase
+independent accepted proof; the complete accepted set is checked first. Dropped usage goes out untagged with a
 row refusal; there is no upload hold. Top-level shares are refolded from exactly
 the kept bucket shares and the untagged remainder, as required by receiver
 reconciliation. Evidence is pruned and references remapped. Display names only
@@ -1169,3 +1170,7 @@ The pure `measure_identity_cap(item, accepted_state)` hook returns
 `accepted_overflow` and `item_bytes` without reading evidence, logging or
 uploading. Here recent means the currently proved, never-accepted candidate
 buckets; already stripped proof cannot be recovered from the hint ledger.
+
+Upstream authority-key allocation loss remains fail-closed: inherited partitions
+are not reclassified as request proof by budget recovery or a uniform starting-account
+retry. Only an intact current grouping can enter the cap allocator.

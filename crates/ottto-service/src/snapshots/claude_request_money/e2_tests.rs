@@ -2608,7 +2608,7 @@ fn e2_identity_conflicting_account_attributes_preserve_complete_own_orgs() {
 }
 
 #[test]
-fn e2_identity_final_twin_union_over_authority_cap_falls_back_to_starting_org() {
+fn e2_identity_final_twin_union_over_authority_cap_withholds_unproved_identity() {
     with_enabled(|| {
         let a = root_file("identity-cap-a");
         let b = root_file("identity-cap-b");
@@ -2637,18 +2637,12 @@ fn e2_identity_final_twin_union_over_authority_cap_falls_back_to_starting_org() 
             .all(|item| !fold(item).accounts.as_ref().unwrap().conflict));
         let item = tag_owned(items, &index).remove(0);
         assert_eq!((item.request_count, item.input_tokens), (20, 20));
-        assert_eq!(item.request_evidence.len(), 1);
-        assert_eq!(
-            item.request_evidence[0].provider_workspace_hash.as_deref(),
-            Some(org_hash(ORG_A).as_str())
-        );
-        assert!(
-            rows_of(&item).all(|row| row.identity_parts.is_none() && row.evidence_ref == Some(0))
-        );
-        assert_eq!(
-            item.request_identity_refusals, 0,
-            "successful retry retains no failed-attempt refusals"
-        );
+        // SOURCE: overflowing proof cannot be replaced by the starting org.
+        // The old uniform-retry expectation would manufacture that identity.
+        assert!(item.request_evidence.is_empty());
+        assert!(rows_of(&item).all(|row| row.identity_parts.is_none()
+            && row.evidence_ref.is_none() && row.account_identifier_hash.is_none()));
+        assert_eq!(item.request_identity_refusals, 1, "the bucket row lost proof");
         assert_evidence_referenced(&item);
         cleanup(&[&a, &b]);
     });

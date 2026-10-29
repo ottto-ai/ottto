@@ -432,15 +432,13 @@ fn sticky_partial_money_absence_cannot_emit_unreconciled_known_cost_shares() {
     for (hour, bucket) in item.usage_buckets.iter_mut().enumerate() {
         let reported = ![0, 24, 48, 72].contains(&hour);
         bucket.model_usage[0].cost_usd = reported.then(|| "0.000003".into());
-        if reported {
-            for c in &mut proof[hour * 3..hour * 3 + 3] {
-                c.usage.costs = UsageCosts {
-                    observed: true,
-                    reported: true,
-                    total: Some(1_000_000),
-                    ..Default::default()
-                };
-            }
+        for c in &mut proof[hour * 3..hour * 3 + 3] {
+            c.usage.costs = UsageCosts {
+                observed: true,
+                reported,
+                total: reported.then_some(1_000_000),
+                ..Default::default()
+            };
         }
     }
     item.model_usage[0].cost_usd = None;
@@ -450,10 +448,80 @@ fn sticky_partial_money_absence_cannot_emit_unreconciled_known_cost_shares() {
         &identity::AcceptedBuckets::default(),
     )
     .unwrap();
-    assert!(
-        matches!(result, Tagged::Fallback { .. }),
-        "no recent prefix can carry known per-key money under an unreported top row"
-    );
-    assert_eq!(item.request_identity_refusals, 576);
+    assert!(matches!(result, Tagged::Sent { .. }));
+    assert!(item.request_identity_refusals > 0);
+    assert!(!sticky_tagged(&item.usage_buckets[575].model_usage[0]));
     sticky_assert_reconciled(&item);
+}
+
+#[test]
+fn sticky_recovery_cannot_promote_an_upstream_inherited_partition_to_proof() {
+    let (mut item, proof) = sticky_session(2);
+    let mut grouping = identity::Grouping::new(2);
+    for c in &proof {
+        grouping.add(&c.bucket_start, &c.row_key, &c.usage, c.identity.as_ref());
+    }
+    grouping.lose_upstream_proof_for_test();
+    let result = identity::apply_grouped(&mut item, grouping).unwrap();
+    assert!(matches!(result, Tagged::Fallback { .. }));
+    assert_eq!(item.request_identity_refusals, 2);
+    assert!(item.request_evidence.is_empty());
+    assert!(item
+        .usage_buckets
+        .iter()
+        .all(|bucket| !sticky_tagged(&bucket.model_usage[0])));
+}
+
+#[test]
+fn sticky_unencodable_open_bucket_does_not_erase_independent_older_accepted_proof() {
+    let (mut item, mut proof) = sticky_session(2);
+    let mut accepted = identity::AcceptedBuckets::default();
+    identity::apply_with_accepted_for_test(&mut item, &proof, &accepted).unwrap();
+    accepted.record(&serde_json::to_value(&item).unwrap());
+    // Seventeen distinct own keys in the current bucket cannot be represented
+    // by one row, but the older accepted bucket remains complete and tiny.
+    for n in 12..26 {
+        let mut extra = proof.last().unwrap().clone();
+        extra.identity = RequestIdentity::Tagged(AuthorityKey {
+            login: Some(format!("{n:064x}")),
+            org: None,
+            basis: identity::TELEMETRY,
+        });
+        proof.push(extra);
+        item.model_usage[0].input_tokens += 1;
+        item.model_usage[0].request_count += 1;
+        item.usage_buckets[1].model_usage[0].input_tokens += 1;
+        item.usage_buckets[1].model_usage[0].request_count += 1;
+    }
+    identity::apply_with_accepted_for_test(&mut item, &proof, &accepted).unwrap();
+    assert!(sticky_tagged(&item.usage_buckets[0].model_usage[0]));
+    assert!(!sticky_tagged(&item.usage_buckets[1].model_usage[0]));
+    assert_eq!(item.request_identity_refusals, 1);
+    sticky_assert_reconciled(&item);
+}
+
+#[test]
+fn sticky_complete_accepted_set_is_checked_before_intermediate_money_fit() {
+    let (mut item, mut proof) = sticky_session(97);
+    for (hour, bucket) in item.usage_buckets.iter_mut().enumerate() {
+        let reported = ![0, 24, 48, 72].contains(&hour);
+        bucket.model_usage[0].cost_usd = reported.then(|| "0.000003".into());
+        for c in &mut proof[hour * 3..hour * 3 + 3] {
+            c.usage.costs = UsageCosts {
+                observed: true,
+                reported,
+                total: reported.then_some(1_000_000),
+                ..Default::default()
+            };
+        }
+    }
+    item.model_usage[0].cost_usd = None;
+    let mut accepted = identity::AcceptedBuckets::default();
+    identity::apply_with_accepted_for_test(&mut item, &proof, &accepted).unwrap();
+    accepted.record(&serde_json::to_value(&item).unwrap());
+    sticky_assert_reconciled(&item);
+    let measured = identity::measure_identity_cap(&item, &accepted).unwrap();
+    assert_eq!(measured.accepted_retained, 97);
+    assert_eq!(measured.accepted_overflow.differs, 0);
+    assert_eq!(measured.item_bytes, identity::item_bytes(&item));
 }

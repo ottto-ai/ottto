@@ -405,6 +405,7 @@ pub(crate) struct Grouping {
     max_groups: usize,
     keys: BTreeSet<AuthorityKey>,
     keys_over_cap: bool,
+    upstream_proof_lost: bool,
     failed: Option<Ineligible>,
     /// Requests a `RequestSink` admitted: those the item's transcript holds,
     /// and telemetry-only (auxiliary) ones the reported rebuild added.
@@ -511,6 +512,12 @@ impl LatestRequests {
 
 impl Grouping {
     #[cfg(test)]
+    pub(crate) fn lose_upstream_proof_for_test(&mut self) {
+        self.upstream_proof_lost = true;
+        self.keys_over_cap = true;
+    }
+
+    #[cfg(test)]
     pub(super) fn desktop_recent(&self) -> &crate::desktop_recent::RecentActivity {
         &self.desktop_recent
     }
@@ -522,6 +529,7 @@ impl Grouping {
             max_groups,
             keys: BTreeSet::new(),
             keys_over_cap: false,
+            upstream_proof_lost: false,
             failed: None,
             transcript_requests: 0,
             telemetry_only_requests: 0,
@@ -966,7 +974,10 @@ fn apply_grouped_with_accepted(
     }
     crate::local_resource_diagnostics::claude_identity_over_cap(&over_cap, attempted_bytes);
     let attempted_counts = cap_counts(item, accepted, None);
-    if let Some((kept, measurement)) = budget::select(item, &grouping, prior_refusals, accepted) {
+    let selected = (!grouping.upstream_proof_lost)
+        .then(|| budget::select(item, &grouping, prior_refusals, accepted))
+        .flatten();
+    if let Some((kept, measurement)) = selected {
         budget::record(&cap_counts(item, accepted, Some(&measurement)));
         let mut visible = grouping;
         for (bucket, keep) in item.usage_buckets.iter().zip(&kept) {
@@ -1085,16 +1096,21 @@ pub(crate) fn measure_identity_cap(
     item: &SnapshotItem,
     accepted: &AcceptedBuckets,
 ) -> Option<CapMeasurement> {
-    let mut grouping = request_owned_grouping(item, None).or_else(|| wire_grouping(item))?;
+    let mut grouping = request_owned_grouping(item).or_else(|| wire_grouping(item))?;
     let mut output = item.clone();
     let known = accepted.get(&item.source_session_id);
     refuse_unproved_accepted(&mut grouping, known);
-    if let Some((_, measured)) = budget::select(
-        &mut output,
-        &grouping,
-        item.request_identity_refusals,
-        known,
-    ) {
+    let selected = (!grouping.upstream_proof_lost)
+        .then(|| {
+            budget::select(
+                &mut output,
+                &grouping,
+                item.request_identity_refusals,
+                known,
+            )
+        })
+        .flatten();
+    if let Some((_, measured)) = selected {
         return Some(measured);
     }
     let mut measured = CapMeasurement::default();
@@ -2663,10 +2679,7 @@ pub(crate) fn take_identity_counts() -> IdentityCounts {
 
 /// Exact final E2 rows, including copied exclusions and telemetry side calls.
 /// E2 owns placement; this owner supplies contract-5 keys and evidence only.
-fn request_owned_grouping(
-    item: &SnapshotItem,
-    fallback: Option<&AccountPartition>,
-) -> Option<Grouping> {
+fn request_owned_grouping(item: &SnapshotItem) -> Option<Grouping> {
     let mut grouping = Grouping::new(bucket_row_count(item));
     super::claude_request_money::e2::visit_identity_rows(
         item,
@@ -2677,7 +2690,6 @@ fn request_owned_grouping(
                 usage.costs.reported = true;
                 usage.costs.total = Some(u128::from(cost) * 1_000_000);
             }
-            let account = fallback.unwrap_or(&account);
             let identity = match account.as_ref() {
                 Some(key) => IdentityRef::Tagged(KeyRef {
                     login: key.login.as_deref(),
@@ -2698,11 +2710,11 @@ fn request_owned_grouping(
             );
         },
     )?;
-    grouping.keys_over_cap |= fallback.is_none()
-        && item
-            .claude_money
-            .as_deref()
-            .is_some_and(|fold| fold.entity.identity_over_cap);
+    grouping.upstream_proof_lost = item
+        .claude_money
+        .as_deref()
+        .is_some_and(|fold| fold.entity.identity_over_cap);
+    grouping.keys_over_cap |= grouping.upstream_proof_lost;
     grouping.latest.unordered |= item
         .claude_money
         .as_deref()
@@ -4069,13 +4081,12 @@ fn tag_item(
         if keeps_markerless_account(item) {
             return None;
         }
-        let grouping = request_owned_grouping(item, None)?;
+        let grouping = request_owned_grouping(item)?;
         let lifecycle = (
             item.source_started_at.clone(),
             item.source_ended_at.clone(),
             item.source_last_activity_at.clone(),
         );
-        let prior_refusals = item.request_identity_refusals;
         normalize_activity(item);
         let tagged = apply_grouped_with_accepted(item, grouping, accepted);
         if tagged.is_err() {
@@ -4084,28 +4095,9 @@ fn tag_item(
                 item.source_ended_at,
                 item.source_last_activity_at,
             ) = lifecycle;
-            return Some(tagged);
         }
-        if matches!(tagged, Ok(Tagged::Sent { .. })) || evidence.accepted_buckets.is_some() {
-            return Some(tagged);
-        }
-        let fallback = item
-            .claude_money
-            .as_deref()?
-            .accounts
-            .as_deref()?
-            .fallback
-            .clone();
-        let grouping = request_owned_grouping(item, Some(&fallback))?;
-        item.request_identity_refusals = prior_refusals;
-        let tagged = apply_grouped_with_accepted(item, grouping, accepted);
-        if tagged.is_err() {
-            (
-                item.source_started_at,
-                item.source_ended_at,
-                item.source_last_activity_at,
-            ) = lifecycle;
-        }
+        // A cap failure cannot authorize a uniform starting-account rewrite.
+        // The budget's proved subset or full strip is the final identity body.
         return Some(tagged);
     }
     let root = owner_root(item)?;

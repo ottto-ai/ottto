@@ -179,6 +179,158 @@ struct Selection {
     refused_rows: u64,
 }
 
+fn add_bucket(
+    item: &SnapshotItem,
+    grouping: &Grouping,
+    selection: &Selection,
+    row_index: &BTreeMap<RowKey, usize>,
+    index: usize,
+) -> Option<(Selection, Vec<RowIdentity>)> {
+    let bucket = &item.usage_buckets[index];
+    let mut next = selection.clone();
+    let mut identities = Vec::new();
+    let mut changed = BTreeSet::new();
+    let mut valid = true;
+    for row in &bucket.model_usage {
+        let key = row_key_from_model_usage(row);
+        let group = grouping.get(&bucket.bucket_start, &key)?;
+        if group.truncated {
+            valid = false;
+            break;
+        }
+        let top_index = row_index[&key];
+        let untagged = group
+            .by_key
+            .get(&None)
+            .is_some_and(|amount| amount.counts != [0; 8]);
+        let absent = row_costs(row).map(Option::is_none);
+        for (count, absent) in next.residual_missing[top_index].iter_mut().zip(absent) {
+            if absent && !untagged {
+                *count -= 1;
+            }
+        }
+        let top = &mut next.top[top_index];
+        let residual = top.get_mut(&None)?;
+        subtract_amounts(residual, &group.total)?;
+        for (poisoned, count) in residual
+            .poisoned
+            .iter_mut()
+            .zip(next.residual_missing[top_index])
+        {
+            *poisoned = count > 0;
+        }
+        for (key, amount) in &group.by_key {
+            let mut wire_amount = amount.clone();
+            // Missing bucket money is missing on every emitted part,
+            // even when the request regrouping held a partial amount.
+            for (field, absent) in absent.into_iter().enumerate() {
+                if absent {
+                    wire_amount.costs[field] = None;
+                    wire_amount.poisoned[field] = true;
+                }
+            }
+            top.entry(key.clone()).or_default().merge(&wire_amount)?;
+        }
+        next.keys.extend(
+            group
+                .by_key
+                .iter()
+                .filter(|(_, amount)| amount.counts != [0; 8])
+                .filter_map(|(key, _)| key.clone()),
+        );
+        let zero_index = group
+            .by_key
+            .keys()
+            .flatten()
+            .map(|key| (key.evidence(), 0))
+            .collect();
+        let identity = row_identity(row, &group.by_key, &zero_index).ok()?;
+        let Some(measured) = metrics(row, &identity) else {
+            valid = false;
+            break;
+        };
+        next.metrics.add(&measured);
+        let has_tag = !matches!(identity, RowIdentity::Untagged);
+        if has_tag && !group.refused {
+            next.refused_rows -= 1;
+        }
+        identities.push(identity);
+        changed.insert(row_index[&key]);
+    }
+    if !valid {
+        return None;
+    }
+    let evidence = next
+        .keys
+        .iter()
+        .map(AuthorityKey::evidence)
+        .collect::<BTreeSet<_>>();
+    if next.keys.len() > MAX_AUTHORITY_KEYS || evidence.len() > MAX_EVIDENCE_ENTRIES {
+        return None;
+    }
+    let zero_index = evidence.iter().map(|key| (key.clone(), 0)).collect();
+    for top in changed {
+        next.metrics.subtract(&next.top_metrics[top]);
+        let identity = row_identity(&item.model_usage[top], &next.top[top], &zero_index).ok()?;
+        let Some(measured) = metrics(&item.model_usage[top], &identity) else {
+            valid = false;
+            break;
+        };
+        next.metrics.add(&measured);
+        next.top_metrics[top] = measured;
+    }
+    if !valid {
+        return None;
+    }
+    Some((next, identities))
+}
+
+fn fits(
+    item: &SnapshotItem,
+    selection: &Selection,
+    base_bytes: usize,
+    prior_refusals: u64,
+) -> Option<usize> {
+    if selection.metrics.parts > MAX_PARTS_PER_ITEM {
+        return None;
+    }
+    for (row, groups) in item.model_usage.iter().zip(&selection.top) {
+        if groups
+            .values()
+            .filter(|amount| amount.counts != [0; 8])
+            .any(|amount| {
+                row_costs(row)
+                    .iter()
+                    .enumerate()
+                    .any(|(field, cost)| cost.is_none() && amount.wire(field).is_some())
+            })
+        {
+            return None;
+        }
+    }
+    let evidence = selection
+        .keys
+        .iter()
+        .map(AuthorityKey::evidence)
+        .collect::<BTreeSet<_>>();
+    let index_bytes = evidence
+        .iter()
+        .enumerate()
+        .map(|(index, key)| {
+            selection.metrics.references.get(key).copied().unwrap_or(0)
+                * (index.to_string().len() - 1)
+        })
+        .sum::<usize>();
+    let bytes = base_bytes
+        .checked_add(selection.metrics.bytes)?
+        .checked_add(index_bytes)?
+        .checked_add(evidence_bytes(
+            &evidence,
+            prior_refusals.saturating_add(selection.refused_rows),
+        )?)?;
+    (bytes <= MAX_ITEM_BYTES).then_some(bytes)
+}
+
 /// Pure allocation over current proof; mutates only the supplied output body.
 /// Full-item serialization happens once for the untagged baseline and once
 /// for the finished body. Each bucket changes at most MAX_ROWS top rows; no
@@ -286,137 +438,45 @@ pub(super) fn select(
         .iter()
         .map(|bucket| vec![RowIdentity::Untagged; bucket.model_usage.len()])
         .collect::<Vec<_>>();
+    // Try the complete accepted set before considering overflow. Derived top
+    // rows can collapse, and missing money can reconcile only when all of an
+    // authority's accepted buckets are present. Intermediate fit is not a
+    // prerequisite for the final accepted set to fit.
+    let mut all_accepted = Some(selection.clone());
+    let mut accepted_rows = Vec::new();
+    for index in order.iter().copied().filter(|&index| is_accepted[index]) {
+        let Some((next, rows)) = all_accepted
+            .as_ref()
+            .and_then(|state| add_bucket(item, grouping, state, &row_index, index))
+        else {
+            all_accepted = None;
+            break;
+        };
+        all_accepted = Some(next);
+        accepted_rows.push((index, rows));
+    }
+    if let Some(state) =
+        all_accepted.filter(|state| fits(item, state, base_bytes, prior_refusals).is_some())
+    {
+        selection = state;
+        for (index, rows) in accepted_rows {
+            kept[index] = true;
+            bucket_identities[index] = rows;
+        }
+    } else {
+        drop(accepted_rows);
+    }
+    // One unencodable candidate cannot discard independent accepted proof.
     for index in order {
-        let bucket = &item.usage_buckets[index];
-        let mut next = selection.clone();
-        let mut identities = Vec::new();
-        let mut changed = BTreeSet::new();
-        let mut valid = true;
-        for row in &bucket.model_usage {
-            let key = row_key_from_model_usage(row);
-            let group = grouping.get(&bucket.bucket_start, &key)?;
-            if group.truncated {
-                valid = false;
-                break;
-            }
-            let top_index = row_index[&key];
-            let untagged = group
-                .by_key
-                .get(&None)
-                .is_some_and(|amount| amount.counts != [0; 8]);
-            let absent = row_costs(row).map(Option::is_none);
-            for (count, absent) in next.residual_missing[top_index].iter_mut().zip(absent) {
-                if absent && !untagged {
-                    *count -= 1;
-                }
-            }
-            let top = &mut next.top[top_index];
-            let residual = top.get_mut(&None)?;
-            subtract_amounts(residual, &group.total)?;
-            for (poisoned, count) in residual
-                .poisoned
-                .iter_mut()
-                .zip(next.residual_missing[top_index])
-            {
-                *poisoned = count > 0;
-            }
-            for (key, amount) in &group.by_key {
-                let mut wire_amount = amount.clone();
-                // Missing bucket money is missing on every emitted part,
-                // even when the request regrouping held a partial amount.
-                for (field, absent) in absent.into_iter().enumerate() {
-                    if absent {
-                        wire_amount.costs[field] = None;
-                        wire_amount.poisoned[field] = true;
-                    }
-                }
-                top.entry(key.clone()).or_default().merge(&wire_amount)?;
-            }
-            next.keys.extend(
-                group
-                    .by_key
-                    .iter()
-                    .filter(|(_, amount)| amount.counts != [0; 8])
-                    .filter_map(|(key, _)| key.clone()),
-            );
-            let zero_index = group
-                .by_key
-                .keys()
-                .flatten()
-                .map(|key| (key.evidence(), 0))
-                .collect();
-            let identity = row_identity(row, &group.by_key, &zero_index).ok()?;
-            let Some(measured) = metrics(row, &identity) else {
-                valid = false;
-                break;
-            };
-            next.metrics.add(&measured);
-            let has_tag = !matches!(identity, RowIdentity::Untagged);
-            if has_tag && !group.refused {
-                next.refused_rows -= 1;
-            }
-            identities.push(identity);
-            changed.insert(row_index[&key]);
+        if kept[index] {
+            continue;
         }
-        if !valid {
-            break;
-        }
-        let evidence = next
-            .keys
-            .iter()
-            .map(AuthorityKey::evidence)
-            .collect::<BTreeSet<_>>();
-        if next.keys.len() > MAX_AUTHORITY_KEYS || evidence.len() > MAX_EVIDENCE_ENTRIES {
-            break;
-        }
-        let zero_index = evidence.iter().map(|key| (key.clone(), 0)).collect();
-        for top in changed {
-            // A parent row with absent money cannot carry a known amount on
-            // just one part. Refuse an unrepresentable partial body rather
-            // than violate receiver per-authority money reconciliation.
-            if next.top[top]
-                .values()
-                .filter(|amount| amount.counts != [0; 8])
-                .any(|amount| {
-                    row_costs(&item.model_usage[top])
-                        .iter()
-                        .enumerate()
-                        .any(|(field, cost)| cost.is_none() && amount.wire(field).is_some())
-                })
-            {
-                valid = false;
-                break;
-            }
-            next.metrics.subtract(&next.top_metrics[top]);
-            let identity =
-                row_identity(&item.model_usage[top], &next.top[top], &zero_index).ok()?;
-            let Some(measured) = metrics(&item.model_usage[top], &identity) else {
-                valid = false;
-                break;
-            };
-            next.metrics.add(&measured);
-            next.top_metrics[top] = measured;
-        }
-        if !valid || next.metrics.parts > MAX_PARTS_PER_ITEM {
-            break;
-        }
-        let index_bytes = evidence
-            .iter()
-            .enumerate()
-            .map(|(index, key)| {
-                next.metrics.references.get(key).copied().unwrap_or(0)
-                    * (index.to_string().len() - 1)
-            })
-            .sum::<usize>();
-        let bytes = base_bytes
-            .checked_add(next.metrics.bytes)?
-            .checked_add(index_bytes)?
-            .checked_add(evidence_bytes(
-                &evidence,
-                prior_refusals.saturating_add(next.refused_rows),
-            )?)?;
-        if bytes > MAX_ITEM_BYTES {
-            break;
+        let Some((next, identities)) = add_bucket(item, grouping, &selection, &row_index, index)
+        else {
+            continue;
+        };
+        if fits(item, &next, base_bytes, prior_refusals).is_none() {
+            continue;
         }
         selection = next;
         kept[index] = true;
