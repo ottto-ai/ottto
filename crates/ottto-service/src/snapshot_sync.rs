@@ -805,6 +805,10 @@ pub(crate) fn settle_withheld_for_test(
         &mut scan,
         &disposition,
     );
+    assert!(
+        scan.snapshots.is_empty(),
+        "account-held bodies stay Unknown and never enter upload"
+    );
     let progress = SnapshotUploadProgress::new(
         "withheld-fixture".into(),
         crate::snapshots::snapshot_quarantine_witness(SnapshotSource::ClaudeCode),

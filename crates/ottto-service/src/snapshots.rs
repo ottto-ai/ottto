@@ -42520,8 +42520,9 @@ impl<'a> DiscoveryRetention<'a> {
         grown || self.owes(path)
     }
 
-    /// An oversized withheld-account key stays observed, never opened; its
-    /// loss is counted beside the ordinary size skip.
+    /// An oversized withheld-account key stays observed without a full parse;
+    /// its refusal is counted beside the ordinary size skip. Existing bounded
+    /// identity sampling can still open it at candidate revalidation.
     fn note_withheld_oversized(&self, source: SnapshotSource, path: &Path) {
         if self.account_holds.contains_key(&local_index_key(path)) {
             line_delivery_unselected(source.api_slug(), UnselectedReason::WithheldOversized);
