@@ -141,9 +141,27 @@ fn nonzero_command_status_is_not_success() {
 fn busy_preflight_json_is_retryable_and_has_not_written_a_plist() {
     let fixture = Fixture::new();
     let _owner = fixture.lock();
-    let busy = ServiceLifecycleTransaction::acquire(&fixture.0, Duration::ZERO)
-        .err()
-        .unwrap();
+    let cleanup_calls = std::cell::Cell::new(0);
+    let writes = std::cell::Cell::new(0);
+    let busy = install_transaction(
+        &fixture.0,
+        Duration::ZERO,
+        || cleanup_calls.set(cleanup_calls.get() + 1),
+        |_| {
+            writes.set(writes.get() + 1);
+            install_with(
+                &fixture.config(),
+                &fixture.0.join("agent.plist"),
+                false,
+                false,
+                || Ok(None),
+                |_| panic!("unexpected mutation"),
+            )
+        },
+    )
+    .unwrap_err();
+    assert_eq!(cleanup_calls.get(), 0);
+    assert_eq!(writes.get(), 0);
     let payload = crate::service_command_error_payload(&busy.context("bootstrap preflight"));
     assert_eq!(payload["ok"], false);
     assert_eq!(payload["error"]["code"], "launch_agent_transaction_busy");
@@ -261,4 +279,50 @@ fn explicit_owner_migration_still_allows_the_locked_plan() {
     )
     .unwrap();
     assert_eq!(calls, ["bootout", "enable", "bootstrap"]);
+}
+
+#[test]
+fn acquired_install_runs_cleanup_before_probe_write_and_mutation() {
+    let fixture = Fixture::new();
+    let events = std::cell::RefCell::new(Vec::new());
+    let plist = fixture.0.join("agent.plist");
+    install_transaction(
+        &fixture.0,
+        Duration::ZERO,
+        || events.borrow_mut().push("cleanup"),
+        |_| {
+            install_with(
+                &fixture.config(),
+                &plist,
+                false,
+                true,
+                || {
+                    events.borrow_mut().push("probe");
+                    assert!(!plist.exists());
+                    Ok(None)
+                },
+                |_| {
+                    events.borrow_mut().push("mutation");
+                    assert!(plist.exists());
+                    Ok(())
+                },
+            )
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        *events.borrow(),
+        ["cleanup", "probe", "mutation", "mutation"]
+    );
+}
+
+#[test]
+fn filesystem_error_json_retains_the_diagnostic_cause() {
+    let error = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::EACCES))
+        .context("open service lifecycle lock");
+    let payload = crate::service_command_error_payload(&error);
+    let message = payload["error"]["message"].as_str().unwrap();
+    assert!(message.contains("open service lifecycle lock"));
+    assert!(message.contains("Permission denied"), "{message}");
+    assert_eq!(payload["error"]["retryable"], false);
 }

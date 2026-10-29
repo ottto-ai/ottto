@@ -8,9 +8,18 @@ A terminated service-bootstrap helper could leave a mutating launchctl child
 alive while another caller replaced the same per-user job. CLI autostart also
 mutated that label without coordinating with bootstrap.
 
-`ottto-core::service_lifecycle` now owns one fixed home/label lock path, its
+`ottto-core::service_lifecycle` now owns one fixed effective-account/label lock path, its
 safety checks, explicit descriptor inheritance, and bounded command cleanup.
 Both helper bootstrap/plist writes and default CLI autostart participate.
+Production resolves the effective uid's account home through the existing
+account resolver, and job domains use the effective uid directly. Inherited
+`HOME`/`UID` no longer select lifecycle identity. CLI default autostart uses
+the account's existing plist; helper configuration/plan file paths keep their
+existing scope. Each lock-directory component must be owned by the effective
+user before the lock is opened or missing subdirectories are created. This
+prevents a preserved foreign HOME from creating an elevated-user lock in
+another account's tree. Ignoring spoofed UID for launchd domains is an
+intentional compatibility correction.
 The file is never unlinked or explicitly unlocked: a surviving child retains
 the same flock after helper termination. The parent keeps CLOEXEC set; only the
 intended child's copy is cleared before exec.
@@ -50,7 +59,11 @@ lost the current owner and repair hint. All three findings were accepted and
 addressed here. A further accepted ordering finding was that serialized CLI
 autostart could still kill a just-loaded daemon before its listener was ready;
 non-destructive automatic start and no replacement fallback address that gap.
-That initial verdict is preserved; no subsequent Claude GO is
+A subsequent shared-implementation review gave conditional clearance only
+for its frozen source and raised the inherited-HOME lock identity gap plus a
+busy-ordering test weakness. Authoritative principal resolution, directory
+ownership checks, environment-spoof subprocess tests and a real install-phase
+contention test address those issues. That initial verdict is preserved; no subsequent Claude GO is
 claimed. Final verification uses the same task identity and one focused,
 sensitive AutoReview pass after relevant CI.
 
@@ -60,7 +73,9 @@ after owner close and Rust helper death, competing acquisition, CLI contention
 without mutation, indeterminate/nonzero CLI start refusal, repeated CLI starts during the
 post-bootstrap listener gap without generation replacement,
 failed-stage short-circuiting, actual JSON decision mapping, owner hints,
-explicit migration, external plist preservation and symlink-lock refusal.
+explicit migration, external plist preservation, directory-owner refusal,
+HOME/UID spoof resistance and symlink-lock refusal. Identity tests resolve
+account metadata read-only and write only synthetic temporary records.
 
 Validation is CI-only for this task. No local Cargo/tests, live launchctl,
 installer action or daemon restart is performed. Exact-head results and the
@@ -68,7 +83,8 @@ focused review outcome are linked from the PR. Native macOS compilation and
 flock behavior remain required before integration; Linux success alone does
 not establish either. No manual macOS dispatch is requested.
 
-Limits: external launchctl, older binaries and installer scripts bypassing the
+Limits: first-party uninstall, external launchctl, older binaries and installer
+scripts bypassing the
 shared implementation remain outside this lock. Requests already accepted by
 launchd cannot be revoked by killing a child. Callers must reconcile ownership
 and runtime identity/readiness after failure or cancellation. A wedged child

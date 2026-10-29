@@ -463,7 +463,7 @@ fn service_command_error_payload(error: &anyhow::Error) -> serde_json::Value {
     } else {
         ("launch_agent_lifecycle_failed", false)
     };
-    json!({"ok": false, "error": {"code": code, "message": error.to_string(), "retryable": retryable}})
+    json!({"ok": false, "error": {"code": code, "message": format!("{error:#}"), "retryable": retryable}})
 }
 
 fn service_transaction_is_busy(error: &anyhow::Error) -> bool {

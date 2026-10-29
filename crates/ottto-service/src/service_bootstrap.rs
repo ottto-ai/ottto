@@ -1,6 +1,8 @@
 //! Locked bootstrap decision; process ownership is shared with CLI autostart.
 use anyhow::{Context, Result};
-use ottto_core::service_lifecycle::{ServiceLifecycleTransaction, COMMAND_TIMEOUT};
+use ottto_core::service_lifecycle::{
+    ServiceLifecyclePrincipal, ServiceLifecycleTransaction, COMMAND_TIMEOUT,
+};
 use ottto_service::macos_service::{self, LaunchAgentConfig, LaunchAgentInstallPlan};
 use std::path::Path;
 use std::process::Command;
@@ -15,31 +17,48 @@ pub(super) fn install(
     migrate_owner: bool,
     execute: bool,
 ) -> Result<LaunchAgentInstallPlan> {
-    // Fixed per-user/label path, never derived from the requested executable,
-    // socket or owner. write-launch-agent participates in the same transaction.
-    let lock = ServiceLifecycleTransaction::acquire(home, LOCK_TIMEOUT)?;
-    ottto_service::legacy_service::cleanup_legacy_services(home);
-    install_with(
-        config,
-        plist,
-        migrate_owner,
-        execute,
-        || loaded_program(&lock),
-        |args| {
-            let (program, rest) = args.split_first().context("empty service command")?;
-            // Plans retain their existing CLI strings; execution uses a fixed path.
-            anyhow::ensure!(program == "launchctl", "unexpected service command");
-            let mut command = Command::new("/bin/launchctl");
-            command.args(rest);
-            let (status, _) = lock.run(&mut command, COMMAND_TIMEOUT)?;
-            anyhow::ensure!(
+    let principal = ServiceLifecyclePrincipal::current()?;
+    install_transaction(
+        &principal.home,
+        LOCK_TIMEOUT,
+        || {
+            ottto_service::legacy_service::cleanup_legacy_services(home);
+        },
+        |lock| {
+            install_with(
+                config,
+                plist,
+                migrate_owner,
+                execute,
+                || loaded_program(lock),
+                |args| {
+                    let (program, rest) = args.split_first().context("empty service command")?;
+                    // Plans retain their existing CLI strings; execution uses a fixed path.
+                    anyhow::ensure!(program == "launchctl", "unexpected service command");
+                    let mut command = Command::new("/bin/launchctl");
+                    command.args(rest);
+                    let (status, _) = lock.run(&mut command, COMMAND_TIMEOUT)?;
+                    anyhow::ensure!(
                 status.success(),
                 "service lifecycle command failed ({status}); installation may be partial: {}",
                 args.join(" ")
             );
-            Ok(())
+                    Ok(())
+                },
+            )
         },
     )
+}
+
+fn install_transaction<T>(
+    lock_home: &Path,
+    timeout: Duration,
+    cleanup: impl FnOnce(),
+    install: impl FnOnce(&ServiceLifecycleTransaction) -> Result<T>,
+) -> Result<T> {
+    let lock = ServiceLifecycleTransaction::acquire(lock_home, timeout)?;
+    cleanup();
+    install(&lock)
 }
 
 fn install_with(

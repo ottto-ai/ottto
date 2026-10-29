@@ -202,3 +202,68 @@ fn abrupt_helper_death_leaves_child_owning_transaction() {
     drop(fixture.lock());
     assert!(fixture.0.join("child-finished").exists());
 }
+
+#[test]
+fn principal_identity_fixture() {
+    let Some(output) = std::env::var_os("OTTTO_LIFECYCLE_PRINCIPAL_OUT") else {
+        return;
+    };
+    // Resolve only: never acquire a lock or write in the real account home.
+    let principal = ServiceLifecyclePrincipal::current().unwrap();
+    fs::write(
+        output,
+        serde_json::to_vec(&(
+            principal.home,
+            principal.uid,
+            crate::user_launchctl_domain(),
+            crate::macos_launch_agent_target(),
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn home_and_uid_overrides_cannot_split_production_lock_principal() {
+    let fixture = Fixture::new();
+    let expected = ServiceLifecyclePrincipal::current().unwrap();
+    let lock = fixture.lock();
+    for variant in ["alternate-home-one", "alternate-home-two"] {
+        let output = fixture.0.join(variant);
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "service_lifecycle::tests::principal_identity_fixture",
+                "--nocapture",
+            ])
+            .env("HOME", fixture.0.join(variant))
+            .env("UID", expected.uid.wrapping_add(1).to_string())
+            .env("OTTTO_LIFECYCLE_PRINCIPAL_OUT", &output);
+        assert!(lock
+            .run(&mut command, Duration::from_secs(5))
+            .unwrap()
+            .0
+            .success());
+        let (home, uid, domain, target): (PathBuf, u32, String, String) =
+            serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
+        assert_eq!(home, expected.home);
+        assert_eq!(uid, expected.uid);
+        assert_eq!(domain, format!("gui/{}", expected.uid));
+        assert_eq!(
+            target,
+            format!("{domain}/{}", crate::MACOS_LAUNCH_AGENT_LABEL)
+        );
+    }
+}
+
+#[test]
+fn foreign_owned_directory_refuses_before_creating_any_lock_folders() {
+    let fixture = Fixture::new();
+    // Inject a different effective uid into the real directory check, without
+    // chown, privilege changes, or touching another account's home.
+    let foreign_uid = unsafe { libc::geteuid() }.wrapping_add(1);
+    assert!(owned_lock_directory(&fixture.0, foreign_uid).is_err());
+    assert!(!fixture.0.join("Library").exists());
+    assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 0);
+}

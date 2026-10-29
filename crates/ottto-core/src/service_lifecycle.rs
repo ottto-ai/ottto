@@ -7,7 +7,7 @@ use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
@@ -20,13 +20,64 @@ const OUTPUT_LIMIT: usize = 1024 * 1024;
 #[error("service lifecycle transaction busy; current job unchanged")]
 pub struct ServiceLifecycleBusy;
 
+/// Authoritative principal for production transactions. Configuration HOME/UID
+/// overrides must not select a different lock for the same launchd job.
+pub struct ServiceLifecyclePrincipal {
+    pub home: PathBuf,
+    pub uid: u32,
+}
+
+impl ServiceLifecyclePrincipal {
+    pub fn current() -> Result<Self> {
+        let uid = unsafe { libc::geteuid() };
+        let user = crate::session_launch::launch_user()
+            .context("cannot resolve effective user's service lifecycle home")?;
+        Ok(Self {
+            home: user.home,
+            uid,
+        })
+    }
+}
+
 pub struct ServiceLifecycleTransaction(File);
+
+fn owned_lock_directory(home: &Path, uid: u32) -> Result<PathBuf> {
+    let check = |path: &Path| -> Result<()> {
+        let metadata = fs::metadata(path)
+            .with_context(|| format!("inspect lifecycle directory {}", path.display()))?;
+        anyhow::ensure!(
+            metadata.is_dir() && metadata.uid() == uid,
+            "refusing lifecycle lock in directory not owned by effective user: {}",
+            path.display()
+        );
+        Ok(())
+    };
+    // Refuse before creating anything, including under sudo with another
+    // account's HOME. Recheck each component after any mkdir race.
+    check(home)?;
+    let mut directory = home.to_path_buf();
+    for component in ["Library", "LaunchAgents"] {
+        directory.push(component);
+        match fs::metadata(&directory) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match fs::create_dir(&directory) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error).context("create lifecycle directory"),
+                }
+            }
+            Err(error) => return Err(error).context("inspect lifecycle directory"),
+        }
+        check(&directory)?;
+    }
+    Ok(directory)
+}
 
 impl ServiceLifecycleTransaction {
     /// The path is fixed by user home and the single job label, for every caller.
     pub fn acquire(home: &Path, timeout: Duration) -> Result<Self> {
-        let directory = home.join("Library/LaunchAgents");
-        fs::create_dir_all(&directory)?;
+        let directory = owned_lock_directory(home, unsafe { libc::geteuid() })?;
         Self::acquire_path(
             &directory.join(format!(
                 ".{}.lifecycle.lock",

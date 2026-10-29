@@ -1,6 +1,6 @@
 #[cfg(unix)]
 use crate::service_lifecycle::{
-    ServiceLifecycleBusy, ServiceLifecycleTransaction, COMMAND_TIMEOUT,
+    ServiceLifecycleBusy, ServiceLifecyclePrincipal, ServiceLifecycleTransaction, COMMAND_TIMEOUT,
 };
 use anyhow::{Context, Result};
 use ottto_protocol::InstallOwner;
@@ -53,11 +53,9 @@ pub fn kickstart_macos_launch_agent() -> Result<()> {
     }
     #[cfg(unix)]
     {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .context("HOME is not set")?;
+        let principal = ServiceLifecyclePrincipal::current()?;
         let deadline = Instant::now() + Duration::from_secs(30);
-        kickstart_with(&home, |transaction, args| {
+        kickstart_with(&principal.home, principal.uid, |transaction, args| {
             let remaining = deadline.saturating_duration_since(Instant::now());
             anyhow::ensure!(
                 !remaining.is_zero(),
@@ -82,6 +80,7 @@ struct LaunchctlExitFailure(ExitStatus);
 #[cfg(unix)]
 fn kickstart_with(
     home: &Path,
+    uid: u32,
     mut execute: impl FnMut(&ServiceLifecycleTransaction, &[&str]) -> Result<ExitStatus>,
 ) -> Result<()> {
     let transaction = match ServiceLifecycleTransaction::acquire(home, Duration::ZERO) {
@@ -92,8 +91,8 @@ fn kickstart_with(
         Err(error) => return Err(error),
     };
     let mut run = |args: &[&str]| execute(&transaction, args);
-    let domain = user_launchctl_domain();
-    let target = macos_launch_agent_target();
+    let domain = format!("gui/{uid}");
+    let target = format!("{domain}/{MACOS_LAUNCH_AGENT_LABEL}");
     let plist = launch_agent_path_from_home(home);
     run_launchctl(&mut run, &["enable", &target])?;
     ensure_launch_agent_loaded(&mut run, &plist, &domain, &target)?;
@@ -189,25 +188,32 @@ fn run_launchctl(run: &mut impl FnMut(&[&str]) -> Result<ExitStatus>, args: &[&s
 }
 
 fn current_uid() -> u32 {
-    if let Some(uid) = std::env::var("UID")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
+    #[cfg(unix)]
     {
-        return uid;
+        unsafe { libc::geteuid() }
     }
-    Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|output| {
-            if output.status.success() {
-                String::from_utf8(output.stdout).ok()
-            } else {
-                None
-            }
-        })
-        .and_then(|value| value.trim().parse::<u32>().ok())
-        .unwrap_or(0)
+    #[cfg(not(unix))]
+    {
+        if let Some(uid) = std::env::var("UID")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+        {
+            return uid;
+        }
+        Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .and_then(|output| {
+                if output.status.success() {
+                    String::from_utf8(output.stdout).ok()
+                } else {
+                    None
+                }
+            })
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+    }
 }
 
 #[cfg(test)]
@@ -300,7 +306,7 @@ mod autostart_tests {
         let fixture = Fixture::new();
         let transaction = ServiceLifecycleTransaction::acquire(&fixture.0, Duration::ZERO).unwrap();
         let original = fs::read(launch_agent_path_from_home(&fixture.0)).unwrap();
-        kickstart_with(&fixture.0, |_, _| {
+        kickstart_with(&fixture.0, current_uid(), |_, _| {
             panic!("CLI issued launchctl while bootstrap owned the label")
         })
         .unwrap();
@@ -310,7 +316,7 @@ mod autostart_tests {
         );
         drop(transaction);
         let mut commands = Vec::new();
-        kickstart_with(&fixture.0, |_, args| {
+        kickstart_with(&fixture.0, current_uid(), |_, args| {
             commands.push(args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
             Ok(status(0))
         })
@@ -334,7 +340,7 @@ mod autostart_tests {
     fn cli_missing_job_bootstraps_the_existing_plist_under_ownership() {
         let fixture = Fixture::new();
         let mut seen = Vec::new();
-        kickstart_with(&fixture.0, |_, args| {
+        kickstart_with(&fixture.0, current_uid(), |_, args| {
             seen.push(args[0].to_owned());
             if args[0] == "print" {
                 Ok(status(113))
@@ -354,7 +360,7 @@ mod autostart_tests {
     fn cli_indeterminate_kickstart_never_boots_out_or_rebootstraps() {
         let fixture = Fixture::new();
         let mut seen = Vec::new();
-        assert!(kickstart_with(&fixture.0, |_, args| {
+        assert!(kickstart_with(&fixture.0, current_uid(), |_, args| {
             seen.push(args[0].to_owned());
             if args[0] == "kickstart" {
                 anyhow::bail!("injected command timeout");
@@ -370,7 +376,7 @@ mod autostart_tests {
         for failing in ["enable", "print"] {
             let fixture = Fixture::new();
             let mut seen = Vec::new();
-            assert!(kickstart_with(&fixture.0, |_, args| {
+            assert!(kickstart_with(&fixture.0, current_uid(), |_, args| {
                 seen.push(args[0].to_owned());
                 Ok(status(if args[0] == failing { 1 } else { 0 }))
             })
@@ -399,7 +405,7 @@ mod autostart_tests {
         let mut seen = Vec::new();
         for _ in 0..3 {
             assert!(!listener_ready);
-            kickstart_with(&fixture.0, |_, args| {
+            kickstart_with(&fixture.0, current_uid(), |_, args| {
                 seen.push(args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>());
                 match args[0] {
                     "print" => return Ok(status(if loaded { 0 } else { 113 })),
@@ -428,7 +434,7 @@ mod autostart_tests {
         for kickoff_status in [7, 113] {
             let fixture = Fixture::new();
             let mut seen = Vec::new();
-            assert!(kickstart_with(&fixture.0, |_, args| {
+            assert!(kickstart_with(&fixture.0, current_uid(), |_, args| {
                 seen.push(args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>());
                 Ok(status(if args[0] == "kickstart" {
                     kickoff_status
