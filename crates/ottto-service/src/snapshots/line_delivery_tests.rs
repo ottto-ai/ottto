@@ -3097,9 +3097,6 @@ fn withheld_equal_fingerprint_recovers_after(failure: &str) {
         // The real owner discards refused/poisoned state before its next cycle.
         // The filesystem supplies a valid birth on the recovery parse below.
         withheld_account::discard_if_refused();
-        if failure == "no-birth" {
-            withheld_account::restart_for_test(&key);
-        }
         let (parsed, scan, recorder) = page(held.clone());
         assert_eq!(
             scan.scanned_file_count, 1,

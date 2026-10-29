@@ -7692,6 +7692,8 @@ impl SourceScanResult {
         {
             if let Some(seen) = pending.withheld_content {
                 index.remember_withheld_content(&pending.index_key, seen);
+            } else {
+                index.forget_withheld_content(&pending.index_key);
             }
         }
     }

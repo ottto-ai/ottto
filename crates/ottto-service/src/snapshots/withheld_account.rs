@@ -147,6 +147,19 @@ impl ScanIndex {
         }
     }
 
+    /// An unstampable object has no completed CONTENT witness. Keep token/age
+    /// disclosure, but make its next recovery a start, not evidence inferred
+    /// from the temporary PARSED accounting stamp.
+    pub(super) fn forget_withheld_content(&self, key: &str) {
+        if self.claude_account_deferred_holds.contains_key(key) {
+            with_state(|state| {
+                if let Some(entry) = state.entries.get_mut(&memo_key(key)) {
+                    entry.seen = None;
+                }
+            });
+        }
+    }
+
     /// Direct CONTENT comparison: no later metadata-sensitive promotion step.
     /// This avoids parsing/line delivery, not the existing acquisition samples.
     pub(super) fn withheld_account_unchanged(&self, key: &str, candidate: &CandidateFile) -> bool {
@@ -154,6 +167,7 @@ impl ScanIndex {
             return false;
         }
         let Some(content) = self.withheld_completed_seen(candidate) else {
+            self.forget_withheld_content(key);
             return false;
         };
         with_state(|state| {
