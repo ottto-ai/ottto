@@ -47269,8 +47269,15 @@ impl ScanIndex {
         now: SystemTime,
     ) -> Result<(Self, LoadOrigin)> {
         if !path.exists() {
-            scan_index_integration::check_missing(path, scan_index_source_label(source))?;
-            return Ok((Self::default(), LoadOrigin::Missing));
+            let persistence_root =
+                scan_index_integration::check_missing(path, scan_index_source_label(source))?;
+            return Ok((
+                Self {
+                    persistence_root,
+                    ..Self::default()
+                },
+                LoadOrigin::Missing,
+            ));
         }
         let _lock = CheckpointLock::acquire(path)?;
         let file =

@@ -451,3 +451,27 @@ fn completed_storage_controls_keep_many_small_negative_holds_with_one_byte_budge
     assert!(lenient_decode::persistence_controls(&index, 8 * 1024 * 1024).is_ok());
     assert!(lenient_decode::persistence_controls(&index, 1).is_err());
 }
+
+#[test]
+fn observed_fresh_load_keeps_first_save_custody_across_same_pass_progress() {
+    let fixture = Fixture::new();
+    fs::remove_file(&fixture.root).unwrap();
+    fs::remove_dir_all(&fixture.shards).unwrap();
+    let mut fresh = fixture.load();
+    assert_eq!(fresh.generation, 0);
+    assert!(fresh.persistence_root.is_some());
+    let mut stale = fresh.clone();
+    let progress = fixture
+        .root
+        .with_file_name("claude_code-scan-index-v3-upload-progress.json");
+    fs::write(&progress, b"{}").unwrap();
+    // The real finish boundary persists progress before its first index save.
+    fresh.save(&fixture.root).unwrap();
+    assert_eq!(fixture.load().generation, 1);
+    fs::remove_file(&fixture.root).unwrap();
+    assert!(stale.save(&fixture.root).is_err());
+    assert!(
+        !fixture.root.exists(),
+        "a prior publication marker forbids resetting a lost root"
+    );
+}
