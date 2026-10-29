@@ -3608,6 +3608,7 @@ fn q8_strict_v1_bridge_keeps_unknown_same_and_inode_reuse_conservative() {
     std::fs::write(&path, b"{}\n").unwrap();
     let scope = Scope("q8".into());
     let mut record = store::DurableRecord {
+        envelope_audit_debt: None,
         format: 1,
         index_generation: 9,
         record: PendingRecord {
@@ -3791,7 +3792,10 @@ fn a1a_859_and_restart_with_active_carry_restore_tail_zero_full_fresh_census() {
                     .written,
                 1
             );
-            let bytes = seed_pinned_v1(&warm.cache, source, &key, &index, pin);
+            let bytes = {
+                assert!(matches!(pin, "72205c6c" | "ffc6c846"));
+                seed_pinned_v1(&warm.cache, source, &key, &index)
+            };
             let sealed = warm
                 .cache
                 .retained_checkpoint(&key)
@@ -4019,6 +4023,7 @@ fn a1a_finite_named_revisions_do_not_enumerate_or_mutate_future_records() {
         )
         .unwrap();
         store::DurableRecord {
+            envelope_audit_debt: None,
             format: 1,
             index_generation: 1,
             record: PendingRecord {
@@ -5130,8 +5135,52 @@ fn c_strict_writer_retires_only_a_successfully_acknowledged_replacement() {
                 "Ok/changed Stamp alone must never retire an ambiguous predecessor"
             );
             assert_eq!(stores.retail_spent[&digest].spent, Some(spent));
+            drop(stores);
             if ambiguous {
                 assert_eq!(std::fs::read(&disk).unwrap(), after_failure);
+                // The unresolved old receipt is not a permanent mutation veto.
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(a1a_row("third", 400).as_bytes())
+                    .unwrap();
+                let prior = index.clone();
+                let (mut next, mut scan, modes) =
+                    a1a_scan_at(&owner, &roots, &root, index.clone(), "2026-08-02T08:02:00Z");
+                assert_eq!(modes, (0, 1, 0));
+                let actual = a1a_wire(&root, &mut next, &mut scan);
+                let cold = E2ScanFixture::default();
+                let (mut ci, mut cs, _) =
+                    a1a_scan_at(&cold, &roots, &root, prior, "2026-08-02T08:02:00Z");
+                assert_eq!(actual, a1a_wire(&root, &mut ci, &mut cs));
+                assert_eq!(
+                    (
+                        scan.snapshots[0].input_tokens,
+                        scan.snapshots[0].request_count
+                    ),
+                    (700, 3)
+                );
+                next.record_accepted_snapshot_fingerprints(
+                    &scan
+                        .snapshots
+                        .iter()
+                        .map(|s| s.snapshot_fingerprint.clone())
+                        .collect(),
+                );
+                next.save(&index_path).unwrap();
+                assert_eq!(
+                    owner
+                        .cache
+                        .durable_write_after_save(lock, source, &next)
+                        .unwrap()
+                        .written,
+                    1
+                );
+                let stores = owner.cache.durable().unwrap();
+                assert!(stores.retail_spent[&digest].original.is_none());
+                assert_eq!(stores.retail_spent[&digest].spent, Some(spent));
+                assert_ne!(std::fs::read(&disk).unwrap(), after_failure);
             } else {
                 assert_ne!(std::fs::read(&disk).unwrap(), original);
             }

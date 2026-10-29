@@ -32120,6 +32120,8 @@ impl OwnedSourceScan {
                         #[cfg(unix)]
                         let mut retail_attempt = None;
                         #[cfg(unix)]
+                        let mut restored_claude = false;
+                        #[cfg(unix)]
                         let (retained, taken_admission, debt) = match retained {
                             None if allow_sample && !parser.reader.reader.is_compressed() => {
                                 let mut interpretation =
@@ -32142,41 +32144,8 @@ impl OwnedSourceScan {
                                 );
                                 resource_probe.full_causes.restore_outcome.record(&restore);
                                 match restore {
-                                    sampled_scan::durable_tail::RestoreOutcome::Restored(taken) => 'restored: {
-                                        if source == SnapshotSource::ClaudeCode {
-                                            let accepted_end = durable_accepted
-                                                .expect("restored accepted floor")
-                                                .end;
-                                            match context.cache.begin_retail(
-                                                source,
-                                                &key,
-                                                &taken.retained.checkpoint,
-                                                parser.reader.reader.get_ref(),
-                                                accepted_end,
-                                                std::time::Instant::now(),
-                                            ) {
-                                                Ok(attempt) => retail_attempt = Some(attempt),
-                                                Err(reason) => {
-                                                    if matches!(
-                                                        reason,
-                                                        sampled_scan::durable_tail::RetailHold::Exhausted
-                                                            | sampled_scan::durable_tail::RetailHold::AccountingLost
-                                                    ) && context.cache.retail_full(
-                                                        &key,
-                                                        parser.reader.reader.get_ref(),
-                                                        accepted_end,
-                                                        std::time::Instant::now(),
-                                                    )
-                                                    {
-                                                        break 'restored (None, taken_admission, debt);
-                                                    }
-                                                    context.cache.durable_retail_hold(
-                                                        source, reason, index, &candidate,
-                                                    );
-                                                    pending!();
-                                                }
-                                            }
-                                        }
+                                    sampled_scan::durable_tail::RestoreOutcome::Restored(taken) => {
+                                        restored_claude = source == SnapshotSource::ClaudeCode;
                                         retained_offset =
                                             Some(taken.retained.checkpoint.sealed_offset());
                                         let admission = (
@@ -32202,8 +32171,12 @@ impl OwnedSourceScan {
                                     }
                                     sampled_scan::durable_tail::RestoreOutcome::Stale(reason)
                                         if source == SnapshotSource::ClaudeCode
-                                            && context.cache.stale_full(&key,
-                                                parser.reader.reader.get_ref(), durable_accepted, reason) =>
+                                            && context.cache.stale_full(
+                                                &key,
+                                                parser.reader.reader.get_ref(),
+                                                durable_accepted,
+                                                reason,
+                                            ) =>
                                     {
                                         (None, taken_admission, debt)
                                     }
@@ -32240,14 +32213,45 @@ impl OwnedSourceScan {
                         let old = retained.filter(|_| allow_sample);
                         context.admission.prepare_started =
                             context.admission.prepare_started.saturating_add(1);
-                        let mode = match parser.prepare_acquisition(
+                        #[cfg(unix)]
+                        let mut retail_hold = None;
+                        let mode = match parser.prepare_acquisition_with_reuse_gate(
                             old,
                             &scope,
                             debt,
                             sampled_scan::now_seconds(),
+                            |checkpoint, file| {
+                                #[cfg(unix)]
+                                if restored_claude {
+                                    let accepted_end = durable_accepted.expect("restored floor").end;
+                                    match context.cache.begin_retail(
+                                        source, &key, checkpoint, file, accepted_end, std::time::Instant::now(),
+                                    ) {
+                                        Ok(attempt) => retail_attempt = Some(attempt),
+                                        Err(reason) => {
+                                            if matches!(reason,
+                                                sampled_scan::durable_tail::RetailHold::Exhausted |
+                                                sampled_scan::durable_tail::RetailHold::AccountingLost)
+                                                && context.cache.retail_full(&key, file, accepted_end, std::time::Instant::now()) {
+                                                return Ok(false);
+                                            }
+                                            retail_hold = Some(reason);
+                                            return Err(anyhow::anyhow!("durable retail held"));
+                                        }
+                                    }
+                                }
+                                #[cfg(not(unix))]
+                                let _ = (checkpoint, file);
+                                Ok(true)
+                            },
                         ) {
                             Ok(mode) => mode,
                             Err(_) => {
+                                #[cfg(unix)]
+                                if let Some(reason) = retail_hold {
+                                    context.cache.durable_retail_hold(source, reason, index, &candidate);
+                                    pending!();
+                                }
                                 context.admission.prepare_failed =
                                     context.admission.prepare_failed.saturating_add(1);
                                 if source == SnapshotSource::ClaudeCode {
