@@ -5826,9 +5826,25 @@ fn b4_structural_growth_paced_no_record_reselection_no_prune_and_restart() {
         }
         panic!("scan did not finish");
     };
-    let (mut index, first, _) = run(cache.clone(), ScanIndex::default(), "2026-10-29T12:00:00Z");
+    let (mut index, mut first, _) =
+        run(cache.clone(), ScanIndex::default(), "2026-10-29T12:00:00Z");
     assert_eq!(first.snapshots.len(), 1);
     assert!(index.claude_request_census.get(&key).is_some());
+    a0h_wire(&root, &mut index, &mut first);
+    index.record_accepted_snapshot_fingerprints(
+        &first
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect(),
+    );
+    assert!(
+        index
+            .accepted_rebuild_incidence
+            .get(&key)
+            .is_some_and(|set| !set.is_empty()),
+        "real accepted incidence before holding growth"
+    );
     index.save(&index_path).unwrap();
     assert_eq!(
         cache
@@ -5869,7 +5885,8 @@ fn b4_structural_growth_paced_no_record_reselection_no_prune_and_restart() {
         + (store::RECORD_BYTES + super::super::AUDIT_AND_SCRATCH_BYTES) as u64
         + 4 * key.len() as u64;
     store::active::set_active_budget_for_test(Some(limit));
-    let ((next, caught, modes), reads) =
+    let oracle_prior = index.clone();
+    let ((mut next, mut caught, modes), reads) =
         a0h_observe(|| run(cache.clone(), index, "2026-10-29T12:00:00Z"));
     assert_eq!(modes, (1, 0, end));
     assert_eq!(reads.1, end, "actual single Full input extent");
@@ -5886,9 +5903,30 @@ fn b4_structural_growth_paced_no_record_reselection_no_prune_and_restart() {
         store_snapshot(&store::store_dir_for_index(&index_path)),
         original_disk
     );
+    let actual = a0h_wire(&root, &mut next, &mut caught);
+    let (mut oracle_index, mut oracle, oracle_modes) = run(
+        Arc::new(SharedCache::default()),
+        oracle_prior,
+        "2026-10-29T12:00:00Z",
+    );
+    assert_eq!(oracle_modes, (1, 0, end), "independent cold Full control");
+    assert_eq!(oracle.snapshots.len(), 1);
+    assert_eq!(actual, a0h_wire(&root, &mut oracle_index, &mut oracle));
+    next.record_accepted_snapshot_fingerprints(
+        &caught
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect(),
+    );
+    next.save(&index_path).unwrap();
     index = next;
     append("growth-2");
     let old_incidence = index.accepted_rebuild_incidence.clone();
+    assert!(
+        old_incidence.get(&key).is_some_and(|set| !set.is_empty()),
+        "nonempty prune premise"
+    );
     let old_census = serde_json::to_value(&index.claude_request_census).unwrap();
     for _ in 0..2 {
         let ((held, output, modes), reads) =
