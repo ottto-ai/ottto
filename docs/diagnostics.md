@@ -533,6 +533,43 @@ With comparison disabled, the existing `disabled_before_lease` decision still
 reports the gate; additional rows on that same decision stage report nonzero
 preparation/save events after work, without creating a comparison permit.
 
+A due terminal that skips whole-index re-arm can additionally emit
+`counts.rearm_veto_ignored`, a sparse object with the closed keys
+`withheld_account`, `evidence_gap`, `requests_refused`, `identity_refusals`,
+`invalid_rows`, `duplicate_rows`, `client_mismatch`, `multi_root_claims`,
+`proof_failure`, `reconstruction_failure`, `missing_inputs`, `rebuild_failure`.
+Each observed reason increments once per skipped terminal, including reasons
+accumulated on earlier pages of that census window. This is the canonical
+selected refusal, not every hypothetical failure in malformed evidence.
+Nonterminal, non-due and re-arming passes do not increment these counters.
+`counts.rearm_fingerprints_preserved` counts nonempty Claude file fingerprints
+that survive every independent clearing condition on those skipped terminals;
+already-empty or independently cleared entries are excluded. It is not a count
+of distinct files across terminals. Window changes reset the process-local
+reason mask; the existing page scope/merge carries published counts.
+
+These are scheduling diagnostics, never proof or attribution. Request refusal,
+identity refusal, proof, input-consistency and rebuild classes can read native
+facts as well as telemetry. Native transcript duplicates retain a structural
+veto even under an unrelated invalid family. A stable native copy keeps vetoing every due terminal by design.
+`counts.rearm_structural_native_duplicate` counts due closed-fence terminals
+where this native-duplicate veto is present (other vetoes may coexist). It is
+sparse, saturating and count-only. Unique appends, unique new sessions/members
+and routine census retirement do not enter a scheduling projection: no such
+projection is added. Telemetry duplicate rows/multi-root claims alone do not
+activate this native veto. Strict loader/read-health failures remain retryable even when their malformed rows would also fail a
+semantic reducer. No extra reader, output stream or persisted diagnostic state
+is introduced.
+
+The three terminal scheduling fields (`rearm_veto_ignored`,
+`rearm_fingerprints_preserved`, `rearm_structural_native_duplicate`) are emitted
+only on the existing `native_collection_page` carrier. The fold follows scan
+collection, so a terminal with nonzero scheduling counts emits an additional
+row with `scanned_files: 0` and `semantic_noops: 0`. This row reports only the
+terminal delta; it does not drain identity, money or record-cap observations.
+The comparison carrier omits these fields to avoid counting them twice. Sum
+counters rather than treating diagnostic row count as a page/file count.
+
 `claude_reread` contains these closed keys:
 
 - `restored_empty_held`, `restored_nonempty_held`, `restored_empty_sibling`,

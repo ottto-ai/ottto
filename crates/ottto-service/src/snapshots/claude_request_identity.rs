@@ -3421,11 +3421,7 @@ fn transcript_requests(item: &SnapshotItem, mut place: impl FnMut(Request<'_>)) 
     Some(())
 }
 
-/// Scheduling-only qualification before the native fold's terminal decision.
-/// Reuse reported classifications, including telemetry-only requests, and the
-/// canonical transcript sink for other items. Missing identity remains healthy;
-/// every refusal kind and grouping failure keeps the due rearm enabled. This
-/// neither tags an item nor changes attribution/ownership settlement.
+/// Diagnostic-only query; never consumed by a scheduling or attribution gate.
 pub(super) fn full_rearm_requests_refused(
     item: &SnapshotItem,
     evidence: &ScanEvidence<'_>,

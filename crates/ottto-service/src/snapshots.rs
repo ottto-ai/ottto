@@ -5,6 +5,7 @@ use crate::codex_scan_diagnostics::{
 };
 use crate::local_resource_diagnostics::claude_absence::Parent;
 use crate::local_resource_diagnostics::claude_contract;
+use crate::local_resource_diagnostics::claude_reread::IgnoredVeto;
 use crate::local_resource_diagnostics::{line_delivery_unselected, UnselectedReason};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
@@ -2282,6 +2283,9 @@ struct ClaudeFullRearmProgress {
     /// not structural (cap, member changed, occurrence key mismatch).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     other_invalidation_observed: bool,
+    // Diagnostic only: a resumed process starts fresh counters, never authority.
+    #[serde(skip)]
+    ignored_vetoes: u16,
     /// A changed or lost baseline owes a real full re-arm even if a later
     /// observation returns to the old bytes before the deadline.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -6843,7 +6847,7 @@ const CLAUDE_FULL_REARM_STRUCTURAL_RECORD_VERSION: u16 = 2;
 /// `request_count` above the distinct ids), or occurrences that do not match
 /// the ids one for one by count. This predicate classifies only own-byte
 /// failures. Page observation and terminal qualification separately veto
-/// incomplete API/trace/clock evidence, identity refusals, account holds,
+/// incomplete API/trace reads and transcript clocks, account holds,
 /// owned-start dependencies, unexplained coverage, occurrence key mismatch,
 /// caps, member changes, stale pending and all unclassified invalidity.
 fn claude_member_invalidity_is_structural(item: &SnapshotItem) -> bool {
@@ -6976,6 +6980,18 @@ fn claude_full_rearm_process() -> u64 {
 }
 
 impl ClaudeFullRearmProgress {
+    fn observe_ignored(&mut self, window: &str, mask: u16) {
+        if mask == 0 {
+            return;
+        }
+        if self.observed_window.as_deref() != Some(window) {
+            self.observed_window = Some(window.to_string());
+            self.structural_roots.clear();
+            self.other_invalidation_observed = false;
+            self.ignored_vetoes = 0;
+        }
+        self.ignored_vetoes |= mask;
+    }
     /// Called on every Claude fold after this page's pending accumulation.
     /// Writes only when the page has something to note, so a window with no
     /// invalid family leaves this memory untouched; an older
@@ -6988,15 +7004,20 @@ impl ClaudeFullRearmProgress {
         counts: &ClaudeDuplicateCensusCounts,
         other_evidence_cause: bool,
     ) {
+        let mask = snapshots.iter().fold(0, |mask, item| {
+            mask | (u16::from(item.claude_account_withheld_reason.is_some())
+                * IgnoredVeto::WithheldAccount.bit())
+                | (u16::from(item.request_identity_refusals > 0)
+                    * IgnoredVeto::IdentityRefusals.bit())
+        });
+        self.observe_ignored(census_window_end, mask);
         let other = other_evidence_cause || counts.page_invalidated_cap_count > 0
             || counts.page_invalidated_member_changed_count > 0
             || counts.page_invalidated_occurrence_mismatch_count > 0
             || snapshots.iter().any(|item| {
-                // Unknown identity failures remain non-structural even when
-                // another member of the same root is structurally invalid.
-                item.request_identity_refusals > 0
-                    || item.claude_usage_occurrences.values().any(|occurrence| !occurrence.event_clock_complete)
-                    || item.claude_account_withheld_reason.is_some()
+                // Attribution refusals and account explanations cannot repair
+                // the census. Keep transcript shape and clock vetoes.
+                item.claude_usage_occurrences.values().any(|occurrence| !occurrence.event_clock_complete)
                     || (!claude_member_invalidity_is_structural(item)
                         && claude_snapshot_request_id_hashes(item).is_none())
                     // Accumulation stops at an already-invalid root. Still
@@ -7022,6 +7043,7 @@ impl ClaudeFullRearmProgress {
             self.observed_window = Some(census_window_end.to_string());
             self.structural_roots.clear();
             self.other_invalidation_observed = false;
+            self.ignored_vetoes = 0;
         }
         self.other_invalidation_observed |= other;
         self.structural_roots.extend(structural);
@@ -8681,10 +8703,17 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     // The canonical ownership reducer validates semantic evidence too (row
     // fingerprints/revisions/clocks and paired clients), beyond file health.
     // No evidence is healthy: the reducer returns Some(empty), not a refusal.
-    let legacy_request_owners = reports_healthy
-        .then(|| claude_legacy_request_owners(api_report, trace_report))
-        .flatten();
-    let other_evidence_cause = legacy_request_owners.is_none()
+    let ownership = reports_healthy.then(|| {
+        classify_claude_legacy_request_owners(api_report.evidence.iter(), &trace_report.evidence)
+    });
+    let ownership_refusal = ownership
+        .as_ref()
+        .and_then(|result| result.as_ref().err())
+        .copied();
+    let legacy_request_owners = ownership.and_then(Result::ok);
+    // Sidecar-content refusals cannot be repaired by rereading transcripts.
+    // Keep failed reads retryable; canonical ownership remains unchanged.
+    let other_evidence_cause = !reports_healthy
         || identity.is_some_and(|evidence| !evidence.unhealthy_roots.is_empty())
         || rfc3339_unix_seconds(census_window_end).is_none()
         || (census_complete
@@ -8765,8 +8794,8 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     } else {
         BTreeMap::new()
     };
+    let mut ignored_vetoes = ownership_refusal.map_or(0, IgnoredVeto::bit);
     let mut proven = BTreeMap::new();
-    let mut semantic_evidence_refused = false;
     let mut reconstructed = BTreeMap::new();
     let witness_roots_before = index
         .claude_usage_family_witnesses
@@ -8836,8 +8865,11 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 trace_report.evidence.get(root_session_id),
                 legacy_exclusions.get(root_session_id),
             ) else {
-                semantic_evidence_refused |= api_report.evidence.contains_key(root_session_id)
-                    || trace_report.evidence.contains_key(root_session_id);
+                if api_report.evidence.contains_key(root_session_id)
+                    || trace_report.evidence.contains_key(root_session_id)
+                {
+                    ignored_vetoes |= IgnoredVeto::ProofFailure.bit();
+                }
                 continue;
             };
             // Only page-item roots consume these rows below. Keep every
@@ -8867,9 +8899,12 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                     trace_report,
                     legacy_request_owners.as_ref(),
                 );
-                semantic_evidence_refused |= family.is_none()
+                if family.is_none()
                     && (api_report.evidence.contains_key(root_session_id)
-                        || trace_report.evidence.contains_key(root_session_id));
+                        || trace_report.evidence.contains_key(root_session_id))
+                {
+                    ignored_vetoes |= IgnoredVeto::ReconstructionFailure.bit();
+                }
                 family.map(|family| (root_session_id.clone(), family))
             })
             .collect();
@@ -8927,9 +8962,12 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                     trace_report,
                     legacy_request_owners.as_ref(),
                 );
-                semantic_evidence_refused |= family.is_none()
+                if family.is_none()
                     && (api_report.evidence.contains_key(root_session_id)
-                        || trace_report.evidence.contains_key(root_session_id));
+                        || trace_report.evidence.contains_key(root_session_id))
+                {
+                    ignored_vetoes |= IgnoredVeto::ReconstructionFailure.bit();
+                }
                 family.map(|family| (root_session_id.clone(), family))
             })
             .collect();
@@ -8952,7 +8990,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         let Some(family) = family else { continue };
         let Some((rows, excluded_request_hashes)) = claude_reported_usage_inputs(item, family)
         else {
-            semantic_evidence_refused = true;
+            ignored_vetoes |= IgnoredVeto::MissingInputs.bit();
             continue;
         };
         // The rebuild mirrors each of its rows into the grouping, so groups
@@ -8969,27 +9007,26 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 Some("session_exclusive_reported_usage:v1".to_string());
             item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
         } else {
-            semantic_evidence_refused = true;
+            // Ordinary preparation is deterministic in-memory validation.
+            // Paid-preflight refusal and sidecar read failure use their own retries.
+            ignored_vetoes |= IgnoredVeto::RebuildFailure.bit();
         }
     }
-
-    // Refusals produced by this pass must veto scheduling before the
-    // terminal can suppress its due rearm. Reported groupings include auxiliary
-    // rows without transcript clocks; counters on items are installed later.
-    if semantic_evidence_refused
-        || identity.is_some_and(|evidence| {
-            snapshots.iter().any(|item| {
-                claude_request_identity::full_rearm_requests_refused(
-                    item,
-                    evidence,
-                    request_groupings.get(&item.source_session_id),
-                    &index.claude_duplicate_request_owners,
-                )
-            })
+    if identity.is_some_and(|evidence| {
+        snapshots.iter().any(|item| {
+            claude_request_identity::full_rearm_requests_refused(
+                item,
+                evidence,
+                request_groupings.get(&item.source_session_id),
+                &index.claude_duplicate_request_owners,
+            )
         })
-    {
-        index.note_claude_full_rearm_evidence_gap(census_window_end);
+    }) {
+        ignored_vetoes |= IgnoredVeto::RequestsRefused.bit();
     }
+    index
+        .claude_full_rearm_progress
+        .observe_ignored(census_window_end, ignored_vetoes);
 
     // The complete local transcript census can disprove ownership through a
     // duplicated request id, but uniqueness is not positive ownership: the
@@ -9023,13 +9060,13 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 )
             });
     duplicate_census.census_invalid = duplicate_census_invalid;
-    // SI-1: an own-byte structural failure masks cross-file duplicates among
-    // otherwise valid families, with or without a full rearm. Once that family
-    // is gone, the next valid complete census can detect those duplicates.
-    let detected_duplicate_request_owners = if census_complete && !duplicate_census_invalid {
+    // Reuse the native census join for a negative scheduling veto even when
+    // an invalid family masks positive duplicate-dependent ownership outputs.
+    // Stable native copies deliberately veto every due suppression (SOURCE).
+    let native_duplicate_request_owners = if census_complete {
         let mut owners = BTreeMap::<String, BTreeSet<(String, String)>>::new();
         for (root_session_id, pending) in &index.claude_usage_family_pending {
-            if pending.invalid || pending.census_window_end != census_window_end {
+            if pending.census_window_end != census_window_end {
                 continue;
             }
             for (member_session_id, occurrences) in &pending.member_occurrences {
@@ -9058,6 +9095,24 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             .collect::<BTreeMap<_, _>>()
     } else {
         BTreeMap::new()
+    };
+    let native_duplicate_veto = !native_duplicate_request_owners.is_empty()
+        || !index.claude_duplicate_request_owners.is_empty();
+    if native_duplicate_veto {
+        index.claude_full_rearm_progress.observe_page(
+            &[],
+            &index.claude_usage_family_pending,
+            census_window_end,
+            &duplicate_census,
+            true,
+        );
+    }
+    // Keep the pre-existing ownership mask; the broader negative query above
+    // never grants ownership, changes attribution or enters a money path.
+    let detected_duplicate_request_owners = if duplicate_census_invalid {
+        BTreeMap::new()
+    } else {
+        native_duplicate_request_owners
     };
     let duplicated_request_hashes = index
         .claude_duplicate_request_owners
@@ -9960,6 +10015,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             negative_keys: negative_keys.len(),
             ..Default::default()
         };
+        let mut preserved = 0;
         for (index_key, entry) in &mut index.files {
             let Some((root_session_id, source_session_id)) =
                 claude_index_path_family_member(Path::new(index_key))
@@ -10050,7 +10106,17 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             } else if proof_candidate && negative {
                 rearm.suppressed = rearm.suppressed.saturating_add(1);
             }
+            preserved += u64::from(!rearmed && !entry.source_file_fingerprint.is_empty());
         }
+        crate::local_resource_diagnostics::claude_reread::terminal_rearm(
+            if full_rearm_suppressed || post_rebuild_skipped {
+                index.claude_full_rearm_progress.ignored_vetoes
+            } else {
+                0
+            },
+            preserved,
+            full_rearm_due && stays_closed && native_duplicate_veto,
+        );
         // Spent only where the latch's re-arm causes ran (a closed fence).
         if cutover_terminal && fence_stays_closed {
             index.claude_full_rearm_progress.contract_cutover = CLAUDE_CONTRACT_CUTOVER_SPENT;
@@ -10074,6 +10140,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             });
         let progress = &mut index.claude_full_rearm_progress;
         progress.observed_window = None;
+        progress.ignored_vetoes = 0;
         progress.structural_roots.clear();
         progress.other_invalidation_observed = false;
     }
@@ -12199,6 +12266,7 @@ fn derive_claude_legacy_usage_exclusions(
     exclusions
 }
 
+#[cfg(test)] // Keep the report Option facade for regression callers.
 fn claude_legacy_request_owners(
     api_report: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
     trace_report: &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
@@ -12221,9 +12289,26 @@ fn claude_legacy_request_owners_from_rows<'a>(
         Vec<crate::claude_local_otel::ClaudeTraceOwnershipEvidence>,
     >,
 ) -> Option<BTreeMap<String, ClaudeLegacyRequestOwner>> {
+    classify_claude_legacy_request_owners(api_rows, trace_rows_by_root).ok()
+}
+
+fn classify_claude_legacy_request_owners<'a>(
+    api_rows: impl IntoIterator<
+        Item = (
+            &'a String,
+            &'a Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence>,
+        ),
+    >,
+    trace_rows_by_root: &BTreeMap<
+        String,
+        Vec<crate::claude_local_otel::ClaudeTraceOwnershipEvidence>,
+    >,
+) -> Result<BTreeMap<String, ClaudeLegacyRequestOwner>, IgnoredVeto> {
     let mut owners = BTreeMap::new();
     for (root_session_id, api_rows) in api_rows {
-        let trace_rows = trace_rows_by_root.get(root_session_id)?;
+        let trace_rows = trace_rows_by_root
+            .get(root_session_id)
+            .ok_or(IgnoredVeto::EvidenceGap)?;
         let members = std::iter::once(root_session_id.clone())
             .chain(
                 trace_rows
@@ -12234,7 +12319,7 @@ fn claude_legacy_request_owners_from_rows<'a>(
             .collect::<BTreeSet<_>>();
         // This graph reads request ids and fingerprints only; the canonical
         // reducer can borrow rows instead of cloning their payload strings.
-        let reduced = reduce_claude_usage_ledger_with_rows(
+        let reduced = classify_claude_usage_ledger_with_rows(
             root_session_id,
             &members,
             api_rows,
@@ -12245,10 +12330,16 @@ fn claude_legacy_request_owners_from_rows<'a>(
             .iter()
             .map(|row| (row.request_id.as_str(), row))
             .collect::<BTreeMap<_, _>>();
-        for row in reduced.rows_by_member.get(root_session_id)? {
-            let trace = trace_by_request.get(row.request_id.as_str())?;
+        for row in reduced
+            .rows_by_member
+            .get(root_session_id)
+            .ok_or(IgnoredVeto::EvidenceGap)?
+        {
+            let trace = trace_by_request
+                .get(row.request_id.as_str())
+                .ok_or(IgnoredVeto::EvidenceGap)?;
             if !trace.agent_id.trim().is_empty() {
-                return None;
+                return Err(IgnoredVeto::EvidenceGap);
             }
             let request_hash = format!("{:x}", Sha256::digest(row.request_id.as_bytes()));
             let evidence_fingerprint = sha256_hex(&[
@@ -12268,11 +12359,11 @@ fn claude_legacy_request_owners_from_rows<'a>(
                 )
                 .is_some()
             {
-                return None;
+                return Err(IgnoredVeto::MultiRootClaims);
             }
         }
     }
-    Some(owners)
+    Ok(owners)
 }
 
 fn claude_legacy_exclusion_evidence_fingerprint(
@@ -12588,19 +12679,32 @@ fn reduce_claude_usage_ledger_with_rows<'a, R>(
     members: &BTreeSet<String>,
     api_rows: &'a [crate::claude_local_otel::ClaudeLocalOtelEvidence],
     trace_rows: &[crate::claude_local_otel::ClaudeTraceOwnershipEvidence],
-    mut row_view: impl FnMut(&'a crate::claude_local_otel::ClaudeLocalOtelEvidence) -> R,
+    row_view: impl FnMut(&'a crate::claude_local_otel::ClaudeLocalOtelEvidence) -> R,
 ) -> Option<ReducedClaudeUsageLedger<R>> {
+    classify_claude_usage_ledger_with_rows(root_session_id, members, api_rows, trace_rows, row_view)
+        .ok()
+}
+
+fn classify_claude_usage_ledger_with_rows<'a, R>(
+    root_session_id: &str,
+    members: &BTreeSet<String>,
+    api_rows: &'a [crate::claude_local_otel::ClaudeLocalOtelEvidence],
+    trace_rows: &[crate::claude_local_otel::ClaudeTraceOwnershipEvidence],
+    mut row_view: impl FnMut(&'a crate::claude_local_otel::ClaudeLocalOtelEvidence) -> R,
+) -> Result<ReducedClaudeUsageLedger<R>, IgnoredVeto> {
     if !members.contains(root_session_id) || api_rows.is_empty() || trace_rows.is_empty() {
-        return None;
+        return Err(IgnoredVeto::EvidenceGap);
     }
     let mut api_by_request = BTreeMap::new();
     for row in api_rows {
-        if !validate_claude_api_row(row, root_session_id)
-            || api_by_request
-                .insert(row.request_id.as_str(), row)
-                .is_some()
+        if !validate_claude_api_row(row, root_session_id) {
+            return Err(IgnoredVeto::InvalidRows);
+        }
+        if api_by_request
+            .insert(row.request_id.as_str(), row)
+            .is_some()
         {
-            return None;
+            return Err(IgnoredVeto::DuplicateRows);
         }
     }
     let mut trace_by_request = BTreeMap::new();
@@ -12610,15 +12714,18 @@ fn reduce_claude_usage_ledger_with_rows<'a, R>(
             || row.request_id.is_empty()
             || !claude_trace_evidence_fingerprint_is_valid(row)
             || OffsetDateTime::parse(&row.observed_at, &Rfc3339).is_err()
-            || trace_by_request
-                .insert(row.request_id.as_str(), row)
-                .is_some()
         {
-            return None;
+            return Err(IgnoredVeto::InvalidRows);
+        }
+        if trace_by_request
+            .insert(row.request_id.as_str(), row)
+            .is_some()
+        {
+            return Err(IgnoredVeto::DuplicateRows);
         }
     }
     if api_by_request.keys().ne(trace_by_request.keys()) {
-        return None;
+        return Err(IgnoredVeto::EvidenceGap);
     }
 
     let mut assigned_hashes = members
@@ -12632,22 +12739,28 @@ fn reduce_claude_usage_ledger_with_rows<'a, R>(
     let mut digest = Sha256::new();
     digest.update(b"claude_reported_usage_ledger:v1\0");
     for (request_id, api_row) in api_by_request {
-        let trace_row = trace_by_request.get(&request_id)?;
+        let trace_row = trace_by_request
+            .get(&request_id)
+            .ok_or(IgnoredVeto::EvidenceGap)?;
         if !api_row.client_request_id.is_empty()
             && !trace_row.client_request_id.is_empty()
             && api_row.client_request_id != trace_row.client_request_id
         {
-            return None;
+            return Err(IgnoredVeto::ClientMismatch);
         }
         let owner = claude_trace_owner_session_id(root_session_id, &trace_row.agent_id);
         if !members.contains(&owner) {
-            return None;
+            return Err(IgnoredVeto::EvidenceGap);
         }
         let request_hash = format!("{:x}", Sha256::digest(request_id.as_bytes()));
         assigned_hashes
-            .get_mut(&owner)?
+            .get_mut(&owner)
+            .ok_or(IgnoredVeto::EvidenceGap)?
             .insert(request_hash.clone());
-        rows_by_member.get_mut(&owner)?.push(row_view(api_row));
+        rows_by_member
+            .get_mut(&owner)
+            .ok_or(IgnoredVeto::EvidenceGap)?
+            .push(row_view(api_row));
         digest.update(request_hash.as_bytes());
         digest.update(b"\0");
         digest.update(owner.as_bytes());
@@ -12657,7 +12770,7 @@ fn reduce_claude_usage_ledger_with_rows<'a, R>(
         digest.update(trace_row.fingerprint.as_bytes());
         digest.update(b"\0");
     }
-    Some(ReducedClaudeUsageLedger {
+    Ok(ReducedClaudeUsageLedger {
         evidence_fingerprint: format!("{:x}", digest.finalize()),
         assigned_request_id_hashes: assigned_hashes,
         rows_by_member,
@@ -43547,6 +43660,11 @@ impl ScanIndex {
             (true, 0) => UnsettledUploadCause::Unattributed.bit(),
             (true, causes) => causes,
         }
+    }
+
+    pub(crate) fn note_claude_ignored_rearm_veto(&mut self, window: &str, mask: u16) {
+        self.claude_full_rearm_progress
+            .observe_ignored(window, mask);
     }
 
     /// The pipeline filters failed sidecars out of otherwise healthy reports.
@@ -89239,7 +89357,7 @@ crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_mem
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarry; origin, roots, capped_roots, replay);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarryOrigin; context_fingerprint, process, full_rearm_window, admission);
 crate::heap_layout_bound::fields!(ClaudeRetryAdmission; after_root, upper_root, complete, roots_complete, progressed, served_before, due_through, due_after_path, due_upper_path, due_complete, oversized_root, oversized_after_path, storage_deferred);
-crate::heap_layout_bound::fields!(ClaudeFullRearmProgress; rebuild_read_full, complete_rebuild_read, observed_window, structural_roots, other_invalidation_observed, structural_rearm_owed, structural_record, traversal_origin, full_rearm_window_next, full_rearm_window, stale_rearm_fence_deadline, stale_rearms_at_deadline, first_proof_hold_since_full_rearm, held_family_roots, contract_cutover);
+crate::heap_layout_bound::fields!(ClaudeFullRearmProgress; rebuild_read_full, complete_rebuild_read, observed_window, structural_roots, other_invalidation_observed, ignored_vetoes, structural_rearm_owed, structural_record, traversal_origin, full_rearm_window_next, full_rearm_window, stale_rearm_fence_deadline, stale_rearms_at_deadline, first_proof_hold_since_full_rearm, held_family_roots, contract_cutover);
 crate::heap_layout_bound::fields!(ClaudeCompleteRebuildRead; origin, members_digest);
 crate::heap_layout_bound::fields!(ClaudeStructuralInvalidRecord; basis, families, suppressed_since_unix_seconds, skipped_full_rearms);
 crate::heap_layout_bound::fields!(ClaudeFullRearmWindow; context_fingerprint, process, window_ends, member_digests);
