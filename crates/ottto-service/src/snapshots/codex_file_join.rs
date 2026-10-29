@@ -3658,8 +3658,7 @@ pub(super) mod tests {
                 &mut census,
                 None,
                 0,
-                &BTreeMap::new(),
-                &BTreeMap::new(),
+                crate::snapshots::DiscoveryRetention::unverified(&BTreeMap::new()),
             )
             .unwrap();
             let parsed = parse_opened_jsonl_file(

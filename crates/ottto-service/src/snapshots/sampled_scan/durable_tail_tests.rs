@@ -996,8 +996,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                         &mut ScanCensus::default(),
                         None,
                         365,
-                        &BTreeMap::new(),
-                        &BTreeMap::new(),
+                        crate::snapshots::DiscoveryRetention::unverified(&BTreeMap::new()),
                     )
                     .unwrap();
                     assert!(sampled_scan::reduction_dependencies(
@@ -1852,8 +1851,7 @@ fn known_corrupt_replacement_case(fail_replacement: bool) {
         &mut census,
         None,
         365,
-        &BTreeMap::new(),
-        &BTreeMap::new(),
+        crate::snapshots::DiscoveryRetention::unverified(&BTreeMap::new()),
     )
     .unwrap();
     cache.durable_hold_exit(

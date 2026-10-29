@@ -1028,8 +1028,7 @@ fn walk_gate_counts_age_and_size_skips_without_changing_selection() {
                 SnapshotSource::ClaudeCode,
                 index.traversal.as_mut().unwrap(),
                 30,
-                &index.files,
-                &index.claude_account_deferred_holds,
+                discovery_retention!(index),
             );
         }
         let counts = &index.traversal.as_ref().unwrap().counts;
@@ -1078,8 +1077,7 @@ fn roster_gate_counts_age_and_size_skips_without_changing_selection() {
             SnapshotSource::Codex,
             index.traversal.as_mut().unwrap(),
             30,
-            &index.files,
-            &index.claude_account_deferred_holds,
+            discovery_retention!(index),
         );
     }
     unselected_page("codex");
@@ -1100,7 +1098,7 @@ fn roster_gate_counts_age_and_size_skips_without_changing_selection() {
             SnapshotSource::Codex,
             index.traversal.as_mut().unwrap(),
             30,
-            &index.files,
+            discovery_retention!(index),
         );
         let counts = &index.traversal.as_ref().unwrap().counts;
         let decided = (
@@ -1141,8 +1139,7 @@ fn walk_all(index: &mut ScanIndex, days: u64) {
             SnapshotSource::ClaudeCode,
             index.traversal.as_mut().unwrap(),
             days,
-            &index.files,
-            &index.claude_account_deferred_holds,
+            discovery_retention!(index),
         );
     }
 }
@@ -1242,8 +1239,10 @@ fn candidate_and_open_gates_keep_withheld_account_keys() {
             &mut census,
             census_at,
             7,
-            &BTreeMap::new(),
-            holds,
+            crate::snapshots::DiscoveryRetention {
+                files: &BTreeMap::new(),
+                account_holds: holds,
+            },
         )
         .map(|candidate| {
             open_and_identify_scan_candidate(
@@ -1252,8 +1251,10 @@ fn candidate_and_open_gates_keep_withheld_account_keys() {
                 &mut census,
                 census_at,
                 7,
-                &BTreeMap::new(),
-                holds,
+                crate::snapshots::DiscoveryRetention {
+                    files: &BTreeMap::new(),
+                    account_holds: holds,
+                },
             )
             .is_some()
         });

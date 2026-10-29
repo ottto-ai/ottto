@@ -29,6 +29,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use toml_edit::{DocumentMut, Item};
 
+/// The owed-key `DiscoveryRetention` of a `ScanIndex`, borrowing only its
+/// registered fields so the traversal can stay mutably borrowed.
+macro_rules! discovery_retention {
+    ($index:expr) => {
+        $crate::snapshots::DiscoveryRetention {
+            files: &$index.files,
+            account_holds: &$index.claude_account_deferred_holds,
+        }
+    };
+}
+
 pub(crate) mod cache_observations;
 #[cfg(test)]
 pub(crate) mod cache_overcap_tests;
@@ -3588,7 +3599,7 @@ pub struct ScanIndex {
     /// committed revision. This content-free map keeps the unresolved
     /// ownership disclosed after the page that parsed it. A key leaves only
     /// when a later parse resolves it or a complete census proves it absent;
-    /// until then discovery ignores its age (`discovery_age_exempt`), so a
+    /// until then discovery ignores its age (`DiscoveryRetention`), so a
     /// present held file is always observed and only an absent one is pruned.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     claude_account_deferred_holds: BTreeMap<String, String>,
@@ -24107,7 +24118,7 @@ fn codex_parent_step_start(
                 },
                 Ok((path, identity, file))
                     if codex_parent_outside_window(
-                        &index.files,
+                        discovery_retention!(index),
                         &path,
                         &file,
                         census_unix_seconds,
@@ -26090,7 +26101,12 @@ impl OwnedSourceScan {
         let next_generation_hints;
         {
             let traversal = index.traversal.as_mut().expect("traversal initialized");
-            refresh_retained_codex_roster(source, traversal, backfill_window_days, &index.files);
+            refresh_retained_codex_roster(
+                source,
+                traversal,
+                backfill_window_days,
+                discovery_retention!(index),
+            );
             next_generation_hints =
                 enqueue_watcher_hints(source, traversal, hinted_paths, watcher_overflowed);
             if continuation.is_none() {
@@ -26098,8 +26114,7 @@ impl OwnedSourceScan {
                     source,
                     traversal,
                     backfill_window_days,
-                    &index.files,
-                    &index.claude_account_deferred_holds,
+                    discovery_retention!(index),
                 );
             }
             release_codex_inventory_hold(source, traversal);
@@ -26403,8 +26418,7 @@ impl OwnedSourceScan {
                     &mut census,
                     census_unix_seconds,
                     backfill_window_days,
-                    &index.files,
-                    &index.claude_account_deferred_holds,
+                    discovery_retention!(index),
                 )
             })
             .collect::<Vec<_>>();
@@ -26443,8 +26457,7 @@ impl OwnedSourceScan {
                         &mut census,
                         census_unix_seconds,
                         backfill_window_days,
-                        &index.files,
-                        &index.claude_account_deferred_holds,
+                        discovery_retention!(index),
                     )
                     .map(|(candidate, _)| candidate)
                 })
@@ -26543,8 +26556,7 @@ impl OwnedSourceScan {
                         &mut ScanCensus::default(),
                         census_unix_seconds,
                         backfill_window_days,
-                        &index.files,
-                        &index.claude_account_deferred_holds,
+                        discovery_retention!(index),
                     ) {
                         Some((twin, _)) => {
                             index.candidate_decision(&twin) == CandidateDecision::Parse
@@ -26622,8 +26634,7 @@ impl OwnedSourceScan {
                     &mut census,
                     census_unix_seconds,
                     backfill_window_days,
-                    &index.files,
-                    &index.claude_account_deferred_holds,
+                    discovery_retention!(index),
                 ) else {
                     continue;
                 };
@@ -26634,8 +26645,7 @@ impl OwnedSourceScan {
                     &mut census,
                     census_unix_seconds,
                     backfill_window_days,
-                    &index.files,
-                    &index.claude_account_deferred_holds,
+                    discovery_retention!(index),
                 ) {
                     identified_candidates.push(opened.0);
                 }
@@ -31014,8 +31024,7 @@ impl OwnedSourceScan {
                 &mut census,
                 census_unix_seconds,
                 backfill_window_days,
-                &index.files,
-                &index.claude_account_deferred_holds,
+                discovery_retention!(index),
                 verification_rescue,
                 sampling.as_ref().map(|context| context.cache.as_ref()),
             ) else {
@@ -41407,7 +41416,7 @@ fn refresh_retained_codex_roster(
     source: SnapshotSource,
     traversal: &mut ScanTraversalCheckpoint,
     backfill_window_days: u64,
-    files: &BTreeMap<String, ScanIndexEntry>,
+    retention: DiscoveryRetention<'_>,
 ) {
     if source != SnapshotSource::Codex || !traversal.pending_directories.is_empty() {
         return;
@@ -41500,7 +41509,7 @@ fn refresh_retained_codex_roster(
                 .ok()
                 .and_then(unix_seconds)
                 .unwrap_or_default();
-            if !sampled_audit::path_requires_verification(files, &path)
+            if !retention.owes(&path)
                 && census_unix_seconds.is_some_and(|now| {
                     !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
                 })
@@ -41672,16 +41681,14 @@ fn advance_bounded_directory_traversal(
     source: SnapshotSource,
     traversal: &mut ScanTraversalCheckpoint,
     backfill_window_days: u64,
-    files: &BTreeMap<String, ScanIndexEntry>,
-    account_holds: &BTreeMap<String, String>,
+    retention: DiscoveryRetention<'_>,
 ) {
     advance_bounded_directory_traversal_with_budget(
         source,
         traversal,
         backfill_window_days,
         MAX_SCAN_DIRECTORY_ENTRIES_PER_TICK,
-        files,
-        account_holds,
+        retention,
     );
 }
 
@@ -41690,8 +41697,7 @@ fn advance_bounded_directory_traversal_with_budget(
     traversal: &mut ScanTraversalCheckpoint,
     backfill_window_days: u64,
     max_entries: usize,
-    files: &BTreeMap<String, ScanIndexEntry>,
-    account_holds: &BTreeMap<String, String>,
+    retention: DiscoveryRetention<'_>,
 ) {
     let walk_issues = |counts: &ScanTraversalCounts| {
         (
@@ -41838,7 +41844,7 @@ fn advance_bounded_directory_traversal_with_budget(
                 .ok()
                 .and_then(unix_seconds)
                 .unwrap_or_default();
-            if !discovery_age_exempt(files, account_holds, &path)
+            if !retention.owes(&path)
                 && census_unix_seconds.is_some_and(|now| {
                     !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
                 })
@@ -41857,7 +41863,7 @@ fn advance_bounded_directory_traversal_with_budget(
                     &mut traversal.oversized_discovery,
                 );
                 line_delivery_unselected(source.api_slug(), UnselectedReason::Size);
-                note_withheld_oversized(source, account_holds, &path);
+                retention.note_withheld_oversized(source, &path);
                 continue;
             }
             if let Some(existing) = traversal
@@ -41910,8 +41916,7 @@ fn candidate_from_traversal_path(
     census: &mut ScanCensus,
     census_unix_seconds: Option<u64>,
     backfill_window_days: u64,
-    files: &BTreeMap<String, ScanIndexEntry>,
-    account_holds: &BTreeMap<String, String>,
+    retention: DiscoveryRetention<'_>,
 ) -> Option<CandidateFile> {
     candidate_from_traversal_path_at(
         source,
@@ -41920,12 +41925,10 @@ fn candidate_from_traversal_path(
         census,
         census_unix_seconds,
         backfill_window_days,
-        files,
-        account_holds,
+        retention,
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn candidate_from_traversal_path_at(
     source: SnapshotSource,
     site: disappearance_diagnostics::Site,
@@ -41933,8 +41936,7 @@ fn candidate_from_traversal_path_at(
     census: &mut ScanCensus,
     census_unix_seconds: Option<u64>,
     backfill_window_days: u64,
-    files: &BTreeMap<String, ScanIndexEntry>,
-    account_holds: &BTreeMap<String, String>,
+    retention: DiscoveryRetention<'_>,
 ) -> Option<CandidateFile> {
     let metadata = match fs::symlink_metadata(&pending.path) {
         Ok(metadata) => metadata,
@@ -41990,7 +41992,7 @@ fn candidate_from_traversal_path_at(
                 &pending.path,
                 &mut census.oversized_discovery,
             );
-            note_withheld_oversized(source, account_holds, &pending.path);
+            retention.note_withheld_oversized(source, &pending.path);
         }
         return None;
     }
@@ -41999,7 +42001,7 @@ fn candidate_from_traversal_path_at(
         .ok()
         .and_then(unix_seconds)
         .unwrap_or_default();
-    if !discovery_age_exempt(files, account_holds, &pending.path)
+    if !retention.owes(&pending.path)
         && census_unix_seconds.is_some_and(|now| {
             !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
         })
@@ -42253,30 +42255,46 @@ fn is_recent_enough_at(
     modified_unix_seconds >= now_unix_seconds.saturating_sub(window_seconds)
 }
 
-/// The discovery-window exemption. Besides an unverified sampled generation,
-/// a Claude key whose parsed revision is withheld for an unresolved account
-/// stays discoverable: it is re-parsed until a parse resolves it, and a held
-/// file that idled past the window would otherwise leave discovery and lose
-/// its withheld growth with its entry and hold. The exemption ends with the
-/// hold; file-size caps still apply.
-fn discovery_age_exempt(
-    files: &BTreeMap<String, ScanIndexEntry>,
-    account_holds: &BTreeMap<String, String>,
-    path: &Path,
-) -> bool {
-    sampled_audit::path_requires_verification(files, path)
-        || account_holds.contains_key(&local_index_key(path))
+/// Owed-key discovery retention, the one shared exemption from the discovery
+/// window (`docs/diagnostics.md`, "Owed-key discovery retention"). Contract: a
+/// key owed by any registered source stays discoverable and observed whatever
+/// its age while owed, so reconciliation never prunes it; its growth takes the
+/// counted Tail path; only a validated catch-up or a proven, counted removal
+/// releases it; it is never a Full cause. File-size caps still apply.
+/// Source-agnostic (the Claude walk, candidate and open gates, the Codex roster
+/// and `codex_parent_outside_window`). Register a source with its field, its
+/// line in `discovery_retention!` and `unverified`, and its line in `owes`.
+#[derive(Clone, Copy)]
+struct DiscoveryRetention<'a> {
+    /// Entries; an unverified sampled generation (`sampled_audit`) is owed.
+    files: &'a BTreeMap<String, ScanIndexEntry>,
+    /// Claude keys withheld for an unresolved account (`withheld_account`).
+    account_holds: &'a BTreeMap<String, String>,
 }
 
-/// An oversized withheld-account key stays observed, never opened; its loss
-/// is counted beside the ordinary size skip.
-fn note_withheld_oversized(
-    source: SnapshotSource,
-    account_holds: &BTreeMap<String, String>,
-    path: &Path,
-) {
-    if account_holds.contains_key(&local_index_key(path)) {
-        line_delivery_unselected(source.api_slug(), UnselectedReason::WithheldOversized);
+impl<'a> DiscoveryRetention<'a> {
+    /// Owed by a registered source: the discovery window does not apply.
+    fn owes(&self, path: &Path) -> bool {
+        sampled_audit::path_requires_verification(self.files, path)
+            || self.account_holds.contains_key(&local_index_key(path))
+    }
+
+    /// An oversized withheld-account key stays observed, never opened; its
+    /// loss is counted beside the ordinary size skip.
+    fn note_withheld_oversized(&self, source: SnapshotSource, path: &Path) {
+        if self.account_holds.contains_key(&local_index_key(path)) {
+            line_delivery_unselected(source.api_slug(), UnselectedReason::WithheldOversized);
+        }
+    }
+
+    /// Entries only: no other owed source (tests and index-free callers).
+    #[cfg(test)]
+    fn unverified(files: &'a BTreeMap<String, ScanIndexEntry>) -> Self {
+        static NONE: BTreeMap<String, String> = BTreeMap::new();
+        Self {
+            files,
+            account_holds: &NONE,
+        }
     }
 }
 
@@ -42294,7 +42312,7 @@ fn opened_candidate_is_within_frozen_window(
 /// has no verification rescue, the exact discovery filter. Discovery never
 /// makes it a candidate, so no parse can produce its ledger.
 fn codex_parent_outside_window(
-    files: &BTreeMap<String, ScanIndexEntry>,
+    retention: DiscoveryRetention<'_>,
     path: &Path,
     file: &File,
     census_unix_seconds: Option<u64>,
@@ -42306,7 +42324,7 @@ fn codex_parent_outside_window(
         .and_then(|metadata| metadata.modified().ok())
         .and_then(unix_seconds)
         .unwrap_or_default();
-    !sampled_audit::path_requires_verification(files, path)
+    !retention.owes(path)
         && census_unix_seconds
             .is_some_and(|now| !is_recent_enough_at(modified, now, backfill_window_days))
 }
@@ -42460,8 +42478,7 @@ fn open_and_identify_scan_candidate(
     census: &mut ScanCensus,
     census_unix_seconds: Option<u64>,
     backfill_window_days: u64,
-    files: &BTreeMap<String, ScanIndexEntry>,
-    account_holds: &BTreeMap<String, String>,
+    retention: DiscoveryRetention<'_>,
 ) -> Option<(CandidateFile, File)> {
     open_and_identify_scan_candidate_with_rescue(
         source,
@@ -42469,8 +42486,7 @@ fn open_and_identify_scan_candidate(
         census,
         census_unix_seconds,
         backfill_window_days,
-        files,
-        account_holds,
+        retention,
         false,
         None,
     )
@@ -42483,8 +42499,7 @@ fn open_and_identify_scan_candidate_with_rescue(
     census: &mut ScanCensus,
     census_unix_seconds: Option<u64>,
     backfill_window_days: u64,
-    files: &BTreeMap<String, ScanIndexEntry>,
-    account_holds: &BTreeMap<String, String>,
+    retention: DiscoveryRetention<'_>,
     verification_rescue: bool,
     cache: Option<&sampled_scan::SharedCache>,
 ) -> Option<(CandidateFile, File)> {
@@ -42526,7 +42541,7 @@ fn open_and_identify_scan_candidate_with_rescue(
                     &candidate.path,
                     &mut census.oversized_discovery,
                 );
-                note_withheld_oversized(source, account_holds, &candidate.path);
+                retention.note_withheld_oversized(source, &candidate.path);
                 return None;
             }
             Err(_) => {
@@ -42535,7 +42550,7 @@ fn open_and_identify_scan_candidate_with_rescue(
             }
         };
     if !verification_rescue
-        && !discovery_age_exempt(files, account_holds, &candidate.path)
+        && !retention.owes(&candidate.path)
         && !opened_candidate_is_within_frozen_window(
             &candidate,
             census_unix_seconds,
@@ -42552,9 +42567,13 @@ fn open_and_identify_scan_candidate_with_rescue(
     }
     // `opened_object_identity` stays the live identity: the parse-time TOCTOU
     // check compares against it. Only the re-read trigger uses the adoption.
-    let Ok(adopted_identity) =
-        adopt_stored_changed_time(source, &mut candidate, files, live, &mut opened_file)
-    else {
+    let Ok(adopted_identity) = adopt_stored_changed_time(
+        source,
+        &mut candidate,
+        retention.files,
+        live,
+        &mut opened_file,
+    ) else {
         census.record_unreadable(UnreadableCause::OpenRead, 1);
         return None;
     };
@@ -53246,8 +53265,7 @@ mod tests {
             &mut census,
             census_at,
             BACKFILL_WINDOW_DAYS,
-            &BTreeMap::new(),
-            &BTreeMap::new(),
+            DiscoveryRetention::unverified(&BTreeMap::new()),
         )
         .expect("recent path is discovered");
 
@@ -54423,8 +54441,7 @@ mod tests {
             traversal,
             BACKFILL_WINDOW_DAYS,
             3,
-            &index.files,
-            &index.claude_account_deferred_holds,
+            discovery_retention!(index),
         );
         assert_eq!(traversal.counts.directory_entry_cap_exceeded_count, 1);
         assert!(traversal.pending_candidates.is_empty());
@@ -90056,8 +90073,7 @@ mod census_unreadable_tests {
             &mut census,
             None,
             30,
-            &BTreeMap::new(),
-            &BTreeMap::new(),
+            DiscoveryRetention::unverified(&BTreeMap::new()),
         )
         .is_none());
         assert_eq!(
@@ -90081,8 +90097,7 @@ mod census_unreadable_tests {
             &mut census,
             None,
             30,
-            &BTreeMap::new(),
-            &BTreeMap::new(),
+            DiscoveryRetention::unverified(&BTreeMap::new()),
         )
         .unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
@@ -90092,8 +90107,7 @@ mod census_unreadable_tests {
             &mut census,
             None,
             30,
-            &BTreeMap::new(),
-            &BTreeMap::new()
+            DiscoveryRetention::unverified(&BTreeMap::new())
         )
         .is_none());
         assert_eq!(
@@ -90118,8 +90132,7 @@ mod census_unreadable_tests {
             SnapshotSource::Codex,
             index.traversal.as_mut().unwrap(),
             30,
-            &index.files,
-            &index.claude_account_deferred_holds,
+            discovery_retention!(index),
         );
         assert_eq!(
             projection(&index.traversal.as_ref().unwrap().counts)["counts"],

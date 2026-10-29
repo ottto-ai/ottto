@@ -253,6 +253,19 @@ page events, not gauges, and are never summed across observers:
   page ending or being dropped mid-file. A file the observer skipped is not
   counted. A later page can count the same file again.
 
+**Owed-key discovery retention.** `DiscoveryRetention` (`snapshots.rs`) is the
+one shared exemption from the discovery window, used by every age gate: the
+Claude/Pi walk, candidate revalidation and open, the Codex roster and
+`codex_parent_outside_window`. A key owed by a registered source stays
+discoverable and observed whatever its age while it is owed, so reconciliation
+never prunes it. Its growth goes through the counted Tail path. Only a validated
+catch-up or a proven, counted removal releases it, and it is never a Full cause.
+File-size caps still apply. Registered sources today are the unverified
+sampled-generation marker (any source) and Claude withheld-account holds. A new
+owed source (a Codex owed-residue set, a compressed hold) registers as one field
+plus its lines in `discovery_retention!`, `unverified` and `owes`; it adds no
+separate exemption.
+
 `counts.line_delivery_unselected` counts discovery skip decisions for the
 page's source: `age` (outside the backfill window, not held for verification
 and not withheld for an unresolved Claude account) and `size` (over the
