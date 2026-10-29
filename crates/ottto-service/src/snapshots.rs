@@ -27241,13 +27241,6 @@ impl OwnedSourceScan {
                                 .iter()
                                 .map(|member| local_index_key(&member.path)),
                         );
-                        // A repair grant is per physical key, never a grant
-                        // to read quiet excluded siblings. Keep its debt if
-                        // native joined settlement needs an ungranted member.
-                        if !codex_child_pair_rederive::group_allowed(index, &group.members) {
-                            index.mark_bounded_sweep_unsettled();
-                            continue;
-                        }
                         // §d.1.2 c: a paused or active cursor job owns a
                         // member. Its selected members stay pending (holding
                         // the census) and are not read again while it lives.
@@ -49045,6 +49038,16 @@ impl ScanIndex {
         now: u64,
         body_witness_adoption: bool,
     ) -> (CandidateDecision, Option<CandidateParseReason>) {
+        self.candidate_decision_with_repair_gate(candidate, now, body_witness_adoption, false)
+    }
+
+    fn candidate_decision_with_repair_gate(
+        &self,
+        candidate: &CandidateFile,
+        now: u64,
+        body_witness_adoption: bool,
+        ignore_child_repair: bool,
+    ) -> (CandidateDecision, Option<CandidateParseReason>) {
         let key = local_index_key(&candidate.path);
         if self.decode_holds_file(&key) {
             return (CandidateDecision::Skip, None);
@@ -49099,7 +49102,16 @@ impl ScanIndex {
                 return (CandidateDecision::Skip, None);
             }
         }
-        if entry.audit_requires_full(now) || sampled_audit::progress_debt(self, &key, now).is_some()
+        let repair_only = ignore_child_repair
+            && matches!(
+                entry.codex_child_pair_rederive,
+                Some(codex_child_pair_rederive::Stamp::Pending {
+                    previous_due: None,
+                    ..
+                })
+            );
+        if (!repair_only && entry.audit_requires_full(now))
+            || sampled_audit::progress_debt(self, &key, now).is_some()
         {
             return (CandidateDecision::Parse, Some(CandidateParseReason::Audit));
         }

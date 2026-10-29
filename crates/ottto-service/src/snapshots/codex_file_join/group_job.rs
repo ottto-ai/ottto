@@ -326,6 +326,13 @@ impl GroupBoot {
             return self.identify(attribution, index, cache);
         }
         if !self.admitted {
+            // HeaderInventory members carry only a sidecar digest. Wait for
+            // the existing identity phase above to build full fingerprints
+            // before asking whether natural work independently selects them.
+            // No new open/probe: a repair cannot broaden the native group.
+            if !codex_child_pair_rederive::group_allowed(index, &self.group.members) {
+                return Boot::Strict;
+            }
             if self.unchanged_joined(index) {
                 return Boot::Unchanged;
             }

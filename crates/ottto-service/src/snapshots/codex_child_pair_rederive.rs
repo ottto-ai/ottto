@@ -299,41 +299,13 @@ pub(super) fn independent_debt(entry: &mut ScanIndexEntry, due: u64) {
 
 /// A retry delay belongs only to this repair. Compare the ordinary selector
 /// with its marker temporarily removed; every other cause keeps its priority.
-fn ordinary_decision(index: &mut ScanIndex, candidate: &CandidateFile) -> CandidateDecision {
-    let key = local_index_key(&candidate.path);
-    let saved = index
-        .files
-        .get_mut(&key)
-        .filter(|entry| {
-            matches!(
-                entry.codex_child_pair_rederive,
-                Some(Stamp::Pending {
-                    previous_due: None,
-                    ..
-                })
-            )
-        })
-        .map(|entry| {
-            entry
-                .scan_identity_version
-                .replace(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into())
-        });
-    let decision = index.candidate_decision_with_reason(candidate).0;
-    if let Some(version) = saved {
-        index
-            .files
-            .get_mut(&key)
-            .expect("borrowed entry")
-            .scan_identity_version = version;
-    }
-    decision
+fn ordinary_decision(index: &ScanIndex, candidate: &CandidateFile) -> CandidateDecision {
+    index
+        .candidate_decision_with_repair_gate(candidate, sampled_scan::now_seconds(), true, true)
+        .0
 }
 
-pub(super) fn delay_only_repair(
-    index: &mut ScanIndex,
-    candidate: &CandidateFile,
-    now: u64,
-) -> bool {
+pub(super) fn delay_only_repair(index: &ScanIndex, candidate: &CandidateFile, now: u64) -> bool {
     let key = local_index_key(&candidate.path);
     index
         .files
@@ -344,7 +316,7 @@ pub(super) fn delay_only_repair(
 
 /// Existing joined custody may not broaden a physical-key repair grant.
 /// Ordinary growth/context/adoption retains its original whole-group path.
-pub(super) fn group_allowed(index: &mut ScanIndex, members: &[CandidateFile]) -> bool {
+pub(super) fn group_allowed(index: &ScanIndex, members: &[CandidateFile]) -> bool {
     let pending = |index: &ScanIndex, member: &CandidateFile| {
         matches!(
             index
