@@ -275,7 +275,7 @@ fn unsafe_subset_overlay_preserves_real_entries_in_both_rollback_cases() {
 fn parent_role_opens_and_retained_ledger_validation_refuse_before_content_io() {
     let root = crate::test_scratch::private_dir("custody-grandchild");
     let child = member(&root, "sessions", OWNER, false);
-    let parent = member(&root, "sessions", PARENT, true);
+    member(&root, "sessions", PARENT, true);
     let mut index = accepted(&root, &child);
     index.codex_parent_ownership_refs.insert(OWNER.into());
     index.codex_parent_ownership_ledgers.insert(
@@ -510,4 +510,37 @@ fn verify_codex_zst_downgrade_roundtrip() {
             );
         }
     }
+}
+
+#[test]
+fn foundation_unknown_owner_coverage_defers_sibling_without_red_or_smaller_body() {
+    let root = crate::test_scratch::private_dir("custody-foundation-sibling");
+    let held = member(&root, "sessions", OWNER, false);
+    let mut index = accepted(&root, &held);
+    latch(&mut index, &held);
+    member(&root, "archived_sessions", OWNER, false);
+    let ((index, scan), rows) = capture(|| normal(&root, index, &[]));
+    assert_no_red(&scan, &rows);
+    assert!(index.files[&local_index_key(&held)]
+        .last_upload_body_witness
+        .is_some());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn malformed_large_hold_streams_to_generic_custody() {
+    let root = crate::test_scratch::private_dir("custody-large-field");
+    let path = member(&root, "sessions", OWNER, false);
+    let mut raw = serde_json::to_value(accepted(&root, &path)).unwrap();
+    let key = local_index_key(&path);
+    raw["files"][&key]["codex_compressed_hold"] = json!(vec![0; 100_000]);
+    let bytes = serde_json::to_vec(&raw).unwrap();
+    let saved = root.join("index.json");
+    fs::write(&saved, bytes).unwrap();
+    let loaded = ScanIndex::load(&saved).unwrap();
+    assert_eq!(
+        loaded.files[&key].codex_compressed_hold,
+        Some(CodexZstCause::OwnerUnproven)
+    );
+    fs::remove_dir_all(root).unwrap();
 }
