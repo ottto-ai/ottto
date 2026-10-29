@@ -4570,6 +4570,12 @@ pub(in crate::snapshots) mod header_cache_tests {
                 previous.committable_subset(&ScanIndex::default(), &accepted, &BTreeMap::new());
             let healthy_key = local_index_key(&healthy_path);
             assert!(previous.files.contains_key(&healthy_key));
+            assert!(previous.files[&healthy_key]
+                .codex_joined_member_set
+                .is_none());
+            assert!(previous.files[&healthy_key]
+                .codex_applied_tier_receipt
+                .is_none());
             let mut paths = paths(&fixture);
             paths.insert(healthy_key.clone());
             let held = local_index_key(&fixture.headers[0].candidate.path);
@@ -4683,13 +4689,8 @@ pub(in crate::snapshots) mod header_cache_tests {
                     .collect::<Vec<_>>();
                 assert_eq!(emitted.len(), 1, "unrelated growing file emits its body");
                 assert_eq!(emitted[0].input_tokens, 200);
-                assert!(
-                    scan.codex_join_validation
-                        .as_ref()
-                        .unwrap()
-                        .inventory
-                        .complete
-                );
+                assert!(scan.codex_join_validation.is_none(),
+                    "held group has no completed join proof; current inventory completeness was asserted before selection");
             } else {
                 assert!(
                     scan.snapshots.is_empty(),
