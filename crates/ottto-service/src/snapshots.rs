@@ -86830,9 +86830,9 @@ mod tests {
                     .remove("session_account_evidence");
             }
             assert_eq!(
-                without_creator,
-                serde_json::to_value(&legacy_items).unwrap(),
-                "{name}"
+                serde_json::to_vec(&without_creator).unwrap(),
+                serde_json::to_vec(&serde_json::to_value(&legacy_items).unwrap()).unwrap(),
+                "all non-evidence bytes, including tokens and cost, stay identical: {name}"
             );
             let mut request = valid_v6_batch_request();
             request.source = "codex".into();
