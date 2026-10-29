@@ -9746,6 +9746,13 @@ where
                 .saturating_add(snapshot_packing_json_length(item)?);
         }
     }
+    // Observe the final emitted candidates. Only stored-body ACK handling below
+    // advances the baseline; a rejected or unstored offer cannot replace it.
+    for item in &batch {
+        progress
+            .accepted_account_hashes
+            .observe(&serde_json::to_value(item)?);
+    }
     let response = upload(batch)?;
     if response.disabled {
         return Ok(SnapshotPageOutcome::Disabled(response.disabled_reason));
@@ -15360,7 +15367,7 @@ mod tests {
         let saved = serde_json::to_vec(&progress).unwrap();
         progress = serde_json::from_slice(&saved).unwrap();
         progress.active_quarantine_witness = Some(test_quarantine_witness());
-        assert_eq!(send(2, "account-b", false, &mut progress), 0);
+        assert_eq!(send(2, "account-b", false, &mut progress), 1);
         assert_eq!(
             send(3, "account-a", true, &mut progress),
             0,

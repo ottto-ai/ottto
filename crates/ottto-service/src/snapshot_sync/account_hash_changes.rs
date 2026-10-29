@@ -33,13 +33,31 @@ impl AcceptedAccounts {
         self.0.is_empty()
     }
 
+    /// Observe final upload candidates against the last stored body. A refused
+    /// or unstored offer may be counted, but must never advance the baseline.
+    pub(super) fn observe(&self, item: &Value) {
+        if let Some((key, digest)) = Self::projection(item) {
+            if self.0.get(&key).is_some_and(|previous| previous != &digest) {
+                crate::local_resource_diagnostics::account_hash_changed(&key);
+            }
+        }
+    }
+
     /// Called only after a stored-body ACK, including count-only legacy ACKs.
-    /// Compare the set of emitted usage account hashes (including unassigned
-    /// rows and identity parts), independent of usage totals and row duplication.
     pub(super) fn record(&mut self, item: &Value) {
-        let Some(session) = item.get("source_session_id").and_then(Value::as_str) else {
+        let Some((key, digest)) = Self::projection(item) else {
             return;
         };
+        if !self.0.contains_key(&key) && self.0.len() >= MAX_SESSIONS {
+            self.0.pop_first();
+        }
+        self.0.insert(key, digest);
+    }
+
+    /// Compare emitted usage account hashes (including unassigned rows and
+    /// identity parts), independent of usage totals and row duplication.
+    fn projection(item: &Value) -> Option<(String, String)> {
+        let session = item.get("source_session_id").and_then(Value::as_str)?;
         let rows = item["model_usage"].as_array().into_iter().flatten().chain(
             item["usage_buckets"]
                 .as_array()
@@ -61,20 +79,14 @@ impl AcceptedAccounts {
             }
         }
         if accounts.is_empty() {
-            return;
+            return None;
         }
         let key = super::cache_session_key(session);
         let digest = format!(
             "{:x}",
             Sha256::digest(serde_json::to_vec(&accounts).expect("account hashes serialize"))
         );
-        if self.0.get(&key).is_some_and(|previous| previous != &digest) {
-            crate::local_resource_diagnostics::account_hash_changed(&key);
-        }
-        if !self.0.contains_key(&key) && self.0.len() >= MAX_SESSIONS {
-            self.0.pop_first();
-        }
-        self.0.insert(key, digest);
+        Some((key, digest))
     }
 }
 
@@ -87,6 +99,11 @@ impl crate::heap_layout_bound::HeapLayoutBound for AcceptedAccounts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn acknowledge(accounts: &mut AcceptedAccounts, body: &Value) {
+        accounts.observe(body);
+        accounts.record(body);
+    }
 
     fn body(account: Option<&str>) -> Value {
         serde_json::json!({
@@ -114,32 +131,41 @@ mod tests {
     #[test]
     fn acknowledged_accounts_survive_restart_and_count_changes_without_identifiers() {
         let mut accounts = AcceptedAccounts::default();
-        assert_eq!(observed(|| accounts.record(&body(Some("account-a")))), 0);
+        assert_eq!(
+            observed(|| acknowledge(&mut accounts, &body(Some("account-a")))),
+            0
+        );
         let saved = serde_json::to_vec(&accounts).unwrap();
         assert!(!String::from_utf8_lossy(&saved).contains("account-a"));
         accounts = serde_json::from_slice(&saved).unwrap();
         let mut same = body(Some("account-a"));
         same["model_usage"][0]["input_tokens"] = 99.into();
         same["usage_buckets"] = serde_json::json!([{"model_usage":same["model_usage"]}]);
-        assert_eq!(observed(|| accounts.record(&same)), 0);
+        assert_eq!(observed(|| acknowledge(&mut accounts, &same)), 0);
         assert_eq!(
             observed(|| {
-                accounts.record(&body(Some("account-b")));
-                accounts.record(&body(Some("account-c")));
-                accounts.record(&body(Some("account-b")));
+                acknowledge(&mut accounts, &body(Some("account-b")));
+                acknowledge(&mut accounts, &body(Some("account-c")));
+                acknowledge(&mut accounts, &body(Some("account-b")));
             }),
             1,
             "count sessions rather than revisions within a finish"
         );
-        assert_eq!(observed(|| accounts.record(&body(Some("account-b")))), 0);
-        assert_eq!(observed(|| accounts.record(&body(None))), 1);
-        assert_eq!(observed(|| accounts.record(&body(Some("account-a")))), 1);
+        assert_eq!(
+            observed(|| acknowledge(&mut accounts, &body(Some("account-b")))),
+            0
+        );
+        assert_eq!(observed(|| acknowledge(&mut accounts, &body(None))), 1);
+        assert_eq!(
+            observed(|| acknowledge(&mut accounts, &body(Some("account-a")))),
+            1
+        );
         let mut mixed = body(None);
         mixed["model_usage"][0]["identity_parts"] = serde_json::json!([
             {"account_identifier_hash":"account-a"},
             {"account_identifier_hash":"account-b"}
         ]);
-        assert_eq!(observed(|| accounts.record(&mixed)), 1);
+        assert_eq!(observed(|| acknowledge(&mut accounts, &mixed)), 1);
     }
 
     #[test]
@@ -153,7 +179,7 @@ mod tests {
             for n in 0..MAX_SESSIONS + 1 {
                 let mut item = body(Some("account-a"));
                 item["source_session_id"] = format!("session-{n}").into();
-                accounts.record(&item);
+                acknowledge(&mut accounts, &item);
             }
         });
         assert_eq!(accounts.0.len(), MAX_SESSIONS);

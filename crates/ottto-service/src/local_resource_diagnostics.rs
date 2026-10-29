@@ -528,7 +528,7 @@ impl Observation {
     }
 }
 
-// Updated only for server-acknowledged stored bodies on this source worker.
+// Final upload candidates compared with their retained accepted bodies on this worker.
 // Drained by the existing finish record; no identifiers reach the log.
 thread_local! {
     static ACCOUNT_HASH_CHANGED: std::cell::RefCell<std::collections::BTreeSet<String>> =
