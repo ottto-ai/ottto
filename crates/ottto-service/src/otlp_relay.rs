@@ -801,12 +801,13 @@ fn handle_client(
         );
     }
 
-    if let Some(activity) = legacy_activity {
-        activity.accepted();
-    }
     let request_source = source_from_request(&request).unwrap_or(source);
     let response =
         local_otlp_export_response(request_source, &request, &ottto_core::default_support_dir());
+    // Only a successful export keeps a legacy port alive or raises its note.
+    if let Some(activity) = legacy_activity.filter(|_| (200..300).contains(&response.status)) {
+        activity.accepted();
+    }
     write_raw_response(
         &mut stream,
         response.status,
