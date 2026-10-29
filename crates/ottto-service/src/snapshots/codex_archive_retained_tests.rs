@@ -826,3 +826,125 @@ fn claude_retained_reuse_is_unchanged_beside_archive_pressure() {
     }
     assert_eq!(observations[0], observations[1]);
 }
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "funded decoder needs validated heap layout"
+)]
+fn custody_precedes_retained_take_and_growing_archive_keeps_its_copy() {
+    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+    let key = local_index_key(&f.0);
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let (mut index, first) = finish_selector(retained_archive_scan(
+        &f,
+        ScanIndex::default(),
+        cache.clone(),
+    ));
+    assert_eq!(first.snapshots.len(), 1);
+    assert!(cache.retained_checkpoint(&key).is_some());
+    retry_due(&mut index, &key);
+    index.hold_compressed(
+        &f.0,
+        codex_session_id_candidates_from_path(&f.0)
+            .into_iter()
+            .collect(),
+        CodexZstCause::ParentLedgerUnbound,
+    );
+    for grow in [false, true] {
+        if grow {
+            File::options()
+                .append(true)
+                .open(&f.0)
+                .unwrap()
+                .write_all(&zstd::stream::encode_all(&b"\n"[..], 1).unwrap())
+                .unwrap();
+        }
+        let ((next, result), rows) = crate::local_resource_diagnostics::capture(|| {
+            finish_selector(retained_archive_scan(&f, index, cache.clone()))
+        });
+        assert!(result.snapshots.is_empty());
+        assert_eq!(decoded_archive_bytes(&rows), 0);
+        assert_eq!(archive_event_count(&rows, "codex_zst_retained_resend"), 0);
+        assert!(
+            cache.retained_checkpoint(&key).is_some(),
+            "custody precedes take even after growth"
+        );
+        assert!(next.files[&key].codex_compressed_hold.is_some());
+        index = next;
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "funded decoder needs validated heap layout"
+)]
+fn new_archive_a1_with_exact_accepted_history_counts_reupgrade_full() {
+    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+    let key = local_index_key(&f.0);
+    let (mut index, first) = finish_selector(retained_archive_scan(
+        &f,
+        ScanIndex::default(),
+        Arc::new(sampled_scan::SharedCache::default()),
+    ));
+    assert_eq!(first.snapshots.len(), 1);
+    index
+        .accepted_snapshot_fingerprints
+        .insert(first.snapshots[0].snapshot_fingerprint.clone());
+    index.files.remove(&key);
+    index.file_snapshot_fingerprints.remove(&key);
+    // The historical-runtime fixture proves the actual old census/save loss;
+    // here the production funded A1 and exact-history counter are exercised.
+    let ((mut index, upgraded), rows) = crate::local_resource_diagnostics::capture(|| {
+        finish_selector(retained_archive_scan(
+            &f,
+            index,
+            Arc::new(sampled_scan::SharedCache::default()),
+        ))
+    });
+    assert_eq!(archive_event_count(&rows, "archive_reupgrade_full"), 1);
+    assert_eq!(archive_event_count(&rows, "codex_zst_first_read_retry"), 0);
+    assert!(decoded_archive_bytes(&rows) > 0);
+    assert_eq!(
+        index.files[&key].archive.as_ref().unwrap().decode_attempts,
+        1
+    );
+    assert!(index.files[&key].codex_protected_owner.is_none());
+    index.settle_archive_bodies(&ack_bodies(&upgraded));
+    let ((_, quiet), rows) = crate::local_resource_diagnostics::capture(|| {
+        finish_selector(retained_archive_scan(
+            &f,
+            checkpoint(&index),
+            Arc::new(sampled_scan::SharedCache::default()),
+        ))
+    });
+    assert!(quiet.snapshots.is_empty());
+    assert_eq!(decoded_archive_bytes(&rows), 0);
+    assert_eq!(archive_event_count(&rows, "archive_reupgrade_full"), 0);
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "funded decoder needs validated heap layout"
+)]
+fn activated_funded_decoder_uses_one_gib_and_unknown_size_probe_refuses() {
+    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+    assert_eq!(FIRST_READ_DECODED_LIMIT, 1 << 30);
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let mut input = OpenedInput::funded(File::open(&f.0).unwrap(), &cache)
+        .unwrap()
+        .unwrap();
+    let OpenedInput::Compressed(reader, _) = &mut input else {
+        panic!("funded archive")
+    };
+    assert_eq!(reader.get_ref().remaining, FIRST_READ_DECODED_LIMIT);
+    // Same production over-limit branch with a tiny synthetic limit; no GiB allocation.
+    reader.get_mut().remaining = 8;
+    assert!(input.read_to_end(&mut Vec::new()).is_err());
+    input.close();
+}

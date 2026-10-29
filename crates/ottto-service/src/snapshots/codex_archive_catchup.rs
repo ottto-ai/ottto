@@ -31,7 +31,7 @@ impl Pass {
 }
 
 use super::*;
-use codex_compressed_input::{ArchiveEvidence, HeaderRead, HeaderWork};
+use codex_compressed_input::{HeaderRead, HeaderWork};
 
 /// A classification is never an ACK, ownership proof or permission to retire
 /// another carrier. `Deferred` keeps selection debt in the existing queue.
@@ -42,30 +42,7 @@ pub(super) enum Admission {
 }
 
 impl ScanIndex {
-    pub(super) fn hold_archive(
-        &mut self,
-        file: &File,
-        path: &Path,
-        cause: CodexZstCause,
-    ) -> Result<()> {
-        let key = local_index_key(path);
-        let archive = ArchiveEvidence::hold(
-            file,
-            path,
-            self.files.get(&key).and_then(|e| e.archive.as_deref()),
-            cause,
-        )?;
-        self.files.entry(key).or_default().archive = Some(Box::new(archive));
-        crate::local_resource_diagnostics::traversal_point(
-            "codex_zst_held",
-            "codex",
-            &BTreeMap::from([("codex_zst_held", BTreeMap::from([(cause, 1_u64)]))]),
-        );
-        Ok(())
-    }
-
-    /// 1b: refusal decisions precede the first header/body decode. The owning
-    /// 0b custody/retirement guard must be integrated before this draft ships.
+    /// Custody is negative scope only; acquisition and ACK remain independent.
     pub(super) fn classify_archive(
         &mut self,
         candidate: &CandidateFile,
@@ -76,6 +53,13 @@ impl ScanIndex {
     ) -> Result<Admission> {
         let key = local_index_key(&candidate.path);
         let ids = codex_session_id_candidates_from_path(&candidate.path);
+        if self
+            .files
+            .get(&key)
+            .is_some_and(|entry| entry.codex_compressed_hold.is_some())
+        {
+            return Ok(Admission::Held);
+        }
         let prior = self
             .files
             .get(&key)
@@ -115,15 +99,15 @@ impl ScanIndex {
                 })
         });
         if family || (!retry && old_carrier) {
-            self.hold_archive(
-                file,
+            self.hold_compressed(
                 &candidate.path,
+                ids.iter().cloned().collect(),
                 if family {
                     CodexZstCause::FamilyUnproven
                 } else {
                     CodexZstCause::ArchiveEquivalenceUnproven
                 },
-            )?;
+            );
             return Ok(Admission::Held);
         }
         if !self
@@ -152,7 +136,11 @@ impl ScanIndex {
                 .flatten()
             {
                 if length > codex_compressed_input::FIRST_READ_DECODED_LIMIT {
-                    self.hold_archive(file, &candidate.path, CodexZstCause::CatchupTooLarge)?;
+                    self.hold_compressed(
+                        &candidate.path,
+                        ids.iter().cloned().collect(),
+                        CodexZstCause::CatchupTooLarge,
+                    );
                     crate::local_resource_diagnostics::traversal_point(
                         "codex_zst_catchup_too_large",
                         "codex",

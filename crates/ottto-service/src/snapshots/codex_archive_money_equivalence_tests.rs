@@ -480,16 +480,10 @@ fn declared_over_1gib_held_without_decoder_and_restart_is_quiet() {
         crate::local_resource_diagnostics::capture(|| finish_selector(scan));
     assert_eq!(decodes(&rows), 0);
     assert!(result.snapshots.is_empty());
-    assert!(matches!(
-        index.files[&local_index_key(&f.0)]
-            .archive
-            .as_ref()
-            .unwrap()
-            .disposition,
-        ArchiveDisposition::Held {
-            cause: CodexZstCause::CatchupTooLarge
-        }
-    ));
+    assert_eq!(
+        index.files[&local_index_key(&f.0)].codex_compressed_hold,
+        Some(CodexZstCause::CatchupTooLarge)
+    );
     let mut scan = discovered_scan(&f, checkpoint(&index), 10);
     scan.index.archive_pass.power = true;
     let ((_, result), rows) = crate::local_resource_diagnostics::capture(|| finish_selector(scan));

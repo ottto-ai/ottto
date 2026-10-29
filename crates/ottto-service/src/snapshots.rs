@@ -82,10 +82,10 @@ mod oversized_discovery;
 pub(crate) use tests::claude_request_account_mixed_fixture;
 #[cfg(test)]
 pub(crate) use tests::output as claude_request_account_output;
+pub(crate) mod codex_archive_catchup;
 #[cfg(test)]
 mod codex_compressed_hold_tests;
 mod codex_compressed_holds;
-pub(crate) mod codex_archive_catchup;
 mod codex_compressed_input;
 #[cfg(test)]
 mod codex_zst_refusal_tests;
@@ -8033,6 +8033,26 @@ pub fn finalize_scan_after_policy_with_body_witness(
             .get(&pending.source_file_fingerprint)
             .cloned()
             .unwrap_or_default();
+        // Exact accepted-body history is already retained by this index. This
+        // counts a first A1 on a new archive key with accepted history (including
+        // re-upgrades); no owner protection or money proof is manufactured.
+        if source == SnapshotSource::Codex
+            && pending.previous_snapshot_fingerprint.is_none()
+            && index
+                .files
+                .get(&pending.index_key)
+                .and_then(|entry| entry.archive.as_deref())
+                .is_some_and(|archive| archive.decode_attempts == 1 && !archive.user_change)
+            && final_fingerprints
+                .iter()
+                .any(|fp| index.accepted_snapshot_fingerprints.contains(fp))
+        {
+            crate::local_resource_diagnostics::traversal_point(
+                "archive_reupgrade_full",
+                "codex",
+                &serde_json::json!({"archive_reupgrade_full": 1}),
+            );
+        }
         let final_group_fingerprint = (!final_fingerprints.is_empty())
             .then(|| snapshot_file_entity_set_hex(&final_fingerprints));
         let final_upload_body_witness = by_source_file_body_witness
@@ -27274,8 +27294,8 @@ impl OwnedSourceScan {
                     .extend(census.archive_terminal_sessions.iter().cloned());
                 // Keep the full roster at construction for 0b's family-wide guard.
                 // Ordinary inventory must never acquire an unseen archive header.
-                index.archive_pass.prep_after =
-                    inventory.retain_cached_archives(index, &traversal.codex_rollout_paths);
+                // Cached-feed filtering follows the paged owner-wide custody scan.
+                inventory.feed_prepared = false;
                 inventory.complete &= traversal.pending_directories.is_empty();
                 inventory
             });
@@ -27598,6 +27618,17 @@ impl OwnedSourceScan {
             }
             if source == SnapshotSource::Codex && !codex_join_prepared {
                 if let Some(inventory) = codex_join_inventory.as_mut() {
+                    if !inventory.feed_prepared {
+                        if !inventory.prepare_feed_custody(index) {
+                            pending!();
+                        }
+                        if let Some(traversal) = index.traversal.as_ref() {
+                            index.archive_pass.prep_after = inventory
+                                .retain_cached_archives(index, &traversal.codex_rollout_paths);
+                        }
+                        inventory.feed_prepared = true;
+                        pending!();
+                    }
                     let decoded_before = inventory.archive_work.decoded_bytes;
                     // Ordinary construction leaves permission false: cached feed only.
                     // The gate is per step, never latched, so a deferral yields.
@@ -27635,6 +27666,15 @@ impl OwnedSourceScan {
                             continue;
                         }
                         if inventory.member_held(&candidate.path) {
+                            if inventory.feed_member_held(&candidate.path) {
+                                index.hold_compressed(
+                                    &candidate.path,
+                                    codex_session_id_candidates_from_path(&candidate.path)
+                                        .into_iter()
+                                        .collect(),
+                                    CodexZstCause::OwnerUnproven,
+                                );
+                            }
                             if !index
                                 .files
                                 .get(&local_index_key(&candidate.path))
@@ -27663,23 +27703,13 @@ impl OwnedSourceScan {
                         let Some(twin) = inventory.family_held.get(&key) else {
                             return true;
                         };
-                        let held = open_candidate_beneath_root(candidate)
-                            .map_err(anyhow::Error::from)
-                            .and_then(|file| {
-                                index.hold_archive(
-                                    &file,
-                                    &candidate.path,
-                                    CodexZstCause::FamilyUnproven,
-                                )
-                            });
-                        if held.is_err() {
-                            // Keep transient failures owed; no manufactured hold.
-                            sampled_scan::codex_cursor::requeue(
-                                index,
-                                &codex_selected_flags,
-                                candidate,
-                            );
-                        }
+                        index.hold_compressed(
+                            &candidate.path,
+                            codex_session_id_candidates_from_path(&candidate.path)
+                                .into_iter()
+                                .collect(),
+                            CodexZstCause::FamilyUnproven,
+                        );
                         if *twin {
                             crate::local_resource_diagnostics::traversal_point(
                                 "codex_zst_plain_twin_skip",
@@ -43792,7 +43822,8 @@ impl<'a> DiscoveryRetention<'a> {
         sampled_audit::path_requires_verification(self.files, path)
             || self.account_holds.contains_key(&local_index_key(path))
             // E2: correctness custody owes stat-only growth until counted release.
-            || self.files.get(&local_index_key(path)).is_some_and(|entry| entry.codex_compressed_hold.is_some())
+            || self.files.get(&local_index_key(path)).is_some_and(|entry| entry.codex_compressed_hold.is_some() || entry.archive.is_some())
+        // #876 mirror: retain this archive arm when replacing the mirror with upstream.
     }
 
     /// An oversized withheld-account key stays observed, never opened; its

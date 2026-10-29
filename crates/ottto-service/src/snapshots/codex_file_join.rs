@@ -391,6 +391,10 @@ pub(super) struct HeaderInventory {
     pub(super) headers: Vec<HeaderWitness>,
     pub(super) directories: DirectoryCensus,
     pub(super) complete: bool,
+    /// Negative owner scope is collected one retained entry per step, before F3.
+    pub(super) feed_prepared: bool,
+    pub(super) feed_after: Option<String>,
+    pub(super) feed_peak: usize,
     pub(super) custody_next: usize,
     pub(super) custody_after: Option<String>,
     pub(super) custody_done: bool,
@@ -551,6 +555,9 @@ impl HeaderInventory {
             complete: paths.len() <= MAX_HEADER_FILES
                 && directories.is_some_and(|value| value.stable),
             read_bytes: 0,
+            feed_prepared: true,
+            feed_after: None,
+            feed_peak: 0,
             custody_next: 0,
             custody_after: None,
             custody_done: false,
@@ -601,15 +608,15 @@ impl HeaderInventory {
         for path in iter.by_ref().take(MAX_HEADER_FILES) {
             last = Some(path.clone());
             // Held-member exclusion precedes header-cache lookup (#878).
-            let held = index
-                .files
-                .get(path)
-                .and_then(|e| e.archive.as_ref())
-                .is_some_and(|a| {
-                    matches!(
-                        a.disposition,
-                        codex_compressed_input::ArchiveDisposition::Held { .. }
-                    )
+            let held = self.feed_member_held(Path::new(path))
+                || index.files.get(path).is_some_and(|e| {
+                    e.codex_compressed_hold.is_some()
+                        || e.archive.as_ref().is_some_and(|a| {
+                            matches!(
+                                a.disposition,
+                                codex_compressed_input::ArchiveDisposition::Held { .. }
+                            )
+                        })
                 });
             if !held
                 && index
@@ -620,10 +627,16 @@ impl HeaderInventory {
             {
                 metadata_checks += 1;
             }
-            if !codex_archive_path(Path::new(path))
-                || (!held && index.archive_header(Path::new(path)).is_some())
-            {
+            if !codex_archive_path(Path::new(path)) {
                 self.pending.push_back(PathBuf::from(path));
+            } else if !held {
+                if index.archive_header(Path::new(path)).is_some() {
+                    self.pending.push_back(PathBuf::from(path));
+                } else {
+                    // An omitted archive is still negative absence scope, even
+                    // when another page selects only an unrelated plain file.
+                    self.first_read_archives.insert(path.clone());
+                }
             }
         }
         crate::local_resource_diagnostics::traversal_point(
@@ -948,7 +961,9 @@ impl HeaderInventory {
             .iter()
             .filter(|h| !self.member_held(&h.candidate.path))
         {
-            if codex_archive_path(&header.candidate.path) { continue; }
+            if codex_archive_path(&header.candidate.path) {
+                continue;
+            }
             let key = group_key(&header.home, &header.owner);
             groups
                 .entry(key)
@@ -1014,7 +1029,8 @@ impl HeaderInventory {
 }
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
 crate::heap_layout_bound::fields!(HeaderWitness; plain_twin, custody_cause, candidate, owner, home, created_unix_ms, metadata, stamp);
-crate::heap_layout_bound::fields!(HeaderInventory; custody_next, absence_held, custody_unknown, custody_after, custody_done, custody_peak, custody_refused, roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, archive_work, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, bounded_out, first_read_archives, deferred_archives, family_held);
+crate::heap_layout_bound::fields!(HeaderInventory; feed_prepared, feed_after, feed_peak, custody_next, absence_held, custody_unknown, custody_after, custody_done, custody_peak, custody_refused, roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, archive_work, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, bounded_out, first_read_archives, deferred_archives, family_held);
+
 
 
 

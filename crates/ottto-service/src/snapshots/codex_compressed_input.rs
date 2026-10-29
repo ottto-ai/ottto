@@ -290,42 +290,6 @@ impl ArchiveEvidence {
             .as_ref()
             .filter(|h| h.filename_matches(path))
     }
-    /// Temporary adapter until PR B supplies owner-wide custody. This keeps
-    /// accepted entry fields untouched and grants no acquisition/ACK authority.
-    pub(super) fn hold(
-        file: &File,
-        path: &Path,
-        previous: Option<&Self>,
-        cause: CodexZstCause,
-    ) -> io::Result<Self> {
-        let stamp = crate::transcript_acquisition::FileStamp::capture(file.metadata()?)?;
-        let mut evidence = match previous.filter(|a| a.stamp.same_content(&stamp)) {
-            Some(a) => a.clone(),
-            None => Self {
-                stamp: stamp.content_only(),
-                logical_id: super::codex_session_id_candidates_from_path(path)
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| invalid("archive logical id unavailable"))?,
-                owner: None,
-                body_witness: None,
-                reservation_saved: false,
-                header_attempted: false,
-                header_bound_reached: false,
-                header_validated: None,
-                decode_attempts: 0,
-                terminal_failures: 0,
-                terminal_attempt: 0,
-                user_change: false,
-                user_context: None,
-                user_generation: 0,
-                user_change_spent: exhausted_archive_generation(),
-                disposition: ArchiveDisposition::HeaderValidated,
-            },
-        };
-        evidence.disposition = ArchiveDisposition::Held { cause };
-        Ok(evidence)
-    }
     pub(super) fn begin(file: &File, path: &Path, previous: Option<&Self>) -> io::Result<Self> {
         let stamp = crate::transcript_acquisition::FileStamp::capture(file.metadata()?)?;
         let logical = path.with_extension("");

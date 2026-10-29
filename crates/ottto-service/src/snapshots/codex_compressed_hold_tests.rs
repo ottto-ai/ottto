@@ -167,7 +167,9 @@ fn publication_validation_skips_a_newly_held_file_before_sampling() {
     let paths = BTreeSet::from([local_index_key(&held), local_index_key(&healthy)]);
     let mut index = ScanIndex::default();
     let mut inv = codex_file_join::HeaderInventory::new(&[sessions], &paths, Some(&dirs));
-    while !inv.step_with_archive(&CodexTitleMetadata::default(), &mut index, None) {}
+    while inv.step_with_archive(&CodexTitleMetadata::default(), &mut index, None)
+        != codex_file_join::HeaderStep::Complete
+    {}
     assert_eq!(inv.headers.len(), 2);
     let home = inv
         .headers
@@ -562,6 +564,27 @@ fn write_codex_zst_downgrade_fixture() {
             .len(),
         2
     );
+    // Activated singleton: deliberately no old-reader protection, tier/join
+    // receipt or unverified marker. The historical runtime must census/save it.
+    let activation_root = out.join("activation");
+    let singleton = member(&activation_root, "sessions", OWNER, true);
+    let mut activation = accepted(&activation_root, &singleton);
+    seed_archive(&mut activation, &singleton, OWNER);
+    let entry = activation
+        .files
+        .get_mut(&local_index_key(&singleton))
+        .unwrap();
+    assert!(entry.codex_protected_owner.is_none());
+    assert!(entry.codex_counting_owner.is_none());
+    assert!(entry.codex_applied_tier_receipt.is_none());
+    assert!(entry.codex_joined_member_set.is_none());
+    let archive = entry.archive.as_mut().unwrap();
+    archive.header_bound_reached = true;
+    archive.owner = Some(OWNER.into());
+    archive.decode_attempts = 1;
+    archive.disposition = ArchiveDisposition::Acquired;
+    activation.save(&out.join("activation.json")).unwrap();
+    fs::write(out.join("activation-key.txt"), local_index_key(&singleton)).unwrap();
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -737,7 +760,9 @@ fn inventory(
     // This direct component seam models admitted archive headers. Production
     // discovery stays .jsonl-only; cached evidence cannot bypass the QoS gate.
     inventory.archive_work.allowed = true;
-    while !inventory.step_with_archive(&CodexTitleMetadata::default(), index, None) {}
+    while inventory.step_with_archive(&CodexTitleMetadata::default(), index, None)
+        != codex_file_join::HeaderStep::Complete
+    {}
     assert!(inventory.complete);
     assert!(inventory.refused.is_empty());
     inventory
@@ -1418,7 +1443,9 @@ fn stale_header_never_mints_custody_after_rewrite_or_replacement_even_on_refusal
                 .is_some_and(|e| e.codex_compressed_hold.is_some()));
             let mut done = false;
             for step in 0..100 {
-                if !inv.step_with_archive(&CodexTitleMetadata::default(), &mut index, None) {
+                if inv.step_with_archive(&CodexTitleMetadata::default(), &mut index, None)
+                    != codex_file_join::HeaderStep::Complete
+                {
                     continue;
                 }
                 if !inv.prepare_custody(&index) {
@@ -1782,7 +1809,9 @@ fn home_inventory(
     );
     // Explicit admission permission for this synthetic multi-home seam only.
     inv.archive_work.allowed = true;
-    while !inv.step_with_archive(&CodexTitleMetadata::default(), index, None) {}
+    while inv.step_with_archive(&CodexTitleMetadata::default(), index, None)
+        != codex_file_join::HeaderStep::Complete
+    {}
     assert!(inv.complete);
     assert!(inv.refused.is_empty());
     inv
@@ -2358,5 +2387,171 @@ fn held_archive_replay_does_not_settle_from_historical_fingerprint_alone() {
             index = next;
         }
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn prior_tombstone_omitted_archive_clean_census_restart_keeps_plain_progress() {
+    use codex_counting_version::{AckEvidence, CountingTombstone};
+    let root = crate::test_scratch::private_dir("activation-omitted-tombstone");
+    let archive = member(&root, "sessions", OWNER, true);
+    let plain = member(&root, "sessions", PARENT, false);
+    let owner = codex_protected_owner(OWNER);
+    let mut index = ScanIndex::default();
+    index.codex_counting_tombstones.insert(
+        owner.clone(),
+        CountingTombstone {
+            evidence: AckEvidence::LegacyAcked,
+            retired_in: "prior-generation".into(),
+            created_unix_ms: None,
+        },
+    );
+    let saved = root.join("index.json");
+    for _ in 0..2 {
+        let sessions = root.join("sessions");
+        let paths = BTreeSet::from([local_index_key(&archive), local_index_key(&plain)]);
+        let mut dirs = codex_file_join::DirectoryCensus::new();
+        dirs.observe(&sessions, &fs::metadata(&sessions).unwrap());
+        let mut inv = codex_file_join::HeaderInventory::new(&[sessions], &paths, Some(&dirs));
+        while !inv.prepare_feed_custody(&index) {}
+        assert!(inv.retain_cached_archives(&index, &paths).is_none());
+        assert!(
+            inv.first_read_archives.contains(&local_index_key(&archive)),
+            "F3 omission is negative absence scope"
+        );
+        let mut scan = staged(&root, index, std::slice::from_ref(&plain));
+        scan.index.traversal.as_mut().unwrap().codex_rollout_paths = paths;
+        scan.index.known_configured_scan_roots = BTreeSet::from([local_index_key(&root)]);
+        scan.codex_join_inventory = Some(inv);
+        let ((mut next, result), rows) = capture(|| no_open(&archive, || run(scan)));
+        assert_eq!(result.unreadable_path_count, 0);
+        assert!(
+            result.census_complete,
+            "later clean census cannot certify archive absence"
+        );
+        assert!(result
+            .snapshots
+            .iter()
+            .all(|body| body.source_session_id == PARENT));
+        assert!(next.files[&local_index_key(&plain)]
+            .last_snapshot_fingerprint
+            .is_some());
+        assert_eq!(
+            next.codex_counting_tombstones[&owner].evidence,
+            AckEvidence::LegacyAcked
+        );
+        assert!(!rows
+            .iter()
+            .any(|row| row["stage"] == "codex_zst_input" || row["stage"] == "codex_zst_inventory"));
+        next.save(&saved).unwrap();
+        index = ScanIndex::load(&saved).unwrap();
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn departed_owner_custody_precedes_f3_header_lookup_and_plain_still_publishes() {
+    let root = crate::test_scratch::private_dir("activation-prefilter-custody");
+    let archive = member(&root, "sessions", OWNER, true);
+    let plain = member(&root, "sessions", PARENT, false);
+    let mut index = ScanIndex::default();
+    seed_archive(&mut index, &archive, OWNER);
+    index.hold_compressed(
+        &root.join("departed.jsonl"),
+        BTreeSet::from([OWNER.into()]),
+        CodexZstCause::ParentLedgerUnbound,
+    );
+    let sessions = root.join("sessions");
+    let mut dirs = codex_file_join::DirectoryCensus::new();
+    dirs.observe(&sessions, &fs::metadata(&sessions).unwrap());
+    let paths = BTreeSet::from([local_index_key(&archive), local_index_key(&plain)]);
+    let mut inv = codex_file_join::HeaderInventory::new(&[sessions], &paths, Some(&dirs));
+    let mut steps = 0;
+    while !inv.prepare_feed_custody(&index) {
+        steps += 1;
+    }
+    assert_eq!(steps, index.files.len(), "one retained entry per step");
+    let (_, rows) = capture(|| inv.retain_cached_archives(&index, &paths));
+    assert_eq!(
+        rows.iter()
+            .map(
+                |row| row["counts"]["codex_zst_cached_inventory_metadata_checks"]
+                    .as_u64()
+                    .unwrap_or(0)
+            )
+            .sum::<u64>(),
+        0,
+        "held before cached stamp lookup"
+    );
+    assert!(inv.feed_member_held(&archive));
+    let mut scan = staged(&root, index, &[archive.clone(), plain]);
+    scan.codex_join_inventory = Some(inv);
+    let ((index, result), _) = capture(|| no_open(&archive, || run(scan)));
+    assert_eq!(result.unreadable_path_count, 0);
+    assert!(result
+        .snapshots
+        .iter()
+        .all(|body| body.source_session_id == PARENT));
+    assert!(index.files[&local_index_key(&archive)]
+        .codex_compressed_hold
+        .is_some());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn historical_census_saved_singleton_schedules_a1_on_reupgrade() {
+    let Some(root) = std::env::var_os("OTTTO_ZST_DOWNGRADE_FIXTURE_DIR").map(PathBuf::from) else {
+        return; // The Linux historical-runtime driver supplies the saved census.
+    };
+    let key = fs::read_to_string(root.join("activation-key.txt")).unwrap();
+    for label in ["stable", "r1"] {
+        let index = ScanIndex::load(&root.join(format!("{label}-census.json"))).unwrap();
+        assert!(!index.files.contains_key(&key));
+        assert!(!index.file_snapshot_fingerprints.contains_key(&key));
+        let sessions = root.join("activation/sessions");
+        let mut scan = OwnedSourceScan::new(
+            SnapshotSource::Codex,
+            &[sessions],
+            index,
+            "2026-10-06T23:00:00Z",
+            7,
+            10,
+            false,
+            None,
+            &[],
+            false,
+            false,
+        );
+        // A real activated discovery construction, not a typed decoder fixture.
+        for _ in 0..100 {
+            if scan
+                .identified_candidates
+                .iter()
+                .any(|candidate| local_index_key(&candidate.path) == key)
+            {
+                break;
+            }
+            scan = match scan.step(None) {
+                OwnedSourceScanStep::Pending(next) => next,
+                OwnedSourceScanStep::Complete { .. } => panic!("archive must be scheduled"),
+            };
+        }
+        let candidate = scan
+            .identified_candidates
+            .iter()
+            .find(|candidate| local_index_key(&candidate.path) == key)
+            .unwrap();
+        assert_eq!(
+            scan.index.candidate_decision(candidate),
+            CandidateDecision::Parse
+        );
+        assert!(
+            scan.index.files.get(&key).is_none(),
+            "new object: A1, no fabricated protection"
+        );
+        assert!(
+            !scan.index.archive_pass.power,
+            "scheduling alone grants no decode"
+        );
     }
 }

@@ -109,6 +109,55 @@ impl ScanIndex {
     }
 }
 impl codex_file_join::HeaderInventory {
+    /// Whole retained roster, paged before the F3 filter. Hashes here are only
+    /// negative scope; they never certify membership, ownership or an ACK.
+    pub(super) fn prepare_feed_custody(&mut self, index: &ScanIndex) -> bool {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let after = self.feed_after.as_ref().map_or(Unbounded, Excluded);
+        let Some((key, entry)) = index.files.range::<String, _>((after, Unbounded)).next() else {
+            return true;
+        };
+        if entry.codex_compressed_hold.is_some() {
+            let owners = index.codex_state_only_blocked_by_file.get(key);
+            let binding = entry
+                .codex_counting_owner
+                .as_deref()
+                .filter(|owner| valid_codex_protected_owner(owner));
+            if !owners.is_some_and(|owners| !owners.is_empty()) && binding.is_none() {
+                self.custody_unknown = true;
+            }
+            for owner in owners
+                .into_iter()
+                .flatten()
+                .map(|owner| codex_protected_owner(owner))
+                .chain(binding.map(str::to_owned))
+            {
+                if self.absence_held.contains(&owner) {
+                    continue;
+                }
+                let Some(cost) = crate::heap_layout_bound::tree_node_bytes::<String, ()>()
+                    .and_then(|cost| cost.checked_add(owner.capacity()))
+                    .and_then(|cost| self.feed_peak.checked_add(cost))
+                    .filter(|cost| *cost <= crate::source_rotation::PARKED_BUDGET / 2)
+                else {
+                    self.refuse_custody();
+                    break;
+                };
+                self.feed_peak = cost;
+                self.absence_held.insert(owner);
+            }
+        }
+        self.feed_after = Some(key.clone());
+        false
+    }
+    pub(super) fn feed_member_held(&self, path: &Path) -> bool {
+        is_compressed_codex_rollout(Some(path), None)
+            && (self.custody_unknown
+                || self.custody_refused
+                || codex_session_id_candidates_from_path(path)
+                    .iter()
+                    .any(|owner| self.absence_held.contains(&codex_protected_owner(owner))))
+    }
     pub(super) fn prepare_custody(&mut self, index: &ScanIndex) -> bool {
         use std::ops::Bound::{Excluded, Unbounded};
         if self.custody_done {
@@ -119,7 +168,11 @@ impl codex_file_join::HeaderInventory {
             // Fixed cursor/temporary slack: no historical population allocation.
             let mut cost =
                 crate::heap_layout_bound::Counter::new(crate::source_rotation::PARKED_BUDGET);
-            if cost.add(OWNER_LOOKUP_SLACK).is_none() {
+            if cost
+                .add(OWNER_LOOKUP_SLACK)
+                .and_then(|_| cost.add(self.feed_peak))
+                .is_none()
+            {
                 self.refuse_custody();
             }
             if index.codex_counting_tombstones.len()
@@ -331,8 +384,7 @@ impl codex_file_join::HeaderInventory {
     }
     pub(super) fn member_held(&self, path: &Path) -> bool {
         // Unattributed custody cannot establish a hold on unrelated plain work.
-        ((self.custody_unknown || self.custody_refused)
-            && is_compressed_codex_rollout(Some(path), None))
+        self.feed_member_held(path)
             || self
                 .headers
                 .binary_search_by(|h| h.candidate.path.as_os_str().cmp(path.as_os_str()))

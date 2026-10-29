@@ -39,6 +39,29 @@ mod codex_zst_downgrade_probe {
         let label = std::env::var("OTTTO_ZST_OLD_DECODER").unwrap();
         decoded.save(&root.join(format!("{label}.json"))).unwrap();
         println!("ZST_OLD_DECODER_VERIFIED {label}");
+        let activation = ScanIndex::load(&root.join("activation.json")).unwrap();
+        let key = fs::read_to_string(root.join("activation-key.txt")).unwrap();
+        assert_eq!(activation.files.len(), 1);
+        assert!(!activation.files[&key].codex_history_is_protected());
+        let mut scan = OwnedSourceScan::new(SnapshotSource::Codex,
+            &[root.join("activation/sessions")], activation,
+            "2026-10-06T23:00:00Z", 7, 10, false, None, &[], false, false);
+        let mut saved = false;
+        for _ in 0..10000 {
+            match scan.step(None) {
+                OwnedSourceScanStep::Pending(next) => scan = next,
+                OwnedSourceScanStep::Complete { mut index, scan: result, .. } => {
+                    assert!(result.census_complete);
+                    assert!(!index.files.contains_key(&key), "old census retires unprotected archive");
+                    assert!(!index.file_snapshot_fingerprints.contains_key(&key));
+                    assert!(!index.accepted_snapshot_fingerprints.is_empty());
+                    index.save(&root.join(format!("{label}-census.json"))).unwrap();
+                    saved = true;
+                    break;
+                }
+            }
+        }
+        assert!(saved, "historical census/save completed");
     }
 }
 '''
@@ -93,6 +116,7 @@ def main():
             fixture_test(tree, "codex_zst_downgrade_probe::loads_branch_written_index", old_env,
                          "ZST_OLD_DECODER_VERIFIED " + label)
         fixture_test(repo, "codex_compressed_hold_tests::verify_codex_zst_downgrade_roundtrip", env)
+        fixture_test(repo, "codex_compressed_hold_tests::historical_census_saved_singleton_schedules_a1_on_reupgrade", env)
         print(json.dumps({"status": "VERIFIED", "stable": STABLE, "r1": args.r1}))
 
 

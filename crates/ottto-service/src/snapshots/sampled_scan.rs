@@ -2043,6 +2043,17 @@ pub(super) fn new_source_parser_with_archive_scope(
     cache: Option<&Arc<SharedCache>>,
     archive_scope: Option<&Scope>,
 ) -> Result<OwnedJsonlParser> {
+    // Dedicated custody precedes every cache take, including retained resends.
+    if source == SnapshotSource::Codex {
+        if let Some(cause) = index
+            .files
+            .get(&local_index_key(&candidate.path))
+            .and_then(|entry| entry.codex_compressed_hold)
+        {
+            codex_zst_refused(cause);
+            anyhow::bail!(cause);
+        }
+    }
     let input = if source == SnapshotSource::Codex
         && is_compressed_codex_rollout(Some(&candidate.path), None)
     {
@@ -2079,6 +2090,13 @@ pub(super) fn new_source_parser_with_archive_scope(
                             .disposition = ArchiveDisposition::Held {
                             cause: CodexZstCause::CorrectionUnapplied,
                         };
+                        index.hold_compressed(
+                            &candidate.path,
+                            codex_session_id_candidates_from_path(&candidate.path)
+                                .into_iter()
+                                .collect(),
+                            CodexZstCause::CorrectionUnapplied,
+                        );
                         codex_zst_refused(CodexZstCause::CorrectionUnapplied);
                         anyhow::bail!(CodexZstCause::CorrectionUnapplied);
                     }
@@ -2108,6 +2126,13 @@ pub(super) fn new_source_parser_with_archive_scope(
                                         cause: CodexZstCause::CorrectionUnapplied,
                                     };
                                 }
+                                index.hold_compressed(
+                                    &candidate.path,
+                                    codex_session_id_candidates_from_path(&candidate.path)
+                                        .into_iter()
+                                        .collect(),
+                                    CodexZstCause::CorrectionUnapplied,
+                                );
                                 codex_zst_refused(CodexZstCause::CorrectionUnapplied);
                             })?;
                         codex_compressed_input::admission_streak(&key, false);
