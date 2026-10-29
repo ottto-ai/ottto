@@ -348,6 +348,13 @@ impl HeaderInventory {
             return false;
         };
         let key = local_index_key(&path);
+        if index
+            .files
+            .get(&key)
+            .is_some_and(|entry| entry.codex_compressed_hold.is_some())
+        {
+            return false;
+        }
         let compressed = is_compressed_codex_rollout(Some(&path), None);
         let mut excluded = false;
         let result = (|| -> Result<HeaderWitness> {

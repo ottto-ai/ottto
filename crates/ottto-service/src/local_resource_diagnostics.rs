@@ -87,6 +87,36 @@ pub(crate) fn codex_zst_refused(cause: CodexZstCause) {
     );
 }
 
+thread_local! {
+    static CODEX_ZST_HELD: std::cell::Cell<[Option<(CodexZstCause, u64)>; CODEX_ZST_CAUSES]> = const { std::cell::Cell::new([None; CODEX_ZST_CAUSES]) };
+}
+pub(crate) fn codex_zst_held(cause: CodexZstCause) {
+    CODEX_ZST_HELD.with(|slot| {
+        let mut counts = slot.get();
+        counts[cause as usize] = Some((
+            cause,
+            counts[cause as usize].map_or(1, |(_, n)| n.saturating_add(1)),
+        ));
+        slot.set(counts);
+    });
+}
+pub(crate) fn flush_codex_zst_held() {
+    CODEX_ZST_HELD.with(|slot| {
+        let counts = slot
+            .replace([None; CODEX_ZST_CAUSES])
+            .into_iter()
+            .flatten()
+            .collect::<BTreeMap<_, _>>();
+        if !counts.is_empty() {
+            traversal_point(
+                "codex_zst_held",
+                "codex",
+                &BTreeMap::from([("codex_zst_held", counts)]),
+            );
+        }
+    });
+}
+
 /// Nonzero-only counters on the existing native_collection_page line.
 #[derive(Default, Serialize)]
 struct ClaudeRecordCaps {

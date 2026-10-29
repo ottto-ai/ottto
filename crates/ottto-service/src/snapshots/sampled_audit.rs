@@ -126,7 +126,10 @@ impl ScanIndexEntry {
             .is_some_and(|debt| now >= debt.due_unix_seconds)
     }
     pub(super) fn retain_history_evidence(&self) -> bool {
-        self.archive.is_some() || self.codex_history_is_protected() || self.has_unverified_source()
+        self.archive.is_some()
+            || self.codex_compressed_hold.is_some()
+            || self.codex_history_is_protected()
+            || self.has_unverified_source()
     }
 }
 impl ScanIndex {
