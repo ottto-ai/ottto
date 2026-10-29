@@ -860,7 +860,7 @@ mod tests {
             cache.insert_taken_reserving("key".into(), taken, 0)
         });
         assert_eq!(
-            &*result.err().expect("layout refuses") as *const _ as usize,
+            &*result.expect_err("layout refuses") as *const _ as usize,
             pointer
         );
         assert_eq!(events.insert_disabled_or_layout_refused, 1);
