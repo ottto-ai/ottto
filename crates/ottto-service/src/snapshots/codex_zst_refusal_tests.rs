@@ -276,11 +276,11 @@ fn compressed_refusal_cardinality_has_unique_pinned_indices() {
         HeaderInvalid,
         DecodeBudget,
         AdmissionStarved,
-        FamilyUnproven,
         CustodyGroupProgressDropped,
+        FamilyUnproven,
     ];
     const _: [(); ALL.len()] = [(); CodexZstCause::__Count as usize];
-    assert_eq!(ALL.last(), Some(&CustodyGroupProgressDropped));
+    assert_eq!(ALL.last(), Some(&FamilyUnproven));
     let indices = ALL
         .map(|cause| cause as usize)
         .into_iter()

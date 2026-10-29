@@ -58,11 +58,11 @@ pub(crate) enum CodexZstCause {
     DecodeBudget,
     #[serde(rename = "admission_starved")]
     AdmissionStarved,
-    #[serde(rename = "CompressedFamilyUnproven")]
-    FamilyUnproven,
     /// Diagnostics only; never written to an archive or custody entry.
     #[serde(rename = "custody_group_progress_dropped")]
     CustodyGroupProgressDropped,
+    #[serde(rename = "CompressedFamilyUnproven")]
+    FamilyUnproven,
     #[doc(hidden)]
     #[serde(skip)]
     __Count,
@@ -1296,14 +1296,11 @@ mod tests {
             HeaderInvalid,
             DecodeBudget,
             AdmissionStarved,
-            FamilyUnproven,
             CustodyGroupProgressDropped,
+            FamilyUnproven,
         ];
         assert_eq!(ALL.len(), super::CODEX_ZST_CAUSES);
-        assert_eq!(
-            CustodyGroupProgressDropped as usize + 1,
-            super::CODEX_ZST_CAUSES
-        );
+        assert_eq!(FamilyUnproven as usize + 1, super::CODEX_ZST_CAUSES);
         for (index, cause) in ALL.iter().enumerate() {
             assert_eq!(*cause as usize, index);
         }
