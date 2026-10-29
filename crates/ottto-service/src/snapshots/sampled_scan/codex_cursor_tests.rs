@@ -11723,6 +11723,8 @@ fn held_growth_survives_old_window_cap_and_reload_then_synthetic_release_tails()
         assert!(witness.is_some());
         index.save(&index_path).unwrap();
         cache.durable_write_after_save(lock, SnapshotSource::Codex, &index);
+        index.files.get_mut(&key).unwrap().codex_compressed_hold =
+            Some(CodexZstCause::ParentLedgerUnbound);
         fixture.append(SESSION, &token_line(2));
         let length = fixture.len(SESSION);
         assert!(length > prefix_len);
@@ -11730,8 +11732,6 @@ fn held_growth_survives_old_window_cap_and_reload_then_synthetic_release_tails()
         // no multi-GiB fixture or changed production cap is needed.
         let cap = over_cap.then_some(length - 1);
         codex_compressed_hold_tests::with_file_cap(cap, || {
-            index.files.get_mut(&key).unwrap().codex_compressed_hold =
-                Some(CodexZstCause::ParentLedgerUnbound);
             assert!(!index.files[&key].has_unverified_source());
             assert!(index.claude_account_deferred_holds.is_empty());
             assert!(discovery_retention!(index).owes(&path));
