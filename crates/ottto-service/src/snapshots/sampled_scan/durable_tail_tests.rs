@@ -4025,16 +4025,16 @@ fn a1t_transitional_full_requires_known_current_floor_and_strict_growth() {
         .unwrap(),
     );
     let floor = AcceptedFloor::of(&index, &key).unwrap();
-    assert!(cache.no_match_full(&file, None).is_none());
+    assert!(cache.no_match_full(&key, &file, None).is_none());
     assert!(
-        cache.no_match_full(&file, Some(floor)).is_none(),
+        cache.no_match_full(&key, &file, Some(floor)).is_none(),
         "same extent, regardless of mtime"
     );
     std::fs::write(&path, b"{}\n{}\n").unwrap();
     let mut ahead = floor;
     ahead.revision = effective_revision(source) + 1;
     assert!(
-        cache.no_match_full(&file, Some(ahead)).is_none(),
+        cache.no_match_full(&key, &file, Some(ahead)).is_none(),
         "P11 revision floor"
     );
     assert_eq!(
@@ -4047,7 +4047,18 @@ fn a1t_transitional_full_requires_known_current_floor_and_strict_growth() {
             .old_binding_no_match,
         0
     );
-    assert!(cache.no_match_full(&file, Some(floor)).is_some());
+    let now = std::time::Instant::now();
+    cache.durable().unwrap().retail_full_now = Some(now);
+    assert!(cache.no_match_full(&key, &file, Some(floor)).is_some());
+    assert!(cache.no_match_full(&key, &file, Some(floor)).is_none());
+    assert!(!cache.stale_full(&key, &file, Some(floor), "context"));
+    assert!(!cache.retail_full(&key, &file, floor.end, now));
+    assert_eq!(cache.durable().unwrap().retail_full_at.len(), 1);
+    assert_eq!(cache.durable().unwrap().counters.stale_full, [0; 3]);
+    assert_eq!(
+        cache.durable().unwrap().counters.ineligible["old_binding_no_match.paced"],
+        1
+    );
     let ((), alarms) = crate::local_resource_diagnostics::capture(|| cache.durable_alarm(source));
     assert_eq!(alarms.len(), 1);
     assert_eq!(
@@ -5411,4 +5422,365 @@ fn b1_future_accepted_floor_blocks_saved_and_closed_claims_before_read() {
         );
         let _ = std::fs::remove_dir_all(root);
     }
+}
+
+// Movable C0 row: existing native scanner and exact emitted-body oracle.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
+fn a1t_no_match_shared_pacing_ram_tail_eviction_release_restart_and_no_rebind() {
+    use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
+    use std::io::Write;
+    let _gate = claude_request_money::e2::GateForTest::set(true);
+    let root = crate::test_scratch::private_dir("ottto-a1t-no-match-pace");
+    let lock = test_locks::hold(&root);
+    let projects = root.join("projects");
+    std::fs::create_dir_all(&projects).unwrap();
+    let path = projects.join("1338a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl");
+    let roots = vec![projects];
+    let key = local_index_key(&path);
+    let ds = DurableSource::ClaudeCode;
+    let source = SnapshotSource::ClaudeCode;
+    let index_path = root.join("index.json");
+    std::fs::write(&path, a1a_row("accepted", 100)).unwrap();
+    let warm = E2ScanFixture::default();
+    warm.begin_durable(source, &root, &index_path);
+    let (mut prior, mut initial, modes) = a1a_scan_at(
+        &warm,
+        &roots,
+        &root,
+        ScanIndex::default(),
+        "2026-08-02T08:00:00Z",
+    );
+    assert_eq!(modes, (1, 0, 0));
+    a1a_wire(&root, &mut prior, &mut initial);
+    assert_eq!(initial.snapshots.len(), 1);
+    assert_eq!(initial.snapshots[0].input_tokens, 100);
+    assert_eq!(initial.snapshots[0].request_count, 1);
+    prior.record_accepted_snapshot_fingerprints(
+        &initial
+            .snapshots
+            .iter()
+            .map(|s| s.snapshot_fingerprint.clone())
+            .collect(),
+    );
+    prior.save(&index_path).unwrap();
+    assert!(!prior.files[&key].source_file_fingerprint.is_empty());
+    assert!(prior.files[&key].last_upload_body_witness.is_some());
+    assert_eq!(
+        warm.cache
+            .durable_write_after_save(lock, source, &prior)
+            .unwrap()
+            .written,
+        1
+    );
+    let (disk_path, survivor) = {
+        let mut stores = warm.cache.durable().unwrap();
+        let slot = stores.claude.as_mut().unwrap();
+        let ReadOutcome::Found(mut record) = slot.store.read(
+            &store::key_digest(ds, &key),
+            &codec::allowlist_digest(source),
+        ) else {
+            panic!("warm verified record");
+        };
+        assert_eq!(record.format, 1);
+        record.record.binding.scope = [91; 32]; // Supported v1, unavailable original semantic inputs.
+        let scope = warm
+            .cache
+            .retained_checkpoint(&key)
+            .unwrap()
+            .scope()
+            .clone();
+        let i = Interpretation::of(source, &key, &prior, false, &slot.namespace);
+        assert_eq!(
+            claude_expected(&key, &scope, &prior, &i, &record).err(),
+            Some("old_binding_no_match")
+        );
+        let bytes = store::tests::pinned_v1_bytes(&record.record, record.index_generation);
+        let disk = std::fs::read_dir(slot.store.dir())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        std::fs::write(&disk, &bytes).unwrap();
+        (disk, bytes)
+    };
+    drop(warm);
+    let binding_before = {
+        let owner = E2ScanFixture::default();
+        owner.begin_durable(source, &root, &index_path);
+        let mut stores = owner.cache.durable().unwrap();
+        let ReadOutcome::Found(record) = stores.slot(ds).as_mut().unwrap().store.read(
+            &store::key_digest(ds, &key),
+            &codec::allowlist_digest(source),
+        ) else {
+            panic!("no-match v1 survivor");
+        };
+        assert_eq!(record.record.binding.scope, [91; 32]);
+        record.record.binding
+    };
+    let owner = E2ScanFixture::default();
+    owner.begin_durable(source, &root, &index_path);
+    let now = std::time::Instant::now();
+    owner.cache.durable().unwrap().retail_full_now = Some(now);
+    let append = |id, input| {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(a1a_row(id, input).as_bytes())
+            .unwrap();
+    };
+    append("first-growth", 200);
+    let before = prior.clone();
+    let ((mut index, mut scan, modes), bytes) = observe_consumed(|| {
+        a1a_scan_at(
+            &owner,
+            &roots,
+            &root,
+            before.clone(),
+            "2026-08-02T08:01:00Z",
+        )
+    });
+    assert_eq!(modes, (1, 0, 0));
+    assert_eq!(bytes, std::fs::metadata(&path).unwrap().len());
+    let first_body = a1a_wire(&root, &mut index, &mut scan);
+    assert_eq!(
+        (
+            scan.snapshots[0].input_tokens,
+            scan.snapshots[0].request_count
+        ),
+        (300, 2)
+    );
+    let cold = E2ScanFixture::default();
+    let (mut ci, mut cs, _) = a1a_scan_at(&cold, &roots, &root, before, "2026-08-02T08:01:00Z");
+    assert_eq!(first_body, a1a_wire(&root, &mut ci, &mut cs));
+    let ((), alarms) =
+        crate::local_resource_diagnostics::capture(|| owner.cache.durable_alarm(source));
+    assert_eq!(alarms.len(), 1);
+    assert_eq!(
+        alarms[0]["counts"]["old_binding_no_match"],
+        serde_json::json!([1, 1])
+    );
+    index.record_accepted_snapshot_fingerprints(
+        &scan
+            .snapshots
+            .iter()
+            .map(|s| s.snapshot_fingerprint.clone())
+            .collect(),
+    );
+    index.save(&index_path).unwrap();
+    assert_eq!(
+        owner
+            .cache
+            .durable_write_after_save(lock, source, &index)
+            .unwrap()
+            .written,
+        0
+    );
+    assert_eq!(
+        std::fs::read(&disk_path).unwrap(),
+        survivor,
+        "Full never persists an unproved rebind"
+    );
+    {
+        let mut stores = owner.cache.durable().unwrap();
+        let ReadOutcome::Found(record) = stores.slot(ds).as_mut().unwrap().store.read(
+            &store::key_digest(ds, &key),
+            &codec::allowlist_digest(source),
+        ) else {
+            panic!("survivor");
+        };
+        assert_eq!(record.record.binding, binding_before);
+    }
+    assert!(owner.cache.retained_checkpoint(&key).is_some());
+    let accepted_first = index.files[&key].size_bytes;
+    append("ram-growth", 400);
+    owner.cache.durable().unwrap().retail_full_now = Some(now + std::time::Duration::from_secs(1));
+    let before = index.clone();
+    let ((mut index, mut scan, modes), bytes) =
+        observe_consumed(|| a1a_scan_at(&owner, &roots, &root, index, "2026-08-02T08:02:00Z"));
+    assert_eq!(
+        modes,
+        (0, 1, 0),
+        "resident copy stays RAM-Tail-able inside cooldown"
+    );
+    assert_eq!(
+        bytes,
+        std::fs::metadata(&path).unwrap().len() - accepted_first
+    );
+    let tail_body = a1a_wire(&root, &mut index, &mut scan);
+    assert_eq!(
+        (
+            scan.snapshots[0].input_tokens,
+            scan.snapshots[0].request_count
+        ),
+        (700, 3)
+    );
+    let cold = E2ScanFixture::default();
+    let (mut ci, mut cs, _) = a1a_scan_at(&cold, &roots, &root, before, "2026-08-02T08:02:00Z");
+    assert_eq!(tail_body, a1a_wire(&root, &mut ci, &mut cs));
+    assert_eq!(
+        owner
+            .cache
+            .durable()
+            .unwrap()
+            .slot(ds)
+            .as_ref()
+            .unwrap()
+            .old_binding_no_match,
+        1
+    );
+    index.record_accepted_snapshot_fingerprints(
+        &scan
+            .snapshots
+            .iter()
+            .map(|s| s.snapshot_fingerprint.clone())
+            .collect(),
+    );
+    index.save(&index_path).unwrap();
+    assert_eq!(
+        owner
+            .cache
+            .durable_write_after_save(lock, source, &index)
+            .unwrap()
+            .written,
+        0
+    );
+    assert_eq!(std::fs::read(&disk_path).unwrap(), survivor);
+    let committed = index;
+    let accepted = committed.files[&key].size_bytes;
+    let witness = committed.files[&key].last_upload_body_witness.clone();
+    assert!(witness.is_some());
+    owner.evict();
+    assert!(owner.cache.retained_checkpoint(&key).is_none());
+    append("cold-growth", 800);
+    let length = std::fs::metadata(&path).unwrap().len();
+    assert!(length > accepted);
+    for seconds in [2, 21599] {
+        owner.cache.durable().unwrap().retail_full_now =
+            Some(now + std::time::Duration::from_secs(seconds));
+        let ((held, scan, modes), io) = a0h_observe(|| {
+            a1a_scan_at(
+                &owner,
+                &roots,
+                &root,
+                committed.clone(),
+                "2026-08-02T08:03:00Z",
+            )
+        });
+        assert_eq!(modes.0, 0);
+        assert_eq!(io, (0, 0), "paced no-match performs no native body read");
+        assert!(scan.snapshots.is_empty(), "held body is absent, not $0");
+        assert_eq!(scan.unreadable_path_count, 0);
+        assert_eq!(held.files[&key].size_bytes, accepted);
+        assert_eq!(held.files[&key].last_upload_body_witness, witness);
+        let candidate = CandidateFile {
+            path: path.clone(),
+            size_bytes: length,
+            modified_unix_seconds: committed.files[&key].modified_unix_seconds,
+            modified_unix_nanos: committed.files[&key].modified_unix_nanos.unwrap_or(0),
+            scan_root: path.parent().unwrap().to_path_buf(),
+            physical_identity: None,
+            source_file_fingerprint: String::new(),
+            legacy_source_file_fingerprint: String::new(),
+            legacy_config_reconciliation_required: false,
+            opened_object_identity: String::new(),
+            fingerprint_changed_nanos: 0,
+            fingerprint_birth_nanos: 0,
+        };
+        assert_eq!(
+            held.candidate_decision_with_reason_at(&candidate, 0),
+            (
+                CandidateDecision::Parse,
+                Some(CandidateParseReason::TranscriptChanged)
+            )
+        );
+        assert_eq!(std::fs::read(&disk_path).unwrap(), survivor);
+    }
+    assert_eq!(
+        owner.cache.durable_counters(source).unwrap().0.ineligible["old_binding_no_match.paced"],
+        2
+    );
+    owner.cache.durable().unwrap().retail_full_now =
+        Some(now + std::time::Duration::from_secs(PACE_SECS));
+    let ((mut index, mut scan, modes), bytes) = observe_consumed(|| {
+        a1a_scan_at(
+            &owner,
+            &roots,
+            &root,
+            committed.clone(),
+            "2026-08-02T14:01:00Z",
+        )
+    });
+    assert_eq!(modes, (1, 0, 0));
+    assert_eq!(bytes, length);
+    let released_body = a1a_wire(&root, &mut index, &mut scan);
+    assert_eq!(
+        (
+            scan.snapshots[0].input_tokens,
+            scan.snapshots[0].request_count
+        ),
+        (1500, 4)
+    );
+    let cold = E2ScanFixture::default();
+    let (mut ci, mut cs, _) = a1a_scan_at(&cold, &roots, &root, committed, "2026-08-02T14:01:00Z");
+    assert_eq!(released_body, a1a_wire(&root, &mut ci, &mut cs));
+    let ((), alarms) =
+        crate::local_resource_diagnostics::capture(|| owner.cache.durable_alarm(source));
+    assert_eq!(alarms.len(), 1);
+    assert_eq!(
+        alarms[0]["counts"]["old_binding_no_match"],
+        serde_json::json!([1, 2])
+    );
+    index.record_accepted_snapshot_fingerprints(
+        &scan
+            .snapshots
+            .iter()
+            .map(|s| s.snapshot_fingerprint.clone())
+            .collect(),
+    );
+    index.save(&index_path).unwrap();
+    assert_eq!(
+        owner
+            .cache
+            .durable_write_after_save(lock, source, &index)
+            .unwrap()
+            .written,
+        0
+    );
+    owner.cache.durable_gc(lock, source, &index).unwrap();
+    assert_eq!(std::fs::read(&disk_path).unwrap(), survivor);
+    let ((_, _, modes), io) =
+        a0h_observe(|| a1a_scan_at(&owner, &roots, &root, index.clone(), "2026-08-02T14:02:00Z"));
+    assert_eq!(modes.0, 0);
+    assert_eq!(io, (0, 0), "idle after release");
+    append("restart-growth", 1600);
+    let restarted = E2ScanFixture::default();
+    restarted.begin_durable(source, &root, &index_path);
+    let before = index.clone();
+    let ((mut index, mut scan, modes), bytes) =
+        observe_consumed(|| a1a_scan_at(&restarted, &roots, &root, index, "2026-08-02T14:03:00Z"));
+    assert_eq!(modes, (1, 0, 0));
+    assert_eq!(bytes, std::fs::metadata(&path).unwrap().len());
+    let restarted_body = a1a_wire(&root, &mut index, &mut scan);
+    assert_eq!(
+        (
+            scan.snapshots[0].input_tokens,
+            scan.snapshots[0].request_count
+        ),
+        (3100, 5)
+    );
+    let cold = E2ScanFixture::default();
+    let (mut ci, mut cs, _) = a1a_scan_at(&cold, &roots, &root, before, "2026-08-02T14:03:00Z");
+    assert_eq!(restarted_body, a1a_wire(&root, &mut ci, &mut cs));
+    let ((), alarms) =
+        crate::local_resource_diagnostics::capture(|| restarted.cache.durable_alarm(source));
+    assert_eq!(alarms.len(), 1);
+    assert_eq!(
+        alarms[0]["counts"]["old_binding_no_match"],
+        serde_json::json!([1, 1])
+    );
+    assert_eq!(std::fs::read(&disk_path).unwrap(), survivor);
+    let _ = std::fs::remove_dir_all(root);
 }
