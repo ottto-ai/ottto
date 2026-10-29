@@ -1005,7 +1005,7 @@ impl RetailAttempt {
         Ok((self.end - offset).min(usize::MAX as u64) as usize)
     }
     fn count(&mut self, offset: u64, n: usize) {
-        let metric = match self.grant {
+        let metric = match self.grant() {
             RetailGrant::Process => 2,
             RetailGrant::Daily => 3,
         };

@@ -646,7 +646,7 @@ enum Rebuild {
 /// file past it is left untouched and counted.
 const GC_RECORDS_PER_PASS: usize = 512;
 #[cfg(test)]
-const INVENTORY_BOUND: usize = GC_RECORDS_PER_PASS;
+pub(crate) const INVENTORY_BOUND: usize = GC_RECORDS_PER_PASS;
 /// T14 rebuilds one pass allows before the store is disabled: more than
 /// `max(T14_BREAKER, 2% of the records loaded)`.
 pub(crate) const T14_BREAKER: u64 = 20;
@@ -1090,9 +1090,9 @@ impl DurableTailStore {
     }
     pub(crate) fn receipt_pending(&self, key: &Digest32) -> bool {
         self.pending.get(key).is_some_and(|pending| {
-            pending
-                .completed
-                .is_none_or(|stamp| stamp_at(&self.record_path(key)).ok() != Some(Some(stamp)))
+            pending.completed.map_or(true, |stamp| {
+                stamp_at(&self.record_path(key)).ok() != Some(Some(stamp))
+            })
         })
     }
 
@@ -1874,7 +1874,7 @@ impl DurableTailStore {
                 .to_str()
                 .and_then(|name| name.strip_suffix(RECORD_SUFFIX))
                 .and_then(parse_hex_digest)
-                .filter(|key| after.is_none_or(|after| *key > after))
+                .filter(|key| after.map_or(true, |after| *key > after))
             {
                 keys.insert(key);
                 if keys.len() > GC_RECORDS_PER_PASS {

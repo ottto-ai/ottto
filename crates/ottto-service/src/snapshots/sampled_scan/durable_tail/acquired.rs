@@ -19,7 +19,7 @@ impl ImmutableCounting {
     pub(crate) fn from_reduction(reduction: &CachedJsonlReduction) -> Result<Self, store::Refusal> {
         Self::canonical(reduction.source(), reduction.durable_counting())
     }
-    pub(crate) fn from_accumulator(
+    pub(in crate::snapshots) fn from_accumulator(
         accumulator: &SnapshotAccumulator,
     ) -> Result<Self, store::Refusal> {
         Self::canonical(accumulator.source, accumulator.durable_counting())
