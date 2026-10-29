@@ -916,6 +916,11 @@ impl super::ScanIndex {
         work: &mut HeaderWork,
     ) -> super::Result<(ValidatedHeader, usize)> {
         use super::*;
+        // Cached ownership evidence cannot grant acquisition permission.
+        if !work.allowed {
+            codex_zst_refused(CodexZstCause::AdmissionRefused);
+            anyhow::bail!("archive inventory power/QoS gate");
+        }
         let file = open_candidate_beneath_root(candidate)?;
         let key = local_index_key(&candidate.path);
         let old = self
@@ -932,7 +937,7 @@ impl super::ScanIndex {
             codex_zst_refused(CodexZstCause::HeaderInvalid);
             anyhow::bail!("archive header unavailable without another read");
         }
-        if !work.allowed || work.cpu_micros >= 30_000_000 {
+        if work.cpu_micros >= 30_000_000 {
             codex_zst_refused(CodexZstCause::AdmissionRefused);
             anyhow::bail!("archive inventory power/QoS/CPU gate");
         }

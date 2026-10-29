@@ -780,3 +780,330 @@ fn unreadable_segment_holds_its_filename_owner_but_not_unrelated_plain() {
         "unresolved segment cannot certify a partial singleton body"
     );
 }
+
+#[test]
+fn retained_archive_queue_and_roster_obey_discovery_off_after_restart() {
+    for disposition in [
+        Some(ArchiveDisposition::HeaderValidated),
+        Some(ArchiveDisposition::Pending {
+            attempts: 1,
+            retry_after: 0,
+        }),
+        None,
+    ] {
+        let bytes = synthetic_rollout();
+        let f = ArchiveFixture::new(&zstd::stream::encode_all(&bytes[..], 1).unwrap());
+        let root = f.0.parent().unwrap().to_owned();
+        let roots = [root.clone()];
+        let plain = root.join("rollout-retained-plain-sibling.jsonl");
+        fs::write(
+            &plain,
+            String::from_utf8(bytes.clone())
+                .unwrap()
+                .replace("compressed-fixture", "retained-plain-sibling"),
+        )
+        .unwrap();
+        // Keep state writes outside the witnessed directory's entries.
+        let related = root.join("rollout-compressed-fixture.jsonl");
+        fs::write(&related, &bytes).unwrap();
+        let accepted = "a".repeat(64); // production accepted-ledger decoder requires 64 hex
+        let state_dir = root.join("state");
+        fs::create_dir(&state_dir).unwrap();
+        let saved_path = state_dir.join("index.json");
+        let reservation_path = state_dir.join("reservation.json");
+        let key = local_index_key(&f.0);
+        let has_evidence = disposition.is_some();
+        let mut index = ScanIndex::default();
+        if let Some(disposition) = disposition {
+            let mut archive =
+                ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, None).unwrap();
+            archive.header_validated =
+                ValidatedHeader::from_bytes(bytes.split_inclusive(|b| *b == b'\n').next().unwrap());
+            archive.header_attempted = true;
+            archive.disposition = disposition;
+            index.files.insert(
+                key.clone(),
+                ScanIndexEntry {
+                    source_file_fingerprint: "historical-file".into(),
+                    last_snapshot_fingerprint: Some(accepted.clone()),
+                    last_upload_body_witness: Some("historical-body".into()),
+                    archive: Some(Box::new(archive)),
+                    ..Default::default()
+                },
+            );
+            index
+                .file_snapshot_fingerprints
+                .insert(key.clone(), BTreeSet::from([accepted.clone()]));
+            index
+                .accepted_snapshot_fingerprints
+                .insert(accepted.clone());
+        }
+        ensure_bounded_traversal(
+            SnapshotSource::Codex,
+            &roots,
+            &mut index,
+            NOW,
+            BACKFILL_WINDOW_DAYS,
+        );
+        let traversal = index.traversal.as_mut().unwrap();
+        traversal.pending_directories.clear();
+        traversal.pending_candidates = [f.0.clone(), plain.clone(), related.clone()]
+            .into_iter()
+            .map(|path| ScanTraversalPath {
+                scan_root: root.clone(),
+                path,
+                census_member: true,
+                watcher_hint: false,
+            })
+            .collect();
+        traversal.codex_rollout_paths = BTreeSet::from([
+            key.clone(),
+            local_index_key(&plain),
+            local_index_key(&related),
+        ]);
+        let mut directories = codex_file_join::DirectoryCensus::new();
+        directories.observe(&root, &fs::metadata(&root).unwrap());
+        traversal.codex_join_directory_census = Some(directories);
+        index.save(&saved_path).unwrap();
+        let (restored, origin) =
+            ScanIndex::load_inner(&saved_path, Some(SnapshotSource::Codex)).unwrap();
+        assert!(matches!(origin, LoadOrigin::Loaded(_)));
+        let traversal = restored.traversal.as_ref().unwrap();
+        assert!(traversal.pending_candidates.iter().any(|p| p.path == f.0));
+        assert!(traversal.codex_rollout_paths.contains(&key));
+        assert_eq!(
+            traversal.context_fingerprint,
+            scan_traversal_context_fingerprint(
+                SnapshotSource::Codex,
+                &roots,
+                &restored,
+                BACKFILL_WINDOW_DAYS
+            )
+        );
+        assert!(
+            traversal
+                .codex_join_directory_census
+                .as_ref()
+                .unwrap()
+                .moved_directories()
+                .is_empty(),
+            "restart must exercise the unchanged retained roster"
+        );
+        if has_evidence {
+            assert!(archive_evidence(&restored, &f).matches(&File::open(&f.0).unwrap()));
+            assert!(restored.archive_header(&f.0).is_some());
+            assert!(
+                restored.accepted_snapshot_fingerprints.contains(&accepted),
+                "seed must survive the real accepted-ledger decoder"
+            );
+        } else {
+            assert!(
+                !restored.files.contains_key(&key),
+                "no pre-inventory evidence entry"
+            );
+        }
+        let entry_before = restored
+            .files
+            .get(&key)
+            .map(|entry| serde_json::to_value(entry).unwrap());
+        let incidence_before = restored.file_snapshot_fingerprints.get(&key).cloned();
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let mut committed = restored.clone();
+        let constructions = super::super::codex_zst_refusal_tests::decoder_construction_count();
+        let ((index, results), rows) = crate::local_resource_diagnostics::capture(|| {
+            let mut index = restored;
+            let mut results = Vec::new();
+            for page in 0..3 {
+                let mut scan = OwnedSourceScan::new(
+                    SnapshotSource::Codex,
+                    &roots,
+                    index,
+                    NOW,
+                    BACKFILL_WINDOW_DAYS,
+                    if page == 0 { 1 } else { 10 },
+                    false,
+                    None,
+                    &[],
+                    false,
+                    true,
+                )
+                .with_sampled_acquisition(cache.clone(), Scope("retained-discovery-off".into()));
+                assert!(scan
+                    .index
+                    .traversal
+                    .as_ref()
+                    .unwrap()
+                    .codex_rollout_paths
+                    .iter()
+                    .all(|key| transcript_path_admitted(Path::new(key))));
+                assert!(scan
+                    .identified_candidates
+                    .iter()
+                    .all(|candidate| candidate.path != f.0));
+                let (next, result) = 'page: {
+                    for _ in 0..1000 {
+                        match scan.step(None) {
+                            OwnedSourceScanStep::Pending(mut next) => {
+                                assert!(next
+                                    .active_file
+                                    .as_ref()
+                                    .is_none_or(|active| active.candidate.path != f.0));
+                                next.persist_archive_reservation(&mut committed, &reservation_path)
+                                    .unwrap();
+                                scan = next;
+                            }
+                            OwnedSourceScanStep::Complete {
+                                mut index,
+                                mut scan,
+                                ..
+                            } => {
+                                finalize_scan_after_policy(
+                                    SnapshotSource::Codex,
+                                    &mut scan,
+                                    &mut index,
+                                );
+                                break 'page (index, scan);
+                            }
+                        }
+                    }
+                    panic!("retained traversal did not complete");
+                };
+                index = next;
+                results.push(result);
+                if page == 0 {
+                    assert!(
+                        index
+                            .traversal
+                            .as_ref()
+                            .unwrap()
+                            .pending_candidates
+                            .iter()
+                            .any(|pending| pending.path == related),
+                        "related plain segment must remain queued across the page restart"
+                    );
+                    assert!(index
+                        .traversal
+                        .as_ref()
+                        .unwrap()
+                        .residue
+                        .index_keys
+                        .contains(&key));
+                }
+                if page == 1 {
+                    // A completed generation must not release retained archive
+                    // custody into a partial plain-only body in the next one.
+                    assert!(
+                        index
+                            .scan_residue_witness
+                            .as_ref()
+                            .unwrap()
+                            .index_keys
+                            .contains(&key),
+                        "path hold must survive a completed generation without an evidence entry"
+                    );
+                    index.traversal = None;
+                }
+                if page < 2 {
+                    index.save(&saved_path).unwrap();
+                    let (restarted, origin) =
+                        ScanIndex::load_inner(&saved_path, Some(SnapshotSource::Codex)).unwrap();
+                    assert!(matches!(origin, LoadOrigin::Loaded(_)));
+                    index = restarted;
+                }
+            }
+            (index, results)
+        });
+        assert_eq!(
+            super::super::codex_zst_refusal_tests::decoder_construction_count(),
+            constructions,
+            "zero decoder constructions"
+        );
+        assert_eq!(decodes(&rows), 0);
+        assert!(
+            !reservation_path.exists(),
+            "zero new persisted reservations"
+        );
+        assert_eq!(
+            committed
+                .files
+                .get(&key)
+                .map(|entry| serde_json::to_value(entry).unwrap()),
+            entry_before
+        );
+        assert_eq!(
+            index
+                .files
+                .get(&key)
+                .map(|entry| serde_json::to_value(entry).unwrap()),
+            entry_before,
+            "entry and archive evidence remain untouched"
+        );
+        assert_eq!(
+            index.file_snapshot_fingerprints.get(&key).cloned(),
+            incidence_before
+        );
+        assert_eq!(
+            index.accepted_snapshot_fingerprints.contains(&accepted),
+            has_evidence
+        );
+        assert!(rows
+            .iter()
+            .any(
+                |row| row["counts"]["archive_terminal_residue"]["CompressedAdmissionRefused"] == 1
+            ));
+        let body_bytes = rows
+            .iter()
+            .map(|row| {
+                row["counts"]["codex_zst_compressed_bytes"]
+                    .as_u64()
+                    .unwrap_or(0)
+            })
+            .sum::<u64>();
+        assert_eq!(body_bytes, 0, "zero archive body bytes");
+        assert_eq!(cache.cursor_reserved(), 0);
+        assert_eq!(
+            results[0].scanned_file_count, 1,
+            "unrelated plain progresses"
+        );
+        assert_eq!(
+            results[1].scanned_file_count, 0,
+            "related plain stays held across the saved page"
+        );
+        assert!(results
+            .iter()
+            .flat_map(|result| &result.snapshots)
+            .any(|snapshot| snapshot.source_session_id == "retained-plain-sibling"));
+        assert!(results
+            .iter()
+            .flat_map(|result| &result.snapshots)
+            .all(|snapshot| snapshot.source_session_id != "compressed-fixture"));
+    }
+}
+
+#[test]
+fn cached_archive_header_does_not_bypass_permission_gate() {
+    let bytes = synthetic_rollout();
+    let f = ArchiveFixture::new(&zstd::stream::encode_all(&bytes[..], 1).unwrap());
+    let key = local_index_key(&f.0);
+    let mut archive = ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, None).unwrap();
+    archive.header_validated =
+        ValidatedHeader::from_bytes(bytes.split_inclusive(|b| *b == b'\n').next().unwrap());
+    archive.disposition = ArchiveDisposition::HeaderValidated;
+    let mut index = ScanIndex::default();
+    index.files.entry(key.clone()).or_default().archive = Some(Box::new(archive));
+    let before = serde_json::to_value(&index.files[&key]).unwrap();
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let mut work = HeaderWork::default();
+    super::super::codex_zst_refusal_tests::assert_refused(CodexZstCause::AdmissionRefused, || {
+        assert!(index
+            .inventory_archive_header(&f.candidate(), Some(&cache), &mut work)
+            .is_err());
+    });
+    assert_eq!(serde_json::to_value(&index.files[&key]).unwrap(), before);
+    assert_eq!((work.physical_bytes, work.decoded_bytes), (0, 0));
+    assert_eq!(cache.cursor_reserved(), 0);
+    assert!(
+        index.archive_header(&f.0).is_some(),
+        "cached metadata remains available"
+    );
+}

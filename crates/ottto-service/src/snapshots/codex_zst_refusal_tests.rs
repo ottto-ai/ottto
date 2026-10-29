@@ -6,6 +6,10 @@ use codex_compressed_input::{compressed_input_credit, is_compressed_codex_rollou
 thread_local! {
     static ACTIVITY: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
 }
+pub(super) fn decoder_construction_count() -> usize {
+    ACTIVITY.with(|counts| counts.get().0)
+}
+
 pub(super) fn decoder_constructed() {
     ACTIVITY.with(|counts| {
         let (d, p) = counts.get();

@@ -26206,8 +26206,79 @@ impl OwnedSourceScan {
             index.record_started_claude_request_identity_contract(claude_request_identity_capture);
         }
         let next_generation_hints;
+        let mut admission_holds = BTreeSet::new();
         {
             let traversal = index.traversal.as_mut().expect("traversal initialized");
+            if source == SnapshotSource::Codex {
+                if progress == TraversalProgress::Started {
+                    // A completed traversal does not retire archive custody.
+                    // Path-only holds also survive before any header/evidence
+                    // entry exists; use the existing durable residue witness.
+                    admission_holds.extend(
+                        index
+                            .scan_residue_witness
+                            .iter()
+                            .flat_map(|w| &w.index_keys)
+                            .filter(|key| {
+                                let path = Path::new(key);
+                                is_compressed_codex_rollout(Some(path), None)
+                                    && !transcript_path_admitted(path)
+                                    && traversal
+                                        .scan_roots
+                                        .iter()
+                                        .any(|root| path.starts_with(root))
+                            })
+                            .map(PathBuf::from),
+                    );
+                    admission_holds.extend(
+                        index
+                            .files
+                            .iter()
+                            .filter(|(key, entry)| {
+                                let path = Path::new(key);
+                                entry.archive.is_some()
+                                    && is_compressed_codex_rollout(Some(path), None)
+                                    && !transcript_path_admitted(path)
+                                    && traversal
+                                        .scan_roots
+                                        .iter()
+                                        .any(|root| path.starts_with(root))
+                            })
+                            .map(|(key, _)| PathBuf::from(key)),
+                    );
+                }
+                // Reapply archive holds after a saved page removed their queue
+                // and roster membership, before admitting later plain segments.
+                admission_holds.extend(
+                    traversal
+                        .residue
+                        .index_keys
+                        .iter()
+                        .filter(|key| {
+                            let path = Path::new(key);
+                            is_compressed_codex_rollout(Some(path), None)
+                                && !transcript_path_admitted(path)
+                        })
+                        .map(PathBuf::from),
+                );
+                // Persisted work has no authority to widen current discovery.
+                // Drop only queue/roster membership; retain entry custody and
+                // disclose excluded archives as scoped holds below.
+                traversal.pending_candidates.retain(|pending| {
+                    let admitted = transcript_path_admitted(&pending.path);
+                    if !admitted {
+                        admission_holds.insert(pending.path.clone());
+                    }
+                    admitted
+                });
+                traversal.codex_rollout_paths.retain(|key| {
+                    let admitted = transcript_path_admitted(Path::new(key));
+                    if !admitted {
+                        admission_holds.insert(PathBuf::from(key));
+                    }
+                    admitted
+                });
+            }
             refresh_retained_codex_roster(source, traversal, backfill_window_days, &index.files);
             next_generation_hints =
                 enqueue_watcher_hints(source, traversal, hinted_paths, watcher_overflowed);
@@ -26481,6 +26552,15 @@ impl OwnedSourceScan {
             causes,
             ..ScanCensus::default()
         };
+        for path in admission_holds {
+            if is_compressed_codex_rollout(Some(&path), None) {
+                let archive = index
+                    .files
+                    .get(&local_index_key(&path))
+                    .and_then(|e| e.archive.as_deref());
+                census.archive_residue(&path, archive, CodexZstCause::AdmissionRefused);
+            }
+        }
         let codex_selected_flags = if source == SnapshotSource::Codex {
             pending_paths
                 .iter()
@@ -26748,6 +26828,12 @@ impl OwnedSourceScan {
                     &traversal.codex_rollout_paths,
                     traversal.codex_join_directory_census.as_ref(),
                 );
+                // Excluding an archive must not certify a partial plain
+                // singleton for that archive's owner. Keep the existing scoped
+                // owner hold while allowing unrelated sessions to progress.
+                inventory
+                    .held_owners
+                    .extend(census.archive_terminal_sessions.iter().cloned());
                 inventory.complete &= traversal.pending_directories.is_empty();
                 inventory
             });
@@ -41820,6 +41906,12 @@ fn codex_fresh_data_pending(
     })
 }
 
+// Shared by fresh discovery and retained work. Archive activation must change
+// this admission boundary before persisted archive paths may be selected.
+fn transcript_path_admitted(path: &Path) -> bool {
+    path.extension().and_then(|value| value.to_str()) == Some("jsonl")
+}
+
 /// Returns how many Codex hints re-entered as next-generation evidence.
 fn enqueue_watcher_hints(
     source: SnapshotSource,
@@ -41841,7 +41933,7 @@ fn enqueue_watcher_hints(
         .map(|(position, candidate)| (candidate.path.clone(), position))
         .collect::<BTreeMap<_, _>>();
     for path in hinted_paths.iter().take(MAX_BACKFILL_FILES_PER_SOURCE) {
-        if path.extension().and_then(|value| value.to_str()) != Some("jsonl")
+        if !transcript_path_admitted(path)
             || (source == SnapshotSource::ClaudeCode
                 && claude_transcript_excluded_from_snapshots(path))
         {
@@ -41975,9 +42067,7 @@ fn refresh_retained_codex_roster(
                 }
                 continue;
             }
-            if !file_type.is_file()
-                || path.extension().and_then(|value| value.to_str()) != Some("jsonl")
-            {
+            if !file_type.is_file() || !transcript_path_admitted(&path) {
                 continue;
             }
             let key = local_index_key(&path);
@@ -42305,9 +42395,7 @@ fn advance_bounded_directory_traversal_with_budget(
                 });
                 continue;
             }
-            if !file_type.is_file()
-                || path.extension().and_then(|value| value.to_str()) != Some("jsonl")
-            {
+            if !file_type.is_file() || !transcript_path_admitted(&path) {
                 continue;
             }
             if source == SnapshotSource::ClaudeCode
@@ -50616,7 +50704,7 @@ fn sha256_hex_owned(parts: &[String]) -> String {
 pub fn paths_from_events(paths: impl IntoIterator<Item = PathBuf>) -> BTreeSet<PathBuf> {
     paths
         .into_iter()
-        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("jsonl"))
+        .filter(|path| transcript_path_admitted(path))
         .collect()
 }
 
