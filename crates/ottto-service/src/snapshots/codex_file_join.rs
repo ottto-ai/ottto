@@ -767,11 +767,13 @@ impl HeaderInventory {
         );
         // One extra probe detects debt; never truncate and claim complete.
         let remaining = iter.next().is_some();
-        self.complete = index.archive_pass.prep_after.is_none()
-            && !remaining
-            && self.directories.stable
-            && !self.decode_unknown;
-        self.bounded_out = !self.complete;
+        let roster_complete =
+            index.archive_pass.prep_after.is_none() && !remaining && self.directories.stable;
+        // Unknown owner evidence needs an ordinary refused-header witness,
+        // not the bound-exhaustion path that intentionally checkpoints none.
+        // Conversely F3 cannot erase an actual raw-scratch refusal.
+        self.bounded_out |= !roster_complete;
+        self.complete = roster_complete && !self.decode_unknown && !self.bounded_out;
         if remaining {
             last
         } else {
@@ -5521,6 +5523,18 @@ pub(in crate::snapshots) mod header_cache_tests {
                 );
             }
             assert_eq!(inv.complete, control == "same");
+            assert!(
+                !inv.bounded_out,
+                "unknown is not population/resource exhaustion"
+            );
+            let mut bound = HeaderInventory::new(&inv.roots, &paths, Some(&census));
+            bound.feed_peak = crate::source_rotation::PARKED_BUDGET / 2;
+            while !bound.prepare_feed_custody(&index) {}
+            bound.retain_cached_archives(&index, &paths);
+            assert!(
+                bound.bounded_out && !bound.complete,
+                "F3 preserves actual raw-scratch refusal"
+            );
             assert_eq!(
                 rows.iter()
                     .filter(|r| r["stage"] == "codex_archive_unknown_owner_hold")
