@@ -478,3 +478,35 @@ fn parked_metadata_error_keeps_discovery_incomplete_until_the_file_is_retried() 
     }
     assert_settled(&home, &server, TARGET);
 }
+
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn directory_replacement_after_metadata_refusal_discovers_new_file_without_a_hint() {
+    const TARGET: &str = "c3333333-3333-4333-8333-333333333333";
+    let server = AckScriptedServer::new();
+    let mut home = AckFinishHome::new(&server);
+    seed_deferred(&home, true);
+    let (p, i, s) = prepare(&mut home);
+    home.finish(p, i, s).unwrap();
+    for n in 0..2050 { std::fs::write(project(&home).join(format!("replace-{n:04}.txt")), "").unwrap(); }
+    let (p, i, s) = prepare(&mut home);
+    home.finish(p, i, s).unwrap();
+    let value = serde_json::to_value(saved(&home)).unwrap();
+    let cursor = value["traversal"]["reconciliation_after"].as_str().unwrap().strip_prefix("\0parked_rewalk:").unwrap();
+    let (offset, _): (u64, Option<String>) = serde_json::from_str(cursor).unwrap();
+    assert!(offset > 0);
+    let refused = std::fs::read_dir(project(&home)).unwrap().nth(offset as usize + 10).unwrap().unwrap().path();
+    crate::snapshots::refuse_parked_metadata_once_for_test(refused);
+    let (p, i, s) = prepare(&mut home);
+    assert!(!s.census_complete);
+    home.finish(p, i, s).unwrap();
+    std::fs::rename(project(&home), home.fixture.base.join("retired-project")).unwrap();
+    std::fs::create_dir_all(project(&home)).unwrap();
+    write_target(&home, TARGET);
+    for _ in 0..4 {
+        let (p, i, s) = prepare(&mut home);
+        home.finish(p, i, s).unwrap();
+    }
+    assert_settled(&home, &server, TARGET);
+}

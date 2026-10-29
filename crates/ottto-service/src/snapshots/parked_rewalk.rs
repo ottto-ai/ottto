@@ -59,7 +59,7 @@ fn recover_parked_claude_metadata(index: &mut ScanIndex, overflowed: bool) {
     }
     let key = format!("{}:{}", traversal.context_fingerprint, traversal.census_window_end);
     #[cfg(test)]
-    let key = format!("{key}:{}", PARKED_REWALK_TEST_EPOCH.load(std::sync::atomic::Ordering::Relaxed));
+    let key = format!("{key}:{}", PARKED_REWALK_TEST_EPOCH.with(std::cell::Cell::get));
     let mut readers = READERS.get_or_init(Default::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if !readers.contains_key(&key) && readers.len() >= 64 {
         // Only cached iterators/cadence are evicted; durable directory/offset
@@ -79,6 +79,14 @@ fn recover_parked_claude_metadata(index: &mut ScanIndex, overflowed: bool) {
         state.reader = None;
         traversal.watcher_hint_seen = false; // this sweep covers the triggering loss
     }
+    if active && state.path.as_os_str().is_empty() {
+        // After process restart/eviction no saved directory identity exists.
+        // Replay this directory's metadata, then one full metadata sweep before
+        // terminal credit. No native bytes, traversal reset or persisted field.
+        let (_, after) = parked_rewalk_position(traversal);
+        parked_rewalk_set_position(traversal, 0, &after);
+        traversal.watcher_hint_seen = true;
+    }
     let (_, reconciliation_after) = parked_rewalk_position(traversal);
     let mut dirs = usize::from(state.reader.is_some());
     let mut new_files = 0;
@@ -86,7 +94,7 @@ fn recover_parked_claude_metadata(index: &mut ScanIndex, overflowed: bool) {
     while dirs < PARKED_REWALK_DIRS && entries < PARKED_REWALK_ENTRIES {
         let Some(directory) = traversal.pending_directories.front().cloned() else { break; };
         let (mut offset, _) = parked_rewalk_position(traversal);
-        if state.reader.is_some() && state.path == directory.path {
+        if state.identity.is_some() && state.path == directory.path {
             let identity = fs::symlink_metadata(&directory.path).ok().as_ref().and_then(parked_directory_identity);
             if identity != state.identity {
                 // A replacement owes this directory from its beginning, with
@@ -212,10 +220,12 @@ fn recover_parked_claude_metadata(index: &mut ScanIndex, overflowed: bool) {
 pub(crate) fn forget_parked_rewalk_process_for_test() {
     // The fixture simulates a process restart by changing the traversal's
     // context-independent window key via this epoch; production uses zero.
-    PARKED_REWALK_TEST_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    PARKED_REWALK_TEST_EPOCH.with(|epoch| epoch.set(epoch.get().wrapping_add(1)));
 }
 #[cfg(test)]
-static PARKED_REWALK_TEST_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+thread_local! {
+    static PARKED_REWALK_TEST_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 #[cfg(test)]
 thread_local! {
@@ -225,11 +235,14 @@ thread_local! {
 }
 #[cfg(test)]
 pub(crate) fn with_parked_page_limit_for_test<T>(limit: usize, run: impl FnOnce() -> T) -> T {
-    let old = PARKED_PAGE_LIMIT.with(|value| value.replace(Some(limit)));
-    let result = run();
-    PARKED_PAGE_LIMIT.with(|value| value.set(old));
-    result
+    struct Reset(Option<usize>);
+    impl Drop for Reset {
+        fn drop(&mut self) { PARKED_PAGE_LIMIT.with(|value| value.set(self.0)); }
+    }
+    let _reset = Reset(PARKED_PAGE_LIMIT.with(|value| value.replace(Some(limit))));
+    run()
 }
+
 #[cfg(test)]
 pub(crate) fn parked_native_opens_for_test() -> Vec<PathBuf> {
     PARKED_NATIVE_OPENS.with(|value| std::mem::take(&mut *value.borrow_mut()))

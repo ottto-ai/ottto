@@ -93,7 +93,9 @@ prefix rather than resetting it. Cached iterators rebind to the durable cursor
 after failed checkpoints; changed directory identity restarts only that directory.
 Unreadable entries retain their position and keep discovery incomplete. The prefix sorts
 before absolute file keys for conservative old-reader reconciliation. No new
-persisted field. Restart rehydrates an iterator offset in bounded chunks; inserts
+persisted field. A known-identity retry rehydrates its iterator offset in bounded chunks. A
+process restart with unknown directory identity conservatively replays the current
+directory and owes a full metadata sweep before terminal credit; inserts
 before an offset are revisited by the next periodic sweep. The metadata iterator
 cache holds at most 64 process-local contexts. Discovery adds no ownership proof.
 
@@ -119,3 +121,8 @@ Removal revalidation preserves the original reason: live activity-window
 exclusions re-check the age/audit predicate; actual disappearances re-check
 NotFound and the parent fence. A present, newly changed file is requeued rather
 than erased or treated as absent.
+
+Directory identity is rechecked even after an iterator was discarded for error
+retry. A replacement restarts that directory's metadata at zero rather than
+applying the removed directory's offset to unknown files. Test-only restart epochs
+are thread-isolated and page-limit overrides unwind safely.
