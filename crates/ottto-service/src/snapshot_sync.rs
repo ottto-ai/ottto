@@ -746,6 +746,7 @@ impl LocalHoldSettlement {
                 scan_result.completed_parses(),
                 &disposition.account_deferred_tokens(&scan_result.snapshots),
             );
+        scan_result.remember_withheld_content(index);
         let progress_blocking_held_fingerprints = disposition.progress_blocking_held_fingerprints(
             &scan_result.snapshots,
             index,
@@ -783,6 +784,37 @@ impl LocalHoldSettlement {
 struct UploadIndexSettlement {
     index: ScanIndex,
     fully_settled: bool,
+}
+
+#[cfg(test)]
+pub(crate) fn settle_withheld_for_test(
+    previous: &ScanIndex,
+    mut index: ScanIndex,
+    mut scan: crate::snapshots::SourceScanResult,
+) -> ScanIndex {
+    let mut disposition = crate::snapshots::ClaudeUsageAuthorityDisposition::default();
+    disposition.defer_sessions(
+        scan.snapshots
+            .iter()
+            .map(|item| item.source_session_id.clone())
+            .collect(),
+    );
+    let holds = LocalHoldSettlement::classify(
+        SnapshotSource::ClaudeCode,
+        &mut index,
+        &mut scan,
+        &disposition,
+    );
+    let progress = SnapshotUploadProgress::new(
+        "withheld-fixture".into(),
+        crate::snapshots::snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+    );
+    settle_completed_upload(index, previous, &progress, &holds).index
+}
+
+#[cfg(test)]
+pub(crate) fn withheld_settled_for_test(index: &ScanIndex) -> bool {
+    upload_settled_without_account_holds(index, true)
 }
 
 /// A persisted account hold was never uploaded, so the backfill and replay it
@@ -4640,33 +4672,45 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
         self.started.elapsed()
     }
     fn retained_bound(&self, limit: usize) -> Option<usize> {
-        let versions = crate::heap_layout_bound::bound(&self.daemon.codex_versions, limit)?;
-        let native = if crate::snapshots::claude_native_comparison::enabled() {
-            self.daemon
-                .native_comparison
-                .retained_bound(limit.checked_sub(versions)?)?
-        } else {
-            0
-        };
-        let owned = versions.checked_add(native)?;
-        let continuation = continuation::retained_bound(limit.checked_sub(owned)?)?;
-        let charged = owned.checked_add(continuation)?;
-        // E3: the withheld-account re-parse memo (RAM only, <= 4,096 entries).
-        let withheld =
-            crate::snapshots::withheld_account::retained_bound(limit.checked_sub(charged)?)?;
-        charged.checked_add(withheld)
+        retained_with_withheld(limit, |limit| {
+            let versions = crate::heap_layout_bound::bound(&self.daemon.codex_versions, limit)?;
+            let native = if crate::snapshots::claude_native_comparison::enabled() {
+                self.daemon
+                    .native_comparison
+                    .retained_bound(limit.checked_sub(versions)?)?
+            } else {
+                0
+            };
+            let owned = versions.checked_add(native)?;
+            let continuation = continuation::retained_bound(limit.checked_sub(owned)?)?;
+            owned.checked_add(continuation)
+        })
+    }
+    fn retained_budget_unavailable(&mut self) {
+        crate::snapshots::withheld_account::discard_retained();
+        self.discard_retained();
     }
     fn discard_retained(&mut self) {
         if crate::snapshots::claude_native_comparison::enabled() {
             self.daemon.native_comparison.discard_retained();
         }
         continuation::discard_retained();
-        crate::snapshots::withheld_account::discard_retained();
+        crate::snapshots::withheld_account::discard_if_refused();
     }
     fn boundary(&mut self, busy: impl Iterator<Item = SnapshotSource>) {
         self.retry
             .boundary(busy, self.home, self.support_dir, self.daemon);
     }
+}
+
+// The portable advisory graph is charged before any layout-dependent graph.
+// A refusal of another graph must not erase this already admitted witness.
+pub(crate) fn retained_with_withheld(
+    limit: usize,
+    other: impl FnOnce(usize) -> Option<usize>,
+) -> Option<usize> {
+    let withheld = crate::snapshots::withheld_account::retained_bound(limit)?;
+    other(limit.checked_sub(withheld)?)?.checked_add(withheld)
 }
 
 pub fn upload_local_health_projection_now(daemon: &LocalDaemon) -> Result<()> {

@@ -1611,6 +1611,26 @@ fn grown_indexed_file_is_read_after_sleep_then_ages_after_commit() {
         caught_up.files[&key].size_bytes, length,
         "new committed size catches up"
     );
+    // TODO #882: move this row to money_oracle::assert_equivalent once the
+    // shared oracle is in our base. Compare the entire current body now.
+    let (_, cold, _) = finish(OwnedSourceScan::new(
+        SnapshotSource::ClaudeCode,
+        &[root.projects()],
+        ScanIndex::default(),
+        &days_from_now(8),
+        730,
+        10,
+        false,
+        None,
+        &[],
+        false,
+        true,
+    ));
+    assert_eq!(
+        serde_json::to_value(&result.snapshots).unwrap(),
+        serde_json::to_value(&cold.snapshots).unwrap(),
+        "aged growth == cold Full body"
+    );
     let fingerprint = caught_up.files[&key].source_file_fingerprint.clone();
     assert_eq!(
         caught_up.files[&key].has_unverified_source(),
@@ -1857,8 +1877,8 @@ fn withheld_account_growth_is_read_after_idling_past_the_window() {
 }
 
 /// Option C (Lead A, round 2) and fixture (c): within a process a held key
-/// whose stamp and account evidence are unchanged is skipped with zero
-/// bytes over many passes. It re-parses exactly once after an account
+/// whose content stamp and account evidence are unchanged has no parse or
+/// line delivery over many passes (bounded identity samples remain). It re-parses exactly once after an account
 /// evidence change, at most once after a restart, and as a Tail on growth;
 /// each re-parse is counted by trigger.
 #[test]
@@ -1908,13 +1928,21 @@ fn withheld_account_reparses_only_on_start_evidence_or_growth() {
     };
     // The resolver withholds the parse, as ScanSettlement records it; only the
     // hold commits, so the key keeps its committed revision.
-    let withhold = |committed: &mut ScanIndex, mut parsed: ScanIndex, result: &SourceScanResult| {
-        let deferred = (parsed.file_snapshot_fingerprints[&key].iter())
-            .map(|fingerprint| (fingerprint.clone(), 0))
-            .collect();
-        assert!(parsed.record_claude_account_deferred_holds(result.completed_parses(), &deferred));
-        assert!(parsed.claude_account_deferred_holds.contains_key(&key));
-        committed.claude_account_deferred_holds = parsed.claude_account_deferred_holds;
+    let checkpoint = root.0.join("held-index.json");
+    let withhold = |committed: &mut ScanIndex, parsed: ScanIndex, result: &SourceScanResult| {
+        // Exercise classify -> Completed settlement -> durable save/reload;
+        // copying the hold map misses the real fingerprint restore seam.
+        *committed =
+            crate::snapshot_sync::settle_withheld_for_test(committed, parsed, result.clone());
+        assert!(committed.claude_account_deferred_holds.contains_key(&key));
+        assert!(!committed.files[&key].source_file_fingerprint.is_empty());
+        committed.save(&checkpoint).unwrap();
+        *committed = ScanIndex::load(&checkpoint).unwrap();
+    };
+    let touch = || {
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_times(fs::FileTimes::new().set_modified(SystemTime::now()))
+            .unwrap();
     };
     let reparses = || {
         let [_, reparses, _] = take_withheld_for_test();
@@ -1929,12 +1957,13 @@ fn withheld_account_reparses_only_on_start_evidence_or_growth() {
     assert_eq!(reads.len(), 1);
     withhold(&mut committed, parsed, &result);
     assert_eq!(reparses(), BTreeMap::new(), "a new hold is no re-parse");
+    touch(); // Before the very first memo lookup: completion must store content.
 
     // Before round 2 every pass re-read the key (TranscriptChanged against
     // its old committed revision).
     for pass in 0..3 {
         let (_, _, reads) = page(committed.clone(), &cache);
-        assert_eq!(reads, Vec::new(), "unchanged pass {pass}: Skip, zero bytes");
+        assert_eq!(reads, Vec::new(), "unchanged pass {pass}: Skip, no parse");
     }
     assert_eq!(reparses(), BTreeMap::new());
 
@@ -1962,6 +1991,7 @@ fn withheld_account_reparses_only_on_start_evidence_or_growth() {
     assert_eq!(reads.len(), 1, "one re-parse on an evidence change");
     withhold(&mut committed, parsed, &result);
     assert_eq!(reparses(), BTreeMap::from([("evidence", 1)]));
+    touch();
     assert_eq!(page(committed.clone(), &cache).2, Vec::new());
 
     // A restart: an empty process memo and RAM cache.
@@ -1982,10 +2012,11 @@ fn withheld_account_reparses_only_on_start_evidence_or_growth() {
     );
     withhold(&mut committed, parsed, &result);
     assert_eq!(reparses(), BTreeMap::from([("growth", 1)]));
+    touch();
     assert_eq!(page(committed.clone(), &cache).2, Vec::new());
 
     // SOURCE condition 1: a metadata-only touch (mtime and ctime move, the
-    // content does not) reads zero bytes, aged past the window or recent.
+    // content does not) has no parse, aged past the window or recent.
     let touch = |modified: SystemTime| {
         let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
         file.set_times(fs::FileTimes::new().set_modified(modified))
@@ -2560,4 +2591,272 @@ fn codex_live_observer_skips_an_actual_overlong_row_before_terminal_usage() {
         "777 must not terminate the live observer"
     );
     assert_eq!(metric(&feed, "codex_prelude_gap_dropped"), 0);
+}
+
+/// Real Completed account settlement carries Tail audit debt onto the committed
+/// subset. Only positively proven deletion may retire both obligations.
+#[test]
+fn completed_withheld_sampled_deletion_releases_debt_with_and_without_hint() {
+    use crate::local_resource_diagnostics::take_withheld_for_test;
+    for hinted in [false, true] {
+        let root = Root::new(if hinted {
+            "ld-deleted-hint"
+        } else {
+            "ld-deleted-census"
+        });
+        let path = root.file(SESSION);
+        let key = local_index_key(&path);
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let page = |index: ScanIndex, hints: &[PathBuf]| {
+            let recorder = Recorder::default();
+            let ((index, scan, _), counts) = capture(|| {
+                finish(
+                    OwnedSourceScan::new(
+                        SnapshotSource::ClaudeCode,
+                        &[root.projects()],
+                        index,
+                        &days_from_now(0),
+                        7,
+                        10,
+                        false,
+                        None,
+                        hints,
+                        false,
+                        true,
+                    )
+                    .with_sampled_acquisition(
+                        cache.clone(),
+                        crate::transcript_acquisition::Scope("deleted-held".into()),
+                    )
+                    .with_line_observer("test", Box::new(recorder.clone())),
+                )
+            });
+            (index, scan, recorder, page_counts(&counts))
+        };
+        append(&path, &assistant_line("u1"));
+        let (previous, _, _, _) = page(ScanIndex::default(), &[]);
+        append(&path, &assistant_line("u2"));
+        let (parsed, scan, recorder, _) = page(previous.clone(), &[]);
+        let modes: Vec<_> = recorder
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::Begin(v) => Some(v.mode),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(modes, vec![held_growth_mode()]);
+        let mut held = crate::snapshot_sync::settle_withheld_for_test(&previous, parsed, scan);
+        assert!(held.claude_account_deferred_holds.contains_key(&key));
+        // Linux refuses the native cache layout; still exercise the same audit
+        // obligation in CI without pretending it performed a Tail there.
+        if !held.files[&key].has_unverified_source() {
+            let fp = held.files[&key].source_file_fingerprint.clone();
+            assert!(held.stage_sampled_audit(
+                &key,
+                &fp,
+                crate::transcript_acquisition::AuditDebt {
+                    due_unix_seconds: 1
+                }
+            ));
+        }
+        assert!(!crate::snapshot_sync::withheld_settled_for_test(&held));
+        let known_tokens = serde_json::to_value(withheld_account::held_gauge().unwrap()).unwrap()
+            ["withheld_held_tokens"]
+            .as_u64()
+            .unwrap();
+        assert!(known_tokens > 0);
+        take_withheld_for_test();
+        fs::remove_file(&path).unwrap();
+        let hints = if hinted {
+            vec![path.clone()]
+        } else {
+            Vec::new()
+        };
+        let (removed, scan, recorder, counts) = page(held, &hints);
+        assert!(
+            recorder.events().is_empty(),
+            "removal never acquires a transcript"
+        );
+        assert_eq!(scan.scanned_file_count, 0);
+        assert!(!removed.files.contains_key(&key));
+        assert!(!removed.claude_account_deferred_holds.contains_key(&key));
+        assert!(crate::snapshot_sync::withheld_settled_for_test(&removed));
+        assert_eq!(counts["withheld_hold_released"]["deleted"], 1);
+        assert_eq!(
+            counts["withheld_hold_released"]["deleted_tokens"],
+            known_tokens
+        );
+        assert_eq!(counts["audit_retired_absent"]["events"], 1);
+        assert!(
+            withheld_account::held_gauge().is_none(),
+            "no gauge membership remains"
+        );
+        append(&path, &assistant_line("new-object"));
+        let (_, scan, recorder, _) = page(removed, &[]);
+        assert_eq!(scan.scanned_file_count, 1, "recreation is A1 FirstRead");
+        assert!(recorder
+            .events()
+            .iter()
+            .any(|e| matches!(e, Event::Begin(v) if v.mode == DeliveryMode::Full)));
+    }
+}
+
+#[test]
+fn withheld_missing_parent_keeps_account_and_audit_debt() {
+    let root = Root::new("ld-missing-parent-held");
+    let parent = root.projects().join("missing");
+    fs::create_dir(&parent).unwrap();
+    let path = parent.join(format!("{SESSION}.jsonl"));
+    let key = local_index_key(&path);
+    append(&path, &assistant_line("u1"));
+    let (previous, _, _) = finish(new_scan(&root.projects(), ScanIndex::default()));
+    append(&path, &assistant_line("u2"));
+    let (parsed, scan, _) = finish(new_scan(&root.projects(), previous.clone()));
+    let mut held = crate::snapshot_sync::settle_withheld_for_test(&previous, parsed, scan);
+    let fp = held.files[&key].source_file_fingerprint.clone();
+    assert!(held.stage_sampled_audit(
+        &key,
+        &fp,
+        crate::transcript_acquisition::AuditDebt {
+            due_unix_seconds: 1
+        }
+    ));
+    fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    assert!(!sampled_audit::proven_absent(&path, &[root.projects()]));
+    let (kept, _, _) = finish(new_scan(&root.projects(), held));
+    assert!(kept.files[&key].has_unverified_source());
+    assert!(kept.claude_account_deferred_holds.contains_key(&key));
+    assert!(!crate::snapshot_sync::withheld_settled_for_test(&kept));
+}
+
+/// Exercise the real rotation admission/discard protocol over multiple cycles.
+/// An opaque sibling graph (as on unsupported Linux layouts) must not discard
+/// this portable, already charged memo. An actual exhausted budget discloses
+/// unavailable details and the durable held population instead of hiding it.
+#[test]
+fn withheld_memo_survives_owner_cycles_and_discloses_budget_refusal() {
+    use crate::source_rotation::{Owner, Step};
+    struct Cycle {
+        index: ScanIndex,
+        root: PathBuf,
+        cache: Arc<sampled_scan::SharedCache>,
+        rows: Vec<Value>,
+        reads: usize,
+    }
+    impl Owner for Cycle {
+        type Source = ();
+        type Frame = ();
+        type Completed = ();
+        fn prepare(&mut self, _: (), _: Option<usize>) -> Result<Option<()>> {
+            Ok(Some(()))
+        }
+        fn validate(&mut self, _: &()) -> Result<()> {
+            Ok(())
+        }
+        fn step(&mut self, _: (), _: Option<usize>) -> Step<(), ()> {
+            let recorder = Recorder::default();
+            let ((index, _, _), counts) = capture(|| {
+                finish(
+                    OwnedSourceScan::new(
+                        SnapshotSource::ClaudeCode,
+                        std::slice::from_ref(&self.root),
+                        self.index.clone(),
+                        &days_from_now(0),
+                        7,
+                        10,
+                        false,
+                        None,
+                        &[],
+                        false,
+                        true,
+                    )
+                    .with_sampled_acquisition(
+                        self.cache.clone(),
+                        crate::transcript_acquisition::Scope("owner-held".into()),
+                    )
+                    .with_line_observer("test", Box::new(recorder.clone())),
+                )
+            });
+            self.index = index;
+            self.reads += recorder
+                .events()
+                .iter()
+                .filter(|e| matches!(e, Event::Begin(_)))
+                .count();
+            self.rows.push(page_counts(&counts));
+            Step::Complete(())
+        }
+        fn bound(&self, _: &(), _: usize) -> Option<usize> {
+            Some(0)
+        }
+        fn finish(&mut self, _: (), _: Option<usize>) -> Result<()> {
+            Ok(())
+        }
+        fn outcome(&mut self, _: (), result: Result<()>) {
+            result.unwrap();
+        }
+        fn monotonic(&self) -> std::time::Duration {
+            std::time::Duration::ZERO
+        }
+        fn retained_bound(&self, limit: usize) -> Option<usize> {
+            crate::snapshot_sync::retained_with_withheld(limit, |_| None)
+        }
+        fn discard_retained(&mut self) {
+            withheld_account::discard_if_refused();
+        }
+        fn retained_budget_unavailable(&mut self) {
+            withheld_account::discard_retained();
+            self.discard_retained();
+        }
+    }
+    let root = Root::new("ld-held-owner");
+    let path = root.file(SESSION);
+    append(&path, &assistant_line("u1"));
+    let (parsed, result, _) = finish(OwnedSourceScan::new(
+        SnapshotSource::ClaudeCode,
+        &[root.projects()],
+        ScanIndex::default(),
+        &days_from_now(0),
+        7,
+        10,
+        false,
+        None,
+        &[],
+        false,
+        true,
+    ));
+    let held =
+        crate::snapshot_sync::settle_withheld_for_test(&ScanIndex::default(), parsed, result);
+    let mut owner = Cycle {
+        index: held,
+        root: root.projects(),
+        cache: Arc::default(),
+        rows: Vec::new(),
+        reads: 0,
+    };
+    for day in [1, 31, 91] {
+        sampled_scan::set_test_now(Some(
+            sampled_scan::now_seconds().saturating_add(day * 86_400),
+        ));
+        crate::source_rotation::run(&mut owner, &[()], crate::source_rotation::PARKED_BUDGET);
+        let row = owner.rows.last().unwrap();
+        assert_eq!(row["withheld_held_count"], 1);
+        assert_eq!(row["withheld_memo_unavailable"], false);
+        assert_eq!(row["withheld_held_tokens"], 30);
+    }
+    assert_eq!(
+        owner.reads, 0,
+        "unrelated layout refusal must not rearm idle held files"
+    );
+    assert_eq!(owner.rows.last().unwrap()["withheld_held_age"]["gt_90d"], 1);
+    crate::source_rotation::run(&mut owner, &[()], 0);
+    let row = owner.rows.last().unwrap();
+    assert_eq!(row["withheld_held_count"], 1);
+    assert_eq!(row["withheld_memo_unavailable"], true);
+    assert!(
+        row.get("withheld_held_tokens").is_none(),
+        "refused details are unknown, never fabricated zero"
+    );
+    sampled_scan::set_test_now(None);
 }

@@ -307,7 +307,7 @@ separate exemption.
 page's source: `age` (outside the backfill window, not held for verification
 and not withheld for an unresolved Claude account) and `size` (over the
 source's file-size cap). `withheld_oversized` counts the decisions, at the walk,
-candidate revalidation or open, that keep an over-cap key observed but unread
+candidate revalidation or open, that keep an over-cap key observed without a full parse
 while its parsed revision is withheld for an unresolved account: the entry and
 hold stay, and growth past the cap is not read. They are recorded
 after the existing decision, are drained by that source's next completed page,
@@ -322,35 +322,63 @@ This covers the walk, candidate/open rechecks, Codex roster and opened parent.
 `counts.discovery_retained.grown` counts aged growth-retention decisions by source
 on the #799 page line, drained per page and omitted at zero. It counts one event
 per gate check, even if another retention source also matches; a file may pass
-several gates. Oversized growth stays observed for reconciliation but unread
-under the existing size cap. Retention grants no new Full-read cause.
+several gates. Oversized growth stays observed for reconciliation without a full parse
+under the existing size cap. Retention grants no new Full-read cause. Directory traversal does not prune
+old directories by age. This arm performs only an indexed committed-size lookup
+and reuses current metadata, adding zero stat calls and zero directory walks;
+all discovery remains inside the existing per-pass walk budget. Tail starts at
+the committed extent where the RAM layout is supported. Unsupported layout,
+restart or eviction takes the existing counted Full fallback; shrink retains A2.
 
 On Claude pages, `counts.withheld_reparse` counts re-parses of keys withheld for
 an unresolved account: `start` (first in this process), `evidence` (same size,
 but the sampled content, the file object, its api/trace sidecar stamps or the
 request identity contract changed) and `growth` (the size changed). A withheld
 key whose content and evidence are unchanged is skipped and not counted; an
-mtime, ctime or xattr change alone reads zero bytes once the key has been
-re-checked unchanged after its last parse. A past-due sampled audit on such a
+mtime, ctime or xattr change alone causes no parse or line delivery; existing
+bounded identity samples still read the opened file. A validated completed parse
+records its content witness immediately. Unknown object generation (including
+missing birth identity) fails closed to the existing counted re-parse path. A past-due sampled audit on such a
 key is deferred to its next counted re-parse (it cannot settle while held). The
 memo behind that skip is RAM only. `counts.withheld_hold_released` counts released holds: `deleted`
-(the held file was proved absent) and `resolved` (a parse bound the account).
-`counts.withheld_hold_unrecorded` counts withheld keys past the 4,096-hold cap
-that could not be recorded (`events`) and their withheld `tokens`; such a key has
-no age exemption. All three are drained like
+(the held file was proved absent), `deleted_tokens` (its last-known withheld
+tokens, when available), and `resolved` (a parse bound the account). A held audit
+obligation is retired only by `sampled_audit::proven_absent`: NotFound beneath a
+present readable parent and configured readable root. This additionally emits
+`counts.audit_retired_absent.events`; it grants no Full, source-verification or
+census credit. Missing parents, unreadable roots and permission errors keep debt.
+Codex-protected entries keep their separate protected history.
+`counts.withheld_hold_unrecorded` counts refused admission attempts past the 4,096-hold cap (`events`) and their
+withheld `tokens`; these are attempts, never unique keys. Admission follows the
+completed-parse order; existing holds remain updateable. Such an unrecorded key
+has no hold age exemption and remains Unknown; no $0 is invented. All three are drained like
 `line_delivery_unselected`.
 `counts.withheld_memo` is a gauge of that memo: `entries` (at most 4,096) and
 `retained_bytes`, the bytes charged to the sync owner's process-retained bound
-(absent where the requested layout is unsupported). A refused charge drops the
-memo with the other retained graphs. Omitted while the memo is empty.
+using a conservative layout-independent allowance (1,536 bytes per possible
+B-tree node per entry, plus a root and state header). This charge is admitted
+before other resident graphs; an unsupported sibling graph does not discard it.
+Its own refused charge drops the advisory details. Omitted while empty.
 `counts.withheld_held_tokens` is a gauge of the withheld tokens across recorded
 holds (each key's tokens at its last parse), and `counts.withheld_held_age` counts
-those held keys by time since this process first recorded them held: `le_30d`,
+those held keys by wall-clock estimates since this process first recorded them held: `le_30d`,
 `31_90d` and `gt_90d`. Both are counts only and RAM only, and omitted while
-nothing is held. First-seen resets on a restart or a refused retained charge,
-so ages are a lower bound; after a restart each held key re-enters on its one
+nothing is held. `counts.withheld_held_count` discloses the durable population;
+`withheld_memo_unavailable: true` explicitly discloses missing/refused advisory
+details, omitting unknown tokens/ages instead of reporting zero. First-seen
+resets on restart or refused retained charge, so these wall-clock age estimates
+are a lower bound; after a restart each held key re-enters on its one
 `start` re-parse. A released key (resolved, deleted, or dropped from the hold
 map) leaves both. The map is charged with the memo.
+
+Known limitations: a renamed held file whose mtime is older than the window can
+lose its withheld usage; removal events and last-known tokens are counted.
+Same-size middle-only rewrites remain Ron's accepted interior-edit residual.
+Evidence outside stamped inputs (including API/trace metadata tokens and
+reader-health recovery) wakes only after restart: a delay while a recorded hold
+keeps the file discoverable, not an age-based drop. A never-binding account keeps
+usage off the server; token/age disclosure is implemented, and bounded-lifetime
+release remains a SOURCE follow-up.
 
 ## Context Footprint Discovery
 

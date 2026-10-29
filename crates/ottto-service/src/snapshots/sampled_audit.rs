@@ -907,3 +907,19 @@ mod provenance_tests {
         }
     }
 }
+
+/// Positive removal only: the path is NotFound beneath a present readable
+/// parent AND a configured, readable root. Missing mounts/parents, symlinks,
+/// permission errors and unreadable roots keep the audit and account debt.
+/// This is absence authority, never source verification or census credit.
+pub(super) fn proven_absent(path: &Path, roots: &[PathBuf]) -> bool {
+    fn readable_directory(path: &Path) -> bool {
+        fs::symlink_metadata(path).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+            && fs::read_dir(path).is_ok()
+    }
+    matches!(fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        && path.parent().is_some_and(readable_directory)
+        && roots
+            .iter()
+            .any(|root| path.starts_with(root) && readable_directory(root))
+}

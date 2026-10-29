@@ -137,7 +137,7 @@ pub(crate) enum UnselectedReason {
     WithheldOversized,
 }
 /// Three reasons, seven withheld events, then one grown-retention event.
-const UNSELECTED_REASONS: usize = 11;
+const UNSELECTED_REASONS: usize = 13;
 /// Claude, Codex, Pi x reason, drained by that source's page line.
 #[cfg(not(test))]
 static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
@@ -181,6 +181,7 @@ pub(crate) enum WithheldEvent {
     /// A withheld key past the hold cap left unrecorded, and its withheld tokens.
     UnrecordedEvents,
     UnrecordedTokens,
+    ReleasedDeletedTokens = 11,
 }
 /// Recorded after the decision; never a gate input.
 pub(crate) fn withheld_event(event: WithheldEvent, amount: u64) {
@@ -195,11 +196,15 @@ fn drain(source: &str, slots: &[(&'static str, usize)]) -> BTreeMap<&'static str
         .filter(|(_, count)| *count > 0)
         .collect()
 }
+pub(crate) fn audit_retired_absent(source: &str) {
+    line_unselected(source, 12, |slot| slot.fetch_add(1, Relaxed));
+}
 /// One aged gate retained a grown indexed file (not a unique-file count).
 pub(crate) fn discovery_retained_grown(source: &str) {
     line_unselected(source, 10, |slot| slot.fetch_add(1, Relaxed));
 }
-const WITHHELD_RELEASED: [(&str, usize); 2] = [("deleted", 3), ("resolved", 7)];
+const WITHHELD_RELEASED: [(&str, usize); 3] =
+    [("deleted", 3), ("resolved", 7), ("deleted_tokens", 11)];
 const WITHHELD_UNRECORDED: [(&str, usize); 2] = [("events", 8), ("tokens", 9)];
 const WITHHELD_REPARSE: [(&str, usize); 3] = [("start", 4), ("evidence", 5), ("growth", 6)];
 #[cfg(test)]
@@ -462,6 +467,8 @@ impl Probe {
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             line_delivery_unselected: BTreeMap<&'static str, u64>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            audit_retired_absent: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             discovery_retained: BTreeMap<&'static str, u64>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             withheld_hold_released: BTreeMap<&'static str, u64>,
@@ -484,6 +491,7 @@ impl Probe {
                 source,
                 &[("age", 0), ("size", 1), ("withheld_oversized", 2)],
             ),
+            audit_retired_absent: drain(source, &[("events", 12)]),
             discovery_retained: drain(source, &[("grown", 10)]),
             withheld_hold_released: drain(source, &WITHHELD_RELEASED),
             withheld_reparse: drain(source, &WITHHELD_REPARSE),
