@@ -162,10 +162,17 @@ rosters, candidates, opened descriptors, parent windows and absence retirement.
 Both archive retention and M3 receipt/hold obligations must survive that union.
 
 The portable unsupported-layout qualification also reads a genuinely lossy
-transcript against an existing native record carrying #865 debt. It requires
+transcript with a terminal oversized line against an existing native record
+carrying #865 debt. It requires
 positive usage and cold semantic/additive equivalence, preserves the record
 when its index debt carrier is missing, and verifies that a failed unlink
 neither changes A nor increments retirement. After the carrier is saved and
 unlink succeeds, restart must retain the debt in the index. This fixture uses
 the production read-settlement and GC paths; it does not qualify the separate
 supported-layout native class-transition matrix.
+
+Retryable malformed JSON is a separate conservative case: the existing parser
+quarantines the whole derived entity and emits no replacement. Its fixture
+requires the prior positive body's finalized fingerprint and upload witness to
+survive index save/reload, with #865 debt retained after the unusable record is
+retired. Neither case changes native publication or source-verification rules.
