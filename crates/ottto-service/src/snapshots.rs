@@ -43439,6 +43439,7 @@ fn open_candidate_file_stat_retained(
 // Standalone readers (including Codex join preparation) have no retained
 // Claude page clock. The selecting/continuation path calls the explicit _at
 // variants, preserving one clock without changing existing helper contracts.
+#[cfg(test)]
 fn open_and_identify_scan_candidate(
     source: SnapshotSource,
     candidate: CandidateFile,
@@ -45925,6 +45926,26 @@ impl ScanIndex {
         self.traversal.as_ref().is_some_and(|traversal| {
             traversal.pending_candidates.is_empty() && traversal.pending_directories.is_empty()
         })
+    }
+
+    /// End a synthetic service round only after every remaining discovery
+    /// candidate was actually parsed in that round. Unaccepted retries remain
+    /// queued; this helper grants no census, settlement or ACK credit.
+    #[cfg(test)]
+    pub(crate) fn terminal_off_service_round_serviced_for_test(
+        &self,
+        parsed: &BTreeSet<String>,
+    ) -> bool {
+        claude_terminal_off()
+            && self.traversal.as_ref().is_some_and(|traversal| {
+                traversal.pending_directories.is_empty()
+                    && traversal.pending_candidates.iter().all(|p| {
+                        !p.census_member
+                            || claude_index_path_member_ref(&p.path).is_some_and(|member| {
+                                parsed.iter().any(|session| member.matches_member(session))
+                            })
+                    })
+            })
     }
 
     #[cfg(test)]

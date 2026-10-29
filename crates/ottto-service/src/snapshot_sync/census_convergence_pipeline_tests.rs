@@ -549,6 +549,7 @@ impl PipelineFixture {
     ) -> Vec<PipelinePage> {
         let mut before_classify = Some(before_classify);
         let mut pages: Vec<PipelinePage> = Vec::new();
+        let mut parsed = BTreeSet::new();
         for number in 0..PIPELINE_MAX_PAGES + 2 {
             let upload = if number == 0 {
                 cycle.first_page_upload
@@ -560,9 +561,12 @@ impl PipelineFixture {
                 Some(edit) => self.page_before_classify(&at, cycle, upload, edit),
                 None => self.page(&at, cycle, upload),
             };
+            parsed.extend(page.parsed.iter().cloned());
             let ended = !page.index.scan_traversal_in_progress_for_test()
                 || page.index.scan_traversal_exhausted_for_test()
-                || page.parsed.contains(PIPELINE_SESSIONS[2]);
+                || page
+                    .index
+                    .terminal_off_service_round_serviced_for_test(&parsed);
             pages.push(page);
             if ended {
                 return pages;

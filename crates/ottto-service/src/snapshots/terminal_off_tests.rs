@@ -1029,3 +1029,53 @@ fn terminal_off_rediscovery_memo_is_bounded_and_eviction_fails_toward_rewalk() {
     });
     assert!(terminal_off_rediscovery_due("scope-0".into(), 100, false));
 }
+
+#[test]
+fn terminal_off_service_round_preserves_failed_page_retry_without_minting_completion() {
+    let scratch = crate::test_scratch::ScratchDir::new("terminal-off-service-frontier");
+    let other = "b1111111-1111-4111-8111-111111111111";
+    for session in [OFF_ROOT, other] {
+        fs::write(
+            scratch.join(format!("{session}.jsonl")),
+            off_line(session, session),
+        )
+        .unwrap();
+    }
+    let mut index = off_index();
+    let first = off_scan(&mut index, &scratch, W1, 1);
+    let mut parsed = first
+        .snapshots
+        .iter()
+        .map(|item| item.source_session_id.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(parsed.len(), 1);
+    let admitted = index.claude_full_rearm_progress.terminal_off_admitted[0].clone();
+    enqueue_terminal_off_retry(index.traversal.as_mut().unwrap(), &admitted, true);
+    assert!(
+        !index.terminal_off_service_round_serviced_for_test(&parsed),
+        "unread queued member is not serviced"
+    );
+    let second = off_scan(&mut index, &scratch, W1, 1);
+    parsed.extend(
+        second
+            .snapshots
+            .iter()
+            .map(|item| item.source_session_id.clone()),
+    );
+    assert_eq!(parsed.len(), 2);
+    assert!(index.terminal_off_service_round_serviced_for_test(&parsed));
+    assert!(
+        !index.scan_traversal_exhausted_for_test(),
+        "failed-page demand stays queued"
+    );
+    assert!(index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .pending_candidates
+        .iter()
+        .any(|p| p.path == admitted.path && p.census_member));
+    assert!(!first.census_complete && !second.census_complete);
+    assert!(index.accepted_snapshot_fingerprints.is_empty());
+    assert!(!claude_terminal_authority(&index, true, W1));
+}

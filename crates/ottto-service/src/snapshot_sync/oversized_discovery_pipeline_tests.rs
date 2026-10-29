@@ -484,6 +484,7 @@ fn oversized_blocking_hold_is_reoffered_once_per_six_hour_floor() {
     let walk = |now: u64| {
         let mut pages = Vec::new();
         let mut starts = Vec::new();
+        let mut parsed = BTreeSet::new();
         for number in 0..C1B_MAX_PAGES {
             let (page, rows) = crate::local_resource_diagnostics::capture(|| {
                 fixture.page(
@@ -495,7 +496,11 @@ fn oversized_blocking_hold_is_reoffered_once_per_six_hour_floor() {
             if let Some(start) = transition_row(&rows, "starting") {
                 starts.push(start);
             }
-            let ended = c1b_traversal_ended(&page.index).0;
+            parsed.extend(page.parsed.iter().cloned());
+            let ended = c1b_traversal_ended(&page.index).0
+                || page
+                    .index
+                    .terminal_off_service_round_serviced_for_test(&parsed);
             pages.push(page);
             if ended {
                 return (pages, starts);
