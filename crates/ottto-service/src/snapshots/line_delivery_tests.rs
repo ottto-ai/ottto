@@ -3538,3 +3538,13 @@ fn withheld_equal_fingerprint_recovers_from_poisoned_memo() {
 fn withheld_equal_fingerprint_recovers_without_birth_identity() {
     withheld_equal_fingerprint_recovers_after("no-birth");
 }
+
+/// Keep body adoption independently discriminating: a missing-activity
+/// control in the multi-cause matrix must not mask this earlier repair.
+#[test]
+fn withheld_body_adoption_restarts_once_then_skips() {
+    withheld_equal_fingerprint_recovers_for_reason(
+        "missing",
+        CandidateParseReason::BodyWitnessAdoption,
+    );
+}
