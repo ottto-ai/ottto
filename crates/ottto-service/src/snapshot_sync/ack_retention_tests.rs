@@ -63,12 +63,19 @@ impl AckFixture {
     }
 
     fn scan(root: &Path, index: &mut ScanIndex) -> SourceScanResult {
-        crate::snapshots::scan_source_roots(
+        // Each fixture call requests a new metadata walk at a fixed clock.
+        // Feed the real rediscovery input; retained traversal is not authority.
+        let relist = index.scan_traversal_exhausted_for_test();
+        crate::snapshots::scan_source_roots_with_attribution_and_hints(
             SnapshotSource::ClaudeCode,
             &[root.to_owned()],
             index,
             "2026-10-25T07:01:00Z",
             crate::snapshots::BACKFILL_WINDOW_DAYS,
+            true,
+            None,
+            &[],
+            relist,
         )
         .unwrap()
     }
@@ -750,7 +757,10 @@ fn partial_index_replacement_retires_only_proven_state_only_ack() {
 #[test]
 fn vanished_files_retire_acks_at_the_next_committed_complete_census_without_growth() {
     let f = AckFixture::new(true);
-    let mut owed = BTreeMap::new();
+    let mut owed = BTreeMap::from([(
+        f.item.snapshot_fingerprint.clone(),
+        snapshot_upload_body_witness(&f.item),
+    )]);
     for revision in 0..20 {
         let (committed, mut progress) = f.load();
         let name = format!("vanished-{revision}");
@@ -800,14 +810,28 @@ fn vanished_files_retire_acks_at_the_next_committed_complete_census_without_grow
         progress.finish_cycle(&f.progress_path).unwrap();
         let (saved, progress) = f.load();
         f.assert_identity(&saved);
-        f.assert_ack(&progress);
         for (fp, witness) in &owed {
-            assert_eq!(
-                progress.accepted_body_witnesses.get(fp),
-                Some(witness),
-                "absence never erases an exact ACK"
-            );
+            // An exact selected save may adopt and release the transport ACK.
+            // Absence never erases that proof from its durable index owner.
             assert!(saved.accepted_snapshot_fingerprint_recorded(fp));
+            let key = saved
+                .file_snapshot_fingerprints
+                .iter()
+                .find(|(_, entities)| entities.contains(fp))
+                .map(|(key, _)| key)
+                .expect("retained exact file incidence");
+            assert_eq!(
+                saved.files[key].last_upload_body_witness,
+                Some(crate::snapshots::snapshot_file_upload_body_set_for_test(
+                    std::slice::from_ref(witness)
+                ))
+            );
+            if let Some(retained) = progress.accepted_body_witnesses.get(fp) {
+                assert_eq!(
+                    retained, witness,
+                    "any duplicate progress custody stays exact"
+                );
+            }
         }
         assert_eq!(saved.current_snapshot_fingerprints().len(), revision + 2);
     }
