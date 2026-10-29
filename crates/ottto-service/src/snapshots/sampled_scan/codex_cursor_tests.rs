@@ -14234,3 +14234,159 @@ fn parked_singleton_across_fresh_index_reprobes_record_debt() {
     );
     assert_eq!(durable.restored, 0);
 }
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
+fn inventory_decoder_releases_without_waiting_for_stores_bounded_join() {
+    let _lock = crate::snapshots::codex_compressed_input::tests::ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap();
+    let root = crate::test_scratch::private_dir("header-lock-order");
+    let path = root.join("rollout-synthetic.jsonl.zst");
+    std::fs::write(
+        &path,
+        zstd::stream::encode_all(
+            &b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"synthetic\"}}\n"[..],
+            1,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let cache = Arc::new(SharedCache::default());
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let held_cache = cache.clone();
+    let holder = std::thread::spawn(move || {
+        let guard = held_cache.durable.lock().unwrap();
+        ready_tx.send(()).unwrap();
+        let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+        drop(guard);
+    });
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    let worker_cache = cache.clone();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let mut state = ScanIndex::default();
+        let candidate = crate::snapshots::codex_zst_refusal_tests::candidate(&path);
+        let success = state
+            .inventory_archive_header(
+                &candidate,
+                Some(&worker_cache),
+                &mut crate::snapshots::codex_compressed_input::HeaderWork {
+                    allowed: true,
+                    ..Default::default()
+                },
+            )
+            .is_ok();
+        done_tx
+            .send((success, worker_cache.cursor_reserved()))
+            .unwrap();
+    });
+    let completed = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    worker.join().unwrap();
+    assert_eq!(
+        completed.unwrap(),
+        (true, 0),
+        "decode and refund never enter Stores"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A failed archive header must hold an already paused same-owner singleton,
+/// even though unrelated inventory members still have a complete census.
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "funded decoder needs validated heap layout"
+)]
+fn invalid_archive_owner_holds_paused_singleton_without_more_reads() {
+    let _lock = crate::snapshots::codex_compressed_input::tests::ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap();
+    let fixture = ScanRoot::new(80);
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        let (mut index, members) = paused_singleton(&fixture, &cache);
+        let archive = fixture.file(SESSION).with_extension("jsonl.zst");
+        assert!(
+            codex_session_id_candidates_from_path(&archive.with_extension(""))
+                .contains(&SESSION.to_owned())
+        );
+        fs::write(&archive, b"corrupt archive").unwrap();
+        let mut candidate = crate::snapshots::codex_zst_refusal_tests::candidate(&archive);
+        candidate.scan_root = fixture.root.clone();
+        candidate.size_bytes = fs::metadata(&archive).unwrap().len();
+        let mut work = codex_compressed_input::HeaderWork {
+            allowed: true,
+            ..Default::default()
+        };
+        let (attempt, rows) = crate::local_resource_diagnostics::capture(|| {
+            index.inventory_archive_header(&candidate, Some(&cache), &mut work)
+        });
+        assert!(attempt.is_err());
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r["stage"] == "codex_zst_inventory")
+                .count(),
+            1
+        );
+        let mut directories = codex_file_join::DirectoryCensus::new();
+        directories.observe(&fixture.root, &fs::metadata(&fixture.root).unwrap());
+        let paths = BTreeSet::from([
+            local_index_key(&archive),
+            local_index_key(&fixture.file(SESSION)),
+        ]);
+        let mut inventory = codex_file_join::HeaderInventory::new(
+            std::slice::from_ref(&fixture.root),
+            &paths,
+            Some(&directories),
+        );
+        let ((), rows) = crate::local_resource_diagnostics::capture(|| {
+            while !inventory.step_with_archive(
+                &CodexTitleMetadata::default(),
+                &mut index,
+                Some(&cache),
+            ) {}
+        });
+        assert!(inventory.complete);
+        assert!(inventory.held_owners.contains(SESSION));
+        assert!(!inventory.complete_for(Some(&SESSION.to_owned())));
+        assert!(inventory.complete_for(Some(&SESSION_B.to_owned())));
+        assert!(rows
+            .iter()
+            .all(|r| r["stage"] != "codex_zst_inventory" && r["stage"] != "codex_zst_input"));
+        let position = |cache: &SharedCache| {
+            cache
+                .with_cursor(|cursor| match &cursor.slot {
+                    Slot::Paused(job) => Some(job.parser.reader.last_complete_line_end()),
+                    _ => None,
+                })
+                .flatten()
+        };
+        let before = position(&cache).expect("paused reader");
+        let certified = counter(&cache, |c| c.jobs_certified);
+        for _ in 0..3 {
+            let ((next, scan), rows) = crate::local_resource_diagnostics::capture(|| {
+                continuation_page(&fixture, index, &cache, &members, |scan| {
+                    scan.codex_join_inventory = Some(inventory.clone());
+                    scan.codex_join_prepared = false;
+                })
+            });
+            index = next;
+            assert!(scan.snapshots.is_empty(), "no partial owner body");
+            assert_eq!(
+                position(&cache),
+                Some(before),
+                "the held reader did not advance"
+            );
+            assert_eq!(counter(&cache, |c| c.jobs_certified), certified);
+            assert!(rows
+                .iter()
+                .all(|r| r["stage"] != "codex_zst_inventory" && r["stage"] != "codex_zst_input"));
+        }
+    });
+}

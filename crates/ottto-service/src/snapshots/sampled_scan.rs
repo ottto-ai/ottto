@@ -2049,6 +2049,7 @@ pub(super) fn new_source_parser(
         artifacts,
         curve,
     )?;
+    parser.reader.capture_header = parser.reader.reader.is_compressed();
     // S2: route archive decodes through the single Full gate.
     parser.accumulator.claude_request_identity_capture = identity_capture;
     if source == SnapshotSource::Codex {
@@ -2085,6 +2086,7 @@ pub(super) fn reduction_dependencies(
     codex: &CodexTitleMetadata,
     claude: &ClaudeTitleMetadata,
     support: Option<&Path>,
+    archive_header: Option<&codex_compressed_input::ValidatedHeader>,
 ) -> Option<String> {
     #[cfg(test)]
     if TEST_REFUSE_REDUCTION_DEPENDENCIES.with(std::cell::Cell::get) {
@@ -2094,7 +2096,7 @@ pub(super) fn reduction_dependencies(
         Some(sha256_hex(&[
             "codex_reduction_dependencies:v1",
             &codex.path_reduction_fingerprint(&candidate.path),
-            &codex_file_join::header_reduction_witness(candidate).ok()?,
+            &codex_file_join::header_reduction_witness(candidate, archive_header).ok()?,
         ]))
     } else {
         let mut scoped = candidate.clone();

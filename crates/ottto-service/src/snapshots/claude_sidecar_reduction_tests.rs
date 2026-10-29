@@ -104,6 +104,7 @@ impl Fixture {
             &CodexTitleMetadata::default(),
             metadata,
             Some(&self.support),
+            None,
         )
         .unwrap();
         (candidate.source_file_fingerprint, reduction)

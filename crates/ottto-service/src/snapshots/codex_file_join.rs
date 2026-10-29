@@ -165,7 +165,11 @@ pub(super) fn member_home(root: &Path) -> PathBuf {
 // One bounded secure acquisition path; semantic inventory and sampled-scope
 // witnesses both use it. Only inventory performs native header decoding.
 fn read_header_bytes(candidate: &CandidateFile) -> Result<(Vec<u8>, String, usize)> {
-    refuse_compressed_codex(Some(&candidate.path), None, CodexZstCause::HeaderUnfunded)?;
+    refuse_compressed_codex(
+        Some(&candidate.path),
+        None,
+        CodexZstCause::GroupReadUnsupported,
+    )?;
     let file = open_candidate_beneath_root(candidate)?;
     let before = file.metadata()?;
     anyhow::ensure!(before.is_file(), "Codex header is not a regular file");
@@ -234,7 +238,16 @@ pub(super) fn path_witness(path: &Path) -> Option<String> {
 }
 /// Raw header digest for a file whose owning header the native inventory has
 /// already established. No extra decoded Value is retained or allocated.
-pub(super) fn header_reduction_witness(candidate: &CandidateFile) -> Result<String> {
+pub(super) fn header_reduction_witness(
+    candidate: &CandidateFile,
+    archive: Option<&codex_compressed_input::ValidatedHeader>,
+) -> Result<String> {
+    if is_compressed_codex_rollout(Some(&candidate.path), None) {
+        return archive.map(|header| header.digest.clone()).ok_or_else(|| {
+            crate::local_resource_diagnostics::codex_zst_refused(CodexZstCause::HeaderInvalid);
+            anyhow::anyhow!("archive header evidence unavailable")
+        });
+    }
     read_header_bytes(candidate).map(|(bytes, _, _)| format!("{:x}", Sha256::digest(bytes)))
 }
 
@@ -248,6 +261,9 @@ pub(super) struct HeaderInventory {
     pub(super) directories: DirectoryCensus,
     pub(super) complete: bool,
     pub(super) read_bytes: usize,
+    pub(super) held_archives: BTreeSet<String>,
+    pub(super) held_owners: BTreeSet<String>,
+    pub(super) archive_work: codex_compressed_input::HeaderWork,
     /// Roster files whose first record was refused, each with the metadata
     /// witness seen at the refusal (`None` when it could not be read). This is
     /// the evidence a held page waits on; see `CodexInventoryHold`.
@@ -264,6 +280,9 @@ fn group_key(home: &Path, owner: &str) -> String {
 }
 
 impl HeaderInventory {
+    pub(super) fn complete_for(&self, owner: Option<&String>) -> bool {
+        self.complete && !owner.is_some_and(|owner| self.held_owners.contains(owner))
+    }
     pub(super) fn new(
         roots: &[PathBuf],
         paths: &BTreeSet<String>,
@@ -281,6 +300,9 @@ impl HeaderInventory {
             complete: paths.len() <= MAX_HEADER_FILES
                 && directories.is_some_and(|value| value.stable),
             read_bytes: 0,
+            held_archives: BTreeSet::new(),
+            held_owners: BTreeSet::new(),
+            archive_work: codex_compressed_input::HeaderWork::default(),
             refused: BTreeMap::new(),
             bounded_out: paths.len() > MAX_HEADER_FILES
                 || !directories.is_some_and(|value| value.stable),
@@ -304,7 +326,16 @@ impl HeaderInventory {
             .map(|index| self.headers[index].owner.as_str())
     }
 
+    #[cfg(test)]
     pub(super) fn step(&mut self, metadata: &CodexTitleMetadata) -> bool {
+        self.step_with_archive(metadata, &mut ScanIndex::default(), None)
+    }
+    pub(super) fn step_with_archive(
+        &mut self,
+        metadata: &CodexTitleMetadata,
+        index: &mut ScanIndex,
+        cache: Option<&Arc<sampled_scan::SharedCache>>,
+    ) -> bool {
         let Some(path) = self.pending.pop_front() else {
             return true;
         };
@@ -326,6 +357,8 @@ impl HeaderInventory {
             return false;
         };
         let key = local_index_key(&path);
+        let compressed = is_compressed_codex_rollout(Some(&path), None);
+        let mut excluded = false;
         let result = (|| -> Result<HeaderWitness> {
             let stat = fs::symlink_metadata(&path)?;
             anyhow::ensure!(
@@ -358,7 +391,25 @@ impl HeaderInventory {
                 &ClaudeTitleMetadata::default(),
                 None,
             );
-            let (header, retried) = read_header_settled(&candidate);
+            let (header, retried) = if compressed {
+                let before = self.archive_work.physical_bytes;
+                let result =
+                    index.inventory_archive_header(&candidate, cache, &mut self.archive_work);
+                excluded = index
+                    .files
+                    .get(&key)
+                    .and_then(|e| e.archive.as_ref())
+                    .is_some_and(|a| a.invalid_header(&candidate.path, &stat));
+                self.read_bytes = self
+                    .read_bytes
+                    .saturating_add((self.archive_work.physical_bytes - before) as usize);
+                (
+                    result.map(|(h, _)| (h.owner, h.created_unix_ms, metadata_witness(&stat), 0)),
+                    0,
+                )
+            } else {
+                read_header_settled(&candidate)
+            };
             // Each abandoned attempt may have consumed its whole bounded prefix.
             self.read_bytes = self
                 .read_bytes
@@ -376,10 +427,19 @@ impl HeaderInventory {
         })();
         match result {
             Ok(header) => self.headers.push(header),
+            Err(_) if excluded => {
+                self.held_owners
+                    .extend(codex_session_id_candidates_from_path(
+                        &Path::new(&key).with_extension(""),
+                    ));
+                self.held_archives.insert(key);
+            }
             Err(_) => {
                 self.complete = false;
                 // A failed read may have consumed its whole bounded prefix.
-                self.read_bytes = self.read_bytes.saturating_add(MAX_HEADER_BYTES + 1);
+                if !compressed {
+                    self.read_bytes = self.read_bytes.saturating_add(MAX_HEADER_BYTES + 1);
+                }
                 let witness = path_witness(Path::new(&key));
                 self.refused.insert(key, witness);
             }
@@ -433,6 +493,15 @@ impl HeaderInventory {
             if metadata_witness(&stat) == header.metadata {
                 continue;
             }
+            if is_compressed_codex_rollout(Some(&header.candidate.path), None) {
+                anyhow::ensure!(
+                    header
+                        .stamp
+                        .same_content(&crate::transcript_acquisition::FileStamp::capture(stat)?),
+                    "archive header stamp changed"
+                );
+                continue;
+            }
             let (current_owner, _, _, _) = read_header(&header.candidate)?;
             anyhow::ensure!(
                 current_owner == header.owner
@@ -445,7 +514,7 @@ impl HeaderInventory {
 }
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
 crate::heap_layout_bound::fields!(HeaderWitness; candidate, owner, home, created_unix_ms, metadata, stamp);
-crate::heap_layout_bound::fields!(HeaderInventory; roots, pending, headers, directories, complete, read_bytes, refused, bounded_out);
+crate::heap_layout_bound::fields!(HeaderInventory; roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, archive_work, refused, bounded_out);
 
 #[derive(Clone, Debug)]
 pub(super) struct Group {
@@ -834,9 +903,7 @@ pub(super) enum JoinRefusal {
     CandidateCopy,
     V2UiOnlyTurn,
     V2UnboundUi,
-    /// A `history_base.thread_id` names no member of this owner's group:
-    /// typically a compressed (`.zst`, not yet scanned) predecessor, or
-    /// another owner's file named without `forked_from_id`.
+    /// A `history_base.thread_id` names no member of this owner's group.
     MissingPredecessor,
     /// A chain refusal (`Gap`, `Overlap`) of a legacy group replayed in
     /// chronological order because its probes exceeded their budget (R1-M1,

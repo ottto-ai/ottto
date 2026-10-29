@@ -5777,6 +5777,7 @@ pub(in crate::snapshots) fn resume_paused_job(
             context.codex,
             context.claude,
             context.support,
+            None,
         )
         .map(|dependency| {
             sampling.file_scope(
@@ -5953,6 +5954,7 @@ pub(in crate::snapshots) fn revalidate(
         inputs.codex,
         inputs.claude,
         inputs.support,
+        None,
     ) else {
         return Resume::Unavailable;
     };
@@ -5973,7 +5975,10 @@ pub(in crate::snapshots) fn revalidate(
     if job.sampling.as_ref().map(|active| &active.scope) != Some(scope) {
         return changed;
     }
-    let Some(inventory) = inputs.inventory.filter(|inventory| inventory.complete) else {
+    let Some(inventory) = inputs
+        .inventory
+        .filter(|inventory| inventory.complete_for(meta.owner.as_ref()))
+    else {
         return Resume::Unavailable;
     };
     let members = inventory
@@ -6040,7 +6045,10 @@ fn revalidate_group(job: &mut OwnedActiveFile, inputs: ResumeInputs<'_>) -> Resu
     {
         return changed;
     }
-    let Some(inventory) = inputs.inventory.filter(|inventory| inventory.complete) else {
+    let Some(inventory) = inputs
+        .inventory
+        .filter(|inventory| inventory.complete_for(Some(&group.owner)))
+    else {
         return Resume::Unavailable;
     };
     let current = inventory

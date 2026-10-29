@@ -34,10 +34,8 @@ pub(crate) enum CodexZstCause {
     ParentLedgerUnbound,
     #[serde(rename = "CompressedPhysicalOffsetUnsupported")]
     PhysicalOffsetUnsupported,
-    #[serde(rename = "CompressedHeaderUnfunded")]
-    HeaderUnfunded,
-    #[serde(rename = "CompressedCompatibilityUnfunded")]
-    CompatibilityUnfunded,
+    #[serde(rename = "CompressedCompatibilityUnsupported")]
+    CompatibilityUnsupported,
     #[serde(rename = "CompressedAdmissionRefused")]
     AdmissionRefused,
     #[serde(rename = "CompressedDecodeFailed")]
@@ -52,6 +50,13 @@ pub(crate) enum CodexZstCause {
     ConstructorUnfunded,
     #[serde(rename = "CompressedDecodedOverLimit")]
     DecodedOverLimit,
+    #[serde(rename = "CompressedParserStateRequired")]
+    ParserStateRequired,
+    #[serde(rename = "CompressedHeaderInvalid")]
+    HeaderInvalid,
+    #[doc(hidden)]
+    #[serde(skip)]
+    __Count,
 }
 impl std::fmt::Display for CodexZstCause {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -59,7 +64,7 @@ impl std::fmt::Display for CodexZstCause {
     }
 }
 impl std::error::Error for CodexZstCause {}
-const CODEX_ZST_CAUSES: usize = CodexZstCause::DecodedOverLimit as usize + 1;
+const CODEX_ZST_CAUSES: usize = CodexZstCause::__Count as usize;
 static CODEX_ZST_REFUSED: [AtomicU64; CODEX_ZST_CAUSES] =
     [const { AtomicU64::new(0) }; CODEX_ZST_CAUSES];
 
@@ -1348,8 +1353,7 @@ mod tests {
             GroupReadUnsupported,
             ParentLedgerUnbound,
             PhysicalOffsetUnsupported,
-            HeaderUnfunded,
-            CompatibilityUnfunded,
+            CompatibilityUnsupported,
             AdmissionRefused,
             DecodeFailed,
             OwnerUnproven,
@@ -1357,6 +1361,8 @@ mod tests {
             SettlementStuck,
             ConstructorUnfunded,
             DecodedOverLimit,
+            ParserStateRequired,
+            HeaderInvalid,
         ];
         assert_eq!(ALL.len(), super::CODEX_ZST_CAUSES);
         for (index, cause) in ALL.iter().enumerate() {

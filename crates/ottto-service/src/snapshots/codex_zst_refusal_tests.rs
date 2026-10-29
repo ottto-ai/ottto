@@ -75,11 +75,11 @@ fn compressed_reader_families_refuse_without_parsing_or_emitting_a_body() {
     .unwrap();
     let member = candidate(&path);
     let file = || File::open(&path).unwrap();
-    assert_refused(CodexZstCause::CompatibilityUnfunded, || {
+    assert_refused(CodexZstCause::CompatibilityUnsupported, || {
         assert!(parse_codex_jsonl_file(&path, "2026-10-28T10:00:00Z", "fixture".into()).is_err());
         assert!(parse_codex_jsonl_file(&path, "2026-10-28T10:00:00Z", "fixture".into()).is_err());
     });
-    assert_refused(CodexZstCause::ConstructorUnfunded, || {
+    assert_refused(CodexZstCause::ParserStateRequired, || {
         assert!(OwnedJsonlParser::new(
             file(),
             &path,
@@ -108,8 +108,8 @@ fn compressed_reader_families_refuse_without_parsing_or_emitting_a_body() {
     assert_refused(CodexZstCause::ProofChildUnsupported, || {
         assert!(CodexProofReader::child("fixture".into(), path.clone(), file()).is_err());
     });
-    assert_refused(CodexZstCause::HeaderUnfunded, || {
-        assert!(codex_file_join::header_reduction_witness(&member).is_err());
+    assert_refused(CodexZstCause::HeaderInvalid, || {
+        assert!(codex_file_join::header_reduction_witness(&member, None).is_err());
     });
     assert_refused(CodexZstCause::PhysicalOffsetUnsupported, || {
         assert!(sampled_scan::codex_cursor::LiveWitness::read(&path, &file(), 8).is_none());
@@ -122,10 +122,12 @@ fn compressed_reader_families_refuse_without_parsing_or_emitting_a_body() {
         &inventory_paths,
         Some(&directories),
     );
-    assert_refused(CodexZstCause::HeaderUnfunded, || {
+    assert_refused(CodexZstCause::AdmissionRefused, || {
         while !inventory.step(&CodexTitleMetadata::default()) {}
         assert!(inventory.headers.is_empty());
         assert!(inventory.refused.contains_key(&local_index_key(&path)));
+        assert!(!inventory.complete);
+        assert_eq!(inventory.read_bytes, 0);
     });
     let paths = BTreeSet::from([local_index_key(&path)]);
     let roots = [root.clone()];
@@ -151,6 +153,20 @@ fn compressed_reader_families_refuse_without_parsing_or_emitting_a_body() {
         );
         assert!(parent.is_err());
         assert!(retained.is_none());
+    });
+    assert_refused(CodexZstCause::ParserStateRequired, || {
+        assert!(OwnedJsonlParser::new(
+            file(),
+            &path,
+            SnapshotSource::Codex,
+            apply_codex_line,
+            Some(&CodexTitleMetadata::default()),
+            None,
+            None,
+            false,
+            true
+        )
+        .is_err());
     });
     let source = SnapshotSource::Codex;
     let index = ScanIndex::default();
@@ -230,4 +246,37 @@ fn predicate_covers_opened_compression_and_leaves_plain_physical_samples_legal()
         assert_eq!(parser.reader.consumed_bytes(), 0);
     });
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn compressed_refusal_cardinality_has_unique_pinned_indices() {
+    use CodexZstCause::*;
+    const ALL: [CodexZstCause; 19] = [
+        ReplayNotAuthorized,
+        ProofParentUnsupported,
+        ProofChildUnsupported,
+        ParentSideUnsupported,
+        DurableTailUnsupported,
+        GroupProbeUnsupported,
+        GroupReadUnsupported,
+        ParentLedgerUnbound,
+        PhysicalOffsetUnsupported,
+        CompatibilityUnsupported,
+        AdmissionRefused,
+        DecodeFailed,
+        OwnerUnproven,
+        OutputHeld,
+        SettlementStuck,
+        ConstructorUnfunded,
+        DecodedOverLimit,
+        ParserStateRequired,
+        HeaderInvalid,
+    ];
+    const _: [(); ALL.len()] = [(); CodexZstCause::__Count as usize];
+    let indices = ALL
+        .map(|cause| cause as usize)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(indices, (0..CodexZstCause::__Count as usize).collect());
+    assert!(serde_json::from_str::<CodexZstCause>("\"__Count\"").is_err());
 }
