@@ -87,7 +87,11 @@ changed native files enter ordinary selection. Matching durable size/mtime/birth
 metadata queues no read of an unchanged transcript. `parked_rewalk{dirs,new_files,
 entries}` counts this work. Existing pending_directories is the durable worklist;
 its census_member=false marker identifies metadata work, and reconciliation_after
-holds a NUL-prefixed entry offset while that work is active. The prefix sorts
+holds a NUL-prefixed tuple of entry offset and prior index-reconciliation cursor
+while that work is active. A metadata sweep restores the paid reconciliation
+prefix rather than resetting it. Cached iterators rebind to the durable cursor
+after failed checkpoints; changed directory identity restarts only that directory.
+Unreadable entries retain their position and keep discovery incomplete. The prefix sorts
 before absolute file keys for conservative old-reader reconciliation. No new
 persisted field. Restart rehydrates an iterator offset in bounded chunks; inserts
 before an offset are revisited by the next periodic sweep. The metadata iterator
@@ -110,3 +114,8 @@ AccountReproof's pre-existing nonterminal fingerprint-version repair is not a
 completion-only clear. The deferral early return bypasses it on refused M4 offers;
 row 6's legacy membership/newly proven family corrections also require the census
 completion gates. Scoped corrections remain uncapped.
+
+Removal revalidation preserves the original reason: live activity-window
+exclusions re-check the age/audit predicate; actual disappearances re-check
+NotFound and the parent fence. A present, newly changed file is requeued rather
+than erased or treated as absent.

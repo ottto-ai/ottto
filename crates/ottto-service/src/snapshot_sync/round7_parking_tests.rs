@@ -374,3 +374,104 @@ fn deferred_terminal_alarm_counts_offers_across_multiple_metadata_pages() {
     assert!(ordinary_pages >= 2);
     assert_eq!(offers, [1, 2, 3], "third deferred TERMINAL offer reaches the alarm despite intervening pages");
 }
+
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn parked_rewalk_rebinds_cached_iterator_after_rejected_checkpoint() {
+    let server = AckScriptedServer::new();
+    let mut home = AckFinishHome::new(&server);
+    seed_deferred(&home, true);
+    let (p, i, s) = prepare(&mut home);
+    home.finish(p, i, s).unwrap();
+    for n in 0..2050 { std::fs::write(project(&home).join(format!("cursor-{n:04}.txt")), "").unwrap(); }
+    let position = |index: &ScanIndex| {
+        let value = serde_json::to_value(index).unwrap();
+        let cursor = value["traversal"]["reconciliation_after"].as_str().unwrap().strip_prefix("\0parked_rewalk:").unwrap();
+        serde_json::from_str::<(u64, Option<String>)>(cursor).unwrap().0
+    };
+    let (p, i, s) = prepare(&mut home);
+    home.finish(p, i, s).unwrap();
+    let durable = position(&saved(&home));
+    let (p, i, s) = prepare(&mut home);
+    let rejected = position(&i);
+    assert!(rejected > durable);
+    drop((p, i, s)); // rejected checkpoint leaves the actual index unchanged
+    let (p, i, s) = prepare(&mut home);
+    let replayed = position(&i);
+    assert!(replayed >= durable && replayed < rejected,
+        "rehydrate the durable offset; never trust the ahead-of-checkpoint cache");
+    assert_eq!(s.scanned_file_count, 0);
+    home.finish(p, i, s).unwrap();
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn parked_rewalk_preserves_paid_index_reconciliation_cursor() {
+    let server = AckScriptedServer::new();
+    let mut home = AckFinishHome::new(&server);
+    seed_deferred(&home, true);
+    let (p, i, s) = prepare(&mut home);
+    home.finish(p, i, s).unwrap();
+    let mut value = serde_json::to_value(saved(&home)).unwrap();
+    let after = value["files"].as_object().unwrap().keys().next().unwrap().clone();
+    value["traversal"]["reconciliation_after"] = after.clone().into();
+    value["traversal"]["reconciliation_started"] = true.into();
+    let mut prior: ScanIndex = serde_json::from_value(value).unwrap();
+    prior.save(&index_path(&home)).unwrap();
+    let (p, i, s) = prepare(&mut home);
+    let value = serde_json::to_value(&i).unwrap();
+    assert_eq!(value["traversal"]["reconciliation_after"], after,
+        "metadata sweep cannot reset a paid reconciliation prefix");
+    assert_eq!(value["traversal"]["reconciliation_started"], true);
+    home.finish(p, i, s).unwrap();
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn parked_old_live_file_is_excluded_without_an_infinite_removal_retry() {
+    let server = AckScriptedServer::new();
+    let mut home = AckFinishHome::new(&server);
+    seed_deferred(&home, true);
+    let (p, i, s) = prepare(&mut home);
+    home.finish(p, i, s).unwrap();
+    let old = write_target(&home, "c3333333-3333-4333-8333-333333333333");
+    std::fs::File::open(&old).unwrap().set_times(std::fs::FileTimes::new()
+        .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1))).unwrap();
+    seed_deferred(&home, false);
+    for _ in 0..4 {
+        let (p, i, s) = prepare(&mut home);
+        home.finish(p, i, s).unwrap();
+        if cached_source_manifest(&snapshot_upload_destination_namespace(&home.device, "device-secret"), SnapshotSource::ClaudeCode).is_some() { break; }
+    }
+    assert!(old.is_file());
+    assert!(cached_source_manifest(&snapshot_upload_destination_namespace(&home.device, "device-secret"), SnapshotSource::ClaudeCode).is_some(),
+        "live age exclusion completes without demanding NotFound");
+    assert!(server.offered.lock().unwrap().iter().all(|body| body["source_session_id"] != "c3333333-3333-4333-8333-333333333333"));
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn parked_metadata_error_keeps_discovery_incomplete_until_the_file_is_retried() {
+    const TARGET: &str = "c3333333-3333-4333-8333-333333333333";
+    let server = AckScriptedServer::new();
+    let mut home = AckFinishHome::new(&server);
+    seed_deferred(&home, true);
+    let (p, i, s) = prepare(&mut home);
+    home.finish(p, i, s).unwrap();
+    let target = write_target(&home, TARGET);
+    seed_deferred(&home, false);
+    crate::snapshots::refuse_parked_metadata_once_for_test(target);
+    let (p, i, s) = prepare(&mut home);
+    assert!(!s.census_complete, "unreadable discovery is never complete");
+    home.finish(p, i, s).unwrap();
+    assert!(cached_source_manifest(&snapshot_upload_destination_namespace(&home.device, "device-secret"), SnapshotSource::ClaudeCode).is_none());
+    for _ in 0..4 {
+        let (p, i, s) = prepare(&mut home);
+        home.finish(p, i, s).unwrap();
+    }
+    assert_settled(&home, &server, TARGET);
+}

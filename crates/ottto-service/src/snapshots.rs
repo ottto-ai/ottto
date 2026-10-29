@@ -30990,6 +30990,7 @@ impl OwnedSourceScan {
                                 && sidecar_census_complete,
                             raw_complete: raw_census_complete,
                             effective_complete: census_complete,
+                            backfill_window_days,
                             needs_clean_followup,
                             restart_after_hints,
                             cursor_scope: sampling

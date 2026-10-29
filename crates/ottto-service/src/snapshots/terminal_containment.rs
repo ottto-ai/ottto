@@ -143,11 +143,12 @@ struct ClaudeTerminalEffects {
     reconcile: bool,
     raw_complete: bool,
     effective_complete: bool,
+    backfill_window_days: u64,
     needs_clean_followup: bool,
     restart_after_hints: bool,
     cursor_scope: String,
 }
-crate::heap_layout_bound::fields!(ClaudeTerminalEffects; removals, reconcile, raw_complete, effective_complete, needs_clean_followup, restart_after_hints, cursor_scope);
+crate::heap_layout_bound::fields!(ClaudeTerminalEffects; removals, reconcile, raw_complete, effective_complete, backfill_window_days, needs_clean_followup, restart_after_hints, cursor_scope);
 
 impl ScanIndex {
     pub(crate) fn claude_terminal_effects_staged(&self) -> bool {
@@ -213,9 +214,21 @@ impl ScanIndex {
         // A caller may have lowered the provisional effective flag after scan
         // (for example a capacity/settlement gate). Raw commit cannot undo it.
         let completion_veto = effects.effective_complete && !scan.census_complete;
-        let unconfirmed = effects.removals.iter().filter(|(key, _)| {
-            !fs::symlink_metadata(key).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-                || !claude_absence_is_removal(SnapshotSource::ClaudeCode, Path::new(key)).is_removal(Path::new(key))
+        let unconfirmed = effects.removals.iter().filter(|(key, vanished)| {
+            match fs::symlink_metadata(key) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound =>
+                    !claude_absence_is_removal(SnapshotSource::ClaudeCode, Path::new(key)).is_removal(Path::new(key)),
+                Ok(metadata) if !*vanished && metadata.is_file() && !metadata.file_type().is_symlink() => {
+                    // removed_index_keys also contains legitimate live-file
+                    // activity-window exclusions. Revalidate the original age
+                    // predicate rather than requiring those files to vanish.
+                    sampled_audit::path_requires_verification(&self.files, Path::new(key))
+                        || !metadata.modified().ok().and_then(unix_seconds)
+                            .zip(rfc3339_unix_seconds(&scan.census_window_end))
+                            .is_some_and(|(modified, now)| !is_recent_enough_at(modified, now, effects.backfill_window_days))
+                }
+                _ => true,
+            }
         }).map(|(key, _)| key.as_str()).collect::<Vec<_>>();
         if !unconfirmed.is_empty() {
             self.requeue_claude_removals(effects.removals.iter().map(|(key, _)| key.as_str()));

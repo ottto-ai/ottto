@@ -15,6 +15,33 @@ struct ParkedDirectoryReader {
     skip: u64,
     offset: u64,
     next_due: Option<std::time::Instant>,
+    identity: Option<[u64; 2]>,
+}
+
+fn parked_rewalk_position(traversal: &ScanTraversalCheckpoint) -> (u64, Option<String>) {
+    traversal.reconciliation_after.as_deref()
+        .and_then(|value| value.strip_prefix(PARKED_REWALK_CURSOR))
+        .and_then(|value| serde_json::from_str(value).ok())
+        .unwrap_or_default()
+}
+fn parked_rewalk_set_position(traversal: &mut ScanTraversalCheckpoint, offset: u64, after: &Option<String>) {
+    // Preserve a partially paid index-reconciliation cursor across metadata
+    // sweeps. Both cursors live in the SAME existing string, never new fields.
+    traversal.reconciliation_after = Some(format!("{PARKED_REWALK_CURSOR}{}", serde_json::to_string(&(offset, after)).expect("cursor tuple serializes")));
+}
+fn parked_directory_identity(metadata: &fs::Metadata) -> Option<[u64; 2]> {
+    #[cfg(unix)] { use std::os::unix::fs::MetadataExt; Some([metadata.dev(), metadata.ino()]) }
+    #[cfg(not(unix))] { let _ = metadata; None }
+}
+
+fn parked_entry_metadata(path: &Path) -> std::io::Result<fs::Metadata> {
+    #[cfg(test)]
+    if PARKED_METADATA_REFUSAL.with(|slot| {
+        let matches = slot.borrow().as_deref() == Some(path);
+        if matches { slot.borrow_mut().take(); }
+        matches
+    }) { return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)); }
+    fs::symlink_metadata(path)
 }
 
 fn parked_rewalk_active(traversal: &ScanTraversalCheckpoint) -> bool {
@@ -47,32 +74,46 @@ fn recover_parked_claude_metadata(index: &mut ScanIndex, overflowed: bool) {
                 scan_root: root.clone(), path: root.clone(), census_member: false, watcher_hint: false,
             });
         }
-        traversal.reconciliation_after = Some(format!("{PARKED_REWALK_CURSOR}0"));
-        traversal.reconciliation_started = false;
+        let after = traversal.reconciliation_after.take().filter(|value| !value.starts_with(PARKED_REWALK_CURSOR));
+        parked_rewalk_set_position(traversal, 0, &after);
         state.reader = None;
         traversal.watcher_hint_seen = false; // this sweep covers the triggering loss
     }
+    let (_, reconciliation_after) = parked_rewalk_position(traversal);
     let mut dirs = usize::from(state.reader.is_some());
     let mut new_files = 0;
     let mut entries = 0;
     while dirs < PARKED_REWALK_DIRS && entries < PARKED_REWALK_ENTRIES {
         let Some(directory) = traversal.pending_directories.front().cloned() else { break; };
+        let (mut offset, _) = parked_rewalk_position(traversal);
+        if state.reader.is_some() && state.path == directory.path {
+            let identity = fs::symlink_metadata(&directory.path).ok().as_ref().and_then(parked_directory_identity);
+            if identity != state.identity {
+                // A replacement owes this directory from its beginning, with
+                // no traversal restart or reuse of an old inode's iterator.
+                offset = 0;
+                parked_rewalk_set_position(traversal, 0, &reconciliation_after);
+                state.reader = None;
+            } else if state.offset != offset {
+                // A rejected save/CAS may leave process state ahead of durable
+                // demand. The checkpoint, not this cache, owns progress.
+                state.reader = None;
+            }
+        }
         if state.reader.is_none() || state.path != directory.path {
-            let offset = traversal.reconciliation_after.as_deref()
-                .and_then(|value| value.strip_prefix(PARKED_REWALK_CURSOR))
-                .and_then(|value| value.parse().ok()).unwrap_or(0);
             // A moved/removed directory is no longer discovery work. This
             // grants no file absence: terminal reconciliation probes files.
             let metadata = fs::symlink_metadata(&directory.path);
             if metadata.as_ref().is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
                 || metadata.as_ref().is_ok_and(|metadata| !metadata.is_dir() || metadata.file_type().is_symlink()) {
                 traversal.pending_directories.pop_front();
-                traversal.reconciliation_after = Some(format!("{PARKED_REWALK_CURSOR}0"));
+                parked_rewalk_set_position(traversal, 0, &reconciliation_after);
                 state.reader = None;
                 dirs += 1;
                 continue;
             }
             // No-follow directory metadata first, exactly as ordinary discovery.
+            state.identity = metadata.as_ref().ok().and_then(parked_directory_identity);
             let opened = metadata.ok()
                 .filter(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
                 .and_then(|_| fs::read_dir(&directory.path).ok());
@@ -90,12 +131,13 @@ fn recover_parked_claude_metadata(index: &mut ScanIndex, overflowed: bool) {
         let next = state.reader.as_mut().and_then(Iterator::next);
         let Some(entry) = next else {
             traversal.pending_directories.pop_front();
-            traversal.reconciliation_after = Some(format!("{PARKED_REWALK_CURSOR}0"));
+            parked_rewalk_set_position(traversal, 0, &reconciliation_after);
             state.reader = None;
             continue;
         };
         entries += 1;
         if state.skip > 0 {
+            if entry.is_err() { state.reader = None; break; }
             // Rehydrate a saved offset after restart in bounded chunks. Skipped
             // entries use no stat or transcript I/O. The next sweep revisits
             // inserts before this offset; no absence decision uses this sweep.
@@ -103,10 +145,21 @@ fn recover_parked_claude_metadata(index: &mut ScanIndex, overflowed: bool) {
             continue;
         }
         state.offset += 1;
-        traversal.reconciliation_after = Some(format!("{PARKED_REWALK_CURSOR}{}", state.offset));
-        let Ok(entry) = entry else { continue; };
+        parked_rewalk_set_position(traversal, state.offset, &reconciliation_after);
+        let retry = |state: &mut ParkedDirectoryReader, traversal: &mut ScanTraversalCheckpoint| {
+            // Never consume an unreadable entry as healthy discovery. Retain
+            // its position for bounded retry before any terminal authority.
+            state.offset = state.offset.saturating_sub(1);
+            parked_rewalk_set_position(traversal, state.offset, &reconciliation_after);
+            state.reader = None;
+        };
+        let entry = match entry { Ok(entry) => entry, Err(_) => { retry(state, traversal); break; } };
         let path = entry.path();
-        let Ok(metadata) = fs::symlink_metadata(&path) else { continue; };
+        let metadata = match parked_entry_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => { retry(state, traversal); break; }
+        };
         if metadata.file_type().is_symlink() { continue; }
         if metadata.is_dir() {
             if !traversal.pending_directories.iter().any(|queued| queued.path == path) {
@@ -134,9 +187,10 @@ fn recover_parked_claude_metadata(index: &mut ScanIndex, overflowed: bool) {
         }
     }
     if traversal.pending_directories.is_empty() {
-        traversal.reconciliation_after = None;
-        traversal.reconciliation_upper_bound = index.files.keys().next_back().cloned();
-        traversal.reconciliation_started = false;
+        traversal.reconciliation_after = reconciliation_after.clone();
+        if !traversal.reconciliation_started {
+            traversal.reconciliation_upper_bound = index.files.keys().next_back().cloned();
+        }
         if traversal.watcher_hint_seen {
             // Another overflow during the sweep may name an already-visited
             // directory. Owe a further metadata sweep before terminal credit.
@@ -145,7 +199,7 @@ fn recover_parked_claude_metadata(index: &mut ScanIndex, overflowed: bool) {
                     scan_root: root.clone(), path: root.clone(), census_member: false, watcher_hint: false,
                 });
             }
-            traversal.reconciliation_after = Some(format!("{PARKED_REWALK_CURSOR}0"));
+            parked_rewalk_set_position(traversal, 0, &reconciliation_after);
             traversal.watcher_hint_seen = false;
         }
         state.next_due = Some(std::time::Instant::now() + PARKED_REWALK_CADENCE);
@@ -165,6 +219,7 @@ static PARKED_REWALK_TEST_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomi
 
 #[cfg(test)]
 thread_local! {
+    static PARKED_METADATA_REFUSAL: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
     static PARKED_PAGE_LIMIT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static PARKED_NATIVE_OPENS: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
 }
@@ -178,4 +233,9 @@ pub(crate) fn with_parked_page_limit_for_test<T>(limit: usize, run: impl FnOnce(
 #[cfg(test)]
 pub(crate) fn parked_native_opens_for_test() -> Vec<PathBuf> {
     PARKED_NATIVE_OPENS.with(|value| std::mem::take(&mut *value.borrow_mut()))
+}
+
+#[cfg(test)]
+pub(crate) fn refuse_parked_metadata_once_for_test(path: PathBuf) {
+    PARKED_METADATA_REFUSAL.with(|slot| *slot.borrow_mut() = Some(path));
 }
