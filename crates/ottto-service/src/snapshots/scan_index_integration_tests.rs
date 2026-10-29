@@ -475,3 +475,248 @@ fn observed_fresh_load_keeps_first_save_custody_across_same_pass_progress() {
         "a prior publication marker forbids resetting a lost root"
     );
 }
+
+#[test]
+fn integrated_manifest_refuses_each_unknown_map_and_counts_before_window_parsing() {
+    for map in 0..3 {
+        let fixture = Fixture::new();
+        fs::remove_file(fixture.bucket_path(map)).unwrap();
+        let index = fixture.load();
+        let (result, rows) = crate::local_resource_diagnostics::capture(|| {
+            index.manifest_for_window(SnapshotSource::ClaudeCode, "invalid", "invalid")
+        });
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "scan_index_map_unavailable"
+        );
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0]["counts"]["scanindex_manifest_unavailable_refused"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert_eq!(rows[0]["source"], "claude_code");
+        assert_eq!(rows[0]["counts"].as_object().unwrap().len(), 1);
+    }
+}
+
+// A retained, already parsed page is the input at the evidence/finalization
+// seam. Preparation happens ONCE before damage, never on held/restored paths.
+fn prepared_recovery_page(
+    fixture: &Fixture,
+    index: &ScanIndex,
+) -> (
+    Vec<SnapshotItem>,
+    crate::claude_local_otel::ClaudeApiEvidenceRead,
+) {
+    use claude_request_money::e2;
+    const ROOT: &str = "a0000000-0000-4000-8000-00000000000a";
+    let path = fixture.scratch.join(format!("{ROOT}.jsonl"));
+    fs::write(&path, b"synthetic retained page\n").unwrap();
+    let opened = File::open(&path).unwrap().metadata().unwrap();
+    let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
+    accumulator.claude_file_birth = ClaudeFileBirth::observe(&path, Some(&opened));
+    accumulator
+        .claude_file_birth
+        .set_birth_for_test(rfc3339_unix_nanos("2026-08-02T07:00:00Z").unwrap());
+    apply_claude_code_line(
+        &json!({
+            "type":"assistant", "version":"2.1.309", "sessionId":ROOT,
+            "timestamp":"2026-08-02T07:00:01Z", "requestId":"r9-request",
+            "message":{"id":"r9-message", "model":"claude-haiku-4-5",
+                "usage":{"input_tokens":37,"output_tokens":7}}
+        }),
+        &mut accumulator,
+    );
+    accumulator.finalize_claude_responses_e2(Some(e2::ReadContext {
+        index,
+        path: &path,
+        twins: &Default::default(),
+    }));
+    let items = accumulator.into_items(&path, "2026-08-02T09:00:00Z", "f".repeat(64), None);
+    let row = crate::snapshots::tests::complete_api_row(ROOT, "r9-request", 1, 37, 7, 0);
+    let dir = fixture.scratch.join(crate::claude_local_otel::STORE_DIR);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join(format!("{:x}.jsonl", Sha256::digest(ROOT.as_bytes()))),
+        serde_json::to_string(&row).unwrap() + "\n",
+    )
+    .unwrap();
+    let evidence =
+        crate::claude_local_otel::ClaudeApiEvidenceRead::load(&fixture.scratch, [ROOT.to_owned()])
+            .unwrap();
+    (items, evidence)
+}
+fn recovery_emission_boundaries(
+    mut items: Vec<SnapshotItem>,
+    evidence: &crate::claude_local_otel::ClaudeApiEvidenceRead,
+    index: &mut ScanIndex,
+) -> (
+    SourceScanResult,
+    Result<SnapshotSourceManifest>,
+    BTreeSet<String>,
+) {
+    use claude_request_money::e2;
+    e2::decide_page_copies(&mut items, index);
+    e2::attach_page(&mut items, evidence);
+    let unresolved = e2::side_calls_page(
+        &mut items,
+        &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+            evidence: evidence.evidence.clone(),
+            health: Default::default(),
+        },
+        &Default::default(),
+        index,
+    );
+    let held = e2::finish_page(&mut items, index, e2::TelemetryRead::Loaded);
+    if !index.persistence_available() {
+        assert_eq!(unresolved, held);
+    }
+    let mut scan = SourceScanResult::empty(SnapshotSource::ClaudeCode);
+    scan.snapshots = items;
+    scan.census_complete = true;
+    scan.pending_finalization.push(PendingIndexFinalization {
+        sampled_audit_verified: false,
+        codex_pending_recovery: false,
+        index_key: "synthetic-file".into(),
+        source_file_fingerprint: "f".repeat(64),
+        previous_snapshot_fingerprint: None,
+        previous_upload_body_witness: None,
+        parse_complete: true,
+        diagnostic_reason: FileReason::Complete,
+        parsed_snapshot_count: 1,
+        effective_upload_body_witness_revision: 0,
+    });
+    index.activate_upload_context("r9-complete-context".into());
+    finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, index);
+    let manifest = index.manifest_for_window(
+        SnapshotSource::ClaudeCode,
+        "2026-08-02T00:00:00Z",
+        "2026-08-03T00:00:00Z",
+    );
+    (scan, manifest, held)
+}
+
+#[test]
+fn integrated_each_damaged_map_holds_then_restores_equal_money_without_transcript_reads() {
+    use claude_request_money::e2;
+    for map in 0..3 {
+        let fixture = Fixture::new();
+        let healthy = fixture.load();
+        let (prepared, evidence) = e2::with_enabled(|| prepared_recovery_page(&fixture, &healthy));
+        assert_eq!(prepared.len(), 1, "positive prepared E2 page");
+        let mut control = healthy.clone();
+        let ((control_scan, control_manifest, control_held), reads) =
+            terminal_contract_retry::source_acquisitions(|| {
+                with_transcript_io_denied(|| {
+                    e2::with_enabled(|| {
+                        recovery_emission_boundaries(prepared.clone(), &evidence, &mut control)
+                    })
+                })
+            });
+        assert!(reads.is_empty());
+        assert!(control_held.is_empty());
+        assert_eq!(control_scan.snapshots.len(), 1);
+        let emitted = &control_scan.snapshots[0];
+        assert_eq!(emitted.input_tokens, 37);
+        assert_eq!(emitted.output_tokens, 7);
+        assert_eq!(emitted.request_count, 1);
+        assert_eq!(
+            emitted.cost.as_ref().unwrap().total_cost_usd.as_deref(),
+            Some("0.0001")
+        );
+        let control_manifest = control_manifest.unwrap();
+        assert!(control_manifest.entity_count > 0);
+        assert_eq!(
+            control.upload_context_fingerprint.as_deref(),
+            Some("r9-complete-context")
+        );
+
+        let payload = fixture.bucket_path(map);
+        let original = fs::read(&payload).unwrap();
+        fs::write(&payload, b"{damaged}").unwrap();
+        let mut unknown = fixture.load();
+        assert!(!unknown.persistence_available());
+        assert_eq!(
+            unknown.persistence_unavailable[map].unwrap().cause,
+            scan_index_persistence::UnavailableCause::Digest
+        );
+        let old_context = unknown.upload_context_fingerprint.clone();
+        let old_pending = unknown.claude_account_family_pending.clone();
+        let old_release = unknown.claude_history_move_released;
+        let old_files = serde_json::to_vec(&unknown.files).unwrap();
+        let ((held_scan, manifest, held), reads) =
+            terminal_contract_retry::source_acquisitions(|| {
+                with_transcript_io_denied(|| {
+                    e2::with_enabled(|| {
+                        unknown.retire_committed_claude_account_pending_windows();
+                        assert!(matches!(
+                            unknown.lower_claude_retired_family_tombstone_fence(
+                                &BTreeSet::new(),
+                                &BTreeSet::new()
+                            ),
+                            ClaudeTombstoneFenceRepair::Kept { .. }
+                        ));
+                        assert!(!claude_stale_rearm_can_reopen_fence(
+                            &unknown,
+                            &BTreeSet::new()
+                        ));
+                        recovery_emission_boundaries(prepared.clone(), &evidence, &mut unknown)
+                    })
+                })
+            });
+        assert!(
+            reads.is_empty(),
+            "held evidence never causes transcript acquisition"
+        );
+        assert!(!held.is_empty());
+        assert!(held_scan.snapshots.is_empty());
+        assert!(!held_scan.census_complete);
+        assert!(manifest
+            .unwrap_err()
+            .to_string()
+            .contains("scan_index_map_unavailable"));
+        assert_eq!(unknown.upload_context_fingerprint, old_context);
+        assert_eq!(unknown.claude_account_family_pending, old_pending);
+        assert_eq!(unknown.claude_history_move_released, old_release);
+        assert_eq!(serde_json::to_vec(&unknown.files).unwrap(), old_files);
+
+        fs::write(&payload, original).unwrap();
+        let ((restored, resumed_scan, resumed_manifest, resumed_held), reads) =
+            terminal_contract_retry::source_acquisitions(|| {
+                with_transcript_io_denied(|| {
+                    let mut restored = fixture.load();
+                    assert!(restored.persistence_available());
+                    assert!(
+                        !unknown.persistence_available(),
+                        "old views never clear in place"
+                    );
+                    let (scan, manifest, held) = e2::with_enabled(|| {
+                        recovery_emission_boundaries(prepared.clone(), &evidence, &mut restored)
+                    });
+                    (restored, scan, manifest.unwrap(), held)
+                })
+            });
+        assert!(
+            reads.is_empty(),
+            "restored evidence reuses the retained page"
+        );
+        assert!(resumed_held.is_empty());
+        // Exact emitted body equality covers tokens, cost, requests, account,
+        // evidence references, attribution and semantic fingerprints together.
+        assert_eq!(
+            serde_json::to_vec(&resumed_scan.snapshots).unwrap(),
+            serde_json::to_vec(&control_scan.snapshots).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_vec(&resumed_manifest).unwrap(),
+            serde_json::to_vec(&control_manifest).unwrap()
+        );
+        assert_eq!(
+            restored.upload_context_fingerprint,
+            control.upload_context_fingerprint
+        );
+        assert_eq!(restored.generation, healthy.generation);
+    }
+}

@@ -249,3 +249,107 @@ fn refusal_is_visible_before_the_first_legacy_source_row_exists() {
     assert_eq!(health.blockers[0].source, "pi");
     std::fs::remove_dir_all(scratch).unwrap();
 }
+
+#[test]
+fn unavailable_shards_project_source_health_alarm_once_and_clear_after_restoration() {
+    use std::os::unix::fs::PermissionsExt;
+    for map in 0..3 {
+        let scratch = crate::test_scratch::private_dir("shard-unavailable-health");
+        let namespace = scratch.join("a".repeat(64));
+        std::fs::create_dir(&namespace).unwrap();
+        std::fs::set_permissions(&namespace, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let root = namespace.join("claude_code-scan-index-v3.json");
+        let shards = namespace.join("claude_code-scan-index-v3.json.shards");
+        std::fs::create_dir(&shards).unwrap();
+        std::fs::set_permissions(&shards, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/scan_index/real-shaped-v1.json")).unwrap();
+        for (name, text) in fixture["payloads"].as_object().unwrap() {
+            let path = shards.join(name);
+            std::fs::write(&path, text.as_str().unwrap()).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        std::fs::write(&root, fixture["root"].as_str().unwrap()).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let source = SnapshotSource::ClaudeCode;
+        let load = || ScanIndex::load_for_snapshot_source_with_origin(&root, source, &scratch);
+        assert!(load().unwrap().0.persistence_available());
+        let manifest: serde_json::Value = serde_json::from_str(fixture["root"].as_str().unwrap()).unwrap();
+        let descriptor = &manifest["objects"][map + 1];
+        let path = shards.join(format!("{}-{:02x}-{}.json", ["account", "usage", "census"][map],
+            descriptor["slot"]["bucket"].as_u64().unwrap(), descriptor["digest"].as_str().unwrap()));
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let daemon = daemon().with_account(account("fixture_user", "fixture@example.invalid"));
+        daemon.state().unwrap().sources.push(codex_health());
+        // The warning must also work before the first legacy source row arrives.
+        let before = health::shard_transitions(source);
+        let (_, records) = crate::local_resource_diagnostics::capture(|| {
+            assert!(!load().unwrap().0.persistence_available());
+            assert!(!load().unwrap().0.persistence_available());
+        });
+        assert_eq!(health::shard_transitions(source), before + 1);
+        let alarms = records.iter().filter(|r| r["counts"]["index_shard_unavailable_alarm"] == 1).collect::<Vec<_>>();
+        assert_eq!(alarms.len(), 1);
+        assert_eq!(alarms[0]["counts"]["unavailable_maps"], 1);
+        assert_eq!(alarms[0]["source"], "claude_code");
+        let counters = records.iter().filter(|r| r["counts"].get("index_shard_unavailable").is_some()).count();
+        assert_eq!(counters, 2, "per-load map/cause counters continue after the first alarm");
+        let status = daemon.status(TOKEN).unwrap();
+        let mut captured = status.clone();
+        let projection = status.canonical_health.unwrap();
+        assert_eq!(projection.overall.state, LocalHealthOverallState::Degraded);
+        assert!(projection.sources.iter().filter(|s| s.app != SourceKind::ClaudeCode)
+            .all(|s| s.blocking_reason.as_deref() != Some(health::SHARD_CODE)));
+        let row = projection.sources.iter().find(|s| s.app == SourceKind::ClaudeCode).unwrap();
+        assert_eq!(row.state, LocalHealthSourceState::Unknown);
+        assert_eq!(row.blocking_reason.as_deref(), Some(health::SHARD_CODE));
+        assert_eq!(row.next_action.as_deref(), Some("contact_support"));
+        let blocker = projection.blockers.iter().find(|b| b.code == health::SHARD_CODE).unwrap();
+        assert_eq!(blocker.source, "claude_code");
+        assert_eq!(blocker.severity, LocalHealthSeverity::Warning);
+        assert_eq!(blocker.clear_condition, health::SHARD_DETAIL);
+        let repeated = daemon.status(TOKEN).unwrap();
+        assert_eq!(repeated.local_health_events.len(), status.local_health_events.len());
+        for event in &repeated.local_health_events {
+            if event.payload["reason"] == health::SHARD_CODE {
+                assert_eq!(event.payload.as_object().unwrap().len(), 4);
+                assert!(event.source_id.is_none());
+                let payload = event.payload.to_string();
+                for forbidden in ["fixture_user", "fixture@example.invalid", "scan-index", "digest", "namespace"] {
+                    assert!(!payload.contains(forbidden));
+                }
+            }
+        }
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let (_, records) = crate::local_resource_diagnostics::capture(|| assert!(load().unwrap().0.persistence_available()));
+        assert!(records.iter().all(|r| r["counts"].get("index_shard_unavailable_alarm").is_none()));
+        assert_eq!(health::shard_transitions(source), before + 2);
+        let recovered = daemon.status(TOKEN).unwrap();
+        assert!(recovered.canonical_health.unwrap().blockers.iter().all(|b| b.code != health::SHARD_CODE));
+        refresh_canonical_local_health(&mut captured);
+        assert!(captured.canonical_health.unwrap().blockers.iter().any(|b| b.code == health::SHARD_CODE),
+            "captured projections do not borrow later live recovery");
+        // A new episode alarms once again. A set/clear pair between status
+        // reads must survive capture as TWO transitions, not vanish together.
+        std::fs::remove_file(&path).unwrap();
+        let (_, records) = crate::local_resource_diagnostics::capture(|| {
+            assert!(!load().unwrap().0.persistence_available());
+            assert!(!load().unwrap().0.persistence_available());
+        });
+        assert_eq!(records.iter().filter(|r| r["counts"]["index_shard_unavailable_alarm"] == 1).count(), 1);
+        let payload_name = path.file_name().unwrap().to_str().unwrap();
+        std::fs::write(&path, fixture["payloads"][payload_name].as_str().unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(load().unwrap().0.persistence_available());
+        let coalesced = daemon.status(TOKEN).unwrap();
+        let events = coalesced.local_health_events.iter().filter(|e|
+            e.payload["reason"] == health::SHARD_CODE).collect::<Vec<_>>();
+        assert_eq!(events.len(), before as usize + 4);
+        assert_eq!(events[events.len() - 2].payload["blocked_sources"], 1);
+        assert_eq!(events[events.len() - 1].payload["blocked_sources"], 0);
+        assert_eq!(health::shard_transitions(source), before + 4);
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+}

@@ -2565,3 +2565,31 @@ pub(crate) fn take_scan_index_storage_observations() -> Vec<StorageReadObservati
 
 #[cfg(test)]
 type StorageReadObservation = (u64, [[u64; 6]; 3]);
+
+/// One content-free alarm on entry to a shard-unavailable source episode.
+pub(crate) fn scan_index_shard_alarm(source: &'static str, unavailable: usize, transitions: u64) {
+    traversal_point(
+        "scan_index_storage",
+        source,
+        &serde_json::json!({
+            "index_shard_unavailable_alarm": 1,
+            "unavailable_maps": unavailable,
+            "blocked_sources": 1,
+            "transitions": transitions,
+        }),
+    );
+}
+pub(crate) fn scan_index_manifest_refused(source: &'static str) {
+    static TOTAL: AtomicU64 = AtomicU64::new(0);
+    let count = TOTAL
+        .fetch_update(Relaxed, Relaxed, |v| Some(v.saturating_add(1)))
+        .unwrap_or_else(|v| v)
+        .saturating_add(1);
+    traversal_point(
+        "scan_index_storage",
+        source,
+        &serde_json::json!({
+            "scanindex_manifest_unavailable_refused": count,
+        }),
+    );
+}

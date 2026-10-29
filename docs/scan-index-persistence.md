@@ -307,3 +307,36 @@ records) under shared admission: losing an unrelated map cannot defund negative
 metadata holds by shrinking the proportional input denominator. Original logical
 padding is retained once. Map validation keeps its existing admission policy;
 this negative-only custody exception grants no acquisition or publication.
+
+## UNKNOWN recovery, manifests and source health
+
+A partial view refuses `manifest_for_window` before window parsing or fingerprint
+selection. `scanindex_manifest_unavailable_refused` counts that refusal on the
+existing local resource diagnostic envelope; no empty eligible manifest escapes.
+
+The source-aware loader also sets the open-string reason
+`index_shard_unavailable` while any map is unavailable. Its source-owned warning
+uses the existing degraded machine-health projection. A complete successful
+reload clears it; missing/quarantined state or unrelated read errors do not prove
+recovery. Version refusal retains its distinct update-app reason. Only state
+changes emit health events, and the first unavailable load of each episode emits
+`index_shard_unavailable_alarm` on the diagnostic line. Per-map/cause counters
+continue on every load. Payload dimensions contain only source, fixed reasons
+and counts, never IDs, paths or digests.
+
+Proposed presentation copy is centralized in `scan_index_health.rs` for wording
+approval: **Not collecting: index needs repair**. Hover: "Collection is paused
+because saved evidence is unavailable. Keep the local index and contact Ottto
+support to restore it; collection resumes when the index is complete."
+The action is `contact_support`; this warning does not authorize deletion,
+quarantine, automatic repair or new acquisition. Consumer label mappings are a
+separate presentation change; the open-string reason and known degraded/warning
+states preserve compatibility without a new protocol enum tag.
+
+Per-map recovery fixtures corrupt a real shard, retain a previously prepared E2
+page while UNKNOWN, restore the original bytes, then reload a complete view.
+They exercise E2, finalization, context adoption and the manifest boundary,
+compare resumed nonzero money and exact emitted bodies with an undamaged control,
+and prohibit transcript reads while held and after restoration. The old partial
+view remains unavailable; recovery never clears its flags in place. Writer
+activation remains disabled until the installed-reader release gate is met.
