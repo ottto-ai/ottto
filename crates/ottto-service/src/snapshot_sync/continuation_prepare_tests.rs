@@ -852,7 +852,11 @@ fn ordinary_durable_continuation_to_eof(
     let cache = std::sync::Arc::new(crate::snapshots::sampled_scan::SharedCache::default());
     let writer = crate::locked_state_dir::test_locks::hold(fixture.index_path.parent().unwrap());
     let mut minted = fixture.preparation(false);
-    let mut inputs = take_continuation_inputs(&mut minted);
+    let mut inputs = take_continuation_inputs(
+        &mut minted,
+        &std::sync::Arc::default(),
+        std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
+    );
     let namespace = cycle_sampled_scope(
         &inputs.account_witness,
         &inputs.upload_destination_namespace,

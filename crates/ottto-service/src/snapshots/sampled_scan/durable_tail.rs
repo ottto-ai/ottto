@@ -1568,9 +1568,9 @@ impl SharedCache {
                     }));
                 }
                 if let Some(owed) = owed {
-                    return Err(MissClass::Unregistered(owed).into().into());
+                    return Err(MissClass::Unregistered(owed).into());
                 }
-                return Err(MissClass::Failure(class).into().into());
+                return Err(MissClass::Failure(class).into());
             }
         };
         if let Some(slot) = stores.slot(source).as_mut() {
