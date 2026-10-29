@@ -766,14 +766,18 @@ Post-release counts line: `codex_zst_first_read_retry`, `codex_zst_retry_alarm`,
 Counters/events are counts-only; do not sum ordinal or running gauge fields.
 
 Correctness custody retains an age-independent file recovery obligation in the
-optional `codex_compressed_hold` field. Stage `codex_held_growth` observes existing
+optional `codex_compressed_hold` field, registered in the shared
+`DiscoveryRetention` view. That registration bypasses age rejection only; it
+never creates verification debt or grants a sample or Full read. Stage
+`codex_held_growth` observes existing
 walk metadata only: `held_growth_bytes` is length above the accepted entry size,
 `held_growth_files` is one for positive observed growth, and `held_over_cap` is
 one when that held plain file exceeds the file cap. These are observations of
 owed work, not unique ingested bytes; repeated passes may observe the same debt.
 They contain no paths or ids. Held growth takes no content/sample read or Full.
 Post-release counts also include all three fields. An over-cap held file remains
-rostered and indexed; it is not silently retired or treated as fresh proof.
+rostered and indexed; ordinary size rejection remains enforced and counted.
+It is not silently retired or treated as fresh proof.
 Release must keep the obligation through counted Tail catch-up from the durable
 checkpoint, preserving the exact cumulative body and witness without prefix
 duplication or Full. This release transition belongs to custody-aware recovery;

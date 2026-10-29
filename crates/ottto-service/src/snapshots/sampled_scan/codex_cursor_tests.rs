@@ -11732,6 +11732,9 @@ fn held_growth_survives_old_window_cap_and_reload_then_synthetic_release_tails()
         codex_compressed_hold_tests::with_file_cap(cap, || {
             index.files.get_mut(&key).unwrap().codex_compressed_hold =
                 Some(CodexZstCause::ParentLedgerUnbound);
+            assert!(!index.files[&key].has_unverified_source());
+            assert!(index.claude_account_deferred_holds.is_empty());
+            assert!(discovery_retention!(index).owes(&path));
             let owner = codex_protected_owner(SESSION);
             index.codex_counting_tombstones.insert(
                 owner.clone(),
@@ -11776,6 +11779,7 @@ fn held_growth_survives_old_window_cap_and_reload_then_synthetic_release_tails()
                 });
                 index = next;
                 assert_eq!(result.unreadable_path_count, 0);
+                assert_eq!(result.oversized_file_count, usize::from(over_cap));
                 assert!(index.files.contains_key(&key));
                 assert_eq!(index.files[&key].size_bytes, prefix_len);
                 assert_eq!(index.files[&key].last_upload_body_witness, witness);

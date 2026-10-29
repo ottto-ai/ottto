@@ -42285,7 +42285,7 @@ fn is_recent_enough_at(
 /// line in `discovery_retention!` and `unverified`, and its line in `owes`.
 #[derive(Clone, Copy)]
 struct DiscoveryRetention<'a> {
-    /// Entries; an unverified sampled generation (`sampled_audit`) is owed.
+    /// Entries; sampled verification debt and dedicated custody are owed.
     files: &'a BTreeMap<String, ScanIndexEntry>,
     /// Claude keys withheld for an unresolved account (`withheld_account`).
     account_holds: &'a BTreeMap<String, String>,
