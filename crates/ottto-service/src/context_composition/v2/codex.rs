@@ -19,8 +19,8 @@ use super::decode::{
 use super::file::LineSink;
 use super::MAX_ITEMS_PER_CALL;
 use crate::composition_kinds::{
-    self as kinds, Agent, Author, ContentLabel, InnerItem, Kind, KindsVersion, LineCtx,
-    ParsedCommand, Part, Verdict,
+    self as kinds, Author, ContentLabel, InnerItem, Kind, KindsVersion, LineCtx, ParsedCommand,
+    Part, Verdict,
 };
 use serde_json::Value;
 use std::borrow::Cow;
@@ -248,13 +248,7 @@ pub(super) fn handle_line(out: &mut LineSink, state: &mut ParseState, line: &[u8
     } else {
         Author::You
     };
-    let ctx = out.ctx(
-        state,
-        Agent::Codex,
-        cwd.as_deref().map(Path::new),
-        false,
-        author,
-    );
+    let ctx = out.ctx(state, cwd.as_deref().map(Path::new), false, author);
     let payload_type = payload.kind.str();
     let payload_type = payload_type.as_deref().unwrap_or("");
     match payload_type {

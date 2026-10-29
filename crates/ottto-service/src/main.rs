@@ -609,6 +609,7 @@ fn run_startup_step(step: StartupStep) {
             }
         }
         StartupStep::RecoverClaudeBrowserAuth => {
+            ottto_service::session_launch::recover_at_startup();
             ottto_service::claude_browser_auth::recover_at_startup()
         }
         StartupStep::RecoverCodexSignIn => ottto_service::codex_sign_in::recover_at_startup(),
@@ -676,11 +677,11 @@ fn start_builtin_relays(daemon: &LocalDaemon) {
         Ok(()) => eprintln!("serving collector check-in heartbeat"),
         Err(error) => eprintln!("collector check-in heartbeat unavailable: {error}"),
     }
-    match ottto_service::mcp_inventory::spawn_mcp_inventory_sync() {
+    match ottto_service::mcp_inventory::spawn_mcp_inventory_sync_for_daemon(daemon) {
         Ok(()) => eprintln!("serving mcp inventory harvest"),
         Err(error) => eprintln!("mcp inventory harvest unavailable: {error}"),
     }
-    match ottto_service::context_footprint::spawn_context_footprint_sync() {
+    match ottto_service::context_footprint::spawn_context_footprint_sync(daemon) {
         Ok(()) => eprintln!("serving context footprint harvest"),
         Err(error) => eprintln!("context footprint harvest unavailable: {error}"),
     }

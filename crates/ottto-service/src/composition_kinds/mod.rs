@@ -55,8 +55,9 @@ pub(crate) enum Kind {
 }
 
 impl Kind {
-    /// The kinds_version 1 categories in wire order. The methodology
-    /// fingerprint (`config_hash`) and per-session totals use this list.
+    /// The kinds_version 1 categories in wire order, used by the test-only
+    /// kinds_version 1 oracle and the kinds tests.
+    #[cfg(test)]
     pub(crate) const ALL: [Kind; 10] = [
         Kind::HarnessAttachments,
         Kind::ShellOutput,
@@ -104,7 +105,8 @@ impl Kind {
 
     /// Position in `ALL` (the v1 per-session slot). Only kinds_version 1
     /// kinds have a slot; a kinds_version 2 kind is a bug (debug builds
-    /// panic, release builds use slot 0).
+    /// panic, release builds use slot 0). Test-only, like `ALL`.
+    #[cfg(test)]
     pub(crate) fn index(self) -> usize {
         let index = Kind::ALL.iter().position(|c| *c == self);
         debug_assert!(index.is_some(), "{self:?} has no kinds_version 1 slot");
@@ -236,12 +238,6 @@ impl Part {
 // Line context and verdicts.
 // -------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Agent {
-    Claude,
-    Codex,
-}
-
 /// Who wrote a prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Author {
@@ -274,8 +270,6 @@ pub(crate) enum KindsVersion {
 /// What the reader knows about the line being classified.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LineCtx<'a> {
-    #[allow(dead_code)] // Informational: no reader branches on it.
-    pub(crate) agent: Agent,
     /// Whether the line belongs to the session's first request.
     pub(crate) request_1: Request1,
     /// The folder the session (or this line's command) runs in.
@@ -293,9 +287,8 @@ pub(crate) struct LineCtx<'a> {
 impl<'a> LineCtx<'a> {
     /// The context the kinds_version 1 reader supplies: it tracks no
     /// request-1 phase, folder, rendered text or author.
-    pub(crate) fn v1(agent: Agent) -> Self {
+    pub(crate) fn v1() -> Self {
         Self {
-            agent,
             request_1: Request1::No,
             cwd: None,
             file_has_rendered: false,
@@ -306,14 +299,12 @@ impl<'a> LineCtx<'a> {
 
     /// A kinds_version 2 context.
     pub(crate) fn v2(
-        agent: Agent,
         request_1: Request1,
         cwd: Option<&'a Path>,
         file_has_rendered: bool,
         author: Author,
     ) -> Self {
         Self {
-            agent,
             request_1,
             cwd,
             file_has_rendered,
@@ -510,7 +501,7 @@ pub(crate) fn claude_attachment(ctx: &LineCtx, att: &ClaudeAttachment) -> Verdic
 
 /// Whether kinds_version 2 knows a Claude attachment type; unknown types
 /// count as `automatic_additions` / `other` (a health counter's input).
-#[allow(dead_code)] // Read once the reader keeps health counters.
+#[cfg(test)]
 pub(crate) fn claude_attachment_known(att_type: &str) -> bool {
     v2::claude_attachment_known(att_type)
 }

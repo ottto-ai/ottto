@@ -5,12 +5,139 @@ use super::cache_lifecycle;
 use serde::Serialize;
 use std::cell::Cell;
 
+/// Closed labels for the existing progress-blocking / restore branches.
+#[derive(Clone, Copy)]
+pub(crate) enum HeldReason {
+    AuthorityUnboundRevision,
+    AuthorityCorrectionPending,
+    AccountHoldUnrecorded,
+    NotRestorable,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct HeldReasons {
+    #[serde(skip_serializing_if = "super::is_zero")]
+    authority_unbound_revision: u64,
+    #[serde(skip_serializing_if = "super::is_zero")]
+    authority_correction_pending: u64,
+    #[serde(skip_serializing_if = "super::is_zero")]
+    account_hold_unrecorded: u64,
+    #[serde(skip_serializing_if = "super::is_zero")]
+    not_restorable: u64,
+}
+impl HeldReasons {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+    fn merge(&mut self, other: Self) {
+        self.authority_unbound_revision = self
+            .authority_unbound_revision
+            .saturating_add(other.authority_unbound_revision);
+        self.authority_correction_pending = self
+            .authority_correction_pending
+            .saturating_add(other.authority_correction_pending);
+        self.account_hold_unrecorded = self
+            .account_hold_unrecorded
+            .saturating_add(other.account_hold_unrecorded);
+        self.not_restorable = self.not_restorable.saturating_add(other.not_restorable);
+    }
+}
+pub(crate) fn held_reason(reason: HeldReason) {
+    update(|counts| {
+        let reasons = &mut counts.claude_reread.held_reason;
+        let counter = match reason {
+            HeldReason::AuthorityUnboundRevision => &mut reasons.authority_unbound_revision,
+            HeldReason::AuthorityCorrectionPending => &mut reasons.authority_correction_pending,
+            HeldReason::AccountHoldUnrecorded => &mut reasons.account_hold_unrecorded,
+            HeldReason::NotRestorable => &mut reasons.not_restorable,
+        };
+        *counter = counter.saturating_add(1);
+    });
+}
+
+// Fixed reason names, shared by the window mask and sparse #799 counters.
+macro_rules! ignored_vetoes {
+    ($($kind:ident => $key:literal),+ $(,)?) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub(crate) enum IgnoredVeto { $($kind),+ }
+        impl IgnoredVeto {
+            pub(crate) const ALL: &'static [(Self, &'static str)] = &[$((Self::$kind, $key)),+];
+            pub(crate) fn bit(self) -> u16 { 1 << self as u16 }
+        }
+    };
+}
+ignored_vetoes! {
+    WithheldAccount => "withheld_account", EvidenceGap => "evidence_gap",
+    RequestsRefused => "requests_refused", IdentityRefusals => "identity_refusals",
+    InvalidRows => "invalid_rows", DuplicateRows => "duplicate_rows",
+    ClientMismatch => "client_mismatch", MultiRootClaims => "multi_root_claims",
+    ProofFailure => "proof_failure", ReconstructionFailure => "reconstruction_failure",
+    MissingInputs => "missing_inputs", RebuildFailure => "rebuild_failure",
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct IgnoredVetoCounts([u64; 12]);
+impl Serialize for IgnoredVetoCounts {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(IgnoredVeto::ALL.iter().filter_map(|(kind, key)| {
+            let n = self.0[*kind as usize];
+            (n != 0).then_some((*key, n))
+        }))
+    }
+}
+impl IgnoredVetoCounts {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+    fn merge(&mut self, other: Self) {
+        self.0 = std::array::from_fn(|i| self.0[i].saturating_add(other.0[i]));
+    }
+}
+pub(crate) fn ignored_vetoes(mask: u16, preserved: u64) {
+    if mask == 0 {
+        return;
+    }
+    update(|counts| {
+        for (kind, _) in IgnoredVeto::ALL {
+            let n = &mut counts.rearm_veto_ignored.0[*kind as usize];
+            *n = n.saturating_add(u64::from(mask & kind.bit() != 0));
+        }
+        counts.rearm_fingerprints_preserved = counts
+            .rearm_fingerprints_preserved
+            .saturating_add(preserved);
+    });
+}
+
+pub(crate) fn structural_native_duplicate() {
+    update(|counts| {
+        counts.rearm_structural_native_duplicate =
+            counts.rearm_structural_native_duplicate.saturating_add(1)
+    });
+}
+
+/// The terminal fold follows collection. Publish its delta on the same #799
+/// page carrier, then retain it for scoped inspection (not comparison output).
+pub(crate) fn terminal_rearm(mask: u16, preserved: u64, native_duplicate: bool) {
+    if mask == 0 && !native_duplicate {
+        return;
+    }
+    let scope = Scope::begin(true);
+    ignored_vetoes(mask, preserved);
+    if native_duplicate {
+        structural_native_duplicate();
+    }
+    let counts = scope.finish();
+    update(|page| page.merge(counts));
+    super::rearm_collection(counts);
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct Rearm {
     #[serde(skip_serializing_if = "super::is_zero")]
     pub(crate) restored_empty_held: u64,
     #[serde(skip_serializing_if = "super::is_zero")]
     pub(crate) restored_nonempty_held: u64,
+    #[serde(skip_serializing_if = "HeldReasons::is_empty")]
+    pub(crate) held_reason: HeldReasons,
     #[serde(skip_serializing_if = "super::is_zero")]
     pub(crate) restored_empty_sibling: u64,
     #[serde(skip_serializing_if = "super::is_zero")]
@@ -31,6 +158,14 @@ pub(crate) struct Rearm {
     pub(crate) retry_admission_cleared: u64,
     #[serde(skip_serializing_if = "super::is_zero")]
     pub(crate) authority_normalization_cleared: u64,
+    #[serde(skip_serializing_if = "super::is_zero")]
+    pub(crate) history_permitted_not_stamped_not_accepted: u64,
+    #[serde(skip_serializing_if = "super::is_zero")]
+    pub(crate) history_permitted_not_stamped_telemetry_unread: u64,
+    #[serde(skip_serializing_if = "super::is_zero")]
+    pub(crate) history_permitted_not_stamped_held: u64,
+    #[serde(skip_serializing_if = "super::is_zero")]
+    pub(crate) history_permitted_not_stamped_other: u64,
 }
 impl Rearm {
     fn merge(&mut self, other: Self) {
@@ -49,8 +184,13 @@ impl Rearm {
             account_reproof_cleared,
             retry_admission_offered,
             retry_admission_cleared,
-            authority_normalization_cleared
+            authority_normalization_cleared,
+            history_permitted_not_stamped_not_accepted,
+            history_permitted_not_stamped_telemetry_unread,
+            history_permitted_not_stamped_held,
+            history_permitted_not_stamped_other
         );
+        self.held_reason.merge(other.held_reason);
     }
     fn is_empty(&self) -> bool {
         *self == Self::default()
@@ -59,6 +199,12 @@ impl Rearm {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct Counts {
+    #[serde(skip_serializing_if = "IgnoredVetoCounts::is_empty")]
+    pub(crate) rearm_veto_ignored: IgnoredVetoCounts,
+    #[serde(skip_serializing_if = "super::is_zero")]
+    pub(crate) rearm_fingerprints_preserved: u64,
+    #[serde(skip_serializing_if = "super::is_zero")]
+    pub(crate) rearm_structural_native_duplicate: u64,
     #[serde(flatten)]
     pub(crate) absence: super::claude_absence::Counts,
     #[serde(flatten)]
@@ -116,12 +262,25 @@ pub(crate) fn cache_capacity_eviction(count_pressure: bool) {
 }
 impl Counts {
     pub(crate) fn merge(&mut self, other: Self) {
+        self.rearm_veto_ignored.merge(other.rearm_veto_ignored);
+        self.rearm_structural_native_duplicate = self
+            .rearm_structural_native_duplicate
+            .saturating_add(other.rearm_structural_native_duplicate);
+        self.rearm_fingerprints_preserved = self
+            .rearm_fingerprints_preserved
+            .saturating_add(other.rearm_fingerprints_preserved);
         self.contract.merge(other.contract);
         self.claude_reread.merge(other.claude_reread);
         self.absence.0 =
             std::array::from_fn(|i| self.absence.0[i].saturating_add(other.absence.0[i]));
         self.retained_cache_page_events
             .merge(other.retained_cache_page_events);
+    }
+    pub(super) fn without_terminal_rearm(mut self) -> Self {
+        self.rearm_veto_ignored = Default::default();
+        self.rearm_fingerprints_preserved = 0;
+        self.rearm_structural_native_duplicate = 0;
+        self
     }
     pub(crate) fn with_current(mut self) -> Self {
         CURRENT.with(|current| {
@@ -172,6 +331,7 @@ impl Drop for Scope {
     }
 }
 pub(crate) fn emit_without_lease(counts: Counts) {
+    let counts = counts.without_terminal_rearm();
     if counts != Counts::default() {
         // The disabled-before-lease point has already reported the gate.
         // Reuse its stage at the end of work only when there are actual events.
@@ -255,6 +415,25 @@ pub(crate) fn clear(site: ClearSite, nonempty: bool) {
         *cleared = cleared.saturating_add(u64::from(nonempty));
     });
 }
+/// Why an upgrade the history gate permitted this page did not stamp.
+pub(crate) enum NotStamped {
+    NotAccepted,
+    TelemetryUnread,
+    Held,
+    Other,
+}
+pub(crate) fn history_permitted_not_stamped(reason: NotStamped) {
+    update(|counts| {
+        let c = &mut counts.claude_reread;
+        let n = match reason {
+            NotStamped::NotAccepted => &mut c.history_permitted_not_stamped_not_accepted,
+            NotStamped::TelemetryUnread => &mut c.history_permitted_not_stamped_telemetry_unread,
+            NotStamped::Held => &mut c.history_permitted_not_stamped_held,
+            NotStamped::Other => &mut c.history_permitted_not_stamped_other,
+        };
+        *n = n.saturating_add(1);
+    });
+}
 pub(crate) fn authority_normalization(cleared: u64) {
     update(|counts| {
         let n = &mut counts.claude_reread.authority_normalization_cleared;
@@ -294,6 +473,26 @@ impl crate::heap_layout_bound::HeapLayoutBound for Reinsertion {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn held_reasons_are_sparse_saturating_and_merged_across_scopes() {
+        let scope = Scope::begin(true);
+        held_reason(HeldReason::AuthorityUnboundRevision);
+        held_reason(HeldReason::AuthorityCorrectionPending);
+        let mut counts = scope.finish();
+        counts.claude_reread.held_reason.not_restorable = u64::MAX;
+        let scope = Scope::begin(true);
+        held_reason(HeldReason::AccountHoldUnrecorded);
+        held_reason(HeldReason::NotRestorable);
+        counts.merge(scope.finish());
+        assert_eq!(
+            serde_json::to_value(counts).unwrap()["claude_reread"]["held_reason"],
+            serde_json::json!({
+                "authority_unbound_revision": 1, "authority_correction_pending": 1,
+                "account_hold_unrecorded": 1, "not_restorable": u64::MAX,
+            })
+        );
+    }
+
     #[test]
     fn page_scope_isolates_sources_nested_work_threads_and_resumption() {
         let scope = Scope::begin(true);
@@ -349,5 +548,61 @@ mod tests {
             serde_json::json!({"reinsert_failed": 1})
         );
         assert_eq!(value["claude_reread"].as_object().unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod ignored_tests {
+    use super::*;
+    #[test]
+    fn ignored_keys_are_sparse_saturating_and_page_local() {
+        assert_eq!(IgnoredVeto::ALL.len(), 12, "closed diagnostic cardinality");
+        assert!(IgnoredVeto::ALL
+            .iter()
+            .all(|(kind, _)| kind.bit() < (1 << 12)));
+        assert_eq!(
+            serde_json::to_value(Counts::default()).unwrap(),
+            serde_json::json!({})
+        );
+        let scope = Scope::begin(true);
+        ignored_vetoes(
+            IgnoredVeto::EvidenceGap.bit() | IgnoredVeto::EvidenceGap.bit(),
+            u64::MAX,
+        );
+        let other = Scope::begin(false);
+        ignored_vetoes(IgnoredVeto::WithheldAccount.bit(), 99);
+        assert_eq!(other.finish(), Counts::default());
+        let mut page = scope.finish();
+        let resumed = Scope::begin(true);
+        ignored_vetoes(IgnoredVeto::EvidenceGap.bit(), 1);
+        page.merge(resumed.finish());
+        assert_eq!(page.rearm_fingerprints_preserved, u64::MAX);
+        assert_eq!(
+            serde_json::to_value(page.rearm_veto_ignored).unwrap(),
+            serde_json::json!({"evidence_gap": 2})
+        );
+        page.rearm_veto_ignored.0[IgnoredVeto::EvidenceGap as usize] = u64::MAX;
+        let mut extra = Counts::default();
+        extra.rearm_veto_ignored.0[IgnoredVeto::EvidenceGap as usize] = 1;
+        page.merge(extra);
+        assert_eq!(
+            page.rearm_veto_ignored.0[IgnoredVeto::EvidenceGap as usize],
+            u64::MAX
+        );
+        assert_eq!(Scope::begin(true).finish(), Counts::default());
+        let scope = Scope::begin(true);
+        structural_native_duplicate();
+        let mut native = scope.finish();
+        assert_eq!(
+            serde_json::to_value(native).unwrap(),
+            serde_json::json!({"rearm_structural_native_duplicate": 1})
+        );
+        native.rearm_structural_native_duplicate = u64::MAX;
+        let extra = Counts {
+            rearm_structural_native_duplicate: 1,
+            ..Counts::default()
+        };
+        native.merge(extra);
+        assert_eq!(native.rearm_structural_native_duplicate, u64::MAX);
     }
 }

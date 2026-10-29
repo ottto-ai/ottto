@@ -1,6 +1,6 @@
 //! The per-workspace accumulator: daily buckets, files and sessions.
 
-use super::{Category, MAX_WINDOW_DAYS};
+use super::Category;
 use std::collections::{BTreeMap, HashSet};
 use time::{Date, OffsetDateTime};
 
@@ -64,14 +64,6 @@ pub(crate) struct DateWindow {
 }
 
 impl DateWindow {
-    pub(super) fn current() -> Self {
-        let now = OffsetDateTime::now_utc();
-        Self {
-            floor: (now - time::Duration::days(MAX_WINDOW_DAYS - 1)).date(),
-            today: now.date(),
-        }
-    }
-
     pub(super) fn contains(&self, date: Date) -> bool {
         date >= self.floor && date <= self.today
     }

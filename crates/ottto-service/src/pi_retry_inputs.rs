@@ -3,6 +3,7 @@
 //! enumerate or parse providers. Unsupported/larger trees stay ordinary work.
 use super::*;
 use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+use crate::transcript_acquisition::FileStamp;
 
 const MAX_PATHS: usize = 128;
 const MAX_PATH_BYTES: usize = 32 * 1024;
@@ -14,19 +15,37 @@ pub(crate) struct PiRetryInputs {
 }
 struct Input {
     path: PathBuf,
-    stamp: [u8; 32],
-    file_fingerprint: Option<String>,
+    stamp: InputStamp,
 }
 
-fn stamp(metadata: &fs::Metadata) -> [u8; 32] {
+enum InputStamp {
+    File(FileStamp),
+    Directory([u8; 32]),
+}
+impl InputStamp {
+    fn capture(metadata: fs::Metadata) -> Option<Self> {
+        if metadata.is_dir() {
+            Some(Self::Directory(directory_membership_stamp(&metadata)))
+        } else {
+            FileStamp::capture(metadata).ok().map(Self::File)
+        }
+    }
+    fn same_content(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::File(a), Self::File(b)) => a.same_content(b),
+            (Self::Directory(a), Self::Directory(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+// Directory membership only; regular files use the acquisition owner's one rule.
+fn directory_membership_stamp(metadata: &fs::Metadata) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(metadata.len().to_be_bytes());
     #[cfg(unix)]
     for n in [
         metadata.dev(),
         metadata.ino(),
-        metadata.ctime() as u64,
-        metadata.ctime_nsec() as u64,
         metadata.mtime() as u64,
         metadata.mtime_nsec() as u64,
     ] {
@@ -35,36 +54,10 @@ fn stamp(metadata: &fs::Metadata) -> [u8; 32] {
     h.finalize().into()
 }
 
-fn identify(root: &Path, path: &Path) -> Option<String> {
-    let mut candidate = CandidateFile {
-        physical_identity: None,
-        scan_root: root.to_owned(),
-        path: path.to_owned(),
-        size_bytes: 0,
-        modified_unix_seconds: 0,
-        modified_unix_nanos: 0,
-        source_file_fingerprint: String::new(),
-        legacy_source_file_fingerprint: String::new(),
-        legacy_config_reconciliation_required: false,
-        opened_object_identity: String::new(),
-        fingerprint_changed_nanos: 0,
-        fingerprint_birth_nanos: 0,
-    };
-    let _file = open_candidate_file(SnapshotSource::Pi, &mut candidate).ok()?;
-    Some(scan_file_fingerprint_with_opened_identity(
-        path,
-        candidate.size_bytes,
-        candidate.modified_unix_nanos,
-        SnapshotSource::Pi.scan_identity_version(),
-        "",
-        &candidate.opened_object_identity,
-    ))
-}
-
 impl PiRetryInputs {
     pub(crate) fn capture(root: &Path) -> Option<Self> {
-        // Canonicalize once to reject symlink roots and every ancestor. The
-        // native opener subsequently uses no-follow descriptor-relative opens.
+        // Freeze the complete path set without opening transcripts. Canonicalize
+        // to reject symlink roots and every ancestor.
         if !root.is_absolute() || root.canonicalize().ok()?.as_path() != root {
             return None;
         }
@@ -83,7 +76,7 @@ impl PiRetryInputs {
             if before.file_type().is_symlink() {
                 return None;
             }
-            let fingerprint = if before.is_dir() {
+            if before.is_dir() {
                 for entry in fs::read_dir(&path).ok()? {
                     let child = entry.ok()?.path();
                     path_bytes = path_bytes.checked_add(child.as_os_str().len())?;
@@ -94,27 +87,22 @@ impl PiRetryInputs {
                     }
                     pending.push(child);
                 }
-                None
             } else if before.is_file() && path.extension().is_some_and(|e| e == "jsonl") {
                 content_bytes = content_bytes.checked_add(before.len())?;
                 if content_bytes > MAX_CONTENT_BYTES {
                     return None;
                 }
-                Some(identify(root, &path)?)
             } else {
                 // Non-transcript files and special objects have no closed
                 // provider semantics in this initial admission.
                 return None;
-            };
+            }
             let after = fs::symlink_metadata(&path).ok()?;
-            if stamp(&before) != stamp(&after) {
+            let stamp = InputStamp::capture(after)?;
+            if !InputStamp::capture(before)?.same_content(&stamp) {
                 return None;
             }
-            result.paths.push(Input {
-                path,
-                stamp: stamp(&after),
-                file_fingerprint: fingerprint,
-            });
+            result.paths.push(Input { path, stamp });
         }
         result.validate().ok()?;
         Some(result)
@@ -134,20 +122,16 @@ impl PiRetryInputs {
         for input in self.paths.iter().chain(self.paths.iter().rev()) {
             let current = fs::symlink_metadata(&input.path)?;
             anyhow::ensure!(
-                !current.file_type().is_symlink() && stamp(&current) == input.stamp,
+                !current.file_type().is_symlink()
+                    && InputStamp::capture(current)
+                        .is_some_and(|stamp| input.stamp.same_content(&stamp)),
                 "optional Pi dependency changed"
             );
-            if let Some(expected) = &input.file_fingerprint {
-                anyhow::ensure!(
-                    identify(&self.root, &input.path).as_ref() == Some(expected),
-                    "optional Pi opened file changed"
-                );
-            }
         }
         Ok(())
     }
 
-    pub(crate) fn covers(&self, items: &[SnapshotItem]) -> bool {
+    pub(crate) fn covers(&self, items: &[SnapshotItem], index: &ScanIndex) -> bool {
         items.iter().all(|item| {
             // Workspace/repository identity can read mutable Git metadata
             // outside these frozen transcript roots. Decline that graph until
@@ -158,10 +142,13 @@ impl PiRetryInputs {
                 && item.repository_label_source.is_none()
                 && item.repository_identity_source.is_none()
                 && item.workspace_kind.is_none()
+                // Reuse the completed scan's path/fingerprint association.
+                // Never mint a second identity by opening a transcript here.
                 && item.source_file_fingerprint.as_ref().is_some_and(|fp| {
-                    self.paths
-                        .iter()
-                        .any(|input| input.file_fingerprint.as_ref() == Some(fp))
+                    !fp.is_empty() && self.paths.iter().filter(|input| matches!(&input.stamp, InputStamp::File(_))).any(|input| {
+                        index.files.get(input.path.to_string_lossy().as_ref())
+                            .is_some_and(|entry| &entry.source_file_fingerprint == fp)
+                    })
                 })
         })
     }
@@ -172,13 +159,8 @@ impl HeapLayoutBound for PiRetryInputs {
         root.heap_bound(c)?;
         c.add(paths.capacity().checked_mul(std::mem::size_of::<Input>())?)?;
         for input in paths {
-            let Input {
-                path,
-                stamp: _,
-                file_fingerprint,
-            } = input;
+            let Input { path, stamp: _ } = input;
             path.heap_bound(c)?;
-            file_fingerprint.heap_bound(c)?;
         }
         Some(())
     }

@@ -148,6 +148,7 @@ pub(super) struct HeaderWitness {
     pub(super) home: PathBuf,
     pub(super) created_unix_ms: Option<i64>,
     metadata: String,
+    stamp: crate::transcript_acquisition::FileStamp,
 }
 pub(super) fn member_home(root: &Path) -> PathBuf {
     root.ancestors()
@@ -164,6 +165,7 @@ pub(super) fn member_home(root: &Path) -> PathBuf {
 // One bounded secure acquisition path; semantic inventory and sampled-scope
 // witnesses both use it. Only inventory performs native header decoding.
 fn read_header_bytes(candidate: &CandidateFile) -> Result<(Vec<u8>, String, usize)> {
+    refuse_compressed_codex(Some(&candidate.path), None, CodexZstCause::HeaderUnfunded)?;
     let file = open_candidate_beneath_root(candidate)?;
     let before = file.metadata()?;
     anyhow::ensure!(before.is_file(), "Codex header is not a regular file");
@@ -186,6 +188,8 @@ fn read_header_bytes(candidate: &CandidateFile) -> Result<(Vec<u8>, String, usiz
 type ReadHeader = (String, Option<i64>, String, usize);
 fn read_header(candidate: &CandidateFile) -> Result<ReadHeader> {
     let (bytes, witness, read_bytes) = read_header_bytes(candidate)?;
+    #[cfg(test)]
+    codex_zst_refusal_tests::jsonl_parse_attempted();
     let value: Value = serde_json::from_slice(&bytes)?;
     let meta =
         codex_session_meta_payload(&value).context("Codex first record is not a owning header")?;
@@ -282,6 +286,15 @@ impl HeaderInventory {
                 || !directories.is_some_and(|value| value.stable),
         }
     }
+    pub(super) fn content_unchanged(&self) -> bool {
+        self.complete
+            && self.pending.is_empty()
+            && self.headers.iter().all(|header| {
+                fs::symlink_metadata(&header.candidate.path)
+                    .and_then(crate::transcript_acquisition::FileStamp::capture)
+                    .is_ok_and(|stamp| header.stamp.same_content(&stamp))
+            })
+    }
     pub(super) fn owner_for_path(&self, path: &Path) -> Option<&str> {
         // Headers append in the pending BTreeSet<String> path order. Compare
         // whole path strings, not Path's component order (a.jsonl vs a/b.jsonl).
@@ -358,6 +371,7 @@ impl HeaderInventory {
                 owner,
                 created_unix_ms,
                 metadata: witness,
+                stamp: crate::transcript_acquisition::FileStamp::capture(stat)?,
             })
         })();
         match result {
@@ -430,7 +444,7 @@ impl HeaderInventory {
     }
 }
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
-crate::heap_layout_bound::fields!(HeaderWitness; candidate, owner, home, created_unix_ms, metadata);
+crate::heap_layout_bound::fields!(HeaderWitness; candidate, owner, home, created_unix_ms, metadata, stamp);
 crate::heap_layout_bound::fields!(HeaderInventory; roots, pending, headers, directories, complete, read_bytes, refused, bounded_out);
 
 #[derive(Clone, Debug)]
@@ -1604,7 +1618,6 @@ pub(super) mod tests {
             }
         }
         let metadata = CodexTitleMetadata::default();
-        boot.admit_for_test(index);
         let mut job = boot.into_job(JobInputs {
             metadata: &metadata,
             traces,
@@ -1615,7 +1628,6 @@ pub(super) mod tests {
         })?;
         let no_scope = |_: &CandidateFile| None;
         let inputs = StepInputs {
-            index,
             metadata: &metadata,
             attribution: None,
             artifacts: false,
@@ -2840,6 +2852,12 @@ pub(super) mod tests {
         let (held_index, held) = retained_page(&root, settled, &[unreadable.clone(), new.clone()]);
         assert!(held.snapshots.is_empty(), "{:?}", held.snapshots);
         assert!(held.ownership_incomplete_file_count > 0);
+        let (c, [unknown, _, _]) = held.causes.summary(held.ownership_incomplete_file_count);
+        assert!(c[ownership::INVENTORY] > 0);
+        assert_eq!(
+            c[..6].iter().sum::<usize>() + unknown,
+            held.ownership_incomplete_file_count
+        );
         let hold = inventory_hold(&held_index).expect("the held page is owed a retry");
         assert!(hold.owed.contains(&local_index_key(&new)));
         assert!(hold
@@ -3004,6 +3022,9 @@ pub(super) mod tests {
         let (after, held) = scan(&root, previous.clone(), 3);
         assert!(!held.census_complete);
         assert_eq!(held.ownership_incomplete_file_count, 2);
+        let (c, [unknown, _, _]) = held.causes.summary(held.ownership_incomplete_file_count);
+        assert_eq!(c[ownership::ABSENT], 2);
+        assert_eq!(c[..6].iter().sum::<usize>() + unknown, 2);
         assert!(held
             .snapshots
             .iter()
@@ -3734,7 +3755,6 @@ pub(super) mod tests {
             )
             .unwrap();
         }
-        boot.admit_for_test(&previous);
         let mut job = boot
             .into_job(JobInputs {
                 metadata: &metadata,
@@ -3747,7 +3767,6 @@ pub(super) mod tests {
             .unwrap();
         let no_scope = |_: &CandidateFile| None;
         let inputs = StepInputs {
-            index: &previous,
             metadata: &metadata,
             attribution: Some(&context),
             artifacts: false,

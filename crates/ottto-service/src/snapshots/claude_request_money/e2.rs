@@ -390,13 +390,19 @@ pub(crate) mod money_mark {
     pub(crate) const CONFLICT: u8 = 16;
     /// This file was kept on ordinary money by the local list.
     pub(crate) const LEGACY: u8 = 32;
+    /// #825's `STAMPED_WITHOUT_PERMIT`, retired with the identity permit
+    /// (contract 5 always on). Stores may still carry it: it is decoded and
+    /// carried through every restamp as stored (durable entry digests bind
+    /// the raw byte), but never set, cleared, acted on or replayed.
+    pub(crate) const RETIRED_PERMIT: u8 = 64;
 }
 /// Money-rule versions and the marks each one re-reads. Version 1 is the
 /// switch-on, whose revision 3 already re-reads every file. A later money
 /// fix appends a row naming the marks it changes, so only those files are
 /// re-owed (once, under the history budget); never a revision bump, which
-/// re-reads the whole history.
-const MONEY_RULES: &[(u16, u8)] = &[(1, 0)];
+/// re-reads the whole history. Version 2 re-owes nothing (#825 seeded its
+/// retired permit mark there); it stays so stored versions keep their meaning.
+const MONEY_RULES: &[(u16, u8)] = &[(1, 0), (2, 0)];
 #[cfg(test)]
 thread_local! {
     static TEST_MONEY_RULES: std::cell::Cell<Option<&'static [(u16, u8)]>> =

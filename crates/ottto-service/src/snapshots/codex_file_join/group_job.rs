@@ -34,6 +34,11 @@ pub(in crate::snapshots) fn new_group_parser(
     context_curve: bool,
     evidence: codex_counting_version::AckEvidence,
 ) -> Result<OwnedJsonlParser> {
+    refuse_compressed_codex(
+        Some(&member.path),
+        None,
+        CodexZstCause::GroupReadUnsupported,
+    )?;
     let mut parser = OwnedJsonlParser::new(
         file,
         &member.path,
@@ -101,6 +106,7 @@ pub(in crate::snapshots) fn job_key(group: &Group) -> String {
 pub(in crate::snapshots) fn refusal_disclosure(owner: &str) -> cursor::Disclosure {
     cursor::Disclosure {
         reason: cursor::DebtReason::HeldTerminal,
+        cause: ownership::GROUP,
         ownership_incomplete_file_count: 1,
         zero_snapshot_usage_evidence: false,
         state_only_blocked_session_ids: vec![owner.to_owned()],
@@ -117,6 +123,7 @@ pub(in crate::snapshots) fn refusal_disclosure(owner: &str) -> cursor::Disclosur
 fn probe_order_disclosure(owner: &str) -> cursor::Disclosure {
     cursor::Disclosure {
         reason: cursor::DebtReason::ProbeBudgetOrder,
+        cause: ownership::GROUP,
         ownership_incomplete_file_count: 0,
         zero_snapshot_usage_evidence: false,
         state_only_blocked_session_ids: vec![owner.to_owned()],
@@ -167,6 +174,7 @@ pub(in crate::snapshots) fn disclose_strict(
     targets: DisclosureTargets<'_>,
 ) {
     targets.census.ownership_incomplete_file_count += members.len();
+    targets.census.causes.add(ownership::GROUP, members.len());
     targets
         .census
         .record_unreadable(UnreadableCause::AliasParser, 1);
@@ -192,8 +200,6 @@ pub(in crate::snapshots) enum Boot {
 
 /// Pre-job group state; one unit of work per scan step.
 pub(in crate::snapshots) struct GroupBoot {
-    reread_members_admitted: BTreeSet<String>,
-    reread_tickets: BTreeMap<String, reread_guard::Ticket>,
     pub(in crate::snapshots) group: Group,
     pub(in crate::snapshots) key: String,
     identified: usize,
@@ -221,7 +227,7 @@ pub(in crate::snapshots) struct GroupBoot {
     legacy_expected: BTreeMap<String, String>,
     evidence: codex_counting_version::AckEvidence,
 }
-crate::heap_layout_bound::fields!(GroupBoot; reread_tickets, reread_members_admitted, group, key, identified, stamps, wake_identities, headers, plan,
+crate::heap_layout_bound::fields!(GroupBoot; group, key, identified, stamps, wake_identities, headers, plan,
     probes, probed, ordered, admitted, probe_bound, probe_limit_bound, own_page, probe_allowance,
     charge, previous_receipts, receipt_scope, legacy_expected, evidence);
 
@@ -250,8 +256,6 @@ impl GroupBoot {
         }
         let evidence = codex_counting_version::members_evidence(&group.members, index);
         Self {
-            reread_members_admitted: BTreeSet::new(),
-            reread_tickets: BTreeMap::new(),
             key: job_key(&group),
             group,
             identified: 0,
@@ -468,6 +472,15 @@ impl GroupBoot {
     /// One legacy-shape member up to its first native record, bounded.
     fn probe(&mut self, i: usize) -> Boot {
         let member = &self.group.members[i];
+        if refuse_compressed_codex(
+            Some(&member.path),
+            None,
+            CodexZstCause::GroupProbeUnsupported,
+        )
+        .is_err()
+        {
+            return Boot::Strict;
+        }
         let cap = self.probe_allowance.min(PROBE_BYTES as u64);
         let result = (|| -> std::io::Result<(Option<Tokens>, bool, u64)> {
             let file = open_candidate_beneath_root(member)?;
@@ -482,6 +495,8 @@ impl GroupBoot {
                     // EOF (or a withheld tail) before any native record.
                     return Ok((None, read > cap, read));
                 }
+                #[cfg(test)]
+                codex_zst_refusal_tests::jsonl_parse_attempted();
                 if let Some(before) = serde_json::from_slice::<Value>(&line)
                     .ok()
                     .as_ref()
@@ -568,7 +583,6 @@ impl GroupBoot {
         let memo_digest = self.memo_digest(inputs.index, inputs.metadata);
         let dependencies = self.dependencies(inputs.metadata);
         let Self {
-            reread_tickets,
             group,
             key,
             stamps,
@@ -635,8 +649,6 @@ impl GroupBoot {
             evidence,
         )
         .map_err(|_| GroupEnd::Strict)?;
-        parser.bind_reread(inputs.index, &first);
-        parser.reread_ticket = reread_tickets.get(&local_index_key(&first.path)).copied();
         let v2 = group_counting_is_v2(&parser.accumulator);
         let mut join = Box::new(StreamProof::new(group.owner.clone(), v2, plan.plans));
         join.begin_member(0);
@@ -649,6 +661,7 @@ impl GroupBoot {
         parser.accumulator.codex_tier_replay = Some(replay);
         let index = inputs.index;
         Ok(Box::new(OwnedActiveFile {
+            recovered_audit_due: None,
             comparison_target: false,
             sampling: None,
             previous_snapshot_fingerprint: index.last_snapshot_fingerprint(&last),
@@ -669,10 +682,10 @@ impl GroupBoot {
             // U1a-2a: a group job is never a side read.
             side_origin: None,
             group: Some(Box::new(GroupJob {
-                reread_tickets,
                 key,
                 owner: group.owner,
                 home: group.home,
+                recovered: vec![None; members.len()],
                 members,
                 stamps,
                 digests,
@@ -710,6 +723,12 @@ pub(in crate::snapshots) struct JobInputs<'a> {
 }
 
 fn open_member_file(member: &mut CandidateFile) -> std::result::Result<File, GroupEnd> {
+    refuse_compressed_codex(
+        Some(&member.path),
+        None,
+        CodexZstCause::GroupReadUnsupported,
+    )
+    .map_err(|_| GroupEnd::Strict)?;
     match open_candidate_file(SnapshotSource::Codex, member) {
         Ok(file) => Ok(file),
         // The member vanished or was renamed: membership changed.
@@ -732,6 +751,12 @@ fn legacy_tee(
     artifacts: bool,
     context_curve: bool,
 ) -> std::result::Result<Option<Box<OwnedJsonlParser>>, GroupEnd> {
+    refuse_compressed_codex(
+        Some(&member.path),
+        None,
+        CodexZstCause::GroupReadUnsupported,
+    )
+    .map_err(|_| GroupEnd::Strict)?;
     if !legacy_expected.contains_key(&local_index_key(&member.path)) {
         return Ok(None);
     }
@@ -753,12 +778,14 @@ fn legacy_tee(
 
 /// The running group job, carried by its `OwnedActiveFile`.
 pub(in crate::snapshots) struct GroupJob {
-    reread_tickets: BTreeMap<String, reread_guard::Ticket>,
     pub(in crate::snapshots) key: String,
     pub(in crate::snapshots) owner: String,
     pub(in crate::snapshots) home: PathBuf,
     /// Canonical order; the last member is the only one that can be live.
     pub(in crate::snapshots) members: Vec<CandidateFile>,
+    /// Each member's recovered missing-carrier deadline, taken once at job
+    /// start; runtime-only, sized at boot, settled per native entry.
+    pub(in crate::snapshots) recovered: Vec<Option<u64>>,
     /// Boot stamps of the members' opened objects, canonical order.
     pub(in crate::snapshots) stamps: Vec<OpenStamp>,
     digests: Vec<String>,
@@ -789,7 +816,7 @@ pub(in crate::snapshots) struct GroupJob {
     /// input cumulatively, so a member swap needs no walk (R2-L3).
     pub(in crate::snapshots) consumed_before: u64,
 }
-crate::heap_layout_bound::fields!(GroupJob; reread_tickets, key, owner, home, members, stamps, digests, current,
+crate::heap_layout_bound::fields!(GroupJob; key, owner, home, members, recovered, stamps, digests, current,
     finished, previous_receipts, receipt_scope, legacy_expected, tee, legacy_baselines, lines,
     charge, probe_bound, probe_limit_bound, own_page, dependencies, memo_digest, scope, walked,
     consumed_before);
@@ -872,7 +899,6 @@ pub(in crate::snapshots) enum GroupStep {
 
 /// Scan facts one group step needs.
 pub(in crate::snapshots) struct StepInputs<'a> {
-    pub(in crate::snapshots) index: &'a ScanIndex,
     pub(in crate::snapshots) metadata: &'a CodexTitleMetadata,
     pub(in crate::snapshots) attribution:
         Option<&'a crate::session_attribution::SessionAttributionContext>,
@@ -989,6 +1015,9 @@ fn member_eof(
             Err(_) => return Err(GroupEnd::Strict),
         }
     }
+    #[cfg(test)]
+    crate::snapshots::sampled_scan::codex_cursor::tests::GROUP_EOF_APPLIED
+        .with(|v| v.set(v.get() + 1));
     if last && paged {
         apply_live_eof_record(active);
     }
@@ -1202,11 +1231,6 @@ fn open_member(
         .saturating_add(active.parser.reader.consumed_bytes());
     let parser = &mut active.parser;
     parser.reader = BoundedJsonlReader::new(OpenedInput::plain(file), jsonl_line_cap(), true);
-    parser.bind_reread(inputs.index, &member);
-    parser.reread_ticket = group
-        .reread_tickets
-        .get(&local_index_key(&member.path))
-        .copied();
     // Context inferred in one physical file must not price an unrelated
     // record at the beginning of another file.
     parser.accumulator.current_selector = SelectorCapture::default();
@@ -1333,7 +1357,7 @@ pub(in crate::snapshots) fn end_group(
                 // A refusal in the live member is witnessed at its refused
                 // offset; one before any complete record is not memoized.
                 let live = live_failed
-                    .then(|| cursor::LiveWitness::read(held, offset))
+                    .then(|| cursor::LiveWitness::read(&active.candidate.path, held, offset))
                     .flatten();
                 if let (Some(digest), Some(stamp)) = (group.memo_digest.clone(), anchor) {
                     if !live_failed || live.is_some() {
@@ -1394,58 +1418,3 @@ pub(in crate::snapshots) fn end_group(
 #[cfg(test)]
 #[path = "group_job_tests.rs"]
 mod tests;
-
-impl GroupBoot {
-    pub(in crate::snapshots) fn admit_rereads(
-        &mut self,
-        index: &mut ScanIndex,
-    ) -> reread_guard::GroupAdmission {
-        let mut awaiting_save = false;
-        for member in &self.group.members {
-            let key = local_index_key(&member.path);
-            if self.reread_members_admitted.contains(&key) {
-                continue;
-            }
-            if index.reread_unchanged_candidate(member) {
-                let reason = index.candidate_decision_with_reason(member).1;
-                match index.admit_unchanged_reread(&key, reason, reread_guard::now()) {
-                    reread_guard::Admission::Refuse => return reread_guard::GroupAdmission::Refuse,
-                    reread_guard::Admission::Admit(ticket) if !ticket.durable => {
-                        awaiting_save = true;
-                        continue;
-                    }
-                    reread_guard::Admission::Admit(ticket) => {
-                        self.reread_tickets.insert(key.clone(), ticket);
-                    }
-                }
-            } else if index
-                .files
-                .get(&key)
-                .is_some_and(|entry| member.size_bytes > entry.size_bytes)
-            {
-                index.reread_guard.note_growth_full(&key);
-            }
-            self.reread_members_admitted.insert(key);
-        }
-        if awaiting_save {
-            reread_guard::GroupAdmission::AwaitSave
-        } else {
-            reread_guard::GroupAdmission::Ready
-        }
-    }
-}
-
-#[cfg(test)]
-impl GroupBoot {
-    pub(in crate::snapshots) fn admit_for_test(&mut self, index: &ScanIndex) {
-        let mut selection = index.clone();
-        selection.reread_guard.require_test_memory_tickets();
-        assert!(
-            matches!(
-                self.admit_rereads(&mut selection),
-                reread_guard::GroupAdmission::Ready
-            ),
-            "unit group driver needs ordinary Admit tickets"
-        );
-    }
-}

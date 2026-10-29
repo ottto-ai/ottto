@@ -17,6 +17,10 @@ const STATE_BYTES: usize =
 pub(super) mod codex_cursor;
 #[cfg(unix)]
 pub(super) mod durable_tail;
+#[cfg(all(unix, test))]
+pub(crate) use durable_tail::MissClass;
+#[cfg(unix)]
+pub(crate) use durable_tail::RestoreOutcome;
 pub(super) mod side_ledger;
 
 /// The retained-copy cache behind `SharedCache::retained`.
@@ -504,6 +508,7 @@ impl OwnedSourceScan {
         cache: Arc<SharedCache>,
         namespace: Scope,
     ) -> Self {
+        self.durable_guard = Some(Arc::downgrade(&cache));
         if matches!(
             self.source,
             SnapshotSource::ClaudeCode | SnapshotSource::Codex
@@ -1989,7 +1994,6 @@ pub(super) fn new_source_parser(
         artifacts,
         curve,
     )?;
-    parser.bind_reread(index, candidate);
     parser.accumulator.claude_request_identity_capture = identity_capture;
     if source == SnapshotSource::Codex {
         configure_tier_replay(&mut parser, candidate, index);
@@ -2014,6 +2018,9 @@ pub(super) fn configure_tier_replay(
     ));
 }
 
+#[cfg(test)]
+thread_local! { static TEST_REFUSE_REDUCTION_DEPENDENCIES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
 /// Actual path-scoped interpretation dependencies. Decode no provider row here;
 /// reuse existing sidecar inventory and bounded owning-header authority.
 pub(super) fn reduction_dependencies(
@@ -2023,6 +2030,10 @@ pub(super) fn reduction_dependencies(
     claude: &ClaudeTitleMetadata,
     support: Option<&Path>,
 ) -> Option<String> {
+    #[cfg(test)]
+    if TEST_REFUSE_REDUCTION_DEPENDENCIES.with(std::cell::Cell::get) {
+        return None;
+    }
     if source == SnapshotSource::Codex {
         Some(sha256_hex(&[
             "codex_reduction_dependencies:v1",
@@ -2076,5 +2087,13 @@ mod cache_lifecycle_tests {
         assert_eq!(counts.take_hit, 0);
         assert_eq!(counts.clear_poisoned_lock, 1);
         assert_eq!(counts.clear_entries_released, 0);
+    }
+}
+
+// The daemon owns this cache; the guard is a non-owning alias beside Context.cache.
+impl HeapLayoutBound for std::sync::Weak<SharedCache> {
+    const INLINE_ONLY: bool = true;
+    fn heap_bound(&self, _: &mut Counter) -> Option<()> {
+        Some(())
     }
 }

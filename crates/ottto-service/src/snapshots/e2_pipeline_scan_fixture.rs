@@ -2,6 +2,17 @@
 use super::*;
 use crate::transcript_acquisition::Scope;
 
+/// The sampled scope and identity-capture mode this fixture's scans bind; a
+/// durable record (#806) restores only under the same pair.
+fn durable_binding(source: SnapshotSource) -> (Scope, bool) {
+    match source {
+        SnapshotSource::ClaudeCode => (Scope("e2-pipeline".into()), CLAUDE_IDENTITY_CAPTURE),
+        // Outside a sync cycle every scan captures (also in tests).
+        _ => (Scope("money-equivalence".into()), true),
+    }
+}
+const CLAUDE_IDENTITY_CAPTURE: bool = false;
+
 #[derive(Default)]
 pub(crate) struct E2ScanFixture {
     pub(crate) cache: Arc<sampled_scan::SharedCache>,
@@ -10,6 +21,27 @@ pub(crate) struct E2ScanFixture {
 impl E2ScanFixture {
     pub(crate) fn paths(&self) -> Vec<PathBuf> {
         self.observed.lock().unwrap().clone()
+    }
+
+    /// Begins this owner's pass on the real durable store beside
+    /// `index_path`, as the daemon does before a scan. `state_dir` holds the
+    /// index and the single-writer lock.
+    pub(crate) fn begin_durable(
+        &self,
+        source: SnapshotSource,
+        state_dir: &Path,
+        index_path: &Path,
+    ) {
+        let (scope, capture) = durable_binding(source);
+        begin_durable_pass(
+            &self.cache,
+            state_dir,
+            source,
+            index_path,
+            false,
+            &scope,
+            capture,
+        );
     }
 
     pub(crate) fn evict(&self) {
@@ -47,10 +79,11 @@ impl E2ScanFixture {
             hints,
             false,
             true,
-            false,
+            CLAUDE_IDENTITY_CAPTURE,
         );
         if sampled {
-            scan = scan.with_sampled_acquisition(self.cache.clone(), Scope("e2-pipeline".into()));
+            let (scope, _) = durable_binding(SnapshotSource::ClaudeCode);
+            scan = scan.with_sampled_acquisition(self.cache.clone(), scope);
         }
         // The same synthetic root births reach the page's staged twin probes,
         // which read metadata before the file is opened for parse.
@@ -88,8 +121,8 @@ impl E2ScanFixture {
             true,
         );
         if sampled {
-            scan = scan
-                .with_sampled_acquisition(self.cache.clone(), Scope("money-equivalence".into()));
+            let (scope, _) = durable_binding(source);
+            scan = scan.with_sampled_acquisition(self.cache.clone(), scope);
         }
         self.drive(scan, &BTreeMap::new())
     }

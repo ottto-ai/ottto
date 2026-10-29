@@ -349,7 +349,6 @@ impl PipelineFixture {
         // Keep all existing field/ACK/debt/restart assertions below, and compare
         // the full state at that boundary with the borrowed reference surface.
         // Both whole-index arms may remember replay witnesses during restore.
-        let _reread_clock = crate::snapshots::reread_guard::TestClock::freeze();
         let borrowed_reference = (matches!(
             &upload,
             PipelineUpload::Accept
@@ -598,6 +597,8 @@ const PIPELINE_HOLD_CYCLE: PipelineCycle<'static> = PipelineCycle {
 #[test]
 #[serial(source_manifests)]
 fn account_deferred_hold_lets_a_bounded_claude_traversal_converge() {
+    // Subject: the legacy account path contract 5 now leaves to untagged bodies.
+    let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = PipelineFixture::new("claude-census-convergence-pipeline");
     let baseline = fixture.baseline();
@@ -725,6 +726,8 @@ fn account_deferred_hold_lets_a_bounded_claude_traversal_converge() {
 #[test]
 #[serial(source_manifests)]
 fn server_deferred_and_retry_pending_holds_keep_the_claude_traversal_incomplete() {
+    // Subject: the legacy account path contract 5 now leaves to untagged bodies.
+    let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
     let _source_manifests = SourceManifestTestGuard::new();
     for retry_pending in [false, true] {
         let fixture = PipelineFixture::new(if retry_pending {
@@ -1780,6 +1783,8 @@ fn real_rejected_page_restores_terminal_hold_and_discloses_refusal_beside_accept
 #[serial(source_manifests)]
 #[serial(client_report)]
 fn real_rejected_page_records_account_hold_across_reload_and_reparses_next_generation() {
+    // Subject: the legacy account path contract 5 now leaves to untagged bodies.
+    let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
     let _source_manifests = SourceManifestTestGuard::new();
     let (fixture, baseline) = mixed_rejected_fixture("h1-real-account-refusal", true);
     assert_real_rejected_hold(
@@ -2095,6 +2100,8 @@ fn rejected_page_with_unbound_authority_only_hold_blocks_without_counting() {
 #[test]
 #[serial(source_manifests)]
 fn rejected_page_with_cap_refused_account_hold_blocks_without_counting() {
+    // Subject: the legacy account path contract 5 now leaves to untagged bodies.
+    let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = PipelineFixture::new("h1-cap-refused-account-hold");
     let baseline = fixture.baseline();

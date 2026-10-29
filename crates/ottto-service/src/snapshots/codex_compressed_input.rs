@@ -3,10 +3,38 @@
 //! bind the header, plain/compressed twin identity and decoder credit at each
 //! open site before it constructs `OpenedInput::compressed`.
 #![cfg_attr(not(test), allow(dead_code))]
+use crate::local_resource_diagnostics::{codex_zst_refused, CodexZstCause};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::mem::size_of;
+use std::path::Path;
 use zstd::zstd_safe::{DCtx, DParameter, InBuffer, OutBuffer};
+
+/// One predicate for a candidate's encoding or the already-opened input kind.
+/// A suffix is only a refusal signal, never ownership or decode authority.
+pub(super) fn is_compressed_codex_rollout(
+    path: Option<&Path>,
+    input: Option<&OpenedInput>,
+) -> bool {
+    path.and_then(Path::file_name)
+        .is_some_and(|name| name.as_encoded_bytes().ends_with(b".jsonl.zst"))
+        || input.is_some_and(OpenedInput::is_compressed)
+}
+
+pub(super) fn refuse_compressed_codex(
+    path: Option<&Path>,
+    input: Option<&OpenedInput>,
+    cause: CodexZstCause,
+) -> io::Result<()> {
+    if is_compressed_codex_rollout(path, input) {
+        codex_zst_refused(cause);
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            serde_json::to_string(&cause).unwrap_or_else(|_| "compressed refusal".into()),
+        ));
+    }
+    Ok(())
+}
 
 /// Compressed bytes buffered from the File, and decoded bytes buffered for the
 /// line reader. Plain input keeps `BufReader::new`'s default capacity.
@@ -46,6 +74,17 @@ pub(super) fn compressed_input_credit() -> io::Result<usize> {
         .ok_or_else(|| invalid("compressed rollout credit overflow"))
 }
 
+fn thread_cpu_micros() -> u64 {
+    let mut spec: libc::timespec = unsafe { std::mem::zeroed() };
+    // SAFETY: valid writable timespec, querying only the current thread.
+    if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut spec) } != 0 {
+        return 0;
+    }
+    (spec.tv_sec as u64)
+        .saturating_mul(1_000_000)
+        .saturating_add(spec.tv_nsec as u64 / 1_000)
+}
+
 /// Streaming decoder with sticky failure and an explicit decoded-byte budget.
 /// EOF is successful only after a complete frame (including checksum). Supports
 /// concatenated frames; a truncated last frame is never a successful prefix.
@@ -56,10 +95,15 @@ pub(super) struct BoundedDecoder<R: Read> {
     remaining: u64,
     frame_complete: bool,
     failed: bool,
+    compressed_bytes: u64,
+    decoded_bytes: u64,
+    cpu_micros: u64,
 }
 
 impl<R: Read> BoundedDecoder<R> {
     fn new(input: R, decoded_limit: u64) -> io::Result<Self> {
+        #[cfg(test)]
+        super::codex_zst_refusal_tests::decoder_constructed();
         let reserved = decoder_reservation()?;
         let mut context = DCtx::try_create()
             .ok_or_else(|| io::Error::other("compressed rollout decoder allocation failed"))?;
@@ -73,6 +117,9 @@ impl<R: Read> BoundedDecoder<R> {
             remaining: decoded_limit,
             frame_complete: false,
             failed: false,
+            compressed_bytes: 0,
+            decoded_bytes: 0,
+            cpu_micros: 0,
         })
     }
 
@@ -106,6 +153,8 @@ impl<R: Read> BoundedDecoder<R> {
                 .map_err(|_| invalid("invalid compressed rollout frame"))?;
             let consumed = input.pos;
             let produced = out.pos();
+            self.compressed_bytes = self.compressed_bytes.saturating_add(consumed as u64);
+            self.decoded_bytes = self.decoded_bytes.saturating_add(produced as u64);
             self.input.consume(consumed);
             self.frame_complete = hint == 0;
             // The credit was paid before construction; never grow past it.
@@ -139,11 +188,29 @@ impl<R: Read> Read for BoundedDecoder<R> {
         if self.failed {
             return Err(invalid("compressed rollout previously failed"));
         }
+        let started = thread_cpu_micros();
         let result = self.read_inner(output);
+        self.cpu_micros = self
+            .cpu_micros
+            .saturating_add(thread_cpu_micros().saturating_sub(started));
         if result.is_err() {
             self.failed = true;
         }
         result
+    }
+}
+
+impl<R: Read> Drop for BoundedDecoder<R> {
+    fn drop(&mut self) {
+        crate::local_resource_diagnostics::traversal_point(
+            "codex_zst_input",
+            "codex",
+            &std::collections::BTreeMap::from([
+                ("codex_zst_compressed_bytes", self.compressed_bytes),
+                ("codex_zst_decoded_bytes", self.decoded_bytes),
+                ("codex_zst_cpu_micros", self.cpu_micros),
+            ]),
+        );
     }
 }
 
@@ -153,7 +220,10 @@ impl<R: Read> Read for BoundedDecoder<R> {
 /// names match the `BufReader<File>` calls the parser already makes.
 pub(super) enum OpenedInput {
     Plain(BufReader<File>),
-    Compressed(Box<BufReader<BoundedDecoder<File>>>),
+    Compressed(
+        Box<BufReader<BoundedDecoder<File>>>,
+        Option<super::sampled_scan::codex_cursor::DecoderOwner>,
+    ),
 }
 
 impl OpenedInput {
@@ -170,11 +240,41 @@ impl OpenedInput {
         }
         let decoder = BoundedDecoder::new(file, decoded_limit)?;
         let decoded = BufReader::with_capacity(BUFFER_BYTES, decoder);
-        Ok(Self::Compressed(Box::new(decoded)))
+        Ok(Self::Compressed(Box::new(decoded), None))
     }
 
+    pub(super) fn funded(
+        file: File,
+        cache: &std::sync::Arc<super::sampled_scan::SharedCache>,
+    ) -> io::Result<Option<Self>> {
+        let credit = compressed_input_credit()?;
+        let Some(owner) = super::sampled_scan::codex_cursor::DecoderOwner::acquire(cache, credit)
+        else {
+            codex_zst_refused(CodexZstCause::AdmissionRefused);
+            return Ok(None);
+        };
+        let mut input = Self::compressed(
+            file,
+            super::max_jsonl_file_bytes(super::SnapshotSource::Codex),
+            credit,
+        );
+        if let Ok(Self::Compressed(_, paid)) = &mut input {
+            *paid = Some(owner);
+        } else {
+            owner.release();
+        }
+        input.map(Some)
+    }
+    pub(super) fn close(self) {
+        if let Self::Compressed(reader, owner) = self {
+            drop(reader);
+            if let Some(owner) = owner {
+                owner.release();
+            }
+        }
+    }
     pub(super) fn is_compressed(&self) -> bool {
-        matches!(self, Self::Compressed(_))
+        matches!(self, Self::Compressed(..))
     }
 
     /// The original opened File: metadata and identity revalidation use it, so
@@ -183,31 +283,32 @@ impl OpenedInput {
     pub(super) fn get_ref(&self) -> &File {
         match self {
             Self::Plain(reader) => reader.get_ref(),
-            Self::Compressed(reader) => reader.get_ref().input.get_ref(),
+            Self::Compressed(reader, _) => reader.get_ref().input.get_ref(),
         }
     }
 
     pub(super) fn get_mut(&mut self) -> &mut File {
         match self {
             Self::Plain(reader) => reader.get_mut(),
-            Self::Compressed(reader) => reader.get_mut().input.get_mut(),
+            Self::Compressed(reader, _) => reader.get_mut().input.get_mut(),
         }
     }
 
     pub(super) fn buffer(&self) -> &[u8] {
         match self {
             Self::Plain(reader) => reader.buffer(),
-            Self::Compressed(reader) => reader.buffer(),
+            Self::Compressed(reader, _) => reader.buffer(),
         }
     }
 
-    /// Retained heap charge. Plain is exactly its buffer capacity; compressed
-    /// charges the box, the decoded buffer and the full decoder credit rather
-    /// than the decoder's current, lazily grown size.
+    /// Funded decoder memory is charged by its outstanding SharedCache claim.
+    /// Unfunded synthetic input charges its box, buffer and full decoder credit;
+    /// plain input charges only its buffer.
     pub(super) fn capacity(&self) -> usize {
         match self {
             Self::Plain(reader) => reader.capacity(),
-            Self::Compressed(reader) => {
+            Self::Compressed(_, Some(_)) => 0, // existing outstanding cache reservation
+            Self::Compressed(reader, _) => {
                 let boxed = size_of::<BufReader<BoundedDecoder<File>>>();
                 boxed
                     .saturating_add(reader.capacity())
@@ -221,7 +322,7 @@ impl Read for OpenedInput {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::Plain(reader) => reader.read(output),
-            Self::Compressed(reader) => reader.read(output),
+            Self::Compressed(reader, _) => reader.read(output),
         }
     }
 }
@@ -230,26 +331,27 @@ impl BufRead for OpenedInput {
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
         match self {
             Self::Plain(reader) => reader.fill_buf(),
-            Self::Compressed(reader) => reader.fill_buf(),
+            Self::Compressed(reader, _) => reader.fill_buf(),
         }
     }
 
     fn consume(&mut self, amount: usize) {
         match self {
             Self::Plain(reader) => reader.consume(amount),
-            Self::Compressed(reader) => reader.consume(amount),
+            Self::Compressed(reader, _) => reader.consume(amount),
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::snapshots) mod tests {
     use super::super::*;
     use super::*;
     use crate::transcript_acquisition::Scope;
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
+    pub(in crate::snapshots) static DECODER_TEST_LOCK: Mutex<()> = Mutex::new(());
     const NOW: &str = "2026-10-07T12:00:00Z";
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -399,6 +501,100 @@ mod tests {
     }
 
     #[test]
+    fn compressed_exclusive_body_supersedes_an_earlier_state_only_emission() {
+        let plain = synthetic_rollout();
+        let archive = fixture(
+            &zstd::stream::encode_all(&plain[..], 1).unwrap(),
+            ".jsonl.zst",
+        );
+        let owner = "compressed-fixture";
+        let mut metadata = CodexTitleMetadata::default();
+        metadata.state_threads.insert(
+            owner.into(),
+            CodexStateThread {
+                tokens_used: 825,
+                model: Some("gpt-synthetic".into()),
+                ..Default::default()
+            },
+        );
+        let mut index = ScanIndex::default();
+        let mut earlier = Vec::new();
+        append_codex_state_only_snapshots(
+            &mut earlier,
+            &metadata,
+            NOW,
+            &mut index,
+            &BTreeSet::new(),
+        );
+        assert_eq!(earlier.len(), 1);
+        assert_eq!(earlier[0].unattributed_total_tokens, 825);
+        assert!(earlier[0].usage_accounting_contract.is_none());
+        index
+            .codex_state_only_snapshot_fingerprints
+            .insert(owner.into(), earlier[0].snapshot_fingerprint.clone());
+
+        // Exercise the existing decoder + native parser seam directly. This
+        // simulates future archive admission without activating discovery.
+        let mut file = File::open(&archive.0).unwrap();
+        let expected = opened_object_identity(SnapshotSource::Codex, &mut file).unwrap();
+        let input =
+            OpenedInput::compressed(file, plain.len() as u64, compressed_input_credit().unwrap())
+                .unwrap();
+        let mut parser = codex_parser(input, &archive.0);
+        while !parser.step().unwrap() {}
+        let mut parsed = parser
+            .finish(
+                &expected,
+                &archive.0,
+                NOW,
+                "compressed-input-fixture".into(),
+                Some(&metadata),
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(parsed.complete());
+        assert_eq!(parsed.snapshots.len(), 1);
+        let native = parsed.snapshots[0].clone();
+        assert_eq!(native.source_session_id, owner);
+        assert_eq!(
+            native.usage_accounting_contract.as_deref(),
+            Some("session_exclusive_reported_usage:v1")
+        );
+        assert_eq!(native.unattributed_total_tokens, 0);
+        // The shared fixture reports last-token deltas 100 + 250 + 400.
+        assert_eq!(native.input_tokens, 750);
+        assert_eq!(native.cache_read_tokens, 375);
+        assert_eq!(native.output_tokens, 75);
+        assert_eq!(native.model_usage[0].model, "gpt-synthetic");
+        append_codex_state_only_snapshots(
+            &mut parsed.snapshots,
+            &metadata,
+            NOW,
+            &mut index,
+            &BTreeSet::new(),
+        );
+        assert_eq!(
+            parsed.snapshots.len(),
+            1,
+            "old state-only evidence must not suppress the real parsed body or append a total"
+        );
+
+        // Daemon-side ordering oracle: the later contracted body is emitted
+        // under the same session key, replacing the prior total. Actual backend
+        // authority ranking remains the backend's independently enforced rule.
+        let mut uploaded = BTreeMap::from([(owner.to_string(), earlier.remove(0))]);
+        for item in parsed.snapshots {
+            uploaded.insert(item.source_session_id.clone(), item);
+        }
+        assert_eq!(
+            snapshot_upload_body_witness(&uploaded[owner]),
+            snapshot_upload_body_witness(&native)
+        );
+        assert_eq!(uploaded[owner].model_usage, native.model_usage);
+    }
+
+    #[test]
     fn compressed_rollout_over_its_decoded_limit_never_finalizes() {
         let plain = synthetic_rollout();
         let encoded = zstd::stream::encode_all(&plain[..], 3).unwrap();
@@ -412,5 +608,94 @@ mod tests {
         let input = OpenedInput::compressed(file, plain.len() as u64 - 1, credit).unwrap();
         let error = parse(codex_parser(input, path), &expected, path).unwrap_err();
         assert!(format!("{error:#}").contains("decoded-byte limit"));
+    }
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
+    fn paid_decoder_closes_after_real_eof_early_read_error_and_caught_unwind() {
+        let _lock = DECODER_TEST_LOCK.lock().unwrap();
+        let encoded = zstd::stream::encode_all(&b"synthetic decoded content"[..], 1).unwrap();
+        let valid = fixture(&encoded, ".zst");
+        let corrupt = fixture(b"invalid frame", ".zst");
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        for exit in 0..4 {
+            let ((result, decoded), rows) = crate::local_resource_diagnostics::capture(|| {
+                let path = if exit == 2 { &corrupt.0 } else { &valid.0 };
+                let mut input = OpenedInput::funded(File::open(path).unwrap(), &cache)
+                    .unwrap()
+                    .unwrap();
+                if let OpenedInput::Compressed(reader, _) = &input {
+                    assert_eq!(
+                        reader.get_ref().remaining,
+                        max_jsonl_file_bytes(SnapshotSource::Codex)
+                    );
+                }
+                assert_eq!(
+                    input.capacity(),
+                    0,
+                    "outstanding credit charges the decoder once"
+                );
+                let mut decoded = Vec::new();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if exit == 1 {
+                        input.read_exact(&mut [0; 1])?;
+                        return Ok(()); // actual read then early exit
+                    }
+                    input.read_to_end(&mut decoded)?;
+                    if exit == 3 {
+                        panic!("synthetic consumer unwind");
+                    }
+                    Ok::<_, io::Error>(())
+                }));
+                input.close(); // explicit release after caught unwind, before propagation
+                (result, decoded)
+            });
+            assert_eq!(result.is_err(), exit == 3);
+            if let Ok(result) = result {
+                assert_eq!(result.is_err(), exit == 2);
+            }
+            if exit == 0 {
+                assert_eq!(decoded, b"synthetic decoded content");
+            }
+            assert_eq!(cache.cursor_reserved(), 0);
+            assert!(!rows.iter().any(|r| r["stage"] == "codex_zst_owner"));
+            assert!(rows.iter().any(|r| r["stage"] == "codex_zst_input"));
+        }
+    }
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
+    fn paid_decoder_yields_to_singleton_and_drop_safety_net_is_observable() {
+        let _lock = DECODER_TEST_LOCK.lock().unwrap();
+        let f = fixture(
+            &zstd::stream::encode_all(&b"synthetic"[..], 1).unwrap(),
+            ".zst",
+        );
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let other = Arc::new(sampled_scan::SharedCache::default());
+        let (panic, rows) = crate::local_resource_diagnostics::capture(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut input = OpenedInput::funded(File::open(&f.0).unwrap(), &cache)
+                    .unwrap()
+                    .unwrap();
+                input.read_exact(&mut [0; 1]).unwrap();
+                assert!(OpenedInput::funded(File::open(&f.0).unwrap(), &other)
+                    .unwrap()
+                    .is_none());
+                assert_eq!(other.cursor_reserved(), 0);
+                panic!("exercise production decoder Drop fallback");
+            }))
+        });
+        assert!(panic.is_err());
+        assert_eq!(cache.cursor_reserved(), 0);
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r["counts"]["leaked_release"] == 1)
+                .count(),
+            1
+        );
+        OpenedInput::funded(File::open(&f.0).unwrap(), &other)
+            .unwrap()
+            .unwrap()
+            .close();
+        assert_eq!(other.cursor_reserved(), 0);
     }
 }

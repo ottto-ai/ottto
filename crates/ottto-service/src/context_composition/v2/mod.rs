@@ -1,13 +1,11 @@
 //! The new-lines composition reader (kinds_version 2).
 //!
-//! The kinds_version 1 harvest re-reads every settled transcript of a
-//! workspace on each cycle. This reader reads each transcript once: a
-//! per-file checkpoint remembers how far the file was read and the parse
-//! state at that point (open tool calls, the residency of lines still in
-//! context, copied-history mode), so a later run reads only the lines added
-//! since. Its daily rows, part, tool, file and session totals live in local
-//! state per repository scope, and the upload sends only the days that
-//! changed.
+//! This reader replaced the historical kinds_version 1 full-transcript
+//! harvest. Per-file checkpoints remember offsets and parse state (open tool
+//! calls, residency and copied-history mode); normal later runs read added
+//! lines, with repair and audit reads subject to their existing budgets.
+//! Daily rows and part, tool, file and session totals live in per-scope local
+//! state, and uploads send only the days that changed.
 //!
 //! - `reader`: bounded line reader (length at open, complete lines only,
 //!   16 MiB line guard).
@@ -23,10 +21,6 @@
 //! Methodology changes apply forward only: a checkpoint keeps its offset
 //! when the parser changes, so old bytes are never read twice.
 //!
-//! The reader replaces the kinds_version 1 harvest when the compile-time
-//! switch `CHANGED_DAYS_UPLOAD_ENABLED` is on (see `changed_days_enabled`);
-//! with the switch off the kinds_version 1 harvest runs unchanged.
-
 mod aggregate;
 mod checkpoint;
 mod claude;
@@ -36,6 +30,8 @@ mod file;
 mod harvest;
 mod health;
 mod reader;
+mod recent;
+pub(crate) use recent::recent_scopes;
 mod scope;
 mod upload;
 
@@ -43,31 +39,6 @@ pub use harvest::run_context_composition_worker;
 pub(super) use harvest::spawn_v2_sync;
 
 use std::time::Duration;
-
-/// Compile-time switch for the changed-days reader and uploader. On: the
-/// daemon runs this reader and uploads changed days (kinds_version 2), and the
-/// kinds_version 1 harvest no longer runs. Set it back to `false` to return to
-/// the kinds_version 1 harvest; the reader's local state stays on disk and is
-/// not read while the switch is off.
-const CHANGED_DAYS_UPLOAD_ENABLED: bool = true;
-/// Development override for the switch above (truthy value turns it on;
-/// debug builds only). It matters only while the switch is off.
-const CHANGED_DAYS_ENV: &str = "OTTTO_CONTEXT_COMPOSITION_CHANGED_DAYS";
-
-pub(super) fn changed_days_enabled() -> bool {
-    changed_days_gate(
-        CHANGED_DAYS_UPLOAD_ENABLED,
-        cfg!(debug_assertions),
-        std::env::var(CHANGED_DAYS_ENV).ok().as_deref(),
-    )
-}
-
-/// The switch decision. The override works in debug builds only: in a
-/// release build with the switch off it would stop the kinds_version 1
-/// uploads and spend the once-per-install first run early.
-fn changed_days_gate(switch: bool, debug_build: bool, override_value: Option<&str>) -> bool {
-    switch || (debug_build && override_value.is_some_and(super::harvest::is_truthy))
-}
 
 /// Local state folder, under the composition state folder.
 const STATE_DIR: &str = "v2";

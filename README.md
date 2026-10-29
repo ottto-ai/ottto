@@ -40,10 +40,12 @@ bound to either `main` or the launch runtime commit, and contains only
 canonical tag-scoped download assets for `release-manifest.json`, every stable
 manifest artifact, and the CycloneDX SBOM before
 `stable_release_published` can pass.
-The same closeout requires a redacted public `Public CI` push-run report from
-the public runtime commit whose public run URL matches the reported run ID,
-with a unique workflow job inventory, canonical public GitHub job URLs for that
-run, and the reviewed runtime, public-surface, and advisory jobs green.
+The same closeout requires a redacted public `Public CI` report, preferably
+from the `merge_group` run of the exact public runtime commit (the queue
+fast-forwards `main` to that tested SHA). A successful `push` run on `main`
+remains accepted during the transition. The report must have a public run URL
+matching its run ID, a unique workflow job inventory, canonical public GitHub
+job URLs for that run, and green runtime, public-surface, and advisory jobs.
 The public repo, release, CI, and final closeout `checked_at` fields plus
 GitHub release/CI timestamps must be parseable ISO-8601 UTC timestamps, so
 reviewed evidence cannot carry ambiguous local time strings. Release and CI

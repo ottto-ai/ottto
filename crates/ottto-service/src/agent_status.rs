@@ -89,8 +89,7 @@ const CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS: u64 = 24 * 60 * 60;
 /// (identify honestly, poll sparsely, circuit-break instead of adapting). The
 /// activity-based slot in `claude_credit_pools` shortens this to 5 min while
 /// the binding is in use on this Mac, and a fresh local statusLine reading
-/// stands in for those reads; `CLAUDE_ACTIVITY_CADENCE_ENABLED` turns the
-/// in-use slot off.
+/// stands in for those reads.
 const CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_SECONDS: u64 = 40 * 60;
 /// Half-width of the deterministic spread applied to the base cadence, giving
 /// an effective gate in the 38-42 minute range.
@@ -153,13 +152,6 @@ const CLAUDE_DESKTOP_DUPLICATE_SESSION_OBSERVATION_MAX: usize = 64;
 const CLAUDE_DESKTOP_PAIR_OBSERVATION_MAX: usize = 20;
 /// The backend accepts at most this many status snapshots in one upload.
 const AGENT_STATUS_UPLOAD_SNAPSHOT_MAX: usize = 10;
-/// Whether the account-less Desktop pair status uploads. The backend keeps a
-/// login's metered current row when this status arrives: an account-less,
-/// meterless status no longer takes the profile of its newest linked
-/// observation, so the current-row cleanup cannot delete this Mac's metered
-/// row for that profile. Pair connect targets are local and do not depend on
-/// this.
-const CLAUDE_DESKTOP_PAIRS_UPLOAD_ENABLED: bool = true;
 // Reuse the daemon's existing detected-use/session retention contract. This
 // warning is a view of the same local activity evidence, not a new lifetime.
 const CLAUDE_UNRESOLVED_ACCOUNT_EVIDENCE_MAX_AGE_SECONDS: i64 =
@@ -2122,6 +2114,66 @@ fn codex_source_health_snapshot(
     source_health_snapshot
 }
 
+/// Read-only launch projection: only saved provider-verified evidence and
+/// current local claims. No CLI detection/probes, provider reads, or wakeups.
+pub(crate) fn session_launch_codex_accounts_status(
+    mut status: CodexAccountsStatusV1,
+    default_home: &Path,
+) -> CodexAccountsStatusV1 {
+    let captured = crate::current_rfc3339_timestamp();
+    let mut candidates = Vec::new();
+    for mut slot in codex_home_slots_checked(&status).0 {
+        if slot.ownership == CodexAccountSlotOwnershipV1::Default {
+            slot.home = default_home.into();
+        }
+        let trust = if slot.ownership == CodexAccountSlotOwnershipV1::Default {
+            CodexHomeTrust::ProviderDefault
+        } else {
+            CodexHomeTrust::Managed
+        };
+        let mut snapshot = base_snapshot(
+            SourceKind::Codex,
+            AgentStatusState::Degraded,
+            AgentStatusCollectionMethod::ConfigFile,
+            captured.clone(),
+            captured.clone(),
+        );
+        if session_launch_codex_identity(&slot.home, trust).is_none() {
+            snapshot.status = AgentStatusState::AuthRequired;
+        } else if let Ok(probe) =
+            codex_saved_quota::serve_saved_for_launch(&slot.home, trust, current_unix_seconds())
+        {
+            if !probe.credential_read_failed {
+                snapshot.account = probe.account;
+                if let (Some(account), Some(identity)) =
+                    (snapshot.account.as_mut(), probe.saved_identity)
+                {
+                    account.account_identifier_hash = Some(identity.account_identifier_hash);
+                    account.organization_identifier_hash = Some(identity.workspace_identifier_hash);
+                    snapshot.quota_windows = probe.quota_windows;
+                    snapshot.credit_balances = probe.credit_balances;
+                    snapshot.status = AgentStatusState::Available;
+                }
+            }
+        }
+        let mut collection = codex_collection_status_from_snapshot(&snapshot);
+        let binding = enforce_codex_registered_binding(&slot, &mut snapshot, &mut collection);
+        let quality = codex_snapshot_quality(&snapshot, &collection);
+        candidates.push(CodexSlotCandidate {
+            slot,
+            snapshot,
+            status: collection,
+            binding,
+            workspace_targets: Vec::new(),
+            quality,
+            auth_modified_at: None,
+        });
+    }
+    canonicalize_codex_candidates(&mut candidates);
+    apply_codex_candidate_statuses(&mut status, &candidates);
+    status
+}
+
 pub(crate) fn annotate_codex_accounts_status(
     status: CodexAccountsStatusV1,
 ) -> CodexAccountsStatusV1 {
@@ -3661,7 +3713,7 @@ fn claude_signed_in_account_without_identity(
 /// A non-OAuth way the default Claude Code login authenticates. Claude Code
 /// gives these precedence over the stored OAuth login.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ClaudeAlternativeAuth {
+pub(crate) enum ClaudeAlternativeAuth {
     Bedrock,
     Vertex,
     ApiKey,
@@ -3728,6 +3780,24 @@ fn claude_alternative_auth(
                 .and_then(|body| serde_json::from_str::<Value>(&body).ok())
         })
         .collect::<Vec<_>>();
+    claude_alternative_auth_layers(
+        &layers,
+        ambient,
+        oauth_usable,
+        approved_api_key_suffixes,
+        stored_console_key,
+    )
+}
+
+/// The same precedence evaluator for a caller that has already read and
+/// validated all layers (highest precedence first).
+pub(crate) fn claude_alternative_auth_layers(
+    layers: &[Value],
+    ambient: &dyn Fn(&str) -> Option<String>,
+    oauth_usable: bool,
+    approved_api_key_suffixes: &[String],
+    stored_console_key: bool,
+) -> Option<ClaudeAlternativeAuth> {
     let present = |value: &Value| match value {
         Value::String(text) => !text.trim().is_empty(),
         Value::Null => false,
@@ -6057,6 +6127,7 @@ pub(crate) fn verify_claude_local_identity(
     })
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 enum ClaudeWorkerDiagnostic {
     Observed(ClaudeConfigSlotUpkeepResultV1),
@@ -6065,6 +6136,7 @@ enum ClaudeWorkerDiagnostic {
     Reconciled,
 }
 
+#[cfg(test)]
 impl ClaudeWorkerDiagnostic {
     fn code(self) -> &'static str {
         use ClaudeConfigSlotUpkeepResultV1 as R;
@@ -6118,6 +6190,7 @@ fn claude_worker_diagnostic_message(code: &str) -> Option<&'static str> {
     })
 }
 
+#[cfg(test)]
 fn append_claude_worker_diagnostic(
     status: &mut ClaudeConfigSlotCollectionStatusV1,
     diagnostic: ClaudeWorkerDiagnostic,
@@ -6153,6 +6226,7 @@ fn append_claude_worker_diagnostic(
     Some(())
 }
 
+#[cfg(test)]
 fn claude_worker_receipt_status(
     queued: &ClaudeConfigSlotDescriptorV1,
     current: &ClaudeConfigSlotDescriptorV1,
@@ -6178,6 +6252,7 @@ fn claude_worker_receipt_status(
     Some(status)
 }
 
+#[cfg(test)]
 pub(crate) fn record_registered_claude_worker_observation(
     descriptor: &ClaudeConfigSlotDescriptorV1,
     result: ClaudeConfigSlotUpkeepResultV1,
@@ -6188,6 +6263,7 @@ pub(crate) fn record_registered_claude_worker_observation(
     );
 }
 
+#[cfg(test)]
 fn record_registered_claude_worker_diagnostic(
     descriptor: &ClaudeConfigSlotDescriptorV1,
     diagnostic: ClaudeWorkerDiagnostic,
@@ -6228,6 +6304,7 @@ fn record_registered_claude_worker_diagnostic(
 /// A worker can find already-valid access after a login/refresh while the
 /// foreground still gates on the old saved deadline. Reconcile only through
 /// the existing exact-root identity verifier and collection-state owner.
+#[cfg(test)]
 pub(crate) fn reconcile_registered_claude_valid_access(
     descriptor: &ClaudeConfigSlotDescriptorV1,
     upkeep: &ottto_protocol::ClaudeConfigSlotUpkeepStatusV1,
@@ -6311,6 +6388,7 @@ pub(crate) fn reconcile_registered_claude_valid_access(
         .unwrap_or(false)
 }
 
+#[cfg(test)]
 fn valid_access_reconciliation_due(
     descriptor: &ClaudeConfigSlotDescriptorV1,
     upkeep: &ottto_protocol::ClaudeConfigSlotUpkeepStatusV1,
@@ -6334,6 +6412,7 @@ fn valid_access_reconciliation_due(
             .is_some_and(|expiry| expiry > now)
 }
 
+#[cfg(test)]
 fn reconciled_valid_access_status(
     queued: &ClaudeConfigSlotDescriptorV1,
     current: &ClaudeConfigSlotDescriptorV1,
@@ -6373,6 +6452,7 @@ fn reconciled_valid_access_status(
     Some(status)
 }
 
+#[cfg(test)]
 fn reconciled_valid_access_status_with_worker_receipt(
     queued: &ClaudeConfigSlotDescriptorV1,
     current: &ClaudeConfigSlotDescriptorV1,
@@ -8209,8 +8289,6 @@ fn blocked_claude_upkeep_status(
 /// No new wire values: the quiet default is collection `refresh_due` with
 /// upkeep `upkeep_disabled` (quota access `paused`), never
 /// `stale_access_token`, which tells the app the provider ended the session.
-/// `PAUSED_EXPIRED_SLOT_ASKS_FOR_SIGN_IN` (open decision Q-A) switches to
-/// `credential_unavailable`, which the app presents as "Sign in again".
 fn paused_claude_refresh_status(
     slot_id: &str,
     observed_at: &str,
@@ -8242,22 +8320,10 @@ fn paused_claude_refresh_status(
             "Claude Code has not refreshed this sign-in since it expired at {expired_at}. \"Keep my Claude accounts signed in\" is off, so Ottto does not refresh it. The last reading is shown with its age. Sign in again, or turn the setting on, to resume now."
         )
     };
-    let (state, code) = if refreshing {
-        (
-            ClaudeConfigSlotCollectionStateV1::RefreshDue,
-            ClaudeConfigSlotDiagnosticCodeV1::RefreshDue,
-        )
-    } else if crate::claude_upkeep::PAUSED_EXPIRED_SLOT_ASKS_FOR_SIGN_IN {
-        (
-            ClaudeConfigSlotCollectionStateV1::CredentialUnavailable,
-            ClaudeConfigSlotDiagnosticCodeV1::CredentialUnavailable,
-        )
-    } else {
-        (
-            ClaudeConfigSlotCollectionStateV1::RefreshDue,
-            ClaudeConfigSlotDiagnosticCodeV1::RefreshDue,
-        )
-    };
+    let (state, code) = (
+        ClaudeConfigSlotCollectionStateV1::RefreshDue,
+        ClaudeConfigSlotDiagnosticCodeV1::RefreshDue,
+    );
     status.state = state;
     status.quota_snapshot = status
         .quota_snapshot
@@ -8665,6 +8731,21 @@ fn capacity_exceeded_status(observed_at: &str) -> ClaudeConfigSlotCollectionStat
 
 fn claude_slot_collection_state_path() -> PathBuf {
     default_support_dir().join(CLAUDE_CONFIG_SLOT_COLLECTION_STATE_FILE)
+}
+
+#[cfg(test)]
+pub(crate) fn publish_blocked_claude_slot_for_test(
+    descriptor: &ClaudeConfigSlotDescriptorV1,
+    candidate: &ClaudeConfigSlotCollectionStatusV1,
+) -> std::io::Result<Option<ClaudeConfigSlotCollectionStatusV1>> {
+    persist_claude_slot_collection_states(
+        &BTreeMap::from([(descriptor.slot_id.clone(), candidate.clone())]),
+        &[],
+        &BTreeMap::from([(descriptor.slot_id.clone(), descriptor.clone())]),
+    )?;
+    Ok(read_persisted_claude_slot_collection_state()
+        .slots
+        .remove(&descriptor.slot_id))
 }
 
 fn persist_claude_slot_collection_states(
@@ -10392,15 +10473,18 @@ fn claude_desktop_pairs_snapshot(
 /// Append this pass's Desktop pair status to the Claude uploads, after every
 /// login and degraded snapshot so coverage is computed from what actually
 /// uploads. The uploads already present are never changed.
+///
+/// The backend keeps a login's metered current row when this status arrives:
+/// an account-less, meterless status no longer takes the profile of its newest
+/// linked observation, so the current-row cleanup cannot delete this Mac's
+/// metered row for that profile. Pair connect targets are local and do not
+/// depend on this.
 fn append_claude_desktop_pairs_snapshot(
     snapshots: &mut Vec<AgentStatusSnapshot>,
     desktop: &ClaudeDesktopPairs,
     captured_at: &str,
     expires_at: &str,
 ) {
-    if !CLAUDE_DESKTOP_PAIRS_UPLOAD_ENABLED {
-        return;
-    }
     let Some(snapshot) = claude_desktop_pairs_snapshot(desktop, snapshots, captured_at, expires_at)
     else {
         return;
@@ -11213,9 +11297,7 @@ fn collect_claude_oauth_usage_unstamped(
     // displaces a saved-reset slot.
     let usage_read =
         claude_credit_pools::claude_usage_read_kind(&read_schedule, &previous_credit_balances, now);
-    let passive_config = if claude_credit_pools::CLAUDE_PASSIVE_READING_ENABLED
-        && usage_read == claude_credit_pools::ClaudeUsageRead::Plain
-    {
+    let passive_config = if usage_read == claude_credit_pools::ClaudeUsageRead::Plain {
         claude_oauth_passive_config(
             caller,
             account_identifier_hash,
@@ -12276,7 +12358,6 @@ fn claude_oauth_usage_slot_seconds(
         latest_activity_at,
         feed_fresh_at,
         claude_oauth_usage_fresh_age_seconds(account_identifier_hash, organization_identifier_hash),
-        claude_credit_pools::CLAUDE_ACTIVITY_CADENCE_ENABLED,
         now,
     )
 }
@@ -12923,6 +13004,7 @@ fn clear_claude_oauth_usage_breaker_with_legacy(
 /// backoff are retired; the default login's rejections, if any, were earned by
 /// a different credential and stay. An account-wide auth verdict written by a
 /// daemon from before caller attribution has only its auth fields cleared.
+#[cfg(test)]
 pub(crate) fn clear_claude_oauth_usage_auth_breaker(
     account_identifier_hash: &str,
     organization_identifier_hash: &str,
@@ -13430,6 +13512,7 @@ fn read_claude_oauth_credential_for_slot(
     read_claude_oauth_credential_state_for_slot(slot).into_credential()
 }
 
+#[cfg(test)]
 pub(crate) fn read_claude_oauth_credential_metadata_for_slot(
     slot: &ClaudeConfigDirSlot,
 ) -> Option<ClaudeOAuthCredentialMetadata> {
@@ -13543,6 +13626,13 @@ enum ClaudeKeychainRead {
 const SECURITY_ITEM_NOT_FOUND_EXIT_CODE: i32 = 44;
 
 fn read_claude_oauth_credential_from_keychain(slot: &ClaudeConfigDirSlot) -> ClaudeKeychainRead {
+    read_claude_oauth_credential_from_keychain_with_timeout(slot, COMMAND_TIMEOUT)
+}
+
+fn read_claude_oauth_credential_from_keychain_with_timeout(
+    slot: &ClaudeConfigDirSlot,
+    timeout: Duration,
+) -> ClaudeKeychainRead {
     if crate::command_env::executable_path("security").is_none() {
         // Without the keychain tool the stored login cannot be confirmed
         // either way: fail closed, never "no login".
@@ -13555,7 +13645,7 @@ fn read_claude_oauth_credential_from_keychain(slot: &ClaudeConfigDirSlot) -> Cla
         return ClaudeKeychainRead::Failed;
     };
     let argument_refs: Vec<_> = arguments.iter().map(String::as_str).collect();
-    let output = run_command_capture("security", &argument_refs, COMMAND_TIMEOUT);
+    let output = run_command_capture("security", &argument_refs, timeout);
     if output.success {
         return ClaudeKeychainRead::Found(output.stdout);
     }
@@ -17453,6 +17543,120 @@ fn require_claude_auth_identity_agreement(
         return Err(ClaudeSlotProbeFailure::IdentityMismatch);
     }
     Ok(())
+}
+
+/// Local claims only: compare with the accepted slot binding, never adopt.
+/// Use the established local login classifier before granting launch or
+/// nickname authority. The exact passwd home is used for file fallback.
+/// No provider executable is invoked. Test reads are scratch-only and never
+/// consult the real Keychain, including on the native CI lane.
+pub(crate) fn session_launch_claude_login_state(
+    slot: &ClaudeConfigDirSlot,
+    home: &Path,
+) -> ClaudeLocalLoginState {
+    let read_file = || {
+        let path = slot.credentials_path(home);
+        if !crate::provider_calls::readable_for_account(&path) {
+            return ClaudeCredentialRead::Unreadable;
+        }
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let file = match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return ClaudeCredentialRead::Absent
+            }
+            Err(_) => return ClaudeCredentialRead::Unreadable,
+        };
+        let Ok(metadata) = file.metadata() else {
+            return ClaudeCredentialRead::Unreadable;
+        };
+        if !metadata.is_file()
+            || metadata.len() > 1024 * 1024
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o077 != 0
+        {
+            return ClaudeCredentialRead::Unreadable;
+        }
+        let mut body = String::new();
+        if file
+            .take(1024 * 1024 + 1)
+            .read_to_string(&mut body)
+            .is_err()
+            || body.len() > 1024 * 1024
+        {
+            return ClaudeCredentialRead::Unreadable;
+        }
+        parse_claude_oauth_credential_read(&body)
+    };
+    #[cfg(all(target_os = "macos", not(test)))]
+    let read =
+        match read_claude_oauth_credential_from_keychain_with_timeout(slot, Duration::from_secs(2))
+        {
+            ClaudeKeychainRead::Found(payload) => parse_claude_oauth_credential_read(&payload),
+            ClaudeKeychainRead::NotFound => read_file(),
+            ClaudeKeychainRead::Failed => ClaudeCredentialRead::Unreadable,
+        };
+    #[cfg(any(not(target_os = "macos"), test))]
+    let read = read_file();
+    claude_local_login_state(&read, OffsetDateTime::now_utc())
+}
+
+pub(crate) fn session_launch_claude_identity(
+    slot: &ClaudeConfigDirSlot,
+    home: &Path,
+) -> Option<(String, String)> {
+    let identity = read_claude_cli_oauth_account(&slot.identity_path(home))?;
+    Some((
+        billing_identity_hash("anthropic", "account", identity.account_uuid.as_deref()?)?,
+        billing_identity_hash(
+            "anthropic",
+            "organization",
+            identity.organization_uuid.as_deref()?,
+        )?,
+    ))
+}
+
+/// Match Codex's explicit-mode precedence. ChatGPT login can retain an
+/// exchanged API key; explicit API/unknown modes cannot inherit stale OAuth.
+pub(crate) fn session_launch_codex_api_key_route(home: &Path, trust: CodexHomeTrust) -> bool {
+    let Some(value) = ottto_core::read_codex_auth_file_secure(home, trust)
+        .ok()
+        .flatten()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+    else {
+        return false;
+    };
+    if let Some(mode) = value.get("auth_mode").filter(|mode| !mode.is_null()) {
+        return mode.as_str() != Some("chatgpt");
+    }
+    // Legacy inference is used only without an explicit mode.
+    [
+        "OPENAI_API_KEY",
+        "personal_access_token",
+        "bedrock_api_key",
+        "bedrock_access_keys",
+    ]
+    .iter()
+    .any(|key| value.get(key).is_some_and(|value| !value.is_null()))
+}
+
+pub(crate) fn session_launch_codex_identity(
+    home: &Path,
+    trust: CodexHomeTrust,
+) -> Option<(String, String)> {
+    if session_launch_codex_api_key_route(home, trust) {
+        return None;
+    }
+    let credential = read_codex_auth_credentials_at(home, trust).ok()??;
+    let (account, workspace) = codex_credential_claimed_ids(&credential)?;
+    Some((
+        billing_identity_hash("openai", "account", &account)?,
+        billing_identity_hash("openai", "workspace", &workspace)?,
+    ))
 }
 
 fn read_claude_cli_oauth_account(path: &Path) -> Option<ClaudeCliOauthAccount> {
@@ -21483,6 +21687,10 @@ mod tests {
             Some(ClaudeAccountAnchorHealthV1::TemporarilyUnavailable)
         );
 
+        assert!(!reconcile_registered_claude_valid_access(
+            &slot,
+            &blocked_upkeep
+        ));
         // Real worker publication of the pre-claim outcome.
         record_registered_claude_worker_observation(
             &slot,
@@ -39048,12 +39256,7 @@ exit 44
             for index in 0..3 {
                 let collection = fixture.slot_collection(index);
                 if expired {
-                    let expected_state =
-                        if crate::claude_upkeep::PAUSED_EXPIRED_SLOT_ASKS_FOR_SIGN_IN {
-                            ClaudeConfigSlotCollectionStateV1::CredentialUnavailable
-                        } else {
-                            ClaudeConfigSlotCollectionStateV1::RefreshDue
-                        };
+                    let expected_state = ClaudeConfigSlotCollectionStateV1::RefreshDue;
                     assert_eq!(collection.state, expected_state, "{label}");
                     assert_ne!(
                         collection.state,
@@ -39614,17 +39817,6 @@ exit 44
         fixture.set_all_expiries(-TimeDuration::hours(1));
         fixture.collect();
         let paused = fixture.slot_collection(0);
-        if crate::claude_upkeep::PAUSED_EXPIRED_SLOT_ASKS_FOR_SIGN_IN {
-            assert_eq!(
-                paused.state,
-                ClaudeConfigSlotCollectionStateV1::CredentialUnavailable
-            );
-            assert_eq!(
-                projected_claude_quota_access_state(&paused),
-                Some(ClaudeQuotaAccessState::AttentionRequired)
-            );
-            return;
-        }
         assert_eq!(paused.state, ClaudeConfigSlotCollectionStateV1::RefreshDue);
         assert_eq!(
             paused.upkeep.as_ref().map(|upkeep| upkeep.result),

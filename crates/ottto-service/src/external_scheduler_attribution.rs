@@ -5,6 +5,7 @@
 //! and privacy-safe repository hashes. Raw plist/crontab/script text and paths
 //! never enter a session fact.
 
+#[cfg(any(target_os = "macos", test))]
 mod live_owner;
 
 use crate::context_footprint::resolve_repository_identity;
@@ -44,6 +45,7 @@ pub(crate) struct ExternalSchedulerInventory {
     definitions: Vec<ExternalSchedulerDefinition>,
     /// Process facts for live-owner proof, gathered at most once per scan.
     /// Each scan gets a fresh inventory value and so a fresh `live`.
+    #[cfg(any(target_os = "macos", test))]
     live: Mutex<live_owner::LiveScan>,
 }
 
@@ -64,6 +66,7 @@ struct ExternalSchedulerDefinition {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ExternalSchedulerKind {
     Launchd,
+    #[cfg(any(target_os = "macos", test))]
     Cron,
 }
 
@@ -71,6 +74,7 @@ impl ExternalSchedulerKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::Launchd => "launchd",
+            #[cfg(any(target_os = "macos", test))]
             Self::Cron => "cron",
         }
     }
@@ -120,7 +124,9 @@ pub(crate) struct ExternalSchedulerSession<'a> {
     pub(crate) normalized_template: Option<&'a str>,
     pub(crate) repository_hash: Option<&'a str>,
     pub(crate) source_started_at: Option<&'a str>,
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) source_session_id: &'a str,
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) transcript_path: &'a Path,
 }
 
@@ -210,6 +216,7 @@ impl ExternalSchedulerInventory {
     fn from_definitions(definitions: Vec<ExternalSchedulerDefinition>) -> Self {
         Self {
             definitions,
+            #[cfg(any(target_os = "macos", test))]
             live: Mutex::default(),
         }
     }
@@ -568,6 +575,8 @@ fn refresh_crontab_inventory(
     #[cfg(not(target_os = "macos"))]
     {
         let _ = key;
+        // Return from this cfg branch before the macOS-only block.
+        #[allow(clippy::needless_return)]
         return (previous_digest, previous_definitions);
     }
     #[cfg(target_os = "macos")]
@@ -810,6 +819,7 @@ impl ExternalSchedulerInventory {
     /// Labels of launchd jobs proven to run this session: remembered from an
     /// earlier scan, or found now in a running candidate job's process tree.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    #[cfg(any(target_os = "macos", test))]
     fn live_owner_labels(
         &self,
         session: &ExternalSchedulerSession<'_>,
@@ -1177,7 +1187,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(ExternalSchedulerInventory; definitions, live);
+crate::heap_layout_bound::fields!(ExternalSchedulerInventory; definitions, #[cfg(any(target_os = "macos", test))] live);
 
 crate::heap_layout_bound::fields!(ExternalSchedulerDefinition; scheduler_kind, opaque_id, launchd_label, provider_source, prompt_signature, repository_hash, schedule);
 
@@ -1188,7 +1198,9 @@ crate::heap_layout_bound::fields!(CalendarConstraint; minute, hour, weekday, day
 impl crate::heap_layout_bound::HeapLayoutBound for ExternalSchedulerKind {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         match self {
-            Self::Launchd | Self::Cron => c.add(0),
+            Self::Launchd => c.add(0),
+            #[cfg(any(target_os = "macos", test))]
+            Self::Cron => c.add(0),
         }
     }
 }

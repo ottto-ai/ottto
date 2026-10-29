@@ -6,9 +6,7 @@ use super::measure::{
 };
 use super::report::{Weight, WorkspaceReport};
 use super::IMAGE_NOMINAL_TOKENS;
-use crate::composition_kinds::{
-    self as kinds, Agent, CallClass, ClaudeAttachment, LineCtx, Verdict,
-};
+use crate::composition_kinds::{self as kinds, CallClass, ClaudeAttachment, LineCtx, Verdict};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -74,7 +72,7 @@ pub(crate) fn parse_claude_session(
         report.copied_history_sessions += 1;
     }
 
-    let ctx = LineCtx::v1(Agent::Claude);
+    let ctx = LineCtx::v1();
 
     // Pass 1: tool_use id -> call class; residency markers.
     let mut tooluse: BTreeMap<String, CallClass> = BTreeMap::new();

@@ -25,18 +25,6 @@ use crate::quota_credit_model::{
     ListObservation, Provider, ReadinessInput, SectionCache, TimeInput,
 };
 
-/// Passive input from Claude Code's own `cachedUsageUtilization` (design R7:
-/// active-account freshness).
-/// Every collection pass records where each caller is signed in, and a
-/// registered slot's identity gate ends the caller's run when it refuses the
-/// slot, as does a pass that skips the collector (an unresolved default-login
-/// identity, a browser re-sign-in), so a body fetched under another
-/// organization is never adopted.
-pub(super) const CLAUDE_PASSIVE_READING_ENABLED: bool = true;
-/// Kill switch for the activity-based slot (design R7). `false` uses the
-/// unused-account gate (38-42 min) for every binding: no in-use boost.
-/// Plain/saved-reset alternation is unaffected (same slot count).
-pub(super) const CLAUDE_ACTIVITY_CADENCE_ENABLED: bool = true;
 /// A saved-reset variant response without a recognizable `cedar_ember` stops
 /// the variant for that binding this long; every slot reads plain meanwhile.
 const SAVED_RESETS_VARIANT_PAUSE_SECONDS: u64 = 24 * 60 * 60;
@@ -635,17 +623,15 @@ pub(super) fn write_claude_read_schedule(
 
 /// The account's read slot (design R7: active-account freshness): the active
 /// slot while the account was active within the feed's last 30 min, else the default
-/// (unused-account) slot. With `activity_cadence` off every slot is the
-/// default slot.
+/// (unused-account) slot.
 pub(super) fn claude_usage_slot_seconds(
     schedule: &ClaudeReadSchedule,
     latest_activity_at: Option<u64>,
     feed_fresh_at: Option<u64>,
     default_slot_seconds: u64,
-    activity_cadence: bool,
     now: u64,
 ) -> u64 {
-    if activity_cadence && claude_binding_in_use(schedule, latest_activity_at, feed_fresh_at, now) {
+    if claude_binding_in_use(schedule, latest_activity_at, feed_fresh_at, now) {
         return ACTIVE_SLOT_SECONDS;
     }
     default_slot_seconds
@@ -948,6 +934,14 @@ pub(super) struct ClaudePassiveConfig {
 
 /// Check a Claude Code `.claude.json` against a binding. Reads only
 /// `oauthAccount` and `cachedUsageUtilization`.
+///
+/// Passive input from Claude Code's own `cachedUsageUtilization` (design R7:
+/// active-account freshness).
+/// Every collection pass records where each caller is signed in, and a
+/// registered slot's identity gate ends the caller's run when it refuses the
+/// slot, as does a pass that skips the collector (an unresolved default-login
+/// identity, a browser re-sign-in), so a body fetched under another
+/// organization is never adopted.
 pub(super) fn claude_passive_config(
     config: &Value,
     account_identifier_hash: &str,
@@ -2063,19 +2057,12 @@ mod tests {
         assert!(!schedule.observe_activity(None));
         assert!(!schedule.observe_activity(Some(900)));
         assert_eq!(schedule.last_activity_at, Some(1_000));
-        let slot = |now| claude_usage_slot_seconds(&schedule, None, None, 2_400, true, now);
+        let slot = |now| claude_usage_slot_seconds(&schedule, None, None, 2_400, now);
         assert_eq!(slot(1_000 + 20 * 60), ACTIVE_SLOT_SECONDS);
         assert_eq!(slot(1_000 + 31 * 60), 2_400);
         // Unused, however long: the unused-account gate, never a longer slot.
         assert_eq!(slot(1_000 + 6 * 3_600 + 1), 2_400);
         assert_eq!(slot(1_000 + 48 * 3_600), 2_400);
-        // Kill switch: the unused-account gate everywhere.
-        for now in [1_000 + 20 * 60, 1_000 + 31 * 60, 1_000 + 6 * 3_600 + 1] {
-            assert_eq!(
-                claude_usage_slot_seconds(&schedule, Some(now), None, 2_400, false, now),
-                2_400
-            );
-        }
     }
 
     #[test]
@@ -2149,7 +2136,6 @@ mod tests {
                 claude_latest_activity_at(feed, "a", "o"),
                 claude_activity_feed_fresh_at(feed),
                 DEFAULT_SLOT,
-                true,
                 now,
             )
         };
@@ -2253,8 +2239,7 @@ mod tests {
         fn pass(&mut self, now: u64, activity: Option<u64>, passive_fetched_at: Option<u64>) {
             let since = claude_observe_caller_binding(&mut self.callers, "default", "a/o", now);
             self.schedule.observe_activity(activity);
-            let slot =
-                claude_usage_slot_seconds(&self.schedule, activity, None, DEFAULT_SLOT, true, now);
+            let slot = claude_usage_slot_seconds(&self.schedule, activity, None, DEFAULT_SLOT, now);
             if !claude_reading_due(self.last_reading_at, self.next_refresh_after, slot, now) {
                 return;
             }

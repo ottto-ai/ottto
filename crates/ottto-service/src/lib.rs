@@ -1,3 +1,4 @@
+mod account_nicknames;
 pub mod active_sessions;
 pub mod adaptive_collector;
 pub mod agent_configs;
@@ -55,6 +56,7 @@ pub(crate) mod quota_credit_model;
 mod relay_auth;
 mod retry_tls;
 pub mod session_attribution;
+pub mod session_launch;
 pub mod snapshot_audit;
 pub mod snapshot_client;
 pub(crate) mod snapshot_retry;
@@ -248,7 +250,11 @@ impl ControlToken {
 
 #[derive(Debug, Clone)]
 pub struct LocalDaemon {
+    session_launch: Arc<Mutex<session_launch::Registry>>,
     transcript_cache: Arc<snapshots::sampled_scan::SharedCache>,
+    footprint_cwds: Arc<context_footprint::CwdProjection>,
+    codex_preludes: Arc<codex_prelude_footprint::CodexPreludeFeed>,
+    codex_versions: Arc<snapshots::codex_version::CodexVersionFeed>,
     native_comparison: Arc<snapshots::claude_native_comparison::lifecycle::Lifecycle>,
     inner: Arc<Mutex<DaemonState>>,
     control_token: ControlToken,
@@ -463,7 +469,13 @@ impl LocalDaemon {
     ) -> Self {
         let now = now.into();
         Self {
+            session_launch: Arc::default(),
             transcript_cache: Arc::new(snapshots::sampled_scan::SharedCache::default()),
+            footprint_cwds: Arc::default(),
+            codex_preludes: Arc::default(),
+            codex_versions: Arc::new(snapshots::codex_version::CodexVersionFeed::new(
+                snapshot_sync::home_dir().ok().as_deref(),
+            )),
             native_comparison: Arc::new(
                 snapshots::claude_native_comparison::lifecycle::Lifecycle::default(),
             ),
@@ -2951,6 +2963,16 @@ fn local_health_blockers_for_status(
     sources: &[LocalHealthSourceV1],
 ) -> Vec<LocalHealthBlockerV1> {
     let mut blockers = Vec::new();
+    if snapshot_sync::snapshot_api_base_url().is_err() {
+        blockers.push(blocker(
+            "connection_binding_unreadable",
+            LocalHealthSeverity::Blocking,
+            "account",
+            LocalHealthAuthority::Setup,
+            &status.generated_at,
+            "Connection binding is unreadable; get a fresh claim code from Ottto Apps, then run `ottto login --claim-code <code>` to reconnect this Mac and resume uploads",
+        ));
+    }
     if !runtime.protocol_match || !runtime.schema_match {
         blockers.push(blocker(
             "protocol_mismatch",
@@ -4923,6 +4945,53 @@ mod tests {
     use serial_test::serial;
 
     const TOKEN: &str = "local_control_token";
+
+    #[test]
+    fn doctor_connection_binding_finding_requires_reconnect_and_clears_after_repair() {
+        if !crate::test_isolation::run_here() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("doctor-connection-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let _support = TestEnvVar::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+        let daemon = daemon().with_account(account("synthetic", "synthetic@example.invalid"));
+        let finding = |status: DaemonStatus| {
+            status
+                .canonical_health
+                .unwrap()
+                .blockers
+                .into_iter()
+                .find(|b| b.code == "connection_binding_unreadable")
+        };
+        assert!(finding(daemon.status(TOKEN).unwrap()).is_none());
+        for bytes in [b"invalid-json".to_vec(), vec![b' '; 64 * 1024 + 1]] {
+            std::fs::write(root.join("connection.json"), bytes).unwrap();
+            let status = daemon.status(TOKEN).unwrap();
+            assert_eq!(
+                status.canonical_health.as_ref().unwrap().overall.state,
+                LocalHealthOverallState::Blocked
+            );
+            let problem = finding(status).expect("doctor must surface stopped uploads");
+            assert_eq!(problem.severity, LocalHealthSeverity::Blocking);
+            assert!(problem.clear_condition.contains("Connection binding"));
+            assert!(problem
+                .clear_condition
+                .contains("`ottto login --claim-code <code>` to reconnect"));
+            assert!(!problem.clear_condition.contains(root.to_str().unwrap()));
+        }
+        std::fs::remove_file(root.join("connection.json")).unwrap();
+        ottto_core::FileConnectionStore::default()
+            .save(&ottto_core::LocalConnectionBinding {
+                setup_run_id: "synthetic".into(),
+                setup_run_token_expires_at: "2099-01-01T00:00:00Z".into(),
+                machine_id: None,
+                claim_code: None,
+                api_base_url: "https://synthetic.invalid".into(),
+            })
+            .unwrap();
+        assert!(finding(daemon.status(TOKEN).unwrap()).is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn rejects_empty_control_token() {

@@ -712,6 +712,8 @@ pub(super) struct GatedHistory {
     pub(super) index_key: String,
     /// `None` while permitted; a hold once denied.
     pub(super) held: Option<HistoryHold>,
+    /// The gate permitted this upgrade (a later hold keeps it true).
+    pub(super) permitted: bool,
     /// Ordinary sync whose request-owned literal is denied
     /// (`HistoryDecision::LiteralDenied`); never an upgrade.
     pub(super) literal_denied: bool,
@@ -722,7 +724,7 @@ pub(super) struct GatedHistory {
     pub(super) local: BTreeSet<String>,
 }
 
-crate::heap_layout_bound::fields!(GatedHistory; index_key, held, literal_denied, previous, local);
+crate::heap_layout_bound::fields!(GatedHistory; index_key, held, permitted, literal_denied, previous, local);
 
 /// Runtime-only gate state of one cycle.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2107,9 +2109,10 @@ mod tests {
     #[test]
     fn unread_telemetry_holds_permitted_upgrades_only() {
         let mut index = super::super::ScanIndex::default();
-        let gated = |held, literal_denied| GatedHistory {
+        let gated = |held: Option<HistoryHold>, literal_denied: bool| GatedHistory {
             index_key: "k".into(),
             held,
+            permitted: held.is_none() && !literal_denied,
             literal_denied,
             previous: None,
             local: BTreeSet::new(),

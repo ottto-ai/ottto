@@ -260,6 +260,7 @@ const CLAUDE_ATTACHMENT_PARTS: [(&str, Part); 45] = [
 ];
 
 /// Types handled by rule rather than by the table above.
+#[cfg(test)]
 const CLAUDE_ATTACHMENT_RULES: [&str; 4] = [
     "prompt_snapshot",
     "deferred_tools_record",
@@ -267,6 +268,7 @@ const CLAUDE_ATTACHMENT_RULES: [&str; 4] = [
     "queued_command",
 ];
 
+#[cfg(test)]
 pub(super) fn claude_attachment_known(att_type: &str) -> bool {
     CLAUDE_ATTACHMENT_RULES.contains(&att_type)
         || CLAUDE_ATTACHMENT_PARTS

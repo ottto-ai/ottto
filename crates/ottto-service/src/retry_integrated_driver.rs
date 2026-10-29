@@ -70,19 +70,10 @@ impl IntegratedSlot {
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
-#[allow(dead_code)] // Historical fault adapters retained for the canonical transport fixture.
 enum IntegratedScript {
     Ack,
     FallbackShed,
     AuthReplay,
-    LostAck,
-    Exhaust,
-    Deadline,
-    BeforePostAccount,
-    AfterAckAccount,
-    LedgerCrash,
-    IndexRace,
-    ProgressRace,
 }
 #[derive(Default)]
 struct IntegratedTrace {
@@ -219,14 +210,6 @@ fn integrated_send(
                     let body = serde_json::to_vec(&request)?;
                     assert!(body.len() <= SNAPSHOT_BATCH_MAX_BYTES);
                     let encoded = crate::snapshot_client::retention_gzip_probe(&body);
-                    if script == IntegratedScript::BeforePostAccount {
-                        let mut changed = current.clone();
-                        changed.account += 1;
-                        assert!(
-                            integrated_post(slot, now + 2_000, &changed, "main", trace).is_err()
-                        );
-                        return Err(anyhow!("authority changed after token"));
-                    }
                     integrated_post(slot, now + 2_000, current, "main", trace)?;
                     match script {
                         IntegratedScript::FallbackShed => {
@@ -251,90 +234,19 @@ fn integrated_send(
                             let _fresh = integrated_token(trace);
                             integrated_post(slot, now + 3_000, current, "auth-replay", trace)?;
                         }
-                        IntegratedScript::LostAck => return Err(anyhow!("synthetic lost ACK")),
-                        IntegratedScript::Exhaust => {
-                            integrated_post(
-                                slot,
-                                now + 3_000,
-                                current,
-                                "encoding-fallback",
-                                trace,
-                            )?;
-                            let _fresh = integrated_token(trace);
-                            integrated_post(slot, now + 4_000, current, "auth-replay", trace)?;
-                            assert!(integrated_post(
-                                slot,
-                                now + 5_000,
-                                current,
-                                "adaptive-fourth",
-                                trace
-                            )
-                            .is_err());
-                            return Err(anyhow!("three physical POSTs exhausted"));
-                        }
-                        IntegratedScript::Deadline => {
-                            assert!(integrated_post(
-                                slot,
-                                deadline,
-                                current,
-                                "late-fallback",
-                                trace
-                            )
-                            .is_err());
-                            assert_eq!(slot.budget.turn_deadline, deadline);
-                            return Err(anyhow!("absolute turn deadline expired"));
-                        }
                         _ => {}
                     }
                     let response = integrated_ack(&request)?;
                     lease.commit();
                     Ok(response)
                 },
-                &mut |p: &mut SnapshotUploadProgress| {
-                    if script == IntegratedScript::LedgerCrash {
-                        return Err(anyhow!("crash before ledger"));
-                    }
-                    p.save(&f.progress_path)
-                },
+                &mut |p: &mut SnapshotUploadProgress| p.save(&f.progress_path),
             )
         };
         slot.items = items;
         let result = result?;
         assert!(matches!(result, SnapshotPageOutcome::Settled { .. }));
         assert_eq!(slot.budget.turn_deadline, deadline);
-        if script == IntegratedScript::AfterAckAccount {
-            let before = std::fs::read(&f.index_path)?;
-            let mut changed = current.clone();
-            changed.account += 1;
-            assert!(f
-                .checkpoint_boundary(|| {
-                    if !slot.budget.phase(now + 4_000, Some(&changed)) {
-                        Err(anyhow!("post-ACK authority"))
-                    } else {
-                        Ok(())
-                    }
-                })
-                .is_err());
-            assert_eq!(std::fs::read(&f.index_path)?, before);
-            return Err(anyhow!("ACK durable; publication authority revoked"));
-        }
-        if script == IntegratedScript::ProgressRace {
-            let mut competing = f.progress.clone();
-            competing.save(&f.progress_path)?;
-            let bytes = std::fs::read(&f.progress_path)?;
-            assert!(f.checkpoint_boundary(|| Ok(())).is_err());
-            assert_eq!(std::fs::read(&f.progress_path)?, bytes);
-            return Err(anyhow!("manual progress generation wins"));
-        }
-        if script == IntegratedScript::IndexRace {
-            let mut newer = ScanIndex::load(&f.index_path)?;
-            newer.mark_bounded_sweep_unsettled();
-            newer.save(&f.index_path)?;
-            let bytes = std::fs::read(&f.index_path)?;
-            assert!(f.checkpoint_boundary(|| Ok(())).is_err());
-            assert_eq!(std::fs::read(&f.index_path)?, bytes);
-            return Err(anyhow!("manual generation wins"));
-        }
         f.checkpoint_boundary(|| {
             if slot.budget.phase(now + 4_000, Some(current)) {
                 Ok(())

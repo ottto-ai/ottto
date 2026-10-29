@@ -193,7 +193,29 @@ pub(crate) struct RederiveReceipt {
     pub(crate) line_bytes: u64,
 }
 
+impl CachedJsonlReduction {
+    #[cfg(test)]
+    pub(in crate::snapshots) fn durable_counting(&self) -> Option<(Option<i64>, u8, u8)> {
+        self.accumulator
+            .codex_counting
+            .as_deref()
+            .map(|c| c.durable_contract())
+    }
+}
 impl Decoded {
+    pub(crate) fn cutover(&self) -> Option<Option<i64>> {
+        self.reduction
+            .accumulator
+            .codex_counting
+            .as_deref()
+            .map(|c| c.durable_cutover())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn counting(&self) -> Option<(Option<i64>, u8, u8)> {
+        self.reduction.durable_counting()
+    }
+
     /// How far the head re-parse must read: the latest mark of a field to
     /// re-derive. 0 when nothing needs the head.
     pub(crate) fn head_end(&self) -> Result<u64, Refuse> {
@@ -348,6 +370,9 @@ pub(crate) fn rederive_parser(
     path: &Path,
     decoded: &Decoded,
 ) -> Result<OwnedJsonlParser> {
+    if decoded.reduction.accumulator.source == SnapshotSource::Codex {
+        refuse_compressed_codex(Some(path), None, CodexZstCause::DurableTailUnsupported)?;
+    }
     // A duplicated descriptor shares the held one's offset: start at 0.
     file.seek(SeekFrom::Start(0))?;
     let acc = &decoded.reduction.accumulator;
@@ -373,3 +398,20 @@ pub(crate) fn rederive_parser(
 #[cfg(test)]
 #[path = "durable_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+pub(crate) fn store_fixture_body(source: SnapshotSource, count: u64, sum: u64) -> Vec<u8> {
+    let reduction = CachedJsonlReduction {
+        accumulator: SnapshotAccumulator::new(source),
+        report: JsonlReadReport::default(),
+        recognized_usage_drop_count: count as usize,
+        positive_recognized_usage_count: sum as usize,
+        positive_usage_evidence: false,
+    };
+    encode(
+        &reduction,
+        crate::durable_tail_store::RECORD_BYTES,
+        1024 * 1024,
+    )
+    .unwrap()
+}

@@ -1926,6 +1926,30 @@ fn failed_read_counts_nothing_and_keeps_the_rest_of_the_scope() {
 }
 
 #[test]
+fn codex_archive_never_read_while_plain_is_counted_unpinned() {
+    let env = Env::new("composition-v2-archive-unpinned");
+    let now = base_now();
+    // Not zstd, so a decode would fail; the zero read and failure counts
+    // show no counted read touched it.
+    let compressed = env
+        .root
+        .join("archived_sessions/rollout-2026-10-01T00-00-00-zzz.jsonl.zst");
+    fs::create_dir_all(compressed.parent().unwrap()).unwrap();
+    fs::write(&compressed, b"not zstd").unwrap();
+    let stats = env.run(Source::Codex, now, None);
+    assert_eq!(
+        (
+            stats.archived,
+            stats.archived_unpinned,
+            stats.bytes_new + stats.bytes_repair + stats.bytes_head,
+            stats.files_failed
+        ),
+        (0, 1, 0, 0)
+    );
+    env.cleanup();
+}
+
+#[test]
 fn codex_archive_move_and_compression_never_read_again() {
     let env = Env::new("composition-v2-archive");
     let now = base_now();
@@ -1959,8 +1983,12 @@ fn codex_archive_move_and_compression_never_read_again() {
     fs::remove_file(&archived).unwrap();
     let stats = env.run(Source::Codex, now + time::Duration::days(2), None);
     assert_eq!(
-        (stats.archived, stats.bytes_new + stats.bytes_repair),
-        (1, 0)
+        (
+            stats.archived,
+            stats.archived_unpinned,
+            stats.bytes_new + stats.bytes_repair
+        ),
+        (1, 0, 0)
     );
     // The scope's next commit marks its checkpoint done, so pins rebuilt
     // from the scope never read it again.
@@ -2534,7 +2562,6 @@ fn parse_state_round_trips() {
 
     // An open call keeps every share (kind, part, weight, file, tool).
     let ctx = crate::composition_kinds::LineCtx::v2(
-        crate::composition_kinds::Agent::Claude,
         crate::composition_kinds::Request1::No,
         Some(Path::new("/w")),
         false,
@@ -5445,35 +5472,6 @@ fn failed_missing_pin_reset_with_equal_offset_stays_pending_after_crash() {
     assert!(stats.checkpoint_restarts > 0);
     assert_eq!(total_tokens(&env.scope(Source::Claude).agg), before);
     env.cleanup();
-}
-
-#[test]
-fn changed_days_reader_runs_in_this_build() {
-    // The daemon starts this reader, and the worker runs, instead of the
-    // kinds_version 1 harvest.
-    assert!(changed_days_enabled());
-}
-
-#[test]
-fn changed_days_switch_rules() {
-    // Switch on: the reader runs in every build, whatever the override says.
-    for debug_build in [false, true] {
-        for value in [None, Some("0"), Some("off"), Some("1")] {
-            assert!(changed_days_gate(true, debug_build, value));
-        }
-    }
-    // Switch off: the kinds_version 1 harvest runs; release builds ignore
-    // the override.
-    for value in [None, Some("0"), Some("off"), Some("1"), Some("true")] {
-        assert!(!changed_days_gate(false, false, value));
-    }
-    // Switch off, debug build: only a truthy override turns the reader on.
-    for value in [None, Some(""), Some("0"), Some("off"), Some("no")] {
-        assert!(!changed_days_gate(false, true, value));
-    }
-    for value in ["1", "true", " on ", "YES"] {
-        assert!(changed_days_gate(false, true, Some(value)));
-    }
 }
 
 #[path = "tests/a34.rs"]
