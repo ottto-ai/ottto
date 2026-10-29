@@ -618,6 +618,13 @@ impl HeaderInventory {
         let mut metadata_checks = 0_u64;
         for path in iter.by_ref().take(MAX_HEADER_FILES) {
             last = Some(path.clone());
+            // Raw custody contributes negative owner scope even when another
+            // custody record excludes all archives from acquisition. This is
+            // metadata-only classification, before every fact-cache operation.
+            if codex_archive_path(Path::new(path)) && index.decode_holds_file(path) {
+                self.pending.push_back(PathBuf::from(path));
+                continue;
+            }
             // Held-member exclusion precedes header-cache lookup (#878).
             let held = self.feed_member_held(Path::new(path))
                 || index.files.get(path).is_some_and(|e| {
@@ -641,8 +648,7 @@ impl HeaderInventory {
             if !codex_archive_path(Path::new(path)) {
                 self.pending.push_back(PathBuf::from(path));
             } else if !held {
-                if index.decode_holds_file(path) || index.archive_header(Path::new(path)).is_some()
-                {
+                if index.archive_header(Path::new(path)).is_some() {
                     self.pending.push_back(PathBuf::from(path));
                 } else {
                     // An omitted archive is still negative absence scope, even
@@ -5057,8 +5063,15 @@ pub(in crate::snapshots) mod header_cache_tests {
         // Two independent known-owner carriers, plus unknown and stale-evidence
         // controls. A historical protected owner is negative scope even when
         // the file changes; header-only evidence requires the same object.
-        for scope in ["protected", "archive", "unknown", "changed", "malformed"] {
-            let known_owner = matches!(scope, "protected" | "archive");
+        for scope in [
+            "protected",
+            "archive",
+            "archive-behind-custody",
+            "unknown",
+            "changed",
+            "malformed",
+        ] {
+            let known_owner = matches!(scope, "protected" | "archive" | "archive-behind-custody");
             let (root, fixture) = tests::fixture();
             let owner = fixture.headers[0].owner.clone();
             let healthy = "ffffffff-1111-4111-8111-ffffffffffff";
@@ -5132,6 +5145,11 @@ pub(in crate::snapshots) mod header_cache_tests {
                 ValidatedHeader::from_bytes((rows[0].to_string() + "\n").as_bytes());
             assert!(evidence.header_validated.is_some());
             evidence.owner = Some(owner.clone());
+            if scope == "archive-behind-custody" {
+                let unknown = root.join("sessions/rollout-unlocated.jsonl.zst");
+                fs::write(&unknown, b"held without owner").unwrap();
+                previous.hold_compressed(&unknown, BTreeSet::new(), CodexZstCause::OwnerUnproven);
+            }
             let mut wire = serde_json::to_value(&previous).unwrap();
             wire["files"][&held] = serde_json::json!({"size_bytes": [], "future_field": [7, 8]});
             match scope {
@@ -5139,7 +5157,7 @@ pub(in crate::snapshots) mod header_cache_tests {
                     wire["files"][&held]["codex_protected_owner"] =
                         serde_json::json!(codex_protected_owner(&owner))
                 }
-                "archive" | "changed" | "malformed" => {
+                "archive" | "archive-behind-custody" | "changed" | "malformed" => {
                     wire["files"][&held]["archive"] = serde_json::to_value(evidence).unwrap();
                     if scope == "changed" {
                         fs::OpenOptions::new()
