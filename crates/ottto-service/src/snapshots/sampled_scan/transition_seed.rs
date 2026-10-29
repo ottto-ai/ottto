@@ -2,6 +2,15 @@
 //! Read the production post-save artifact unchanged: never rewrite its version,
 //! binding, allowlist, body or trailer. Source pins below fail on codec drift;
 //! a future writer must supply archived bytes rather than relabel its output.
+//!
+//! Serializer regions are extracted by the single companion Python standard-
+//! library tool used for both baseline generation and candidate verification.
+//! Only tests launch it; production has no subprocess or dependency change.
+//! It balances Rust tokens, preserves literals, removes comments/whitespace,
+//! discovers durable macros/trait impls and follows local helpers/constants.
+//! Explicit roots cover body encoding, allowlist labels, session-start content
+//! hashes, source slugs and owned-container Deref. See the tool docstring for
+//! the catalog limits: external helpers/import resolution need owner review.
 use super::*;
 use sha2::{Digest, Sha256};
 
@@ -44,14 +53,9 @@ pub(crate) fn seed_pinned_v1(
     bytes
 }
 
-// Conservative closure of CachedJsonlReduction + Rederive's serializer graph:
-// every 53d05a43 source unit defining a durable struct/enum or handwritten
-// Durable/HDigest/key/empty implementation, plus owned_heap's container helpers.
-// Whole files pin constants, label tables, helper functions and field order,
-// including SelectorCapture and CountingVersion/AckEvidence. A new dependency
-// requires editing one of these pinned definitions and therefore refuses too.
-// This intentionally also refuses unrelated edits in those units; do not refresh
-// hashes from the candidate. Supply historical artifacts when the writer drifts.
+// Pin serializer-relevant regions of the 16 baseline compilation units.
+// Hashes are generated with the SAME extractor using --baseline 53d05a43;
+// unrelated source edits are ignored, and new serializer definitions refuse.
 struct SourcePin {
     path: &'static str,
     text: &'static str,
@@ -61,109 +65,120 @@ const PINNED_SOURCES: &[SourcePin] = &[
     SourcePin {
         path: "codex_prelude_footprint.rs",
         text: include_str!("../../codex_prelude_footprint.rs"),
-        sha256: "9cc88564fc5dca3bc4b710e00ca1d4ddb20eb9ee36d562abe5e9a027fa9f675e",
+        sha256: "b309171b8f22488d0d471a054a1d69f39425b585b2746c813c92497a4703cde4",
     },
     SourcePin {
         path: "durable_tail_codec.rs",
         text: include_str!("../../durable_tail_codec.rs"),
-        sha256: "c4e15c5d669876f8e92e10db812386bd6bb2d6ed9b543d7d8505c5cda6c1fa7a",
+        sha256: "d74857522993a5c46daf5523d1eaf26edefa51e34c2dbe74ce0952ebc4d4a723",
     },
     SourcePin {
         path: "snapshots/cache_observations.rs",
         text: include_str!("../cache_observations.rs"),
-        sha256: "2b3965077015d599a07c2508963d97ce4a25873336689a0e41bc9f36671526d9",
+        sha256: "2395f78462fda87e452acdb1b9b11dce2636218c6681c32de998e2dcc023901a",
     },
     SourcePin {
         path: "snapshots/claude_context_file_birth.rs",
         text: include_str!("../claude_context_file_birth.rs"),
-        sha256: "3c89201a5a950afc499e904782b4b47d9e2a111a7edf1437675113c0f678bd49",
+        sha256: "4c8ecdba2a1b0cea91dcad8bfff18a87696a6360d856ebf85973d6b274c2cc37",
     },
     SourcePin {
         path: "snapshots/claude_request_identity.rs",
         text: include_str!("../claude_request_identity.rs"),
-        sha256: "0a19f1f84d4612ef560b7b5b80297eed0b2921cfe95983ec5c82bd5758378587",
+        sha256: "31193b9227acff19af78364c9ec27e6716a8e744cf3c7ca033892f2d832fc2db",
     },
     SourcePin {
         path: "snapshots/claude_response_records.rs",
         text: include_str!("../claude_response_records.rs"),
-        sha256: "85b9bc82c366301cddcb66e3f98233c15ea75fbc46d6fa4efee9aa8d1ad42135",
+        sha256: "77ee17b44a27a48f549ca40ba5455b55b5f72f92162adf366536f58dc95d5fa7",
     },
     SourcePin {
         path: "snapshots/codex_counting_version.rs",
         text: include_str!("../codex_counting_version.rs"),
-        sha256: "825f0adb25c9a724c8554f7f94f00ec5e3b05a6f2c265eb9b6c28adc1c11ead1",
+        sha256: "da1f61e4aa46ebe6761ba910b4fbc4340d96058bdfba9c6758f384846ca76127",
     },
     SourcePin {
         path: "snapshots/codex_usage_occurrence.rs",
         text: include_str!("../codex_usage_occurrence.rs"),
-        sha256: "d9f07000a832756d7649b282b1689134879cd5b5d570dd88c3e82b5bb783e075",
+        sha256: "4e8573b957476d37c720ded6a6c8d89f7a15a3e69557ac8813144a5b40fdc4e2",
     },
     SourcePin {
         path: "snapshots/compaction_events.rs",
         text: include_str!("../compaction_events.rs"),
-        sha256: "141363c840e4e1162e8aa447b82dbd6b5bdc81ceb7eb418c2121793b85af482c",
+        sha256: "7e2270137d1aa0d104542d03e07e1bea0fb7b1b2bb9707d9e6078fb10f26b56c",
     },
     SourcePin {
         path: "snapshots/context_curve.rs",
         text: include_str!("../context_curve.rs"),
-        sha256: "8bda8658c184e027b7cd080e7ca43c3f3f1f47e978cec682e15a74035a72bd78",
+        sha256: "6fb3a00d5dd3ff71364e9303f8b3228e7fea4cbec23cc81420fc636281762ae8",
     },
     SourcePin {
         path: "snapshots/local_context_points.rs",
         text: include_str!("../local_context_points.rs"),
-        sha256: "84e4a1768648f2b9b667d0dee738d27942cb7166d74899ff8121b09ecff67755",
+        sha256: "b45880d5789fd5147384d591126d2333141774c931170c251ae47e4a0f9b3bb2",
     },
     SourcePin {
         path: "snapshots/sampled_jsonl/durable.rs",
         text: include_str!("../sampled_jsonl/durable.rs"),
-        sha256: "23aca37dbf2c9fed9b21c39be142d50eeb1e707dbae3539d5113b57c4ddb475b",
+        sha256: "2d35c65818faadc48fd3cdbbb7782eed7ad3e2228b12a1b86859360fbbde19e3",
     },
     SourcePin {
         path: "snapshots/sampled_jsonl.rs",
         text: include_str!("../sampled_jsonl.rs"),
-        sha256: "01c58d7f14b4df3de72d1bcada3230fda08c5af8302bb52c12897bea61028746",
+        sha256: "6a91f5ee85d9f58f926232a09cf1460966959fffb80b4c5a970c61affb12dd1f",
     },
     SourcePin {
         path: "snapshots/session_start.rs",
         text: include_str!("../session_start.rs"),
-        sha256: "e27611e8e8036d7bd068c466e86183bc773dd543adddcf9d7989fd7c1f01cf29",
+        sha256: "a762a2f77dfddb18e9784b2b780a0a4e21ee73d2c99ca42a081e55ace97c3447",
     },
     SourcePin {
         path: "snapshots.rs",
         text: include_str!("../../snapshots.rs"),
-        sha256: "21868107bf2022113d8d906f67fa42f94dea8f826e47c7867a4ec8f2d3a2368d",
+        sha256: "8d957f0c5928181a5d0c544146ac3404ce7d229fdec0f4fe6b3447c9d7e456aa",
     },
     SourcePin {
         path: "owned_heap.rs",
         text: include_str!("../../owned_heap.rs"),
-        sha256: "aca2f7c2f5c1827968ad04fd3140bf24709c519034e897310ffc5accde5d75e1",
+        sha256: "44d81bb377a95a48f38f5b5c0dc44bcfe3ab92bb5f834e8d5db2ecf491a44af4",
     },
 ];
 
-// The only source differences allowed from MAIN 53d05a43: the two exact
-// cfg(test) byte observers introduced by this fixture. No serializer definition,
-// constant, label, enum tag or handwritten codec is removed from the hash.
-const CONSUMPTION_OBSERVERS: [&str; 2] = [
-    "                    #[cfg(all(test, unix))]\n                    sampled_scan::transition_fixture::record_consumed((offset + 1) as u64);\n",
-    "                    #[cfg(all(test, unix))]\n                    sampled_scan::transition_fixture::record_consumed(len as u64);\n",
-];
-
 fn verify_pinned_sources(replacement: Option<(&str, &str)>) -> Result<(), &'static str> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let sources = PINNED_SOURCES
+        .iter()
+        .map(|pin| {
+            let text = replacement
+                .filter(|(path, _)| *path == pin.path)
+                .map_or(pin.text, |(_, text)| text);
+            (pin.path, text)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut child = Command::new("python3")
+        .args(["-c", include_str!("transition_serializer_regions.py")])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("test serializer extractor requires Python 3");
+    // Python drains the full request before emitting its small response (16 hashes),
+    // so writing snapshots.rs before collecting stdout cannot fill both pipes.
+    let mut input = child.stdin.take().unwrap();
+    input
+        .write_all(&serde_json::to_vec(&sources).unwrap())
+        .unwrap();
+    drop(input);
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "serializer extraction failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let hashes: BTreeMap<String, String> = serde_json::from_slice(&output.stdout).unwrap();
     for pin in PINNED_SOURCES {
-        let source = replacement
-            .filter(|(path, _)| *path == pin.path)
-            .map_or(pin.text, |(_, text)| text);
-        let digest = if pin.path == "snapshots.rs" {
-            let original = CONSUMPTION_OBSERVERS
-                .into_iter()
-                .fold(source.to_string(), |text, observer| {
-                    text.replace(observer, "")
-                });
-            Sha256::digest(original.as_bytes())
-        } else {
-            Sha256::digest(source.as_bytes())
-        };
-        if format!("{digest:x}") != pin.sha256 {
+        if hashes.get(pin.path).map(String::as_str) != Some(pin.sha256) {
             return Err(pin.path);
         }
     }
@@ -171,12 +186,14 @@ fn verify_pinned_sources(replacement: Option<(&str, &str)>) -> Result<(), &'stat
 }
 
 fn assert_pinned_body_writer() {
-    verify_pinned_sources(None)
+    static VERIFIED: std::sync::OnceLock<Result<(), &'static str>> = std::sync::OnceLock::new();
+    VERIFIED
+        .get_or_init(|| verify_pinned_sources(None))
         .expect("pinned MAIN 53d05a43 writer changed; provide genuine archived writer bytes");
 }
 
 #[test]
-fn pinned_v1_full_serializer_sources_match_main() {
+fn pinned_v1_serializer_regions_match_main() {
     // Portable positive control: provenance must also run without native layout.
     assert_pinned_body_writer();
 }
@@ -211,6 +228,48 @@ fn pinned_v1_refuses_nested_counting_version_drift() {
         "snapshots/codex_counting_version.rs",
         "    1 => V2,",
         "    9 => V2,",
+    );
+}
+
+#[test]
+fn pinned_v1_accepts_unrelated_function_and_comment_edits() {
+    let path = "snapshots.rs";
+    let pin = PINNED_SOURCES.iter().find(|pin| pin.path == path).unwrap();
+    let changed = format!("{}\n// Unrelated comment, with fake durable_struct!(Ignored {{ N n: u64 }});\nfn unrelated_fixture_function() {{ let _text = \"impl Durable for Ignored {{}}\"; }}\n", pin.text);
+    assert_ne!(changed, pin.text);
+    assert_eq!(verify_pinned_sources(Some((path, &changed))), Ok(()));
+}
+
+#[test]
+fn pinned_v1_refuses_added_durable_struct() {
+    let path = "snapshots.rs";
+    let pin = PINNED_SOURCES.iter().find(|pin| pin.path == path).unwrap();
+    let changed = format!(
+        "{}\ncrate::durable_tail_codec::durable_struct!(Added {{ N n: u64 }});\n",
+        pin.text
+    );
+    assert_eq!(verify_pinned_sources(Some((path, &changed))), Err(path));
+}
+
+#[test]
+fn pinned_v1_refuses_added_manual_durable_impl() {
+    let path = "snapshots.rs";
+    let pin = PINNED_SOURCES.iter().find(|pin| pin.path == path).unwrap();
+    let changed = format!("{}\nimpl crate::durable_tail_codec::Durable for Added {{ fn put(&self, e: &mut Enc) {{ e.varint(9); }} }}\n", pin.text);
+    assert_eq!(verify_pinned_sources(Some((path, &changed))), Err(path));
+}
+
+#[test]
+fn pinned_v1_refuses_encoding_constant_and_local_helper_drift() {
+    assert_source_drift_refused(
+        "snapshots/sampled_jsonl/durable.rs",
+        "pub(crate) const HEAD_BOUND: u64 = 1024 * 1024;",
+        "pub(crate) const HEAD_BOUND: u64 = 2 * 1024 * 1024;",
+    );
+    assert_source_drift_refused(
+        "snapshots/sampled_jsonl/durable.rs",
+        "let mut e = Enc::hash(domain);",
+        "let mut e = Enc::hash(\"different-domain\");",
     );
 }
 
