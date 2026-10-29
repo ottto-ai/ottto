@@ -251,30 +251,59 @@ pub(in crate::snapshots) struct CachedHeader {
 #[derive(Default)]
 pub(in crate::snapshots) struct HeaderCache {
     entries: BTreeMap<String, CachedHeader>,
+    // Immutable entry heaps, charged once at insertion via their field macros.
+    // Keep the cursor's per-step walk independent of the roster population.
+    heap_bytes: usize,
 }
 impl HeaderCache {
     pub(in crate::snapshots) fn retain_roster(&mut self, paths: &VecDeque<PathBuf>) {
         // Pending paths preserve the roster's complete-string sort order.
-        self.entries.retain(|key, _| {
-            paths
+        let heap_bytes = &mut self.heap_bytes;
+        self.entries.retain(|key, header| {
+            let keep = paths
                 .binary_search_by(|path| path.as_os_str().cmp(Path::new(key).as_os_str()))
-                .is_ok()
+                .is_ok();
+            if !keep {
+                *heap_bytes = heap_bytes.saturating_sub(Self::entry_heap(key.capacity(), header));
+            }
+            keep
         });
     }
     pub(in crate::snapshots) fn get(&self, key: &str) -> Option<CachedHeader> {
         self.entries.get(key).cloned()
     }
     pub(in crate::snapshots) fn refresh(&mut self, key: String, header: Option<CachedHeader>) {
-        self.entries.remove(&key);
+        if let Some((key, old)) = self.entries.remove_entry(&key) {
+            self.heap_bytes = self
+                .heap_bytes
+                .saturating_sub(Self::entry_heap(key.capacity(), &old));
+        }
         if let Some(header) = header {
             if self.entries.len() < MAX_HEADER_FILES {
+                self.heap_bytes = self
+                    .heap_bytes
+                    .saturating_add(Self::entry_heap(key.capacity(), &header));
                 self.entries.insert(key, header);
             }
         }
     }
+    fn entry_heap(key_capacity: usize, header: &CachedHeader) -> usize {
+        use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+        let mut c = Counter::new(usize::MAX);
+        c.add(key_capacity)
+            .and_then(|()| header.heap_bound(&mut c))
+            .map_or(usize::MAX, |()| c.bytes)
+    }
+    pub(in crate::snapshots) fn charge(
+        &self,
+        c: &mut crate::heap_layout_bound::Counter,
+    ) -> Option<()> {
+        crate::heap_layout_bound::tree_nodes::<String, CachedHeader>(self.entries.len(), c)?;
+        c.add(self.heap_bytes)
+    }
 }
 crate::heap_layout_bound::fields!(CachedHeader; stamp, owner, created_unix_ms, read_bytes);
-crate::heap_layout_bound::fields!(HeaderCache; entries);
+crate::heap_layout_bound::fields!(HeaderCache; entries, heap_bytes);
 
 /// One small secure header read per existing native scan step. No transcript
 /// or header Value is parked between steps.
@@ -374,6 +403,7 @@ impl HeaderInventory {
             return false;
         };
         let key = local_index_key(&path);
+        self.reuse_misses += 1;
         let result = (|| -> Result<HeaderWitness> {
             let stat = fs::symlink_metadata(&path)?;
             anyhow::ensure!(
@@ -417,6 +447,7 @@ impl HeaderInventory {
                 // cannot authorize reuse of owning-header facts.
                 if cached.stamp.same_object(&stamp) && cached.stamp.same_content(&stamp) {
                     self.reuse_hits += 1;
+                    self.reuse_misses -= 1;
                     self.bytes_avoided = self.bytes_avoided.saturating_add(cached.read_bytes);
                     return Ok(HeaderWitness {
                         home: member_home(&candidate.scan_root),
@@ -427,7 +458,6 @@ impl HeaderInventory {
                     });
                 }
             }
-            self.reuse_misses += 1;
             let (header, retried) = read_header_settled(&candidate);
             // Each abandoned attempt may have consumed its whole bounded prefix.
             self.read_bytes = self
@@ -4059,6 +4089,15 @@ mod header_cache_tests {
         while !inventory.step_cached(&CodexTitleMetadata::default(), Some(cache)) {}
         inventory
     }
+    fn assert_charge(cache: &HeaderCache) {
+        use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+        let mut summary = Counter::new(usize::MAX);
+        cache.charge(&mut summary).unwrap();
+        let mut walked = Counter::new(usize::MAX);
+        cache.completed_heap_bound(&mut walked).unwrap();
+        assert_eq!(summary.bytes, walked.bytes);
+        assert!(summary.visits_for_test() < 10);
+    }
     fn paths(inventory: &HeaderInventory) -> BTreeSet<String> {
         inventory
             .headers
@@ -4170,7 +4209,7 @@ mod header_cache_tests {
                         .refresh(format!("fake-{number}"), Some(facts.clone()));
                 }
                 assert_eq!(cursor.headers.entries.len(), MAX_HEADER_FILES);
-                assert!(crate::heap_layout_bound::bound(&cursor.headers, usize::MAX).is_some());
+                assert_charge(&cursor.headers);
             })
             .unwrap();
         let removed = paths.pop_last().unwrap();
@@ -4180,11 +4219,15 @@ mod header_cache_tests {
             .with_cursor(|cursor| {
                 assert_eq!(cursor.headers.entries.len(), 1);
                 assert!(cursor.headers.get(&removed).is_none());
+                assert_charge(&cursor.headers);
             })
             .unwrap();
         page(&root, &BTreeSet::new(), &cache);
         cache
-            .with_cursor(|cursor| assert!(cursor.headers.entries.is_empty()))
+            .with_cursor(|cursor| {
+                assert!(cursor.headers.entries.is_empty());
+                assert_charge(&cursor.headers);
+            })
             .unwrap();
         fs::remove_dir_all(root).unwrap();
     }

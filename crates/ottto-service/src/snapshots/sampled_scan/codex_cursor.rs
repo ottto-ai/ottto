@@ -2368,7 +2368,7 @@ impl HeapLayoutBound for CursorState {
             Slot::Empty | Slot::ActiveElsewhere { .. } => c.add(0)?,
             Slot::Paused(_) => c.add(*slot_charge)?,
         }
-        headers.heap_bound(c)?;
+        headers.charge(c)?;
         slot_key.heap_bound(c)?;
         slot_members.heap_bound(c)?;
         // Owner strings and joined member keys are visited (one each).
