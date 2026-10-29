@@ -1608,6 +1608,8 @@ fn census_records_are_charged_with_the_scan_index_and_leave_entries_alone() {
     // re-read rule rebuilds the scan fingerprint from the ctime so a
     // ctime-only change never re-reads, and only for the same object
     // generation, bound by its exact birth (owner-approved 464 -> 472 -> 480).
+    // #876's RAM fragment pointer adds 8; immutable counting-owner Box<str>
+    // recovers 8 from Option<String>, preserving this original layout contract.
     const SCAN_INDEX_ENTRY_BYTES: usize = 480;
     assert_eq!(
         std::mem::size_of::<ScanIndexEntry>(),

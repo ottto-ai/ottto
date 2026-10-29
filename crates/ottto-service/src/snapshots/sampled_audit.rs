@@ -476,6 +476,59 @@ mod tests {
         index
     }
     #[test]
+    fn virtual_recovery_keeps_grown_keys_observed_without_reading_before_due() {
+        use crate::snapshots::claude_request_census::{
+            ClaudeRequestCensusRecord as Record, ClaudeRequestCensusShape as Shape,
+        };
+        let mut index = index();
+        let mut candidate = candidate();
+        let key = local_index_key(&candidate.path);
+        let record =
+            Record::synthetic_for_test(&"a".repeat(64), 1, Shape::IdentityIncomplete, vec![1])
+                .with_unverified_for_test(true);
+        index
+            .claude_request_census_mut_for_test()
+            .insert_for_test(&key, record);
+        index.held_audit_progress = Some(HeldAuditProgress {
+            key: key.clone(),
+            due: 100,
+            attempted: false,
+        });
+        candidate.size_bytes += 1;
+        candidate.source_file_fingerprint = "changed".into();
+        assert!(awaits_hold_deadline_restoration(&index, &key));
+        assert!(
+            discovery_retention!(index).owes_with_len(
+                SnapshotSource::ClaudeCode,
+                &candidate.path,
+                candidate.size_bytes
+            ),
+            "growth stays discoverable, never dropped"
+        );
+        assert_eq!(
+            index.candidate_decision_at(&candidate, 99),
+            CandidateDecision::Skip,
+            "scheduling future virtual debt cannot acquire the grown file"
+        );
+        assert_eq!(
+            index.candidate_decision_with_reason_at(&candidate, 100),
+            (CandidateDecision::Parse, Some(CandidateParseReason::Audit)),
+            "due read retains its counted audit cause"
+        );
+        index
+            .files
+            .get_mut(&key)
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+        assert_eq!(
+            index.candidate_decision_at(&candidate, 99),
+            CandidateDecision::Parse,
+            "genuine external rearm is not hidden by the virtual delay"
+        );
+    }
+
+    #[test]
     fn sampled_audit_oldest_deadline_not_ack_or_tail_controls_idle_selection() {
         let mut index = index();
         let candidate = candidate();

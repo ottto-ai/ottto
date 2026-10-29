@@ -127,6 +127,13 @@ impl HeapLayoutBound for PathBuf {
         c.add(self.capacity())
     }
 }
+// Immutable owned string slices have no spare capacity or nested allocations.
+impl HeapLayoutBound for Box<str> {
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
+        c.add(self.len())
+    }
+}
 impl<T: HeapLayoutBound> HeapLayoutBound for Option<T> {
     fn stable_heap(&self) -> bool {
         self.as_ref().map_or(true, HeapLayoutBound::stable_heap)

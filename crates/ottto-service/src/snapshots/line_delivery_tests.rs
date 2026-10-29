@@ -1952,6 +1952,15 @@ fn withheld_account_reparses_only_on_start_evidence_or_growth() {
     };
     let cache = Arc::new(sampled_scan::SharedCache::default());
     append(&path, &assistant_line("u1"));
+    // macOS setattrlist(2): backdating mtime before creation also backdates
+    // creation. Establish the oldest touch BEFORE recording object generation;
+    // later touches then change only mtime/ctime on APFS as well as Linux.
+    let file = File::options().write(true).open(&path).unwrap();
+    file.set_modified(UNIX_EPOCH + std::time::Duration::from_secs(1))
+        .unwrap();
+    file.set_modified(SystemTime::now()).unwrap();
+    let original_birth = file.metadata().unwrap().created().ok();
+
     let (mut committed, _, reads) = page(ScanIndex::default(), &cache);
     assert_eq!(reads.len(), 1);
     append(&path, &assistant_line("u2"));
@@ -2027,6 +2036,11 @@ fn withheld_account_reparses_only_on_start_evidence_or_growth() {
     let hour_ago = SystemTime::now() - std::time::Duration::from_secs(3_600);
     for modified in [UNIX_EPOCH + std::time::Duration::from_secs(1), hour_ago] {
         touch(modified);
+        assert_eq!(
+            fs::metadata(&path).unwrap().created().ok(),
+            original_birth,
+            "a pure touch must preserve the object-generation premise"
+        );
         assert_eq!(page(committed.clone(), &cache).2, Vec::new(), "a touch");
     }
     assert_eq!(reparses(), BTreeMap::new(), "a touch is no re-parse");

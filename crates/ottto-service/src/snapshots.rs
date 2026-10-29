@@ -4413,9 +4413,9 @@ pub struct ScanIndexEntry {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_codex_protected_owner"
+        deserialize_with = "deserialize_codex_counting_owner"
     )]
-    pub codex_counting_owner: Option<String>,
+    pub codex_counting_owner: Option<Box<str>>,
     /// The ctime (unix nanos) in the opened-object identity that produced
     /// `source_file_fingerprint` (Claude and Codex only). With size, mtime
     /// and file birth unchanged the next scan rebuilds the identity from it,
@@ -4428,6 +4428,11 @@ pub struct ScanIndexEntry {
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub(crate) opened_birth_nanos: u64,
 }
+// Verify the EXISTING native entry-layout contract during compile-only checks.
+// No budget, whitelist or substitute bound is changed.
+#[cfg(all(test, target_os = "macos", target_pointer_width = "64"))]
+const _: () = assert!(std::mem::size_of::<ScanIndexEntry>() == 480);
+
 impl ScanIndexEntry {
     fn codex_recovery_is_pending(&self) -> bool {
         self.codex_captured_joined_member_set.is_some()
@@ -4446,6 +4451,14 @@ impl ScanIndexEntry {
             || self.codex_captured_uncommitted
     }
 }
+// Boxed immutable hash text recovers the fragment pointer's eight inline bytes.
+// The existing validator and serialized string/None representation are unchanged.
+fn deserialize_codex_counting_owner<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Box<str>>, D::Error> {
+    deserialize_codex_protected_owner(deserializer).map(|owner| owner.map(String::into_boxed_str))
+}
+
 fn deserialize_codex_protected_owner<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<Option<String>, D::Error> {
@@ -30175,7 +30188,8 @@ impl OwnedSourceScan {
                     // fingerprint it describes; no separate save can split them.
                     if let Some(entry) = index.files.get_mut(&index_key) {
                         entry.codex_counting_v2 = codex_counting_v2;
-                        entry.codex_counting_owner = counting_owner.clone();
+                        entry.codex_counting_owner =
+                            counting_owner.clone().map(String::into_boxed_str);
                         entry.codex_fragment = bound_fragment.map(Box::new);
                     }
                     // Native settlement accepts disclosed terminal row loss, even
@@ -30282,7 +30296,8 @@ impl OwnedSourceScan {
                             // Set only by a V2 decision; a Legacy group clears
                             // any stale mark with the ACK it rewrites.
                             entry.codex_counting_v2 = codex_counting_v2;
-                            entry.codex_counting_owner = counting_owner.clone();
+                            entry.codex_counting_owner =
+                                counting_owner.clone().map(String::into_boxed_str);
                         }
                     }
                 }
@@ -49196,6 +49211,18 @@ impl ScanIndex {
         // A withheld key keeps its old committed revision; unless re-armed it
         // re-parses only once per process or on a stamp/evidence change.
         if withheld_unchanged {
+            return (CandidateDecision::Skip, None);
+        }
+        // The virtual N1 recovery slot schedules its own one permitted Full.
+        // Grown retention keeps the key observed, but cannot bypass that due
+        // time after a marker-erasing reload (there may be no reusable copy).
+        if !entry.source_file_fingerprint.is_empty()
+            && sampled_audit::awaits_hold_deadline_restoration(self, &key)
+            && self
+                .held_audit_progress
+                .as_ref()
+                .is_some_and(|slot| slot.key == key && !slot.attempted && now < slot.due)
+        {
             return (CandidateDecision::Skip, None);
         }
         let known_fragment = entry.codex_fragment.as_ref().is_some_and(|fragment| {

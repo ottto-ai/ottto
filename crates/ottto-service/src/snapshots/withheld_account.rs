@@ -10,7 +10,17 @@ pub(super) struct Seen {
     size_bytes: u64,
     evidence: [u8; 32],
 }
-crate::heap_layout_bound::fields!(Seen; size_bytes, evidence);
+impl crate::heap_layout_bound::HeapLayoutBound for Seen {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        let Self {
+            size_bytes: _,
+            evidence: _,
+        } = self;
+        c.add(0)
+    }
+}
 
 const PARSED: &str = "claude_withheld_account_evidence:v1";
 const CONTENT: &str = "claude_withheld_account_content:v1";
@@ -301,6 +311,12 @@ fn charge(entries: usize) -> Option<usize> {
 }
 pub(crate) fn retained_bound(limit: usize) -> Option<usize> {
     with_state(|state| {
+        if state.entries.is_empty() {
+            // Free any empty retained B-tree root. The static mutex/header is
+            // not a daemon heap allocation and must not reserve a phantom node.
+            state.entries = BTreeMap::new();
+            return Some(0);
+        }
         let bytes = charge(state.entries.len()).filter(|bytes| *bytes <= limit);
         if bytes.is_none() {
             state.refused = true;
@@ -424,6 +440,30 @@ pub(super) fn poison_for_test() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_witness_has_no_heap_and_costs_one_visit() {
+        use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+        let seen = Seen {
+            size_bytes: 1,
+            evidence: [7; 32],
+        };
+        let mut counter = Counter::new(0);
+        seen.heap_bound(&mut counter).unwrap();
+        assert_eq!(counter.bytes, 0);
+        assert_eq!(counter.visits_for_test(), 1);
+    }
+
+    #[test]
+    fn empty_memo_releases_its_root_and_charges_no_phantom_node() {
+        with_state(|state| {
+            state.entry(memo_key("temporary"));
+            state.entries.clear();
+        });
+        assert_eq!(retained_bound(0), Some(0));
+        assert!(with_state(|state| state.entries.is_empty()).unwrap());
+    }
+
     use crate::heap_layout_bound::tree_node_bytes;
 
     #[test]

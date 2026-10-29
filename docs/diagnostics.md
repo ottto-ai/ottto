@@ -475,7 +475,9 @@ memo details and cannot discard those admitted sibling graphs or BASE-exit
 native comparison. An unsupported sibling alone does not discard a memo that
 fits the available allowance. Persistently refused memo details remain unknown
 and require the existing counted recovery path until they can be retained.
-Omitted while empty. `counts.withheld_held_tokens` is a gauge of the withheld
+An empty memo releases its B-tree root and charges no heap bytes. The completed
+content witness is fixed inline data; its accounting needs one visit and no
+heap allocation. `counts.withheld_held_tokens` is a gauge of the withheld
 tokens across recorded holds (each key's tokens at its last parse), and
 `counts.withheld_held_age` counts those held keys by wall-clock estimates since
 this process first recorded them held: `le_30d`, `31_90d` and `gt_90d`. Both are

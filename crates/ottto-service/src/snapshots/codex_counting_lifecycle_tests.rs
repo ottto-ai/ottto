@@ -91,7 +91,7 @@ fn acked_original(v2: bool, old_binding: bool) -> Acked {
     // This build binds even while inactive: the realistic Legacy move.
     assert_eq!(
         entry.codex_counting_owner,
-        Some(codex_protected_owner(SESSION))
+        Some(codex_protected_owner(SESSION).into_boxed_str())
     );
     if !old_binding {
         previous
@@ -378,7 +378,7 @@ fn moved_evidence_is_shared_by_group_cursor_and_retained_restore() {
     assert!(!codex_counting_version::reusable_under_view(
         &restored, &singleton
     ));
-    old.codex_counting_owner = Some(codex_protected_owner(SESSION));
+    old.codex_counting_owner = Some(codex_protected_owner(SESSION).into_boxed_str());
     index.files.insert(old_key, old);
     codex_counting_version::prepare_moved_evidence(&mut index, &owners, false);
     let singleton = codex_counting_version::singleton_view(&candidate, &index);
@@ -429,7 +429,7 @@ fn acked_entry(v2: bool, owner: Option<String>) -> ScanIndexEntry {
         "last_snapshot_fingerprint":"old-ack","codex_counting_v2":v2
     }))
     .unwrap();
-    entry.codex_counting_owner = owner;
+    entry.codex_counting_owner = owner.map(String::into_boxed_str);
     entry
 }
 
