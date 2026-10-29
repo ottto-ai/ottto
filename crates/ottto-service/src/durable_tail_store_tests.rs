@@ -2189,3 +2189,25 @@ fn property_table_keeps_both_historical_v1_envelopes_byte_identical() {
         ));
     }
 }
+
+/// Frozen pass state for continuation lifecycle regressions; test-only, no filesystem reads.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ContinuationPassState {
+    pub(crate) checked: bool,
+    pub(crate) counts: [u64; 2],
+    pub(crate) rebuilt: BTreeSet<Digest32>,
+    pub(crate) authorized: BTreeSet<Digest32>,
+}
+
+pub(crate) fn continuation_pass_state(store: &DurableTailStore) -> ContinuationPassState {
+    ContinuationPassState {
+        checked: store.checked,
+        counts: store.pass,
+        rebuilt: store.rebuilt.clone(),
+        authorized: store
+            .durable
+            .iter()
+            .filter_map(|(key, (_, _, yes))| yes.then_some(*key))
+            .collect(),
+    }
+}

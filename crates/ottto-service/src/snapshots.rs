@@ -167,6 +167,8 @@ use claude_response_records::{
 };
 use codex_compressed_input::OpenedInput;
 pub(crate) use pi_retry_inputs::PiRetryInputs;
+#[cfg(all(test, unix))]
+pub(crate) use sampled_scan::durable_tail::tests::ContinuationDurableState;
 // Stage 1 (N2): the cursor side of a continuation page, for StateMissing's
 // adapter in `snapshot_sync` (inert while continuation pages are disabled).
 #[cfg(test)]

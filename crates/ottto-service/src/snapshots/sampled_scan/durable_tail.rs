@@ -1802,7 +1802,7 @@ pub(crate) fn record_consumed(bytes: u64) {
 
 #[cfg(test)]
 #[path = "durable_tail_tests.rs"]
-mod tests;
+pub(in crate::snapshots) mod tests;
 
 #[cfg(test)]
 pub(crate) fn seed_pinned_v1(

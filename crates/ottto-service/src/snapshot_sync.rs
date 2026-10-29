@@ -6673,22 +6673,12 @@ fn prepare_continuation_source(
         home,
         &inputs.scan_agent_status_collection.codex_scan_homes,
     )?;
-    // K5: use the ordinary page's namespace and the same durable source dispatch.
+    // K5: reuse the ordinary page's namespace and durable pass, including GC/breaker state.
     let sampled_scope = cycle_sampled_scope(
         &inputs.account_witness,
         &inputs.upload_destination_namespace,
         &inputs.index_path,
         inputs.context_curve_enabled,
-        false,
-    );
-    #[cfg(unix)]
-    crate::snapshots::begin_durable_pass(
-        cache,
-        support_dir,
-        source,
-        &inputs.index_path,
-        false, // A continuation never performs fresh-index cleanup.
-        &sampled_scope,
         false,
     );
     let scan = crate::snapshots::OwnedSourceScan::new_continuation(
