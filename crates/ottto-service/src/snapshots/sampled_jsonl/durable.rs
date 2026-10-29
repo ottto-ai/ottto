@@ -176,19 +176,14 @@ pub(in crate::snapshots) fn encode_parts(
         return Err(Refuse::NotRederivable("SnapshotAccumulator.source"));
     }
     let rederive = rederive_digests(acc, line_cap)?;
-    let put = |e: &mut Enc| {
+    Enc::count_write(limit, |e| {
         acc.put(e)?;
         report.put(e)?;
         scalars.0.put(e)?;
         scalars.1.put(e)?;
         scalars.2.put(e)?;
         rederive.put(e)
-    };
-    let mut count = Enc::count(limit);
-    put(&mut count)?;
-    let mut e = Enc::bytes(count.counted());
-    put(&mut e)?;
-    Ok(e.into_bytes())
+    })
 }
 
 /// Structural body verification only: no reduction, re-derivation or live

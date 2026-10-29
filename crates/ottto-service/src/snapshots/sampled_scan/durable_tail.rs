@@ -422,6 +422,7 @@ fn refuse_class(refuse: Refuse) -> &'static str {
         Refuse::NonEmpty(field) | Refuse::NotRederivable(field) | Refuse::NotDigest(field) => field,
         Refuse::UnknownLabel => "static_label",
         Refuse::TooLarge => "record_bytes",
+        Refuse::WriteFailed => "encode_io",
     }
 }
 
