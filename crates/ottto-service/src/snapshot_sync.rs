@@ -6048,7 +6048,9 @@ fn prepare_sync_source_inner(
         snapshot_quarantine_witness(source),
     )?;
     let (mut index, load_origin) =
-        ScanIndex::load_for_snapshot_source_with_origin(&index_path, source, support_dir)?;
+        daemon
+            .transcript_cache
+            .load_source_index(&index_path, source, support_dir)?;
     upload_progress.recover_ack_retirement_handoff(
         &mut index,
         &index_path,
@@ -6590,8 +6592,7 @@ fn prepare_continuation_source(
         &inputs.upload_destination_namespace,
         snapshot_quarantine_witness(source),
     )?;
-    let (mut index, _) =
-        ScanIndex::load_for_snapshot_source_with_origin(&inputs.index_path, source, support_dir)?;
+    let (mut index, _) = cache.load_source_index(&inputs.index_path, source, support_dir)?;
     upload_progress.configure_ack_capacity(&index);
     let backfill_state = load_backfill_state(support_dir);
     let replay_generation = cycle_replay_generation(

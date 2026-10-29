@@ -387,8 +387,13 @@ indefinitely until its state changes. Counting has no once-per-process cap.
 Codex's already-known unterminated EOF fragment is excluded from grown retention
 and its fate/age population when a validated cursor certificate and retained
 prefix reduction bind the entire residual to the unchanged object. This RAM-only
-binding reuses discovery metadata (no additional stat), requires known birth,
-and grants no audit completion or custody release. The selector also requires
+binding travels with the existing charged RAM reduction and is recovered before
+ordinary and continuation source discovery after an index reload. Recovery
+requires the committed extent and sampled fingerprint to match that completion.
+It reuses discovery metadata (no additional stat), requires known birth,
+and grants no audit completion or custody release. Losing the RAM copy or process
+still loses this optional witness; the existing counted catch-up then applies.
+The selector also requires
 the existing sampled fingerprint to match, after independent audit/context gates.
 Real extra bytes, termination, replacement or missing binding use the ordinary
 counted catch-up path; a length difference alone never proves a known fragment.

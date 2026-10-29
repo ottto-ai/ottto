@@ -66,6 +66,9 @@ impl BoundFragment {
             stamp: Stamp::candidate(candidate)?,
         })
     }
+    pub(super) fn committed_offset(&self) -> u64 {
+        self.offset
+    }
     pub(super) fn matches(&self, committed: u64, len: u64, stamp: Option<Stamp>) -> bool {
         committed == self.offset && len == self.stamp.words[0] && stamp == Some(self.stamp)
     }

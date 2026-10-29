@@ -323,6 +323,13 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
             .get(key)
             .map(|entry| entry.retained.checkpoint.sealed_offset())
     }
+    /// Visit admitted copies without taking them or changing victim order.
+    /// Callers must not perform I/O or re-enter the owning cache in `visit`.
+    pub(crate) fn visit(&self, mut visit: impl FnMut(&str, &Retained<S>)) {
+        for (key, entry) in &self.entries {
+            visit(key, &entry.retained);
+        }
+    }
     /// A retained entry without taking it (M1 durable write after an index
     /// save encodes it in place under the retained lock).
     #[cfg_attr(not(unix), allow(dead_code))]

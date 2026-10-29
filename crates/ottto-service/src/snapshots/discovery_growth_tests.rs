@@ -483,3 +483,233 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
     assert!(idle.snapshots.is_empty(), "emitted once");
     assert!(reads.0.lock().unwrap().0.is_empty());
 }
+
+/// The ordinary/continuation cache-aware load seam must preserve a REAL cursor
+/// completion across saves, not a hand-seeded index witness on one live scan.
+#[test]
+fn codex_fragment_survives_source_preparation_reload_then_catches_up_exactly() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return; // Native RAM admission; Linux is explicitly not this receipt.
+    }
+    let f = Fixture::new();
+    let source = SnapshotSource::Codex;
+    let token = |n| {
+        json!({"timestamp":"2026-10-06T10:00:00Z", "type":"event_msg",
+        "payload":{"type":"token_count","info":{"model":"fixture-model",
+        "total_token_usage":{"input_tokens":n,"output_tokens":n},
+        "last_token_usage":{"input_tokens":10,"output_tokens":10}}}})
+        .to_string()
+    };
+    let prefix = format!(
+        "{}\n{}\n",
+        json!({"type":"session_meta",
+        "timestamp":"2026-10-06T09:00:00Z","payload":{"id":SESSION}}),
+        token(10)
+    );
+    fs::write(&f.path, &prefix).unwrap();
+    let (index, initial, _, _) = f.page(source, ScanIndex::default());
+    assert_eq!(initial.snapshots.len(), 1, "real committed prefix");
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&f.path)
+        .unwrap()
+        .write_all(token(20).as_bytes())
+        .unwrap();
+    f.age(91);
+    let (mut index, _, reads, _) = f.page(source, index);
+    let key = local_index_key(&f.path);
+    assert_eq!(reads.0.lock().unwrap().0, vec![DeliveryMode::Tail]);
+    assert_eq!(index.files[&key].size_bytes, prefix.len() as u64);
+    assert!(
+        index.files[&key].codex_fragment.is_some(),
+        "real completion bound a fragment"
+    );
+    assert!(
+        index.files[&key].has_unverified_source(),
+        "fragment keeps audit debt"
+    );
+    assert_eq!(
+        f.cache.retained_checkpoint(&key).unwrap().sealed_offset(),
+        prefix.len() as u64
+    );
+    let due = index.files[&key]
+        .unverified_deadline()
+        .expect("explicit fragment audit deadline");
+    assert!(
+        sampled_scan::now_seconds() < due,
+        "fixture is before the audit deadline"
+    );
+    let saved_fingerprint = index.files[&key].source_file_fingerprint.clone();
+    let index_path = f.root.join("index.json");
+    index.save(&index_path).unwrap();
+    assert!(
+        ScanIndex::load(&index_path).unwrap().files[&key]
+            .codex_fragment
+            .is_none(),
+        "witness must remain absent from disk"
+    );
+
+    for pass in 0..2 {
+        // This exact production seam is called before either sync builder's
+        // discovery constructor. No hand restoration of BoundFragment.
+        let (loaded, _) = f
+            .cache
+            .load_source_index(&index_path, source, &f.root)
+            .unwrap();
+        assert!(loaded.files[&key].codex_fragment.is_some(), "reload {pass}");
+        assert_eq!(loaded.files[&key].unverified_deadline(), Some(due));
+        assert!(
+            sampled_scan::now_seconds() < due,
+            "quiet preparation must precede audit"
+        );
+        let ((mut next, quiet, reads, rows), counts) =
+            crate::local_resource_diagnostics::cache_lifecycle::observe(|| f.page(source, loaded));
+        assert_eq!(quiet.scanned_file_count, 0, "quiet preparation {pass}");
+        assert!(quiet.snapshots.is_empty());
+        assert!(
+            reads.0.lock().unwrap().0.is_empty(),
+            "no acquisition or line delivery"
+        );
+        assert_eq!(counts.take_hit + counts.take_absent, 0, "no reacquisition");
+        assert_eq!(next.files[&key].source_file_fingerprint, saved_fingerprint);
+        assert!(next.files[&key].has_unverified_source(), "no audit credit");
+        let page = rows
+            .iter()
+            .find(|r| r["counts"]["sampled_acquisition"].is_object())
+            .unwrap();
+        assert_eq!(
+            page["counts"]["sampled_acquisition"]["completed_native_bytes"],
+            0
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r["counts"]["discovery_retained"]["grown"]
+                    .as_u64()
+                    .is_some_and(|n| n != 0)),
+            "no grown events"
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row["counts"].get("codex_fragment_tail_repeat").is_none()),
+            "sparse repeat counter is zero on a quiet reloaded preparation"
+        );
+        let saved_counts = f.save_and_report(&mut next, &quiet);
+        fate(&saved_counts, 0, 0);
+        assert_eq!(
+            saved_counts["discovery_retained_grown_age"],
+            json!({"le_30d":0,"d31_90":0,"gt_90d":0,"unknown":0})
+        );
+    }
+    // A retained witness cannot attach to another committed revision/extent.
+    let mut changed = ScanIndex::load(&index_path).unwrap();
+    changed.files.get_mut(&key).unwrap().source_file_fingerprint = "different".into();
+    changed.save(&index_path).unwrap();
+    assert!(f
+        .cache
+        .load_source_index(&index_path, source, &f.root)
+        .unwrap()
+        .0
+        .files[&key]
+        .codex_fragment
+        .is_none());
+    index = ScanIndex::load(&index_path).unwrap();
+    index.files.get_mut(&key).unwrap().source_file_fingerprint = saved_fingerprint;
+    index.files.get_mut(&key).unwrap().size_bytes += 1;
+    index.save(&index_path).unwrap();
+    assert!(f
+        .cache
+        .load_source_index(&index_path, source, &f.root)
+        .unwrap()
+        .0
+        .files[&key]
+        .codex_fragment
+        .is_none());
+    index = ScanIndex::load(&index_path).unwrap();
+    index.files.get_mut(&key).unwrap().size_bytes -= 1;
+    index.save(&index_path).unwrap();
+
+    // Missing RAM authority fails open; the real cache remains available for
+    // the append control. This grants neither persisted proof nor audit ACK.
+    let empty = sampled_scan::SharedCache::default();
+    assert!(empty
+        .load_source_index(&index_path, source, &f.root)
+        .unwrap()
+        .0
+        .files[&key]
+        .codex_fragment
+        .is_none());
+    let (loaded, _) = f
+        .cache
+        .load_source_index(&index_path, source, &f.root)
+        .unwrap();
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&f.path)
+        .unwrap()
+        .write_all(format!("\n{}\n", token(30)).as_bytes())
+        .unwrap();
+    f.age(91);
+    let (mut caught, catch_up, reads, rows) = f.page(source, loaded);
+    assert_eq!(reads.0.lock().unwrap().0, vec![DeliveryMode::Tail]);
+    assert_eq!(catch_up.snapshots.len(), 1);
+    assert_eq!(
+        caught.files[&key].size_bytes,
+        fs::metadata(&f.path).unwrap().len()
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r["counts"]["discovery_retained"]["grown"]
+                .as_u64()
+                .is_some_and(|n| n > 0)),
+        "real appended bytes counted"
+    );
+    assert!(
+        rows.iter()
+            .all(|row| row["counts"].get("codex_fragment_tail_repeat").is_none()),
+        "a terminated append is not a fragment-only repeat"
+    );
+    fate(&f.save_and_report(&mut caught, &catch_up), 1, 0);
+
+    // Independent cold native Full with the same collection timestamp: compare
+    // complete policy-filtered bodies rather than normalizing token totals.
+    let mut cold = OwnedSourceScan::new(
+        source,
+        std::slice::from_ref(&f.root),
+        ScanIndex::default(),
+        &catch_up.snapshots[0].collected_at,
+        BACKFILL_WINDOW_DAYS,
+        10,
+        false,
+        None,
+        &[],
+        false,
+        true,
+    );
+    let cold = loop {
+        match cold.step(None) {
+            OwnedSourceScanStep::Pending(next) => cold = next,
+            OwnedSourceScanStep::Complete {
+                mut index,
+                mut scan,
+                ..
+            } => {
+                apply_upload_policy(source, &mut scan.snapshots, SnapshotUploadPolicy::default());
+                finalize_scan_after_policy(source, &mut scan, &mut index);
+                break scan;
+            }
+        }
+    };
+    assert_eq!(
+        serde_json::to_value(&catch_up.snapshots).unwrap(),
+        serde_json::to_value(&cold.snapshots).unwrap(),
+        "exact catch-up body equals cold Full"
+    );
+    let (loaded, _) = f
+        .cache
+        .load_source_index(&index_path, source, &f.root)
+        .unwrap();
+    let (_, quiet, reads, _) = f.page(source, loaded);
+    assert!(quiet.snapshots.is_empty(), "no repeated catch-up");
+    assert!(reads.0.lock().unwrap().0.is_empty());
+}

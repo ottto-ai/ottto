@@ -30227,10 +30227,12 @@ impl OwnedSourceScan {
                             debug_assert!(file_sampling
                                 .as_ref()
                                 .map_or(true, |sampled| sampled.key.len() == key.len()));
-                            let admitted = context.cache.insert_admitted(
+                            let admitted = context.cache.insert_fragment_admitted(
                                 key,
                                 completed,
                                 finalization_charge.unwrap_or(0),
+                                bound_fragment
+                                    .map(|bound| (bound, source_file_fingerprint.as_str())),
                             );
                             if admitted {
                                 if let Some(active) = file_sampling.as_ref() {

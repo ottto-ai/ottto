@@ -24,7 +24,39 @@ pub(crate) use durable_tail::RestoreOutcome;
 pub(super) mod side_ledger;
 
 /// The retained-copy cache behind `SharedCache::retained`.
-pub(super) type RetainedCache = TranscriptCache<CachedJsonlReduction>;
+/// Native RAM advice travels with the charged copy, outside its persisted codec.
+/// Losing the copy loses the advice and leaves the index's audit debt intact.
+pub(super) struct RetainedReduction {
+    reduction: CachedJsonlReduction,
+    fragment: Option<Box<FragmentWitness>>,
+}
+struct FragmentWitness {
+    bound: codex_fragment::BoundFragment,
+    fingerprint: String,
+}
+crate::heap_layout_bound::fields!(FragmentWitness; bound, fingerprint);
+crate::heap_layout_bound::fields!(RetainedReduction; reduction, fragment);
+#[cfg(test)]
+impl From<CachedJsonlReduction> for RetainedReduction {
+    fn from(reduction: CachedJsonlReduction) -> Self {
+        Self {
+            reduction,
+            fragment: None,
+        }
+    }
+}
+impl std::ops::Deref for RetainedReduction {
+    type Target = CachedJsonlReduction;
+    fn deref(&self) -> &Self::Target {
+        &self.reduction
+    }
+}
+impl crate::transcript_cache::FrozenCacheState for RetainedReduction {
+    fn supports_frozen_charge(&self) -> bool {
+        crate::transcript_cache::FrozenCacheState::supports_frozen_charge(&self.reduction)
+    }
+}
+pub(super) type RetainedCache = TranscriptCache<RetainedReduction>;
 
 thread_local! {
     /// This thread holds the retained lock (a `RetainedGuard` is alive).
@@ -147,7 +179,54 @@ impl HeapLayoutBound for SharedCache {
         c.add(side_ledger::SIDE_LEDGER_BYTES)
     }
 }
+#[cfg(test)]
+impl RetainedGuard<'_> {
+    pub(super) fn insert(
+        &mut self,
+        key: String,
+        retained: crate::transcript_cache::Retained<CachedJsonlReduction>,
+    ) -> bool {
+        self.guard.insert(
+            key,
+            crate::transcript_cache::Retained {
+                checkpoint: retained.checkpoint,
+                state: retained.state.into(),
+            },
+        )
+    }
+}
 impl SharedCache {
+    /// Ordinary and continuation preparation must recover RAM advice before
+    /// constructing a scan: its constructor already runs discovery gates.
+    pub(crate) fn load_source_index(
+        &self,
+        path: &Path,
+        source: SnapshotSource,
+        support_dir: &Path,
+    ) -> Result<(ScanIndex, ScanIndexLoadOrigin)> {
+        let (mut index, origin) =
+            ScanIndex::load_for_snapshot_source_with_origin(path, source, support_dir)?;
+        if source == SnapshotSource::Codex {
+            if let Ok(retained) = self.retained() {
+                // At most CACHE_ENTRIES copies; no index-sized scan or scratch.
+                retained.visit(|key, copy| {
+                    let Some(entry) = index.files.get_mut(key) else {
+                        return;
+                    };
+                    let Some(witness) = copy.state.fragment.as_ref() else {
+                        return;
+                    };
+                    if copy.checkpoint.sealed_offset() == entry.size_bytes
+                        && witness.fingerprint == entry.source_file_fingerprint
+                        && witness.bound.committed_offset() == entry.size_bytes
+                    {
+                        entry.codex_fragment = Some(Box::new(witness.bound));
+                    }
+                });
+            }
+        }
+        Ok((index, origin))
+    }
     /// The retained-copy lock. Lock order: retained, then cursor, never the
     /// reverse; never twice on one thread (both checked in debug builds).
     pub(super) fn retained(&self) -> std::sync::LockResult<RetainedGuard<'_>> {
@@ -240,7 +319,15 @@ impl SharedCache {
         key: &str,
     ) -> Option<crate::transcript_cache::Taken<CachedJsonlReduction>> {
         match self.retained() {
-            Ok(mut cache) => cache.take(key),
+            Ok(mut cache) => cache.take(key).map(|taken| crate::transcript_cache::Taken {
+                retained: crate::transcript_cache::Retained {
+                    checkpoint: taken.retained.checkpoint,
+                    state: taken.retained.state.reduction,
+                },
+                modified_hint: taken.modified_hint,
+                finalization_charge: taken.finalization_charge,
+                e2_held_new_file: taken.e2_held_new_file,
+            }),
             Err(_) => {
                 record(Event::TakePoisonedLock);
                 None
@@ -341,7 +428,30 @@ impl SharedCache {
         completed: sampled_jsonl::CompletedNativeAcquisition,
         live_bytes: usize,
     ) -> bool {
-        if let Some(state) = completed.reduction {
+        self.insert_fragment_admitted(key, completed, live_bytes, None)
+    }
+    pub(super) fn insert_fragment_admitted(
+        &self,
+        key: String,
+        completed: sampled_jsonl::CompletedNativeAcquisition,
+        live_bytes: usize,
+        fragment: Option<(codex_fragment::BoundFragment, &str)>,
+    ) -> bool {
+        if let Some(reduction) = completed.reduction {
+            // At most one fixed-size witness + 64-byte existing digest is
+            // transient before admission; the acquisition scratch reserve
+            // covers it. Admission charges the complete adapter thereafter.
+            let state = RetainedReduction {
+                reduction,
+                fragment: fragment
+                    .filter(|(_, fingerprint)| fingerprint.len() == 64)
+                    .map(|(bound, fingerprint)| {
+                        Box::new(FragmentWitness {
+                            bound,
+                            fingerprint: fingerprint.to_owned(),
+                        })
+                    }),
+            };
             if let Ok(mut cache) = self.retained() {
                 // The whole cursor state (paused job, memo, parked and rotation
                 // records, outstanding claims) and the side ledger's fixed charge
@@ -1395,8 +1505,7 @@ pub(super) fn tail_completion_budget(
     let key_len = file.key.len();
     let key_bound = crate::heap_layout_bound::bound(&file.key, usize::MAX);
     // 2. The insert-aware budget, computed before the clone charge.
-    let Some(slot) = crate::transcript_cache::entry_slot_bytes::<CachedJsonlReduction>(key_len)
-    else {
+    let Some(slot) = crate::transcript_cache::entry_slot_bytes::<RetainedReduction>(key_len) else {
         return (
             RetainBudget::Granted {
                 budget: 0,
@@ -1445,9 +1554,7 @@ pub(super) fn tail_completion_budget(
         probe.k = Some(clone.max(finalization_prev));
     });
     let Some(entry_limit) = crate::transcript_cache::ENTRY_BYTES
-        .checked_sub(crate::transcript_cache::entry_overhead::<
-            CachedJsonlReduction,
-        >())
+        .checked_sub(crate::transcript_cache::entry_overhead::<RetainedReduction>())
         .zip(key_bound)
         .and_then(|(limit, key)| limit.checked_sub(key))
     else {
