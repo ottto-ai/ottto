@@ -252,19 +252,62 @@ impl LossyPrefixIdentity {
     }
 }
 
+// The Vec niche carries this RAM-only domain without growing plain witnesses.
+// Delegate physical heap traversal directly, preserving its visit and byte cost.
+#[derive(Clone, Debug)]
+enum CheckpointSamples {
+    Physical(Samples),
+    Archive,
+}
+impl CheckpointSamples {
+    fn as_ref(&self) -> Option<&Samples> {
+        match self {
+            Self::Physical(samples) => Some(samples),
+            Self::Archive => None,
+        }
+    }
+    #[cfg(all(test, unix))]
+    fn as_mut(&mut self) -> Option<&mut Samples> {
+        match self {
+            Self::Physical(samples) => Some(samples),
+            Self::Archive => None,
+        }
+    }
+}
+impl crate::heap_layout_bound::HeapLayoutBound for CheckpointSamples {
+    fn stable_heap(&self) -> bool {
+        self.as_ref()
+            .map_or(true, crate::heap_layout_bound::HeapLayoutBound::stable_heap)
+    }
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        match self.as_ref() {
+            Some(samples) => crate::heap_layout_bound::HeapLayoutBound::heap_bound(samples, c),
+            None => c.add(0),
+        }
+    }
+    fn completed_heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        match self.as_ref() {
+            Some(samples) => {
+                crate::heap_layout_bound::HeapLayoutBound::completed_heap_bound(samples, c)
+            }
+            None => c.add(0),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Checkpoint {
     stamp: FileStamp,
     scope: Scope,
-    // None is the RAM-only archive domain; Some keeps native physical samples.
-    samples: Option<Samples>,
+    // The archive domain carries no physical sample or offset authority.
+    samples: CheckpointSamples,
     last_full_verified_unix_seconds: u64,
     audit_debt: Option<AuditDebt>,
 }
 
 // Vec's non-null representation supplies the archive discriminant without
 // growing ordinary checkpoints or changing their frozen cache charge.
-const _: () = assert!(std::mem::size_of::<Option<Samples>>() == std::mem::size_of::<Samples>());
+const _: () = assert!(std::mem::size_of::<CheckpointSamples>() == std::mem::size_of::<Samples>());
 
 impl Checkpoint {
     /// RAM-only archive reduction witness. It certifies no physical prefix or
@@ -274,13 +317,13 @@ impl Checkpoint {
         Ok(Self {
             stamp: FileStamp::capture(file.metadata()?)?.content_only(),
             scope: scope.clone(),
-            samples: None,
+            samples: CheckpointSamples::Archive,
             last_full_verified_unix_seconds: now,
             audit_debt: None,
         })
     }
     pub(crate) fn is_compressed(&self) -> bool {
-        self.samples.is_none()
+        matches!(self.samples, CheckpointSamples::Archive)
     }
     /// A cache admission hint only. Source validation still uses the complete
     /// stamp, scope, samples and independent audit obligation.
@@ -1021,7 +1064,7 @@ impl ReadPlan {
         Ok(Checkpoint {
             stamp: self.stamp,
             scope: self.scope,
-            samples: Some(self.samples),
+            samples: CheckpointSamples::Physical(self.samples),
             last_full_verified_unix_seconds: verified,
             audit_debt,
         })
@@ -1174,7 +1217,7 @@ impl ReadPlan {
         Ok(Checkpoint {
             stamp,
             scope: self.scope,
-            samples: Some(self.samples),
+            samples: CheckpointSamples::Physical(self.samples),
             last_full_verified_unix_seconds: verified,
             audit_debt,
         })
@@ -1588,7 +1631,7 @@ impl DurableCertificate {
                 changed: current.changed,
             },
             scope,
-            samples: Some(Samples {
+            samples: CheckpointSamples::Physical(Samples {
                 sealed_offset: self.sealed_offset,
                 head,
                 boundary,
@@ -1833,7 +1876,7 @@ mod tests {
         let plain = Checkpoint {
             stamp: baseline.stamp.clone(),
             scope: baseline.scope.clone(),
-            samples: Some(baseline.samples.clone()),
+            samples: CheckpointSamples::Physical(baseline.samples.clone()),
             last_full_verified_unix_seconds: baseline.last_full_verified_unix_seconds,
             audit_debt: baseline.audit_debt,
         };
@@ -1841,6 +1884,19 @@ mod tests {
             crate::heap_layout_bound::bound(&plain, usize::MAX),
             crate::heap_layout_bound::bound(&baseline, usize::MAX)
         );
+        use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+        let mut before = Counter::new(usize::MAX);
+        baseline.heap_bound(&mut before).unwrap();
+        let mut after = Counter::new(usize::MAX);
+        plain.heap_bound(&mut after).unwrap();
+        assert_eq!(before.bytes, after.bytes);
+        assert_eq!(before.visits_for_test(), after.visits_for_test());
+        let mut before = Counter::new(usize::MAX);
+        baseline.completed_heap_bound(&mut before).unwrap();
+        let mut after = Counter::new(usize::MAX);
+        plain.completed_heap_bound(&mut after).unwrap();
+        assert_eq!(before.bytes, after.bytes);
+        assert_eq!(before.visits_for_test(), after.visits_for_test());
         let mut file = f.open();
         let archive = Checkpoint::completed_archive(&file, &scope(), 100).unwrap();
         assert!(archive.is_compressed());
@@ -2798,7 +2854,7 @@ mod tests {
         );
         // Unequal windows: `seal_as` marks them, both refuse.
         let mut unequal = cp.clone();
-        unequal.samples.head.pop();
+        unequal.samples.as_mut().unwrap().head.pop();
         assert_eq!(
             prepared(&f, &unequal, &scope(), 1100),
             Err(FullReason::InvalidCheckpoint)
@@ -3503,7 +3559,7 @@ mod tests {
         let checkpoint = Checkpoint {
             stamp,
             scope: scope(),
-            samples: Some(Samples {
+            samples: CheckpointSamples::Physical(Samples {
                 sealed_offset: sealed,
                 head,
                 boundary: boundary.clone(),
