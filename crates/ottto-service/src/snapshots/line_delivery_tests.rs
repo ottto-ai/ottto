@@ -3238,8 +3238,8 @@ fn withheld_equal_fingerprint_recovers_for_reason(failure: &str, reason: Candida
     match reason {
         CandidateParseReason::UploadContext => {
             previous.upload_context_fingerprint = Some("retry-context".into());
-            // A real previously unsettled page prevents the finalizer from
-            // adopting the active global context before account settlement.
+            // The prior checkpoint enters with unresolved context debt.
+            // The reader may drain its census before account settlement.
             previous.bounded_sweep_had_unsettled_upload = true;
         }
         CandidateParseReason::BodyWitnessAdoption => {}
@@ -3273,9 +3273,14 @@ fn withheld_equal_fingerprint_recovers_for_reason(failure: &str, reason: Candida
     assert_eq!(held.files[&key].source_file_fingerprint, fingerprint);
     assert!(held.claude_account_deferred_holds.contains_key(&key));
     if reason == CandidateParseReason::UploadContext {
+        // A drained reader can adopt its global context at finalization. The
+        // real checkpoint subset restores the previous context independently
+        // of that read and the Completed per-file account restoration. Exercise
+        // that composition, rather than assuming the old sweep flag survives.
+        held = held.committable_subset(&previous, &accepted, &BTreeMap::new());
         assert_ne!(
             held.upload_context_fingerprint, held.active_upload_context_fingerprint,
-            "real Completed preserves the unsettled context debt"
+            "real checkpoint preserves the unsettled context debt"
         );
     }
     let checkpoint = root.0.join("equal-held.json");
