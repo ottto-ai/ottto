@@ -1,0 +1,262 @@
+//! GUARDRAILS rule 5: a held-audit progress open that keeps failing backs
+//! off and parks, its debt still owed, and never blocks a healthy held key.
+//! These drive the page scheduler directly, so they also run off macOS.
+use super::*;
+use crate::snapshots::claude_request_census::{
+    ClaudeRequestCensusRecord, ClaudeRequestCensusShape,
+};
+
+const D: u64 = 1_000_000;
+const CAP: u64 = OPEN_BACKOFF_CAP_SECONDS;
+
+/// A scratch scan root; a failing key's file does not exist until a
+/// fixture creates it (its stat change).
+struct Root(crate::test_scratch::ScratchDir);
+impl Root {
+    fn new(name: &str) -> Self {
+        Self(crate::test_scratch::ScratchDir::new(&format!(
+            "held-open-backoff-{name}"
+        )))
+    }
+    fn key(&self, name: &str) -> String {
+        local_index_key(&self.0.join(name))
+    }
+}
+
+fn held_index(root: &Root, keys: &[&str]) -> ScanIndex {
+    let mut index = ScanIndex {
+        traversal: Some(
+            serde_json::from_value(json!({
+                "context_fingerprint":"c", "census_window_end":"2026-10-29T00:00:00Z",
+                "scan_roots":[&*root.0], "pending_directories":[], "pending_candidates":[],
+                "observed_index_keys":[], "reconciliation_upper_bound":null,
+                "reconciliation_after":null, "reconciliation_started":false, "counts":{}
+            }))
+            .unwrap(),
+        ),
+        ..ScanIndex::default()
+    };
+    for key in keys {
+        index.files.insert(
+            (*key).to_owned(),
+            serde_json::from_value(json!({
+                "size_bytes": 1, "modified_unix_seconds": 1,
+                "modified_unix_nanos": 1, "source_file_fingerprint": "source",
+                "last_snapshot_fingerprint": null,
+                "scan_identity_version": LOCAL_SCAN_INDEX_IDENTITY_VERSION,
+            }))
+            .unwrap(),
+        );
+        index.claude_request_census_mut_for_test().insert_for_test(
+            key,
+            ClaudeRequestCensusRecord::synthetic_for_test(
+                &"ab".repeat(32),
+                0,
+                ClaudeRequestCensusShape::IdentityIncomplete,
+                vec![1],
+            )
+            .with_unverified_for_test(true),
+        );
+        assert!(awaits_hold_deadline_restoration(&index, key));
+    }
+    index
+}
+
+/// One page's progress preparation. A queued `failing` key fails its secure
+/// open; any other queued key opens and its Full releases the hold.
+fn page(index: &mut ScanIndex, now: u64, failing: &str) -> Option<String> {
+    let key = schedule_held_audit_progress(index, now)?;
+    assert!(progress_debt(index, &key, now).is_some(), "queued keys owe");
+    if key == failing {
+        progress_open_failed(index, &key, now);
+    } else {
+        progress_opened(index, &key);
+        index.claude_request_census.remove(&key);
+    }
+    Some(key)
+}
+
+fn slot(index: &ScanIndex) -> Option<(String, u64, bool)> {
+    index
+        .held_audit_progress
+        .as_ref()
+        .map(|slot| (slot.key.clone(), slot.due, slot.attempted))
+}
+
+fn parked_alarms(records: &[serde_json::Value]) -> usize {
+    records
+        .iter()
+        .filter(|record| record["stage"] == "claude_held_audit_open_parked")
+        .count()
+}
+
+#[test]
+fn held_open_failure_backs_off_parks_once_and_keeps_due_owed() {
+    reset_open_backoff_for_test();
+    let root = Root::new("park");
+    let failing = root.key("000-unavailable.jsonl");
+    let healthy = root.key("session.jsonl");
+    let mut index = held_index(&root, &[&failing, &healthy]);
+    index.held_audit_progress = Some(HeldAuditProgress {
+        key: failing.clone(),
+        due: D,
+        attempted: false,
+    });
+
+    // Fixed clock: 1 page, then doubling waits. The healthy key takes the
+    // page's single attempt right after the first failure.
+    let (attempts, alarms) = crate::local_resource_diagnostics::capture(|| {
+        (1..=9)
+            .map(|_| page(&mut index, D, &failing))
+            .collect::<Vec<_>>()
+    });
+    let f = Some(failing.clone());
+    assert_eq!(
+        attempts,
+        vec![
+            f.clone(),
+            Some(healthy.clone()),
+            f.clone(),
+            None,
+            f.clone(),
+            None,
+            None,
+            None,
+            f.clone(),
+        ],
+        "failures 1-4 retry after 1, 2 and 4 pages; the healthy key progressed"
+    );
+    assert_eq!(parked_alarms(&alarms), 0);
+    assert!(!awaits_hold_deadline_restoration(&index, &healthy));
+    // Only the failing key is left: it holds the slot, unqueued, at D.
+    assert_eq!(slot(&index), Some((failing.clone(), D, false)));
+    assert_eq!(held_audit_open_failed(D + 60), (1, 60));
+
+    // Each wait is capped at 6 h: failures 5-8, then the 8th parks, once.
+    let mut now = D;
+    let (attempts, alarms) = crate::local_resource_diagnostics::capture(|| {
+        (0..4)
+            .map(|_| {
+                now += CAP;
+                page(&mut index, now, &failing)
+            })
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(attempts, vec![f.clone(); 4]);
+    assert_eq!(parked_alarms(&alarms), 1, "one alarm per park");
+    let alarm = alarms
+        .iter()
+        .find(|record| record["stage"] == "claude_held_audit_open_parked")
+        .unwrap();
+    assert_eq!(alarm["counts"]["held_audit_open_failures"], 8);
+    assert_eq!(alarm["counts"]["held_audit_open_owed_age_seconds"], now - D);
+    assert!(!alarm.to_string().contains("unavailable"), "no path");
+
+    // Parked: no retries, even past the cap; the debt stays owed at D.
+    let (attempts, alarms) = crate::local_resource_diagnostics::capture(|| {
+        (0..4)
+            .map(|_| {
+                now += 4 * CAP;
+                page(&mut index, now, &failing)
+            })
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(attempts, vec![None; 4]);
+    assert_eq!(parked_alarms(&alarms), 0);
+    assert_eq!(slot(&index), Some((failing.clone(), D, false)));
+    assert!(awaits_hold_deadline_restoration(&index, &failing));
+    assert_eq!(
+        debt_for_key(&index, &failing, now).map(|debt| debt.due_unix_seconds),
+        Some(D)
+    );
+    let path = root.0.join("index.json");
+    index.save(&path).unwrap();
+    let reloaded = ScanIndex::load(&path).unwrap();
+    assert_eq!(slot(&reloaded), Some((failing.clone(), D, false)));
+    assert_eq!(
+        debt_for_key(&reloaded, &failing, now).map(|debt| debt.due_unix_seconds),
+        Some(D)
+    );
+    let mut index = reloaded;
+
+    // A stat change retries once; a failed retry stays parked, no new alarm.
+    fs::write(&failing, b"{}\n").unwrap();
+    let (attempts, alarms) = crate::local_resource_diagnostics::capture(|| {
+        (0..3)
+            .map(|_| {
+                now += 4 * CAP;
+                page(&mut index, now, &failing)
+            })
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(attempts, vec![f.clone(), None, None], "retried once");
+    assert_eq!(parked_alarms(&alarms), 0);
+    assert_eq!(slot(&index), Some((failing.clone(), D, false)));
+
+    // A restart forgets the backoff and retries at the same owed D.
+    reset_open_backoff_for_test();
+    assert_eq!(held_audit_open_failed(now), (0, 0));
+    assert_eq!(page(&mut index, now, ""), f);
+    assert!(!awaits_hold_deadline_restoration(&index, &failing));
+    assert_eq!(held_audit_open_failed(now), (0, 0), "success clears it");
+}
+
+/// A parked key's stat change lets its retry succeed: the Full runs with
+/// the original D, and the backoff entry is dropped.
+#[test]
+fn held_open_parked_key_stat_change_retries_at_owed_due() {
+    reset_open_backoff_for_test();
+    let root = Root::new("stat");
+    let failing = root.key("held.jsonl");
+    let mut index = held_index(&root, &[&failing]);
+    index.held_audit_progress = Some(HeldAuditProgress {
+        key: failing.clone(),
+        due: D,
+        attempted: false,
+    });
+    let mut now = D;
+    for _ in 0..OPEN_PARK_FAILURES {
+        assert_eq!(
+            page(&mut index, now, &failing).as_deref(),
+            Some(failing.as_str())
+        );
+        now += CAP;
+    }
+    assert_eq!(page(&mut index, now, &failing), None, "parked");
+    fs::write(&failing, b"{}\n").unwrap();
+    let key = schedule_held_audit_progress(&mut index, now).expect("stat change retries");
+    assert_eq!(
+        progress_debt(&index, &key, now).map(|debt| debt.due_unix_seconds),
+        Some(D)
+    );
+    progress_opened(&mut index, &key);
+    assert_eq!(slot(&index), Some((failing.clone(), D, true)));
+    assert_eq!(held_audit_open_failed(now), (0, 0));
+}
+
+/// A blocked key yields the slot to any eligible key, and the restorer
+/// converting a backing-off key carries its owed due.
+#[test]
+fn held_open_backoff_due_carries_into_rotation_and_restoration() {
+    reset_open_backoff_for_test();
+    let root = Root::new("carry");
+    let failing = root.key("a.jsonl");
+    let other = root.key("b.jsonl");
+    let mut index = held_index(&root, &[&failing, &other]);
+    index.held_audit_progress = Some(HeldAuditProgress {
+        key: failing.clone(),
+        due: D,
+        attempted: false,
+    });
+    assert_eq!(
+        page(&mut index, D, &failing).as_deref(),
+        Some(failing.as_str())
+    );
+    // The other key inherits the slot's due; it is not later than D.
+    assert_eq!(slot(&index), Some((other.clone(), D, false)));
+    // Capacity opens: the restorer converts the failing key with D, not
+    // now + interval.
+    let mut restored = index.clone();
+    assert_eq!(restore_held_audit_deadlines(&mut restored, D + 100), 1);
+    assert_eq!(restored.files[&failing].unverified_deadline(), Some(D));
+}

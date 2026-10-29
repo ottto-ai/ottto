@@ -30871,10 +30871,12 @@ impl OwnedSourceScan {
                         &history_upgrade,
                         index.claude_reemission_exclusions.state(),
                     );
+                    let held_audit_open_failed =
+                        sampled_audit::held_audit_open_failed(sampled_scan::now_seconds());
                     // Count-only attribution of why Claude files were selected
                     // on this page. No path, session, or identifier is named.
                     eprintln!(
-                        "local snapshot census claude parse reasons: upload_context_matches={} {} compaction_summary_unlinked_parent={} body_witness_adoption_deferred={} body_witness_adoption_excluded={} body_witness_adoption_held_no_list={} body_witness_adoption_exclusions_invalid={} body_witness_adoption_list={} body_witness_adoption_stop={} body_witness_adoption_stop_withheld_folds={} history_upgrade_owed={} history_upgrade_permitted={} history_emission_denied={} history_listed_literal_roots={} history_reowed={} history_activation_refused={} claude_reemission_family_closure_root_absent_excluded={} identity_incomplete_holds_entered_process_total={} identity_incomplete_holds_cleared_process_total={} identity_incomplete_hold_deadlines_restored_process_total={}",
+                        "local snapshot census claude parse reasons: upload_context_matches={} {} compaction_summary_unlinked_parent={} body_witness_adoption_deferred={} body_witness_adoption_excluded={} body_witness_adoption_held_no_list={} body_witness_adoption_exclusions_invalid={} body_witness_adoption_list={} body_witness_adoption_stop={} body_witness_adoption_stop_withheld_folds={} history_upgrade_owed={} history_upgrade_permitted={} history_emission_denied={} history_listed_literal_roots={} history_reowed={} history_activation_refused={} claude_reemission_family_closure_root_absent_excluded={} identity_incomplete_holds_entered_process_total={} identity_incomplete_holds_cleared_process_total={} identity_incomplete_hold_deadlines_restored_process_total={} held_audit_open_failed_keys={} held_audit_open_failed_oldest_age_seconds={}",
                         index.upload_context_fingerprint == index.active_upload_context_fingerprint,
                         census_count_fields(&CANDIDATE_PARSE_REASON_NAMES, &census.parse_reasons),
                         census.claude_compaction_unlinked_parent_count,
@@ -30904,7 +30906,9 @@ impl OwnedSourceScan {
                         history_upgrade.family_closure_root_absent_excluded,
                         claude_request_census::identity_incomplete_hold_totals().0,
                         claude_request_census::identity_incomplete_hold_totals().1,
-                        claude_request_census::identity_incomplete_hold_deadlines_restored_total()
+                        claude_request_census::identity_incomplete_hold_deadlines_restored_total(),
+                        held_audit_open_failed.0,
+                        held_audit_open_failed.1
                     );
                     if history_upgrade.family_closure_root_absent_excluded > 0 {
                         crate::local_resource_diagnostics::claude_reemission_family_closure_root_absent_excluded(
@@ -31664,7 +31668,11 @@ impl OwnedSourceScan {
                 sampling.as_ref().map(|context| context.cache.as_ref()),
             ) else {
                 if verification_rescue {
-                    sampled_audit::progress_open_failed(index, &rescue_key);
+                    sampled_audit::progress_open_failed(
+                        index,
+                        &rescue_key,
+                        sampled_scan::now_seconds(),
+                    );
                 }
                 pending!();
             };

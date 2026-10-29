@@ -168,3 +168,118 @@ fn fe_n1_failed_secure_open_keeps_virtual_due() {
     assert!(mints_v1(&mut index, &result, 0..6));
     assert_eq!(markers(&index), CACHE_ENTRIES - 1);
 }
+
+/// GUARDRAILS rule 5 through the real open path: an unavailable held key
+/// backs off by pages (1, 2, 4), each wait capped at 6 h, and parks with
+/// one alarm after 8 failed opens, its due D still owed across save/reload.
+/// A healthy held key takes the page's single attempt in those same pages.
+/// Creating the parked file (a stat change) retries it once.
+#[test]
+fn fe_n1_failing_held_open_backs_off_parks_and_never_blocks_healthy_key() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _clock = TestClock;
+    sampled_audit::reset_open_backoff_for_test();
+    const CAP: u64 = 6 * 60 * 60;
+    let due = sampled_scan::now_seconds() - 20 * CAP;
+    let hold = erased_hold(due);
+    let key = hold.key.clone();
+    let bytes = String::from_utf8(bytes_of(&hold.fixture.file.0)).unwrap();
+    let mut index = hold.index;
+    let template = index.files[&key].clone();
+    let record = index
+        .claude_request_census_for_test()
+        .get(&key)
+        .unwrap()
+        .clone();
+    let unavailable = hold.fixture.root.join("000-unavailable/held.jsonl");
+    let failing = local_index_key(&unavailable);
+    index.files.insert(failing.clone(), template);
+    index
+        .claude_request_census_mut_for_test()
+        .insert_for_test(&failing, record);
+    // Both held files are aged out of discovery: only the slot opens them.
+    File::open(&hold.fixture.file.0)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH)
+        .unwrap();
+    saturate(&mut index, &key, due);
+    owe(&mut index, &failing, due);
+
+    let mut now = due;
+    let turn = |index: ScanIndex, now: u64| {
+        sampled_scan::set_test_now(Some(now));
+        let queued = restored();
+        let (index, _, seen) = plain(&hold.fixture, CLAUDE, index, &hold.cache);
+        (index, restored() - queued, seen.modes.0)
+    };
+    // Fixed clock: attempts on pages 1 (K), 2 (healthy), 3, 5 (K).
+    let mut attempts = Vec::new();
+    for _ in 0..5 {
+        let (next, queued, fulls) = turn(index, now);
+        index = next;
+        attempts.push((queued, fulls));
+    }
+    assert_eq!(attempts, vec![(1, 0), (1, 1), (1, 0), (0, 0), (1, 0)]);
+    assert!(hold_released(&index, &key), "the healthy key progressed");
+    assert_eq!(sampled_audit::held_audit_open_failed(now).0, 1);
+    assert_eq!(
+        index
+            .held_audit_progress
+            .as_ref()
+            .map(|slot| (slot.key.clone(), slot.due)),
+        Some((failing.clone(), due))
+    );
+
+    // Capped waits: failures 4-8; the 8th parks with exactly one alarm.
+    let (next, alarms) = crate::local_resource_diagnostics::capture(|| {
+        let mut index = index;
+        for _ in 0..5 {
+            now += CAP;
+            let (next, queued, fulls) = turn(index, now);
+            index = next;
+            assert_eq!((queued, fulls), (1, 0));
+        }
+        for _ in 0..2 {
+            now += 4 * CAP;
+            let (next, queued, _) = turn(index, now);
+            index = next;
+            assert_eq!(queued, 0, "parked");
+        }
+        index
+    });
+    let mut index = next;
+    assert_eq!(
+        alarms
+            .iter()
+            .filter(|record| record["stage"] == "claude_held_audit_open_parked")
+            .count(),
+        1
+    );
+    index.save(&hold.index_path).unwrap();
+    let index = ScanIndex::load(&hold.index_path).unwrap();
+    assert!(sampled_audit::awaits_hold_deadline_restoration(
+        &index, &failing
+    ));
+    assert_eq!(
+        sampled_audit::debt_for_key(&index, &failing, now).map(|debt| debt.due_unix_seconds),
+        Some(due),
+        "parked debt stays owed at D"
+    );
+    assert_eq!(markers(&index), CACHE_ENTRIES - 1);
+
+    // The parked file appears (a stat change): one retry, which audits it.
+    fs::create_dir_all(unavailable.parent().unwrap()).unwrap();
+    fs::write(&unavailable, bytes.replace(SESSION, "held")).unwrap();
+    File::open(&unavailable)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH)
+        .unwrap();
+    now += CAP;
+    let (index, queued, fulls) = turn(index, now);
+    assert_eq!((queued, fulls), (1, 1), "retried once");
+    assert_eq!(sampled_audit::held_audit_open_failed(now).0, 0);
+    assert_eq!(markers(&index), CACHE_ENTRIES - 1);
+}

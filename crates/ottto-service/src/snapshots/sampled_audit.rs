@@ -260,8 +260,9 @@ pub(super) fn awaits_hold_deadline_restoration(index: &ScanIndex, key: &str) -> 
 /// `p` because plain v2 cannot prove the lost tag was `c`. Each restored
 /// entry owes one Full; the deadline only delays it. Restorations take free
 /// audit slots and always leave one, so sampling stays supported. A key
-/// whose unattempted progress slot already owes an earlier due keeps it:
-/// converting the obligation re-arms debt, never moves it later (#865).
+/// whose unattempted progress slot (or failed-open backoff) already owes an
+/// earlier due keeps it: converting the obligation re-arms debt, never moves
+/// it later (#865).
 pub(super) fn restore_held_audit_deadlines(index: &mut ScanIndex, now: u64) -> usize {
     let pending = index
         .files
@@ -293,6 +294,7 @@ pub(super) fn restore_held_audit_deadlines(index: &mut ScanIndex, now: u64) -> u
             .as_ref()
             .filter(|(owed, _)| owed == key)
             .map_or(due, |(_, owed)| due.min(*owed));
+        let due = with_open_backoff(|backoff| backoff.owed(key)).map_or(due, |owed| due.min(owed));
         if let Some(entry) = index.files.get_mut(key) {
             entry.scan_identity_version = Some(provenance_marker(due, true));
         }
@@ -311,8 +313,9 @@ pub(super) fn restore_held_audit_deadlines(index: &mut ScanIndex, now: u64) -> u
 /// sampled marker or taking the last sampled slot. It grants no authority.
 /// `attempted` is set only once the secure open succeeds. A failed open
 /// rotates too but keeps the owed due, so debt never moves later; census
-/// holds stay eligible for the next round. The fixed population therefore
-/// cannot starve a readable member.
+/// holds stay eligible for the next round. A key whose open keeps failing
+/// backs off and then parks (`OpenBackoff`), and holds the slot only while no
+/// other key can use it, so it never starves a readable member.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct HeldAuditProgress {
     pub(super) key: String,
@@ -350,19 +353,196 @@ fn progress_eligible(index: &ScanIndex, key: &str) -> bool {
 }
 
 /// BTreeMap order plus a persisted cursor gives every held path a turn,
-/// including when a prior turn failed its secure open/cap.
-fn next_progress_key(index: &ScanIndex, after: Option<&str>) -> Option<String> {
-    let eligible = |key: &&String| progress_eligible(index, key.as_str());
-    let records = || index.claude_request_census.records().map(|(key, _)| key);
-    records()
-        .filter(eligible)
-        .find(|key| after.map_or(true, |after| key.as_str() > after))
-        .or_else(|| records().find(eligible))
-        .cloned()
+/// including when a prior turn failed its secure open/cap. A key that is
+/// backing off or parked is chosen only when no other key is eligible: it
+/// then holds the slot, and its due, without being queued.
+fn next_progress_key(index: &ScanIndex, after: Option<&str>, now: u64) -> Option<String> {
+    let records = || {
+        index
+            .claude_request_census
+            .records()
+            .map(|(key, _)| key)
+            .filter(|key| progress_eligible(index, key.as_str()))
+    };
+    let pick = |blocked: bool| {
+        let wanted = |key: &&String| open_blocked(key, now) == blocked;
+        records()
+            .filter(wanted)
+            .find(|key| after.map_or(true, |after| key.as_str() > after))
+            .or_else(|| records().find(wanted))
+            .cloned()
+    };
+    pick(false).or_else(|| pick(true))
 }
 
+/// A slot for `key` never owes a later due than its failed-open backoff, or
+/// than the same key's unattempted previous slot.
+fn progress_slot(key: String, due: u64, previous: Option<&HeldAuditProgress>) -> HeldAuditProgress {
+    let due = with_open_backoff(|backoff| backoff.owed(&key)).map_or(due, |owed| due.min(owed));
+    let due = previous
+        .filter(|slot| slot.key == key && !slot.attempted && slot.due > 0)
+        .map_or(due, |slot| due.min(slot.due));
+    HeldAuditProgress {
+        key,
+        due,
+        attempted: false,
+    }
+}
+
+/// GUARDRAILS rule 5: a progress Full whose secure open keeps failing backs
+/// off instead of retrying every page: 1 page after the first failure,
+/// doubling, each wait capped at 6 h. The eighth consecutive failure parks
+/// the key (one alarm); a parked key is retried only after its stat changes,
+/// or after a restart. RAM only: nothing here is persisted, and its owed due,
+/// census hold and slot are never cleared or moved later.
+const OPEN_PARK_FAILURES: u8 = 8;
+const OPEN_BACKOFF_CAP_SECONDS: u64 = 6 * 60 * 60;
+/// Census keys are at most 4 KiB, so the map stays bounded (about 1 MiB at
+/// worst). Beyond it the longest-quiet key is forgotten and simply retried.
+const OPEN_BACKOFF_KEYS: usize = 256;
+
+type OpenStamp = Option<[i64; 7]>;
+
+fn open_stamp(key: &str) -> OpenStamp {
+    let metadata = std::fs::metadata(key).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some([
+            metadata.dev() as i64,
+            metadata.ino() as i64,
+            metadata.size() as i64,
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        ])
+    }
+    #[cfg(not(unix))]
+    {
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |elapsed| elapsed.as_nanos() as i64);
+        Some([metadata.len() as i64, modified, 0, 0, 0, 0, 0])
+    }
+}
+
+#[derive(Debug, Clone)]
+struct OpenFailure {
+    failures: u8,
+    owed_due: u64,
+    first_failed: u64,
+    last_failed: u64,
+    retry_page: u64,
+    stamp: OpenStamp,
+}
+
+#[derive(Debug)]
+struct OpenBackoff {
+    page: u64,
+    keys: BTreeMap<String, OpenFailure>,
+}
+impl OpenBackoff {
+    const fn new() -> Self {
+        Self {
+            page: 0,
+            keys: BTreeMap::new(),
+        }
+    }
+    fn blocked(&self, key: &str, now: u64) -> bool {
+        self.keys.get(key).is_some_and(|failure| {
+            (failure.failures >= OPEN_PARK_FAILURES
+                || (self.page < failure.retry_page
+                    && now < failure.last_failed.saturating_add(OPEN_BACKOFF_CAP_SECONDS)))
+                && open_stamp(key) == failure.stamp
+        })
+    }
+    fn owed(&self, key: &str) -> Option<u64> {
+        self.keys.get(key).map(|failure| failure.owed_due)
+    }
+    /// Some(parked failure) exactly when this failure parks the key.
+    fn record_failure(&mut self, key: &str, due: u64, now: u64) -> Option<OpenFailure> {
+        if !self.keys.contains_key(key) && self.keys.len() >= OPEN_BACKOFF_KEYS {
+            let quiet = self
+                .keys
+                .iter()
+                .min_by_key(|(_, failure)| failure.last_failed)
+                .map(|(key, _)| key.clone());
+            if let Some(quiet) = quiet {
+                self.keys.remove(&quiet);
+            }
+        }
+        let page = self.page;
+        let failure = self.keys.entry(key.to_owned()).or_insert(OpenFailure {
+            failures: 0,
+            owed_due: due,
+            first_failed: now,
+            last_failed: now,
+            retry_page: page,
+            stamp: None,
+        });
+        failure.failures = failure.failures.saturating_add(1);
+        failure.owed_due = failure.owed_due.min(due);
+        failure.last_failed = now;
+        failure.retry_page = page.saturating_add(1 << u32::from(failure.failures - 1).min(62));
+        failure.stamp = open_stamp(key);
+        (failure.failures == OPEN_PARK_FAILURES).then(|| failure.clone())
+    }
+}
+
+#[cfg(not(test))]
+static OPEN_BACKOFF: std::sync::Mutex<OpenBackoff> = std::sync::Mutex::new(OpenBackoff::new());
+#[cfg(test)]
+thread_local! {
+    static OPEN_BACKOFF: std::cell::RefCell<OpenBackoff> =
+        const { std::cell::RefCell::new(OpenBackoff::new()) };
+}
+
+/// A leaf lock: `run` never takes another lock or re-enters.
+fn with_open_backoff<T>(run: impl FnOnce(&mut OpenBackoff) -> T) -> T {
+    #[cfg(not(test))]
+    {
+        run(&mut OPEN_BACKOFF
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
+    }
+    #[cfg(test)]
+    OPEN_BACKOFF.with(|backoff| run(&mut backoff.borrow_mut()))
+}
+
+fn open_blocked(key: &str, now: u64) -> bool {
+    with_open_backoff(|backoff| backoff.blocked(key, now))
+}
+
+/// Census-line counts: keys whose progress open failed and are still owed
+/// (backing off or parked), and the age of the oldest first failure.
+pub(super) fn held_audit_open_failed(now: u64) -> (usize, u64) {
+    with_open_backoff(|backoff| {
+        (
+            backoff.keys.len(),
+            backoff
+                .keys
+                .values()
+                .map(|failure| now.saturating_sub(failure.first_failed))
+                .max()
+                .unwrap_or(0),
+        )
+    })
+}
+
+#[cfg(test)]
+pub(super) fn reset_open_backoff_for_test() {
+    with_open_backoff(|backoff| *backoff = OpenBackoff::new());
+}
+
+#[cfg(test)]
+mod open_backoff_tests;
+
 /// The queued progress Full for `key` passed its secure open: the slot's
-/// turn is spent, so the next preparation rotates to a fresh interval.
+/// turn is spent, so the next preparation rotates to a fresh interval, and
+/// any failed-open backoff ends.
 pub(super) fn progress_opened(index: &mut ScanIndex, key: &str) {
     if let Some(slot) = index
         .held_audit_progress
@@ -370,13 +550,22 @@ pub(super) fn progress_opened(index: &mut ScanIndex, key: &str) {
         .filter(|slot| slot.key == key)
     {
         slot.attempted = true;
+        with_open_backoff(|backoff| backoff.keys.remove(key));
     }
 }
 
-/// The queued progress Full for `key` failed its secure open. Rotate the
-/// turn (wrapping to `key` itself when it is the only eligible member) but
-/// keep the owed due: a failed open never re-arms a later deadline.
-pub(super) fn progress_open_failed(index: &mut ScanIndex, key: &str) {
+#[derive(Serialize)]
+struct HeldAuditOpenParked {
+    held_audit_open_failures: u8,
+    held_audit_open_owed_age_seconds: u64,
+    held_audit_open_failed_keys: usize,
+}
+
+/// The queued progress Full for `key` failed its secure open. Back the key
+/// off (or park it), then rotate the turn, wrapping to `key` itself when no
+/// other member is eligible, but keep the owed due: a failed open never
+/// re-arms a later deadline.
+pub(super) fn progress_open_failed(index: &mut ScanIndex, key: &str, now: u64) {
     let Some(due) = index
         .held_audit_progress
         .as_ref()
@@ -385,11 +574,49 @@ pub(super) fn progress_open_failed(index: &mut ScanIndex, key: &str) {
     else {
         return;
     };
-    index.held_audit_progress = next_progress_key(index, Some(key)).map(|key| HeldAuditProgress {
-        key,
-        due,
-        attempted: false,
+    let (parked, keys) =
+        with_open_backoff(|backoff| (backoff.record_failure(key, due, now), backoff.keys.len()));
+    if let Some(parked) = parked {
+        // Counts only; no path or id. Once per park.
+        crate::local_resource_diagnostics::claude_held_audit_open_parked(&HeldAuditOpenParked {
+            held_audit_open_failures: parked.failures,
+            held_audit_open_owed_age_seconds: now.saturating_sub(parked.owed_due),
+            held_audit_open_failed_keys: keys,
+        });
+    }
+    let previous = index.held_audit_progress.take();
+    index.held_audit_progress = next_progress_key(index, Some(key), now)
+        .map(|next| progress_slot(next, due, previous.as_ref()));
+}
+
+/// Select this page's progress slot: keep an unattempted, unblocked slot,
+/// else rotate. Returns the key to queue: the slot is due and its key is not
+/// backing off or parked. A blocked key keeps the slot and its due unqueued.
+fn schedule_held_audit_progress(index: &mut ScanIndex, now: u64) -> Option<String> {
+    with_open_backoff(|backoff| {
+        backoff.page = backoff.page.saturating_add(1);
+        backoff
+            .keys
+            .retain(|key, _| awaits_hold_deadline_restoration(index, key));
     });
+    let previous = index.held_audit_progress.clone();
+    let keep = previous.as_ref().is_some_and(|slot| {
+        !slot.attempted
+            && slot.due > 0
+            && now
+                .checked_add(AUDIT_INTERVAL_SECONDS)
+                .is_some_and(|latest| slot.due <= latest)
+            && progress_eligible(index, slot.key.as_str())
+            && !open_blocked(&slot.key, now)
+    });
+    if !keep {
+        let key = next_progress_key(index, previous.as_ref().map(|slot| slot.key.as_str()), now);
+        index.held_audit_progress = key
+            .zip(now.checked_add(AUDIT_INTERVAL_SECONDS))
+            .map(|(key, due)| progress_slot(key, due, previous.as_ref()));
+    }
+    let slot = index.held_audit_progress.as_ref()?;
+    (now >= slot.due && !open_blocked(&slot.key, now)).then(|| slot.key.clone())
 }
 
 impl OwnedSourceScan {
@@ -399,32 +626,10 @@ impl OwnedSourceScan {
         if self.file_limit == 0 {
             return;
         }
-        let previous = self.index.held_audit_progress.as_ref();
-        let keep = previous.is_some_and(|slot| {
-            !slot.attempted
-                && slot.due > 0
-                && now
-                    .checked_add(AUDIT_INTERVAL_SECONDS)
-                    .is_some_and(|latest| slot.due <= latest)
-                && progress_eligible(&self.index, slot.key.as_str())
-        });
-        if !keep {
-            let key = next_progress_key(&self.index, previous.map(|slot| slot.key.as_str()));
-            self.index.held_audit_progress =
-                key.zip(now.checked_add(AUDIT_INTERVAL_SECONDS))
-                    .map(|(key, due)| HeldAuditProgress {
-                        key,
-                        due,
-                        attempted: false,
-                    });
-        }
-        let Some(slot) = self.index.held_audit_progress.as_ref() else {
+        let Some(key) = schedule_held_audit_progress(&mut self.index, now) else {
             return;
         };
-        if now < slot.due {
-            return;
-        }
-        let path = PathBuf::from(&slot.key);
+        let path = PathBuf::from(&key);
         // First match, not deepest: the root enters the sampled scope hash.
         let Some(root) = self
             .index
@@ -434,7 +639,6 @@ impl OwnedSourceScan {
         else {
             return;
         };
-        let key = slot.key.clone();
         let Some(entry) = self.index.files.get(&key) else {
             return;
         };
