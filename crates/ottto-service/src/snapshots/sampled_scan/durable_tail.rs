@@ -28,7 +28,20 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(super) mod acquired;
-pub(crate) use acquired::{AcquisitionProtocol, ImmutableCounting};
+pub(crate) use acquired::{AcquiredChain, AcquisitionProtocol, ImmutableCounting};
+mod owed;
+pub(in crate::snapshots) use owed::OwedCompletionAdmission;
+pub(crate) use owed::{OwedAdmission, OwedQuery, ReceiptOwed};
+mod write_ahead;
+pub(crate) use crate::durable_tail_store::ActiveLease;
+pub(in crate::snapshots) use write_ahead::{
+    CommitFences, FinishAcquisition, LiveFinishView, NativeFinishAttempt,
+};
+pub(crate) use write_ahead::{
+    Degraded, DegradedCause, HeldCause, NotPersisted, PrepareOutcome, PrepareStoreFailure,
+    PreparedRecord, ReceiptProof, ReconcileOutcome, RecordIdentity, Unprepared,
+    UnpreparedDisposition, WriteOutcome,
+};
 
 use super::super::*;
 use super::SharedCache;
@@ -150,6 +163,9 @@ pub(crate) struct Counters {
     /// GC's largest keep map: index keys with a record on disk, at most the
     /// store's `INVENTORY_BOUND`, whatever the index size.
     pub(crate) gc_keep_peak: u64,
+    /// M3 D3 Claude holds: [growth bytes, released by write, released by
+    /// content change, unfunded hold marker].
+    pub(crate) d3: [u64; write_ahead::D3_COUNTS],
 }
 
 impl Counters {
@@ -176,7 +192,8 @@ impl Counters {
              guard_header_bytes={} guard_verify_bytes={} delete_verify_bytes={} overwrite_verify_bytes={} \
              uninventoried_records={} store_write_skipped[unknown,inventory_overflow]={:?} \
              gc_records_deleted={} gc_records_read={} gc_bytes_read={} gc_keep_peak={} \
-             records_invalidated={} mutation_unproved={} peak_codec_bytes={} t14_rebuild_full_started={}",
+             records_invalidated={} mutation_unproved={} peak_codec_bytes={} t14_rebuild_full_started={} \
+             d3_hold[growth_bytes,released_write,released_content,unfunded]={:?}",
             source.api_slug(),
             self.original_v1_mapped,
             self.durable_restore_after_selection_clear,
@@ -229,6 +246,7 @@ impl Counters {
             store.mutation_unproved,
             store.peak_codec_bytes,
             store.t14_rebuild_full_started,
+            self.d3,
         )
     }
 }
@@ -249,6 +267,8 @@ struct Slot {
     held: u64,
     old_binding_no_match: u64,
     reported: [u64; 22],
+    /// Last reported D3 Claude hold key count.
+    d3_reported: u64,
 }
 
 impl Slot {
@@ -366,6 +386,11 @@ pub(crate) struct Stores {
     #[cfg(test)]
     retail_full_now: Option<std::time::SystemTime>,
     upgrade_reads: std::sync::Arc<AtomicU64>,
+    /// G3: a source whose owed key could not be enrolled stays conservatively
+    /// owed until reconstruction or a disabled store clears it.
+    owed_overflow: [bool; crate::snapshots::durable_sources::SOURCES.len()],
+    /// D3 resource-pause observations and the first-hold alarm.
+    d3: write_ahead::D3State,
 }
 
 #[derive(Default)]
@@ -373,6 +398,10 @@ struct KeyCustody {
     spent: Option<(u64, std::time::Instant)>,
     original: Option<store::MutationWitness>,
     upgrade_started: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// G3 content-free debt class for this source+key.
+    owed: owed::OwedMark,
+    /// D3: this Claude key's stale predecessor survived a failed write.
+    hold: Option<write_ahead::ClaudeHold>,
 }
 fn custody_node_bytes() -> Option<usize> {
     crate::heap_layout_bound::tree_node_bytes::<store::Digest32, Box<KeyCustody>>()?
@@ -698,12 +727,16 @@ fn claude_expected(
     interpretation: &Interpretation<'_>,
     record: &store::DurableRecord,
 ) -> Result<(Expected, u64), &'static str> {
-    if record.format != 1
-        || record.record.allowlist != codec::allowlist_digest(SnapshotSource::ClaudeCode)
-    {
+    if record.record.allowlist != codec::allowlist_digest(SnapshotSource::ClaudeCode) {
         return Err("old_binding_representation");
     }
     let current = effective_revision(SnapshotSource::ClaudeCode);
+    if record.format == store::FORMAT_V3 {
+        return claude_expected_v3(key, scope, index, interpretation, record, current);
+    }
+    if record.format != 1 {
+        return Err("old_binding_representation");
+    }
     // NAMED_REVISION_CANDIDATES: record/entry applied, current code, explicitly retained active.
     let applied = index
         .files
@@ -751,6 +784,49 @@ fn claude_expected(
     proof.0.binding.entry = record.record.binding.entry;
     proof.0.committed_generation = record.index_generation;
     Ok(proof)
+}
+
+/// A v3 record names its finite acquired revision r_a; there is no candidate
+/// search. Its entry digest is reserved; the S2 floor and certificate decide.
+fn claude_expected_v3(
+    key: &str,
+    scope: &Scope,
+    index: &ScanIndex,
+    interpretation: &Interpretation<'_>,
+    record: &store::DurableRecord,
+    current: u64,
+) -> Result<(Expected, u64), &'static str> {
+    let acquired = record
+        .record
+        .acquisition
+        .ok_or("old_binding_representation")?
+        .acquired_revision;
+    let mut expected = expected(
+        DurableSource::ClaudeCode,
+        SnapshotSource::ClaudeCode,
+        key,
+        scope,
+        index,
+        interpretation,
+        Some((record.format, record.record.allowlist, acquired)),
+    )
+    .ok_or("accepted_floor_missing")?;
+    if expected.binding.context != record.record.binding.context {
+        return Err("context");
+    }
+    if expected.binding.scope != record.record.binding.scope {
+        return Err("old_binding_no_match");
+    }
+    if acquired != current {
+        return Err(if acquired > current {
+            "revision_downgrade"
+        } else {
+            "revision_adoption_required"
+        });
+    }
+    expected.binding.entry = record.record.binding.entry;
+    expected.committed_generation = record.index_generation;
+    Ok((expected, acquired))
 }
 
 fn ineligible_class(reason: store::Ineligible) -> &'static str {
@@ -913,7 +989,81 @@ impl DurableCustody {
     pub(crate) fn upgrade_mut(&mut self) -> Option<&mut UpgradeRead> {
         self.upgrade.as_mut()
     }
+    pub(crate) fn has_active(&self) -> bool {
+        self.active.is_some()
+    }
+    pub(crate) fn active_mut(&mut self) -> Option<&mut store::ActiveLease> {
+        self.active.as_mut()
+    }
+    /// The acquisition's single lease: acquired once, then charged in place.
+    pub(crate) fn ensure_active(
+        &mut self,
+        cache: &SharedCache,
+        source: SnapshotSource,
+        need_bytes: u64,
+    ) -> Result<&mut store::ActiveLease, LeaseBusy> {
+        match self.active.as_mut() {
+            Some(lease) => lease.charge(need_bytes).map_err(|_| LeaseBusy)?,
+            None => match cache.acquire_active(source, need_bytes) {
+                store::LeaseWait::Granted(lease) => self.active = Some(lease),
+                store::LeaseWait::Busy | store::LeaseWait::OverBudget => return Err(LeaseBusy),
+            },
+        }
+        self.active.as_mut().ok_or(LeaseBusy)
+    }
+    #[allow(clippy::result_large_err)] // Refusal returns the caller's lease.
+    pub(crate) fn attach_active(
+        &mut self,
+        lease: store::ActiveLease,
+    ) -> Result<(), store::ActiveLease> {
+        if self.active.is_some() {
+            return Err(lease);
+        }
+        self.active = Some(lease);
+        Ok(())
+    }
+    pub(crate) fn release_active(&mut self) {
+        if let Some(lease) = self.active.take() {
+            lease.release();
+        }
+    }
+    pub(crate) fn owed(&self) -> Option<&ReceiptOwed> {
+        self.owed.as_ref()
+    }
+    /// While debt exists the chain lives only inside it, never twice.
+    pub(crate) fn chain(&self) -> Option<&AcquiredChain> {
+        self.chain.as_ref()
+    }
+    pub(crate) fn chain_mut(&mut self) -> Option<&mut AcquiredChain> {
+        self.chain.as_mut()
+    }
+    pub(crate) fn take_chain(&mut self) -> Option<AcquiredChain> {
+        self.chain.take()
+    }
+    pub(crate) fn take_owed(&mut self) -> Option<ReceiptOwed> {
+        self.owed.take()
+    }
+    #[allow(clippy::result_large_err)] // Refusal returns the original debt.
+    pub(crate) fn put_owed(&mut self, owed: ReceiptOwed) -> Result<(), ReceiptOwed> {
+        if self.owed.is_some() || self.chain.is_some() {
+            return Err(owed);
+        }
+        self.owed = Some(owed);
+        Ok(())
+    }
+    #[allow(clippy::result_large_err)] // Refusal returns the original chain.
+    pub(crate) fn put_chain(&mut self, chain: AcquiredChain) -> Result<(), AcquiredChain> {
+        if self.owed.is_some() || self.chain.is_some() {
+            return Err(chain);
+        }
+        self.chain = Some(chain);
+        Ok(())
+    }
 }
+
+/// The acquisition's active lease could not be granted or extended.
+#[derive(Debug)]
+pub(crate) struct LeaseBusy;
 
 pub(crate) struct UpgradeRead {
     object: (u64, u64, u64),
@@ -1059,7 +1209,8 @@ fn authorize_strict(
     key: &str,
     index: &ScanIndex,
     custody: &mut KeyCustody,
-    replacement: &PendingRecord,
+    replacement: &Binding,
+    certificate: &DurableCertificate,
 ) {
     slot.store
         .revoke(&store::key_digest(DurableSource::ClaudeCode, key));
@@ -1105,9 +1256,9 @@ fn authorize_strict(
             custody.original.as_ref(),
             slot.migration_expected(key, index, record),
         ) {
-            if replacement.binding == current.binding {
+            if *replacement == current.binding {
                 slot.store
-                    .authorize_migration(&record, &current, &replacement.certificate, proof);
+                    .authorize_migration(&record, &current, certificate, proof);
             }
         }
     }
@@ -1552,10 +1703,19 @@ impl SharedCache {
                 held: 0,
                 old_binding_no_match: 0,
                 reported: [0; 22],
+                d3_reported: 0,
             });
         }
         if let Some(slot) = slot.as_mut() {
             slot.store.begin_pass();
+            // At most one resource probe per pass; the store owns its back-off.
+            // Held keys retry through their own next native write.
+            if slot.store.resource_paused() {
+                if let Some(writer) = crate::locked_state_dir::held_for(&slot.dir) {
+                    let index_len = std::fs::metadata(index_path).map_or(0, |m| m.len());
+                    slot.store.check_resources(writer, index_len);
+                }
+            }
         }
     }
 
@@ -2735,6 +2895,7 @@ impl SharedCache {
             )),
         )
         .ok_or(MissClass::NoEntry)?;
+        let mut adapter_revision = None;
         if source == DurableSource::ClaudeCode {
             let (original, revision) =
                 match claude_expected(key, scope, index, interpretation, &record) {
@@ -2820,6 +2981,7 @@ impl SharedCache {
                 return Err(self.stale("behind_accepted.legacy"));
             }
             expected = original;
+            adapter_revision = Some(revision);
         }
         let restored = self.durable_restore_record(
             snapshot_source,
@@ -2931,13 +3093,87 @@ impl SharedCache {
         {
             return Err(self.stale("behind_accepted.legacy"));
         }
+        let mut durable = DurableCustody::default();
+        if let Some(chain) = self.restored_chain(
+            snapshot_source,
+            key,
+            &record,
+            adapter_revision,
+            &checkpoint,
+            held,
+            index,
+            lease,
+        ) {
+            durable
+                .put_chain(chain)
+                .unwrap_or_else(|_| unreachable!("fresh custody"));
+        }
         Ok(Ok(sampled_jsonl::CompletedNativeAcquisition {
-            durable: Default::default(),
+            durable,
             checkpoint,
             reduction: Some(reduction),
             released: None,
             unsealed: false,
         }))
+    }
+
+    /// The restored chain inherits the original proof: a Claude v1 record's
+    /// unique adapter revision (Legacy), or a v3 record's verified r_a and
+    /// protocol. Codex v1 has no unique mapping and gets no chain; nothing is
+    /// restamped. O is computed on the held FD, whose position is restored.
+    #[allow(clippy::too_many_arguments)]
+    fn restored_chain(
+        &self,
+        snapshot_source: SnapshotSource,
+        key: &str,
+        record: &store::DurableRecord,
+        adapter_revision: Option<u64>,
+        checkpoint: &Checkpoint,
+        held: &mut File,
+        index: &ScanIndex,
+        lease: &mut store::ActiveLease,
+    ) -> Option<AcquiredChain> {
+        use std::io::{Seek, SeekFrom};
+        let ds = durable_source(snapshot_source)?;
+        let (revision, protocol) = match (record.format, record.record.acquisition) {
+            (store::FORMAT_V3, Some(acquisition)) => {
+                (acquisition.acquired_revision, acquisition.protocol)
+            }
+            (store::FORMAT_V1, None) => (adapter_revision?, AcquisitionProtocol::Legacy),
+            _ => return None,
+        };
+        let binding = self.live_binding(
+            ds,
+            snapshot_source,
+            key,
+            checkpoint.scope(),
+            index,
+            revision,
+        )?;
+        // Two bounded content samples plus the digest text, funded before input.
+        lease
+            .charge((2 * FILE_CONTENT_SAMPLE_BYTES + 128) as u64)
+            .ok()?;
+        let position = held.stream_position().ok()?;
+        let identity = opened_object_identity(snapshot_source, held);
+        held.seek(SeekFrom::Start(position)).ok()?;
+        let identity = identity.ok()?;
+        let m = held.metadata().ok()?;
+        acquired::restore_chain(
+            acquired::ChainInputs {
+                source: snapshot_source,
+                key,
+                opened_object_identity: &identity,
+                object: (m.dev(), m.ino(), birth_unix_nanos(&m)),
+                checkpoint,
+                binding,
+                acquired_revision: revision,
+                committed_generation: index.generation,
+            },
+            protocol,
+            lease,
+        )
+        .ok()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3277,13 +3513,15 @@ impl SharedCache {
                     continue;
                 }
                 let stores = &mut *stores;
+                let replacement = pending.iter().find(|r| r.binding.key == digest)?;
                 authorize_strict(
                     stores.slots[source.slot()].as_mut()?,
                     snapshot_source,
                     key,
                     index,
                     stores.retail_spent.get_mut(&digest)?,
-                    pending.iter().find(|r| r.binding.key == digest)?,
+                    &replacement.binding,
+                    &replacement.certificate,
                 );
             }
         }
@@ -3552,9 +3790,16 @@ impl SharedCache {
             [0; 4]
         };
         let recovery = stores.counters.recovery_full[source as usize];
+        let [hold_keys, oldest_age] = if claude {
+            stores.claude_holds()
+        } else {
+            [0, 0]
+        };
+        let hold_alarm = claude && stores.take_hold_alarm();
         let Some(slot) = stores.slot(source).as_mut() else {
             return;
         };
+        let hold_changed = std::mem::replace(&mut slot.d3_reported, hold_keys) != hold_keys;
         let (store, disabled) = (slot.store.counters(), slot.store.disabled());
         let now = [
             slot.held,
@@ -3606,6 +3851,15 @@ impl SharedCache {
                     mode_repaired: pair(2),
                     store_disabled: disabled.filter(|_| last[3] == 0),
                 },
+            );
+        }
+        // D3: the first Claude hold alarms at once; the key count and oldest
+        // age then travel whenever the count changes. Store faults, degraded
+        // publishes, stale refusals and pause seconds ride the store counters.
+        if hold_alarm || hold_changed {
+            crate::local_resource_diagnostics::durable_tail_alarm(
+                snapshot_source.api_slug(),
+                &serde_json::json!({"d3_claude_hold": {"keys": hold_keys, "oldest_age": oldest_age}}),
             );
         }
     }
