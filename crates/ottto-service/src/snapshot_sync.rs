@@ -6673,6 +6673,24 @@ fn prepare_continuation_source(
         home,
         &inputs.scan_agent_status_collection.codex_scan_homes,
     )?;
+    // K5: use the ordinary page's namespace and the same durable source dispatch.
+    let sampled_scope = cycle_sampled_scope(
+        &inputs.account_witness,
+        &inputs.upload_destination_namespace,
+        &inputs.index_path,
+        inputs.context_curve_enabled,
+        false,
+    );
+    #[cfg(unix)]
+    crate::snapshots::begin_durable_pass(
+        cache,
+        support_dir,
+        source,
+        &inputs.index_path,
+        false, // A continuation never performs fresh-index cleanup.
+        &sampled_scope,
+        false,
+    );
     let scan = crate::snapshots::OwnedSourceScan::new_continuation(
         &roots,
         index,
@@ -6686,17 +6704,7 @@ fn prepare_continuation_source(
     )
     .with_continuation_deadline(deadline)
     .with_reread_persistence()
-    .with_sampled_acquisition(
-        std::sync::Arc::clone(cache),
-        // K5: the ordinary Codex page's scope; Codex never captures.
-        cycle_sampled_scope(
-            &inputs.account_witness,
-            &inputs.upload_destination_namespace,
-            &inputs.index_path,
-            inputs.context_curve_enabled,
-            false,
-        ),
-    )
+    .with_sampled_acquisition(std::sync::Arc::clone(cache), sampled_scope)
     .with_codex_side_pass(Some(codex_side_pass));
     Ok(Ok(SourcePreparation {
         native_comparison_reservation: None,

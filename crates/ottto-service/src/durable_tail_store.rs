@@ -98,7 +98,7 @@ pub(crate) trait SingleWriter {
     fn state_dir(&self) -> &Path;
 }
 
-/// The sources M1 keeps. Pi is never stored.
+/// Sources admitted by the durable property table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum DurableSource {
     ClaudeCode,
@@ -106,17 +106,13 @@ pub(crate) enum DurableSource {
 }
 impl DurableSource {
     fn tag(self) -> u8 {
-        match self {
-            Self::ClaudeCode => 1,
-            Self::Codex => 2,
-        }
+        self.properties().tag
     }
     fn from_tag(tag: u8) -> Option<Self> {
-        match tag {
-            1 => Some(Self::ClaudeCode),
-            2 => Some(Self::Codex),
-            _ => None,
-        }
+        crate::snapshots::durable_sources::SOURCES
+            .iter()
+            .find(|row| row.tag == tag)
+            .map(|row| row.source)
     }
 }
 
@@ -892,7 +888,7 @@ impl DurableTailStore {
             let stored = DurableRecord {
                 record,
                 index_generation: committed_generation,
-                format: FORMAT_VERSION,
+                format: self.source.properties().format,
             };
             let bytes = encode(&stored);
             let ack_bytes = if self.source == DurableSource::ClaudeCode {
@@ -1288,18 +1284,14 @@ fn decode_header(bytes: &[u8], key: &Digest32, source: DurableSource) -> Result<
     }
     let allowlist = c.array::<32>().ok_or(Refusal::Undecodable)?;
     let tag = c.u8().ok_or(Refusal::Undecodable)?;
-    // Both pinned v1 writers (72205c6c and ffc6c846) use these lists.
-    let pin = match tag {
-        1 => "8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c",
-        2 => "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1",
-        _ => return Err(Refusal::Unknown),
-    };
-    if format != 1 || Some(allowlist) != parse_hex_digest(pin) {
+    let admitted = DurableSource::from_tag(tag).ok_or(Refusal::Unknown)?;
+    let row = admitted.properties();
+    if format != row.format || Some(allowlist) != parse_hex_digest(row.allowlist_pin) {
         return Err(Refusal::Unknown);
     }
     let binding = (|| {
         Some(Binding {
-            source: DurableSource::from_tag(tag)?,
+            source: admitted,
             key: c.array()?,
             context: c.array()?,
             scope: c.array()?,
@@ -1433,7 +1425,7 @@ fn encode_header(out: &mut Vec<u8>, record: &PendingRecord, generation: u64) {
     let binding = &record.binding;
     let certificate = &record.certificate;
     out.extend_from_slice(&MAGIC);
-    out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    out.extend_from_slice(&binding.source.properties().format.to_le_bytes());
     out.extend_from_slice(&record.allowlist);
     out.push(binding.source.tag());
     for part in [

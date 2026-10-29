@@ -198,8 +198,7 @@ struct Slot {
 /// Process-lifetime durable state beside the RAM cache.
 #[derive(Default)]
 pub(crate) struct Stores {
-    claude: Option<Slot>,
-    codex: Option<Slot>,
+    slots: [Option<Slot>; crate::snapshots::durable_sources::SOURCES.len()],
     /// Keys admitted to the RAM cache since their source's last write.
     touched: BTreeSet<String>,
     /// Selection provenance: the source-file fingerprint each admitted
@@ -239,10 +238,7 @@ impl Stores {
         true
     }
     fn slot(&mut self, source: DurableSource) -> &mut Option<Slot> {
-        match source {
-            DurableSource::ClaudeCode => &mut self.claude,
-            DurableSource::Codex => &mut self.codex,
-        }
+        &mut self.slots[source.slot()]
     }
 }
 
@@ -258,11 +254,7 @@ impl SingleWriter for crate::locked_state_dir::LockedStateDir {
 }
 
 pub(crate) fn durable_source(source: SnapshotSource) -> Option<DurableSource> {
-    match source {
-        SnapshotSource::ClaudeCode => Some(DurableSource::ClaudeCode),
-        SnapshotSource::Codex => Some(DurableSource::Codex),
-        SnapshotSource::Pi => None,
-    }
+    DurableSource::from_snapshot(source)
 }
 
 #[derive(Clone, Copy)]
@@ -354,8 +346,8 @@ fn expected(
     let entry = index.files.get(key)?;
     let (format, allowlist, revision) = representation.unwrap_or_else(|| {
         (
-            store::FORMAT_VERSION,
-            codec::allowlist_digest(snapshot_source),
+            source.properties().format,
+            source.properties().allowlist(),
             effective_revision(snapshot_source),
         )
     });
@@ -935,7 +927,11 @@ impl SharedCache {
     ) -> Result<Option<UpgradeRead>, RetailHold> {
         let key = store::key_digest(DurableSource::ClaudeCode, key);
         let mut stores = self.durable().ok_or(RetailHold::AccountingLost)?;
-        if !stores.claude.as_ref().is_some_and(|s| s.store.absent(&key)) {
+        if !stores
+            .slot(DurableSource::ClaudeCode)
+            .as_ref()
+            .is_some_and(|s| s.store.absent(&key))
+        {
             return Ok(None);
         }
         if !stores.fund_key(key) {
@@ -1082,7 +1078,7 @@ impl SharedCache {
     ) -> Option<Result<Taken<CachedJsonlReduction>, RestoreOutcome>> {
         let source = durable_source(snapshot_source)?;
         let store_key = store::key_digest(source, key);
-        let allowlist = codec::allowlist_digest(snapshot_source);
+        let allowlist = source.properties().allowlist();
         let record = {
             let mut stores = self.durable()?;
             stores.counters.restore_attempts += 1;
@@ -1206,7 +1202,7 @@ impl SharedCache {
         }
         if source == DurableSource::ClaudeCode && stores.fund_key(store_key) {
             let proof = stores
-                .claude
+                .slot(source)
                 .as_ref()?
                 .store
                 .mutation_witness(&record, &expected);
@@ -1348,7 +1344,7 @@ impl SharedCache {
         index: &ScanIndex,
     ) -> Option<store::BatchReceipt> {
         let source = durable_source(snapshot_source)?;
-        let allowlist = codec::allowlist_digest(snapshot_source);
+        let allowlist = source.properties().allowlist();
         let (touched, mut selected, namespace, identity_capture) = {
             let mut stores = self.durable()?;
             let slot = stores.slot(source).as_ref()?;
@@ -1473,12 +1469,16 @@ impl SharedCache {
             for key in offered.values() {
                 let digest = store::key_digest(source, key);
                 if !stores.fund_key(digest) {
-                    stores.claude.as_mut()?.store.revoke(&digest);
+                    stores
+                        .slot(DurableSource::ClaudeCode)
+                        .as_mut()?
+                        .store
+                        .revoke(&digest);
                     continue;
                 }
                 let stores = &mut *stores;
                 authorize_strict(
-                    stores.claude.as_mut()?,
+                    stores.slots[source.slot()].as_mut()?,
                     snapshot_source,
                     key,
                     index,
@@ -1515,8 +1515,7 @@ impl SharedCache {
             for digest in offered.keys() {
                 if let Some(c) = stores.retail_spent.get_mut(digest) {
                     if c.original.as_ref().is_some_and(|p| {
-                        stores
-                            .claude
+                        stores.slots[source.slot()]
                             .as_ref()
                             .expect("slot")
                             .store
@@ -1552,7 +1551,7 @@ impl SharedCache {
         let Some(source) = durable_source(snapshot_source) else {
             return Ok(());
         };
-        let allowlist = codec::allowlist_digest(snapshot_source);
+        let allowlist = source.properties().allowlist();
         let Some(mut stores) = self.durable() else {
             return Ok(());
         };

@@ -3122,7 +3122,7 @@ fn b1_absent_o3_fixture(sidecar_census_complete: bool, cancel_before_read: bool)
         .cache
         .durable()
         .unwrap()
-        .claude
+        .slot(DurableSource::ClaudeCode)
         .as_ref()
         .unwrap()
         .store
@@ -3391,8 +3391,11 @@ fn b1_strict_tail_writer_retries_with_the_original_witness_after_memo_loss() {
         let custody = &stores.retail_spent[&digest];
         assert!(custody.original.is_some());
         let spent = custody.spent.expect("retail high water retained");
-        stores.claude.as_mut().unwrap().store =
-            DurableTailStore::new(dir.clone(), DurableSource::ClaudeCode);
+        stores
+            .slot(DurableSource::ClaudeCode)
+            .as_mut()
+            .unwrap()
+            .store = DurableTailStore::new(dir.clone(), DurableSource::ClaudeCode);
         spent
     };
     store::test_hooks::set_before_rename(Some(Box::new(|_, _| {
@@ -3519,8 +3522,11 @@ fn c_strict_writer_retires_only_a_successfully_acknowledged_replacement() {
             let custody = &stores.retail_spent[&digest];
             assert!(custody.original.is_some());
             let spent = custody.spent.expect("retail high water retained");
-            stores.claude.as_mut().unwrap().store =
-                DurableTailStore::new(dir.clone(), DurableSource::ClaudeCode);
+            stores
+                .slot(DurableSource::ClaudeCode)
+                .as_mut()
+                .unwrap()
+                .store = DurableTailStore::new(dir.clone(), DurableSource::ClaudeCode);
             spent
         };
 
@@ -3565,7 +3571,11 @@ fn c_strict_writer_retires_only_a_successfully_acknowledged_replacement() {
                     .as_ref()
                     .expect("original custody on error");
                 assert_eq!(
-                    stores.claude.as_ref().unwrap().store.witness_current(proof),
+                    stores.slots[DurableSource::ClaudeCode.slot()]
+                        .as_ref()
+                        .unwrap()
+                        .store
+                        .witness_current(proof),
                     !ambiguous
                 );
                 assert_eq!(stores.retail_spent[&digest].spent, Some(spent));

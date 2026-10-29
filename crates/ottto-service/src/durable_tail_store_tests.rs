@@ -2139,3 +2139,53 @@ fn claude_mutation_proof_expires_at_pass_boundary_and_unmemoized_records_survive
     );
     assert_eq!(fs::read(&disk).unwrap(), before);
 }
+
+#[test]
+fn property_table_keeps_both_historical_v1_envelopes_byte_identical() {
+    use crate::snapshots::durable_sources::SOURCES;
+    use crate::snapshots::SnapshotSource;
+    let scratch = Scratch::new();
+    let path = scratch.transcript("synthetic.jsonl", b"{}\n");
+    assert_eq!(SOURCES.len(), 2);
+    assert_eq!(DurableSource::from_snapshot(SnapshotSource::Pi), None);
+    assert_eq!(DurableSource::from_tag(0), None);
+    assert_eq!(DurableSource::from_tag(3), None);
+    for (ordinal, row) in SOURCES.iter().enumerate() {
+        assert_eq!(row.source.slot(), ordinal);
+        assert_eq!(row.source.properties().source, row.source);
+        assert_eq!(DurableSource::from_snapshot(row.snapshot), Some(row.source));
+        assert_eq!(DurableSource::from_tag(row.tag), Some(row.source));
+        assert_eq!(row.tag, (ordinal + 1) as u8);
+        assert_eq!(row.format, 1);
+        assert_eq!(Some(row.allowlist()), parse_hex_digest(row.allowlist_pin));
+        let mut record = pending(
+            binding("acct", "scope", ("fp", None)),
+            certificate(&path),
+            1,
+        );
+        record.binding.source = row.source;
+        record.binding.key = key_digest(row.source, INDEX_KEY);
+        record.allowlist = row.allowlist();
+        record.body = crate::snapshots::durable_store_fixture_body(row.snapshot, 1, 7);
+        let stored = DurableRecord {
+            record,
+            index_generation: 17,
+            format: row.format,
+        };
+        let bytes = encode(&stored);
+        assert_eq!(bytes, pinned_v1_bytes(&stored.record, 17));
+        assert_eq!(&bytes[8..10], &1_u16.to_le_bytes());
+        assert_eq!(bytes[42], (ordinal + 1) as u8);
+        verify(&bytes, row.source).unwrap();
+        let decoded = decode(&bytes, &row.allowlist()).unwrap();
+        assert_eq!(decoded.record.body, stored.record.body);
+        assert_eq!(decoded.record.binding, stored.record.binding);
+        assert_eq!(decoded.index_generation, 17);
+        let mut unknown = bytes.clone();
+        unknown[10] ^= 1;
+        assert!(matches!(
+            decode_header(&unknown, &stored.record.binding.key, row.source),
+            Err(Refusal::Unknown)
+        ));
+    }
+}

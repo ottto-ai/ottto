@@ -511,10 +511,11 @@ impl OwnedSourceScan {
         namespace: Scope,
     ) -> Self {
         self.durable_guard = Some(Arc::downgrade(&cache));
-        if matches!(
-            self.source,
-            SnapshotSource::ClaudeCode | SnapshotSource::Codex
-        ) {
+        #[cfg(unix)]
+        let admitted = durable_tail::durable_source(self.source).is_some();
+        #[cfg(not(unix))]
+        let admitted = self.source != SnapshotSource::Pi;
+        if admitted {
             sampled_audit::normalize_marker_storage(&mut self.index);
             if self.source == SnapshotSource::ClaudeCode {
                 sampled_audit::restore_held_audit_deadlines(&mut self.index, now_seconds());

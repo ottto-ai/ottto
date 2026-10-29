@@ -116,6 +116,8 @@ mod launcher_recognition_tests;
 mod local_context_points;
 pub(crate) use local_context_points::LocalContextPoint;
 use local_context_points::{local_context_points_recent, LocalContextPoints};
+#[cfg(unix)]
+pub(crate) mod durable_sources;
 #[cfg(test)]
 pub(crate) mod e2_pipeline_scan_fixture;
 pub(crate) mod line_delivery;
@@ -134,7 +136,7 @@ pub(crate) fn verify_durable_body(
     let mut d = crate::durable_tail_codec::Dec::new(body);
     let nested = <SnapshotSource as crate::durable_tail_codec::Durable>::take(&mut d).ok();
     nested.and_then(sampled_scan::durable_tail::durable_source) == Some(source)
-        && sampled_jsonl::durable::verify(body).is_ok()
+        && (source.properties().verify)(body).is_ok()
 }
 #[cfg(all(test, unix))]
 pub(crate) fn durable_store_fixture_body(source: SnapshotSource, count: u64, sum: u64) -> Vec<u8> {
