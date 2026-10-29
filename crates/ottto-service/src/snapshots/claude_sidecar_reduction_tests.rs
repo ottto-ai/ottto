@@ -1559,3 +1559,84 @@ fn desktop_completed_census_counts_existing_held_retry_reads() {
         1
     );
 }
+
+#[test]
+fn desktop_inventory_backoff_keeps_growing_native_prefix_and_cold_body_parity() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    let home = crate::test_scratch::ScratchDir::new("desktop-growing-backoff");
+    let mut f = Fixture::new(1);
+    let old_dir = f.dir.clone();
+    f.dir = home.join(".claude/projects");
+    fs::create_dir_all(&f.dir).unwrap();
+    let path = f.dir.join(format!("{}.jsonl", f.session));
+    fs::rename(&f.path, &path).unwrap();
+    f.path = path;
+    fs::remove_dir_all(old_dir).unwrap();
+    let support = home.join("Library/Application Support");
+    let store = support
+        .join("Claude/claude-code-sessions")
+        .join("123e4567-e89b-12d3-a456-426614174000")
+        .join("123e4567-e89b-12d3-a456-426614174001");
+    fs::create_dir_all(&store).unwrap();
+    fs::write(
+        store.join("one.json"),
+        json!({"cliSessionId":f.session,"createdAt":"2026-08-02T06:59:00Z"}).to_string(),
+    )
+    .unwrap();
+    let cache = Arc::new(SharedCache::default());
+    let prior = settle(raw_scan_at(
+        &f,
+        ScanIndex::default(),
+        Some(cache.clone()),
+        true,
+        COLLECTED,
+        |_| {},
+    ));
+    assert!(prior.claude_desktop_identity_census_complete);
+    let alt = support.join("Claude-UNRELATED");
+    fs::create_dir_all(&alt).unwrap();
+    fs::write(alt.join("config.json"), "{}").unwrap();
+    f.append_transcript(1);
+    let at = "2026-08-02T07:10:01Z";
+    let (cached, rows) = crate::local_resource_diagnostics::capture(|| {
+        raw_scan_at(&f, prior.clone(), Some(cache), true, at, |_| {})
+    });
+    assert!(!cached.result.sidecar_census_complete);
+    assert!(
+        !cached.result.census_complete,
+        "native reuse never promotes census coverage"
+    );
+    assert!(!cached.index.claude_desktop_identity_census_complete);
+    assert_eq!(cached.result.snapshots.len(), 1);
+    assert_eq!(
+        cached.result.snapshots[0]
+            .session_account_evidence
+            .as_ref()
+            .unwrap()
+            .identity_disposition,
+        Some("missing")
+    );
+    assert_layout_mode(cached.modes, (0, 1, 0));
+    assert_eq!(
+        cached.native_bytes,
+        if crate::heap_layout_bound::layout_supported() {
+            (f.lines[1].len() + 1) as u64
+        } else {
+            fs::metadata(&f.path).unwrap().len()
+        }
+    );
+    assert_eq!(
+        rows.iter()
+            .filter_map(
+                |row| row["counts"]["desktop_metadata"]["scoped_acquisition_attempts"].as_u64()
+            )
+            .sum::<u64>(),
+        1
+    );
+    let full = raw_scan_at(&f, prior, None, true, at, |_| {});
+    assert_eq!(
+        exact_bodies(&cached),
+        exact_bodies(&full),
+        "the cold Full oracle applies the same incomplete metadata and emits identical bodies"
+    );
+}

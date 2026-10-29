@@ -87,3 +87,16 @@ qualified contract-5 requests keep their admission rules. Complete census recove
 marks existing account-held retries with a now-complete Desktop proof for read
 accounting. Their existing retry/retention path remains authoritative. Recovery
 never clears source fingerprints, the accepted body ledger or the owner map.
+
+`scoped_acquisition_attempts` counts Claude acquisition attempts whose inventory
+coverage is incomplete but whose per-session reduction dependencies are checked.
+Claude captures native reductions before applying Desktop metadata at finish;
+exact file scope, object/prefix samples, audit debt, copy limits and family gates
+still decide reuse. An unrelated inventory restart therefore does not convert a
+growing session's valid Tail into a prefix Full. This narrows acquisition's
+coverage prerequisite for Claude only. Census/identity/publication gates and
+Codex's closed-world prerequisite remain unchanged. A native macOS Tail fixture
+compares emitted bodies against a cold Full under the same partial metadata;
+Linux verifies the unsupported-layout Full fallback. A healthy inventory cooldown
+keeps retry_attempt=0, so a subsequent first metadata error retains the existing
+initial one-minute retry rather than accidentally doubling it.

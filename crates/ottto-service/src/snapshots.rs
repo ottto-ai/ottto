@@ -16511,16 +16511,21 @@ impl ClaudeTitleMetadata {
             sweep_had_errors
         };
 
-        if metadata.sidecar_census_incomplete || inventory_changed {
-            // Also cool down a completed inventory restart. Otherwise a small
-            // profile can flap forever without ever entering the error backoff.
-            // Healthy cached metadata remains usable during this quiet period.
+        if metadata.sidecar_census_incomplete {
             index.claude_desktop_store_retry_attempt =
                 index.claude_desktop_store_retry_attempt.saturating_add(1);
             let now = now.unwrap_or_default();
             index.claude_desktop_store_retry_not_before_unix_seconds = Some(now.saturating_add(
                 unhealthy_scan_retry_delay_seconds(index.claude_desktop_store_retry_attempt),
             ));
+        } else if inventory_changed {
+            // Healthy inventory cooldown is not an unhealthy attempt: the first
+            // later error must still get the ordinary initial retry interval.
+            index.claude_desktop_store_retry_attempt = 0;
+            index.claude_desktop_store_retry_not_before_unix_seconds = Some(
+                now.unwrap_or_default()
+                    .saturating_add(unhealthy_scan_retry_delay_seconds(1)),
+            );
         } else {
             index.claude_desktop_store_retry_attempt = 0;
             index.claude_desktop_store_retry_not_before_unix_seconds = None;
@@ -32426,7 +32431,20 @@ impl OwnedSourceScan {
                     .admission
                     .sidecar_census_complete
                     .observe(sidecar_census_complete);
-                if owning_header_is_current && state_census_complete && sidecar_census_complete {
+                // Claude's retained reduction is captured before metadata is
+                // applied in finish. Its exact per-session dependencies still
+                // fence reuse; unrelated inventory coverage cannot force a Full
+                // on growth. Coverage/identity/publication gates below remain
+                // unchanged, and Codex still needs its closed-world sidecars.
+                let scoped_claude_metadata =
+                    source == SnapshotSource::ClaudeCode && !sidecar_census_complete;
+                if owning_header_is_current
+                    && state_census_complete
+                    && (sidecar_census_complete || scoped_claude_metadata)
+                {
+                    if scoped_claude_metadata {
+                        crate::local_resource_diagnostics::claude_reread::desktop_scoped_acquisition();
+                    }
                     let reduction_sidecar = sampled_scan::reduction_dependencies(
                         source,
                         &candidate,
@@ -76416,6 +76434,10 @@ mod tests {
         let scope = Scope::begin(true);
         let first = load(&dirs, &mut index, "2026-10-25T10:00:00Z");
         assert!(!first.sidecar_census_incomplete);
+        assert_eq!(
+            index.claude_desktop_store_retry_attempt, 0,
+            "healthy cooldown does not consume an error attempt"
+        );
         assert!(index.claude_desktop_store_inventory.is_some());
         assert_eq!(
             index.claude_desktop_store_retry_not_before_unix_seconds,
