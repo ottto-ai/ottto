@@ -171,9 +171,10 @@ head's failure list remains the next runtime authority. Current83 groups are
 33 completion-fold,28 context/history awaiting the receipt PR,19 proof/grant,
 one named-agent money-liveness investigation, and two new fixture assumptions.
 The two new failures were investigated: E2 intentionally preserves its request-
-identity collector while account identity stays Unknown; the diagnostic age
-field moved away from the line suffix when retention JSON was appended.
-Exact token/cost/account and age checks stay. Correction setup now checks real
+identity collector while account identity stays Unknown; retention JSON had
+broken the diagnostic age suffix. Production now preserves that suffix, keeping
+historical-suite assertions byte-unchanged. Exact token/cost/account and age
+checks stay. Correction setup now checks real
 multi-page family coverage rather than assuming an ordinary terminal page has
 no retried family member. Exact finalizer identity capture remains evidence,
 not owned-start or census authority. An unchanged member may reconstruct its
