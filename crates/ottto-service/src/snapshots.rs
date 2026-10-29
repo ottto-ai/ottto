@@ -43486,18 +43486,6 @@ impl ScanIndex {
             let session_id = &item.source_session_id;
             let key = sha256_hex(&["session_owner:v1", machine_id, session_id]);
             let existing = self.session_account_bindings.get(&key);
-            if source == SnapshotSource::ClaudeCode
-                && existing.is_none()
-                && item
-                    .session_account_evidence
-                    .as_ref()
-                    .is_some_and(|evidence| evidence.identity_disposition == Some("conflict"))
-            {
-                // Conflicting native profiles cannot establish a new owner.
-                // Use the existing counted account-deferral/retention path.
-                deferred.insert(session_id.clone());
-                continue;
-            }
             match source {
                 SnapshotSource::Codex => {
                     if !codex_rows_prove_oauth(item) {
@@ -43562,6 +43550,19 @@ impl ScanIndex {
                     }
                 }
                 SnapshotSource::ClaudeCode => {
+                    if existing.is_none()
+                        && item
+                            .session_account_evidence
+                            .as_ref()
+                            .is_some_and(|evidence| {
+                                evidence.identity_disposition == Some("conflict")
+                            })
+                    {
+                        // Conflicting native profiles cannot establish a new owner.
+                        // Use the existing counted account-deferral/retention path.
+                        deferred.insert(session_id.clone());
+                        continue;
+                    }
                     let observed = exact_session_account_hash(item);
                     match (existing, observed.as_deref()) {
                         (Some(owner), Some(hash)) if owner.account_identifier_hash == hash => {}

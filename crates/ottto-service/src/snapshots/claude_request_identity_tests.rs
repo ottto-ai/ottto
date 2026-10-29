@@ -2826,6 +2826,28 @@ fn bind_owner_a(
     )
 }
 
+#[test]
+fn unbound_contract5_requests_survive_conflicting_creator_profiles() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    for mixed in [false, true] {
+        // Real request classification proves the rows independently of the
+        // creator. A cross-profile creator conflict must not revoke that proof.
+        let (dir, mut items, _) = bound_case(mixed, Some(OWNER_A));
+        items[0].session_account_evidence.as_mut().unwrap().identity_disposition = Some("conflict");
+        let mut capability = claude_request_accounts::MixedUploads::default();
+        capability.admit_request_identity(&items[0]);
+        assert!(capability.permits_request_identity(&items[0]));
+        let before = serde_json::to_value(&items).unwrap();
+        let (deferred, bindings, rows_unchanged) =
+            bind_owner_a(&mut items, &capability, false, "machine");
+        assert!(!deferred, "request proof does not establish a creator binding");
+        assert!(bindings.is_empty());
+        assert!(rows_unchanged);
+        assert_eq!(serde_json::to_value(&items).unwrap(), before);
+        let _ = fs::remove_dir_all(dir);
+    }
+}
+
 /// SESSION ruling 3: a bound session admits this scan's exact contract-5 body
 /// only when creator proof is absent or names the retained owner, for mixed
 /// AND single-identity bodies (including all-A rows that would take today's
