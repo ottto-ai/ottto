@@ -764,6 +764,11 @@ impl LocalHoldSettlement {
             None
         };
         disposition.retain_uploadable(&mut scan_result.snapshots);
+        crate::snapshots::record_lineage_parentless_while_incomplete(
+            source,
+            &scan_result.snapshots,
+            index,
+        );
         let retry_pending_family_count = index.claude_usage_authority_pending_count();
         Self {
             held_entity_count,
@@ -23814,7 +23819,8 @@ mod tests {
         std::fs::write(
             store.join("local_session.json"),
             serde_json::json!({
-                "cliSessionId":session,"createdAt":"2026-09-30T10:00:00Z"
+                "cliSessionId":session,"createdAt":"2026-09-30T10:00:00Z",
+                "spawnedFrom":{"sessionId":"local_missing_parent"}
             })
             .to_string(),
         )
@@ -23957,11 +23963,50 @@ mod tests {
                 &mut index,
                 snapshot_upload_body_witness,
             );
+            if cycle == 0 {
+                for account_hold in [false, true] {
+                    let mut held_page = page.clone();
+                    let mut held_index = index.clone();
+                    let mut held_disposition =
+                        crate::snapshots::ClaudeUsageAuthorityDisposition::default();
+                    let held_sessions = BTreeSet::from([session.to_string()]);
+                    if account_hold {
+                        held_disposition.defer_sessions(held_sessions);
+                    } else {
+                        held_disposition.hold_request_owned(held_sessions);
+                    }
+                    let scope =
+                        crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+                    let held = LocalHoldSettlement::classify(
+                        SnapshotSource::ClaudeCode,
+                        &mut held_index,
+                        &mut held_page,
+                        &held_disposition,
+                    );
+                    assert!(held.page_held());
+                    assert!(held_page.snapshots.is_empty());
+                    assert!(
+                        serde_json::to_value(scope.finish())
+                            .unwrap()
+                            .get("lineage_parentless_while_incomplete")
+                            .is_none(),
+                        "account/authority-held bodies are not offers"
+                    );
+                }
+            }
+            let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
             let holds = LocalHoldSettlement::classify(
                 SnapshotSource::ClaudeCode,
                 &mut index,
                 &mut page,
                 &disposition,
+            );
+            assert_eq!(
+                serde_json::to_value(scope.finish()).unwrap()
+                    ["lineage_parentless_while_incomplete"]["files"]
+                    .as_u64()
+                    .unwrap_or(0),
+                u64::from(cycle == 0)
             );
             assert!(!holds.any());
             assert_eq!(

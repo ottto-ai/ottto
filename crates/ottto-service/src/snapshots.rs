@@ -8157,8 +8157,6 @@ pub fn finalize_scan_after_policy_with_body_witness(
                 .unwrap_or(true)
     });
 
-    record_lineage_parentless_while_incomplete(source, &result.snapshots, index);
-
     // State-only Codex entities do not have a source-file fingerprint, so they
     // cannot use the file finalization table above. Rebind their durable map to
     // the final post-enrichment/post-policy/post-cutoff fingerprint here. This
@@ -8213,7 +8211,7 @@ pub fn finalize_scan_after_policy_with_body_witness(
 /// Observe only offers that survived policy, holds and semantic no-op removal.
 /// Cached Desktop child metadata is already resident; no source reads or durable
 /// state are needed. Scratch is bounded by this page's emitted items.
-fn record_lineage_parentless_while_incomplete(
+pub(crate) fn record_lineage_parentless_while_incomplete(
     source: SnapshotSource,
     snapshots: &[SnapshotItem],
     index: &ScanIndex,
@@ -77765,6 +77763,11 @@ mod tests {
             result.snapshots.push(item);
             let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
             finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut index);
+            record_lineage_parentless_while_incomplete(
+                SnapshotSource::ClaudeCode,
+                &result.snapshots,
+                &index,
+            );
             assert_eq!(result.snapshots.len(), 1, "the child is actually offered");
             let counts = serde_json::to_value(scope.finish()).unwrap();
             assert_eq!(
@@ -77779,6 +77782,11 @@ mod tests {
                 result.snapshots.push(result.snapshots[0].clone());
                 let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
                 finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut index);
+                record_lineage_parentless_while_incomplete(
+                    SnapshotSource::ClaudeCode,
+                    &result.snapshots,
+                    &index,
+                );
                 assert_eq!(
                     serde_json::to_value(scope.finish()).unwrap()
                         ["lineage_parentless_while_incomplete"]["files"],
@@ -77791,6 +77799,11 @@ mod tests {
                     .parent_session_ref = Some(parent.clone());
                 let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
                 finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut index);
+                record_lineage_parentless_while_incomplete(
+                    SnapshotSource::ClaudeCode,
+                    &result.snapshots,
+                    &index,
+                );
                 assert!(serde_json::to_value(scope.finish())
                     .unwrap()
                     .get("lineage_parentless_while_incomplete")
@@ -77800,6 +77813,11 @@ mod tests {
                 result.snapshots.truncate(1);
                 let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
                 finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut index);
+                record_lineage_parentless_while_incomplete(
+                    SnapshotSource::ClaudeCode,
+                    &result.snapshots,
+                    &index,
+                );
                 assert!(serde_json::to_value(scope.finish())
                     .unwrap()
                     .get("lineage_parentless_while_incomplete")
