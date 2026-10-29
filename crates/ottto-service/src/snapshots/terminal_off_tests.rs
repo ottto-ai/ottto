@@ -1197,3 +1197,42 @@ fn terminal_off_counterfactual_preview_preserves_the_actual_discovery_turn() {
         "the control clone did not consume the real owner's turn"
     );
 }
+
+#[test]
+fn terminal_off_unhinted_append_waits_for_real_cadence_then_is_discovered() {
+    let scratch = crate::test_scratch::ScratchDir::new("terminal-off-unhinted-cadence");
+    let path = scratch.join(format!("{OFF_ROOT}.jsonl"));
+    fs::write(&path, off_line(OFF_ROOT, "X")).unwrap();
+    let mut index = off_index();
+    let first = off_scan(&mut index, &scratch, W1, 10);
+    off_accept(&mut index, &first);
+    let key = local_index_key(&path);
+    let before = index.files[&key].source_file_fingerprint.clone();
+    let samples = START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get);
+    let bytes = TERMINAL_OFF_BODY_BYTES_FOR_TEST.with(std::cell::Cell::get);
+    // No watcher notification, memo expiry shortcut or source re-arm. Only
+    // the normal collected_at clock can discover this physical append.
+    let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+    use std::io::Write;
+    file.write_all(off_line(OFF_ROOT, "Y").as_bytes()).unwrap();
+    drop(file);
+    for at in ["2026-08-20T10:03:00Z", "2026-08-20T10:06:59Z"] {
+        index = serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
+        let quiet = off_scan(&mut index, &scratch, at, 10);
+        assert_eq!(quiet.scanned_file_count, 0);
+        assert_eq!(index.files[&key].source_file_fingerprint, before);
+        assert_eq!(
+            START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get),
+            samples
+        );
+        assert_eq!(
+            TERMINAL_OFF_BODY_BYTES_FOR_TEST.with(std::cell::Cell::get),
+            bytes
+        );
+    }
+    let changed = off_scan(&mut index, &scratch, "2026-08-20T10:07:00Z", 10);
+    assert_eq!(changed.scanned_file_count, 1);
+    assert_ne!(index.files[&key].source_file_fingerprint, before);
+    assert!(TERMINAL_OFF_BODY_BYTES_FOR_TEST.with(std::cell::Cell::get) > bytes);
+    assert!(!changed.census_complete);
+}

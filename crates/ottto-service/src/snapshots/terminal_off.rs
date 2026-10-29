@@ -423,16 +423,24 @@ fn refresh_terminal_off_discovery(
     // the corresponding path was consumed earlier in this retained window.
     // This wakes the existing bounded metadata walk; the ordinary candidate
     // selector and privacy/history/backoff gates still own every body read.
-    let owed = !index.terminal_contract_retries.is_empty()
-        || index.upload_context_fingerprint != index.active_upload_context_fingerprint
+    let owed = index
+        .terminal_contract_retries
+        .values()
+        .any(|key| !sampled_audit::candidate_open_blocked(key, now))
         || index.files.iter().any(|(key, entry)| {
-            entry.source_file_fingerprint.is_empty()
+            let needs_service = index.upload_context_fingerprint
+                != index.active_upload_context_fingerprint
+                || entry.source_file_fingerprint.is_empty()
                 || (!entry.has_unverified_source()
                     && entry.scan_identity_version.as_deref()
                         != Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION))
                 || sampled_audit::debt_for_key(index, key, now)
                     .is_some_and(|debt| now >= debt.due_unix_seconds)
-                || index.effective_upload_body_witness_revision_requires_adoption(key)
+                || index.effective_upload_body_witness_revision_requires_adoption(key);
+            // Keep D, but a forbidden open cannot authorize a whole-corpus
+            // rewalk. This is metadata-only: #903's same-stat backoff/park
+            // remains authoritative, while a changed stat wakes this key.
+            needs_service && !sampled_audit::candidate_open_blocked(key, now)
         });
     if !terminal_off_rediscovery_due(scope, now, changed || overflow || owed) {
         return;
