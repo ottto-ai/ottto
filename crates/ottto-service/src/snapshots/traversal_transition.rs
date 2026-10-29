@@ -74,6 +74,14 @@ pub(super) struct Starting {
 }
 
 impl Starting {
+    pub(super) fn rearm_cause(&self) -> crate::local_resource_diagnostics::rearm_cause::Cause {
+        use crate::local_resource_diagnostics::rearm_cause::Cause;
+        match self.reason {
+            StartReason::NoRetainedTraversal => Cause::NoRetainedTraversal,
+            StartReason::ContextChanged => Cause::ContextChanged,
+            StartReason::TerminalUnhealthyRetry => Cause::TerminalUnhealthyRetry,
+        }
+    }
     /// Called only AFTER the existing resume/backoff early return. Thus a
     /// retained matching traversal reached the real terminal-unhealthy retry.
     pub(super) fn capture(

@@ -7875,6 +7875,17 @@ fn admission_floor(cache: &SharedCache) -> usize {
     retained_floor(cache) + crate::snapshots::sampled_scan::side_ledger::SIDE_LEDGER_BYTES
 }
 
+/// Boundary requests must use the least cursor state admission can reach.
+/// Real scan pages also warm optional header facts; those can yield before
+/// provenance, witnesses or retained copies, and are not a mandatory floor.
+/// Keep `cursor_resident` whole so no-eviction assertions still include them.
+fn cursor_without_header_facts(cache: &SharedCache) -> usize {
+    let headers = cache
+        .with_cursor(|cursor| cursor.headers.optional_bytes().unwrap())
+        .unwrap();
+    cache.cursor_resident().checked_sub(headers).unwrap()
+}
+
 /// Every release `release_join_owners` reports, with its member keys.
 fn released(
     cache: &SharedCache,
@@ -8147,7 +8158,7 @@ fn hopeless_admission_evicts_nothing() {
         // Measured with no retained copy and no provenance: the least an
         // admission could ever evict down to.
         let floor = admission_floor(&cache);
-        let empty = cache.cursor_resident();
+        let empty = cursor_without_header_facts(&cache);
         cache.insert(
             key.clone(),
             sampled_jsonl::CompletedNativeAcquisition {
@@ -8183,9 +8194,12 @@ fn hopeless_admission_evicts_nothing() {
         }
         // Optional twin: room for the claim, not for the claim and the floor.
         let claim = join_charge(JOIN_THIRD, &members);
-        with_test_state_budget(resident + claim + floor - 1, || {
-            cache.record_join_owner(JOIN_THIRD, &members);
-        });
+        with_test_state_budget(
+            cursor_without_header_facts(&cache) + claim + floor - 1,
+            || {
+                cache.record_join_owner(JOIN_THIRD, &members);
+            },
+        );
         assert_eq!(join_entry(&cache, JOIN_THIRD), None);
         intact();
         assert_eq!(cache.cursor_resident(), resident);
@@ -8320,7 +8334,7 @@ fn outstanding_claim_is_charged_against_a_retained_insert() {
         assert!(cache.retained_checkpoint(&key).is_some());
         // F4b: the side ledger's reservation is part of the floor.
         let with_copy = admission_floor(&cache);
-        let state = cache.cursor_resident();
+        let state = cursor_without_header_facts(&cache);
         assert!(with_copy + state <= STATE_BYTES);
         let copy = cache.take(&key).expect("retained").retained;
         // F4b exact boundary: a claim that leaves exactly the copy's room
@@ -8862,7 +8876,7 @@ fn witness_admission() -> WitnessAdmission {
         .unwrap_or_else(|| panic!("a certified copy: {}", counters(&cache)))
         .retained;
     let floor = admission_floor(&cache);
-    let empty = cache.cursor_resident();
+    let empty = cursor_without_header_facts(&cache);
     // A single-session root has no parent refs: no `parents` entry exists.
     assert!(cache
         .with_cursor(|cursor| cursor.parents.is_empty())
@@ -8952,7 +8966,7 @@ fn hopeless_admission_keeps_every_witness() {
         }
         // Optional twin: a third namespace inside the floor window.
         let refused = counter(cache, |c| c.parent_witness_refused);
-        with_test_state_budget(resident + setup.floor + 1, || {
+        with_test_state_budget(cursor_without_header_facts(cache) + setup.floor + 1, || {
             assert!(!cache.witness_parent(
                 &Scope("witness-namespace-3".into()),
                 "scope",
@@ -8967,7 +8981,7 @@ fn hopeless_admission_keeps_every_witness() {
         // witness (its node and key) are forgotten.
         let node =
             crate::heap_layout_bound::tree_node_bytes::<String, (ParentWitness, usize)>().unwrap();
-        let after = resident
+        let after = cursor_without_header_facts(cache)
             - join_charge(JOIN_OWNER, &setup.members)
             - join_charge(JOIN_OTHER, &setup.members)
             - node
@@ -10818,6 +10832,131 @@ fn a_retained_insert_decides_without_the_proof_and_retires_it_when_needed() {
         credit.refund();
         assert_eq!(cache.cursor_reserved(), 0);
     });
+}
+
+/// R2 optional-header composition uses the existing main copy measure and
+/// production allocation callback, including the shape-F measure's view.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn header_facts_never_shrink_the_main_copy_budget_and_yield_before_allocation() {
+    let (root, fixture) = codex_file_join::tests::fixture();
+    let paths = fixture
+        .headers
+        .iter()
+        .map(|header| local_index_key(&header.candidate.path))
+        .collect();
+    let cache = Arc::new(SharedCache::default());
+    let credit = cache
+        .cursor_reserve(
+            STATE_BYTES - admission_floor(&cache) - cache.cursor_resident() - 128 * 1024,
+        )
+        .unwrap();
+    let first = codex_file_join::header_cache_tests::page(&root, &paths, &cache);
+    assert!(first.complete);
+    assert_eq!(first.reuse_misses, 2);
+    let bytes = cache
+        .with_cursor(|cursor| cursor.headers.optional_bytes().unwrap())
+        .unwrap();
+    assert!(bytes > 0);
+    cache.retire_headers_over_room(bytes);
+    assert_eq!(
+        cache
+            .with_cursor(|cursor| cursor.headers.optional_bytes().unwrap())
+            .unwrap(),
+        bytes
+    );
+    cache.retire_headers_over_room(bytes - 1);
+    assert!(cache
+        .with_cursor(|cursor| cursor.headers.is_empty())
+        .unwrap());
+    let refreshed = codex_file_join::header_cache_tests::page(&root, &paths, &cache);
+    assert_eq!((refreshed.reuse_misses, refreshed.reuse_evictions), (2, 2));
+    let job = proof_job("header-proof", "/idx/header-proof.json", "inc-1", 4096);
+    assert!(suspend(&cache, job));
+    cache.retire_headers_over_room(bytes);
+    assert!(cache
+        .with_cursor(|cursor| cursor.headers.is_empty())
+        .unwrap());
+    assert!(
+        cache.proof_suspended_for_test().is_some(),
+        "header pressure must preserve proof authority"
+    );
+    cache.retire_proof_over_room(0);
+    assert!(cache.proof_suspended_for_test().is_none());
+    let refreshed = codex_file_join::header_cache_tests::page(&root, &paths, &cache);
+    assert_eq!(refreshed.reuse_evictions, 2);
+    let context = main_context(&cache);
+    let (budget, step) = super::super::copy_budget_step(Some(&context), None, true);
+    assert!(budget > 0 && budget < super::super::ENTRY_BYTES);
+    let headers = cache
+        .with_cursor(|cursor| std::mem::take(&mut cursor.headers))
+        .unwrap();
+    let (cold_budget, cold_step) = super::super::copy_budget_step(Some(&context), None, true);
+    cache
+        .with_cursor(|cursor| cursor.headers = headers)
+        .unwrap();
+    assert_eq!((budget, step), (cold_budget, cold_step));
+    assert_eq!(
+        cache
+            .with_cursor(|cursor| cursor.headers.optional_bytes().unwrap())
+            .unwrap(),
+        bytes,
+        "measurement alone cannot evict"
+    );
+    super::super::retire_proof_beside_copy(Some(&context), budget, step);
+    assert!(cache
+        .with_cursor(|cursor| cursor.headers.is_empty())
+        .unwrap());
+    assert!(super::super::copy_retire_probe().unwrap().fits());
+    let next = codex_file_join::header_cache_tests::page(&root, &paths, &cache);
+    assert_eq!(
+        (next.reuse_hits, next.reuse_misses, next.reuse_evictions),
+        (0, 2, 2)
+    );
+    credit.refund();
+    assert_eq!(cache.cursor_reserved(), 0);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn release_paths_reclaim_headers_only_when_the_ranked_fit_is_reachable() {
+    for path in 0..3 {
+        let (root, fixture) = codex_file_join::tests::fixture();
+        let paths = fixture
+            .headers
+            .iter()
+            .map(|header| local_index_key(&header.candidate.path))
+            .collect();
+        let cache = SharedCache::default();
+        let first = codex_file_join::header_cache_tests::page(&root, &paths, &cache);
+        assert!(first.complete);
+        let before = cache
+            .with_cursor(|cursor| cursor.headers.optional_bytes().unwrap())
+            .unwrap();
+        assert!(before > 0);
+        let release = |pinned| match path {
+            0 => cache.release_to_fit(pinned),
+            1 => cache.release_older_to_fit(pinned, (1, 0)),
+            _ => cache.release_older_prefix_to_fit(pinned, (1, 0), 0),
+        };
+        assert!(!release(STATE_BYTES), "hopeless claims evict nothing");
+        assert_eq!(
+            cache
+                .with_cursor(|cursor| cursor.headers.optional_bytes().unwrap())
+                .unwrap(),
+            before
+        );
+        let pinned =
+            STATE_BYTES - cache.cursor_resident_for_main() + before - retained_floor(&cache);
+        assert!(release(pinned));
+        assert!(cache
+            .with_cursor(|cursor| cursor.headers.is_empty())
+            .unwrap());
+        let next = codex_file_join::header_cache_tests::page(&root, &paths, &cache);
+        assert_eq!((next.reuse_hits, next.reuse_evictions), (0, 2));
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 fn main_context(cache: &Arc<SharedCache>) -> super::super::Context {
@@ -13882,6 +14021,122 @@ fn decoder_floor_preserves_a_real_primary_tail_and_other_retained_copy() {
     });
 }
 
+/// Header occupancy is observable, never a decoder eviction or a promise
+/// that an unrelated progress admission will run before the next attempt.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
+fn decoder_header_occupancy_refusal_is_counted_without_reclamation() {
+    use crate::local_resource_diagnostics::capture;
+    let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let clock = TestClock;
+    clock.set(1_900_000_000);
+    with_test_limits(2048, 8192, 64, || {
+        let fixture = ScanRoot::new(40);
+        let cache = Arc::new(SharedCache::default());
+        let key = local_index_key(&fixture.file(SESSION));
+        let mut index = ScanIndex::default();
+        for _ in 0..64 {
+            let (next, _) = page(&fixture, index, Some(Arc::clone(&cache)));
+            index = next;
+            if cache.retained_checkpoint(&key).is_some() {
+                break;
+            }
+        }
+        assert!(cache.retained_checkpoint(&key).is_some());
+        let resident = cache.cursor_resident();
+        let headers = cache
+            .with_cursor(|cursor| cursor.headers.optional_bytes().unwrap())
+            .unwrap();
+        assert!(headers > 0, "production inventory warmed header facts");
+        let cursor = cursor_without_header_facts(&cache);
+        assert_eq!(resident, cursor + headers);
+        let retained = retained_floor(&cache);
+        let credit = codex_compressed_input::compressed_input_credit().unwrap();
+        let side = super::super::side_ledger::SIDE_LEDGER_BYTES;
+        // T is the exact free-only decoder boundary WITHOUT optional facts:
+        // C + R + D + ENTRY_BYTES + 2*SIDE. With facts it needs T + H.
+        let budget = cursor + retained + credit + ENTRY_BYTES + 2 * side;
+        let archive = Temp::new(
+            "decoder-header-occupancy",
+            &zstd::stream::encode_all(&b"synthetic archive"[..], 1).unwrap(),
+        );
+        let cause = "decoder_refused_header_occupancy";
+        let refuse = |limit, expected: usize| {
+            let ((), rows) = capture(|| {
+                with_test_state_budget(limit, || {
+                    assert!(OpenedInput::funded(File::open(&archive.0).unwrap(), &cache)
+                        .unwrap()
+                        .is_none());
+                });
+            });
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row["counts"]["codex_zst_refused"][cause].is_u64())
+                    .count(),
+                expected
+            );
+            assert_eq!(rows.len(), expected + 1, "only refusal count records");
+            assert!(rows.iter().any(|row| {
+                row["counts"]["codex_zst_refused"]["CompressedAdmissionRefused"].is_u64()
+            }));
+            assert_eq!(cache.cursor_resident(), resident, "no header reclamation");
+            assert!(cache.retained_checkpoint(&key).is_some());
+            assert_eq!(cache.cursor_reserved(), 0);
+        };
+        refuse(budget - 1, 0); // Even without facts it cannot fit.
+        for _ in 0..2 {
+            refuse(budget, 1); // Count each attempt; no bounded retry is claimed.
+        }
+        let other = Arc::new(SharedCache::default());
+        let owner = DecoderOwner::acquire(&other, 1).unwrap();
+        refuse(budget, 0); // Singleton busy is not header-occupancy refusal.
+        owner.release();
+
+        // An actual decoder fits with the measured H bytes available, and
+        // success produces no occupancy refusal or header eviction.
+        let ((), rows) = capture(|| {
+            with_test_state_budget(budget + headers, || {
+                let mut input = OpenedInput::funded(File::open(&archive.0).unwrap(), &cache)
+                    .unwrap()
+                    .unwrap();
+                input.read_exact(&mut [0; 1]).unwrap();
+                assert_eq!(cache.cursor_reserved(), credit);
+                input.close();
+            });
+        });
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["stage"], "codex_zst_input");
+        assert!(
+            rows[0]["counts"]["codex_zst_decoded_bytes"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert_eq!(cache.cursor_resident(), resident);
+        assert_eq!(cache.cursor_reserved(), 0);
+
+        // Test-only counterfactual control, not a production reclaim path:
+        // release ONLY H, then the same decoder fits the original exact T.
+        cache.with_cursor(|cursor| cursor.headers.clear()).unwrap();
+        assert_eq!(cache.cursor_resident(), cursor);
+        let ((), rows) = capture(|| {
+            with_test_state_budget(budget, || {
+                let input = OpenedInput::funded(File::open(&archive.0).unwrap(), &cache)
+                    .unwrap()
+                    .unwrap();
+                input.close();
+            });
+        });
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["stage"], "codex_zst_input");
+        assert_eq!(rows[0]["counts"]["codex_zst_decoded_bytes"], 0);
+        assert!(cache.retained_checkpoint(&key).is_some());
+        assert_eq!(cache.cursor_reserved(), 0);
+    });
+}
+
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
 fn decoder_release_and_unwind_follow_the_production_stores_guard() {
@@ -14116,4 +14371,128 @@ fn mcp_version_waits_for_resumed_cursor_eof() {
         }
         panic!("cursor never completed");
     });
+}
+
+/// R1 singleton: a paged cursor job starts while its file is indexed, so it
+/// captures no missing-carrier due, then parks; the per-pass index loses the
+/// entry. On completion settlement re-probes the record read-only (live
+/// context, once-clamped) and stages the marker, counting the miss and the
+/// staged transition once each. The job is not invalidated.
+#[test]
+fn parked_singleton_across_fresh_index_reprobes_record_debt() {
+    use crate::durable_tail_store as store;
+    use std::io::Read;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(40);
+    let path = fixture.file(SESSION);
+    let key = local_index_key(&path);
+    let incomplete = |scan: &mut OwnedSourceScan| scan.sidecar_census_complete = false;
+    let (mut index, _, _) = page_with(
+        &fixture,
+        ScanIndex::default(),
+        None,
+        "cursor-fixture",
+        NOW,
+        incomplete,
+    );
+    assert!(index.files.contains_key(&key));
+    // A same-context debt record for the indexed file.
+    let state = fixture.root.parent().unwrap().to_path_buf();
+    let index_path = state.join("index.json");
+    let scope = Scope("cursor-fixture".into());
+    let now = crate::snapshots::sampled_scan::now_seconds();
+    let due = now - 90;
+    let mut file = fs::File::open(&path).unwrap();
+    let mut plan =
+        crate::transcript_acquisition::ReadPlan::prepare(&mut file, None, &scope, None, now)
+            .unwrap();
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).unwrap();
+    plan.observe_complete_records(&bytes).unwrap();
+    let mut certificate = plan
+        .commit_after_native_completion(&file, &scope, now)
+        .unwrap()
+        .durable_certificate(0)
+        .unwrap();
+    certificate.audit_debt_unix_seconds = Some(due);
+    let ds = store::DurableSource::Codex;
+    let lock = crate::locked_state_dir::test_locks::hold(&state);
+    let mut disk = store::DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+    let pending = store::PendingRecord {
+        binding: store::Binding {
+            source: ds,
+            key: store::key_digest(ds, &key),
+            context: store::context_digest(&scope.0, None),
+            scope: [0; 32],
+            entry: [0; 32],
+        },
+        certificate,
+        body: crate::snapshots::durable_store_fixture_body(SnapshotSource::Codex, 0, 0),
+        allowlist: crate::snapshots::sampled_jsonl::durable::allowlist_digest(
+            SnapshotSource::Codex,
+        ),
+    };
+    assert_eq!(
+        disk.write_after_save(lock, 1, vec![pending])
+            .unwrap()
+            .written,
+        1
+    );
+    drop(disk);
+    fixture.append(SESSION, &token_line(41));
+    index.traversal = None;
+    let cache = Arc::new(SharedCache::default());
+    cache.durable_begin_pass(SnapshotSource::Codex, &index_path, &scope, false);
+    let index = with_test_limits(2048, 1024, 64, || {
+        let mut index = index;
+        let mut cleared = false;
+        for _ in 0..64 {
+            let (next, _, _) = page_with(
+                &fixture,
+                index,
+                Some(Arc::clone(&cache)),
+                "cursor-fixture",
+                NOW,
+                incomplete,
+            );
+            index = next;
+            let done =
+                counter(&cache, |c| c.jobs_certified) + counter(&cache, |c| c.jobs_uncertified);
+            if done > 0 {
+                break;
+            }
+            if !cleared && counter(&cache, |c| c.jobs_paused) > 0 {
+                // The per-pass index loads without the parked file's entry.
+                index.files.remove(&key);
+                cleared = true;
+            }
+        }
+        assert!(cleared, "the job parked: {}", counters(&cache));
+        assert_eq!(
+            counter(&cache, |c| c.jobs_invalidated),
+            0,
+            "{}",
+            counters(&cache)
+        );
+        index
+    });
+    assert_eq!(
+        index.files[&key].unverified_deadline(),
+        Some(due),
+        "staged from the record at settlement"
+    );
+    let (durable, _) = cache.durable_counters(SnapshotSource::Codex).unwrap();
+    // A start-time restore attempt on the then-indexed entry may count its
+    // own carrier miss (A's existing-entry rearm); the re-probe adds one.
+    assert!(durable
+        .ineligible
+        .get("audit_carrier")
+        .is_some_and(|n| *n >= 1));
+    assert_eq!(
+        durable.ineligible.get("audit_carrier_staged_unverified"),
+        Some(&1)
+    );
+    assert_eq!(durable.restored, 0);
 }

@@ -1,6 +1,7 @@
 //! Local proof for joining physical Codex rollouts. Requested-tier selectors
 //! retain the existing reader's meaning; response ownership is a separate fact.
 use super::*;
+use crate::transcript_acquisition::FileStamp;
 
 mod group_job;
 pub(super) use group_job::{
@@ -164,13 +165,16 @@ pub(super) fn member_home(root: &Path) -> PathBuf {
 }
 // One bounded secure acquisition path; semantic inventory and sampled-scope
 // witnesses both use it. Only inventory performs native header decoding.
-fn read_header_bytes(candidate: &CandidateFile) -> Result<(Vec<u8>, String, usize)> {
+fn read_header_bytes(candidate: &CandidateFile) -> Result<(Vec<u8>, String, usize, FileStamp)> {
     refuse_compressed_codex(Some(&candidate.path), None, CodexZstCause::HeaderUnfunded)?;
     let file = open_candidate_beneath_root(candidate)?;
     let before = file.metadata()?;
     anyhow::ensure!(before.is_file(), "Codex header is not a regular file");
+    let stamp = FileStamp::capture(before.clone())?;
     let mut reader = BufReader::with_capacity(1024, file.take((MAX_HEADER_BYTES + 1) as u64));
     let mut bytes = Vec::new();
+    #[cfg(all(test, unix))]
+    header_cache_tests::READ_CALLS.with(|calls| calls.set(calls.get() + 1));
     reader.read_until(b'\n', &mut bytes)?;
     anyhow::ensure!(
         bytes.len() <= MAX_HEADER_BYTES && bytes.last() == Some(&b'\n'),
@@ -179,15 +183,16 @@ fn read_header_bytes(candidate: &CandidateFile) -> Result<(Vec<u8>, String, usiz
     let after = reader.get_ref().get_ref().metadata()?;
     let witness = metadata_witness(&before);
     anyhow::ensure!(
-        metadata_witness(&after) == witness,
+        stamp.same_content(&FileStamp::capture(after.clone())?)
+            && metadata_witness(&after) == witness,
         HEADER_CHANGED_WHILE_READ
     );
     let read_bytes = (MAX_HEADER_BYTES + 1) - reader.get_ref().limit() as usize;
-    Ok((bytes, witness, read_bytes))
+    Ok((bytes, witness, read_bytes, stamp))
 }
-type ReadHeader = (String, Option<i64>, String, usize);
+type ReadHeader = (CachedHeader, String);
 fn read_header(candidate: &CandidateFile) -> Result<ReadHeader> {
-    let (bytes, witness, read_bytes) = read_header_bytes(candidate)?;
+    let (bytes, witness, read_bytes, stamp) = read_header_bytes(candidate)?;
     #[cfg(test)]
     codex_zst_refusal_tests::jsonl_parse_attempted();
     let value: Value = serde_json::from_slice(&bytes)?;
@@ -200,7 +205,15 @@ fn read_header(candidate: &CandidateFile) -> Result<ReadHeader> {
         .and_then(Value::as_str)
         .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
         .and_then(|created| i64::try_from(created.unix_timestamp_nanos() / 1_000_000).ok());
-    Ok((owner, created_unix_ms, witness, read_bytes))
+    Ok((
+        CachedHeader {
+            stamp,
+            owner,
+            created_unix_ms,
+            read_bytes,
+        },
+        witness,
+    ))
 }
 /// Live rollouts are appended to while the inventory reads them. An append
 /// that lands during the bounded first-record read moves the bracketing
@@ -235,8 +248,102 @@ pub(super) fn path_witness(path: &Path) -> Option<String> {
 /// Raw header digest for a file whose owning header the native inventory has
 /// already established. No extra decoded Value is retained or allocated.
 pub(super) fn header_reduction_witness(candidate: &CandidateFile) -> Result<String> {
-    read_header_bytes(candidate).map(|(bytes, _, _)| format!("{:x}", Sha256::digest(bytes)))
+    read_header_bytes(candidate).map(|(bytes, _, _, _)| format!("{:x}", Sha256::digest(bytes)))
 }
+
+/// RAM-only validated facts; candidate attribution and metadata witnesses are
+/// rebuilt from the current secure object on every inventory step.
+#[derive(Clone, Debug)]
+pub(in crate::snapshots) struct CachedHeader {
+    stamp: FileStamp,
+    owner: String,
+    created_unix_ms: Option<i64>,
+    read_bytes: usize,
+}
+#[derive(Default)]
+pub(in crate::snapshots) struct HeaderCache {
+    entries: BTreeMap<String, CachedHeader>,
+    // Immutable entry heaps, charged once at insertion via their field macros.
+    // Keep the cursor's per-step walk independent of the roster population.
+    heap_bytes: usize,
+    // Pending count, drained into the next active Codex inventory carrier.
+    evictions: usize,
+}
+impl HeaderCache {
+    pub(in crate::snapshots) fn retain_roster(&mut self, paths: &VecDeque<PathBuf>) {
+        // Pending paths preserve the roster's complete-string sort order.
+        let heap_bytes = &mut self.heap_bytes;
+        let evictions = &mut self.evictions;
+        self.entries.retain(|key, header| {
+            let keep = paths
+                .binary_search_by(|path| path.as_os_str().cmp(Path::new(key).as_os_str()))
+                .is_ok();
+            if !keep {
+                *evictions = evictions.saturating_add(1);
+                *heap_bytes = heap_bytes.saturating_sub(Self::entry_heap(key.capacity(), header));
+            }
+            keep
+        });
+    }
+    pub(in crate::snapshots) fn clear(&mut self) {
+        self.evictions = self.evictions.saturating_add(self.entries.len());
+        self.entries.clear();
+        self.heap_bytes = 0;
+    }
+    fn take_evictions(&mut self) -> usize {
+        std::mem::take(&mut self.evictions)
+    }
+    pub(in crate::snapshots) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+    pub(in crate::snapshots) fn admission_charge(
+        key_capacity: usize,
+        header: &CachedHeader,
+    ) -> Option<usize> {
+        crate::heap_layout_bound::tree_node_bytes::<String, CachedHeader>()?
+            .checked_add(Self::entry_heap(key_capacity, header))
+    }
+    pub(in crate::snapshots) fn get(&self, key: &str) -> Option<CachedHeader> {
+        self.entries.get(key).cloned()
+    }
+    pub(in crate::snapshots) fn refresh(&mut self, key: String, header: Option<CachedHeader>) {
+        if let Some((key, old)) = self.entries.remove_entry(&key) {
+            self.evictions = self.evictions.saturating_add(1);
+            self.heap_bytes = self
+                .heap_bytes
+                .saturating_sub(Self::entry_heap(key.capacity(), &old));
+        }
+        if let Some(header) = header {
+            if self.entries.len() < MAX_HEADER_FILES {
+                self.heap_bytes = self
+                    .heap_bytes
+                    .saturating_add(Self::entry_heap(key.capacity(), &header));
+                self.entries.insert(key, header);
+            }
+        }
+    }
+    fn entry_heap(key_capacity: usize, header: &CachedHeader) -> usize {
+        use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+        let mut c = Counter::new(usize::MAX);
+        c.add(key_capacity)
+            .and_then(|()| header.heap_bound(&mut c))
+            .map_or(usize::MAX, |()| c.bytes)
+    }
+    pub(in crate::snapshots) fn optional_bytes(&self) -> Option<usize> {
+        crate::heap_layout_bound::tree_node_bytes::<String, CachedHeader>()?
+            .checked_mul(self.entries.len())?
+            .checked_add(self.heap_bytes)
+    }
+    pub(in crate::snapshots) fn charge(
+        &self,
+        c: &mut crate::heap_layout_bound::Counter,
+    ) -> Option<()> {
+        crate::heap_layout_bound::tree_nodes::<String, CachedHeader>(self.entries.len(), c)?;
+        c.add(self.heap_bytes)
+    }
+}
+crate::heap_layout_bound::fields!(CachedHeader; stamp, owner, created_unix_ms, read_bytes);
+crate::heap_layout_bound::fields!(HeaderCache; entries, heap_bytes, evictions);
 
 /// One small secure header read per existing native scan step. No transcript
 /// or header Value is parked between steps.
@@ -248,6 +355,11 @@ pub(super) struct HeaderInventory {
     pub(super) directories: DirectoryCensus,
     pub(super) complete: bool,
     pub(super) read_bytes: usize,
+    pub(super) reuse_hits: usize,
+    pub(super) reuse_misses: usize,
+    pub(super) bytes_avoided: usize,
+    pub(super) reuse_evictions: usize,
+    cache_pruned: bool,
     /// Roster files whose first record was refused, each with the metadata
     /// witness seen at the refusal (`None` when it could not be read). This is
     /// the evidence a held page waits on; see `CodexInventoryHold`.
@@ -281,6 +393,11 @@ impl HeaderInventory {
             complete: paths.len() <= MAX_HEADER_FILES
                 && directories.is_some_and(|value| value.stable),
             read_bytes: 0,
+            reuse_hits: 0,
+            reuse_misses: 0,
+            bytes_avoided: 0,
+            reuse_evictions: 0,
+            cache_pruned: false,
             refused: BTreeMap::new(),
             bounded_out: paths.len() > MAX_HEADER_FILES
                 || !directories.is_some_and(|value| value.stable),
@@ -304,7 +421,28 @@ impl HeaderInventory {
             .map(|index| self.headers[index].owner.as_str())
     }
 
+    #[cfg(test)]
     pub(super) fn step(&mut self, metadata: &CodexTitleMetadata) -> bool {
+        self.step_cached(metadata, None)
+    }
+    pub(super) fn step_cached(
+        &mut self,
+        metadata: &CodexTitleMetadata,
+        cache: Option<&sampled_scan::SharedCache>,
+    ) -> bool {
+        if !self.cache_pruned {
+            self.cache_pruned = true;
+            if let Some(cache) = cache {
+                cache.with_cursor(|cursor| cursor.headers.retain_roster(&self.pending));
+            }
+        }
+        if let Some(cache) = cache {
+            self.reuse_evictions = self.reuse_evictions.saturating_add(
+                cache
+                    .with_cursor(|cursor| cursor.headers.take_evictions())
+                    .unwrap_or(0),
+            );
+        }
         let Some(path) = self.pending.pop_front() else {
             return true;
         };
@@ -325,7 +463,12 @@ impl HeaderInventory {
             self.bounded_out = true;
             return false;
         };
+        // 11b-0b composition: skip a currently held file BEFORE any header
+        // lookup. Reuse only owner/time/stamp/read-count facts; rebuild custody
+        // cause, owner fences, completeness, membership and exclusions each pass.
+        // The second landing must preserve 11b's early skip and test warm -> held.
         let key = local_index_key(&path);
+        self.reuse_misses += 1;
         let result = (|| -> Result<HeaderWitness> {
             let stat = fs::symlink_metadata(&path)?;
             anyhow::ensure!(
@@ -359,25 +502,57 @@ impl HeaderInventory {
                 &ClaudeTitleMetadata::default(),
                 None,
             );
-            let (header, retried) = read_header_settled(&candidate);
-            // Each abandoned attempt may have consumed its whole bounded prefix.
-            self.read_bytes = self
-                .read_bytes
-                .saturating_add(retried.saturating_mul(MAX_HEADER_BYTES + 1));
-            let (owner, created_unix_ms, witness, bytes) = header?;
-            self.read_bytes = self.read_bytes.saturating_add(bytes);
+            let mut reused = None;
+            if let Some(cached) = cache.and_then(|cache| {
+                cache
+                    .with_cursor(|cursor| cursor.headers.get(&key))
+                    .flatten()
+            }) {
+                let current = open_candidate_beneath_root(&candidate)?.metadata()?;
+                let stamp = FileStamp::capture(current.clone())?;
+                // Non-Unix stamps have no object identity; length alone
+                // cannot authorize reuse of owning-header facts.
+                if cached.stamp.same_object(&stamp) && cached.stamp.same_content(&stamp) {
+                    self.reuse_hits += 1;
+                    self.reuse_misses -= 1;
+                    self.bytes_avoided = self.bytes_avoided.saturating_add(cached.read_bytes);
+                    reused = Some((cached, metadata_witness(&current)));
+                }
+            }
+            let (facts, witness) = match reused {
+                Some(header) => header,
+                None => {
+                    if let Some(cache) = cache {
+                        cache.refresh_header(key.clone(), None);
+                    }
+                    let (header, retried) = read_header_settled(&candidate);
+                    // Each abandoned attempt may consume its whole prefix.
+                    self.read_bytes = self
+                        .read_bytes
+                        .saturating_add(retried.saturating_mul(MAX_HEADER_BYTES + 1));
+                    let (facts, witness) = header?;
+                    self.read_bytes = self.read_bytes.saturating_add(facts.read_bytes);
+                    if let Some(cache) = cache {
+                        cache.refresh_header(key.clone(), Some(facts.clone()));
+                    }
+                    (facts, witness)
+                }
+            };
             Ok(HeaderWitness {
                 home: member_home(&candidate.scan_root),
                 candidate,
-                owner,
-                created_unix_ms,
+                owner: facts.owner,
+                created_unix_ms: facts.created_unix_ms,
                 metadata: witness,
-                stamp: crate::transcript_acquisition::FileStamp::capture(stat)?,
+                stamp: facts.stamp,
             })
         })();
         match result {
             Ok(header) => self.headers.push(header),
             Err(_) => {
+                if let Some(cache) = cache {
+                    cache.refresh_header(key.clone(), None);
+                }
                 self.complete = false;
                 // A failed read may have consumed its whole bounded prefix.
                 self.read_bytes = self.read_bytes.saturating_add(MAX_HEADER_BYTES + 1);
@@ -434,10 +609,10 @@ impl HeaderInventory {
             if metadata_witness(&stat) == header.metadata {
                 continue;
             }
-            let (current_owner, _, _, _) = read_header(&header.candidate)?;
+            let (current, _) = read_header(&header.candidate)?;
             anyhow::ensure!(
-                current_owner == header.owner
-                    || (!selected.contains(&current_owner) && !selected.contains(&header.owner)),
+                current.owner == header.owner
+                    || (!selected.contains(&current.owner) && !selected.contains(&header.owner)),
                 "Codex joining header ownership changed"
             );
         }
@@ -446,7 +621,7 @@ impl HeaderInventory {
 }
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
 crate::heap_layout_bound::fields!(HeaderWitness; candidate, owner, home, created_unix_ms, metadata, stamp);
-crate::heap_layout_bound::fields!(HeaderInventory; roots, pending, headers, directories, complete, read_bytes, refused, bounded_out);
+crate::heap_layout_bound::fields!(HeaderInventory; roots, pending, headers, directories, complete, read_bytes, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, bounded_out);
 
 #[derive(Clone, Debug)]
 pub(super) struct Group {
@@ -3954,3 +4129,239 @@ pub(super) mod tests {
         assert_eq!(stream(&[changed]), Some((JoinRefusal::UiUnmatched, 0)));
     }
 }
+
+#[cfg(all(test, unix))]
+pub(in crate::snapshots) mod header_cache_tests {
+    use super::*;
+    thread_local! {
+        pub(in crate::snapshots) static READ_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    pub(in crate::snapshots) fn page(
+        root: &Path,
+        paths: &BTreeSet<String>,
+        cache: &sampled_scan::SharedCache,
+    ) -> HeaderInventory {
+        let sessions = root.join("sessions");
+        let mut census = DirectoryCensus::new();
+        census.observe(&sessions, &fs::metadata(&sessions).unwrap());
+        let mut inventory = HeaderInventory::new(&[sessions], paths, Some(&census));
+        while !inventory.step_cached(&CodexTitleMetadata::default(), Some(cache)) {}
+        inventory
+    }
+    fn assert_charge(cache: &HeaderCache) {
+        use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+        let mut summary = Counter::new(usize::MAX);
+        cache.charge(&mut summary).unwrap();
+        let mut walked = Counter::new(usize::MAX);
+        cache.completed_heap_bound(&mut walked).unwrap();
+        assert_eq!(summary.bytes, walked.bytes);
+        assert!(summary.visits_for_test() < 10);
+    }
+    fn paths(inventory: &HeaderInventory) -> BTreeSet<String> {
+        inventory
+            .headers
+            .iter()
+            .map(|header| local_index_key(&header.candidate.path))
+            .collect()
+    }
+    fn facts(inventory: &HeaderInventory) -> Vec<(String, String, Option<i64>)> {
+        inventory
+            .headers
+            .iter()
+            .map(|header| {
+                (
+                    local_index_key(&header.candidate.path),
+                    header.owner.clone(),
+                    header.created_unix_ms,
+                )
+            })
+            .collect()
+    }
+    #[test]
+    fn unchanged_pages_reuse_without_reading_and_restart_is_cold() {
+        let (root, fixture) = tests::fixture();
+        let paths = paths(&fixture);
+        let cache = sampled_scan::SharedCache::default();
+        let first = page(&root, &paths, &cache);
+        assert!(first.complete);
+        assert_eq!(first.reuse_misses, paths.len());
+        assert!(first.read_bytes > 0);
+        READ_CALLS.with(|calls| calls.set(0));
+        let second = page(&root, &paths, &cache);
+        assert!(second.complete);
+        assert_eq!(second.reuse_hits, paths.len());
+        assert_eq!(second.reuse_misses, 0);
+        assert_eq!(second.reuse_evictions, 0);
+        assert_eq!(second.read_bytes, 0);
+        assert_eq!(second.bytes_avoided, first.read_bytes);
+        READ_CALLS.with(|calls| assert_eq!(calls.get(), 0));
+        assert_eq!(facts(&first), facts(&second));
+        let cold = page(&root, &paths, &sampled_scan::SharedCache::default());
+        assert_eq!(facts(&cold), facts(&second));
+        assert_eq!(cold.read_bytes, first.read_bytes);
+        READ_CALLS.with(|calls| assert_eq!(calls.get(), paths.len()));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn growth_and_replacement_refresh_once_failures_never_become_hits() {
+        let (root, fixture) = tests::fixture();
+        let paths = paths(&fixture);
+        let cache = sampled_scan::SharedCache::default();
+        page(&root, &paths, &cache);
+        let path = Path::new(paths.first().unwrap());
+        let original = fs::read(path).unwrap();
+        let mut grown = original.clone();
+        grown.extend_from_slice(b"{}\n");
+        fs::write(path, &grown).unwrap();
+        READ_CALLS.with(|calls| calls.set(0));
+        let growth = page(&root, &paths, &cache);
+        assert_eq!(growth.reuse_misses, 1);
+        assert_eq!(growth.reuse_hits, 1);
+        assert_eq!(growth.reuse_evictions, 1);
+        READ_CALLS.with(|calls| assert_eq!(calls.get(), 1));
+        assert_eq!(page(&root, &paths, &cache).read_bytes, 0);
+        let modified = fs::metadata(path).unwrap().modified().unwrap();
+        let replacement = root.join("replacement");
+        fs::write(&replacement, &grown).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        fs::rename(replacement, path).unwrap();
+        let replaced = page(&root, &paths, &cache);
+        assert_eq!(replaced.reuse_misses, 1, "inode alone invalidates");
+        assert_eq!(replaced.reuse_evictions, 1);
+        assert_eq!(page(&root, &paths, &cache).read_bytes, 0);
+        fs::write(path, b"{incomplete").unwrap();
+        for attempt in 0..2 {
+            let refused = page(&root, &paths, &cache);
+            assert!(!refused.complete);
+            assert_eq!(refused.refused.len(), 1);
+            assert_eq!(refused.reuse_misses, 1);
+            assert_eq!(refused.reuse_hits, 1);
+            assert_eq!(refused.reuse_evictions, usize::from(attempt == 0));
+            assert!(cache
+                .with_cursor(|cursor| cursor.headers.get(paths.first().unwrap()))
+                .unwrap()
+                .is_none());
+        }
+        fs::write(path, original).unwrap();
+        assert_eq!(page(&root, &paths, &cache).reuse_misses, 1);
+        assert_eq!(page(&root, &paths, &cache).read_bytes, 0);
+        fs::remove_file(path).unwrap();
+        let missing = page(&root, &paths, &cache);
+        assert!(!missing.complete, "unreadable is not a hit");
+        assert_eq!(missing.reuse_evictions, 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn byte_admission_refuses_optional_facts_and_clear_releases_them() {
+        let (root, fixture) = tests::fixture();
+        let paths = paths(&fixture);
+        let cache = sampled_scan::SharedCache::default();
+        let refused =
+            sampled_scan::codex_cursor::with_test_state_budget(0, || page(&root, &paths, &cache));
+        assert!(
+            refused.complete,
+            "cache refusal never refuses the inventory"
+        );
+        assert_eq!(facts(&refused), facts(&fixture));
+        assert!(cache
+            .with_cursor(|cursor| cursor.headers.is_empty())
+            .unwrap());
+        let populated = page(&root, &paths, &cache);
+        assert_eq!(populated.reuse_misses, paths.len());
+        assert_eq!(page(&root, &paths, &cache).read_bytes, 0);
+        cache.clear();
+        assert!(cache
+            .with_cursor(|cursor| cursor.headers.is_empty())
+            .unwrap());
+        READ_CALLS.with(|calls| calls.set(0));
+        let cleared = page(&root, &paths, &cache);
+        assert_eq!(cleared.reuse_misses, paths.len());
+        assert_eq!(cleared.reuse_evictions, paths.len());
+        READ_CALLS.with(|calls| assert_eq!(calls.get(), paths.len()));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn cache_population_is_capped_and_roster_removal_evicts() {
+        let (root, fixture) = tests::fixture();
+        let mut paths = paths(&fixture);
+        let cache = sampled_scan::SharedCache::default();
+        page(&root, &paths, &cache);
+        cache
+            .with_cursor(|cursor| {
+                let facts = cursor.headers.get(paths.first().unwrap()).unwrap();
+                for number in 0..=MAX_HEADER_FILES {
+                    cursor
+                        .headers
+                        .refresh(format!("fake-{number}"), Some(facts.clone()));
+                }
+                assert_eq!(cursor.headers.entries.len(), MAX_HEADER_FILES);
+                assert_charge(&cursor.headers);
+            })
+            .unwrap();
+        let removed = paths.pop_last().unwrap();
+        let next = page(&root, &paths, &cache);
+        assert_eq!(next.reuse_hits, 1);
+        assert_eq!(next.reuse_evictions, MAX_HEADER_FILES - 1);
+        cache
+            .with_cursor(|cursor| {
+                assert_eq!(cursor.headers.entries.len(), 1);
+                assert!(cursor.headers.get(&removed).is_none());
+                assert_charge(&cursor.headers);
+            })
+            .unwrap();
+        let empty = page(&root, &BTreeSet::new(), &cache);
+        assert_eq!(empty.reuse_evictions, 1);
+        cache
+            .with_cursor(|cursor| {
+                assert!(cursor.headers.entries.is_empty());
+                assert_charge(&cursor.headers);
+            })
+            .unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn ctime_only_reuses_but_nanosecond_mtime_and_symlink_do_not() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let (root, fixture) = tests::fixture();
+        let paths = paths(&fixture);
+        let cache = sampled_scan::SharedCache::default();
+        page(&root, &paths, &cache);
+        let path = Path::new(paths.first().unwrap());
+        let stat = fs::metadata(path).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        let unchanged = page(&root, &paths, &cache);
+        assert_eq!(unchanged.read_bytes, 0);
+        // A refreshed ctime witness also avoids validation's fallback read.
+        READ_CALLS.with(|calls| calls.set(0));
+        unchanged
+            .validate_membership(&fixture.headers[0].owner, &root)
+            .unwrap();
+        READ_CALLS.with(|calls| assert_eq!(calls.get(), 0));
+        let modified = stat.modified().unwrap() + std::time::Duration::from_nanos(1);
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert_eq!(page(&root, &paths, &cache).reuse_misses, 1);
+        let moved = root.join("moved");
+        fs::rename(path, &moved).unwrap();
+        symlink(&moved, path).unwrap();
+        let refused = page(&root, &paths, &cache);
+        assert!(!refused.complete);
+        assert_eq!(refused.refused.len(), 1);
+        assert_eq!(refused.reuse_hits, 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
+#[path = "codex_file_join/header_cache_output_tests.rs"]
+mod header_cache_output_tests;
