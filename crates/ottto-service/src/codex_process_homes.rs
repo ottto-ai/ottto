@@ -2,8 +2,11 @@
 //! Open rollout paths prove which home that process used without reading its
 //! environment, arguments, credentials, or any transcript content.
 
+#[cfg(any(target_os = "macos", test))]
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "macos", test))]
+use std::path::Path;
+use std::path::PathBuf;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CodexProcessHome {
@@ -26,6 +29,7 @@ pub(crate) fn running_codex_homes() -> Vec<CodexProcessHome> {
     Vec::new()
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn parse_open_rollouts(body: &str) -> Vec<CodexProcessHome> {
     let mut processes = BTreeMap::<u32, (String, BTreeSet<PathBuf>)>::new();
     let mut current_pid = None;
@@ -53,6 +57,7 @@ fn parse_open_rollouts(body: &str) -> Vec<CodexProcessHome> {
         .collect()
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn rollout_home(path: &Path) -> Option<PathBuf> {
     if !path.is_absolute()
         || path.extension().and_then(|part| part.to_str()) != Some("jsonl")

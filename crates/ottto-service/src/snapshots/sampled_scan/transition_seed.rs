@@ -43,14 +43,22 @@ pub(crate) fn seed_pinned_v1(
     let slot = stores.slot(ds).as_mut().unwrap();
     let interpretation =
         Interpretation::of(source, key, index, slot.identity_capture, &slot.namespace);
-    let expected = expected(ds, source, key, checkpoint.scope(), index, &interpretation).unwrap();
-    let record = match slot
-        .store
-        .read(&expected.binding.key, &codec::allowlist_digest(source))
-    {
+    let expected = expected(
+        ds,
+        source,
+        key,
+        checkpoint.scope(),
+        index,
+        &interpretation,
+        None,
+    )
+    .unwrap();
+    let record = match slot.store.read(&expected.binding.key) {
         ReadOutcome::Found(record) => record,
         other => panic!("pinned writer did not produce a readable record: {other:?}"),
     };
+    assert_eq!(record.format, 1);
+    assert_eq!(record.record.allowlist, codec::allowlist_digest(source));
     assert_eq!(record.record.binding, expected.binding);
     assert_eq!(record.index_generation, index.generation);
     let name = expected

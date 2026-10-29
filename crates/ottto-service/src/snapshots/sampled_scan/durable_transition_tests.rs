@@ -582,14 +582,12 @@ fn shared_transition_crash_edges_reach_sigkill_and_keep_a_valid_survivor() {
             1,
             "{point:?}: predecessor or successor survives"
         );
-        let outcome = store.read(
-            inventory.iter().next().unwrap(),
-            &fixture::allowlist_digest(SOURCE),
-        );
-        assert!(
-            matches!(outcome, crate::durable_tail_store::ReadOutcome::Found(_)),
-            "{point:?}: survivor structurally verified"
-        );
+        match store.read(inventory.iter().next().unwrap()) {
+            crate::durable_tail_store::ReadOutcome::Found(record) => {
+                assert_eq!(record.record.allowlist, fixture::allowlist_digest(SOURCE));
+            }
+            other => panic!("{point:?}: survivor not structurally verified: {other:?}"),
+        }
         // Restart the native pipeline over the actual survivor, then append.
         // A post-index-save/pre-record crash may need M1's Full fallback; it
         // must still emit current money, never the older record's smaller body.

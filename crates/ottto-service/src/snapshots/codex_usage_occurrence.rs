@@ -54,6 +54,27 @@ pub(super) struct CodexCounting {
 }
 
 impl CodexCounting {
+    pub(super) fn durable_cutover(&self) -> Option<i64> {
+        self.cutover_unix_ms
+    }
+
+    #[cfg(test)]
+    pub(super) fn durable_contract(&self) -> (Option<i64>, u8, u8) {
+        (
+            self.cutover_unix_ms,
+            match self.version {
+                None => 0,
+                Some(CountingVersion::Legacy) => 1,
+                Some(CountingVersion::V2) => 2,
+            },
+            match self.evidence {
+                AckEvidence::None => 0,
+                AckEvidence::V2Marked => 1,
+                AckEvidence::LegacyAcked => 2,
+            },
+        )
+    }
+
     pub(super) fn new(evidence: AckEvidence, cutover_unix_ms: Option<i64>) -> Self {
         Self {
             evidence,
