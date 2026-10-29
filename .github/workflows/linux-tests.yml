@@ -98,6 +98,9 @@ jobs:
         # Keep going past a failing test binary so one run lists every failure.
         run: cargo test --workspace --locked --no-fail-fast -- --nocapture
 
+      - name: Custody old-reader compatibility (0.1.201 and pinned R1)
+        run: python3 scripts/test_codex_zst_downgrade.py --r1 0061a4b0cd2bb71510e67586e949a0362609e6ee
+
       - name: Connector tests
         run: cargo test --manifest-path crates/Cargo.toml --workspace --locked
 

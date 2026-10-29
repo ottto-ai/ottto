@@ -82,6 +82,18 @@ const CODEX_ZST_CAUSES: usize = CodexZstCause::__Count as usize;
 static CODEX_ZST_REFUSED: [AtomicU64; CODEX_ZST_CAUSES] =
     [const { AtomicU64::new(0) }; CODEX_ZST_CAUSES];
 
+pub(crate) fn codex_held_growth(bytes: u64, over_cap: u64) {
+    traversal_point(
+        "codex_held_growth",
+        "codex",
+        &BTreeMap::from([
+            ("held_growth_bytes", bytes),
+            ("held_growth_files", u64::from(bytes != 0)),
+            ("held_over_cap", over_cap),
+        ]),
+    );
+}
+
 pub(crate) fn codex_zst_refused(cause: CodexZstCause) {
     let counter = &CODEX_ZST_REFUSED[cause as usize];
     let previous = counter
@@ -123,6 +135,36 @@ pub(crate) fn codex_state_only(scanned: usize, emitted: usize, noops: usize) {
             )]),
         );
     }
+}
+
+thread_local! {
+    static CODEX_ZST_HELD: std::cell::Cell<[Option<(CodexZstCause, u64)>; CODEX_ZST_CAUSES]> = const { std::cell::Cell::new([None; CODEX_ZST_CAUSES]) };
+}
+pub(crate) fn codex_zst_held(cause: CodexZstCause) {
+    CODEX_ZST_HELD.with(|slot| {
+        let mut counts = slot.get();
+        counts[cause as usize] = Some((
+            cause,
+            counts[cause as usize].map_or(1, |(_, n)| n.saturating_add(1)),
+        ));
+        slot.set(counts);
+    });
+}
+pub(crate) fn flush_codex_zst_held() {
+    CODEX_ZST_HELD.with(|slot| {
+        let counts = slot
+            .replace([None; CODEX_ZST_CAUSES])
+            .into_iter()
+            .flatten()
+            .collect::<BTreeMap<_, _>>();
+        if !counts.is_empty() {
+            traversal_point(
+                "codex_zst_held",
+                "codex",
+                &BTreeMap::from([("codex_zst_held", counts)]),
+            );
+        }
+    });
 }
 
 /// Nonzero-only counters on the existing native_collection_page line.

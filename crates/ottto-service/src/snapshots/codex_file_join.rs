@@ -375,6 +375,7 @@ pub(super) struct HeaderInventory {
     pub(super) headers: Vec<HeaderWitness>,
     pub(super) directories: DirectoryCensus,
     pub(super) complete: bool,
+    pub(super) custody_incomplete: bool,
     pub(super) read_bytes: usize,
     pub(super) held_archives: BTreeSet<String>,
     pub(super) held_owners: BTreeSet<String>,
@@ -420,6 +421,7 @@ impl HeaderInventory {
             complete: paths.len() <= MAX_HEADER_FILES
                 && directories.is_some_and(|value| value.stable),
             read_bytes: 0,
+            custody_incomplete: false,
             held_archives: BTreeSet::new(),
             held_owners: BTreeSet::new(),
             archive_work: codex_compressed_input::HeaderWork::default(),
@@ -515,6 +517,15 @@ impl HeaderInventory {
         // group/owner gates scope their custody hold without stalling siblings.
         // Warm facts must not supply or refresh that evidence while held.
         let key = local_index_key(&path);
+        if index
+            .files
+            .get(&key)
+            .is_some_and(|entry| entry.codex_compressed_hold.is_some())
+        {
+            self.custody_incomplete = true;
+            self.complete = false;
+            return false;
+        }
         if self.held_archives.contains(&key) {
             return false;
         }
@@ -523,6 +534,7 @@ impl HeaderInventory {
         if compressed && decode_held {
             self.complete = false;
             self.refused.insert(key, path_witness(&path));
+
             return false;
         }
         let cache = cache.filter(|_| !decode_held);
@@ -733,7 +745,8 @@ impl HeaderInventory {
 }
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
 crate::heap_layout_bound::fields!(HeaderWitness; candidate, owner, home, created_unix_ms, metadata, stamp);
-crate::heap_layout_bound::fields!(HeaderInventory; roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, archive_work, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, bounded_out);
+crate::heap_layout_bound::fields!(HeaderInventory; custody_incomplete, roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, archive_work, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, bounded_out);
+
 
 #[derive(Clone, Debug)]
 pub(super) struct Group {

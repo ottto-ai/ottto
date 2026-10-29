@@ -1084,6 +1084,27 @@ Post-release counts line: `codex_zst_first_read_retry`, `codex_zst_retry_alarm`,
 `archive_terminal_residue_session_count`, `codex_zst_admission_alarm`.
 Counters/events are counts-only; do not sum ordinal or running gauge fields.
 
+Correctness custody retains an age-independent file recovery obligation in the
+optional `codex_compressed_hold` field, registered in the shared
+`DiscoveryRetention` view. That registration bypasses age rejection only; it
+never creates verification debt or grants a sample or Full read. Stage
+`codex_held_growth` observes existing
+walk metadata only: `held_growth_bytes` is length above the accepted entry size,
+`held_growth_files` is one for positive observed growth, and `held_over_cap` is
+one when that held plain file exceeds the file cap. These are observations of
+owed work, not unique ingested bytes; repeated passes may observe the same debt.
+They contain no paths or ids. Held growth takes no content/sample read or Full.
+Post-release counts also include all three fields. An over-cap held file remains
+rostered and indexed; ordinary size rejection remains enforced and counted.
+It is not silently retired or treated as fresh proof.
+Release must keep the obligation through counted Tail catch-up from the durable
+checkpoint, preserving the exact cumulative body and witness without prefix
+duplication or Full. This release transition belongs to custody-aware recovery;
+clearing the field before age/cap-independent catch-up admission is forbidden.
+Before archive discovery activation, the same obligation must cover every plain
+member withheld by an owning archive fence, including refused fanout. Discovery
+remains off until its grow/idle/cap/release matrix is qualified.
+
 Terminal Held/Refused archives use scoped residue, including quiet skipped
 stamps; they do not add sweep-wide unreadable (RU). Bodyless Pending is the
 bounded Z-PENDING RU exception. Admission denial spends no decode reservation;
