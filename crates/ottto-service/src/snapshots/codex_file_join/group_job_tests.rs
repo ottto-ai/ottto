@@ -3585,6 +3585,13 @@ fn protected_group_peer_does_not_spend_corruption_rebuild_before_input() {
     fs::write(&records[1].1, &corrupt).unwrap();
     let cache = Arc::new(SharedCache::default());
     let source = SnapshotSource::Codex;
+    // The synthetic scanner helper does not install a durable store itself.
+    cache.durable_begin_pass(
+        source,
+        &root.join("index.json"),
+        &Scope("group-fixture".into()),
+        false,
+    );
     let (index, held) = sampled(&root, ScanIndex::default(), 10, &cache);
     assert!(held.snapshots.is_empty());
     assert_eq!(

@@ -373,8 +373,21 @@ struct KeyCustody {
 fn custody_node_bytes() -> Option<usize> {
     crate::heap_layout_bound::tree_node_bytes::<store::Digest32, Box<KeyCustody>>()?
         .checked_add(std::mem::size_of::<KeyCustody>() + std::mem::align_of::<KeyCustody>())?
-        .checked_add(64) // Both Arc payloads/headers/alignment, conservatively per node.
+        .checked_add(arc_allocation_bytes::<std::sync::atomic::AtomicBool>()?)
 }
+
+// ArcInner on the qualified Rust toolchains: strong + weak counters, then data.
+// Round the requested allocation to its alignment; no allocator usable-size claim.
+fn arc_allocation_bytes<T>() -> Option<usize> {
+    let align = std::mem::align_of::<T>().max(std::mem::align_of::<usize>());
+    (2 * std::mem::size_of::<usize>())
+        .checked_add(std::mem::size_of::<T>())?
+        .checked_add(align - 1)
+        .map(|bytes| bytes / align * align)
+}
+// upgrade_started is charged per key. The ONE shared upgrade_reads Arc is
+// charged once against the prepaid extra root node, never once per key.
+const _: () = assert!(std::mem::size_of::<AtomicU64>() <= 8);
 
 impl Stores {
     fn retry_offered(&mut self, offered: BTreeMap<store::Digest32, String>, index: &ScanIndex) {
@@ -3534,7 +3547,14 @@ impl SharedCache {
         ];
         let last = std::mem::replace(&mut slot.reported, now);
         drop(stores);
-        crate::local_resource_diagnostics::durable_tail_alarm(snapshot_source.api_slug(), &store);
+        // Preserve the store's nonzero observations without emitting a second,
+        // empty alarm beside a cause-only pacing/near-cap report.
+        if store != store::StoreCounters::default() {
+            crate::local_resource_diagnostics::durable_tail_alarm(
+                snapshot_source.api_slug(),
+                &store,
+            );
+        }
         if now != last {
             let pair = |n: usize| [now[n].saturating_sub(last[n]), now[n]];
             crate::local_resource_diagnostics::durable_tail_alarm(

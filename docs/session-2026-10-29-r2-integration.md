@@ -16,3 +16,18 @@ Migration rereads acquire active allocation credit before taking the store lock.
 Grouped guards classify every member before starting corruption rebuilds, and
 Codex resource-recovery pacing starts after page and cursor admission. AuditDue
 and ClockChanged retain the acquisition behavior of this main endpoint.
+
+Round 3 repairs composition against the Linux failure receipt. The mutation
+witness keeps its key, content, exact filesystem stamp and immutable floor;
+a nonzero floor encoding removes the outer optional tag. Per-key accounting
+charges its observer flag, while the shared process counter fits the already
+paid root credit. The custody node remains within 1024 bytes without increasing
+the reserve or enabling unsupported cache layouts. Empty store-counter alarms
+are suppressed beside cause-only reports; nonzero store observations remain.
+
+P3's neutral S2 floor outcome takes precedence over the earlier Claude-specific
+floor tags. The tests still require no certificate/body input, no publication,
+and unchanged predecessor bytes. Receipt-pending retains slot6 in the eight-slot
+composed diagnostics. New migration/resource fixtures supply required timestamp
+fields; the mixed protected/corrupt group fixture installs its durable store
+before exercising the production guard. No local runtime tests are executed.
