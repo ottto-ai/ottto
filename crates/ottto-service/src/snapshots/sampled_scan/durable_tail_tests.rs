@@ -724,6 +724,7 @@ fn owned_prepare_rejects_with_original_box_graph_flags_and_unique_guard() {
             "scope",
             "read_error",
             "buffered",
+            "finished",
             "occupied",
             "source",
             "priority",
@@ -771,16 +772,33 @@ fn owned_prepare_rejects_with_original_box_graph_flags_and_unique_guard() {
             .unwrap();
             let address = (&*taken) as *const Taken<CachedJsonlReduction> as usize;
             let file = if arm == "read_error" {
+                std::io::Write::write_all(
+                    &mut std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&path)
+                        .unwrap(),
+                    b"{}\n",
+                )
+                .unwrap();
                 std::fs::OpenOptions::new().write(true).open(&path).unwrap()
             } else {
                 File::open(&path).unwrap()
             };
             let mut parser = owned_parser(source, &path, file);
+            assert!(!parser.reader.reader.is_compressed());
+            assert!(parser.reader.reader.buffer().is_empty() && !parser.reader.finished);
+            assert!(
+                parser.reader.reader.accepts_durable(),
+                "fresh native invariant"
+            );
             if arm == "source" {
                 parser.source = SnapshotSource::Pi;
             }
             if arm == "buffered" {
                 assert!(!parser.reader.reader.fill_buf().unwrap().is_empty());
+            }
+            if arm == "finished" {
+                parser.reader.finished = true;
             }
             if arm == "occupied" {
                 parser
@@ -793,17 +811,24 @@ fn owned_prepare_rejects_with_original_box_graph_flags_and_unique_guard() {
             } else {
                 scope
             };
-            let rejected = match parser.prepare_acquisition_owned(
-                Some(taken),
-                &passed_scope,
-                None,
-                1_800_000_000,
-            ) {
+            let (result, events) = crate::local_resource_diagnostics::capture(|| {
+                parser.prepare_acquisition_owned(Some(taken), &passed_scope, None, 1_800_000_000)
+            });
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["counts"]["prepare_invariant"] == 1)
+                    .count(),
+                usize::from(matches!(arm, "buffered" | "finished" | "occupied")),
+                "fixed invariant alarm, distinct from old-checkpoint I/O"
+            );
+            let rejected = match result {
                 Ok(_) => panic!("{source:?}/{arm} unexpectedly accepted"),
                 Err(rejected) => rejected,
             };
             let expected_refusal = match arm {
                 "scope" => sampled_jsonl::PreparationRefusal::NonTransient("prepare_scope"),
+                "read_error" => sampled_jsonl::PreparationRefusal::NonTransient("prepare_io"),
                 "source" | "capture" | "counting" | "priority" => {
                     sampled_jsonl::PreparationRefusal::NonTransient("prepare_incompatible")
                 }
@@ -4126,6 +4151,8 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
     impl Drop for DependenciesReset {
         fn drop(&mut self) {
             super::super::TEST_REFUSE_REDUCTION_DEPENDENCIES.with(|v| v.set(false));
+            crate::transcript_acquisition::OLD_SAMPLE_IO_ERROR.with(|v| v.set(false));
+            sampled_jsonl::preparation_tests::set(None);
         }
     }
     let _reset = DependenciesReset;
@@ -4136,7 +4163,14 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
             "prepare_incompatible",
             "dependency",
             "census",
+            "prepare_io",
+            "prepare_full",
+            "large_dependency",
+            "large_header",
         ] {
+            if reason.starts_with("large_") && source != SnapshotSource::Codex {
+                continue;
+            }
             let root = crate::test_scratch::ScratchDir::new("returned-original-full");
             let _lock = test_locks::hold(&root);
             let sessions = root.join("sessions");
@@ -4154,11 +4188,15 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
             let key = local_index_key(&path);
             let index_path = root.join("index.json");
             let cache = Arc::new(SharedCache::default());
+            let guard_facts = std::rc::Rc::new(std::cell::Cell::new(None));
+            let guard_checks = std::rc::Rc::new(std::cell::Cell::new(0));
+            let full_frame_checks = std::cell::Cell::new(0);
             let run = |index: ScanIndex,
                        cache: Option<Arc<SharedCache>>,
                        namespace: &str,
                        refusal: &str,
                        at: &str| {
+                let cache_probe = cache.clone();
                 let mut scan = OwnedSourceScan::new_with_identity_capture(
                     source,
                     std::slice::from_ref(&sessions),
@@ -4173,6 +4211,18 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
                     true,
                     true,
                 );
+                if at.starts_with("2028") {
+                    assert_eq!(
+                        scan.census_window_end, at,
+                        "fresh census, not a frozen 2026 walk"
+                    );
+                    let census = scan.census_unix_seconds.expect("real discovery clock");
+                    let modified =
+                        unix_seconds(std::fs::metadata(&path).unwrap().modified().unwrap())
+                            .unwrap();
+                    assert!(census - modified > 365 * 86400, "quiet genuinely past W");
+                    assert_eq!(scan.backfill_window_days, 365);
+                }
                 if let Some(cache) = cache {
                     scan = scan.with_sampled_acquisition(cache, Scope(namespace.into()));
                 }
@@ -4185,11 +4235,94 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
                     scan.state_census_complete = false;
                 }
                 super::super::TEST_REFUSE_REDUCTION_DEPENDENCIES
-                    .with(|v| v.set(refusal == "dependency"));
+                    .with(|v| v.set(matches!(refusal, "dependency" | "large_dependency")));
+                crate::transcript_acquisition::OLD_SAMPLE_IO_ERROR
+                    .with(|v| v.set(refusal == "prepare_io"));
+                let mut header_removed = false;
+                let mut full_checked = false;
                 let mut metrics = (0, 0, 0);
+                let mut saw_original = false;
+                let mut saw_missing_input = false;
                 for _ in 0..10000 {
+                    if refusal == "large_header" && scan.codex_join_prepared && !header_removed {
+                        let inventory = scan
+                            .codex_join_inventory
+                            .as_mut()
+                            .expect("real owning inventory");
+                        assert!(inventory.complete);
+                        assert!(inventory
+                            .headers
+                            .iter()
+                            .any(|header| header.candidate.path == path));
+                        inventory
+                            .headers
+                            .retain(|header| header.candidate.path != path);
+                        header_removed = true;
+                    }
+                    if refusal == "prepare_full" && cache_probe.is_some() && !full_checked {
+                        if let Some(active) = scan.active_file.as_mut() {
+                            let acquisition =
+                                active.sampling.as_ref().expect("real sampled Full frame");
+                            assert!(matches!(
+                                acquisition.mode,
+                                crate::transcript_acquisition::ReadMode::Full(_)
+                            ));
+                            assert_eq!(active.parser.reader.consumed_bytes(), 0);
+                            assert_eq!(
+                                active
+                                    .parser
+                                    .reader
+                                    .reader
+                                    .get_mut()
+                                    .stream_position()
+                                    .unwrap(),
+                                0
+                            );
+                            assert!(
+                                active.parser.reader.reader.accepts_durable(),
+                                "old guard never copied into fresh reader"
+                            );
+                            let cache = cache_probe.as_ref().unwrap();
+                            store::ActiveLease::timeout_next_acquire_for_test(
+                                std::time::Duration::from_millis(5),
+                            );
+                            let store::LeaseWait::Granted(lease) = cache.acquire_active(source, 0)
+                            else {
+                                panic!("preparation lease must release BEFORE zero-based Full");
+                            };
+                            lease.release();
+                            let mut original =
+                                cache.take(&key).expect("returned original still resident");
+                            let guard = original
+                                .durable
+                                .retail_mut()
+                                .expect("unique returned custody");
+                            assert_eq!(
+                                Some((guard.object, guard.next, guard.end, guard.old_end)),
+                                guard_facts.get()
+                            );
+                            assert!(cache
+                                .return_prepared_taken(key.clone(), Box::new(original))
+                                .is_ok());
+                            full_checked = true;
+                            full_frame_checks.set(full_frame_checks.get() + 1);
+                        }
+                    }
                     if let Some(context) = scan.sampling.as_ref() {
                         metrics = (context.full_files, context.tail_files, context.native_bytes);
+                        if refusal.starts_with("large_") {
+                            let admission = serde_json::to_value(context.admission).unwrap();
+                            saw_original |=
+                                admission["retained_entry"]["matched"].as_u64().unwrap_or(0) > 0;
+                            let gate = if refusal == "large_header" {
+                                "owning_header_current"
+                            } else {
+                                "reduction_dependencies_available"
+                            };
+                            saw_missing_input |= admission[gate]["assessed"].as_u64().unwrap_or(0)
+                                > 0
+                                && admission[gate]["matched"] == 0;
+                        }
                     }
                     match scan.step(None) {
                         OwnedSourceScanStep::Pending(next) => scan = next,
@@ -4197,6 +4330,18 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
                             mut index, scan, ..
                         } => {
                             super::super::TEST_REFUSE_REDUCTION_DEPENDENCIES.with(|v| v.set(false));
+                            // The old-checkpoint fault remains enabled throughout
+                            // Full completion; only a reused old plan can trip it.
+                            if refusal == "large_header" {
+                                assert!(header_removed);
+                            }
+                            if refusal.starts_with("large_") {
+                                assert!(saw_original, "actual native take of resident original");
+                                assert!(
+                                    saw_missing_input,
+                                    "actual unavailable-input admission gate"
+                                );
+                            }
                             let mut projected = scan.clone();
                             apply_upload_policy(
                                 source,
@@ -4228,7 +4373,7 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
                 cache.retained().unwrap().peek(&key).is_some(),
                 "actual resident premise"
             );
-            let (index, idle, metrics) = run(
+            let (mut index, idle, metrics) = run(
                 index,
                 Some(cache.clone()),
                 "original",
@@ -4243,8 +4388,39 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
             );
             if reason == "prepare_incompatible" {
                 let mut original = cache.take(&key).expect("real original");
-                let acc = original.retained.state.accumulator_for_test();
-                acc.claude_request_identity_capture = !acc.claude_request_identity_capture;
+                // Real source/counting graph incompatibility; capture-only
+                // equality is pre-cutover and disappears with main #840.
+                let other_path = root.join("other-source.jsonl");
+                let other_source = if source == SnapshotSource::Codex {
+                    SnapshotSource::ClaudeCode
+                } else {
+                    SnapshotSource::Codex
+                };
+                let capture = original
+                    .retained
+                    .state
+                    .accumulator_for_test()
+                    .claude_request_identity_capture;
+                let mut other = owned_fixture(other_source, &other_path, &Scope("other".into()));
+                other
+                    .retained
+                    .state
+                    .accumulator_for_test()
+                    .claude_request_identity_capture = capture;
+                assert_eq!(
+                    other
+                        .retained
+                        .state
+                        .accumulator_for_test()
+                        .claude_request_identity_capture,
+                    original
+                        .retained
+                        .state
+                        .accumulator_for_test()
+                        .claude_request_identity_capture
+                );
+                assert_ne!(other.retained.state.accumulator_for_test().source, source);
+                original.retained.state = other.retained.state;
                 assert!(cache
                     .return_prepared_taken(key.clone(), Box::new(original))
                     .is_ok());
@@ -4266,12 +4442,90 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
                 "{suffix}"
             )
             .unwrap();
+            if reason == "prepare_full" {
+                let mut original = cache.take(&key).expect("actual native resident");
+                assert!(original.durable.is_empty());
+                let attempt = cache
+                    .begin_retail(
+                        source,
+                        &key,
+                        &original.retained.checkpoint,
+                        &File::open(&path).unwrap(),
+                        original.retained.checkpoint.sealed_offset(),
+                        std::time::Instant::now(),
+                    )
+                    .unwrap();
+                guard_facts.set(Some((
+                    attempt.object,
+                    attempt.next,
+                    attempt.end,
+                    attempt.old_end,
+                )));
+                original.durable.put_retail(attempt);
+                assert!(cache
+                    .return_prepared_taken(key.clone(), Box::new(original))
+                    .is_ok());
+                index
+                    .files
+                    .get_mut(&key)
+                    .unwrap()
+                    .set_unverified_deadline(1);
+                let facts = guard_facts.clone();
+                let checks = guard_checks.clone();
+                sampled_jsonl::preparation_tests::set(Some(Box::new(move |taken| {
+                    let guard = taken
+                        .durable
+                        .retail
+                        .as_ref()
+                        .expect("custody before real ReadPlan Full");
+                    assert_eq!(
+                        Some((guard.object, guard.next, guard.end, guard.old_end)),
+                        facts.get()
+                    );
+                    checks.set(checks.get() + 1);
+                    Ok(())
+                })));
+            }
             let namespace = if reason == "prepare_scope" {
                 "changed"
             } else {
                 "original"
             };
             let original_len = std::fs::metadata(&path).unwrap().len();
+            if reason.starts_with("large_") {
+                assert!(
+                    cache.retained().unwrap().peek(&key).is_some(),
+                    "real retained original before refusal"
+                );
+                assert_eq!(cache.counters_for_test().jobs_started, 0);
+                let (_, held, modes) =
+                    codex_cursor::with_test_limits(original_len * 2, original_len - 1, 64, || {
+                        assert!(
+                            std::fs::metadata(&path).unwrap().len()
+                                > codex_cursor::Limits::current().singleton()
+                        );
+                        run(
+                            index,
+                            Some(cache.clone()),
+                            namespace,
+                            reason,
+                            "2026-10-29T12:00:00Z",
+                        )
+                    });
+                assert!(held.snapshots.is_empty());
+                assert_eq!(modes, (0, 0, 0), "missing inputs cannot grant Full/body");
+                let counters = cache.counters_for_test();
+                assert_eq!(counters.jobs_started, 0, "no cursor start");
+                assert!(
+                    counters.jobs_deferred_inputs > 0,
+                    "actual no-plan InputsUnavailable gate"
+                );
+                assert!(
+                    cache.retained().unwrap().peek(&key).is_some(),
+                    "original returned losslessly"
+                );
+                continue;
+            }
             let (_, oracle, _) = run(
                 index.clone(),
                 None,
@@ -4309,13 +4563,40 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
                 "actual refused-original caller reached"
             );
             assert_eq!(index.files[&key].size_bytes, original_len);
+            if reason == "prepare_full" {
+                assert_eq!(
+                    guard_checks.get(),
+                    1,
+                    "one original guard, actual prepare_full branch"
+                );
+                assert_eq!(
+                    full_frame_checks.get(),
+                    1,
+                    "lease released before actual Full body"
+                );
+                assert!(events
+                    .iter()
+                    .all(|event| event["counts"]["active_drop_release"] != 1));
+                let full = events
+                    .iter()
+                    .position(|event| event["counts"]["returned_original_full"][reason] == 1)
+                    .unwrap();
+                assert!(events[..full]
+                    .iter()
+                    .any(|event| event["counts"]["active_current_bytes"] == 0));
+                sampled_jsonl::preparation_tests::set(None);
+            }
             // A quiet period longer than W cannot hide unread suffix: growth
             // was already fully counted and committed before entering quiet.
             let (next, quiet, metrics) = run(
                 index,
                 Some(cache.clone()),
                 namespace,
-                "",
+                if reason == "prepare_io" {
+                    "prepare_io"
+                } else {
+                    ""
+                },
                 "2028-10-29T12:00:00Z",
             );
             assert!(quiet.snapshots.is_empty());
@@ -4327,7 +4608,11 @@ fn production_returned_nontransient_original_reads_growth_once_then_quiet_restar
                 ScanIndex::load(&index_path).unwrap(),
                 Some(Arc::new(SharedCache::default())),
                 namespace,
-                "",
+                if reason == "prepare_io" {
+                    "prepare_io"
+                } else {
+                    ""
+                },
                 "2028-10-29T12:00:00Z",
             );
             assert!(idle.snapshots.is_empty());
