@@ -29362,7 +29362,8 @@ impl OwnedSourceScan {
                                 || sampled_scan::compatible_reduction(&parser.accumulator))
                     })
                     .and_then(|(context, active)| {
-                        let held = parser.reader.reader.get_ref().try_clone().ok()?;
+                        let held =
+                            native_writeahead_descriptor(&candidate.path, &parser.reader.reader)?;
                         Some((context, active, held))
                     });
                 #[cfg(unix)]
@@ -35327,6 +35328,18 @@ enum NativeDisposition {
     /// No effect this pass. The completion keeps its debt, the committed
     /// entry its accepted body and witness, and the key stays discoverable.
     Hold,
+}
+
+/// Descriptor acquisition for the already admitted M3 finish route. Use the
+/// existing input-kind predicate before chain/lease/debt acquisition: archive
+/// checkpoints belong to the ordinary archive owner, never physical prefixes.
+/// This does not change the single transcript-path admission boundary.
+#[cfg(unix)]
+fn native_writeahead_descriptor(path: &Path, input: &OpenedInput) -> Option<File> {
+    if codex_compressed_input::is_compressed_codex_rollout(Some(path), Some(input)) {
+        return None;
+    }
+    input.get_ref().try_clone().ok()
 }
 
 /// The facts the commit fences check against, all frozen before mutation.

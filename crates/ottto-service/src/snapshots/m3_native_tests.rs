@@ -170,3 +170,89 @@ fn m3_d3_held_claude_key_stays_discoverable_past_the_window() {
     marked.files.get_mut(&key).unwrap().size_bytes = 64;
     assert!(discover(&marked.files));
 }
+
+/// Exercise the production M3 descriptor boundary with a real decoder, even
+/// when the path looks plain. The remaining route preconditions cannot turn
+/// the archive input into physical prefix authority or candidate-less debt.
+#[test]
+fn m3_compressed_archive_bypasses_staging_and_finishes_without_receipt_debt() {
+    let root = crate::test_scratch::ScratchDir::new("m3-archive-route");
+    let path = root.join("rollout.jsonl");
+    let archive = root.join("rollout.jsonl.zst");
+    let source = SnapshotSource::Codex;
+    let text = [
+        json!({"type":"session_meta","timestamp":"2026-10-07T10:00:00Z",
+            "payload":{"id":"0199f7a0-0000-7000-8000-0000000d7a11","cwd":"/tmp/m3-archive","source":"cli"}}),
+        json!({"type":"turn_context","timestamp":"2026-10-07T10:00:00Z",
+            "payload":{"turn_id":"turn-1","model":"gpt-5.2","cwd":"/tmp/m3-archive"}}),
+        json!({"type":"event_msg","timestamp":"2026-10-07T10:00:00Z",
+            "payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":10},
+                "last_token_usage":{"input_tokens":100,"output_tokens":10}}}}),
+    ].into_iter().map(|v| v.to_string()+"\n").collect::<String>();
+    fs::write(&path, &text).unwrap();
+    fs::write(
+        &archive,
+        zstd::stream::encode_all(text.as_bytes(), 1).unwrap(),
+    )
+    .unwrap();
+    let plain = OpenedInput::plain(File::open(&path).unwrap());
+    assert!(
+        native_writeahead_descriptor(&path, &plain).is_some(),
+        "plain control"
+    );
+    assert!(
+        native_writeahead_descriptor(&archive, &plain).is_none(),
+        "path guard"
+    );
+    let input = OpenedInput::compressed(
+        File::open(&archive).unwrap(),
+        1024 * 1024,
+        codex_compressed_input::compressed_input_credit().unwrap(),
+    )
+    .unwrap();
+    assert!(
+        native_writeahead_descriptor(&path, &input).is_none(),
+        "input kind, independent of suffix"
+    );
+    let identity = opened_object_identity(source, &mut File::open(&archive).unwrap()).unwrap();
+    let mut parser = OwnedJsonlParser::new_opened(
+        input,
+        &archive,
+        source,
+        apply_codex_line,
+        None,
+        None,
+        None,
+        false,
+        false,
+    )
+    .unwrap();
+    while !parser.step().unwrap() {}
+    let cache = sampled_scan::SharedCache::default();
+    let key = local_index_key(&archive);
+    assert!(native_writeahead_descriptor(&archive, &parser.reader.reader).is_none());
+    let ordinary = parser
+        .finish(
+            &identity,
+            &archive,
+            "2026-10-20T12:00:00Z",
+            "archive-fp".into(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    assert!(
+        !ordinary.snapshots.is_empty(),
+        "ordinary completion retains positive usage"
+    );
+    assert!(ordinary.snapshots.iter().any(|s| s.input_tokens > 0));
+    assert!(
+        !cache.owes_discovery(source, &key),
+        "no M3 receipt debt or Hold"
+    );
+    assert!(
+        cache.durable_counters(source).is_none(),
+        "M3 acquired no store/lease"
+    );
+}
