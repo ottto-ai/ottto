@@ -60,27 +60,17 @@ fn census_records_keep_the_held_revision_and_cover_it_in_window() {
         census_pipeline_window(&first.scan.census_window_end)
     );
 
-    // TD1h: covered in-window at the terminal of the same census window.
-    assert!(last.scan.census_complete);
+    // Retained same-window records remain evidence; terminal-off never turns
+    // them into an OPEN fence or complete-census shadow proof.
+    assert!(!last.scan.census_complete);
     assert_eq!(last.scan.census_window_end, first.scan.census_window_end);
     assert!(last.index.claude_account_deferred_hold_count() <= 1);
-    let shadow = last
-        .scan
-        .claude_request_census_shadow
-        .expect("complete Claude terminal measures the shadow");
-    assert_eq!(shadow.family_keys, PIPELINE_SESSIONS.len());
-    assert!(shadow.covered_by_window >= 1, "{shadow:?}");
-    assert_eq!(shadow.missing_account_hold, 0, "{shadow:?}");
-    assert_eq!(
-        shadow.covered_by_fingerprint + shadow.covered_by_window,
-        shadow.family_keys,
-        "{shadow:?}"
-    );
-    assert!(shadow.would_open, "{shadow:?}");
-    // Non-terminal pages measure nothing.
-    assert!(pages[..pages.len() - 1]
+    assert!(pages
         .iter()
         .all(|page| page.scan.claude_request_census_shadow.is_none()));
+    assert!(pages
+        .iter()
+        .all(|page| page.uploaded.is_disjoint(&page.held)));
 }
 
 const CENSUS_PARITY_ID_LESS: &str = "d4444444-4444-4444-8444-444444444444";

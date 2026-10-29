@@ -506,7 +506,11 @@ fn resume_claude_retry_admission(index: &mut ScanIndex, at: &str) {
     }
 }
 
-fn enqueue_terminal_off_retry(traversal: &mut ScanTraversalCheckpoint, key: &str) {
+fn enqueue_terminal_off_retry(
+    traversal: &mut ScanTraversalCheckpoint,
+    key: &str,
+    census_member: bool,
+) {
     let path = Path::new(key);
     if claude_index_path_member_ref(path).is_none()
         || path.extension().and_then(|v| v.to_str()) != Some("jsonl")
@@ -525,7 +529,7 @@ fn enqueue_terminal_off_retry(traversal: &mut ScanTraversalCheckpoint, key: &str
         traversal.pending_candidates.push_back(ScanTraversalPath {
             scan_root: root.clone(),
             path: path.to_path_buf(),
-            census_member: true,
+            census_member,
             watcher_hint: false,
         });
     }
@@ -543,7 +547,9 @@ impl ScanIndex {
         }
         if let Some(traversal) = self.traversal.as_mut() {
             for key in keys {
-                enqueue_terminal_off_retry(traversal, key);
+                // Already observed held custody is a reread, not new discovery.
+                // G1 lets real-loss/floor retries restart despite rereads.
+                enqueue_terminal_off_retry(traversal, key, false);
             }
         }
     }
@@ -571,7 +577,7 @@ impl ScanIndex {
             }) {
                 continue;
             }
-            enqueue_terminal_off_retry(traversal, key);
+            enqueue_terminal_off_retry(traversal, key, true);
         }
     }
 }

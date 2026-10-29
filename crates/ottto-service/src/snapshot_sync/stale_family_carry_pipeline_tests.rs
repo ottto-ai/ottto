@@ -167,9 +167,14 @@ fn c1b_traversal_ended(index: &ScanIndex) -> (bool, bool) {
     match saved.get("traversal").filter(|value| !value.is_null()) {
         None => (true, false),
         Some(traversal) => {
-            let walked = ["pending_directories", "pending_candidates"]
-                .iter()
-                .all(|queue| traversal[*queue].as_array().is_some_and(Vec::is_empty));
+            // G1: physical discovery can end with already-observed held
+            // rereads retained. They remain queued and grant no proof.
+            let walked = traversal["pending_directories"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+                && traversal["pending_candidates"]
+                    .as_array()
+                    .is_some_and(|paths| paths.iter().all(|path| path["census_member"] == false));
             (walked, walked)
         }
     }

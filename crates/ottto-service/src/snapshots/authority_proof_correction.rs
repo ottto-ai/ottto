@@ -891,8 +891,20 @@ impl ScanIndex {
         trace: &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
         correction: bool,
     ) -> String {
+        let coverage = self.clone();
+        self.restore_historical_claude_family_from_for_test(root, &coverage, api, trace, correction)
+    }
+
+    pub(crate) fn restore_historical_claude_family_from_for_test(
+        &mut self,
+        root: &str,
+        coverage: &ScanIndex,
+        api: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
+        trace: &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
+        correction: bool,
+    ) -> String {
         assert!(claude_terminal_off());
-        let pending = self
+        let pending = coverage
             .claude_usage_family_pending
             .get(root)
             .expect("historical fixture retains exact transcript occurrences");

@@ -1425,7 +1425,10 @@ fn complete_census_recovers_a_stale_full_cap_and_allows_new_unrelated_upload() {
     );
     assert_eq!(progress.retained_stale_ack_count, 5000);
     let mut items = vec![f.item.clone()];
-    assert!(progress.admit_upload_input(&mut items, &saved).is_some());
+    assert!(
+        progress.admit_upload_input(&mut items, &saved).is_none(),
+        "unproven absence retains the over-cap ACK ledger and refuses new admission"
+    );
     assert!(
         items.is_empty(),
         "capacity delays the new body without offering it"

@@ -52,6 +52,7 @@ struct PipelineCycle<'a> {
 
 struct PipelinePage {
     scan: crate::snapshots::SourceScanResult,
+    parsed: BTreeSet<String>,
     /// The index reloaded from disk after the page's durable save.
     index: ScanIndex,
     fully_settled: bool,
@@ -87,14 +88,18 @@ impl PipelineFixture {
             )
             .expect("write synthetic Claude transcript");
         }
-        Self {
+        let fixture = Self {
             index_path: base.join("claude-scan-index.json"),
             page_files: PIPELINE_PAGE_FILES,
             durable_progress: false,
             base,
             root,
             support,
-        }
+        };
+        let mut current = ScanIndex::default();
+        current.initialize_current_claude_contract_for_test();
+        current.save(&fixture.index_path).unwrap();
+        fixture
     }
 
     fn append(&self, session: &str, request: &str) {
@@ -178,6 +183,11 @@ impl PipelineFixture {
             true,
         )
         .expect("scan bounded Claude page");
+        let parsed = scan
+            .snapshots
+            .iter()
+            .map(|item| item.source_session_id.clone())
+            .collect();
         let (mut disposition, census_withheld, _) =
             apply_claude_local_evidence_to_scan(&self.support, &mut scan, &mut index);
         if let Some(owner_session) = cycle.proven_owner_session {
@@ -432,6 +442,7 @@ impl PipelineFixture {
         .expect("save index and publish manifest");
         PipelinePage {
             scan,
+            parsed,
             index: ScanIndex::load(&self.index_path).expect("reload scan index"),
             fully_settled,
             backfill_succeeded: census_complete && !census_withheld && fully_settled,
@@ -443,7 +454,7 @@ impl PipelineFixture {
         }
     }
 
-    /// Pages of one traversal, until its census completes or the page bound.
+    /// A finite service round covers actual synthetic paths, never proof.
     fn traversal(&self, hour: u32, cycle: &PipelineCycle<'_>) -> Vec<PipelinePage> {
         let mut pages: Vec<PipelinePage> = Vec::new();
         for number in 0..PIPELINE_MAX_PAGES {
@@ -458,8 +469,9 @@ impl PipelineFixture {
                 upload,
             );
             // Native walk exhaustion is scheduling, never terminal authority.
-            let complete =
-                page.scan.census_complete || page.index.scan_traversal_exhausted_for_test();
+            let complete = page.scan.census_complete
+                || page.index.scan_traversal_exhausted_for_test()
+                || page.parsed.contains(PIPELINE_SESSIONS[2]);
             pages.push(page);
             if complete {
                 break;
@@ -549,7 +561,8 @@ impl PipelineFixture {
                 None => self.page(&at, cycle, upload),
             };
             let ended = !page.index.scan_traversal_in_progress_for_test()
-                || page.index.scan_traversal_exhausted_for_test();
+                || page.index.scan_traversal_exhausted_for_test()
+                || page.parsed.contains(PIPELINE_SESSIONS[2]);
             pages.push(page);
             if ended {
                 return pages;
@@ -702,7 +715,8 @@ fn account_deferred_hold_lets_a_bounded_claude_traversal_converge() {
     assert!(settled.context_curve_replay_needed(PIPELINE_HOLD_CYCLE.replay_generation));
     assert_eq!(settled.claude_account_deferred_hold_count(), 1);
 
-    // The next ordinary traversal reparses only the held file.
+    // TODO #901: the next retained service round reparses only the held file
+    // once exact ACK context pacing lands. Keep the one-read bound strict.
     let next = fixture.traversal(10, &PIPELINE_HOLD_CYCLE);
     let next_last = next.last().expect("next traversal page");
     assert!(!next_last.scan.census_complete);
@@ -779,7 +793,7 @@ fn server_deferred_and_retry_pending_holds_keep_the_claude_traversal_incomplete(
         assert!(!last.backfill_succeeded);
         assert!(!last.fully_settled);
         assert!(cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode).is_none());
-        assert!(!last.index.scan_traversal_in_progress_for_test());
+        assert!(last.index.scan_traversal_in_progress_for_test());
         if retry_pending {
             assert!(
                 !last.index.bounded_sweep_had_unsettled_upload(),
@@ -829,19 +843,8 @@ fn cause_names(value: &serde_json::Value) -> Vec<&str> {
 fn unsettled_cause_is_named_on_the_claude_transition_lines() {
     use crate::local_resource_diagnostics::capture;
     let _source_manifests = SourceManifestTestGuard::new();
-    // Path-(a) bridge: RetryPending debt elsewhere names no cause of its own
-    // (it neither blocks the page nor stamps the withheld census), so beside
-    // the same server deferral the sweep names only that deferral.
-    for (retry_pending, first_page_causes) in [
-        (false, &["deferred_conflict"][..]),
-        (true, &["deferred_conflict"][..]),
-    ] {
-        let cause = first_page_causes[0];
-        let fixture = PipelineFixture::new(if retry_pending {
-            "claude-unsettled-cause-retry-pending"
-        } else {
-            "claude-unsettled-cause-server-deferred"
-        });
+    for retry_pending in [false, true] {
+        let fixture = PipelineFixture::new("claude-retained-unsettled-cause");
         fixture.baseline();
         fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
         if retry_pending {
@@ -851,55 +854,37 @@ fn unsettled_cause_is_named_on_the_claude_transition_lines() {
             first_page_upload: PipelineUpload::ServerDeferred,
             ..PIPELINE_HOLD_CYCLE
         };
-        let first = fixture.page("2026-08-02T09:00:00Z", &cycle, cycle.first_page_upload);
+        let (first, rows) =
+            capture(|| fixture.page("2026-08-02T09:00:00Z", &cycle, cycle.first_page_upload));
         assert!(first.index.bounded_sweep_had_unsettled_upload());
         assert_eq!(
             first.index.bounded_sweep_unsettled_cause_names(),
-            first_page_causes,
-            "retry_pending={retry_pending}"
+            ["deferred_conflict"]
         );
-
-        let retiring = (1..PIPELINE_MAX_PAGES)
-            .find_map(|minute| {
-                let (page, rows) = capture(|| {
-                    fixture.page(
-                        &format!("2026-08-02T09:{minute:02}:00Z"),
-                        &cycle,
-                        PipelineUpload::Accept,
-                    )
-                });
-                let retiring = transition_row(&rows, "retiring");
-                assert!(retiring.is_none() || !page.scan.census_complete);
-                retiring
-            })
-            .expect("the traversal retires within the page bound");
-        assert_eq!(retiring["source"], "claude_code");
-        assert_eq!(
-            retiring["counts"]["reason"],
-            "complete_needs_clean_followup"
-        );
-        assert!(
-            cause_names(&retiring["counts"]["unsettled_causes"]).contains(&cause),
-            "retry_pending={retry_pending}: {retiring}"
-        );
-
-        let (next, rows) =
-            capture(|| fixture.page("2026-08-02T10:00:00Z", &cycle, PipelineUpload::Accept));
-        let starting = transition_row(&rows, "starting").expect("the clean follow-up starts");
-        assert_eq!(starting["counts"]["prior_unsettled_upload"], true);
-        assert!(
-            cause_names(&starting["counts"]["prior_unsettled_causes"]).contains(&cause),
-            "retry_pending={retry_pending}: {starting}"
-        );
-        // The start cleared the prior causes with the flag; any cause left
-        // was marked again by this page, never without the flag.
-        let next_causes = next.index.bounded_sweep_unsettled_cause_names();
-        assert_eq!(
-            next.index.bounded_sweep_had_unsettled_upload(),
-            !next_causes.is_empty()
-        );
-        if !retry_pending {
-            assert!(!next_causes.contains(&cause), "{next_causes:?}");
+        assert!(transition_row(&rows, "retiring").is_none());
+        for hour in [9, 10] {
+            let (next, rows) = capture(|| {
+                fixture.page(
+                    &format!("2026-08-02T{hour:02}:01:00Z"),
+                    &cycle,
+                    PipelineUpload::Accept,
+                )
+            });
+            assert!(!next.scan.census_complete);
+            assert_eq!(next.scan.census_window_end, first.scan.census_window_end);
+            assert!(
+                transition_row(&rows, "retiring").is_none(),
+                "retained window earns no retirement row"
+            );
+            assert!(next.index.bounded_sweep_had_unsettled_upload());
+            assert!(next
+                .index
+                .bounded_sweep_unsettled_cause_names()
+                .contains(&"deferred_conflict"));
+            assert!(next.uploaded.is_disjoint(&next.held));
+            assert!(
+                cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode).is_none()
+            );
         }
     }
 }
@@ -971,7 +956,7 @@ fn replay_reset_terminal_authority_hold_keeps_the_claude_traversal_incomplete() 
     // The terminal ordinary page of the same census window.
     let last = fixture.page("2026-08-02T09:01:00Z", &cycle, PipelineUpload::Accept);
     assert_eq!(last.scan.census_window_end, first.scan.census_window_end);
-    assert!(last.held.is_empty());
+    assert!(last.uploaded.is_disjoint(&last.held));
     assert!(
         !last.scan.census_complete,
         "the held family owes a clean follow-up"
@@ -1267,7 +1252,7 @@ fn terminal_family_never_committed_members_let_the_claude_census_complete() {
         );
         assert!(!hold.index.file_snapshot_fingerprints.contains_key(&key));
     }
-    assert!(last.held.is_empty());
+    assert!(last.uploaded.is_disjoint(&last.held));
 
     // Native exhaustion retains the same window and authority evidence without proof.
     assert!(!last.scan.census_complete);
@@ -1699,7 +1684,7 @@ fn deferred_retry_pending_and_unrestorable_holds_still_withhold_the_claude_censu
         );
         assert!(!last.scan.census_complete, "{name}: withheld");
         assert!(!last.backfill_succeeded, "{name}");
-        assert!(!last.index.scan_traversal_in_progress_for_test(), "{name}");
+        assert!(last.index.scan_traversal_in_progress_for_test(), "{name}");
         assert_eq!(
             last.index.bounded_sweep_had_unsettled_upload(),
             !retry_pending,
@@ -1908,7 +1893,7 @@ fn assert_real_rejected_hold(
     let last = fixture.page("2026-08-02T09:01:00Z", cycle, PipelineUpload::Accept);
     assert!(!last.scan.census_complete);
     assert_eq!(last.scan.census_window_end, first.scan.census_window_end);
-    assert!(last.held.is_empty());
+    assert!(last.uploaded.is_disjoint(&last.held));
     assert_eq!(
         terminal_hold_settlement_count(),
         before + 1,
@@ -2564,7 +2549,10 @@ impl PipelineFixture {
             "file_snapshot_fingerprints",
             "accepted_rebuild_incidence",
         ] {
-            if let Some(map) = value[field].as_object_mut() {
+            if let Some(map) = value
+                .get_mut(field)
+                .and_then(serde_json::Value::as_object_mut)
+            {
                 map.retain(|key, _| !keys.contains(key));
             }
         }
@@ -2573,7 +2561,10 @@ impl PipelineFixture {
             "claude_usage_family_pending",
             "claude_account_family_pending",
         ] {
-            if let Some(map) = value[field].as_object_mut() {
+            if let Some(map) = value
+                .get_mut(field)
+                .and_then(serde_json::Value::as_object_mut)
+            {
                 map.remove(session);
             }
         }
@@ -2892,8 +2883,8 @@ fn observed_unindexed_retry_pending_member_keeps_its_family_after_a_replay_reset
     assert_eq!(pages.len(), 1, "a single-page traversal");
     let last = pages.last().expect("terminal page");
     assert_eq!(
-        last.scan.census_residue_index_key_count, 1,
-        "the raw census completed and named the member as residue"
+        last.scan.census_residue_index_key_count, 0,
+        "completion effects withhold the raw-terminal residue decision"
     );
     assert!(
         !last.index.files.contains_key(&key),
@@ -3697,7 +3688,7 @@ fn due_reoffer_rejected_page_preserves_terminal_and_retry_pending_holds() {
         );
         let last = fixture.page("2026-08-02T09:01:00Z", &cycle, PipelineUpload::Accept);
         assert!(!last.scan.census_complete);
-        assert_eq!(last.backfill_succeeded, !retry_pending);
+        assert!(!last.backfill_succeeded);
         assert_eq!(last.scan.census_window_end, first.scan.census_window_end);
     }
 }

@@ -200,3 +200,30 @@ Small-cohort completion/corrections remain delayed, and strict analytics pause.
 A branch macOS run is required before any guard. This helper dispatches no run;
 Linux compilation is not a supported-layout runtime receipt. The receipt PR
 must merge first; this change ships in the same release or after it, never alone.
+
+
+Round17 decision: Ron accepted 2026-10-29: ships with per-class gauges/alarms;
+per-family completion, usage-proof retirement and the CAS peak are next-release
+top priorities. Ordinary held-history measurement is post-release gauge work,
+not a request for a persisted field or a release block. Source context pacing
+and mixed-file C1 remain paired with the separate receipt change.
+
+Retained Claude scheduling now drains FIFO after existing recovery and due
+family debt. Repeated audits cannot overtake a watcher indefinitely on one-file
+pages. A held, already-observed member requeues as a reread (G1), so the real-
+loss/floor retry remains reachable; failed transport pages keep their census
+obligation. No queue entry is discarded and no hold or proof credit changes.
+The existing one-file root/agent money fixture and six-hour floor controls
+retain their exact token, settlement and budget checks.
+
+Shared pipeline fixtures distinguish finite service rounds from terminal
+completion, preserve current-contract baseline inputs without clearing upgrade
+debt, and retain held revision/census records without opening the duplicate
+fence. Old-reader retirement builders no longer serialize absent optional maps
+as null. Historical proof input is built from actual complete fixture reads,
+separately labelled from release evidence; no terminal path or new grant runs.
+The original wire golden is explicit fixture-only completion coverage with
+its original assertions byte-unchanged. A separate production-default wire
+fixture checks unchanged money and exact ACK, rejecting a wrong body witness,
+while strict cache/curve proof stays off. The completion knob remains absent
+from money, upload, history, correction and census pipeline suites.

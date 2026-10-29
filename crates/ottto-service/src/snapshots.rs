@@ -26828,6 +26828,18 @@ impl OwnedSourceScan {
             }
         }
         let retry_service_end = pending_paths.len();
+        if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
+            // This traversal can outlive a completed walk indefinitely. Keep
+            // recovery/due-retry ownership above, then service its retained
+            // queue in FIFO order: a repeatedly due audit must not starve an
+            // earlier watcher/changed-file obligation on one-file pages.
+            while pending_paths.len() < selection_limit {
+                let Some(candidate) = traversal.pending_candidates.pop_front() else {
+                    break;
+                };
+                pending_paths.push(candidate);
+            }
+        }
         let audit_now = sampled_scan::now_seconds();
         while pending_paths.len() < selection_limit {
             let Some(position) = traversal.pending_candidates.iter().position(|candidate| {
@@ -45754,6 +45766,17 @@ impl ScanIndex {
             .admission
             .as_ref()
             .map(|state| (state.after_root.as_deref(), state.complete))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn initialize_current_claude_contract_for_test(&mut self) {
+        assert!(self.files.is_empty() && self.traversal.is_none());
+        assert!(self.claude_request_identity_contract.is_none());
+        assert!(!self.claude_request_identity_contract_changed);
+        // Controlled already-current reader INPUT, not clearing real upgrade
+        // debt. Use before the fixture's first transcript is indexed only.
+        self.claude_request_identity_contract =
+            Some(claude_request_identity::cycle_contract(true).into());
     }
 
     #[cfg(test)]
@@ -68401,12 +68424,25 @@ mod tests {
                 "finalized file retains exact source/head/body identity"
             );
             assert!(entry.last_upload_body_witness.is_some());
-            assert_eq!(
-                index.claude_account_family_pending[&root].member_requests[&member]
-                    .identity_revision,
-                expected,
-                "exact finalizer revision is captured evidence, not owned-start or census proof"
-            );
+            let pending = &index.claude_account_family_pending[&root];
+            match &pending.member_requests[&member].identity_revision {
+                Some(actual) => assert_eq!(
+                    Some(actual),
+                    expected.as_ref(),
+                    "only the exact finalized revision is captured"
+                ),
+                None => assert!(
+                    pending.invalid
+                        || result
+                            .snapshots
+                            .iter()
+                            .filter(|item| item.source_file_fingerprint.as_deref()
+                                == Some(entry.source_file_fingerprint.as_str()))
+                            .any(|item| exact_session_account_hash(item).as_ref()
+                                != Some(&pending.account_identifier_hash)),
+                    "an unqualified account body cannot acquire a pending identity revision"
+                ),
+            }
         }
         fs::remove_dir_all(dir).unwrap();
     }
@@ -77452,7 +77488,69 @@ mod tests {
     }
 
     #[test]
+    fn terminal_off_original_carrier_wire_preserves_money_and_exact_ack_without_strict_analytics() {
+        assert!(claude_terminal_off());
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+        let mut item = claude_original_carrier_fixture(&claude_original_carrier_metadata(), "");
+        assert_eq!(
+            (item.input_tokens, item.output_tokens, item.request_count),
+            (10, 2, 1)
+        );
+        prepare_cache_observations(&mut item, None);
+        assert!(item.cache_observations.is_none());
+        assert!(item.context_curve.as_ref().map_or(true, |curve| !matches!(
+            curve.coverage.as_str(),
+            "complete" | "sampled"
+        )));
+        let original = (
+            item.input_tokens,
+            item.output_tokens,
+            item.request_count,
+            item.model_usage.clone(),
+            item.usage_buckets.clone(),
+        );
+        let mut request = valid_v6_batch_request();
+        request.source = "claude_code".into();
+        request.snapshots = vec![item];
+        apply_upload_policy(
+            SnapshotSource::ClaudeCode,
+            &mut request.snapshots,
+            request.upload_policy,
+        );
+        request.snapshots[0].snapshot_fingerprint =
+            snapshot_fingerprint(SnapshotSource::ClaudeCode, &request.snapshots[0]);
+        let item = &request.snapshots[0];
+        assert_eq!(
+            (
+                item.input_tokens,
+                item.output_tokens,
+                item.request_count,
+                item.model_usage.clone(),
+                item.usage_buckets.clone()
+            ),
+            original
+        );
+        let witness = snapshot_upload_body_witness(item);
+        let response = |digest: &str| {
+            serde_json::from_value::<crate::snapshot_client::SnapshotBatchResponse>(json!({
+                "accepted":1,"sessions_reconciled":0,"session_ids":[],"disabled":false,
+                "entity_ack_contract": SNAPSHOT_ENTITY_ACK_CONTRACT,
+                "accepted_entities":[{"source_session_id":item.source_session_id,
+                    "snapshot_fingerprint":item.snapshot_fingerprint,"occurrence_count":1,
+                    "body_witness_version":7,"body_witness_digest":digest}],
+                "unchanged_entities":[],"rejected_entities":[],"conflict_entities":[]
+            }))
+            .unwrap()
+        };
+        response(&witness).validate_entity_ack(&request).unwrap();
+        assert!(response(&"0".repeat(64))
+            .validate_entity_ack(&request)
+            .is_err());
+    }
+
+    #[test]
     fn claude_original_carrier_source_generated_wire_corpus() {
+        let _completion_paths = crate::snapshots::ClaudeCompletionPathsForTest::enable();
         // Released pre-flip bytes built without e2::finish_page, which emits the hours gate on.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let complete = claude_original_carrier_fixture(&claude_original_carrier_metadata(), "");
@@ -77486,9 +77584,6 @@ mod tests {
                         item = claude_original_carrier_fixture(&metadata, "");
                     }
                     prepare_cache_observations(&mut item, None);
-                    // Containment pauses new strict cache output on all installs.
-                    // The remaining wire/account/ACK domains retain their exact checks.
-                    let cache = cache && item.cache_observations.is_some();
                     if !cache {
                         item.cache_observations = None;
                         item.cache_observations_state = None;

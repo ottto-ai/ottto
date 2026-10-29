@@ -262,6 +262,9 @@ impl ApcFixture {
             native_terminal_seen: std::cell::Cell::new(false),
             census_before_fold: std::cell::Cell::new(false),
         };
+        let mut current = ScanIndex::default();
+        current.initialize_current_claude_contract_for_test();
+        current.save(&fixture.index_path).unwrap();
         for (session, path) in [
             (
                 APC_SIBLING,
@@ -1042,7 +1045,10 @@ impl ApcFixture {
             "file_snapshot_fingerprints",
             "accepted_rebuild_incidence",
         ] {
-            if let Some(map) = value[field].as_object_mut() {
+            if let Some(map) = value
+                .get_mut(field)
+                .and_then(serde_json::Value::as_object_mut)
+            {
                 for key in keys.values() {
                     map.remove(key);
                 }
@@ -1053,7 +1059,10 @@ impl ApcFixture {
             "claude_usage_family_pending",
             "claude_account_family_pending",
         ] {
-            if let Some(map) = value[field].as_object_mut() {
+            if let Some(map) = value
+                .get_mut(field)
+                .and_then(serde_json::Value::as_object_mut)
+            {
                 map.remove(APC_ROOT);
             }
         }
@@ -1088,8 +1097,31 @@ impl ApcFixture {
             &self.support,
             [APC_ROOT.to_string()],
         );
-        let proof =
-            index.restore_historical_claude_family_for_test(APC_ROOT, &api, &trace, correction);
+        // Build historical INPUT from a complete ordinary read of the actual
+        // fixture files, independently of this release's partial held window.
+        // This is setup work, not a claimed release terminal grant or receipt.
+        let mut coverage = ScanIndex::default();
+        let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&self.root),
+            &mut coverage,
+            "2026-08-02T08:00:00Z",
+            183,
+            100,
+            true,
+        )
+        .unwrap();
+        crate::snapshots::apply_claude_reported_usage_with_index(
+            &mut scan.snapshots,
+            &api,
+            &trace,
+            &mut coverage,
+            false,
+            "2026-08-02T08:00:00Z",
+        );
+        let proof = index.restore_historical_claude_family_from_for_test(
+            APC_ROOT, &coverage, &api, &trace, correction,
+        );
         index
             .save(&self.index_path)
             .expect("restore old-reader proof/owed custody");
