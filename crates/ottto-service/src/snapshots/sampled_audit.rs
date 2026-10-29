@@ -908,9 +908,9 @@ mod provenance_tests {
     }
 }
 
-/// Positive removal only: the path is NotFound beneath a present readable
-/// parent AND a configured, readable root. Missing mounts/parents, symlinks,
-/// permission errors and unreadable roots keep the audit and account debt.
+/// Positive removal only: a file or intermediate directory is NotFound beneath
+/// a readable ancestor securely reached from a configured, readable root.
+/// Missing roots, symlinks and permission errors keep the audit and account debt.
 /// This is absence authority, never source verification or census credit.
 pub(super) fn proven_absent(path: &Path, roots: &[PathBuf]) -> bool {
     #[cfg(unix)]
@@ -943,10 +943,10 @@ fn proven_absent_beneath_root(path: &Path, root: &Path) -> std::io::Result<bool>
         }
         Ok(unsafe { File::from_raw_fd(fd) })
     }
-    fn final_name_absent(parent: &File, name: &std::ffi::CStr) -> std::io::Result<bool> {
+    fn name_absent(parent: &File, name: &std::ffi::CStr) -> std::io::Result<bool> {
         let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
-        // A dangling final symlink is present, not positive absence. Stat
-        // relative to the pinned parent without opening any transcript bytes.
+        // A dangling symlink is present, not positive absence. Stat relative
+        // to the pinned parent without opening any transcript bytes.
         let result = unsafe {
             libc::fstatat(
                 parent.as_raw_fd(),
@@ -978,7 +978,10 @@ fn proven_absent_beneath_root(path: &Path, root: &Path) -> std::io::Result<bool>
     {
         return Ok(false);
     }
-    let Ok(relative) = path.strip_prefix(root) else {
+    // Preserve the nofollow check on the root's final component even when its
+    // configured spelling has a trailing separator or `/.`.
+    let root: PathBuf = root.components().collect();
+    let Ok(relative) = path.strip_prefix(&root) else {
         return Ok(false);
     };
     let mut names = Vec::new();
@@ -998,19 +1001,29 @@ fn proven_absent_beneath_root(path: &Path, root: &Path) -> std::io::Result<bool>
     root_options
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    let mut directories = vec![root_options.open(root)?];
+    let mut directories = vec![root_options.open(&root)?];
+    let mut missing_name = final_name;
     for name in parents {
-        let next = open_directory(directories.last().expect("opened root"), name)?;
-        directories.push(next);
+        match open_directory(directories.last().expect("opened ancestor"), name) {
+            Ok(next) => directories.push(next),
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                // The last pinned directory is the nearest existing ancestor.
+                // Do not traverse the missing suffix or accept any other error.
+                missing_name = name;
+                break;
+            }
+            Err(error) => return Err(error),
+        }
     }
-    if !final_name_absent(directories.last().expect("opened parent"), final_name)? {
+    if !name_absent(directories.last().expect("opened ancestor"), missing_name)? {
         return Ok(false);
     }
 
     // A removed/replaced ancestor can leave a readable but detached descriptor.
     // Rewalk from the configured root and compare every pinned directory before
-    // accepting the final ENOENT. Any observed substitution keeps the debt.
-    let mut directory = root_options.open(root)?;
+    // accepting ENOENT at the same missing component. Any observed substitution
+    // or recreation (even an empty directory) keeps the debt.
+    let mut directory = root_options.open(&root)?;
     if !same_directory(&directory, &directories[0])? {
         return Ok(false);
     }
@@ -1020,7 +1033,7 @@ fn proven_absent_beneath_root(path: &Path, root: &Path) -> std::io::Result<bool>
             return Ok(false);
         }
     }
-    final_name_absent(&directory, final_name)
+    name_absent(&directory, missing_name)
 }
 
 #[cfg(all(test, unix))]
@@ -1088,13 +1101,59 @@ mod absence_tests {
     }
 
     #[test]
-    fn missing_parent_cannot_prove_transcript_absence() {
+    fn missing_intermediate_directory_beneath_readable_root_proves_absence() {
         let fixture = Fixture::new();
         let path = fixture.transcript();
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
-        assert!(!proven_absent(&path, &fixture.roots()));
+        assert!(proven_absent(&path, &fixture.roots()));
         fs::remove_dir_all(fixture.0.join("root/project")).unwrap();
+        assert!(proven_absent(&path, &fixture.roots()));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"recreated transcript").unwrap();
         assert!(!proven_absent(&path, &fixture.roots()));
+    }
+
+    #[test]
+    fn missing_configured_root_cannot_prove_absence() {
+        let fixture = Fixture::new();
+        let path = fixture.transcript();
+        fs::remove_dir_all(fixture.0.join("root")).unwrap();
+        assert!(!proven_absent(&path, &fixture.roots()));
+    }
+
+    #[test]
+    fn dangling_symlink_or_non_directory_ancestor_cannot_prove_absence() {
+        let fixture = Fixture::new();
+        let path = fixture.transcript();
+        let project = fixture.0.join("root/project");
+        fs::remove_dir_all(&project).unwrap();
+        symlink("missing-project", &project).unwrap();
+        assert!(!proven_absent(&path, &fixture.roots()));
+        fs::remove_file(&project).unwrap();
+        fs::write(&project, b"not a directory").unwrap();
+        assert!(!proven_absent(&path, &fixture.roots()));
+    }
+
+    #[test]
+    fn unreadable_existing_ancestor_or_root_cannot_prove_absence() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Root can bypass directory permissions; this control needs an
+        // unprivileged process to exercise the permission-error boundary.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let fixture = Fixture::new();
+        let path = fixture.transcript();
+        let root = fixture.0.join("root");
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        for directory in [path.parent().unwrap().parent().unwrap(), root.as_path()] {
+            let permissions = fs::metadata(directory).unwrap().permissions();
+            fs::set_permissions(directory, fs::Permissions::from_mode(0)).unwrap();
+            let absent = proven_absent(&path, &fixture.roots());
+            fs::set_permissions(directory, permissions).unwrap();
+            assert!(!absent);
+        }
     }
 
     #[test]
@@ -1124,10 +1183,12 @@ mod absence_tests {
         ));
         let root_link = fixture.0.join("root-link");
         symlink(fixture.0.join("root"), &root_link).unwrap();
-        assert!(!proven_absent(
-            &root_link.join("project/session/subagents/file.jsonl"),
-            &[root_link]
-        ));
+        for root in [root_link.clone(), root_link.join(""), root_link.join(".")] {
+            assert!(!proven_absent(
+                &root.join("project/session/subagents/file.jsonl"),
+                &[root]
+            ));
+        }
         fs::remove_dir_all(fixture.0.join("root")).unwrap();
         assert!(!proven_absent(&path, &fixture.roots()));
     }

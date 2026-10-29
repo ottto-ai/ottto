@@ -2749,12 +2749,103 @@ fn withheld_missing_parent_keeps_account_and_audit_debt() {
             due_unix_seconds: 1
         }
     ));
-    fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    // A missing configured root is uncertain; a missing project beneath a
+    // readable configured root is now positive absence.
+    fs::remove_dir_all(root.projects()).unwrap();
     assert!(!sampled_audit::proven_absent(&path, &[root.projects()]));
     let (kept, _, _) = finish(new_scan(&root.projects(), held));
     assert!(kept.files[&key].has_unverified_source());
     assert!(kept.claude_account_deferred_holds.contains_key(&key));
     assert!(!crate::snapshot_sync::withheld_settled_for_test(&kept));
+}
+
+/// Deleting a project beneath a readable root retires both indexed debts,
+/// through either a remove hint or the existing bounded reconciliation page.
+#[test]
+fn withheld_removed_project_releases_account_and_audit_debt() {
+    for hinted in [false, true] {
+        let root = Root::new("ld-removed-project-held");
+        let project = root.projects().join("project");
+        let parent = project.join("session/subagents");
+        fs::create_dir_all(&parent).unwrap();
+        let path = parent.join(format!("{SESSION}.jsonl"));
+        let key = local_index_key(&path);
+        append(&path, &assistant_line("u1"));
+        let (previous, _, _) = finish(new_scan(&root.projects(), ScanIndex::default()));
+        append(&path, &assistant_line("u2"));
+        let (parsed, scan, _) = finish(new_scan(&root.projects(), previous.clone()));
+        let mut held = crate::snapshot_sync::settle_withheld_for_test(&previous, parsed, scan);
+        assert!(held.claude_account_deferred_holds.contains_key(&key));
+        let fp = held.files[&key].source_file_fingerprint.clone();
+        assert!(held.stage_sampled_audit(
+            &key,
+            &fp,
+            crate::transcript_acquisition::AuditDebt {
+                due_unix_seconds: 1
+            }
+        ));
+        let incidence = held.file_snapshot_fingerprints[&key].clone();
+        let acknowledgements = held.accepted_snapshot_fingerprints.clone();
+        let known_tokens = serde_json::to_value(withheld_account::held_gauge().unwrap()).unwrap()
+            ["withheld_held_tokens"]
+            .as_u64()
+            .unwrap();
+        assert!(known_tokens > 0);
+        fs::remove_dir_all(&project).unwrap();
+        assert!(sampled_audit::proven_absent(&path, &[root.projects()]));
+        let hints = if hinted { vec![path.clone()] } else { vec![] };
+        let recorder = Recorder::default();
+        let baseline = held.clone();
+        let ((after, scan, _), counts) = capture(|| {
+            finish(
+                OwnedSourceScan::new(
+                    SnapshotSource::ClaudeCode,
+                    &[root.projects()],
+                    held,
+                    NOW,
+                    BACKFILL_WINDOW_DAYS,
+                    10,
+                    false,
+                    None,
+                    &hints,
+                    false,
+                    true,
+                )
+                .with_line_observer("test", Box::new(recorder.clone())),
+            )
+        });
+        assert!(recorder.events().is_empty(), "absence never acquires bytes");
+        assert_eq!(scan.scanned_file_count, 0);
+        if !hinted {
+            assert!(scan.census_complete);
+        }
+        let after = crate::snapshot_sync::settle_withheld_for_test(&baseline, after, scan);
+        assert!(!after.files.contains_key(&key));
+        assert!(!after.claude_account_deferred_holds.contains_key(&key));
+        assert!(crate::snapshot_sync::withheld_settled_for_test(&after));
+        assert_eq!(after.file_snapshot_fingerprints.get(&key), Some(&incidence));
+        assert_eq!(after.accepted_snapshot_fingerprints, acknowledgements);
+        assert!(withheld_account::held_gauge().is_none());
+        let counts = page_counts(&counts);
+        assert_eq!(counts["withheld_hold_released"]["deleted"], 1);
+        assert_eq!(
+            counts["withheld_hold_released"]["deleted_tokens"],
+            known_tokens
+        );
+        assert_eq!(counts["audit_retired_absent"]["events"], 1);
+        fs::create_dir_all(&parent).unwrap();
+        append(&path, &assistant_line("new-object"));
+        let recorder = Recorder::default();
+        let (_, scan, _) = finish(
+            new_scan(&root.projects(), after)
+                .with_line_observer("test", Box::new(recorder.clone())),
+        );
+        assert_eq!(scan.scanned_file_count, 1, "recreation is A1 FirstRead");
+        assert!(recorder
+            .events()
+            .iter()
+            .any(|event| matches!(event, Event::Begin(view) if view.mode == DeliveryMode::Full)));
+    }
 }
 
 /// Exercise the real rotation admission/discard protocol over multiple cycles.
@@ -2889,10 +2980,12 @@ fn withheld_memo_survives_owner_cycles_and_discloses_budget_refusal() {
 }
 
 /// Hold-only checkpoints must use the same positive proof as indexed holds.
-/// A clean root census cannot prove anything about a missing ancestor.
+/// A missing project beneath a readable root is positive absence; a missing
+/// configured root remains uncertain even after checkpoint reload.
 #[test]
 fn withheld_new_completed_checkpoint_requires_positive_absence() {
-    for missing_parent in [true, false] {
+    for removed in ["root", "project", "file"] {
+        let missing_root = removed == "root";
         let root = Root::new("ld-held-new-absence");
         let parent = root.projects().join("project");
         fs::create_dir_all(&parent).unwrap();
@@ -2908,8 +3001,10 @@ fn withheld_new_completed_checkpoint_requires_positive_absence() {
         held.save(&checkpoint).unwrap();
         let held = ScanIndex::load(&checkpoint).unwrap();
         fs::remove_file(&path).unwrap();
-        if missing_parent {
+        if removed == "project" {
             fs::remove_dir(&parent).unwrap();
+        } else if missing_root {
+            fs::remove_dir_all(root.projects()).unwrap();
         }
         let recorder = Recorder::default();
         let ((after, _, _), counts) = capture(|| {
@@ -2921,18 +3016,18 @@ fn withheld_new_completed_checkpoint_requires_positive_absence() {
         assert!(recorder.events().is_empty(), "absence never parses");
         assert_eq!(
             after.claude_account_deferred_holds.contains_key(&key),
-            missing_parent
+            missing_root
         );
         assert_eq!(
             crate::snapshot_sync::withheld_settled_for_test(&after),
-            !missing_parent
+            !missing_root
         );
         let counts = page_counts(&counts);
         assert_eq!(
             counts["withheld_hold_released"]["deleted"]
                 .as_u64()
                 .unwrap_or(0),
-            u64::from(!missing_parent)
+            u64::from(!missing_root)
         );
         assert_eq!(
             counts["audit_retired_absent"]["events"]
