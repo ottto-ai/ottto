@@ -73,9 +73,10 @@ pub(crate) const WRITE_PASS_BYTES: usize = store::WRITE_PASS_BYTES;
 /// - M3 per-key debt/D3-hold and P1-1 restore-pending maps, 2*257 nodes of
 ///   <=1024 bytes = 526,336 bytes (`KEY_RESERVE_BYTES`).
 ///
-/// Total 1,978,368 bytes. Lead A approved 1,452,032 on 2026-10-29; the M3 key
-/// reserve is the r7 owner re-pin request. Native/container evidence remains
-/// required; this pin is not enforcement by the cache's heap walk.
+/// Total 1,978,368 bytes supersedes the earlier 1,452,032 map estimate.
+/// The 526,336-byte M3 key reserve is debited from STATE_BYTES, within the
+/// existing cache budget. Native/container evidence remains required; this
+/// explicit prepayment is separate from the retained graph's heap walk.
 #[cfg(test)]
 pub(crate) const STORES_RESIDENT_BOUND: usize = 2 * store::MAX_RECORDS * 256
     + 2 * (store::MAX_BATCH + 1) * 4096
