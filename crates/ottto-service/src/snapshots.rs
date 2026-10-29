@@ -92537,10 +92537,9 @@ impl ScanIndex {
     pub(crate) fn retain_persistence_baseline_from(&mut self, committed: &Self) {
         self.persistence_root = committed.persistence_root.clone();
         self.persistence_controls = committed.persistence_controls.clone();
-        self.persistence_legacy_recovery = self
-            .persistence_legacy_recovery
-            .clone()
-            .or_else(|| committed.persistence_legacy_recovery.clone());
+        // A published baseline has consumed its shared recovery grant. Adopt
+        // its exact custody, including None, rather than retaining a spent Arc.
+        self.persistence_legacy_recovery = committed.persistence_legacy_recovery.clone();
         self.persistence_unavailable = std::array::from_fn(|i| {
             self.persistence_unavailable[i].or(committed.persistence_unavailable[i])
         });
