@@ -1599,7 +1599,7 @@ fn desktop_inventory_backoff_keeps_growing_native_prefix_and_cold_body_parity() 
     f.append_transcript(1);
     let at = "2026-08-02T07:10:01Z";
     let (cached, rows) = crate::local_resource_diagnostics::capture(|| {
-        raw_scan_at(&f, prior.clone(), Some(cache), true, at, |_| {})
+        raw_scan_at(&f, prior.clone(), Some(cache.clone()), true, at, |_| {})
     });
     assert!(!cached.result.sidecar_census_complete);
     assert!(
@@ -1638,5 +1638,33 @@ fn desktop_inventory_backoff_keeps_growing_native_prefix_and_cold_body_parity() 
         exact_bodies(&cached),
         exact_bodies(&full),
         "the cold Full oracle applies the same incomplete metadata and emits identical bodies"
+    );
+    // Physical growth can win the selection gate while metadata still forces
+    // ScopeChanged: the actual Full reason, not that gate, owns the read count.
+    let index = settle(cached);
+    f.append_transcript(2);
+    fs::write(
+        store.join("one.json"),
+        json!({"cliSessionId":f.session,
+        "createdAt":"2026-08-02T06:59:00Z", "title":"own changed title", "titleSource":"user"})
+        .to_string(),
+    )
+    .unwrap();
+    let (changed, rows) = crate::local_resource_diagnostics::capture(|| {
+        raw_scan_at(&f, index, Some(cache), true, "2026-08-02T07:12:00Z", |_| {})
+    });
+    assert!(changed.index.claude_desktop_identity_census_complete);
+    assert_eq!(changed.native_bytes, fs::metadata(&f.path).unwrap().len());
+    assert_eq!(
+        changed.reasons[FullReason::ScopeChanged.slot()],
+        usize::from(crate::heap_layout_bound::layout_supported())
+    );
+    assert_eq!(
+        rows.iter()
+            .filter_map(
+                |row| row["counts"]["desktop_metadata"]["source_revision_body_rereads"].as_u64()
+            )
+            .sum::<u64>(),
+        u64::from(crate::heap_layout_bound::layout_supported())
     );
 }

@@ -53,9 +53,12 @@ wire field:
 - `inventory_restarts`: changed/unknown ordered store inventory resets the
   metadata cursor, ceiling and coverage claims. An old absent inventory counts
   once when established; subsequent unchanged loads count zero.
-- `source_revision_body_rereads`: a `SourceChanged` selection actually consumes
+- `source_revision_body_rereads`: a `SourceChanged` selection or actual
+  `Full(ScopeChanged)` acquisition consumes
   its first transcript body bytes. This includes Desktop/usage sidecar revisions
-  and opened-object revisions; it is not exclusively Desktop attribution.
+  and opened-object/interpretation revisions; it is not exclusively Desktop
+  attribution. Checking the actual mode covers simultaneous growth and metadata
+  changes even when the first selection gate was `TranscriptChanged`.
 - `legacy_identity_body_rereads`: the same actual-read event selected by the
   separate legacy identity adoption path. Both body counters count files per
   attempt, including attempts that later fail; selection or an unchanged native

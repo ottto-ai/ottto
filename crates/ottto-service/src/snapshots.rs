@@ -28278,6 +28278,8 @@ impl OwnedSourceScan {
                 {
                     // Count only the first actual body bytes. SourceChanged
                     // includes Desktop/usage sidecar and object revisions;
+                    // ScopeChanged also catches a metadata change concurrent
+                    // with growth (whose selection reason is TranscriptChanged).
                     // LegacyIdentity is the separate one-time legacy upgrade.
                     if claude_title_metadata
                         .recovered_account_holds
@@ -28286,11 +28288,13 @@ impl OwnedSourceScan {
                         crate::local_resource_diagnostics::claude_reread::desktop_recovered_hold_body_read();
                     } else {
                         match index.candidate_decision_with_reason(&active.candidate).1 {
-                            Some(CandidateParseReason::SourceChanged) => {
-                                crate::local_resource_diagnostics::claude_reread::desktop_revision_body_read(false);
-                            }
                             Some(CandidateParseReason::LegacyIdentity) => {
                                 crate::local_resource_diagnostics::claude_reread::desktop_revision_body_read(true);
+                            }
+                            reason if reason == Some(CandidateParseReason::SourceChanged)
+                                || active.sampling.as_ref().is_some_and(|read| matches!(read.mode,
+                                    crate::transcript_acquisition::ReadMode::Full(crate::transcript_acquisition::FullReason::ScopeChanged))) => {
+                                crate::local_resource_diagnostics::claude_reread::desktop_revision_body_read(false);
                             }
                             _ => {}
                         }
