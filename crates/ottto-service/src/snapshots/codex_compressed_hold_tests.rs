@@ -124,6 +124,9 @@ fn accepted(root: &Path, path: &Path) -> ScanIndex {
     index
         .file_snapshot_fingerprints
         .insert(key, BTreeSet::from([fp.clone()]));
+    let activity = snapshot_semantic_activity_at(body);
+    assert!(activity.is_some(), "genuine accepted semantic activity");
+    index.snapshot_activity_at.insert(fp.clone(), activity);
     index.accepted_snapshot_fingerprints.insert(fp);
     fs::remove_file(control).unwrap();
     index
@@ -199,6 +202,20 @@ fn replay_retains_historical_coverage_without_new_ack_credit() {
     latch(&mut index, &path);
     let before = index.files[&local_index_key(&path)].clone();
     let incidence = index.file_snapshot_fingerprints.clone();
+    let activity = index.snapshot_activity_at.clone();
+    assert_eq!(activity.len(), 1);
+    let prior_manifest = index
+        .manifest_for_window(
+            SnapshotSource::Codex,
+            "2000-01-01T00:00:00Z",
+            "2100-01-01T00:00:00Z",
+        )
+        .unwrap();
+    assert_eq!(prior_manifest.entity_count, 1);
+    index.snapshot_activity_at.insert(
+        "obsolete-unheld".into(),
+        Some("2026-10-01T00:00:00Z".into()),
+    );
     assert!(index.prepare_historical_replay("synthetic-replay".into()));
     assert_eq!(
         index.files[&local_index_key(&path)].last_snapshot_fingerprint,
@@ -211,8 +228,29 @@ fn replay_retains_historical_coverage_without_new_ack_credit() {
     );
     let saved = root.join("index.json");
     index.save(&saved).unwrap();
-    let ((index, result), rows) = capture(|| normal(&root, ScanIndex::load(&saved).unwrap(), &[]));
+    let ((mut index, mut result), rows) = capture(|| {
+        no_open(&path, || {
+            normal(&root, ScanIndex::load(&saved).unwrap(), &[])
+        })
+    });
     assert_no_red(&result, &rows);
+    assert!(result.census_complete, "custody-only terminal census");
+    finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut index);
+    assert_eq!(
+        index.snapshot_activity_at, activity,
+        "existing finalizer prunes orphan activity"
+    );
+    let manifest = index
+        .manifest_for_window(
+            SnapshotSource::Codex,
+            "2000-01-01T00:00:00Z",
+            "2100-01-01T00:00:00Z",
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(manifest).unwrap(),
+        serde_json::to_value(prior_manifest).unwrap()
+    );
     assert_eq!(index.file_snapshot_fingerprints, incidence);
     assert_eq!(
         index.files[&local_index_key(&path)].last_upload_body_witness,

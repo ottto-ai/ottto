@@ -45811,7 +45811,15 @@ impl ScanIndex {
                 .get(key)
                 .is_some_and(|e| e.codex_compressed_hold.is_some())
         });
-        self.snapshot_activity_at.clear();
+        // Custody's retained incidence still needs its historical activity.
+        // The ordinary finalizer prunes orphan activity without a second set.
+        if !self
+            .files
+            .values()
+            .any(|entry| entry.codex_compressed_hold.is_some())
+        {
+            self.snapshot_activity_at.clear();
+        }
         self.accepted_snapshot_fingerprints.clear();
         self.accepted_snapshot_fingerprint_ledger_version = SNAPSHOT_ACCEPTED_LEDGER_VERSION;
         self.accepted_incidence_pending_census = false;
