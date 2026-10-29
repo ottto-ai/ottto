@@ -27696,6 +27696,15 @@ impl OwnedSourceScan {
                     }
 
                     inventory.classify_bound_archives();
+                    // Keep A's negative scope for still-denied persisted work;
+                    // activated family holds must not newly suppress plain P.
+                    inventory.held_owners.extend(
+                        census
+                            .archive_terminal_index_keys
+                            .iter()
+                            .filter(|key| !transcript_path_admitted(source, Path::new(key)))
+                            .flat_map(|key| codex_session_id_candidates_from_path(Path::new(key))),
+                    );
                     // Named family holds apply only to X. P retains main's
                     // publication behavior; held archives never enter groups.
                     identified_candidates.retain(|candidate| {

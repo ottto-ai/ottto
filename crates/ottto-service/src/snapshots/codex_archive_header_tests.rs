@@ -890,6 +890,7 @@ fn retained_archive_queue_and_roster_obey_discovery_off_after_restart() {
         traversal.pending_candidates = [f.0.clone(), plain.clone(), related.clone()]
             .into_iter()
             .map(|path| ScanTraversalPath {
+                order_modified: None,
                 scan_root: root.clone(),
                 path,
                 census_member: true,
