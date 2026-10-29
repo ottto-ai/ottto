@@ -4,44 +4,70 @@ Agent: Codex. Session: `01a1892d-458c-7001-8500-fb04c42804e5`.
 Task/review identity: `codex/bootstrap-transaction-ownership`.
 Base: `2c560a8c9ea3fd681f027933f56890371ea6f499`.
 
-`service bootstrap` previously waited indefinitely for launchctl and had no
-cross-process transaction ownership. Terminating its direct helper could leave
-a mutating child alive while another helper replaced the same job.
+A terminated service-bootstrap helper could leave a mutating launchctl child
+alive while another caller replaced the same per-user job. CLI autostart also
+mutated that label without coordinating with bootstrap.
 
-Both `write-launch-agent` and `bootstrap` now take a fixed per-user, per-label
-file lock before inspecting ownership or writing the plist. The lock is never
-unlinked or explicitly unlocked. Only explicitly spawned lifecycle children
-inherit its descriptor, keeping the same flock alive after helper exit or
-abrupt termination. A competing helper waits up to five seconds and refuses
-changes if the lock is still held. Execution uses `/bin/launchctl`; generated
-plan strings and CLI flags remain unchanged.
+`ottto-core::service_lifecycle` now owns one fixed home/label lock path, its
+safety checks, explicit descriptor inheritance, and bounded command cleanup.
+Both helper bootstrap/plist writes and default CLI autostart participate.
+The file is never unlinked or explicitly unlocked: a surviving child retains
+the same flock after helper termination. The parent keeps CLOEXEC set; only the
+intended child's copy is cleared before exec.
 
-The current-label ownership probe and each lifecycle command have a ten-second
-polling deadline and a one MiB output cap. Normal timeout/error cleanup kills
-and waits for the direct child before returning. An unparseable successful
-probe or a query failure other than exact service absence refuses mutation.
-A failed stage aborts the remaining sequence and reports a possible partial
-installation. Successful command exit still does not assert daemon readiness.
+Bootstrap waits up to five seconds for the transaction. CLI autostart tries
+once and, if busy, issues no launchctl commands and returns to the CLI's
+existing bounded socket retry. Participating launchctl commands use a fixed
+executable path, a ten-second polling deadline, a one MiB output cap, and
+kill/wait cleanup. CLI command work also has a thirty-second budget. Its
+existing finite loaded-job reconciliation is retained; indeterminate command
+errors stop recovery. A failed bootout cannot proceed to bootstrap unless its
+status specifically means that the job is already absent.
 
-Regression coverage uses temporary files, injected command/ownership seams and
-shell builtins. It covers bounded command kill/reap, inherited lock retention,
-helper death while a child owns the transaction, competing lock acquisition,
-nonzero stage short-circuiting, unknown probe refusal, external-owner
-noninterference and symlink-lock refusal. Tests never contact launchd.
+The helper's ownership probe runs under the lock and refuses unknown results.
+It reuses the existing ownership decision and shared refusal-message builder,
+including the current owner and owner-specific repair hint. Explicit owner
+migration remains available. Failed stages abort the remaining helper plan.
+Successful command exit does not assert daemon readiness.
 
-Validation is CI-only for this task. No local Cargo command, test execution,
-live launchctl operation, installer action or daemon restart is authorized.
-The PR links exact-head Linux CI and the required local strict AutoReview
-receipt. Native macOS compilation and flock behavior remain required before
-integration; Linux success alone does not prove either. No manual macOS
-workflow dispatch is requested.
+The service error envelope and nonzero exit status are preserved. JSON error
+classification is corrected:
 
-Limits: the lock coordinates callers using this implementation. It cannot
-serialize external launchctl invocations, old helper binaries, or shell
-installers that bypass it. A request already accepted by launchd cannot be
-revoked by killing a child. After failure or helper cancellation, the caller
-must reconcile actual ownership and daemon identity/readiness; it must not
-interpret helper completion as successful installation. A wedged child left
-by helper SIGKILL can retain the lock indefinitely, causing later attempts to
-fail closed. Legacy-label cleanup is unchanged and precedes this transaction;
-its separate process/SMAppService behavior is outside this change.
+| Condition | Code | Retryable |
+| --- | --- | --- |
+| Existing owner refusal | `launch_agent_owner_conflict` | false |
+| Transaction busy before cleanup, writes or current-job commands | `launch_agent_transaction_busy` | true |
+| Unknown probe, filesystem/command failure or indeterminate mutation | `launch_agent_lifecycle_failed` | false |
+
+A typed lifecycle failure overrides nested preflight markers, so a failed
+mutation never becomes retryable merely because an underlying error is busy.
+
+An independent source review of `b19b46f33` returned NO-GO: CLI autostart bypassed
+the lock, all errors were mislabeled as owner conflicts, and refusal messages
+lost the current owner and repair hint. All three findings were accepted and
+addressed here. That initial verdict is preserved; no subsequent Claude GO is
+claimed. Final verification uses the same task identity and one focused,
+sensitive AutoReview pass after relevant CI.
+
+Regression tests use temporary files, injected command results and synthetic
+subprocesses, never live launchd. They cover timeout kill/reap, inheritance
+after owner close and Rust helper death, competing acquisition, CLI contention
+without mutation, indeterminate CLI recovery refusal, conclusive recovery,
+failed-stage short-circuiting, actual JSON decision mapping, owner hints,
+explicit migration, external plist preservation and symlink-lock refusal.
+
+Validation is CI-only for this task. No local Cargo/tests, live launchctl,
+installer action or daemon restart is performed. Exact-head results and the
+focused review outcome are linked from the PR. Native macOS compilation and
+flock behavior remain required before integration; Linux success alone does
+not establish either. No manual macOS dispatch is requested.
+
+Limits: external launchctl, older binaries and installer scripts bypassing the
+shared implementation remain outside this lock. Requests already accepted by
+launchd cannot be revoked by killing a child. Callers must reconcile ownership
+and runtime identity/readiness after failure or cancellation. A wedged child
+left by helper SIGKILL can hold the lock indefinitely, causing later attempts
+to fail closed. Legacy-label cleanup remains separate behavior and runs after
+lock acquisition, before current-label inspection/writes; its own process and
+SMAppService timing is unchanged. No persistent transaction journal, atomic
+plist replacement or rollback protocol is introduced.

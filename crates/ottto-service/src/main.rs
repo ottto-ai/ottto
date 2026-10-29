@@ -434,14 +434,7 @@ fn main() -> Result<()> {
                 if json {
                     println!(
                         "{}",
-                        serde_json::to_string_pretty(&json!({
-                            "ok": false,
-                            "error": {
-                                "code": "launch_agent_owner_conflict",
-                                "message": error.to_string(),
-                                "retryable": false
-                            }
-                        }))?
+                        serde_json::to_string_pretty(&service_command_error_payload(&error))?
                     );
                     std::process::exit(2);
                 }
@@ -451,6 +444,40 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn service_command_error_payload(error: &anyhow::Error) -> serde_json::Value {
+    // A mutation failure takes precedence over any nested preflight marker.
+    let (code, retryable) = if error
+        .downcast_ref::<macos_service::LaunchAgentLifecycleFailure>()
+        .is_some()
+    {
+        ("launch_agent_lifecycle_failed", false)
+    } else if error
+        .downcast_ref::<macos_service::LaunchAgentOwnerConflict>()
+        .is_some()
+    {
+        ("launch_agent_owner_conflict", false)
+    } else if service_transaction_is_busy(error) {
+        ("launch_agent_transaction_busy", true)
+    } else {
+        ("launch_agent_lifecycle_failed", false)
+    };
+    json!({"ok": false, "error": {"code": code, "message": error.to_string(), "retryable": retryable}})
+}
+
+fn service_transaction_is_busy(error: &anyhow::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error
+            .downcast_ref::<ottto_core::service_lifecycle::ServiceLifecycleBusy>()
+            .is_some()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
+    }
 }
 
 fn load_registered_device_sources() -> Option<LocalDeviceBinding> {
@@ -516,8 +543,6 @@ fn handle_service_command(command: ServiceCommand) -> Result<()> {
     config.companion_code_requirement = companion_code_requirement;
     let plist_path = macos_service::launch_agent_path(&home);
     let plan = if write {
-        // Retired labels are separate from the current single-owner job.
-        ottto_service::legacy_service::cleanup_legacy_services(&home);
         #[cfg(unix)]
         {
             service_bootstrap::install(&home, &config, &plist_path, migrate_owner, execute)?

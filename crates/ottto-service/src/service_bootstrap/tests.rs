@@ -1,5 +1,5 @@
 use super::*;
-use std::io::{BufRead, BufReader, Write};
+use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -15,8 +15,8 @@ impl Fixture {
         fs::create_dir(&path).unwrap();
         Self(path)
     }
-    fn lock(&self) -> TransactionLock {
-        TransactionLock::acquire(&self.0.join("lock"), Duration::from_secs(1)).unwrap()
+    fn lock(&self) -> ServiceLifecycleTransaction {
+        ServiceLifecycleTransaction::acquire(&self.0, Duration::from_secs(1)).unwrap()
     }
     fn config(&self) -> LaunchAgentConfig {
         LaunchAgentConfig::local_user_default(
@@ -30,90 +30,6 @@ impl Drop for Fixture {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
-struct Reap(Child);
-impl Drop for Reap {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-#[test]
-fn hanging_command_is_bounded_killed_and_reaped() {
-    let fixture = Fixture::new();
-    let lock = fixture.lock();
-    // A single process and shell builtins: no surviving sleep/grandchild.
-    let mut command = Command::new("/bin/sh");
-    command.args(["-c", "while :; do :; done"]);
-    let child = lock.spawn(command.stdout(Stdio::piped())).unwrap();
-    let pid = child.id();
-    let mut reap = Reap(child);
-    let start = Instant::now();
-    assert!(complete(&mut reap.0, Duration::from_millis(50)).is_err());
-    assert!(start.elapsed() < Duration::from_secs(3));
-    let mut status = 0;
-    assert_eq!(
-        unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) },
-        -1
-    );
-    assert_eq!(
-        io::Error::last_os_error().raw_os_error(),
-        Some(libc::ECHILD)
-    );
-}
-
-#[test]
-fn inherited_child_keeps_lock_after_owner_close() {
-    let fixture = Fixture::new();
-    let lock = fixture.lock();
-    let mut command = Command::new("/bin/sh");
-    command
-        .args(["-c", "printf ready; read release"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped());
-    let mut child = Reap(lock.spawn(&mut command).unwrap());
-    let mut ready = [0; 5];
-    child
-        .0
-        .stdout
-        .as_mut()
-        .unwrap()
-        .read_exact(&mut ready)
-        .unwrap();
-    assert_eq!(&ready, b"ready");
-    drop(lock);
-    assert!(TransactionLock::acquire(&fixture.0.join("lock"), Duration::from_millis(50)).is_err());
-    child
-        .0
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(b"release\n")
-        .unwrap();
-    assert!(child.0.wait().unwrap().success());
-    drop(fixture.lock());
-}
-
-#[test]
-fn competing_transaction_waits_until_owner_finishes() {
-    let fixture = Fixture::new();
-    let lock = fixture.lock();
-    let path = fixture.0.join("lock");
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let other = std::thread::spawn(move || {
-        ready_tx.send(()).unwrap();
-        let acquired = TransactionLock::acquire(&path, Duration::from_secs(3)).unwrap();
-        done_tx.send(()).unwrap();
-        drop(acquired);
-    });
-    ready_rx.recv().unwrap();
-    assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
-    drop(lock);
-    done_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-    other.join().unwrap();
-}
-
 #[test]
 fn failed_mutation_stops_before_later_commands() {
     for fail_at in 0..3 {
@@ -194,73 +110,6 @@ fn external_owner_keeps_plist_and_job_unchanged() {
 }
 
 #[test]
-fn symlink_lock_is_refused_without_touching_target() {
-    let fixture = Fixture::new();
-    let target = fixture.0.join("target");
-    fs::write(&target, b"keep").unwrap();
-    std::os::unix::fs::symlink(&target, fixture.0.join("lock")).unwrap();
-    assert!(TransactionLock::acquire(&fixture.0.join("lock"), Duration::ZERO).is_err());
-    assert_eq!(fs::read(target).unwrap(), b"keep");
-}
-
-// This harness entry is invoked only in a separate process by the test below.
-// Acquiring and spawning in Rust avoids shell redirection machinery reusing
-// arbitrary inherited descriptor numbers before the fake command starts.
-#[test]
-fn bootstrap_owner_fixture() {
-    let Some(directory) = std::env::var_os("OTTTO_BOOTSTRAP_TEST_OWNER_DIR") else {
-        return;
-    };
-    let lock = TransactionLock::acquire(
-        &PathBuf::from(directory).join("lock"),
-        Duration::from_secs(1),
-    )
-    .unwrap();
-    let mut command = Command::new("/bin/sh");
-    command.args(["-c", "printf 'ottto-child-ready\\n'; read release"]);
-    let mut child = lock.spawn(&mut command).unwrap();
-    child.wait().unwrap();
-}
-
-#[test]
-fn abrupt_helper_death_leaves_child_owning_transaction() {
-    let fixture = Fixture::new();
-    let mut command = Command::new(std::env::current_exe().unwrap());
-    command
-        .args([
-            "--exact",
-            "service_bootstrap::tests::bootstrap_owner_fixture",
-            "--nocapture",
-        ])
-        .env("OTTTO_BOOTSTRAP_TEST_OWNER_DIR", &fixture.0)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped());
-    let mut owner = Reap(command.spawn().unwrap());
-    let mut output = BufReader::new(owner.0.stdout.take().unwrap());
-    loop {
-        let mut line = String::new();
-        assert!(
-            output.read_line(&mut line).unwrap() > 0,
-            "helper exited before child readiness"
-        );
-        if line.contains("ottto-child-ready") {
-            break;
-        }
-    }
-    owner.0.kill().unwrap();
-    owner.0.wait().unwrap();
-    assert!(TransactionLock::acquire(&fixture.0.join("lock"), Duration::from_millis(50)).is_err());
-    owner
-        .0
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(b"release\n")
-        .unwrap();
-    drop(fixture.lock());
-}
-
-#[test]
 fn nonzero_command_status_is_not_success() {
     let fixture = Fixture::new();
     let lock = fixture.lock();
@@ -276,7 +125,7 @@ fn nonzero_command_status_is_not_success() {
             calls += 1;
             let mut command = Command::new("/bin/sh");
             command.args(["-c", "exit 7"]);
-            let (status, _) = run(&lock, &mut command, Duration::from_secs(1))?;
+            let (status, _) = lock.run(&mut command, Duration::from_secs(1))?;
             anyhow::ensure!(status.success(), "nonzero: {status}");
             Ok(())
         },
@@ -286,4 +135,130 @@ fn nonzero_command_status_is_not_success() {
         .to_string()
         .contains("installation may be partial"));
     assert_eq!(calls, 1);
+}
+
+#[test]
+fn busy_preflight_json_is_retryable_and_has_not_written_a_plist() {
+    let fixture = Fixture::new();
+    let _owner = fixture.lock();
+    let busy = ServiceLifecycleTransaction::acquire(&fixture.0, Duration::ZERO)
+        .err()
+        .unwrap();
+    let payload = crate::service_command_error_payload(&busy.context("bootstrap preflight"));
+    assert_eq!(payload["ok"], false);
+    assert_eq!(payload["error"]["code"], "launch_agent_transaction_busy");
+    assert_eq!(payload["error"]["retryable"], true);
+    assert_eq!(payload.as_object().unwrap().len(), 2);
+    assert_eq!(payload["error"].as_object().unwrap().len(), 3);
+    assert!(!fixture.0.join("agent.plist").exists());
+}
+
+#[test]
+fn actual_failed_decisions_map_to_nonretryable_lifecycle_json() {
+    let fixture = Fixture::new();
+    let config = fixture.config();
+    let probe_error = install_with(
+        &config,
+        &fixture.0.join("agent.plist"),
+        false,
+        true,
+        || anyhow::bail!("unknown loaded owner"),
+        |_| panic!("mutation after failed query"),
+    )
+    .unwrap_err();
+    assert!(!fixture.0.join("agent.plist").exists());
+    let mut calls = 0;
+    let mutation_error = install_with(
+        &config,
+        &fixture.0.join("agent.plist"),
+        false,
+        true,
+        || Ok(Some(config.executable_path.clone())),
+        |_| {
+            calls += 1;
+            Err(ottto_core::service_lifecycle::ServiceLifecycleBusy.into())
+        },
+    )
+    .unwrap_err();
+    assert_eq!(calls, 1);
+    for error in [
+        probe_error,
+        mutation_error,
+        anyhow::anyhow!("unclassified filesystem failure"),
+    ] {
+        let payload = crate::service_command_error_payload(&error);
+        assert_eq!(payload["error"]["code"], "launch_agent_lifecycle_failed");
+        assert_eq!(payload["error"]["retryable"], false);
+    }
+}
+
+#[test]
+fn owner_refusal_json_preserves_current_owner_and_specific_repair_hint() {
+    for (path, owner, hint) in [
+        (
+            "/opt/homebrew/opt/ottto/bin/ottto-service",
+            "Homebrew",
+            "Use brew services restart ottto",
+        ),
+        (
+            "/Users/test/.ottto/bin/ottto-service",
+            "hosted-installer",
+            "Rerun the hosted installer",
+        ),
+    ] {
+        let fixture = Fixture::new();
+        let plist = fixture.0.join("agent.plist");
+        let mut external = fixture.config();
+        external.executable_path = PathBuf::from(path);
+        macos_service::write_launch_agent(&external, &plist).unwrap();
+        let before = fs::read(&plist).unwrap();
+        let error = install_with(
+            &fixture.config(),
+            &plist,
+            false,
+            true,
+            || Ok(Some(external.executable_path.clone())),
+            |_| panic!("owner refusal mutated job"),
+        )
+        .unwrap_err();
+        assert!(error
+            .downcast_ref::<macos_service::LaunchAgentOwnerConflict>()
+            .is_some());
+        let payload = crate::service_command_error_payload(&error);
+        assert_eq!(payload["error"]["code"], "launch_agent_owner_conflict");
+        assert_eq!(payload["error"]["retryable"], false);
+        let message = payload["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains(&format!(
+                "existing owner is {owner}, requested owner is app-bundle"
+            )),
+            "{message}"
+        );
+        assert!(message.contains(hint), "{message}");
+        assert_eq!(fs::read(&plist).unwrap(), before);
+    }
+}
+
+#[test]
+fn explicit_owner_migration_still_allows_the_locked_plan() {
+    let fixture = Fixture::new();
+    let config = fixture.config();
+    let mut calls = Vec::new();
+    install_with(
+        &config,
+        &fixture.0.join("agent.plist"),
+        true,
+        true,
+        || {
+            Ok(Some(PathBuf::from(
+                "/opt/homebrew/opt/ottto/bin/ottto-service",
+            )))
+        },
+        |args| {
+            calls.push(args[1].clone());
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(calls, ["bootout", "enable", "bootstrap"]);
 }
