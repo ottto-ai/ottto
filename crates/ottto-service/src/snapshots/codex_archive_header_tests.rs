@@ -2592,24 +2592,32 @@ fn denied_archive_inventory_debt_releases_once_and_paces_without_plain_body_rere
         archives.insert(local_index_key(&path));
     }
     let cache = Arc::new(sampled_scan::SharedCache::default());
-    let (mut index, baseline) = with_archive_discovery(false, || {
-        finish_selector(
-            OwnedSourceScan::new(
-                SnapshotSource::Codex,
-                &roots,
-                ScanIndex::default(),
-                NOW,
-                BACKFILL_WINDOW_DAYS,
-                10,
-                false,
-                None,
-                &[],
-                false,
-                false,
-            )
-            .with_sampled_acquisition(cache.clone(), Scope("activation-held-debt".into())),
-        )
-    });
+    let ((mut index, baseline), baseline_reads) =
+        terminal_contract_retry::source_acquisitions(|| {
+            with_archive_discovery(false, || {
+                finish_selector(
+                    OwnedSourceScan::new(
+                        SnapshotSource::Codex,
+                        &roots,
+                        ScanIndex::default(),
+                        NOW,
+                        BACKFILL_WINDOW_DAYS,
+                        10,
+                        false,
+                        None,
+                        &[],
+                        false,
+                        false,
+                    )
+                    .with_sampled_acquisition(cache.clone(), Scope("activation-held-debt".into())),
+                )
+            })
+        });
+    assert_eq!(
+        baseline_reads.get(&plain).copied().unwrap_or(0),
+        1,
+        "positive control for native body I/O probe"
+    );
     assert_eq!(baseline.snapshots.len(), 1);
     assert_eq!(baseline.snapshots[0].source_session_id, "stable-plain");
     index.record_accepted_snapshot_fingerprints(&BTreeSet::from([baseline.snapshots[0]
@@ -2688,6 +2696,16 @@ fn denied_archive_inventory_debt_releases_once_and_paces_without_plain_body_rere
                     .residue
                     .codex_inventory_hold
                     .is_none());
+                assert!(
+                    archives.iter().all(|key| scan
+                        .index
+                        .traversal
+                        .as_ref()
+                        .unwrap()
+                        .codex_rollout_paths
+                        .contains(key)),
+                    "scoped activation relist includes every sibling"
+                );
                 scan.index.archive_pass.power = false;
                 scan.index.archive_pass.cpu = 30_000_000;
                 finish_selector(scan)
