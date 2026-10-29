@@ -29065,7 +29065,8 @@ impl OwnedSourceScan {
                                 .as_os_str()
                                 .cmp(b.candidate.path.as_os_str())
                         });
-                        inventory.hold_custodied_siblings(index);
+                        inventory.custody_next = 0;
+                        codex_join_prepared = false;
                         !inventory.custody_refused
                             && !inventory.custody_unknown
                             && aliases
