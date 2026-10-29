@@ -3703,7 +3703,8 @@ fn carried_ack_age_survives_restart_and_alarms_without_eviction_until_release() 
         assert!(scan_index_containment_lines_for_test()
             .last()
             .unwrap()
-            .ends_with("carried_ack_pending_age_seconds=0"));
+            .split_whitespace()
+            .any(|field| field == "carried_ack_pending_age_seconds=0"));
         assert_eq!(
             scan_index_containment_lines_for_test()[before..]
                 .iter()
@@ -3756,7 +3757,8 @@ fn carried_ack_age_survives_restart_and_alarms_without_eviction_until_release() 
         assert!(scan_index_containment_lines_for_test()
             .last()
             .unwrap()
-            .ends_with("carried_ack_pending_age_seconds=0"));
+            .split_whitespace()
+            .any(|field| field == "carried_ack_pending_age_seconds=0"));
         assert_eq!(
             scan_index_containment_lines_for_test()[before..]
                 .iter()

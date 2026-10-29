@@ -164,3 +164,38 @@ proof, tombstone or retirement credit. Unbounded semantic retention must be
 reviewed by E1, Lead A and Lead B before merge; a finite per-pass allowance is
 not a lifetime storage cap. The context receipt and mixed-file hold remain
 separate work until the receipt PR merges.
+
+
+Round16 captures Linux40929265898 before edits:119→88→83 failures. The new
+head's failure list remains the next runtime authority. Current83 groups are
+33 completion-fold,28 context/history awaiting the receipt PR,19 proof/grant,
+one named-agent money-liveness investigation, and two new fixture assumptions.
+The two new failures were investigated: E2 intentionally preserves its request-
+identity collector while account identity stays Unknown; the diagnostic age
+field moved away from the line suffix when retention JSON was appended.
+Exact token/cost/account and age checks stay. Correction setup now checks real
+multi-page family coverage rather than assuming an ordinary terminal page has
+no retried family member. Exact finalizer identity capture remains evidence,
+not owned-start or census authority. An unchanged member may reconstruct its
+old exact proof while the changed thinking member remains held.
+
+Retention alarms are visibility only: retained transport ACKs>50000,
+RetryPending families>1000 and held-history compact metadata>64MiB. Counts,
+compact bytes and oldest evidence age are on census diagnostics. Byte counting
+streams metadata without allocating a JSON cohort copy or reading transcripts.
+The optional potentially corpus-sized pending-proof byte gauge stays unknown
+rather than serializing occurrence maps every page. New exact ACK ages use a
+bounded65536-entry runtime memo; legacy/untracked ACK ages stay unknown, never
+an admission/release timer. The alarm throttle keeps64 destination windows;
+process restart or scope eviction can repeat visibility alarms. No persisted
+field or format changes. Pending proof, correction ownership, held custody and
+all existing exact settlement checks remain independent of these diagnostics.
+
+Terminal-off makes today's never-completing retention permanent for installs
+that would have completed; bounded later by paging/reconstruction (tracked
+effort). Large observed cohorts require explicit resource planning: measured
+state/gross-growth projections and their limitations are disclosed in the PR.
+Small-cohort completion/corrections remain delayed, and strict analytics pause.
+A branch macOS run is required before any guard. This helper dispatches no run;
+Linux compilation is not a supported-layout runtime receipt. The receipt PR
+must merge first; this change ships in the same release or after it, never alone.

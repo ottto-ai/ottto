@@ -380,16 +380,18 @@ fn family_proven_before_thinking_reader_reproves_after_upgrade() {
     );
     never_terminal(&index);
     assert!(disposition.quarantined_entity_count() > 0);
-    assert!(census
-        .iter()
-        .all(|item| item.usage_accounting_contract.is_none()));
+    // The changed root cannot reconstruct the old reasoning-zero proof.
+    // An unchanged child can still reconstruct its exact historical body.
+    assert_eq!(census[0].usage_accounting_contract, None);
     assert_eq!(census[0].reasoning_output_tokens, 8);
     assert_eq!(census[0].output_tokens, 20);
     let mut uploadable = census;
     disposition.retain_uploadable(&mut uploadable);
     assert!(
-        uploadable.is_empty(),
-        "changed proof stays owed, never uploads an unproven authority replacement"
+        uploadable
+            .iter()
+            .all(|item| item.source_session_id != FAMILY_ROOT),
+        "changed root stays owed; only exactly reconstructable historical members may upload"
     );
     assert!(index
         .claude_usage_authority_quarantine

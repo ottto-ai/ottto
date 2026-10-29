@@ -958,10 +958,16 @@ impl ApcFixture {
         let last = first.last().expect("terminal page");
         assert!(!last.scan.census_complete);
         assert!(first.iter().all(|page| page.held.is_empty()));
-        assert!(
-            last.parsed.is_disjoint(&family),
-            "the family sits entirely on earlier pages"
-        );
+        // The last native page is ordinary work under containment and can
+        // include a retried member beside the terminal sentinel. Assert real
+        // multi-page coverage, without inventing a completion-only boundary.
+        assert!(first.len() >= 2);
+        let observed: BTreeSet<_> = first
+            .iter()
+            .flat_map(|page| page.parsed.intersection(&family).cloned())
+            .collect();
+        assert_eq!(observed, family);
+        assert!(first.iter().any(|page| page.parsed.contains(APC_TERMINAL)));
         assert!(
             last.index
                 .claude_usage_family_witness_digest_for_test(APC_ROOT)
@@ -2706,65 +2712,68 @@ fn retry_pending_family_reproved_at_withheld_native_terminal_reloads_without_qua
     let established = fixture.establish();
     let _enabled = crate::snapshots::claude_native_comparison::enable_for_test();
     fixture.retain_native_terminal.set(true);
-    // New real request cannot reconstruct from W0; paired evidence lets the
-    // next raw-complete native terminal prove W1 despite the withheld census.
+    // New real request cannot reconstruct W0. Production containment must
+    // retain W0 + RetryPending across native selected saves, not prove W1.
     fixture.append_family_request(Some(APC_AGENTS[0]), "req_recovered", 4);
+    let mut saw_bound_debt = false;
     for number in 0..APC_MAX_PAGES {
         let page = fixture.page(&format!("2026-08-02T10:{number:02}:00Z"), ApcUpload::Accept);
-        // Select the native terminal that sees the RetryPending record; the
-        // ordinary census before its fold must then be withheld (before the
-        // path-(a) bridge through the sweep mark, since then through the debt
-        // itself), so only the native fold can re-prove the family.
-        let target = fixture.native_terminal_seen.get()
-            && page.record_before().is_some_and(|record| !record.terminal);
-        if !target {
-            fixture.assert_durable(&page, 10);
-            continue;
+        assert!(!page.scan.census_complete);
+        assert!(!fixture.census_before_fold.get());
+        assert!(page.uploaded.is_disjoint(&page.held));
+        assert_eq!(
+            page.index
+                .claude_usage_family_witness_digest_for_test(APC_ROOT),
+            Some(established.proven.clone()),
+            "native service cannot grant W1"
+        );
+        if let Some(record) = page.record() {
+            saw_bound_debt = true;
+            assert!(record.bound_to_retained_witness);
+            assert_eq!(record.proven_witness_fingerprint, established.proven);
+            assert!(
+                record.correction.is_none(),
+                "held bodies earn no correction grant"
+            );
+            if let Some(before) = page
+                .record_before()
+                .filter(|_| page.parsed.is_disjoint(&apc_family_sessions()))
+            {
+                assert_eq!(
+                    record.failed_reconstruction_count,
+                    before.failed_reconstruction_count
+                );
+                assert_eq!(
+                    record.retry_after_unix_seconds,
+                    before.retry_after_unix_seconds
+                );
+                assert_eq!(
+                    record.member_source_file_fingerprints,
+                    before.member_source_file_fingerprints
+                );
+            }
         }
-        assert!(number > 0);
-        assert!(
-            !fixture.census_before_fold.get(),
-            "the ordinary census before the native fold is withheld"
-        );
-        assert!(page.parsed.is_disjoint(&apc_family_sessions()));
-        let before = page.record_before().unwrap();
-        assert!(before.bound_to_retained_witness);
-        assert_eq!(before.proven_witness_fingerprint, established.proven);
-        assert_eq!(
-            fixture.quarantined_index_count(),
-            0,
-            "withheld native terminal must not quarantine the whole index"
-        );
-        assert!(page.index.generation > 0);
-        let record = page.record().expect("RetryPending record survives reproof");
-        assert!(record.bound_to_retained_witness);
-        assert_ne!(record.proven_witness_fingerprint, established.proven);
-        assert_eq!(
-            record.failed_reconstruction_count,
-            before.failed_reconstruction_count
-        );
-        assert_eq!(
-            record.retry_after_unix_seconds,
-            before.retry_after_unix_seconds
-        );
-        assert_eq!(
-            record.member_source_file_fingerprints,
-            before.member_source_file_fingerprints
-        );
-        assert!(
-            record.correction.is_none(),
-            "held bodies earn no correction grant"
-        );
         assert_eq!(
             page.index.snapshot_unproven_terminal_count(),
             page.before.snapshot_unproven_terminal_count()
         );
         let reloaded = ScanIndex::load(&fixture.index_path).unwrap();
         assert_eq!(reloaded.generation, page.index.generation);
+        assert_eq!(
+            reloaded.claude_usage_family_witness_digest_for_test(APC_ROOT),
+            Some(established.proven.clone())
+        );
         fixture.assert_durable(&page, 10);
-        return;
     }
-    panic!("PRECONDITION_NOT_REACHED: withheld raw-complete native terminal with RetryPending");
+    assert!(
+        saw_bound_debt,
+        "actual changed request retains bound unproven correction custody"
+    );
+    assert_eq!(
+        fixture.quarantined_index_count(),
+        0,
+        "native selected saves never quarantine the whole index"
+    );
 }
 
 /// CONTROLLED: after a natural authority record forms, its persisted binding

@@ -579,13 +579,32 @@ impl ScanIndex {
 /// Gauges only; clocks are the oldest retained durable evidence, not an
 /// invented time of absence. Old records with no clock report unknown_age.
 /// This read-only view cannot retire debt, settle an ACK or grant proof.
-#[derive(Default, Debug, Serialize)]
+#[derive(Debug, Serialize)]
 struct RetentionGauge {
     items: usize,
+    /// Compact retained metadata bytes; excludes the external transcript corpus.
+    bytes: Option<usize>,
     oldest_age_seconds: Option<u64>,
     unknown_age: usize,
 }
+impl Default for RetentionGauge {
+    fn default() -> Self {
+        Self {
+            items: 0,
+            bytes: Some(0),
+            oldest_age_seconds: None,
+            unknown_age: 0,
+        }
+    }
+}
 impl RetentionGauge {
+    fn charge<T: Serialize + ?Sized>(&mut self, value: &T) {
+        self.bytes = Some(
+            self.bytes
+                .unwrap_or(0)
+                .saturating_add(retained_metadata_bytes(value)),
+        );
+    }
     fn observe(&mut self, count: usize, clock: Option<u64>, now: u64) {
         self.items = self.items.saturating_add(count);
         match clock {
@@ -626,8 +645,10 @@ impl ScanIndex {
                 // Presence/absence remains UNPROVEN; count every retained owner,
                 // including possible absence, rather than stat the corpus here.
                 debt.retry_pending_families.observe(1, clock, now);
+                debt.retry_pending_families.charge(&(root, record));
             }
             if let Some(correction) = &record.proof_correction {
+                debt.owed_correction_members.charge(correction);
                 debt.owed_correction_members
                     .observe(correction.owed_member_ids.len(), clock, now);
             }
@@ -636,23 +657,29 @@ impl ScanIndex {
         // changed revision. Count all retained pending, including future
         // correction/reconstruction debt behind an existing witness.
         for pending in self.claude_usage_family_pending.values() {
+            // This optional extra gauge has potentially corpus-sized occurrence
+            // maps. Do not serialize them every page for diagnostics alone.
+            debt.delayed_proof_families.bytes = None;
             debt.delayed_proof_families.observe(
                 1,
                 rfc3339_unix_seconds(&pending.census_window_end),
                 now,
             );
         }
-        for entry in self.files.values() {
+        for (key, entry) in &self.files {
             let clock = (entry.modified_unix_seconds > 0).then_some(entry.modified_unix_seconds);
             debt.file_entries.observe(1, clock, now);
+            debt.file_entries.charge(&(key, entry));
             if self
                 .claude_history_emission_held(&entry.source_file_fingerprint)
                 .is_some()
             {
                 debt.held_history_files.observe(1, clock, now);
+                debt.held_history_files.charge(&(key, entry));
             }
         }
         for fp in &self.accepted_snapshot_fingerprints {
+            debt.accepted_index_acks.charge(fp);
             debt.accepted_index_acks.observe(
                 1,
                 self.snapshot_activity_at
@@ -662,8 +689,9 @@ impl ScanIndex {
                 now,
             );
         }
-        for clock in self.claude_retired_family_tombstones.values() {
+        for (root, clock) in self.claude_retired_family_tombstones.iter() {
             debt.tombstones.observe(1, Some(*clock), now);
+            debt.tombstones.charge(&(root, clock));
         }
         debt.manifest_withheld.observe(
             1,
@@ -673,5 +701,171 @@ impl ScanIndex {
             now,
         );
         debt
+    }
+}
+
+// Diagnostic byte accounting streams into a counter: no transcript reads and
+// no materialized JSON copy of the retained cohort. Bytes mean compact retained
+// metadata, not a claim about allocator RSS or the external transcript corpus.
+pub(crate) fn retained_metadata_bytes<T: Serialize + ?Sized>(value: &T) -> usize {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, value).expect("retained metadata serialization");
+    counter.0
+}
+
+// Initial visibility thresholds, not admission caps. Tune using post-release
+// M4 gauges. No alarm removes custody or changes a money/proof decision.
+const TERMINAL_RETAINED_ACK_ALARM_COUNT: usize = 50_000;
+const TERMINAL_RETRY_PENDING_ALARM_COUNT: usize = 1_000;
+const TERMINAL_HELD_HISTORY_ALARM_BYTES: usize = 64 * 1024 * 1024;
+fn retention_threshold_exceeded(class: u8, count: usize, bytes: usize) -> bool {
+    match class {
+        1 => count > TERMINAL_RETRY_PENDING_ALARM_COUNT,
+        2 => bytes > TERMINAL_HELD_HISTORY_ALARM_BYTES,
+        4 => count > TERMINAL_RETAINED_ACK_ALARM_COUNT,
+        _ => false,
+    }
+}
+#[derive(Default)]
+struct RetentionAlarmWindow {
+    window: String,
+    fired: u8,
+}
+impl RetentionAlarmWindow {
+    fn observe(&mut self, window: &str, class: u8, exceeded: bool) -> bool {
+        if self.window != window {
+            self.window = window.into();
+            self.fired = 0;
+        }
+        if !exceeded || self.fired & class != 0 {
+            return false;
+        }
+        self.fired |= class;
+        true
+    }
+}
+fn retention_alarm(context: &str, window: &str, class: u8, exceeded: bool) -> bool {
+    // Bounded runtime throttle only. Old inactive destinations can be evicted;
+    // returning to one can repeat an alarm, never suppress its retained debt.
+    static MEMO: OnceLock<Mutex<std::collections::VecDeque<(String, RetentionAlarmWindow)>>> =
+        OnceLock::new();
+    let Ok(mut memo) = MEMO.get_or_init(Default::default).lock() else {
+        return exceeded;
+    };
+    let at = match memo.iter().position(|(key, _)| key == context) {
+        Some(at) => at,
+        None => {
+            if memo.len() == 64 {
+                memo.pop_front();
+            }
+            memo.push_back((context.into(), RetentionAlarmWindow::default()));
+            memo.len() - 1
+        }
+    };
+    memo[at].1.observe(window, class, exceeded)
+}
+impl ScanIndex {
+    fn terminal_retention_alarms(&self, debt: &TerminalRetention) -> serde_json::Value {
+        let context = self
+            .active_upload_context_fingerprint
+            .as_deref()
+            .unwrap_or("unknown");
+        let window = self
+            .traversal
+            .as_ref()
+            .map(|t| t.census_window_end.as_str())
+            .unwrap_or("no_window");
+        serde_json::json!({
+            "retry_pending_families": retention_alarm(context, window, 1,
+                retention_threshold_exceeded(1, debt.retry_pending_families.items, debt.retry_pending_families.bytes.unwrap_or(0))),
+            "retained_index_acks": retention_alarm(context, window, 4,
+                retention_threshold_exceeded(4, debt.accepted_index_acks.items, debt.accepted_index_acks.bytes.unwrap_or(0))),
+            "held_history": retention_alarm(context, window, 2,
+                retention_threshold_exceeded(2, debt.held_history_files.items, debt.held_history_files.bytes.unwrap_or(0))),
+            "thresholds": {"retry_pending_families": TERMINAL_RETRY_PENDING_ALARM_COUNT,
+                "held_history_bytes": TERMINAL_HELD_HISTORY_ALARM_BYTES,
+                "retained_acks": TERMINAL_RETAINED_ACK_ALARM_COUNT},
+            "visibility_only": true
+        })
+    }
+    pub(crate) fn note_terminal_off_transport_retention(
+        &self,
+        transport: &BTreeSet<String>,
+        bytes: usize,
+        oldest_age_seconds: Option<u64>,
+        unknown_age: usize,
+    ) {
+        if !claude_terminal_off() {
+            return;
+        }
+        let context = self
+            .active_upload_context_fingerprint
+            .as_deref()
+            .unwrap_or("unknown");
+        let window = self
+            .traversal
+            .as_ref()
+            .map(|t| t.census_window_end.as_str())
+            .unwrap_or("no_window");
+        let count = transport.len();
+        // The ledger can transfer exact ACK custody into the index. Count
+        // their union without allocating another set or double-counting it.
+        let union_count = self.accepted_snapshot_fingerprints.union(transport).count();
+        let alarm = retention_alarm(
+            context,
+            window,
+            4,
+            retention_threshold_exceeded(4, union_count, bytes),
+        );
+        emit_scan_index_containment_line(format!(
+            "local snapshot census: source=claude_code terminal_off_retained_acks={} terminal_off_retained_acks_alarm={alarm} retained_ack_union_count={union_count} retained_acks_threshold={} visibility_only=1",
+            serde_json::json!({"items":count,"bytes":bytes,"oldest_age_seconds":oldest_age_seconds,
+                "unknown_age":unknown_age}), TERMINAL_RETAINED_ACK_ALARM_COUNT));
+    }
+}
+
+#[cfg(test)]
+mod retention_alarm_tests {
+    use super::*;
+    #[test]
+    fn terminal_off_retention_thresholds_alarm_once_per_window_without_disposing_debt() {
+        for (class, threshold) in [
+            (1, TERMINAL_RETRY_PENDING_ALARM_COUNT),
+            (2, TERMINAL_HELD_HISTORY_ALARM_BYTES),
+            (4, TERMINAL_RETAINED_ACK_ALARM_COUNT),
+        ] {
+            let mut memo = RetentionAlarmWindow::default();
+            for observed in [threshold - 1, threshold] {
+                assert!(!memo.observe(
+                    "W1",
+                    class,
+                    retention_threshold_exceeded(class, observed, observed)
+                ));
+            }
+            assert!(memo.observe(
+                "W1",
+                class,
+                retention_threshold_exceeded(class, threshold + 1, threshold + 1)
+            ));
+            assert!(!memo.observe("W1", class, true));
+            assert!(!memo.observe("W1", class, false));
+            assert!(!memo.observe("W1", class, true));
+            assert!(memo.observe("W2", class, true));
+        }
+        let value = BTreeMap::from([("retained", vec!["proof debt"; 17])]);
+        assert_eq!(
+            retained_metadata_bytes(&value),
+            serde_json::to_vec(&value).unwrap().len()
+        );
     }
 }

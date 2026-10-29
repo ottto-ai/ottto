@@ -59,6 +59,7 @@ mod continuation;
 mod reason_reoffer;
 mod rejection_log;
 mod strict_cohort;
+mod terminal_retention;
 
 // Direct API host; the apex `ottto.net/backend` proxy is retired in the marketing cutover.
 const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
@@ -1923,6 +1924,7 @@ impl SnapshotUploadProgress {
             self.reason_reoffer_counts.accepted += 1;
         }
         self.permanent_rejections.remove(fingerprint);
+        terminal_retention::accepted(&self.destination_namespace_hash, fingerprint, body_witness);
         self.accepted_fingerprints.insert(fingerprint.to_string());
         self.accepted_body_witnesses
             .insert(fingerprint.to_string(), body_witness.to_string());
@@ -6799,16 +6801,7 @@ fn finish_sync_source(
         preparation.native_comparison_lease.is_some(),
     );
     if preparation.source == SnapshotSource::ClaudeCode && crate::snapshots::claude_terminal_off() {
-        // The legacy ACK ledger has no age clock. Unknown is disclosed rather
-        // than invented; current-context stamps remain owned by the receipt PR.
-        crate::local_resource_diagnostics::traversal_point(
-            "terminal_off_retained_acks",
-            "claude_code",
-            &serde_json::json!({"gauge": preparation.upload_progress.accepted_fingerprints.len(),
-                "unsettled": preparation.upload_progress.retained_stale_ack_count,
-                "oldest_age_seconds": null,
-                "unknown_age": preparation.upload_progress.accepted_fingerprints.len()}),
-        );
+        terminal_retention::note(&index, &preparation.upload_progress);
     }
     let SourcePreparation {
         mut native_comparison_reservation,

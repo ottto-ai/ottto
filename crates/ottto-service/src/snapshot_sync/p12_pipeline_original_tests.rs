@@ -958,7 +958,8 @@ impl RearmFixture {
                 RearmUpload::Accept,
             );
             let ended = !page.index.scan_traversal_in_progress_for_test()
-                || page.index.scan_traversal_exhausted_for_test();
+                || page.index.scan_traversal_exhausted_for_test()
+                || page.parsed.contains(REARM_TERMINAL);
             pages.push(page);
             if ended {
                 return;

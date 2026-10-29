@@ -1231,11 +1231,17 @@ fn e2_pipeline_trace_named_agent_on_another_page_is_not_published_on_root() {
         }
         // An absent agent must stay due or be co-scheduled. Observe the next
         // real bounded pages; a named side call must eventually reach it.
+        let mut walk_receipts = vec![json!({"body_count":p.scan.snapshots.len(),
+            "scanned":p.scan.scanned_file_count, "root_held":crate::snapshots::e2_pipeline_scan_fixture::explicitly_held(&p.disposition, ROOT),
+            "e2":e2::take_counts()})];
         let mut items = p.scan.snapshots.clone();
         p.finish();
         let mut index = c.reload(&mut p.index);
         for _ in 0..6 {
             let mut next = ready(&c, &scanner, index, 1, false);
+            walk_receipts.push(json!({"body_count":next.scan.snapshots.len(),
+                "scanned":next.scan.scanned_file_count, "root_held":crate::snapshots::e2_pipeline_scan_fixture::explicitly_held(&next.disposition, ROOT),
+                "e2":e2::take_counts()}));
             items.extend(next.scan.snapshots.clone());
             next.finish();
             index = c.reload(&mut next.index);
@@ -1248,7 +1254,7 @@ fn e2_pipeline_trace_named_agent_on_another_page_is_not_published_on_root() {
             items
                 .iter()
                 .any(|s| s.source_session_id == ROOT && s.input_tokens == 11),
-            "the appended root must eventually publish, without the named side call"
+            "the appended root must eventually publish, without the named side call; receipts={walk_receipts:?}"
         );
         assert!(items.iter().any(|s| s.source_session_id==format!("{ROOT}_agent-000") && s.input_tokens==25),"off-page named agent must eventually publish its side call");
     });
@@ -2833,14 +2839,32 @@ fn terminal_off_unproven_cohort_uploads_full_tokens_and_cost_with_unknown_accoun
             item.cost.as_ref().unwrap().total_cost_usd.as_deref(),
             Some("0.000123")
         );
+        assert!(!item.model_usage.is_empty());
         assert!(item
             .model_usage
             .iter()
+            .chain(
+                item.usage_buckets
+                    .iter()
+                    .flat_map(|bucket| &bucket.model_usage)
+            )
             .all(|row| row.account_identifier_hash.is_none()));
+        // E2 publishes the request-identity collector before the legacy
+        // account classifier. Unknown is the absence of account attribution,
+        // not the legacy collector's name (which E2 intentionally preserves).
         assert_eq!(
             item.provenance.collector,
-            crate::snapshots::claude_request_accounts::UNKNOWN
+            crate::snapshots::claude_request_identity::COLLECTOR
         );
+        let display = item
+            .claude_account_display
+            .as_ref()
+            .expect("request-owned account display");
+        assert_eq!(
+            display.current.status,
+            crate::snapshots::claude_request_identity::CURRENT_UNKNOWN
+        );
+        assert!(display.current.account_identifier_hash.is_none());
         page.finish();
         let mut progress = e2_progress();
         let (result, sent, _) = upload(&page.scan.snapshots, &mut progress, ack);

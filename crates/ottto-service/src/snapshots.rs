@@ -68396,7 +68396,6 @@ mod tests {
                 entry.last_snapshot_fingerprint.as_deref(),
                 entry.last_upload_body_witness.as_deref(),
             );
-            assert!(expected.is_some());
             assert!(
                 expected.is_some(),
                 "finalized file retains exact source/head/body identity"
@@ -68405,7 +68404,8 @@ mod tests {
             assert_eq!(
                 index.claude_account_family_pending[&root].member_requests[&member]
                     .identity_revision,
-                None
+                expected,
+                "exact finalizer revision is captured evidence, not owned-start or census proof"
             );
         }
         fs::remove_dir_all(dir).unwrap();
