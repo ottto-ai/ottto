@@ -422,7 +422,7 @@ impl Probe {
                 .filter(|(_, count)| *count > 0)
                 .collect(),
             reread: if claude {
-                self.page_events.with_current()
+                self.page_events.with_current().without_terminal_rearm()
             } else {
                 Default::default()
             },
@@ -453,6 +453,34 @@ impl Probe {
             counts,
         });
     }
+}
+
+// Terminal scheduling runs after collection. Same carrier, zero scan counts,
+// no process sampling or draining another producer's identity/money counters.
+fn rearm_collection(rearm: claude_reread::Counts) {
+    #[derive(Serialize)]
+    struct Counts {
+        #[serde(flatten)]
+        collection: CollectionCounts,
+        #[serde(flatten)]
+        rearm: claude_reread::Counts,
+    }
+    emit(&Record {
+        schema_version: SCHEMA_VERSION,
+        process_id: std::process::id(),
+        stage: "native_collection_page",
+        source: Source::from_slug("claude_code"),
+        observation: Observation::between(0, None, None),
+        counts: Counts {
+            collection: CollectionCounts {
+                scanned_files: 0,
+                semantic_noops: 0,
+                sampled_acquisition: None,
+                full_causes: Default::default(),
+            },
+            rearm,
+        },
+    });
 }
 
 /// All retained account-pending families, including held/incomplete families;
@@ -818,7 +846,7 @@ impl NativeDecision {
             "claude_code",
             &Counts {
                 decision: self.0.get(),
-                events: self.1.get().with_current(),
+                events: self.1.get().with_current().without_terminal_rearm(),
             },
         );
     }
@@ -1928,6 +1956,75 @@ mod tests {
         for row in rows {
             assert_eq!(row["schema_version"], 2);
             assert!(serde_json::to_string(&row).unwrap().len() < 4096);
+        }
+    }
+
+    #[test]
+    fn terminal_rearm_counts_use_page_carrier_once_and_do_not_drain_other_producers() {
+        let (_, rows) = capture(|| {
+            let scope = claude_reread::Scope::begin(true);
+            claude_record_cap_half_file();
+            claude_reread::clear(claude_reread::ClearSite::OwnedStart, true);
+            claude_reread::terminal_rearm(
+                claude_reread::IgnoredVeto::WithheldAccount.bit(),
+                7,
+                false,
+            );
+            claude_reread::terminal_rearm(0, 0, true);
+            // Zero deltas never manufacture a scheduling row.
+            claude_reread::terminal_rearm(0, 99, false);
+            NativeDecision::new().emit();
+            let counts = scope.finish();
+            assert_eq!(counts.rearm_structural_native_duplicate, 1);
+            assert_eq!(counts.rearm_fingerprints_preserved, 7);
+            // The ordinary page still owns its cap observation. It must not
+            // repeat terminal counters from the parent scope or kept counts.
+            let mut probe = Probe::start();
+            probe.page_events = counts;
+            probe.collection(
+                "claude_code",
+                CollectionCounts {
+                    scanned_files: 1,
+                    semantic_noops: 0,
+                    sampled_acquisition: None,
+                    full_causes: Default::default(),
+                },
+            );
+            // Disabled comparison must omit these fields too.
+            claude_reread::emit_without_lease(counts);
+        });
+        assert_eq!(rows.len(), 5);
+        for row in &rows[..2] {
+            assert_eq!(row["stage"], "native_collection_page");
+            assert_eq!(row["source"], "claude_code");
+            assert_eq!(row["schema_version"], 2);
+            assert_eq!(row["counts"]["scanned_files"], 0);
+            assert_eq!(row["counts"]["semantic_noops"], 0);
+            assert!(row["counts"]
+                .get("claude_money_record_cap_half_files")
+                .is_none());
+        }
+        assert_eq!(
+            rows[0]["counts"]["rearm_veto_ignored"],
+            serde_json::json!({"withheld_account": 1})
+        );
+        assert_eq!(rows[0]["counts"]["rearm_fingerprints_preserved"], 7);
+        assert_eq!(rows[1]["counts"]["rearm_structural_native_duplicate"], 1);
+        assert_eq!(rows[2]["stage"], "native_comparison_decision");
+        assert_eq!(rows[2]["counts"]["claude_reread"]["owned_start_cleared"], 1);
+        assert_eq!(rows[3]["counts"]["claude_money_record_cap_half_files"], 1);
+        assert_eq!(rows[4]["stage"], "native_comparison_decision");
+        for row in &rows[2..] {
+            for key in [
+                "rearm_veto_ignored",
+                "rearm_fingerprints_preserved",
+                "rearm_structural_native_duplicate",
+            ] {
+                assert!(
+                    row["counts"].get(key).is_none(),
+                    "terminal delta repeated: {row}"
+                );
+            }
         }
     }
 

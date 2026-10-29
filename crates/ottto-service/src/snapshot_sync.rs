@@ -3319,6 +3319,7 @@ struct SyncCounts {
     over_line_cap_count: u64,
     recognized_usage_drop_count: u64,
     ownership_incomplete_file_count: u64,
+    causes: crate::snapshots::ownership_diagnostics::Summary,
     snapshot_unproven_terminal_count: u64,
     snapshot_superseded_terminal_count: u64,
     cooldown_conflict_deferred: usize,
@@ -3442,6 +3443,9 @@ impl SyncCounts {
             over_line_cap_count: scan_result.over_line_cap_count as u64,
             recognized_usage_drop_count: scan_result.recognized_usage_drop_count as u64,
             ownership_incomplete_file_count: scan_result.ownership_incomplete_file_count as u64,
+            causes: scan_result
+                .causes
+                .summary(scan_result.ownership_incomplete_file_count),
             snapshot_unproven_terminal_count: 0,
             snapshot_superseded_terminal_count: 0,
             cooldown_conflict_deferred: 0,
@@ -3469,7 +3473,7 @@ impl SyncCounts {
     }
 
     fn terminal_census_line(&self, source: &str) -> String {
-        format!(
+        let mut line = format!(
             "snapshot terminal_census source={source} census_complete={} scanned_files={} \
              uploaded={} unproven_terminal={} superseded_terminal={} \
              ownership_incomplete_files={} zero_snapshot_usage_evidence_files={} \
@@ -3485,7 +3489,11 @@ impl SyncCounts {
             self.cooldown_conflict_deferred,
             crate::snapshots::terminal_contract_retry::local_count(),
             crate::snapshots::terminal_contract_retry::exhausted_count(),
-        )
+        );
+        if source == "codex" {
+            line.push_str(&crate::snapshots::ownership_diagnostics::line(self.causes));
+        }
+        line
     }
 
     fn with_snapshot_terminal_counts(mut self, index: &ScanIndex) -> Self {
@@ -9052,7 +9060,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             stats.exact_request_set_root_count += 1;
         } else {
             stats.request_set_mismatch_root_count += 1;
-            full_rearm_evidence_complete = false;
             stats.api_only_request_count += api_request_ids.difference(&trace_request_ids).count();
             stats.trace_only_request_count +=
                 trace_request_ids.difference(&api_request_ids).count();
@@ -9065,6 +9072,12 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             stats.trace_evidence_row_count += rows.len();
             trace_report.evidence.insert(root_session_id, rows);
         }
+    }
+    if stats.request_set_mismatch_root_count > 0 {
+        index.note_claude_ignored_rearm_veto(
+            &scan_result.census_window_end,
+            crate::local_resource_diagnostics::claude_reread::IgnoredVeto::EvidenceGap.bit(),
+        );
     }
     // E2 side calls need the trace-named owner, so they follow the trace read.
     let side_calls_unresolved = crate::snapshots::claude_request_money::e2::side_calls_page(
@@ -24099,3 +24112,38 @@ crate::heap_layout_bound::fields!(PermanentSnapshotRejection; body_witness, reas
 
 crate::heap_layout_bound::fields!(PreparedTraceRead; generation, report);
 crate::heap_layout_bound::fields!(PreparedClaudeLocalEvidence; sessions, api, api_failed, trace_rows, traces, healthy_roots);
+
+#[cfg(test)]
+mod ownership_census_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_appends_scanner_partition_only_for_codex_and_keeps_unproven_separate() {
+        let mut contributions = [0; 8];
+        contributions[0] = 2;
+        let counts = SyncCounts {
+            ownership_incomplete_file_count: 5,
+            snapshot_unproven_terminal_count: 3,
+            causes: (contributions, [0, 77, 0]),
+            ..SyncCounts::default()
+        };
+        let line = counts.terminal_census_line("codex");
+        assert!(line.contains("unproven_terminal=3"));
+        assert!(line.contains("ownership_incomplete_files=5"));
+        assert!(line.contains("ownership_incomplete_contributions{bucket=\"inventory_hold\"}=2"));
+        assert!(line.contains("ownership_incomplete_generation_start=77"));
+        assert!(!line.contains("ownership_incomplete_distinct_paths{"));
+        assert!(!line.contains("bucket=\"unattributed\""));
+        assert!(
+            line.find("terminal_contract_retry_exhausted=").unwrap()
+                < line
+                    .find("ownership_incomplete_contributions{bucket=")
+                    .unwrap()
+        );
+        for source in ["claude_code", "pi"] {
+            assert!(!counts
+                .terminal_census_line(source)
+                .contains("ownership_incomplete_contributions{bucket="));
+        }
+    }
+}

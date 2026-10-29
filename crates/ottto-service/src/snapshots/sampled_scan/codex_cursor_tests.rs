@@ -740,6 +740,7 @@ fn parentless_created_thread_hold_is_monotone_only_when_append_incurable() {
 fn disclosure() -> Disclosure {
     Disclosure {
         reason: DebtReason::HeldTerminal,
+        cause: ownership::PARSER,
         ownership_incomplete_file_count: 1,
         zero_snapshot_usage_evidence: false,
         state_only_blocked_session_ids: vec![SESSION.into()],
@@ -754,6 +755,7 @@ fn disclosure() -> Disclosure {
 fn strict(reason: DebtReason) -> Disclosure {
     Disclosure {
         reason,
+        cause: ownership::GROUP,
         ownership_incomplete_file_count: 0,
         zero_snapshot_usage_evidence: false,
         state_only_blocked_session_ids: vec![SESSION.into()],
@@ -13749,4 +13751,71 @@ fn decoder_drop_under_cursor_strands_credit_without_relocking() {
     cache.with_cursor(|c| settle_claim(c, c.id, 4096)).unwrap();
     DECODER_LIVE.store(false, std::sync::atomic::Ordering::SeqCst);
     DecoderOwner::acquire(&cache, 4096).unwrap().release();
+}
+
+#[test]
+fn ownership_disclosure_replays_preserve_cause_and_group_strict_uses_group_bucket() {
+    let candidate = CandidateFile {
+        path: PathBuf::from("/synthetic/ownership-same.jsonl"),
+        scan_root: PathBuf::from("/synthetic"),
+        physical_identity: None,
+        size_bytes: 0,
+        modified_unix_seconds: 0,
+        modified_unix_nanos: 0,
+        source_file_fingerprint: "synthetic".into(),
+        legacy_source_file_fingerprint: String::new(),
+        legacy_config_reconciliation_required: false,
+        opened_object_identity: String::new(),
+        fingerprint_changed_nanos: 0,
+        fingerprint_birth_nanos: 0,
+    };
+    for cause in [ownership::CREATED, ownership::PARENT, ownership::PARSER] {
+        let mut index = ScanIndex::default();
+        let mut census = ScanCensus::default();
+        census.causes = census.causes.page(Some(77));
+        let mut residue = BTreeSet::new();
+        let mut blocked = BTreeSet::new();
+        let mut residue_blocked = BTreeSet::new();
+        let mut pending = Vec::new();
+        let mut debt = disclosure();
+        debt.cause = cause;
+        for _ in 0..2 {
+            disclose_terminal_codex_debt(
+                &debt,
+                &candidate,
+                (None, None),
+                &mut index,
+                DisclosureTargets {
+                    census: &mut census,
+                    residue_index_keys: &mut residue,
+                    residue_blocked_session_ids: &mut residue_blocked,
+                    codex_state_only_blocked_session_ids: &mut blocked,
+                    pending_finalization: &mut pending,
+                },
+            );
+        }
+        let (c, [unknown, _, _]) = census
+            .causes
+            .summary(census.ownership_incomplete_file_count);
+        assert_eq!(census.ownership_incomplete_file_count, 2);
+        assert_eq!(c[cause], 2);
+        assert_eq!(c[..6].iter().sum::<usize>() + unknown, 2);
+        assert_eq!(residue.len(), 1);
+        codex_file_join::disclose_strict(
+            "synthetic-owner",
+            std::slice::from_ref(&candidate),
+            DisclosureTargets {
+                census: &mut census,
+                residue_index_keys: &mut residue,
+                residue_blocked_session_ids: &mut residue_blocked,
+                codex_state_only_blocked_session_ids: &mut blocked,
+                pending_finalization: &mut pending,
+            },
+        );
+        let (c, [unknown, _, _]) = census
+            .causes
+            .summary(census.ownership_incomplete_file_count);
+        assert_eq!(c[ownership::GROUP], 1);
+        assert_eq!(c[..6].iter().sum::<usize>() + unknown, 3);
+    }
 }
