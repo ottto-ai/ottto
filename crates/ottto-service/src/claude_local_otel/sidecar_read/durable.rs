@@ -1,5 +1,5 @@
 //! v1 at-least-once sidecar acquisition. Compiled in the contract harness until
-//! SOURCE/Lead B approve persistence and the real end-to-end path is proven.
+//! SOURCE approves persistence and the real end-to-end path is proven.
 use super::*;
 use crate::durable_tail_store::{
     self as store, CodecRow, DurableSource, DurableTailStore, ReadOutcome, SingleWriter,
@@ -73,7 +73,7 @@ struct Entry {
     api_fatal: Option<io::ErrorKind>,
 }
 
-pub(super) struct Reader {
+pub(crate) struct Reader {
     support: PathBuf,
     store: DurableTailStore,
     context: store::Digest32,
@@ -87,7 +87,7 @@ pub(super) struct Reader {
 }
 
 impl Reader {
-    pub(super) fn new(support: &Path, index_path: &Path, namespace: &str, generation: u64) -> Self {
+    pub(crate) fn new(support: &Path, index_path: &Path, namespace: &str, generation: u64) -> Self {
         // THIN P2 adapter: this row becomes a source-keyed codec-table row.
         // Same directory, source tag, v1 envelope and SingleWriter proof.
         let row = CodecRow {
@@ -112,10 +112,16 @@ impl Reader {
             counts: [Counts::default(); 2],
         }
     }
-    pub(super) fn begin_pass(&mut self) {
+    pub(crate) fn begin_pass(&mut self) {
         self.bootstrap_left = BOOTSTRAP_PASS_BYTES;
         self.counts = [Counts::default(); 2];
         self.store.begin_pass();
+    }
+    pub(crate) fn body_bytes(&self) -> [u64; 2] {
+        self.counts.map(|counts| counts.bytes_read)
+    }
+    pub(crate) fn rebuilds(&self) -> [u64; 2] {
+        self.counts.map(|counts| counts.rewrite_rebuilds)
     }
     fn binding(&self, session: &str) -> store::Binding {
         // DECISION(19b-§8-SOURCE): explicit kind domain + owning-session id;
@@ -246,8 +252,8 @@ impl Reader {
         } else {
             entry.failures = 0;
         }
-        // DECISION(19b-§8-LeadB): existing v1 incomplete/estimate contract.
-        // Never return stale cumulative rows as complete on an I/O refusal.
+        // Lead B: cumulative rows are acquisition only. Refusals disclose
+        // incomplete; the consumer holds any previously accepted body (S2).
         let mut reports = reports(&entry.pair);
         if api.is_err() {
             reports.0.health = failure_health[0].clone();
@@ -328,7 +334,7 @@ impl Reader {
     }
     /// Call ONLY after the owning ScanIndex save succeeded. This is v1
     /// at-least-once post-save persistence, NEVER a write-ahead receipt.
-    pub(super) fn write_after_save<W: SingleWriter>(
+    pub(crate) fn write_after_save<W: SingleWriter>(
         &mut self,
         writer: &W,
         index: &crate::snapshots::ScanIndex,
@@ -776,7 +782,7 @@ thread_local! {
 }
 // Same real loader seam for ordinary, strict and paid/prepared tests. No
 // runtime flag or provider state: activation is scoped to a synthetic fixture.
-pub(super) fn with_reader<T>(reader: Reader, f: impl FnOnce() -> T) -> (Reader, T) {
+pub(crate) fn with_reader<T>(reader: Reader, f: impl FnOnce() -> T) -> (Reader, T) {
     struct Reset;
     impl Drop for Reset {
         fn drop(&mut self) {

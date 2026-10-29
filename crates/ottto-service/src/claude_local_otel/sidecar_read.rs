@@ -1,9 +1,13 @@
 //! Sidecar acquisition boundary shared by ordinary and paid loaders.
 //! The live path delegates to existing whole-file readers until the durable
-//! contract harness is executed and SOURCE/Lead B approve activation.
+//! contract harness is executed and SOURCE approves activation.
 use super::*;
 use crate::source_rotation::PaidReservation;
 mod counts;
+#[cfg(all(test, unix))]
+pub(super) fn record_holds(count: u64) {
+    counts::record_holds(count);
+}
 
 pub(super) fn take_counts() -> BTreeMap<&'static str, u64> {
     counts::take()
@@ -48,8 +52,8 @@ pub(super) fn trace(
         }
         return report;
     }
-    // DECISION(19b-§8-LeadB): retain the current cohort failure semantics;
-    // approve cumulative re-fold and incomplete/estimate behavior for v1.
+    // Lead B: consumers rejoin the entire cumulative projection; accepted
+    // owned-complete bodies hold on refusal rather than emitting estimates.
     load_trace_whole_file(support_dir, session_ids)
 }
 

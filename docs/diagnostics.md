@@ -140,6 +140,11 @@ no identifiers, paths, values, prompts or telemetry bodies.
 | `fragments`, `fragment_reread_bytes` | Incomplete EOF disclosures per decision, and prior unsealed bytes replayed on growth. EOF rows are held until LF; quiet fragments read no body bytes. |
 | `failures`, `persistent_failures` | Refused source acquisitions or paired-store writes; a paired failure can count for both kinds. Persistent means at least three consecutive failures of that operation in the retained process owner. |
 
+`sidecar_accepted_body_holds` counts families whose durable-route consumer
+retains an accepted native body and witness on incomplete telemetry (S2).
+It grants no acquisition, settlement or ACK credit. This guard is currently
+active only with the synthetic durable reader, alongside the other counters.
+
 Nonzero `sidecar_read_alarm` accompanies persistent failures. Counts accumulate
 between Claude `source_finish` drains, so overlapping owners are process totals,
 not exact per-page attribution. Test counters are thread-isolated. Zero keys

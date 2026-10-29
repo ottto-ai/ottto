@@ -188,13 +188,20 @@ struct Page {
 }
 impl Page {
     fn enrich(&mut self, corpus: &Corpus) -> crate::snapshots::ClaudeUsageAuthorityDisposition {
+        self.enrich_prepared(corpus, None)
+    }
+    fn enrich_prepared(
+        &mut self,
+        corpus: &Corpus,
+        prepared: Option<PreparedClaudeLocalEvidence>,
+    ) -> crate::snapshots::ClaudeUsageAuthorityDisposition {
         let ((mut disposition, _, _), released) =
             e2::pipeline_test_observer::capture_released(|| {
                 try_apply_claude_local_evidence_to_scan_with_comparison(
                     &corpus.support,
                     &mut self.scan,
                     &mut self.index,
-                    None,
+                    prepared,
                     None,
                     None,
                     Some((&self.cache, &self.committed)),
@@ -2781,4 +2788,9 @@ fn e2_pipeline_held_new_file_lifetime_losses_preserve_main_body() {
     for loss in 1..=3 {
         withheld_new_file_retries_from_retained_read(false, false, loss);
     }
+}
+
+#[cfg(unix)]
+mod durable_sidecar_money_tests {
+    include!("durable_sidecar_money_tests.rs");
 }

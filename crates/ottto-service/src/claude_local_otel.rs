@@ -31,6 +31,10 @@ mod bounded_read;
 #[cfg(test)]
 mod decoder_tests;
 mod sidecar_read;
+#[cfg(all(test, unix))]
+pub(crate) use sidecar_read::durable::{
+    with_reader as with_durable_sidecar_reader, Reader as DurableSidecarTestReader,
+};
 
 pub(crate) fn take_sidecar_read_counts() -> BTreeMap<&'static str, u64> {
     sidecar_read::take_counts()
@@ -41,6 +45,31 @@ pub(crate) fn durable_sidecar_prepared_fixture(
     check: impl FnOnce(&Path, &(ClaudeLocalOtelLoadReport, ClaudeTraceOwnershipLoadReport)),
 ) {
     sidecar_read::durable::prepared_fixture(check);
+}
+
+/// Consumer S2 guard, active only in the synthetic durable-route harness.
+/// Native accepted ledger + witness remain the authority; no money in slots.
+#[cfg(all(test, unix))]
+pub(crate) fn durable_sidecar_held_roots(
+    support: &Path,
+    index: &crate::snapshots::ScanIndex,
+    items: &[crate::snapshots::SnapshotItem],
+    healthy: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    if !sidecar_read::durable::active_for(support) {
+        return BTreeSet::new();
+    }
+    let held: BTreeSet<_> = items
+        .iter()
+        .filter_map(|item| {
+            let root = crate::snapshots::claude_request_money::request_owned_family_root(item)?;
+            (!healthy.contains(root)
+                && crate::snapshots::durable_sidecar_has_accepted_body(index, root))
+            .then(|| root.to_owned())
+        })
+        .collect();
+    sidecar_read::record_holds(held.len() as u64);
+    held
 }
 
 pub(crate) const STORE_DIR: &str = "local-otel/claude-code-effort";

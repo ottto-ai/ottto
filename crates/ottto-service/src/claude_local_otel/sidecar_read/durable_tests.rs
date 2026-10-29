@@ -895,3 +895,81 @@ fn fatal_api_directory_or_open_error_vetoes_the_whole_permissive_cohort() {
         }
     }
 }
+
+#[test]
+fn crash_after_suffix_decode_before_save_replays_each_fingerprint_once() {
+    const CHILD: &str = "OTTTO_SIDECAR_CRASH_FIXTURE";
+    if let Some(dir) = std::env::var_os(CHILD) {
+        let dir = PathBuf::from(dir);
+        let state = dir.join("state");
+        let _writer = LockedStateDir::acquire(&state).unwrap();
+        let index_path = state.join("index.json");
+        let index = ScanIndex::load(&index_path).unwrap();
+        let reader = Reader::new(&dir, &index_path, "synthetic", index.generation);
+        let (reader, actual) = load(reader, &dir);
+        assert_eq!(actual.0.evidence["scope"].len(), 2);
+        assert_eq!(actual.1.evidence["scope"].len(), 2);
+        assert!(reader.counts[0].bytes_read > 0);
+        let mut marker = File::create(dir.join("decoded-before-offset-save")).unwrap();
+        marker
+            .write_all(b"two unique rows; suffix decoded; no save")
+            .unwrap();
+        marker.sync_all().unwrap();
+        // SAFETY: this isolated child owns its fixture and only kills itself.
+        unsafe {
+            libc::raise(libc::SIGKILL);
+        }
+        panic!("SIGKILL returned");
+    }
+    let mut fixture = Fixture::new("sidecar-crash-dedupe");
+    let (mut api, mut trace) = bytes("first");
+    fixture.write("scope", &api, &trace);
+    let (mut reader, _) = load(fixture.reader(), &fixture.dir);
+    fixture.save(&mut reader);
+    // Repeated rows straddle the committed offset. The old fingerprint must
+    // be restored, and crash replay of the new row must not add another row.
+    let (a, t) = bytes("late");
+    let (replay_api, replay_trace) = (api.clone(), trace.clone());
+    for (kind, replay, new) in [
+        (Kind::Api, &replay_api, &a),
+        (Kind::Trace, &replay_trace, &t),
+    ] {
+        fixture.append(kind, replay);
+        fixture.append(kind, new);
+    }
+    api.extend(&replay_api);
+    api.extend(&a);
+    trace.extend(&replay_trace);
+    trace.extend(&t);
+    drop(reader);
+    fixture.writer.take();
+    let name = std::thread::current().name().unwrap().to_owned();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg(name)
+        .arg("--nocapture")
+        .env(CHILD, &fixture.dir)
+        .status()
+        .unwrap();
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+    assert_eq!(
+        fs::read(fixture.dir.join("decoded-before-offset-save")).unwrap(),
+        b"two unique rows; suffix decoded; no save"
+    );
+    let (mut reader, actual) = load(fixture.restart(), &fixture.dir);
+    assert_eq!(actual, frozen(&api, &trace));
+    assert_eq!(actual.0.evidence["scope"].len(), 2);
+    assert_eq!(actual.1.evidence["scope"].len(), 2);
+    assert_eq!(
+        body_bytes(&reader),
+        (
+            (replay_api.len() + a.len()) as u64,
+            (replay_trace.len() + t.len()) as u64
+        )
+    );
+    fixture.save(&mut reader);
+    let (reader, actual) = load(fixture.restart(), &fixture.dir);
+    assert_eq!(actual, frozen(&api, &trace));
+    assert_eq!(body_bytes(&reader), (0, 0));
+}

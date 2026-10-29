@@ -5237,6 +5237,21 @@ fn claude_index_file_body_accepted(
             })
 }
 
+/// Conservative S2 seam for the dark durable-sidecar route. Any accepted
+/// native body is protected on a telemetry refusal, including older estimates;
+/// the acquisition record itself grants no accepted-money authority.
+#[cfg(all(test, unix))]
+pub(crate) fn durable_sidecar_has_accepted_body(index: &ScanIndex, root: &str) -> bool {
+    index.files.iter().any(|(key, entry)| {
+        claude_index_path_member_ref(Path::new(key)).is_some_and(|member| member.root == root)
+            && entry
+                .last_upload_body_witness
+                .as_ref()
+                .is_some_and(|w| !w.is_empty())
+            && claude_index_file_body_accepted(index, key, entry)
+    })
+}
+
 /// Whether the accepted ledger is current and not being rebuilt by the
 /// legacy settlement reconciliation.
 fn claude_accepted_ledger_is_current(index: &ScanIndex) -> bool {

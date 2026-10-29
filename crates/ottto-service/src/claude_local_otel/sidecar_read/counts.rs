@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 #[cfg(not(test))]
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-const KEYS: [&str; 26] = [
+const KEYS: [&str; 27] = [
     "sidecar_api_selected",
     "sidecar_api_opened",
     "sidecar_api_bytes_read",
@@ -30,12 +30,13 @@ const KEYS: [&str; 26] = [
     "sidecar_trace_fragment_reread_bytes",
     "sidecar_trace_failures",
     "sidecar_trace_persistent_failures",
+    "sidecar_accepted_body_holds",
 ];
 #[cfg(not(test))]
-static COUNTS: [AtomicU64; 26] = [const { AtomicU64::new(0) }; 26];
+static COUNTS: [AtomicU64; 27] = [const { AtomicU64::new(0) }; 27];
 #[cfg(test)]
 thread_local! {
-    static COUNTS: std::cell::RefCell<[u64; 26]> = const { std::cell::RefCell::new([0; 26]) };
+    static COUNTS: std::cell::RefCell<[u64; 27]> = const { std::cell::RefCell::new([0; 27]) };
 }
 #[cfg(all(test, unix))]
 pub(super) fn record(kind: usize, fields: [u64; 13]) {
@@ -48,9 +49,16 @@ pub(super) fn record(kind: usize, fields: [u64; 13]) {
         }
     });
 }
+#[cfg(all(test, unix))]
+pub(super) fn record_holds(count: u64) {
+    COUNTS.with(|counts| {
+        let mut counts = counts.borrow_mut();
+        counts[26] = counts[26].saturating_add(count);
+    });
+}
 pub(super) fn take() -> BTreeMap<&'static str, u64> {
     #[cfg(not(test))]
-    let values: [u64; 26] = std::array::from_fn(|index| COUNTS[index].swap(0, Relaxed));
+    let values: [u64; 27] = std::array::from_fn(|index| COUNTS[index].swap(0, Relaxed));
     #[cfg(test)]
     let values = COUNTS.with(|counts| std::mem::take(&mut *counts.borrow_mut()));
     let mut counts: BTreeMap<_, _> = KEYS

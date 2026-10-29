@@ -9184,6 +9184,16 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         cache.record_e2_held_new_files(committed, index, &scan_result.snapshots, &withheld);
     }
     disposition.hold_request_owned(withheld);
+    // Lead B S2: a durable-route refusal cannot replace accepted money with
+    // an estimate. Keep the native body/witness and retry the whole join.
+    // Activation stays dark; wire this same consumer guard with the reader.
+    #[cfg(all(test, unix))]
+    disposition.hold_request_owned(crate::claude_local_otel::durable_sidecar_held_roots(
+        support_dir,
+        index,
+        &scan_result.snapshots,
+        &strict_healthy_roots,
+    ));
     if request_owned_enabled {
         for item in &mut scan_result.snapshots {
             if let Some(root) =
