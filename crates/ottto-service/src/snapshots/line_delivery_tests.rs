@@ -2687,6 +2687,15 @@ fn completed_withheld_sampled_deletion_releases_debt_with_and_without_hint() {
             "removal never acquires a transcript"
         );
         assert_eq!(scan.scanned_file_count, 0);
+        if !hinted {
+            assert!(
+                scan.census_complete,
+                "NO-HINT removal uses a healthy completed census"
+            );
+            assert_eq!(scan.disappeared_file_count, 0);
+            assert_eq!(scan.symlink_rejected_count, 0);
+            assert_eq!(scan.unreadable_path_count, 0);
+        }
         assert!(!removed.files.contains_key(&key));
         assert!(!removed.claude_account_deferred_holds.contains_key(&key));
         assert!(crate::snapshot_sync::withheld_settled_for_test(&removed));
