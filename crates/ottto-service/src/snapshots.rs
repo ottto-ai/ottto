@@ -26560,7 +26560,7 @@ impl OwnedSourceScan {
         );
         let mut resource_probe = crate::local_resource_diagnostics::Probe::start();
         let index = &mut owned_index;
-        if source == SnapshotSource::Codex && continuation.is_none() {
+        if source == SnapshotSource::Codex {
             index.archive_pass.prepare();
         }
         index.activate_quarantine_witness(source);

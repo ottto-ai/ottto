@@ -85,7 +85,7 @@ fn cpu_budget_survives_scan_completion_partial_commit_and_continuation_pages() {
         1,
         false,
         false,
-        &BTreeSet::new(),
+        None,
         None,
     );
     assert!(next.index.archive_pass.cpu >= 30_000_001);

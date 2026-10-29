@@ -15,10 +15,10 @@ publication behavior. Moves retain old evidence; oversized catch-up is held
 before decoding. A funded first read has a 1 GiB decoded limit in addition to the
 independent decoder ceiling. Held evidence never supplies an acknowledgement.
 
-This development checkpoint still requires native power, owner-wide custody,
-retention, accepted-state retry and consumer integration before activation can
-ship. An unsettled attempt currently defers rather than decoding again; retained
-body resending remains unfinished. Synthetic fixtures are present but unexecuted.
+This development checkpoint still requires owner-wide custody, retention,
+consumer qualification and runtime validation before activation can ship.
+Native power uses the continuation platform seam. Pending archive resends use
+retained reductions; synthetic fixtures are present but unexecuted.
 
 
 Completed archive reductions may enter the existing process cache under its

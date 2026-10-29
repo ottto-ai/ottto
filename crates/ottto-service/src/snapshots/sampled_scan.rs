@@ -2030,9 +2030,32 @@ pub(super) fn new_source_parser_with_archive_scope(
                     && !a.user_change
                     && matches!(a.disposition, ArchiveDisposition::Pending { .. })
             });
+        if reuse && archive_scope.is_none() {
+            codex_compressed_input::admission_streak(&key, true);
+            traversal_point(
+                "codex_zst_retained_scope_deferred",
+                "codex",
+                &serde_json::json!({"codex_zst_retained_scope_deferred":1}),
+            );
+            anyhow::bail!(codex_compressed_input::ArchiveAdmissionYield);
+        }
         if reuse {
             if let Some((cache, scope)) = cache.zip(archive_scope) {
                 if let Some(taken) = cache.take(&key) {
+                    if taken.retained.checkpoint.stamp_matches(&file)?
+                        && taken.retained.checkpoint.scope() != scope
+                    {
+                        index
+                            .files
+                            .get_mut(&key)
+                            .and_then(|e| e.archive.as_mut())
+                            .expect("matching archive")
+                            .disposition = ArchiveDisposition::Held {
+                            cause: CodexZstCause::CorrectionUnapplied,
+                        };
+                        codex_zst_refused(CodexZstCause::CorrectionUnapplied);
+                        anyhow::bail!(CodexZstCause::CorrectionUnapplied);
+                    }
                     if taken.retained.checkpoint.stamp_matches(&file)?
                         && taken.retained.checkpoint.scope() == scope
                     {
