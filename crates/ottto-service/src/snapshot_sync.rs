@@ -6953,6 +6953,8 @@ fn finish_sync_source(
         };
         #[cfg(test)]
         tests::permanent_finish_pipeline_tests::reason_reoffer_pipeline_tests::record_evidence_stats(&stats);
+        #[cfg(test)]
+        tests::permanent_finish_pipeline_tests::record_terminal_fixture_stats(&stats);
         if let Ok(counts) = serde_json::to_string(&stats) {
             eprintln!(
                 "local snapshot sync: claude local evidence duration_ms={} cache_creation_rejected_interpretations_total={} full_rearm_suppressed={} full_rearm_skipped_invalid_unchanged={} counts={counts}",

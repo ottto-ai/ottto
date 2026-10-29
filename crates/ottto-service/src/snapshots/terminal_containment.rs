@@ -5,6 +5,7 @@ pub(crate) const CLAUDE_TERMINAL_MAX_INPUT_BYTES: u64 = 16 * 1024 * 1024;
 const CLAUDE_TERMINAL_MAX_EST_DECODED_BYTES: u64 = 512 * 1024 * 1024;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct ClaudeTerminalFoldDeferred {
+    pub cause: &'static str,
     pub roots: usize,
     pub est_bytes: u64,
     pub sidecar_bytes: u64,
@@ -12,7 +13,7 @@ pub struct ClaudeTerminalFoldDeferred {
     pub stat_skipped: bool,
 }
 
-crate::heap_layout_bound::fields!(ClaudeTerminalFoldDeferred; roots, est_bytes, sidecar_bytes, stat_skipped);
+crate::heap_layout_bound::fields!(ClaudeTerminalFoldDeferred; cause, roots, est_bytes, sidecar_bytes, stat_skipped);
 
 pub(crate) fn claude_terminal_cohort(index: &ScanIndex, snapshots: &[SnapshotItem]) -> BTreeSet<String> {
     let mut roots = claude_pending_family_session_ids(index)
@@ -48,6 +49,7 @@ fn claude_terminal_budget(roots: usize, sidecar_bytes: u64) -> Option<ClaudeTerm
         || sidecar_bytes > CLAUDE_TERMINAL_MAX_INPUT_BYTES
         || est_bytes > CLAUDE_TERMINAL_MAX_EST_DECODED_BYTES)
         .then_some(ClaudeTerminalFoldDeferred {
+            cause: "preflight",
             roots,
             est_bytes,
             sidecar_bytes,
@@ -106,7 +108,7 @@ impl ScanIndex {
                 "claude_code",
                 &counts,
             );
-            eprintln!("ALARM terminal_fold_deferred roots={} est_bytes={} sidecar_bytes={}: terminal offer incomplete; all witnesses retained", counts.roots, counts.est_bytes, counts.sidecar_bytes);
+            eprintln!("ALARM terminal_fold_deferred cause=preflight roots={} est_bytes={} sidecar_bytes={}: terminal offer incomplete; all witnesses retained", counts.roots, counts.est_bytes, counts.sidecar_bytes);
         }
     }
 
@@ -153,11 +155,12 @@ struct ClaudeTerminalEffects {
     removals: Vec<(String, bool)>,
     reconcile: bool,
     raw_complete: bool,
+    effective_complete: bool,
     needs_clean_followup: bool,
     restart_after_hints: bool,
     cursor_scope: String,
 }
-crate::heap_layout_bound::fields!(ClaudeTerminalEffects; removals, reconcile, raw_complete, needs_clean_followup, restart_after_hints, cursor_scope);
+crate::heap_layout_bound::fields!(ClaudeTerminalEffects; removals, reconcile, raw_complete, effective_complete, needs_clean_followup, restart_after_hints, cursor_scope);
 
 impl ScanIndex {
     pub(crate) fn claude_terminal_effects_staged(&self) -> bool {
@@ -167,6 +170,7 @@ impl ScanIndex {
     pub(crate) fn defer_claude_terminal_read(&mut self, snapshots: &[SnapshotItem]) {
         let roots = claude_terminal_cohort(self, snapshots).len();
         let counts = ClaudeTerminalFoldDeferred {
+            cause: "read_allowance",
             roots,
             est_bytes: u64::MAX,
             sidecar_bytes: u64::MAX,
@@ -176,7 +180,7 @@ impl ScanIndex {
         self.claude_full_rearm_progress.complete_rebuild_read = None;
         self.claude_full_rearm_progress.terminal_fold_deferred = Some(counts);
         crate::local_resource_diagnostics::traversal_point("terminal_fold_deferred", "claude_code", &counts);
-        eprintln!("ALARM terminal_fold_deferred roots={roots}: bounded terminal read refused; ordinary page continues with parked traversal");
+        eprintln!("ALARM terminal_fold_deferred cause=read_allowance roots={roots}: bounded terminal read refused; ordinary page continues with parked traversal");
     }
 
     /// Called only after ALL terminal API/trace reads (including fallbacks)
@@ -188,6 +192,9 @@ impl ScanIndex {
         comparison_active: bool,
     ) -> Option<Box<claude_native_comparison::TerminalTraversal>> {
         let effects = self.claude_full_rearm_progress.terminal_effects.take()?;
+        // A caller may have lowered the provisional effective flag after scan
+        // (for example a capacity/settlement gate). Raw commit cannot undo it.
+        let completion_veto = effects.effective_complete && !scan.census_complete;
         for (key, vanished) in &effects.removals {
             if let Some(traversal) = self.traversal.as_mut() {
                 traversal.observed_index_keys.remove(key);
@@ -210,7 +217,7 @@ impl ScanIndex {
                 eprintln!("local snapshot census kept RetryPending families: absence retirement refused ({})", refusal.as_str());
             }
             self.drain_claude_retired_family_tombstone_fence(&traversal);
-            scan.census_complete = !effects.needs_clean_followup
+            scan.census_complete = !completion_veto && !effects.needs_clean_followup
                 && self.claude_usage_authority_pending_count() == 0
                 && self.decode_holds.is_empty();
             if scan.census_complete {

@@ -64,6 +64,7 @@ fn terminal_budget_rejects_whole_cohort_before_raw_retirement_and_every_fold() {
         "rejected raw terminal keeps traversal"
     );
     assert_eq!(index.claude_terminal_fold_deferred().unwrap().roots, 65);
+    assert_eq!(index.claude_terminal_fold_deferred().unwrap().cause, "preflight");
     assert_eq!(witness_bytes(&index), before);
     let (_, withheld, stats) =
         crate::snapshot_sync::apply_claude_local_evidence_to_scan(&support, &mut scan, &mut index);
@@ -195,6 +196,7 @@ fn terminal_reader_growth_refuses_before_any_staged_completion_effect() {
         let (overrun, bytes) = crate::snapshot_sync::bounded_terminal_read_for_test(&support, &mut scan, &mut index);
         assert!(overrun, "growth during_trace={during_trace} exhausts the reader allowance");
         assert!(bytes <= CLAUDE_TERMINAL_MAX_INPUT_BYTES);
+        assert_eq!(index.claude_terminal_fold_deferred().unwrap().cause, "read_allowance");
         assert!(!scan.census_complete);
         assert!(scan.scan_cap_hit);
         assert!(index.traversal.is_some(), "late refusal parks the existing traversal");
@@ -298,4 +300,24 @@ fn partial_deferred_page_keeps_unsettled_file_in_existing_traversal_queue() {
         assert_eq!(pending[0].path, Path::new(&key));
     }
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn bounded_terminal_commit_preserves_a_later_effective_completion_veto() {
+    let support = temp_dir("terminal-veto-support");
+    let root = temp_dir("terminal-veto-transcripts");
+    let mut index = ScanIndex::default();
+    let mut scan = scan_source_roots_with_test_limit_and_claude_support(
+        std::slice::from_ref(&root), &mut index, "2026-08-02T07:10:00Z",
+        BACKFILL_WINDOW_DAYS, 100, &support,
+    ).unwrap();
+    assert!(scan.census_complete);
+    scan.census_complete = false;
+    let (overrun, _) = crate::snapshot_sync::bounded_terminal_read_for_test(&support, &mut scan, &mut index);
+    assert!(!overrun);
+    assert!(!scan.census_complete, "raw commit cannot undo a later effective veto");
+    assert!(scan.scan_cap_hit);
+    assert!(scan.claude_request_census_shadow.is_none());
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(support);
 }

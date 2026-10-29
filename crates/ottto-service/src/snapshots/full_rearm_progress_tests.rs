@@ -2609,7 +2609,9 @@ fn late_account_telemetry_reselects_the_family_without_whole_index_rearm() {
         let mut paid = scan(&mut index, WINDOW);
         enrich(&mut paid, &mut index);
         let quiet = rearm.terminal(&mut index, &paid.snapshots);
-        assert!(quiet.suppression.full_rearm_suppressed, "{quiet:?}");
+        // Containment 2 leaves this due full replay suppressed even without
+        // the structural skip certificate (the previous replay never ran).
+        assert_eq!(quiet.counts.rearm_full_suppressed, 1, "{quiet:?}");
         assert_eq!(quiet.rearmed_files, 0);
         finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut paid, &mut index);
         let unchanged = scan(&mut index, WINDOW);
@@ -2657,8 +2659,8 @@ fn late_account_telemetry_reselects_the_family_without_whole_index_rearm() {
             .is_empty());
         let run = rearm.terminal(&mut index, &completed.snapshots);
         assert!(
-            run.suppression.full_rearm_suppressed && !run.counts.full_rearm,
-            "{run:?}"
+            run.counts.rearm_full_suppressed == 1 && !run.counts.full_rearm,
+            "containment 2 suppresses the due replay independently of the structural certificate: {run:?}"
         );
         assert_eq!(
             run.rearmed_files, 0,

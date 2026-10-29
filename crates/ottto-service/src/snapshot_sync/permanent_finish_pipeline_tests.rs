@@ -1699,6 +1699,9 @@ fn deferred_terminal_uploads_and_saves_parked_traversal_across_passes() {
         let (result, lines) =
             crate::local_resource_diagnostics::capture(|| home.finish(preparation, index, scan));
         result.expect("deferred terminal is an ordinary successful page");
+        let stats = TERMINAL_FIXTURE_STATS.with(|slot| slot.take().unwrap());
+        assert_eq!(stats.terminal_fold_deferred.unwrap().cause, "preflight");
+        assert!(!stats.duplicate_census.census_complete);
         let offered = server.offered.lock().unwrap();
         assert!(
             offered.len() > previous_offers,
@@ -1763,4 +1766,76 @@ fn frozen_terminal_readset_is_consumed_once_without_a_second_allowance() {
     assert!(terminal.is_none());
     assert!(prepared.unwrap().terminal_frozen);
     let _ = std::fs::remove_dir_all(support);
+}
+
+thread_local! {
+    static TERMINAL_FIXTURE_STATS: std::cell::RefCell<Option<ClaudeLocalEvidenceStats>> = const { std::cell::RefCell::new(None) };
+}
+pub(crate) fn record_terminal_fixture_stats(stats: &ClaudeLocalEvidenceStats) {
+    TERMINAL_FIXTURE_STATS.with(|slot| slot.replace(Some(stats.clone())));
+}
+
+/// Late API/trace growth must use B1's real POST/ACK/settlement path. In
+/// particular, refusing the terminal read never spends the staged raw effects.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn read_allowance_growth_demotes_terminal_and_uploads_and_settles_current_page() {
+    for during_trace in [false, true] {
+        let server = AckScriptedServer::new();
+        let mut home = AckFinishHome::new(&server);
+        let source = SnapshotSource::ClaudeCode;
+        let namespace = snapshot_upload_destination_namespace(&home.device, "device-secret");
+        let index_path = snapshot_v3_index_path(&snapshot_destination_scoped_index_path(
+            &snapshot_index_path(&home.support, source), &namespace,
+        ));
+        let extra = "20000000-0000-4000-8000-000000000001";
+        let mut seed = serde_json::to_value(ScanIndex::default()).unwrap();
+        seed["claude_usage_family_pending"][extra] = serde_json::json!({
+            "census_window_end": "2026-01-01T00:00:00Z",
+            "member_request_id_hashes": {}, "member_occurrences": {}, "invalid": false
+        });
+        seed["claude_retired_family_tombstones_uncertain"] = true.into();
+        let mut index: ScanIndex = serde_json::from_value(seed).unwrap();
+        index.save(&index_path).unwrap();
+        let pending = serde_json::to_value(&index).unwrap()["claude_usage_family_pending"][extra].clone();
+        let (api, trace) = crate::claude_local_otel::terminal_sidecar_paths_for_test(&home.support, extra);
+        std::fs::create_dir_all(api.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(trace.parent().unwrap()).unwrap();
+        std::fs::write(&api, b"").unwrap();
+        std::fs::write(&trace, b"\n").unwrap();
+        let (preparation, index, mut scan) = home.prepare("reader growth");
+        assert!(index.claude_terminal_effects_staged());
+        assert!(index.claude_terminal_fold_deferred().is_none());
+        assert!(!scan.snapshots.is_empty());
+        // The helper deliberately lowers its flag for ACK-capacity fixtures;
+        // this case offers the scanner's admitted terminal instead.
+        scan.census_complete = true;
+        let window = serde_json::to_value(&index).unwrap()["traversal"]["census_window_end"].clone();
+        let _hook = crate::claude_local_otel::terminal_growth_hook_for_test(during_trace, |path| {
+            let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            file.set_len(crate::snapshots::CLAUDE_TERMINAL_MAX_INPUT_BYTES + 1).unwrap();
+        });
+        let (result, lines) = crate::local_resource_diagnostics::capture(|| home.finish(preparation, index, scan));
+        result.expect("late reader refusal still uploads the ordinary page");
+        let stats = TERMINAL_FIXTURE_STATS.with(|slot| slot.take().unwrap());
+        assert_eq!(stats.terminal_fold_deferred.unwrap().cause, "read_allowance");
+        assert!(!stats.duplicate_census.census_complete, "zero terminal usage folds");
+        let offered = server.offered.lock().unwrap();
+        assert!(!offered.is_empty(), "current page actually POSTed");
+        let saved = ScanIndex::load(&index_path).unwrap();
+        for body in offered.iter() {
+            assert!(saved.accepted_snapshot_fingerprint_recorded(body["snapshot_fingerprint"].as_str().unwrap()),
+                "the real ACK settled into the saved index");
+        }
+        let value = serde_json::to_value(&saved).unwrap();
+        assert_eq!(value["traversal"]["census_window_end"], window);
+        assert_eq!(value["claude_usage_family_pending"][extra], pending);
+        assert_eq!(value["claude_retired_family_tombstones_uncertain"], true);
+        assert!(cached_source_manifest(&namespace, source).is_none());
+        assert!(lines.iter().any(|line| line["stage"] == "terminal_fold_deferred"
+            && line["counts"]["cause"] == "read_allowance"));
+        assert!(crate::claude_local_otel::terminal_last_read_bytes_for_test()
+            <= crate::snapshots::CLAUDE_TERMINAL_MAX_INPUT_BYTES);
+    }
 }

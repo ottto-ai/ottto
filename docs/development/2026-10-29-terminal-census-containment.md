@@ -27,7 +27,8 @@ Raw-terminal effects are staged in memory until the bounded attempt succeeds:
 watcher removal, missing-file reconciliation, disposition prune, absence
 retirement, tombstone-fence draining and request-census prune. A late refusal
 drops the plan and leaves the existing traversal parked. No cloned index or new
-durable cursor is used for rollback. In-budget effects commit before folds.
+durable cursor is used for rollback. In-budget effects commit before folds, preserving any later effective-completion
+veto from the caller.
 
 A refused terminal becomes an ordinary incomplete page with scan_cap_hit=true.
 Current-page evidence, finalization, upload, ACK settlement and index save
@@ -39,8 +40,8 @@ unsettled changed-file demand in the existing traversal queue; no fresh walk or
 fingerprint clear is needed. Native-comparison selected fallback still withholds
 and queues dependent bodies; deferral revokes eligibility without dropping it.
 
-Local terminal_fold_deferred diagnostics report roots and estimated/stat bytes
-and alarm. A process-local terminal_fold_deferred_consecutive counter alarms at
+Local terminal_fold_deferred diagnostics report roots and estimated/stat bytes,
+label cause=preflight or cause=read_allowance, and alarm. A process-local terminal_fold_deferred_consecutive counter alarms at
 three consecutive deferred passes; process restart resets this diagnostic.
 
 On the measured M4 cohort (thousands of retained roots), 100% of terminal offers

@@ -30965,6 +30965,7 @@ impl OwnedSourceScan {
                                 && state_census_complete
                                 && sidecar_census_complete,
                             raw_complete: raw_census_complete,
+                            effective_complete: census_complete,
                             needs_clean_followup,
                             restart_after_hints,
                             cursor_scope: sampling
@@ -72318,10 +72319,12 @@ mod tests {
         assert!(cap_index.claude_duplicate_request_witness_overflowed);
         assert!(cap_index.claude_duplicate_request_owners.is_empty());
         assert_eq!(cap_sibling_page[0].peak_context_fill_tokens, None);
+        // Containment 2 suppresses the whole-index re-arm. The closed fence
+        // and all strict posture vetoes above remain authoritative.
         assert!(cap_index
             .files
             .values()
-            .all(|entry| entry.source_file_fingerprint.is_empty()));
+            .all(|entry| !entry.source_file_fingerprint.is_empty()));
 
         cap_index.files.remove(&local_index_key(&sibling_path));
         let mut cap_recovery = vec![corrective_page[0].clone()];
@@ -77957,6 +77960,11 @@ mod tests {
         )
         .expect("first scan");
         assert_eq!(first.snapshots.len(), 1);
+        crate::snapshot_sync::apply_claude_local_evidence_to_scan(
+            &support_dir,
+            &mut first,
+            &mut index,
+        );
         finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut first, &mut index);
 
         let body = format!(
