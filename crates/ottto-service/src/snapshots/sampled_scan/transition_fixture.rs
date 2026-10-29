@@ -13,6 +13,7 @@
 //! - a1: live preparation/finish success/error and receipt BEFORE publication.
 //! - audit gate: quiet/append after 1h/50h and >256 slots, clock/debt controls.
 //! - E2: protected nonempty TierReplay, group/EOF/archive and cursor custody.
+//!
 //! M1's named crash edges cannot stand in for the later edges; cheap/raw I/O
 //! stays unmeasured until the acquisition owner supplies a real observation.
 use crate::snapshots::{
