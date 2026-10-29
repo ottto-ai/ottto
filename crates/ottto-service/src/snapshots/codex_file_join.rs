@@ -407,6 +407,8 @@ pub(super) struct HeaderInventory {
     pub(super) read_bytes: usize,
     pub(super) held_archives: BTreeSet<String>,
     pub(super) held_owners: BTreeSet<String>,
+    // Negative protected-owner hashes from raw decode custody, never facts.
+    decode_held_owners: BTreeSet<String>,
     pub(super) first_read_archives: BTreeSet<String>,
     pub(super) deferred_archives: BTreeSet<String>,
     /// Bound archives held by name with a resolved family sibling (value: twin).
@@ -529,8 +531,13 @@ impl HeaderInventory {
             .collect();
         self.family_held = held;
     }
+    pub(super) fn resumable_for(&self, owner: Option<&String>, custody_deferred: bool) -> bool {
+        !owner.is_some_and(|id| self.decode_held_owners.contains(&codex_protected_owner(id)))
+            && (self.complete_for(owner) || (custody_deferred && self.complete))
+    }
     pub(super) fn complete_for(&self, owner: Option<&String>) -> bool {
         self.complete
+            && !owner.is_some_and(|id| self.decode_held_owners.contains(&codex_protected_owner(id)))
             && !owner.is_some_and(|owner| {
                 self.held_owners.contains(owner)
                     || self.headers.iter().any(|h| {
@@ -570,6 +577,7 @@ impl HeaderInventory {
             absence_held: BTreeSet::new(),
             held_archives: BTreeSet::new(),
             held_owners: BTreeSet::new(),
+            decode_held_owners: BTreeSet::new(),
             first_read_archives: BTreeSet::new(),
             deferred_archives: BTreeSet::new(),
             family_held: BTreeMap::new(),
@@ -759,7 +767,20 @@ impl HeaderInventory {
             // Existing raw owner / same-object archive evidence scopes the
             // negative hold downstream, just as for a held plain member. No
             // header acquisition or cache operation is allowed on this path.
-            if index.decode_held_codex_owner(&key).is_some() {
+            if let Some(owner) = index.decode_held_codex_owner(&key) {
+                if !self.decode_held_owners.contains(&owner) {
+                    let cost = crate::heap_layout_bound::tree_node_bytes::<String, ()>()
+                        .and_then(|node| node.checked_add(owner.capacity()))
+                        .and_then(|node| self.feed_peak.checked_add(node))
+                        .filter(|cost| *cost <= crate::source_rotation::PARKED_BUDGET / 2);
+                    let Some(cost) = cost else {
+                        self.complete = false;
+                        self.bounded_out = true;
+                        return HeaderStep::Pending;
+                    };
+                    self.feed_peak = cost;
+                    self.decode_held_owners.insert(owner);
+                }
                 return HeaderStep::Pending;
             }
             // Unknown ownership retains the ordinary refused-header hold and
@@ -1050,7 +1071,7 @@ impl HeaderInventory {
 }
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
 crate::heap_layout_bound::fields!(HeaderWitness; plain_twin, custody_cause, candidate, owner, home, created_unix_ms, metadata, stamp);
-crate::heap_layout_bound::fields!(HeaderInventory; cached_archives_only, feed_prepared, feed_after, feed_peak, custody_next, absence_held, custody_unknown, custody_after, custody_done, custody_peak, custody_refused, roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, archive_work, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, bounded_out, first_read_archives, deferred_archives, family_held);
+crate::heap_layout_bound::fields!(HeaderInventory; cached_archives_only, feed_prepared, feed_after, feed_peak, custody_next, absence_held, custody_unknown, custody_after, custody_done, custody_peak, custody_refused, roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, decode_held_owners, archive_work, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, bounded_out, first_read_archives, deferred_archives, family_held);
 
 #[derive(Clone, Debug)]
 pub(super) struct Group {
@@ -5187,6 +5208,19 @@ pub(in crate::snapshots) mod header_cache_tests {
                         assert_eq!(raw_slot(&owned.index), before);
                         assert_eq!(inventory.complete, known_owner, "{scope}");
                         assert_eq!(inventory.refused.contains_key(&held), !known_owner);
+                        assert!(!inventory.complete_for(Some(&owner)));
+                        for deferred_custody in [false, true] {
+                            assert!(
+                                !inventory.resumable_for(Some(&owner), deferred_custody),
+                                "same-owner paused job cannot bypass raw decode custody"
+                            );
+                            assert_eq!(
+                                inventory
+                                    .resumable_for(Some(&healthy.to_owned()), deferred_custody),
+                                known_owner,
+                                "unrelated cursor keeps ordinary completeness semantics"
+                            );
+                        }
                         assert_eq!(
                             (
                                 inventory.archive_work.physical_bytes,

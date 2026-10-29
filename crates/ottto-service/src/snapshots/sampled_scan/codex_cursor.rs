@@ -6398,8 +6398,7 @@ pub(in crate::snapshots) fn revalidate(
         return changed;
     }
     let Some(inventory) = inputs.inventory.filter(|inventory| {
-        inventory.complete_for(meta.owner.as_ref())
-            || (meta.custody_deferred.is_some() && inventory.complete)
+        inventory.resumable_for(meta.owner.as_ref(), meta.custody_deferred.is_some())
     }) else {
         return Resume::Unavailable;
     };
@@ -6509,8 +6508,7 @@ fn revalidate_group(job: &mut OwnedActiveFile, inputs: ResumeInputs<'_>) -> Resu
         return changed;
     }
     let Some(inventory) = inputs.inventory.filter(|inventory| {
-        inventory.complete_for(Some(&group.owner))
-            || (meta.custody_deferred.is_some() && inventory.complete)
+        inventory.resumable_for(Some(&group.owner), meta.custody_deferred.is_some())
     }) else {
         return Resume::Unavailable;
     };
