@@ -2544,16 +2544,6 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
     );
     index.save(&index_path).unwrap();
     let interpretation = Interpretation::of(source, &key, &index, false, &namespace);
-    let binding = expected(
-        DurableSource::Codex,
-        source,
-        &key,
-        &scope,
-        &index,
-        &interpretation,
-    )
-    .unwrap()
-    .binding;
     let (reduction, checkpoint) = native_record_of(&path, &scope, source);
     assert!(reduction.supports_frozen_charge());
     let incoming = Retained {
@@ -2561,27 +2551,32 @@ fn header_facts_yield_to_real_durable_restore_but_not_hopeless_admission() {
         state: reduction,
     };
     assert!(bound(&incoming, crate::transcript_cache::ENTRY_BYTES).is_some());
-    let mut store = DurableTailStore::new(
+    // Use the production writer's current binding construction, rather than
+    // coupling this fixture to the internal expected() signature.
+    let writer = SharedCache::default();
+    writer.durable_begin_pass(source, &index_path, &namespace, false);
+    assert!(writer.insert_admitted(
+        key.clone(),
+        sampled_jsonl::CompletedNativeAcquisition {
+            checkpoint: incoming.checkpoint,
+            reduction: Some(incoming.state),
+            released: None,
+            unsealed: false,
+        },
+        0
+    ));
+    writer.durable_note_selection(&key, "fp");
+    assert_eq!(
+        writer
+            .durable_write_after_save(lock, source, &index)
+            .unwrap()
+            .written,
+        1
+    );
+    let store = DurableTailStore::new(
         store::store_dir_for_index(&index_path),
         DurableSource::Codex,
     );
-    store
-        .write_after_save(
-            lock,
-            index.generation,
-            vec![PendingRecord {
-                binding,
-                certificate: certificate(&path, &scope),
-                body: codec::encode(
-                    &incoming.state,
-                    store::RECORD_BYTES,
-                    jsonl_line_cap() as u64,
-                )
-                .unwrap(),
-                allowlist: codec::allowlist_digest(source),
-            }],
-        )
-        .unwrap();
     let records = || {
         std::fs::read_dir(store.dir())
             .unwrap()
