@@ -8,7 +8,7 @@ pub(super) enum Refusal {
     Invalid,
     DecodeHold,
     Quarantine,
-    IdentityOrContext,
+    IdentityOrLedger,
     Membership,
     HeldMember,
     DuplicateOwner,
@@ -17,7 +17,6 @@ pub(super) enum Refusal {
     AccountDebt,
     Unaccepted,
     UsageProof,
-    ReceiptB1,
     RetryCarryB3,
     CarrierS4,
 }
@@ -124,11 +123,9 @@ fn known_refusal(
     }
     if index.claude_request_identity_contract_changed
         || index.claude_request_identity_contract.is_none()
-        || index.upload_context_fingerprint.is_none()
-        || index.upload_context_fingerprint != index.active_upload_context_fingerprint
         || !claude_accepted_ledger_is_current(index)
     {
-        return Some(Refusal::IdentityOrContext);
+        return Some(Refusal::IdentityOrLedger);
     }
     let Some(family) = files else {
         return Some(Refusal::Membership);
@@ -195,10 +192,7 @@ fn known_refusal(
     {
         return Some(Refusal::AuditOrCorrection);
     }
-    if files
-        .values()
-        .any(|file| !claude_stale_member_independently_accepted(index, file.key, file.entry))
-    {
+    if files.values().any(|file| !file_body_accepted(index, file)) {
         return Some(Refusal::Unaccepted);
     }
     let Some(witness) = index.claude_usage_family_witnesses.get(root) else {
@@ -235,14 +229,46 @@ fn known_refusal(
     None
 }
 
-fn accepted_usage_receipt<'a>(
-    _index: &'a ScanIndex,
-    _root: &str,
+// The selected-index finalizer commits the body-set witness and entity set
+// together. The accepted ledger excludes not_stored and permanent refusals;
+// quarantine/decode checks also reject partial or held selected groups.
+fn file_body_accepted(index: &ScanIndex, file: &MemberFile<'_>) -> bool {
+    claude_index_file_body_accepted(index, file.key, file.entry)
+        && file
+            .entry
+            .last_upload_body_witness
+            .as_deref()
+            .and_then(codex_digest_from_hex)
+            .is_some()
+        && file
+            .entry
+            .last_snapshot_fingerprint
+            .as_deref()
+            .and_then(codex_digest_from_hex)
+            == index
+                .file_snapshot_fingerprints
+                .get(file.key)
+                .map(snapshot_file_entity_set_digest)
+}
+
+fn accepted_usage_body<'a>(
+    index: &'a ScanIndex,
+    root: &str,
+    pending: &ClaudeUsageFamilyPending,
+    files: Option<&FamilyFiles<'_>>,
 ) -> Result<&'a ClaudeUsageFamilyWitness, Refusal> {
-    // TODO(E7 B1): Is #901's per-file receipt the exact accepted usage evidence,
-    // binding all member/native/context/account/destination/body/correction revisions?
-    // ACKed NULL, stale or refused bodies must never authorize this transition.
-    Err(Refusal::ReceiptB1)
+    if let Some(reason) = known_refusal(index, root, pending, files) {
+        return Err(reason);
+    }
+    // Matching retained request/occurrence proof plus the existing authority
+    // demotion fence binds usage to the accepted selected body. An ACKed NULL
+    // body has no qualifying proof or retains authority quarantine. A digest
+    // alone says nothing about usage. No #901 receipt or active-context match
+    // is required: changing context cannot revoke an already accepted body.
+    index
+        .claude_usage_family_witnesses
+        .get(root)
+        .ok_or(Refusal::UsageProof)
 }
 
 fn retry_carry_replacement(_index: &ScanIndex, _root: &str) -> Result<(), Refusal> {
@@ -257,10 +283,7 @@ fn settlement<'a>(
     pending: &ClaudeUsageFamilyPending,
     files: Option<&FamilyFiles<'_>>,
 ) -> Settlement<'a> {
-    if let Some(reason) = known_refusal(index, root, pending, files) {
-        return Settlement::Refused(reason);
-    }
-    match accepted_usage_receipt(index, root).and_then(|commitment| {
+    match accepted_usage_body(index, root, pending, files).and_then(|commitment| {
         retry_carry_replacement(index, root)?;
         Ok(commitment)
     }) {
@@ -296,8 +319,9 @@ pub(super) struct Counts {
     pub(super) considered: Weight,
     pub(super) settled: Weight,
     pub(super) refused: BTreeMap<Refusal, Weight>,
-    // Independent gate observations overlap the primary refusals. B1 must not
-    // hide the B3 backlog. They are never added to the disjoint totals above.
+    pub(super) accepted_body: Weight,
+    // Independent unresolved B3/S4 observations overlap primary refusals.
+    // They are never added to the disjoint totals above.
     pub(super) owner_gates: BTreeMap<Refusal, Weight>,
     pub(super) byte_measurement_failed: u64,
     pub(super) compacted: Weight,
@@ -342,9 +366,6 @@ fn classify_index(
             0
         });
         counts.considered.add(bytes);
-        if let Err(reason) = accepted_usage_receipt(index, root) {
-            counts.owner_gates.entry(reason).or_default().add(bytes);
-        }
         if let Err(reason) = retry_carry_replacement(index, root) {
             counts.owner_gates.entry(reason).or_default().add(bytes);
         }
@@ -359,6 +380,12 @@ fn classify_index(
             Some(inventory) => settlement(index, root, pending, inventory.get(root.as_str())),
             None => Settlement::Refused(Refusal::Scratch),
         };
+        if matches!(
+            result,
+            Settlement::Settled(_) | Settlement::Refused(Refusal::RetryCarryB3)
+        ) {
+            counts.accepted_body.add(bytes);
+        }
         let retire = may_retire(index, root, &result);
         match result {
             Settlement::Settled(commitment) => {
@@ -567,7 +594,8 @@ mod tests {
             &snapshot_file_entity_set_digest(&entities),
         )));
         entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
-        entry.last_upload_body_witness = Some("accepted-body".into());
+        entry.last_upload_body_witness =
+            Some(snapshot_file_upload_body_set_hex(["3".repeat(64).as_str()]));
         index.files.insert(KEY.into(), entry);
         index.accepted_snapshot_fingerprints = entities.clone();
         index
@@ -575,28 +603,23 @@ mod tests {
             .insert(KEY.into(), entities);
         index
     }
+    fn body_decision(index: &ScanIndex) -> Result<&ClaudeUsageFamilyWitness, Refusal> {
+        let inventory = build_inventory(index);
+        accepted_usage_body(
+            index,
+            ROOT,
+            &index.claude_usage_family_pending[ROOT],
+            inventory.get(ROOT),
+        )
+    }
     fn decision(index: &ScanIndex) -> Settlement<'_> {
-        // The pure predicate needs no heap-layout admission or host I/O.
-        let files = BTreeMap::from([(
-            ClaudeIndexPathMemberRef {
-                root: ROOT,
-                subagent_stem: None,
-            },
-            MemberFile {
-                key: KEY,
-                entry: &index.files[KEY],
-                duplicate: false,
-            },
-        )]);
-        let family = FamilyFiles {
-            members: files,
-            held: false,
-        };
+        // Pure semantic qualification needs no native layout admission or I/O.
+        let inventory = build_inventory(index);
         settlement(
             index,
             ROOT,
             &index.claude_usage_family_pending[ROOT],
-            Some(&family),
+            inventory.get(ROOT),
         )
     }
     fn refused(index: &ScanIndex, expected: Refusal) {
@@ -613,7 +636,7 @@ mod tests {
             KEY,
             &index.files[KEY]
         ));
-        refused(&index, Refusal::ReceiptB1);
+        refused(&index, Refusal::RetryCarryB3);
         assert!(!negative_scheduling_carrier_durable(&index, ROOT));
         assert!(!may_retire(&index, ROOT, &decision(&index)));
         assert!(!may_retire(
@@ -627,13 +650,38 @@ mod tests {
             refused(&changed, Refusal::Unaccepted);
         }
         let mut null = index.clone();
-        null.files.get_mut(KEY).unwrap().last_upload_body_witness = Some("acked-NULL-body".into());
+        // Production NULL demotion of a retained usage witness is quarantined.
+        // An arbitrary magic body-hash string is not evidence of NULL semantics.
+        null.files.get_mut(KEY).unwrap().last_upload_body_witness =
+            Some(snapshot_file_upload_body_set_hex(["4".repeat(64).as_str()]));
+        let proof =
+            claude_usage_family_witness_fingerprint(&null.claude_usage_family_witnesses[ROOT]);
+        null.claude_usage_authority_quarantine.insert(
+            ROOT.into(),
+            ClaudeUsageAuthorityQuarantineRecord {
+                contract: CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION.into(),
+                proven_witness_fingerprint: proof,
+                member_source_file_fingerprints: BTreeMap::from([(
+                    ROOT.into(),
+                    null.files[KEY].source_file_fingerprint.clone(),
+                )]),
+                failed_reconstruction_count: 1,
+                disposition: ClaudeUsageAuthorityQuarantineDisposition::RetryPending,
+                retry_after_unix_seconds: claude_usage_authority_retry_deadline(ROOT, "proof"),
+                proof_correction: None,
+            },
+        );
         assert!(claude_index_file_body_accepted(
             &null,
             KEY,
             &null.files[KEY]
         ));
-        refused(&null, Refusal::ReceiptB1);
+        assert!(claude_usage_authority_preserves_pending(
+            &null.claude_usage_authority_quarantine[ROOT],
+            &null.claude_usage_family_witnesses[ROOT]
+        ));
+        assert_eq!(body_decision(&null).unwrap_err(), Refusal::Quarantine);
+        refused(&null, Refusal::Quarantine);
         let mut old = index.clone();
         old.files.get_mut(KEY).unwrap().last_snapshot_fingerprint = Some("stale-head".into());
         refused(&old, Refusal::Unaccepted);
@@ -642,6 +690,124 @@ mod tests {
             Err(Refusal::RetryCarryB3)
         ));
     }
+    #[test]
+    fn b1_accepted_body_survives_context_change_without_a_native_receipt() {
+        let mut index = fixture();
+        index.upload_context_fingerprint = Some("context-C".into());
+        index.activate_upload_context("context-C".into());
+        let expected = index.claude_usage_family_witnesses[ROOT].clone();
+        assert_eq!(body_decision(&index).unwrap(), &expected);
+        refused(&index, Refusal::RetryCarryB3);
+        // No #901 receipt is installed by this fixture. The real context setter
+        // changes active selection context, not the accepted body or its ACK.
+        index.activate_upload_context("context-D".into());
+        assert_ne!(
+            index.upload_context_fingerprint,
+            index.active_upload_context_fingerprint
+        );
+        assert_eq!(body_decision(&index).unwrap(), &expected);
+        refused(&index, Refusal::RetryCarryB3);
+        // Persisted accepted evidence remains sufficient after runtime-only
+        // context/receipt state disappears on a round trip.
+        let restored: ScanIndex =
+            serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
+        let mut restored = restored;
+        restored.claude_reemission_exclusions =
+            ReemissionExclusions::with_state(ListState::Installed);
+        assert_eq!(body_decision(&restored).unwrap(), &expected);
+        refused(&restored, Refusal::RetryCarryB3);
+    }
+
+    #[test]
+    fn b1_body_ack_exclusions_are_refused() {
+        for case in [
+            "not_stored",
+            "partial",
+            "lost",
+            "refusal",
+            "quarantined",
+            "unequal_set",
+            "no_body",
+            "malformed_body",
+            "no_usage_proof",
+            "changed_occurrence",
+        ] {
+            let mut index = fixture();
+            let expected = match case {
+                // Transport hold_unstored_body excludes this entity from the
+                // accepted ledger, even if it was offered alongside stored ones.
+                "not_stored" | "partial" => {
+                    index.accepted_snapshot_fingerprints.remove(&"2".repeat(64));
+                    Refusal::Unaccepted
+                }
+                "lost" => {
+                    index.accepted_snapshot_fingerprints.clear();
+                    Refusal::Unaccepted
+                }
+                "refusal" | "quarantined" => {
+                    index.quarantined_snapshot_fingerprints.insert(
+                        "1".repeat(64),
+                        SnapshotQuarantineRecord {
+                            reconstruction_contract: terminal_contract_retry::legacy_contract(),
+                            contract_retry_claims: None,
+                            witness: snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+                            retry_after_unix_seconds: 0,
+                            upload_body_witness: Some("3".repeat(64)),
+                            failed_reconstruction_count: 1,
+                            disposition: if case == "refusal" {
+                                SnapshotQuarantineDisposition::UnprovenTerminal
+                            } else {
+                                SnapshotQuarantineDisposition::RetryPending
+                            },
+                        },
+                    );
+                    Refusal::Unaccepted
+                }
+                "unequal_set" => {
+                    // Every new entity is ACKed, but the file's committed head
+                    // binds the earlier set. ACK membership alone is insufficient.
+                    index
+                        .file_snapshot_fingerprints
+                        .get_mut(KEY)
+                        .unwrap()
+                        .insert("5".repeat(64));
+                    index.accepted_snapshot_fingerprints.insert("5".repeat(64));
+                    Refusal::Unaccepted
+                }
+                "no_body" => {
+                    index.files.get_mut(KEY).unwrap().last_upload_body_witness = None;
+                    Refusal::Unaccepted
+                }
+                "malformed_body" => {
+                    index.files.get_mut(KEY).unwrap().last_upload_body_witness =
+                        Some("unbound".into());
+                    Refusal::Unaccepted
+                }
+                "no_usage_proof" => {
+                    index.claude_usage_family_witnesses.clear();
+                    Refusal::UsageProof
+                }
+                "changed_occurrence" => {
+                    index
+                        .claude_usage_family_pending
+                        .get_mut(ROOT)
+                        .unwrap()
+                        .member_occurrences
+                        .get_mut(ROOT)
+                        .unwrap()
+                        .values_mut()
+                        .next()
+                        .unwrap()
+                        .output_tokens += 1;
+                    Refusal::UsageProof
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(body_decision(&index).unwrap_err(), expected, "{case}");
+            refused(&index, expected);
+        }
+    }
+
     #[test]
     fn holds_duplicates_quarantine_and_missing_member_are_classified_before_owner_gates() {
         let mut index = fixture();
@@ -697,8 +863,8 @@ mod tests {
             1
         );
         assert_eq!(
-            counts.owner_gates[&Refusal::ReceiptB1].pending_value_bytes,
-            bytes
+            counts.accepted_body.families,
+            u64::from(crate::heap_layout_bound::layout_supported())
         );
         assert_eq!(
             counts.owner_gates[&Refusal::RetryCarryB3].pending_value_bytes,
