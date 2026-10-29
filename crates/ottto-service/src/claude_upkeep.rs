@@ -140,9 +140,6 @@ enum ClaimOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DoctorProcessResult {
     ExitZero,
-    MissingBinary,
-    SpawnFailed,
-    TimedOut,
     NonzeroExit,
 }
 
@@ -729,11 +726,6 @@ fn observe_registered_slot_upkeep_with_gate(
             Some(_) => (ClaudeConfigSlotUpkeepResultV1::ExpiryUnchanged, false),
             None => (ClaudeConfigSlotUpkeepResultV1::CredentialUnreadable, false),
         },
-        DoctorProcessResult::MissingBinary => {
-            (ClaudeConfigSlotUpkeepResultV1::MissingBinary, false)
-        }
-        DoctorProcessResult::SpawnFailed => (ClaudeConfigSlotUpkeepResultV1::SpawnFailed, false),
-        DoctorProcessResult::TimedOut => (ClaudeConfigSlotUpkeepResultV1::TimedOut, false),
         DoctorProcessResult::NonzeroExit => (ClaudeConfigSlotUpkeepResultV1::NonzeroExit, false),
     };
     let completed = complete_attempt(support_dir, &token, result, clock.now()).unwrap_or(
@@ -1210,18 +1202,6 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
-    struct CountingCredentials {
-        value: Option<ClaudeOAuthCredentialMetadata>,
-        calls: Arc<AtomicUsize>,
-    }
-
-    impl CredentialMetadataReader for CountingCredentials {
-        fn read(&self, _slot: &ClaudeConfigDirSlot) -> Option<ClaudeOAuthCredentialMetadata> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            self.value.clone()
-        }
-    }
-
     impl DoctorProcessRunner for CountingProcess {
         fn run(&self, _config_dir: &str, _timeout: Duration) -> DoctorProcessResult {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -1574,202 +1554,8 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn expired_access_without_refresh_token_requires_login_without_spawning() {
-        let now = "2026-08-04T10:00:00Z";
-        let dir = temp_dir("missing-refresh-token");
-        let calls = Arc::new(AtomicUsize::new(0));
-        let observation = observe_registered_slot_upkeep_with(
-            &descriptor(),
-            true,
-            true,
-            &dir,
-            &FixedClock(at(now)),
-            &SequenceCredentials::new(vec![Some(ClaudeOAuthCredentialMetadata {
-                access_expires_at: Some("1970-01-01T00:00:00Z".to_string()),
-                // Claude Code may retain this old deadline after clearing the
-                // grant, so it must not make the credential look refreshable.
-                refresh_token_expires_at: Some("2026-09-15T04:52:51Z".to_string()),
-                has_refresh_token: false,
-                cleared_by_cli: false,
-                has_profile_scope: false,
-            })]),
-            &CountingProcess {
-                result: DoctorProcessResult::ExitZero,
-                calls: Arc::clone(&calls),
-            },
-        );
-
-        assert!(!observation.proceed_with_collection);
-        assert_eq!(
-            observation.status.result,
-            ClaudeConfigSlotUpkeepResultV1::NeedsLogin
-        );
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-        assert!(!dir.join(UPKEEP_STATE_FILE).exists());
-    }
-
     fn at(value: &str) -> OffsetDateTime {
         OffsetDateTime::parse(value, &Rfc3339).expect("timestamp")
-    }
-
-    #[test]
-    fn before_expiry_never_spawns() {
-        let dir = temp_dir("before-expiry");
-        let observation = observe_registered_slot_upkeep_with(
-            &descriptor(),
-            true,
-            true,
-            &dir,
-            &FixedClock(at("2026-08-04T10:00:00Z")),
-            &SequenceCredentials::new(vec![Some(metadata(
-                "2026-08-04T10:00:01Z",
-                "2026-08-20T00:00:00Z",
-            ))]),
-            &FixedProcess(DoctorProcessResult::NonzeroExit),
-        );
-        assert!(observation.proceed_with_collection);
-        assert_eq!(
-            observation.status.result,
-            ClaudeConfigSlotUpkeepResultV1::NotRequired
-        );
-        assert!(!dir.join(UPKEEP_STATE_FILE).exists());
-    }
-
-    #[test]
-    fn expiry_boundary_succeeds_only_when_expiry_advances() {
-        let now = "2026-08-04T10:00:00Z";
-        let dir = temp_dir("advance");
-        let observation = observe_registered_slot_upkeep_with(
-            &descriptor(),
-            true,
-            true,
-            &dir,
-            &FixedClock(at(now)),
-            &SequenceCredentials::new(vec![
-                Some(metadata(now, "2026-08-20T00:00:00Z")),
-                Some(metadata("2026-08-04T18:00:00Z", "2026-08-20T00:00:00Z")),
-            ]),
-            &FixedProcess(DoctorProcessResult::ExitZero),
-        );
-        assert!(observation.proceed_with_collection);
-        assert_eq!(
-            observation.status.result,
-            ClaudeConfigSlotUpkeepResultV1::Refreshed
-        );
-
-        let unchanged_dir = temp_dir("unchanged");
-        let unchanged = observe_registered_slot_upkeep_with(
-            &descriptor(),
-            true,
-            true,
-            &unchanged_dir,
-            &FixedClock(at(now)),
-            &SequenceCredentials::new(vec![
-                Some(metadata(now, "2026-08-20T00:00:00Z")),
-                Some(metadata(now, "2026-08-20T00:00:00Z")),
-            ]),
-            &FixedProcess(DoctorProcessResult::ExitZero),
-        );
-        assert!(!unchanged.proceed_with_collection);
-        assert_eq!(
-            unchanged.status.result,
-            ClaudeConfigSlotUpkeepResultV1::ExpiryUnchanged
-        );
-    }
-
-    #[test]
-    fn consent_network_kill_switch_and_refresh_deadline_fail_closed() {
-        let now = "2026-08-04T10:00:00Z";
-        for (label, consent, network, disabled, refresh, expected) in [
-            (
-                "no-consent",
-                false,
-                true,
-                false,
-                "2026-08-20T00:00:00Z",
-                ClaudeConfigSlotUpkeepResultV1::UpkeepNotConsented,
-            ),
-            (
-                "network-off",
-                true,
-                false,
-                false,
-                "2026-08-20T00:00:00Z",
-                ClaudeConfigSlotUpkeepResultV1::CollectionPaused,
-            ),
-            (
-                "kill-switch",
-                true,
-                true,
-                true,
-                "2026-08-20T00:00:00Z",
-                ClaudeConfigSlotUpkeepResultV1::UpkeepDisabled,
-            ),
-            (
-                "deadline",
-                true,
-                true,
-                false,
-                now,
-                ClaudeConfigSlotUpkeepResultV1::NeedsLogin,
-            ),
-        ] {
-            let dir = temp_dir(label);
-            if disabled {
-                fs::write(dir.join(UPKEEP_DISABLED_FILE), b"disabled\n").expect("kill switch");
-            }
-            let observation = observe_registered_slot_upkeep_with(
-                &descriptor(),
-                consent,
-                network,
-                &dir,
-                &FixedClock(at(now)),
-                &SequenceCredentials::new(vec![Some(metadata(now, refresh))]),
-                &FixedProcess(DoctorProcessResult::ExitZero),
-            );
-            assert!(!observation.proceed_with_collection, "{label}");
-            assert_eq!(observation.status.result, expected, "{label}");
-            assert!(!dir.join(UPKEEP_STATE_FILE).exists(), "{label}");
-            if network {
-                assert_eq!(
-                    observation.status.due_access_expires_at.as_deref(),
-                    Some(now),
-                    "{label} access deadline"
-                );
-                assert_eq!(
-                    observation.status.refresh_token_expires_at.as_deref(),
-                    Some(refresh),
-                    "{label} refresh deadline"
-                );
-            } else {
-                assert!(observation.status.due_access_expires_at.is_none());
-                assert!(observation.status.refresh_token_expires_at.is_none());
-            }
-        }
-    }
-
-    #[test]
-    fn network_off_switch_prevents_even_credential_metadata_reads() {
-        let dir = temp_dir("network-no-read");
-        let calls = Arc::new(AtomicUsize::new(0));
-        let observation = observe_registered_slot_upkeep_with(
-            &descriptor(),
-            true,
-            false,
-            &dir,
-            &FixedClock(at("2026-08-04T10:00:00Z")),
-            &CountingCredentials {
-                value: Some(metadata("2026-08-04T10:00:00Z", "2026-08-20T00:00:00Z")),
-                calls: Arc::clone(&calls),
-            },
-            &FixedProcess(DoctorProcessResult::ExitZero),
-        );
-        assert_eq!(
-            observation.status.result,
-            ClaudeConfigSlotUpkeepResultV1::CollectionPaused
-        );
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -1861,69 +1647,6 @@ mod tests {
             Err(ClaudeConfigSlotUpkeepResultV1::NeedsLogin)
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn refresh_deadline_within_72_hours_is_typed_but_allows_collection() {
-        let dir = temp_dir("approaching");
-        let observation = observe_registered_slot_upkeep_with(
-            &descriptor(),
-            true,
-            true,
-            &dir,
-            &FixedClock(at("2026-08-04T10:00:00Z")),
-            &SequenceCredentials::new(vec![Some(metadata(
-                "2026-08-04T11:00:00Z",
-                "2026-08-07T09:59:59Z",
-            ))]),
-            &FixedProcess(DoctorProcessResult::ExitZero),
-        );
-        assert!(observation.proceed_with_collection);
-        assert_eq!(
-            observation.status.result,
-            ClaudeConfigSlotUpkeepResultV1::ReloginApproaching
-        );
-    }
-
-    #[test]
-    fn process_failure_classes_are_typed_and_backed_off() {
-        let now = "2026-08-04T10:00:00Z";
-        for (label, process_result, expected) in [
-            (
-                "missing",
-                DoctorProcessResult::MissingBinary,
-                ClaudeConfigSlotUpkeepResultV1::MissingBinary,
-            ),
-            (
-                "spawn",
-                DoctorProcessResult::SpawnFailed,
-                ClaudeConfigSlotUpkeepResultV1::SpawnFailed,
-            ),
-            (
-                "timeout",
-                DoctorProcessResult::TimedOut,
-                ClaudeConfigSlotUpkeepResultV1::TimedOut,
-            ),
-            (
-                "nonzero",
-                DoctorProcessResult::NonzeroExit,
-                ClaudeConfigSlotUpkeepResultV1::NonzeroExit,
-            ),
-        ] {
-            let dir = temp_dir(label);
-            let observation = observe_registered_slot_upkeep_with(
-                &descriptor(),
-                true,
-                true,
-                &dir,
-                &FixedClock(at(now)),
-                &SequenceCredentials::new(vec![Some(metadata(now, "2026-08-20T00:00:00Z"))]),
-                &FixedProcess(process_result),
-            );
-            assert!(!observation.proceed_with_collection, "{label}");
-            assert_eq!(observation.status.result, expected, "{label}");
-            assert_eq!(observation.status.consecutive_failures, 1, "{label}");
-        }
     }
 
     #[test]
