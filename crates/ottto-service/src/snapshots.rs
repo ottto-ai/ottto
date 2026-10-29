@@ -44322,7 +44322,7 @@ impl ScanIndex {
                                 evidence.identity_disposition == Some("conflict")
                                     || (!self.claude_desktop_identity_census_complete
                                         && evidence.identity_disposition == Some("missing")
-                                        && evidence.account_identifier_hash.is_some())
+                                        && !mixed.permits_single_account(item))
                             })
                     {
                         if item
@@ -44336,7 +44336,9 @@ impl ScanIndex {
                         } else {
                             // An incomplete census vetoes only a new owner: keep
                             // the usage/cost body uploadable, with no account tag
-                            // borrowed from the partial native-profile cache.
+                            // borrowed from the partial native-profile cache,
+                            // including released scalar-only cache entries.
+                            // Fresh independent request proof remains eligible.
                             set_session_account_hash(item, None);
                         }
                         continue;
@@ -66866,6 +66868,90 @@ mod tests {
                 .excluded_request_id_hashes,
             BTreeSet::from([hash("req_a"), hash("req_b")])
         );
+    }
+
+    #[test]
+    fn desktop_incomplete_census_preserves_fresh_request_account_proof() {
+        let _gate = claude_request_money::e2::GateForTest::off();
+        let (dir, root, items) = claude_account_family_fixture();
+        let api = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+            evidence: BTreeMap::from([(
+                root.clone(),
+                (1..=4)
+                    .map(|n| complete_api_row(&root, &format!("req_{n}"), n, 10, 10, 0))
+                    .collect(),
+            )]),
+            ..Default::default()
+        };
+        let trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
+            evidence: BTreeMap::from([(
+                root,
+                (1..=4)
+                    .map(|n| {
+                        complete_trace_row(&items[0].source_session_id, &format!("req_{n}"), "")
+                    })
+                    .collect(),
+            )]),
+            ..Default::default()
+        };
+        for missing_carrier in [false, true] {
+            for complete_clocks in [false, true] {
+                let mut item = items[0].clone();
+                item.session_account_evidence = missing_carrier.then(|| {
+                    ClaudeTitleMetadata::default().session_account_evidence(&item.source_session_id)
+                });
+                if !complete_clocks {
+                    for occurrence in item.claude_usage_occurrences.values_mut() {
+                        occurrence.event_clock_complete = false;
+                    }
+                }
+                let qualification =
+                    claude_request_accounts::apply(std::slice::from_mut(&mut item), &api, &trace);
+                assert_eq!(
+                    qualification.coverage,
+                    [if complete_clocks {
+                        claude_request_accounts::Coverage::Complete
+                    } else {
+                        claude_request_accounts::Coverage::UnprovedEventClock
+                    }]
+                );
+                let original = item.clone();
+                let mut index = ScanIndex::default();
+                assert!(!index.claude_desktop_identity_census_complete);
+                assert!(index
+                    .bind_session_accounts_with_mixed(
+                        SnapshotSource::ClaudeCode,
+                        "machine",
+                        std::slice::from_mut(&mut item),
+                        &[],
+                        &qualification.mixed,
+                    )
+                    .is_empty());
+                assert_eq!(index.session_account_bindings.len(), 1);
+                assert_eq!(exact_session_account_hash(&item), Some("a".repeat(64)));
+                assert_eq!(
+                    serde_json::to_value(&item).unwrap(),
+                    serde_json::to_value(&original).unwrap()
+                );
+                if missing_carrier {
+                    // A collector marker copied without this scan's capability
+                    // cannot upgrade cached tags into independent request proof.
+                    let mut marker_only = original;
+                    let mut index = ScanIndex::default();
+                    assert!(index
+                        .bind_session_accounts(
+                            SnapshotSource::ClaudeCode,
+                            "machine",
+                            std::slice::from_mut(&mut marker_only),
+                            &[],
+                        )
+                        .is_empty());
+                    assert!(exact_session_account_hash(&marker_only).is_none());
+                    assert!(index.session_account_bindings.is_empty());
+                }
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     fn d1_subagent_account_specimen(

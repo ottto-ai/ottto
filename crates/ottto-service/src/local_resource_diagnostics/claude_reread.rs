@@ -642,23 +642,36 @@ mod tests {
     fn discovery_alarms_count_first_failure_and_third_consecutive_cap() {
         super::DESKTOP_DISCOVERY_STATE
             .with(|state| state.store(0, std::sync::atomic::Ordering::Relaxed));
-        let (counts, rows) = crate::local_resource_diagnostics::capture(|| {
-            let scope = super::Scope::begin(true);
+        let scope = super::Scope::begin(true);
+        let (_, first) = crate::local_resource_diagnostics::capture(|| {
             super::desktop_discovery(false, true);
-            super::desktop_discovery(true, false);
-            super::desktop_discovery(false, false); // interrupts the streak
-            for _ in 0..4 {
-                super::desktop_discovery(true, false);
-            }
-            scope.finish()
         });
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0]["stage"], "desktop_discovery_incomplete");
+        let (_, before_interruption) = crate::local_resource_diagnostics::capture(|| {
+            super::desktop_discovery(true, false);
+        });
+        assert!(before_interruption.is_empty());
+        let (_, interruption) = crate::local_resource_diagnostics::capture(|| {
+            super::desktop_discovery(false, false); // interrupts the streak
+        });
+        assert!(interruption.is_empty());
+        for consecutive in 1..=4 {
+            let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+                super::desktop_discovery(true, false);
+            });
+            if consecutive == 3 {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0]["stage"], "desktop_discovery_capped_persistent");
+            } else {
+                assert!(rows.is_empty(), "consecutive cap {consecutive}");
+            }
+        }
+        let counts = scope.finish();
         assert_eq!(
             serde_json::to_value(counts).unwrap()["desktop_discovery_incomplete"],
             serde_json::json!({"capped":5,"error":1})
         );
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0]["stage"], "desktop_discovery_incomplete");
-        assert_eq!(rows[1]["stage"], "desktop_discovery_capped_persistent");
         let scope = super::Scope::begin(true);
         super::desktop_discovery(false, true);
         let mut first = scope.finish();

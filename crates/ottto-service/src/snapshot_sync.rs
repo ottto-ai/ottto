@@ -23806,13 +23806,13 @@ mod tests {
     #[test]
     #[serial(source_manifests)]
     fn desktop_incomplete_discovery_uploads_new_session_unbound_then_clean_sweep_binds() {
-        desktop_unbound_upload_revision_fixture("2026-09-30");
+        desktop_unbound_upload_revision_fixture("2026-09-30", false);
     }
 
     #[test]
     #[serial(source_manifests)]
     fn desktop_forward_cohort_binding_uses_new_upload_revision() {
-        let evidence = desktop_unbound_upload_revision_fixture("2026-10-30");
+        let evidence = desktop_unbound_upload_revision_fixture("2026-10-30", false);
         let cutoff = OffsetDateTime::parse("2026-10-30T00:00:00Z", &Rfc3339).unwrap();
         assert!(
             evidence.first_admitted_at >= cutoff,
@@ -23854,7 +23854,7 @@ mod tests {
     #[test]
     #[serial(source_manifests)]
     fn desktop_forward_cohort_binding_has_no_late_naming_write() {
-        let evidence = desktop_unbound_upload_revision_fixture("2026-10-30");
+        let evidence = desktop_unbound_upload_revision_fixture("2026-10-30", false);
         // Capture EVERY request, not just batch callbacks. No status, weak
         // naming, reconciliation or alternate endpoint carries the bind.
         assert_eq!(
@@ -23876,7 +23876,44 @@ mod tests {
         );
     }
 
-    fn desktop_unbound_upload_revision_fixture(day: &str) -> DesktopUploadRevisionEvidence {
+    #[test]
+    #[serial(source_manifests)]
+    fn desktop_released_scalar_cache_uploads_unbound_then_binds_by_new_revision() {
+        let evidence = desktop_unbound_upload_revision_fixture("2026-10-30", true);
+        assert!(
+            evidence.first_admitted_at
+                >= OffsetDateTime::parse("2026-10-30T00:00:00Z", &Rfc3339).unwrap()
+        );
+        let old = &evidence.offers[0]["snapshots"][0];
+        let new = &evidence.offers[1]["snapshots"][0];
+        assert!(old["session_account_evidence"]
+            .get("account_identifier_hash")
+            .is_none());
+        assert_eq!(
+            new["session_account_evidence"]["identity_disposition"],
+            "complete"
+        );
+        for key in ["revision_hash", "revision_v2_hash"] {
+            assert_ne!(old["semantic_envelope"][key], new["semantic_envelope"][key]);
+        }
+        assert_eq!(
+            old["semantic_envelope"]["component_hashes"]["usage_accounting"],
+            new["semantic_envelope"]["component_hashes"]["usage_accounting"]
+        );
+        assert_eq!(old["cost"], new["cost"]);
+        assert_eq!(
+            evidence.requests,
+            vec![
+                "POST /api/v1/agent-session-snapshots/batches HTTP/1.1",
+                "POST /api/v1/agent-session-snapshots/batches HTTP/1.1",
+            ]
+        );
+    }
+
+    fn desktop_unbound_upload_revision_fixture(
+        day: &str,
+        released_scalar_cache: bool,
+    ) -> DesktopUploadRevisionEvidence {
         // Exercise the legacy owner path, real scan/evidence fold, hold filter,
         // resumable upload driver, wire validation, HTTP POST and entity ACK.
         // Money is explicit nonzero input at the owner seam; this does not
@@ -23923,6 +23960,22 @@ mod tests {
             serde_json::to_value(&index).unwrap()["claude_desktop_identity_census_complete"],
             true
         );
+        if released_scalar_cache {
+            // Deserialize the released cache shape: the scalar survives, while
+            // the later original-identity carrier is absent, not fabricated.
+            let mut saved = serde_json::to_value(&index).unwrap();
+            let entries = saved["claude_desktop_title_files"].as_object_mut().unwrap();
+            assert_eq!(entries.len(), 1);
+            for entry in entries.values_mut() {
+                assert!(entry["account_identifier_hash"].is_string());
+                entry.as_object_mut().unwrap().remove("original_identity");
+            }
+            saved["claude_desktop_store_retry_not_before_unix_seconds"] =
+                serde_json::json!(OffsetDateTime::parse(&format!("{day}T10:10:00Z"), &Rfc3339)
+                    .unwrap()
+                    .unix_timestamp());
+            index = serde_json::from_value(saved).unwrap();
+        }
         // Preserve the cached unique hash, then fail discovery before a NEW
         // transcript arrives. An unopened root could contradict that hash.
         let saved_support = home.join("saved-support");
@@ -24031,15 +24084,48 @@ mod tests {
                     .identity_disposition,
                 Some(if cycle == 0 { "missing" } else { "complete" })
             );
-            assert!(before
-                .model_usage
-                .iter()
-                .all(|row| row.account_identifier_hash
-                    == before
-                        .session_account_evidence
-                        .as_ref()
+            if released_scalar_cache && cycle == 0 {
+                let saved = serde_json::to_value(&index).unwrap();
+                let entries = saved["claude_desktop_title_files"].as_object().unwrap();
+                assert_eq!(entries.len(), 1);
+                let entry = entries.values().next().unwrap();
+                assert!(entry.get("original_identity").is_none());
+                let scalar = entry["account_identifier_hash"].as_str().unwrap();
+                assert!(before
+                    .model_usage
+                    .iter()
+                    .chain(
+                        before
+                            .usage_buckets
+                            .iter()
+                            .flat_map(|b| b.model_usage.iter())
+                    )
+                    .all(|row| row.account_identifier_hash.as_deref() == Some(scalar)));
+                assert!(before
+                    .session_account_evidence
+                    .as_ref()
+                    .unwrap()
+                    .account_identifier_hash
+                    .is_none());
+                assert!(
+                    saved["claude_desktop_store_retry_not_before_unix_seconds"]
+                        .as_i64()
                         .unwrap()
-                        .account_identifier_hash));
+                        > OffsetDateTime::parse(&at, &Rfc3339)
+                            .unwrap()
+                            .unix_timestamp()
+                );
+            } else {
+                assert!(before
+                    .model_usage
+                    .iter()
+                    .all(|row| row.account_identifier_hash
+                        == before
+                            .session_account_evidence
+                            .as_ref()
+                            .unwrap()
+                            .account_identifier_hash));
+            }
             let deferred = index.bind_session_accounts_with_mixed(
                 SnapshotSource::ClaudeCode,
                 "machine",
