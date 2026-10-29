@@ -1604,13 +1604,24 @@ pub(in crate::snapshots) mod tests {
         ));
         let saved = checkpoint(&index); // upload failure / lost ACK, then restart
         assert!(saved.files[&key].last_snapshot_fingerprint.is_none());
+        assert!(saved.files[&key]
+            .archive
+            .as_ref()
+            .unwrap()
+            .body_witness
+            .is_some());
         assert!(saved.accepted_snapshot_fingerprints.is_empty());
         assert!(!saved.file_snapshot_fingerprints.contains_key(&key));
         let expected_pending_money = serde_json::to_value(&result.snapshots).unwrap();
         // Neither an unsettled in-memory pass nor its durable checkpoint can
         // consume another decode before six hours; neither fabricates a body.
         for state in [index.clone(), saved] {
-            let missing_body = state.files[&key].last_snapshot_fingerprint.is_none();
+            let missing_body = state.files[&key]
+                .archive
+                .as_ref()
+                .unwrap()
+                .body_witness
+                .is_none();
             let (mut state, result, rows, _) = archive_pass(&f, state, true, None);
             assert_eq!(decodes(&rows), 0);
             assert!(result.snapshots.is_empty());
@@ -1891,9 +1902,21 @@ pub(in crate::snapshots) mod tests {
             assert!(restored.files[&key].last_snapshot_fingerprint.is_none());
             restored.migrate(f.candidate());
             restored.record(f.candidate(), None, ScanParseOutcome::Unknown);
-            let unhealthy = matches!(restored.files[&key].archive.as_ref().unwrap().disposition, ArchiveDisposition::Held { .. } | ArchiveDisposition::Refused { .. });
+            let terminal = restored.files[&key].archive.as_ref().unwrap().terminal_cause();
             let (_, result, rows, _) = archive_pass(&f, checkpoint(&restored), true, None);
-            assert_eq!(result.unreadable_path_count > 0, unhealthy);
+            assert_eq!(result.unreadable_path_count, 0);
+            assert_eq!(
+                result.census_residue_blocked_session_count,
+                usize::from(terminal.is_some())
+            );
+            let expected = terminal
+                .map(|cause| serde_json::to_value(BTreeMap::from([(cause, 1)])).unwrap());
+            assert_eq!(
+                rows.iter()
+                    .find(|row| row["stage"] == "archive_terminal_residue")
+                    .map(|row| row["counts"]["archive_terminal_residue"].clone()),
+                expected
+            );
             assert_eq!(decodes(&rows), 0);
             assert!(result.snapshots.is_empty());
         }

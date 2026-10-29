@@ -43001,15 +43001,15 @@ fn open_and_identify_scan_candidate_with_rescue(
                 return None;
             }
         };
-    if let Some((entry, archive)) = files
+    if let Some(archive) = files
         .get(&local_index_key(&candidate.path))
-        .and_then(|entry| entry.archive.as_ref().map(|archive| (entry, archive)))
-        .filter(|(_, archive)| source == SnapshotSource::Codex && archive.quiet(&opened_file))
+        .and_then(|entry| entry.archive.as_ref())
+        .filter(|archive| source == SnapshotSource::Codex && archive.quiet(&opened_file))
     {
         if let Some(cause) = archive.terminal_cause() {
             census.archive_residue(&candidate.path, Some(archive), cause);
         } else if matches!(archive.disposition, ArchiveDisposition::Pending { .. })
-            && entry.last_snapshot_fingerprint.is_none()
+            && archive.body_witness.is_none()
         {
             census.record_unreadable(UnreadableCause::Reduction, 1);
         }

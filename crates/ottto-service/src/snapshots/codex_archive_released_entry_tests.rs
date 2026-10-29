@@ -1,10 +1,10 @@
 // Test-only vendored file-entry decode path, identical at ALL pins:
 // 0.1.201: 7997fe740064273ffc145d2168c299f5d8b9ee3d
 // R1: 0061a4b0cd2bb71510e67586e949a0362609e6ee
-// R1-main: 68094b0da69fa38130c1420bfec6ab309820724d
-// snapshots.rs:4254-4339 / 4282-4367 / 4293-4378 (entry),
-// 4358-4363 / 4386-4391 / 4397-4402 (owner).
-// codex_file_join.rs:542-570 / 545-573 / 545-573 (receipt).
+// R1-main: ff914a4a036c6a25666fbcca46c45220bd3c4d97
+// snapshots.rs:4254-4339 / 4282-4367 / 4308-4393 (entry),
+// 4358-4363 / 4386-4391 / 4412-4417 (owner).
+// codex_file_join.rs:542-570 / 545-573 / 556-584 (receipt).
 // Only enclosing module/imports added.
 // SHA256 of original source spans (including trailing newline):
 // entry: 2e94303dd6fd9252e3288d3375290e73906d811ca3dc57dd7177e406fde12622

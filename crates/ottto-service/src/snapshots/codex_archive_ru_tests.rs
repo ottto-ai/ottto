@@ -63,6 +63,75 @@ fn quiet_held_and_refused_site_has_no_ru_and_healthy_census_work_proceeds() {
 }
 
 #[test]
+fn quiet_pending_discloses_a_bodyless_current_attempt_despite_historical_output() {
+    for current_body in [None, Some("current-body".to_owned())] {
+        let f = ArchiveFixture::new(b"quiet-current-stamp-only");
+        let key = local_index_key(&f.0);
+        let mut archive = ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, None).unwrap();
+        assert!(
+            archive.body_witness.is_none(),
+            "begin clears the current body"
+        );
+        archive.body_witness = current_body.clone();
+        assert!(archive.quiet(&File::open(&f.0).unwrap()));
+        let mut index = ScanIndex::default();
+        index.files.insert(
+            key.clone(),
+            ScanIndexEntry {
+                source_file_fingerprint: "historical-file".into(),
+                last_snapshot_fingerprint: Some("historical-entity".into()),
+                last_upload_body_witness: Some("historical-body".into()),
+                archive: Some(Box::new(archive)),
+                ..Default::default()
+            },
+        );
+        index
+            .file_snapshot_fingerprints
+            .insert(key.clone(), BTreeSet::from(["historical-entity".into()]));
+        index
+            .accepted_snapshot_fingerprints
+            .insert("historical-entity".into());
+        let path = f.0.parent().unwrap().join("current-pending-index.json");
+        for pass in 0..3 {
+            index.save(&path).unwrap();
+            let (restored, origin) =
+                ScanIndex::load_inner(&path, Some(SnapshotSource::Codex)).unwrap();
+            assert!(matches!(origin, LoadOrigin::Loaded(_)));
+            assert_eq!(
+                restored.files[&key].last_snapshot_fingerprint.as_deref(),
+                Some("historical-entity")
+            );
+            // Incomplete traversal counts survive restart and aggregate pages.
+            let carried = restored
+                .traversal
+                .as_ref()
+                .map_or(0, |traversal| traversal.counts.unreadable_path_count);
+            let new_unreadable = usize::from(current_body.is_none());
+            assert_eq!(carried, pass * new_unreadable);
+            let (next, result, rows, _) = archive_pass(&f, restored, false, None);
+            assert_eq!(decodes(&rows), 0, "quiet means no reacquisition");
+            assert_eq!(
+                result.unreadable_path_count,
+                carried + new_unreadable,
+                "each quiet pass adds one current-bodyless disclosure"
+            );
+            assert_eq!(result.census_complete, current_body.is_some());
+            assert_eq!(result.census_residue_blocked_session_count, 0);
+            assert!(result.snapshots.is_empty());
+            assert!(!rows
+                .iter()
+                .any(|row| row["stage"] == "archive_terminal_residue"));
+            assert_eq!(archive_evidence(&next, &f).body_witness, current_body);
+            assert_eq!(
+                next.files[&key].last_upload_body_witness.as_deref(),
+                Some("historical-body")
+            );
+            index = next;
+        }
+    }
+}
+
+#[test]
 fn settlement_exhausted_parser_error_has_no_ru_and_healthy_census_work_proceeds() {
     let f = ArchiveFixture::new(b"exhausted-stamp-only");
     let mut evidence = ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, None).unwrap();
