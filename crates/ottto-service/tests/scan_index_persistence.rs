@@ -346,7 +346,7 @@ fn corrupt_missing_truncated_symlink_and_mode_refuse_without_gc() {
         }
         let before = object_paths(&scratch).len();
         let root = fs::read(scratch.root()).unwrap();
-        assert!(store.open().is_err());
+        assert!(matches!(store.open(), Err(_) | Ok(Opened::Partial(_, _))));
         assert!(store
             .collect(
                 &committed.root,
@@ -385,7 +385,7 @@ fn malformed_future_manifest_never_mutates() {
         let bytes = serde_json::to_vec(&root).unwrap();
         fs::write(scratch.root(), &bytes).unwrap();
         let count = object_paths(&scratch).len();
-        assert!(store.open().is_err());
+        assert!(matches!(store.open(), Err(_) | Ok(Opened::Partial(_, _))));
         assert!(store
             .collect(
                 &committed.root,
@@ -735,7 +735,7 @@ fn sources_and_metadata_routing_coverage_are_explicit() {
     assert!(store.commit(&missing(&store), 1, &Unrouted).is_err());
     // The failed first save left an immutable orphan, not evidence of a
     // never-initialized store. Preserve it and refuse a fresh scan.
-    assert!(store.open().is_err());
+    assert!(matches!(store.open(), Err(_) | Ok(Opened::Partial(_, _))));
     assert!(!scratch.root().exists());
     assert!(!object_paths(&scratch).is_empty());
 }
@@ -1003,7 +1003,7 @@ fn compatibility_sentinel_is_not_logical_files_and_orphan_reuse_is_not_a_write()
     invalid["files"] = json!({"synthetic-forbidden": {}});
     let bytes = serde_json::to_vec(&invalid).unwrap();
     fs::write(scratch.root(), &bytes).unwrap();
-    assert!(store.open().is_err());
+    assert!(matches!(store.open(), Err(_) | Ok(Opened::Partial(_, _))));
     assert_eq!(fs::read(scratch.root()).unwrap(), bytes);
 }
 
@@ -1095,7 +1095,10 @@ fn fifo_shard_refuses_without_waiting_for_a_writer() {
     use std::os::unix::ffi::OsStrExt;
     let name = std::ffi::CString::new(object.as_os_str().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
-    assert!(s.store().open().is_err());
+    assert!(matches!(
+        s.store().open(),
+        Err(_) | Ok(Opened::Partial(_, _))
+    ));
 }
 
 #[test]
@@ -1110,12 +1113,24 @@ fn storage_tag_without_outer_fence_never_becomes_empty_legacy() {
             manifest.as_object_mut().unwrap().remove("schema_version");
         }
         fs::write(s.root(), serde_json::to_vec(&manifest).unwrap()).unwrap();
-        assert!(s.store().open().is_err());
+        assert!(matches!(
+            s.store().open(),
+            Err(_) | Ok(Opened::Partial(_, _))
+        ));
     }
     let s = Scratch::new();
     s.install();
+    let _ = opened(&s.store());
+    fs::write(
+        s.0.join("scan-index.corrupt.1.2.json"),
+        b"prior root witness",
+    )
+    .unwrap();
     fs::remove_file(s.root()).unwrap();
-    assert!(s.store().open().is_err());
+    assert!(matches!(
+        s.store().open(),
+        Err(_) | Ok(Opened::Partial(_, _))
+    ));
 }
 #[test]
 fn whitespace_padded_legacy_controls_keep_their_generation() {
@@ -1147,9 +1162,13 @@ fn syntax_failure_never_erases_an_observed_storage_fence() {
     ] {
         let s = Scratch::new();
         fs::write(s.root(), bytes).unwrap();
-        assert!(s.store().open().is_err());
+        assert!(matches!(
+            s.store().open(),
+            Err(_) | Ok(Opened::Partial(_, _))
+        ));
         assert_eq!(fs::read_to_string(s.root()).unwrap(), bytes);
-        assert_eq!(fs::read_dir(&s.0).unwrap().count(), 1);
+        assert!(s.0.join("scan-index.json.storage-prior").exists());
+        assert_eq!(fs::read_dir(&s.0).unwrap().count(), 2);
     }
 }
 
@@ -1158,6 +1177,7 @@ fn opened(store: &LockedStore) -> (Value, LoadedRoot) {
         Opened::Sharded(reader, root) => (Box::new(reader), root),
         Opened::Legacy(file, root) => (Box::new(file), root),
         Opened::Missing(_) => panic!("missing"),
+        Opened::Partial(_, _) => panic!("unknown maps are not a complete index"),
     };
     let mut bytes = Vec::new();
     input.read_to_end(&mut bytes).unwrap();
@@ -1165,7 +1185,7 @@ fn opened(store: &LockedStore) -> (Value, LoadedRoot) {
 }
 
 #[test]
-fn failed_first_publication_keeps_orphans_and_refuses_fresh_reset() {
+fn failed_first_publication_without_prior_state_discards_owned_orphans() {
     let s = Scratch::new();
     let store = s.store();
     let root = missing(&store);
@@ -1182,8 +1202,11 @@ fn failed_first_publication_keeps_orphans_and_refuses_fresh_reset() {
     assert!(error.downcast_ref::<CommitPublished>().is_none());
     assert!(!s.root().exists());
     assert!(!object_paths(&s).is_empty());
-    assert!(store.open().is_err());
-    assert!(store.compare(&root).is_err());
+    assert!(matches!(store.open().unwrap(), Opened::Missing(_)));
+    assert_eq!(store.take_read_stats().scanindex_orphan_init_discarded, 1);
+    assert!(!s.0.join("scan-index.json.shards").exists());
+    assert!(store.compare(&root).is_ok());
+    store.commit(&root, 1, &Fixture::new(1, 0).plan()).unwrap();
 }
 #[test]
 fn gc_cursor_restarts_payload_sweep_after_root_change() {
@@ -1226,3 +1249,6 @@ fn gc_cursor_restarts_payload_sweep_after_root_change() {
     assert_eq!(object_paths(&s).len(), 1);
     assert_eq!(load(&store).0, Fixture::new(2, 0).logical(2));
 }
+
+#[path = "support/scan_index_r3.rs"]
+mod r3;

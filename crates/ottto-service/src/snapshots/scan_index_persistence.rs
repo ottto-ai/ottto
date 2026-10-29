@@ -101,10 +101,15 @@ impl Slot {
 #[serde(deny_unknown_fields)]
 struct Object {
     slot: Slot,
+    #[serde(default)]
+    generation: u64,
     bytes: u64,
     digest: String,
 }
 impl Object {
+    fn same_payload(&self, other: &Self) -> bool {
+        self.slot == other.slot && self.bytes == other.bytes && self.digest == other.digest
+    }
     fn filename(&self) -> String {
         format!("{}-{}.json", self.slot.label(), self.digest)
     }
@@ -124,6 +129,8 @@ struct Manifest {
     generation: u64,
     binding: Binding,
     padding_bytes: u64,
+    #[serde(default)]
+    maps: Vec<MapManifest>,
     objects: Vec<Object>,
 }
 
@@ -160,6 +167,9 @@ impl Stamp {
 #[derive(Clone, Debug)]
 enum Root {
     Missing,
+    Unavailable {
+        generation: u64,
+    },
     Legacy {
         digest: String,
         generation: u64,
@@ -180,7 +190,7 @@ impl LoadedRoot {
     pub(crate) fn generation(&self) -> Option<u64> {
         match &*self.0 {
             Root::Sharded { manifest, .. } => Some(manifest.generation),
-            Root::Legacy { generation, .. } => Some(*generation),
+            Root::Legacy { generation, .. } | Root::Unavailable { generation } => Some(*generation),
             _ => None,
         }
     }
@@ -195,6 +205,60 @@ pub(crate) enum Opened {
     Missing(LoadedRoot),
     Legacy(File, LoadedRoot),
     Sharded(LogicalReader, LoadedRoot),
+    Partial(PartialIndex, LoadedRoot),
+}
+
+/// A map is known only when its root inventory and EVERY referenced bucket
+/// validate. Unknown carries no iterable entries and is never an empty map.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UnavailableCause {
+    Missing,
+    Generation,
+    Digest,
+    Decode,
+    Descriptor,
+    Unsafe,
+}
+impl UnavailableCause {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Generation => "generation",
+            Self::Digest => "digest",
+            Self::Decode => "decode",
+            Self::Descriptor => "descriptor",
+            Self::Unsafe => "unsafe",
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MapUnavailable {
+    pub map: Field,
+    pub cause: UnavailableCause,
+}
+pub(crate) enum MapAvailability {
+    Known(LogicalReader),
+    Unknown(MapUnavailable),
+}
+/// Separate from a complete index: no implicit JSON/default/empty conversion.
+/// Metadata and known siblings remain readable; unknown maps cannot authorize
+/// retirement, release, fence opening, a legacy export or a new root commit.
+pub(crate) struct PartialIndex {
+    pub metadata: LogicalReader,
+    pub maps: [MapAvailability; 3],
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ReadStats {
+    pub scanindex_orphan_init_discarded: u64,
+    /// index_shard_unavailable{map,cause}, fixed low-cardinality axes only.
+    pub index_shard_unavailable: [[u64; 6]; 3],
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct MapManifest {
+    field: Field,
+    generation: u64,
+    buckets: Vec<u8>,
 }
 
 /// Existing checkpoint flock is a caller precondition. Directory handles and
@@ -206,6 +270,8 @@ pub(crate) struct LockedStore {
     objects_name: std::ffi::CString,
     binding: Binding,
     metadata_fields: &'static [&'static str],
+    prior_root_seen: std::cell::Cell<bool>,
+    read_stats: std::cell::Cell<ReadStats>,
 }
 
 fn cstring(bytes: &[u8]) -> Result<std::ffi::CString> {
@@ -396,6 +462,7 @@ impl<W: Write> HashWriter<W> {
         self.hash.update(self.bytes.to_le_bytes());
         Object {
             slot,
+            generation: 0,
             bytes: self.bytes,
             digest: hex(self.hash.finalize()),
         }
@@ -681,6 +748,8 @@ impl LockedStore {
             objects_name: cstring(&object_name)?,
             binding,
             metadata_fields,
+            prior_root_seen: std::cell::Cell::new(false),
+            read_stats: std::cell::Cell::new(ReadStats::default()),
         })
     }
     fn directory(&self, create: bool) -> Result<File> {
@@ -701,9 +770,15 @@ impl LockedStore {
         check_directory(&dir)?;
         Ok(dir)
     }
+    fn payload_directory(&self) -> Result<File> {
+        self.directory(false)
+    }
     fn current(&self) -> Result<(Option<File>, Root)> {
         let mut file = match open_at(&self.parent, &self.root_name, libc::O_RDONLY) {
-            Ok(file) => file,
+            Ok(file) => {
+                self.prior_root_seen.set(true);
+                file
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 match self.directory(false) {
                     Ok(_) => bail!("scan_index_root_missing_with_shards"),
@@ -754,8 +829,32 @@ impl LockedStore {
                 .take(MAX_ROOT_BYTES as u64 + 1)
                 .read_to_end(&mut bytes)?;
             ensure!(bytes.len() <= MAX_ROOT_BYTES, "scan_index_root_size");
-            let manifest: Manifest = serde_json::from_slice(&bytes)
+            let mut manifest: Manifest = serde_json::from_slice(&bytes)
                 .map_err(|_| anyhow::anyhow!("scan_index_manifest_refused"))?;
+            // Compatibility with the earlier, unshipped format-1 encoding:
+            // absence of ALL reference generations AND of the inventory is
+            // its legacy discriminator. New roots always write positive paired
+            // generations and explicit inventories, including known-empty maps.
+            if manifest.maps.is_empty() && manifest.objects.iter().all(|o| o.generation == 0) {
+                for object in &mut manifest.objects {
+                    object.generation = manifest.generation;
+                }
+                manifest.maps = Field::all()
+                    .into_iter()
+                    .map(|field| MapManifest {
+                        field,
+                        generation: manifest.generation,
+                        buckets: manifest
+                            .objects
+                            .iter()
+                            .filter_map(|o| match o.slot {
+                                Slot::Bucket { field: f, bucket } if f == field => Some(bucket),
+                                _ => None,
+                            })
+                            .collect(),
+                    })
+                    .collect();
+            }
             self.validate_manifest(&manifest)?;
             Root::Sharded {
                 digest: root_digest(&bytes),
@@ -808,11 +907,14 @@ impl LockedStore {
             "scan_index_duplicate_or_unordered_slot"
         );
         let mut total = 0u64;
+        ensure!(manifest.maps.len() <= 3, "scan_index_map_count");
         for object in &manifest.objects {
-            ensure!(
-                valid_digest(&object.digest) && object.bytes >= 2,
-                "scan_index_descriptor"
-            );
+            if matches!(object.slot, Slot::Metadata) {
+                ensure!(
+                    valid_digest(&object.digest) && object.bytes >= 2,
+                    "scan_index_metadata_descriptor"
+                );
+            }
             total = total
                 .checked_add(object.bytes)
                 .context("scan_index_length_overflow")?;
@@ -847,7 +949,7 @@ impl LockedStore {
             hash.write_all(&scratch[..n])?;
         }
         ensure!(
-            hash.finish(object.slot) == *object,
+            hash.finish(object.slot).same_payload(object),
             "scan_index_object_integrity"
         );
         file.seek(SeekFrom::Start(0))?;
@@ -872,7 +974,32 @@ impl LockedStore {
         );
         Ok(before)
     }
+    #[cfg(test)]
     pub(crate) fn open(&self) -> Result<Opened> {
+        self.open_structural()
+    }
+    // Internal reconciliation of a just-serialized publication. Production
+    // LOAD callers must supply their semantic decoder through the checked API.
+    fn open_structural(&self) -> Result<Opened> {
+        self.open_with_map_validator(&mut |_, _| Ok(()))
+    }
+    /// Integration supplies the EXISTING semantic map codec. A semantic failure
+    /// becomes Unknown for that map, never a defaulted/empty decoded container.
+    pub(crate) fn open_with_map_validator(
+        &self,
+        validate: &mut impl FnMut(Field, &mut LogicalReader) -> Result<()>,
+    ) -> Result<Opened> {
+        self.recover_fresh_init()?;
+        // Retain root-presence evidence BEFORE any fallible representation or
+        // payload validation, including a missing/corrupt metadata object.
+        match open_at(&self.parent, &self.root_name, libc::O_RDONLY) {
+            Ok(file) => {
+                Stamp::capture(&file, false)?;
+                self.note_prior_root()?;
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
         let (file, mut root) = self.current()?;
         match &mut root {
             Root::Missing => Ok(Opened::Missing(LoadedRoot(Arc::new(root)))),
@@ -880,21 +1007,160 @@ impl LockedStore {
                 file.context("scan_index_missing_file")?,
                 LoadedRoot(Arc::new(root)),
             )),
+            Root::Unavailable { .. } => bail!("scan_index_internal_partial"),
             Root::Sharded {
                 manifest, stamps, ..
             } => {
-                let dir = self.directory(false)?;
-                for object in &manifest.objects {
-                    stamps.push(self.validate_object(&dir, object)?);
+                let dir = self.payload_directory()?;
+                let meta = &manifest.objects[0];
+                ensure!(
+                    meta.generation == manifest.generation,
+                    "scan_index_metadata_generation"
+                );
+                let meta_stamp = self.validate_object(&dir, meta)?;
+                let mut verified = manifest.clone();
+                verified.objects = vec![meta.clone()];
+                let mut verified_stamps = vec![meta_stamp];
+                let mut unknown = [None; 3];
+                for (map_index, field) in Field::all().into_iter().enumerate() {
+                    let inventories: Vec<_> =
+                        manifest.maps.iter().filter(|m| m.field == field).collect();
+                    let objects: Vec<_> = manifest
+                        .objects
+                        .iter()
+                        .filter(|o| matches!(o.slot, Slot::Bucket { field:f,.. } if f == field))
+                        .collect();
+                    let declared = inventories.first().copied();
+                    let cause = if inventories.len() != 1 {
+                        Some(UnavailableCause::Descriptor)
+                    } else if declared.is_some_and(|m| m.generation != manifest.generation) {
+                        Some(UnavailableCause::Generation)
+                    } else if declared.is_some_and(|m| {
+                        m.buckets.len() != objects.len()
+                            || !m.buckets.windows(2).all(|p| p[0] < p[1])
+                            || m.buckets.iter().zip(&objects).any(
+                                |(b, o)| !matches!(o.slot,Slot::Bucket {bucket,..} if bucket == *b),
+                            )
+                    }) {
+                        Some(UnavailableCause::Descriptor)
+                    } else {
+                        None
+                    };
+                    unknown[map_index] = cause;
+                    if cause.is_some() {
+                        continue;
+                    }
+                    for object in objects {
+                        let cause = if object.generation != manifest.generation {
+                            Some(UnavailableCause::Generation)
+                        } else if !valid_digest(&object.digest) {
+                            Some(UnavailableCause::Digest)
+                        } else if object.bytes < 2 {
+                            Some(UnavailableCause::Descriptor)
+                        } else {
+                            None
+                        };
+                        if let Some(cause) = cause {
+                            unknown[map_index] = Some(cause);
+                            break;
+                        }
+                        match self.validate_object(&dir, object) {
+                            Ok(stamp) => {
+                                verified.objects.push(object.clone());
+                                verified_stamps.push(stamp);
+                            }
+                            Err(error) => {
+                                let cause = if error
+                                    .downcast_ref::<io::Error>()
+                                    .is_some_and(|e| e.kind() == io::ErrorKind::NotFound)
+                                {
+                                    UnavailableCause::Missing
+                                } else if error.to_string().contains("integrity")
+                                    || error.to_string().contains("length")
+                                {
+                                    UnavailableCause::Digest
+                                } else if error.to_string().contains("unsafe")
+                                    || error.to_string().contains("aliased")
+                                {
+                                    UnavailableCause::Unsafe
+                                } else {
+                                    UnavailableCause::Decode
+                                };
+                                unknown[map_index] = Some(cause);
+                                break;
+                            }
+                        }
+                    }
                 }
+                for (i, field) in Field::all().into_iter().enumerate() {
+                    if unknown[i].is_none() {
+                        let mut view = LogicalReader::selected(
+                            dir.try_clone()?,
+                            &verified,
+                            &verified_stamps,
+                            false,
+                            &[field],
+                        )?;
+                        if validate(field, &mut view).is_err() {
+                            unknown[i] = Some(UnavailableCause::Decode);
+                        }
+                    }
+                }
+                if unknown.iter().any(Option::is_some) {
+                    let mut stats = self.read_stats.get();
+                    for (i, cause) in unknown.iter().enumerate() {
+                        if let Some(cause) = cause {
+                            stats.index_shard_unavailable[i][*cause as usize] =
+                                stats.index_shard_unavailable[i][*cause as usize].saturating_add(1);
+                        }
+                    }
+                    self.read_stats.set(stats);
+                    let metadata = LogicalReader::selected(
+                        dir.try_clone()?,
+                        &verified,
+                        &verified_stamps,
+                        true,
+                        &[],
+                    )?;
+                    let mut maps = Vec::with_capacity(3);
+                    for (i, field) in Field::all().into_iter().enumerate() {
+                        maps.push(if let Some(cause) = unknown[i] {
+                            MapAvailability::Unknown(MapUnavailable { map: field, cause })
+                        } else {
+                            MapAvailability::Known(LogicalReader::selected(
+                                dir.try_clone()?,
+                                &verified,
+                                &verified_stamps,
+                                false,
+                                &[field],
+                            )?)
+                        });
+                    }
+                    let generation = manifest.generation;
+                    return Ok(Opened::Partial(
+                        PartialIndex {
+                            metadata,
+                            maps: maps
+                                .try_into()
+                                .map_err(|_| anyhow::anyhow!("scan_index_internal_maps"))?,
+                        },
+                        LoadedRoot(Arc::new(Root::Unavailable { generation })),
+                    ));
+                }
+                *stamps = verified_stamps;
                 let view = LogicalReader::new(dir, manifest, stamps)?;
                 Ok(Opened::Sharded(view, LoadedRoot(Arc::new(root))))
             }
         }
     }
+
     /// Bounded manifest-only CAS on an already loaded sharded baseline. No old
     /// logical decode. Legacy callers still perform their original full CAS.
     pub(crate) fn compare(&self, expected: &LoadedRoot) -> Result<()> {
+        ensure!(
+            !matches!(&*expected.0, Root::Unavailable { .. }),
+            "scan_index_unknown_maps_require_repair"
+        );
         let (_, current) = self.current()?;
         let same = match (&*expected.0, &current) {
             (Root::Missing, Root::Missing) => true,
@@ -962,9 +1228,10 @@ impl LockedStore {
         for slot in slots {
             let mut hash = HashWriter::new(io::sink(), &self.binding, slot)?;
             fragments.write(slot, &mut hash)?;
-            let object = hash.finish(slot);
+            let mut object = hash.finish(slot);
+            object.generation = generation;
             let unchanged = matches!(&*expected.0, Root::Sharded { manifest, .. }
-                if manifest.objects.contains(&object));
+                if manifest.objects.iter().any(|old|old.same_payload(&object)));
             if !unchanged {
                 required += u128::from(object.bytes);
             }
@@ -988,7 +1255,7 @@ impl LockedStore {
                 } => manifest
                     .objects
                     .iter()
-                    .position(|o| *o == object)
+                    .position(|o| o.same_payload(&object))
                     .map(|i| &stamps[i]),
                 _ => None,
             };
@@ -1033,6 +1300,20 @@ impl LockedStore {
             generation,
             binding: self.binding.clone(),
             padding_bytes: 0,
+            maps: Field::all()
+                .into_iter()
+                .map(|field| MapManifest {
+                    field,
+                    generation,
+                    buckets: objects
+                        .iter()
+                        .filter_map(|o| match o.slot {
+                            Slot::Bucket { field: f, bucket } if f == field => Some(bucket),
+                            _ => None,
+                        })
+                        .collect(),
+                })
+                .collect(),
             objects,
         };
         let logical_len = LogicalReader::new(dir.try_clone()?, &manifest, &stamps)?.length;
@@ -1078,6 +1359,7 @@ impl LockedStore {
         // From here on an error MUST carry the candidate generation. Never
         // return an ordinary precommit error that rolls RAM generation back.
         let publication = (|| -> Result<()> {
+            self.note_prior_root()?;
             observe(Edge::RootRename)?;
             self.parent.sync_all()?;
             observe(Edge::ParentSync)?;
@@ -1089,7 +1371,7 @@ impl LockedStore {
             // with complete objects can reconcile process death/error, but a
             // persistent directory-sync failure stays an explicit committed
             // error. Caller updates RAM generation and pauses before effects.
-            let reconcile = self.open();
+            let reconcile = self.open_structural();
             let exact = matches!(reconcile, Ok(Opened::Sharded(_, ref loaded))
                 if matches!(&*loaded.0, Root::Sharded { digest, .. } if *digest == root_digest(&bytes)));
             return Err(CommitPublished {
@@ -1138,7 +1420,7 @@ impl LockedStore {
         fragments.write(object.slot, &mut hash)?;
         hash.flush()?;
         ensure!(
-            hash.finish(object.slot) == *object,
+            hash.finish(object.slot).same_payload(object),
             "scan_index_fragment_changed"
         );
         observe(Edge::PayloadFlush)?;
@@ -1685,6 +1967,15 @@ pub(crate) struct LogicalReader {
 }
 impl LogicalReader {
     fn new(directory: File, manifest: &Manifest, stamps: &[Stamp]) -> Result<Self> {
+        Self::selected(directory, manifest, stamps, true, &Field::all())
+    }
+    fn selected(
+        directory: File,
+        manifest: &Manifest,
+        stamps: &[Stamp],
+        metadata: bool,
+        fields: &[Field],
+    ) -> Result<Self> {
         let mut reader = Self {
             directory,
             spans: Vec::with_capacity(MAX_OBJECTS * 2 + 10),
@@ -1695,28 +1986,35 @@ impl LogicalReader {
         reader.push_bytes(
             format!(
                 "{{\"schema_version\":{},\"generation\":{}",
-                manifest.logical_schema_version, manifest.generation
+                if metadata && fields.is_empty() {
+                    OUTER_SCHEMA
+                } else {
+                    manifest.logical_schema_version
+                },
+                manifest.generation
             )
             .into_bytes(),
         )?;
-        let metadata = &manifest.objects[0];
-        // '{}' metadata can be empty. Whitespace-only interiors are legal too;
-        // count keys instead of deciding from byte length at view construction.
-        let file = open_at(
-            &reader.directory,
-            &cstring(metadata.filename().as_bytes())?,
-            libc::O_RDONLY,
-        )?;
-        let mut decoder =
-            serde_json::Deserializer::from_reader(BufReader::new(KeyGuard::new(file)));
-        // Integrity/field validation already completed. This bounded key count
-        // streams metadata without decoding its values or duplicating schema.
-        let count = decoder.deserialize_map(KeyCount)?;
-        if count > 0 {
-            reader.push_bytes(b",".to_vec())?;
-            reader.object(metadata, &stamps[0])?;
+        if metadata {
+            let metadata = &manifest.objects[0];
+            // '{}' metadata can be empty. Whitespace-only interiors are legal too;
+            // count keys instead of deciding from byte length at view construction.
+            let file = open_at(
+                &reader.directory,
+                &cstring(metadata.filename().as_bytes())?,
+                libc::O_RDONLY,
+            )?;
+            let mut decoder =
+                serde_json::Deserializer::from_reader(BufReader::new(KeyGuard::new(file)));
+            // Integrity/field validation already completed. This bounded key count
+            // streams metadata without decoding its values or duplicating schema.
+            let count = decoder.deserialize_map(KeyCount)?;
+            if count > 0 {
+                reader.push_bytes(b",".to_vec())?;
+                reader.object(metadata, &stamps[0])?;
+            }
         }
-        for field in Field::all() {
+        for field in fields.iter().copied() {
             reader.push_bytes(format!(",\"{}\":{{", field.name()).into_bytes())?;
             let mut first = true;
             for (i, object) in manifest.objects.iter().enumerate() {
@@ -1882,8 +2180,9 @@ impl LockedStore {
         self.compare(expected)?;
         rename_at(&self.parent, &temp.name, &self.parent, &self.root_name)?;
         let result = (|| -> Result<LoadedRoot> {
+            self.note_prior_root()?;
             self.parent.sync_all()?;
-            match self.open()? {
+            match self.open_structural()? {
                 Opened::Legacy(_, root) if root.generation() == Some(generation) => Ok(root),
                 _ => bail!("scan_index_legacy_output_refused"),
             }
@@ -1895,5 +2194,224 @@ impl LockedStore {
             }
             .into()
         })
+    }
+}
+
+// Uses directory handles throughout; never follows manifest/provider paths.
+fn visit_storage_directory(
+    dir: &File,
+    mut visit: impl FnMut(&std::ffi::CStr) -> Result<()>,
+) -> Result<()> {
+    let file = open_at(dir, &cstring(b".")?, libc::O_RDONLY | libc::O_DIRECTORY)?;
+    let fd = std::os::fd::IntoRawFd::into_raw_fd(file);
+    let pointer = unsafe { libc::fdopendir(fd) };
+    if pointer.is_null() {
+        unsafe {
+            libc::close(fd);
+        }
+        bail!("scan_index_directory_scan");
+    }
+    struct Scan(*mut libc::DIR);
+    impl Drop for Scan {
+        fn drop(&mut self) {
+            unsafe {
+                libc::closedir(self.0);
+            }
+        }
+    }
+    let scan = Scan(pointer);
+    loop {
+        #[cfg(target_os = "macos")]
+        let errno = unsafe { libc::__error() };
+        #[cfg(not(target_os = "macos"))]
+        let errno = unsafe { libc::__errno_location() };
+        unsafe {
+            *errno = 0;
+        }
+        let entry = unsafe { libc::readdir(scan.0) };
+        if entry.is_null() {
+            ensure!(unsafe { *errno } == 0, "scan_index_directory_scan");
+            break;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if matches!(name.to_bytes(), b"." | b"..") {
+            continue;
+        }
+        visit(name)?;
+    }
+    Ok(())
+}
+fn orphan_slot(name: &str) -> Option<(Slot, &str)> {
+    let stem = name.strip_suffix(".json")?;
+    let (label, digest) = stem.rsplit_once('-')?;
+    if !valid_digest(digest) {
+        return None;
+    }
+    if label == "metadata" {
+        return Some((Slot::Metadata, digest));
+    }
+    let (tag, bucket) = label.split_once('-')?;
+    if bucket.len() != 2 {
+        return None;
+    }
+    let bucket = u8::from_str_radix(bucket, 16).ok()?;
+    let field = match tag {
+        "account" => Field::AccountPending,
+        "usage" => Field::UsagePending,
+        "census" => Field::RequestCensus,
+        _ => return None,
+    };
+    Some((Slot::Bucket { field, bucket }, digest))
+}
+fn owned_payload_temp(name: &str) -> bool {
+    name.strip_prefix(".tmp-")
+        .is_some_and(|s| s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+impl LockedStore {
+    pub(crate) fn take_read_stats(&self) -> ReadStats {
+        self.read_stats.replace(ReadStats::default())
+    }
+    fn note_prior_root(&self) -> Result<()> {
+        self.prior_root_seen.set(true);
+        let mut name = self.root_name.to_bytes().to_vec();
+        name.extend_from_slice(b".storage-prior");
+        let name = cstring(&name)?;
+        const MARKER: &[u8] = b"scan_index_prior_root_v1\n";
+        match open_at(&self.parent, &name, libc::O_RDONLY) {
+            Ok(mut file) => {
+                let stamp = Stamp::capture(&file, true)?;
+                ensure!(
+                    stamp.bytes <= MARKER.len() as u64,
+                    "scan_index_prior_marker"
+                );
+                let mut bytes = Vec::with_capacity(MARKER.len());
+                file.read_to_end(&mut bytes)?;
+                if bytes == MARKER {
+                    return Ok(());
+                }
+                // Recover a pre-atomic empty/truncated OWN marker only while
+                // the caller has an actual root. Unknown marker bytes refuse.
+                ensure!(MARKER.starts_with(&bytes), "scan_index_prior_marker");
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        let mut prefix = self.root_name.to_bytes().to_vec();
+        prefix.extend_from_slice(b".storage-tmp-");
+        let temp = Temp::with_prefix(&self.parent, &prefix)?;
+        let mut output = &temp.file;
+        output.write_all(MARKER)?;
+        temp.file.sync_all()?;
+        rename_at(&self.parent, &temp.name, &self.parent, &name)?;
+        self.parent.sync_all()?;
+        Ok(())
+    }
+    fn recover_fresh_init(&self) -> Result<()> {
+        match open_at(&self.parent, &self.root_name, libc::O_RDONLY) {
+            Ok(_) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        let root = self
+            .root_name
+            .to_str()
+            .map_err(|_| anyhow::anyhow!("scan_index_root_name"))?;
+        let stem = root.strip_suffix(".json").unwrap_or(root);
+        let family = stem.strip_suffix("-v2").unwrap_or(stem);
+        let temp_prefix = format!("{root}.storage-tmp-");
+        let own_temp = |name: &str| {
+            name.strip_prefix(&temp_prefix)
+                .is_some_and(|s| s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        };
+        let mut temps = false;
+        // Validate EVERY parent witness before any deletion. Unrecognized
+        // siblings in this index family are evidence of possible prior state.
+        visit_storage_directory(&self.parent, |name| {
+            let text = name
+                .to_str()
+                .map_err(|_| anyhow::anyhow!("scan_index_prior_state_unknown"))?;
+            if own_temp(text) {
+                Stamp::capture(&open_at(&self.parent, name, libc::O_RDONLY)?, true)?;
+                temps = true;
+            } else if text.starts_with(family)
+                && text != self.objects_name.to_str()?
+                && text != format!("{root}.lock")
+                && text != format!("{stem}.lock")
+            {
+                bail!("scan_index_prior_state_requires_repair");
+            }
+            Ok(())
+        })?;
+        ensure!(
+            !self.prior_root_seen.get(),
+            "scan_index_prior_state_requires_repair"
+        );
+        let dir = match self.payload_directory() {
+            Ok(dir) => Some(dir),
+            Err(e)
+                if e.downcast_ref::<io::Error>()
+                    .is_some_and(|e| e.kind() == io::ErrorKind::NotFound) =>
+            {
+                None
+            }
+            Err(e) => return Err(e),
+        };
+        if let Some(dir) = &dir {
+            visit_storage_directory(dir, |name| {
+                let text = name
+                    .to_str()
+                    .map_err(|_| anyhow::anyhow!("scan_index_orphan_unknown"))?;
+                let file = open_at(dir, name, libc::O_RDONLY)?;
+                let stamp = Stamp::capture(&file, true)?;
+                if let Some((slot, digest)) = orphan_slot(text) {
+                    self.validate_object(
+                        dir,
+                        &Object {
+                            slot,
+                            generation: 0,
+                            bytes: stamp.bytes,
+                            digest: digest.into(),
+                        },
+                    )?;
+                } else {
+                    ensure!(owned_payload_temp(text), "scan_index_orphan_unknown");
+                }
+                Ok(())
+            })?;
+        }
+        // Existing checkpoint flock excludes concurrent index publication.
+        if let Some(dir) = dir {
+            visit_storage_directory(&dir, |name| {
+                Stamp::capture(&open_at(&dir, name, libc::O_RDONLY)?, true)?;
+                unlink_at(&dir, name)?;
+                Ok(())
+            })?;
+            dir.sync_all()?;
+            ensure!(
+                unsafe {
+                    libc::unlinkat(
+                        self.parent.as_raw_fd(),
+                        self.objects_name.as_ptr(),
+                        libc::AT_REMOVEDIR,
+                    )
+                } == 0,
+                "scan_index_orphan_directory"
+            );
+        } else if !temps {
+            return Ok(());
+        }
+        visit_storage_directory(&self.parent, |name| {
+            if name.to_str().is_ok_and(own_temp) {
+                Stamp::capture(&open_at(&self.parent, name, libc::O_RDONLY)?, true)?;
+                unlink_at(&self.parent, name)?;
+            }
+            Ok(())
+        })?;
+        self.parent.sync_all()?;
+        let mut stats = self.read_stats.get();
+        stats.scanindex_orphan_init_discarded =
+            stats.scanindex_orphan_init_discarded.saturating_add(1);
+        self.read_stats.set(stats);
+        Ok(())
     }
 }
