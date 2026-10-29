@@ -26149,7 +26149,8 @@ impl OwnedSourceScan {
                 let now = rfc3339_unix_seconds(collected_at).unwrap_or_default();
                 // Round 8: by owed age (<=30 d, 31-90 d, >90 d), and those
                 // that grew more than 7 days after this process saw them owed.
-                let (mut pace, mut ages) = (codex_owed_pace(), [0; 4]);
+                let mut ages = [0; 4];
+                let mut pace = codex_owed_pace();
                 for key in hold.into_iter().flat_map(|hold| &hold.owed) {
                     let (_, _, stamp, ages_seen) = pace.entry(key.clone()).or_default();
                     let size = stamp.as_ref().map_or(u64::MAX, |((size, _), _)| *size);
@@ -26158,6 +26159,7 @@ impl OwnedSourceScan {
                     ages[usize::from(days > 30) + usize::from(days > 90)] += 1;
                     ages[3] += u64::from(grown.saturating_sub(seen) > 7 * 86_400);
                 }
+                drop(pace);
                 codex_owed_gauge(hold.map_or(0, |hold| hold.owed.len() as u64), now, ages);
             }
         }
@@ -26469,16 +26471,26 @@ impl OwnedSourceScan {
         // (N1's, or the hold's witnesses) are as at its last refusal.
         let traversal = index.traversal.as_ref();
         if let Some(hold) = traversal.and_then(|t| t.residue.codex_inventory_hold.as_ref()) {
-            let (now, mut pace) = (rfc3339_unix_seconds(collected_at), codex_owed_pace());
-            let (mut woken, mut evidence) = (0, None);
-            let witnesses = || {
-                let mut witnesses = hold.refused_headers.iter().chain(&hold.outside_roster);
-                codex_owed_moved
-                    || (hold.refused_headers.is_empty() && hold.outside_roster.is_empty())
-                    || witnesses.any(|(key, witness)| {
-                        codex_file_join::path_witness(Path::new(key)) != *witness
-                    })
+            // Round 9 (DoD 22): the witness stats run between two pace locks.
+            // The second decides from each key's current entry; a key that
+            // became hold-witnessed after the peek is tried (`moved`).
+            let peek = {
+                let pace = codex_owed_pace();
+                files.iter().any(|candidate| {
+                    let key = local_index_key(&candidate.path);
+                    hold.owed.contains(&key)
+                        && matches!(pace.get(&key), Some((_, _, Some((_, None)), _)))
+                })
             };
+            let mut witnesses = hold.refused_headers.iter().chain(&hold.outside_roster);
+            let moved = !peek
+                || codex_owed_moved
+                || (hold.refused_headers.is_empty() && hold.outside_roster.is_empty())
+                || witnesses.any(|(key, witness)| {
+                    codex_file_join::path_witness(Path::new(key)) != *witness
+                });
+            let (now, mut pace) = (rfc3339_unix_seconds(collected_at), codex_owed_pace());
+            let mut woken = 0;
             files.retain(|candidate| {
                 let key = local_index_key(&candidate.path);
                 if !hold.owed.contains(&key) {
@@ -26497,7 +26509,7 @@ impl OwnedSourceScan {
                             Some(inputs) => {
                                 *inputs == codex_owed_inputs(&codex_title_metadata, &candidate.path)
                             }
-                            None => !*evidence.get_or_insert_with(|| witnesses()),
+                            None => !moved,
                         }
                 });
                 codex_owed_event(CodexOwedEvent::Paced, u64::from(paced));
@@ -41737,11 +41749,29 @@ fn record_codex_inventory_hold(
         return;
     }
     // Round 8: until this evidence or the file moves, a retry reads nothing.
+    // Round 9 (DoD 22): stat outside the pace lock; a stamp that changed in
+    // between is kept and this one dropped, never applied stale.
+    let held = held.iter().filter(|key| hold.owed.contains(*key));
+    let before = {
+        let pace = codex_owed_pace();
+        let stamp = |key: &String| pace.get(key).and_then(|entry| entry.2.clone());
+        held.map(|key| (key.clone(), stamp(key)))
+            .collect::<Vec<_>>()
+    };
+    let stamped = before
+        .into_iter()
+        .map(|(key, before)| {
+            let stat = fs::symlink_metadata(&key).ok();
+            let own = stat.and_then(|stat| Some((stat.len(), unix_nanos(stat.modified().ok()?)?)));
+            (key, before, own.map(|own| (own, None)))
+        })
+        .collect::<Vec<_>>();
     let mut pace = codex_owed_pace();
-    for key in held.iter().filter(|key| hold.owed.contains(*key)) {
-        let stat = fs::symlink_metadata(key).ok();
-        let own = stat.and_then(|stat| Some((stat.len(), unix_nanos(stat.modified().ok()?)?)));
-        pace.entry(key.clone()).or_default().2 = own.map(|own| (own, None));
+    for (key, before, stamp) in stamped {
+        let entry = pace.entry(key).or_default();
+        if entry.2 == before {
+            entry.2 = stamp;
+        }
     }
 }
 
@@ -41762,18 +41792,19 @@ fn record_codex_owed_input(
     if !hold.owed.contains(&key) {
         return;
     }
+    if hold.refused_headers.len() < MAX_CODEX_INVENTORY_HOLD_KEYS {
+        // Round 9 (DoD 22): this stat precedes the pace lock.
+        let witness = codex_file_join::path_witness(path);
+        hold.refused_headers.insert(key.clone(), witness);
+    }
     let mut pace = codex_owed_pace();
-    let (n, due, last, _) = pace.entry(key.clone()).or_default();
+    let (n, due, last, _) = pace.entry(key).or_default();
     (*n, *last) = (n.saturating_add(1), Some(stamp));
     *due = now.saturating_add(3_600 * if *n < CODEX_OWED_ATTEMPTS { 1 } else { 6 });
     codex_owed_event(
         CodexOwedEvent::Disabled,
         u64::from(*n == CODEX_OWED_ATTEMPTS),
     );
-    if hold.refused_headers.len() < MAX_CODEX_INVENTORY_HOLD_KEYS {
-        hold.refused_headers
-            .insert(key, codex_file_join::path_witness(path));
-    }
 }
 
 /// Owed key -> (input refusals, not before, last refused stamp): hourly, then
@@ -41895,8 +41926,7 @@ fn release_codex_inventory_hold(
             .iter()
             .any(|(key, witness)| roster.contains(key) || moved(key, witness));
     let released = retry_due || evidence;
-    let mut counts = [0; 3];
-    let mut pace = codex_owed_pace();
+    let (mut counts, mut forget) = ([0; 3], Vec::new());
     hold.owed.retain(|key| {
         let (event, release) = match fs::symlink_metadata(key) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (0, !roster.contains(key)),
@@ -41910,9 +41940,18 @@ fn release_codex_inventory_hold(
             }),
         };
         counts[event] += u64::from(release);
-        let _ = (release && event != 2).then(|| pace.remove(key));
+        if release && event != 2 {
+            forget.push(key.clone());
+        }
         !release || event == 2
     });
+    // Round 9 (DoD 22): the stats above ran unlocked. A forgotten entry is
+    // only ever a retry (no stamp), never a skip.
+    let mut pace = codex_owed_pace();
+    for key in &forget {
+        pace.remove(key);
+    }
+    drop(pace);
     codex_owed_event(CodexOwedEvent::Removed, counts[0]);
     codex_owed_event(CodexOwedEvent::CaughtUp, counts[1]);
     codex_owed_event(CodexOwedEvent::AccessError, counts[2]);
