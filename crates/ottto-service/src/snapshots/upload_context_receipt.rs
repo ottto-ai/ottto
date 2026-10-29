@@ -172,6 +172,20 @@ impl ScanIndex {
                     .insert(key.clone(), binding);
             }
         }
+        // These are parked at preparation even when no candidate is opened.
+        // Counting only candidate skips would miss the quiet no-walk path.
+        self.mixed_context_view.held_files = self
+            .mixed_context_view
+            .bindings
+            .keys()
+            .filter(|key| self.file_upload_context_waits_for_retry(key))
+            .count() as u64;
+        if self.mixed_context_view.held_files > 0 {
+            eprintln!(
+                "upload_context_mixed_held files={} scope=prepare",
+                self.mixed_context_view.held_files
+            );
+        }
     }
 
     fn mixed_context_current(&self, key: &str) -> bool {
@@ -222,17 +236,6 @@ impl ScanIndex {
                     })
                 })
     }
-    pub(super) fn note_mixed_context_hold(&mut self, candidate: &CandidateFile) {
-        if self.mixed_context_view.claude && self.file_upload_context_backoff_holds(candidate) {
-            self.mixed_context_view.held_files =
-                self.mixed_context_view.held_files.saturating_add(1);
-            eprintln!(
-                "upload_context_mixed_held files={} scope=prepare",
-                self.mixed_context_view.held_files
-            );
-        }
-    }
-
     pub(crate) fn source_upload_context_matches(&self) -> bool {
         self.upload_context_fingerprint == self.active_upload_context_fingerprint
     }

@@ -32730,7 +32730,6 @@ impl OwnedSourceScan {
             }
             match decision {
                 CandidateDecision::Skip => {
-                    index.note_mixed_context_hold(&candidate);
                     #[cfg(feature = "replay-harness")]
                     resource_probe.index_reuse_skip();
                     if let Some(phase) = native_comparison.as_mut() {
