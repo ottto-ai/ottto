@@ -2938,6 +2938,7 @@ fn spent_known_corrupt_group_keeps_census_healthy_and_peer_progresses() {
     disk.write_after_save(
         &writer,
         1,
+        0,
         vec![store::PendingRecord {
             binding: store::Binding {
                 source: store::DurableSource::Codex,
@@ -3006,7 +3007,7 @@ fn spent_known_corrupt_group_keeps_census_healthy_and_peer_progresses() {
         .iter()
         .any(|item| item.source_session_id == peer_owner));
     let (counts, stats) = cache.durable_counters(source).unwrap();
-    assert_eq!(counts.durable_held, [0; 5]);
+    assert_eq!(counts.durable_held, [0; 6]);
     assert_eq!(counts.not_persisted.get("known_corrupt_held"), Some(&1));
     assert_eq!(stats.t14_rebuild_full_started, 1);
     assert_eq!(fs::read(&record).unwrap(), corrupt);
@@ -3051,7 +3052,7 @@ fn durable_hold_on_one_member_holds_the_joined_group() {
             assert_eq!(fs::read(&record).unwrap(), bytes);
             assert!(durable.durable_held[store::Refusal::NewerFormat as usize] >= 1);
         } else {
-            assert_eq!(durable.durable_held, [0; 5]);
+            assert_eq!(durable.durable_held, [0; 6]);
         }
         scanned.push(result.scanned_file_count);
         fs::remove_dir_all(root).unwrap();
@@ -3219,7 +3220,10 @@ fn seed_member_debts<W: crate::durable_tail_store::SingleWriter>(
         });
     }
     let mut disk = store::DurableTailStore::new(dir, ds);
-    let written = disk.write_after_save(writer, 1, pending).unwrap().written;
+    let written = disk
+        .write_after_save(writer, 1, 0, pending)
+        .unwrap()
+        .written;
     assert_eq!(written, debts.len());
     seeded
 }
@@ -3309,7 +3313,7 @@ fn grouped_missing_carriers_mark_each_member_until_verified(paged: bool) {
         Some(&2)
     );
     assert_eq!(counts.restored, 0);
-    assert_eq!(counts.durable_held, [0; 5]);
+    assert_eq!(counts.durable_held, [0; 6]);
     // Actual save and post-save GC keep both predecessors while debt is owed.
     index.save(&index_path).unwrap();
     crate::snapshots::durable_after_save(&cache, &root, source, &index);

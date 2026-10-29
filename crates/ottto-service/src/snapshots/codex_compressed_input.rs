@@ -5,7 +5,7 @@
 #![cfg_attr(not(test), allow(dead_code))]
 use crate::local_resource_diagnostics::{codex_zst_refused, CodexZstCause};
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read, Seek};
 use std::mem::size_of;
 use std::path::Path;
 use zstd::zstd_safe::{DCtx, DParameter, InBuffer, OutBuffer};
@@ -219,16 +219,63 @@ impl<R: Read> Drop for BoundedDecoder<R> {
 /// sampled plain-file offsets cannot be applied to compressed data. Method
 /// names match the `BufReader<File>` calls the parser already makes.
 pub(super) enum OpenedInput {
-    Plain(BufReader<File>),
+    Plain(BufReader<NativeFile>),
     Compressed(
         Box<BufReader<BoundedDecoder<File>>>,
         Option<super::sampled_scan::codex_cursor::DecoderOwner>,
     ),
 }
 
+pub(super) struct NativeFile {
+    file: File,
+    custody: super::DurableCustody,
+}
+impl Read for NativeFile {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        #[cfg(unix)]
+        if let Some(attempt) = self.custody.retail_mut() {
+            return attempt.read(&mut self.file, bytes);
+        }
+        self.file.read(bytes)
+    }
+}
+impl io::Seek for NativeFile {
+    fn seek(&mut self, at: io::SeekFrom) -> io::Result<u64> {
+        self.file.seek(at)
+    }
+}
+
 impl OpenedInput {
     pub(super) fn plain(file: File) -> Self {
-        Self::Plain(BufReader::new(file))
+        Self::Plain(BufReader::new(NativeFile {
+            file,
+            custody: Default::default(),
+        }))
+    }
+
+    pub(super) fn take_durable(&mut self) -> super::DurableCustody {
+        match self {
+            Self::Plain(reader) => std::mem::take(&mut reader.get_mut().custody),
+            Self::Compressed(..) => Default::default(),
+        }
+    }
+    pub(super) fn accepts_durable(&self) -> bool {
+        matches!(self, Self::Plain(reader) if reader.get_ref().custody.is_empty())
+    }
+    pub(super) fn put_durable(&mut self, durable: super::DurableCustody) {
+        match self {
+            Self::Plain(reader) if reader.get_ref().custody.is_empty() => {
+                reader.get_mut().custody = durable
+            }
+            _ => unreachable!("validated empty Plain owner"),
+        }
+    }
+
+    #[cfg(all(unix, test))]
+    pub(super) fn put_retail(&mut self, attempt: super::sampled_scan::durable_tail::RetailAttempt) {
+        if let Self::Plain(reader) = self {
+            reader.get_mut().custody.put_retail(attempt);
+        }
     }
 
     /// `credit` must cover `compressed_input_credit()`. `decoded_limit` is the
@@ -282,14 +329,14 @@ impl OpenedInput {
     /// decoder reaches EOF.
     pub(super) fn get_ref(&self) -> &File {
         match self {
-            Self::Plain(reader) => reader.get_ref(),
+            Self::Plain(reader) => &reader.get_ref().file,
             Self::Compressed(reader, _) => reader.get_ref().input.get_ref(),
         }
     }
 
     pub(super) fn get_mut(&mut self) -> &mut File {
         match self {
-            Self::Plain(reader) => reader.get_mut(),
+            Self::Plain(reader) => &mut reader.get_mut().file,
             Self::Compressed(reader, _) => reader.get_mut().input.get_mut(),
         }
     }

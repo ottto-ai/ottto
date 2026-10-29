@@ -8086,6 +8086,7 @@ fn hopeless_admission_evicts_nothing() {
         cache.insert(
             key.clone(),
             sampled_jsonl::CompletedNativeAcquisition {
+                durable: Default::default(),
                 checkpoint: copy.checkpoint,
                 reduction: Some(copy.state),
                 released: None,
@@ -8244,6 +8245,7 @@ fn outstanding_claim_is_charged_against_a_retained_insert() {
             .retained;
         let completed = |copy: crate::transcript_cache::Retained<_>| {
             sampled_jsonl::CompletedNativeAcquisition {
+                durable: Default::default(),
                 checkpoint: copy.checkpoint,
                 reduction: Some(copy.state),
                 released: None,
@@ -8805,6 +8807,7 @@ fn witness_admission() -> WitnessAdmission {
     cache.insert(
         key.clone(),
         sampled_jsonl::CompletedNativeAcquisition {
+            durable: Default::default(),
             checkpoint: copy.checkpoint,
             reduction: Some(copy.state),
             released: None,
@@ -10704,6 +10707,7 @@ fn a_retained_insert_decides_without_the_proof_and_retires_it_when_needed() {
         }
         let completed = |copy: crate::transcript_cache::Retained<_>| {
             sampled_jsonl::CompletedNativeAcquisition {
+                durable: Default::default(),
                 checkpoint: copy.checkpoint,
                 reduction: Some(copy.state),
                 released: None,
@@ -10803,6 +10807,7 @@ fn a_suspended_proof_never_shrinks_mains_copy_budget() {
         }
         let completed = |copy: crate::transcript_cache::Retained<_>| {
             sampled_jsonl::CompletedNativeAcquisition {
+                durable: Default::default(),
                 checkpoint: copy.checkpoint,
                 reduction: Some(copy.state),
                 released: None,
@@ -13927,7 +13932,7 @@ fn parked_singleton_across_fresh_index_reprobes_record_debt() {
         ),
     };
     assert_eq!(
-        disk.write_after_save(lock, 1, vec![pending])
+        disk.write_after_save(lock, 1, 0, vec![pending])
             .unwrap()
             .written,
         1

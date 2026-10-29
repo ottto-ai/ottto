@@ -5,13 +5,16 @@
 //! The body holds the allowlisted fields (`N`/`H`/`U`/`L`, see
 //! `durable_tail_codec`) and, for each re-derived content field, the digest of
 //! its value. The marks (`DurableMarks`, `SessionStartState::content_end`) say
-//! where in the file each was last assigned. Restore re-parses the file head
-//! up to the latest mark, at most `HEAD_BOUND` bytes, and preads at most one
-//! named line (the title); every value must hash-equal its digest, else the
-//! entry reads in Full.
+//! where in the file each was last assigned. Production restore holds any
+//! nonempty re-derivation obligation before input: native parser/JSON growth
+//! has no proved allocation owner. Empty obligations move the paid decoded
+//! graph directly. The legacy test oracle retains head/named-line bounds and
+//! every hash fence; it grants no production read permission.
 #![cfg_attr(not(test), allow(dead_code))]
 
+#[cfg(test)]
 use std::fs::File;
+#[cfg(test)]
 use std::io::{Read, Seek, SeekFrom};
 
 use super::*;
@@ -141,7 +144,34 @@ pub(crate) fn encode(
     limit: usize,
     line_cap: u64,
 ) -> Result<Vec<u8>, Refuse> {
-    let acc = &reduction.accumulator;
+    let CachedJsonlReduction {
+        accumulator: acc,
+        report,
+        recognized_usage_drop_count,
+        positive_recognized_usage_count,
+        positive_usage_evidence,
+    } = reduction;
+    encode_parts(
+        acc,
+        report,
+        (
+            *recognized_usage_drop_count,
+            *positive_recognized_usage_count,
+            *positive_usage_evidence,
+        ),
+        limit,
+        line_cap,
+    )
+}
+
+// Same field order as CachedJsonlReduction::put, borrowing native fields.
+pub(in crate::snapshots) fn encode_parts(
+    acc: &SnapshotAccumulator,
+    report: &JsonlReadReport,
+    scalars: (usize, usize, bool),
+    limit: usize,
+    line_cap: u64,
+) -> Result<Vec<u8>, Refuse> {
     if !matches!(
         acc.source,
         SnapshotSource::ClaudeCode | SnapshotSource::Codex
@@ -149,9 +179,18 @@ pub(crate) fn encode(
         return Err(Refuse::NotRederivable("SnapshotAccumulator.source"));
     }
     let rederive = rederive_digests(acc, line_cap)?;
-    let mut e = Enc::bytes(limit);
-    reduction.put(&mut e)?;
-    rederive.put(&mut e)?;
+    let put = |e: &mut Enc| {
+        acc.put(e)?;
+        report.put(e)?;
+        scalars.0.put(e)?;
+        scalars.1.put(e)?;
+        scalars.2.put(e)?;
+        rederive.put(e)
+    };
+    let mut count = Enc::count(limit);
+    put(&mut count)?;
+    let mut e = Enc::bytes(count.counted());
+    put(&mut e)?;
     Ok(e.into_bytes())
 }
 
@@ -171,6 +210,7 @@ pub(crate) struct Decoded {
     rederive: Rederive,
 }
 
+#[cfg(test)]
 pub(crate) fn decode(body: &[u8], source: SnapshotSource) -> Result<Decoded, Corrupt> {
     let mut d = Dec::new(body);
     let reduction = CachedJsonlReduction::take(&mut d)?;
@@ -183,6 +223,36 @@ pub(crate) fn decode(body: &[u8], source: SnapshotSource) -> Result<Decoded, Cor
         reduction,
         rederive,
     })
+}
+
+/// Funds typed decode only; re-derivation is a separate allocation boundary.
+#[cfg(unix)]
+pub(crate) fn decode_bounded(
+    body: &[u8],
+    source: SnapshotSource,
+    lease: &mut crate::durable_tail_store::ActiveLease,
+) -> Result<Decoded, crate::durable_tail_codec::DecodeFailure> {
+    use crate::durable_tail_codec::DecodeFailure;
+    if !crate::heap_layout_bound::layout_supported() {
+        return Err(DecodeFailure::Budget);
+    }
+    lease
+        .charge(std::mem::size_of::<Decoded>() as u64)
+        .map_err(|_| DecodeFailure::Budget)?;
+    let mut reserve = |bytes| lease.charge(bytes).is_ok();
+    let mut d = Dec::bounded(body, &mut reserve);
+    let result = (|| {
+        let reduction = CachedJsonlReduction::take(&mut d)?;
+        let rederive = Rederive::take(&mut d)?;
+        if d.remaining() != 0 || reduction.accumulator.source != source {
+            return Err(Corrupt);
+        }
+        Ok(Decoded {
+            reduction,
+            rederive,
+        })
+    })();
+    d.outcome(result)
 }
 
 /// Re-derivation I/O, for the per-pass receipt.
@@ -202,6 +272,10 @@ impl CachedJsonlReduction {
             .map(|c| c.durable_contract())
     }
 }
+/// Native re-derive allocations have no proved pre-growth owner yet.
+#[derive(Debug)]
+pub(crate) struct RederiveUnfunded;
+
 impl Decoded {
     pub(crate) fn cutover(&self) -> Option<Option<i64>> {
         self.reduction
@@ -211,6 +285,17 @@ impl Decoded {
             .map(|c| c.durable_cutover())
     }
 
+    /// Move the already-paid graph only when no content needs native input.
+    /// Even a zero head mark cannot excuse a nonempty digest obligation.
+    pub(crate) fn without_rederive(
+        self,
+    ) -> Result<(CachedJsonlReduction, RederiveReceipt), RederiveUnfunded> {
+        if self.rederive != Rederive::default() {
+            return Err(RederiveUnfunded);
+        }
+        Ok((self.reduction, RederiveReceipt::default()))
+    }
+
     #[cfg(test)]
     pub(crate) fn counting(&self) -> Option<(Option<i64>, u8, u8)> {
         self.reduction.durable_counting()
@@ -218,6 +303,7 @@ impl Decoded {
 
     /// How far the head re-parse must read: the latest mark of a field to
     /// re-derive. 0 when nothing needs the head.
+    #[cfg(test)]
     pub(crate) fn head_end(&self) -> Result<u64, Refuse> {
         let acc = &self.reduction.accumulator;
         let marks = acc.durable_marks;
@@ -250,6 +336,7 @@ impl Decoded {
     }
 
     /// The title line to pread, when the head re-parse does not reach it.
+    #[cfg(test)]
     fn title_line(&self, head_end: u64) -> Result<Option<(u64, u64)>, Refuse> {
         if self.rederive.title.is_none() {
             return Ok(None);
@@ -268,6 +355,7 @@ impl Decoded {
     /// 0 (`rederive_parser`), and `file` for the named-line pread. Every value
     /// must hash-equal its digest. The decoded copy is consumed either way: a
     /// refusal leaves nothing behind.
+    #[cfg(test)]
     pub(crate) fn rederive(
         self,
         mut parser: OwnedJsonlParser,
@@ -351,6 +439,7 @@ impl Decoded {
 }
 
 /// Exactly one complete line: `len` bytes at `offset`, ending in a newline.
+#[cfg(test)]
 fn pread_line(file: &mut File, offset: u64, len: u64) -> std::io::Result<Vec<u8>> {
     let len = usize::try_from(len).map_err(|_| std::io::ErrorKind::InvalidInput)?;
     let mut line = vec![0; len];
@@ -365,6 +454,7 @@ fn pread_line(file: &mut File, offset: u64, len: u64) -> std::io::Result<Vec<u8>
 /// A fresh parser for re-derivation: the same source and options as the
 /// record's, no title metadata and no live inputs (no re-derived field reads
 /// them), and no reread binding (a bounded head read, not a Full).
+#[cfg(test)]
 pub(crate) fn rederive_parser(
     mut file: File,
     path: &Path,

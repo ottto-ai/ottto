@@ -3842,7 +3842,7 @@ fn no_record_keys_keep_existing_full_admission_after_restart() {
         assert_eq!(production_body(source, scan), production_body(source, cold));
         assert_eq!(
             cache.durable_counters(source).unwrap().0.durable_held,
-            [0; 5]
+            [0; 6]
         );
     }
 }
@@ -3957,7 +3957,7 @@ fn completed_full_audit_before_durable_replacement_recovers_after_restart() {
         );
         assert_eq!(
             restart.durable_counters(source).unwrap().0.durable_held,
-            [0; 5]
+            [0; 6]
         );
         assert_eq!(production_body(source, scan), production_body(source, cold));
         assert!(!repaired.files[&key].has_unverified_source());
@@ -4029,7 +4029,7 @@ fn missing_index_debt_carrier_recovers_by_full_in_one_pass_for_both_sources() {
             allowlist: sampled_jsonl::durable::allowlist_digest(source),
         };
         assert_eq!(
-            disk.write_after_save(lock, 1, vec![pending])
+            disk.write_after_save(lock, 1, 0, vec![pending])
                 .unwrap()
                 .written,
             1
@@ -4128,7 +4128,7 @@ fn missing_index_debt_carrier_recovers_by_full_in_one_pass_for_both_sources() {
             None,
             "verified-first Full never stages recovered debt"
         );
-        assert_eq!(counts.durable_held, [0; 5]);
+        assert_eq!(counts.durable_held, [0; 6]);
         assert_eq!(
             counts.restore_attempts, 0,
             "missing membership never reaches restore"
@@ -4241,7 +4241,7 @@ fn missing_index_debt_carrier_recovers_by_full_in_one_pass_for_both_sources() {
         let (counts, _) = restart.durable_counters(source).unwrap();
         assert_eq!(counts.ineligible.get("audit_carrier"), None);
         assert_eq!(counts.restore_attempts, 0);
-        assert_eq!(counts.durable_held, [0; 5]);
+        assert_eq!(counts.durable_held, [0; 6]);
     }
 }
 
@@ -4287,7 +4287,7 @@ fn missing_index_terminal_loss_carries_recovered_debt_until_verified_full_for_bo
             allowlist: sampled_jsonl::durable::allowlist_digest(source),
         };
         assert_eq!(
-            disk.write_after_save(lock, 1, vec![pending])
+            disk.write_after_save(lock, 1, 0, vec![pending])
                 .unwrap()
                 .written,
             1
@@ -4365,7 +4365,7 @@ fn missing_index_terminal_loss_carries_recovered_debt_until_verified_full_for_bo
         );
         assert_eq!(counts.restored, 0);
         assert_eq!(counts.restore_attempts, 0);
-        assert_eq!(counts.durable_held, [0; 5]);
+        assert_eq!(counts.durable_held, [0; 6]);
         let (_, cold, _) =
             production_scan(&fixture, source, ScanIndex::default(), None, &namespace.0);
         assert_eq!(production_body(source, scan), production_body(source, cold));
@@ -4525,7 +4525,7 @@ fn missing_carrier_future_debt_clamps_only_in_live_context_for_both_sources() {
                 allowlist: sampled_jsonl::durable::allowlist_digest(source),
             };
             assert_eq!(
-                disk.write_after_save(lock, 1, vec![pending])
+                disk.write_after_save(lock, 1, 0, vec![pending])
                     .unwrap()
                     .written,
                 1
@@ -4581,7 +4581,7 @@ fn missing_carrier_future_debt_clamps_only_in_live_context_for_both_sources() {
             let (counts, _) = cache.durable_counters(source).unwrap();
             assert_eq!(counts.restored, 0);
             assert_eq!(counts.restore_attempts, 0);
-            assert_eq!(counts.durable_held, [0; 5]);
+            assert_eq!(counts.durable_held, [0; 6]);
             if matching {
                 assert!(index.files[&key].has_unverified_source());
                 let due = index.files[&key].unverified_deadline().unwrap();

@@ -11,7 +11,7 @@
 //!   that save's committed generation, and only when their content changed
 //!   since the last durable write (dirty), at most `MAX_BATCH` per save.
 //! - Each write is temp file (0600, create-new), fsync, rename, then one
-//!   directory fsync per batch. A torn, truncated or flipped record fails its
+//!   directory and parent fsync per record. A torn, truncated or flipped record fails its
 //!   SHA-256 trailer and is refused as `Corrupt`.
 //! - A record restores only under its own source, key, context and scope, and
 //!   only when its generation is at or below the loaded index's committed
@@ -40,16 +40,17 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+pub(crate) mod active;
+pub(crate) use active::{ActiveLease, ActiveOverBudget, LeaseWait, ACTIVE_BYTES};
+
 /// Envelope format. Bump on any envelope or certificate layout change.
 pub(crate) const FORMAT_VERSION: u16 = 1;
 const MAGIC: [u8; 8] = *b"ottto-dt";
 /// One record never exceeds the RAM cache's per-entry bound
 /// (`transcript_cache::ENTRY_BYTES`): the store keeps only what RAM can.
 pub(crate) const RECORD_BYTES: usize = crate::transcript_cache::ENTRY_BYTES;
-/// At most as many records as the RAM cache has entries.
+/// Verification memo precision, independent of disk admission.
 pub(crate) const MAX_RECORDS: usize = crate::transcript_cache::CACHE_ENTRIES;
-/// The store's own disk cap, stated separately from any RAM bound.
-pub(crate) const STORE_BYTES: u64 = 32 * 1024 * 1024;
 /// Dirty records written per index save; the rest stay dirty for the next.
 pub(crate) const MAX_BATCH: usize = 32;
 const RECORD_SUFFIX: &str = ".rec";
@@ -74,6 +75,12 @@ const CERTIFICATE_BYTES: usize = 8 * 3 // device, inode, length
     + 1 // debt flag
     + 8; // debt
 const TRAILER_BYTES: usize = 32;
+// Classifier reallocation (old header + envelope), then input + copied body.
+// Conservative cumulative reservation; no credit is refunded between phases.
+const INPUT_ENVELOPE: usize = RECORD_BYTES + HEADER_BYTES + TRAILER_BYTES + 1;
+pub(crate) const RESTORE_INPUT_BYTES: u64 =
+    (3 * INPUT_ENVELOPE + std::mem::size_of::<DurableRecord>()) as u64;
+pub(crate) const BODY_BYTES: usize = RECORD_BYTES - HEADER_BYTES - TRAILER_BYTES;
 
 /// Every 32-byte digest in the envelope (outside the codec body), as
 /// `Type.field`. Each is a domain-separated SHA-256; the H audit
@@ -302,6 +309,7 @@ pub(crate) enum Refusal {
     Undecodable,
     Unbindable,
     Corrupt,
+    ReceiptPending,
 }
 
 /// The outcome of reading one key.
@@ -364,7 +372,7 @@ impl DurableRecord {
 
 /// Content-free counts for the budget receipts. One pass is one restore
 /// read phase or one post-save write phase; `take_pass` resets them.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct StoreCounters {
     /// Record files on disk after the last write or GC, and their bytes.
     pub(crate) disk_records: u64,
@@ -378,15 +386,23 @@ pub(crate) struct StoreCounters {
     pub(crate) records_clean: u64,
     pub(crate) records_deferred: u64,
     pub(crate) batches: u64,
-    /// Budget refusals: a record over `RECORD_BYTES` or a store over
-    /// `STORE_BYTES`. A verified predecessor stays until replacement;
-    /// without one, the entry is Full after restart.
+    /// Encoded record refusals, independent of cache and memo capacity. A
+    /// verified predecessor stays until replacement; without one, the entry
+    /// is Full after restart.
     pub(crate) budget_refused: u64,
+    pub(crate) durable_floor_skipped: u64,
+    pub(crate) receipt_reconciled: u64,
+    pub(crate) receipt_pending_held: u64,
+    pub(crate) receipt_pending_records: u64,
+    pub(crate) durable_write_failed_published: u64,
+    /// Failed physical attempt boundaries: setup, inventory, statvfs.
+    pub(crate) store_write_failed: [u64; 3],
     /// Per-pass read I/O.
     pub(crate) bytes_read: u64,
     pub(crate) records_read: u64,
+    pub(crate) mutation_unproved: u64,
     pub(crate) missing: u64,
-    pub(crate) format_hold: [u64; 5],
+    pub(crate) format_hold: [u64; 6],
     /// Writes skipped: predecessor unknown, or a new key while record files
     /// exceed `INVENTORY_BOUND` (offered again after the next save).
     pub(crate) store_write_skipped: [u64; 2],
@@ -430,7 +446,7 @@ pub(crate) struct BatchReceipt {
 pub(crate) struct DurableTailStore {
     dir: PathBuf,
     source: DurableSource,
-    durable: BTreeMap<Digest32, (Option<Digest32>, Stamp)>,
+    durable: BTreeMap<Digest32, (Option<Digest32>, Stamp, bool)>,
     counters: StoreCounters,
     /// The store-level fault that made this store memory-only for the process.
     disabled: Option<&'static str>,
@@ -439,6 +455,8 @@ pub(crate) struct DurableTailStore {
     pass: [u64; 2],
     /// Process-lifetime attempts, removed only after a successful replacement.
     rebuilt: BTreeMap<Digest32, Rebuild>,
+    startup_synced: bool,
+    pending: BTreeMap<Digest32, (Option<Stamp>, u64, Digest32, u8)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -450,15 +468,17 @@ enum Rebuild {
 }
 
 /// The most record files one GC or inventory pass looks at. Twice the
-/// admission cap, so a full store plus its replacements always fits; any
+/// memo precision bound; existing-key updates remain possible beyond it; any
 /// file past it is left untouched and counted.
 pub(crate) const INVENTORY_BOUND: usize = 2 * MAX_RECORDS;
 /// T14 rebuilds one pass allows before the store is disabled: more than
 /// `max(T14_BREAKER, 2% of the records loaded)`.
 pub(crate) const T14_BREAKER: u64 = 20;
 const REBUILT_BOUND: usize = 64;
+// Three actual failures for one receipt bound this hold; lease waits do not count.
+const RECEIPT_RECONCILE_FAILURES: u8 = 3;
 // A memo entry stays within the 128 bytes per record `STORES_RESIDENT_BOUND` charges.
-const _: () = assert!(std::mem::size_of::<(Digest32, (Option<Digest32>, Stamp))>() <= 128);
+const _: () = assert!(std::mem::size_of::<(Digest32, (Option<Digest32>, Stamp, bool))>() <= 128);
 
 impl DurableTailStore {
     pub(crate) fn new(dir: PathBuf, source: DurableSource) -> Self {
@@ -471,20 +491,26 @@ impl DurableTailStore {
             checked: false,
             pass: [0; 2],
             rebuilt: BTreeMap::new(),
+            startup_synced: false,
+            pending: BTreeMap::new(),
         }
     }
 
     /// A new pass: the directory is checked again and the T14 breaker resets.
     pub(crate) fn begin_pass(&mut self) {
         self.checked = false;
+        for (_, _, allowed) in self.durable.values_mut() {
+            *allowed = false;
+        }
         self.pass = [0; 2];
+        self.usable(None);
     }
 
     pub(crate) fn disabled(&self) -> Option<&'static str> {
         self.disabled
     }
 
-    fn disable(&mut self, cause: &'static str) {
+    pub(crate) fn disable(&mut self, cause: &'static str) {
         if self.disabled.is_none() {
             self.disabled = Some(cause);
         }
@@ -493,16 +519,29 @@ impl DurableTailStore {
 
     /// The store-level check, once per pass: a directory we own gets 0700
     /// back; anything else disables the store (absent is fine).
-    fn usable(&mut self) -> bool {
+    fn usable(&mut self, writer: Option<&dyn SingleWriter>) -> bool {
+        let writer = writer.or_else(|| {
+            crate::locked_state_dir::held_for(&self.dir).map(|w| w as &dyn SingleWriter)
+        });
+        let writable = writer.is_some_and(|w| self.check_writer(w).is_ok());
         if !self.checked && self.disabled.is_none() {
             self.checked = true;
             match inspect_path(&self.dir) {
                 Ok(metadata) if !metadata.is_dir() => self.disable("not_directory"),
                 Ok(metadata) => {
-                    self.repair(&self.dir.clone(), &metadata, 0o700);
+                    if !self.repair(&self.dir.clone(), &metadata, 0o700, writable) {
+                        return false;
+                    }
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(_) => self.disable("directory_access"),
+            }
+        }
+        if writable && !self.startup_synced && self.disabled.is_none() && self.dir.exists() {
+            if self.sync_store().is_err() {
+                self.disable("startup_sync");
+            } else {
+                self.startup_synced = true;
             }
         }
         self.disabled.is_none()
@@ -510,10 +549,14 @@ impl DurableTailStore {
 
     /// Our own entry gets `mode` back (counted); a foreign owner or a failed
     /// repair disables the store.
-    fn repair(&mut self, path: &Path, metadata: &fs::Metadata, mode: u32) -> bool {
+    fn repair(&mut self, path: &Path, metadata: &fs::Metadata, mode: u32, writable: bool) -> bool {
         if metadata.uid() != our_uid() {
             self.disable("foreign_owner");
         } else if metadata.permissions().mode() & 0o777 != mode {
+            if !writable {
+                self.disable("mode_without_writer");
+                return false;
+            }
             match fs::set_permissions(path, fs::Permissions::from_mode(mode)) {
                 Ok(()) => self.counters.mode_repaired += 1,
                 Err(_) => self.disable("mode_unrepairable"),
@@ -528,21 +571,24 @@ impl DurableTailStore {
     }
 
     pub(crate) fn representation(&mut self, key: &Digest32) -> Option<(u16, Digest32)> {
-        self.classify(key, "delete")
+        self.classify(key, "delete", None)
             .ok()
             .flatten()
             .map(|h| (h.format, h.record.allowlist))
     }
 
     pub(crate) fn counters(&self) -> StoreCounters {
-        self.counters
+        StoreCounters {
+            receipt_pending_records: self.pending.len() as u64,
+            ..self.counters
+        }
     }
 
     /// The counters since the last call, which resets them. The disk totals
     /// are a level, not a flow, and are kept.
     #[cfg(test)]
     pub(crate) fn take_pass(&mut self) -> StoreCounters {
-        let pass = self.counters;
+        let pass = self.counters();
         self.counters = StoreCounters {
             disk_records: pass.disk_records,
             disk_bytes: pass.disk_bytes,
@@ -558,8 +604,18 @@ impl DurableTailStore {
     /// Owner/mode (store-level) precede header dispatch, which precedes the
     /// size check. Only a verified known record licenses mutation. `Ok(None)`
     /// also when the store is disabled.
-    fn classify(&mut self, key: &Digest32, work: &str) -> Result<Option<Header>, Refusal> {
-        if !self.usable() {
+    fn classify(
+        &mut self,
+        key: &Digest32,
+        work: &str,
+        writer: Option<&dyn SingleWriter>,
+    ) -> Result<Option<Header>, Refusal> {
+        let writable = writer
+            .or_else(|| {
+                crate::locked_state_dir::held_for(&self.dir).map(|w| w as &dyn SingleWriter)
+            })
+            .is_some_and(|w| self.check_writer(w).is_ok());
+        if !self.usable(writer) {
             return Ok(None);
         }
         let path = self.record_path(key);
@@ -577,7 +633,7 @@ impl DurableTailStore {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
                 Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
                     let repaired = match inspect_path(&path) {
-                        Ok(m) => m.is_file() && self.repair(&path, &m, 0o600),
+                        Ok(m) => m.is_file() && self.repair(&path, &m, 0o600, writable),
                         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
                         Err(_) => false,
                     };
@@ -601,7 +657,7 @@ impl DurableTailStore {
             if !metadata.is_file() {
                 return Err(Refusal::Undecodable);
             }
-            if !self.repair(&path, &metadata, 0o600) {
+            if !self.repair(&path, &metadata, 0o600, writable) {
                 return Ok(None);
             }
             #[cfg(test)]
@@ -619,25 +675,30 @@ impl DurableTailStore {
             } else {
                 self.counters.guard_header_bytes += n as u64;
             }
-            let binding = decode_header(&header, key, self.source)?;
+            let mut binding = decode_header(&header, key, self.source)?;
             // After any repair: its ctime moved.
             let Some(metadata) = self.inspect_file(&file) else {
                 return Ok(None);
             };
             let stamp = Stamp::of(&metadata);
+            binding.stamp = Some(stamp);
             if !metadata.is_file()
                 || metadata.len() > (RECORD_BYTES + HEADER_BYTES + TRAILER_BYTES) as u64
             {
                 return Err(Refusal::Corrupt);
             }
-            if self.durable.get(key).is_some_and(|(_, old)| *old == stamp) {
-                return Ok(Some(binding));
+            if let Some((content, old, _)) = self.durable.get(key) {
+                if *old == stamp && (work != "overwrite" || content.is_some()) {
+                    binding.content = *content;
+                    return Ok(Some(binding));
+                }
             }
             #[cfg(test)]
             test_hooks::before_access(&path, "body")
                 .map_err(|e| self.read_failure(e, Refusal::Corrupt))?;
             let mut bytes = header;
-            file.take((RECORD_BYTES + TRAILER_BYTES + 1) as u64)
+            bytes.reserve_exact(INPUT_ENVELOPE - bytes.len());
+            file.take((INPUT_ENVELOPE - n) as u64)
                 .read_to_end(&mut bytes)
                 .map_err(|e| self.read_failure(e, Refusal::Corrupt))?;
             let read = bytes.len().saturating_sub(n) as u64;
@@ -648,8 +709,11 @@ impl DurableTailStore {
             }
             self.note_codec(bytes.capacity());
             verify(&bytes, self.source)?;
+            if work == "overwrite" {
+                binding.content = Some(stored_digest(&bytes));
+            }
             if self.durable.len() < MAX_RECORDS || self.durable.contains_key(key) {
-                self.durable.insert(*key, (None, stamp));
+                self.durable.insert(*key, (None, stamp, false));
             }
             Ok(Some(binding))
         })();
@@ -696,7 +760,13 @@ impl DurableTailStore {
         has_index: bool,
         live_context: &Digest32,
     ) -> Result<Option<u64>, Refusal> {
-        let result = self.classify(key, "guard");
+        if self.disabled.is_some() {
+            return Ok(None); // D-DISABLED: keep debt, publish valid RAM under native fences.
+        }
+        if self.pending.contains_key(key) {
+            return Err(Refusal::ReceiptPending);
+        }
+        let result = self.classify(key, "guard", None);
         self.pass[0] += u64::from(!matches!(result, Ok(None)));
         match result {
             Err(Refusal::Corrupt) if !self.rebuilt.contains_key(key) => {
@@ -727,7 +797,7 @@ impl DurableTailStore {
     /// debt, read only. No T14 breaker accounting, rebuild authorization or
     /// hold; refusals and foreign contexts contribute nothing.
     pub(crate) fn carrier_debt(&mut self, key: &Digest32, live_context: &Digest32) -> Option<u64> {
-        self.classify(key, "guard")
+        self.classify(key, "guard", None)
             .ok()
             .flatten()
             .filter(|header| header.record.binding.context == *live_context)
@@ -754,8 +824,27 @@ impl DurableTailStore {
         held
     }
 
+    /// Cold caller owns the process-wide lease before taking Stores.
+    pub(crate) fn read_bounded(
+        &mut self,
+        key: &Digest32,
+        lease: &mut ActiveLease,
+    ) -> Result<ReadOutcome, ActiveOverBudget> {
+        lease.charge(RESTORE_INPUT_BYTES)?;
+        Ok(self.read(key))
+    }
+
     pub(crate) fn read(&mut self, key: &Digest32) -> ReadOutcome {
-        match self.classify(key, "guard") {
+        if self.disabled.is_some() {
+            return ReadOutcome::Missing; // Never reuse ambiguous disabled-store bytes.
+        }
+        if self.pending.contains_key(key) {
+            return ReadOutcome::Refused(Refusal::ReceiptPending);
+        }
+        self.read_known(key, None)
+    }
+    fn read_known(&mut self, key: &Digest32, writer: Option<&dyn SingleWriter>) -> ReadOutcome {
+        match self.classify(key, "guard", writer) {
             Err(reason) => return ReadOutcome::Refused(reason),
             Ok(None) => {
                 self.counters.missing += 1;
@@ -778,16 +867,8 @@ impl DurableTailStore {
         self.note_codec(bytes.capacity() + bytes.len().saturating_sub(HEADER_BYTES));
         match decode(&bytes) {
             Ok(record) => {
-                if let Some((content, _)) = self.durable.get_mut(key) {
-                    // Memo the verified STORED representation, not the decoded
-                    // certificate whose compatibility debt was dropped.
-                    let mut header = [0; HEADER_BYTES];
-                    header.copy_from_slice(&bytes[..HEADER_BYTES]);
-                    header[171..179].fill(0); // committed generation is not content
-                    *content = Some(content_digest_parts(
-                        &header,
-                        &bytes[HEADER_BYTES..bytes.len() - TRAILER_BYTES],
-                    ));
+                if let Some((content, _, _)) = self.durable.get_mut(key) {
+                    *content = Some(stored_digest(&bytes));
                 }
                 ReadOutcome::Found(Box::new(record))
             }
@@ -795,15 +876,123 @@ impl DurableTailStore {
         }
     }
 
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+    pub(crate) fn receipt_pending(&self, key: &Digest32) -> bool {
+        self.pending.contains_key(key)
+    }
+
+    pub(crate) fn reconcile_pending(
+        &mut self,
+        writer: &dyn SingleWriter,
+        key: &Digest32,
+    ) -> io::Result<bool> {
+        self.check_writer(writer)?;
+        if self.disabled.is_some() {
+            return Err(io::Error::other("store disabled"));
+        }
+        let result = self.reconcile_pending_inner(writer, key);
+        if result.is_err() {
+            if let Some(pending) = self.pending.get_mut(key) {
+                pending.3 = pending.3.saturating_add(1);
+                if pending.3 >= RECEIPT_RECONCILE_FAILURES {
+                    self.disable("receipt_unreconciled");
+                }
+            }
+        }
+        result
+    }
+
+    fn reconcile_pending_inner(
+        &mut self,
+        writer: &dyn SingleWriter,
+        key: &Digest32,
+    ) -> io::Result<bool> {
+        if !self.usable(Some(writer)) {
+            return Err(io::Error::other("store disabled"));
+        }
+        let Some((prior, generation, content, _)) = self.pending.get(key).copied() else {
+            return Ok(true);
+        };
+        let path = self.record_path(key);
+        let stamp = || fs::symlink_metadata(&path).ok().map(|m| Stamp::of(&m));
+        let before = stamp();
+        self.durable.remove(key); // Reconcile must fully verify, even a memo hit.
+        let receipted = match self.read_known(key, Some(writer)) {
+            ReadOutcome::Found(record) if before == stamp() => {
+                if record.index_generation == generation && record_digest(&record) == content {
+                    let file = OpenOptions::new()
+                        .read(true)
+                        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                        .open(&path)?;
+                    if Some(Stamp::of(&file.metadata()?)) != before {
+                        return Err(io::Error::other("survivor changed"));
+                    }
+                    file.sync_all()?;
+                    true
+                } else if prior.is_some() && before == prior && record.format == FORMAT_VERSION {
+                    if stamp() != before {
+                        return Err(io::Error::other("predecessor changed"));
+                    }
+                    remove_if_present(&path)?;
+                    false
+                } else {
+                    return Err(io::Error::other("unadjudicated survivor"));
+                }
+            }
+            ReadOutcome::Missing if before.is_none() && self.disabled.is_none() => false,
+            _ => return Err(io::Error::other("unverified survivor")),
+        };
+        self.sync_store()?;
+        if (receipted && stamp() != before)
+            || (!receipted
+                && !fs::symlink_metadata(&path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound))
+        {
+            return Err(io::Error::other("survivor changed"));
+        }
+        self.pending.remove(key);
+        if receipted {
+            self.counters.receipt_reconciled += 1;
+        } else {
+            self.counters.durable_write_failed_published += 1;
+        }
+        Ok(receipted)
+    }
+
+    /// Only a fully verified original binding may authorize a Claude mutation.
+    pub(crate) fn authorize(&mut self, record: &DurableRecord, expected: &Expected) {
+        if record.eligible(expected).is_err() {
+            return;
+        }
+        let key = record.record.binding.key;
+        let digest = record_digest(record);
+        let path = self.record_path(&key);
+        if let Some((Some(content), stamp, allowed)) = self.durable.get_mut(&key) {
+            *allowed = *content == digest
+                && fs::symlink_metadata(path).is_ok_and(|m| Stamp::of(&m) == *stamp);
+        }
+    }
+    fn authorized(&mut self, key: &Digest32) -> bool {
+        let allowed = self.source != DurableSource::ClaudeCode
+            || self.durable.get(key).is_some_and(|(_, stamp, yes)| {
+                *yes && fs::symlink_metadata(self.record_path(key))
+                    .is_ok_and(|m| Stamp::of(&m) == *stamp)
+            });
+        self.counters.mutation_unproved += u64::from(!allowed);
+        allowed
+    }
+
     /// The post-save write. Call only after `ScanIndex::save` succeeded, with
     /// that save's committed generation and only entries that save kept.
     /// Clean records (same content as the last durable write) are skipped;
     /// at most `MAX_BATCH` dirty records are written, the rest are deferred.
-    /// One directory fsync covers the batch.
+    /// Each record syncs the store and parent; ambiguous outcomes stay pending.
     pub(crate) fn write_after_save<W: SingleWriter>(
         &mut self,
         writer: &W,
         committed_generation: u64,
+        index_length: u64,
         pending: Vec<PendingRecord>,
     ) -> io::Result<BatchReceipt> {
         // A paused rebuild absent from pending must survive this save.
@@ -812,7 +1001,7 @@ impl DurableTailStore {
                 self.rebuilt.insert(record.binding.key, Rebuild::Offered);
             }
         }
-        let result = self.write_batch(writer, committed_generation, pending);
+        let result = self.write_batch(writer, committed_generation, index_length, pending);
         for (key, state) in &mut self.rebuilt {
             if *state == Rebuild::Offered {
                 *state = if result.as_ref().is_ok_and(|r| r.deferred_keys.contains(key)) {
@@ -829,12 +1018,13 @@ impl DurableTailStore {
         &mut self,
         writer: &W,
         committed_generation: u64,
+        index_length: u64,
         pending: Vec<PendingRecord>,
     ) -> io::Result<BatchReceipt> {
         self.check_writer(writer)?;
         let mut receipt = BatchReceipt::default();
         let mut dirty = Vec::new();
-        if !self.usable() {
+        if !self.usable(Some(writer)) {
             return Ok(receipt);
         }
         // The caller's bodies stay live for the whole batch.
@@ -849,37 +1039,69 @@ impl DurableTailStore {
             ) {
                 continue;
             }
-            // A rebuild may replace its corrupt predecessor once, after save.
-            match self.classify(&record.binding.key, "overwrite") {
-                Err(Refusal::Corrupt) | Ok(_) => {}
-                Err(_) => {
-                    self.counters.store_write_skipped[0] += 1;
+            if self.pending.contains_key(&record.binding.key)
+                && self.reconcile_pending(writer, &record.binding.key).is_err()
+            {
+                let stamp = fs::symlink_metadata(self.record_path(&record.binding.key))
+                    .ok()
+                    .map(|m| Stamp::of(&m));
+                let same = self
+                    .pending
+                    .get(&record.binding.key)
+                    .is_some_and(|(prior, ..)| prior.is_some() && *prior == stamp);
+                if !(same
+                    && matches!(
+                        self.classify(&record.binding.key, "overwrite", Some(writer)),
+                        Err(Refusal::Corrupt)
+                    ))
+                {
+                    receipt.deferred_keys.push(record.binding.key);
                     continue;
                 }
             }
+            // A rebuild may replace its corrupt predecessor once, after save.
+            let (prior, previous_content) =
+                match self.classify(&record.binding.key, "overwrite", Some(writer)) {
+                    Err(Refusal::Corrupt) => (
+                        fs::symlink_metadata(self.record_path(&record.binding.key))
+                            .ok()
+                            .map(|m| Stamp::of(&m)),
+                        None,
+                    ),
+                    Err(_) => {
+                        self.counters.store_write_skipped[0] += 1;
+                        continue;
+                    }
+                    // Carry the exact verified predecessor into conditional retirement.
+                    Ok(Some(_)) if !self.authorized(&record.binding.key) => continue,
+                    Ok(Some(old)) => (old.stamp, old.content),
+                    Ok(None) => (None, None),
+                };
             let content = content_digest(&record);
-            if self
-                .durable
-                .get(&record.binding.key)
-                .is_some_and(|(old, _)| *old == Some(content))
-            {
+            if previous_content == Some(content) {
                 receipt.clean += 1;
             } else {
-                dirty.push((record, content));
+                dirty.push((record, content, prior));
             }
         }
-        if !self.usable() {
+        if !self.usable(Some(writer)) {
             return Ok(BatchReceipt::default());
         }
         if dirty.is_empty() {
             self.counters.records_clean += receipt.clean as u64;
             return Ok(receipt);
         }
-        ensure_private_dir(&self.dir)?;
-        let (mut on_disk, mut unlisted) = self.scan_disk()?;
-        let mut changed = false;
-        for (record, content) in dirty {
-            if receipt.written + receipt.budget_refused >= MAX_BATCH {
+        ensure_private_dir(&self.dir).inspect_err(|_| self.counters.store_write_failed[0] += 1)?;
+        self.checked = false;
+        if !self.usable(Some(writer)) {
+            return Ok(receipt);
+        }
+        let (mut on_disk, mut unlisted) = self
+            .scan_disk()
+            .inspect_err(|_| self.counters.store_write_failed[1] += 1)?;
+        let mut attempted = 0;
+        for (record, content, prior) in dirty {
+            if attempted >= MAX_BATCH {
                 receipt.deferred += 1;
                 receipt.deferred_keys.push(record.binding.key);
                 continue;
@@ -899,7 +1121,7 @@ impl DurableTailStore {
                 }
             }
             if !on_disk.contains_key(&key)
-                && on_disk.len() as u64 + unlisted[0] > INVENTORY_BOUND as u64
+                && on_disk.len() as u64 + unlisted[0] >= INVENTORY_BOUND as u64
             {
                 self.counters.store_write_skipped[1] += 1;
                 receipt.deferred_keys.push(key);
@@ -911,39 +1133,58 @@ impl DurableTailStore {
                 index_generation: committed_generation,
                 format: FORMAT_VERSION,
             };
-            let bytes = encode(&stored);
-            self.note_codec(pending_bytes + bytes.capacity());
-            let previous = on_disk.get(&key).copied().unwrap_or(0);
-            let total = on_disk
-                .values()
-                .sum::<u64>()
-                .saturating_add(unlisted[1])
-                .saturating_sub(previous)
-                .saturating_add(bytes.len() as u64);
-            if bytes.len() > RECORD_BYTES
-                || total > STORE_BYTES
-                || (previous == 0 && on_disk.len() >= MAX_RECORDS)
-            {
+            if stored.record.body.len() > BODY_BYTES {
                 // Preserve the verified predecessor until an ordinary
                 // replacement succeeds, including on budget refusal.
                 self.durable.remove(&key);
                 receipt.budget_refused += 1;
                 continue;
             }
-            write_atomic(&self.dir, &path, &bytes)?;
+            let bytes = encode(&stored);
+            self.note_codec(pending_bytes + bytes.capacity());
+            let previous = on_disk.get(&key).copied().unwrap_or(0);
+            if previous == 0
+                && !above_floor(&self.dir, bytes.len() as u64, index_length)
+                    .inspect_err(|_| self.counters.store_write_failed[2] += 1)?
+            {
+                self.counters.durable_floor_skipped += 1;
+                continue;
+            }
+            if self.pending.len() >= MAX_BATCH {
+                self.disable("obligation_overflow");
+                break;
+            }
+            attempted += 1;
+            self.pending
+                .insert(key, (prior, committed_generation, content, 0));
+            if write_atomic(&self.dir, &path, &bytes, prior)
+                .and_then(|_| self.sync_store())
+                .is_err()
+            {
+                match self.reconcile_pending(writer, &key) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        on_disk.remove(&key);
+                        continue;
+                    }
+                    Err(_) => {
+                        self.counters.receipt_pending_held += 1;
+                        receipt.deferred_keys.push(key);
+                        continue;
+                    }
+                }
+            } else {
+                self.pending.remove(&key);
+            }
             self.rebuilt.remove(&key);
-            changed = true;
             on_disk.insert(key, bytes.len() as u64);
             let stamp = Stamp::of(&fs::symlink_metadata(&path)?);
             if self.durable.len() < MAX_RECORDS || self.durable.contains_key(&key) {
-                self.durable.insert(key, (Some(content), stamp));
+                self.durable.insert(key, (Some(content), stamp, true));
             }
             receipt.written += 1;
             receipt.bytes_written += bytes.len() as u64;
             self.counters.max_record_bytes = self.counters.max_record_bytes.max(bytes.len() as u64);
-        }
-        if changed {
-            sync_dir(&self.dir)?;
         }
         self.counters.batches += 1;
         self.counters.records_written += receipt.written as u64;
@@ -969,7 +1210,7 @@ impl DurableTailStore {
         keep: &BTreeMap<Digest32, Option<Digest32>>,
     ) -> io::Result<()> {
         self.check_writer(writer)?;
-        if !self.usable() {
+        if !self.usable(Some(writer)) {
             return Ok(());
         }
         let entries = match fs::read_dir(&self.dir) {
@@ -1011,7 +1252,12 @@ impl DurableTailStore {
                 unlisted_bytes += len;
                 continue;
             }
-            let verdict = match self.classify(&key, "delete") {
+            if self.pending.contains_key(&key) {
+                on_disk.insert(key, len);
+                continue;
+            }
+            let verdict = match self.classify(&key, "delete", Some(writer)) {
+                Ok(Some(_)) if !self.authorized(&key) => Some(len),
                 Ok(Some(header)) => {
                     // Missing membership cannot erase its debt evidence. A
                     // fresh-index cleanup has no trusted context (zero).
@@ -1051,7 +1297,7 @@ impl DurableTailStore {
         }
         self.durable.retain(|key, _| on_disk.contains_key(key));
         if deleted {
-            sync_dir(&self.dir)?;
+            self.sync_store()?;
         }
         self.set_disk_level(
             &on_disk,
@@ -1097,19 +1343,22 @@ impl DurableTailStore {
     ) -> io::Result<usize> {
         self.check_writer(writer)?;
         let mut removed = 0;
-        if !self.usable() {
+        if !self.usable(Some(writer)) {
             return Ok(0);
         }
         for key in keys {
             let path = self.record_path(key);
-            if matches!(self.classify(key, "delete"), Ok(Some(_))) {
+            if !self.pending.contains_key(key)
+                && matches!(self.classify(key, "delete", Some(writer)), Ok(Some(_)))
+                && self.authorized(key)
+            {
                 remove_if_present(&path)?;
                 removed += 1;
             }
             self.durable.remove(key);
         }
         if removed > 0 {
-            sync_dir(&self.dir)?;
+            self.sync_store()?;
             self.counters.records_invalidated += removed as u64;
             let (on_disk, unlisted) = self.scan_disk()?;
             self.set_disk_level(&on_disk, unlisted);
@@ -1117,20 +1366,31 @@ impl DurableTailStore {
         Ok(removed)
     }
 
-    fn check_writer<W: SingleWriter>(&self, writer: &W) -> io::Result<()> {
+    fn check_writer<W: SingleWriter + ?Sized>(&self, writer: &W) -> io::Result<()> {
         if self.dir.starts_with(writer.state_dir()) {
             Ok(())
         } else {
             Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "durable store is outside the locked state directory",
+                "store outside writer root",
             ))
         }
+    }
+
+    fn sync_store(&self) -> io::Result<()> {
+        sync_dir(&self.dir)?;
+        sync_dir(
+            self.dir
+                .parent()
+                .ok_or_else(|| io::Error::other("store parent"))?,
+        )
     }
 
     /// Record files and their sizes, as on disk now: the first
     /// `INVENTORY_BOUND` by key, the rest only counted and summed.
     fn scan_disk(&self) -> io::Result<(BTreeMap<Digest32, u64>, [u64; 2])> {
+        #[cfg(test)]
+        test_hooks::write_failure("inventory")?;
         let mut on_disk = BTreeMap::new();
         let mut unlisted = [0; 2];
         for entry in fs::read_dir(&self.dir)? {
@@ -1177,6 +1437,26 @@ fn content_digest_parts(header: &[u8], body: &[u8]) -> Digest32 {
     digest("ottto-dt-content:v2", &[header, body])
 }
 
+/// Memo the verified STORED representation, not the decoded certificate
+/// whose compatibility debt was dropped.
+fn stored_digest(bytes: &[u8]) -> Digest32 {
+    let mut header = [0; HEADER_BYTES];
+    header.copy_from_slice(&bytes[..HEADER_BYTES]);
+    header[171..179].fill(0); // committed generation is not content
+    content_digest_parts(&header, &bytes[HEADER_BYTES..bytes.len() - TRAILER_BYTES])
+}
+
+/// `stored_digest` of a decoded record: its envelope debt goes back into the
+/// header (debt tag, due, then the body length end it).
+fn record_digest(stored: &DurableRecord) -> Digest32 {
+    let mut header = Vec::with_capacity(HEADER_BYTES);
+    encode_header(&mut header, &stored.record, 0);
+    let debt = HEADER_BYTES - 12;
+    header[debt - 1] = u8::from(stored.envelope_audit_debt.is_some());
+    header[debt..debt + 8].copy_from_slice(&stored.envelope_audit_debt.unwrap_or(0).to_le_bytes());
+    content_digest_parts(&header, &stored.record.body)
+}
+
 fn inspect_path(path: &Path) -> io::Result<fs::Metadata> {
     #[cfg(test)]
     test_hooks::before_access(path, "metadata")?;
@@ -1206,12 +1486,41 @@ fn parse_hex_digest(text: &str) -> Option<Digest32> {
 }
 
 fn ensure_private_dir(dir: &Path) -> io::Result<()> {
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)?;
-    // `mkdir` masks the mode with the umask; pin it.
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+    #[cfg(test)]
+    test_hooks::write_failure("setup")?;
+    match fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    Ok(()) // The caller rechecks owner/type and repairs the new directory's mode.
+}
+
+// An absent record leaves index length plus max(2 GiB, 1% volume).
+fn above_floor(dir: &Path, encoded: u64, index_len: u64) -> io::Result<bool> {
+    #[cfg(test)]
+    test_hooks::write_failure("statvfs")?;
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes())
+        .map_err(|_| io::Error::other("store path"))?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: valid NUL-terminated path and writable statvfs storage.
+    if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: statvfs succeeded and initialized the structure.
+    let stat = unsafe { stat.assume_init() };
+    let available = (stat.f_bavail as u64).checked_mul(stat.f_frsize as u64);
+    let volume = (stat.f_blocks as u64).checked_mul(stat.f_frsize as u64);
+    Ok(floor_allows(available, volume, encoded, index_len))
+}
+fn floor_allows(available: Option<u64>, volume: Option<u64>, encoded: u64, index_len: u64) -> bool {
+    available.zip(volume).is_some_and(|(available, volume)| {
+        available
+            .checked_sub(encoded)
+            .and_then(|n| n.checked_sub(index_len))
+            .is_some_and(|left| left >= (2 * 1024 * 1024 * 1024).max(volume / 100))
+    })
 }
 
 /// `Ok(None)` when absent. Refuses a non-regular file, a file readable by
@@ -1227,7 +1536,7 @@ fn read_private(path: &Path) -> io::Result<Option<Vec<u8>>> {
     }
     let file = match OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
     {
         Ok(file) => file,
@@ -1256,15 +1565,14 @@ fn read_private(path: &Path) -> io::Result<Option<Vec<u8>>> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct Stamp(u64);
+struct Stamp([u64; 3], [i64; 4]);
 impl Stamp {
-    /// Process-local memo key over (dev, ino, size, mtime, ctime).
+    /// Exact process-local (dev, ino, size, mtime, ctime) verification stamp.
     fn of(m: &fs::Metadata) -> Self {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        [m.dev(), m.ino(), m.len()].hash(&mut hasher);
-        [m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec()].hash(&mut hasher);
-        Self(hasher.finish())
+        Self(
+            [m.dev(), m.ino(), m.len()],
+            [m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec()],
+        )
     }
 }
 
@@ -1303,6 +1611,8 @@ struct Header {
     format: u16,
     body_len: usize,
     audit_debt: Option<u64>,
+    stamp: Option<Stamp>,
+    content: Option<Digest32>,
 }
 fn decode_header(bytes: &[u8], key: &Digest32, source: DurableSource) -> Result<Header, Refusal> {
     let mut c = Cursor(bytes);
@@ -1370,6 +1680,8 @@ fn decode_header(bytes: &[u8], key: &Digest32, source: DurableSource) -> Result<
             format,
             body_len: c.u32()? as usize,
             audit_debt: None,
+            stamp: None,
+            content: None,
         })
     })();
     let mut header = parsed.ok_or(Refusal::Corrupt)?;
@@ -1401,6 +1713,8 @@ fn verify(bytes: &[u8], source: DurableSource) -> Result<(), Refusal> {
 }
 
 fn remove_if_present(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    test_hooks::before_unlink(path)?;
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -1409,8 +1723,8 @@ fn remove_if_present(path: &Path) -> io::Result<()> {
 }
 
 /// Temp file (create-new, 0600), write, fsync, rename. The caller syncs the
-/// directory once per batch.
-fn write_atomic(dir: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
+/// directory and its parent before issuing a receipt.
+fn write_atomic(dir: &Path, path: &Path, bytes: &[u8], prior: Option<Stamp>) -> io::Result<()> {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -1422,13 +1736,21 @@ fn write_atomic(dir: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&temp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
         #[cfg(test)]
         test_hooks::before_rename(&temp, path)?;
+        let actual = match fs::symlink_metadata(path) {
+            Ok(metadata) => Some(Stamp::of(&metadata)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        if actual != prior {
+            return Err(io::Error::other("predecessor changed"));
+        }
         fs::rename(&temp, path)
     })();
     if result.is_err() {
@@ -1440,7 +1762,11 @@ fn write_atomic(dir: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
 fn sync_dir(dir: &Path) -> io::Result<()> {
     #[cfg(test)]
     test_hooks::before_dir_sync(dir)?;
-    File::open(dir)?.sync_all()
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(dir)?
+        .sync_all()
 }
 
 /// Little-endian envelope: magic, format version, allowlist digest, source,
@@ -1562,10 +1888,12 @@ pub(crate) mod test_hooks {
     type AccessHook = Box<dyn FnMut(&Path, &str) -> io::Result<()>>;
 
     thread_local! {
+        static WRITE_FAILURE: RefCell<Option<&'static str>> = const { RefCell::new(None) };
         static BEFORE_RENAME: RefCell<Option<Hook>> = const { RefCell::new(None) };
         static BEFORE_DIR_SYNC: RefCell<Option<DirHook>> = const { RefCell::new(None) };
         static BEFORE_ACCESS: RefCell<Option<AccessHook>> = const { RefCell::new(None) };
         static RECORDS_FIRST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static BEFORE_UNLINK: RefCell<Option<DirHook>> = const { RefCell::new(None) };
         static UID: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
     }
 
@@ -1592,6 +1920,28 @@ pub(crate) mod test_hooks {
             });
         }
         entries
+    }
+    pub(crate) fn set_write_failure(stage: Option<&'static str>) {
+        WRITE_FAILURE.with(|s| *s.borrow_mut() = stage);
+    }
+    pub(super) fn write_failure(stage: &'static str) -> io::Result<()> {
+        WRITE_FAILURE.with(|s| {
+            if *s.borrow() == Some(stage) {
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    pub(crate) fn set_before_unlink(hook: Option<DirHook>) {
+        BEFORE_UNLINK.with(|h| *h.borrow_mut() = hook);
+    }
+    pub(super) fn before_unlink(path: &Path) -> io::Result<()> {
+        BEFORE_UNLINK.with(|h| match h.borrow_mut().as_mut() {
+            Some(hook) => hook(path),
+            None => Ok(()),
+        })
     }
 
     /// The uid the store treats as its own (a foreign owner without root).
