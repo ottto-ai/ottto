@@ -1955,7 +1955,8 @@ impl SnapshotUploadProgress {
         };
         let patch = serde_json::from_value(patch.clone())?;
         let state =
-            crate::snapshots::cache_state_from_patch(self.accepted_cache_states.get(&key), &patch);
+            crate::snapshots::cache_state_from_patch(self.accepted_cache_states.get(&key), &patch)
+                .ok_or_else(|| anyhow!("cache observations have unparseable accepted state"))?;
         self.accepted_cache_states.insert(key, state);
         Ok(())
     }
@@ -14350,7 +14351,7 @@ mod tests {
         );
         let wire = network.cache_observations.as_ref().unwrap();
         assert!(wire.validate());
-        let expected = crate::snapshots::cache_state_from_patch(Some(&prior), wire);
+        let expected = crate::snapshots::cache_state_from_patch(Some(&prior), wire).unwrap();
         assert_eq!(network.cache_observations_state.as_ref(), Some(&expected));
         assert!(
             crate::canonical_json::canonicalize(&expected)
