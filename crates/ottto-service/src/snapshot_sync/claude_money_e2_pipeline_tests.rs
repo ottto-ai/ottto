@@ -1577,8 +1577,8 @@ fn e2_pipeline_real_family_crosses_two_mib_root_first() {
                 high = mid
             }
         }
-        let (below, bytes_below) = measure(&mut c, low);
-        let (above, bytes_above) = measure(&mut c, high);
+        let (mut below, bytes_below) = measure(&mut c, low);
+        let (mut above, bytes_above) = measure(&mut c, high);
         assert!(bytes_below <= SNAPSHOT_BATCH_MAX_BYTES && bytes_above > SNAPSHOT_BATCH_MAX_BYTES);
         assert!(
             bytes_above - bytes_below < 32,

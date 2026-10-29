@@ -203,3 +203,8 @@ pub(crate) fn indexed_size(index: &ScanIndex, path: &Path) -> Option<u64> {
         .get(&local_index_key(path))
         .map(|entry| entry.size_bytes)
 }
+
+/// Read the actual runtime context for the exact-ACK fixture bridge.
+pub(crate) fn active_upload_context(index: &ScanIndex) -> Option<&str> {
+    index.active_upload_context_fingerprint.as_deref()
+}

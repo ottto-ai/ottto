@@ -383,7 +383,7 @@ impl HistoryFixture {
                         })
                         .map(|item| item.source_session_id.clone()),
                 );
-                let response = super::claude_money_e2_pipeline_tests::ack(items)?;
+                let response = super::claude_money_e2_pipeline_tests::ack(&items)?;
                 response.validate_entity_ack(&SnapshotBatchRequest {
                     schema_version: SNAPSHOT_SCHEMA_VERSION,
                     source: SnapshotSource::ClaudeCode.api_slug().into(),
