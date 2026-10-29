@@ -12,7 +12,8 @@ can affect attribution.
 Before any input or owned capture, the active lease pays the exact head buffer,
 serde string/key scratch growth, bounded captured strings and fixed typed state.
 The decoded graph already has its codec funding. Existing certificate checks
-and held-FD `FileStamp::same_content` fences surround extraction. Real physical
+and held-FD `FileStamp::same_content` fences surround extraction. Map-only typed
+wrappers also keep wrong-shape error messages fixed-size. Real physical
 bytes, including a later refusal, use the existing diagnostics carrier.
 
 Structural refusal differs from transient FIFO contention. On real growth,

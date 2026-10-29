@@ -33,6 +33,33 @@ impl<'de> Deserialize<'de> for Cwd {
     }
 }
 
+/// serde's default struct type error can format the entire rejected string.
+/// Intercept strings at every object boundary; errors stay fixed-size as well
+/// as captures. Unknown map members still use the derived IgnoredAny path.
+#[derive(Default)]
+struct Object<T>(T);
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Object<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct MapOnly<T>(std::marker::PhantomData<T>);
+        impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for MapOnly<T> {
+            type Value = Object<T>;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("content object")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                map: M,
+            ) -> Result<Self::Value, M::Error> {
+                T::deserialize(serde::de::value::MapAccessDeserializer::new(map)).map(Object)
+            }
+            fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> {
+                Err(E::custom("content object shape"))
+            }
+        }
+        d.deserialize_any(MapOnly(std::marker::PhantomData))
+    }
+}
+
 #[derive(Default, Deserialize)]
 struct Fields {
     #[serde(default)]
@@ -41,7 +68,7 @@ struct Fields {
 #[derive(Default, Deserialize)]
 struct Nested {
     #[serde(default)]
-    payload: Fields,
+    payload: Object<Fields>,
 }
 #[derive(Deserialize)]
 struct Row {
@@ -52,11 +79,11 @@ struct Row {
     #[serde(default)]
     workspace: Cwd,
     #[serde(default)]
-    payload: Fields,
+    payload: Object<Fields>,
     #[serde(default)]
-    session_meta: Nested,
+    session_meta: Object<Nested>,
     #[serde(default)]
-    turn_context: Nested,
+    turn_context: Object<Nested>,
     #[serde(default, rename = "type")]
     kind: Cwd,
 }
@@ -89,7 +116,9 @@ impl Decoded {
                     (8 * CWD_CAP
                         + size_of::<Row>()
                         + size_of::<serde_json::Deserializer<serde_json::de::SliceRead<'_>>>()
-                        + size_of::<RederiveReceipt>()) as u64,
+                        + size_of::<RederiveReceipt>()
+                        + size_of::<serde_json::Error>()
+                        + 256) as u64,
                 )
             })
             .ok_or(RederiveUnfunded)
@@ -127,8 +156,9 @@ impl Decoded {
             .iter()
             .rposition(|b| *b == b'\n')
             .map_or(0, |at| at + 1);
-        let row: Row = serde_json::from_slice(&head[start..])
+        let row: Object<Row> = serde_json::from_slice(&head[start..])
             .map_err(|_| Refuse::NotRederivable("workspace_capture"))?;
+        let row = row.0;
         let raw = match self.reduction.accumulator.source {
             SnapshotSource::ClaudeCode => row.cwd.0.or(row.project_path.0).or(row.workspace.0),
             SnapshotSource::Codex => {
@@ -136,12 +166,12 @@ impl Decoded {
                 // apply_codex_owned_line. Hash equality also excludes wrong
                 // ownership/compaction candidates without granting authority.
                 let meta = if row.kind.0.as_deref() == Some("session_meta") {
-                    row.payload.cwd.0.clone()
+                    row.payload.0.cwd.0.clone()
                 } else {
-                    row.session_meta.payload.cwd.0
+                    row.session_meta.0.payload.0.cwd.0
                 };
-                meta.or(row.turn_context.payload.cwd.0)
-                    .or(row.payload.cwd.0)
+                meta.or(row.turn_context.0.payload.0.cwd.0)
+                    .or(row.payload.0.cwd.0)
                     .or(row.cwd.0)
             }
             SnapshotSource::Pi => return Err(Refuse::NotRederivable("workspace_source")),

@@ -1775,3 +1775,29 @@ fn bounded_workspace_cap_and_escaped_text_keep_native_values_or_refuse() {
         Some(PathBuf::from("/tmp/abc"))
     );
 }
+
+#[test]
+fn workspace_wrong_object_shapes_refuse_without_formatting_the_input() {
+    let scratch = Scratch::new("workspace-shape-error");
+    for field in ["payload", "session_meta", "turn_context"] {
+        let path = scratch.write(
+            "wrong-shape",
+            &[json!({"type":"progress", "cwd":"/tmp/synthetic",
+            field: "\u{0080}".repeat(100_000)})
+            .to_string()],
+        );
+        let (native, _) = full_read(&path, SnapshotSource::ClaudeCode);
+        let body = encode(&native, crate::durable_tail_store::BODY_BYTES, line_cap()).unwrap();
+        let mut decoded = decode(&body, SnapshotSource::ClaudeCode).unwrap();
+        decoded.rederive = Rederive {
+            workspace: decoded.rederive.workspace,
+            ..Default::default()
+        };
+        assert!(decoded.rederive.workspace.is_some());
+        decoded.content_charge().unwrap();
+        assert!(matches!(
+            decoded.rederive_content(&File::open(&path).unwrap()),
+            Err(Refuse::NotRederivable("workspace_capture"))
+        ));
+    }
+}
