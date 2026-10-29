@@ -337,7 +337,7 @@ impl GroupBoot {
         }
         if self.headers.len() < n {
             let member = &self.group.members[self.headers.len()];
-            let Ok((bytes, _, read)) = read_header_bytes(member) else {
+            let Ok((bytes, _, read, _)) = read_header_bytes(member) else {
                 return Boot::Strict;
             };
             self.charge = self.charge.saturating_add(read as u64);
@@ -1196,7 +1196,7 @@ fn open_member(
     if last && paged {
         // The live member may have grown since boot; its line 0 must not
         // have changed (TOCTOU), and its object is fenced below.
-        let (bytes, _, read) = read_header_bytes(&member).map_err(|_| GroupEnd::Changed)?;
+        let (bytes, _, read, _) = read_header_bytes(&member).map_err(|_| GroupEnd::Changed)?;
         group.charge = group.charge.saturating_add(read as u64);
         if format!("{:x}", Sha256::digest(&bytes)) != group.digests[position] {
             return Err(GroupEnd::Changed);

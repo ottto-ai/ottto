@@ -27101,7 +27101,10 @@ impl OwnedSourceScan {
             }
             if source == SnapshotSource::Codex && !codex_join_prepared {
                 if let Some(inventory) = codex_join_inventory.as_mut() {
-                    if !inventory.step(&codex_title_metadata) {
+                    if !inventory.step_cached(
+                        &codex_title_metadata,
+                        sampling.as_ref().map(|context| context.cache.as_ref()),
+                    ) {
                         pending!();
                     }
                     let selected = identified_candidates
@@ -31698,6 +31701,8 @@ impl OwnedSourceScan {
             }
             match decision {
                 CandidateDecision::Skip => {
+                    #[cfg(feature = "replay-harness")]
+                    resource_probe.index_reuse_skip();
                     if let Some(phase) = native_comparison.as_mut() {
                         if let Some(credit) = capture_credit.as_deref_mut() {
                             phase.record_actual_skip_paid(
