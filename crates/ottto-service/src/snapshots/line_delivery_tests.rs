@@ -2003,7 +2003,10 @@ fn ld2_singleton_job_carries_one_begin_and_end_across_real_cursor_pages() {
 fn ld2_paused_overlong_line_uses_the_same_buffer_and_waits_for_newline() {
     let root = Root::new("ld2-partial");
     let path = root.file(SESSION);
-    append(&path, b"12345678901234567890\n{}\n");
+    // Exceed the native plain reader's 8 KiB buffer: a newline in its first
+    // fill would complete the line before the chunked skip can yield.
+    let overlong = vec![b'x'; 32 * 1024];
+    append(&path, &[overlong, b"\n{}\n".to_vec()].concat());
     let trace = Arc::new(Mutex::new(ManifestTrace::default()));
     let manifest = root.0.join("manifest.json");
     let scan = new_scan(&root.projects(), ScanIndex::default())
@@ -2017,6 +2020,11 @@ fn ld2_paused_overlong_line_uses_the_same_buffer_and_waits_for_newline() {
     first.begin_armed(&mut active, &scan.roots);
     assert!(!first.step(&mut active).unwrap());
     assert!(active.parser.reader.consumed_bytes() > 0);
+    assert!(active.parser.reader.consumed_bytes() < 32 * 1024);
+    assert!(
+        active.parser.reader.skipping.is_some(),
+        "must really park inside the skip"
+    );
     assert_eq!(active.parser.reader.last_complete_line_end(), 0);
     assert_eq!(trace.lock().unwrap().lines, 0);
     first.pause(&mut active);
@@ -2030,7 +2038,7 @@ fn ld2_paused_overlong_line_uses_the_same_buffer_and_waits_for_newline() {
     finish(scan);
     let trace = trace.lock().unwrap();
     assert_eq!(trace.lines, 2);
-    assert_eq!(trace.last_end, 24);
+    assert_eq!(trace.last_end, fs::metadata(&path).unwrap().len());
     assert_eq!(trace.ends.len(), 1);
     assert!(trace.ends[0].is_complete());
 }

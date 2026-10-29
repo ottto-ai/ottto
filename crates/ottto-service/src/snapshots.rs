@@ -34741,8 +34741,10 @@ fn apply_physical_line(
             None
         }
     };
+    // Both consumers borrow the same parsed container; moving Value between
+    // callbacks would change its address despite retaining the same payload.
+    let value = value.as_ref();
     if let Some((length, end, tap)) = deliver {
-        let value = value.as_ref();
         tap(
             length,
             &line_delivery::PhysicalLine {
@@ -34755,7 +34757,7 @@ fn apply_physical_line(
         );
     }
     if let Some(value) = value {
-        on_value(&value);
+        on_value(value);
     }
 }
 
