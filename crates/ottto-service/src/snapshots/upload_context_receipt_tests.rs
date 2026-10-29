@@ -1267,3 +1267,89 @@ fn real_scan_oversized_context_unit_gets_all_fresh_acks_without_reparse() {
             <= crate::snapshot_sync::SNAPSHOT_BATCH_MAX_BYTES));
     f.assert_quiet();
 }
+
+#[test]
+fn real_scan_ordinary_codex_group_precedes_context_group_under_read_cap() {
+    let (root, _) = codex_file_join::tests::counting_v2_fixture();
+    let _cutover = codex_counting_version::TestCutover::set(0);
+    let mut f = Fixture::new(SnapshotSource::Codex);
+    fs::remove_file(&f.path).unwrap();
+    for (name, original, other) in [
+        ("a", "a", false),
+        ("b", "b", false),
+        ("c", "a", true),
+        ("d", "b", true),
+    ] {
+        let mut body = fs::read_to_string(root.join("sessions").join(format!("{original}.jsonl")))
+            .unwrap()
+            .replace("2026-10-01", "2026-10-29");
+        if other {
+            body = body.replace(
+                "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+                "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            );
+        }
+        fs::write(f.root.join(format!("{name}.jsonl")), body).unwrap();
+    }
+    fs::remove_dir_all(root).unwrap();
+    f.path = f.root.join("a.jsonl");
+    let previous = f.index.clone();
+    let (scan, _) = f.walk(true);
+    assert_eq!(scan.scanned_file_count, 4);
+    f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
+    assert_eq!(
+        f.uploader
+            .send(f.source, &mut f.index, &previous, &scan.snapshots)
+            .unwrap()
+            .0,
+        4
+    );
+    let path = f.root.join("d.jsonl");
+    let mut changed = fs::read_to_string(&path).unwrap();
+    changed.push(' '); // physical growth forces the joined unit's ordinary read
+    fs::write(&path, changed).unwrap();
+    let limit = ["c", "d"]
+        .iter()
+        .map(|name| {
+            fs::metadata(f.root.join(format!("{name}.jsonl")))
+                .unwrap()
+                .len()
+        })
+        .sum();
+    f.index
+        .activate_file_upload_context(f.source, "e".repeat(64));
+    f.cache = Arc::default();
+    let previous = f.index.clone();
+    let ((scan, _), order) = upload_context_read::with_read_limit(limit, || f.walk(true));
+    assert!(
+        order
+            .first()
+            .is_some_and(|path| path.ends_with("c.jsonl") || path.ends_with("d.jsonl")),
+        "changed group goes before lexically earlier context-only group"
+    );
+    assert_eq!(scan.scanned_file_count, 2);
+    f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
+    assert_eq!(
+        f.uploader
+            .send(f.source, &mut f.index, &previous, &scan.snapshots)
+            .unwrap()
+            .0,
+        2
+    );
+    f.cache = Arc::default();
+    let previous = f.index.clone();
+    let (scan, _) = f.walk(true);
+    assert_eq!(
+        scan.scanned_file_count, 2,
+        "deferred context group continues next pass"
+    );
+    f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
+    assert_eq!(
+        f.uploader
+            .send(f.source, &mut f.index, &previous, &scan.snapshots)
+            .unwrap()
+            .0,
+        2
+    );
+    f.assert_quiet();
+}

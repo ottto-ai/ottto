@@ -127,6 +127,9 @@ impl Budget {
         self.admitted.extend(keys);
         true
     }
+    pub(super) fn is_admitted(&self, candidate: &CandidateFile) -> bool {
+        self.admitted.contains(&local_index_key(&candidate.path))
+    }
     pub(super) fn defer(&mut self, candidate: CandidateFile) {
         self.deferred.push(candidate);
     }
@@ -149,7 +152,7 @@ impl Budget {
                 }
             });
         }
-        if self.admitted.contains(&key) || index.context_only_read(candidate) {
+        if self.admitted.contains(&key) {
             if first {
                 index.context_read_counts.files += 1;
             }
@@ -215,3 +218,21 @@ pub(super) fn with_read_limit<T>(limit: u64, f: impl FnOnce() -> T) -> (T, Vec<P
 }
 crate::heap_layout_bound::fields!(LocalCounts; files, local_bytes, wire_allowance);
 crate::heap_layout_bound::fields!(Budget; native_limit, native_read, native_reserved, wire_reserved, admitted, read_files, cursor_ordinary_charged, deferred);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn context_cursor_room_excludes_prior_ordinary_native_bytes() {
+        let mut budget = Budget::new(SnapshotSource::Codex);
+        budget.native_read = 1024;
+        let mut page = sampled_scan::codex_cursor::PageBudget::default();
+        budget.charge_cursor_ordinary(&mut page);
+        let limits = sampled_scan::codex_cursor::Limits::current();
+        page.charge(true, limits.singleton() - 1025);
+        assert!(!page.cursor_exhausted(limits));
+        page.charge(true, 1);
+        assert!(page.cursor_exhausted(limits));
+        budget.charge_cursor_ordinary(&mut page); // charged only once
+    }
+}

@@ -27840,10 +27840,30 @@ impl OwnedSourceScan {
                         }
                     }
                 }
+                if index.file_upload_context_enabled {
+                    codex_join_groups
+                        .make_contiguous()
+                        .sort_by_cached_key(|group| {
+                            group
+                                .members
+                                .iter()
+                                .all(|candidate| index.context_only_read(candidate))
+                        });
+                }
                 codex_join_prepared = true;
                 pending!();
             }
             if let Some(mut boot) = codex_join_active.take() {
+                if boot
+                    .group
+                    .members
+                    .iter()
+                    .any(|candidate| context_read_budget.is_admitted(candidate))
+                {
+                    // The group's cursor shares the room left by ordinary
+                    // native reads, just like a singleton or resumed cursor.
+                    context_read_budget.charge_cursor_ordinary(&mut codex_page);
+                }
                 // R2-N2: a group larger than the singleton budget asks for
                 // the cursor before its first header read; one that would
                 // wait (or is fenced) reads no header or probe this page.
@@ -28251,6 +28271,13 @@ impl OwnedSourceScan {
                                     && index.candidate_decision_with_reason(candidate).0
                                         == CandidateDecision::Parse
                             }))
+                        && (!index.file_upload_context_enabled
+                            || !codex_join_groups.iter().any(|group| {
+                                group
+                                    .members
+                                    .iter()
+                                    .any(|candidate| !index.context_only_read(candidate))
+                            }))
                         && codex_page.claim_resume()
                 }) {
                     // Continuing the paused job is the highest scheduling class.
@@ -28346,10 +28373,15 @@ impl OwnedSourceScan {
             // the next group is a re-read.
             let rereads_wait = || {
                 codex_join_groups.front().is_some_and(|group| {
-                    !sampled_scan::codex_cursor::census_member(
-                        &codex_selected_flags,
-                        group.members.iter().map(|member| member.path.as_path()),
-                    )
+                    (!index.file_upload_context_enabled
+                        || group
+                            .members
+                            .iter()
+                            .all(|candidate| index.context_only_read(candidate)))
+                        && !sampled_scan::codex_cursor::census_member(
+                            &codex_selected_flags,
+                            group.members.iter().map(|member| member.path.as_path()),
+                        )
                 }) && identified_candidates.iter().any(|candidate| {
                     sampled_scan::codex_cursor::selected_census_member(
                         &codex_selected_flags,
