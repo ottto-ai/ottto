@@ -4054,7 +4054,8 @@ fn admit_locked(
             cursor.headers = headers;
             return false;
         }
-        drop(headers);
+        cursor.headers = headers;
+        cursor.headers.clear();
     }
     if admitter == Admitter::Proof {
         debug_assert!(!mandatory, "a proof admission is never mandatory");

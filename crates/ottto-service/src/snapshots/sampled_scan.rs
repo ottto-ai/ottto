@@ -175,7 +175,7 @@ impl SharedCache {
         } else {
             record(Event::ClearPoisonedLock);
         }
-        self.with_cursor(|cursor| cursor.headers = codex_file_join::HeaderCache::default());
+        self.with_cursor(|cursor| cursor.headers.clear());
     }
     /// M1: evict retained copies in victim order until they fit the state
     /// budget beside the cursor state and `pinned` bytes, measured under
