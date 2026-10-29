@@ -136,6 +136,7 @@ fn replay_revisions_and_applied_markers_bind_without_changing_the_allowlist() {
             &scope,
             index,
             &interpretation,
+            None,
         )
         .unwrap()
         .binding
@@ -281,6 +282,7 @@ fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
             &scope,
             &index,
             &interpretation,
+            None,
         )
         .unwrap()
         .binding;
@@ -432,6 +434,7 @@ fn attribution_capture_toggle_refuses_the_previous_claude_record() {
             &scope,
             &index,
             &interpretation,
+            None,
         )
         .unwrap()
         .binding;
@@ -465,6 +468,7 @@ fn attribution_capture_toggle_refuses_the_previous_claude_record() {
             &scope,
             &index,
             &after,
+            None,
         )
         .unwrap()
         .binding;
@@ -1989,7 +1993,7 @@ fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites(
             index.save(&index_path).unwrap();
             let interp = Interpretation::of(source, &key, &index, false, &namespace);
             let ds = durable_source(source).unwrap();
-            let mut binding = expected(ds, source, &key, &scope, &index, &interp)
+            let mut binding = expected(ds, source, &key, &scope, &index, &interp, None)
                 .unwrap()
                 .binding;
             binding.scope = scope_for(
@@ -2078,7 +2082,7 @@ fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites(
                     Err(std::io::Error::other("injected"))
                 })));
                 let mut v2 = pending.clone();
-                v2.binding = expected(ds, source, &key, &scope, &index, &interp)
+                v2.binding = expected(ds, source, &key, &scope, &index, &interp, None)
                     .unwrap()
                     .binding;
                 let mut disk_store = DurableTailStore::new(dir.clone(), ds);
@@ -2092,7 +2096,7 @@ fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites(
                 // An ordinary replacement may exceed an unchanged record/store
                 // budget. It must not delete the still-authoritative v1 image.
                 let mut over_budget = pending.clone();
-                over_budget.binding = expected(ds, source, &key, &scope, &index, &interp)
+                over_budget.binding = expected(ds, source, &key, &scope, &index, &interp, None)
                     .unwrap()
                     .binding;
                 over_budget.body.resize(store::RECORD_BYTES, 0);
@@ -2192,6 +2196,7 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
                 &scope,
                 &index,
                 &interpretation,
+                Some((1, codec::allowlist_digest(source))),
             )
             .unwrap()
             .binding,
@@ -2220,7 +2225,7 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
             ReadOutcome::Found(r) => r,
             other => panic!("{other:?}"),
         };
-        assert_eq!(store.representation(&pending.binding.key).unwrap().0, 1);
+        assert_eq!(old.format, 1);
         let fact = codec::decode(&old.record.body, source)
             .unwrap()
             .counting()
@@ -2266,10 +2271,7 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
                 ReadOutcome::Found(r) => r,
                 other => panic!("{other:?}"),
             };
-            assert_eq!(
-                store.representation(&next.record.binding.key).unwrap().0,
-                store::FORMAT_VERSION
-            );
+            assert_eq!(next.format, store::FORMAT_VERSION);
             let restart = SharedCache::default();
             restart.durable_begin_pass(source, &index_path, &namespace, false);
             let second = restart
@@ -2290,10 +2292,17 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
             let _new_cutover = TestCutover::set(1);
             let changed = Interpretation::of(source, &key, &index, false, &namespace);
             let mut disagreement = pending.clone();
-            disagreement.binding =
-                expected(DurableSource::Codex, source, &key, &scope, &index, &changed)
-                    .unwrap()
-                    .binding;
+            disagreement.binding = expected(
+                DurableSource::Codex,
+                source,
+                &key,
+                &scope,
+                &index,
+                &changed,
+                Some((1, pending.allowlist)),
+            )
+            .unwrap()
+            .binding;
             std::fs::write(
                 &disk,
                 store::tests::pinned_v1_bytes(&disagreement, index.generation),
@@ -2684,6 +2693,7 @@ fn compressed_record_refuses_before_certificate_restore_or_body_decode() {
     };
     let record = store::DurableRecord {
         envelope_audit_debt: None,
+        format: store::FORMAT_VERSION,
         record: PendingRecord {
             binding,
             certificate: certificate(&plain, &scope),
@@ -2768,9 +2778,9 @@ fn scope_for(
     format: u16,
     allowlist: &store::Digest32,
 ) -> store::Digest32 {
-    assert_eq!(format, 1);
     store::replay_scope_digest(
-        &store::scope_digest(
+        &store::scope_digest_for(
+            format,
             &scope.0,
             allowlist,
             &interpretation.identity_contract,
@@ -3124,6 +3134,7 @@ fn a_permit_era_record_restores_under_the_always_on_capture() {
         &scope,
         &index,
         &before,
+        None,
     )
     .unwrap()
     .binding;

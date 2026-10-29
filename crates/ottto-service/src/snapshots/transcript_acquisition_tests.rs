@@ -3714,10 +3714,7 @@ fn pinned_v1_bootstrap_ordinary_save_then_second_restart_tails_without_a_full() 
             "actual post-save adapter takes CURRENT index debt"
         );
         assert_eq!(record.record.certificate.audit_debt_unix_seconds, None);
-        assert_eq!(
-            disk.representation(&record.record.binding.key).unwrap().0,
-            crate::durable_tail_store::FORMAT_VERSION
-        );
+        assert_eq!(record.format, crate::durable_tail_store::FORMAT_VERSION);
         drop(second);
         fixture.file.append(&usage(source, 160, 2, "fixture-model"));
         let third = Arc::new(sampled_scan::SharedCache::default());

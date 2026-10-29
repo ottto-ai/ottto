@@ -27546,11 +27546,20 @@ impl OwnedSourceScan {
                     }
                 }
                 #[cfg(unix)]
-                if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
+                if let (Some(cache), Some(group)) = (
+                    durable_guard.as_ref().and_then(std::sync::Weak::upgrade),
+                    job.group.as_mut(),
+                ) {
+                    // Each member's missing-carrier deadline rides with the
+                    // job across pause and defer to its own native entry.
                     if let Some((member, reason)) = group_members.iter().find_map(|member| {
-                        cache
-                            .durable_full_hold(source, &local_index_key(&member.path), true)
-                            .map(|reason| (member, reason))
+                        let mut due = None;
+                        let key = local_index_key(&member.path);
+                        let held = cache.durable_member_hold(source, &key, index, &mut due);
+                        if let Some(at) = group.members.iter().position(|m| m.path == member.path) {
+                            group.recovered[at] = due;
+                        }
+                        held.map(|reason| (member, reason))
                     }) {
                         cache.durable_hold_exit(source, reason, index, member, &mut census);
                         pending!();
@@ -28377,9 +28386,10 @@ impl OwnedSourceScan {
                     group,
                     side_origin,
                 } = *active;
-                if let Some(mut group) = group {
+                let member_dues = group.map_or_else(Vec::new, |mut group| {
                     codex_legacy_join_baselines.extend(group.take_legacy_baselines());
-                }
+                    std::mem::take(&mut group.recovered)
+                });
                 let mut parser = parser;
                 // The repository identity X_out measured, if any (#665 U3).
                 let mut measured_repository_identity = None;
@@ -29813,6 +29823,41 @@ impl OwnedSourceScan {
                         entry.codex_counting_v2 = codex_counting_v2;
                         entry.codex_counting_owner = counting_owner.clone();
                     }
+                    // Each grouped member, aliases included, settles its own
+                    // recovered debt on its native-created entry: unverified
+                    // stages the existing marker; verified retires and counts.
+                    for (member, &due) in aliases.iter().zip(&member_dues) {
+                        let key = local_index_key(&member.path);
+                        let marked = index
+                            .files
+                            .get(&key)
+                            .and_then(ScanIndexEntry::unverified_deadline);
+                        let staged = !source_verified
+                            && due.is_some_and(|due_unix_seconds| {
+                                index.stage_sampled_audit(
+                                    &key,
+                                    &member.source_file_fingerprint,
+                                    crate::transcript_acquisition::AuditDebt { due_unix_seconds },
+                                )
+                            });
+                        if let Some(context) = sampling.as_mut() {
+                            if let Some(owed) = marked.or(due).filter(|_| source_verified) {
+                                context.complete_audit(owed);
+                            }
+                            #[cfg(unix)]
+                            for (counted, class) in [
+                                (due.is_some(), "audit_carrier"),
+                                (
+                                    staged && marked.is_none(),
+                                    "audit_carrier_staged_unverified",
+                                ),
+                            ] {
+                                if counted {
+                                    context.cache.durable_note_carrier(class);
+                                }
+                            }
+                        }
+                    }
                     // Native settlement accepts disclosed terminal row loss, even
                     // though that acquisition cannot certify a verified prefix.
                     // Its sampled publication still owes the prepared deadline;
@@ -29851,7 +29896,9 @@ impl OwnedSourceScan {
                                 context.audit_slots = context.audit_slots.saturating_sub(1);
                                 #[cfg(unix)]
                                 if recovered_audit_due.is_some() && !source_verified {
-                                    context.cache.durable_note_audit_staged();
+                                    context
+                                        .cache
+                                        .durable_note_carrier("audit_carrier_staged_unverified");
                                 }
                             }
                         }

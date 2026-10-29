@@ -245,6 +245,7 @@ impl<'a> Interpretation<'a> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn expected(
     source: DurableSource,
     snapshot_source: SnapshotSource,
@@ -252,6 +253,7 @@ fn expected(
     scope: &Scope,
     index: &ScanIndex,
     interpretation: &Interpretation<'_>,
+    representation: Option<(u16, store::Digest32)>,
 ) -> Option<Expected> {
     let entry = index.files.get(key)?;
     Some(Expected {
@@ -262,7 +264,14 @@ fn expected(
                 &interpretation.namespace.0,
                 index.active_upload_context_fingerprint.as_deref(),
             ),
-            scope: replay_scope(snapshot_source, scope, index, interpretation, None),
+            scope: replay_scope_for(
+                snapshot_source,
+                scope,
+                index,
+                interpretation,
+                None,
+                representation,
+            ),
             entry: store::replay_entry_digest(
                 &store::entry_digest(
                     &entry.source_file_fingerprint,
@@ -320,12 +329,26 @@ fn replay_scope(
     interpretation: &Interpretation<'_>,
     replay: Option<Obligation>,
 ) -> store::Digest32 {
+    replay_scope_for(source, scope, index, interpretation, replay, None)
+}
+
+fn replay_scope_for(
+    source: SnapshotSource,
+    scope: &Scope,
+    index: &ScanIndex,
+    interpretation: &Interpretation<'_>,
+    replay: Option<Obligation>,
+    representation: Option<(u16, store::Digest32)>,
+) -> store::Digest32 {
+    let (format, allowlist) =
+        representation.unwrap_or_else(|| (store::FORMAT_VERSION, codec::allowlist_digest(source)));
     let body_revision = replay.filter(|row| row.kind == ObligationKind::BodyWitness);
     let money_rule = replay.filter(|row| row.kind == ObligationKind::MoneyRule);
     store::replay_scope_digest(
-        &store::scope_digest(
+        &store::scope_digest_for(
+            format,
             &scope.0,
-            &codec::allowlist_digest(source),
+            &allowlist,
             &interpretation.identity_contract,
             &interpretation.counting_view,
         ),
@@ -558,12 +581,41 @@ impl SharedCache {
         held
     }
 
-    pub(crate) fn durable_note_audit_staged(&self) {
+    /// `audit_carrier` (recovered miss) or `audit_carrier_staged_unverified`.
+    pub(crate) fn durable_note_carrier(&self, class: &'static str) {
         if let Some(mut stores) = self.durable() {
-            Counters::bump(
-                &mut stores.counters.ineligible,
-                "audit_carrier_staged_unverified",
-            );
+            Counters::bump(&mut stores.counters.ineligible, class);
+        }
+    }
+
+    /// A grouped member's `durable_full_hold` at job start, also taking its
+    /// once-clamped live-context missing-carrier deadline (Addendum 6). The
+    /// group settlement counts it once per member that publishes.
+    pub(crate) fn durable_member_hold(
+        &self,
+        snapshot_source: SnapshotSource,
+        key: &str,
+        index: &ScanIndex,
+        recovered_audit_due: &mut Option<u64>,
+    ) -> Option<store::Refusal> {
+        let source = durable_source(snapshot_source)?;
+        let mut stores = self.durable()?;
+        let slot = stores.slot(source).as_mut()?;
+        let live_context = store::context_digest(
+            &slot.namespace.0,
+            index.active_upload_context_fingerprint.as_deref(),
+        );
+        match slot.store.full_guard(
+            &store::key_digest(source, key),
+            true,
+            index.files.contains_key(key),
+            &live_context,
+        ) {
+            Ok(due) => {
+                *recovered_audit_due = due.map(|due| due.min(super::now_seconds()));
+                None
+            }
+            Err(reason) => Some(reason),
         }
     }
 
@@ -739,8 +791,16 @@ impl SharedCache {
             return Err(MissClass::AuditCarrier);
         }
         index.files.get(key).ok_or(MissClass::NoEntry)?;
-        let expected = expected(source, snapshot_source, key, scope, index, interpretation)
-            .ok_or(MissClass::NoEntry)?;
+        let expected = expected(
+            source,
+            snapshot_source,
+            key,
+            scope,
+            index,
+            interpretation,
+            Some((record.format, record.record.allowlist)),
+        )
+        .ok_or(MissClass::NoEntry)?;
         let restored =
             self.durable_restore_record(snapshot_source, &record, &expected, path, scope, held);
         // Registry probes include allowlist hashing; keep them outside Stores.
@@ -962,6 +1022,7 @@ impl SharedCache {
                     retained.checkpoint.scope(),
                     index,
                     &interpretation,
+                    None,
                 ) else {
                     continue;
                 };
@@ -1085,9 +1146,17 @@ impl SharedCache {
                         identity_capture,
                         namespace,
                     );
-                    slot.store.representation(&digest)?;
-                    expected(source, snapshot_source, key, scope, index, &interpretation)
-                        .map(|expected| expected.binding.scope)
+                    let representation = slot.store.representation(&digest)?;
+                    expected(
+                        source,
+                        snapshot_source,
+                        key,
+                        scope,
+                        index,
+                        &interpretation,
+                        Some(representation),
+                    )
+                    .map(|expected| expected.binding.scope)
                 });
                 keep.insert(digest, scope);
             }
