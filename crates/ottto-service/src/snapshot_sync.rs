@@ -5726,7 +5726,6 @@ fn prepare_sync_source(
     result
 }
 
-#[allow(clippy::too_many_arguments)]
 fn register_line_observers(
     mut scan: crate::snapshots::OwnedSourceScan,
     source: SnapshotSource,
@@ -5746,6 +5745,7 @@ fn register_line_observers(
     scan
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_sync_source_inner(
     client: &SnapshotApiClient,
     device: &LocalDeviceBinding,
