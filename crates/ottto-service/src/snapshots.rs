@@ -27570,7 +27570,6 @@ impl OwnedSourceScan {
                         )
                     });
                     let mut ordinary_singleton_slots = None;
-                    let mut context_group_admitted = false;
                     for (own, group) in groups {
                         if group
                             .members
@@ -27793,7 +27792,6 @@ impl OwnedSourceScan {
                             continue;
                         }
                         if !fenced {
-                            context_group_admitted |= context_group;
                             used += group.members.len();
                             if own {
                                 // Nothing else joins its page.
@@ -27873,7 +27871,8 @@ impl OwnedSourceScan {
                         && used + identified_candidates.len() > file_limit
                     {
                         // G1: re-reads leave before any census member.
-                        let context_evict = context_group_admitted
+                        let context_evict = index
+                            .file_upload_context_enabled
                             .then(|| {
                                 let disposable = |candidate: &CandidateFile| {
                                     index.context_only_read(candidate)

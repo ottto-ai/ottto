@@ -243,3 +243,8 @@ wire bytes charge each actual POST attempt. Settled receipt groups take the norm
 candidate skip path so unchanged aliases stop reparsing on subsequent relists;
 ordinary recovery gates and protected census assertions remain intact. No local
 Cargo tests; all-target wrapper clippy and Linux CI provide validation.
+
+Focused review also caught a settled-skip alias displacing an ordinary singleton
+beside an ordinary group. Disposable context/skip entries now leave first whenever
+receipt mode is active, preserving existing census preference within each class.
+A portable three-slot fixture covers that exact group/skip/singleton combination.

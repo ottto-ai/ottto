@@ -1558,3 +1558,89 @@ fn real_scan_new_unhinted_singleton_precedes_context_group_at_file_limit_two() {
 fn real_scan_same_size_rewrite_precedes_context_group_at_file_limit_two() {
     ordinary_singleton_precedes_context_group(true);
 }
+
+#[test]
+fn real_scan_settled_alias_cannot_evict_an_ordinary_singleton_beside_ordinary_group() {
+    let (root, _) = codex_file_join::tests::counting_v2_fixture();
+    let _cutover = codex_counting_version::TestCutover::set(0);
+    let mut f = Fixture::new(SnapshotSource::Codex);
+    let singleton = f.root.join("z.jsonl");
+    let body = fs::read(&f.path).unwrap();
+    fs::remove_file(&f.path).unwrap();
+    for (name, original, other) in [
+        ("a", "a", false),
+        ("b", "b", false),
+        ("c", "a", true),
+        ("d", "b", true),
+    ] {
+        let mut body = fs::read_to_string(root.join("sessions").join(format!("{original}.jsonl")))
+            .unwrap()
+            .replace("2026-10-01", "2026-10-29");
+        if other {
+            body = body.replace(
+                "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+                "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            );
+        }
+        fs::write(f.root.join(format!("{name}.jsonl")), body).unwrap();
+    }
+    fs::remove_dir_all(root).unwrap();
+    let previous = f.index.clone();
+    let (scan, _) = f.walk(true);
+    f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
+    assert_eq!(
+        f.uploader
+            .send(f.source, &mut f.index, &previous, &scan.snapshots)
+            .unwrap()
+            .0,
+        4
+    );
+    // A remains receipt-settled. B has ordinary physical work; z is new.
+    fs::write(&singleton, body).unwrap();
+    let d = f.root.join("d.jsonl");
+    let mut body = fs::read(&d).unwrap();
+    body.push(b' ');
+    fs::write(d, body).unwrap();
+    f.index.traversal = None;
+    ensure_bounded_traversal(
+        f.source,
+        std::slice::from_ref(&f.root),
+        &mut f.index,
+        "2026-10-29T12:00:00Z",
+        BACKFILL_WINDOW_DAYS,
+    );
+    let traversal = f.index.traversal.as_mut().unwrap();
+    advance_bounded_directory_traversal(f.source, traversal, BACKFILL_WINDOW_DAYS, &f.index.files);
+    traversal
+        .pending_candidates
+        .make_contiguous()
+        .sort_by_key(
+            |pending| match pending.path.file_stem().and_then(|name| name.to_str()) {
+                Some("a") => 0,
+                Some("c") => 1,
+                Some("z") => 2,
+                _ => 3,
+            },
+        );
+    f.cache = Arc::default();
+    let previous = f.index.clone();
+    let ((scan, _), reads) =
+        terminal_contract_retry::source_acquisitions(|| f.walk_with_file_limit(true, 3));
+    assert_eq!(scan.scanned_file_count, 3);
+    assert_eq!(
+        reads,
+        ["c", "d", "z"]
+            .into_iter()
+            .map(|name| (f.root.join(format!("{name}.jsonl")), 1))
+            .collect()
+    );
+    f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
+    let first = f.uploader.posts.len();
+    f.uploader
+        .send(f.source, &mut f.index, &previous, &scan.snapshots)
+        .unwrap();
+    assert!(f.uploader.posts[first..]
+        .iter()
+        .flatten()
+        .any(|item| item["source_session_id"] == SESSION));
+}
