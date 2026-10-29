@@ -54,6 +54,10 @@ pub(crate) enum CodexZstCause {
     ParserStateRequired,
     #[serde(rename = "CompressedHeaderInvalid")]
     HeaderInvalid,
+    #[serde(rename = "decode_budget")]
+    DecodeBudget,
+    #[serde(rename = "admission_starved")]
+    AdmissionStarved,
     #[doc(hidden)]
     #[serde(skip)]
     __Count,
@@ -1363,6 +1367,8 @@ mod tests {
             DecodedOverLimit,
             ParserStateRequired,
             HeaderInvalid,
+            DecodeBudget,
+            AdmissionStarved,
         ];
         assert_eq!(ALL.len(), super::CODEX_ZST_CAUSES);
         for (index, cause) in ALL.iter().enumerate() {

@@ -991,44 +991,63 @@ still have main's index-reset recovery gap there; the paired completion closes
 it for every member/alias. Both parts must ship in the same release, in order;
 the first is not a standalone recovery-complete release.
 
-Archive disposition stays `pending` until the final body is ACK-settled.
+Archive disposition stays `pending` until exact current-body ACK settlement.
 Each admitted attempt clears its own body witness; only successful output
-finalization binds a new witness. Carried body facts and old ACKs cannot settle
-a failed current attempt. Prior native archive coverage uses its validated
-logical id, including while a later attempt is pending, so quiet scans preserve
-the exclusive token/model breakdown instead of replacing it with a state total.
-The pending attempt count and deadline are checkpointed through the existing
-scan/sync checkpoint hook before any decoder read. Save failure releases the decoder and
-restores committed evidence; restart retains the six-hour/three-attempt bound.
-The in-process permission to read is never serialized and grants no ACK authority.
-Pending evidence carries a retry deadline: at most one first-read re-decode per
-six hours. Each retry increments `codex_zst_first_read_retry` on the same carrier;
-its decoded bytes are included above. Three failed settlements hold the archive
-with counted cause `CompressedSettlementStuck`; no empty or zero-cost body is
-substituted. Settled, empty, held and refused stamps remain quiet until content
-changes. Decoder safety-net release emits `codex_zst_owner.counts.leaked_release`;
-normal completion and error paths release explicitly after any Stores guard.
+finalization binds a new witness. Old body facts/ACKs cannot settle a failed
+current attempt. Validated logical-id coverage preserves the accepted token/model
+breakdown during quiet pending scans. No empty or zero-cost replacement is made.
+The existing scan/sync checkpoint persists the reservation before any decode;
+save failure closes the decoder, restores committed evidence and emits no retry
+or retry alarm. Read permission is process-local and grants no ACK authority.
 
-Main-scan archive refusals, held results and pending attempts without a current
-body also increment the unreadable census,
-including unchanged stamps skipped without a decoder. Admission refusal is a
-transient yield: it consumes no attempt or retry counter and changes no evidence.
-Only frame/checksum/truncation, decoded-limit and owner failures are sticky.
-Read/identity I/O, expired launch evidence and parent-pending/deferred output stay
-pending under the same six-hour/three-attempt bound. Over-limit decoded bytes are
-reported by `codex_zst_decoded_bytes`; unknown/stuck money is never reported as $0.
+The first body acquisition is A1. Further first-read recovery is the named
+`codex_zst_first_read_retry` EXCEPTION to one A1 per object, **Lead A approved
+2026-10-29**, until **11b-1b resume from retained acquisition** replaces it.
+There is no retained acquisition/output resume on this prerequisite head.
+An unchanged stamp permits at most six committed decode reservations total,
+including reservations interrupted before bytes, with six-hour retry deadlines.
+Three DURABLY RECORDED terminal upload failures stop recovery; Completed without
+the current body ACK and Rejected are terminal, while Shed/Deferred/transport
+errors are not. Terminal outcomes increment in RAM and may be lost before the
+next index save. Repeated crashes there can reach Stuck(`decode_budget`) instead
+of Stuck(`CompressedSettlementStuck`), never more than six A1/recovery decodes.
+Stuck retains accepted money, stale/unknown, never $0. An exact current-body ACK
+can revive either settlement hold. No counter resets on ordinary retry/restart.
 
-`codex_zst_input` and `codex_zst_first_read_retry` are the A1 FirstRead accounting
-for archives, including recovery reads, and are not generic Full rereads. A retry
-is counted only after funding succeeds. A changed same-content stamp resets to
-attempt 1; Stuck never retries without a stamp change. Pending(3) from an
-interrupted upload becomes Stuck at the third attempt’s first unsettled finish,
-or the next due admission after a crash, without another decode or invented ACK. LD observers see each admitted recovery delivery and
-must deduplicate their derived results by the opened object.
+For under-cap compressed size C and decoded size D, body attempts together read
+at most 6C physical / 6D decoded bytes per stamp (over-limit probes add at most one
+decoded byte per attempt); header work has its separate bounds below. Changing
+content stamps starts a new budget; evidence retirement is outside this bound.
+Approved activation requires ≤1 GiB per catch-up decode, real AC/utility QoS and
+≤10% of one core pacing. This prerequisite still uses the 2 GiB Codex decoder
+ceiling and has no production pacing; discovery stays OFF until 11b-1a/1b close
+both gaps. These future limits are not current-head execution evidence.
 
-Archive body decoding remains undiscovered until the activation slice. User-change
-(A3) and approved code-replay (A4) correction handling is a separate prerequisite
-to that activation; this completion/reservation slice grants neither authority.
+A saved retry emits `codex_zst_first_read_retry: 1` and
+`codex_zst_retry_alarm: 1` at stages of the same names on `local_resources`, once
+per committed retry, even if the process crashes before bytes. Alarm condition
+is any saved first-read retry (decode attempt >1); `decode_attempt` is the ordinal,
+not an additive counter. It flags use of the exception, not a claim of cap breach.
+Failed/repeated reservation saves emit neither. `codex_zst_input` records actual
+decoder activity/bytes, including recovery; it does not create another A1 grant.
+LD observes each admitted delivery and deduplicates by opened object.
+Post-release counts line: `codex_zst_first_read_retry`, `codex_zst_retry_alarm`,
+`codex_zst_input`, `codex_zst_refused`, `archive_terminal_residue`,
+`archive_terminal_residue_session_count`, `codex_zst_admission_alarm`.
+Counters/events are counts-only; do not sum ordinal or running gauge fields.
+
+Terminal Held/Refused archives use scoped residue, including quiet skipped
+stamps; they do not add sweep-wide unreadable (RU). Bodyless Pending is the
+bounded Z-PENDING RU exception. Admission denial spends no decode reservation;
+yields 1–11 use Z-ADMISSION RU and yield 12 onward uses scoped admission_starved.
+Frame/checksum/truncation, decoded-limit and owner failures remain sticky.
+Transient read/identity I/O or parent-pending/deferred output stays pending under
+the first-read retry bound. Unknown/stuck money is never $0.
+Decoder safety-net release emits `codex_zst_owner.counts.leaked_release`; normal
+success/error releases explicitly after Stores guards drop.
+
+A3/A4 correction permission is a separate prerequisite; this settlement slice
+grants neither. Quiet settled/empty/held/refused stamps decode zero bytes.
 
 Decoder admission keeps fixed headroom of one 8 MiB primary entry plus side-ledger
 bytes; the resident cache is charged once. Each admission yield increments the
@@ -1068,8 +1087,33 @@ double-UUID names outside that set receive counted `CompressedOwnerUnproven`
 holds. Universal archive coverage is not claimed.
 `CompressedParserStateRequired` identifies an accidental plain-constructor call
 for an archive; the paid main parser uses its stateful factory.
-`codex_zst_refused` reader failures also enter the unreadable census at their
-caller; the direct compatibility API has no census. Refusals retain prior output.
+Nonterminal `codex_zst_refused` reader failures enter the unreadable census at
+their caller; terminal archive holds use the scoped residue above. The direct
+compatibility API has no census. Refusals retain prior output.
+
+Terminal archive holds/refusals use `archive_terminal_residue{cause}` instead of
+a sweep-wide unreadable count. `archive_terminal_residue_session_count` is the
+running distinct-session count for that page (not an additive counter). Affected
+sessions remain unknown for state-only, absence retirement and departed-owner
+release decisions; other files can complete census. The existing durable residue
+witness retains the affected keys/session blocks; terminal receipts disclose its
+cardinalities instead of clean success, without making this loss retryable.
+Bodyless Pending remains
+unreadable within its bounded recovery window. Admission uses unreadable until
+that archive's twelfth consecutive yield, then `admission_starved` residue.
+`codex_zst_admission_alarm.admission_starved_count` counts currently starved keys
+in the existing bounded process map; unrelated admissions never reset them.
+Restart or map eviction loses the RAM-only streak; no durable lifetime bound is
+claimed.
+
+The native parser-construction error boundary permits archive RU only for an
+actual typed admission yield (Z-ADMISSION, until that archive's twelfth yield) or
+bodyless Pending (Z-PENDING). It does not infer a yield from a generic error or
+an old streak. Known settlement exhaustion stays terminal scoped residue;
+other construction failures without those exceptions disclose scoped
+`CompressedConstructorUnfunded` residue. Actual read/decode I/O keeps its separate
+failure classification. Quiet Held/Refused and native terminal OutputHeld also
+use scoped residue, letting healthy siblings complete census-gated work.
 
 ## Codex ownership-incomplete causes
 

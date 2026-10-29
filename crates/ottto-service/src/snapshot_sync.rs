@@ -3377,6 +3377,8 @@ impl SyncCounts {
         self.ownership_incomplete_file_count > 0
             || self.zero_snapshot_usage_evidence_count > 0
             || self.dropped_usage_record_count > 0
+            || self.census_residue_blocked_session_count > 0
+            || self.census_residue_index_key_count > 0
     }
 
     fn disclosed_loss(&self) -> DisclosedLoss {
@@ -7519,7 +7521,24 @@ fn finish_sync_source(
     let ack_scan_referenced =
         upload_progress.ack_retirement_scan_references(&committed_index, &index);
     // Settle exact current bodies before selection can restore older file facts.
-    index.settle_archive_bodies(&upload_progress.accepted_body_witnesses);
+    let submitted = scan_result
+        .snapshots
+        .iter()
+        .map(|s| {
+            (
+                s.snapshot_fingerprint.clone(),
+                snapshot_upload_body_witness(s),
+            )
+        })
+        .collect();
+    index.settle_archive_outcome(
+        &upload_progress.accepted_body_witnesses,
+        matches!(
+            &upload_result,
+            Ok(ResumableUploadResult::Completed | ResumableUploadResult::Rejected { .. })
+        ),
+        Some(&submitted),
+    );
     match upload_result {
         Ok(ResumableUploadResult::Completed) => {
             clear_shed_streak(source);
@@ -24131,5 +24150,20 @@ mod ownership_census_tests {
                 .terminal_census_line(source)
                 .contains("ownership_incomplete_contributions{bucket="));
         }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn archive_residue_receipt_discloses_terminal_loss_without_retryable_error() {
+    for (keys, sessions) in [(0, 1), (1, 0)] {
+        let counts = SyncCounts {
+            census_complete: true,
+            census_residue_index_key_count: keys,
+            census_residue_blocked_session_count: sessions,
+            ..SyncCounts::default()
+        };
+        assert_eq!(counts.disclosed_loss(), DisclosedLoss::Terminal);
+        assert!(!counts.has_retryable_problems());
     }
 }

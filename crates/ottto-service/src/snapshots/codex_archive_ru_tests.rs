@@ -1,0 +1,285 @@
+// R3: exercise the actual quiet, parser-error and native-finish census callers.
+fn archive_ru_healthy_sibling(scan: &mut OwnedSourceScan) {
+    for owner in ["compressed-fixture", "healthy-ru-sibling"] {
+        scan.codex_title_metadata.state_threads.insert(
+            owner.into(),
+            CodexStateThread {
+                tokens_used: 10,
+                ..Default::default()
+            },
+        );
+    }
+}
+fn assert_archive_ru_residue(result: &SourceScanResult, rows: &[Value], cause: CodexZstCause) {
+    assert_eq!(result.unreadable_path_count, 0);
+    assert!(result.census_complete, "{result:#?}");
+    assert_eq!(result.census_residue_blocked_session_count, 1);
+    let cause = serde_json::to_value(cause).unwrap();
+    assert!(rows
+        .iter()
+        .any(|r| r["counts"]["archive_terminal_residue"][cause.as_str().unwrap()] == 1));
+    assert_eq!(
+        result
+            .snapshots
+            .iter()
+            .map(|s| s.source_session_id.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["healthy-ru-sibling"])
+    );
+}
+
+#[test]
+fn quiet_held_and_refused_site_has_no_ru_and_healthy_census_work_proceeds() {
+    for disposition in [
+        ArchiveDisposition::Held {
+            cause: CodexZstCause::OutputHeld,
+        },
+        ArchiveDisposition::Refused {
+            cause: CodexZstCause::DecodeFailed,
+        },
+    ] {
+        let f = ArchiveFixture::new(b"quiet-stamp-only");
+        let mut evidence = ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, None).unwrap();
+        let cause = match disposition {
+            ArchiveDisposition::Held { cause } | ArchiveDisposition::Refused { cause } => cause,
+            _ => unreachable!(),
+        };
+        evidence.disposition = disposition;
+        let mut index = ScanIndex::default();
+        index
+            .files
+            .entry(local_index_key(&f.0))
+            .or_default()
+            .archive = Some(Box::new(evidence));
+        let (_, result, rows, _) =
+            archive_pass_with(&f, index, false, None, &[], archive_ru_healthy_sibling);
+        assert_eq!(
+            decodes(&rows),
+            0,
+            "quiet caller must not construct a decoder"
+        );
+        assert_archive_ru_residue(&result, &rows, cause);
+    }
+}
+
+#[test]
+fn settlement_exhausted_parser_error_has_no_ru_and_healthy_census_work_proceeds() {
+    let f = ArchiveFixture::new(b"exhausted-stamp-only");
+    let mut evidence = ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, None).unwrap();
+    evidence.decode_attempts = 6;
+    evidence.disposition = ArchiveDisposition::Pending {
+        attempts: 6,
+        retry_after: 0,
+    };
+    let mut index = ScanIndex::default();
+    index
+        .files
+        .entry(local_index_key(&f.0))
+        .or_default()
+        .archive = Some(Box::new(evidence));
+    let (index, result, rows, _) =
+        archive_pass_with(&f, index, false, None, &[], archive_ru_healthy_sibling);
+    assert_eq!(
+        decodes(&rows),
+        0,
+        "stop_exhausted runs before decoder funding"
+    );
+    assert!(matches!(
+        archive_evidence(&index, &f).disposition,
+        ArchiveDisposition::Held {
+            cause: CodexZstCause::DecodeBudget
+        }
+    ));
+    assert_archive_ru_residue(&result, &rows, CodexZstCause::DecodeBudget);
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "funded decoder needs validated heap layout"
+)]
+fn native_finish_output_held_has_no_ru_and_healthy_census_work_proceeds() {
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let mut bytes = synthetic_rollout();
+    bytes.extend_from_slice(b"not-json\n"); // complete frame, known owner, incomplete reduction
+    let f = ArchiveFixture::new(&zstd::stream::encode_all(&bytes[..], 1).unwrap());
+    let (index, result, rows, ends) = archive_pass_with(
+        &f,
+        ScanIndex::default(),
+        true,
+        None,
+        &[],
+        archive_ru_healthy_sibling,
+    );
+    let evidence = archive_evidence(&index, &f);
+    assert_eq!(decodes(&rows), 1);
+    assert_eq!(evidence.owner.as_deref(), Some("compressed-fixture"));
+    assert!(evidence.header_validated.is_some());
+    assert!(matches!(
+        evidence.disposition,
+        ArchiveDisposition::Held {
+            cause: CodexZstCause::OutputHeld
+        }
+    ));
+    assert!(!ends
+        .0
+        .lock()
+        .unwrap()
+        .contains(&super::super::line_delivery::DeliveryEnd::Complete));
+    assert_archive_ru_residue(&result, &rows, CodexZstCause::OutputHeld);
+}
+
+#[test]
+fn parser_admission_ru_ends_at_own_twelfth_yield() {
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let f = correction_archive();
+    let key = local_index_key(&f.0);
+    admission_streak(&key, false);
+    for attempt in 1..=12 {
+        let (_, result, rows, _) = archive_pass_with(
+            &f,
+            ScanIndex::default(),
+            false,
+            None,
+            &[],
+            archive_ru_healthy_sibling,
+        );
+        assert_eq!(decodes(&rows), 0);
+        if attempt < 12 {
+            assert_eq!(result.unreadable_path_count, 1);
+            assert!(!result.census_complete);
+            assert!(!rows
+                .iter()
+                .any(|r| r["stage"] == "archive_terminal_residue"));
+        } else {
+            assert_archive_ru_residue(&result, &rows, CodexZstCause::AdmissionStarved);
+            assert!(rows
+                .iter()
+                .any(|r| r["stage"] == "codex_zst_admission_alarm"));
+        }
+    }
+    admission_streak(&key, false);
+}
+
+#[test]
+fn parser_errors_without_admission_yield_or_bodyless_pending_have_no_generic_ru() {
+    let f = ArchiveFixture::new(b"classification-only");
+    let key = local_index_key(&f.0);
+    admission_streak(&key, false);
+    let mut index = ScanIndex::default();
+    let mut census = ScanCensus::default();
+    let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+        census.archive_parser_failure(
+            SnapshotSource::Codex,
+            &index,
+            &f.0,
+            &anyhow::anyhow!("synthetic construction failure"),
+        );
+    });
+    assert_eq!(census.unreadable_path_count, 0);
+    assert!(rows
+        .iter()
+        .any(|r| r["counts"]["archive_terminal_residue"]["CompressedConstructorUnfunded"] == 1));
+    let mut evidence = ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, None).unwrap();
+    assert!(evidence.body_witness.is_none());
+    index.files.entry(key.clone()).or_default().archive = Some(Box::new(evidence.clone()));
+    let mut pending = ScanCensus::default();
+    pending.archive_parser_failure(
+        SnapshotSource::Codex,
+        &index,
+        &f.0,
+        &anyhow::anyhow!("synthetic pending failure"),
+    );
+    assert_eq!(
+        pending.unreadable_path_count, 1,
+        "only bodyless Pending qualifies"
+    );
+    evidence.body_witness = Some("a".repeat(64));
+    index.files.get_mut(&key).unwrap().archive = Some(Box::new(evidence));
+    let mut body_retained = ScanCensus::default();
+    body_retained.archive_parser_failure(
+        SnapshotSource::Codex,
+        &index,
+        &f.0,
+        &anyhow::anyhow!("synthetic owed-body failure"),
+    );
+    assert_eq!(body_retained.unreadable_path_count, 0);
+}
+
+#[test]
+fn scoped_header_and_constructor_failures_survive_witness_without_terminal_archive_marker() {
+    for cause in [
+        CodexZstCause::HeaderInvalid,
+        CodexZstCause::ConstructorUnfunded,
+    ] {
+        let f = ArchiveFixture::new(b"witness-boundary-only");
+        let key = local_index_key(&f.0);
+        let mut index = ScanIndex::default();
+        if cause == CodexZstCause::HeaderInvalid {
+            // Inventory's failed first-line state; no Held/Refused marker exists.
+            let mut evidence =
+                ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, None).unwrap();
+            evidence.disposition = ArchiveDisposition::HeaderValidated;
+            evidence.header_attempted = true;
+            evidence.decode_attempts = 0;
+            assert!(evidence.terminal_cause().is_none());
+            index.files.entry(key.clone()).or_default().archive = Some(Box::new(evidence));
+        } else {
+            assert!(!index.files.contains_key(&key));
+        }
+        let mut scan = OwnedSourceScan::new(
+            SnapshotSource::Codex,
+            &[],
+            index,
+            NOW,
+            365,
+            10,
+            false,
+            None,
+            &[],
+            false,
+            false,
+        );
+        scan.codex_join_prepared = true;
+        scan.identified_candidates.clear();
+        archive_ru_healthy_sibling(&mut scan);
+        scan.census.observed_index_keys.insert(key.clone());
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            if cause == CodexZstCause::HeaderInvalid {
+                scan.census
+                    .archive_residue(&f.0, archive_evidence(&scan.index, &f).into(), cause);
+            } else {
+                scan.census.archive_parser_failure(
+                    SnapshotSource::Codex,
+                    &scan.index,
+                    &f.0,
+                    &anyhow::anyhow!("synthetic constructor failure"),
+                );
+            }
+        });
+        for step in 0..1000 {
+            scan = match scan.step(None) {
+                OwnedSourceScanStep::Pending(next) => next,
+                OwnedSourceScanStep::Complete {
+                    scan: result,
+                    index,
+                    ..
+                } => {
+                    assert_archive_ru_residue(&result, &rows, cause);
+                    assert!(index
+                        .scan_residue_witness
+                        .as_ref()
+                        .unwrap()
+                        .index_keys
+                        .contains(&key));
+                    break;
+                }
+            };
+            assert_ne!(step, 999, "witness census did not finish");
+        }
+    }
+}
