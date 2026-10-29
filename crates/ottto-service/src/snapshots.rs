@@ -9267,13 +9267,17 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     // Design E: an item without a provider-proven start keeps its own-only
     // scalars by the file birth rule. Loaded telemetry only vetoes them; the
     // census fence and family pending are no longer consulted for scalars.
-    let file_birth_tripwire = claude_context_file_birth::ClaudeTelemetryTripwire::build(
+    let mut file_birth_tripwire = claude_context_file_birth::ClaudeTelemetryTripwire::build(
         snapshots,
         max_pending_occurrences,
         api_report,
         trace_report,
         veto_api_rows,
     );
+    if !reports_healthy {
+        file_birth_tripwire.refuse_incomplete_dependencies();
+    }
+
     let multi_file_members = claude_context_file_birth::claude_multi_file_members(snapshots, index);
     let mut context_file_birth = ClaudeContextFileBirthCounts::default();
     #[cfg(test)]
