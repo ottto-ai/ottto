@@ -4384,6 +4384,14 @@ fn a0h_pace_evicted_alone_emits_one_alarm_without_a_full_delta() {
         alarms[0]["counts"]["retail_exhausted_paced"],
         serde_json::json!([0, 0])
     );
+    for cause in [
+        "old_binding_no_match",
+        "context",
+        "restore_semantics",
+        "revision_adoption_required",
+    ] {
+        assert_eq!(alarms[0]["counts"][cause], serde_json::json!([0, 0]));
+    }
     let ((), repeated) = crate::local_resource_diagnostics::capture(|| cache.durable_alarm(source));
     assert!(repeated.is_empty());
     let _ = std::fs::remove_dir_all(root);
