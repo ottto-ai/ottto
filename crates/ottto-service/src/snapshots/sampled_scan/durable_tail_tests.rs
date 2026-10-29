@@ -91,6 +91,10 @@ fn empty_custody_scope_rejection_precedes_audit_clock_and_all_body_reads() {
             Ok(_) => panic!("scope reused"),
         };
         assert!(rejected.error.to_string().contains("scope"));
+        assert_eq!(
+            rejected.refusal,
+            sampled_jsonl::PreparationRefusal::NonTransient("prepare_scope")
+        );
         let original = rejected.taken.unwrap();
         assert_eq!(&*original as *const _ as usize, address);
         assert_eq!(
@@ -984,6 +988,14 @@ fn owned_prepare_rejects_with_original_box_graph_flags_and_unique_guard() {
                 Ok(_) => panic!("{source:?}/{arm} unexpectedly accepted"),
                 Err(rejected) => rejected,
             };
+            let expected_refusal = match arm {
+                "scope" => sampled_jsonl::PreparationRefusal::NonTransient("prepare_scope"),
+                "source" | "capture" | "counting" | "priority" => {
+                    sampled_jsonl::PreparationRefusal::NonTransient("prepare_incompatible")
+                }
+                _ => sampled_jsonl::PreparationRefusal::Transient,
+            };
+            assert_eq!(rejected.refusal, expected_refusal, "{source:?}/{arm}");
             let mut returned = rejected.taken.expect("every rejection returns Taken");
             assert_eq!(
                 (&*returned) as *const Taken<CachedJsonlReduction> as usize,
@@ -2813,7 +2825,9 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                     scan.sampling = None;
                 }
                 if bypass == "allow_sample_false" {
-                    scan.sampling.as_mut().unwrap().audit_metadata_supported = false;
+                    if let Some(context) = scan.sampling.as_mut() {
+                        context.audit_metadata_supported = false;
+                    }
                 }
                 if bypass == "state_false" {
                     scan.state_census_complete = false;
@@ -4272,5 +4286,234 @@ fn other_source_restore_after_return_release(
             panic!("other restore leaked the released owner")
         };
         lease.release();
+    }
+}
+
+/// Existing MAIN/S2 leaves: a real resident take is losslessly returned, then
+/// this SAME native step starts Full with no old graph. These are not cold API tests.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "validated native admission layout")]
+fn production_returned_nontransient_original_reads_growth_once_then_quiet_restart_is_idle() {
+    use std::io::Write;
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    assert!(crate::heap_layout_bound::layout_supported());
+    let _gate = claude_request_money::e2::GateForTest::set(true);
+    struct DependenciesReset;
+    impl Drop for DependenciesReset {
+        fn drop(&mut self) {
+            super::super::TEST_REFUSE_REDUCTION_DEPENDENCIES.with(|v| v.set(false));
+        }
+    }
+    let _reset = DependenciesReset;
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        for reason in [
+            "eligibility",
+            "prepare_scope",
+            "prepare_incompatible",
+            "dependency",
+            "census",
+        ] {
+            let root = crate::test_scratch::ScratchDir::new("returned-original-full");
+            let _lock = test_locks::hold(&root);
+            let sessions = root.join("sessions");
+            std::fs::create_dir(&sessions).unwrap();
+            let path = sessions.join(if source == SnapshotSource::Codex {
+                "rollout-2026-10-07T10-00-00-019fa111-2222-7333-8444-555555555555.jsonl"
+            } else {
+                "11111111-2222-4333-8444-555555555555.jsonl"
+            });
+            if source == SnapshotSource::Codex {
+                codex_budget_fixture(&path, "019fa111-2222-7333-8444-555555555555", None);
+            } else {
+                native_fixture(&path);
+            }
+            let key = local_index_key(&path);
+            let index_path = root.join("index.json");
+            let cache = Arc::new(SharedCache::default());
+            let run = |index: ScanIndex,
+                       cache: Option<Arc<SharedCache>>,
+                       namespace: &str,
+                       refusal: &str,
+                       at: &str| {
+                let mut scan = OwnedSourceScan::new_with_identity_capture(
+                    source,
+                    std::slice::from_ref(&sessions),
+                    index,
+                    at,
+                    365,
+                    100,
+                    false,
+                    None,
+                    &[],
+                    false,
+                    true,
+                    true,
+                );
+                if let Some(cache) = cache {
+                    scan = scan.with_sampled_acquisition(cache, Scope(namespace.into()));
+                }
+                if refusal == "eligibility" {
+                    if let Some(context) = scan.sampling.as_mut() {
+                        context.audit_metadata_supported = false;
+                    }
+                }
+                if refusal == "census" {
+                    scan.state_census_complete = false;
+                }
+                super::super::TEST_REFUSE_REDUCTION_DEPENDENCIES
+                    .with(|v| v.set(refusal == "dependency"));
+                let mut metrics = (0, 0, 0);
+                for _ in 0..10000 {
+                    if let Some(context) = scan.sampling.as_ref() {
+                        metrics = (context.full_files, context.tail_files, context.native_bytes);
+                    }
+                    match scan.step(None) {
+                        OwnedSourceScanStep::Pending(next) => scan = next,
+                        OwnedSourceScanStep::Complete {
+                            mut index, scan, ..
+                        } => {
+                            super::super::TEST_REFUSE_REDUCTION_DEPENDENCIES.with(|v| v.set(false));
+                            let mut projected = scan.clone();
+                            apply_upload_policy(
+                                source,
+                                &mut projected.snapshots,
+                                SnapshotUploadPolicy::default(),
+                            );
+                            finalize_scan_after_policy(source, &mut projected, &mut index);
+                            let accepted = projected
+                                .snapshots
+                                .iter()
+                                .map(|item| item.snapshot_fingerprint.clone())
+                                .collect();
+                            index.record_accepted_snapshot_fingerprints(&accepted);
+                            return (index, scan, metrics);
+                        }
+                    }
+                }
+                panic!("real scanner did not complete")
+            };
+            let (index, first, _) = run(
+                ScanIndex::default(),
+                Some(cache.clone()),
+                "original",
+                "",
+                "2026-10-29T12:00:00Z",
+            );
+            assert_eq!(first.snapshots.len(), 1, "native seed {source:?}");
+            assert!(
+                cache.retained().unwrap().peek(&key).is_some(),
+                "actual resident premise"
+            );
+            let (index, idle, metrics) = run(
+                index,
+                Some(cache.clone()),
+                "original",
+                "",
+                "2026-10-29T12:00:00Z",
+            );
+            assert!(idle.snapshots.is_empty());
+            assert_eq!(
+                (metrics.0, metrics.2),
+                (0, 0),
+                "idle0Full/0body before growth"
+            );
+            if reason == "prepare_incompatible" {
+                let mut original = cache.take(&key).expect("real original");
+                let acc = original.retained.state.accumulator_for_test();
+                acc.claude_request_identity_capture = !acc.claude_request_identity_capture;
+                assert!(cache
+                    .return_prepared_taken(key.clone(), Box::new(original))
+                    .is_ok());
+            }
+            let suffix = if source == SnapshotSource::Codex {
+                let total = 100 * crate::snapshots::session_start::WINDOW_REQUESTS as u64 + 25;
+                serde_json::json!({"type":"event_msg","timestamp":"2026-10-07T10:02:00Z","payload":{"type":"token_count","info":{
+                    "model":"gpt-5.2","total_token_usage":{"input_tokens":total,"output_tokens":total/10},
+                    "last_token_usage":{"input_tokens":25,"output_tokens":3}}}})
+            } else {
+                serde_json::json!({"type":"assistant","sessionId":"11111111-2222-4333-8444-555555555555","timestamp":"2026-10-07T10:02:00Z",
+                    "requestId":"req-fallthrough","message":{"id":"msg-fallthrough","model":"fixture-model","usage":{"input_tokens":25,"output_tokens":3}}})
+            };
+            writeln!(
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap(),
+                "{suffix}"
+            )
+            .unwrap();
+            let namespace = if reason == "prepare_scope" {
+                "changed"
+            } else {
+                "original"
+            };
+            let original_len = std::fs::metadata(&path).unwrap().len();
+            let (_, oracle, _) = run(
+                index.clone(),
+                None,
+                namespace,
+                reason,
+                "2026-10-29T12:00:00Z",
+            );
+            assert_eq!(oracle.snapshots.len(), 1, "independent native Full premise");
+            let ((mut index, grown, metrics), events) =
+                crate::local_resource_diagnostics::capture(|| {
+                    run(
+                        index,
+                        Some(cache.clone()),
+                        namespace,
+                        reason,
+                        "2026-10-29T12:00:00Z",
+                    )
+                });
+            assert_eq!(
+                metrics,
+                (1, 0, original_len),
+                "same-step counted Full {source:?}/{reason}"
+            );
+            assert_eq!(
+                serde_json::to_value(&grown.snapshots).unwrap(),
+                serde_json::to_value(&oracle.snapshots).unwrap(),
+                "exact cumulative body with no duplicated prefix"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["counts"]["returned_original_full"][reason] == 1)
+                    .count(),
+                1,
+                "actual refused-original caller reached"
+            );
+            assert_eq!(index.files[&key].size_bytes, original_len);
+            // A quiet period longer than W cannot hide unread suffix: growth
+            // was already fully counted and committed before entering quiet.
+            let (next, quiet, metrics) = run(
+                index,
+                Some(cache.clone()),
+                namespace,
+                "",
+                "2028-10-29T12:00:00Z",
+            );
+            assert!(quiet.snapshots.is_empty());
+            assert_eq!((metrics.0, metrics.2), (0, 0), "quiet >=W0Full/0body");
+            index = next;
+            index.save(&index_path).unwrap();
+            drop(cache);
+            let (restarted, idle, metrics) = run(
+                ScanIndex::load(&index_path).unwrap(),
+                Some(Arc::new(SharedCache::default())),
+                namespace,
+                "",
+                "2028-10-29T12:00:00Z",
+            );
+            assert!(idle.snapshots.is_empty());
+            assert_eq!((metrics.0, metrics.2), (0, 0), "quiet restart0Full/0body");
+            assert!(restarted
+                .files
+                .get(&key)
+                .is_none_or(|entry| entry.size_bytes == original_len));
+        }
     }
 }
