@@ -4234,3 +4234,299 @@ fn a0h_native_exhaustion_growth_pacing_reselection_and_restart_body() {
         let _ = std::fs::remove_dir_all(root);
     }
 }
+
+#[test]
+fn stale_growth_gate_keeps_transient_and_future_floors_held_and_shares_pacing() {
+    let root = crate::test_scratch::private_dir("stale-growth-gate");
+    let path = root.join("t.jsonl");
+    std::fs::write(&path, b"{}\n").unwrap();
+    let file = File::open(&path).unwrap();
+    let cache = SharedCache::default();
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        "k".into(),
+        serde_json::from_value(serde_json::json!({
+            "size_bytes":3,"source_file_fingerprint":"accepted",
+            "effective_upload_body_witness_revision":effective_revision(SnapshotSource::ClaudeCode)
+        }))
+        .unwrap(),
+    );
+    let floor = AcceptedFloor::of(&index, "k").unwrap();
+    for reason in ["context", "restore_semantics", "revision_adoption_required"] {
+        assert!(!cache.stale_full("k", &file, Some(floor), reason), "idle");
+    }
+    std::fs::write(&path, b"{}\n{}\n").unwrap();
+    for reason in [
+        "descriptor",
+        "accepted_floor_metadata",
+        "revision_downgrade",
+        "other",
+    ] {
+        assert!(!cache.stale_full("k", &file, Some(floor), reason));
+    }
+    let mut future = floor;
+    future.revision += 1;
+    assert!(!cache.stale_full("k", &file, Some(future), "context"));
+    assert!(!cache.stale_full("k", &file, None, "context"));
+    let now = std::time::Instant::now();
+    cache.durable().unwrap().retail_full_now = Some(now);
+    assert!(cache.stale_full("k", &file, Some(floor), "context"));
+    assert!(
+        !cache.stale_full("k", &file, Some(floor), "restore_semantics"),
+        "cause changes do not renew pacing"
+    );
+    assert!(
+        !cache.retail_full("k", &file, 3, now),
+        "same key shares its cooldown with Q11"
+    );
+    cache.durable().unwrap().retail_full_now = Some(now + std::time::Duration::from_secs(21600));
+    assert!(cache.stale_full("k", &file, Some(floor), "revision_adoption_required"));
+    let stores = cache.durable().unwrap();
+    assert_eq!(stores.counters.stale_full, [1, 0, 1]);
+    assert_eq!(
+        stores.counters.retail_full[0], 0,
+        "no false retail attribution"
+    );
+    assert!(stores.retail_spent.is_empty());
+    drop(stores);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
+fn stale_growth_native_reason_full_pacing_reselection_survivor_and_restart() {
+    use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
+    use std::io::Write;
+    let _gate = claude_request_money::e2::GateForTest::set(true);
+    for (cause, reason) in ["context", "restore_semantics", "revision_adoption_required"]
+        .into_iter()
+        .enumerate()
+    {
+        let root = crate::test_scratch::private_dir("stale-native");
+        let lock = test_locks::hold(&root);
+        let projects = root.join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        let path = projects.join("1338a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl");
+        let roots = vec![projects];
+        let key = local_index_key(&path);
+        let source = SnapshotSource::ClaudeCode;
+        let ds = DurableSource::ClaudeCode;
+        let index_path = root.join("index.json");
+        std::fs::write(&path, a0h_row("prefix", 100)).unwrap();
+        let warm = E2ScanFixture::default();
+        warm.begin_durable(source, &root, &index_path);
+        let (mut prior, mut scan, mode) = a0h_scan(&warm, &roots, &root, ScanIndex::default());
+        assert_eq!(mode.0, 1);
+        a0h_wire(&root, &mut prior, &mut scan);
+        prior.record_accepted_snapshot_fingerprints(
+            &scan
+                .snapshots
+                .iter()
+                .map(|s| s.snapshot_fingerprint.clone())
+                .collect(),
+        );
+        prior.save(&index_path).unwrap();
+        assert_eq!(
+            warm.cache
+                .durable_write_after_save(lock, source, &prior)
+                .unwrap()
+                .written,
+            1
+        );
+        let scope = warm
+            .cache
+            .retained_checkpoint(&key)
+            .unwrap()
+            .scope()
+            .clone();
+        let (disk_path, bytes) = {
+            let mut stores = warm.cache.durable().unwrap();
+            let slot = stores.claude.as_mut().unwrap();
+            let ReadOutcome::Found(mut record) = slot.store.read(
+                &store::key_digest(ds, &key),
+                &codec::allowlist_digest(source),
+            ) else {
+                panic!("verified v1 premise")
+            };
+            assert_eq!(record.format, 1);
+            match reason {
+                "context" => record.record.binding.context = [93; 32],
+                "restore_semantics" => record.record.body = b"broken codec".to_vec(),
+                "revision_adoption_required" => {
+                    let revision = effective_revision(source).checked_sub(1).unwrap();
+                    prior
+                        .files
+                        .get_mut(&key)
+                        .unwrap()
+                        .effective_upload_body_witness_revision = revision;
+                    prior.active_effective_upload_body_witness_revision = revision;
+                    assert!(!prior.effective_upload_body_witness_revision_requires_adoption(&key));
+                    let i = Interpretation::of(source, &key, &prior, false, &slot.namespace);
+                    record.record.binding.scope = expected(
+                        ds,
+                        source,
+                        &key,
+                        &scope,
+                        &prior,
+                        &i,
+                        Some((1, codec::allowlist_digest(source), revision)),
+                    )
+                    .unwrap()
+                    .binding
+                    .scope;
+                }
+                _ => unreachable!(),
+            }
+            let i = Interpretation::of(source, &key, &prior, false, &slot.namespace);
+            if reason == "restore_semantics" {
+                assert!(claude_expected(&key, &scope, &prior, &i, &record).is_ok());
+                assert!(codec::decode(&record.record.body, source).is_err());
+            } else {
+                assert_eq!(
+                    claude_expected(&key, &scope, &prior, &i, &record).err(),
+                    Some(reason)
+                );
+            }
+            let disk = std::fs::read_dir(slot.store.dir())
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let bytes = store::tests::pinned_v1_bytes(&record.record, record.index_generation);
+            std::fs::write(&disk, &bytes).unwrap();
+            (disk, bytes)
+        };
+        prior.save(&index_path).unwrap();
+        let accepted = prior.files[&key].size_bytes;
+        let witness = prior.files[&key].last_upload_body_witness.clone();
+        assert!(witness.is_some());
+        let owner = E2ScanFixture::default();
+        owner.begin_durable(source, &root, &index_path);
+        let ((_, _, mode), io) = a0h_observe(|| a0h_scan(&owner, &roots, &root, prior.clone()));
+        assert_eq!(mode.0, 0);
+        assert_eq!(io, (0, 0));
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(a0h_row("growth", 200).as_bytes())
+            .unwrap();
+        let now = std::time::Instant::now();
+        owner.cache.durable().unwrap().retail_full_now = Some(now);
+        let ((mut index, mut scan, modes), io) =
+            a0h_observe(|| a0h_scan(&owner, &roots, &root, prior.clone()));
+        assert_eq!(modes, (1, 0, 0), "{reason}: real native Full");
+        assert_eq!(io.1, std::fs::metadata(&path).unwrap().len());
+        let body = a0h_wire(&root, &mut index, &mut scan);
+        assert_eq!(
+            (
+                scan.snapshots[0].input_tokens,
+                scan.snapshots[0].request_count
+            ),
+            (300, 2)
+        );
+        let cold = E2ScanFixture::default();
+        let (mut ci, mut cs, _) = a0h_scan(&cold, &roots, &root, prior.clone());
+        assert_eq!(body, a0h_wire(&root, &mut ci, &mut cs));
+        assert_eq!(
+            owner.cache.durable_counters(source).unwrap().0.stale_full[cause],
+            1
+        );
+        let ((), alarm) =
+            crate::local_resource_diagnostics::capture(|| owner.cache.durable_alarm(source));
+        assert_eq!(alarm.len(), 1);
+        assert_eq!(alarm[0]["counts"][reason], serde_json::json!([1, 1]));
+        assert_eq!(std::fs::read(&disk_path).unwrap(), bytes);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(a0h_row("more", 400).as_bytes())
+            .unwrap();
+        // No ACK/save: unchanged committed prefix is reselected on every paced pass.
+        for seconds in [1, 21599] {
+            owner.evict();
+            owner.begin_durable(source, &root, &index_path);
+            owner.cache.durable().unwrap().retail_full_now =
+                Some(now + std::time::Duration::from_secs(seconds));
+            let ((held, scan, modes), io) =
+                a0h_observe(|| a0h_scan(&owner, &roots, &root, prior.clone()));
+            assert_eq!(modes.0, 0);
+            assert_eq!(io, (0, 0));
+            assert!(scan.snapshots.is_empty());
+            assert_eq!(held.files[&key].size_bytes, accepted);
+            assert_eq!(held.files[&key].last_upload_body_witness, witness);
+            let candidate = CandidateFile {
+                path: path.clone(),
+                scan_root: path.parent().unwrap().into(),
+                physical_identity: None,
+                size_bytes: std::fs::metadata(&path).unwrap().len(),
+                modified_unix_seconds: prior.files[&key].modified_unix_seconds,
+                modified_unix_nanos: prior.files[&key].modified_unix_nanos.unwrap_or(0),
+                source_file_fingerprint: String::new(),
+                legacy_source_file_fingerprint: String::new(),
+                legacy_config_reconciliation_required: false,
+                opened_object_identity: String::new(),
+                fingerprint_changed_nanos: 0,
+                fingerprint_birth_nanos: 0,
+            };
+            assert_eq!(
+                held.candidate_decision_with_reason_at(&candidate, 0),
+                (
+                    CandidateDecision::Parse,
+                    Some(CandidateParseReason::TranscriptChanged)
+                )
+            );
+        }
+        owner.evict();
+        owner.cache.durable().unwrap().retail_full_now =
+            Some(now + std::time::Duration::from_secs(21600));
+        let ((mut index, mut scan, modes), io) =
+            a0h_observe(|| a0h_scan(&owner, &roots, &root, prior.clone()));
+        assert_eq!(modes, (1, 0, 0));
+        assert_eq!(io.1, std::fs::metadata(&path).unwrap().len());
+        let body = a0h_wire(&root, &mut index, &mut scan);
+        assert_eq!(
+            (
+                scan.snapshots[0].input_tokens,
+                scan.snapshots[0].request_count
+            ),
+            (700, 3)
+        );
+        let cold = E2ScanFixture::default();
+        let (mut ci, mut cs, _) = a0h_scan(&cold, &roots, &root, prior.clone());
+        assert_eq!(body, a0h_wire(&root, &mut ci, &mut cs));
+        assert_eq!(
+            owner.cache.durable_counters(source).unwrap().0.stale_full[cause],
+            2
+        );
+        assert!(index.files.contains_key(&key));
+        assert_eq!(
+            owner
+                .cache
+                .durable_write_after_save(lock, source, &prior)
+                .unwrap()
+                .written,
+            0
+        );
+        owner.cache.durable_gc(lock, source, &prior).unwrap();
+        assert_eq!(std::fs::read(&disk_path).unwrap(), bytes);
+        let restarted = E2ScanFixture::default();
+        restarted.begin_durable(source, &root, &index_path);
+        let ((_, _, modes), io) =
+            a0h_observe(|| a0h_scan(&restarted, &roots, &root, prior.clone()));
+        assert_eq!(modes.0, 1);
+        assert!(io.1 > 0);
+        assert_eq!(
+            restarted
+                .cache
+                .durable_counters(source)
+                .unwrap()
+                .0
+                .stale_full[cause],
+            1
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+}

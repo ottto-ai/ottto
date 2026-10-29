@@ -31899,6 +31899,13 @@ impl OwnedSourceScan {
                                     {
                                         (None, taken_admission)
                                     }
+                                    sampled_scan::durable_tail::RestoreOutcome::Stale(reason)
+                                        if source == SnapshotSource::ClaudeCode
+                                            && context.cache.stale_full(&key,
+                                                parser.reader.reader.get_ref(), durable_accepted, reason) =>
+                                    {
+                                        (None, taken_admission)
+                                    }
                                     sampled_scan::durable_tail::RestoreOutcome::Stale(_) => {
                                         context.cache.durable_stale_hold(source, index, &candidate);
                                         pending!();
