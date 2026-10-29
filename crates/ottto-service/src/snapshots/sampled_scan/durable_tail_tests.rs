@@ -2258,6 +2258,18 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
                 },
                 0,
             );
+            // A format-1 restore alone is clean: the current writer still emits
+            // v1. Stage real current-index debt to exercise an ordinary dirty
+            // replacement without changing the decoded counting decision.
+            let due = unix_seconds(SystemTime::now()).unwrap() + 120;
+            let fingerprint = index.files[&key].source_file_fingerprint.clone();
+            assert!(index.stage_sampled_audit(
+                &key,
+                &fingerprint,
+                crate::transcript_acquisition::AuditDebt {
+                    due_unix_seconds: due
+                }
+            ));
             cache.durable_note_selection(&key, &index.files[&key].source_file_fingerprint);
             index.save(&index_path).unwrap();
             assert_eq!(
@@ -2272,6 +2284,8 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
                 other => panic!("{other:?}"),
             };
             assert_eq!(next.format, store::FORMAT_VERSION);
+            assert_eq!(next.envelope_audit_debt, Some(due));
+            assert_ne!(std::fs::read(&disk).unwrap(), bytes);
             let restart = SharedCache::default();
             restart.durable_begin_pass(source, &index_path, &namespace, false);
             let second = restart

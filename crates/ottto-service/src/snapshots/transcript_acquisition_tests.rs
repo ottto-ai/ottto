@@ -3605,6 +3605,9 @@ fn pinned_v1_bootstrap_ordinary_save_then_second_restart_tails_without_a_full() 
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
+    // OwnedSourceScan::new enables identity capture for both sources in tests.
+    // Bind every durable pass to that same mode, including Codex.
+    let identity_capture = true;
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let fixture = ScanFixture::new(source);
         fixture.file.append(&usage(source, 100, 0, "fixture-model"));
@@ -3614,12 +3617,7 @@ fn pinned_v1_bootstrap_ordinary_save_then_second_restart_tails_without_a_full() 
         let lock = crate::locked_state_dir::test_locks::hold(&state);
         let index_path = state.join("index.json");
         let first = Arc::new(sampled_scan::SharedCache::default());
-        first.durable_begin_pass(
-            source,
-            &index_path,
-            &namespace,
-            source == SnapshotSource::ClaudeCode,
-        );
+        first.durable_begin_pass(source, &index_path, &namespace, identity_capture);
         let (mut index, _, modes) = production_scan(
             &fixture,
             source,
@@ -3648,12 +3646,7 @@ fn pinned_v1_bootstrap_ordinary_save_then_second_restart_tails_without_a_full() 
         drop(first);
         fixture.file.append(&usage(source, 130, 1, "fixture-model"));
         let second = Arc::new(sampled_scan::SharedCache::default());
-        second.durable_begin_pass(
-            source,
-            &index_path,
-            &namespace,
-            source == SnapshotSource::ClaudeCode,
-        );
+        second.durable_begin_pass(source, &index_path, &namespace, identity_capture);
         let loaded = ScanIndex::load(&index_path).unwrap();
         let (mut warm, scan, modes) = production_scan(
             &fixture,
@@ -3718,12 +3711,7 @@ fn pinned_v1_bootstrap_ordinary_save_then_second_restart_tails_without_a_full() 
         drop(second);
         fixture.file.append(&usage(source, 160, 2, "fixture-model"));
         let third = Arc::new(sampled_scan::SharedCache::default());
-        third.durable_begin_pass(
-            source,
-            &index_path,
-            &namespace,
-            source == SnapshotSource::ClaudeCode,
-        );
+        third.durable_begin_pass(source, &index_path, &namespace, identity_capture);
         let loaded = ScanIndex::load(&index_path).unwrap();
         let (_, scan, modes) =
             production_scan(&fixture, source, loaded.clone(), Some(third), &namespace.0);
@@ -3855,6 +3843,9 @@ fn completed_full_audit_before_durable_replacement_recovers_after_restart() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
+    // OwnedSourceScan::new enables identity capture for both sources in tests.
+    // Bind every durable pass to that same mode, including Codex.
+    let identity_capture = true;
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let fixture = ScanFixture::new(source);
         fixture.file.append(&usage(source, 100, 0, "fixture-model"));
@@ -3865,12 +3856,7 @@ fn completed_full_audit_before_durable_replacement_recovers_after_restart() {
         let index_path = state.join("index.json");
         let begin = || {
             let cache = Arc::new(sampled_scan::SharedCache::default());
-            cache.durable_begin_pass(
-                source,
-                &index_path,
-                &namespace,
-                source == SnapshotSource::ClaudeCode,
-            );
+            cache.durable_begin_pass(source, &index_path, &namespace, identity_capture);
             cache
         };
         let cache = begin();
