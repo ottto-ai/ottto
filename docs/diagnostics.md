@@ -64,9 +64,11 @@ Each completed `native_collection_page` records existing scanned-file and
 semantic-no-op counts. `sampled_acquisition` is `null` when unavailable. Its
 full/tail/unchanged selection counts describe acquisition decisions, including
 repeated or subsequently failed plans; they are not distinct file counts.
-`completed_native_bytes` and `completed_guard_bytes` count only completed
-sampled JSONL read plans. Failed reads, joined-file replay, discovery, headers,
-sidecars and independent identity reads are excluded. Zero here does not prove
+`completed_native_bytes` counts completed sampled JSONL read plans.
+`completed_guard_bytes` also includes actual returned head/boundary bytes from
+quiet-retirement validation attempts, including attempts that keep their debt.
+Other failed reads, joined-file replay, discovery, headers, sidecars and
+independent identity reads are excluded. Zero here does not prove
 zero filesystem work. Collection timing covers native initialization and steps,
 including time parked between steps, and ends before post-policy finalization
 and upload. A capped/partial page is still a completed page.
@@ -79,8 +81,20 @@ Their sum equals `full_selections`. It also records `priority_full_replays`,
 `audits_started`, `audits_completed`, `max_start_overdue_seconds` and
 `max_completion_overdue_seconds`. Separate `index_state_at_page_end` gauges
 record `pending_audits`, `overdue_audits` and `oldest_due_age_seconds` using the
-existing index calculations. These are state, not events; overdue work remains
-owed until full verification. Both objects are absent when sampling is null.
+existing index calculations. These three fields are state gauges. The same
+object adds page-event counts `audit_quiet_retired` and `audit_cap_full`:
+complete-c quiet obligations retired after both samples, stable EOF/stamp and
+native completion/RAM admission, and per-file native Full fallbacks or refused
+new-obligation completions at the 256-marker cap. Both reset each scan page.
+Freed slots become usable on the next committed scan; the current page reserves
+them because partial-save reconciliation can restore an unacknowledged marker.
+Thus a cap event can coexist with a live pending gauge below 256.
+A positive cap count emits `sampled_audit_cap_alarm` through this local carrier,
+with cap-event and pending-marker counts; alarm when `audit_cap_full > 0`.
+It grants no upload/census authority. Existing marked Tails remain enabled;
+unavailable obligations are never evicted. Quiet retirement keeps the old Full
+verification time and grants no `audits_completed` or source-verification credit.
+Both objects are absent when sampling is null.
 
 Additive version 2 Claude counts on the existing page/check-in carrier classify
 refused census-member NotFounds by the **existing immediate-parent metadata

@@ -266,6 +266,44 @@ impl Checkpoint {
     pub(crate) fn audit_debt(&self) -> Option<AuditDebt> {
         self.audit_debt
     }
+    /// The interpretation scope this checkpoint was made under.
+    pub(crate) fn scope(&self) -> &Scope {
+        &self.scope
+    }
+
+    /// Cheap quiet-file validation, never historical Full verification. The
+    /// host must require complete c provenance and a loss-free Unchanged read.
+    pub(crate) fn quiet_audit_matches(
+        &self,
+        file: &mut File,
+        scope: &Scope,
+        bytes_read: &mut usize,
+    ) -> io::Result<bool> {
+        if self.audit_debt.is_none()
+            || scope != &self.scope
+            || self.samples.sealed_offset != self.stamp.length
+            || !self.samples.valid_for(self.stamp.length)
+            || !self.stamp_matches(file)?
+        {
+            return Ok(false);
+        }
+        let head = sample_at(file, 0, &self.samples.head, bytes_read)?;
+        let boundary = sample_at(
+            file,
+            self.samples.sealed_offset - self.samples.boundary.len() as u64,
+            &self.samples.boundary,
+            bytes_read,
+        )?;
+        #[cfg(test)]
+        between_guards();
+        let eof = file.seek(SeekFrom::End(0))?;
+        Ok(head && boundary && eof == self.stamp.length && self.stamp_matches(file)?)
+    }
+
+    /// Only after quiet validation AND native completion; grants no Full credit.
+    pub(crate) fn retire_quiet_audit(&mut self) {
+        self.audit_debt = None;
+    }
     #[cfg(test)]
     pub(crate) fn last_full_verified(&self) -> u64 {
         self.last_full_verified_unix_seconds
@@ -1472,11 +1510,6 @@ pub(crate) fn birth_unix_nanos(metadata: &Metadata) -> u64 {
 impl Checkpoint {
     /// This checkpoint as a content-free durable certificate. `None` when its
     /// samples are not valid for its stamp (such a checkpoint never admits).
-    /// The interpretation scope this checkpoint was made under.
-    pub(crate) fn scope(&self) -> &Scope {
-        &self.scope
-    }
-
     pub(crate) fn durable_certificate(&self, birth_nanos: u64) -> Option<DurableCertificate> {
         if !self.samples.valid_for(self.stamp.length)
             || self.samples.head.len() != self.samples.boundary.len()
@@ -2000,6 +2033,98 @@ mod tests {
                 due.unwrap_or(4_600)
                     .min(if append { 4_600 } else { u64::MAX })
             );
+        }
+    }
+
+    #[test]
+    fn quiet_sampling_requires_both_windows_stable_stamp_scope_and_eof() {
+        for arm in [
+            "quiet",
+            "size",
+            "mtime",
+            "head",
+            "boundary",
+            "partial",
+            "scope",
+            "changed_after_samples",
+        ] {
+            let bytes = wide_rows("quiet-check");
+            let f = Fixture::new(&bytes);
+            let mut cp = initial(&f, 100);
+            cp.audit_debt = Some(AuditDebt {
+                due_unix_seconds: 101,
+            });
+            let original_modified = f.open().metadata().unwrap().modified().unwrap();
+            match arm {
+                "size" => f.append(b"appended\n"),
+                "mtime" => f
+                    .open()
+                    .set_modified(original_modified + std::time::Duration::from_secs(1))
+                    .unwrap(),
+                "head" | "boundary" => {
+                    let mut changed = bytes.clone();
+                    let offset = if arm == "head" { 1 } else { changed.len() - 2 };
+                    changed[offset] ^= 1;
+                    f.replace_bytes(&changed);
+                    f.open().set_modified(original_modified).unwrap();
+                }
+                "partial" => cp.samples.sealed_offset -= 1,
+                _ => {}
+            }
+            let checked_scope = if arm == "scope" {
+                Scope("other".into())
+            } else {
+                scope()
+            };
+            if matches!(arm, "head" | "boundary") {
+                assert!(cp.stamp_matches(&f.open()).unwrap());
+            }
+            struct Reset;
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    set_between_guards(None);
+                }
+            }
+            let _reset = Reset;
+            if arm == "changed_after_samples" {
+                let path = f.0.clone();
+                set_between_guards(Some(Box::new(move || {
+                    OpenOptions::new()
+                        .append(true)
+                        .open(&path)
+                        .unwrap()
+                        .write_all(b"grown\n")
+                        .unwrap();
+                })));
+            }
+            let mut read = 0;
+            let (result, reads) = capture_sample_reads(|| {
+                cp.quiet_audit_matches(&mut f.open(), &checked_scope, &mut read)
+            });
+            assert_eq!(result.unwrap(), arm == "quiet", "{arm}");
+            assert_eq!(
+                cp.audit_debt(),
+                Some(AuditDebt {
+                    due_unix_seconds: 101
+                }),
+                "check alone never retires"
+            );
+            if matches!(arm, "quiet" | "head" | "boundary" | "changed_after_samples") {
+                assert_eq!(reads.len(), 2, "both windows read");
+                assert_eq!(read, 2 * SAMPLE_BYTES);
+                assert_eq!(reads[0].offset, Ok(0));
+                assert_eq!(
+                    reads[1].offset,
+                    Ok(bytes.len() as u64 - SAMPLE_BYTES as u64)
+                );
+            } else {
+                assert_eq!(read, 0);
+            }
+            if arm == "quiet" {
+                cp.retire_quiet_audit();
+                assert_eq!(cp.audit_debt(), None);
+                assert_eq!(cp.last_full_verified(), 100);
+            }
         }
     }
 

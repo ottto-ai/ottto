@@ -94,3 +94,33 @@ requirements and pins ScopeObject as the sole refusal: a frozen read with growth
 and no H3c grant fails completion object revalidation. No local Cargo execution;
 E1 must rerun Linux, native macOS contracts and money, then obtain exact-head
 review. Prior money and review receipts do not qualify the new head.
+
+
+Round 7 pairs gate removal with bounded sampled-obligation retention. A complete
+`c` entry may retire only on an ordinary Unchanged read whose scope/object and
+checkpoint content stamp still match, with both <=4 KiB head/boundary samples
+and held-FD EOF/stamp revalidation. Native completion must remain complete,
+loss-free and sealed, and the replacement copy must be admitted. Only then are
+checkpoint debt and index scheduling marker cleared together; the existing
+save/writer persists the cleared certificate. Full verification time stays old,
+and source_verified, census and Full-audit credit still see the owed debt.
+Deferred/failed persistence remains owed on the older disk certificate; a disk
+retirement is asserted only after its writer receipt.
+
+At 256 marked entries, only an unmarked file needing fresh debt takes its native
+Full fallback (`audit_cap_full`); already-marked files still Tail, and quiet
+debt-free checkpoint reuse remains available. Existing/imported obligations are
+never evicted or capped by deletion. New prefix/lossy obligations without a slot
+are refused before publication and retained in the existing traversal retry queue
+with the age-window bypass. Quiet retirement releases capacity for the next
+committed scan, while this page reserves it against partial-save restoration.
+Central staging
+and prefix-marking checks enforce the cap, including unavailable Codex cohorts.
+`audit_quiet_retired` and `audit_cap_full` sit beside pending/overdue diagnostics;
+a positive cap count emits the local `sampled_audit_cap_alarm`.
+
+Prefix `p`, malformed/legacy tags, growing or changed files, partial/lossy reads,
+cursor fragments, failed samples/final revalidation and refused retention keep
+their obligation. No new representation, store/codec, proof rule, cap increase,
+Full cause enum or global sampling switch is introduced. Native/money CI and
+SOURCE/Lead B sign-off remain owner gates; no local Cargo execution.

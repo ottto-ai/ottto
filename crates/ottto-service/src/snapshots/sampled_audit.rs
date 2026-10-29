@@ -130,6 +130,33 @@ impl ScanIndexEntry {
     }
 }
 impl ScanIndex {
+    /// Existing obligations are never evicted. Imported over-cap populations
+    /// must drain before any new marker can be admitted.
+    pub(super) fn can_stage_sampled_audit(&self, key: &str) -> bool {
+        self.files
+            .get(key)
+            .is_some_and(ScanIndexEntry::has_unverified_source)
+            || self
+                .files
+                .values()
+                .filter(|entry| entry.has_unverified_source())
+                .take(CACHE_ENTRIES)
+                .count()
+                < CACHE_ENTRIES
+    }
+
+    pub(super) fn retire_quiet_audit(&mut self, key: &str, fingerprint: &str) -> bool {
+        let Some(entry) = self.files.get_mut(key).filter(|entry| {
+            entry.source_file_fingerprint == fingerprint
+                && entry.has_unverified_source()
+                && !entry.has_prefix_provenance()
+        }) else {
+            return false;
+        };
+        entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
+        true
+    }
+
     /// Called only by a current validated native source completion. Entry/source
     /// equality fences an older completion; the existing writer owns lock/CAS.
     /// A delivery ACK never calls this method as source-verification authority.
@@ -139,6 +166,9 @@ impl ScanIndex {
         source_fingerprint: &str,
         debt: AuditDebt,
     ) -> bool {
+        if !self.can_stage_sampled_audit(key) {
+            return false;
+        }
         let Some(entry) = self
             .files
             .get_mut(key)
@@ -182,6 +212,9 @@ impl ScanIndex {
         true
     }
     pub(super) fn mark_sealed_prefix(&mut self, key: &str, source_fingerprint: &str) -> bool {
+        if !self.can_stage_sampled_audit(key) {
+            return false;
+        }
         let Some(entry) = self
             .files
             .get_mut(key)
@@ -473,6 +506,61 @@ mod tests {
         index.confirmed_empty_files.insert(key);
         index
     }
+    #[test]
+    fn marked_population_admission_and_quiet_retirement_share_the_cap() {
+        let mut index = index();
+        for n in 0..CACHE_ENTRIES {
+            let key = format!("missing-{n}");
+            index.files.insert(key.clone(), entry());
+            assert!(index.stage_sampled_audit(
+                &key,
+                "source",
+                AuditDebt {
+                    due_unix_seconds: 200
+                }
+            ));
+        }
+        let key = local_index_key(&candidate().path);
+        assert!(!index.stage_sampled_audit(
+            &key,
+            "source",
+            AuditDebt {
+                due_unix_seconds: 200
+            }
+        ));
+        assert!(!index.mark_sealed_prefix(&key, "source"));
+        assert!(index.stage_sampled_audit(
+            "missing-0",
+            "source",
+            AuditDebt {
+                due_unix_seconds: 100
+            }
+        ));
+        assert!(index.mark_sealed_prefix("missing-0", "source"));
+        assert!(
+            !index.retire_quiet_audit("missing-0", "source"),
+            "prefix cannot retire"
+        );
+        assert!(!index.retire_quiet_audit("missing-1", "stale"));
+        assert!(index.retire_quiet_audit("missing-1", "source"));
+        assert!(index.stage_sampled_audit(
+            &key,
+            "source",
+            AuditDebt {
+                due_unix_seconds: 200
+            }
+        ));
+        assert_eq!(
+            index
+                .files
+                .values()
+                .filter(|entry| entry.has_unverified_source())
+                .count(),
+            CACHE_ENTRIES
+        );
+        assert!(index.files["missing-0"].has_unverified_source());
+    }
+
     #[test]
     fn sampled_audit_oldest_deadline_not_ack_or_tail_controls_idle_selection() {
         let mut index = index();

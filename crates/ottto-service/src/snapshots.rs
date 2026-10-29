@@ -28686,6 +28686,38 @@ impl OwnedSourceScan {
                 } else {
                     None
                 };
+                // Retain the obligation until native finish and RAM admission.
+                // Only ordinary complete-c Unchanged acquisitions can retire it.
+                let quiet_audit_checked = if let (Some(completed), Some(active), Some(context)) = (
+                    completed_acquisition.as_ref(),
+                    file_sampling.as_ref(),
+                    sampling.as_mut(),
+                ) {
+                    if active.mode == crate::transcript_acquisition::ReadMode::Unchanged
+                        && index.files.get(&active.key).is_some_and(|entry| {
+                            entry.has_unverified_source() && !entry.has_prefix_provenance()
+                        })
+                        && !index.claude_request_census.get(&active.key).is_some_and(
+                            claude_request_census::ClaudeRequestCensusRecord::identity_incomplete_hold,
+                        )
+                    {
+                        let mut bytes = 0;
+                        let checked = completed
+                            .checkpoint
+                            .quiet_audit_matches(
+                                parser.reader.reader.get_mut(),
+                                &active.scope,
+                                &mut bytes,
+                            )
+                            .unwrap_or(false);
+                        context.sample_bytes = context.sample_bytes.saturating_add(bytes as u64);
+                        checked
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
                 #[cfg(test)]
                 sampled_scan::test_hooks::fire(sampled_scan::test_hooks::Point::AfterRetain);
                 // U1a-2a G17b + C9′: a side read's certificate, without
@@ -29526,7 +29558,58 @@ impl OwnedSourceScan {
                 let held_progress_audit =
                     sampled_audit::progress_debt(index, &index_key, sampled_scan::now_seconds())
                         .is_some();
+                // A new prefix/lossy obligation without a slot cannot publish
+                // or mutate its index entry. Existing marked files keep custody.
+                let needs_marker = cursor_fragment.is_some()
+                    || completed_acquisition
+                        .as_ref()
+                        .is_some_and(|completed| completed.checkpoint.audit_debt().is_some())
+                    || (completed_acquisition.is_none()
+                        && file_sampling
+                            .as_ref()
+                            .is_some_and(|active| active.audit_due.is_some()));
+                let slot_unfunded = sampling
+                    .as_ref()
+                    .is_some_and(|context| context.audit_slots == 0)
+                    && !index
+                        .files
+                        .get(&index_key)
+                        .is_some_and(ScanIndexEntry::has_unverified_source);
+                if needs_marker
+                    && !held_progress_audit
+                    && (slot_unfunded || !index.can_stage_sampled_audit(&index_key))
+                {
+                    if let Some(context) = sampling.as_mut() {
+                        context.audit_cap_full += 1;
+                    }
+                    // Keep the refused live path discoverable past the age
+                    // window using the existing persisted traversal queue.
+                    if let Some(traversal) = index.traversal.as_mut() {
+                        if !traversal
+                            .pending_candidates
+                            .iter()
+                            .any(|path| path.path == candidate.path)
+                        {
+                            traversal.pending_candidates.push_back(ScanTraversalPath {
+                                scan_root: candidate.scan_root.clone(),
+                                path: candidate.path.clone(),
+                                census_member: true,
+                                watcher_hint: true,
+                            });
+                        }
+                    }
+                    census.record_unreadable(UnreadableCause::Reduction, 1);
+                    pending!();
+                }
+                // Debt-free after quiet retirement is scheduling state, not
+                // Full authority, including a later forced Unchanged read.
                 let source_verified = cursor_fragment.is_none()
+                    && file_sampling.as_ref().is_some_and(|active| {
+                        matches!(
+                            active.mode,
+                            crate::transcript_acquisition::ReadMode::Full(_)
+                        )
+                    })
                     && completed_acquisition
                         .as_ref()
                         .is_some_and(|completed| completed.checkpoint.audit_debt().is_none())
@@ -29855,14 +29938,39 @@ impl OwnedSourceScan {
                         }
                     }
                     if let Some(fragment) = cursor_fragment {
-                        index.stage_sampled_audit(
+                        let was_pending = index
+                            .files
+                            .get(&index_key)
+                            .is_some_and(ScanIndexEntry::has_unverified_source);
+                        if index.stage_sampled_audit(
                             &index_key,
                             &source_file_fingerprint,
                             fragment.debt,
-                        );
+                        ) && !was_pending
+                        {
+                            if let Some(context) = sampling.as_mut() {
+                                context.audit_slots = context.audit_slots.saturating_sub(1);
+                            }
+                        }
                     }
-                    if let Some(completed) = completed_acquisition {
-                        if let Some(context) = sampling.as_ref() {
+                    if let Some(mut completed) = completed_acquisition {
+                        if let Some(context) = sampling.as_mut() {
+                            let quiet_retired = quiet_audit_checked
+                                && !completed.unsealed
+                                && completed.reduction.is_some()
+                                && cursor_fragment.is_none()
+                                && state_census_complete
+                                && sidecar_census_complete
+                                && sampled_jsonl::loss_free_source_report(
+                                    &report,
+                                    recognized_usage_drop_count,
+                                    dropped_usage_record_count,
+                                );
+                            // All source/census/Full-credit decisions above saw
+                            // the owed debt. This clears only scheduling state.
+                            if quiet_retired {
+                                completed.checkpoint.retire_quiet_audit();
+                            }
                             // A clone allocates exactly its length, and is the
                             // sampled key: R0's insert term assumes both.
                             let key = index_key.clone();
@@ -29876,6 +29984,15 @@ impl OwnedSourceScan {
                                 finalization_charge.unwrap_or(0),
                             );
                             if admitted {
+                                if quiet_retired
+                                    && index
+                                        .retire_quiet_audit(&index_key, &source_file_fingerprint)
+                                {
+                                    context.audit_quiet_retired += 1;
+                                    // Reuse only on the next committed scan:
+                                    // partial-save reconciliation may restore
+                                    // this marker without accepting its body.
+                                }
                                 if let Some(active) = file_sampling.as_ref() {
                                     active.reinsertion.admitted();
                                 }
@@ -30713,6 +30830,10 @@ impl OwnedSourceScan {
                         .map(|debt| audit_now.saturating_sub(debt.due_unix_seconds))
                         .max()
                         .unwrap_or(0);
+                    if context.audit_cap_full > 0 {
+                        crate::local_resource_diagnostics::traversal_point("sampled_audit_cap_alarm", source.api_slug(),
+                            &serde_json::json!({"audit_cap_full": context.audit_cap_full, "pending_audits": pending}));
+                    }
                     crate::local_resource_diagnostics::ReadCounts {
                         full_selections: context.full_files,
                         tail_selections: context.tail_files,
@@ -30731,6 +30852,8 @@ impl OwnedSourceScan {
                             max_completion_overdue_seconds: context.completion_overdue_seconds,
                         },
                         index_state_at_page_end: crate::local_resource_diagnostics::IndexState {
+                            audit_quiet_retired: context.audit_quiet_retired,
+                            audit_cap_full: context.audit_cap_full,
                             pending_audits: pending,
                             overdue_audits: overdue,
                             oldest_due_age_seconds: oldest_due_age,
@@ -31742,7 +31865,7 @@ impl OwnedSourceScan {
                         // restore. The legacy prefix/proof paths retain their
                         // own rules until S1. A same-process E2-held read may
                         // reuse only its own certificate, without authority.
-                        let allow_sample = (index.files.contains_key(&key) || e2_held_new_file)
+                        let mut allow_sample = (index.files.contains_key(&key) || e2_held_new_file)
                             && !protected
                             && !forced_family
                             && !comparison_target
@@ -31766,13 +31889,6 @@ impl OwnedSourceScan {
                             .admission
                             .audit_slot_available
                             .observe(context.audit_slots > 0);
-                        context.admission.sampling_allowed.observe(allow_sample);
-                        if retained_present && !allow_sample {
-                            context.admission.retained_entry_rejected_by_eligibility = context
-                                .admission
-                                .retained_entry_rejected_by_eligibility
-                                .saturating_add(1);
-                        }
                         let scope = context.file_scope(
                             source,
                             &candidate,
@@ -31837,6 +31953,34 @@ impl OwnedSourceScan {
                             }
                             retained => (retained, taken_admission),
                         };
+                        // The cap funds NEW obligations, never a global restore
+                        // gate. Marked files Tail; quiet debt-free copies reuse.
+                        if allow_sample
+                            && context.audit_slots == 0
+                            && !index
+                                .files
+                                .get(&key)
+                                .is_some_and(ScanIndexEntry::has_unverified_source)
+                            && !retained.as_ref().is_some_and(|old| {
+                                old.checkpoint.audit_debt().is_none()
+                                    && old.checkpoint.sealed_offset() == candidate.size_bytes
+                                    && old.checkpoint.scope() == &scope
+                                    && old
+                                        .checkpoint
+                                        .stamp_matches(parser.reader.reader.get_ref())
+                                        .unwrap_or(false)
+                            })
+                        {
+                            allow_sample = false;
+                            context.audit_cap_full += 1;
+                        }
+                        context.admission.sampling_allowed.observe(allow_sample);
+                        if retained_present && !allow_sample {
+                            context.admission.retained_entry_rejected_by_eligibility = context
+                                .admission
+                                .retained_entry_rejected_by_eligibility
+                                .saturating_add(1);
+                        }
                         let old = retained.filter(|_| allow_sample);
                         context.admission.prepare_started =
                             context.admission.prepare_started.saturating_add(1);

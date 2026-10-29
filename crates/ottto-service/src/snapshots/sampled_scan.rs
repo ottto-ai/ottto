@@ -406,13 +406,15 @@ pub(super) struct Context {
     pub(super) priority_replays: usize,
     pub(super) audits_started: usize,
     pub(super) audits_completed: usize,
+    pub(super) audit_quiet_retired: usize,
+    pub(super) audit_cap_full: usize,
     pub(super) start_overdue_seconds: u64,
     pub(super) completion_overdue_seconds: u64,
     pub(super) admission: crate::local_resource_diagnostics::AcquisitionAdmission,
 }
 crate::heap_layout_bound::fields!(Context; cache, namespace, audit_metadata_supported, audit_slots,
     full_files, tail_files, unchanged_files, native_bytes, sample_bytes, full_reasons,
-    priority_replays, audits_started, audits_completed, start_overdue_seconds,
+    priority_replays, audits_started, audits_completed, audit_quiet_retired, audit_cap_full, start_overdue_seconds,
     completion_overdue_seconds, admission);
 
 pub(super) struct Active {
@@ -541,6 +543,8 @@ impl OwnedSourceScan {
                 priority_replays: 0,
                 audits_started: 0,
                 audits_completed: 0,
+                audit_quiet_retired: 0,
+                audit_cap_full: 0,
                 start_overdue_seconds: 0,
                 completion_overdue_seconds: 0,
                 admission: Default::default(),
@@ -878,6 +882,8 @@ fn context_overhead(context: &Context) -> Option<usize> {
         priority_replays: _,
         audits_started: _,
         audits_completed: _,
+        audit_quiet_retired: _,
+        audit_cap_full: _,
         start_overdue_seconds: _,
         completion_overdue_seconds: _,
         admission,
