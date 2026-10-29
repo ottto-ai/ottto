@@ -1339,17 +1339,25 @@ overwrite; backend authority rules independently govern successor acceptance.
 ### Deferred custody on a running Codex job
 
 `custody_latch_deferred` uses the existing counts-only `local_resources` carrier.
-`events` is one per already-acquired job that first observes a new correctness
-custody decision. `pages` and `age_seconds` are observed lifetime gauges for that
-job, not additive byte counts; no file path or session id is logged. Existing
+`count` (also exposed as the compatibility alias `events`) is one per
+already-acquired job that first observes a new correctness custody decision.
+`pages` and `oldest_age` (seconds) are observed lifetime maxima for that job,
+not additive counts. Each observed deferred pass also emits the same counts on
+`durable_tail_alarm`, independently of custody-overflow alarms. The gauges reset
+when the existing job ends; no path or session id is logged. Existing
 native collection counters account for the job's continuation bytes.
 
 The dedicated optional custody field saves the negative decision before another
 continuation byte. Only that existing job can continue, within its original
 frozen extent and original stamp, scope and counting checks. New jobs exclude
 held members. A restart loads ordinary quiet custody before header acquisition.
-The job's output is withheld as a unit before accepted extent, ACK, fingerprint
-or witness updates. Its normal completion, error, loss, eviction or scope change
+Main's existing ownership checks still decide the acquired group's unit: a
+complete valid join publishes once; an incomplete join publishes nothing and
+advances no accepted extent, ACK, fingerprint or witness. The independent
+negative custody decision retains its owner attribution through acceptance;
+a later mint gives no publication credit and prevents smaller P-only output.
+Singleton custody cannot trigger a new replay Full. Normal completion, error,
+loss, eviction or scope change
 releases the slot through the existing lifecycle; the saved decision then permits
 no further read. Unavailable group evidence ends after three ordinary resume
 pages; group jobs are never accelerated. Catch-up/release remains owner work.
@@ -1366,5 +1374,5 @@ the held set fits (expected never on a normal machine); it alarms per pass.
 Census-gated retirement and carried-ACK completion wait while prior state-only
 fingerprints, activity and manifest coverage are retained.
 
-Post-release counts: `custody_latch_deferred.events`; observe its `pages` and
-`age_seconds` lifetime gauges alongside existing held-growth and native read counts.
+Post-release counts: `custody_latch_deferred.count`; observe its `pages` and
+`oldest_age` lifetime gauges and distinct deferral alarm alongside existing held-growth and native read counts.

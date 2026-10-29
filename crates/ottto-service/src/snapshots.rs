@@ -28901,10 +28901,14 @@ impl OwnedSourceScan {
                         );
                     }
                 }
-                // A deferred correctness decision withholds this job as a unit.
-                // Accepted extents, ACKs and witnesses remain at their prior end.
+                // Only the already acquired GROUP may finish through main's
+                // unit ownership checks: a complete union publishes once, an
+                // incomplete union gives no accepted extent/witness/ACK. Custody
+                // never starts a new acquisition or authorizes a replay Full.
+                // A singleton cannot borrow the group's completion authority.
                 if source == SnapshotSource::Codex
                     && active.cursor.is_some()
+                    && active.group.is_none()
                     && sampled_scan::codex_cursor::job_has_custody(&active, index)
                 {
                     if let Some(lease) = codex_cursor_lease.take() {
@@ -49698,6 +49702,16 @@ impl ScanIndex {
         key: &str,
         blocked: BTreeSet<String>,
     ) {
+        // A finishing in-flight union may publish, but cannot release the
+        // independent correctness custody decision or its owner scope.
+        if self
+            .files
+            .get(key)
+            .is_some_and(|entry| entry.codex_compressed_hold.is_some())
+        {
+            self.extend_codex_blocked_attribution(key, blocked);
+            return;
+        }
         let previous = if blocked.is_empty() {
             self.codex_state_only_blocked_by_file.remove(key)
         } else {
@@ -49756,6 +49770,13 @@ impl ScanIndex {
     ) {
         for key in accepting_keys {
             let key = key.as_ref();
+            if self
+                .files
+                .get(key)
+                .is_some_and(|entry| entry.codex_compressed_hold.is_some())
+            {
+                continue;
+            }
             let emptied = self
                 .codex_state_only_blocked_by_file
                 .get_mut(key)

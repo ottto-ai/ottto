@@ -97,15 +97,16 @@ pub(crate) fn codex_held_growth(bytes: u64, over_cap: u64) {
     );
 }
 
-/// Per-job deferrals and observed lifetime gauges, counts only.
+/// Per-job count; pages and oldest_age (seconds) are observed maxima, not sums.
+/// Alarm each observed deferred pass; no independent clock or content read.
 pub(crate) fn custody_latch_deferred(events: u64, pages: u64, age_seconds: u64) {
-    traversal_point(
-        "custody_latch_deferred",
-        "codex",
-        &serde_json::json!({
-            "custody_latch_deferred": {"events": events, "pages": pages, "age_seconds": age_seconds}
-        }),
-    );
+    let counts = serde_json::json!({
+        "custody_latch_deferred": {
+            "count": events, "events": events, "pages": pages, "oldest_age": age_seconds
+        }
+    });
+    traversal_point("custody_latch_deferred", "codex", &counts);
+    durable_tail_alarm("codex", &counts);
 }
 
 pub(crate) fn custody_overflow() {

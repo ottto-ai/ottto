@@ -1456,7 +1456,7 @@ fn stale_header_never_mints_custody_after_rewrite_or_replacement_even_on_refusal
 
 #[test]
 fn state_only_exclusion_refusal_keeps_prior_fingerprint_activity_and_manifest() {
-    fn with_state(root: &Path, index: ScanIndex) -> (ScanIndex, SourceScanResult) {
+    fn with_state(root: &Path, index: ScanIndex, present: bool) -> (ScanIndex, SourceScanResult) {
         let mut scan = OwnedSourceScan::new(
             SnapshotSource::Codex,
             &[root.join("sessions")],
@@ -1472,19 +1472,21 @@ fn state_only_exclusion_refusal_keeps_prior_fingerprint_activity_and_manifest() 
         );
         scan.state_census_complete = true;
         scan.sidecar_census_complete = true;
-        scan.codex_title_metadata.state_threads.insert(
-            PARENT.into(),
-            CodexStateThread {
-                tokens_used: 1000,
-                updated_at: Some("2026-10-06T00:00:00Z".into()),
-                ..Default::default()
-            },
-        );
+        if present {
+            scan.codex_title_metadata.state_threads.insert(
+                PARENT.into(),
+                CodexStateThread {
+                    tokens_used: 1000,
+                    updated_at: Some("2026-10-06T00:00:00Z".into()),
+                    ..Default::default()
+                },
+            );
+        }
         run(scan)
     }
     let root = crate::test_scratch::private_dir("custody-state-refusal-keeps");
     let held = member(&root, "sessions", OWNER, false);
-    let (mut index, mut seed) = with_state(&root, ScanIndex::default());
+    let (mut index, mut seed) = with_state(&root, ScanIndex::default(), true);
     finalize_scan_after_policy(SnapshotSource::Codex, &mut seed, &mut index);
     assert!(index
         .codex_state_only_snapshot_fingerprints
@@ -1515,7 +1517,7 @@ fn state_only_exclusion_refusal_keeps_prior_fingerprint_activity_and_manifest() 
         index.save(&saved).unwrap();
         index = ScanIndex::load(&saved).unwrap();
         let ((mut next, mut result), rows) =
-            capture(|| no_open(&held, || with_state(&root, index)));
+            capture(|| no_open(&held, || with_state(&root, index, true)));
         assert!(
             !result.state_census_complete,
             "refusal must reach finalizer"
@@ -1540,6 +1542,27 @@ fn state_only_exclusion_refusal_keeps_prior_fingerprint_activity_and_manifest() 
         );
         index = next;
     }
+    // Funding recovers; the unrelated gone state thread must now retire.
+    index
+        .codex_state_only_blocked_by_file
+        .insert(local_index_key(&held), BTreeSet::from([OWNER.to_owned()]));
+    index.codex_state_only_blocked_session_ids = BTreeSet::from([OWNER.to_owned()]);
+    index.traversal = None;
+    let (mut recovered, mut result) = no_open(&held, || with_state(&root, index, false));
+    assert!(
+        result.state_census_complete,
+        "funded exclusion recovers completeness"
+    );
+    finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut recovered);
+    assert!(!recovered
+        .codex_state_only_snapshot_fingerprints
+        .contains_key(PARENT));
+    assert!(fingerprints
+        .values()
+        .all(|fp| !recovered.snapshot_activity_at.contains_key(fp)));
+    assert!(recovered.files[&local_index_key(&held)]
+        .codex_compressed_hold
+        .is_some());
     fs::remove_dir_all(root).unwrap();
 }
 

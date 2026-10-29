@@ -159,11 +159,8 @@ impl HeaderWitness {
         fs::symlink_metadata(&self.candidate.path).is_ok_and(|stat| {
             stat.is_file()
                 && !stat.file_type().is_symlink()
-                && (metadata_witness(&stat) == self.metadata
-                    || { let old = &self.stamp;
-                        crate::transcript_acquisition::FileStamp::capture(stat)
-                            .is_ok_and(|now| old.same_content(&now))
-                    })
+                && crate::transcript_acquisition::FileStamp::capture(stat)
+                    .is_ok_and(|now| self.stamp.same_content(&now))
         })
     }
 }

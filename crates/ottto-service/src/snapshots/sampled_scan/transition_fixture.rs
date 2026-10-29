@@ -1,7 +1,6 @@
 //! Minimal test-only mirror of E1/E4 #882 shared money oracle.
 //! Exact types/comparator from origin/e4/transition-fixture; drop this mirror
 //! when #882 merges. No independent comparator or normalization policy.
-#![allow(dead_code)]
 use crate::snapshots::{
     snapshot_semantic_envelope, SnapshotItem, SnapshotSource, SnapshotUploadPolicy,
 };
@@ -490,4 +489,24 @@ fn crash_extension_names_are_disjoint_from_the_m1_matrix() {
     }
     assert_eq!(names.len(), 32);
     assert!(names.contains("BeforeCodexPublication"));
+}
+
+/// Comparator-only controls; this is not an acquisition/zero-I/O receipt.
+#[test]
+fn shared_custody_money_oracle_empty_restart_controls() {
+    for mode in [
+        Mode::ColdFull,
+        Mode::Ram,
+        Mode::DiskRestore,
+        Mode::Restart,
+        Mode::EvictRetry,
+    ] {
+        let mut empty = RouteResult::emitted(mode, SnapshotSource::Codex, Vec::new(), &[]);
+        assert_eq!(empty.restored, 0);
+        if matches!(mode, Mode::DiskRestore | Mode::Restart | Mode::EvictRetry) {
+            empty.io.cheap_checks = Some(0);
+            empty.io.other_reads = Some(0);
+            money_oracle::assert_quiet_restart_zero_bytes(&empty);
+        }
+    }
 }
