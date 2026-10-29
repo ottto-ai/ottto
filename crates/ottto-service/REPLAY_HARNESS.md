@@ -112,9 +112,18 @@ count from the actual candidate-skip branch, and zero `durable_store_io`.
 The latter reuses the existing store's restore attempts, record/GC read counts,
 and body/header/verification/GC byte counts. Missing telemetry stays null.
 
-P2 asserts at most one Full plus a positive Tail count. Every Full must have an
-actual diagnostic cause in the test's pinned transitional set with its named
-retiring slice; missing, unknown or unaccounted causes fail. Restore misses are
-never translated into allowed causes. Every P2 prints the exact `full_causes`,
-`restore_outcome` and aggregate page record. A panicking synthetic fixture retains
-its directory and prints aggregate JSONL to the test log.
+P0 emits `durable_after_save_diagnostics` after the real index save. It counts
+only regular digest-named record entries in its own scratch store, without
+reading record bodies. The row includes lock ownership, store initialization,
+disabled reason, heap-layout support and existing write/refusal counters.
+Unavailable or unsafe inventories remain null; a missing directory counts zero.
+`durable_records_after_save` in P0 totals aggregates these inventories. Later
+passes do not perform this extra directory inventory. The synthetic chain
+requires a positive P0 count before testing restarts. Unsupported native heap
+layouts remain visible as degraded; this tool never bypasses production admission.
+
+P2 requires zero Full, a positive Tail count and no Full cause. There are no
+transitional exceptions or aliases for missing records. Every P2 prints the
+exact `full_causes`, `restore_outcome` and aggregate page record. A panicking
+synthetic fixture retains its directory and prints aggregate JSONL to the test
+log. P3 and the final chain-to-COLD equality count only after P2 succeeds.
