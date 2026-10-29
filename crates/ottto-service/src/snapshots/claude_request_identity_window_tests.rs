@@ -622,13 +622,13 @@ fn sticky_individually_over_parts_bucket_preserves_joint_accepted_money_proof() 
     sticky_assert_joint_pair_survives(true);
 }
 
-fn sticky_assert_collective_byte_pair(newer_bad: bool) {
+fn sticky_assert_collective_byte_pair(newer_bad: bool, refusal_gap: bool) {
     let bad_hour = if newer_bad {
         "2026-09-01T12:00:00Z"
     } else {
         "2026-09-01T09:00:00Z"
     };
-    let requests = [
+    let mut requests = vec![
         display_request(Some("max"), HOUR_10, 1, login_key(OWNER_A), Some(HOUR_10)),
         display_request(Some("max"), HOUR_11, 1, login_key(OWNER_A), Some(HOUR_11)),
         display_request(
@@ -654,10 +654,26 @@ fn sticky_assert_collective_byte_pair(newer_bad: bool) {
             Some(bad_hour),
         ),
     ];
+    if refusal_gap {
+        requests.truncate(2);
+        for (plan, org) in [("pro", 'c'), ("team", 'e'), ("enterprise", 'f')] {
+            requests.push(display_request(
+                Some(plan),
+                bad_hour,
+                1,
+                RequestIdentity::Tagged(AuthorityKey {
+                    login: None,
+                    org: Some(org.to_string().repeat(64)),
+                    basis: identity::TRANSCRIPT_ORG,
+                }),
+                Some(bad_hour),
+            ));
+        }
+    }
     let (mut item, timed) = display_item(&requests);
     item.collected_at = "2026-09-01T12:05:00Z".into();
-    item.input_tokens = 4;
-    item.request_count = 4;
+    item.input_tokens = requests.len() as u64;
+    item.request_count = requests.len() as u64;
     item.output_tokens = 0;
     item.cache_read_tokens = 0;
     item.cache_creation_5m_tokens = 0;
@@ -675,6 +691,13 @@ fn sticky_assert_collective_byte_pair(newer_bad: bool) {
     let mut clean = stripped(&item);
     clean.provenance.collector = identity::COLLECTOR.into();
     let base = identity::item_bytes(&clean);
+    let bad_rows = if refusal_gap {
+        3
+    } else if newer_bad {
+        2
+    } else {
+        1
+    };
     let extra = |kept: usize| {
         let mut candidate = clean.clone();
         let mut shares = proof.clone();
@@ -687,7 +710,7 @@ fn sticky_assert_collective_byte_pair(newer_bad: bool) {
             &identity::AcceptedBuckets::default(),
         )
         .unwrap();
-        candidate.request_identity_refusals = u64::from(newer_bad) + if kept == 2 { 1 } else { 2 };
+        candidate.request_identity_refusals = bad_rows + u64::from(kept == 1);
         identity::item_bytes(&candidate) - base
     };
     let pair_extra = extra(2);
@@ -696,7 +719,28 @@ fn sticky_assert_collective_byte_pair(newer_bad: bool) {
         pair_extra < single_extra,
         "the complete top row collapses to Single"
     );
-    let headroom = (pair_extra + single_extra) / 2;
+    let headroom = if refusal_gap {
+        let mut candidate = clean.clone();
+        let mut latest = proof.clone();
+        for c in latest.iter_mut().take(2) {
+            c.identity = RequestIdentity::Missing;
+        }
+        identity::apply_with_accepted_for_test(
+            &mut candidate,
+            &latest,
+            &identity::AcceptedBuckets::default(),
+        )
+        .unwrap();
+        let no_refusal_extra = identity::item_bytes(&candidate) - base;
+        candidate.request_identity_refusals = 2;
+        let refused_extra = identity::item_bytes(&candidate) - base;
+        assert!(pair_extra < no_refusal_extra + 1);
+        assert!(no_refusal_extra + 1 < single_extra);
+        assert!(no_refusal_extra + 1 < refused_extra);
+        no_refusal_extra + 1
+    } else {
+        (pair_extra + single_extra) / 2
+    };
     let target = identity::MAX_ITEM_BYTES - headroom;
     let mut filler = clean.usage_buckets[0].model_usage[0].clone();
     filler.model = "claude-filler".into();
@@ -774,9 +818,14 @@ fn sticky_assert_collective_byte_pair(newer_bad: bool) {
 
 #[test]
 fn sticky_byte_cap_keeps_joint_accepted_pair_when_an_older_bucket_cannot_fit() {
-    sticky_assert_collective_byte_pair(false);
+    sticky_assert_collective_byte_pair(false, false);
 }
 #[test]
 fn sticky_byte_cap_keeps_joint_accepted_pair_when_open_bucket_metadata_cannot_fit() {
-    sticky_assert_collective_byte_pair(true);
+    sticky_assert_collective_byte_pair(true, false);
+}
+
+#[test]
+fn sticky_byte_cap_charges_unavoidable_refusal_metadata_before_open_priority() {
+    sticky_assert_collective_byte_pair(true, true);
 }

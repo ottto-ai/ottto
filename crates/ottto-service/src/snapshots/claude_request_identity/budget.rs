@@ -234,10 +234,18 @@ struct Selection {
 // unavoidable top representation: Single for one key, key-only parts with no
 // money for multiple keys. Excluding a bucket on this bound cannot exclude a
 // collectively fitting set, including the otherwise protected open bucket.
-fn intrinsically_fits(item: &SnapshotItem, grouping: &Grouping, index: usize, base: usize) -> bool {
+fn intrinsically_fits(
+    item: &SnapshotItem,
+    grouping: &Grouping,
+    index: usize,
+    base: usize,
+    tagged_rows: usize,
+    mandatory_refusals: u64,
+) -> bool {
     let minimum = || -> Option<Metrics> {
         let mut total = Metrics::default();
         let mut keys = BTreeSet::new();
+        let mut own_tagged_rows = 0usize;
         for row in &item.usage_buckets[index].model_usage {
             let group = grouping.get(
                 &item.usage_buckets[index].bucket_start,
@@ -253,6 +261,7 @@ fn intrinsically_fits(item: &SnapshotItem, grouping: &Grouping, index: usize, ba
                     (amount.counts != [0; 8]).then_some((key.as_ref()?, amount))
                 })
                 .collect::<Vec<_>>();
+            own_tagged_rows += usize::from(!tagged.is_empty());
             keys.extend(tagged.iter().map(|(key, _)| (*key).clone()));
             let zero_index = keys
                 .iter()
@@ -282,7 +291,16 @@ fn intrinsically_fits(item: &SnapshotItem, grouping: &Grouping, index: usize, ba
             .iter()
             .map(AuthorityKey::evidence)
             .collect::<BTreeSet<_>>();
-        total.bytes += evidence_bytes(&evidence, 0)?;
+        let metadata = evidence_bytes(&evidence, mandatory_refusals)?;
+        total.bytes += metadata;
+        // Either every other tagged row stays (each adds at least a row
+        // evidence_ref), or at least one is stripped and adds a refusal.
+        // Charge the smaller cost, so a refused older pair cannot make an
+        // independently impossible open bucket appear feasible by a few bytes.
+        let other_tags = (tagged_rows - own_tagged_rows) * ",\"evidence_ref\":0".len();
+        let extra_refusal =
+            evidence_bytes(&evidence, mandatory_refusals.saturating_add(1))? - metadata;
+        total.bytes += other_tags.min(extra_refusal);
         total.bytes += evidence
             .iter()
             .enumerate()
@@ -505,6 +523,8 @@ pub(super) fn select(
         keys: BTreeSet::new(),
         refused_rows: 0,
     };
+    let mut tagged_rows = 0;
+    let mut mandatory_refusals = prior_refusals;
     for bucket in &item.usage_buckets {
         for row in &bucket.model_usage {
             let group = grouping.get(&bucket.bucket_start, &row_key_from_model_usage(row))?;
@@ -512,6 +532,8 @@ pub(super) fn select(
                 .by_key
                 .iter()
                 .any(|(key, amount)| key.is_some() && amount.counts != [0; 8]);
+            tagged_rows += usize::from(has_tag);
+            mandatory_refusals = mandatory_refusals.saturating_add(u64::from(group.refused));
             selection.refused_rows += u64::from(group.refused || has_tag);
             let top = *row_index.get(&row_key_from_model_usage(row))?;
             selection.top[top]
@@ -551,7 +573,14 @@ pub(super) fn select(
         .filter(|&index| is_accepted[index])
         .collect::<Vec<_>>();
     for &index in &accepted_order {
-        if !intrinsically_fits(item, grouping, index, base_bytes) {
+        if !intrinsically_fits(
+            item,
+            grouping,
+            index,
+            base_bytes,
+            tagged_rows,
+            mandatory_refusals,
+        ) {
             continue;
         }
         let Some((next, rows)) =
