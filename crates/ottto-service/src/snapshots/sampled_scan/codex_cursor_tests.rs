@@ -14946,8 +14946,10 @@ fn held_foreign_path_keeps_unrelated_output_and_stale_job_retirement() {
         assert!(!cache.cursor_slot_free());
         let resumed = counter(&cache, |c| c.jobs_resumed);
         for n in 1..=NAMESPACE_STALE_PAGES {
-            let mut bytes = codex_line(json!({"type":"session_meta", "timestamp":NOW,
-                "payload":{"id":healthy,"timestamp":NOW}}));
+            let mut bytes = codex_line(
+                json!({"type":"session_meta", "timestamp":"2026-10-07T10:00:00Z",
+                "payload":{"id":healthy,"timestamp":"2026-10-07T10:00:00Z"}}),
+            );
             bytes.extend(token_line(n));
             assert!(
                 bytes.len() < 1024,

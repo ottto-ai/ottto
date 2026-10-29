@@ -1248,8 +1248,16 @@ fn unattributed_opaque_filename_uses_retained_counting_binding_as_negative_scope
         let original = member(&root, "sessions", OWNER, false);
         let held = original.with_file_name("a.jsonl");
         fs::rename(original, &held).unwrap();
-        let (mut index, accepted) = codex_file_join::tests::scan(&root, ScanIndex::default(), 10);
+        let (mut index, mut accepted) =
+            codex_file_join::tests::scan(&root, ScanIndex::default(), 10);
         assert_eq!(accepted.snapshots.len(), 1);
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut accepted, &mut index);
+        index.accepted_snapshot_fingerprints.extend(
+            accepted
+                .snapshots
+                .iter()
+                .map(|snapshot| snapshot.snapshot_fingerprint.clone()),
+        );
         let key = local_index_key(&held);
         assert_eq!(
             index.files[&key].codex_counting_owner.as_deref(),
