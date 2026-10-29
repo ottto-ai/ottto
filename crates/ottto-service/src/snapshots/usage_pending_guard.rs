@@ -172,8 +172,11 @@ pub(super) struct Runtime {
     paced: BTreeMap<String, u64>,
     // Keys admitted for a withheld Full during the current candidate visit.
     withheld: BTreeSet<String>,
+    // Paced keys whose withheld Full completed: it satisfied every audit due
+    // by its pace stamp. The committed entry keeps its audit obligation.
+    audited: BTreeSet<String>,
 }
-crate::heap_layout_bound::fields!(Runtime; slots, slot_occurrences, paced, withheld);
+crate::heap_layout_bound::fields!(Runtime; slots, slot_occurrences, paced, withheld, audited);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Growth {
@@ -295,6 +298,36 @@ impl Holds {
             &json!({"held_member_growth_slots":1,"held_member_growth_occurrences":count}),
         );
         Growth::Recorded
+    }
+    /// Request keys read while held; they still veto other families.
+    pub(super) fn growth_hashes(&self) -> impl Iterator<Item = &String> {
+        self.runtime
+            .slots
+            .values()
+            .flat_map(|slot| slot.occurrences.keys())
+    }
+    /// The family's `window` evidence held in its slots, shaped as pending.
+    pub(super) fn growth_pending(&self, root: &str, window: &str) -> ClaudeUsageFamilyPending {
+        let mut pending = ClaudeUsageFamilyPending {
+            derived_request_members: BTreeSet::new(),
+            census_window_end: window.to_owned(),
+            member_request_id_hashes: BTreeMap::new(),
+            member_occurrences: BTreeMap::new(),
+            invalid: false,
+            idless_revision: None,
+        };
+        for (member, slot) in &self.runtime.slots {
+            if slot.root == root && slot.window == window {
+                pending
+                    .member_request_id_hashes
+                    .insert(member.clone(), BTreeSet::new());
+                pending.derived_request_members.insert(member.clone());
+                pending
+                    .member_occurrences
+                    .insert(member.clone(), slot.occurrences.clone());
+            }
+        }
+        pending
     }
     /// Remove a family's slots; those of `window` re-window it after resolution.
     pub(super) fn take_member_growth(
@@ -765,10 +798,12 @@ impl ScanIndex {
                 .map(|(key, _)| key.clone());
             if let Some(oldest) = oldest {
                 runtime.paced.remove(&oldest);
+                runtime.audited.remove(&oldest);
                 pace_evicted = 1;
             }
         }
         runtime.paced.insert(key.clone(), now);
+        runtime.audited.remove(&key);
         runtime.withheld.insert(key);
         let mut counts = serde_json::Map::new();
         counts.insert("withheld_full".into(), json!(1));
@@ -785,6 +820,22 @@ impl ScanIndex {
     #[cfg(test)]
     pub(super) fn usage_guard_pace_for_test(&mut self, keys: impl IntoIterator<Item = String>) {
         self.usage_guard_holds.runtime.paced = keys.into_iter().map(|key| (key, 0)).collect();
+    }
+    /// A completed withheld Full read the whole file: audits due by its pace
+    /// stamp are satisfied for this process, so the next visit can Tail.
+    pub(super) fn usage_guard_mark_audited(&mut self, key: &str) {
+        let runtime = &mut self.usage_guard_holds.runtime;
+        if runtime.paced.contains_key(key) {
+            runtime.audited.insert(key.to_owned());
+        }
+    }
+    pub(super) fn usage_guard_audit_satisfied(&self, key: &str, due_unix_seconds: u64) -> bool {
+        let runtime = &self.usage_guard_holds.runtime;
+        runtime.audited.contains(key)
+            && runtime
+                .paced
+                .get(key)
+                .is_some_and(|at| due_unix_seconds <= *at)
     }
     pub(super) fn usage_guard_is_withheld(&self, key: &str) -> bool {
         self.usage_guard_holds.runtime.withheld.contains(key)

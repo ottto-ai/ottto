@@ -9003,6 +9003,13 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             &index.claude_usage_family_pending,
             legacy_request_owners.as_ref(),
         );
+        let retained_occurrences = index
+            .claude_usage_family_pending
+            .values()
+            .flat_map(|pending| pending.member_occurrences.values())
+            .map(BTreeMap::len)
+            .fold(0_usize, usize::saturating_add);
+        let mut resolved_holds = Vec::new();
         for (root_session_id, members) in &complete_families {
             if uncertified_roots.contains(root_session_id) {
                 continue;
@@ -9010,7 +9017,38 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             let Some(base_pending) = index.claude_usage_family_pending.get(root_session_id) else {
                 continue;
             };
-            let mut pending = base_pending.clone();
+            // B3 phase 1 (Lead B P1-a): a held stale family re-windows only
+            // after resolution. A missing or incomplete witness resolves when
+            // this window's held growth is a complete family that proves; its
+            // old-window proof is replaced only then, within the pending cap.
+            let held_growth = (base_pending.census_window_end != census_window_end
+                && matches!(
+                    index.usage_guard_holds.reason(root_session_id),
+                    Some(
+                        usage_pending_guard::Unknown::MissingWitness
+                            | usage_pending_guard::Unknown::IncompleteMember
+                            | usage_pending_guard::Unknown::CompactedOrigin
+                    )
+                ))
+            .then(|| {
+                index
+                    .usage_guard_holds
+                    .growth_pending(root_session_id, census_window_end)
+            })
+            .filter(|growth| {
+                let count = |pending: &ClaudeUsageFamilyPending| {
+                    pending
+                        .member_occurrences
+                        .values()
+                        .map(BTreeMap::len)
+                        .fold(0_usize, usize::saturating_add)
+                };
+                retained_occurrences
+                    .saturating_sub(count(base_pending))
+                    .saturating_add(count(growth))
+                    <= max_pending_occurrences
+            });
+            let mut pending = held_growth.clone().unwrap_or_else(|| base_pending.clone());
             for member in confirmed_empty_claude_family_members(index, root_session_id) {
                 pending
                     .member_request_id_hashes
@@ -9059,7 +9097,23 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             if !retain_rows {
                 family.rows_by_member = BTreeMap::new();
             }
+            if let Some(growth) = held_growth {
+                resolved_holds.push((root_session_id.clone(), growth));
+            }
             proven.insert(root_session_id.clone(), family);
+        }
+        for (root_session_id, growth) in resolved_holds {
+            index
+                .usage_guard_holds
+                .take_member_growth(&root_session_id, "");
+            index
+                .claude_usage_family_pending
+                .insert(root_session_id, growth);
+            crate::local_resource_diagnostics::traversal_point(
+                "claude_usage_held_member_growth",
+                SnapshotSource::ClaudeCode.api_slug(),
+                &json!({"held_family_resolved_rewindowed":1}),
+            );
         }
         reconstructed = index
             .claude_usage_family_witnesses
@@ -9292,10 +9346,27 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     } else {
         native_duplicate_request_owners
     };
+    // B3 phase 1 (Lead B 4c): a held stale family's request keys, old window
+    // and held growth, are excluded from duplicate detection above, so they
+    // still veto any other family that shares them.
+    let held_request_hashes = index
+        .claude_usage_family_pending
+        .iter()
+        .filter(|(root_session_id, _)| {
+            !index.usage_guard_holds.global() && index.usage_guard_holds.holds(root_session_id)
+        })
+        .flat_map(|(_, pending)| {
+            pending
+                .membership()
+                .values()
+                .flat_map(|hashes| hashes.iter())
+        })
+        .chain(index.usage_guard_holds.growth_hashes());
     let duplicated_request_hashes = index
         .claude_duplicate_request_owners
         .keys()
         .chain(detected_duplicate_request_owners.keys())
+        .chain(held_request_hashes)
         .cloned()
         .collect::<BTreeSet<_>>();
     if census_complete {
@@ -10498,6 +10569,7 @@ fn claude_stale_pending_keeps_census_invalid(
         })
 }
 
+#[cfg(test)]
 fn accumulate_claude_usage_family_pending_with_limit(
     snapshots: &[SnapshotItem],
     pending_by_root: &mut BTreeMap<String, ClaudeUsageFamilyPending>,
@@ -29915,6 +29987,7 @@ impl OwnedSourceScan {
                     && index.usage_guard_take_withheld(&local_index_key(&candidate.path))
                 {
                     index.usage_guard_record_withheld(&parsed_file.snapshots, &census_window_end);
+                    index.usage_guard_mark_audited(&local_index_key(&candidate.path));
                     let budget = if completed_acquisition
                         .as_ref()
                         .is_some_and(|completed| completed.released.is_some())
@@ -32887,6 +32960,12 @@ impl OwnedSourceScan {
                                 crate::transcript_acquisition::AuditDebt { due_unix_seconds }
                             }),
                         );
+                    // A completed withheld Full already read the whole file
+                    // for this debt (runtime custody; the entry keeps it).
+                    let audited = debt.is_some_and(|debt| {
+                        index.usage_guard_audit_satisfied(&key, debt.due_unix_seconds)
+                    });
+                    let debt = debt.filter(|_| !audited);
                     let forced = comparison_target
                         || claude_index_path_member_ref(&candidate.path).is_some_and(|member| {
                             forced_claude_family_reparses.contains(member.root)
@@ -32897,7 +32976,7 @@ impl OwnedSourceScan {
                     if !context.audit_metadata_supported
                         || !state_census_complete
                         || forced
-                        || (debt.is_none() && context.audit_slots == 0)
+                        || (debt.is_none() && !audited && context.audit_slots == 0)
                     {
                         usage_pending_guard::full_blocked(&candidate.path);
                         pending!();

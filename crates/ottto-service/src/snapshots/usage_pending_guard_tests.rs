@@ -454,6 +454,37 @@ fn phase1_held_member_growth_keeps_siblings_and_rewindows_after_resolution() {
 }
 
 #[test]
+fn phase1_held_growth_is_offered_to_the_prover_as_current_pending() {
+    // A missing witness resolves only from this window's complete held
+    // growth; the prover sees it as ordinary current-window pending.
+    let (mut index, root, items) = held_family_index();
+    accumulate_guarded(&mut index, &items);
+    let growth = index.usage_guard_holds.growth_pending(&root, CARRY_RETRY);
+    assert_eq!(growth.census_window_end, CARRY_RETRY);
+    assert!(!growth.invalid);
+    let before = &index.claude_usage_family_pending[&root];
+    assert_eq!(
+        growth.membership().keys().collect::<Vec<_>>(),
+        before.membership().keys().collect::<Vec<_>>()
+    );
+    assert_eq!(growth.member_occurrences, before.member_occurrences);
+    for member in growth.membership().keys() {
+        assert!(growth
+            .membership()
+            .get(member)
+            .unwrap()
+            .iter()
+            .eq(growth.member_occurrences[member].keys()));
+    }
+    assert!(index
+        .usage_guard_holds
+        .growth_pending(&root, CARRY_FAILED)
+        .member_occurrences
+        .is_empty());
+    assert_eq!(index.usage_guard_holds.growth_hashes().count(), 5);
+}
+
+#[test]
 fn phase1_held_member_growth_over_cap_takes_the_counted_resource_path() {
     let (mut index, root, items) = held_family_index();
     // Member bound: the 257th distinct member is refused.
@@ -519,6 +550,11 @@ fn phase1_withheld_full_needs_real_growth_and_is_paced_per_key() {
         && row["counts"]["withheld_full_missing_witness"] == 1
         && row["counts"]["pace_evicted"] == 0));
     assert!(fixture.index.usage_guard_is_withheld(&key));
+    // Only a completed withheld Full satisfies the audits due by its stamp.
+    assert!(!fixture.index.usage_guard_audit_satisfied(&key, 0));
+    fixture.index.usage_guard_mark_audited(&key);
+    assert!(fixture.index.usage_guard_audit_satisfied(&key, 0));
+    assert!(!fixture.index.usage_guard_audit_satisfied(&key, u64::MAX));
     // The entry stays indexed as committed; nothing re-arms it.
     assert!(!fixture.index.files[&key].source_file_fingerprint.is_empty());
     // One per key per 6 h, across the projection rebuilds of later visits.
@@ -540,6 +576,8 @@ fn phase1_withheld_full_needs_real_growth_and_is_paced_per_key() {
     });
     assert!(admitted);
     assert!(rows.iter().any(|row| row["counts"]["pace_evicted"] == 1));
+    // A new withheld Full has not completed yet: its audit is owed again.
+    assert!(!fixture.index.usage_guard_audit_satisfied(&key, 0));
     // An unheld family never takes the withheld Full.
     let mut known = retry_durable_fixture(0, 1);
     known.index.refresh_usage_guard_holds_at(Some(CARRY_RETRY));
@@ -548,8 +586,9 @@ fn phase1_withheld_full_needs_real_growth_and_is_paced_per_key() {
     assert!(!known.index.usage_guard_admit_withheld_full(&grown));
 }
 
-#[test]
-fn phase1_held_stale_family_does_not_block_an_unrelated_owned_start() {
+/// An owned start of an unrelated family beside an Unknown-held stale family.
+/// With `overlap`, the held family's old-window proof shares its request key.
+fn owned_start_beside_held_family(overlap: bool) -> Option<&'static str> {
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let path = temp_file("claude-held-unrelated-owned-start");
     let source_session_id = path
@@ -591,7 +630,11 @@ fn phase1_held_stale_family_does_not_block_an_unrelated_owned_start() {
     );
     // An unrelated Unknown-held family: stale pending, no witness, indexed.
     let held = CARRY_ROOT;
-    let hash = "a".repeat(64);
+    let hash = if overlap {
+        format!("{:x}", Sha256::digest(b"req_owned"))
+    } else {
+        "a".repeat(64)
+    };
     index
         .files
         .insert(carry_key(held, None), manifest_index_entry(Some("held")));
@@ -613,7 +656,7 @@ fn phase1_held_stale_family_does_not_block_an_unrelated_owned_start() {
         },
     );
     let before = index.claude_usage_family_pending[held].clone();
-    apply_claude_reported_usage_with_index(
+    let disposition = apply_claude_reported_usage_with_index(
         &mut items,
         &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
             evidence: BTreeMap::from([(source_session_id.clone(), vec![api])]),
@@ -628,21 +671,28 @@ fn phase1_held_stale_family_does_not_block_an_unrelated_owned_start() {
         "2026-08-20T11:02:00Z",
     );
     assert_eq!(index.usage_guard_reason(held), Some(Unknown::MissingWitness));
-    // The unrelated family's owned start is still verified and published.
     assert_eq!(
         items[0].usage_accounting_contract.as_deref(),
         Some("session_exclusive_reported_usage:v1")
     );
-    assert_eq!(
-        items[0]
-            .context_curve
-            .as_ref()
-            .map(|curve| curve.coverage.as_str()),
-        Some("complete")
-    );
     // The held family keeps its scoped, byte-identical proof through the terminal.
     assert_eq!(index.claude_usage_family_pending[held], before);
+    let admission = disposition.posture_admission(&items[0].source_session_id);
     let _ = fs::remove_file(path);
+    admission
+}
+
+#[test]
+fn phase1_held_stale_family_does_not_block_an_unrelated_owned_start() {
+    // Lead B 4c: the hold is scoped; an unrelated owned start stays strict.
+    assert_eq!(owned_start_beside_held_family(false), Some("strict"));
+}
+
+#[test]
+fn phase1_held_stale_family_still_vetoes_a_family_sharing_its_request() {
+    // Its request keys left duplicate detection with the census veto, so
+    // they veto an overlapping family's strict posture directly.
+    assert_ne!(owned_start_beside_held_family(true), Some("strict"));
 }
 
 /// Counts-only inventory comparison entry. Supply one frozen ScanIndex, or a
