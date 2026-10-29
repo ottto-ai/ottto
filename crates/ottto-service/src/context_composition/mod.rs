@@ -28,6 +28,7 @@ mod measure;
 #[cfg(test)]
 mod report;
 mod v2;
+pub(crate) use v2::recent_scopes;
 
 pub use harvest::spawn_context_composition_sync;
 pub use v2::run_context_composition_worker;

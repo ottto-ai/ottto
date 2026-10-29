@@ -6,11 +6,24 @@ use crate::transcript_acquisition::{FileObject, ReadMode};
 use serde_json::Value;
 use std::time::SystemTime;
 
-/// The scan's heap bound charges an observer's pass state as this constant.
-const OBSERVER_HEAP_BYTES: usize = 64 * 1024;
+pub(crate) const fn checked_observer_heap_bytes(bytes: usize) -> usize {
+    assert!(bytes <= 256 * 1024);
+    bytes
+}
+/// Default declared pass-state charge, preserved for the Claude observer.
+const OBSERVER_HEAP_BYTES: usize = checked_observer_heap_bytes(64 * 1024);
 /// Synchronous in the read: O(line), no I/O or cache/rotation lock, pass
-/// state within `OBSERVER_HEAP_BYTES`; never paces or blocks acquisition.
+/// state within its static declaration; never paces or blocks acquisition.
 pub(crate) trait LineObserver {
+    fn declared_heap_bytes(&self) -> usize {
+        OBSERVER_HEAP_BYTES
+    }
+    fn root_ordinal(&self, root: &std::path::Path, roots: &[std::path::PathBuf]) -> Option<u16> {
+        roots
+            .iter()
+            .position(|r| r == root)
+            .and_then(|i| u16::try_from(i).ok())
+    }
     fn begin(&mut self, file: &FileView) -> Want;
     fn line(&mut self, file: &FileView, line: &PhysicalLine<'_>);
     /// Exactly once per `begin`, `Want::Skip` included.
@@ -35,10 +48,15 @@ pub(crate) struct FileView {
     pub(crate) object: FileObject,
     pub(crate) mtime: Option<SystemTime>,
     pub(crate) mode: DeliveryMode,
+    /// Checked ordinal into the immutable roots used to construct this scan.
+    pub(crate) root: Option<u16>,
+    pub(crate) start: u64,
 }
 /// A complete line's one parse; none if blank, malformed, non-UTF-8 or overlong.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct PhysicalLine<'a> {
+    /// Absolute physical end after the newline, including skipped bytes.
+    pub(crate) end: u64,
     pub(crate) value: Option<&'a Value>,
 }
 /// `Incomplete`: the file left the pass before its read completed.
@@ -56,6 +74,7 @@ pub(super) struct LineDelivery {
     armed: bool,
     open: Option<(FileView, bool)>,
     counts: LineDeliveryCounts,
+    declared_heap_bytes: usize,
 }
 impl OwnedSourceScan {
     /// `name` keys the page counts (`line_delivery.<name>`).
@@ -64,7 +83,10 @@ impl OwnedSourceScan {
         name: &'static str,
         observer: Box<dyn LineObserver + Send>,
     ) -> Self {
+        let declared_heap_bytes = observer.declared_heap_bytes();
+        debug_assert!(declared_heap_bytes <= 256 * 1024);
         self.line_delivery = Some(LineDelivery {
+            declared_heap_bytes,
             name,
             observer,
             armed: false,
@@ -74,6 +96,15 @@ impl OwnedSourceScan {
         self
     }
 }
+impl OwnedActiveFile {
+    /// Shared primary-reader role gate for borrowed consumers.
+    pub(super) fn is_primary_for(&self, source: SnapshotSource) -> bool {
+        self.parser.source == source
+            && self.side_origin.is_none()
+            && !self.comparison_target
+            && self.group.is_none()
+    }
+}
 impl LineDelivery {
     /// A fresh primary read of the active file: opened, or replaced in place.
     pub(super) fn arm(&mut self) {
@@ -81,12 +112,8 @@ impl LineDelivery {
         self.armed = true;
     }
     /// The single begin site: the common step dispatch, roles final.
-    pub(super) fn begin_armed(&mut self, active: &OwnedActiveFile) {
-        if !std::mem::take(&mut self.armed)
-            || active.side_origin.is_some()
-            || active.comparison_target
-            || active.group.is_some()
-        {
+    pub(super) fn begin_armed(&mut self, active: &OwnedActiveFile, roots: &[std::path::PathBuf]) {
+        if !std::mem::take(&mut self.armed) || !active.is_primary_for(active.parser.source) {
             return;
         }
         let reader = &active.parser.reader;
@@ -103,6 +130,13 @@ impl LineDelivery {
             object,
             mtime: held.modified().ok(),
             mode,
+            root: self
+                .observer
+                .root_ordinal(&active.candidate.scan_root, roots),
+            start: reader
+                .acquisition
+                .as_ref()
+                .map_or(0, |plan| plan.start_offset()),
         };
         let want = self.observer.begin(&view) == Want::Lines;
         self.open = Some((view, want));
@@ -151,6 +185,6 @@ impl Drop for LineDelivery {
 }
 impl crate::heap_layout_bound::HeapLayoutBound for LineDelivery {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(std::mem::size_of_val(&*self.observer).checked_add(OBSERVER_HEAP_BYTES)?)
+        c.add(std::mem::size_of_val(&*self.observer).checked_add(self.declared_heap_bytes)?)
     }
 }

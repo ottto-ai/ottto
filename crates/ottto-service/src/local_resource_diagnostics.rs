@@ -162,6 +162,72 @@ pub(crate) fn line_delivery_unselected(source: &str, reason: UnselectedReason) {
 
 const SCHEMA_VERSION: u8 = 2;
 
+pub(crate) fn connection_binding_read<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
+    credential_file_read(result).inspect_err(|_| {
+        traversal_point(
+            "connection_binding_read",
+            "unknown",
+            &serde_json::json!({"connection_binding_unreadable": 1}),
+        );
+    })
+}
+
+#[cfg(not(test))]
+static CREDENTIAL_FILE_CAP_REFUSED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+#[cfg(test)]
+thread_local! {
+    static CREDENTIAL_FILE_CAP_REFUSED: [AtomicU64; 4] = const { [const { AtomicU64::new(0) }; 4] };
+}
+/// Observe typed cap errors before snapshot callers replace their detail.
+/// Ordinary snapshot sync and retained retry use these same authority loads.
+pub(crate) fn credential_file_read<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
+    use ottto_core::{CredentialFileCapRefused, TokenStoreError};
+    let kind = result.as_ref().err().and_then(|error| {
+        error.chain().find_map(|cause| {
+            if let Some(TokenStoreError::OversizeRefused) = cause.downcast_ref::<TokenStoreError>()
+            {
+                return Some(CredentialFileCapRefused::FileSecret);
+            }
+            cause
+                .downcast_ref::<CredentialFileCapRefused>()
+                .or_else(|| {
+                    cause
+                        .downcast_ref::<std::io::Error>()?
+                        .get_ref()?
+                        .downcast_ref::<CredentialFileCapRefused>()
+                })
+                .copied()
+        })
+    });
+    if let Some(kind) = kind {
+        let (slot, file_kind) = match kind {
+            CredentialFileCapRefused::DeviceBinding => (0, "device_binding"),
+            CredentialFileCapRefused::FileSecret => (1, "file_secret"),
+            CredentialFileCapRefused::ConnectionBinding => (2, "connection_binding"),
+            CredentialFileCapRefused::PendingDeviceCredential => (3, "pending_device_credential"),
+        };
+        let increment = |counts: &[AtomicU64; 4]| {
+            counts[slot]
+                .fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)))
+                .map_or(u64::MAX, |n| n.saturating_add(1))
+        };
+        #[cfg(not(test))]
+        let total = increment(&CREDENTIAL_FILE_CAP_REFUSED);
+        #[cfg(test)]
+        let total = CREDENTIAL_FILE_CAP_REFUSED.with(increment);
+        traversal_point(
+            "credential_file_cap_refusal",
+            "unknown",
+            &serde_json::json!({
+                "file_kind": file_kind,
+                "credential_file_cap_refused": 1,
+                "credential_file_cap_refused_total": total,
+            }),
+        );
+    }
+    result
+}
+
 /// Cumulative shared-process totals, NOT events attributed to the finishing
 /// page/source. No CPU/RSS probe, lookup, new collection trigger or wire event.
 pub(crate) fn cache_lifecycle_totals() {
@@ -356,7 +422,7 @@ impl Probe {
                 .filter(|(_, count)| *count > 0)
                 .collect(),
             reread: if claude {
-                self.page_events.with_current()
+                self.page_events.with_current().without_terminal_rearm()
             } else {
                 Default::default()
             },
@@ -387,6 +453,34 @@ impl Probe {
             counts,
         });
     }
+}
+
+// Terminal scheduling runs after collection. Same carrier, zero scan counts,
+// no process sampling or draining another producer's identity/money counters.
+fn rearm_collection(rearm: claude_reread::Counts) {
+    #[derive(Serialize)]
+    struct Counts {
+        #[serde(flatten)]
+        collection: CollectionCounts,
+        #[serde(flatten)]
+        rearm: claude_reread::Counts,
+    }
+    emit(&Record {
+        schema_version: SCHEMA_VERSION,
+        process_id: std::process::id(),
+        stage: "native_collection_page",
+        source: Source::from_slug("claude_code"),
+        observation: Observation::between(0, None, None),
+        counts: Counts {
+            collection: CollectionCounts {
+                scanned_files: 0,
+                semantic_noops: 0,
+                sampled_acquisition: None,
+                full_causes: Default::default(),
+            },
+            rearm,
+        },
+    });
 }
 
 /// All retained account-pending families, including held/incomplete families;
@@ -752,7 +846,7 @@ impl NativeDecision {
             "claude_code",
             &Counts {
                 decision: self.0.get(),
-                events: self.1.get().with_current(),
+                events: self.1.get().with_current().without_terminal_rearm(),
             },
         );
     }
@@ -1273,6 +1367,109 @@ mod tests {
     }
 
     #[test]
+    fn connection_binding_failures_are_counted_without_sensitive_detail() {
+        let (_, lines) = capture(|| {
+            assert!(connection_binding_read(Ok::<_, anyhow::Error>(None::<()>))
+                .unwrap()
+                .is_none());
+            assert_eq!(connection_binding_read(Ok(7)).unwrap(), 7);
+            for message in [
+                "open connection binding /private/synthetic",
+                "parse connection binding https://synthetic.invalid",
+            ] {
+                let error =
+                    connection_binding_read::<()>(Err(anyhow::anyhow!(message))).unwrap_err();
+                assert_eq!(error.to_string(), message);
+            }
+            let error = anyhow::Error::new(ottto_core::CredentialFileCapRefused::ConnectionBinding);
+            assert!(connection_binding_read::<()>(Err(error)).is_err());
+        });
+        let unreadable: Vec<_> = lines
+            .iter()
+            .filter(|r| r["stage"] == "connection_binding_read")
+            .collect();
+        assert_eq!(unreadable.len(), 3);
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|r| r["stage"] == "credential_file_cap_refusal")
+                .count(),
+            1
+        );
+        for line in unreadable {
+            assert_eq!(line["schema_version"], 2);
+            assert_eq!(line["source"], "unknown");
+            assert_eq!(
+                line["counts"],
+                serde_json::json!({"connection_binding_unreadable": 1})
+            );
+            let text = line.to_string();
+            assert!(!text.contains("/private") && !text.contains("synthetic.invalid"));
+        }
+    }
+
+    #[test]
+    fn typed_credential_cap_errors_use_existing_carrier_and_preserve_result() {
+        use ottto_core::{CredentialFileCapRefused, FileDeviceStore, TokenStoreError};
+        CREDENTIAL_FILE_CAP_REFUSED.with(|counts| counts.iter().for_each(|n| n.store(0, Relaxed)));
+        let path = std::env::temp_dir().join(format!("credential-carrier-{}", std::process::id()));
+        std::fs::write(&path, vec![b' '; 64 * 1024 + 1]).unwrap();
+        let store = FileDeviceStore::new(&path);
+        let (_, lines) = capture(|| {
+            let error = credential_file_read(store.load()).unwrap_err();
+            assert!(format!("{error:#}").contains("exceeds 64 KiB"));
+            assert!(credential_file_read(store.load_with_credential_generation()).is_err());
+            assert!(
+                credential_file_read(ottto_core::FileConnectionStore::new(&path).load()).is_err()
+            );
+            assert!(credential_file_read(
+                ottto_core::FilePendingDeviceCredentialStore::new(&path).load()
+            )
+            .is_err());
+            // The core secret store preserves this typed variant across its API.
+            let secret: anyhow::Result<()> = Err(TokenStoreError::OversizeRefused.into());
+            assert!(credential_file_read(secret)
+                .unwrap_err()
+                .is::<TokenStoreError>());
+            // Growth refusals carry the same typed inner error through io::Error.
+            let growth: anyhow::Result<()> = Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                CredentialFileCapRefused::FileSecret,
+            )
+            .into());
+            assert!(credential_file_read(growth).is_err());
+            assert_eq!(credential_file_read(Ok(7)).unwrap(), 7);
+            let other: anyhow::Result<()> = Err(anyhow::anyhow!("ordinary read failure"));
+            assert!(credential_file_read(other).is_err());
+        });
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(lines.len(), 6);
+        for (i, line) in lines.iter().enumerate() {
+            assert_eq!(line["schema_version"], 2);
+            assert_eq!(line["stage"], "credential_file_cap_refusal");
+            assert_eq!(line["source"], "unknown");
+            assert_eq!(
+                line["counts"]["file_kind"],
+                match i {
+                    0 | 1 => "device_binding",
+                    2 => "connection_binding",
+                    3 => "pending_device_credential",
+                    _ => "file_secret",
+                }
+            );
+            assert_eq!(line["counts"]["credential_file_cap_refused"], 1);
+            assert_eq!(
+                line["counts"]["credential_file_cap_refused_total"],
+                match i {
+                    0 | 2 | 3 | 4 => 1,
+                    _ => 2,
+                }
+            );
+            assert_eq!(line["counts"].as_object().unwrap().len(), 3);
+        }
+    }
+
+    #[test]
     fn history_proof_correction_deferral_is_counted() {
         let ((), lines) = capture(|| {
             claude_history_proof_correction_deferred(2);
@@ -1759,6 +1956,75 @@ mod tests {
         for row in rows {
             assert_eq!(row["schema_version"], 2);
             assert!(serde_json::to_string(&row).unwrap().len() < 4096);
+        }
+    }
+
+    #[test]
+    fn terminal_rearm_counts_use_page_carrier_once_and_do_not_drain_other_producers() {
+        let (_, rows) = capture(|| {
+            let scope = claude_reread::Scope::begin(true);
+            claude_record_cap_half_file();
+            claude_reread::clear(claude_reread::ClearSite::OwnedStart, true);
+            claude_reread::terminal_rearm(
+                claude_reread::IgnoredVeto::WithheldAccount.bit(),
+                7,
+                false,
+            );
+            claude_reread::terminal_rearm(0, 0, true);
+            // Zero deltas never manufacture a scheduling row.
+            claude_reread::terminal_rearm(0, 99, false);
+            NativeDecision::new().emit();
+            let counts = scope.finish();
+            assert_eq!(counts.rearm_structural_native_duplicate, 1);
+            assert_eq!(counts.rearm_fingerprints_preserved, 7);
+            // The ordinary page still owns its cap observation. It must not
+            // repeat terminal counters from the parent scope or kept counts.
+            let mut probe = Probe::start();
+            probe.page_events = counts;
+            probe.collection(
+                "claude_code",
+                CollectionCounts {
+                    scanned_files: 1,
+                    semantic_noops: 0,
+                    sampled_acquisition: None,
+                    full_causes: Default::default(),
+                },
+            );
+            // Disabled comparison must omit these fields too.
+            claude_reread::emit_without_lease(counts);
+        });
+        assert_eq!(rows.len(), 5);
+        for row in &rows[..2] {
+            assert_eq!(row["stage"], "native_collection_page");
+            assert_eq!(row["source"], "claude_code");
+            assert_eq!(row["schema_version"], 2);
+            assert_eq!(row["counts"]["scanned_files"], 0);
+            assert_eq!(row["counts"]["semantic_noops"], 0);
+            assert!(row["counts"]
+                .get("claude_money_record_cap_half_files")
+                .is_none());
+        }
+        assert_eq!(
+            rows[0]["counts"]["rearm_veto_ignored"],
+            serde_json::json!({"withheld_account": 1})
+        );
+        assert_eq!(rows[0]["counts"]["rearm_fingerprints_preserved"], 7);
+        assert_eq!(rows[1]["counts"]["rearm_structural_native_duplicate"], 1);
+        assert_eq!(rows[2]["stage"], "native_comparison_decision");
+        assert_eq!(rows[2]["counts"]["claude_reread"]["owned_start_cleared"], 1);
+        assert_eq!(rows[3]["counts"]["claude_money_record_cap_half_files"], 1);
+        assert_eq!(rows[4]["stage"], "native_comparison_decision");
+        for row in &rows[2..] {
+            for key in [
+                "rearm_veto_ignored",
+                "rearm_fingerprints_preserved",
+                "rearm_structural_native_duplicate",
+            ] {
+                assert!(
+                    row["counts"].get(key).is_none(),
+                    "terminal delta repeated: {row}"
+                );
+            }
         }
     }
 

@@ -583,7 +583,12 @@ fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
         ));
         cache.durable_note_selection(&key, fingerprint);
     };
-    for arm in ["spent", "too_large"] {
+    for (arm, t14) in [
+        ("spent", false),
+        ("too_large", false),
+        ("spent", true),
+        ("too_large", true),
+    ] {
         let root = crate::test_scratch::private_dir(&format!("ottto-dt-budget-{arm}"));
         let lock = test_locks::hold(&root);
         let index_path = root.join("index.json");
@@ -616,9 +621,15 @@ fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
         index.files.insert(local_index_key(&c), entry(&c, "fp-c0"));
         index.save(&index_path).unwrap();
         prior.durable_write_after_save(lock, source, &index);
-        let existing = record_files();
+        let mut existing = record_files();
         assert_eq!(existing.len(), 1, "{arm}: c's prior record");
         drop(prior);
+        if t14 {
+            for (path, bytes) in &mut existing {
+                *bytes.last_mut().unwrap() ^= 1;
+                std::fs::write(path, bytes).unwrap();
+            }
+        }
 
         // Process 1: a and b, then c's replacement, all resident.
         let id_bytes = 3 * 1024 * 1024;
@@ -664,6 +675,10 @@ fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
         }
         let cache = SharedCache::default();
         cache.durable_begin_pass(source, &index_path, &namespace, false);
+        assert_eq!(
+            cache.durable_full_hold(source, &local_index_key(&c), true),
+            None
+        );
         admit(&cache, &a, "fp-a", (reduction_a, checkpoint_a));
         admit(&cache, &b, "fp-b", (reduction_b, checkpoint_b));
         admit(&cache, &c, "fp-c1", (reduction_c, checkpoint_c));
@@ -712,6 +727,7 @@ fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
             counts.summary(source, &disk)
         );
         assert_eq!(counts.write_deferred, 1, "{arm}");
+        assert_eq!(disk.t14_rebuild_full_started, u64::from(t14));
         assert_eq!(disk.records_written, 3, "{arm}: c's replacement written");
         assert_eq!(disk.disk_records, 3, "{arm}");
         assert!(
@@ -761,6 +777,7 @@ fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
         let (counts, disk) = restart.durable_counters(source).unwrap();
         println!("dt_budget {arm} restart: {}", counts.summary(source, &disk));
         assert_eq!(counts.restored, 3, "{arm}");
+        assert_eq!(disk.t14_rebuild_full_started, 0);
         let _ = std::fs::remove_dir_all(root);
     }
 }
@@ -1181,6 +1198,679 @@ fn foreign_owned_store_alarms_once_and_holds_nothing() {
     assert_eq!(counts["held_keys"], serde_json::json!([0, 0]));
     assert_eq!(counts["t14_rebuild"], serde_json::json!([0, 0]));
     assert_eq!(std::fs::read(&record_path).unwrap(), bytes);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// F1 needs the real acquisition/publication seam, beyond store-only outcomes.
+#[test]
+fn store_io_failures_emit_cold_production_body_without_holds() {
+    use std::os::unix::fs::PermissionsExt;
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            store::test_hooks::set_before_access(None);
+        }
+    }
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        for fault in ["permission", "open", "header", "body", "restore_open"] {
+            if fault == "restore_open" && !crate::heap_layout_bound::layout_supported() {
+                continue;
+            }
+            let _reset = Reset;
+            let root = crate::test_scratch::private_dir("ottto-dt-access-body");
+            let lock = test_locks::hold(&root);
+            let sessions = root.join("sessions");
+            std::fs::create_dir(&sessions).unwrap();
+            let path = sessions.join("0199f7a0-0000-7000-8000-0000000d7a11.jsonl");
+            if source == SnapshotSource::Codex {
+                codex_budget_fixture(&path, "0199f7a0-0000-7000-8000-0000000d7a11", None);
+            } else {
+                native_fixture(&path);
+            }
+            let key = local_index_key(&path);
+            let index_path = root.join("index.json");
+            let namespace = Scope("access-body".into());
+            let run = |cache: Arc<SharedCache>, index: ScanIndex| {
+                let mut scan = OwnedSourceScan::new(
+                    source,
+                    std::slice::from_ref(&sessions),
+                    index,
+                    "2026-10-20T12:00:00Z",
+                    365,
+                    100,
+                    false,
+                    None,
+                    &[],
+                    false,
+                    true,
+                )
+                .with_sampled_acquisition(cache, namespace.clone());
+                for _ in 0..10_000 {
+                    match scan.step(None) {
+                        OwnedSourceScanStep::Pending(next) => scan = next,
+                        OwnedSourceScanStep::Complete {
+                            index,
+                            scan: mut result,
+                            ..
+                        } => {
+                            apply_upload_policy(
+                                source,
+                                &mut result.snapshots,
+                                SnapshotUploadPolicy::default(),
+                            );
+                            assert!(!result.snapshots.is_empty(), "production body emitted");
+                            return (index, serde_json::to_value(result.snapshots).unwrap());
+                        }
+                    }
+                }
+                panic!("scan did not finish");
+            };
+            let (_, cold_body) = run(Arc::new(SharedCache::default()), ScanIndex::default());
+            let ds = durable_source(source).unwrap();
+            let digest = store::key_digest(ds, &key);
+            let mut disk = DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+            disk.write_after_save(
+                lock,
+                1,
+                vec![PendingRecord {
+                    binding: Binding {
+                        source: ds,
+                        key: digest,
+                        context: [0; 32],
+                        scope: [0; 32],
+                        entry: [0; 32],
+                    },
+                    certificate: certificate(&path, &namespace),
+                    body: crate::snapshots::durable_store_fixture_body(source, 0, 0),
+                    allowlist: codec::allowlist_digest(source),
+                }],
+            )
+            .unwrap();
+            let record = disk.dir().join(format!(
+                "{}.rec",
+                digest
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            ));
+            let before = std::fs::read(&record).unwrap();
+            if fault == "permission" {
+                std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o644)).unwrap();
+            }
+            let denied = record.clone();
+            let opens = std::rc::Rc::new(std::cell::Cell::new(0));
+            let calls = opens.clone();
+            store::test_hooks::set_before_access(Some(Box::new(move |path, op| {
+                if path == denied && op == "open" {
+                    calls.set(calls.get() + 1);
+                }
+                if path == denied && op == if fault == "permission" { "open" } else { fault } {
+                    Err(if fault == "permission" {
+                        std::io::ErrorKind::PermissionDenied.into()
+                    } else {
+                        std::io::Error::from_raw_os_error(libc::EIO)
+                    })
+                } else {
+                    Ok(())
+                }
+            })));
+            let cache = Arc::new(SharedCache::default());
+            cache.durable_begin_pass(source, &index_path, &namespace, false);
+            let mut index = ScanIndex::default();
+            if fault == "restore_open" {
+                index.files.insert(key.clone(), serde_json::from_value(serde_json::json!({"size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"fp"})).unwrap());
+            }
+            let (index, body) = run(cache.clone(), index);
+            assert_eq!(body, cold_body);
+            assert_eq!(
+                opens.get(),
+                if matches!(fault, "permission" | "restore_open") {
+                    2
+                } else {
+                    1
+                },
+                "{fault}: bounded reads"
+            );
+            let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
+                crate::snapshots::durable_after_save(&cache, &root, source, &index);
+                cache.durable_begin_pass(source, &index_path, &namespace, false);
+                assert_eq!(cache.durable_hold(source, &key), None);
+                cache.durable_alarm(source);
+            });
+            assert_eq!(alarms.len(), 1);
+            assert_eq!(alarms[0]["counts"]["store_disabled"], "record_access");
+            assert_eq!(alarms[0]["counts"]["held_keys"], serde_json::json!([0, 0]));
+            assert_eq!(
+                alarms[0]["counts"]["t14_rebuild"],
+                serde_json::json!([0, 0])
+            );
+            assert_eq!(
+                alarms[0]["counts"]["mode_repaired"],
+                serde_json::json!([
+                    u64::from(fault == "permission"),
+                    u64::from(fault == "permission")
+                ])
+            );
+            let (counts, stats) = cache.durable_counters(source).unwrap();
+            assert_eq!(counts.durable_held, [0; 5]);
+            assert_eq!(stats.format_hold, [0; 5]);
+            assert_eq!(stats.records_written, 0);
+            assert_eq!(stats.gc_records_deleted + stats.gc_temps_deleted, 0);
+            assert_eq!(std::fs::read(&record).unwrap(), before);
+            assert_eq!(
+                std::fs::metadata(&record).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+}
+
+/// N8: the allowance is spent even when the production write adapter never
+/// receives a replacement (retention or allowlist codec refusal).
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn t14_without_retention_or_encodable_reduction_holds_on_later_passes() {
+    let source = SnapshotSource::ClaudeCode;
+    for arm in ["retention", "codec"] {
+        let root = crate::test_scratch::private_dir("ottto-dt-unreplaced");
+        let lock = test_locks::hold(&root);
+        let index_path = root.join("index.json");
+        let path = root.join("session.jsonl");
+        native_fixture(&path);
+        if arm == "codec" {
+            use std::io::Write;
+            let line = serde_json::json!({"type":"assistant","sessionId":"11111111-2222-4333-8444-555555555555", "timestamp":"2026-10-07T10:00:01Z","requestId":"req-skill", "message":{"id":"msg-skill","role":"assistant","model":"fixture-model","content":[{"type":"tool_use","id":"tool-skill","name":"Bash","input":{"command":"cat ~/.claude/skills/pdf/SKILL.md"}}],"usage":{"input_tokens":1,"output_tokens":1}}});
+            writeln!(
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap(),
+                "{line}"
+            )
+            .unwrap();
+        }
+        let key = local_index_key(&path);
+        let namespace = Scope("unreplaced".into());
+        let (reduction, checkpoint) = native_record(&path, &namespace);
+        if arm == "codec" {
+            assert!(matches!(
+                codec::encode(&reduction, store::RECORD_BYTES, jsonl_line_cap() as u64),
+                Err(Refuse::NonEmpty("SnapshotAccumulator.activity_skills"))
+            ));
+        }
+        let ds = durable_source(source).unwrap();
+        let digest = store::key_digest(ds, &key);
+        let mut disk = DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+        disk.write_after_save(
+            lock,
+            1,
+            vec![PendingRecord {
+                binding: Binding {
+                    source: ds,
+                    key: digest,
+                    context: [0; 32],
+                    scope: [0; 32],
+                    entry: [0; 32],
+                },
+                certificate: certificate(&path, &namespace),
+                body: crate::snapshots::durable_store_fixture_body(source, 0, 0),
+                allowlist: codec::allowlist_digest(source),
+            }],
+        )
+        .unwrap();
+        let record = disk.dir().join(format!(
+            "{}.rec",
+            digest
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        ));
+        let mut before = std::fs::read(&record).unwrap();
+        *before.last_mut().unwrap() ^= 1;
+        std::fs::write(&record, &before).unwrap();
+        let cache = SharedCache::default();
+        cache.durable_begin_pass(source, &index_path, &namespace, false);
+        assert_eq!(cache.durable_hold(source, &key), None);
+        assert_eq!(cache.durable_full_hold(source, &key, true), None);
+        let admitted = cache.insert_admitted(
+            key.clone(),
+            sampled_jsonl::CompletedNativeAcquisition {
+                checkpoint,
+                reduction: (arm == "codec").then_some(reduction),
+                released: None,
+                unsealed: false,
+            },
+            0,
+        );
+        assert_eq!(admitted, arm == "codec");
+        cache.durable_note_selection(&key, "fp");
+        let mut index = ScanIndex::default();
+        index.files.insert(key.clone(), serde_json::from_value(serde_json::json!({"size_bytes":std::fs::metadata(&path).unwrap().len(),"modified_unix_seconds":1,"source_file_fingerprint":"fp"})).unwrap());
+        index.save(&index_path).unwrap();
+        cache.durable_write_after_save(lock, source, &index);
+        let (counts, stats) = cache.durable_counters(source).unwrap();
+        assert_eq!(stats.records_written, 0);
+        assert_eq!(stats.t14_rebuild, 1);
+        if arm == "codec" {
+            assert_eq!(
+                counts
+                    .not_persisted
+                    .get("SnapshotAccumulator.activity_skills"),
+                Some(&1)
+            );
+        }
+        let previous_holds = stats.format_hold[store::Refusal::Corrupt as usize];
+        for n in 1..=3 {
+            cache.durable_begin_pass(source, &index_path, &namespace, false);
+            assert_eq!(
+                cache.durable_hold(source, &key),
+                (arm == "retention").then_some(store::Refusal::Corrupt)
+            );
+            let (counts, stats) = cache.durable_counters(source).unwrap();
+            assert_eq!(stats.t14_rebuild, 1);
+            assert_eq!(counts.durable_held, [0; 5]);
+            assert_eq!(
+                stats.format_hold[store::Refusal::Corrupt as usize],
+                previous_holds + n
+            );
+        }
+        assert_eq!(std::fs::read(&record).unwrap(), before);
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+fn known_corrupt_scan(
+    source: SnapshotSource,
+    sessions: &Path,
+    cache: &Arc<SharedCache>,
+    index: ScanIndex,
+    namespace: &Scope,
+    at: &str,
+) -> (ScanIndex, SourceScanResult, [u64; 3]) {
+    let capture = claude_request_identity::captures(source);
+    let mut scan = OwnedSourceScan::new_with_identity_capture(
+        source,
+        &[sessions.to_path_buf()],
+        index,
+        at,
+        365,
+        100,
+        false,
+        None,
+        &[],
+        false,
+        true,
+        capture,
+    )
+    .with_sampled_acquisition(cache.clone(), namespace.clone());
+    assert!(scan.sampling.as_ref().unwrap().audit_metadata_supported);
+    assert_eq!(scan.claude_request_identity_capture, capture);
+    let mut reads = [0; 3];
+    for _ in 0..100_000 {
+        match scan.step(None) {
+            OwnedSourceScanStep::Pending(next) => {
+                if let Some(context) = next.sampling.as_ref() {
+                    reads = [
+                        context.full_files as u64,
+                        context.tail_files as u64,
+                        context.native_bytes,
+                    ];
+                }
+                scan = next;
+            }
+            OwnedSourceScanStep::Complete {
+                mut index,
+                mut scan,
+                ..
+            } => {
+                apply_upload_policy(source, &mut scan.snapshots, SnapshotUploadPolicy::default());
+                finalize_scan_after_policy(source, &mut scan, &mut index);
+                index.record_accepted_snapshot_fingerprints(
+                    &scan
+                        .snapshots
+                        .iter()
+                        .map(|item| item.snapshot_fingerprint.clone())
+                        .collect(),
+                );
+                return (index, scan, reads);
+            }
+        }
+    }
+    panic!("synthetic scan did not finish");
+}
+
+/// The fixture premise runs on Linux too, without requiring retained layout.
+#[test]
+fn known_corrupt_fixture_capture_and_audit_premises_match() {
+    let root = crate::test_scratch::private_dir("ottto-known-corrupt-premises");
+    let sessions = root.join("sessions");
+    std::fs::create_dir(&sessions).unwrap();
+    native_fixture(&sessions.join("session.jsonl"));
+    let source = SnapshotSource::ClaudeCode;
+    let namespace = Scope("known-corrupt-premises".into());
+    let cache = Arc::new(SharedCache::default());
+    cache.durable_begin_pass(
+        source,
+        &root.join("index.json"),
+        &namespace,
+        claude_request_identity::captures(source),
+    );
+    let (_, scan, _) = known_corrupt_scan(
+        source,
+        &sessions,
+        &cache,
+        ScanIndex::default(),
+        &namespace,
+        "2026-10-20T12:00:00Z",
+    );
+    assert!(scan.census_complete);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// B1: exercise the REAL scanner hold exit, retained Tail and eviction. A
+/// healthy peer publishes, and terminal census settlement retires an absent
+/// file despite the held key. The held key's accepted body is never replaced.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS retained layout")]
+fn known_corrupt_ram_tail_then_eviction_keeps_source_census_healthy() {
+    for fail_replacement in [false, true] {
+        known_corrupt_replacement_case(fail_replacement);
+    }
+}
+
+fn known_corrupt_replacement_case(fail_replacement: bool) {
+    use std::io::Write;
+    let root = crate::test_scratch::private_dir("ottto-known-corrupt-census");
+    let lock = test_locks::hold(&root);
+    let sessions = root.join("sessions");
+    std::fs::create_dir(&sessions).unwrap();
+    let source = SnapshotSource::ClaudeCode;
+    let capture = claude_request_identity::captures(source);
+    let namespace = Scope("known-corrupt-census".into());
+    let index_path = root.join("index.json");
+    let [held, peer, gone] =
+        ["held", "peer", "gone"].map(|name| sessions.join(format!("{name}.jsonl")));
+    for (n, path) in [&held, &peer, &gone].into_iter().enumerate() {
+        native_fixture(path);
+        let text = std::fs::read_to_string(path)
+            .unwrap()
+            .replace(
+                "11111111-2222-4333-8444-555555555555",
+                &format!("11111111-2222-4333-8444-{n:012}"),
+            )
+            .replace("req-dt-owed", &format!("req-{n}"))
+            .replace("msg-dt-owed", &format!("msg-{n}"));
+        std::fs::write(path, text).unwrap();
+    }
+    let seed = Arc::new(SharedCache::default());
+    let (mut index, seeded, _) = known_corrupt_scan(
+        source,
+        &sessions,
+        &seed,
+        ScanIndex::default(),
+        &namespace,
+        "2026-10-20T12:00:00Z",
+    );
+    assert!(seeded.census_complete);
+    let key = local_index_key(&held);
+    let gone_key = local_index_key(&gone);
+    let digest = store::key_digest(DurableSource::ClaudeCode, &key);
+    let mut disk = DurableTailStore::new(
+        store::store_dir_for_index(&index_path),
+        DurableSource::ClaudeCode,
+    );
+    disk.write_after_save(
+        lock,
+        1,
+        vec![PendingRecord {
+            binding: Binding {
+                source: DurableSource::ClaudeCode,
+                key: digest,
+                context: [0; 32],
+                scope: [0; 32],
+                entry: [0; 32],
+            },
+            certificate: certificate(&held, &namespace),
+            body: crate::snapshots::durable_store_fixture_body(source, 0, 0),
+            allowlist: codec::allowlist_digest(source),
+        }],
+    )
+    .unwrap();
+    let record = disk.dir().join(format!(
+        "{}.rec",
+        digest
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    ));
+    let mut corrupt = std::fs::read(&record).unwrap();
+    *corrupt.last_mut().unwrap() ^= 1;
+    std::fs::write(&record, &corrupt).unwrap();
+    let mut cache = Arc::new(SharedCache::default());
+    cache.durable_begin_pass(source, &index_path, &namespace, capture);
+    for entry in index.files.values_mut() {
+        entry.source_file_fingerprint.clear();
+    }
+    let (mut index, rebuilt, reads) = known_corrupt_scan(
+        source,
+        &sessions,
+        &cache,
+        index,
+        &namespace,
+        "2026-10-20T12:01:00Z",
+    );
+    assert!(
+        reads[0] >= 1,
+        "rebuild Full plus cold peer cache admissions"
+    );
+    assert_eq!(rebuilt.unreadable_path_count, 0);
+    assert!(cache.retained().unwrap().peek(&key).is_some());
+    assert_eq!(
+        cache.durable_hold(source, &key),
+        None,
+        "fresh RAM in the SAME pass wins"
+    );
+    index.save(&index_path).unwrap();
+    if fail_replacement {
+        let record = record.clone();
+        store::test_hooks::set_before_rename(Some(Box::new(move |_, target| {
+            if target == record {
+                Err(std::io::Error::other("rebuild replacement failed"))
+            } else {
+                Ok(())
+            }
+        })));
+    }
+    let ((), startup_alarms) = crate::local_resource_diagnostics::capture(|| {
+        crate::snapshots::durable_after_save(&cache, &root, source, &index)
+    });
+    store::test_hooks::set_before_rename(None);
+    assert_eq!(startup_alarms.len(), 1);
+    assert_eq!(startup_alarms[0]["counts"]["t14_rebuild_full_started"], 1);
+    if fail_replacement {
+        assert_eq!(std::fs::read(&record).unwrap(), corrupt);
+    } else {
+        assert!(matches!(
+            disk.read(&digest, &codec::allowlist_digest(source)),
+            store::ReadOutcome::Found(_)
+        ));
+        cache.retained().unwrap().remove(&key);
+        assert_eq!(
+            cache.durable_hold(source, &key),
+            None,
+            "repaired record never holds"
+        );
+        // A fresh process restores the healthy replacement, with no T14 Full.
+        cache = Arc::new(SharedCache::default());
+    }
+    let append = |path: &Path, request: &str| {
+        let row = serde_json::json!({"type":"assistant","sessionId": if path == held.as_path() {"11111111-2222-4333-8444-000000000000"} else {"11111111-2222-4333-8444-000000000001"},"timestamp":"2026-10-07T10:00:01Z","requestId":request,"message":{"id":request,"model":"fixture-model","usage":{"input_tokens":200,"output_tokens":20}}});
+        writeln!(
+            std::fs::OpenOptions::new().append(true).open(path).unwrap(),
+            "{row}"
+        )
+        .unwrap();
+    };
+    append(&held, "req-held-append");
+    cache.durable_begin_pass(source, &index_path, &namespace, capture);
+    let (next, tailed, reads) = known_corrupt_scan(
+        source,
+        &sessions,
+        &cache,
+        index,
+        &namespace,
+        "2026-10-20T12:02:00Z",
+    );
+    index = next;
+    let (restore_counts, restore_store) = cache.durable_counters(source).unwrap();
+    assert_eq!(
+        reads[0],
+        0,
+        "failed_replacement={fail_replacement}: {}",
+        restore_counts.summary(source, &restore_store)
+    );
+    assert!(reads[1] >= 1);
+    assert!(tailed.census_complete);
+    assert!(tailed
+        .snapshots
+        .iter()
+        .any(|item| item.source_session_id == "11111111-2222-4333-8444-000000000000"));
+    let (_, full, _) = known_corrupt_scan(
+        source,
+        &sessions,
+        &Arc::new(SharedCache::default()),
+        ScanIndex::default(),
+        &namespace,
+        "2026-10-20T12:02:00Z",
+    );
+    let held_body = |scan: &SourceScanResult| {
+        serde_json::to_value(
+            scan.snapshots
+                .iter()
+                .filter(|item| item.source_session_id == "11111111-2222-4333-8444-000000000000")
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    };
+    assert_eq!(held_body(&tailed), held_body(&full));
+    if !fail_replacement {
+        let (_, stats) = cache.durable_counters(source).unwrap();
+        assert_eq!(
+            restore_counts.restored, 1,
+            "healthy replacement restored after restart"
+        );
+        assert_eq!(
+            stats.t14_rebuild_full_started, 0,
+            "restart restored the repaired record"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+        return;
+    }
+    let accepted = index.files[&key].clone();
+    cache.retained().unwrap().remove(&key);
+    append(&held, "req-held-after-eviction");
+    append(&peer, "req-peer-progress");
+    std::fs::remove_file(&gone).unwrap();
+    cache.durable_begin_pass(source, &index_path, &namespace, capture);
+    let (index, held_scan, reads) = known_corrupt_scan(
+        source,
+        &sessions,
+        &cache,
+        index,
+        &namespace,
+        "2026-10-20T12:03:00Z",
+    );
+    assert_eq!(reads[0], 0, "held key does not Full; peer has RAM");
+    assert!(
+        held_scan.census_complete,
+        "one known_corrupt key must not poison source census"
+    );
+    assert_eq!(held_scan.unreadable_path_count, 0);
+    assert!(
+        held_scan.claude_request_census_shadow.is_some(),
+        "terminal close/settle ran"
+    );
+    assert!(
+        !index.files.contains_key(&gone_key),
+        "healthy terminal retired absent peer"
+    );
+    assert_eq!(
+        index.files[&key].last_snapshot_fingerprint,
+        accepted.last_snapshot_fingerprint
+    );
+    assert_eq!(
+        index.files[&key].last_upload_body_witness,
+        accepted.last_upload_body_witness
+    );
+    assert!(!held_scan
+        .snapshots
+        .iter()
+        .any(|item| item.source_session_id == "11111111-2222-4333-8444-000000000000"));
+    assert!(held_scan
+        .snapshots
+        .iter()
+        .any(|item| item.source_session_id == "11111111-2222-4333-8444-000000000001"));
+    let (counts, stats) = cache.durable_counters(source).unwrap();
+    assert!(counts.not_persisted["known_corrupt_memory_only"] > 0);
+    assert!(counts.not_persisted["known_corrupt_held"] > 0);
+    assert_eq!(counts.durable_held, [0; 5]);
+    assert_eq!(stats.t14_rebuild_full_started, 1);
+    let ((), alarms) = crate::local_resource_diagnostics::capture(|| cache.durable_alarm(source));
+    assert!(alarms
+        .iter()
+        .all(|alarm| alarm["counts"]["t14_rebuild_full_started"]
+            .as_u64()
+            .unwrap()
+            <= 1));
+    assert_eq!(std::fs::read(&record).unwrap(), corrupt);
+    // P2 review: preserve size/mtime while replacing the object. The healthy
+    // production exit must still invalidate stale request-hash authority.
+    let mut index = index;
+    assert!(index.claude_request_census.get(&key).is_some());
+    let replacement = held.with_extension("replacement");
+    let bytes = std::fs::read(&held).unwrap();
+    std::fs::write(&replacement, &bytes[..accepted.size_bytes as usize]).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&replacement)
+        .unwrap()
+        .set_modified(
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(accepted.modified_unix_seconds),
+        )
+        .unwrap();
+    std::fs::rename(&replacement, &held).unwrap();
+    let mut census = ScanCensus::default();
+    let candidate = candidate_from_traversal_path(
+        source,
+        ScanTraversalPath {
+            scan_root: sessions.clone(),
+            path: held.clone(),
+            census_member: true,
+            watcher_hint: false,
+        },
+        &mut census,
+        None,
+        365,
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    cache.durable_hold_exit(
+        source,
+        store::Refusal::Corrupt,
+        &mut index,
+        &candidate,
+        &mut census,
+    );
+    assert!(index.claude_request_census.get(&key).is_none());
+    assert_eq!(census.unreadable_path_count, 0);
+    let mut restarted = DurableTailStore::new(disk.dir().to_path_buf(), DurableSource::ClaudeCode);
+    assert_eq!(restarted.full_hold(&digest, true), None);
+    assert_eq!(
+        restarted.counters().t14_rebuild_full_started,
+        1,
+        "a restart gets one fresh attempt, not a persisted repetition count"
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 

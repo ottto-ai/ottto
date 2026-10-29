@@ -6275,6 +6275,7 @@ impl DebtReason {
 #[derive(Clone, Debug)]
 pub(in crate::snapshots) struct Disclosure {
     pub(in crate::snapshots) reason: DebtReason,
+    pub(in crate::snapshots) cause: usize,
     pub(in crate::snapshots) ownership_incomplete_file_count: usize,
     pub(in crate::snapshots) zero_snapshot_usage_evidence: bool,
     pub(in crate::snapshots) state_only_blocked_session_ids: Vec<String>,
@@ -6288,7 +6289,7 @@ pub(in crate::snapshots) struct Disclosure {
     /// hit (held disclosure only, never proof).
     pub(in crate::snapshots) parent_unresolvable: Option<CodexParentUnresolvable>,
 }
-crate::heap_layout_bound::fields!(Disclosure; reason, ownership_incomplete_file_count,
+crate::heap_layout_bound::fields!(Disclosure; reason, cause, ownership_incomplete_file_count,
     zero_snapshot_usage_evidence, state_only_blocked_session_ids, diagnostic_reason,
     parsed_snapshot_count, held, parent_ref, parent_unresolvable);
 
@@ -6339,6 +6340,7 @@ fn strict_disclosure(
     let owner = job.parser.accumulator.source_session_id.clone().or(owner);
     Disclosure {
         reason,
+        cause: ownership::GROUP,
         ownership_incomplete_file_count: 0,
         zero_snapshot_usage_evidence: false,
         state_only_blocked_session_ids: owner.into_iter().collect(),
@@ -6788,6 +6790,10 @@ pub(in crate::snapshots) fn disclose_terminal_codex_debt(
     if settleable {
         targets.census.ownership_incomplete_file_count +=
             disclosure.ownership_incomplete_file_count;
+        targets
+            .census
+            .causes
+            .add(disclosure.cause, disclosure.ownership_incomplete_file_count);
         targets.census.zero_snapshot_usage_evidence_count +=
             usize::from(disclosure.zero_snapshot_usage_evidence);
         // PR-1: the fresh finish's line and drop totals.

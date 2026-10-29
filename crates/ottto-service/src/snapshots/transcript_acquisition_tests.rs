@@ -4598,3 +4598,5 @@ fn pi_retention_refusal_is_cache_only_and_counts_bytes() {
     assert_eq!(counts.retention_bound_refused_pi, 0);
     assert_eq!(counts.retention_bound_refused_pi_bytes, 0);
 }
+
+mod codex_mcp_version_tests;
