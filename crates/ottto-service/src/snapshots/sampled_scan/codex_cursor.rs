@@ -4040,6 +4040,22 @@ fn admit_locked(
     mandatory: bool,
     admitter: Admitter,
 ) -> bool {
+    if !cursor.headers.is_empty() && !proof_free_room(retained, cursor, charge) {
+        // Optional header facts yield before native progress or older copies.
+        // Prove feasibility without them before dropping anything; hopeless
+        // charges retain the cache, just as they retain other resident state.
+        let headers = std::mem::take(&mut cursor.headers);
+        let feasible = if admitter == Admitter::Proof {
+            proof_free_room(retained, cursor, charge)
+        } else {
+            admission_feasible(cursor, charge, mandatory)
+        };
+        if !feasible {
+            cursor.headers = headers;
+            return false;
+        }
+        drop(headers);
+    }
     if admitter == Admitter::Proof {
         debug_assert!(!mandatory, "a proof admission is never mandatory");
         return !mandatory && proof_free_room(retained, cursor, charge);
@@ -4087,7 +4103,42 @@ fn admit_locked(
     }
 }
 
+// Header facts are only scalar/string graphs. Use the shared field walker
+// and budget on portable builds too; native cursor admission keeps its existing
+// layout-supported gate. Opaque or over-visit resident graphs refuse caching.
+fn header_room(retained: &super::RetainedCache, cursor: &CursorState, charge: usize) -> bool {
+    let Some(limit) = admission_budget() else {
+        return false;
+    };
+    let mut c = Counter::new(limit);
+    c.add(std::mem::size_of_val(retained) + std::mem::size_of_val(cursor))
+        .and_then(|()| retained.heap_bound(&mut c))
+        .and_then(|()| cursor.heap_bound(&mut c))
+        .and_then(|()| c.add(charge))
+        .is_some()
+}
+
 impl SharedCache {
+    pub(in crate::snapshots) fn refresh_header(
+        &self,
+        key: String,
+        header: Option<codex_file_join::CachedHeader>,
+    ) {
+        let Ok(retained) = self.retained() else {
+            self.with_cursor(|cursor| cursor.headers.refresh(key, None));
+            return;
+        };
+        self.with_cursor(|cursor| {
+            cursor.headers.refresh(key.clone(), None);
+            if let Some(header) = header {
+                if codex_file_join::HeaderCache::admission_charge(key.capacity(), &header)
+                    .is_some_and(|charge| header_room(&retained, cursor, charge))
+                {
+                    cursor.headers.refresh(key, Some(header));
+                }
+            }
+        });
+    }
     /// The cursor lock, marked held (`CursorHeld`) for `run`. Also R0's
     /// blocking resident measure (`SharedCache::heap_bound`).
     pub(in crate::snapshots) fn with_cursor<T>(
@@ -6845,3 +6896,119 @@ pub(in crate::snapshots) fn disclose_terminal_codex_debt(
 #[cfg(test)]
 #[path = "codex_cursor_tests.rs"]
 mod tests;
+
+#[cfg(all(test, target_os = "macos"))]
+mod header_admission_tests {
+    use super::*;
+    fn populated() -> (PathBuf, Arc<SharedCache>, String) {
+        let (root, fixture) = codex_file_join::tests::fixture();
+        let paths = fixture
+            .headers
+            .iter()
+            .map(|header| local_index_key(&header.candidate.path))
+            .collect::<BTreeSet<_>>();
+        let mut inventory = codex_file_join::HeaderInventory::new(
+            &[root.join("sessions")],
+            &paths,
+            Some(&fixture.directories),
+        );
+        let cache = Arc::new(SharedCache::default());
+        while !inventory.step_cached(&CodexTitleMetadata::default(), Some(&cache)) {}
+        let key = paths.first().unwrap().clone();
+        assert!(cache
+            .with_cursor(|cursor| cursor.headers.get(&key))
+            .flatten()
+            .is_some());
+        (root, cache, key)
+    }
+    #[test]
+    fn header_byte_admission_stops_below_count_cap() {
+        let (root, cache, key) = populated();
+        let facts = cache
+            .with_cursor(|cursor| cursor.headers.get(&key))
+            .flatten()
+            .unwrap();
+        let mut refused = false;
+        for number in 0..codex_file_join::MAX_HEADER_FILES {
+            let key = format!("header-{number}");
+            cache.refresh_header(key.clone(), Some(facts.clone()));
+            if cache
+                .with_cursor(|cursor| cursor.headers.get(&key))
+                .flatten()
+                .is_none()
+            {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused, "byte-full must refuse below the roster count cap");
+        assert!(cache
+            .with_cursor(|cursor| state_for_main(cursor))
+            .flatten()
+            .is_some());
+        // Real cursor reservations still succeed by dropping optional facts.
+        let credit = cache
+            .cursor_reserve(8 * 1024 * 1024)
+            .expect("native progress wins");
+        assert!(cache
+            .with_cursor(|cursor| cursor.headers.is_empty())
+            .unwrap());
+        drop(credit);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn over_budget_facts_yield_for_native_admission_but_hopeless_claims_keep_them() {
+        let (root, cache, key) = populated();
+        assert!(with_test_state_budget(0, || cache.cursor_reserve(1024)).is_none());
+        assert!(cache
+            .with_cursor(|cursor| cursor.headers.get(&key))
+            .flatten()
+            .is_some());
+        cache
+            .with_cursor(|cursor| {
+                let facts = cursor.headers.get(&key).unwrap();
+                // Model a resident graph that became full after caching headers.
+                for number in 0..codex_file_join::MAX_HEADER_FILES {
+                    cursor
+                        .headers
+                        .refresh(format!("header-{number}"), Some(facts.clone()));
+                }
+                assert!(state_for_main(cursor).is_none(), "starvation precondition");
+            })
+            .unwrap();
+        let credit = cache
+            .cursor_reserve(1024)
+            .expect("headers cannot strand a cursor");
+        assert!(cache
+            .with_cursor(|cursor| cursor.headers.is_empty())
+            .unwrap());
+        drop(credit);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn optional_proof_can_reclaim_header_room() {
+        let (root, cache, key) = populated();
+        let mut retained = cache.retained().unwrap();
+        cache
+            .with_cursor(|cursor| {
+                let facts = cursor.headers.get(&key).unwrap();
+                for number in 0..codex_file_join::MAX_HEADER_FILES {
+                    cursor
+                        .headers
+                        .refresh(format!("header-{number}"), Some(facts.clone()));
+                }
+                assert!(!proof_free_room(&retained, cursor, 1024));
+                assert!(admit_locked(
+                    &mut retained,
+                    cursor,
+                    1024,
+                    false,
+                    Admitter::Proof
+                ));
+                assert!(cursor.headers.is_empty());
+            })
+            .unwrap();
+        drop(retained);
+        fs::remove_dir_all(root).unwrap();
+    }
+}

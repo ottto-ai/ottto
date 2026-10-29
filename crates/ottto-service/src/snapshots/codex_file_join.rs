@@ -269,6 +269,16 @@ impl HeaderCache {
             keep
         });
     }
+    pub(in crate::snapshots) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+    pub(in crate::snapshots) fn admission_charge(
+        key_capacity: usize,
+        header: &CachedHeader,
+    ) -> Option<usize> {
+        crate::heap_layout_bound::tree_node_bytes::<String, CachedHeader>()?
+            .checked_add(Self::entry_heap(key_capacity, header))
+    }
     pub(in crate::snapshots) fn get(&self, key: &str) -> Option<CachedHeader> {
         self.entries.get(key).cloned()
     }
@@ -478,7 +488,7 @@ impl HeaderInventory {
                         created_unix_ms,
                         read_bytes: bytes,
                     });
-                cache.with_cursor(|cursor| cursor.headers.refresh(key.clone(), facts));
+                cache.refresh_header(key.clone(), facts);
             }
             Ok(HeaderWitness {
                 home: member_home(&candidate.scan_root),
@@ -492,7 +502,7 @@ impl HeaderInventory {
             Ok(header) => self.headers.push(header),
             Err(_) => {
                 if let Some(cache) = cache {
-                    cache.with_cursor(|cursor| cursor.headers.refresh(key.clone(), None));
+                    cache.refresh_header(key.clone(), None);
                 }
                 self.complete = false;
                 // A failed read may have consumed its whole bounded prefix.
@@ -4192,6 +4202,34 @@ mod header_cache_tests {
             !page(&root, &paths, &cache).complete,
             "unreadable is not a hit"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn byte_admission_refuses_optional_facts_and_clear_releases_them() {
+        let (root, fixture) = tests::fixture();
+        let paths = paths(&fixture);
+        let cache = sampled_scan::SharedCache::default();
+        let refused =
+            sampled_scan::codex_cursor::with_test_state_budget(0, || page(&root, &paths, &cache));
+        assert!(
+            refused.complete,
+            "cache refusal never refuses the inventory"
+        );
+        assert_eq!(facts(&refused), facts(&fixture));
+        assert!(cache
+            .with_cursor(|cursor| cursor.headers.is_empty())
+            .unwrap());
+        let populated = page(&root, &paths, &cache);
+        assert_eq!(populated.reuse_misses, paths.len());
+        assert_eq!(page(&root, &paths, &cache).read_bytes, 0);
+        cache.clear();
+        assert!(cache
+            .with_cursor(|cursor| cursor.headers.is_empty())
+            .unwrap());
+        READ_CALLS.with(|calls| calls.set(0));
+        let cleared = page(&root, &paths, &cache);
+        assert_eq!(cleared.reuse_misses, paths.len());
+        READ_CALLS.with(|calls| assert_eq!(calls.get(), paths.len()));
         fs::remove_dir_all(root).unwrap();
     }
     #[test]

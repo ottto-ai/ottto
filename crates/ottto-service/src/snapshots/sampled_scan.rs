@@ -166,15 +166,16 @@ impl SharedCache {
             ))),
         }
     }
-    /// Copy-refusal release: evicts retained copies only. The paused cursor
-    /// job, the held-singleton memo, parked records and rotation state are
-    /// charged and bounded in `heap_bound`, and survive (K6).
+    /// Copy-refusal release: evicts retained copies and optional header facts.
+    /// The paused cursor job, held-singleton memo, parked records and rotation
+    /// state are charged and bounded in `heap_bound`, and survive (K6).
     pub(super) fn clear(&self) {
         if let Ok(mut cache) = self.retained() {
             cache.clear();
         } else {
             record(Event::ClearPoisonedLock);
         }
+        self.with_cursor(|cursor| cursor.headers = codex_file_join::HeaderCache::default());
     }
     /// M1: evict retained copies in victim order until they fit the state
     /// budget beside the cursor state and `pinned` bytes, measured under
