@@ -281,7 +281,11 @@ those pages). On Codex pages, `counts.codex_owed` counts `held` (keys that
 became owed), `overflow` (past the 10,000-key bound a new key keeps only the
 window), `oversized` (an owed key over the size cap, kept observed and unread)
 and `dropped` (owed keys lost when a red restart closes a partially settled
-sweep; an open gap that should stay zero), and
+sweep; an open gap that should stay zero). An overflow also raises its own
+local alarm, `codex_owed_overflow_alarm` with `overflow=[this call, process
+total]`, apart from `held` and the drained counts. A red restart of a
+partially settled sweep starts the next generation in the same page for owed
+keys only; #867's generation marker then moves once.
 `counts.codex_owed_released` counts `caught_up` and `removed`. All three are
 drained like `line_delivery_unselected`.
 

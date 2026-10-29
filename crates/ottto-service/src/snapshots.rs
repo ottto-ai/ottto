@@ -30795,7 +30795,9 @@ impl OwnedSourceScan {
                 // decode hold just marked) otherwise keeps its marker for the
                 // clean follow-up the next page starts, and that walk re-reads
                 // the stale files. Owed Codex keys start that follow-up here
-                // instead, so they ride it rather than being dropped.
+                // instead, so they ride it rather than being dropped; only they
+                // are carried, and #867's generation marker moves once, to this
+                // start's census boundary (`causes.page` on the next page).
                 let settled = !index.bounded_sweep_had_unsettled_upload;
                 if (settled && !carried_next_generation.is_empty()) || carried_codex_owed.is_some()
                 {
@@ -41685,16 +41687,21 @@ fn record_codex_owed_input(traversal: &mut ScanTraversalCheckpoint, path: &Path)
 /// then idles is never dropped. Bounded: past `MAX_CODEX_INVENTORY_HOLD_KEYS`
 /// a new key keeps only the window; owed keys are never evicted.
 fn owe_codex_keys<'k>(hold: &mut CodexInventoryHold, keys: impl IntoIterator<Item = &'k String>) {
+    let mut overflow = 0;
     for key in keys {
         if hold.owed.contains(key) {
             continue;
         }
         if hold.owed.len() >= MAX_CODEX_INVENTORY_HOLD_KEYS {
-            codex_owed_event(CodexOwedEvent::Overflow, 1);
+            overflow += 1;
             continue;
         }
         hold.owed.insert(key.clone());
         codex_owed_event(CodexOwedEvent::Held, 1);
+    }
+    if overflow > 0 {
+        codex_owed_event(CodexOwedEvent::Overflow, overflow);
+        crate::local_resource_diagnostics::codex_owed_overflow_alarm(overflow);
     }
 }
 

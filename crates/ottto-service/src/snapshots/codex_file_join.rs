@@ -3080,11 +3080,23 @@ pub(super) mod tests {
     }
     #[test]
     fn red_parent_restart_mid_sweep_keeps_the_owed_key() {
-        // G1 (a): a parent-resolution restart closes a partially settled
-        // sweep while a key is owed. The in-page next generation starts
-        // anyway and carries it: nothing is dropped and nothing is read.
-        let (root, mut held_index, _, new, _) = held_behind_unreadable_header();
+        // G1 (a) with E1's and E2's conditions: a parent-resolution restart
+        // closes a partially settled sweep while `new` is owed. The in-page
+        // next generation starts anyway and carries only the owed key:
+        // nothing is dropped and nothing is read. The non-owed unsettled
+        // `a.jsonl` keeps its retry and is emitted exactly once. Each
+        // generation reports its #867 contributions once, under its own
+        // marker, and the marker moves once.
+        use crate::snapshots::ownership_diagnostics::{Summary, INVENTORY};
+        let (root, mut held_index, unreadable, new, _) = held_behind_unreadable_header();
         let key = local_index_key(&new);
+        let known = root.join("sessions/a.jsonl");
+        // Its upload failed: the committed entry is behind the file.
+        let mut text = fs::read_to_string(&known).unwrap();
+        for row in &member(KNOWN, "k-2", 50, 150)[1..] {
+            text.push_str(&(serde_json::to_string(row).unwrap() + "\n"));
+        }
+        fs::write(&known, text).unwrap();
         held_index
             .traversal
             .as_mut()
@@ -3092,13 +3104,53 @@ pub(super) mod tests {
             .codex_parent_resolution_retry_required = true;
         held_index.mark_bounded_sweep_unsettled();
         crate::local_resource_diagnostics::take_codex_owed_for_test();
-        let (index, page) = retained_page(&root, held_index, &[]);
-        assert_eq!(page.scanned_file_count, 0, "no re-read, no Full");
-        assert!(page.snapshots.is_empty(), "{:?}", page.snapshots);
+        // E2: buckets + unattributed = S, with no invalid reset, in both
+        // generations.
+        let summary = |page: &SourceScanResult| -> Summary {
+            let summary = page.causes.summary(page.ownership_incomplete_file_count);
+            let (c, [unattributed, _, invalid]) = summary;
+            let total = c[..6].iter().sum::<usize>() + unattributed;
+            assert_eq!(total, page.ownership_incomplete_file_count);
+            assert_eq!(invalid, 0);
+            summary
+        };
+        // Before the retry deadline (RETAINED_AT + 60 s): no page-start retry.
+        let restarted_at = "2026-10-06T23:00:30Z";
+        let (index, restart) = retained_page_at(&root, held_index, &[], restarted_at);
+        assert_eq!(restart.scanned_file_count, 0, "no re-read, no Full");
+        assert!(restart.snapshots.is_empty(), "{:?}", restart.snapshots);
         // Before G1 the restart dropped the traversal and its owed keys.
-        assert!(inventory_hold(&index).is_some_and(|hold| hold.owed.contains(&key)));
+        let hold = inventory_hold(&index).expect("carried into the next generation");
+        assert!(hold.owed.contains(&key));
+        assert!(
+            !hold.owed.contains(&local_index_key(&known)),
+            "only owed keys"
+        );
         let (owed, _) = crate::local_resource_diagnostics::take_codex_owed_for_test();
         assert_eq!(owed.get("dropped"), None);
+        // The old generation's contributions, on its last line.
+        let (old, [_, old_marker, _]) = summary(&restart);
+        assert!(old[INVENTORY] > 0, "{old:?}");
+        fs::remove_file(&unreadable).unwrap();
+        let (mut index, mut emitted, mut markers) = (index, Vec::new(), Vec::new());
+        for at in ["2026-10-06T23:01:00Z", "2026-10-06T23:01:30Z"] {
+            let (next, page) = retained_page_at(&root, index, &[], at);
+            let (c, [_, marker, _]) = summary(&page);
+            assert_eq!(c[INVENTORY], 0, "nothing carried into the new generation");
+            markers.push(marker);
+            emitted.extend(
+                page.snapshots
+                    .iter()
+                    .filter(|item| item.source_session_id == KNOWN)
+                    .map(|item| item.input_tokens),
+            );
+            index = next;
+        }
+        let started = rfc3339_unix_seconds(restarted_at).unwrap() as usize;
+        assert_ne!(old_marker, started);
+        assert_eq!(markers, vec![started; 2], "the marker moves once");
+        assert_eq!(emitted, vec![150], "retried once, never duplicated");
+        assert!(inventory_hold(&index).is_none(), "caught up, then released");
         fs::remove_dir_all(root).unwrap();
     }
     #[test]

@@ -2205,3 +2205,37 @@ fn codex_owed_keys_stay_discoverable_and_unpruned_while_owed() {
     assert_eq!(counted.1, BTreeMap::new());
     assert_eq!(kept, BTreeSet::new());
 }
+
+/// Lead A's paced-map rule: an owed-key overflow raises its own local alarm,
+/// apart from `held`, with a process total beyond the drained page counts.
+#[test]
+fn codex_owed_overflow_raises_its_own_alarm() {
+    let mut hold = CodexInventoryHold {
+        owed: (0..MAX_CODEX_INVENTORY_HOLD_KEYS)
+            .map(|n| format!("/owed/{n}.jsonl"))
+            .collect(),
+        ..CodexInventoryHold::default()
+    };
+    let late = ["/late/a.jsonl".to_string(), "/late/b.jsonl".to_string()];
+    crate::local_resource_diagnostics::take_codex_owed_for_test();
+    let ((), records) =
+        crate::local_resource_diagnostics::capture(|| owe_codex_keys(&mut hold, &late));
+    assert_eq!(
+        hold.owed.len(),
+        MAX_CODEX_INVENTORY_HOLD_KEYS,
+        "never evicted"
+    );
+    let alarms = records
+        .iter()
+        .filter(|record| record["stage"] == "codex_owed_overflow_alarm")
+        .collect::<Vec<_>>();
+    assert_eq!(alarms.len(), 1, "{records:?}");
+    assert_eq!(alarms[0]["counts"]["overflow"][0], 2);
+    assert!(alarms[0]["counts"]["overflow"][1].as_u64().unwrap() >= 2);
+    let (owed, _) = crate::local_resource_diagnostics::take_codex_owed_for_test();
+    assert_eq!(
+        owed,
+        BTreeMap::from([("overflow", 2)]),
+        "not counted as held"
+    );
+}

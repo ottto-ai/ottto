@@ -224,6 +224,22 @@ const CODEX_OWED: [(&str, usize); 4] = [
     ("dropped", 12),
 ];
 const CODEX_OWED_RELEASED: [(&str, usize); 2] = [("caught_up", 10), ("removed", 11)];
+static CODEX_OWED_OVERFLOW_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Local alarm, its own and apart from `held` (Lead A's paced-map rule):
+/// new owed Codex keys past the bound kept only the window. This call's
+/// count and a saturating process total. Counts only; no path or id.
+pub(crate) fn codex_owed_overflow_alarm(keys: u64) {
+    #[derive(Serialize)]
+    struct Alarm {
+        overflow: [u64; 2],
+    }
+    let total = CODEX_OWED_OVERFLOW_TOTAL
+        .fetch_update(Relaxed, Relaxed, |total| Some(total.saturating_add(keys)))
+        .unwrap_or_default()
+        .saturating_add(keys);
+    let overflow = [keys, total];
+    traversal_point("codex_owed_overflow_alarm", "codex", &Alarm { overflow });
+}
 const CODEX_OWED_WAKE: [(&str, usize); 2] = [("events", 13), ("inventory_bytes", 14)];
 #[cfg(test)]
 pub(crate) fn take_codex_owed_for_test(
