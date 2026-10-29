@@ -76656,9 +76656,13 @@ mod tests {
             }
         }
         let mut index = ScanIndex::default();
-        index.activate_upload_context("already-admitted-context".into());
+        index.activate_file_upload_context(
+            SnapshotSource::ClaudeCode,
+            "already-admitted-context".into(),
+        );
         index.activate_effective_upload_body_witness_revision(1);
-        let baseline = scan_source_roots(
+        let previous = index.clone();
+        let mut baseline = scan_source_roots(
             SnapshotSource::ClaudeCode,
             std::slice::from_ref(&root),
             &mut index,
@@ -76667,16 +76671,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(baseline.snapshots.len(), roots * 2);
-        index.record_accepted_snapshot_fingerprints(
-            &baseline
-                .snapshots
-                .iter()
-                .map(|item| item.snapshot_fingerprint.clone())
-                .collect(),
+        let mut loaded =
+            claude_context_backfill_settle(&home, &previous, &mut baseline, &mut index);
+        loaded.activate_file_upload_context(
+            SnapshotSource::ClaudeCode,
+            "already-admitted-context".into(),
         );
-        index.save(&home.join("scan-index.json")).unwrap();
-        let mut loaded = ScanIndex::load(&home.join("scan-index.json")).unwrap();
-        loaded.activate_upload_context("already-admitted-context".into());
         assert_eq!(loaded.files.len(), roots * 2);
         assert!(loaded
             .files
@@ -76690,7 +76690,10 @@ mod tests {
         index: &mut ScanIndex,
         limit: usize,
     ) -> SourceScanResult {
-        index.activate_upload_context("already-admitted-context".into());
+        index.activate_file_upload_context(
+            SnapshotSource::ClaudeCode,
+            "already-admitted-context".into(),
+        );
         index.activate_effective_upload_body_witness_revision(
             crate::snapshot_sync::effective_upload_body_witness_revision(
                 SnapshotSource::ClaudeCode,
@@ -76728,6 +76731,17 @@ mod tests {
             .iter()
             .map(|item| item.snapshot_fingerprint.clone())
             .collect();
+        let mut uploader = crate::snapshot_sync::upload_context_receipt_tests::Uploader::new(
+            SnapshotSource::ClaudeCode,
+        );
+        uploader.activate(
+            SnapshotSource::ClaudeCode,
+            index.active_upload_context_fingerprint.clone().unwrap(),
+            index,
+        );
+        uploader
+            .send(SnapshotSource::ClaudeCode, index, previous, &scan.snapshots)
+            .unwrap();
         let mut settled = index.committable_subset(previous, &accepted, &BTreeMap::new());
         settled.save(&home.join("scan-index.json")).unwrap();
         ScanIndex::load(&home.join("scan-index.json")).unwrap()

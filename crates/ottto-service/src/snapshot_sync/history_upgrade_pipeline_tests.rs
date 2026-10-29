@@ -214,7 +214,10 @@ impl HistoryFixture {
         .expect("load scan index");
         let loaded_fresh = origin != crate::snapshots::ScanIndexLoadOrigin::Loaded
             || (index.generation == 0 && index.files.is_empty());
-        index.activate_upload_context(cycle.upload_context.to_string());
+        index.activate_file_upload_context(
+            SnapshotSource::ClaudeCode,
+            cycle.upload_context.to_string(),
+        );
         let mut backfill = crate::backfill::load_backfill_state(&self.support);
         if cycle.bootstrapped {
             crate::backfill::mark_backfill_complete_for_destination(
@@ -261,6 +264,12 @@ impl HistoryFixture {
         if cycle.request_identity {
             index.observe_claude_request_identity_contract(true);
         }
+        activate_source_upload_context(
+            SnapshotSource::ClaudeCode,
+            cycle.upload_context.to_string(),
+            &mut index,
+            &mut progress,
+        );
         let committed_index = index.clone();
         let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
             SnapshotSource::ClaudeCode,
@@ -345,6 +354,7 @@ impl HistoryFixture {
             scan.snapshots.extend(copies);
         }
         index.retain_claude_history_emission_permitted(&mut scan.snapshots);
+        progress.prepare_context_receipt_candidates(&index, &committed_index, &scan.snapshots);
         let mut uploaded = BTreeSet::new();
         let mut uploaded_literal = BTreeSet::new();
         let mut accepted = 0;
@@ -373,7 +383,17 @@ impl HistoryFixture {
                         })
                         .map(|item| item.source_session_id.clone()),
                 );
-                Ok(accepted_batch(items.len()))
+                let response = super::claude_money_e2_pipeline_tests::ack(items)?;
+                response.validate_entity_ack(&SnapshotBatchRequest {
+                    schema_version: SNAPSHOT_SCHEMA_VERSION,
+                    source: SnapshotSource::ClaudeCode.api_slug().into(),
+                    machine_id: HISTORY_MACHINE_ID.into(),
+                    collector_version: None,
+                    snapshots: items,
+                    upload_policy: SnapshotUploadPolicy::default(),
+                    client_report: crate::client_report::ClientReport::empty(),
+                })?;
+                Ok(response)
             },
             |_| Ok(()),
         )
@@ -405,6 +425,10 @@ impl HistoryFixture {
         };
         let mut index = settlement.index;
         settle_index_after_upload(&mut index, &committed_index, &progress);
+        index.accept_file_upload_context_acks(
+            &progress.context_receipt_candidates,
+            &progress.fresh_context_body_acks,
+        );
         index.save(&index_path).expect("save scan index");
         HistoryOutcome {
             scan,

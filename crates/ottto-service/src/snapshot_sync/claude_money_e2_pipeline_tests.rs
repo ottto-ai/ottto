@@ -145,7 +145,10 @@ impl Corpus {
             crate::snapshots::claude_terminal_off(),
             "money pipeline requires production policy"
         );
-        index.activate_upload_context("e2-synthetic-destination".into());
+        index.activate_file_upload_context(
+            SnapshotSource::ClaudeCode,
+            "e2-synthetic-destination".into(),
+        );
         index.activate_effective_upload_body_witness_revision(if e2::enabled() {
             3
         } else {
@@ -255,6 +258,49 @@ impl Page {
         self.index
             .retain_claude_history_emission_permitted(&mut self.scan.snapshots);
         holds
+    }
+    // Same context/ACK capture and whole-file receipt ordering as finish.
+    // Captured before POST; restored/stale/count-only ACKs cannot adopt.
+    fn upload_context(
+        &mut self,
+        progress: &mut SnapshotUploadProgress,
+        respond: impl FnMut(&[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+    ) -> (
+        Result<ResumableUploadResult>,
+        Vec<Vec<u8>>,
+        Vec<Vec<String>>,
+    ) {
+        let context = self
+            .index
+            .active_upload_context_fingerprint
+            .clone()
+            .unwrap();
+        activate_source_upload_context(
+            SnapshotSource::ClaudeCode,
+            context,
+            &mut self.index,
+            progress,
+        );
+        progress.prepare_context_receipt_candidates(
+            &self.index,
+            &self.committed,
+            &self.scan.snapshots,
+        );
+        let result = upload(&self.scan.snapshots, progress, respond);
+        self.index.accept_file_upload_context_acks(
+            &progress.context_receipt_candidates,
+            &progress.fresh_context_body_acks,
+        );
+        result
+    }
+    fn accept(&mut self) {
+        let mut progress = e2_progress();
+        assert_eq!(
+            self.upload_context(&mut progress, ack).0.unwrap(),
+            ResumableUploadResult::Completed
+        );
+        self.index
+            .record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
     }
     fn receipt(&self) -> Vec<(String, String, String)> {
         self.scan
@@ -384,7 +430,7 @@ fn upload(
     );
     (result, sent, order)
 }
-fn ack(batch: &[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
+pub(super) fn ack(batch: &[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
     let mut response = accepted_batch(0);
     response.entity_ack_contract = Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
     // Head-CAS covers the whole request once any item carries cache
@@ -496,7 +542,7 @@ fn ready(
         released: p.released,
     };
     send.finish();
-    let (result, _, _) = upload(&send.scan.snapshots, &mut e2_progress(), ack);
+    let (result, _, _) = send.upload_context(&mut e2_progress(), ack);
     assert_eq!(
         result.unwrap(),
         ResumableUploadResult::Completed,
@@ -542,8 +588,8 @@ fn e2_pipeline_dark_matches_fold_absent_publication_and_selection_body() {
     reference.finish();
     assert_eq!(dark.receipt(), reference.receipt());
     let (mut a, mut b) = (e2_progress(), e2_progress());
-    let (ra, ba, oa) = upload(&dark.scan.snapshots, &mut a, ack);
-    let (rb, bb, ob) = upload(&reference.scan.snapshots, &mut b, ack);
+    let (ra, ba, oa) = dark.upload_context(&mut a, ack);
+    let (rb, bb, ob) = reference.upload_context(&mut b, ack);
     assert_eq!(ra.unwrap(), rb.unwrap());
     assert_eq!((ba, oa), (bb, ob));
     assert_eq!(canonical(&a), canonical(&b));
@@ -576,6 +622,7 @@ fn e2_pipeline_full_tail_unchanged_eviction_and_restart_are_cumulative() {
         assert_mode(first.modes, (1, 0, 0));
         assert_eq!(total(&first), 1);
         first.finish();
+        first.accept();
         let prior = c.reload(&mut first.index);
         std::fs::OpenOptions::new()
             .append(true)
@@ -603,6 +650,7 @@ fn e2_pipeline_full_tail_unchanged_eviction_and_restart_are_cumulative() {
             canonical(&full.scan.snapshots)
         );
         tail.finish();
+        tail.accept();
         let prior = c.reload(&mut tail.index);
         // Unaccepted exact body remains due; a fresh sidecar is read even if
         // the transcript prefix and length are unchanged.
@@ -642,6 +690,7 @@ fn mutation_case(kind: &str) {
         let scanner = E2ScanFixture::default();
         let mut first = ready(&c, &scanner, ScanIndex::default(), 100, true);
         first.finish();
+        first.accept();
         let prior = c.reload(&mut first.index);
         let changed = match kind {
             "truncate" => {
@@ -762,6 +811,7 @@ fn e2_pipeline_birth_store_survives_save_reload_move_then_copy() {
         let mut moved_page = ready(&c, &scanner, prior, 100, false);
         assert_eq!(total(&moved_page), 1, "a move inherits the original cutoff");
         moved_page.finish();
+        moved_page.accept();
         let prior = c.reload(&mut moved_page.index);
         c.write_at(
             &format!("copy/{ROOT}.jsonl"),
@@ -822,6 +872,7 @@ fn twins(reverse: bool) {
         assert_eq!(first.scan.snapshots.len(), 1);
         let expected = canonical(&first.scan.snapshots);
         first.finish();
+        first.accept();
         let prior = c.reload(&mut first.index);
         let repeated = ready(&c, &scanner, prior, 100, false);
         assert_eq!(
@@ -866,7 +917,7 @@ fn e2_pipeline_settled_twins_are_not_read_again() {
             page.finish();
             if !page.scan.snapshots.is_empty() {
                 let mut progress = e2_progress();
-                let (result, _, _) = upload(&page.scan.snapshots, &mut progress, ack);
+                let (result, _, _) = page.upload_context(&mut progress, ack);
                 assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
                 page.index
                     .record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
@@ -910,7 +961,7 @@ fn e2_pipeline_off_page_twin_hold_preserves_complete_history() {
         assert_eq!(total(&complete), 2);
         complete.finish();
         let mut progress = e2_progress();
-        let (result, _, _) = upload(&complete.scan.snapshots, &mut progress, ack);
+        let (result, _, _) = complete.upload_context(&mut progress, ack);
         assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
         complete
             .index
@@ -960,6 +1011,7 @@ fn e2_pipeline_deleted_original_leaves_one_count_after_restart() {
         let mut first = ready(&c, &scanner, ScanIndex::default(), 100, false);
         assert_eq!(total(&first), 1);
         first.finish();
+        first.accept();
         let prior = c.reload(&mut first.index);
         std::fs::remove_file(original).unwrap();
         let stored = stored_bodies(&prior);
@@ -1121,7 +1173,7 @@ fn e2_pipeline_quiet_otel_only_change_replaces_estimate_without_count_growth() {
         );
         first.finish();
         let mut progress = e2_progress();
-        upload(&first.scan.snapshots, &mut progress, ack).0.unwrap();
+        first.upload_context(&mut progress, ack).0.unwrap();
         first
             .index
             .record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
@@ -1175,7 +1227,8 @@ fn e2_pipeline_trace_named_agent_on_another_page_is_not_published_on_root() {
         let mut baseline = ready(&c, &scanner, ScanIndex::default(), 100, false);
         baseline.finish();
         let mut baseline_progress = e2_progress();
-        upload(&baseline.scan.snapshots, &mut baseline_progress, ack)
+        baseline
+            .upload_context(&mut baseline_progress, ack)
             .0
             .unwrap();
         assert_eq!(
@@ -1307,7 +1360,7 @@ fn retry_case(conflict: bool) {
         let original = canonical(&p.scan.snapshots);
         let fingerprints = p.receipt();
         let mut progress = e2_progress();
-        let (failed, first, order) = upload(&p.scan.snapshots, &mut progress, |_| {
+        let (failed, first, order) = p.upload_context(&mut progress, |_| {
             Err(anyhow!("synthetic connection reset before ACK"))
         });
         assert!(failed.is_err());
@@ -1454,7 +1507,7 @@ fn family_count_case(count: usize) {
         assert_eq!(p.scan.snapshots.len(), count);
         p.finish();
         let mut progress = e2_progress();
-        let (result, _, order) = upload(&p.scan.snapshots, &mut progress, ack);
+        let (result, _, order) = p.upload_context(&mut progress, ack);
         assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
         assert_eq!(
             order.iter().map(Vec::len).collect::<Vec<_>>(),
@@ -1531,10 +1584,10 @@ fn e2_pipeline_real_family_crosses_two_mib_root_first() {
             bytes_above - bytes_below < 32,
             "adjacent model lengths bracket the actual 2 MiB boundary"
         );
-        let (r, _, b) = upload(&below.scan.snapshots, &mut e2_progress(), ack);
+        let (r, _, b) = below.upload_context(&mut e2_progress(), ack);
         assert_eq!(r.unwrap(), ResumableUploadResult::Completed);
         assert_eq!(b.len(), 1);
-        let (r, _, b) = upload(&above.scan.snapshots, &mut e2_progress(), ack);
+        let (r, _, b) = above.upload_context(&mut e2_progress(), ack);
         assert_eq!(r.unwrap(), ResumableUploadResult::Completed);
         assert_eq!(b.iter().map(Vec::len).collect::<Vec<_>>(), vec![3, 1]);
         assert_eq!(b[0][0], ROOT);
@@ -1569,6 +1622,7 @@ fn e2_pipeline_branch_copy_without_new_reply_keeps_original_totals_only() {
         assert_eq!(total(&original), 1);
         let original_totals = sum(&original.scan.snapshots);
         original.finish();
+        original.accept();
         let prior = c.reload(&mut original.index);
         c.write_at(
             &format!("{COPY}.jsonl"),
@@ -1689,6 +1743,7 @@ fn restored_twins(reverse: bool, equal: bool) {
             "all-prebirth restored twins must count once on their first page"
         );
         first.finish();
+        first.accept();
         let stored = stored_bodies(&first.index);
         let prior = c.reload(&mut first.index);
         let mut again = ready(&c, &scanner, prior, 100, false);
@@ -1740,10 +1795,12 @@ fn e2_pipeline_deletion_reload_then_later_move_keeps_birth() {
         let scanner = E2ScanFixture::default();
         let mut first = ready(&c, &scanner, ScanIndex::default(), 100, false);
         first.finish();
+        first.accept();
         let prior = c.reload(&mut first.index);
         std::fs::remove_file(old).unwrap();
         let mut absent = ready(&c, &scanner, prior, 100, false);
         absent.finish();
+        absent.accept();
         let prior = c.reload(&mut absent.index);
         c.write_at(
             &format!("new-location/{ROOT}.jsonl"),
@@ -1783,7 +1840,7 @@ fn e2_pipeline_twin_byte_budget_hold_preserves_accepted_complete_history() {
                       mut page: Page,
                       progress: &mut SnapshotUploadProgress| {
             page.finish();
-            upload(&page.scan.snapshots, progress, ack).0.unwrap();
+            page.upload_context(progress, ack).0.unwrap();
             let holds = LocalHoldSettlement::classify(
                 SnapshotSource::ClaudeCode,
                 &mut page.index,
@@ -1869,7 +1926,7 @@ fn settle(
     progress: &mut SnapshotUploadProgress,
 ) -> ScanIndex {
     page.finish();
-    upload(&page.scan.snapshots, progress, ack).0.unwrap();
+    page.upload_context(progress, ack).0.unwrap();
     let holds = LocalHoldSettlement::classify(
         SnapshotSource::ClaudeCode,
         &mut page.index,
@@ -2046,6 +2103,7 @@ fn branch_by(version: &str) {
         let mut original = ready(&c, &scanner, ScanIndex::default(), 100, false);
         assert_eq!(total(&original), 1);
         original.finish();
+        original.accept();
         let prior = c.reload(&mut original.index);
         c.write_at(
             &format!("{COPY}.jsonl"),
@@ -2604,7 +2662,7 @@ fn conflict_only(subagent: bool) {
             bytes,
             "restart re-derives the same carrier bytes"
         );
-        let (result, _, _) = upload(&restart.scan.snapshots, &mut progress, ack);
+        let (result, _, _) = restart.upload_context(&mut progress, ack);
         assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
     });
 }
@@ -2653,7 +2711,7 @@ fn settle_captured_holds(
     progress: &mut SnapshotUploadProgress,
 ) -> ScanIndex {
     let holds = page.finish();
-    upload(&page.scan.snapshots, progress, ack).0.unwrap();
+    page.upload_context(progress, ack).0.unwrap();
     let mut settled = settle_completed_upload(page.index, committed, progress, &holds);
     settle_index_after_upload(&mut settled.index, committed, progress);
     c.reload(&mut settled.index)
@@ -2867,7 +2925,7 @@ fn terminal_off_unproven_cohort_uploads_full_tokens_and_cost_with_unknown_accoun
         assert!(display.current.account_identifier_hash.is_none());
         page.finish();
         let mut progress = e2_progress();
-        let (result, sent, _) = upload(&page.scan.snapshots, &mut progress, ack);
+        let (result, sent, _) = page.upload_context(&mut progress, ack);
         assert!(matches!(result.unwrap(), ResumableUploadResult::Completed));
         assert_eq!(sent.len(), 1);
         for item in &page.scan.snapshots {
