@@ -28694,6 +28694,8 @@ impl OwnedSourceScan {
                     sampling.as_mut(),
                 ) {
                     if active.mode == crate::transcript_acquisition::ReadMode::Unchanged
+                        // Withheld bodies retain their obligation until release.
+                        && !index.claude_account_deferred_holds.contains_key(&active.key)
                         && index.files.get(&active.key).is_some_and(|entry| {
                             entry.has_unverified_source() && !entry.has_prefix_provenance()
                         })
@@ -29577,6 +29579,7 @@ impl OwnedSourceScan {
                         .is_some_and(ScanIndexEntry::has_unverified_source);
                 if needs_marker
                     && !held_progress_audit
+                    && !index.claude_account_deferred_holds.contains_key(&index_key)
                     && (slot_unfunded || !index.can_stage_sampled_audit(&index_key))
                 {
                     if let Some(context) = sampling.as_mut() {
@@ -29902,7 +29905,10 @@ impl OwnedSourceScan {
                             .files
                             .get(&index_key)
                             .is_some_and(ScanIndexEntry::has_unverified_source);
-                        if index.stage_sampled_audit(&index_key, &source_file_fingerprint, debt)
+                        // Held retries bypass cap Full/counting, not the
+                        // committed-slot reservation for a NEW marker.
+                        if !slot_unfunded
+                            && index.stage_sampled_audit(&index_key, &source_file_fingerprint, debt)
                             && !was_pending
                         {
                             if let Some(context) = sampling.as_mut() {
@@ -29914,7 +29920,9 @@ impl OwnedSourceScan {
                     }
                     if source == SnapshotSource::ClaudeCode {
                         if claude_grown_prefix {
-                            index.mark_sealed_prefix(&index_key, &source_file_fingerprint);
+                            if !slot_unfunded {
+                                index.mark_sealed_prefix(&index_key, &source_file_fingerprint);
+                            }
                         } else if completed_acquisition.is_some()
                             && cursor_fragment.is_none()
                             && file_sampling.as_ref().is_some_and(|active| {
@@ -29942,11 +29950,13 @@ impl OwnedSourceScan {
                             .files
                             .get(&index_key)
                             .is_some_and(ScanIndexEntry::has_unverified_source);
-                        if index.stage_sampled_audit(
-                            &index_key,
-                            &source_file_fingerprint,
-                            fragment.debt,
-                        ) && !was_pending
+                        if !slot_unfunded
+                            && index.stage_sampled_audit(
+                                &index_key,
+                                &source_file_fingerprint,
+                                fragment.debt,
+                            )
+                            && !was_pending
                         {
                             if let Some(context) = sampling.as_mut() {
                                 context.audit_slots = context.audit_slots.saturating_sub(1);
@@ -31956,6 +31966,9 @@ impl OwnedSourceScan {
                         // The cap funds NEW obligations, never a global restore
                         // gate. Marked files Tail; quiet debt-free copies reuse.
                         if allow_sample
+                            // Account-held reparses belong to withheld_reparse;
+                            // central staging still bounds fresh audit markers.
+                            && !index.claude_account_deferred_holds.contains_key(&key)
                             && context.audit_slots == 0
                             && !index
                                 .files

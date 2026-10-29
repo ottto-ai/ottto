@@ -124,3 +124,24 @@ cursor fragments, failed samples/final revalidation and refused retention keep
 their obligation. No new representation, store/codec, proof rule, cap increase,
 Full cause enum or global sampling switch is introduced. Native/money CI and
 SOURCE/Lead B sign-off remain owner gates; no local Cargo execution.
+
+Round 8 excludes keys in `claude_account_deferred_holds` from quiet retirement
+and both `audit_cap_full` decisions. Their withheld-body retry remains owned by
+the account-hold path, with no double count against `withheld_reparse`.
+Checkpoint debt is retained; central marker admission still refuses marker 257.
+Fresh held markers also require a slot reserved before this scan, including
+ordinary debt, sealed prefixes and cursor fragments; a working retirement cannot
+fund them before a partial save restores the old obligation.
+After release, normal quiet validation and per-file cap policy resume. Held-key
+partial saves preserve the obligation; retirement still releases capacity only
+for the next scan of the committed index.
+
+The cap remains `CACHE_ENTRIES = 256`. Marker storage is at most 64 bytes per
+marked entry, so scheduling payload is at most 16,384 bytes (16 KiB) per index
+copy, within the existing 1 MiB marker-and-scratch reserve. This derived bound
+covers marker payload, not existing entry/key/map/receipt memory or daemon RSS.
+The existing cache count is reused without raising a resource limit. The
+`sampled_audit_cap_alarm` fires on the first cap event (`audit_cap_full > 0`),
+with no minimum event count or cooldown. Held quiet/release and saturated held
+retry fixtures complement the partial-save slot-reservation regression; native
+execution and fresh money/SOURCE/selection reviews remain owed.
