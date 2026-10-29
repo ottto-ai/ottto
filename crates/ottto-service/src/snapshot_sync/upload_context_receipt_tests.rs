@@ -485,6 +485,9 @@ impl Uploader {
         self.progress.context_resend.not_stored_files()
     }
 
+    pub(crate) fn set_byte_allowance(&mut self, bytes: usize) {
+        self.progress.context_resend.set_byte_allowance(bytes);
+    }
     pub(crate) fn counts(&self) -> (u64, u64, u64, u64) {
         let c = &self.progress.context_resend.counts;
         (c.entities, c.bytes, c.identical, c.changed)

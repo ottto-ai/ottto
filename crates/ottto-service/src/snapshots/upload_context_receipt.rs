@@ -26,11 +26,16 @@ impl Candidate {
         self.bodies.iter()
     }
     pub(crate) fn previous_body_matches(&self, previous: &ScanIndex) -> bool {
-        previous
-            .files
-            .get(&self.key)
-            .and_then(|entry| entry.last_upload_body_witness.as_ref())
-            == Some(&self.receipt.body_witness)
+        // The additive witness deliberately omits semantic/policy fields
+        // such as titles. Equal additive evidence is not an identical body
+        // when D changed the semantic entity set.
+        previous.file_snapshot_fingerprints.get(&self.key)
+            == Some(&self.bodies.keys().cloned().collect())
+            && previous
+                .files
+                .get(&self.key)
+                .and_then(|entry| entry.last_upload_body_witness.as_ref())
+                == Some(&self.receipt.body_witness)
     }
     pub(crate) fn has_accepted_predecessor(&self, previous: &ScanIndex) -> bool {
         previous

@@ -26833,21 +26833,6 @@ impl OwnedSourceScan {
             .saturating_sub(pending_paths.len())
             .min(carry_replay.len());
         pending_paths.extend(carry_replay.drain(..replayed));
-        // Promote fresh work once, within the existing census reservation.
-        if matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex)
-            && index.upload_context_fingerprint != index.active_upload_context_fingerprint
-        {
-            select_context_fresh_paths(
-                &mut traversal.pending_candidates,
-                &mut pending_paths,
-                selection_limit,
-                ordinary_census_pending,
-                |candidate| {
-                    !index.files.contains_key(&local_index_key(&candidate.path))
-                        || codex_fresh_data_pending(candidate, &index.files)
-                },
-            );
-        }
         while pending_paths.len() < selection_limit {
             let Some(position) = traversal
                 .pending_candidates
@@ -42131,28 +42116,6 @@ fn codex_selection_may_exhaust_page(
         }
     }
     false
-}
-
-/// A single FIFO-preserving pass; metadata is assessed at most once per path.
-/// Fresh context work cannot spend the ordinary census's reserved slot.
-fn select_context_fresh_paths(
-    pending: &mut VecDeque<ScanTraversalPath>,
-    selected: &mut Vec<ScanTraversalPath>,
-    limit: usize,
-    census_pending: bool,
-    mut fresh: impl FnMut(&ScanTraversalPath) -> bool,
-) {
-    let fresh_limit = limit.saturating_sub(usize::from(census_pending));
-    for _ in 0..pending.len() {
-        let Some(candidate) = pending.pop_front() else {
-            break;
-        };
-        if selected.len() < fresh_limit && fresh(&candidate) {
-            selected.push(candidate);
-        } else {
-            pending.push_back(candidate);
-        }
-    }
 }
 
 /// Priority only, never read admission. Byte length is content-relevant;

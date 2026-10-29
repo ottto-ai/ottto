@@ -169,6 +169,10 @@ fn bootstrap_cache_heads_with_budget(
     mut persist: impl FnMut(&mut SnapshotUploadProgress) -> Result<()>,
 ) -> Result<usize> {
     let leased = progress.active_reason_reoffers.clone();
+    // A catch-up probe must not precede any ordinary full body in this pass,
+    // including one whose own probe is sent in the first bootstrap stage.
+    progress.context_resend.bootstrap_blocks_catchup =
+        progress.context_resend.has_pending_ordinary();
     let mut shed = false;
     let result = (|| -> Result<usize> {
         let mut deferred = 0usize;
@@ -225,6 +229,7 @@ fn bootstrap_cache_heads_with_budget(
         }
         Ok(deferred)
     })();
+    progress.context_resend.bootstrap_blocks_catchup = false;
     if result.is_err() {
         progress.finish_reason_reoffers(&leased, shed, poison_scope);
     }
@@ -7477,6 +7482,15 @@ fn finish_sync_source(
             Err(error) => return Err(error),
         }
         if bootstrap_capacity_error.is_none() {
+            // A paced-out probe has no head token yet. Keep its existing
+            // selection debt for the next pass rather than failing healthy
+            // ordinary uploads or fabricating a predecessor token.
+            scan_result.snapshots.retain(|item| {
+                !upload_progress
+                    .context_resend
+                    .deferred
+                    .contains(&item.snapshot_fingerprint)
+            });
             let held = apply_bootstrapped_cache_heads(&mut scan_result.snapshots, &upload_progress)
                 .inspect_err(log_bootstrap_failure("apply"))
                 .inspect_err(|_| {
@@ -9446,8 +9460,8 @@ enum ResumableUploadResult {
     Rejected {
         count: usize,
     },
-    /// Accepted siblings are durably checkpointed; actual backend conflicts
-    /// remain held for bounded retry.
+    /// Accepted siblings are durably checkpointed; backend conflicts remain
+    /// held for bounded retry and paced context offers wait for a later pass.
     Deferred {
         count: usize,
     },
@@ -10319,30 +10333,86 @@ where
         units.push(order[start..end].to_vec());
         start = end;
     }
-    units.sort_by_key(|unit| {
-        unit.iter().all(|(index, _, _)| {
+    // Preserve the native census/family selection. At this transport boundary
+    // split stamp-only offers out of mixed units, so no ordinary new/changed
+    // body shares a request (and its retry latency) with context catch-up.
+    let mut ordinary_units = Vec::new();
+    let mut catchup_units = Vec::new();
+    for unit in units {
+        let (catchup, ordinary): (Vec<_>, Vec<_>) = unit.into_iter().partition(|(index, _, _)| {
             progress
                 .context_resend
                 .is_catchup(fingerprint(&items[*index]))
-        })
-    });
-    let mut unit_ends = Vec::with_capacity(units.len());
+        });
+        if !ordinary.is_empty() {
+            ordinary_units.push(ordinary);
+        }
+        if !catchup.is_empty() {
+            catchup_units.push(catchup);
+        }
+    }
+    let ordinary_entities = ordinary_units
+        .iter()
+        .flatten()
+        .map(|(index, _, _)| fingerprint(&items[*index]))
+        .collect::<BTreeSet<_>>();
+    // A bootstrap invocation sees only its probes. It cannot send catch-up
+    // ahead of ordinary bodies that the main uploader has not reached yet.
+    let ordinary_in_this_call = progress
+        .context_resend
+        .ordinary_work_is_in(&ordinary_entities);
+    let ordinary_bytes = ordinary_units
+        .iter()
+        .flatten()
+        .fold(0usize, |sum, (_, bytes, _)| {
+            sum.saturating_add(bytes.saturating_add(2))
+        });
+    // Charge all ordinary input before admitting any stamp-only offer. New
+    // usage always passes, including a pass larger than the allowance. The
+    // existing 2 MiB packing target is also the maximum catch-up allowance
+    // per source pass; successive invocations share the remaining allowance.
+    progress
+        .context_resend
+        .reserve_ordinary_bytes(ordinary_bytes);
+    let mut context_budget_deferred = 0usize;
+    let mut unit_ends = Vec::new();
     order.clear();
-    for unit in units {
+    for unit in ordinary_units {
         order.extend(unit);
-        unit_ends.push(order.len());
+        unit_ends.push((order.len(), false));
+    }
+    for unit in catchup_units {
+        let start = order.len();
+        for item in unit {
+            if ordinary_in_this_call
+                && progress
+                    .context_resend
+                    .admit_catchup_bytes(item.1.saturating_add(2))
+            {
+                order.push(item);
+            } else {
+                context_budget_deferred += 1;
+                progress
+                    .context_resend
+                    .deferred
+                    .insert(fingerprint(&items[item.0]).to_string());
+            }
+        }
+        if order.len() > start {
+            unit_ends.push((order.len(), true));
+        }
     }
     let mut batch = Vec::new();
     let mut batch_bytes = 2usize;
     let mut current_batch_class = None;
     let mut unit_start = 0;
-    for unit_end in unit_ends {
+    for (unit_end, catchup) in unit_ends {
         let unit = &order[unit_start..unit_end];
         unit_start = unit_end;
         let unit_bytes = unit
             .iter()
             .fold(0usize, |sum, (_, bytes, _)| sum.saturating_add(*bytes));
-        let unit_class = unit[0].2;
+        let unit_class = (unit[0].2, catchup);
         if !batch.is_empty()
             && (batch.len() + unit.len() > SNAPSHOT_BATCH_LIMIT
                 || batch_bytes.saturating_add(unit_bytes) > SNAPSHOT_BATCH_MAX_BYTES
@@ -10553,9 +10623,9 @@ where
         .count();
     if let Some(error) = deferred_validation_error {
         Err(error)
-    } else if conflicted_entities > 0 {
+    } else if conflicted_entities > 0 || context_budget_deferred > 0 {
         Ok(ResumableUploadResult::Deferred {
-            count: conflicted_entities,
+            count: conflicted_entities.saturating_add(context_budget_deferred),
         })
     } else if permanent_rejected > 0 {
         Ok(ResumableUploadResult::Rejected {

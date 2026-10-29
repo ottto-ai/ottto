@@ -784,10 +784,13 @@ fn real_uploader_new_usage_precedes_pending_context_catchup() {
     f.uploader
         .send(f.source, &mut f.index, &previous, &scan.snapshots)
         .unwrap();
-    let post = f.uploader.posts.last().unwrap();
-    assert_eq!(post[0]["source_session_id"], "zz-new-usage");
-    assert_eq!(post.len(), 2);
-    assert!(serde_json::to_vec(post).unwrap().len() <= 2 * 1024 * 1024);
+    let posts = &f.uploader.posts[1..];
+    assert_eq!(posts[0][0]["source_session_id"], "zz-new-usage");
+    assert_eq!(posts[0].len(), 1, "ordinary usage has its own first POST");
+    assert_eq!(posts.iter().map(Vec::len).sum::<usize>(), 2);
+    assert!(posts
+        .iter()
+        .all(|post| serde_json::to_vec(post).unwrap().len() <= 2 * 1024 * 1024));
 }
 #[test]
 fn real_uploader_not_stored_backs_off_but_growth_earns_receipt() {
@@ -883,6 +886,10 @@ fn real_uploader_privacy_reducing_context_uses_destination_policy() {
     f.uploader
         .send(f.source, &mut f.index, &previous, &scan.snapshots)
         .unwrap();
+    assert_eq!(
+        f.uploader.posts.last().unwrap()[0]["session_display_name"],
+        "synthetic title"
+    );
     let previous = f.index.clone();
     f.index
         .activate_file_upload_context(f.source, "e".repeat(64));
@@ -911,43 +918,73 @@ fn real_uploader_privacy_reducing_context_uses_destination_policy() {
 }
 
 #[test]
-fn context_catchup_fresh_priority_classifies_backlog_once_and_preserves_fifo() {
-    let path = |n| ScanTraversalPath {
-        scan_root: PathBuf::from("synthetic"),
-        path: PathBuf::from(format!("{n:04}")),
-        census_member: true,
-        watcher_hint: false,
-    };
-    let mut pending = (0..200).map(path).collect::<VecDeque<_>>();
-    let mut selected = Vec::new();
-    let mut metadata_calls = 0;
-    select_context_fresh_paths(&mut pending, &mut selected, 51, true, |candidate| {
-        metadata_calls += 1;
-        candidate.path.to_string_lossy().parse::<usize>().unwrap() >= 100
-    });
-    assert_eq!(selected.len(), 50);
-    assert!(metadata_calls <= 200, "at most one stat per queued path");
-    let retained = pending
-        .into_iter()
-        .map(|p| p.path.to_string_lossy().parse::<usize>().unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(retained, (0..100).chain(150..200).collect::<Vec<_>>());
-}
-#[test]
-fn context_catchup_fresh_priority_cannot_spend_single_reserved_census_slot() {
-    let path = |name: &str, hinted: bool| ScanTraversalPath {
-        scan_root: PathBuf::from("synthetic"),
-        path: PathBuf::from(name),
-        census_member: !hinted,
-        watcher_hint: hinted,
-    };
-    let mut pending = VecDeque::from([path("old-census", false), path("new-hint", true)]);
-    let mut selected = Vec::new();
-    select_context_fresh_paths(&mut pending, &mut selected, 1, true, |_| true);
-    assert!(selected.is_empty());
-    assert_eq!(
-        pending.pop_front().unwrap().path,
-        PathBuf::from("old-census")
-    );
-    // The following normal census selection still owns that one slot.
+fn real_uploader_context_catchup_spends_only_budget_left_after_new_usage() {
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let mut f = Fixture::new(source);
+        let empty = f.index.clone();
+        let old = uploader_group(&mut f, 3);
+        f.uploader.activate(source, "d".repeat(64), &mut f.index);
+        f.uploader.send(source, &mut f.index, &empty, &old).unwrap();
+        let previous = f.index.clone();
+        f.index.activate_file_upload_context(source, "e".repeat(64));
+        let (mut scan, _) = f.walk(false);
+        let mut usage = old[0].clone();
+        usage.source_session_id = "zz-new-usage".into();
+        scan.snapshots = old.clone();
+        scan.snapshots.push(usage);
+        finalize_scan_after_policy(source, &mut scan, &mut f.index);
+        let usage = scan
+            .snapshots
+            .iter()
+            .find(|item| item.source_session_id == "zz-new-usage")
+            .unwrap();
+        // Exactly enough packing allowance for ordinary usage plus one old
+        // body, including separators and the conservative array reserve.
+        let ordinary_bytes = serde_json::to_vec(usage).unwrap().len() + 3;
+        let old_bytes = old
+            .iter()
+            .map(|item| serde_json::to_vec(item).unwrap().len() + 3)
+            .max()
+            .unwrap();
+        f.uploader.activate(source, "e".repeat(64), &mut f.index);
+        f.uploader.set_byte_allowance(ordinary_bytes + old_bytes);
+        let first = f.uploader.posts.len();
+        f.uploader
+            .send(source, &mut f.index, &previous, &scan.snapshots)
+            .unwrap();
+        let posts = &f.uploader.posts[first..];
+        assert_eq!(posts[0].len(), 1);
+        assert_eq!(posts[0][0]["source_session_id"], "zz-new-usage");
+        assert_eq!(
+            posts.iter().map(Vec::len).sum::<usize>(),
+            2,
+            "only one catch-up fits the remainder"
+        );
+        assert_eq!(f.uploader.counts().2, 1);
+        let reacked = posts
+            .iter()
+            .flatten()
+            .map(|item| item["snapshot_fingerprint"].clone())
+            .collect::<Vec<_>>();
+        f.uploader.restart(source, &"e".repeat(64));
+        f.uploader.activate(source, "e".repeat(64), &mut f.index);
+        f.uploader.set_byte_allowance(2 * old_bytes);
+        let next = f.uploader.posts.len();
+        f.uploader
+            .send(source, &mut f.index, &previous, &scan.snapshots)
+            .unwrap();
+        let remaining = f.uploader.posts[next..]
+            .iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            remaining.len(),
+            2,
+            "remaining catch-up continues on the next pass"
+        );
+        assert!(remaining
+            .iter()
+            .all(|item| !reacked.contains(&item["snapshot_fingerprint"])));
+        assert_eq!(f.uploader.counts().2, 2);
+    }
 }

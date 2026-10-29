@@ -129,3 +129,31 @@ Frozen complete progress codecs at0.1.201,0.1.202 and0.1.203 ignore the stamp ma
 missing maps load as unknown. All receipt-adoption quietness fixtures now drive
 the production resumable uploader with retained progress and validated fake
 transport. Direct `exact_acks` helpers remain mint-refusal unit seams only.
+
+Round 7 removes the receipt-specific native freshness promotion. It could split
+terminal-family members across pages and disturb delivery-free membership;
+the protected census pipeline assertions remain unchanged. Receipt transport
+priority now leaves native census/family selection to its existing owner.
+
+Identical-versus-changed classification compares the prior semantic entity set
+as well as the additive body witness. Additive witnesses omit display titles,
+so title redaction under the current destination policy is a changed ordinary
+revision even when its additive digest is equal. The real-uploader privacy
+fixture retains its changed-counter assertion and checks both the title-bearing
+old POST and the title-free new POST.
+
+At upload packing, every ordinary new/changed body precedes stamp-only catch-up,
+including within mixed family units. Separate requests isolate ordinary bodies
+from catch-up retry latency. All ordinary input reserves bytes first; ordinary
+uploads remain admitted even when they exceed the allowance. The existing
+2 MiB request-packing target now also caps stamp-only catch-up across a source
+pass, and catch-up uses only its remaining bytes. This is a new catch-up ceiling
+using an existing constant, not a pre-existing aggregate upload cap. Deferred
+offers retain context debt and use the existing Deferred/partial-save path;
+only a real ACK stamps a body. A restarted next pass sends the remainder without
+re-sending newly stamped bodies. The tight-budget fixture covers both sources.
+
+Cache-head bootstrap cannot send catch-up probes before ordinary full bodies.
+Paced-out probes wait for a later pass without inventing a head token or
+blocking ordinary siblings. No persisted field, timer or daemon operation is
+added by these round-7 repairs. Validation runs no local Cargo tests.

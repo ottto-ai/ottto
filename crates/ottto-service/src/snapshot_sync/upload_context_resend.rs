@@ -18,12 +18,20 @@ pub(super) struct Cycle {
     files: Vec<(BTreeSet<String>, u64)>,
     pub not_stored: BTreeSet<String>,
     pub counts: ResendCounts,
+    // Shared by every uploader invocation in this source pass. Ordinary
+    // bodies reserve first, even when they exceed this allowance; only
+    // stamp-only catch-up is capped by the existing packing byte target.
+    remaining_bytes: usize,
+    ordinary_pending: BTreeSet<String>,
+    pub deferred: BTreeSet<String>,
+    pub bootstrap_blocks_catchup: bool,
 }
 impl Cycle {
     pub(super) fn new(context: String, source_matches: bool) -> Self {
         Self {
             active: Some(context),
             source_matches,
+            remaining_bytes: SNAPSHOT_BATCH_MAX_BYTES,
             ..Self::default()
         }
     }
@@ -42,6 +50,30 @@ impl Cycle {
     pub(super) fn is_catchup(&self, entity: &str) -> bool {
         self.resends.get(entity) == Some(&true)
     }
+    pub(super) fn reserve_ordinary_bytes(&mut self, bytes: usize) {
+        self.remaining_bytes = self.remaining_bytes.saturating_sub(bytes);
+    }
+    pub(super) fn admit_catchup_bytes(&mut self, bytes: usize) -> bool {
+        if bytes > self.remaining_bytes {
+            return false;
+        }
+        self.remaining_bytes -= bytes;
+        true
+    }
+    #[cfg(test)]
+    pub(super) fn set_byte_allowance(&mut self, bytes: usize) {
+        self.remaining_bytes = bytes;
+    }
+    pub(super) fn ordinary_work_is_in(&self, entities: &BTreeSet<&str>) -> bool {
+        !self.bootstrap_blocks_catchup
+            && self
+                .ordinary_pending
+                .iter()
+                .all(|entity| entities.contains(entity.as_str()))
+    }
+    pub(super) fn has_pending_ordinary(&self) -> bool {
+        !self.ordinary_pending.is_empty()
+    }
     pub(super) fn retain_candidates(
         &mut self,
         candidates: &[crate::snapshots::UploadContextReceiptCandidate],
@@ -53,6 +85,9 @@ impl Cycle {
         self.resends.retain(|fp, _| self.candidates.contains(fp));
     }
     pub(super) fn note_attempt(&mut self, entity: &str, bytes: u64) {
+        if !self.is_catchup(entity) {
+            self.ordinary_pending.remove(entity);
+        }
         if let Some(identical) = self.resends.get(entity) {
             if self.attempted.insert(entity.to_string()) {
                 self.counts.entities += 1;
@@ -131,10 +166,21 @@ impl SnapshotUploadProgress {
                 }
             }
         }
+        self.context_resend.ordinary_pending = items
+            .iter()
+            .filter(|item| {
+                !self.context_resend.is_catchup(&item.snapshot_fingerprint)
+                    && !self.contains_body(
+                        &item.snapshot_fingerprint,
+                        &snapshot_upload_body_witness(item),
+                    )
+            })
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect();
     }
 }
 crate::heap_layout_bound::fields!(ResendCounts; entities, bytes, identical, changed);
-crate::heap_layout_bound::fields!(Cycle; active, source_matches, candidates, resends, attempted, files, not_stored, counts);
+crate::heap_layout_bound::fields!(Cycle; active, source_matches, candidates, resends, attempted, files, not_stored, counts, remaining_bytes, ordinary_pending, deferred, bootstrap_blocks_catchup);
 
 #[cfg(test)]
 thread_local! { static LAST_COUNTS: std::cell::Cell<(u64,u64)> = const { std::cell::Cell::new((0,0)) }; }
