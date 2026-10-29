@@ -2727,3 +2727,55 @@ fn paced_restore_residue_prevents_35_day_census_retirement_until_catchup() {
         "negative control: ordinary quiet retirement remains enabled after catch-up"
     );
 }
+
+#[test]
+#[cfg(unix)]
+fn native_shrink_requires_exact_committed_census_and_opened_object() {
+    use std::os::unix::fs::MetadataExt;
+    let scratch = crate::test_scratch::ScratchDir::new("census-native-shrink");
+    let root = scratch.join("projects");
+    census_write(
+        &root,
+        "shrink.jsonl",
+        &[census_response("shrink", Some("r"), "m", 1, 10)],
+    );
+    let mut index = ScanIndex::default();
+    census_scan(&root, &mut index, "2026-10-29T09:00:00Z");
+    let key = census_key(&index, &root, "shrink.jsonl");
+    let metadata = std::fs::metadata(&key).unwrap();
+    let physical = Some([metadata.dev(), metadata.ino()]);
+    let length = index.files[&key].size_bytes;
+    assert!(length > 0);
+    let proves = |index: &ScanIndex, length, physical| {
+        claude_request_census::proves_indexed_shrink(index, &key, length, physical)
+    };
+    assert!(proves(&index, length - 1, physical));
+    assert!(
+        !proves(&index, length, physical),
+        "no change, no permission"
+    );
+    assert!(
+        !proves(&index, length - 1, None),
+        "unknown object remains held"
+    );
+    assert!(
+        !proves(
+            &index,
+            length - 1,
+            Some([metadata.dev(), metadata.ino() ^ 1])
+        ),
+        "wrong object remains held"
+    );
+    let fingerprint = index.files[&key].source_file_fingerprint.clone();
+    index.files.get_mut(&key).unwrap().source_file_fingerprint = "unbound".into();
+    assert!(
+        !proves(&index, length - 1, physical),
+        "stale original cannot grant Full"
+    );
+    index.files.get_mut(&key).unwrap().source_file_fingerprint = fingerprint;
+    index.files.get_mut(&key).unwrap().modified_unix_seconds += 1;
+    assert!(
+        !proves(&index, length - 1, physical),
+        "wrong committed stamp remains held"
+    );
+}

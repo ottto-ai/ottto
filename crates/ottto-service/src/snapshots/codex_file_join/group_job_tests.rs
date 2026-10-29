@@ -3026,6 +3026,7 @@ fn durable_hold_on_one_member_holds_the_joined_group() {
     for refused_members in 0..=2 {
         let held = refused_members > 0;
         let (root, _) = fixture();
+        let _writer = crate::locked_state_dir::test_locks::hold(&root);
         let cache = Arc::new(SharedCache::default());
         let index_path = root.join("index.json");
         let namespace = Scope("group-fixture".into());

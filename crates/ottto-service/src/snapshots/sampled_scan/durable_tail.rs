@@ -314,6 +314,8 @@ pub(crate) struct AcceptedFloor {
     generation: u64,
     entry: store::Digest32,
     strict: bool,
+    /// A lossy read's raw extent is not a verified accepted-body prefix.
+    verified_extent: bool,
 }
 impl AcceptedFloor {
     pub(crate) fn of(index: &ScanIndex, key: &str) -> Option<Self> {
@@ -324,6 +326,7 @@ impl AcceptedFloor {
             birth: e.opened_birth_nanos,
             generation: index.generation,
             strict: !e.source_file_fingerprint.is_empty(),
+            verified_extent: !e.has_unverified_source(),
             entry: store::replay_entry_digest(
                 &store::entry_digest(
                     &e.source_file_fingerprint,
@@ -337,7 +340,10 @@ impl AcceptedFloor {
         })
     }
     pub(crate) fn behind(self, length: u64) -> bool {
-        length < self.end || effective_revision(SnapshotSource::ClaudeCode) < self.revision
+        (self.verified_extent && length < self.end) || !self.permits_real_edit()
+    }
+    pub(crate) fn permits_real_edit(self) -> bool {
+        effective_revision(SnapshotSource::ClaudeCode) >= self.revision
     }
 }
 

@@ -1369,6 +1369,24 @@ fn owned_prepare_rejects_with_original_box_graph_flags_and_unique_guard() {
                 usize::from(matches!(arm, "buffered" | "finished" | "occupied")),
                 "fixed invariant alarm, distinct from old-checkpoint I/O"
             );
+            if arm == "capture" {
+                assert!(
+                    matches!(
+                        result,
+                        Ok(crate::transcript_acquisition::ReadMode::Unchanged)
+                    ),
+                    "#840: capture-only mode is source-derived, not an incompatibility"
+                );
+                assert_eq!(parser.reader.consumed_bytes(), 0);
+                assert!(parser.accumulator.claude_request_identity_capture);
+                let mut owner = parser.reader.reader.take_durable();
+                let attempt = owner.take_retail().expect("same unique guard transferred");
+                assert_eq!((attempt.object, attempt.next, attempt.end), expected_guard);
+                attempt.finish();
+                assert!(owner.is_empty());
+                assert_eq!(cache.durable().unwrap().retail_spent.len(), 1);
+                continue;
+            }
             let rejected = match result {
                 Ok(_) => panic!("{source:?}/{arm} unexpectedly accepted"),
                 Err(rejected) => rejected,
@@ -2673,25 +2691,25 @@ fn attribution_capture_toggle_refuses_the_previous_claude_record() {
     if !crate::test_isolation::run_here() {
         return;
     }
-    let root = crate::test_scratch::private_dir("ottto-dt-attribution");
-    let lock = test_locks::hold(&root);
-    let source = SnapshotSource::ClaudeCode;
-    let namespace = Scope("attribution-test".into());
-    let scope = Scope("attribution-file".into());
-    let index_path = root.join("index.json");
-    let path = root.join("11111111-2222-4333-8444-555555555555.jsonl");
-    native_fixture(&path);
-    let key = local_index_key(&path);
-    let mut index = ScanIndex::default();
-    index.files.insert(
-        key.clone(),
-        serde_json::from_value(serde_json::json!({
-            "size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"fp"
-        }))
-        .unwrap(),
-    );
-    index.save(&index_path).unwrap();
     for before in [false, true] {
+        let root = crate::test_scratch::private_dir("ottto-dt-attribution");
+        let lock = test_locks::hold(&root);
+        let source = SnapshotSource::ClaudeCode;
+        let namespace = Scope("attribution-test".into());
+        let scope = Scope("attribution-file".into());
+        let index_path = root.join("index.json");
+        let path = root.join("11111111-2222-4333-8444-555555555555.jsonl");
+        native_fixture(&path);
+        let key = local_index_key(&path);
+        let mut index = ScanIndex::default();
+        index.files.insert(
+            key.clone(),
+            serde_json::from_value(serde_json::json!({
+                "size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"fp"
+            }))
+            .unwrap(),
+        );
+        index.save(&index_path).unwrap();
         // Isolated child process: no concurrent test can observe the env.
         std::env::set_var(
             "OTTTO_CLAUDE_ATTRIBUTION_CAPTURE",
@@ -2773,8 +2791,8 @@ fn attribution_capture_toggle_refuses_the_previous_claude_record() {
         assert_eq!(counts.ineligible.get("scope"), Some(&1));
         assert_eq!(counts.restored, 0);
         assert_eq!(disk.records_read, 1);
+        let _ = std::fs::remove_dir_all(root);
     }
-    let _ = std::fs::remove_dir_all(root);
 }
 
 /// A Codex transcript whose open call's id is `call_id_bytes` long: the id
@@ -3356,11 +3374,15 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                 let alarmed = reachable && kind != "none";
                 assert_eq!(
                     alarms.len(),
-                    usize::from(alarmed),
+                    1 + usize::from(alarmed),
                     "{source:?}/{kind}/{bypass}"
                 );
                 if alarmed {
-                    let alarm = &alarms[0];
+                    assert!(
+                        alarms[0]["counts"]["records_read"].is_number(),
+                        "separate store counters"
+                    );
+                    let alarm = &alarms[1];
                     assert_eq!(alarm["stage"], "durable_tail_alarm");
                     assert_eq!(alarm["source"], source.api_slug());
                     let pair = |on: bool| serde_json::json!([u64::from(on), u64::from(on)]);
@@ -3459,8 +3481,17 @@ fn foreign_owned_store_alarms_once_and_holds_nothing() {
             fresh.durable_alarm(source);
         }
     });
-    assert_eq!(alarms.len(), 1, "one store-level alarm");
-    let counts = &alarms[0]["counts"];
+    assert_eq!(
+        alarms.len(),
+        3,
+        "two store snapshots plus exactly one state alarm"
+    );
+    let state: Vec<_> = alarms
+        .iter()
+        .filter(|a| !a["counts"]["store_disabled"].is_null())
+        .collect();
+    assert_eq!(state.len(), 1, "one store-level disable alarm");
+    let counts = &state[0]["counts"];
     assert_eq!(counts["store_disabled"], "foreign_owner");
     assert_eq!(counts["held_keys"], serde_json::json!([0, 0]));
     assert_eq!(counts["t14_rebuild"], serde_json::json!([0, 0]));
@@ -3608,7 +3639,16 @@ fn store_io_failures_emit_cold_production_body_without_holds() {
                 );
                 cache.durable_alarm(source);
             });
-            assert_eq!(alarms.len(), 1);
+            let disabled: Vec<_> = alarms
+                .iter()
+                .filter(|a| !a["counts"]["store_disabled"].is_null())
+                .collect();
+            assert_eq!(
+                disabled.len(),
+                1,
+                "exactly one store disable, independent of active-lease telemetry"
+            );
+            let alarms = disabled;
             assert_eq!(alarms[0]["counts"]["store_disabled"], "record_access");
             assert_eq!(alarms[0]["counts"]["held_keys"], serde_json::json!([0, 0]));
             assert_eq!(
@@ -5216,7 +5256,8 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
         .unwrap();
     for pass in 0..2 {
         let mut index = ScanIndex::load(&index_path).unwrap();
-        let record = match DurableTailStore::new(dir.clone(), source).read(&record_key) {
+        let mut writer = DurableTailStore::new(dir.clone(), source);
+        let record = match writer.read(&record_key) {
             ReadOutcome::Found(record) => record,
             other => panic!("{other:?}"),
         };
@@ -5235,10 +5276,22 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
         assert_eq!(current.audit_debt_unix_seconds, Some(due));
         let mut rewritten = record.record.clone();
         rewritten.certificate = current;
-        let old_wire = store::tests::pinned_v1_bytes(&rewritten, index.generation);
-        DurableTailStore::new(dir.clone(), source)
+        let old_wire = store::tests::pinned_v1_bytes(&rewritten, record.index_generation);
+        writer.authorize(
+            &record,
+            &Expected {
+                binding: record.record.binding.clone(),
+                committed_generation: index.generation,
+            },
+        );
+        let receipt = writer
             .write_after_save(lock, index.generation, 0, vec![rewritten])
             .unwrap();
+        assert_eq!(
+            (receipt.clean, receipt.written),
+            (1, 0),
+            "unchanged content does not rewrite the stored generation"
+        );
         let record_path = dir.join(format!(
             "{}.rec",
             record_key
@@ -5357,7 +5410,8 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
                 1,
                 "completed audit must replace the debt-bearing predecessor, not memo-skip it"
             );
-            let record = match DurableTailStore::new(dir.clone(), source).read(&record_key) {
+            let mut writer = DurableTailStore::new(dir.clone(), source);
+            let record = match writer.read(&record_key) {
                 ReadOutcome::Found(r) => r,
                 other => panic!("{other:?}"),
             };
@@ -7050,7 +7104,7 @@ fn s2_unknown_is_same_and_only_independent_replacement_skips_floor() {
     not(target_os = "macos"),
     ignore = "requires qualified native heap layout"
 )]
-fn warm_shortened_old_file_keeps_accepted_body_floor_without_publication() {
+fn verified_warm_shrink_reads_exact_changed_body_once_and_preserves_ack() {
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -7077,7 +7131,7 @@ fn warm_shortened_old_file_keeps_accepted_body_floor_without_publication() {
     let source = SnapshotSource::ClaudeCode;
     let namespace = Scope("p3-warm-s2".into());
     let cache = Arc::new(SharedCache::default());
-    let run = |index| {
+    let run = |cache: Arc<SharedCache>, index| {
         let mut scan = OwnedSourceScan::new_with_identity_capture(
             source,
             std::slice::from_ref(&sessions),
@@ -7092,7 +7146,7 @@ fn warm_shortened_old_file_keeps_accepted_body_floor_without_publication() {
             true,
             true,
         )
-        .with_sampled_acquisition(cache.clone(), namespace.clone());
+        .with_sampled_acquisition(cache, namespace.clone());
         let mut modes = (0, 0, 0);
         for _ in 0..10_000 {
             if let Some(context) = scan.sampling.as_ref() {
@@ -7105,15 +7159,13 @@ fn warm_shortened_old_file_keeps_accepted_body_floor_without_publication() {
         }
         panic!("warm S2 fixture did not finish");
     };
-    let (accepted, first, _) = run(ScanIndex::default());
+    let (accepted, first, _) = run(cache.clone(), ScanIndex::default());
     let key = local_index_key(&path);
     assert_eq!(first.snapshots[0].input_tokens, 125);
     assert!(
         cache.retained().unwrap().peek(&key).is_some(),
         "real warm premise"
     );
-    let entry = serde_json::to_value(&accepted.files[&key]).unwrap();
-    let census = accepted.claude_request_census.get(&key).unwrap().clone();
     let witness = accepted.files[&key].last_upload_body_witness.clone();
     std::fs::OpenOptions::new()
         .write(true)
@@ -7134,23 +7186,29 @@ fn warm_shortened_old_file_keeps_accepted_body_floor_without_publication() {
         &path,
         prefix
     ));
-    let (held, body, modes) = run(accepted);
-    assert!(
-        body.snapshots.is_empty(),
-        "cannot publish100 below accepted125"
-    );
+    let prior = accepted.clone();
+    let (changed, body, modes) = run(cache.clone(), accepted);
+    assert_eq!(body.snapshots.len(), 1);
     assert_eq!(
-        body.unreadable_path_count, 0,
-        "known floor is census-neutral"
+        body.snapshots[0].input_tokens, 100,
+        "A2: actual changed body"
     );
+    assert_eq!(body.unreadable_path_count, 0);
+    assert_eq!(modes, (1, 0, prefix));
+    assert_eq!(changed.files[&key].size_bytes, prefix);
     assert_eq!(
-        modes,
-        (0, 0, 0),
-        "no Full/Tail selection or native body before S2"
+        changed.files[&key].last_upload_body_witness, witness,
+        "acquisition grants no ACK"
     );
-    assert_eq!(serde_json::to_value(&held.files[&key]).unwrap(), entry);
-    assert_eq!(held.files[&key].last_upload_body_witness, witness);
-    assert_eq!(held.claude_request_census.get(&key), Some(&census));
+    let (_, cold, cold_modes) = run(Arc::new(SharedCache::default()), prior);
+    assert_eq!(cold_modes, (1, 0, prefix));
+    assert_eq!(
+        serde_json::to_value(&body.snapshots).unwrap(),
+        serde_json::to_value(&cold.snapshots).unwrap()
+    );
+    let (_, idle, modes) = run(cache, changed);
+    assert!(idle.snapshots.is_empty());
+    assert_eq!(modes, (0, 0, 0), "changed body acquired exactly once");
 }
 
 /// Every retained #865 probe needs input credit even on a memo hit. The

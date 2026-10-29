@@ -2740,6 +2740,31 @@ pub(crate) fn record_claude_request_census(
     }
 }
 
+/// A2 metadata proof for the currently opened object, independent of optional
+/// RAM/disk restore. A verified census must bind the exact committed fingerprint,
+/// mtime and physical object. Missing/stale/unknown evidence grants nothing.
+pub(super) fn proves_indexed_shrink(
+    index: &ScanIndex,
+    key: &str,
+    length: u64,
+    physical: Option<[u64; 2]>,
+) -> bool {
+    let (Some(record), Some(entry)) = (index.claude_request_census.get(key), index.files.get(key))
+    else {
+        return false;
+    };
+    length < entry.size_bytes
+        && !record.unverified
+        && !record.is_birth_stub()
+        && !entry.source_file_fingerprint.is_empty()
+        && decode_fingerprint(&entry.source_file_fingerprint)
+            == Some(record.source_file_fingerprint)
+        && record.modified == Some(entry.modified_unix_seconds)
+        && record
+            .birth
+            .is_some_and(|birth| physical == Some([birth.device, birth.inode]))
+}
+
 /// A Held key keeps copy proof while its committed entry is still the
 /// version the record describes (the server's stale body), on the same
 /// physical object; the file itself may have grown. A cleared (reparse-debt)

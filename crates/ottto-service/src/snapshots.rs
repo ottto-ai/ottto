@@ -31281,6 +31281,22 @@ impl OwnedSourceScan {
             ) else {
                 pending!();
             };
+            // A2: a current, source-verified census independently proves that
+            // THIS committed object shrank. Read its new body even without a
+            // reusable optional record; unknown/downgrade floors remain holds.
+            #[cfg(unix)]
+            let native_edit_proven = source == SnapshotSource::ClaudeCode
+                && accepted_floor.is_some_and(|a| a.permits_real_edit())
+                && claude_request_census::proves_indexed_shrink(
+                    index,
+                    &local_index_key(&candidate.path),
+                    candidate.size_bytes,
+                    candidate.physical_identity,
+                );
+            #[cfg(unix)]
+            if native_edit_proven {
+                restore_floor = None;
+            }
             if preflight_source_file_fingerprint
                 .as_ref()
                 .is_some_and(|fingerprint| fingerprint != &candidate.source_file_fingerprint)
@@ -32130,6 +32146,18 @@ impl OwnedSourceScan {
                 };
                 #[cfg(not(unix))]
                 let taken = context.cache.take(&key);
+                #[cfg(unix)]
+                let taken = if native_edit_proven {
+                    // A real edit invalidates the old graph; no Tail spend or
+                    // guardless reuse. Drop it before releasing transfer credit.
+                    drop(taken);
+                    if let Some(lease) = preparation_lease.take() {
+                        lease.release();
+                    }
+                    None
+                } else {
+                    taken
+                };
                 // The original and its funding move together if ordinary cache
                 // admission refuses. The active frame retries before any read.
                 macro_rules! return_original {
@@ -32317,7 +32345,7 @@ impl OwnedSourceScan {
                         // Keep S2 even when sampling itself is unavailable.
                         #[cfg(unix)]
                         if !allow_sample
-                            && accepted_floor.is_some_and(|a| {
+                            && restore_floor.is_some_and(|a| {
                                 parser
                                     .reader
                                     .reader
@@ -32354,7 +32382,10 @@ impl OwnedSourceScan {
                         let mut restored_plan = None;
                         #[cfg(unix)]
                         let (mut retained, taken_admission, debt) = match retained {
-                            None if allow_sample && !parser.reader.reader.is_compressed() => {
+                            None if allow_sample
+                                && !native_edit_proven
+                                && !parser.reader.reader.is_compressed() =>
+                            {
                                 let mut interpretation =
                                     sampled_scan::durable_tail::Interpretation::of(
                                         source,
@@ -32363,8 +32394,7 @@ impl OwnedSourceScan {
                                         claude_request_identity_capture,
                                         &context.namespace,
                                     );
-                                interpretation.accepted = accepted_floor;
-                                restore_floor = accepted_floor;
+                                interpretation.accepted = restore_floor;
                                 let restore = context.cache.durable_restore(
                                     source,
                                     &key,
@@ -32733,7 +32763,7 @@ impl OwnedSourceScan {
             }
             // S2 is a publication floor, including warm, census/dependency
             // fallback and unsampled routes. Only the strict cold-record
-            // replacement proof above may clear it. No plan means use the
+            // replacement or independently bound native shrink proof may clear it. No plan means use the
             // actual held extent, never a fabricated zero or a skipped guard.
             #[cfg(unix)]
             if restore_floor.is_some_and(|a| {

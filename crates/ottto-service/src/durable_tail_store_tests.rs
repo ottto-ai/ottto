@@ -2223,6 +2223,14 @@ fn inventory_overflow_replaces_existing_records_and_defers_new_keys() {
     }
     // Fresh process: no RAM memo of the known record.
     let mut store = scratch.store();
+    let predecessor = found(store.read(&b.key));
+    store.authorize(
+        &predecessor,
+        &Expected {
+            binding: b.clone(),
+            committed_generation: 1,
+        },
+    );
     let mut new = b.clone();
     new.key = key_digest(DurableSource::ClaudeCode, "new-session");
     new.entry = entry_digest("fp-new", None);
@@ -2381,13 +2389,13 @@ fn access_failures_disable_instead_of_holding_and_not_found_stays_absent() {
     ] {
         let _reset = ResetFaults;
         let scratch = Scratch::new();
-        let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+        let lock = crate::locked_state_dir::test_locks::hold(&scratch.root);
         let transcript = scratch.transcript("t.jsonl", b"{}\n");
         let b = binding("acct", "scope", ("fp", None));
         let mut store = scratch.store();
         store
             .write_after_save(
-                &lock,
+                lock,
                 1,
                 0,
                 vec![pending(b.clone(), certificate(&transcript), 1)],
@@ -2454,7 +2462,7 @@ fn access_failures_disable_instead_of_holding_and_not_found_stays_absent() {
             assert_eq!(cold.read(&b.key), ReadOutcome::Missing);
             assert_eq!(
                 cold.write_after_save(
-                    &lock,
+                    lock,
                     2,
                     0,
                     vec![pending(b.clone(), certificate(&transcript), 2)]
@@ -2462,7 +2470,7 @@ fn access_failures_disable_instead_of_holding_and_not_found_stays_absent() {
                 .unwrap(),
                 BatchReceipt::default()
             );
-            cold.gc(&lock, &[0; 32], &BTreeMap::new()).unwrap();
+            cold.gc(lock, &[0; 32], &BTreeMap::new()).unwrap();
             cold.begin_pass();
             assert_eq!(cold.hold(&b.key), None);
         }
@@ -3236,7 +3244,7 @@ fn delayed_t14_receipt_allows_clean_then_changed_offer_without_second_rebuild() 
     for reconcile_before_offer in [false, true] {
         let _reset = ResetFaults;
         let scratch = Scratch::new();
-        let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+        let lock = crate::locked_state_dir::test_locks::hold(&scratch.root);
         let transcript = scratch.transcript("t.jsonl", b"{}\n");
         let mut b = binding("acct", "scope", ("fp", None));
         b.source = DurableSource::Codex;
@@ -3262,7 +3270,7 @@ fn delayed_t14_receipt_allows_clean_then_changed_offer_without_second_rebuild() 
             record
         };
         let mut store = new_store();
-        store.write_after_save(&lock, 1, 0, vec![item(1)]).unwrap();
+        store.write_after_save(lock, 1, 0, vec![item(1)]).unwrap();
         let path = record_file(&store, &b.key);
         let mut corrupt = fs::read(&path).unwrap();
         *corrupt.last_mut().unwrap() ^= 1;
@@ -3276,7 +3284,7 @@ fn delayed_t14_receipt_allows_clean_then_changed_offer_without_second_rebuild() 
         test_hooks::set_before_dir_sync(Some(Box::new(|_| Err(io::Error::other("late sync")))));
         let replacement = item(2);
         let receipt = cold
-            .write_after_save(&lock, 2, 0, vec![replacement.clone()])
+            .write_after_save(lock, 2, 0, vec![replacement.clone()])
             .unwrap();
         assert_eq!(receipt.deferred_keys, vec![b.key]);
         assert!(cold.pending.contains_key(&b.key));
@@ -3284,14 +3292,14 @@ fn delayed_t14_receipt_allows_clean_then_changed_offer_without_second_rebuild() 
         assert_ne!(fs::read(&path).unwrap(), corrupt, "rename happened");
         test_hooks::set_before_dir_sync(None);
         if reconcile_before_offer {
-            assert!(cold.reconcile_pending(&lock, &b.key).unwrap());
+            assert!(cold.reconcile_pending(lock, &b.key).unwrap());
             assert!(
                 !cold.rebuilt.contains_key(&b.key),
                 "external positive receipt clears latch"
             );
         }
         let clean = cold
-            .write_after_save(&lock, 2, 0, vec![replacement])
+            .write_after_save(lock, 2, 0, vec![replacement])
             .unwrap();
         assert_eq!((clean.written, clean.clean), (0, 1));
         assert!(!cold.pending.contains_key(&b.key));
@@ -3301,7 +3309,7 @@ fn delayed_t14_receipt_allows_clean_then_changed_offer_without_second_rebuild() 
         );
         let changed = item(3);
         let receipt = cold
-            .write_after_save(&lock, 3, 0, vec![changed.clone()])
+            .write_after_save(lock, 3, 0, vec![changed.clone()])
             .unwrap();
         assert_eq!(receipt.written, 1, "future healthy update remains writable");
         assert_eq!(cold.counters().t14_rebuild_full_started, 1);
