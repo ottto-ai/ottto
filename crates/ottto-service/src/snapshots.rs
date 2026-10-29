@@ -48723,9 +48723,8 @@ impl ScanIndex {
         // A withheld key's audit debt (carried onto its reverted entry) cannot
         // settle while held; an unchanged one defers it to its next counted
         // re-parse, usually the binding read, instead of a Full every pass.
-        let audit = entry.audit_requires_full(now)
-            && (entry.source_file_fingerprint.is_empty()
-                || !self.withheld_account_unchanged(&key, candidate));
+        // DoD-20 proof: neutralized audit deferral (pre-round-9 gate).
+        let audit = entry.audit_requires_full(now);
         if audit || sampled_audit::progress_debt(self, &key, now).is_some() {
             return (CandidateDecision::Parse, Some(CandidateParseReason::Audit));
         }

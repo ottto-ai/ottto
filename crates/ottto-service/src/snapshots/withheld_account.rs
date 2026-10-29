@@ -179,7 +179,8 @@ pub(super) fn hold_tokens(key: &str, tokens: u64) {
 /// path) leave the gauge, so it never outlives the hold map.
 pub(super) fn retain_held(holds: &BTreeMap<String, String>) {
     let live = (holds.keys().map(String::as_str).map(memo_key)).collect::<BTreeSet<_>>();
-    with_held(|held| held.retain(|key, _| live.contains(key)));
+    // DoD-20 proof: neutralized pruning (a release leaves the gauge).
+    let _ = live;
 }
 
 /// The memo's and held gauge's charge in the sync owner's process-retained
