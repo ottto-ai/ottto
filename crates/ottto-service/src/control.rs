@@ -32032,6 +32032,8 @@ X-API-Key = "otel_redacted"
                 last_error: None,
             })
             .unwrap();
+        let first = daemon.status_for_trusted_client().unwrap().relay;
+        assert!(first.last_error.is_none(), "one sighting is not reported");
         let relay = daemon.status_for_trusted_client().unwrap().relay;
         assert_eq!(relay.state, ottto_protocol::RelayRuntimeState::Connected);
         let finding = relay.last_error.unwrap();
@@ -32116,6 +32118,16 @@ X-API-Key = "otel_redacted"
             .unwrap();
         let settings = root.join(".claude/settings.json");
         let before = fs::read(&settings).unwrap();
+        // No flapping: the first sighting raises neither finding nor blocker.
+        let first = daemon.status_for_trusted_client().unwrap();
+        assert!(first.relay.last_error.is_none());
+        assert!(first
+            .canonical_health
+            .as_ref()
+            .unwrap()
+            .blockers
+            .iter()
+            .all(|blocker| blocker.code != "claude_relay_endpoint_mismatch"));
         let finding = daemon
             .status_for_trusted_client()
             .unwrap()
@@ -32140,6 +32152,12 @@ X-API-Key = "otel_redacted"
         // The uploaded projection re-reads status, then re-projects it.
         let mut uploaded = daemon.status_for_trusted_client().unwrap();
         crate::refresh_canonical_local_health(&mut uploaded);
+        // One projection per status: a raised blocker never takes a revision
+        // above the cleared status that follows it.
+        let revision = |status: &ottto_protocol::DaemonStatus| {
+            status.canonical_health.as_ref().unwrap().revision
+        };
+        let raised_revision = revision(&daemon.status_for_trusted_client().unwrap());
         for status in [daemon.status_for_trusted_client().unwrap(), uploaded] {
             let (codes, overall) = mismatch_blockers(&status);
             assert_eq!(
@@ -32187,6 +32205,7 @@ X-API-Key = "otel_redacted"
         write_startup_relay_settings(&root, "http://127.0.0.1:43119");
         let cleared = daemon.status_for_trusted_client().unwrap();
         assert!(cleared.relay.last_error.is_none());
+        assert_eq!(revision(&cleared), raised_revision);
         assert!(
             mismatch_blockers(&cleared).0.is_empty(),
             "blocker clears on match"
@@ -32199,6 +32218,15 @@ X-API-Key = "otel_redacted"
             .contains_key(&finding.code)
         );
         write_startup_relay_settings(&root, "http://127.0.0.1:48123");
+        assert!(
+            daemon
+                .status_for_trusted_client()
+                .unwrap()
+                .relay
+                .last_error
+                .is_none(),
+            "an agreeing check resets the streak"
+        );
         let disabled = EnvVarGuard::set_str("OTTTO_PATCH_CLAUDE_CODE_DISABLED", "1");
         assert!(daemon
             .status_for_trusted_client()

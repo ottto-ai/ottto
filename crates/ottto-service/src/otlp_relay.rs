@@ -18,7 +18,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -559,6 +559,40 @@ pub(crate) fn bind_replacement_local_relay_listener(
 }
 
 pub(crate) const RELAY_ENDPOINT_MISMATCH_CODE: &str = "claude_relay_endpoint_mismatch";
+
+/// A restart or rebind can briefly disagree with settings. Report a mismatch
+/// only once the same one is seen again at least this long after first.
+#[cfg(not(test))]
+const RELAY_MISMATCH_PERSIST: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const RELAY_MISMATCH_PERSIST: Duration = Duration::ZERO;
+
+/// In-memory streak for the mismatch finding: set after two evaluations of the
+/// same mismatch, cleared by the first evaluation without one.
+#[derive(Debug, Default)]
+pub(crate) struct RelayMismatchDebounce(std::sync::Mutex<Option<(Instant, String)>>);
+
+impl RelayMismatchDebounce {
+    pub(crate) fn observe(&self, finding: Option<StableMessage>) -> Option<StableMessage> {
+        let mut seen = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(finding) = finding else {
+            *seen = None;
+            return None;
+        };
+        match seen.as_ref() {
+            Some((since, text)) if *text == finding.text => {
+                (since.elapsed() >= RELAY_MISMATCH_PERSIST).then_some(finding)
+            }
+            _ => {
+                *seen = Some((Instant::now(), finding.text.clone()));
+                None
+            }
+        }
+    }
+}
 
 pub(crate) fn approved_endpoint_mismatch(relay: &RelayState) -> Option<StableMessage> {
     if relay.state != RelayRuntimeState::Connected {

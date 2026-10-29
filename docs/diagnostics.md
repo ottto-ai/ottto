@@ -595,7 +595,10 @@ and `ottto doctor --json` expose `relay.last_error.code` as
 `claude_local_evidence` diagnostics section includes the same finding.
 Canonical local health carries it as a `Warning` blocker with the same code
 (owner `source`), so the machine reads `degraded` and the existing machine-health
-upload reports it to Ottto the same day. The blocker clears with the finding.
+upload reports it to Ottto the same day. Its uploaded text carries no ports.
+To avoid flapping on a restart or rebind, the finding and blocker appear only
+once the same mismatch is seen again at least 60 seconds after first sight; the
+first agreeing check clears both. The support diagnostics item is not delayed.
 
 This compares current approved settings with the daemon's listener state; it
 does not probe exporters or prove that a running Claude process reloaded its
