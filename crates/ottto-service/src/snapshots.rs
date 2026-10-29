@@ -31781,25 +31781,21 @@ impl OwnedSourceScan {
                     pending!();
                 }
             }
-            if source == SnapshotSource::ClaudeCode
-                && claude_terminal_off()
-                && !index
-                    .claude_full_rearm_progress
-                    .terminal_off_admitted
-                    .iter()
-                    .any(|p| p.path == candidate.path)
-            {
-                // Sampling may inject one progress candidate after constructor
-                // selection. Capture its actual root too, within this page.
-                index
-                    .claude_full_rearm_progress
-                    .terminal_off_admitted
-                    .push(ScanTraversalPath {
+            if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
+                // Progress preparation can REPLACE a constructor candidate at
+                // the same path with another configured root. Retry custody
+                // follows the candidate actually opened, not the old producer.
+                let admitted = &mut index.claude_full_rearm_progress.terminal_off_admitted;
+                if let Some(prior) = admitted.iter_mut().find(|p| p.path == candidate.path) {
+                    prior.scan_root.clone_from(&candidate.scan_root);
+                } else {
+                    admitted.push(ScanTraversalPath {
                         scan_root: candidate.scan_root.clone(),
                         path: candidate.path.clone(),
                         census_member: false,
                         watcher_hint: false,
                     });
+                }
             }
             // Path-(a) tombstone: a returning, unindexed member of a family
             // this index retired as absent. It is never skipped forever and

@@ -4813,3 +4813,209 @@ fn terminal_off_overlapping_root_retry_preserves_native_scope_and_reads_no_full(
     );
     assert!(index.accepted_snapshot_fingerprints.is_empty());
 }
+
+#[test]
+fn terminal_off_constructor_progress_replacement_survives_held_and_failed_reload_without_scope_full(
+) {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    use super::claude_request_census::{ClaudeRequestCensusRecord, ClaudeRequestCensusShape};
+    let source = SnapshotSource::ClaudeCode;
+    let scratch = crate::test_scratch::ScratchDir::new("terminal-off-actual-progress-root");
+    let nested = scratch.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    let fixture = Fixture(nested.join("a1111111-1111-4111-8111-111111111111.jsonl"));
+    fixture.append(&usage(source, 100, 0, "fixture-model"));
+    let roots = vec![scratch.to_path_buf(), nested.clone()];
+    let mut scan = OwnedSourceScan::new(
+        source,
+        &roots,
+        ScanIndex::default(),
+        NOW,
+        183,
+        10,
+        false,
+        None,
+        &[],
+        false,
+        false,
+    );
+    let original = scan.identified_candidates.front().unwrap().clone();
+    assert_eq!(
+        original.scan_root, nested,
+        "real directory constructor selects K"
+    );
+    let key = local_index_key(&fixture.0);
+    let entry: ScanIndexEntry = serde_json::from_value(json!({
+        "size_bytes":original.size_bytes,
+        "modified_unix_seconds":original.modified_unix_seconds,
+        "modified_unix_nanos":original.modified_unix_nanos,
+        "source_file_fingerprint":original.source_file_fingerprint,
+        "last_snapshot_fingerprint":null,
+        "scan_identity_version":LOCAL_SCAN_INDEX_IDENTITY_VERSION,
+    }))
+    .unwrap();
+    scan.index.files.insert(key.clone(), entry.clone());
+    scan.index
+        .claude_request_census_mut_for_test()
+        .insert_for_test(
+            &key,
+            ClaudeRequestCensusRecord::synthetic_for_test(
+                &"ab".repeat(32),
+                0,
+                ClaudeRequestCensusShape::IdentityIncomplete,
+                vec![1],
+            )
+            .with_unverified_for_test(true),
+        );
+    for n in 0..crate::transcript_cache::CACHE_ENTRIES {
+        let mut occupied = entry.clone();
+        occupied.set_unverified_deadline(1);
+        scan.index.files.insert(format!("occupied-{n}"), occupied);
+    }
+    scan.index.held_audit_progress = Some(sampled_audit::HeldAuditProgress {
+        key: key.clone(),
+        due: 1,
+        attempted: false,
+    });
+    assert_eq!(
+        scan.index.claude_full_rearm_progress.terminal_off_admitted[0].scan_root,
+        nested
+    );
+    let mut scan = scan.with_sampled_acquisition(
+        Arc::new(sampled_scan::SharedCache::default()),
+        Scope("terminal-off-producer-root".into()),
+    );
+    let admitted = scan.identified_candidates.front().unwrap().clone();
+    assert_eq!(admitted.path, original.path);
+    assert_eq!(
+        admitted.scan_root, roots[0],
+        "real due progress replaces the SAME key"
+    );
+    assert!(
+        !scan.index.files[&key].has_unverified_source(),
+        "capacity kept K plain v2"
+    );
+    let scope_index = scan.index.clone();
+    let scope = scan.sampling.as_ref().unwrap().file_scope(
+        source,
+        &admitted,
+        "",
+        false,
+        false,
+        &scope_index,
+    );
+    let (retained, _, _, _) = acquire_with(
+        &fixture,
+        source,
+        &CodexTitleMetadata::default(),
+        &scope,
+        None,
+        100,
+        true,
+    );
+    // Run the actual final candidate boundary, without editing any candidate
+    // root or admitted inventory. The active parser yields after selection.
+    for _ in 0..100 {
+        if scan.active_file.is_some() {
+            break;
+        }
+        scan = match scan.step(None) {
+            OwnedSourceScanStep::Pending(next) => next,
+            OwnedSourceScanStep::Complete { .. } => {
+                panic!("candidate must enter the real active read")
+            }
+        };
+    }
+    assert!(scan.active_file.is_some());
+    let actual = &scan.index.claude_full_rearm_progress.terminal_off_admitted[0];
+    assert_eq!(actual.path, fixture.0);
+    assert_eq!(
+        actual.scan_root, admitted.scan_root,
+        "same-path UPSERT follows actual read"
+    );
+    for failed in [false, true] {
+        let mut index = scan.index.clone();
+        index.traversal.as_mut().unwrap().pending_candidates.clear();
+        if failed {
+            // Real selected-save insertion with no newly accepted file.
+            let previous = ScanIndex::default();
+            let mut selected = index.clone();
+            selected
+                .traversal
+                .as_mut()
+                .unwrap()
+                .pending_candidates
+                .clear();
+            index.retain_terminal_off_page_retries(&previous, &BTreeSet::new(), &mut selected);
+            index = selected;
+        } else {
+            index.retain_terminal_off_held_retries(&BTreeSet::from([key.clone()]));
+        }
+        let path = scratch.join(if failed {
+            "failed-index.json"
+        } else {
+            "held-index.json"
+        });
+        index.save(&path).unwrap();
+        let index = ScanIndex::load(&path).unwrap();
+        let queued = index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .pending_candidates
+            .front()
+            .unwrap();
+        assert_eq!(queued.scan_root, admitted.scan_root);
+        let retry = candidate_from_traversal_path(
+            source,
+            queued.clone(),
+            &mut ScanCensus::default(),
+            None,
+            183,
+            &index.files,
+        )
+        .unwrap();
+        let retry_scope = scan.sampling.as_ref().unwrap().file_scope(
+            source,
+            &retry,
+            "",
+            false,
+            false,
+            &scope_index,
+        );
+        assert_eq!(
+            scope, retry_scope,
+            "held/failed selected reload preserves actual Scope"
+        );
+    }
+    let (retained, mode, _, _) = acquire_with(
+        &fixture,
+        source,
+        &CodexTitleMetadata::default(),
+        &scope,
+        retained,
+        101,
+        true,
+    );
+    assert_eq!(mode, ReadMode::Unchanged, "zero ScopeChanged Full bytes");
+    // Removing the actual configured root remains invalidation: a retry
+    // cannot silently rebound to the other, still configured overlapping root.
+    let mut changed = scan.index.clone();
+    changed.traversal.as_mut().unwrap().scan_roots = vec![nested];
+    changed
+        .traversal
+        .as_mut()
+        .unwrap()
+        .pending_candidates
+        .clear();
+    changed.retain_terminal_off_held_retries(&BTreeSet::from([key]));
+    assert!(changed
+        .traversal
+        .as_ref()
+        .unwrap()
+        .pending_candidates
+        .is_empty());
+    drop(retained);
+}
