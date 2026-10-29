@@ -1,7 +1,8 @@
 // Runs on Linux: no funded decoder, native layout or runtime input is needed.
-const ARCHIVE_RELEASED_DECODERS: [(&str, &str); 2] = [
+const ARCHIVE_RELEASED_DECODERS: [(&str, &str); 3] = [
     ("0.1.201", "7997fe740064273ffc145d2168c299f5d8b9ee3d"),
     ("R1", "0061a4b0cd2bb71510e67586e949a0362609e6ee"),
+    ("R1-main", "68094b0da69fa38130c1420bfec6ab309820724d"),
 ];
 
 // The released lenient decoder's files lane invokes this exact typed entry
