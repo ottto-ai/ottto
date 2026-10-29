@@ -58,6 +58,9 @@ pub(crate) enum CodexZstCause {
     DecodeBudget,
     #[serde(rename = "admission_starved")]
     AdmissionStarved,
+    /// Diagnostics only; never written to an archive or custody entry.
+    #[serde(rename = "custody_group_progress_dropped")]
+    CustodyGroupProgressDropped,
     #[doc(hidden)]
     #[serde(skip)]
     __Count,
@@ -81,6 +84,17 @@ pub(crate) fn codex_held_growth(bytes: u64, over_cap: u64) {
             ("held_growth_files", u64::from(bytes != 0)),
             ("held_over_cap", over_cap),
         ]),
+    );
+}
+
+pub(crate) fn custody_group_progress_dropped(bytes: u64) {
+    traversal_point(
+        "custody_group_progress_dropped",
+        "codex",
+        &BTreeMap::from([(
+            CodexZstCause::CustodyGroupProgressDropped,
+            BTreeMap::from([("events", 1), ("bytes", bytes)]),
+        )]),
     );
 }
 
@@ -1255,14 +1269,32 @@ mod tests {
             HeaderInvalid,
             DecodeBudget,
             AdmissionStarved,
+            CustodyGroupProgressDropped,
         ];
         assert_eq!(ALL.len(), super::CODEX_ZST_CAUSES);
+        assert_eq!(
+            CustodyGroupProgressDropped as usize + 1,
+            super::CODEX_ZST_CAUSES
+        );
         for (index, cause) in ALL.iter().enumerate() {
             assert_eq!(*cause as usize, index);
         }
     }
 
     use super::*;
+
+    #[test]
+    fn custody_progress_drop_emits_both_additive_units_only() {
+        let ((), lines) = capture(|| custody_group_progress_dropped(4097));
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["stage"], "custody_group_progress_dropped");
+        assert_eq!(
+            lines[0]["counts"],
+            serde_json::json!({
+                "custody_group_progress_dropped": {"events": 1, "bytes": 4097}
+            })
+        );
+    }
 
     #[test]
     fn history_proof_correction_deferral_is_counted() {

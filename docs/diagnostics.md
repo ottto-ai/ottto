@@ -762,7 +762,8 @@ decoder activity/bytes, including recovery; it does not create another A1 grant.
 LD observes each admitted delivery and deduplicates by opened object.
 Post-release counts line: `codex_zst_first_read_retry`, `codex_zst_retry_alarm`,
 `codex_zst_input`, `codex_zst_refused`, `archive_terminal_residue`,
-`archive_terminal_residue_session_count`, `codex_zst_admission_alarm`.
+`archive_terminal_residue_session_count`, `codex_zst_admission_alarm`,
+`custody_group_progress_dropped.events`, `custody_group_progress_dropped.bytes`.
 Counters/events are counts-only; do not sum ordinal or running gauge fields.
 
 Correctness custody retains an age-independent file recovery obligation in the
@@ -864,3 +865,20 @@ other construction failures without those exceptions disclose scoped
 `CompressedConstructorUnfunded` residue. Actual read/decode I/O keeps its separate
 failure classification. Quiet Held/Refused and native terminal OutputHeld also
 use scoped residue, letting healthy siblings complete census-gated work.
+
+Stage `custody_group_progress_dropped` uses the same `local_resources` carrier.
+`counts.custody_group_progress_dropped` contains additive per-drop `events` (one)
+and `bytes` (consumed bytes discarded from unheld plain members of that paused
+group, excluding held and unread members). Completed members contribute their
+frozen consumed extent; the current member contributes its reader's consumed
+bytes, excluding read-ahead and acquisition guard bytes. A drop with zero unheld
+progress emits no event. These are process-local observations, not persisted
+totals; no paths or ids are emitted. Emission occurs after releasing the cursor
+lock. Sum records for the observed process interval; absence means zero observed
+drops, not evidence about a previous process.
+
+Accepted residual: at most one Tail re-read of an unheld group member's paused
+suffix per custody latch, bounded by the cursor page budget; Tail only. The held
+member remains excluded from later group formation. Exit: custody-aware group
+continuation retaining unheld parser offsets independently of held-member
+authority. This count grants no new Full, custody release or publication credit.

@@ -14133,3 +14133,251 @@ fn invalid_archive_owner_holds_paused_singleton_without_more_reads() {
         }
     });
 }
+
+#[test]
+fn retained_held_plain_job_releases_slot_without_reading() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(80);
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        let (mut index, members) = paused_singleton(&fixture, &cache);
+        index
+            .files
+            .entry(local_index_key(&fixture.file(SESSION)))
+            .or_default()
+            .codex_compressed_hold = Some(CodexZstCause::ParentLedgerUnbound);
+        let resumed = counter(&cache, |c| c.jobs_resumed);
+        let ended = counter(&cache, |c| c.jobs_unavailable_ended);
+        assert!(!cache.cursor_slot_free());
+        cache.cursor_end_custody(&Scope("foreign".into()), &index, None);
+        assert!(!cache.cursor_slot_free(), "foreign namespace keeps its job");
+        for _ in 0..3 {
+            let (next, scan) = codex_compressed_hold_tests::no_open(&fixture.file(SESSION), || {
+                continuation_page(&fixture, index, &cache, &members, |_| {})
+            });
+            index = next;
+            assert!(scan.snapshots.is_empty());
+            assert_eq!(scan.unreadable_path_count, 0);
+            assert_eq!(counter(&cache, |c| c.jobs_resumed), resumed);
+            assert_eq!(counter(&cache, |c| c.jobs_unavailable_ended), ended + 1);
+            assert!(cache.cursor_slot_free());
+            assert_eq!(cache.with_cursor(|c| c.slot_charge), Some(0));
+            assert!(index.files[&local_index_key(&fixture.file(SESSION))]
+                .codex_compressed_hold
+                .is_some());
+        }
+    });
+}
+
+#[test]
+fn mixed_custody_drop_is_counted_once_then_reacquires_only_a_durable_tail() {
+    use crate::snapshots::codex_file_join::tests::usage;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    fn chain(prefix: &str, created: &str, start: u64, lines: u64) -> Vec<u8> {
+        let mut body = codex_line(json!({"type": "session_meta", "timestamp": created,
+            "payload": {"id": SESSION, "timestamp": created}}));
+        for n in 1..=lines {
+            let total = start + n * 10;
+            body.extend(codex_line(json!({"type": "token_usage_record",
+                "timestamp": "2026-10-07T10:01:00Z", "payload": {"thread_id": SESSION,
+                "response_id": format!("{prefix}-{n}"), "usage": usage(10),
+                "thread_token_usage": usage(total)}})));
+            body.extend(codex_line(json!({"type": "event_msg",
+                "timestamp": "2026-10-07T10:01:00Z", "payload": {"type": "token_count",
+                "info": {"last_token_usage": usage(10), "total_token_usage": usage(total)}}})));
+        }
+        body
+    }
+    let clock = TestClock;
+    clock.set(1_900_000_000);
+    let fixture = ScanRoot::new(0);
+    let plain = fixture.file(SESSION);
+    let held = fixture.root.join("later.jsonl");
+    let key = local_index_key(&plain);
+    let held_key = local_index_key(&held);
+    let prefix = chain("p", "2026-10-07T10:00:00Z", 0, 1);
+    fs::write(&plain, &prefix).unwrap();
+    let state = fixture._dir.0.join("state");
+    fs::create_dir_all(&state).unwrap();
+    let index_path = state.join("index.json");
+    let lock = crate::locked_state_dir::test_locks::hold(&state);
+    let cache = Arc::new(SharedCache::default());
+    let namespace = Scope("cursor-fixture".into());
+    let capture = crate::snapshots::claude_request_identity::capture_by_default();
+    cache.durable_begin_pass(SnapshotSource::Codex, &index_path, &namespace, capture);
+    let (mut index, accepted) = page(&fixture, ScanIndex::default(), Some(Arc::clone(&cache)));
+    assert!(
+        !accepted.snapshots.is_empty(),
+        "genuine accepted checkpoint"
+    );
+    let checkpoint = cache
+        .retained_checkpoint(&key)
+        .expect("P retained checkpoint");
+    assert_eq!(checkpoint.sealed_offset(), prefix.len() as u64);
+    index.save(&index_path).unwrap();
+    cache.durable_write_after_save(lock, SnapshotSource::Codex, &index);
+    assert!(
+        fs::read_dir(crate::durable_tail_store::store_dir_for_index(&index_path))
+            .unwrap()
+            .next()
+            .is_some(),
+        "durable record actually written"
+    );
+    let whole = chain("p", "2026-10-07T10:00:00Z", 0, 30);
+    assert_eq!(&whole[..prefix.len()], &prefix);
+    fixture.append(SESSION, &whole[prefix.len()..]);
+    fs::write(&held, chain("h", "2026-10-07T10:30:00Z", 300, 30)).unwrap();
+    index.traversal = None;
+    with_test_limits(2048, 1024, 64, || {
+        for _ in 0..8 {
+            index = page(&fixture, index, Some(Arc::clone(&cache))).0;
+            if cache.paused_members_for_test().is_some() {
+                break;
+            }
+        }
+        let members = cache
+            .paused_members_for_test()
+            .expect("actual paused GROUP");
+        assert_eq!(members, BTreeSet::from([key.clone(), held_key.clone()]));
+        let consumed = cache
+            .with_cursor(|cursor| {
+                let Slot::Paused(job) = &cursor.slot else {
+                    panic!("paused")
+                };
+                let group = job.group.as_ref().expect("group parser");
+                assert_eq!(group.current, 0, "P is the current first member");
+                assert_eq!(job.candidate.path, plain);
+                job.parser.reader.consumed_bytes()
+            })
+            .unwrap();
+        assert!(
+            consumed > checkpoint.sealed_offset(),
+            "P consumed beyond its durable prefix"
+        );
+        assert_eq!(counter(&cache, |c| c.groups_started), 1);
+        index
+            .files
+            .entry(held_key.clone())
+            .or_default()
+            .codex_compressed_hold = Some(CodexZstCause::ParentLedgerUnbound);
+        index.codex_state_only_blocked_by_file.remove(&held_key);
+        index.save(&index_path).unwrap();
+        index = ScanIndex::load(&index_path).unwrap();
+        assert_eq!(
+            index.files[&held_key].codex_compressed_hold,
+            Some(CodexZstCause::ParentLedgerUnbound)
+        );
+        assert!(index.files[&key].codex_compressed_hold.is_none());
+        assert!(!index
+            .codex_state_only_blocked_by_file
+            .contains_key(&held_key));
+        assert!(
+            !cache.cursor_slot_free(),
+            "reload retained the paused cache"
+        );
+        let ended = counter(&cache, |c| c.jobs_unavailable_ended);
+        let ((next, _), rows) = crate::local_resource_diagnostics::capture(|| {
+            codex_compressed_hold_tests::no_open(&held, || {
+                continuation_page(&fixture, index, &cache, &members, |_| {})
+            })
+        });
+        index = next;
+        let drops = rows
+            .iter()
+            .filter(|r| r["stage"] == "custody_group_progress_dropped")
+            .collect::<Vec<_>>();
+        assert_eq!(drops.len(), 1);
+        let counts = &drops[0]["counts"]["custody_group_progress_dropped"];
+        assert_eq!(counts, &json!({"events": 1, "bytes": consumed}));
+        assert!(cache.cursor_slot_free());
+        assert_eq!(counter(&cache, |c| c.jobs_unavailable_ended), ended + 1);
+        // Make the next acquisition restore its genuine disk record, rather
+        // than merely reuse a RAM reduction. Keep the same shared cursor cache.
+        cache.clear();
+        cache.durable_begin_pass(SnapshotSource::Codex, &index_path, &namespace, capture);
+        let mut file = File::open(&plain).unwrap();
+        let interpretation = crate::snapshots::sampled_scan::durable_tail::Interpretation::of(
+            SnapshotSource::Codex,
+            &key,
+            &index,
+            capture,
+            &namespace,
+        );
+        let crate::snapshots::sampled_scan::durable_tail::RestoreOutcome::Restored(old) = cache
+            .durable_restore(
+                SnapshotSource::Codex,
+                &key,
+                &plain,
+                checkpoint.scope(),
+                &mut file,
+                &index,
+                &interpretation,
+            )
+        else {
+            panic!("real disk checkpoint must restore")
+        };
+        assert_eq!(old.retained.checkpoint.sealed_offset(), prefix.len() as u64);
+        let identity = opened_object_identity(SnapshotSource::Codex, &mut file).unwrap();
+        let mut parser = OwnedJsonlParser::new(
+            file,
+            &plain,
+            SnapshotSource::Codex,
+            apply_codex_line,
+            None,
+            None,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        let mode = parser
+            .prepare_acquisition(Some(old.retained), checkpoint.scope(), None, 1_900_000_000)
+            .unwrap();
+        assert_eq!(mode, crate::transcript_acquisition::ReadMode::Tail);
+        assert_eq!(
+            parser.reader.acquisition.as_ref().unwrap().start_offset(),
+            prefix.len() as u64
+        );
+        let mut recorder = codex_scan(&fixture, index.clone(), NOW)
+            .with_sampled_acquisition(Arc::clone(&cache), namespace.clone())
+            .sampling
+            .take()
+            .unwrap();
+        recorder.record_mode(mode, None);
+        assert_eq!((recorder.full_files, recorder.tail_files), (0, 1));
+        while !parser.step().unwrap() {}
+        assert_eq!(
+            parser.reader.consumed_bytes(),
+            (whole.len() - prefix.len()) as u64
+        );
+        let parsed = parser
+            .finish(&identity, &plain, NOW, "tail".into(), None, None, None)
+            .unwrap();
+        assert!(!parsed.snapshots.is_empty());
+        // This cut retains the conservative foreign-index publication fence.
+        // Tail acquisition above proves the discarded suffix has a real durable
+        // recovery point; ordinary selective publication is qualified in0b0b.
+        for _ in 0..5 {
+            index.traversal = None;
+            let ((next, scan), rows) = crate::local_resource_diagnostics::capture(|| {
+                codex_compressed_hold_tests::no_open(&held, || {
+                    page(&fixture, index, Some(Arc::clone(&cache)))
+                })
+            });
+            index = next;
+            assert!(scan.snapshots.is_empty());
+            assert!(rows
+                .iter()
+                .all(|r| r["stage"] != "custody_group_progress_dropped"));
+            assert_eq!(counter(&cache, |c| c.groups_started), 1);
+            assert_eq!(
+                index.files[&held_key].codex_compressed_hold,
+                Some(CodexZstCause::ParentLedgerUnbound)
+            );
+        }
+    });
+}

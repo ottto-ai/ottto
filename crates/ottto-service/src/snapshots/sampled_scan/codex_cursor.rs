@@ -4429,6 +4429,63 @@ impl SharedCache {
             .unwrap_or(false)
     }
 
+    /// Retire this namespace's held attempt without reading; disk custody stays owed.
+    pub(in crate::snapshots) fn cursor_end_custody(
+        &self,
+        namespace: &Scope,
+        index: &ScanIndex,
+        inventory: Option<&codex_file_join::HeaderInventory>,
+    ) {
+        let dropped = self.with_cursor(|cursor| {
+            let Slot::Paused(job) = &cursor.slot else {
+                return None;
+            };
+            let Some(meta) = job.cursor.as_ref().filter(|m| m.namespace == namespace.0) else {
+                return None;
+            };
+            let held = |key: &String| {
+                index
+                    .files
+                    .get(key)
+                    .is_some_and(|e| e.codex_compressed_hold.is_some())
+                    || inventory.is_some_and(|inv| inv.member_held(Path::new(key)))
+            };
+            if !cursor.slot_key.as_ref().is_some_and(&held) && !cursor.slot_members.iter().any(held)
+            {
+                return None;
+            }
+            let bytes = job.group.as_ref().map_or(0, |group| {
+                group
+                    .members
+                    .iter()
+                    .zip(&group.stamps)
+                    .enumerate()
+                    .take(group.current + 1)
+                    .filter(|(_, (member, _))| !held(&local_index_key(&member.path)))
+                    .fold(0_u64, |bytes, (at, (_, stamp))| {
+                        bytes.saturating_add(if at == group.current {
+                            job.parser.reader.consumed_bytes()
+                        } else {
+                            stamp.extent
+                        })
+                    })
+            });
+            // Saved pace is not a parser checkpoint: disclose unheld progress lost.
+            cursor.rotation.waiting.retain(|key, _| {
+                key.split_once('\0') != Some((meta.namespace.as_str(), meta.key.as_str()))
+            });
+            cursor.slot = Slot::Empty;
+            cursor.slot_key = None;
+            cursor.slot_members.clear();
+            cursor.slot_charge = 0;
+            cursor.counters.jobs_unavailable_ended += 1;
+            (bytes != 0).then_some(bytes)
+        });
+        if let Some(bytes) = dropped.flatten() {
+            crate::local_resource_diagnostics::custody_group_progress_dropped(bytes);
+        }
+    }
+
     /// The key of the paused or active job (tests; selection uses
     /// `cursor_job_owns`).
     #[cfg(test)]

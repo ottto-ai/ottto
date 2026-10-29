@@ -26638,6 +26638,13 @@ impl OwnedSourceScan {
         attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
         capture_credit: Option<&mut Option<crate::source_rotation::PaidReservation>>,
     ) -> Result<OwnedSourceScanStep, crate::source_rotation::LocalRefusal> {
+        if let Some(context) = self.sampling.as_ref() {
+            context.cache.cursor_end_custody(
+                &context.namespace,
+                &self.index,
+                self.codex_join_inventory.as_ref(),
+            );
+        }
         let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(
             self.source == SnapshotSource::ClaudeCode,
         );
@@ -26851,6 +26858,7 @@ impl OwnedSourceScan {
                     if !done {
                         pending!();
                     }
+                    inventory.refresh_custody(index);
                     if inventory.custody_incomplete
                         || index
                             .files
@@ -26871,6 +26879,7 @@ impl OwnedSourceScan {
                         codex_join_prepared = true;
                         pending!();
                     }
+
                     let unresolved = &inventory.held_owners;
                     residue_blocked_session_ids.extend(unresolved.iter().cloned());
                     codex_state_only_blocked_session_ids.extend(unresolved.iter().cloned());
@@ -27656,9 +27665,27 @@ impl OwnedSourceScan {
                 // that selected no candidates (no header inventory: no
                 // evidence for the job this page). A deferred job therefore
                 // never spins within a page.
-                if let Some(context) = sampling.as_ref().filter(|_| {
+                if let Some(context) = sampling.as_ref() {
+                    context.cache.cursor_end_custody(
+                        &context.namespace,
+                        index,
+                        codex_join_inventory.as_ref(),
+                    );
+                }
+                if let Some(context) = sampling.as_ref().filter(|context| {
                     !codex_page.cursor_exhausted(sampled_scan::codex_cursor::Limits::current())
-                        && codex_join_inventory.is_some()
+                        && !index.files.iter().any(|(key, entry)| {
+                            entry.codex_compressed_hold.is_some()
+                                && context.cache.cursor_job_owns(key)
+                        })
+                        && codex_join_inventory.as_ref().is_some_and(|inv| {
+                            !inv.headers.iter().any(|h| {
+                                inv.member_held(&h.candidate.path)
+                                    && context
+                                        .cache
+                                        .cursor_job_owns(&local_index_key(&h.candidate.path))
+                            })
+                        })
                         && codex_page.claim_resume()
                 }) {
                     // Continuing the paused job is the highest scheduling class.

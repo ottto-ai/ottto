@@ -157,6 +157,39 @@ fn normal(root: &Path, index: ScanIndex, hints: &[PathBuf]) -> (ScanIndex, Sourc
 }
 
 #[test]
+fn publication_validation_skips_a_newly_held_file_before_sampling() {
+    let root = crate::test_scratch::private_dir("custody-publication-validation");
+    let held = member(&root, "sessions", OWNER, false);
+    let healthy = member(&root, "sessions", PARENT, false);
+    let sessions = root.join("sessions");
+    let mut dirs = codex_file_join::DirectoryCensus::new();
+    dirs.observe(&sessions, &fs::metadata(&sessions).unwrap());
+    let paths = BTreeSet::from([local_index_key(&held), local_index_key(&healthy)]);
+    let mut index = ScanIndex::default();
+    let mut inv = codex_file_join::HeaderInventory::new(&[sessions], &paths, Some(&dirs));
+    while !inv.step_with_archive(&CodexTitleMetadata::default(), &mut index, None) {}
+    assert_eq!(inv.headers.len(), 2);
+    let home = inv
+        .headers
+        .iter()
+        .find(|h| h.owner == PARENT)
+        .unwrap()
+        .home
+        .clone();
+    latch(&mut index, &held);
+    inv.refresh_custody(&index);
+    assert!(inv.member_held(&held));
+    assert!(!inv.member_held(&healthy));
+    assert!(!inv.complete_for(Some(&OWNER.to_owned())));
+    assert!(inv.complete_for(Some(&PARENT.to_owned())));
+    let old_len = fs::metadata(&held).unwrap().len();
+    fs::write(&held, b"invalid replacement after custody\n").unwrap();
+    assert_ne!(old_len, fs::metadata(&held).unwrap().len());
+    no_open(&held, || inv.validate_membership(PARENT, &home).unwrap());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn watcher_removal_full_save_restart_recreation_keeps_unprotected_accepted_evidence() {
     let root = crate::test_scratch::private_dir("custody-watcher");
     let path = member(&root, "sessions", OWNER, false);
