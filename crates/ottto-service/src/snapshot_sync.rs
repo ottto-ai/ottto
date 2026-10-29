@@ -5982,6 +5982,12 @@ fn prepare_sync_source_inner(
     )?;
     let (mut index, load_origin) =
         ScanIndex::load_for_snapshot_source_with_origin(&index_path, source, support_dir)?;
+    let parked_rewalk_loaded_generation = index.generation;
+    #[cfg(test)]
+    tests::permanent_finish_pipeline_tests::prepare_checkpoint_hook_for_test(
+        &mut index,
+        &index_path,
+    );
     upload_progress.recover_ack_retirement_handoff(
         &mut index,
         &index_path,
@@ -6200,6 +6206,9 @@ fn prepare_sync_source_inner(
         &sampled_scope,
         request_identity_capture,
     );
+    if source == SnapshotSource::ClaudeCode {
+        index.observe_parked_rewalk_load(parked_rewalk_loaded_generation);
+    }
     let mut scan = crate::snapshots::OwnedSourceScan::new_with_identity_capture(
         source,
         &roots,

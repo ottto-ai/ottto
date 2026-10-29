@@ -52,6 +52,7 @@ fn parked_rewalk_active(traversal: &ScanTraversalCheckpoint) -> bool {
 fn recover_parked_claude_metadata(index: &mut ScanIndex, overflowed: bool) {
     use std::sync::OnceLock;
     static READERS: OnceLock<Mutex<BTreeMap<String, ParkedDirectoryReader>>> = OnceLock::new();
+    let loaded_generation = index.claude_full_rearm_progress.parked_rewalk_loaded_generation.unwrap_or(index.generation);
     let checkpoint_generation = index.generation;
     let Some(traversal) = index.traversal.as_mut() else { return; };
     let active = parked_rewalk_active(traversal);
@@ -81,9 +82,11 @@ fn recover_parked_claude_metadata(index: &mut ScanIndex, overflowed: bool) {
         state.reader = None;
         traversal.watcher_hint_seen = false; // this sweep covers the triggering loss
     }
-    if active && checkpoint_generation <= state.checkpoint_generation {
-        // Existing durable generation is the acknowledgement of the previous
-        // metadata checkpoint. No advance means replay/identity debt was not
+    if active && loaded_generation <= state.checkpoint_generation {
+        // Compare the generation loaded BEFORE preparatory claims/saves with
+        // the generation at the previous scan's issue boundary. Preparatory
+        // writes cannot acknowledge a rejected metadata page. No advance means
+        // replay/identity debt was not
         // accepted; never use a merely learned identity to skip old demand.
         state.reader = None;
         state.identity = None;
@@ -268,4 +271,10 @@ pub(crate) fn refuse_parked_metadata_once_for_test(path: PathBuf) {
 #[cfg(test)]
 pub(crate) fn parked_metadata_refusal_consumed_for_test() -> bool {
     PARKED_METADATA_REFUSAL.with(|slot| slot.borrow().is_none())
+}
+
+impl ScanIndex {
+    pub(crate) fn observe_parked_rewalk_load(&mut self, generation: u64) {
+        self.claude_full_rearm_progress.parked_rewalk_loaded_generation = Some(generation);
+    }
 }

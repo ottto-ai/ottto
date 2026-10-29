@@ -132,3 +132,9 @@ it has not advanced since the prior metadata page, cached directory identity and
 iterator progress are discarded and replay debt is re-established. A rejected
 checkpoint cannot turn newly learned identity into permission to skip an older
 cursor. No persisted acknowledgement or generation field is added.
+
+Metadata acknowledgement compares the generation loaded before ANY preparatory
+claim, retirement or adoption save against the previous metadata scan's issue
+generation. The loaded observation is serde(skip); preparatory saves cannot
+acknowledge rejected replay debt. The rejected-restart fixture executes a real
+terminal-contract retry-claim save before the next native scan.

@@ -215,7 +215,7 @@ fn terminal_containment_adds_no_persisted_fields() {
     index.note_claude_terminal_fold_offer(true);
     let value = serde_json::to_value(index).unwrap();
     let progress = &value["claude_full_rearm_progress"];
-    for name in ["scoped_rearm_pending", "terminal_fold_deferred", "terminal_fold_checked", "terminal_effects", "terminal_fold_deferred_consecutive"] {
+    for name in ["scoped_rearm_pending", "terminal_fold_deferred", "terminal_fold_checked", "terminal_effects", "terminal_fold_deferred_consecutive", "parked_rewalk_loaded_generation"] {
         assert!(progress.get(name).is_none(), "{name} must never persist");
     }
 }

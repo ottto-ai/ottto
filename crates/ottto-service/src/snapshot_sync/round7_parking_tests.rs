@@ -535,6 +535,20 @@ fn rejected_restart_replay_keeps_full_metadata_sweep_debt() {
     let (p, i, s) = prepare(&mut home);
     assert_eq!(serde_json::to_value(&i).unwrap()["traversal"]["watcher_hint_seen"], true);
     drop((p, i, s)); // replay learned identity, but its checkpoint was rejected
+    PREPARE_CHECKPOINT_HOOK.with(|slot| slot.set(Some(|index, path| {
+        let before = index.generation;
+        let fp = format!("{:064x}", 4242);
+        let mut record = crate::snapshots::snapshot_quarantine_record(SnapshotSource::ClaudeCode);
+        record.contract_retry_claims = Some(0);
+        index.quarantined_snapshot_fingerprints.insert(fp.clone(), record.clone());
+        record.contract_retry_claims = Some(1);
+        let mut progress = SnapshotUploadProgress::new("round7-claim-scope".into(),
+            snapshot_quarantine_witness(SnapshotSource::ClaudeCode));
+        progress.quarantined_fingerprints.insert(fp, record);
+        progress.save(&path.with_extension("fixture-claim-progress.json")).unwrap();
+        save_terminal_contract_claims_for_scan(index, &progress, path).unwrap();
+        assert!(index.generation > before, "actual preparatory retry-claim save");
+    })));
     let (p, i, s) = prepare(&mut home);
     let value = serde_json::to_value(&i).unwrap();
     assert_eq!(value["traversal"]["watcher_hint_seen"], true, "rejected replay never spends full-sweep debt");
