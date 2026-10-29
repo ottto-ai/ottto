@@ -1343,8 +1343,8 @@ fn observe_base_prelude(experimental_base_exit: bool) {
     let quiet = fixture.generation(10);
     assert_eq!(
         rearm_reads(&quiet),
-        rearm_family_sessions().len(),
-        "base re-reads all three members, not the original optimized zero-read requirement"
+        0,
+        "terminal-off issues no proof-driven full rearm; quiet-context selection requires paired #901"
     );
     assert_eq!(
         RearmFixture::family_heads(&quiet.last().unwrap().index),
