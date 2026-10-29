@@ -24330,3 +24330,8 @@ pub(crate) fn archive_power_ready() -> bool {
     use continuation::{NoPlatformSignals, PlatformGates, PlatformState};
     NoPlatformSignals.power() == PlatformState::Allowed
 }
+
+/// Share continuation's work threshold with archive admission.
+pub(crate) fn archive_work_ready(micros: u64) -> bool {
+    std::time::Duration::from_micros(micros) <= continuation::CONTENTION_WORK
+}

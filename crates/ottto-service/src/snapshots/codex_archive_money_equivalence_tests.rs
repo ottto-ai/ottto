@@ -1,5 +1,5 @@
-// Synthetic candidates exercise backlog plumbing before production discovery.
-fn seeded_scan(f: &ArchiveFixture, mut index: ScanIndex, limit: usize) -> OwnedSourceScan {
+// Synthetic filesystem fixtures exercise the production discovery path.
+fn discovered_scan(f: &ArchiveFixture, mut index: ScanIndex, limit: usize) -> OwnedSourceScan {
     let root = f.0.parent().unwrap().to_owned();
     let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
     ensure_bounded_traversal(
@@ -16,19 +16,6 @@ fn seeded_scan(f: &ArchiveFixture, mut index: ScanIndex, limit: usize) -> OwnedS
         BACKFILL_WINDOW_DAYS,
         &index.files,
     );
-    // Explicit test-only roster/queue seeding; no production discovery opt-in.
-    for entry in fs::read_dir(&root).unwrap() {
-        let path = entry.unwrap().path();
-        if codex_archive_path(&path) {
-            traversal.codex_rollout_paths.insert(local_index_key(&path));
-            traversal.pending_candidates.push_back(ScanTraversalPath {
-                scan_root: root.clone(),
-                path,
-                census_member: true,
-                watcher_hint: true,
-            });
-        }
-    }
     OwnedSourceScan::new(
         SnapshotSource::Codex,
         &[root],
@@ -54,7 +41,7 @@ fn fake_thread_cpu_and_clock_enforce_archive_boundary_pacing() {
     assert!(!pass.ready(0));
     pass.observe(Some(0), 19_999_999);
     pass.started = true;
-    pass.observe(Some(29_999_999), 1);
+    pass.observe(Some(29_999_999), 0);
     assert!(pass.ready(1));
     pass.observe(Some(2), 1);
     assert!(!pass.ready(1));
@@ -69,7 +56,7 @@ fn fake_thread_cpu_and_clock_enforce_archive_boundary_pacing() {
 #[test]
 fn cpu_budget_survives_scan_completion_partial_commit_and_continuation_pages() {
     let f = ArchiveFixture::new(b"no decoder permission");
-    let mut scan = seeded_scan(&f, ScanIndex::default(), 1);
+    let mut scan = discovered_scan(&f, ScanIndex::default(), 1);
     scan.index.archive_pass.power = true;
     scan.index.archive_pass.started = true;
     scan.index.archive_pass.observe(Some(30_000_001), 1);
@@ -109,7 +96,7 @@ fn cpu_budget_survives_scan_completion_partial_commit_and_continuation_pages() {
         !restarted.archive_pass.power,
         "RAM scheduling is not durable permission"
     );
-    let ordinary = seeded_scan(&f, next.index, 1);
+    let ordinary = discovered_scan(&f, next.index, 1);
     assert_eq!(ordinary.index.archive_pass.cpu, 0);
     assert!(
         !ordinary.index.archive_pass.power,
@@ -137,7 +124,7 @@ fn no_inventory_storm_and_live_work_precedes_paced_backlog() {
     )
     .unwrap();
     for (power, cpu) in [(false, 0), (true, 30_000_000)] {
-        let mut scan = seeded_scan(&f, ScanIndex::default(), 100);
+        let mut scan = discovered_scan(&f, ScanIndex::default(), 100);
         assert_eq!(scan.identified_candidates.front().unwrap().path, plain);
         assert_eq!(
             scan.identified_candidates.len(),
@@ -197,7 +184,7 @@ fn archive_hints_are_backlog_and_newest_archive_is_selected_first() {
         watcher_hint: true,
     };
     assert!(!codex_fresh_data_pending(&pending, &BTreeMap::new()));
-    let scan = seeded_scan(&f, ScanIndex::default(), 1);
+    let scan = discovered_scan(&f, ScanIndex::default(), 1);
     assert_eq!(scan.identified_candidates.len(), 1);
     assert_eq!(scan.identified_candidates.front().unwrap().path, f.0);
 }
@@ -217,7 +204,7 @@ fn stamp_matching_header_inventory_never_decodes_archives() {
     state
         .inventory_archive_header(&f.candidate(), Some(&cache), &mut funded_header_work())
         .unwrap();
-    let mut scan = seeded_scan(&f, state, 1);
+    let mut scan = discovered_scan(&f, state, 1);
     let mut inventory = scan.codex_join_inventory.take().unwrap();
     let (_, rows) = crate::local_resource_diagnostics::capture(|| {
         while !inventory.step_with_archive(
@@ -237,7 +224,7 @@ fn stamp_matching_header_inventory_never_decodes_archives() {
         .write_all(b"changed")
         .unwrap();
     assert!(scan.index.archive_header(&f.0).is_none());
-    let mut replaced = seeded_scan(&f, scan.index, 1);
+    let mut replaced = discovered_scan(&f, scan.index, 1);
     let inventory = replaced.codex_join_inventory.as_mut().unwrap();
     assert!(inventory.step_with_archive(
         &CodexTitleMetadata::default(),
@@ -263,22 +250,29 @@ fn unseen_archives_do_not_spend_the_plain_header_population_cap() {
     let mut inventory = codex_file_join::HeaderInventory::new(&[root], &paths, Some(&dirs));
     assert!(!inventory.complete, "full roster exceeds original cap");
     let mut index = ScanIndex::default();
-    inventory.retain_cached_archives(&index, &paths);
-    assert!(inventory.complete);
-    assert!(inventory.step_with_archive(&CodexTitleMetadata::default(), &mut index, None));
+    index.archive_pass.prep_after = inventory.retain_cached_archives(&index, &paths);
+    assert!(
+        !inventory.complete,
+        "partial roster never certifies absence"
+    );
+    assert!(index.archive_pass.prep_after.is_some());
+    assert_eq!(
+        inventory.step_with_archive(&CodexTitleMetadata::default(), &mut index, None),
+        codex_file_join::HeaderStep::Complete
+    );
     assert!(inventory.headers.is_empty());
 }
 
 #[test]
-fn watcher_retained_refresh_and_bounded_walk_remain_plain_only() {
+fn watcher_retained_refresh_and_bounded_walk_admit_exact_codex_archives() {
     let f = ArchiveFixture::new(b"discovery must not decode");
     let root = f.0.parent().unwrap().to_owned();
     let plain = root.join("rollout-live.jsonl");
     fs::write(&plain, synthetic_rollout()).unwrap();
     let paths = vec![plain.clone(), f.0.clone()];
     assert_eq!(
-        paths_from_events(paths.clone()),
-        BTreeSet::from([plain.clone()])
+        paths_from_events(SnapshotSource::Codex, paths.clone()),
+        BTreeSet::from([plain.clone(), f.0.clone()])
     );
     let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
     for source in [
@@ -296,16 +290,181 @@ fn watcher_retained_refresh_and_bounded_walk_remain_plain_only() {
         );
         let traversal = index.traversal.as_mut().unwrap();
         enqueue_watcher_hints(source, traversal, &paths, false);
-        assert!(traversal.pending_candidates.iter().all(|p| p.path == plain));
+        assert!(traversal
+            .pending_candidates
+            .iter()
+            .all(|p| p.path == plain || (source == SnapshotSource::Codex && p.path == f.0)));
         refresh_retained_codex_roster(source, traversal, BACKFILL_WINDOW_DAYS, &index.files);
-        assert!(!traversal
-            .codex_rollout_paths
-            .contains(&local_index_key(&f.0)));
+        assert_eq!(
+            traversal
+                .codex_rollout_paths
+                .contains(&local_index_key(&f.0)),
+            source == SnapshotSource::Codex
+        );
         advance_bounded_directory_traversal(source, traversal, BACKFILL_WINDOW_DAYS, &index.files);
-        assert!(traversal.pending_candidates.iter().all(|p| p.path == plain));
-        assert!(!traversal
-            .codex_rollout_paths
-            .contains(&local_index_key(&f.0)));
+        assert!(traversal
+            .pending_candidates
+            .iter()
+            .all(|p| p.path == plain || (source == SnapshotSource::Codex && p.path == f.0)));
+        assert_eq!(
+            traversal
+                .codex_rollout_paths
+                .contains(&local_index_key(&f.0)),
+            source == SnapshotSource::Codex
+        );
         assert!(traversal.pending_directories.is_empty());
     }
+}
+
+#[test]
+fn many_short_steps_over_contention_work_decode_no_archive() {
+    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let f = ArchiveFixture::new(b"contention denies before decode");
+    let mut scan = selector_scan(
+        &f,
+        ScanIndex::default(),
+        Arc::new(sampled_scan::SharedCache::default()),
+        VecDeque::from([f.candidate()]),
+        true,
+    );
+    for _ in 0..21 {
+        scan.index.archive_pass.observe(Some(0), 1_000_000);
+    }
+    assert!(!scan.index.archive_pass.ready(u64::MAX));
+    let ((_, result), rows) = crate::local_resource_diagnostics::capture(|| finish_selector(scan));
+    assert_eq!(decodes(&rows), 0);
+    assert_eq!(result.unreadable_path_count, 0);
+}
+
+#[test]
+fn rejected_archives_then_late_eligible_entry_bounded_prep() {
+    let f = ArchiveFixture::new(b"never read rejected archives");
+    let root = f.0.parent().unwrap().to_owned();
+    let plain = root.join("rollout-zzzz.jsonl");
+    fs::write(&plain, synthetic_rollout()).unwrap();
+    let paths = (0..codex_file_join::MAX_HEADER_FILES + 5)
+        .map(|n| local_index_key(&root.join(format!("rollout-{n:06}.jsonl.zst"))))
+        .chain(std::iter::once(local_index_key(&plain)))
+        .collect();
+    let mut dirs = codex_file_join::DirectoryCensus::new();
+    dirs.observe(&root, &fs::metadata(&root).unwrap());
+    let mut index = ScanIndex::default();
+    let mut inventory =
+        codex_file_join::HeaderInventory::new(std::slice::from_ref(&root), &paths, Some(&dirs));
+    index.archive_pass.prep_after = inventory.retain_cached_archives(&index, &paths);
+    assert!(!inventory.complete);
+    assert!(index.archive_pass.prep_after.is_some());
+    index.archive_pass.prep_after = inventory.retain_cached_archives(&index, &paths);
+    assert!(
+        !inventory.complete,
+        "later quantum is not whole-roster authority"
+    );
+    assert!(index.archive_pass.prep_after.is_none());
+    while inventory.step_with_archive(&CodexTitleMetadata::default(), &mut index, None)
+        != codex_file_join::HeaderStep::Complete
+    {}
+    assert_eq!(inventory.headers.len(), 1, "late plain entry reached");
+    assert_eq!(inventory.headers[0].candidate.path, plain);
+}
+
+#[test]
+fn source_aware_events_reject_nonexact_archive_suffixes() {
+    let paths = [
+        "rollout-x.jsonl",
+        "rollout-x.jsonl.zst",
+        "rollout-x.zst",
+        "rollout-x.jsonl.zst.tmp",
+    ]
+    .map(PathBuf::from);
+    assert_eq!(
+        paths_from_events(SnapshotSource::Codex, paths.clone()).len(),
+        2
+    );
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Pi] {
+        assert_eq!(
+            paths_from_events(source, paths.clone()),
+            BTreeSet::from([paths[0].clone()])
+        );
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "funded decoder needs validated heap layout"
+)]
+fn compressed_only_root_read_once_and_acked_then_quiet_restart() {
+    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+    let mut scan = discovered_scan(&f, ScanIndex::default(), 10).with_sampled_acquisition(
+        Arc::new(sampled_scan::SharedCache::default()),
+        Scope("discovery-recovery".into()),
+    );
+    scan.index.archive_pass.power = true;
+    let ((mut index, result), rows) =
+        crate::local_resource_diagnostics::capture(|| finish_selector(scan));
+    assert_eq!(result.snapshots.len(), 1);
+    assert_eq!(decodes(&rows), 2, "one inventory prefix and one A1 body");
+    index.settle_archive_bodies(
+        &result
+            .snapshots
+            .iter()
+            .map(|s| {
+                (
+                    s.snapshot_fingerprint.clone(),
+                    snapshot_upload_body_witness(s),
+                )
+            })
+            .collect(),
+    );
+    assert!(matches!(
+        index.files[&local_index_key(&f.0)]
+            .archive
+            .as_ref()
+            .unwrap()
+            .disposition,
+        ArchiveDisposition::Acquired
+    ));
+    for _ in 0..5 {
+        let mut scan = discovered_scan(&f, checkpoint(&index), 10).with_sampled_acquisition(
+            Arc::new(sampled_scan::SharedCache::default()),
+            Scope("discovery-recovery".into()),
+        );
+        scan.index.archive_pass.power = true;
+        let ((next, result), rows) =
+            crate::local_resource_diagnostics::capture(|| finish_selector(scan));
+        assert_eq!(decodes(&rows), 0, "restart is not a Full cause");
+        assert!(result.snapshots.is_empty());
+        index = next;
+    }
+}
+
+#[test]
+fn declared_over_1gib_held_without_decoder_and_restart_is_quiet() {
+    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let mut frame = vec![0x28, 0xb5, 0x2f, 0xfd, 0xe0];
+    frame.extend_from_slice(&(FIRST_READ_DECODED_LIMIT + 1).to_le_bytes());
+    let f = ArchiveFixture::new(&frame);
+    let mut scan = discovered_scan(&f, ScanIndex::default(), 10);
+    scan.index.archive_pass.power = true;
+    let ((index, result), rows) =
+        crate::local_resource_diagnostics::capture(|| finish_selector(scan));
+    assert_eq!(decodes(&rows), 0);
+    assert!(result.snapshots.is_empty());
+    assert!(matches!(
+        index.files[&local_index_key(&f.0)]
+            .archive
+            .as_ref()
+            .unwrap()
+            .disposition,
+        ArchiveDisposition::Held {
+            cause: CodexZstCause::CatchupTooLarge
+        }
+    ));
+    let mut scan = discovered_scan(&f, checkpoint(&index), 10);
+    scan.index.archive_pass.power = true;
+    let ((_, result), rows) = crate::local_resource_diagnostics::capture(|| finish_selector(scan));
+    assert!(result.snapshots.is_empty());
+    assert_eq!(decodes(&rows), 0);
+    assert!(!rows.iter().any(|r| r["stage"] == "codex_zst_frame_header"));
 }

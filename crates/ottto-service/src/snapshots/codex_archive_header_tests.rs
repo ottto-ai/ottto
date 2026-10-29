@@ -1876,6 +1876,7 @@ fn selector_scan(
     scan.codex_join_inventory = Some(inventory);
     scan.codex_join_prepared = false;
     scan.census_unix_seconds = None;
+    scan.index.archive_pass.power = true;
     scan
 }
 
@@ -1943,7 +1944,7 @@ fn selector_archive_pass(
     not(target_os = "macos"),
     ignore = "funded decoder needs validated heap layout"
 )]
-fn deferred_archive_keeps_plain_uploads_and_requeues_without_refusal_debt() {
+fn production_inventory_denial_holds_scoped_and_sibling_progresses() {
     let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
     for gate in ["battery", "admission", "cpu", "page"] {
         let f =
@@ -2000,6 +2001,7 @@ fn deferred_archive_keeps_plain_uploads_and_requeues_without_refusal_debt() {
             !rows.iter().any(|r| r["stage"] == "codex_zst_refused"),
             "{gate}"
         );
+        assert_eq!(result.unreadable_path_count, 0, "{gate}");
         assert_eq!(result.ownership_incomplete_file_count, 0, "{gate}");
         assert_eq!(result.scanned_file_count, 1, "{gate}");
         assert_eq!(
@@ -2110,7 +2112,7 @@ fn large_header_rollout() -> Vec<u8> {
     not(target_os = "macos"),
     ignore = "funded decoder needs validated heap layout"
 )]
-fn oversized_archive_defers_before_full_without_blocking_unrelated_census_work() {
+fn bound_archive_mixed_owner_plain_publishes_identical_and_hold_stays_quiet() {
     let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
     let f = ArchiveFixture::new(&zstd::stream::encode_all(&large_header_rollout()[..], 1).unwrap());
     let plain = f.0.with_file_name("rollout-compressed-fixture.jsonl");
@@ -2118,22 +2120,16 @@ fn oversized_archive_defers_before_full_without_blocking_unrelated_census_work()
     let mut member = super::super::codex_zst_refusal_tests::candidate(&plain);
     member.size_bytes = fs::metadata(&plain).unwrap().len();
     let cache = Arc::new(sampled_scan::SharedCache::default());
-    let (mut state, result) = finish_selector(selector_scan(
+    let (_, first_control) = finish_selector(selector_scan(
         &f,
         ScanIndex::default(),
         cache.clone(),
         VecDeque::from([member.clone()]),
         true,
     ));
-    assert_eq!(result.snapshots.len(), 1);
-    let accepted = BTreeSet::from([result.snapshots[0].snapshot_fingerprint.clone()]);
-    state.record_accepted_snapshot_fingerprints(&accepted);
-    let plain_body = state.files[&local_index_key(&plain)]
-        .last_upload_body_witness
-        .clone();
-    assert!(plain_body.is_some());
-    // Establish the once-only inventory partial before testing zero-byte deferral.
-    let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+    assert_eq!(first_control.snapshots.len(), 1);
+    let mut state = ScanIndex::default();
+    let (_, first_rows) = crate::local_resource_diagnostics::capture(|| {
         assert!(matches!(
             state
                 .inventory_archive_header(&f.candidate(), Some(&cache), &mut funded_header_work())
@@ -2141,134 +2137,56 @@ fn oversized_archive_defers_before_full_without_blocking_unrelated_census_work()
             HeaderRead::BoundReached
         ));
     });
-    assert_eq!(decodes(&rows), 1);
-    assert_eq!(
-        rows.iter()
-            .map(
-                |row| row["counts"]["codex_aux_reads"]["header_read_attempts"]["inventory"]
-                    .as_u64()
-                    .unwrap_or(0)
-            )
-            .sum::<u64>(),
-        1
-    );
-    assert!(!rows
-        .iter()
-        .any(|row| row["counts"]["whole_reads"].as_u64().unwrap_or(0) > 0));
+    assert_eq!(decodes(&first_rows), 1);
     for pass in 0..5 {
-        let unrelated = format!("unrelated-{pass}");
-        let live_path = f.0.with_file_name(format!("rollout-{unrelated}.jsonl"));
-        let mut bytes = Vec::new();
-        for row in synthetic_rollout()
-            .split(|b| *b == b'\n')
-            .filter(|r| !r.is_empty())
-        {
-            let mut row: Value = serde_json::from_slice(row).unwrap();
-            if row["type"] == "session_meta" {
-                row["payload"]["id"] = json!(unrelated);
-            }
-            serde_json::to_writer(&mut bytes, &row).unwrap();
-            bytes.push(b'\n');
-        }
-        fs::write(&live_path, bytes).unwrap();
-        let mut live = super::super::codex_zst_refusal_tests::candidate(&live_path);
-        live.size_bytes = fs::metadata(&live_path).unwrap().len();
-        let mut gated_steps = 0;
+        let mut control_index = checkpoint(&state);
+        control_index.files.remove(&local_index_key(&f.0));
+        let (_, control) = finish_selector(selector_scan(
+            &f,
+            control_index,
+            cache.clone(),
+            VecDeque::from([member.clone()]),
+            true,
+        ));
         let ((next, result), rows) = crate::local_resource_diagnostics::capture(|| {
-            let mut scan = selector_scan(
+            finish_selector(selector_scan(
                 &f,
                 checkpoint(&state),
                 cache.clone(),
-                VecDeque::from([f.candidate(), member.clone(), live]),
+                VecDeque::from([f.candidate(), member.clone()]),
                 true,
-            );
-            scan.state_census_complete = true;
-            scan.sidecar_census_complete = true;
-            finish_selector_with(scan, |next| {
-                if next.codex_join_prepared
-                    && next
-                        .identified_candidates
-                        .iter()
-                        .any(|c| c.path == live_path)
-                {
-                    gated_steps += 1;
-                    let inventory = next.codex_join_inventory.as_ref().unwrap();
-                    assert!(inventory.deferred_archives.contains(&local_index_key(&f.0)));
-                    assert!(inventory.complete_for(Some(&unrelated)));
-                    assert!(!inventory.complete_for(Some(&"compressed-fixture".to_owned())));
-                    // Exercise the production census health predicate that RU used to veto.
-                    assert!(next.native_comparison_is_healthy());
-                    for held in [&f.0, &plain] {
-                        assert!(next.residue_index_keys.contains(&local_index_key(held)));
-                    }
-                }
-            })
+            ))
         });
-        assert!(
-            gated_steps > 0,
-            "unrelated work actually reached its census gate"
-        );
-        assert_eq!(
-            decodes(&rows),
-            0,
-            "no inventory or Full decode during sibling deferral"
-        );
-        assert!(!rows.iter().any(|row| row["stage"] == "codex_zst_refused"));
+        assert_eq!(decodes(&rows), 0);
+        assert!(!rows.iter().any(|r| r["stage"] == "codex_zst_inventory"));
         assert_eq!(result.unreadable_path_count, 0);
-        assert_eq!(result.ownership_incomplete_file_count, 0);
-        assert_eq!(result.snapshots.len(), 1);
-        assert_eq!(result.snapshots[0].source_session_id, unrelated);
-        assert!(result.snapshots[0].input_tokens > 0);
-        assert_eq!(
-            next.files[&local_index_key(&plain)].last_upload_body_witness,
-            plain_body
-        );
-        assert_eq!(next.accepted_snapshot_fingerprints, accepted);
-        let evidence = next.files[&local_index_key(&f.0)].archive.as_ref().unwrap();
-        assert!(matches!(
-            evidence.disposition,
-            ArchiveDisposition::HeaderValidated
-        ));
-        assert!(evidence.body_witness.is_none());
-        let pending = &next.traversal.as_ref().unwrap().pending_candidates;
-        for held in [&f.0, &plain] {
-            assert_eq!(pending.iter().filter(|p| p.path == *held).count(), 1);
+        if pass == 0 {
+            assert_eq!(result.snapshots.len(), 1);
         }
+        assert_eq!(
+            result
+                .snapshots
+                .iter()
+                .map(snapshot_upload_body_witness)
+                .collect::<Vec<_>>(),
+            control
+                .snapshots
+                .iter()
+                .map(snapshot_upload_body_witness)
+                .collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            next.files[&local_index_key(&f.0)]
+                .archive
+                .as_ref()
+                .unwrap()
+                .disposition,
+            ArchiveDisposition::Held {
+                cause: CodexZstCause::FamilyUnproven
+            }
+        ));
         state = next;
     }
-    fs::remove_file(&plain).unwrap();
-    let (mut state, result, rows, _) = selector_archive_pass(&f, checkpoint(&state));
-    assert_eq!(
-        decodes(&rows),
-        1,
-        "exactly one A1 Full after sibling resolution"
-    );
-    assert!(!rows.iter().any(|row| row["stage"] == "codex_zst_inventory"));
-    assert_eq!(result.snapshots.len(), 1);
-    assert_eq!(result.snapshots[0].source_session_id, "compressed-fixture");
-    state.settle_archive_bodies(
-        &result
-            .snapshots
-            .iter()
-            .map(|s| {
-                (
-                    s.snapshot_fingerprint.clone(),
-                    snapshot_upload_body_witness(s),
-                )
-            })
-            .collect(),
-    );
-    assert!(matches!(
-        state.files[&local_index_key(&f.0)]
-            .archive
-            .as_ref()
-            .unwrap()
-            .disposition,
-        ArchiveDisposition::Acquired
-    ));
-    let (_, result, rows, _) = selector_archive_pass(&f, checkpoint(&state));
-    assert_eq!(decodes(&rows), 0);
-    assert!(result.snapshots.is_empty());
 }
 
 #[test]

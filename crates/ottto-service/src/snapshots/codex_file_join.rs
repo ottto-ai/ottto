@@ -403,6 +403,8 @@ pub(super) struct HeaderInventory {
     pub(super) held_owners: BTreeSet<String>,
     pub(super) first_read_archives: BTreeSet<String>,
     pub(super) deferred_archives: BTreeSet<String>,
+    /// Bound archives held by name with a resolved family sibling (value: twin).
+    pub(super) family_held: BTreeMap<String, bool>,
     pub(super) archive_work: codex_compressed_input::HeaderWork,
     pub(super) reuse_hits: usize,
     pub(super) reuse_misses: usize,
@@ -455,33 +457,71 @@ impl HeaderInventory {
         // read_bytes is NOT reset: repeated real edits reach the existing bound.
         crate::local_resource_diagnostics::codex_zst_held(CodexZstCause::OwnerUnproven);
     }
-    pub(super) fn defer_bound_siblings(&mut self) {
-        let mut owners = BTreeMap::<String, usize>::new();
+    /// 0a r3 (Lead B 2026-10-29): a bound archive X with a resolved sibling of
+    /// its filename owner (a validated plain P, or another bound, invalid or
+    /// validated archive) is held by name, quietly: X never decodes and P keeps
+    /// publishing exactly as without X. Only unresolved (deferred) siblings
+    /// defer X; once they resolve, X takes its one A1 read or is held.
+    pub(super) fn classify_bound_archives(&mut self) {
+        let owners_of =
+            |key: &str| codex_session_id_candidates_from_path(&Path::new(key).with_extension(""));
+        let mut plain = BTreeMap::<&str, Vec<&Path>>::new();
+        let mut archives = BTreeMap::<String, usize>::new();
         for header in &self.headers {
-            *owners.entry(header.owner.clone()).or_default() += 1;
-        }
-        // Bound and deferred sets may share a physical member; count it once.
-        let paths = self
-            .first_read_archives
-            .iter()
-            .chain(&self.held_archives)
-            .chain(&self.deferred_archives)
-            .collect::<BTreeSet<_>>();
-        for key in paths {
-            for owner in codex_session_id_candidates_from_path(&Path::new(key).with_extension("")) {
-                *owners.entry(owner).or_default() += 1;
+            if is_compressed_codex_rollout(Some(&header.candidate.path), None) {
+                *archives.entry(header.owner.clone()).or_default() += 1;
+            } else {
+                plain
+                    .entry(&header.owner)
+                    .or_default()
+                    .push(&header.candidate.path);
             }
         }
-        self.deferred_archives.extend(
-            self.first_read_archives
+        for key in self.first_read_archives.union(&self.held_archives) {
+            for owner in owners_of(key) {
+                *archives.entry(owner).or_default() += 1;
+            }
+        }
+        let pending = self
+            .deferred_archives
+            .iter()
+            .flat_map(|key| owners_of(key))
+            .collect::<BTreeSet<_>>();
+        let mut held = self.family_held.clone();
+        let validated = self
+            .headers
+            .iter()
+            .filter(|h| codex_archive_path(&h.candidate.path))
+            .map(|h| local_index_key(&h.candidate.path))
+            .collect::<BTreeSet<_>>();
+        for key in self.first_read_archives.union(&validated) {
+            let owners = owners_of(key);
+            let name = Path::new(key).with_extension("");
+            let name = name.file_name();
+            if owners
                 .iter()
-                .filter(|key| {
-                    codex_session_id_candidates_from_path(&Path::new(key).with_extension(""))
-                        .iter()
-                        .any(|owner| owners.get(owner).is_some_and(|count| *count > 1))
-                })
-                .cloned(),
-        );
+                .any(|o| plain.contains_key(o.as_str()) || archives.get(o).is_some_and(|n| *n > 1))
+            {
+                let twin = owners
+                    .iter()
+                    .filter_map(|o| plain.get(o.as_str()))
+                    .flatten()
+                    .any(|p| p.file_name() == name);
+                held.insert(key.clone(), twin);
+            } else if owners.iter().any(|o| pending.contains(o)) {
+                self.deferred_archives.insert(key.clone());
+            }
+        }
+        // A held family owner never holds or refuses its plain member.
+        self.held_owners = self
+            .first_read_archives
+            .iter()
+            .filter(|key| !held.contains_key(*key))
+            .chain(&self.deferred_archives)
+            .chain(&self.held_archives)
+            .flat_map(|key| owners_of(key))
+            .collect();
+        self.family_held = held;
     }
     pub(super) fn complete_for(&self, owner: Option<&String>) -> bool {
         self.complete
@@ -522,6 +562,7 @@ impl HeaderInventory {
             held_owners: BTreeSet::new(),
             first_read_archives: BTreeSet::new(),
             deferred_archives: BTreeSet::new(),
+            family_held: BTreeMap::new(),
             archive_work: codex_compressed_input::HeaderWork::default(),
             reuse_hits: 0,
             reuse_misses: 0,
@@ -542,21 +583,49 @@ impl HeaderInventory {
                     .is_ok_and(|stamp| header.stamp.same_content(&stamp))
             })
     }
-    /// Build the ordinary read queue AFTER full-roster family registration.
-    pub(super) fn retain_cached_archives(&mut self, index: &ScanIndex, paths: &BTreeSet<String>) {
+    /// Inspect at most one quantum, before filtering. A partial feed cannot
+    /// certify absence. The RAM cursor advances even when all archives reject.
+    pub(super) fn retain_cached_archives(
+        &mut self,
+        index: &ScanIndex,
+        paths: &BTreeSet<String>,
+    ) -> Option<String> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let mut iter = match index.archive_pass.prep_after.as_ref() {
+            Some(after) => paths.range((Excluded(after.clone()), Unbounded)),
+            None => paths.range::<String, _>(..),
+        };
         self.pending.clear();
-        self.pending.extend(
-            paths
-                .iter()
-                .filter(|path| {
-                    !codex_archive_path(Path::new(path))
-                        || index.archive_header(Path::new(path)).is_some()
-                })
-                .take(MAX_HEADER_FILES + 1)
-                .map(PathBuf::from),
-        );
-        self.complete = self.pending.len() <= MAX_HEADER_FILES && self.directories.stable;
+        let mut last = None;
+        for path in iter.by_ref().take(MAX_HEADER_FILES) {
+            last = Some(path.clone());
+            // Held-member exclusion precedes header-cache lookup (#878).
+            let held = index
+                .files
+                .get(path)
+                .and_then(|e| e.archive.as_ref())
+                .is_some_and(|a| {
+                    matches!(
+                        a.disposition,
+                        codex_compressed_input::ArchiveDisposition::Held { .. }
+                    )
+                });
+            if !codex_archive_path(Path::new(path))
+                || (!held && index.archive_header(Path::new(path)).is_some())
+            {
+                self.pending.push_back(PathBuf::from(path));
+            }
+        }
+        // One extra probe detects debt; never truncate and claim complete.
+        let remaining = iter.next().is_some();
+        self.complete =
+            index.archive_pass.prep_after.is_none() && !remaining && self.directories.stable;
         self.bounded_out = !self.complete;
+        if remaining {
+            last
+        } else {
+            None
+        }
     }
     pub(super) fn owner_for_path(&self, path: &Path) -> Option<&str> {
         // Headers append in the pending BTreeSet<String> path order. Compare
@@ -658,6 +727,31 @@ impl HeaderInventory {
             return HeaderStep::Pending;
         }
         let cache = cache.filter(|_| !decode_held);
+        // #878 composition: custody is consulted before any header fact lookup.
+        if let Some(cause) = index
+            .files
+            .get(&key)
+            .and_then(|e| e.archive.as_ref())
+            .and_then(|a| match a.disposition {
+                codex_compressed_input::ArchiveDisposition::Held { cause } => Some((a, cause)),
+                _ => None,
+            })
+            .and_then(|(a, cause)| {
+                fs::symlink_metadata(&path)
+                    .ok()
+                    .and_then(|m| crate::transcript_acquisition::FileStamp::capture(m).ok())
+                    .filter(|stamp| a.stamp.same_content(stamp))
+                    .map(|_| cause)
+            })
+        {
+            if cause == CodexZstCause::FamilyUnproven {
+                self.family_held.insert(key, false);
+            } else {
+                self.held_archives.insert(key);
+            }
+            return HeaderStep::Pending;
+        }
+
         let mut excluded = false;
         let mut deferred = false;
         let result = (|| -> Result<Option<HeaderWitness>> {
@@ -836,6 +930,7 @@ impl HeaderInventory {
             .iter()
             .filter(|h| !self.member_held(&h.candidate.path))
         {
+            if codex_archive_path(&header.candidate.path) { continue; }
             let key = group_key(&header.home, &header.owner);
             groups
                 .entry(key)
@@ -901,7 +996,8 @@ impl HeaderInventory {
 }
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
 crate::heap_layout_bound::fields!(HeaderWitness; plain_twin, custody_cause, candidate, owner, home, created_unix_ms, metadata, stamp);
-crate::heap_layout_bound::fields!(HeaderInventory; custody_next, absence_held, custody_unknown, custody_after, custody_done, custody_peak, custody_refused, roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, archive_work, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, bounded_out, first_read_archives, deferred_archives);
+crate::heap_layout_bound::fields!(HeaderInventory; custody_next, absence_held, custody_unknown, custody_after, custody_done, custody_peak, custody_refused, roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, archive_work, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, bounded_out, first_read_archives, deferred_archives, family_held);
+
 
 
 #[derive(Clone, Debug)]

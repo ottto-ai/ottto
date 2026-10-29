@@ -38,6 +38,7 @@ pub(super) fn refuse_compressed_codex(
 /// Compressed bytes buffered from the File, and decoded bytes buffered for the
 /// line reader. Plain input keeps `BufReader::new`'s default capacity.
 const BUFFER_BYTES: usize = 8 * 1024;
+pub(super) const FIRST_READ_DECODED_LIMIT: u64 = 1024 * 1024 * 1024;
 // Independent from the decoded-file limit: a small file may demand a huge window.
 const WINDOW_LOG: u32 = 23;
 
@@ -274,6 +275,35 @@ impl ArchiveEvidence {
         self.header_validated
             .as_ref()
             .filter(|h| h.filename_matches(path))
+    }
+    /// Temporary adapter until PR B supplies owner-wide custody. This keeps
+    /// accepted entry fields untouched and grants no acquisition/ACK authority.
+    pub(super) fn hold(
+        file: &File,
+        path: &Path,
+        previous: Option<&Self>,
+        cause: CodexZstCause,
+    ) -> io::Result<Self> {
+        let stamp = crate::transcript_acquisition::FileStamp::capture(file.metadata()?)?;
+        let mut evidence = match previous.filter(|a| a.stamp.same_content(&stamp)) {
+            Some(a) => a.clone(),
+            None => Self {
+                stamp: stamp.content_only(),
+                logical_id: super::codex_session_id_candidates_from_path(path)
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| invalid("archive logical id unavailable"))?,
+                owner: None,
+                body_witness: None,
+                reservation_saved: false,
+                header_attempted: false,
+                header_bound_reached: false,
+                header_validated: None,
+                disposition: ArchiveDisposition::HeaderValidated,
+            },
+        };
+        evidence.disposition = ArchiveDisposition::Held { cause };
+        Ok(evidence)
     }
     pub(super) fn begin(file: &File, path: &Path, previous: Option<&Self>) -> io::Result<Self> {
         let stamp = crate::transcript_acquisition::FileStamp::capture(file.metadata()?)?;
@@ -646,7 +676,7 @@ impl OpenedInput {
         };
         let mut input = Self::compressed(
             file,
-            super::max_jsonl_file_bytes(super::SnapshotSource::Codex),
+            FIRST_READ_DECODED_LIMIT.min(super::max_jsonl_file_bytes(super::SnapshotSource::Codex)),
             credit,
         );
         if let Ok(Self::Compressed(_, paid)) = &mut input {

@@ -13,7 +13,11 @@ pub(super) struct RootSidecar {
 // Keep the precise clock in each home for the existing native ownership checks.
 const COPY_CREATION_PRECISION_NANOS: i128 = 1_000_000_000;
 
-fn copy_locator<'a>(root: &Path, id: &str, row: &'a CodexStateThread) -> Option<&'a Path> {
+fn copy_locator<'a>(
+    root: &Path,
+    id: &str,
+    row: &'a CodexStateThread,
+) -> Option<std::borrow::Cow<'a, Path>> {
     let path = Path::new(row.rollout_path.as_deref()?);
     let relative = path.strip_prefix(root).ok()?;
     if !path.is_absolute()
@@ -29,7 +33,7 @@ fn copy_locator<'a>(root: &Path, id: &str, row: &'a CodexStateThread) -> Option<
     {
         return None;
     }
-    Some(relative)
+    Some(codex_logical_rollout_path(relative))
 }
 
 fn compatible_copy(

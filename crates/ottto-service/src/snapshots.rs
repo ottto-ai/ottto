@@ -26708,22 +26708,6 @@ impl OwnedSourceScan {
                 backfill_window_days,
                 discovery_retention!(index),
             );
-            if source == SnapshotSource::Codex {
-                traversal
-                    .pending_candidates
-                    .make_contiguous()
-                    .sort_by_cached_key(|p| {
-                        let archive = codex_archive_path(&p.path);
-                        let modified = archive
-                            .then(|| {
-                                fs::symlink_metadata(&p.path)
-                                    .and_then(|m| m.modified())
-                                    .ok()
-                            })
-                            .flatten();
-                        (archive, std::cmp::Reverse(modified))
-                    });
-            }
             release_codex_inventory_hold(source, traversal);
         }
         if source == SnapshotSource::Codex {
@@ -27010,6 +26994,21 @@ impl OwnedSourceScan {
         } else {
             BTreeMap::new()
         };
+        // Sort only the selected page; never stat or allocate sort scratch for
+        // the entire pending roster on every construction. Live work first.
+        if source == SnapshotSource::Codex {
+            pending_paths.sort_by_cached_key(|p| {
+                let archive = codex_archive_path(&p.path);
+                let modified = archive
+                    .then(|| {
+                        fs::symlink_metadata(&p.path)
+                            .and_then(|m| m.modified())
+                            .ok()
+                    })
+                    .flatten();
+                (archive, std::cmp::Reverse(modified))
+            });
+        }
         let mut files = pending_paths
             .into_iter()
             .filter_map(|pending| {
@@ -27272,7 +27271,8 @@ impl OwnedSourceScan {
                     .extend(census.archive_terminal_sessions.iter().cloned());
                 // Keep the full roster at construction for 0b's family-wide guard.
                 // Ordinary inventory must never acquire an unseen archive header.
-                inventory.retain_cached_archives(index, &traversal.codex_rollout_paths);
+                index.archive_pass.prep_after =
+                    inventory.retain_cached_archives(index, &traversal.codex_rollout_paths);
                 inventory.complete &= traversal.pending_directories.is_empty();
                 inventory
             });
@@ -27595,7 +27595,6 @@ impl OwnedSourceScan {
             }
             if source == SnapshotSource::Codex && !codex_join_prepared {
                 if let Some(inventory) = codex_join_inventory.as_mut() {
-                    let before = inventory.archive_work.physical_bytes;
                     let decoded_before = inventory.archive_work.decoded_bytes;
                     // Ordinary construction leaves permission false: cached feed only.
                     // The gate is per step, never latched, so a deferral yields.
@@ -27616,7 +27615,7 @@ impl OwnedSourceScan {
                     inventory.archive_work.allowed = allowed;
                     index.archive_pass.started |=
                         inventory.archive_work.decoded_bytes > decoded_before;
-                    codex_page.charge(false, inventory.archive_work.physical_bytes - before);
+                    codex_page.charge(false, inventory.archive_work.decoded_bytes - decoded_before);
                     if done != codex_file_join::HeaderStep::Complete {
                         pending!();
                     }
@@ -27653,7 +27652,41 @@ impl OwnedSourceScan {
                         }
                     }
 
-                    inventory.defer_bound_siblings();
+                    inventory.classify_bound_archives();
+                    // Named family holds apply only to X. P retains main's
+                    // publication behavior; held archives never enter groups.
+                    identified_candidates.retain(|candidate| {
+                        let key = local_index_key(&candidate.path);
+                        let Some(twin) = inventory.family_held.get(&key) else {
+                            return true;
+                        };
+                        let held = open_candidate_beneath_root(candidate).and_then(|file| {
+                            index.hold_archive(
+                                &file,
+                                &candidate.path,
+                                CodexZstCause::FamilyUnproven,
+                            )
+                        });
+                        if held.is_err() {
+                            // Keep transient failures owed; no manufactured hold.
+                            sampled_scan::codex_cursor::requeue(
+                                index,
+                                &codex_selected_flags,
+                                candidate,
+                            );
+                        }
+                        if *twin {
+                            crate::local_resource_diagnostics::traversal_point(
+                                "codex_zst_plain_twin_skip",
+                                "codex",
+                                &BTreeMap::from([("codex_zst_plain_twin_skip", 1_u64)]),
+                            );
+                        }
+                        residue_index_keys.insert(key);
+                        residue_blocked_session_ids
+                            .extend(codex_session_id_candidates_from_path(&candidate.path));
+                        false
+                    });
                     let unresolved = &inventory.held_owners;
                     residue_blocked_session_ids.extend(unresolved.iter().cloned());
                     codex_state_only_blocked_session_ids.extend(unresolved.iter().cloned());
@@ -32907,11 +32940,29 @@ impl OwnedSourceScan {
                 pending!();
             }
             if source == SnapshotSource::Codex && codex_archive_path(&candidate.path) {
-                if !index.archive_pass.ready(
-                    codex_page.singleton_remaining(sampled_scan::codex_cursor::Limits::current()),
+                match index.classify_archive(
+                    &candidate,
+                    &opened_file,
+                    codex_join_inventory.as_ref(),
+                    sampling.as_ref().map(|c| &c.cache),
+                    &mut codex_page,
                 ) {
-                    sampled_scan::codex_cursor::requeue(index, &codex_selected_flags, &candidate);
-                    pending!();
+                    Ok(codex_archive_catchup::Admission::Read) => {}
+                    Ok(codex_archive_catchup::Admission::Held) => {
+                        residue_index_keys.insert(local_index_key(&candidate.path));
+                        residue_blocked_session_ids
+                            .extend(codex_session_id_candidates_from_path(&candidate.path));
+                        pending!();
+                    }
+                    Ok(codex_archive_catchup::Admission::Deferred) | Err(_) => {
+                        sampled_scan::codex_cursor::requeue(
+                            index,
+                            &codex_selected_flags,
+                            &candidate,
+                        );
+                        residue_index_keys.insert(local_index_key(&candidate.path));
+                        pending!();
+                    }
                 }
                 crate::context_composition::set_utility_qos();
                 index.archive_pass.started = true;
@@ -43562,7 +43613,7 @@ fn collect_recent_jsonl_files(
         if !file_type.is_file() {
             continue;
         }
-        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+        if !snapshot_transcript_path(source, &path) {
             continue;
         }
         // Claude's Workflow-tool journal is bookkeeping, never a session. Drop
@@ -50931,6 +50982,8 @@ fn resolve_codex_identity_option(value: Option<String>) -> Option<String> {
 /// yields both the complete legacy remainder and the modern remainder. Callers
 /// with trusted state/header evidence must select the unique supported key.
 fn codex_session_id_candidates_from_path(path: &Path) -> Vec<String> {
+    let logical = codex_logical_rollout_path(path);
+    let path = logical.as_ref();
     let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
         return Vec::new();
     };
@@ -51656,11 +51709,28 @@ fn sha256_hex_owned(parts: &[String]) -> String {
     format!("{:x}", digest.finalize())
 }
 
+fn snapshot_transcript_path(source: SnapshotSource, path: &Path) -> bool {
+    path.extension().and_then(|s| s.to_str()) == Some("jsonl")
+        || (source == SnapshotSource::Codex && codex_archive_path(path))
+}
+
+/// Identity comparisons only. The open path, index key and ACK stay physical.
+fn codex_logical_rollout_path(path: &Path) -> std::borrow::Cow<'_, Path> {
+    if codex_archive_path(path) {
+        std::borrow::Cow::Owned(path.with_extension(""))
+    } else {
+        std::borrow::Cow::Borrowed(path)
+    }
+}
+
 fn codex_archive_path(path: &Path) -> bool {
     is_compressed_codex_rollout(Some(path), None)
 }
 
-pub fn paths_from_events(paths: impl IntoIterator<Item = PathBuf>) -> BTreeSet<PathBuf> {
+pub fn paths_from_events(
+    source: SnapshotSource,
+    paths: impl IntoIterator<Item = PathBuf>,
+) -> BTreeSet<PathBuf> {
     paths
         .into_iter()
         .filter(|path| transcript_path_admitted(path))

@@ -266,7 +266,7 @@ fn predicate_covers_opened_compression_and_leaves_plain_physical_samples_legal()
 #[test]
 fn compressed_refusal_cardinality_has_unique_pinned_indices() {
     use CodexZstCause::*;
-    const ALL: [CodexZstCause; 26] = [
+    const ALL: [CodexZstCause; 28] = [
         ReplayNotAuthorized,
         ProofParentUnsupported,
         ProofChildUnsupported,
@@ -293,9 +293,11 @@ fn compressed_refusal_cardinality_has_unique_pinned_indices() {
         CompatibilityUnfunded,
         DecoderRefusedHeaderOccupancy,
         FamilyUnproven,
+        ArchiveEquivalenceUnproven,
+        CatchupTooLarge,
     ];
     const _: [(); ALL.len()] = [(); CodexZstCause::__Count as usize];
-    assert_eq!(ALL.last(), Some(&FamilyUnproven));
+    assert_eq!(ALL.last(), Some(&CatchupTooLarge));
     let indices = ALL
         .map(|cause| cause as usize)
         .into_iter()

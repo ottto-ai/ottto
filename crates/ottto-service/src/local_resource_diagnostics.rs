@@ -70,10 +70,13 @@ pub(crate) enum CodexZstCause {
     DecoderRefusedHeaderOccupancy = 24,
     #[serde(rename = "CompressedFamilyUnproven")]
     FamilyUnproven = 25,
-
+    #[serde(rename = "ArchiveEquivalenceUnproven")]
+    ArchiveEquivalenceUnproven = 26,
+    #[serde(rename = "CompressedCatchupTooLarge")]
+    CatchupTooLarge = 27,
     #[doc(hidden)]
     #[serde(skip)]
-    __Count = 26,
+    __Count = 28,
 }
 impl std::fmt::Display for CodexZstCause {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1534,6 +1537,8 @@ mod tests {
             CompatibilityUnfunded,
             DecoderRefusedHeaderOccupancy,
             FamilyUnproven,
+            ArchiveEquivalenceUnproven,
+            CatchupTooLarge,
         ];
         assert_eq!(ALL.len(), super::CODEX_ZST_CAUSES);
         assert_eq!(
@@ -1541,7 +1546,8 @@ mod tests {
             "decoder_refused_header_occupancy"
         );
         let mut labels = std::collections::BTreeSet::new();
-        assert_eq!(FamilyUnproven as usize + 1, super::CODEX_ZST_CAUSES);
+        assert_eq!(CatchupTooLarge as usize + 1, super::CODEX_ZST_CAUSES);
+
 
         for (index, cause) in ALL.iter().enumerate() {
             assert_eq!(*cause as usize, index);
