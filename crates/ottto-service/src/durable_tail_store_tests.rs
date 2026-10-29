@@ -241,15 +241,23 @@ fn crash_matrix_index_old_new_by_checkpoint_old_new_torn_missing() {
 
     let torn = |bytes: &[u8]| {
         let mut variants = vec![
-            bytes[..bytes.len() / 2].to_vec(),
-            bytes[..bytes.len() - 1].to_vec(),
-            bytes[..20].to_vec(),
-            Vec::new(),
+            (bytes[..bytes.len() / 2].to_vec(), Refusal::Corrupt),
+            (bytes[..bytes.len() - 1].to_vec(), Refusal::Corrupt),
+            (bytes[..20].to_vec(), Refusal::Undecodable),
+            (Vec::new(), Refusal::Undecodable),
         ];
         let mut flipped = bytes.to_vec();
         let middle = flipped.len() / 2;
         flipped[middle] ^= 0x40;
-        variants.push(flipped);
+        let reason = if (HEADER_BYTES - 13..HEADER_BYTES - 4).contains(&middle) {
+            // This midpoint hits the zero-debt pair on the current fixture.
+            // Noncanonical debt is U before trailer validation, never T14.
+            assert_eq!(&bytes[HEADER_BYTES - 13..HEADER_BYTES - 4], &[0; 9]);
+            Refusal::Unbindable
+        } else {
+            Refusal::Corrupt
+        };
+        variants.push((flipped, reason));
         variants
     };
 
@@ -291,13 +299,8 @@ fn crash_matrix_index_old_new_by_checkpoint_old_new_torn_missing() {
                 "index {index_label} x checkpoint {checkpoint_label}"
             );
         }
-        for bytes in torn(&new_record) {
+        for (bytes, expected) in torn(&new_record) {
             put_record(&record_file(&store, &key), &bytes);
-            let expected = if bytes.len() < 171 {
-                Refusal::Undecodable
-            } else {
-                Refusal::Corrupt
-            };
             assert_eq!(
                 store.read(&key),
                 ReadOutcome::Refused(expected),

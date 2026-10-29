@@ -163,8 +163,8 @@ calling these measurements installed evidence.
 
 A `durable_tail_alarm` record (schema 2 additive) follows a post-save pass
 whose durable-store counts for that source changed. Each count is
-`[since the last alarm, process total]`: `held_keys` (files held because their
-record has an unknown or newer format), `t14_rebuild` (known corrupt records
+`[since the last alarm, process total]`: `held_keys` (unknown, newer,
+undecodable or unbindable records, including missing audit carriers), `t14_rebuild` (known corrupt records
 read Full once and replaced after the save) and `mode_repaired` (store
 directory or records restored to owner-only). `store_disabled` appears once,
 with `foreign_owner`, `not_directory`, `mode_unrepairable` or `t14_breaker`
