@@ -629,7 +629,7 @@ fn e2_real_caller_parity_at_tight_allowances() {
     files(&support, &mut saved);
     let mut run = |budget: usize, conflict: bool| {
         std::fs::remove_dir_all(&support).unwrap();
-        for (path, bytes) in &saved {
+        for (path, bytes, permissions) in &saved {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, bytes).unwrap();
             std::fs::set_permissions(path, permissions.clone()).unwrap();

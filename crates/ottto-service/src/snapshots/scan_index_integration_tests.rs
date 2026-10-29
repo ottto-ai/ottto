@@ -373,6 +373,15 @@ fn authorized_legacy_quarantine_rebuild_keeps_opaque_custody_until_replacement()
     assert_eq!(rebuilt.generation, 1);
     assert!(rebuilt.persistence_legacy_recovery.is_none());
     assert_eq!(fixture.load().generation, 1);
+    // Captured recovery adopts the publication and must use ordinary CAS on
+    // its next checkpoint, rather than retrying the spent first-save grant.
+    let mut adopted = clone.clone();
+    adopted.generation = rebuilt.generation;
+    adopted.retain_persistence_baseline_from(&rebuilt);
+    assert!(adopted.persistence_legacy_recovery.is_none());
+    adopted.save(&fixture.root).unwrap();
+    assert_eq!(adopted.generation, 2);
+    assert_eq!(fixture.load().generation, 2);
     // A stale clone cannot re-use the spent recovery grant.
     assert!(clone.save(&fixture.root).is_err());
     fs::remove_file(&fixture.root).unwrap();
