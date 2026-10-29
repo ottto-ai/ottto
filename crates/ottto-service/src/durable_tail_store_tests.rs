@@ -2563,6 +2563,7 @@ fn original_witness_survives_memo_turnover_but_never_a_different_record() {
             }
             "body" => {
                 let replacement = DurableRecord {
+                    envelope_audit_debt: None,
                     record: pending(b.clone(), certificate(&path), 3),
                     index_generation: 1,
                     format: 1,
@@ -2847,6 +2848,7 @@ fn property_table_keeps_both_historical_v1_envelopes_byte_identical() {
         record.allowlist = row.allowlist();
         record.body = crate::snapshots::durable_store_fixture_body(row.snapshot, 1, 7);
         let stored = DurableRecord {
+            envelope_audit_debt: None,
             record,
             index_generation: 17,
             format: row.format,
@@ -2856,7 +2858,7 @@ fn property_table_keeps_both_historical_v1_envelopes_byte_identical() {
         assert_eq!(&bytes[8..10], &1_u16.to_le_bytes());
         assert_eq!(bytes[42], (ordinal + 1) as u8);
         verify(&bytes, row.source).unwrap();
-        let decoded = decode(&bytes, &row.allowlist()).unwrap();
+        let decoded = decode(&bytes).unwrap();
         assert_eq!(decoded.record.body, stored.record.body);
         assert_eq!(decoded.record.binding, stored.record.binding);
         assert_eq!(decoded.index_generation, 17);
@@ -2882,7 +2884,7 @@ pub(crate) fn continuation_pass_state(store: &DurableTailStore) -> ContinuationP
     ContinuationPassState {
         checked: store.checked,
         counts: store.pass,
-        rebuilt: store.rebuilt.clone(),
+        rebuilt: store.rebuilt.keys().copied().collect(),
         authorized: store
             .durable
             .iter()

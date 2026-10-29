@@ -131,6 +131,19 @@ impl OwnedJsonlParser {
         debt: Option<AuditDebt>,
         now: u64,
     ) -> Result<ReadMode> {
+        self.prepare_acquisition_with_reuse_gate(old, scope, debt, now, |_, _| Ok(true))
+    }
+
+    /// The ordinary planner chooses Full/Tail/Unchanged before any resource
+    /// reuse allowance is spent. Refusing reuse falls back on the fresh parser.
+    pub(super) fn prepare_acquisition_with_reuse_gate(
+        &mut self,
+        old: Option<Retained<CachedJsonlReduction>>,
+        scope: &Scope,
+        debt: Option<AuditDebt>,
+        now: u64,
+        mut reuse: impl FnMut(&Checkpoint, &File) -> Result<bool>,
+    ) -> Result<ReadMode> {
         // Checkpoints, samples and resume offsets are physical-file bytes. A
         // compressed stream has none, so it is never sampled or resumed.
         refuse_compressed_codex(
@@ -174,13 +187,25 @@ impl OwnedJsonlParser {
                             })
                         }))
         });
-        let plan = ReadPlan::prepare(
+        let mut plan = ReadPlan::prepare(
             self.reader.reader.get_mut(),
             old.as_ref().map(|old| &old.checkpoint),
             scope,
             debt,
             now,
         )?;
+        if plan.mode() == ReadMode::Tail
+            && !reuse(
+                &old.as_ref()
+                    .expect("Tail requires retained state")
+                    .checkpoint,
+                self.reader.reader.get_ref(),
+            )?
+        {
+            // No body or retained reduction has been consumed. The existing
+            // StateMissing plan reads the same held object from zero.
+            plan = ReadPlan::prepare(self.reader.reader.get_mut(), None, scope, debt, now)?;
+        }
         let mode = plan.mode();
         if matches!(mode, ReadMode::Full(_)) && self.source == SnapshotSource::Codex {
             self.accumulator.codex_observed_priority_turns = Some(BTreeMap::new());

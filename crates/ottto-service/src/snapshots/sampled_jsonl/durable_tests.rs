@@ -1517,3 +1517,57 @@ fn compressed_rederive_refuses_before_seek_or_jsonl_parse() {
         );
     });
 }
+
+#[test]
+fn tail_reuse_allowance_cannot_block_an_independently_due_full() {
+    use crate::transcript_cache::Retained;
+    let scratch = Scratch::new("tail-admission");
+    let path = scratch.write("native.jsonl", &["{}".into()]);
+    let source = SnapshotSource::ClaudeCode;
+    let (state, checkpoint) = full_read(&path, source);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"{}\n")
+        .unwrap();
+    let mut due = parser(&path, source);
+    let mode = due
+        .prepare_acquisition_with_reuse_gate(
+            Some(Retained {
+                checkpoint: checkpoint.clone(),
+                state: state.clone(),
+            }),
+            &scope(),
+            Some(crate::transcript_acquisition::AuditDebt {
+                due_unix_seconds: NOW,
+            }),
+            NOW,
+            |_, _| panic!("an owed Full never spends or checks a Tail allowance"),
+        )
+        .unwrap();
+    assert_eq!(mode, ReadMode::Full(FullReason::AuditDue));
+    let mut limited = parser(&path, source);
+    let calls = std::cell::Cell::new(0);
+    let mode = limited
+        .prepare_acquisition_with_reuse_gate(
+            Some(Retained { checkpoint, state }),
+            &scope(),
+            None,
+            NOW,
+            |_, _| {
+                calls.set(calls.get() + 1);
+                Ok(false)
+            },
+        )
+        .unwrap();
+    assert_eq!(calls.get(), 1, "only the actual Tail asks for permission");
+    assert_eq!(mode, ReadMode::Full(FullReason::StateMissing));
+    while !limited.step().unwrap() {}
+    let (cold, _) = full_read(&path, source);
+    assert_eq!(
+        encode(&limited.reduction_copy(), 1 << 20, 1 << 20).unwrap(),
+        encode(&cold, 1 << 20, 1 << 20).unwrap(),
+        "fallback uses the fresh native reduction"
+    );
+}

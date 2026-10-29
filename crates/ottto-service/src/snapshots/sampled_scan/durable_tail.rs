@@ -845,9 +845,10 @@ fn authorize_strict(
         if prior.is_none() {
             *prior = slot.store.mutation_witness(&record, &expected);
         }
-        if let Some(proof) = prior.as_ref() {
-            slot.store.authorize_witness(&record, &expected, proof);
-        }
+        // An ambiguous prior receipt still owns its unresolved custody. It is
+        // not permission for the freshly verified current record: prove that
+        // record independently so later dirty writes can make progress.
+        slot.store.authorize(&record, &expected);
     }
 }
 
@@ -1641,7 +1642,7 @@ impl SharedCache {
         }
         record.eligible(expected).map_err(Failure::Ineligible)?;
         let decoded = codec::decode(&record.record.body, source).map_err(|_| Failure::Corrupt)?;
-        if source == SnapshotSource::ClaudeCode && decoded.counting().is_some() {
+        if source == SnapshotSource::ClaudeCode && decoded.cutover().is_some() {
             return Err(Failure::Corrupt);
         }
         if decoded
