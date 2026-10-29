@@ -93,6 +93,11 @@ impl ScanIndex {
     ) {
         let key = local_index_key(path);
         let entry = self.files.entry(key.clone()).or_default();
+        let cause = if entry.codex_compressed_hold == Some(CodexZstCause::ParentLedgerUnbound) {
+            CodexZstCause::ParentLedgerUnbound
+        } else {
+            cause
+        };
         let changed = entry.codex_compressed_hold != Some(cause);
         entry.codex_compressed_hold = Some(cause);
         self.codex_state_only_blocked_session_ids
@@ -290,6 +295,60 @@ impl codex_file_join::HeaderInventory {
                 .binary_search_by(|h| h.candidate.path.as_os_str().cmp(path.as_os_str()))
                 .is_ok_and(|at| self.headers[at].custody_cause.is_some())
     }
+}
+
+pub(super) fn parent_unbound(
+    parent: &str,
+    census: CodexParentCensus<'_>,
+    metadata: &CodexTitleMetadata,
+) -> bool {
+    let parent = resolve_codex_identity(parent);
+    let mut archive = false;
+    for key in census.paths.iter().take(codex_file_join::MAX_HEADER_FILES) {
+        let path = Path::new(key);
+        let compressed = is_compressed_codex_rollout(Some(path), None);
+        let logical = if compressed {
+            path.with_extension("")
+        } else {
+            path.to_owned()
+        };
+        if codex_session_id_candidates_from_path(&logical).contains(&parent) {
+            if !compressed {
+                return false;
+            }
+            archive = true;
+        }
+    }
+    if archive {
+        return true;
+    }
+    // State metadata can locate a compressed parent before archive discovery.
+    // Only lstat: this cannot create an archive candidate or decoder permission.
+    metadata
+        .state_threads
+        .get(&parent)
+        .and_then(|thread| thread.rollout_path.as_deref())
+        .is_some_and(|key| {
+            let path = Path::new(key);
+            let compressed = is_compressed_codex_rollout(Some(path), None);
+            let plain = if compressed {
+                path.with_extension("")
+            } else {
+                path.to_owned()
+            };
+            let archive = if compressed {
+                path.to_owned()
+            } else {
+                PathBuf::from(format!("{key}.zst"))
+            };
+            census
+                .scan_roots
+                .iter()
+                .any(|root| archive.starts_with(root))
+                && fs::symlink_metadata(plain).is_err()
+                && fs::symlink_metadata(archive)
+                    .is_ok_and(|stat| stat.is_file() && !stat.file_type().is_symlink())
+        })
 }
 
 impl OwnedSourceScan {

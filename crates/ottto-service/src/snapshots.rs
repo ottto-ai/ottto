@@ -29823,6 +29823,49 @@ impl OwnedSourceScan {
                         pending!();
                     }
                 };
+                if source == SnapshotSource::Codex
+                    && side_origin.is_none()
+                    && parsed_file.codex_parent_ledger_consulted
+                    && (parsed_file.codex_parent_resolution_pending
+                        || parsed_file.codex_parent_unresolvable.is_some())
+                    && parsed_file
+                        .codex_parent_session_ref
+                        .as_deref()
+                        .is_some_and(|parent| {
+                            codex_compressed_holds::parent_unbound(
+                                parent,
+                                codex_parent_identities.census(index),
+                                &codex_title_metadata,
+                            )
+                        })
+                {
+                    let owners = parsed_file.state_only_blocked_session_ids.clone();
+                    if let Some(inventory) = codex_join_inventory.as_mut() {
+                        inventory
+                            .headers
+                            .sort_unstable_by(|a, b| a.owner.cmp(&b.owner));
+                        for owner in &owners {
+                            inventory.mark_custody_owner(owner, CodexZstCause::ParentLedgerUnbound);
+                        }
+                        inventory.headers.sort_unstable_by(|a, b| {
+                            a.candidate
+                                .path
+                                .as_os_str()
+                                .cmp(b.candidate.path.as_os_str())
+                        });
+                        inventory.custody_next = 0;
+                        codex_join_prepared = false;
+                    }
+                    // Sibling/alias minting must use paged current-witness
+                    // qualification, including the refused admission path.
+                    index.hold_compressed(
+                        &candidate.path,
+                        owners.clone(),
+                        CodexZstCause::ParentLedgerUnbound,
+                    );
+                    codex_state_only_blocked_session_ids.extend(owners);
+                    pending!();
+                }
                 if let Some(evidence) = index
                     .files
                     .get_mut(&local_index_key(&candidate.path))
