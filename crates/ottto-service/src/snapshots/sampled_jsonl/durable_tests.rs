@@ -1926,6 +1926,9 @@ fn m3_seam_live_bytes_equal_retained_copy_and_output_equals_legacy() {
         // Oracle: the copy a certified completion retains, then the legacy
         // wrapper's output over the same parser.
         let mut legacy = parser(&path, source);
+        legacy
+            .prepare_acquisition(None, &scope(), None, NOW)
+            .unwrap();
         while !legacy.step().unwrap() {}
         legacy.accumulator.codex_turn_traces = traces();
         // This fixture qualifies an encodable live state; first-prompt raw
@@ -1935,6 +1938,7 @@ fn m3_seam_live_bytes_equal_retained_copy_and_output_equals_legacy() {
         let retained = legacy.durable_test_reduction_copy();
         let legacy = items(legacy, &path, source);
         let mut live = parser(&path, source);
+        live.prepare_acquisition(None, &scope(), None, NOW).unwrap();
         while !live.step().unwrap() {}
         live.accumulator.codex_turn_traces = traces();
         // This fixture qualifies an encodable live state; first-prompt raw

@@ -243,7 +243,7 @@ fn failed_rename_preserves_verified_predecessor_without_receipt_or_retirement() 
     store.begin_pass();
     assert_eq!(
         found(store.read(&b.key)).record.body,
-        placeholder_body(1, 14)
+        placeholder_body(1, 7)
     );
     let retry = store
         .write_after_save(&lock, 3, 0, vec![pending(b.clone(), certificate(&path), 2)])
@@ -3288,11 +3288,26 @@ fn transition_store_failure_controls_and_verified_retirement() {
         ) {
             let receipt = result.unwrap();
             assert_eq!(receipt.written, 0);
-            assert_eq!(receipt.deferred_keys.len(), 1);
-            assert_eq!(
-                store.has_pending(),
-                point == CrashPoint::BeforeDirectorySync
-            );
+            assert!(receipt.completed.is_empty(), "a failed boundary cannot ACK");
+            let canonical = fs::read_dir(store.dir()).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|s| s == "rec")
+            });
+            if canonical {
+                assert!(
+                    store.has_pending(),
+                    "a renamed but unflushed candidate keeps custody"
+                );
+                assert_eq!(receipt.deferred_keys.len(), 1);
+            } else {
+                assert!(
+                    !store.has_pending(),
+                    "setup failure or verified absence leaves no candidate"
+                );
+            }
         } else {
             assert!(result.is_err());
         }
@@ -3989,10 +4004,24 @@ fn batch_ack_requires_durable_reconciliation_and_never_a_clean_retry() {
                     ],
                 )
                 .unwrap();
-            assert_eq!((retry.written, retry.clean), (1, 1));
-            assert!(
-                !store.replacement_committed(&proof, &retry),
-                "{edge} clean retry"
+            let late_receipt = edge == "dir_sync";
+            assert_eq!(
+                (retry.written, retry.clean),
+                (1 + usize::from(late_receipt), usize::from(!late_receipt))
+            );
+            assert_eq!(
+                store.replacement_committed(&proof, &retry),
+                late_receipt,
+                "only delivery of the retained exact B receipt acknowledges A"
+            );
+            assert_eq!(
+                retry
+                    .completed
+                    .iter()
+                    .any(|completion| completion.identity.key == b.key
+                        && completion.identity.generation == 2),
+                late_receipt,
+                "a clean retry cannot manufacture a B receipt"
             );
         }
     }

@@ -879,8 +879,8 @@ mod durable_restart {
         first.durable_write_after_save(state.lock, SOURCE, &prior);
         assert_eq!(
             state.store_records(),
-            1,
-            "native pre-ACK record exists before cache admission"
+            usize::from(crate::heap_layout_bound::layout_supported()),
+            "native persistence requires this binary's supported restore layout"
         );
         prior
     }
@@ -1184,7 +1184,10 @@ mod durable_restart {
                 let mut prior = settle(seed);
                 prior.save(&state.index_path).unwrap();
                 first.durable_write_after_save(state.lock, SOURCE, &prior);
-                assert_eq!(state.store_records(), 1);
+                assert_eq!(
+                    state.store_records(),
+                    usize::from(crate::heap_layout_bound::layout_supported())
+                );
                 drop(first);
                 let native_before = fs::read(&f.path).unwrap();
                 if append_native {

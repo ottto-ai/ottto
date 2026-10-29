@@ -589,7 +589,14 @@ fn native_full_debt_map_declines_before_write_and_keeps_the_emitted_body() {
         snapshot_upload_body_witness(&cold[0])
     );
     let (counts, disk) = cache.durable_counters(CLAUDE).unwrap();
-    assert_eq!(counts.not_persisted.get("wa.pass_budget"), Some(&1));
+    if crate::heap_layout_bound::layout_supported() {
+        assert_eq!(counts.not_persisted.get("wa.pass_budget"), Some(&1));
+    } else {
+        assert_eq!(
+            counts.ineligible["native_stage_skipped.layout_unsupported.claude"],
+            1
+        );
+    }
     assert_eq!(disk.records_written, 0, "unfunded write never starts");
     assert_eq!(disk.receipt_pending_records, 0);
     assert_eq!(disk.store_faults, 0);
@@ -659,8 +666,10 @@ fn protected_history_refuses_singleton_restore_across_passes_before_record_io() 
             let mut stores = cache.durable().unwrap();
             let slot = stores.slot(DurableSource::Codex).as_mut().unwrap();
             for n in 0..2 * store::MAX_RECORDS {
-                slot.decided
-                    .insert(format!("other-{n}"), Some(Scope("ordinary".into())));
+                slot.decided.insert(
+                    format!("other-{n}"),
+                    ScopeDecision::Scope(Scope("ordinary".into())),
+                );
             }
         }
         let interpretation =
@@ -685,4 +694,34 @@ fn protected_history_refuses_singleton_restore_across_passes_before_record_io() 
         assert_eq!(counts.ineligible["wa.class_changed.restore_refused"], 1);
         std::fs::remove_dir_all(root).unwrap();
     }
+}
+
+#[test]
+fn layout_unavailability_preserves_future_audit_and_state_missing_selection_cause() {
+    let (root, _, mut file) = grown("m3-layout-future-audit");
+    let now = 1_800_000_000;
+    let future = now + 3600;
+    let key = "already-selected";
+    let mut index = ScanIndex::default();
+    index.files.insert(key.into(), entry());
+    assert!(index.stage_sampled_audit(
+        key,
+        "fp",
+        crate::transcript_acquisition::AuditDebt {
+            due_unix_seconds: future
+        }
+    ));
+    let debt = MissClass::LayoutUnavailable(Some(future)).rearm_audit(&mut index, key, now);
+    assert_eq!(index.files[key].unverified_deadline(), Some(future));
+    let plan = ReadPlan::prepare(&mut file, None, &Scope("selected".into()), debt, now).unwrap();
+    assert!(
+        matches!(
+            plan.mode(),
+            crate::transcript_acquisition::ReadMode::Full(FullReason::StateMissing)
+        ),
+        "a missing restore shortcut cannot mint an AuditDue Full"
+    );
+    drop(plan);
+    drop(file);
+    std::fs::remove_dir_all(root).unwrap();
 }

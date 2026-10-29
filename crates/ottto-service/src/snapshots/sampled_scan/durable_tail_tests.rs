@@ -11035,7 +11035,7 @@ impl ContinuationDurableState {
         assert_eq!(slot.namespace, self.namespace, "ordinary namespace binding");
         assert!(!slot.identity_capture);
         assert_eq!(
-            slot.decided.get(&self.key).and_then(Option::as_ref),
+            slot.decided.get(&self.key).and_then(ScopeDecision::scope),
             Some(&self.scope),
             "ordinary GC decision survives continuation"
         );
@@ -12561,8 +12561,10 @@ fn o3_changed_object_and_scope_memo_capacity_read_without_replacement_authority(
                 .as_mut()
                 .unwrap();
             for n in 0..2 * store::MAX_RECORDS {
-                slot.decided
-                    .insert(format!("other-{n}"), Some(Scope("bounded".into())));
+                slot.decided.insert(
+                    format!("other-{n}"),
+                    ScopeDecision::Scope(Scope("bounded".into())),
+                );
             }
         }
         let mut saved = f.prior.clone();

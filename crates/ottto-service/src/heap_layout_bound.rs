@@ -81,7 +81,27 @@ pub(crate) fn bound<T: HeapLayoutBound>(value: &T, limit: usize) -> Option<usize
     value.heap_bound(&mut c)?;
     Some(c.bytes)
 }
+#[cfg(test)]
+thread_local! { static FORCE_UNSUPPORTED_LAYOUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+/// Test only, downward override: an unqualified Linux layout is never promoted.
+#[cfg(test)]
+pub(crate) fn with_unsupported_layout_for_test<R>(run: impl FnOnce() -> R) -> R {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FORCE_UNSUPPORTED_LAYOUT.with(|v| v.set(self.0));
+        }
+    }
+    let _reset = Reset(FORCE_UNSUPPORTED_LAYOUT.with(|v| v.replace(true)));
+    run()
+}
+
 pub(crate) fn layout_supported() -> bool {
+    #[cfg(test)]
+    if FORCE_UNSUPPORTED_LAYOUT.with(std::cell::Cell::get) {
+        return false;
+    }
     cfg!(target_os = "macos")
         && cfg!(target_pointer_width = "64")
         && compiler_layout_supported(env!("OTTTO_SCAN_LAYOUT_RUSTC"))

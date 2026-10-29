@@ -1167,13 +1167,15 @@ mod tests {
                 "eviction revokes permission"
             );
             let before = store.counters.guard_verify_bytes;
+            let header_before = store.counters.guard_header_bytes;
             let ReadOutcome::Found(record) = store.read(&missing) else {
                 panic!("reverify evicted A");
             };
             assert_eq!(
-                store.counters.guard_verify_bytes - before,
+                store.counters.guard_verify_bytes - before + store.counters.guard_header_bytes
+                    - header_before,
                 record.wire.as_ref().unwrap().encoded_len,
-                "exactly one bounded full record reread"
+                "one bounded reread: dispatch/header plus body/trailer, all counted"
             );
             store.authorize(
                 &record,

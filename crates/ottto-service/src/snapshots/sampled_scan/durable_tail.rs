@@ -288,13 +288,30 @@ impl Counters {
     }
 }
 
+/// Per-pass decisions share the existing index-bounded map. Layout GC is
+/// authorized only by the actual selected read's settlement, never its probe.
+#[derive(Clone, Debug)]
+enum ScopeDecision {
+    Scope(Scope),
+    Excluded,
+    LayoutUnavailable { settled: bool, verified: bool },
+}
+impl ScopeDecision {
+    fn scope(&self) -> Option<&Scope> {
+        match self {
+            Self::Scope(scope) => Some(scope),
+            _ => None,
+        }
+    }
+}
+
 struct Slot {
     dir: PathBuf,
     index_path: PathBuf,
     store: DurableTailStore,
     /// File scopes decided this pass, by key: GC drops a record bound to
     /// another scope. Keys not decided this pass keep their records.
-    decided: BTreeMap<String, Option<Scope>>,
+    decided: BTreeMap<String, ScopeDecision>,
     /// The pass's sampled scope and identity-capture mode.
     namespace: Scope,
     identity_capture: bool,
@@ -362,7 +379,7 @@ impl Slot {
         let scope = self
             .decided
             .get(key)
-            .and_then(Option::as_ref)
+            .and_then(ScopeDecision::scope)
             .ok_or("o3.scope_missing")?;
         let i = Interpretation::of(
             SnapshotSource::ClaudeCode,
@@ -1457,7 +1474,7 @@ fn authorize_strict(
     slot.indexed = index.files.len();
     slot.store
         .revoke(&store::key_digest(DurableSource::ClaudeCode, key));
-    let Some(scope) = slot.decided.get(key).and_then(Option::as_ref) else {
+    let Some(scope) = slot.decided.get(key).and_then(ScopeDecision::scope) else {
         return;
     };
     let source = durable_source(snapshot_source).expect("durable source");
@@ -2727,7 +2744,9 @@ impl SharedCache {
                     || stores
                         .slot(DurableSource::Codex)
                         .as_ref()
-                        .is_some_and(|slot| matches!(slot.decided.get(key), Some(None)));
+                        .is_some_and(|slot| {
+                            matches!(slot.decided.get(key), Some(ScopeDecision::Excluded))
+                        });
                 if excluded {
                     Counters::bump(
                         &mut stores.counters.ineligible,
@@ -2863,6 +2882,12 @@ impl SharedCache {
                 RestoreOutcome::FloorHeld
             }
             Err(RestoreOutcome::Miss(class @ MissClass::RealEdit(_))) => {
+                lease.release();
+                RestoreOutcome::Miss(class)
+            }
+            Err(RestoreOutcome::Miss(class @ MissClass::LayoutUnavailable(_))) => {
+                // Absence for this already-selected acquisition, not a new
+                // Full permission. Native preparation keeps its usual S2 checks.
                 lease.release();
                 RestoreOutcome::Miss(class)
             }
@@ -3157,6 +3182,34 @@ impl SharedCache {
                 }
             }
         };
+        if record.format == store::FORMAT_V3 && !crate::heap_layout_bound::layout_supported() {
+            let mut stores = self.durable().ok_or(MissClass::Unavailable)?;
+            let slot = stores.slot(source).as_mut().ok_or(MissClass::Unavailable)?;
+            if slot.decided.len() >= slot.indexed.saturating_add(2 * store::MAX_RECORDS)
+                && !slot.decided.contains_key(key)
+            {
+                return Err(RestoreOutcome::Pending); // Budget deferral: no input, no GC.
+            }
+            slot.decided.insert(
+                key.to_owned(),
+                ScopeDecision::LayoutUnavailable {
+                    settled: false,
+                    verified: false,
+                },
+            );
+            Counters::bump(
+                &mut stores.counters.ineligible,
+                "restore_unavailable.layout",
+            );
+            let audit_debt = (record.record.binding.context
+                == store::context_digest(
+                    &interpretation.namespace.0,
+                    index.active_upload_context_fingerprint.as_deref(),
+                ))
+            .then_some(record.envelope_audit_debt)
+            .flatten();
+            return Err(MissClass::LayoutUnavailable(audit_debt).into());
+        }
         // Missing membership is itself missing audit custody. Check the verified
         // same-context carrier before the entry-dependent binding; indexed keys
         // retain their existing real-edit and accepted-floor precedence below.
@@ -3792,7 +3845,8 @@ impl SharedCache {
         if slot.decided.len() < slot.indexed.saturating_add(2 * store::MAX_RECORDS)
             || slot.decided.contains_key(key)
         {
-            slot.decided.insert(key.to_string(), None);
+            slot.decided
+                .insert(key.to_string(), ScopeDecision::Excluded);
             Counters::bump(
                 &mut stores.counters.ineligible,
                 if parked {
@@ -3803,6 +3857,90 @@ impl SharedCache {
             );
         } else {
             Counters::bump(&mut stores.counters.ineligible, "pass_overflow.decided");
+        }
+    }
+
+    pub(in crate::snapshots) fn durable_note_native_layout_skipped(&self, source: SnapshotSource) {
+        if let Some(mut stores) = self.durable() {
+            Counters::bump(
+                &mut stores.counters.ineligible,
+                match source {
+                    SnapshotSource::ClaudeCode => "native_stage_skipped.layout_unsupported.claude",
+                    _ => "native_stage_skipped.layout_unsupported.codex",
+                },
+            );
+        }
+    }
+
+    /// Read completion/failure, never selection, budget deferral or cancellation.
+    pub(in crate::snapshots) fn durable_layout_read_settled(
+        &self,
+        snapshot_source: SnapshotSource,
+        key: &str,
+        index: &mut ScanIndex,
+        verified: bool,
+    ) {
+        if crate::heap_layout_bound::layout_supported() {
+            return;
+        }
+        let Some(source) = durable_source(snapshot_source) else {
+            return;
+        };
+        let Some(mut stores) = self.durable() else {
+            return;
+        };
+        let Some(slot) = stores.slot(source).as_mut() else {
+            return;
+        };
+        // Some selectors (history adoption) intentionally skip restore. They
+        // may still retire a known unrestorable A after their actual read.
+        let digest = store::key_digest(source, key);
+        let Some((format, _)) = slot.store.representation(&digest) else {
+            return;
+        };
+        if format != store::FORMAT_V3 {
+            return;
+        }
+        if slot.decided.len() >= slot.indexed.saturating_add(2 * store::MAX_RECORDS)
+            && !slot.decided.contains_key(key)
+        {
+            return;
+        }
+        let was_counted = matches!(
+            slot.decided.get(key),
+            Some(ScopeDecision::LayoutUnavailable { .. })
+        );
+        // A failed/lossy read cannot clear envelope debt. Re-arm only the
+        // existing same-context index carrier before post-save GC can retire A.
+        if !verified {
+            let context = store::context_digest(
+                &slot.namespace.0,
+                index.active_upload_context_fingerprint.as_deref(),
+            );
+            if let Some(due) = slot.store.carrier_debt(&digest, &context) {
+                let now = super::now_seconds();
+                let _ =
+                    MissClass::LayoutUnavailable(Some(due.min(now))).rearm_audit(index, key, now);
+            }
+        }
+        slot.decided.insert(
+            key.to_owned(),
+            ScopeDecision::LayoutUnavailable {
+                settled: true,
+                verified,
+            },
+        );
+        if !was_counted {
+            Counters::bump(
+                &mut stores.counters.ineligible,
+                "restore_unavailable.layout",
+            );
+        }
+        if !verified {
+            Counters::bump(
+                &mut stores.counters.ineligible,
+                "restore_unavailable.layout.read_failed",
+            );
         }
     }
 
@@ -3819,8 +3957,12 @@ impl SharedCache {
         if slot.decided.len() < slot.indexed.saturating_add(2 * store::MAX_RECORDS)
             || slot.decided.contains_key(key)
         {
-            if !matches!(slot.decided.get(key), Some(None)) {
-                slot.decided.insert(key.to_string(), Some(scope.clone()));
+            if !matches!(
+                slot.decided.get(key),
+                Some(ScopeDecision::Excluded | ScopeDecision::LayoutUnavailable { .. })
+            ) {
+                slot.decided
+                    .insert(key.to_string(), ScopeDecision::Scope(scope.clone()));
             }
         } else {
             Counters::bump(&mut stores.counters.ineligible, "pass_overflow.decided");
@@ -4215,7 +4357,23 @@ impl SharedCache {
                 if !inventory.contains(&digest) {
                     continue;
                 }
-                if matches!(slot.decided.get(key), Some(None))
+                if let Some(ScopeDecision::LayoutUnavailable { settled, verified }) =
+                    slot.decided.get(key)
+                {
+                    keep.insert(
+                        digest,
+                        if *settled {
+                            store::GcKeep::LayoutUnavailable {
+                                audit_debt: index.files[key].unverified_deadline(),
+                                verified: *verified,
+                            }
+                        } else {
+                            store::GcKeep::Unknown
+                        },
+                    );
+                    continue;
+                }
+                if matches!(slot.decided.get(key), Some(ScopeDecision::Excluded))
                     || source == DurableSource::Codex
                         && index.files[key].codex_history_is_protected()
                 {
@@ -4230,7 +4388,7 @@ impl SharedCache {
                 let scope = slot
                     .decided
                     .get(key)
-                    .and_then(Option::as_ref)
+                    .and_then(ScopeDecision::scope)
                     .and_then(|scope| {
                         if index.files[key].has_unverified_source() {
                             return None; // Keep the predecessor until a verified Full replaces it.
@@ -4349,10 +4507,22 @@ impl SharedCache {
             oldest_age: u64,
         }
         #[derive(serde::Serialize)]
+        struct StageSkipped {
+            layout_unsupported: u64,
+        }
+        #[derive(serde::Serialize)]
+        struct RestoreUnavailable {
+            layout: u64,
+            gc: u64,
+        }
+        #[derive(serde::Serialize)]
         struct StoreAlarm {
             #[serde(flatten)]
             store: store::StoreCounters,
             owed_overflow_discovery_only: bool,
+            platform: &'static str,
+            native_stage_skipped: StageSkipped,
+            restore_unavailable: RestoreUnavailable,
             #[serde(skip_serializing_if = "Option::is_none")]
             d3_claude_hold: Option<HoldAlarm>,
         }
@@ -4424,6 +4594,22 @@ impl SharedCache {
         };
         let hold_alarm = claude && stores.take_hold_alarm();
         let owed_overflow_discovery_only = stores.owed_overflow[source.slot()];
+        let skipped = stores
+            .counters
+            .ineligible
+            .get(if claude {
+                "native_stage_skipped.layout_unsupported.claude"
+            } else {
+                "native_stage_skipped.layout_unsupported.codex"
+            })
+            .copied()
+            .unwrap_or(0);
+        let unavailable = stores
+            .counters
+            .ineligible
+            .get("restore_unavailable.layout")
+            .copied()
+            .unwrap_or(0);
         let Some(slot) = stores.slot(source).as_mut() else {
             return;
         };
@@ -4467,6 +4653,14 @@ impl SharedCache {
                 &StoreAlarm {
                     store,
                     owed_overflow_discovery_only,
+                    platform: std::env::consts::OS,
+                    native_stage_skipped: StageSkipped {
+                        layout_unsupported: skipped,
+                    },
+                    restore_unavailable: RestoreUnavailable {
+                        layout: unavailable,
+                        gc: store.restore_unavailable_layout_gc,
+                    },
                     d3_claude_hold: (claude && (hold_keys > 0 || hold_alarm || hold_changed))
                         .then_some(HoldAlarm {
                             keys: hold_keys,
@@ -4534,6 +4728,8 @@ impl SharedCache {
 pub(crate) enum MissClass {
     AcceptedFloor,
     ExcludedClass,
+    /// Known v3, but this binary's bounded restore layout is unavailable.
+    LayoutUnavailable(Option<u64>),
     RealEdit(FullReason),
     Unavailable,
     NoEntry,
@@ -4560,14 +4756,25 @@ impl MissClass {
         key: &str,
         now: u64,
     ) -> Option<crate::transcript_acquisition::AuditDebt> {
-        if !matches!(self, Self::AuditCarrier) {
-            return None;
-        }
+        let envelope_due = match self {
+            Self::AuditCarrier => None,
+            Self::LayoutUnavailable(Some(due)) => Some(due),
+            _ => return None,
+        };
         let entry = index.files.get_mut(key)?;
         let due = entry
             .unverified_deadline()
             .filter(|due| *due > 0)
-            .map_or(now, |due| due.min(now));
+            .map_or(envelope_due.unwrap_or(now), |due| {
+                due.min(envelope_due.unwrap_or(now))
+            });
+        // Layout unavailability cannot turn the existing selection into a
+        // due-audit read. Preserve a valid future deadline until settlement.
+        let due = if matches!(self, Self::AuditCarrier) {
+            due.min(now)
+        } else {
+            due
+        };
         entry.set_unverified_deadline(due);
         Some(crate::transcript_acquisition::AuditDebt {
             due_unix_seconds: due,
@@ -4587,6 +4794,7 @@ impl MissClass {
         }
         match self {
             Self::ExcludedClass => "class_excluded",
+            Self::LayoutUnavailable(_) => "restore_unavailable.layout",
             Self::AcceptedFloor => "accepted_body_floor",
             Self::RealEdit(reason) => match reason {
                 FullReason::Replaced => "s2_skipped_real_edit.replaced",

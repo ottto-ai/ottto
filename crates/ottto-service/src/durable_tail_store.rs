@@ -605,6 +605,7 @@ pub(crate) struct StoreCounters {
     pub(crate) gc_records_deleted: u64,
     pub(crate) native_class_retired: u64,
     pub(crate) native_class_parked: u64,
+    pub(crate) restore_unavailable_layout_gc: u64,
     pub(crate) gc_temps_deleted: u64,
     /// Actual dispatch/representation header bytes read by GC; body verification has separate counters.
     pub(crate) gc_records_read: u64,
@@ -621,7 +622,13 @@ pub(crate) struct StoreCounters {
 pub(crate) enum GcKeep {
     Unknown,
     Scope(Digest32),
-    Excluded { audit_debt: Option<u64> },
+    Excluded {
+        audit_debt: Option<u64>,
+    },
+    LayoutUnavailable {
+        audit_debt: Option<u64>,
+        verified: bool,
+    },
 }
 
 /// Fixed-size key/content/target identities for the strict Claude caller.
@@ -1960,7 +1967,27 @@ impl DurableTailStore {
                 on_disk.insert(key, len);
                 continue;
             }
+            let mut layout_retirement = None;
             let verdict = match self.classify(&key, "delete", Some(writer)) {
+                Ok(Some(header))
+                    if header.format == FORMAT_V3
+                        && !crate::heap_layout_bound::layout_supported() =>
+                {
+                    match keep.get(&key) {
+                        Some(GcKeep::LayoutUnavailable {
+                            audit_debt,
+                            verified,
+                        }) if *verified
+                            || header.audit_debt.map_or(true, |due| {
+                                audit_debt.is_some_and(|carrier| carrier > 0 && carrier <= due)
+                            }) =>
+                        {
+                            layout_retirement = header.stamp;
+                            None
+                        }
+                        _ => Some(len), // No actual settled read: preserve A.
+                    }
+                }
                 Ok(Some(header))
                     if (matches!(keep.get(&key), Some(GcKeep::Excluded { .. }))
                         || !keep.contains_key(&key))
@@ -2004,7 +2031,11 @@ impl DurableTailStore {
                     let live = binding.context == *live_context
                         && match keep.get(&key) {
                             Some(GcKeep::Scope(scope)) => *scope == binding.scope,
-                            Some(GcKeep::Unknown | GcKeep::Excluded { .. }) => true,
+                            Some(
+                                GcKeep::Unknown
+                                | GcKeep::Excluded { .. }
+                                | GcKeep::LayoutUnavailable { .. },
+                            ) => true,
                             None => false,
                         };
                     live.then_some(len)
@@ -2018,7 +2049,15 @@ impl DurableTailStore {
                     on_disk.insert(key, len);
                 }
                 None => {
+                    if let Some(stamp) = layout_retirement {
+                        if stamp_at(&path)? != Some(stamp) {
+                            on_disk.insert(key, len);
+                            continue; // Replaced since verification: never unlink the new record.
+                        }
+                    }
                     remove_if_present(&path)?;
+                    self.counters.restore_unavailable_layout_gc +=
+                        u64::from(layout_retirement.is_some());
                     self.durable.remove(&key);
                     self.counters.gc_records_deleted += 1;
                     deleted = true;

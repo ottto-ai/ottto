@@ -1,7 +1,7 @@
 # M3 write-ahead assembly
 
-The assembly now stages the existing format-3 envelope from the native PRE
-accumulator, commits an owned private temporary file, and settles its exact
+The assembly stages the existing format-3 envelope on a supported restore
+layout from the native PRE accumulator, commits an owned private temporary file, and settles its exact
 receipt before cursor, membership or publication effects. Retained and no-copy
 completion use the same typed serializer. The five facade entry points remain
 `prepare_live`, `commit_prepared`, `resolve_failed_preparation`,
@@ -119,12 +119,32 @@ GC uses that same canonical classification. No persisted field is added.
 Portable cap fixtures cover actual native publication with a full debt map and
 one-pass saturation/eviction of 256 authorized memo entries for both sources.
 
-Linux runtime qualification remains open. The earlier run passed both Clippy
-jobs but exposed runtime failures, including the parked old-writer provenance
-rows. In particular, a native record can exist on an unsupported retained layout;
-a quiet selected file then cannot restore and the existing growth-only resource
-Full policy can defer it. The permitted fallback for a quiet selection remains
-an owner decision; no new Full cause or permission was added here.
+Round 13 applies the accepted layout qualification. Native live staging uses
+exactly the restore codec's supported-layout predicate, before acquiring a chain
+or writing a v3 record. Unsupported layouts keep the legacy path and count
+`native_stage_skipped{layout_unsupported}`.
+
+A known v3 record on an unsupported layout is absent for an already-selected
+read: `restore_unavailable{layout}` is counted and the selector keeps its own
+reason for an ordinary `Full(StateMissing)`. An unselected key still reads zero
+bytes. Newer formats and unknown representations retain their holds and bytes.
+The existing bounded per-pass decision map carries whether that actual native
+read settled. Deferred reads preserve the record. After settlement or a counted
+read failure, post-save GC may retire only the fully verified known record;
+a failed or lossy read must first retain any envelope audit debt in the index.
+A verified Full can discharge that audit through its normal completion. GC
+rechecks the verified target stamp before unlink and counts successful removal.
+No layout fallback creates receipt, money ACK, membership or a new Full cause.
+
+The existing diagnostics snapshot includes platform, stage skips, unavailable
+restores and retirement counts. Both layout fallback and GC counts stay zero on
+the qualified macOS production layout. Portable fixtures use only a downward
+test override of the real predicate; they never declare Linux layout supported.
+A supported-layout control still exercises actual restore and Tail.
+
+Linux runtime qualification remains open, including #882's parked provenance
+rows. Runtime results and exact-head Clippy receipts are reported separately;
+compile checks and authored fixtures are not claimed as executed money proof.
 
 At the future E2 B/C composition seam, discovery must use one union of
 `DiscoveryRecovery` and `DiscoveryRetention` at directory traversal, retained

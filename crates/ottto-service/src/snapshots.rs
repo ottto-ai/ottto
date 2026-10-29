@@ -139,6 +139,8 @@ mod file_set_digest_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod m3_d3_tests;
 #[cfg(all(test, unix))]
+mod m3_layout_tests;
+#[cfg(all(test, unix))]
 mod m3_native_tests;
 #[cfg(test)]
 pub(crate) use codex_counting_version::TestCutover;
@@ -28314,6 +28316,15 @@ impl OwnedSourceScan {
                         pending!();
                     }
                     Err(error) => {
+                        #[cfg(unix)]
+                        if let Some(context) = sampling.as_ref() {
+                            context.cache.durable_layout_read_settled(
+                                source,
+                                &local_index_key(&active.candidate.path),
+                                index,
+                                false,
+                            );
+                        }
                         migration_failure!(&active.candidate);
                         // U1a-2a G14a: a side read error is its charged
                         // attempt; no census line, no dequeue.
@@ -29401,6 +29412,10 @@ impl OwnedSourceScan {
                     .and_then(|(context, active)| {
                         let held =
                             native_writeahead_descriptor(&candidate.path, &parser.reader.reader)?;
+                        if !crate::heap_layout_bound::layout_supported() {
+                            context.cache.durable_note_native_layout_skipped(source);
+                            return None;
+                        }
                         Some((context, active, held))
                     });
                 #[cfg(unix)]
@@ -29517,6 +29532,15 @@ impl OwnedSourceScan {
                         pending!();
                     }
                     Err(_error) => {
+                        #[cfg(unix)]
+                        if let Some(context) = sampling.as_ref() {
+                            context.cache.durable_layout_read_settled(
+                                source,
+                                &local_index_key(&candidate.path),
+                                index,
+                                false,
+                            );
+                        }
                         migration_failure!(&candidate);
                         #[cfg(test)]
                         sampled_scan::test_hooks::record_finish_error(&_error);
@@ -30208,6 +30232,15 @@ impl OwnedSourceScan {
                             recognized_usage_drop_count,
                             dropped_usage_record_count,
                         ));
+                #[cfg(unix)]
+                if let Some(context) = sampling.as_ref() {
+                    context.cache.durable_layout_read_settled(
+                        source,
+                        &index_key,
+                        index,
+                        source_verified && parse_complete,
+                    );
+                }
                 if source == SnapshotSource::ClaudeCode {
                     index.claude_full_rearm_progress.rebuild_read_full &= parse_complete
                         && source_verified

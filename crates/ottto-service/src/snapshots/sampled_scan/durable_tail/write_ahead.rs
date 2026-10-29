@@ -601,6 +601,10 @@ impl SharedCache {
         view: &LiveFinishView<'_>,
     ) -> PrepareOutcome {
         let chain = view.chain;
+        if !crate::heap_layout_bound::layout_supported() {
+            self.durable_note_native_layout_skipped(chain.source());
+            return PrepareOutcome::NotPersisted(NotPersisted::Layout);
+        }
         let Some(source) = durable_source(chain.source()) else {
             return PrepareOutcome::NotPersisted(NotPersisted::Layout);
         };
