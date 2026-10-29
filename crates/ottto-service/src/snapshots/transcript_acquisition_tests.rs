@@ -3664,3 +3664,5 @@ fn sampled_native_codex_over_cap_cache_breaks_tail_with_full_parse_parity() {
     assert_eq!(body, oracle(&fixture, source));
     assert_eq!(uploaded_cache_breaks(&body), (first, &json!(6)));
 }
+
+mod codex_mcp_version_tests;

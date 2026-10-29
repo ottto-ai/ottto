@@ -4670,6 +4670,7 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
                     ticket.with_inputs(take_continuation_inputs(
                         &mut completed.0,
                         &self.daemon.codex_preludes,
+                        self.daemon.codex_versions.clone(),
                     ))
                 })
             });
@@ -4707,14 +4708,18 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
         self.started.elapsed()
     }
     fn retained_bound(&self, limit: usize) -> Option<usize> {
+        let versions = crate::heap_layout_bound::bound(&self.daemon.codex_versions, limit)?;
         let native = if crate::snapshots::claude_native_comparison::enabled() {
-            self.daemon.native_comparison.retained_bound(limit)?
+            self.daemon
+                .native_comparison
+                .retained_bound(limit.checked_sub(versions)?)?
         } else {
             0
         };
+        let owned = versions.checked_add(native)?;
         // Stage 1 (K2): a held continuation ticket's inputs; zero while inert.
-        let continuation = continuation::retained_bound(limit.checked_sub(native)?)?;
-        native.checked_add(continuation)
+        let continuation = continuation::retained_bound(limit.checked_sub(owned)?)?;
+        owned.checked_add(continuation)
     }
     fn discard_retained(&mut self) {
         if crate::snapshots::claude_native_comparison::enabled() {
@@ -6281,7 +6286,8 @@ fn prepare_sync_source_inner(
         request_identity_capture,
     )
     .with_sampled_acquisition(daemon.transcript_cache.clone(), sampled_scope.clone())
-    .with_codex_side_pass(codex_side_pass);
+    .with_codex_side_pass(codex_side_pass)
+    .with_codex_versions(daemon.codex_versions.clone());
     if source == SnapshotSource::ClaudeCode {
         scan = scan.with_line_observer("footprint", daemon.footprint_cwds.observer());
     } else if source == SnapshotSource::Codex {
@@ -6341,6 +6347,7 @@ fn prepare_sync_source_inner(
 /// (`continuation::retained_bound`).
 struct ContinuationInputs {
     codex_preludes: std::sync::Arc<crate::codex_prelude_footprint::CodexPreludeFeed>,
+    codex_versions: std::sync::Arc<crate::snapshots::codex_version::CodexVersionFeed>,
     account_witness: [u8; 32],
     activity_hint: crate::snapshot_client::ActivityHintResponse,
     receipt_window_days: u64,
@@ -6358,7 +6365,7 @@ struct ContinuationInputs {
 crate::heap_layout_bound::fields!(ContinuationInputs; codex_preludes, account_witness, activity_hint,
     receipt_window_days, context_curve_enabled, cache_observations_enabled,
     scan_agent_status_collection, attribution_context, upload_policy,
-    upload_destination_namespace, receipt_client, index_path, upload_progress_path);
+    upload_destination_namespace, receipt_client, index_path, upload_progress_path; shared codex_versions);
 
 impl ContinuationInputs {
     /// Whether the moved attribution context is present (tests read this
@@ -6376,6 +6383,7 @@ impl ContinuationInputs {
 fn take_continuation_inputs(
     preparation: &mut SourcePreparation,
     codex_preludes: &std::sync::Arc<crate::codex_prelude_footprint::CodexPreludeFeed>,
+    codex_versions: std::sync::Arc<crate::snapshots::codex_version::CodexVersionFeed>,
 ) -> ContinuationInputs {
     let mut activity_hint = preparation.activity_hint.clone();
     // The prepare took the raw key out of its hint already; never keep one.
@@ -6384,6 +6392,7 @@ fn take_continuation_inputs(
     }
     ContinuationInputs {
         codex_preludes: std::sync::Arc::clone(codex_preludes),
+        codex_versions,
         account_witness: preparation.account_witness,
         activity_hint,
         receipt_window_days: preparation.receipt_window_days,
@@ -6668,7 +6677,8 @@ fn prepare_continuation_source(
         ),
     )
     .with_codex_side_pass(Some(codex_side_pass))
-    .with_line_observer("codex_prelude", inputs.codex_preludes.observer(&roots));
+    .with_line_observer("codex_prelude", inputs.codex_preludes.observer(&roots))
+    .with_codex_versions(inputs.codex_versions.clone());
     Ok(Ok(SourcePreparation {
         native_comparison_reservation: None,
         native_comparison_lease: None,

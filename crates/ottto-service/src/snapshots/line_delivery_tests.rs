@@ -440,6 +440,10 @@ fn unplanned_claude_read_delivers_all_lines_from_zero_and_counts_them() {
         Some(&recorder),
         None,
     );
+    assert!(recorder
+        .events()
+        .iter()
+        .any(|e| matches!(e, Event::Begin(v) if v.source == SnapshotSource::ClaudeCode)));
     assert_eq!(result.scanned_file_count, 1);
 
     let held = fs::metadata(&path).unwrap();
@@ -622,6 +626,14 @@ fn codex_group_member_reads_call_no_observer() {
         false,
     )
     .with_line_observer("test", Box::new(recorder.clone()));
+    scan = step_until(scan, |s| {
+        s.active_file.as_deref().is_some_and(|a| a.group.is_some())
+    });
+    assert!(!scan
+        .active_file
+        .as_deref()
+        .unwrap()
+        .is_primary_for(SnapshotSource::Codex));
     let result = loop {
         match scan.step(None) {
             OwnedSourceScanStep::Pending(next) => scan = next,

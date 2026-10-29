@@ -1,6 +1,6 @@
 //! Configured-MCP context-footprint harvest.
 //!
-//! On each periodic snapshot sync this module discovers the MCP servers each
+//! Every six hours this module discovers the MCP servers each
 //! coding agent has configured (Claude Code, Codex), runs the MCP
 //! `initialize` + `tools/list` handshake against every reachable server, and
 //! POSTs the raw `tools/list` output to the backend ingest endpoint
@@ -19,6 +19,7 @@
 //! until a network MCP client lands — see `TODO(mcp-http-transport)` below.
 
 use crate::snapshot_client::{load_snapshot_device_credentials, SnapshotApiClient};
+use crate::snapshots::codex_version::{CodexVersionFeed, Sample};
 use crate::snapshots::SnapshotSource;
 use anyhow::{anyhow, Result};
 use ottto_core::{default_support_dir, LocalDeviceBinding};
@@ -34,8 +35,10 @@ use std::process::Child;
 use std::process::Command;
 #[cfg(not(unix))]
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(unix))]
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
@@ -283,7 +286,7 @@ enum LoadingPolicy {
 }
 
 impl LoadingPolicy {
-    fn read(home: &Path, source: SnapshotSource) -> Self {
+    fn read(home: &Path, source: SnapshotSource, codex_version: Option<&str>) -> Self {
         match source {
             SnapshotSource::ClaudeCode => LoadingPolicy::Claude {
                 home: home.to_path_buf(),
@@ -291,7 +294,7 @@ impl LoadingPolicy {
                 env: claude_loading_env(&claude_user_settings(home)),
             },
             SnapshotSource::Codex => LoadingPolicy::Codex {
-                version: codex_client_version(home),
+                version: codex_version.map(str::to_string),
             },
             SnapshotSource::Pi => LoadingPolicy::Unsupported,
         }
@@ -421,7 +424,7 @@ fn tool_search_auto_pct(env: &ClaudeLoadingEnv) -> Option<u8> {
 
 /// `major.minor.patch` from a version string such as `2.1.300 (Claude Code)`
 /// or `0.155.0-alpha.16.4`.
-fn parse_version(value: &str) -> Option<(u64, u64, u64)> {
+pub(crate) fn parse_version(value: &str) -> Option<(u64, u64, u64)> {
     let core = value
         .trim()
         .split(|c: char| c.is_whitespace() || c == '-' || c == '+')
@@ -518,93 +521,6 @@ fn claude_client_version(home: &Path) -> Option<String> {
         .map(str::trim)
         .filter(|version| parse_version(version).is_some())
         .map(|version| version.chars().take(64).collect())
-}
-
-/// Bound on the first session-log line read for the Codex version.
-const CODEX_SESSION_META_MAX_BYTES: u64 = 64 * 1024;
-
-/// The `cli_version` of the newest Codex session log under
-/// `~/.codex/sessions/YYYY/MM/DD/`. Directory and file names sort by time, so
-/// only the newest branch is listed and one bounded first line is read.
-fn codex_client_version(home: &Path) -> Option<String> {
-    use std::io::Read;
-
-    fn newest_child(dir: &Path, want_dir: bool) -> Option<PathBuf> {
-        std::fs::read_dir(dir)
-            .ok()?
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| {
-                entry.file_type().is_ok_and(|kind| {
-                    if want_dir {
-                        kind.is_dir()
-                    } else {
-                        kind.is_file()
-                    }
-                })
-            })
-            .map(|entry| entry.path())
-            .filter(|path| {
-                let name = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("");
-                if want_dir {
-                    name.chars().all(|c| c.is_ascii_digit())
-                } else {
-                    name.starts_with("rollout-") && name.ends_with(".jsonl")
-                }
-            })
-            .max()
-    }
-
-    let mut dir = home.join(".codex").join("sessions");
-    for _ in 0..3 {
-        dir = newest_child(&dir, true)?;
-    }
-    let newest = newest_child(&dir, false);
-    if newest_archive_is_newer(&dir, newest.as_deref()) {
-        // Archives are never decoded here; the version comes from an older
-        // plain log, or is unknown.
-        eprintln!(
-            "mcp_harvest codex_version=unavailable reason=CompressedClientVersionUnavailable"
-        );
-    }
-    let file = std::fs::File::open(newest?).ok()?;
-    let mut reader = BufReader::new(file.take(CODEX_SESSION_META_MAX_BYTES));
-    let mut first = String::new();
-    reader.read_line(&mut first).ok()?;
-    let meta: Value = serde_json::from_str(first.trim()).ok()?;
-    meta.get("payload")
-        .and_then(|payload| payload.get("cli_version"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|version| parse_version(version).is_some())
-        .map(|version| version.chars().take(64).collect())
-}
-
-/// Whether the newest rollout in `dir` is a `.jsonl.zst` archive, newer than
-/// `newest_plain` (or with no plain log at all). Names only, nothing is read.
-fn newest_archive_is_newer(dir: &Path, newest_plain: Option<&Path>) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return false;
-    };
-    let newest_archive = entries
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
-        .filter_map(|entry| {
-            let name = entry.file_name().into_string().ok()?;
-            let stem = name.strip_suffix(".zst")?;
-            (stem.starts_with("rollout-") && stem.ends_with(".jsonl")).then(|| stem.to_string())
-        })
-        .max();
-    let plain = newest_plain
-        .and_then(|path| path.file_name())
-        .and_then(|name| name.to_str());
-    match (newest_archive, plain) {
-        (Some(archive), Some(plain)) => archive.as_str() > plain,
-        (Some(_), None) => true,
-        (None, _) => false,
-    }
 }
 
 /// Stamp each harvested server with its loading decision.
@@ -1650,11 +1566,12 @@ fn build_inventory(
     source: SnapshotSource,
     machine_id: Option<&str>,
     deadline: Instant,
+    codex_version: Option<&str>,
 ) -> BuildResult {
     let started = Instant::now();
     let configured = discover_servers(home, source);
     let capabilities = discover_capabilities(home, source);
-    let policy = LoadingPolicy::read(home, source);
+    let policy = LoadingPolicy::read(home, source, codex_version);
     let spawn_env = SpawnEnv::resolve();
     let (mut servers, throttled, claude_deferred) =
         harvest_servers(&configured, deadline, &spawn_env);
@@ -1669,6 +1586,7 @@ fn build_inventory(
         dropped: configured.len() - servers.len(),
         throttled,
         claude_deferred,
+        version_available: policy.client_version().is_some(),
     };
     BuildResult {
         inventory: McpInventoryIngestRequest {
@@ -1698,6 +1616,7 @@ fn unbounded_deadline() -> Instant {
 /// log line for live benchmarking + alerting. Never includes any server command,
 /// url, or schema.
 struct HarvestMetrics {
+    version_available: bool,
     source: SnapshotSource,
     wall: Duration,
     configured: usize,
@@ -1711,12 +1630,12 @@ struct HarvestMetrics {
 }
 
 impl HarvestMetrics {
-    fn log(&self) {
+    fn log(&self, observed: u64, rejected: u64) {
         let (self_rss_mb, children_rss_mb, cpu_s) = process_resource_usage();
         eprintln!(
             "mcp_harvest_metrics source={} wall_ms={} configured={} reachable={} \
              unreachable={} dropped={} throttled={} claude_deferred={} max_rss_self_mb={} \
-             max_rss_children_mb={} cpu_s={:.2}",
+             max_rss_children_mb={} cpu_s={:.2} version_available={} version_observed={} version_rejected={} seed_rejected={}",
             self.source.api_slug(),
             self.wall.as_millis(),
             self.configured,
@@ -1728,6 +1647,10 @@ impl HarvestMetrics {
             self_rss_mb,
             children_rss_mb,
             cpu_s,
+            self.version_available,
+            observed,
+            rejected,
+            SEED_REJECTED.load(Ordering::Relaxed),
         );
     }
 }
@@ -1821,6 +1744,7 @@ pub fn dump_inventory(agent: &str) -> Result<Value> {
         source,
         best_effort_machine_id().as_deref(),
         unbounded_deadline(),
+        dump_seed(source).as_ref().and_then(Sample::version),
     );
     serde_json::to_value(&built.inventory).map_err(|error| anyhow!("encode inventory: {error}"))
 }
@@ -1833,7 +1757,13 @@ pub fn dump_all_inventories() -> Result<Value> {
     let inventories: Vec<Value> = [SnapshotSource::ClaudeCode, SnapshotSource::Codex]
         .into_iter()
         .map(|source| {
-            let built = build_inventory(&home, source, machine_id.as_deref(), unbounded_deadline());
+            let built = build_inventory(
+                &home,
+                source,
+                machine_id.as_deref(),
+                unbounded_deadline(),
+                dump_seed(source).as_ref().and_then(Sample::version),
+            );
             serde_json::to_value(&built.inventory)
         })
         .collect::<std::result::Result<_, _>>()
@@ -1847,8 +1777,10 @@ pub fn dump_all_inventories() -> Result<Value> {
 
 /// Persisted per-source record of the last successfully-uploaded inventory, so a
 /// byte-identical inventory can skip the upload entirely on the next cycle.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct InventoryCacheEntry {
+    #[serde(default, deserialize_with = "load_seed")]
+    seed: Option<VersionSeed>,
     /// The destination principal that received this upload (`device_id`,
     /// `machine_id`, API base URL). A skip is only valid against the SAME
     /// destination: if the daemon is re-claimed/re-onboarded (new device or
@@ -1860,6 +1792,52 @@ struct InventoryCacheEntry {
     /// RFC3339 timestamp of the last successful POST (drives the staleness
     /// force-refresh).
     posted_at: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct VersionSeed {
+    cli_version: Option<String>,
+    started_at: String,
+}
+impl VersionSeed {
+    fn sample(&self) -> Option<Sample> {
+        Sample::new(&self.started_at, self.cli_version.as_deref()).filter(|s| s.version().is_some())
+    }
+    fn from_sample(sample: Sample) -> Self {
+        Self {
+            cli_version: sample.version().map(str::to_string),
+            started_at: sample.started_at.format(&Rfc3339).unwrap_or_default(),
+        }
+    }
+}
+static SEED_REJECTED: AtomicU64 = AtomicU64::new(0);
+fn load_seed<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<VersionSeed>, D::Error> {
+    let raw = Value::deserialize(d)?;
+    if raw.is_null() {
+        return Ok(None);
+    }
+    let seed = serde_json::from_value::<VersionSeed>(raw)
+        .ok()
+        .filter(|s| s.sample().is_some());
+    if seed.is_none() {
+        SEED_REJECTED.fetch_add(1, Ordering::Relaxed);
+    }
+    Ok(seed)
+}
+fn dump_seed(source: SnapshotSource) -> Option<Sample> {
+    let device = ottto_core::FileDeviceStore::default().load().ok()??;
+    let machine = crate::snapshot_sync::snapshot_machine_id(&device).ok()??;
+    let identity = destination_identity(
+        &device,
+        &machine,
+        &crate::snapshot_sync::snapshot_api_base_url().ok()?,
+    );
+    read_cache(&cache_path(&default_support_dir(), source))
+        .filter(|c| c.identity == identity)?
+        .seed?
+        .sample()
 }
 
 /// The destination identity an upload was attributed to. A change in any
@@ -1893,7 +1871,9 @@ fn write_cache(path: &Path, entry: &InventoryCacheEntry) {
     if std::fs::create_dir_all(dir).is_err() {
         return;
     }
-    let Ok(payload) = serde_json::to_vec(entry) else {
+    let mut entry = entry.clone();
+    entry.seed = entry.seed.filter(|s| s.sample().is_some());
+    let Ok(payload) = serde_json::to_vec(&entry) else {
         return;
     };
     let temp = path.with_extension("json.tmp");
@@ -2016,12 +1996,18 @@ fn clear_org_disabled_marker(path: &Path) {
 /// has been granted (`enabled_snapshot_sources`), and only when the device is
 /// registered at all — so telemetry-off ⇒ no device/sources ⇒ no harvest.
 pub fn spawn_mcp_inventory_sync() -> Result<()> {
+    spawn_inventory_sync(None)
+}
+pub fn spawn_mcp_inventory_sync_for_daemon(daemon: &crate::LocalDaemon) -> Result<()> {
+    spawn_inventory_sync(Some(daemon.codex_versions.clone()))
+}
+fn spawn_inventory_sync(feed: Option<Arc<CodexVersionFeed>>) -> Result<()> {
     let home = crate::snapshot_sync::home_dir()?;
     let support_dir = default_support_dir();
     std::thread::Builder::new()
         .name("ottto-mcp-inventory-sync".to_string())
         .spawn(move || loop {
-            if let Err(error) = harvest_all_once(&home, &support_dir) {
+            if let Err(error) = harvest_all_once(&home, &support_dir, feed.as_deref()) {
                 eprintln!(
                     "mcp inventory harvest skipped: {}",
                     crate::snapshot_sync::safe_error(&error)
@@ -2034,7 +2020,11 @@ pub fn spawn_mcp_inventory_sync() -> Result<()> {
 }
 
 /// One harvest cycle across every granted agent source on this machine.
-fn harvest_all_once(home: &Path, support_dir: &Path) -> Result<()> {
+fn harvest_all_once(
+    home: &Path,
+    support_dir: &Path,
+    feed: Option<&CodexVersionFeed>,
+) -> Result<()> {
     // Local kill-switch: a user can disable the harvest on their own machine
     // (independent of the org setting) by setting `OTTTO_MCP_HARVEST_DISABLED` or
     // dropping `<support>/mcp_inventory/disabled`. Checked first, so a disabled
@@ -2064,6 +2054,7 @@ fn harvest_all_once(home: &Path, support_dir: &Path) -> Result<()> {
             &api_base_url,
             home,
             support_dir,
+            feed,
         ) {
             eprintln!(
                 "mcp inventory harvest skipped for {}: {}",
@@ -2103,6 +2094,7 @@ fn harvest_source(
     api_base_url: &str,
     home: &Path,
     support_dir: &Path,
+    feed: Option<&CodexVersionFeed>,
 ) -> Result<()> {
     let relay_token = client.issue_relay_token(device, device_secret, source)?;
     let identity = destination_identity(device, machine_id, api_base_url);
@@ -2128,13 +2120,31 @@ fn harvest_source(
         Err(_) => {}
     }
 
+    let path = cache_path(support_dir, source);
+    let cached = read_cache(&path);
+    let (live, observed, rejected) = feed
+        .filter(|_| source == SnapshotSource::Codex)
+        .map_or((None, 0, 0), CodexVersionFeed::snapshot);
+    let seed = (source == SnapshotSource::Codex)
+        .then(|| {
+            Sample::newest(
+                cached
+                    .as_ref()
+                    .filter(|c| c.identity == identity)
+                    .and_then(|c| c.seed.as_ref())
+                    .and_then(VersionSeed::sample),
+                live,
+            )
+        })
+        .flatten();
     let BuildResult { inventory, metrics } = build_inventory(
         home,
         source,
         Some(machine_id),
         Instant::now() + MCP_HARVEST_CYCLE_BUDGET,
+        seed.as_ref().and_then(Sample::version),
     );
-    metrics.log();
+    metrics.log(observed, rejected);
 
     // A throttled cycle harvested only part of the configured surface; uploading
     // it would drop the un-probed servers from /optimize. Skip the POST and leave
@@ -2144,9 +2154,7 @@ fn harvest_source(
     }
 
     let hash = inventory_hash(&inventory)?;
-    let path = cache_path(support_dir, source);
     let now = OffsetDateTime::now_utc();
-    let cached = read_cache(&path);
 
     if keep_last_inventory(metrics.claude_deferred, cached.as_ref(), &identity, now) {
         return Ok(());
@@ -2175,6 +2183,9 @@ fn harvest_source(
             identity,
             inventory_sha256: hash,
             posted_at: now.format(&Rfc3339).unwrap_or_default(),
+            seed: seed
+                .filter(|s| s.version() == inventory.client_version.as_deref())
+                .map(VersionSeed::from_sample),
         },
     );
     Ok(())
@@ -2484,31 +2495,6 @@ mod tests {
             println!("MCP_RESOURCE mode={mode} fds_before={} fds_after={} threads_before={} threads_after={} admitted=0", before.0,after.0,before.1,after.1);
             assert_eq!(after, before);
         }
-    }
-
-    #[test]
-    fn codex_version_notes_a_newer_archive_without_reading_it() {
-        let home = test_home("codex-version-archive");
-        let day = home.join(".codex/sessions/2026/10/28");
-        fs::create_dir_all(&day).unwrap();
-        let meta = r#"{"type":"session_meta","payload":{"cli_version":"0.50.0"}}"#;
-        let older = day.join("rollout-2026-10-28T01-00-00-a.jsonl");
-        fs::write(&older, format!("{meta}\n")).unwrap();
-        assert!(!newest_archive_is_newer(&day, Some(&older)));
-        // A plain log's own archive twin is not newer.
-        fs::write(day.join("rollout-2026-10-28T01-00-00-a.jsonl.zst"), b"x").unwrap();
-        assert!(!newest_archive_is_newer(&day, Some(&older)));
-        // A directory named like an archive is not one.
-        fs::create_dir(day.join("rollout-2026-10-28T03-00-00-c.jsonl.zst")).unwrap();
-        assert!(!newest_archive_is_newer(&day, Some(&older)));
-        fs::remove_dir(day.join("rollout-2026-10-28T03-00-00-c.jsonl.zst")).unwrap();
-        // A newer archive is reported, from its name alone; the version still
-        // comes from the older plain log.
-        fs::write(day.join("rollout-2026-10-28T02-00-00-b.jsonl.zst"), b"x").unwrap();
-        assert!(newest_archive_is_newer(&day, Some(&older)));
-        assert!(newest_archive_is_newer(&day, None));
-        assert_eq!(codex_client_version(&home).as_deref(), Some("0.50.0"));
-        fs::remove_dir_all(&home).unwrap();
     }
 
     fn test_home(name: &str) -> PathBuf {
@@ -3143,7 +3129,7 @@ url = "https://unset.test/mcp"
             json!({ "env": { "ENABLE_TOOL_SEARCH": "false" } }).to_string(),
         )
         .unwrap();
-        let policy = LoadingPolicy::read(&home, SnapshotSource::ClaudeCode);
+        let policy = LoadingPolicy::read(&home, SnapshotSource::ClaudeCode, None);
         let configured = discover_claude_code(&home);
         let mut servers: Vec<McpServerInput> = configured.iter().map(unreachable_server).collect();
         apply_loading_policy(&mut servers, &configured, &policy);
@@ -3164,7 +3150,7 @@ url = "https://unset.test/mcp"
             json!({ "env": { "ENABLE_TOOL_SEARCH": "auto:5" } }).to_string(),
         )
         .unwrap();
-        let policy = LoadingPolicy::read(&home, SnapshotSource::ClaudeCode);
+        let policy = LoadingPolicy::read(&home, SnapshotSource::ClaudeCode, None);
         assert_eq!(policy.tool_search_auto_pct(), None);
         let mut servers: Vec<McpServerInput> = configured.iter().map(unreachable_server).collect();
         apply_loading_policy(&mut servers, &configured, &policy);
@@ -3175,7 +3161,7 @@ url = "https://unset.test/mcp"
     }
 
     #[test]
-    fn loading_policy_reads_claude_settings_and_codex_session_version() {
+    fn loading_policy_reads_claude_settings_and_accepts_codex_sample() {
         let home = test_home("loading-policy");
         fs::create_dir_all(home.join(".claude")).unwrap();
         fs::write(
@@ -3201,7 +3187,7 @@ url = "https://unset.test/mcp"
             json!({ "env": { "ENABLE_TOOL_SEARCH": "auto:20" } }).to_string(),
         )
         .unwrap();
-        let policy = LoadingPolicy::read(&home, SnapshotSource::ClaudeCode);
+        let policy = LoadingPolicy::read(&home, SnapshotSource::ClaudeCode, None);
         assert_eq!(policy.client_version().as_deref(), Some("2.1.299"));
         assert_eq!(policy.tool_search_auto_pct(), Some(20));
 
@@ -3215,37 +3201,7 @@ url = "https://unset.test/mcp"
         assert_eq!(by_name("lazy").loading_mode, "unknown");
         assert_eq!(by_name("lazy").loading_mode_basis, "tool_search_auto");
 
-        // Codex: the newest session log's first line carries the version.
-        let day = home
-            .join(".codex")
-            .join("sessions")
-            .join("2026")
-            .join("10")
-            .join("18");
-        fs::create_dir_all(&day).unwrap();
-        let old_day = home
-            .join(".codex")
-            .join("sessions")
-            .join("2026")
-            .join("09")
-            .join("30");
-        fs::create_dir_all(&old_day).unwrap();
-        fs::write(
-            old_day.join("rollout-2026-09-30T01-00-00-a.jsonl"),
-            "{\"payload\":{\"cli_version\":\"0.140.0\"}}\n",
-        )
-        .unwrap();
-        fs::write(
-            day.join("rollout-2026-10-18T01-00-00-a.jsonl"),
-            "{\"payload\":{\"cli_version\":\"0.160.0\"}}\n",
-        )
-        .unwrap();
-        fs::write(
-            day.join("rollout-2026-10-18T09-00-00-b.jsonl"),
-            "{\"type\":\"session_meta\",\"payload\":{\"cli_version\":\"0.162.1\"}}\n{}\n",
-        )
-        .unwrap();
-        let codex = LoadingPolicy::read(&home, SnapshotSource::Codex);
+        let codex = LoadingPolicy::read(&home, SnapshotSource::Codex, Some("0.162.1"));
         assert_eq!(codex.client_version().as_deref(), Some("0.162.1"));
         assert_eq!(codex.tool_search_auto_pct(), None);
 
@@ -3360,6 +3316,7 @@ url = "https://unset.test/mcp"
             SnapshotSource::Pi,
             Some("otm_test"),
             unbounded_deadline(),
+            None,
         );
         assert_eq!(built.inventory.agent_source, "pi");
         assert!(built.inventory.servers.is_empty());
@@ -3376,6 +3333,7 @@ url = "https://unset.test/mcp"
                 SnapshotSource::ClaudeCode,
                 None,
                 unbounded_deadline(),
+                None,
             )
             .inventory,
         )
@@ -3390,6 +3348,7 @@ url = "https://unset.test/mcp"
                 SnapshotSource::ClaudeCode,
                 Some("otm_x"),
                 unbounded_deadline(),
+                None,
             )
             .inventory,
         )
@@ -3624,6 +3583,7 @@ done
     fn cache_freshness_tracks_max_staleness() {
         let now = OffsetDateTime::from_unix_timestamp(1_750_000_000).unwrap();
         let fresh = InventoryCacheEntry {
+            seed: None,
             identity: "d|m|u".to_string(),
             inventory_sha256: "x".to_string(),
             posted_at: now.format(&Rfc3339).unwrap(),
@@ -3640,6 +3600,7 @@ done
 
         // An unparseable timestamp is treated as stale (force a re-POST).
         let corrupt = InventoryCacheEntry {
+            seed: None,
             identity: "d|m|u".to_string(),
             inventory_sha256: "x".to_string(),
             posted_at: "not-a-timestamp".to_string(),
@@ -3698,6 +3659,7 @@ done
         Enabled,
         Disabled,
         Error,
+        UploadError,
     }
 
     /// Mock backend accepting exactly `count` requests, dispatching by path:
@@ -3760,10 +3722,15 @@ done
                             "200 OK",
                             format!(
                                 r#"{{"source":"claude_code","server_time":"2099-01-01T00:00:00Z","record_count_15m":0,"record_count_24h":0,"local_usage_reconciliation_enabled":true,"backfill_window_days":183,"recommended_scan_after":"2099-01-01T00:00:00Z","mcp_inventory_harvest_enabled":{}}}"#,
-                                matches!(mode, HintMode::Enabled)
+                                matches!(mode, HintMode::Enabled | HintMode::UploadError)
                             ),
                         ),
                     }
+                } else if matches!(hint, HintMode::UploadError) {
+                    (
+                        "500 Internal Server Error",
+                        r#"{"error":"upload"}"#.to_string(),
+                    )
                 } else {
                     ("200 OK", r#"{"snapshot_id":"snap_1"}"#.to_string())
                 };
@@ -3801,6 +3768,7 @@ done
             base,
             home,
             support_dir,
+            None,
         )
     }
 
@@ -4106,6 +4074,7 @@ done
     fn a_deferred_claude_server_keeps_only_a_fresh_last_inventory() {
         let now = OffsetDateTime::now_utc();
         let entry = |identity: &str, age_days: i64| InventoryCacheEntry {
+            seed: None,
             identity: identity.to_string(),
             inventory_sha256: "hash".to_string(),
             posted_at: (now - time::Duration::days(age_days))
@@ -4176,4 +4145,5 @@ done
         assert!(!alive(other_pid));
         let _ = fs::remove_dir_all(&dir);
     }
+    include!("mcp_inventory_version_tests.rs");
 }
