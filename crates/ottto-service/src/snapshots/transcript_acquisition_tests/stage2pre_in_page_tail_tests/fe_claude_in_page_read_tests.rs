@@ -1947,8 +1947,8 @@ fn erased_hold(due: u64) -> ErasedHold {
 }
 
 /// The restoration a sampled scan's setup runs, dated one interval before
-/// `due`: the candidate clock stays real, so only an earlier restoration can
-/// come due within a test. Real-clock pages prove the scan seam.
+/// `due`. Real-clock pages prove no-read scheduling; the injected scan clock
+/// then advances both slot preparation and candidate selection to the due time.
 fn restore_dated(index: &mut ScanIndex, due: u64) -> usize {
     sampled_audit::restore_held_audit_deadlines(
         index,

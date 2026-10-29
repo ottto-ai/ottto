@@ -31903,9 +31903,11 @@ impl OwnedSourceScan {
                         CandidateDecision::Parse,
                         Some(CandidateParseReason::ForcedFamily),
                     ),
+                    // Use the same audit clock as slot preparation and the
+                    // rescue above; a future virtual slot must stay future.
                     None => index.candidate_decision_in_window(
                         &candidate,
-                        unix_seconds(SystemTime::now()).unwrap_or_default(),
+                        sampled_scan::now_seconds(),
                         census_unix_seconds,
                         backfill_window_days,
                     ),

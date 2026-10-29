@@ -155,3 +155,20 @@ The generation control compares a forward birth change; it does not prove an
 unconditional reused-inode fence across the accepted backwards-clamp signature.
 This disclosure follows the approved observable conjunction; production logic and
 all test assertions are unchanged.
+
+
+## Round28 shared audit clock and full-body comparison clock
+
+The selected candidate now uses the sampled scan's existing audit clock, as slot
+preparation and verification rescue already do. The discovery census clock and
+window remain separate. This keeps an aged grown N1 key observed without treating
+a future virtual slot as overdue; recent growth still selects immediately. The
+production clock is still Unix wall time; the existing test override now reaches
+this scan seam too. No Skip predicate or deadline-restoration policy is widened.
+
+The native sleep-growth/cold-Full body comparison differed only in `collected_at`
+by one second, because its setup sampled the collection clock twice. It now
+freezes that exact comparison clock before either path; the complete body
+equality assertion, including every timestamp, is unchanged. A portable real-scan
+control covers two zero-delivery passes before a virtual slot and one Full when
+due, while the existing recent-growth and native failed-audit controls remain.

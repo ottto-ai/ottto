@@ -1539,6 +1539,99 @@ fn codex_roster_retains_aged_indexed_growth() {
     );
 }
 
+/// The scan seam must share the virtual-slot clock, including when the
+/// discovery growth arm admits an aged key that main would have filtered.
+#[test]
+fn grown_virtual_audit_uses_the_scheduling_clock_before_and_at_due() {
+    use crate::snapshots::claude_request_census::{
+        ClaudeRequestCensusRecord as Record, ClaudeRequestCensusShape as Shape,
+    };
+    use crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS as INTERVAL;
+    struct Clock;
+    impl Drop for Clock {
+        fn drop(&mut self) {
+            sampled_scan::set_test_now(None);
+        }
+    }
+    let _clock = Clock;
+    let wall = sampled_scan::now_seconds();
+    let now = wall - 4 * INTERVAL;
+    let due = now + INTERVAL;
+    assert!(due < wall, "wall time would prematurely select this slot");
+    sampled_scan::set_test_now(Some(now));
+    let root = Root::new("ld-grown-virtual-clock");
+    let path = root.file(SESSION);
+    let key = local_index_key(&path);
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    append(&path, &assistant_line("u1"));
+    let (mut index, _, _, _) =
+        claude_page(&root.projects(), ScanIndex::default(), None, Some(&cache));
+    assert!(index.claude_account_deferred_holds.is_empty());
+    assert!(!index.files[&key].has_unverified_source());
+    let template = index.files[&key].clone();
+    let record = Record::synthetic_for_test(
+        &template.source_file_fingerprint,
+        1,
+        Shape::IdentityIncomplete,
+        vec![1],
+    )
+    .with_unverified_for_test(true);
+    index
+        .claude_request_census_mut_for_test()
+        .insert_for_test(&key, record);
+    // Reserve all but the existing last slot, as in the real erased-hold
+    // regression; no restored marker can hide the virtual-slot clock seam.
+    for n in 0..crate::transcript_cache::CACHE_ENTRIES - 1 {
+        let mut pending = template.clone();
+        pending.set_unverified_deadline(now);
+        index
+            .files
+            .insert(format!("/unavailable-clock-debt/{n}"), pending);
+    }
+    index.held_audit_progress = Some(sampled_audit::HeldAuditProgress {
+        key: key.clone(),
+        due,
+        attempted: false,
+    });
+    append(&path, &assistant_line("u2"));
+    File::open(&path).unwrap().set_modified(UNIX_EPOCH).unwrap();
+    cache.clear();
+    let length = fs::metadata(&path).unwrap().len();
+    assert!(length > index.files[&key].size_bytes);
+    assert!(!discovery_retention!(index).owes(&path));
+    assert!(discovery_retention!(index).owes_with_len(SnapshotSource::ClaudeCode, &path, length));
+    assert!(sampled_audit::awaits_hold_deadline_restoration(
+        &index, &key
+    ));
+    for _ in 0..2 {
+        let observer = Recorder::default();
+        let (next, result, _, _) =
+            claude_page(&root.projects(), index, Some(&observer), Some(&cache));
+        assert!(
+            observer.events().is_empty(),
+            "future slot schedules no acquisition or delivery"
+        );
+        assert_eq!(result.scanned_file_count, 0);
+        let slot = next.held_audit_progress.as_ref().unwrap();
+        assert_eq!(slot.due, due);
+        assert!(!slot.attempted);
+        index = next;
+    }
+    sampled_scan::set_test_now(Some(due));
+    let observer = Recorder::default();
+    let (_, result, _, _) = claude_page(&root.projects(), index, Some(&observer), Some(&cache));
+    let modes = observer
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::Begin(view) => Some(view.mode),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(modes, vec![DeliveryMode::Full], "due recovery reads once");
+    assert_eq!(result.scanned_file_count, 1);
+}
+
 /// Growth followed by more than W of downtime is still read exactly once.
 /// Committing the new length releases this exemption; generic Tail audit debt
 /// is discharged explicitly before asserting ordinary aging, as in the hold fixture.
@@ -1548,7 +1641,15 @@ fn grown_indexed_file_is_read_after_sleep_then_ages_after_commit() {
     let path = root.file(SESSION);
     let key = local_index_key(&path);
     let cache = Arc::new(sampled_scan::SharedCache::default());
+    // Freeze the comparison's collection clock before either path executes;
+    // a native Tail and cold Full can finish on opposite sides of a second.
+    let after_sleep = days_from_now(8);
     let page = |index: ScanIndex, days| {
+        let now = if days == 8 {
+            after_sleep.clone()
+        } else {
+            days_from_now(days)
+        };
         let recorder = Recorder::default();
         let ((index, result, _), _) = capture(|| {
             finish(
@@ -1556,7 +1657,7 @@ fn grown_indexed_file_is_read_after_sleep_then_ages_after_commit() {
                     SnapshotSource::ClaudeCode,
                     &[root.projects()],
                     index,
-                    &days_from_now(days),
+                    &now,
                     7,
                     10,
                     false,
@@ -1619,7 +1720,7 @@ fn grown_indexed_file_is_read_after_sleep_then_ages_after_commit() {
         SnapshotSource::ClaudeCode,
         &[root.projects()],
         ScanIndex::default(),
-        &days_from_now(8),
+        &after_sleep,
         730,
         10,
         false,
