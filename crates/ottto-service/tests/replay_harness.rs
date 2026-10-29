@@ -224,37 +224,215 @@ impl PlatformDiagnostics {
     }
 }
 
-fn retention_witness(rows: &[Value]) -> RetentionWitness {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CounterClass {
+    LayoutWitness,
+    NonLayoutFailure,
+    Observation,
+}
+
+// Exhaustive cache_lifecycle.rs::counters! registry. Citations below are
+// relative to src/ and describe the emitter, not a guess from the key's name.
+// Only retention_bound_refused can witness the real layout gate; the existing
+// PlatformDiagnostics gate still requires the real layout_supported=false.
+const LIFECYCLE_COUNTERS: &[(&str, CounterClass)] = &[
+    // transcript_cache.rs::take: destructively acquired an existing entry.
+    ("take_hit", CounterClass::Observation),
+    // transcript_cache.rs::take: no resident entry; no historical cause claimed.
+    ("take_absent", CounterClass::Observation),
+    // snapshots/sampled_scan.rs::SharedCache::take: retained lock poisoned.
+    ("take_poisoned_lock", CounterClass::NonLayoutFailure),
+    // transcript_cache.rs::admit_at_rank: candidate remains admitted.
+    ("insert_admitted", CounterClass::Observation),
+    // transcript_cache.rs::admit_at_rank: live reservation exceeds byte limit.
+    (
+        "insert_live_reservation_refused",
+        CounterClass::NonLayoutFailure,
+    ),
+    // transcript_cache.rs::admit_at_rank: clock overflow clears cache/refuses.
+    ("insert_clock_reset", CounterClass::NonLayoutFailure),
+    // transcript_cache.rs::admit_at_rank: count-disabled OR layout; ambiguous,
+    // so this is not an accepted substitute for the retention layout witness.
+    (
+        "insert_disabled_or_layout_refused",
+        CounterClass::NonLayoutFailure,
+    ),
+    // transcript_cache.rs::admit_at_rank: retained/entry bound not admitted.
+    ("insert_entry_bound_refused", CounterClass::NonLayoutFailure),
+    // transcript_cache.rs::admit_at_rank: state has no frozen-charge support.
+    (
+        "insert_frozen_charge_refused",
+        CounterClass::NonLayoutFailure,
+    ),
+    // transcript_cache.rs::admit_at_rank: key cannot fit the entry allowance.
+    ("insert_key_bound_refused", CounterClass::NonLayoutFailure),
+    // transcript_cache.rs::admit_at_rank: candidate itself lost victim ordering.
+    ("insert_self_evicted", CounterClass::NonLayoutFailure),
+    // transcript_cache.rs::admit_at_rank: no victim can satisfy admission.
+    ("insert_no_victim_refused", CounterClass::NonLayoutFailure),
+    // snapshots/sampled_scan.rs::SharedCache::insert_admitted: retained lock poisoned.
+    ("insert_poisoned_lock", CounterClass::NonLayoutFailure),
+    // transcript_cache.rs::admit_at_rank: capacity victim action; not refusal.
+    ("insert_entries_evicted", CounterClass::Observation),
+    // transcript_cache.rs::evict_until: cursor reservation victim action.
+    (
+        "cursor_reservation_entries_evicted",
+        CounterClass::Observation,
+    ),
+    // transcript_cache.rs::evict_until: copy-refusal victim action only.
+    ("copy_refusal_entries_evicted", CounterClass::Observation),
+    // transcript_cache.rs::evict_until: bytes of released victims.
+    ("copy_refusal_bytes_released", CounterClass::Observation),
+    // snapshots/sampled_scan.rs::fit_residents: remeasure unknown resident bound.
+    ("copy_refusal_remeasured", CounterClass::Observation),
+    // snapshots/sampled_scan.rs::fit_residents: residents already fit, no release.
+    ("copy_refusal_kept", CounterClass::Observation),
+    // snapshots/sampled_scan.rs::release_for_copy_refusal: walk hit visit cap.
+    (
+        "copy_refusal_walk_visit_limit",
+        CounterClass::NonLayoutFailure,
+    ),
+    // transcript_cache.rs::evict_until: CopyAdmission victim action.
+    ("copy_refusal_admission_evicted", CounterClass::Observation),
+    // snapshots/sampled_scan.rs::release_for_copy_refusal: unsupported AUDIT
+    // METADATA clears cache; distinct from the native heap-layout gate (E1 F1).
+    ("clear_metadata_unsupported", CounterClass::NonLayoutFailure),
+    // snapshots/sampled_scan.rs::release_for_copy_refusal: conservative native
+    // baseline unknown-bound clear; ordinary action, not layout proof itself.
+    (
+        "clear_full_resident_bound_unknown",
+        CounterClass::Observation,
+    ),
+    // snapshots/sampled_scan.rs::release_for_copy_refusal: no active copy charge.
+    ("clear_no_active", CounterClass::Observation),
+    // snapshots/sampled_scan.rs::release_for_copy_refusal: other active charge
+    // cannot fit/be measured, even after fitting attempts; not the Full baseline.
+    ("clear_other_active", CounterClass::NonLayoutFailure),
+    // transcript_cache.rs::clear: number of released entries, not clear cause.
+    ("clear_entries_released", CounterClass::Observation),
+    // snapshots/sampled_scan.rs::SharedCache::clear: retained lock poisoned.
+    ("clear_poisoned_lock", CounterClass::NonLayoutFailure),
+    // snapshots/sampled_jsonl.rs::retain_reduction: unfinished/failed/lossy parse.
+    (
+        "retention_incomplete_or_lossy",
+        CounterClass::NonLayoutFailure,
+    ),
+    // snapshots/sampled_jsonl.rs::retain_reduction/retain_after_release:
+    // reduction dependencies incompatible with optional retention.
+    ("retention_incompatible", CounterClass::NonLayoutFailure),
+    // snapshots/sampled_jsonl.rs::retain_reduction/retain_after_release:
+    // retention_bound failed; qualified only with real unsupported layout flag.
+    ("retention_bound_refused", CounterClass::LayoutWitness),
+    // snapshots/sampled_jsonl.rs::retain_reduction/retain_after_release: no plan.
+    ("retention_no_plan", CounterClass::NonLayoutFailure),
+    // snapshots/sampled_jsonl.rs::retain_reduction/retain_after_release:
+    // EOF/certificate does not match sealed prefix; copy refused.
+    ("retention_unsealed_eof", CounterClass::NonLayoutFailure),
+    // snapshots/sampled_jsonl.rs::retain_reduction/retain_after_release:
+    // actual reduction clone exceeds its bound.
+    (
+        "retention_clone_bound_refused",
+        CounterClass::NonLayoutFailure,
+    ),
+    // snapshots.rs native completion: finalization budget/bound refuses copy.
+    (
+        "retention_finalization_bound_refused",
+        CounterClass::NonLayoutFailure,
+    ),
+    // snapshots/sampled_jsonl.rs::retain_reduction/retain_after_release:
+    // completed reduction produced; successful observation, not admission yet.
+    ("retention_produced", CounterClass::Observation),
+    // snapshots.rs:8833 (apply_claude_reported_usage_*): prefix bodies excluded
+    // from family proof census; provenance bookkeeping, not retention refusal.
+    ("prefix_excluded_bodies", CounterClass::Observation),
+    // snapshots/sampled_audit.rs::complete_native_recomposition: prefix tag cleared.
+    ("prefix_tag_clears", CounterClass::Observation),
+];
+
+// CachePage flattens the registry above and adds these sparse scalars.
+const PAGE_ONLY_COUNTERS: &[(&str, CounterClass)] = &[
+    // local_resource_diagnostics/claude_reread.rs::cache_capacity_eviction(true):
+    // count-pressure victims, not a refusal of the candidate.
+    ("insert_count_entries_evicted", CounterClass::Observation),
+    // local_resource_diagnostics/claude_reread.rs::cache_capacity_eviction(false):
+    // byte-pressure victims, not a refusal of the candidate.
+    ("insert_byte_entries_evicted", CounterClass::Observation),
+    // local_resource_diagnostics/claude_reread.rs::Reinsertion::drop:
+    // destructive hit left without successful readmission.
+    ("reinsert_failed", CounterClass::NonLayoutFailure),
+];
+
+fn checked_counter_map(
+    counts: &Value,
+    page: bool,
+) -> Result<&serde_json::Map<String, Value>, String> {
+    let counts = counts.as_object().ok_or("counter object required")?;
+    for (key, count) in counts {
+        let class = LIFECYCLE_COUNTERS
+            .iter()
+            .find(|(name, _)| *name == key)
+            .or_else(|| {
+                if page {
+                    PAGE_ONLY_COUNTERS.iter().find(|(name, _)| *name == key)
+                } else {
+                    None
+                }
+            })
+            .map(|(_, class)| *class)
+            .ok_or_else(|| format!("unclassified lifecycle counter: {key}"))?;
+        let count = count
+            .as_u64()
+            .ok_or_else(|| format!("invalid counter value: {key}"))?;
+        if class == CounterClass::NonLayoutFailure && count != 0 {
+            return Err(format!("non-layout lifecycle failure: {key}"));
+        }
+    }
+    // Process Counts serializes EVERY registered key, including zeros. Unlike
+    // CachePage's sparse map, a missing process key is not an observed zero.
+    if !page {
+        for (key, _) in LIFECYCLE_COUNTERS {
+            if !counts.contains_key(*key) {
+                return Err(format!("missing lifecycle counter: {key}"));
+            }
+        }
+    }
+    Ok(counts)
+}
+
+fn retention_witness(rows: &[Value]) -> Result<RetentionWitness, String> {
     let counts = &rows
         .iter()
         .rev()
         .find(|row| row["record"]["stage"] == "process_retained_cache_lifecycle_totals")
-        .expect("actual lifecycle witness required")["record"]["counts"];
-    let mut other_refusals = 0u64;
-    for (field, count) in counts.as_object().expect("lifecycle counts required") {
-        let non_layout = (field.starts_with("retention_")
-            && field != "retention_bound_refused"
-            && field != "retention_produced")
-            || (field.starts_with("insert_")
-                && field != "insert_admitted"
-                && field != "insert_entries_evicted")
-            || field.contains("poisoned")
-            || field == "copy_refusal_walk_visit_limit";
-        if non_layout {
-            other_refusals = other_refusals
-                .checked_add(count.as_u64().expect("refusal count required"))
-                .expect("refusal overflow");
+        .ok_or("actual lifecycle witness required")?["record"]["counts"];
+    let counts = checked_counter_map(counts, false)?;
+    let mut insert_admitted = counts["insert_admitted"]
+        .as_u64()
+        .ok_or("admission witness required")?;
+    for row in rows
+        .iter()
+        .filter(|row| row["record"]["stage"] == "native_collection_page")
+    {
+        // CachePage is omitted entirely when empty; null/malformed is not empty.
+        if let Some(page) = row["record"]["counts"].get("retained_cache_page_events") {
+            let page = checked_counter_map(page, true)?;
+            // Sparse omission means zero. Preserve a positive admission in
+            // either carrier for the existing unsupported-layout zero gate.
+            if let Some(count) = page.get("insert_admitted") {
+                insert_admitted =
+                    insert_admitted.max(count.as_u64().ok_or("admission count required")?);
+            }
         }
     }
-    RetentionWitness {
+    // Overlapping process totals and page deltas are validated independently,
+    // never added. Every positive lifecycle failure already returned Err.
+    Ok(RetentionWitness {
         bound_refused: counts["retention_bound_refused"]
             .as_u64()
-            .expect("layout witness required"),
-        insert_admitted: counts["insert_admitted"]
-            .as_u64()
-            .expect("admission witness required"),
-        other_refusals,
-    }
+            .ok_or("layout witness required")?,
+        insert_admitted,
+        other_refusals: 0,
+    })
 }
 
 fn refusal_count(value: &Value) -> u64 {
@@ -290,7 +468,7 @@ fn p0_diagnostics(rows: &[Value]) -> PlatformDiagnostics {
         .as_u64()
         .expect("P0 inventory required");
     assert_eq!(totals(rows)["durable_records_after_save"], records_after_p0);
-    let mut witness = retention_witness(rows);
+    let mut witness = retention_witness(rows).expect("classified P0 lifecycle witness");
     for field in [
         "not_persisted",
         "write_unlocked",
@@ -328,7 +506,7 @@ fn growth_diagnostics(p0: &PlatformDiagnostics, rows: &[Value]) -> PlatformDiagn
     let counts = &row["record"]["counts"];
     let reads = &counts["sampled_acquisition"];
     let mut observed = p0.clone();
-    observed.page = retention_witness(rows);
+    observed.page = retention_witness(rows).expect("classified growth lifecycle witness");
     observed.full = reads["full_selections"]
         .as_u64()
         .expect("page Full count required");
@@ -431,6 +609,226 @@ fn platform_gate_accepts_supported_layout_restore_and_tail_only() {
     d.full_causes = json!({});
     d.restore_outcome = json!({"restored":1});
     assert!(d.validate_growth().is_ok());
+}
+
+// No filesystem/process fixture: these exercise the JSON -> witness adapter,
+// before PlatformDiagnostics can hide an omitted counter in other_refusals=0.
+fn unsupported_lifecycle_rows() -> Vec<Value> {
+    let mut counts = serde_json::Map::new();
+    for (key, _) in LIFECYCLE_COUNTERS {
+        counts.insert((*key).into(), json!(0));
+    }
+    counts.insert("retention_bound_refused".into(), json!(1));
+    counts.insert("take_absent".into(), json!(1));
+    counts.insert("copy_refusal_remeasured".into(), json!(2));
+    counts.insert("clear_no_active".into(), json!(1));
+    vec![
+        json!({"kind":"local_resources", "record":{
+            "stage":"process_retained_cache_lifecycle_totals", "counts":counts}}),
+        json!({"kind":"local_resources", "record":{
+            "stage":"native_collection_page", "counts":{
+                "retained_cache_page_events":{
+                    "retention_bound_refused":1, "take_absent":1,
+                    "copy_refusal_remeasured":2, "clear_no_active":1}}}}),
+    ]
+}
+
+fn extraction_gate(rows: &[Value]) -> Result<(), String> {
+    let witness = retention_witness(rows)?;
+    let mut diagnostics = linux_witness();
+    diagnostics.p0 = witness.clone();
+    diagnostics.page = witness;
+    diagnostics.validate_growth().map_err(str::to_owned)
+}
+
+fn boundary_counts(rows: &mut [Value], page: bool) -> &mut serde_json::Map<String, Value> {
+    let counts = if page {
+        &mut rows[1]["record"]["counts"]["retained_cache_page_events"]
+    } else {
+        &mut rows[0]["record"]["counts"]
+    };
+    counts.as_object_mut().unwrap()
+}
+
+#[test]
+fn lifecycle_extraction_accepts_valid_unsupported_rows() {
+    assert!(extraction_gate(&unsupported_lifecycle_rows()).is_ok());
+}
+
+#[test]
+fn lifecycle_extraction_rejects_clear_metadata_unsupported() {
+    for page in [false, true] {
+        let mut rows = unsupported_lifecycle_rows();
+        boundary_counts(&mut rows, page).insert("clear_metadata_unsupported".into(), json!(1));
+        assert_eq!(
+            extraction_gate(&rows).unwrap_err(),
+            "non-layout lifecycle failure: clear_metadata_unsupported"
+        );
+    }
+}
+
+#[test]
+fn lifecycle_extraction_rejects_every_non_layout_failure() {
+    for page in [false, true] {
+        let extras = if page { PAGE_ONLY_COUNTERS } else { &[] };
+        for (key, class) in LIFECYCLE_COUNTERS.iter().chain(extras) {
+            if *class == CounterClass::NonLayoutFailure {
+                let mut rows = unsupported_lifecycle_rows();
+                boundary_counts(&mut rows, page).insert((*key).into(), json!(1));
+                assert_eq!(
+                    extraction_gate(&rows).unwrap_err(),
+                    format!("non-layout lifecycle failure: {key}"),
+                    "page={page}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn lifecycle_extraction_keeps_every_ordinary_observation_neutral() {
+    for page in [false, true] {
+        let extras = if page { PAGE_ONLY_COUNTERS } else { &[] };
+        for (key, class) in LIFECYCLE_COUNTERS.iter().chain(extras) {
+            // insert_admitted is an observation, but the existing unsupported
+            // layout gate independently requires zero admitted inserts.
+            if *class == CounterClass::Observation && *key != "insert_admitted" {
+                let mut rows = unsupported_lifecycle_rows();
+                boundary_counts(&mut rows, page).insert((*key).into(), json!(1));
+                assert!(extraction_gate(&rows).is_ok(), "key={key} page={page}");
+            }
+        }
+    }
+}
+
+#[test]
+fn lifecycle_extraction_preserves_admission_observations_for_the_gate() {
+    for page in [false, true] {
+        let mut rows = unsupported_lifecycle_rows();
+        boundary_counts(&mut rows, page).insert("insert_admitted".into(), json!(1));
+        assert!(
+            retention_witness(&rows).is_ok(),
+            "admission is an observation"
+        );
+        assert!(
+            extraction_gate(&rows).is_err(),
+            "unsupported layout still requires zero admissions"
+        );
+    }
+}
+
+#[test]
+fn lifecycle_extraction_rejects_unknown_keys_even_when_zero() {
+    for page in [false, true] {
+        let mut rows = unsupported_lifecycle_rows();
+        boundary_counts(&mut rows, page).insert("unclassified_counter".into(), json!(0));
+        assert_eq!(
+            extraction_gate(&rows).unwrap_err(),
+            "unclassified lifecycle counter: unclassified_counter"
+        );
+    }
+}
+
+#[test]
+fn lifecycle_extraction_rejects_missing_malformed_and_wrong_carrier_counts() {
+    let mut rows = unsupported_lifecycle_rows();
+    boundary_counts(&mut rows, false).remove("take_absent");
+    assert_eq!(
+        extraction_gate(&rows).unwrap_err(),
+        "missing lifecycle counter: take_absent"
+    );
+    for page in [false, true] {
+        let mut rows = unsupported_lifecycle_rows();
+        boundary_counts(&mut rows, page).insert("take_absent".into(), Value::Null);
+        assert_eq!(
+            extraction_gate(&rows).unwrap_err(),
+            "invalid counter value: take_absent"
+        );
+    }
+    let mut rows = unsupported_lifecycle_rows();
+    boundary_counts(&mut rows, false).insert("reinsert_failed".into(), json!(0));
+    assert_eq!(
+        extraction_gate(&rows).unwrap_err(),
+        "unclassified lifecycle counter: reinsert_failed"
+    );
+    let mut rows = unsupported_lifecycle_rows();
+    rows[1]["record"]["counts"]["retained_cache_page_events"] = Value::Null;
+    assert_eq!(
+        extraction_gate(&rows).unwrap_err(),
+        "counter object required"
+    );
+}
+
+#[test]
+fn lifecycle_classification_covers_core_registry_and_page_schema() {
+    // Intentional source-shape tripwire, not a parser implementation. These
+    // public definitions enumerate the actual serialized counters. New keys
+    // must fail even if zero-valued sparse keys never appear in this fixture.
+    let registry = include_str!("../src/local_resource_diagnostics/cache_lifecycle.rs");
+    assert_eq!(registry.matches("counters! {").count(), 1);
+    let fields = registry
+        .split_once("counters! {")
+        .unwrap()
+        .1
+        .split_once("\n}")
+        .unwrap()
+        .0;
+    let registered: std::collections::BTreeSet<_> = fields
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("//"))
+        .map(|line| {
+            line.split_once(':')
+                .expect("registry field definition")
+                .0
+                .trim()
+        })
+        .collect();
+    let classified: std::collections::BTreeSet<_> =
+        LIFECYCLE_COUNTERS.iter().map(|(key, _)| *key).collect();
+    assert_eq!(
+        classified.len(),
+        LIFECYCLE_COUNTERS.len(),
+        "duplicate classification"
+    );
+    assert_eq!(
+        classified, registered,
+        "classify every lifecycle schema change"
+    );
+
+    let source = include_str!("../src/local_resource_diagnostics/claude_reread.rs");
+    let fields = source
+        .split_once("pub(crate) struct CachePage {")
+        .unwrap()
+        .1
+        .split_once("\n}")
+        .unwrap()
+        .0;
+    let mut registered: std::collections::BTreeSet<_> = fields
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("pub(crate) "))
+        .map(|line| {
+            line.split_once(':')
+                .expect("page field definition")
+                .0
+                .trim()
+        })
+        .collect();
+    assert!(
+        registered.remove("events"),
+        "CachePage must flatten lifecycle events"
+    );
+    let classified: std::collections::BTreeSet<_> =
+        PAGE_ONLY_COUNTERS.iter().map(|(key, _)| *key).collect();
+    assert_eq!(
+        classified.len(),
+        PAGE_ONLY_COUNTERS.len(),
+        "duplicate page classification"
+    );
+    assert_eq!(
+        classified, registered,
+        "classify every page-only schema change"
+    );
 }
 
 fn assert_quiet_restart(rows: &[Value]) {
