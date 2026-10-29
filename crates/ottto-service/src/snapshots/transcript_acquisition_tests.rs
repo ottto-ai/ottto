@@ -4094,7 +4094,12 @@ fn missing_index_debt_carrier_holds_in_the_production_scanner_for_both_sources()
         let mut active = cache;
         for _ in 0..2 {
             saved.save(&index_path).unwrap();
+            let before_gc = active.durable_counters(source).unwrap().1.gc_records_read;
             durable_after_save(&active, &fixture.dir, source, &saved);
+            assert!(
+                active.durable_counters(source).unwrap().1.gc_records_read > before_gc,
+                "actual post-save GC ran"
+            );
             assert_eq!(
                 fs::read(&record_path).unwrap(),
                 original,
@@ -4115,12 +4120,25 @@ fn missing_index_debt_carrier_holds_in_the_production_scanner_for_both_sources()
                 &namespace,
                 source == SnapshotSource::ClaudeCode,
             );
-            let (next, scan, modes) = production_scan(
+            let loaded = ScanIndex::load(&index_path).unwrap();
+            // An incomplete census persists a real retry delay. Advance that
+            // scheduler clock to its due edge; never erase traversal custody.
+            let retry_at = loaded
+                .traversal
+                .as_ref()
+                .and_then(|traversal| traversal.unhealthy_retry_not_before_unix_seconds)
+                .expect("held census scheduled its next walk");
+            let collected_at = time::OffsetDateTime::from_unix_timestamp(retry_at as i64)
+                .unwrap()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap();
+            let (next, scan, modes, _) = production_scan_at(
                 &fixture,
                 source,
-                ScanIndex::load(&index_path).unwrap(),
+                loaded,
                 Some(restart.clone()),
                 &namespace.0,
+                &collected_at,
             );
             assert_eq!(modes, (0, 0, 0));
             assert!(!next.files.contains_key(&key));
