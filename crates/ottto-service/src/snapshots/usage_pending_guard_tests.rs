@@ -17,6 +17,14 @@ fn route(index: &ScanIndex, roots: &BTreeSet<String>, route: usize) -> BTreeSet<
     }
 }
 
+/// Production builds holds inside the retry traversal, whose window is newer
+/// than the failed window the fixtures accumulated their pending in.
+fn retry_under_way(index: &mut ScanIndex) {
+    if let Some(traversal) = index.traversal.as_mut() {
+        traversal.census_window_end = CARRY_RETRY.into();
+    }
+}
+
 #[test]
 fn phase1_three_states_on_ordinary_streaming_batch_keep_independent_acceptance() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -54,7 +62,7 @@ fn phase1_three_states_on_ordinary_streaming_batch_keep_independent_acceptance()
             );
             let roots = BTreeSet::from([root.clone()]);
             let before = serde_json::to_value(&fixture.index).unwrap();
-            fixture.index.refresh_usage_guard_holds();
+            fixture.index.refresh_usage_guard_holds_at(Some(CARRY_RETRY));
             assert_eq!(
                 serde_json::to_value(&fixture.index).unwrap(),
                 before,
@@ -149,13 +157,14 @@ fn phase1_known_guard_matches_old_and_missing_inventory_is_unknown() {
         usage_pending_guard::verdict(&index, CARRY_ROOT),
         Verdict::Unknown(Unknown::IncompleteMember)
     );
-    index.refresh_usage_guard_holds();
+    index.refresh_usage_guard_holds_at(Some(CARRY_RETRY));
     assert!(index.usage_guard_holds.holds(CARRY_ROOT));
 }
 
 #[test]
 fn phase1_key_only_child_holds_prefix_owner_without_owner_names() {
     let mut index = carry_index();
+    retry_under_way(&mut index);
     carry_family(&mut index, CARRY_UNWITNESSED, &[None], true);
     let hash = index.claude_usage_family_pending[CARRY_ROOT]
         .membership()
@@ -208,6 +217,7 @@ fn phase1_old_file_growth_discovery_survives_unknown_resolution_and_restart_twic
         .unwrap();
     let path = fixture.candidates[0].path.clone();
     let key = local_index_key(&path);
+    retry_under_way(&mut fixture.index);
     fixture.index.refresh_usage_guard_holds();
     // Force the discovery-age gate, independently of real wall time.
     File::options()
@@ -278,6 +288,7 @@ fn phase1_old_file_growth_discovery_survives_unknown_resolution_and_restart_twic
 #[test]
 fn phase1_mutation_rebuilds_dependent_hold_before_cancellation() {
     let mut index = carry_index();
+    retry_under_way(&mut index);
     carry_family(&mut index, CARRY_UNWITNESSED, &[None], true);
     index
         .claude_usage_family_witnesses
@@ -304,6 +315,7 @@ fn phase1_mutation_rebuilds_dependent_hold_before_cancellation() {
 #[test]
 fn phase1_unknown_dependency_scope_counts_global_once() {
     let mut index = carry_index();
+    retry_under_way(&mut index);
     let witness = index
         .claude_usage_family_witnesses
         .get_mut(CARRY_ROOT)
@@ -324,6 +336,47 @@ fn phase1_unknown_dependency_scope_counts_global_once() {
             assert_eq!(count, 0);
         }
     }
+}
+
+#[test]
+fn phase1_current_window_accumulation_is_not_stale_proof() {
+    let mut index = carry_index();
+    // A paged re-read of this window has recorded only the root member so far.
+    let pending = index
+        .claude_usage_family_pending
+        .get_mut(CARRY_ROOT)
+        .unwrap();
+    let agent = carry_member(CARRY_ROOT, Some(CARRY_AGENT));
+    pending.member_request_id_hashes.remove(&agent);
+    pending.member_occurrences.remove(&agent);
+    assert_eq!(
+        usage_pending_guard::verdict(&index, CARRY_ROOT),
+        Verdict::Unknown(Unknown::IncompleteMember)
+    );
+    // The traversal accumulating this window keeps its owed sibling reads.
+    index.refresh_usage_guard_holds();
+    assert!(!index.usage_guard_holds.holds(CARRY_ROOT));
+    let sibling = carry_key(CARRY_ROOT, Some(CARRY_AGENT));
+    assert!(!index.usage_guard_holds.holds_path(Path::new(&sibling)));
+    assert!(index.usage_guard_holds.retains_path(Path::new(&sibling)));
+    assert_eq!(index.usage_guard_reason(CARRY_ROOT), None);
+    // The same record is stale proof once a newer traversal starts.
+    index.refresh_usage_guard_holds_at(Some(CARRY_RETRY));
+    assert_eq!(
+        index.usage_guard_reason(CARRY_ROOT),
+        Some(Unknown::IncompleteMember)
+    );
+}
+
+#[test]
+fn phase1_refused_held_read_keeps_the_census_incomplete() {
+    let mut census = ScanCensus::default();
+    let (_, rows) =
+        crate::local_resource_diagnostics::capture(|| usage_pending_guard::full_blocked(&mut census));
+    assert_eq!(census.unreadable_path_count, 1);
+    assert!(rows
+        .iter()
+        .any(|row| row["counts"]["unknown_full_blocked"] == 1));
 }
 
 /// Counts-only inventory comparison entry. Supply one frozen ScanIndex, or a
@@ -362,7 +415,8 @@ fn phase1_replay_frozen_scan_index_guard_comparison() {
                 .unwrap_or_else(|_| {
                     panic!("frozen checkpoint decode refused; no repair attempted")
                 });
-        index.refresh_usage_guard_holds();
+        // Model the next traversal start: every retained pending is stale.
+        index.refresh_usage_guard_holds_at(None);
         checkpoints += 1;
         global_unknown += u64::from(index.usage_guard_holds.global());
         let roots = index

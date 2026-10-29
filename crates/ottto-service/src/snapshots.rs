@@ -32748,7 +32748,7 @@ impl OwnedSourceScan {
                         || forced
                         || (debt.is_none() && context.audit_slots == 0)
                     {
-                        usage_pending_guard::full_blocked();
+                        usage_pending_guard::full_blocked(&mut census);
                         pending!();
                     }
                     let Some(dependencies) = sampled_scan::reduction_dependencies(
@@ -32758,7 +32758,7 @@ impl OwnedSourceScan {
                         &claude_title_metadata,
                         claude_effort_support_dir_ref,
                     ) else {
-                        usage_pending_guard::full_blocked();
+                        usage_pending_guard::full_blocked(&mut census);
                         pending!();
                     };
                     let scope = context.file_scope(
@@ -32770,7 +32770,7 @@ impl OwnedSourceScan {
                         index,
                     );
                     let Ok(checkpoint) = context.cache.claude_checkpoint(&key) else {
-                        usage_pending_guard::full_blocked();
+                        usage_pending_guard::full_blocked(&mut census);
                         pending!();
                     };
                     if let Some(checkpoint) = checkpoint {
@@ -32783,12 +32783,12 @@ impl OwnedSourceScan {
                             )
                             .unwrap_or(false)
                         {
-                            usage_pending_guard::full_blocked();
+                            usage_pending_guard::full_blocked(&mut census);
                             pending!();
                         }
                         let Ok(taken) = context.cache.take_claude_checkpoint(&key, &checkpoint)
                         else {
-                            usage_pending_guard::full_blocked();
+                            usage_pending_guard::full_blocked(&mut census);
                             pending!();
                         };
                         taken
@@ -32989,7 +32989,7 @@ impl OwnedSourceScan {
                                         if continuation_only {
                                             // Unknown never manufactures an audit re-arm
                                             // from a restore miss or consumes its predecessor.
-                                            usage_pending_guard::full_blocked();
+                                            usage_pending_guard::full_blocked(&mut census);
                                             pending!();
                                         }
                                         let rearmed = class.rearm_audit(
@@ -33031,7 +33031,7 @@ impl OwnedSourceScan {
                         {
                             // A refused durable restore retains its disk predecessor.
                             // RAM certificates were rechecked under the lock before take.
-                            usage_pending_guard::full_blocked();
+                            usage_pending_guard::full_blocked(&mut census);
                             pending!();
                         }
                         let old = retained.filter(|_| allow_sample);
@@ -33365,7 +33365,7 @@ impl OwnedSourceScan {
                     matches!(plan.mode, crate::transcript_acquisition::ReadMode::Full(_))
                 })
             {
-                usage_pending_guard::full_blocked();
+                usage_pending_guard::full_blocked(&mut census);
                 pending!();
             }
             #[cfg(unix)]
@@ -41974,7 +41974,9 @@ fn ensure_bounded_traversal(
             && !REFUSE_CLAUDE_STALE_FAMILY_CARRY_BUDGET_FOR_TEST.with(std::cell::Cell::get);
         let mut admission = None;
         let mut covered_roots = None;
-        index.refresh_usage_guard_holds();
+        // The new checkpoint does not exist yet; every pending older than
+        // this start's window is stale proof.
+        index.refresh_usage_guard_holds_at(Some(collected_at));
         let mut stale_carry_rejection_counts = StaleCarryRejectionCounts::default();
         let carry = if streaming_carry {
             // Existing scheduling debt survives even if the whole set now fits.

@@ -135,9 +135,11 @@ pub(super) struct Holds {
     // Resolution does not revoke age rescue before actual Tail catch-up.
     catchup: Vec<String>,
     global: bool,
+    // Built projections answer every root; unbuilt or dirty ones fall back.
+    built: bool,
     dirty: bool,
 }
-crate::heap_layout_bound::fields!(Holds; roots, catchup, global, dirty);
+crate::heap_layout_bound::fields!(Holds; roots, catchup, global, built, dirty);
 
 fn has_root(roots: &[(String, Unknown)], root: &str) -> bool {
     roots
@@ -180,7 +182,12 @@ impl Holds {
     pub(super) fn holds_path(&self, path: &Path) -> bool {
         claude_index_path_member_ref(path).is_some_and(|member| self.holds(member.root))
     }
-    fn build(index: &ScanIndex) -> Option<Self> {
+    fn fresh(&self) -> bool {
+        self.built && !self.dirty
+    }
+    // `current` is the census window being accumulated now. Its pending is
+    // ordinary current evidence, not a stale token record, and is never held.
+    fn build(index: &ScanIndex, current: Option<&str>) -> Option<Self> {
         use crate::heap_layout_bound::Counter;
         let mut cost = Counter::new(crate::source_rotation::PARKED_BUDGET);
         let owners = index
@@ -228,7 +235,18 @@ impl Holds {
         inventory.sort_unstable();
         let mut held = Vec::new();
         held.try_reserve_exact(roots).ok()?;
+        let is_current = |root: &str| {
+            current.is_some_and(|current| {
+                index
+                    .claude_usage_family_pending
+                    .get(root)
+                    .is_some_and(|pending| pending.census_window_end == current)
+            })
+        };
         for root in index.claude_usage_family_pending.keys() {
+            if is_current(root) {
+                continue;
+            }
             let verdict =
                 if index.decode_holds_family(root) || index.decode_has_opaque_file_incidence() {
                     Verdict::Unknown(Unknown::Decode)
@@ -256,6 +274,7 @@ impl Holds {
                 roots: held,
                 catchup,
                 global: false,
+                built: true,
                 dirty: false,
             });
         }
@@ -350,26 +369,41 @@ impl Holds {
                 break;
             }
         }
+        // Closure may pass through a current family; that family itself
+        // keeps its ordinary current-window reads.
+        held.retain(|(root, _)| !is_current(root));
         Some(Self {
             roots: held,
             catchup,
             global: false,
+            built: true,
             dirty: false,
         })
     }
 }
 
 impl ScanIndex {
+    fn current_census_window(&self) -> Option<String> {
+        self.traversal
+            .as_ref()
+            .map(|traversal| traversal.census_window_end.clone())
+    }
     pub(super) fn refresh_usage_guard_holds(&mut self) {
+        let current = self.current_census_window();
+        self.refresh_usage_guard_holds_at(current.as_deref());
+    }
+    /// A traversal start passes its new window before the checkpoint exists.
+    pub(super) fn refresh_usage_guard_holds_at(&mut self, current: Option<&str>) {
         #[cfg(test)]
         if REPLAY_OLD.with(std::cell::Cell::get) {
             self.usage_guard_holds = Holds::default();
             return;
         }
-        match Holds::build(self) {
+        match Holds::build(self, current) {
             Some(holds) => self.usage_guard_holds = holds,
             None => {
                 self.usage_guard_holds.global = true;
+                self.usage_guard_holds.built = true;
                 self.usage_guard_holds.dirty = false;
             }
         }
@@ -384,12 +418,16 @@ impl ScanIndex {
         if REPLAY_OLD.with(std::cell::Cell::get) {
             return None;
         }
-        self.usage_guard_holds
-            .reason(root)
-            .or_else(|| match verdict(self, root) {
-                Verdict::Unknown(reason) => Some(reason),
-                _ => None,
-            })
+        let holds = &self.usage_guard_holds;
+        if holds.fresh() {
+            // The sorted projection already classified every pending root.
+            return holds.reason(root);
+        }
+        // Unbuilt or dirty: conservative dynamic verdict for this root.
+        holds.reason(root).or_else(|| match verdict(self, root) {
+            Verdict::Unknown(reason) => Some(reason),
+            _ => None,
+        })
     }
     pub(super) fn usage_guard_observe_growth(&self, candidate: &CandidateFile) {
         if self.usage_guard_holds.holds_path(&candidate.path) {
@@ -430,7 +468,10 @@ impl ScanIndex {
     }
 }
 
-pub(super) fn full_blocked() {
+/// The refused read keeps the census incomplete, so terminal cleanup cannot
+/// retire the held pending proof and a later walk cannot take the Full read.
+pub(super) fn full_blocked(census: &mut ScanCensus) {
+    census.record_unreadable(UnreadableCause::Reduction, 1);
     crate::local_resource_diagnostics::traversal_point(
         "claude_usage_unknown_acquisition",
         SnapshotSource::ClaudeCode.api_slug(),
