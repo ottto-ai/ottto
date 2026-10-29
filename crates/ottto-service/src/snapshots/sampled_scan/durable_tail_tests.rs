@@ -4773,7 +4773,20 @@ fn b1_absent_o3_fixture(sidecar_census_complete: bool, cancel_before_read: bool)
                         let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
                             owner.cache.durable_alarm(source)
                         });
-                        assert!(alarms.is_empty());
+                        assert_eq!(alarms.len(), 1, "admission is separately alarmed");
+                        assert_eq!(
+                            alarms[0]["counts"]["upgrade_missing_full"],
+                            serde_json::json!([1, 1])
+                        );
+                        assert_eq!(
+                            alarms[0]["counts"]["upgrade_state_missing"],
+                            serde_json::json!([0, 0]),
+                            "cancel has no native-read credit"
+                        );
+                        let ((), repeated) = crate::local_resource_diagnostics::capture(|| {
+                            owner.cache.durable_alarm(source)
+                        });
+                        assert!(repeated.is_empty(), "no duplicate admission alarm");
                         let _ = std::fs::remove_dir_all(root);
                         return;
                     }
@@ -5215,6 +5228,15 @@ pub(crate) struct ContinuationDurableState {
 }
 
 impl ContinuationDurableState {
+    pub(crate) fn finish_ordinary_eof<T>(&self, finish: impl FnOnce() -> T) -> T {
+        let (result, bytes) = observe_consumed(finish);
+        assert_eq!(
+            bytes, 0,
+            "ordinary resumes the parked EOF without reading native bytes"
+        );
+        result
+    }
+
     pub(crate) fn seed(
         cache: &SharedCache,
         index: &mut ScanIndex,

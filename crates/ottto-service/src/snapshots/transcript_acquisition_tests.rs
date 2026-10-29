@@ -3600,11 +3600,10 @@ fn codex_compaction_events_and_points_match_full_read_at_every_tail_split() {
 /// expected/scope/restore/write seams. Each restart has zero Fulls.
 #[cfg(unix)]
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn pinned_v1_bootstrap_ordinary_save_then_second_restart_tails_without_a_full() {
     use crate::durable_tail_store as store;
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
+    assert!(crate::heap_layout_bound::layout_supported());
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let fixture = ScanFixture::new(source);
         fixture.file.append(&usage(source, 100, 0, "fixture-model"));
@@ -3806,10 +3805,9 @@ fn sampled_native_codex_over_cap_cache_breaks_tail_with_full_parse_parity() {
 /// Enabling the durable cache must preserve main's Full-on-miss admission.
 #[cfg(unix)]
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn no_record_keys_keep_existing_full_admission_after_restart() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
+    assert!(crate::heap_layout_bound::layout_supported());
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let fixture = ScanFixture::new(source);
         fixture.file.append(&usage(source, 100, 0, "fixture-model"));
@@ -3851,10 +3849,9 @@ fn no_record_keys_keep_existing_full_admission_after_restart() {
 /// Restart must re-arm the audit, not freeze the old debt-bearing record.
 #[cfg(unix)]
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn completed_full_audit_before_durable_replacement_recovers_after_restart() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
+    assert!(crate::heap_layout_bound::layout_supported());
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let fixture = ScanFixture::new(source);
         fixture.file.append(&usage(source, 100, 0, "fixture-model"));

@@ -883,7 +883,7 @@ fn ordinary_durable_continuation_to_eof(
     crate::snapshots::with_test_limits_for_test(2048, 1024, 64, || {
         let mut ordinary = OwnedSourceScan::new(
             SnapshotSource::Codex,
-            &[root],
+            &[root.clone()],
             index,
             &at,
             30,
@@ -895,13 +895,21 @@ fn ordinary_durable_continuation_to_eof(
             false,
         )
         .with_sampled_acquisition(std::sync::Arc::clone(&cache), namespace.clone());
-        let (mut index, scan) = loop {
+        let (mut index, mut scan) = loop {
             match ordinary.step(None) {
                 OwnedSourceScanStep::Pending(next) => ordinary = next,
                 OwnedSourceScanStep::Complete { index, scan, .. } => break (index, scan),
             }
         };
-        assert!(!scan.continuation_committed());
+        assert!(
+            scan.snapshots.is_empty(),
+            "ordinary job genuinely paused before EOF"
+        );
+        inputs.evidence = scan.take_continuation_evidence();
+        assert!(
+            inputs.evidence.is_some(),
+            "carry certified ordinary inventory"
+        );
         let ticket = scan
             .continuation_ticket()
             .expect("ordinary job genuinely paused");
@@ -926,21 +934,59 @@ fn ordinary_durable_continuation_to_eof(
                 &fixture.support_dir,
                 &cache,
                 &mut inputs,
-                &members,
                 Some(Duration::from_secs(300)),
                 Instant::now() + Duration::from_secs(20),
             )
             .unwrap();
             state.assert_preserved(&cache);
             match result {
-                ContinuationScan::Uncommitted { ticket, snapshots } => {
-                    assert_eq!(snapshots, 0, "no publication before native EOF");
-                    assert!(ticket.is_some(), "page {page} re-paused its real job");
+                ContinuationScan::Uncommitted {
+                    ticket: Some(_),
+                    snapshots,
+                } => {
+                    assert_eq!(
+                        snapshots, 0,
+                        "page {page}: no publication before native EOF"
+                    );
                 }
-                ContinuationScan::Committed(completion) => {
-                    let (_, mut index, scan) = *completion;
-                    assert!(scan.continuation_committed(), "genuine native EOF");
+                ContinuationScan::Uncommitted {
+                    ticket: None,
+                    snapshots,
+                } => {
+                    assert_eq!(
+                        snapshots, 0,
+                        "continuation parks EOF for ordinary settlement"
+                    );
+                    let (mut index, scan) = state.finish_ordinary_eof(|| {
+                        let mut ordinary = OwnedSourceScan::new(
+                            SnapshotSource::Codex,
+                            &[root.clone()],
+                            ScanIndex::load(&fixture.index_path).unwrap(),
+                            &at,
+                            30,
+                            10,
+                            false,
+                            None,
+                            &[],
+                            false,
+                            false,
+                        )
+                        .with_sampled_acquisition(std::sync::Arc::clone(&cache), namespace.clone());
+                        loop {
+                            match ordinary.step(None) {
+                                OwnedSourceScanStep::Pending(next) => ordinary = next,
+                                OwnedSourceScanStep::Complete { index, scan, .. } => {
+                                    break (index, scan)
+                                }
+                            }
+                        }
+                    });
+                    assert!(
+                        scan.continuation_ticket().is_none(),
+                        "ordinary settled genuine native EOF"
+                    );
                     assert!(!scan.snapshots.is_empty(), "native result reached EOF");
+                    state.assert_preserved(&cache);
                     index.save(&fixture.index_path).unwrap();
                     crate::snapshots::durable_after_save(
                         &cache,
