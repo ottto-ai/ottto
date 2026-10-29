@@ -3067,6 +3067,14 @@ fn b1_funded_custody_does_not_evict_or_reset_spent_keys_at_overflow() {
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "native retained layout")]
 fn b1_absent_o3_saves_before_read_counts_native_start_then_writes_and_restores() {
+    for (sidecar_census_complete, cancel_before_read) in
+        [(true, false), (false, false), (false, true)]
+    {
+        b1_absent_o3_fixture(sidecar_census_complete, cancel_before_read);
+    }
+}
+
+fn b1_absent_o3_fixture(sidecar_census_complete: bool, cancel_before_read: bool) {
     use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
     use std::io::Write;
     let _gate = claude_request_money::e2::GateForTest::set(true);
@@ -3106,9 +3114,20 @@ fn b1_absent_o3_saves_before_read_counts_native_start_then_writes_and_restores()
         .unwrap()
         .write_all(a1a_row("second", 200).as_bytes())
         .unwrap();
+    assert!(std::fs::metadata(&path).unwrap().len() > committed.files[&key].size_bytes);
     let prior = committed.clone();
     let owner = E2ScanFixture::default();
     owner.begin_durable(source, &root, &index_path);
+    assert!(owner
+        .cache
+        .durable()
+        .unwrap()
+        .claude
+        .as_ref()
+        .unwrap()
+        .store
+        .absent(&store::key_digest(DurableSource::ClaudeCode, &key)));
+    let _ = crate::local_resource_diagnostics::capture(|| owner.cache.durable_alarm(source));
     let mut owned = OwnedSourceScan::new_with_identity_capture(
         source,
         &roots,
@@ -3124,6 +3143,7 @@ fn b1_absent_o3_saves_before_read_counts_native_start_then_writes_and_restores()
         false,
     )
     .with_sampled_acquisition(owner.cache.clone(), Scope("e2-pipeline".into()));
+    owned.sidecar_census_complete = sidecar_census_complete;
     let before = UPGRADE_OBSERVED.with(|n| n.get());
     let mut failed_save = false;
     let mut saw_claim_before_read = false;
@@ -3131,6 +3151,17 @@ fn b1_absent_o3_saves_before_read_counts_native_start_then_writes_and_restores()
     let (mut index, mut scan) = loop {
         turns += 1;
         assert!(turns < 100_000, "O3 native scan must terminate");
+        let context = owned.sampling.as_ref().unwrap();
+        if !sidecar_census_complete {
+            assert_eq!(
+                (
+                    context.full_files,
+                    context.tail_files,
+                    context.unchanged_files
+                ),
+                (0, 0, 0)
+            );
+        }
         match owned.step(None) {
             OwnedSourceScanStep::Pending(mut next) => {
                 if next.index.reread_guard.needs_save() && !failed_save {
@@ -3144,31 +3175,87 @@ fn b1_absent_o3_saves_before_read_counts_native_start_then_writes_and_restores()
                 next.persist_reread_reservations(&mut committed, &index_path)
                     .unwrap();
                 if next.index.reread_guard.upgrade_claimed(&key)
+                    && next.active_file.is_some()
                     && UPGRADE_OBSERVED.with(|n| n.get()) == before
                 {
                     saw_claim_before_read = true;
+                    let active = next.active_file.as_ref().unwrap();
+                    assert_eq!(active.sampling.is_some(), sidecar_census_complete);
+                    assert_eq!(active.parser.reader.consumed_bytes(), 0);
+                    let counts = owner.cache.durable_counters(source).unwrap().0;
                     assert_eq!(
-                        owner
-                            .cache
-                            .durable_counters(source)
-                            .unwrap()
-                            .0
-                            .upgrade_state_missing,
-                        0
+                        (counts.upgrade_claimed, counts.upgrade_state_missing),
+                        (1, 0)
                     );
+                    assert!(failed_save);
+                    assert!(
+                        !ScanIndex::load(&index_path)
+                            .unwrap()
+                            .reread_guard
+                            .upgrade_missing(&key, true),
+                        "saved once evidence refuses restart even before native I/O"
+                    );
+                    let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
+                        owner.cache.durable_alarm(source)
+                    });
+                    assert!(alarms
+                        .iter()
+                        .all(|alarm| alarm["counts"]["upgrade_state_missing"]
+                            == serde_json::json!([0, 0])));
+                    if cancel_before_read {
+                        drop(next);
+                        assert_eq!(UPGRADE_OBSERVED.with(|n| n.get()), before);
+                        let counts = owner.cache.durable_counters(source).unwrap().0;
+                        assert_eq!(
+                            (counts.upgrade_claimed, counts.upgrade_state_missing),
+                            (1, 0)
+                        );
+                        let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
+                            owner.cache.durable_alarm(source)
+                        });
+                        assert!(alarms.is_empty());
+                        let _ = std::fs::remove_dir_all(root);
+                        return;
+                    }
                 }
                 owned = next;
             }
             OwnedSourceScanStep::Complete { index, scan, .. } => break (index, scan),
         }
     };
+    assert!(
+        !cancel_before_read,
+        "cancellation must occur before native I/O"
+    );
     assert!(failed_save && saw_claim_before_read);
     assert_eq!(UPGRADE_OBSERVED.with(|n| n.get()), before + 1);
+    let ((), alarms) =
+        crate::local_resource_diagnostics::capture(|| owner.cache.durable_alarm(source));
+    assert_eq!(alarms.len(), 1);
+    assert_eq!(alarms[0]["stage"], "durable_tail_alarm");
+    assert_eq!(
+        alarms[0]["counts"]["upgrade_state_missing"],
+        serde_json::json!([1, 1])
+    );
+    assert_eq!(alarms[0]["counts"]["upgrade_count_basis"], "native_read");
+    let ((), alarms) =
+        crate::local_resource_diagnostics::capture(|| owner.cache.durable_alarm(source));
+    assert!(alarms.is_empty(), "no duplicate alarm delta");
     let counts = owner.cache.durable_counters(source).unwrap().0;
     assert_eq!(
         (counts.upgrade_claimed, counts.upgrade_state_missing),
         (1, 1)
     );
+    assert!(!ScanIndex::load(&index_path)
+        .unwrap()
+        .reread_guard
+        .upgrade_missing(&key, true));
+    if !sidecar_census_complete {
+        assert!(!scan.snapshots.is_empty(), "unsampled native output");
+        assert!(owner.cache.retained_checkpoint(&key).is_none());
+        let _ = std::fs::remove_dir_all(root);
+        return; // No sampled reduction to persist/restore on this path.
+    }
     let cold = E2ScanFixture::default();
     let (mut cold_index, mut cold_scan, _) =
         a1a_scan_at(&cold, &roots, &root, prior, "2026-08-02T08:01:00Z");

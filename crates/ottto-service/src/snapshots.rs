@@ -32250,10 +32250,13 @@ impl OwnedSourceScan {
                     pending!();
                 }
             }
-            if let Some((context, (mode, audit_due))) = sampling.as_mut().zip(planned_mode) {
+            if let Some(context) = sampling.as_mut() {
                 #[cfg(unix)]
                 if source == SnapshotSource::ClaudeCode
-                    && matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
+                    // No plan is the existing unsampled native Full path.
+                    && planned_mode.map_or(true, |(mode, _)| {
+                        matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
+                    })
                     && index
                         .reread_guard
                         .upgrade_claimed(&local_index_key(&active.candidate.path))
@@ -32272,7 +32275,9 @@ impl OwnedSourceScan {
                         }
                     }
                 }
-                context.record_mode(mode, audit_due);
+                if let Some((mode, audit_due)) = planned_mode {
+                    context.record_mode(mode, audit_due);
+                }
             }
             if let Some(delivery) = line_delivery.as_mut() {
                 delivery.arm();
