@@ -4710,14 +4710,25 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
     }
 }
 
-// The portable advisory graph is charged before any layout-dependent graph.
-// A refusal of another graph must not erase this already admitted witness.
+// Existing retained graphs have priority over the advisory memo. Refusing only
+// the memo must not trigger the rotation's discard of admitted sibling graphs.
 pub(crate) fn retained_with_withheld(
     limit: usize,
     other: impl FnOnce(usize) -> Option<usize>,
 ) -> Option<usize> {
-    let withheld = crate::snapshots::withheld_account::retained_bound(limit)?;
-    other(limit.checked_sub(withheld)?)?.checked_add(withheld)
+    let owned = other(limit);
+    // Even when siblings are unsupported, price the portable memo against the
+    // available allowance so their discard preserves it only if it fits.
+    let remaining = limit.checked_sub(owned.unwrap_or(0))?;
+    match crate::snapshots::withheld_account::retained_bound(remaining) {
+        Some(withheld) => owned?.checked_add(withheld),
+        None => {
+            // Frees all memo allocations; held population remains disclosed
+            // with unavailable details and no optional memo storage to charge.
+            crate::snapshots::withheld_account::discard_if_refused();
+            owned
+        }
+    }
 }
 
 pub fn upload_local_health_projection_now(daemon: &LocalDaemon) -> Result<()> {

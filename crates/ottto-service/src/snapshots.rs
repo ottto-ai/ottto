@@ -178,6 +178,8 @@ mod stale_carry_diagnostics;
 mod transcript_acquisition_tests;
 mod traversal_transition;
 pub(crate) mod withheld_account;
+#[cfg(test)]
+mod withheld_owner_charge_tests;
 use stale_carry_diagnostics::{
     Counts as StaleCarryRejectionCounts, Rejection as StaleCarryRejection,
 };
