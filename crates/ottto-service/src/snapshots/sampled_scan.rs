@@ -27,11 +27,11 @@ pub(super) mod durable_tail;
 pub(crate) use durable_tail::MissClass;
 #[cfg(unix)]
 pub(crate) use durable_tail::RestoreOutcome;
-pub(super) mod side_ledger;
 #[cfg(all(test, unix))]
 mod m3_format_tests;
 #[cfg(all(test, unix))]
 mod m3_write_ahead_tests;
+pub(super) mod side_ledger;
 
 /// The retained-copy cache behind `SharedCache::retained`.
 pub(super) type RetainedCache = TranscriptCache<CachedJsonlReduction>;

@@ -176,9 +176,7 @@ pub(crate) fn durable_store_fixture_body(source: SnapshotSource, count: u64, sum
 
 pub(crate) mod sampled_scan;
 #[cfg(unix)]
-pub(crate) use sampled_scan::durable_tail::{
-    AcquisitionProtocol, ImmutableCounting,
-};
+pub(crate) use sampled_scan::durable_tail::{AcquisitionProtocol, ImmutableCounting};
 mod stale_carry_diagnostics;
 #[cfg(test)]
 mod transcript_acquisition_tests;

@@ -1561,16 +1561,22 @@ impl DurableTailStore {
                 ..
             }) = self.pending.get(&key).copied()
             {
-                if completed_content != content || receipt.completed.len() >= MAX_BATCH {
+                if receipt.completed.len() >= MAX_BATCH {
                     receipt.deferred_keys.push(key);
                     continue;
+                }
+                // Deliver the exact B receipt even when the native graph has
+                // advanced to C. Requeue C; do not require B's body to survive.
+                if completed_content != content {
+                    receipt.deferred += 1;
+                    receipt.deferred_keys.push(key);
                 }
                 receipt.written += 1;
                 receipt.bytes_written += candidate.encoded_len;
                 receipt.completed.push(ReceiptProof {
                     identity: candidate,
                     stamp,
-                    content,
+                    content: completed_content,
                 });
                 continue; // Exact completed B, before stale-A authorization or clean handling.
             }
@@ -1664,8 +1670,11 @@ impl DurableTailStore {
                 continue;
             }
             if self.pending.len() >= MAX_BATCH {
-                self.disable("obligation_overflow");
-                break;
+                // Completed candidates retain custody until atomic delivery.
+                // A full owner defers before I/O; it does not disable the store.
+                receipt.deferred += 1;
+                receipt.deferred_keys.push(key);
+                continue;
             }
             if ack_bytes != 0 {
                 receipt
@@ -1708,6 +1717,8 @@ impl DurableTailStore {
                 Ok(ReconcileOutcome::Receipted(proof)) if proof.identity == candidate => proof,
                 Ok(ReconcileOutcome::Retired(proof)) if proof.candidate == candidate => {
                     on_disk.remove(&key);
+                    receipt.deferred += 1;
+                    receipt.deferred_keys.push(key);
                     continue;
                 }
                 _ => {
