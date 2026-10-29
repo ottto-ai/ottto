@@ -3073,7 +3073,8 @@ fn a1t_no_match_growth_full_restart_recounts_without_dropping_or_adding_the_pref
     // A higher selector reason must not mask growth into a hold. A due audit
     // reaches the no-match restore and takes the counted Full; owed adoption
     // is refused before the record is read ("history_owed"), so it takes the
-    // ordinary uncounted Miss Full. Neither drops the appended usage.
+    // ordinary uncounted Miss Full. Neither drops the appended usage: each
+    // arm emits the same wire as a cold Full under the same index.
     for arm in ["audit", "adoption"] {
         let mut selected = ScanIndex::load(&index_path).unwrap();
         let entry = selected.files.get_mut(&key).unwrap();
@@ -3128,21 +3129,45 @@ fn a1t_no_match_growth_full_restart_recounts_without_dropping_or_adding_the_pref
         assert!(alarms
             .iter()
             .all(|a| a["counts"]["held_keys"] == serde_json::json!([0, 0])));
-        if arm == "audit" {
-            let emitted = a1a_wire(&root, &mut index, &mut scan);
-            assert_eq!(
-                (
-                    scan.snapshots[0].input_tokens,
-                    scan.snapshots[0].output_tokens,
-                    scan.snapshots[0].request_count
-                ),
-                (300, 20, 2)
+        if arm == "adoption" {
+            // Literal policy, explicit: revision 3's row sends request-owned
+            // literals only while no list pauses or names the family. With no
+            // list installed, the grown file is Changed => NotOwed (no gated
+            // history), and the literal guard is Open, so nothing is vetoed.
+            assert!(!index.claude_reemission_exclusions.pauses_adoption());
+            assert!(index.claude_reemission_exclusions.is_empty());
+            assert!(
+                index.claude_history_emission.files.is_empty(),
+                "changed growth is not gated history"
             );
-            let cold = E2ScanFixture::default();
-            let (mut cold_index, mut cold_scan, _) =
-                a1a_scan_at(&cold, &roots, &root, selected, "2026-08-02T08:01:30Z");
-            assert_eq!(emitted, a1a_wire(&root, &mut cold_index, &mut cold_scan));
+            assert_eq!(
+                index.claude_literal_guard(&scan.snapshots),
+                crate::snapshots::claude_history_upgrade::LiteralGuard::Open
+            );
         }
+        let emitted = a1a_wire(&root, &mut index, &mut scan);
+        assert!(!emitted.is_empty(), "{arm}");
+        assert_eq!(scan.snapshots.len(), 1, "{arm}");
+        assert_eq!(
+            (
+                scan.snapshots[0].input_tokens,
+                scan.snapshots[0].output_tokens,
+                scan.snapshots[0].request_count
+            ),
+            (300, 20, 2),
+            "{arm}: accepted 100 plus appended 200, never the prefix twice"
+        );
+        // Cold Full from the same index: same active revision, monotone flag
+        // and list policy.
+        let cold = E2ScanFixture::default();
+        let (mut cold_index, mut cold_scan, cold_modes) =
+            a1a_scan_at(&cold, &roots, &root, selected, "2026-08-02T08:01:30Z");
+        assert_eq!(cold_modes, (1, 0, 0), "{arm}");
+        assert_eq!(
+            emitted,
+            a1a_wire(&root, &mut cold_index, &mut cold_scan),
+            "{arm}: exact emitted body, no normalization"
+        );
         assert_eq!(std::fs::read(&disk_path).unwrap(), survivor, "{arm}");
     }
     for restart in 0..2 {
