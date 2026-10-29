@@ -638,6 +638,7 @@ impl<R: Read> Drop for BoundedDecoder<R> {
 /// sampled plain-file offsets cannot be applied to compressed data. Method
 /// names match the `BufReader<File>` calls the parser already makes.
 pub(super) enum OpenedInput {
+    RetainedArchive(File),
     Plain(BufReader<File>),
     Compressed(
         Box<BufReader<BoundedDecoder<File>>>,
@@ -711,7 +712,7 @@ impl OpenedInput {
         }
     }
     pub(super) fn is_compressed(&self) -> bool {
-        matches!(self, Self::Compressed(..))
+        matches!(self, Self::Compressed(..) | Self::RetainedArchive(_))
     }
 
     /// The original opened File: metadata and identity revalidation use it, so
@@ -719,6 +720,7 @@ impl OpenedInput {
     /// decoder reaches EOF.
     pub(super) fn get_ref(&self) -> &File {
         match self {
+            Self::RetainedArchive(file) => file,
             Self::Plain(reader) => reader.get_ref(),
             Self::Compressed(reader, _) => reader.get_ref().input.get_ref().get_ref(),
         }
@@ -726,6 +728,7 @@ impl OpenedInput {
 
     pub(super) fn get_mut(&mut self) -> &mut File {
         match self {
+            Self::RetainedArchive(file) => file,
             Self::Plain(reader) => reader.get_mut(),
             Self::Compressed(reader, _) => reader.get_mut().input.get_mut().get_mut(),
         }
@@ -733,6 +736,7 @@ impl OpenedInput {
 
     pub(super) fn buffer(&self) -> &[u8] {
         match self {
+            Self::RetainedArchive(_) => &[],
             Self::Plain(reader) => reader.buffer(),
             Self::Compressed(reader, _) => reader.buffer(),
         }
@@ -743,6 +747,7 @@ impl OpenedInput {
     /// plain input charges only its buffer.
     pub(super) fn capacity(&self) -> usize {
         match self {
+            Self::RetainedArchive(_) => 0,
             Self::Plain(reader) => reader.capacity(),
             Self::Compressed(_, Some(_)) => 0, // existing outstanding cache reservation
             Self::Compressed(reader, _) => {
@@ -758,6 +763,7 @@ impl OpenedInput {
 impl Read for OpenedInput {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
         match self {
+            Self::RetainedArchive(_) => Ok(0),
             Self::Plain(reader) => reader.read(output),
             Self::Compressed(reader, _) => reader.read(output),
         }
@@ -767,6 +773,7 @@ impl Read for OpenedInput {
 impl BufRead for OpenedInput {
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
         match self {
+            Self::RetainedArchive(_) => Ok(&[]),
             Self::Plain(reader) => reader.fill_buf(),
             Self::Compressed(reader, _) => reader.fill_buf(),
         }
@@ -774,6 +781,7 @@ impl BufRead for OpenedInput {
 
     fn consume(&mut self, amount: usize) {
         match self {
+            Self::RetainedArchive(_) => debug_assert_eq!(amount, 0),
             Self::Plain(reader) => reader.consume(amount),
             Self::Compressed(reader, _) => reader.consume(amount),
         }
@@ -1135,6 +1143,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for ArchiveDisposition {
 #[cfg(test)]
 pub(in crate::snapshots) mod tests {
     include!("codex_archive_header_tests.rs");
+    include!("codex_archive_retained_tests.rs");
     include!("codex_archive_correction_tests.rs");
     include!("codex_archive_ru_tests.rs");
     include!("codex_archive_released_entry_tests.rs");

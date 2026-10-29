@@ -102,6 +102,53 @@ pub(super) struct LiveReductionInputs {
 }
 
 impl OwnedJsonlParser {
+    pub(super) fn restore_archive_reduction(
+        &mut self,
+        old: Retained<CachedJsonlReduction>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.reader.reader.is_compressed() && old.state.accumulator.source == self.source,
+            "archive retained source mismatch"
+        );
+        anyhow::ensure!(
+            old.state
+                .accumulator
+                .codex_observed_priority_turns
+                .as_ref()
+                .is_some_and(|observed| observed.iter().all(|(turn, priority)| *priority
+                    == self
+                        .accumulator
+                        .codex_turn_traces
+                        .as_ref()
+                        .is_some_and(|traces| traces.is_priority_turn(turn)))),
+            "archive priority dependencies changed"
+        );
+        anyhow::ensure!(
+            codex_counting_version::reusable(
+                old.state.accumulator.codex_counting.as_deref(),
+                self.accumulator.codex_counting.as_deref()
+            ),
+            "archive counting dependencies changed"
+        );
+        let inputs = self.take_live_reduction_inputs();
+        let CachedJsonlReduction {
+            accumulator,
+            report,
+            recognized_usage_drop_count,
+            positive_recognized_usage_count,
+            positive_usage_evidence,
+        } = old.state;
+        self.accumulator = accumulator;
+        self.restore_live_reduction_inputs(inputs);
+        self.reader.report = report;
+        self.recognized_usage_drop_count = recognized_usage_drop_count;
+        self.positive_recognized_usage_count = positive_recognized_usage_count;
+        self.positive_usage_evidence = positive_usage_evidence;
+        self.archive_checkpoint = Some(old.checkpoint);
+        self.reader.finished = true;
+        Ok(())
+    }
+
     /// The source mtime this read's checkpoint will carry
     /// (`ReadPlan::modified_hint`); `None` without a plan.
     pub(super) fn planned_modified_hint(&self) -> Option<(i64, i64)> {
@@ -230,10 +277,14 @@ impl OwnedJsonlParser {
         let inputs = self.take_live_reduction_inputs();
         let bound = (|| {
             let state = crate::heap_layout_bound::bound(&self.accumulator, limit)?;
-            let checkpoint = crate::heap_layout_bound::bound(
-                self.reader.acquisition.as_ref()?,
-                limit.checked_sub(state)?,
-            )?;
+            let checkpoint = if let Some(archive) = self.archive_checkpoint.as_ref() {
+                crate::heap_layout_bound::bound(archive, limit.checked_sub(state)?)?
+            } else {
+                crate::heap_layout_bound::bound(
+                    self.reader.acquisition.as_ref()?,
+                    limit.checked_sub(state)?,
+                )?
+            };
             let inline = std::mem::size_of::<CachedJsonlReduction>()
                 .checked_sub(std::mem::size_of::<SnapshotAccumulator>())?;
             let total = state.checked_add(checkpoint)?.checked_add(inline)?;
@@ -302,6 +353,26 @@ impl OwnedJsonlParser {
             }
             false
         };
+        if let Some(checkpoint) = self.archive_checkpoint.take() {
+            anyhow::ensure!(
+                checkpoint.stamp_matches(self.reader.reader.get_ref())?
+                    && checkpoint.scope() == scope,
+                "archive changed before retention"
+            );
+            let reduction = admitted_copy.then(|| self.reduction_copy()).filter(|r| {
+                crate::heap_layout_bound::bound(
+                    r,
+                    remaining_copy_budget.min(crate::transcript_cache::ENTRY_BYTES),
+                )
+                .is_some()
+            });
+            return Ok(Some(CompletedNativeAcquisition {
+                checkpoint,
+                reduction,
+                released: None,
+                unsealed: false,
+            }));
+        }
         let Some(plan) = self.reader.acquisition.take() else {
             record(Event::RetentionNoPlan);
             return Ok(None);

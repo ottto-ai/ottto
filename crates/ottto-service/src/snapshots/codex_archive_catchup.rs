@@ -121,16 +121,16 @@ impl ScanIndex {
             )?;
             return Ok(Admission::Held);
         }
-        // Until retained-body replay is wired to PR A, an unsettled attempt
-        // cannot buy a second decode. Exact late ACK settlement remains valid.
-        if retry {
-            return Ok(Admission::Deferred);
-        }
         if !self
             .archive_pass
             .ready(budget.singleton_remaining(sampled_scan::codex_cursor::Limits::current()))
         {
             return Ok(Admission::Deferred);
+        }
+        // An unchanged pending object already has a validated header. The
+        // retained hit (or bounded lost-copy retry) is resolved by the parser.
+        if retry {
+            return Ok(Admission::Read);
         }
         #[cfg(unix)]
         {

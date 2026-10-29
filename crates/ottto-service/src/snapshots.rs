@@ -26997,10 +26997,12 @@ impl OwnedSourceScan {
         // Sort only the selected page; never stat or allocate sort scratch for
         // the entire pending roster on every construction. Live work first.
         if source == SnapshotSource::Codex {
+            let mut metadata_checks = 0_u64;
             pending_paths.sort_by_cached_key(|p| {
                 let archive = codex_archive_path(&p.path);
                 let modified = archive
                     .then(|| {
+                        metadata_checks += 1;
                         fs::symlink_metadata(&p.path)
                             .and_then(|m| m.modified())
                             .ok()
@@ -27008,6 +27010,11 @@ impl OwnedSourceScan {
                     .flatten();
                 (archive, std::cmp::Reverse(modified))
             });
+            crate::local_resource_diagnostics::traversal_point(
+                "codex_zst_order_metadata",
+                "codex",
+                &BTreeMap::from([("codex_zst_order_metadata_checks", metadata_checks)]),
+            );
         }
         let mut files = pending_paths
             .into_iter()
@@ -29835,7 +29842,11 @@ impl OwnedSourceScan {
                 // after the commit.
                 let side_parsed_stamp = completed_acquisition
                     .as_ref()
-                    .filter(|_| source == SnapshotSource::Codex && aliases.is_empty())
+                    .filter(|_| {
+                        source == SnapshotSource::Codex
+                            && aliases.is_empty()
+                            && !parser.reader.reader.is_compressed()
+                    })
                     .and_then(|_| {
                         sampled_scan::codex_cursor::OpenStamp::capture(
                             parser.reader.reader.get_ref(),
@@ -32969,7 +32980,35 @@ impl OwnedSourceScan {
                 crate::context_composition::set_utility_qos();
                 index.archive_pass.started = true;
             }
-            let mut parser = match sampled_scan::new_source_parser(
+            let archive_scope = sampling
+                .as_ref()
+                .filter(|_| {
+                    source == SnapshotSource::Codex
+                        && codex_archive_path(&candidate.path)
+                        && state_census_complete
+                        && sidecar_census_complete
+                })
+                .and_then(|context| {
+                    sampled_scan::reduction_dependencies(
+                        source,
+                        &candidate,
+                        &codex_title_metadata,
+                        &claude_title_metadata,
+                        claude_effort_support_dir_ref,
+                        index.archive_header(&candidate.path),
+                    )
+                    .map(|dependency| {
+                        context.file_scope(
+                            source,
+                            &candidate,
+                            &dependency,
+                            true,
+                            context_curve_enabled,
+                            index,
+                        )
+                    })
+                });
+            let mut parser = match sampled_scan::new_source_parser_with_archive_scope(
                 opened_file,
                 &candidate,
                 source,
@@ -32981,6 +33020,7 @@ impl OwnedSourceScan {
                 claude_request_identity_capture,
                 index,
                 sampling.as_ref().map(|context| &context.cache),
+                archive_scope.as_ref(),
             ) {
                 Ok(parser) => parser,
                 // U1a-2a G6: the side read's charged attempt; no census line.
@@ -33059,6 +33099,26 @@ impl OwnedSourceScan {
                         }
                         pending!();
                     }
+                }
+            } else if parser.reader.reader.is_compressed() {
+                if let Some(scope) = archive_scope {
+                    let mode = if parser.reader.finished {
+                        crate::transcript_acquisition::ReadMode::Unchanged
+                    } else {
+                        crate::transcript_acquisition::ReadMode::Full(
+                            crate::transcript_acquisition::FullReason::StateMissing,
+                        )
+                    };
+                    file_sampling = Some(sampled_scan::Active {
+                        key: local_index_key(&candidate.path),
+                        scope,
+                        mode,
+                        audit_due: None,
+                        retained_hint: None,
+                        retained_finalization_charge: 0,
+                        retained_usage: None,
+                        reinsertion: Default::default(),
+                    });
                 }
             } else if let Some(context) = sampling
                 .as_mut()
@@ -34519,6 +34579,7 @@ struct OwnedJsonlParser {
     source_read_probe: Option<PathBuf>,
     reader: BoundedJsonlReader<OpenedInput>,
     accumulator: SnapshotAccumulator,
+    archive_checkpoint: Option<crate::transcript_acquisition::Checkpoint>,
     source: SnapshotSource,
     apply_line: fn(&Value, &mut SnapshotAccumulator),
     recognized_usage_drop_count: usize,
@@ -34625,6 +34686,7 @@ impl OwnedJsonlParser {
                 source == SnapshotSource::Codex,
             ),
             accumulator,
+            archive_checkpoint: None,
             source,
             apply_line,
             recognized_usage_drop_count: 0,
@@ -92680,7 +92742,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_unresolvable, codex_parent_ledger_unusable, codex_parent_ledger_consulted,
     codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, recovered_audit_due, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
-crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
+crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, reader, accumulator, archive_checkpoint, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
 crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery; shared codex_versions);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);

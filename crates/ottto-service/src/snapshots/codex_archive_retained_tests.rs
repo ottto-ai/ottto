@@ -1,0 +1,371 @@
+// Synthetic, normal inventory/selector fixtures. No upload, durable archive
+// restoration, physical sample or archive Tail is used by these controls.
+fn retained_archive_scan(
+    f: &ArchiveFixture,
+    index: ScanIndex,
+    cache: Arc<sampled_scan::SharedCache>,
+) -> OwnedSourceScan {
+    let mut scan = selector_scan(f, index, cache, VecDeque::from([f.candidate()]), true);
+    scan.state_census_complete = true;
+    scan.sidecar_census_complete = true;
+    scan
+}
+fn decoded_archive_bytes(rows: &[Value]) -> u64 {
+    rows.iter()
+        .map(|r| {
+            r["counts"]["codex_zst_decoded_bytes"].as_u64().unwrap_or(0)
+                + r["counts"]["codex_zst_inventory_decoded_bytes"]
+                    .as_u64()
+                    .unwrap_or(0)
+        })
+        .sum()
+}
+fn archive_event_count(rows: &[Value], event: &str) -> u64 {
+    rows.iter()
+        .map(|r| r["counts"][event].as_u64().unwrap_or(0))
+        .sum()
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "funded decoder needs validated heap layout"
+)]
+fn unsettled_retained_archive_resends_zero_decoded_bytes_and_exact_ack_settles() {
+    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let key = local_index_key(&f.0);
+    let (mut index, first) = finish_selector(retained_archive_scan(
+        &f,
+        ScanIndex::default(),
+        cache.clone(),
+    ));
+    assert_eq!(first.snapshots.len(), 1);
+    assert!(
+        cache.retained_checkpoint(&key).is_some(),
+        "completed decode actually admitted"
+    );
+    let attempt = index.files[&key].archive.as_ref().unwrap().decode_attempts;
+    retry_due(&mut index, &key);
+    let ((mut index, resent), rows) = crate::local_resource_diagnostics::capture(|| {
+        finish_selector(retained_archive_scan(&f, index, cache.clone()))
+    });
+    assert_eq!(
+        decoded_archive_bytes(&rows),
+        0,
+        "actual decoder/input counters"
+    );
+    assert_eq!(decodes(&rows), 0, "no inventory decoder either");
+    assert_eq!(archive_event_count(&rows, "codex_zst_retained_resend"), 1);
+    assert_eq!(archive_event_count(&rows, "codex_zst_first_read_retry"), 0);
+    assert_eq!(
+        index.files[&key].archive.as_ref().unwrap().decode_attempts,
+        attempt
+    );
+    assert_eq!(resent.snapshots.len(), 1);
+    assert_eq!(
+        snapshot_upload_body_witness(&first.snapshots[0]),
+        snapshot_upload_body_witness(&resent.snapshots[0])
+    );
+    let wrong = BTreeMap::from([(
+        resent.snapshots[0].snapshot_fingerprint.clone(),
+        "wrong".to_owned(),
+    )]);
+    index.settle_archive_bodies(&wrong);
+    assert!(matches!(
+        index.files[&key].archive.as_ref().unwrap().disposition,
+        ArchiveDisposition::Pending { .. }
+    ));
+    index.settle_archive_bodies(&ack_bodies(&resent));
+    assert!(matches!(
+        index.files[&key].archive.as_ref().unwrap().disposition,
+        ArchiveDisposition::Acquired
+    ));
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "funded decoder needs validated heap layout"
+)]
+fn evicted_archive_retries_once_with_counted_bounded_decode() {
+    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let key = local_index_key(&f.0);
+    let (mut index, first) = finish_selector(retained_archive_scan(
+        &f,
+        ScanIndex::default(),
+        cache.clone(),
+    ));
+    assert_eq!(first.snapshots.len(), 1);
+    assert!(cache.retained_checkpoint(&key).is_some());
+    // Exercise the cache's actual budget-eviction path, not an explicit take.
+    let _ = cache
+        .retained()
+        .unwrap()
+        .release_until_for(0, crate::transcript_cache::Release::CopyAdmission);
+    assert!(cache.retained_checkpoint(&key).is_none());
+    retry_due(&mut index, &key);
+    let ((index, resent), rows) = crate::local_resource_diagnostics::capture(|| {
+        finish_selector(retained_archive_scan(&f, index, cache.clone()))
+    });
+    assert_eq!(decodes(&rows), 1);
+    assert!(decoded_archive_bytes(&rows) > 0);
+    assert_eq!(archive_event_count(&rows, "codex_zst_first_read_retry"), 1);
+    assert_eq!(archive_event_count(&rows, "codex_zst_retained_resend"), 0);
+    assert_eq!(resent.snapshots.len(), 1);
+    assert_eq!(
+        index.files[&key].archive.as_ref().unwrap().decode_attempts,
+        2
+    );
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "funded decoder needs validated heap layout"
+)]
+fn changed_archive_object_never_takes_prior_retained_copy() {
+    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let key = local_index_key(&f.0);
+    let (index, first) = finish_selector(retained_archive_scan(
+        &f,
+        ScanIndex::default(),
+        cache.clone(),
+    ));
+    assert_eq!(first.snapshots.len(), 1);
+    assert!(cache.retained_checkpoint(&key).is_some());
+    let replacement = f.0.with_extension("replacement");
+    fs::write(
+        &replacement,
+        zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap(),
+    )
+    .unwrap();
+    fs::rename(replacement, &f.0).unwrap();
+    let (((index, result), rows), cache_events) =
+        crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
+            crate::local_resource_diagnostics::capture(|| {
+                finish_selector(retained_archive_scan(&f, index, cache.clone()))
+            })
+        });
+    assert_eq!(
+        cache_events.take_hit, 0,
+        "replacement never takes the old resident"
+    );
+    assert_eq!(archive_event_count(&rows, "codex_zst_retained_resend"), 0);
+    assert!(decoded_archive_bytes(&rows) > 0);
+    assert_eq!(result.snapshots.len(), 1);
+    assert_eq!(
+        index.files[&key].archive.as_ref().unwrap().decode_attempts,
+        1
+    );
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "funded decoder needs validated heap layout"
+)]
+fn twin_without_content_equivalence_holds_archive_and_preserves_plain_body() {
+    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    for equivalent in [false, true] {
+        let plain_bytes = synthetic_rollout();
+        let mut archive_bytes = plain_bytes.clone();
+        if !equivalent {
+            archive_bytes.extend_from_slice(b"{\"type\":\"different_content\"}\n");
+        }
+        assert_eq!(plain_bytes == archive_bytes, equivalent);
+        let f = ArchiveFixture::new(&zstd::stream::encode_all(&archive_bytes[..], 1).unwrap());
+        let plain = f.0.with_extension("");
+        fs::write(&plain, &plain_bytes).unwrap();
+        let mut member = super::super::codex_zst_refusal_tests::candidate(&plain);
+        member.size_bytes = plain_bytes.len() as u64;
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let (_, control) = finish_selector(selector_scan(
+            &f,
+            ScanIndex::default(),
+            cache.clone(),
+            VecDeque::from([member.clone()]),
+            true,
+        ));
+        let mut index = ScanIndex::default();
+        index
+            .inventory_archive_header(&f.candidate(), Some(&cache), &mut funded_header_work())
+            .unwrap();
+        let ((index, result), rows) = crate::local_resource_diagnostics::capture(|| {
+            finish_selector(selector_scan(
+                &f,
+                index,
+                cache,
+                VecDeque::from([member, f.candidate()]),
+                true,
+            ))
+        });
+        assert_eq!(decodes(&rows), 0);
+        assert_eq!(decoded_archive_bytes(&rows), 0);
+        assert_eq!(result.snapshots.len(), 1);
+        assert_eq!(
+            snapshot_upload_body_witness(&result.snapshots[0]),
+            snapshot_upload_body_witness(&control.snapshots[0])
+        );
+        assert!(matches!(
+            index.files[&local_index_key(&f.0)]
+                .archive
+                .as_ref()
+                .unwrap()
+                .disposition,
+            ArchiveDisposition::Held {
+                cause: CodexZstCause::FamilyUnproven
+            }
+        ));
+    }
+}
+
+#[test]
+fn prior_plain_carrier_or_tombstone_holds_move_before_any_content_read() {
+    let f = ArchiveFixture::new(b"not even a valid zstd frame: no header read allowed");
+    let id = codex_protected_owner("compressed-fixture");
+    for tombstone_only in [false, true] {
+        let mut index = ScanIndex::default();
+        let plain = local_index_key(&f.0.with_extension(""));
+        if tombstone_only {
+            index.codex_counting_tombstones.insert(
+                id.clone(),
+                codex_counting_version::CountingTombstone {
+                    evidence: codex_counting_version::AckEvidence::LegacyAcked,
+                    retired_in: NOW.into(),
+                    created_unix_ms: None,
+                },
+            );
+        } else {
+            index.files.insert(
+                plain.clone(),
+                ScanIndexEntry {
+                    codex_protected_owner: Some(id.clone()),
+                    last_upload_body_witness: Some("accepted-body".into()),
+                    ..ScanIndexEntry::default()
+                },
+            );
+        }
+        index.archive_pass.power = true;
+        let before = serde_json::to_value(&index).unwrap();
+        let (decision, rows) = crate::local_resource_diagnostics::capture(|| {
+            index
+                .classify_archive(
+                    &f.candidate(),
+                    &File::open(&f.0).unwrap(),
+                    None,
+                    None,
+                    &mut sampled_scan::codex_cursor::PageBudget::default(),
+                )
+                .unwrap()
+        });
+        assert!(matches!(decision, codex_archive_catchup::Admission::Held));
+        assert_eq!(decoded_archive_bytes(&rows), 0);
+        assert!(!rows.iter().any(|r| r["stage"] == "codex_zst_frame_header"));
+        let after = serde_json::to_value(&index).unwrap();
+        assert_eq!(
+            after["codex_counting_tombstones"],
+            before["codex_counting_tombstones"]
+        );
+        assert_eq!(after["files"][&plain], before["files"][&plain]);
+        assert!(matches!(
+            index.files[&local_index_key(&f.0)]
+                .archive
+                .as_ref()
+                .unwrap()
+                .disposition,
+            ArchiveDisposition::Held {
+                cause: CodexZstCause::ArchiveEquivalenceUnproven
+            }
+        ));
+    }
+}
+
+#[test]
+fn only_pending_sibling_resolution_restores_one_a1_eligibility() {
+    let f = ArchiveFixture::new(b"metadata only");
+    let own = local_index_key(&f.0);
+    let peer = local_index_key(
+        &f.0.with_file_name("rollout-2026-10-07T00-00-00-compressed-fixture.jsonl.zst"),
+    );
+    let paths = BTreeSet::from([own.clone(), peer.clone()]);
+    let mut inventory = codex_file_join::HeaderInventory::new(&[], &paths, None);
+    inventory.first_read_archives.insert(own.clone());
+    inventory.deferred_archives.insert(peer);
+    inventory.classify_bound_archives();
+    assert!(inventory.deferred_archives.contains(&own));
+    assert!(inventory.family_held.is_empty());
+    inventory.deferred_archives.clear(); // resolved to a different owner; no related peer remains
+    inventory.classify_bound_archives();
+    assert!(!inventory.deferred_archives.contains(&own));
+    assert!(inventory.first_read_archives.contains(&own));
+    assert!(
+        inventory.family_held.is_empty(),
+        "eligibility is not a sticky family hold"
+    );
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "funded decoder needs validated heap layout"
+)]
+fn plain_retained_output_and_charge_are_unchanged_beside_archive_pressure() {
+    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+    let plain = f.0.with_file_name("rollout-plain-peer.jsonl");
+    fs::write(
+        &plain,
+        String::from_utf8(synthetic_rollout())
+            .unwrap()
+            .replace("compressed-fixture", "plain-peer"),
+    )
+    .unwrap();
+    let mut member = super::super::codex_zst_refusal_tests::candidate(&plain);
+    member.size_bytes = fs::metadata(&plain).unwrap().len();
+    let mut observations = Vec::new();
+    for with_archive in [false, true] {
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        if with_archive {
+            let (_, archive) = finish_selector(retained_archive_scan(
+                &f,
+                ScanIndex::default(),
+                cache.clone(),
+            ));
+            assert_eq!(archive.snapshots.len(), 1);
+            assert!(cache.retained_checkpoint(&local_index_key(&f.0)).is_some());
+        }
+        let pressure = OpenedInput::funded(File::open(&f.0).unwrap(), &cache)
+            .unwrap()
+            .unwrap();
+        let mut scan = selector_scan(
+            &f,
+            ScanIndex::default(),
+            cache.clone(),
+            VecDeque::from([member.clone()]),
+            true,
+        );
+        scan.state_census_complete = true;
+        scan.sidecar_census_complete = true;
+        let (index, result) = finish_selector(scan);
+        pressure.close();
+        assert_eq!(result.snapshots.len(), 1);
+        let checkpoint = cache
+            .retained_checkpoint(&local_index_key(&plain))
+            .expect("plain retained under the same pressure");
+        assert_eq!(cache.cursor_reserved(), 0);
+        observations.push((
+            snapshot_upload_body_witness(&result.snapshots[0]),
+            checkpoint.sealed_offset(),
+            index.files[&local_index_key(&plain)]
+                .last_upload_body_witness
+                .clone(),
+        ));
+    }
+    assert_eq!(observations[0], observations[1]);
+}

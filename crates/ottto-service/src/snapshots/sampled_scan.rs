@@ -382,7 +382,7 @@ impl SharedCache {
                 // M1: an admitted copy is a durable write candidate after the
                 // next successful index save (the durable lock is a leaf).
                 #[cfg(unix)]
-                if admitted {
+                if admitted && !codex_archive_path(Path::new(&touched)) {
                     self.durable_touch(&touched);
                 }
                 return admitted;
@@ -1985,10 +1985,88 @@ pub(super) fn new_source_parser(
     index: &mut ScanIndex,
     cache: Option<&Arc<SharedCache>>,
 ) -> Result<OwnedJsonlParser> {
+    new_source_parser_with_archive_scope(
+        file,
+        candidate,
+        source,
+        metadata,
+        traces,
+        parents,
+        artifacts,
+        curve,
+        identity_capture,
+        index,
+        cache,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn new_source_parser_with_archive_scope(
+    file: File,
+    candidate: &CandidateFile,
+    source: SnapshotSource,
+    metadata: &CodexTitleMetadata,
+    traces: Option<Arc<CodexTurnTraceMap>>,
+    parents: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
+    artifacts: bool,
+    curve: bool,
+    identity_capture: bool,
+    index: &mut ScanIndex,
+    cache: Option<&Arc<SharedCache>>,
+    archive_scope: Option<&Scope>,
+) -> Result<OwnedJsonlParser> {
     let input = if source == SnapshotSource::Codex
         && is_compressed_codex_rollout(Some(&candidate.path), None)
     {
         let key = local_index_key(&candidate.path);
+        let reuse = index
+            .files
+            .get(&key)
+            .and_then(|e| e.archive.as_deref())
+            .is_some_and(|a| {
+                a.matches(&file)
+                    && !a.quiet(&file)
+                    && !a.user_change
+                    && matches!(a.disposition, ArchiveDisposition::Pending { .. })
+            });
+        if reuse {
+            if let Some((cache, scope)) = cache.zip(archive_scope) {
+                if let Some(taken) = cache.take(&key) {
+                    if taken.retained.checkpoint.stamp_matches(&file)?
+                        && taken.retained.checkpoint.scope() == scope
+                    {
+                        let mut parser = OwnedJsonlParser::new_opened(
+                            OpenedInput::RetainedArchive(file),
+                            &candidate.path,
+                            source,
+                            apply_codex_line,
+                            Some(metadata),
+                            traces,
+                            parents,
+                            artifacts,
+                            curve,
+                        )?;
+                        configure_tier_replay(&mut parser, candidate, index);
+                        codex_counting_version::configure_singleton(&mut parser, candidate, index);
+                        parser.restore_archive_reduction(taken.retained)?;
+                        index
+                            .files
+                            .get_mut(&key)
+                            .and_then(|e| e.archive.as_mut())
+                            .expect("matching archive")
+                            .reservation_saved = true;
+                        traversal_point(
+                            "codex_zst_retained_resend",
+                            "codex",
+                            &serde_json::json!({"codex_zst_retained_resend":1,"codex_zst_decoded_bytes":0}),
+                        );
+                        return Ok(parser);
+                    }
+                }
+            }
+        }
+
         if let Some(archive) = index.files.get_mut(&key).and_then(|e| e.archive.as_mut()) {
             anyhow::ensure!(
                 !archive.quiet(&file),
@@ -2056,6 +2134,19 @@ pub(super) fn new_source_parser(
         curve,
     )?;
     parser.reader.capture_header = parser.reader.reader.is_compressed();
+    if parser.reader.reader.is_compressed() {
+        parser.accumulator.codex_observed_priority_turns = Some(BTreeMap::new());
+        parser.archive_checkpoint = archive_scope
+            .map(|scope| {
+                crate::transcript_acquisition::Checkpoint::completed_archive(
+                    parser.reader.reader.get_ref(),
+                    scope,
+                    now_seconds(),
+                )
+            })
+            .transpose()?;
+    }
+
     // S2: route archive decodes through the single Full gate.
     parser.accumulator.claude_request_identity_capture = identity_capture;
     if source == SnapshotSource::Codex {

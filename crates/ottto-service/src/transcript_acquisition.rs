@@ -262,6 +262,18 @@ pub(crate) struct Checkpoint {
 }
 
 impl Checkpoint {
+    /// RAM-only archive reduction witness. It certifies no physical prefix or
+    /// samples: archives are replace-only and never enter durable restoration.
+    /// The caller supplies a complete validated decode before cache admission.
+    pub(crate) fn completed_archive(file: &File, scope: &Scope, now: u64) -> io::Result<Self> {
+        Ok(Self {
+            stamp: FileStamp::capture(file.metadata()?)?.content_only(),
+            scope: scope.clone(),
+            samples: Samples::default(),
+            last_full_verified_unix_seconds: now,
+            audit_debt: None,
+        })
+    }
     /// A cache admission hint only. Source validation still uses the complete
     /// stamp, scope, samples and independent audit obligation.
     pub(crate) fn modified_hint(&self) -> (i64, i64) {

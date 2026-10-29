@@ -597,6 +597,7 @@ impl HeaderInventory {
         };
         self.pending.clear();
         let mut last = None;
+        let mut metadata_checks = 0_u64;
         for path in iter.by_ref().take(MAX_HEADER_FILES) {
             last = Some(path.clone());
             // Held-member exclusion precedes header-cache lookup (#878).
@@ -610,12 +611,29 @@ impl HeaderInventory {
                         codex_compressed_input::ArchiveDisposition::Held { .. }
                     )
                 });
+            if !held
+                && index
+                    .files
+                    .get(path)
+                    .and_then(|e| e.archive.as_ref())
+                    .is_some()
+            {
+                metadata_checks += 1;
+            }
             if !codex_archive_path(Path::new(path))
                 || (!held && index.archive_header(Path::new(path)).is_some())
             {
                 self.pending.push_back(PathBuf::from(path));
             }
         }
+        crate::local_resource_diagnostics::traversal_point(
+            "codex_zst_cached_inventory_metadata",
+            "codex",
+            &BTreeMap::from([(
+                "codex_zst_cached_inventory_metadata_checks",
+                metadata_checks,
+            )]),
+        );
         // One extra probe detects debt; never truncate and claim complete.
         let remaining = iter.next().is_some();
         self.complete =
