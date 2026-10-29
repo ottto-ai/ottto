@@ -254,6 +254,8 @@ impl LossyPrefixIdentity {
 
 #[derive(Clone, Debug)]
 pub(crate) struct Checkpoint {
+    // RAM domain only; never part of a durable certificate or offset plan.
+    compressed: bool,
     stamp: FileStamp,
     scope: Scope,
     samples: Samples,
@@ -267,12 +269,16 @@ impl Checkpoint {
     /// The caller supplies a complete validated decode before cache admission.
     pub(crate) fn completed_archive(file: &File, scope: &Scope, now: u64) -> io::Result<Self> {
         Ok(Self {
+            compressed: true,
             stamp: FileStamp::capture(file.metadata()?)?.content_only(),
             scope: scope.clone(),
             samples: Samples::default(),
             last_full_verified_unix_seconds: now,
             audit_debt: None,
         })
+    }
+    pub(crate) fn is_compressed(&self) -> bool {
+        self.compressed
     }
     /// A cache admission hint only. Source validation still uses the complete
     /// stamp, scope, samples and independent audit obligation.
@@ -313,7 +319,7 @@ impl Checkpoint {
             exact_stamp: false,
             scope: &self.scope.0,
             sealed_offset: self.samples.sealed_offset,
-            samples_valid: self.samples.valid_for(self.stamp.length),
+            samples_valid: !self.is_compressed() && self.samples.valid_for(self.stamp.length),
             verified: self.last_full_verified_unix_seconds,
         }
     }
@@ -343,11 +349,12 @@ impl Checkpoint {
         stamp.length = self.samples.sealed_offset;
         // Unequal windows can never be valid: `admits` then refuses the seal
         // as `InvalidCheckpoint`, exactly as `prepare` refuses the checkpoint.
-        let sample_len = if self.samples.head.len() == self.samples.boundary.len() {
-            u32::try_from(self.samples.head.len()).unwrap_or(u32::MAX)
-        } else {
-            u32::MAX
-        };
+        let sample_len =
+            if !self.is_compressed() && self.samples.head.len() == self.samples.boundary.len() {
+                u32::try_from(self.samples.head.len()).unwrap_or(u32::MAX)
+            } else {
+                u32::MAX
+            };
         PrefixSeal {
             stamp,
             scope: scope.0.clone(),
@@ -998,6 +1005,7 @@ impl ReadPlan {
             ));
         }
         Ok(Checkpoint {
+            compressed: false,
             stamp: self.stamp,
             scope: self.scope,
             samples: self.samples,
@@ -1151,6 +1159,7 @@ impl ReadPlan {
         let mut stamp = self.stamp;
         stamp.length = sealed;
         Ok(Checkpoint {
+            compressed: false,
             stamp,
             scope: self.scope,
             samples: self.samples,
@@ -1392,7 +1401,7 @@ crate::heap_layout_bound::fields!(FileStamp; length, #[cfg(unix)] device, #[cfg(
     #[cfg(unix)] modified, #[cfg(unix)] changed);
 crate::heap_layout_bound::fields!(Samples; sealed_offset, head, boundary);
 crate::heap_layout_bound::fields!(LossyPrefixIdentity; stamp, samples);
-crate::heap_layout_bound::fields!(Checkpoint; stamp, scope, samples, last_full_verified_unix_seconds, audit_debt);
+crate::heap_layout_bound::fields!(Checkpoint; compressed, stamp, scope, samples, last_full_verified_unix_seconds, audit_debt);
 crate::heap_layout_bound::fields!(ReadPlan; mode, stamp, scope, samples, start_offset,
     last_full_verified_unix_seconds, debt, guard_bytes_read, pending_record);
 crate::heap_layout_bound::fields!(PrefixSeal; stamp, scope, sample_len, head_sha256, boundary_sha256,
@@ -1489,7 +1498,8 @@ impl Checkpoint {
     }
 
     pub(crate) fn durable_certificate(&self, birth_nanos: u64) -> Option<DurableCertificate> {
-        if !self.samples.valid_for(self.stamp.length)
+        if self.is_compressed()
+            || !self.samples.valid_for(self.stamp.length)
             || self.samples.head.len() != self.samples.boundary.len()
         {
             return None;
@@ -1560,6 +1570,7 @@ impl DurableCertificate {
     ) -> Result<(Checkpoint, DurableAdmission), CertificateRefusal> {
         let (admission, head, boundary, current) = self.admit_samples(file)?;
         let checkpoint = Checkpoint {
+            compressed: false,
             stamp: FileStamp {
                 length: self.length,
                 device: self.device,
@@ -3428,6 +3439,7 @@ mod tests {
         assert!(allocated(&file) <= SPARSE_ALLOCATED_BYTES);
         let now = 1000;
         let checkpoint = Checkpoint {
+            compressed: false,
             stamp,
             scope: scope(),
             samples: Samples {

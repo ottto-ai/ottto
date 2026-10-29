@@ -241,8 +241,30 @@ impl SharedCache {
         &self,
         key: &str,
     ) -> Option<crate::transcript_cache::Taken<CachedJsonlReduction>> {
+        self.take_domain(key, false)
+    }
+    // Only the Pending archive re-emission path may consume this domain.
+    fn take_archive(
+        &self,
+        key: &str,
+    ) -> Option<crate::transcript_cache::Taken<CachedJsonlReduction>> {
+        self.take_domain(key, true)
+    }
+    fn take_domain(
+        &self,
+        key: &str,
+        compressed: bool,
+    ) -> Option<crate::transcript_cache::Taken<CachedJsonlReduction>> {
         match self.retained() {
-            Ok(mut cache) => cache.take(key),
+            Ok(mut cache) => {
+                if cache
+                    .peek(key)
+                    .is_some_and(|old| old.checkpoint.is_compressed() != compressed)
+                {
+                    return None;
+                }
+                cache.take(key)
+            }
             Err(_) => {
                 record(Event::TakePoisonedLock);
                 None
@@ -364,7 +386,7 @@ impl SharedCache {
                 // ranked residents against.
                 let live_bytes_in = live_bytes;
                 #[cfg(unix)]
-                let touched = key.clone();
+                let touched = (!completed.checkpoint.is_compressed()).then(|| key.clone());
                 let retained = crate::transcript_cache::Retained {
                     checkpoint: completed.checkpoint,
                     state,
@@ -378,11 +400,12 @@ impl SharedCache {
                 let reserved = self.retained_reservation(&cache, &key, &retained, live_bytes, rank);
                 let admitted =
                     cache.insert_reserving_at_rank(key, retained, reserved, live_bytes, Some(rank));
+
                 self.drop_suspended_proof_if_over(&cache, live_bytes_in);
                 // M1: an admitted copy is a durable write candidate after the
                 // next successful index save (the durable lock is a leaf).
                 #[cfg(unix)]
-                if admitted && !codex_archive_path(Path::new(&touched)) {
+                if let Some(touched) = touched.filter(|_| admitted) {
                     self.durable_touch(&touched);
                 }
                 return admitted;
@@ -2040,7 +2063,7 @@ pub(super) fn new_source_parser_with_archive_scope(
         }
         if reuse {
             if let Some((cache, scope)) = cache.zip(archive_scope) {
-                if let Some(taken) = cache.take(&key) {
+                if let Some(taken) = cache.take_archive(&key) {
                     if taken.retained.checkpoint.stamp_matches(&file)?
                         && taken.retained.checkpoint.scope() != scope
                     {

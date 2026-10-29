@@ -67,6 +67,7 @@ fn archive_downgrade_index(f: &ArchiveFixture, extra: Option<CodexZstCause>) -> 
     for (n, disposition) in dispositions.into_iter().enumerate() {
         let mut archive = ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, None).unwrap();
         archive.disposition = disposition;
+        archive.header_bound_reached = true;
         archive.decode_attempts = 6;
         archive.terminal_failures = 2;
         archive.terminal_attempt = 5;
@@ -121,6 +122,7 @@ fn assert_released_archive_roundtrip(mut index: ScanIndex, f: &ArchiveFixture) {
                 raw["archive"].is_object(),
                 "branch writer premise: {release}"
             );
+            assert_eq!(raw["archive"]["header_bound_reached"], true);
             let mut expected = raw.clone();
             expected.as_object_mut().unwrap().remove("archive");
             assert_eq!(old["files"][key], expected, "custody retained: {release}");

@@ -2396,3 +2396,101 @@ fn sibling_inventory_at_population_cap_counts_shared_physical_keys_once() {
         ])
     );
 }
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "funded decoder needs validated heap layout"
+)]
+fn changed_archive_stamp_resets_header_bound_and_decodes_one_bounded_prefix() {
+    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let bytes = zstd::stream::encode_all(&large_header_rollout()[..], 1).unwrap();
+    let f = ArchiveFixture::new(&bytes);
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let key = local_index_key(&f.0);
+    let mut index = ScanIndex::default();
+    assert!(matches!(
+        index
+            .inventory_archive_header(&f.candidate(), Some(&cache), &mut funded_header_work())
+            .unwrap(),
+        HeaderRead::BoundReached
+    ));
+    let old = index.files[&key].archive.as_ref().unwrap().clone();
+    assert!(old.header_bound_reached);
+    // Atomic replacement changes the object even with byte-identical content.
+    let replacement = f.0.with_extension("replacement");
+    fs::write(&replacement, bytes).unwrap();
+    fs::rename(replacement, &f.0).unwrap();
+    let reset = ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, Some(&old)).unwrap();
+    assert!(!reset.header_bound_reached);
+    let mut work = funded_header_work();
+    let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+        for _ in 0..3 {
+            assert!(matches!(
+                index
+                    .inventory_archive_header(&f.candidate(), Some(&cache), &mut work)
+                    .unwrap(),
+                HeaderRead::BoundReached
+            ));
+        }
+    });
+    assert_eq!(decodes(&rows), 1);
+    assert_eq!(work.decoded_bytes, codex_file_join::MAX_HEADER_BYTES as u64);
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "funded decoder needs validated heap layout"
+)]
+fn missing_or_malformed_header_bound_loads_false_and_reads_at_most_one_prefix() {
+    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    for value in [
+        None,
+        Some(json!("true")),
+        Some(json!({"invalid": [true]})),
+        Some(json!(null)),
+        Some(json!(1)),
+    ] {
+        let f =
+            ArchiveFixture::new(&zstd::stream::encode_all(&large_header_rollout()[..], 1).unwrap());
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let key = local_index_key(&f.0);
+        let mut archive = ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, None).unwrap();
+        archive.disposition = ArchiveDisposition::HeaderValidated;
+        archive.decode_attempts = 0;
+        let mut index = ScanIndex::default();
+        index.files.entry(key.clone()).or_default().archive = Some(Box::new(archive));
+        let path = f.0.parent().unwrap().join("header-flag-index.json");
+        index.save(&path).unwrap();
+        let mut raw: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let flags = raw["files"][&key]["archive"].as_object_mut().unwrap();
+        if let Some(value) = value {
+            flags.insert("header_bound_reached".into(), value);
+        } else {
+            flags.remove("header_bound_reached");
+        }
+        fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+        let mut loaded = ScanIndex::load(&path).unwrap();
+        assert!(
+            !loaded.files[&key]
+                .archive
+                .as_ref()
+                .unwrap()
+                .header_bound_reached
+        );
+        let mut work = funded_header_work();
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            for _ in 0..3 {
+                assert!(matches!(
+                    loaded
+                        .inventory_archive_header(&f.candidate(), Some(&cache), &mut work)
+                        .unwrap(),
+                    HeaderRead::BoundReached
+                ));
+            }
+        });
+        assert_eq!(decodes(&rows), 1);
+        assert_eq!(work.decoded_bytes, codex_file_join::MAX_HEADER_BYTES as u64);
+    }
+}

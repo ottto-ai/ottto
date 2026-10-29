@@ -173,7 +173,7 @@ pub(crate) struct ArchiveEvidence {
     pub(super) header_validated: Option<ValidatedHeader>,
     #[serde(default)]
     header_attempted: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "header_bound_or_false")]
     header_bound_reached: bool,
     #[serde(default)]
     pub(super) decode_attempts: u8,
@@ -199,6 +199,20 @@ fn valid_archive_context(context: &str) -> bool {
         && context
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+// SOURCE: an unknown representation grants no skip authority. Consume it
+// without retaining arbitrary malformed content or failing the whole entry.
+fn header_bound_or_false<'de, D: serde::Deserializer<'de>>(de: D) -> Result<bool, D::Error> {
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Flag {
+        Bool(bool),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(matches!(
+        serde::Deserialize::deserialize(de)?,
+        Flag::Bool(true)
+    ))
 }
 fn bounded_archive_context<'de, D: serde::Deserializer<'de>>(
     de: D,

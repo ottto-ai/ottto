@@ -596,3 +596,102 @@ fn unavailable_retained_archive_scope_keeps_copy_and_defers_without_decode_credi
         attempt
     );
 }
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "funded decoder needs validated heap layout"
+)]
+fn compressed_retained_save_never_writes_a_durable_record() {
+    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let index_path = f.0.parent().unwrap().join("retained-save-index.json");
+    let writer = crate::locked_state_dir::test_locks::hold(f.0.parent().unwrap());
+    let namespace = Scope("archive-ram-only".into());
+    cache.durable_begin_pass(SnapshotSource::Codex, &index_path, &namespace, false);
+    let (mut index, result) = finish_selector(retained_archive_scan(
+        &f,
+        ScanIndex::default(),
+        cache.clone(),
+    ));
+    assert_eq!(result.snapshots.len(), 1);
+    let key = local_index_key(&f.0);
+    assert!(cache.retained_checkpoint(&key).unwrap().is_compressed());
+    // Force selection/touch as a hostile caller: the actual writer must fence
+    // this even though normal archive admission never marks it for persistence.
+    cache.durable_note_selection(&key, &index.files[&key].source_file_fingerprint);
+    cache.durable_touch(&key);
+    index.save(&index_path).unwrap();
+    cache.durable_write_after_save(writer, SnapshotSource::Codex, &index);
+    cache
+        .durable_gc(writer, SnapshotSource::Codex, &index)
+        .unwrap();
+    let (counts, disk) = cache.durable_counters(SnapshotSource::Codex).unwrap();
+    assert_eq!(counts.not_persisted.get("compressed"), Some(&1));
+    assert_eq!(disk.disk_records, 0);
+    assert_eq!(disk.records_written, 0);
+    assert_eq!(counts.gc_keep_peak, 0);
+    let checkpoint = cache.retained_checkpoint(&key).unwrap();
+    assert!(checkpoint.durable_certificate(0).is_none());
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "funded decoder needs validated heap layout"
+)]
+fn plain_prepare_cannot_take_or_reuse_a_compressed_retained_entry() {
+    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let key = local_index_key(&f.0);
+    let (_, result) = finish_selector(retained_archive_scan(
+        &f,
+        ScanIndex::default(),
+        cache.clone(),
+    ));
+    assert_eq!(result.snapshots.len(), 1);
+    let old = {
+        let resident = cache.retained().unwrap();
+        let old = resident.peek(&key).unwrap();
+        crate::transcript_cache::Retained {
+            checkpoint: old.checkpoint.clone(),
+            state: old.state.clone(),
+        }
+    };
+    let scope = old.checkpoint.scope().clone();
+    let plain = f.0.with_extension("");
+    fs::write(&plain, synthetic_rollout()).unwrap();
+    // Even a mismapped plain key cannot move this domain through normal take.
+    cache.insert(
+        local_index_key(&plain),
+        super::super::sampled_jsonl::CompletedNativeAcquisition {
+            checkpoint: old.checkpoint.clone(),
+            reduction: Some(old.state.clone()),
+            released: None,
+            unsealed: false,
+        },
+        0,
+    );
+    let (taken, events) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
+        cache.take(&local_index_key(&plain))
+    });
+    assert!(taken.is_none());
+    assert_eq!(events.take_hit, 0);
+    assert!(cache
+        .retained_checkpoint(&local_index_key(&plain))
+        .is_some());
+    let mut parser = codex_parser(
+        OpenedInput::Plain(BufReader::new(File::open(&plain).unwrap())),
+        &plain,
+    );
+    let mode = parser
+        .prepare_acquisition(Some(old), &scope, None, sampled_scan::now_seconds())
+        .unwrap();
+    assert!(matches!(
+        mode,
+        crate::transcript_acquisition::ReadMode::Full(_)
+    ));
+    assert!(cache.retained_checkpoint(&key).is_some());
+}

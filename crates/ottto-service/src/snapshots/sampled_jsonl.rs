@@ -107,7 +107,9 @@ impl OwnedJsonlParser {
         old: Retained<CachedJsonlReduction>,
     ) -> Result<()> {
         anyhow::ensure!(
-            self.reader.reader.is_compressed() && old.state.accumulator.source == self.source,
+            self.reader.reader.is_compressed()
+                && old.checkpoint.is_compressed()
+                && old.state.accumulator.source == self.source,
             "archive retained source mismatch"
         );
         anyhow::ensure!(
@@ -197,7 +199,8 @@ impl OwnedJsonlParser {
             // Capture is a function of the source (contract 5 always on,
             // `claude_request_identity::captures`), so the same source keeps
             // the capture mode its markers were built in.
-            old.state.accumulator.source == self.source
+            !old.checkpoint.is_compressed()
+                && old.state.accumulator.source == self.source
                 // A retained reduction continues only under the counting rule
                 // this parse's own evidence selects. Both unset while inactive.
                 && codex_counting_version::reusable(
