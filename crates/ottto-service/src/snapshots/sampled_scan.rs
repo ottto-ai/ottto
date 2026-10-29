@@ -2072,7 +2072,19 @@ pub(super) fn new_source_parser_with_archive_scope(
                         )?;
                         configure_tier_replay(&mut parser, candidate, index);
                         codex_counting_version::configure_singleton(&mut parser, candidate, index);
-                        parser.restore_archive_reduction(taken.retained)?;
+                        parser
+                            .restore_archive_reduction(taken.retained)
+                            .inspect_err(|_| {
+                                if let Some(archive) =
+                                    index.files.get_mut(&key).and_then(|e| e.archive.as_mut())
+                                {
+                                    archive.disposition = ArchiveDisposition::Held {
+                                        cause: CodexZstCause::CorrectionUnapplied,
+                                    };
+                                }
+                                codex_zst_refused(CodexZstCause::CorrectionUnapplied);
+                            })?;
+                        codex_compressed_input::admission_streak(&key, false);
                         index
                             .files
                             .get_mut(&key)
