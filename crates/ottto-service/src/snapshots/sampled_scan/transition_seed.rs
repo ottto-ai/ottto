@@ -65,7 +65,7 @@ const PINNED_SOURCES: &[SourcePin] = &[
     SourcePin {
         path: "codex_prelude_footprint.rs",
         text: include_str!("../../codex_prelude_footprint.rs"),
-        sha256: "b309171b8f22488d0d471a054a1d69f39425b585b2746c813c92497a4703cde4",
+        sha256: "2459e58e5f2bb58ecf30ac8e27a7bb04e42fb059fe7b1164ab5640958c1a47ef",
     },
     SourcePin {
         path: "durable_tail_codec.rs",
@@ -75,67 +75,67 @@ const PINNED_SOURCES: &[SourcePin] = &[
     SourcePin {
         path: "snapshots/cache_observations.rs",
         text: include_str!("../cache_observations.rs"),
-        sha256: "2395f78462fda87e452acdb1b9b11dce2636218c6681c32de998e2dcc023901a",
+        sha256: "8e6149a1d900c8b08fcef32c98dffb2d2068ab693b19c40ac142ba33d1daf0f9",
     },
     SourcePin {
         path: "snapshots/claude_context_file_birth.rs",
         text: include_str!("../claude_context_file_birth.rs"),
-        sha256: "4c8ecdba2a1b0cea91dcad8bfff18a87696a6360d856ebf85973d6b274c2cc37",
+        sha256: "860991b52bf5bb2cf8cbfe97cfd0cc718bea4c04b48fe6e5730371f4cf46d588",
     },
     SourcePin {
         path: "snapshots/claude_request_identity.rs",
         text: include_str!("../claude_request_identity.rs"),
-        sha256: "31193b9227acff19af78364c9ec27e6716a8e744cf3c7ca033892f2d832fc2db",
+        sha256: "1e69a00b4ebee5293c50a5821bd762593d57fcc40a2972194313ef8ce1c0e08c",
     },
     SourcePin {
         path: "snapshots/claude_response_records.rs",
         text: include_str!("../claude_response_records.rs"),
-        sha256: "77ee17b44a27a48f549ca40ba5455b55b5f72f92162adf366536f58dc95d5fa7",
+        sha256: "64f73ce9b4efea512629c05a5dc7a1c5becafd869b2d97a585f55672e170d80d",
     },
     SourcePin {
         path: "snapshots/codex_counting_version.rs",
         text: include_str!("../codex_counting_version.rs"),
-        sha256: "da1f61e4aa46ebe6761ba910b4fbc4340d96058bdfba9c6758f384846ca76127",
+        sha256: "958f27ce4b7bf9c91290ae7335b51176f0c70f61840fcb797cc6ccec8388dc18",
     },
     SourcePin {
         path: "snapshots/codex_usage_occurrence.rs",
         text: include_str!("../codex_usage_occurrence.rs"),
-        sha256: "4e8573b957476d37c720ded6a6c8d89f7a15a3e69557ac8813144a5b40fdc4e2",
+        sha256: "3a136aa935ea75df886802f9ead0f92c2710a68ef5f6260b7485e138d91148a3",
     },
     SourcePin {
         path: "snapshots/compaction_events.rs",
         text: include_str!("../compaction_events.rs"),
-        sha256: "7e2270137d1aa0d104542d03e07e1bea0fb7b1b2bb9707d9e6078fb10f26b56c",
+        sha256: "022e30453631e93a71583b9e8cb451620e88685122fb27bfd9e94f5ac29f05ce",
     },
     SourcePin {
         path: "snapshots/context_curve.rs",
         text: include_str!("../context_curve.rs"),
-        sha256: "6fb3a00d5dd3ff71364e9303f8b3228e7fea4cbec23cc81420fc636281762ae8",
+        sha256: "33b96640a27df9c4509a5668ccc1f34a0d4451dcfa2da5b862e2ecdcdaed6392",
     },
     SourcePin {
         path: "snapshots/local_context_points.rs",
         text: include_str!("../local_context_points.rs"),
-        sha256: "b45880d5789fd5147384d591126d2333141774c931170c251ae47e4a0f9b3bb2",
+        sha256: "32ed5c1287c1bb742c10d1920aaaa9e4ac779602deff0c1b1f7519b64a6ea700",
     },
     SourcePin {
         path: "snapshots/sampled_jsonl/durable.rs",
         text: include_str!("../sampled_jsonl/durable.rs"),
-        sha256: "27b26458253274b54befb92b8d914789bbc1f88cbd9b14c24379d4327ea0ed3a",
+        sha256: "c9f9e6319304086bc0fe97d94d285570f93c24728f5d6c6129f9ffc61447523c",
     },
     SourcePin {
         path: "snapshots/sampled_jsonl.rs",
         text: include_str!("../sampled_jsonl.rs"),
-        sha256: "6a91f5ee85d9f58f926232a09cf1460966959fffb80b4c5a970c61affb12dd1f",
+        sha256: "877dc114bbc0b3814961b085864c8f0fb7ee4f6be6566c52ac5393820efe118e",
     },
     SourcePin {
         path: "snapshots/session_start.rs",
         text: include_str!("../session_start.rs"),
-        sha256: "a762a2f77dfddb18e9784b2b780a0a4e21ee73d2c99ca42a081e55ace97c3447",
+        sha256: "2a5639944e4ba77464af196159ceebd26aa471b711240ccf866dd5e07a0afad3",
     },
     SourcePin {
         path: "snapshots.rs",
         text: include_str!("../../snapshots.rs"),
-        sha256: "8d957f0c5928181a5d0c544146ac3404ce7d229fdec0f4fe6b3447c9d7e456aa",
+        sha256: "f3f1bd26369ffc30fbc292e9d2d3c093eae55f8ea6e2cf349b56801248550cc2",
     },
     SourcePin {
         path: "owned_heap.rs",

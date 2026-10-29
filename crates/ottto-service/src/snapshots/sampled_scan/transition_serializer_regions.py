@@ -118,7 +118,12 @@ def regions(path, source):
     chosen = set()
     for i, token in enumerate(t):
         if token in ("durable_struct", "durable_enum") and t[i + 1:i + 3] == ["!", "("]:
-            chosen.add((i, ends[i + 2]))
+            start = i
+            while start >= 3 and t[start - 2:start] == [":", ":"] and re.fullmatch(
+                r'[A-Za-z_][A-Za-z_0-9]*', t[start - 3]
+            ):
+                start -= 3
+            chosen.add((start, ends[i + 2]))
         elif token == "impl":
             body = body_start(t, ends, i + 1)
             header = t[i:body]
