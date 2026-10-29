@@ -212,7 +212,10 @@ fn abrupt_helper_death_leaves_child_owning_transaction() {
     // Both inherit the lock; only the helper is killed. read is a builtin,
     // and closing the gate on any assertion failure makes the child exit.
     command
-        .args(["-c", "/bin/sh -c 'printf ready; read release' <&0 & wait"])
+        .args([
+            "-c",
+            "exec 3<&0; /bin/sh -c 'printf ready; read release' <&3 & wait",
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped());
     let mut owner = Reap(lock.spawn(&mut command).unwrap());
