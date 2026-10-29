@@ -276,10 +276,10 @@ struct MergeBaseScanTraversalCounts {
     // Persisted positional slots: diagnostic additions must remain last.
     /// retired_<old>: decode-only placeholder; keeps positional slots; never written.
     #[serde(rename = "unchanged_reread_admitted", default, skip_serializing)]
-    retired_unchanged_reread_admitted: serde::de::IgnoredAny,
+    _retired_unchanged_reread_admitted: serde::de::IgnoredAny,
     /// retired_<old>: decode-only placeholder; keeps positional slots; never written.
     #[serde(rename = "reread_budget_refused", default, skip_serializing)]
-    retired_reread_budget_refused: serde::de::IgnoredAny,
+    _retired_reread_budget_refused: serde::de::IgnoredAny,
 }
 
 #[test]

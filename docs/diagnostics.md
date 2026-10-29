@@ -705,6 +705,8 @@ The labels are closed: the six causes below and `unattributed`, emitted last.
 Omitted new fields mean zero in their stated scope. Existing fields keep their
 order; no paths, ids, tokens, membership, distinct counts or cap flags are emitted.
 
+Contributions reset at the generation-start marker (`ownership_incomplete_generation_start`).
+
 **Buckets count CONTRIBUTIONS, not distinct files.** Contributions are
 generation-cumulative, restart-retained, the same unit as scanner S in
 `ownership_incomplete_files`. Both the scalar and buckets are generation-cumulative;
