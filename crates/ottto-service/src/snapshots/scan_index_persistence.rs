@@ -829,32 +829,8 @@ impl LockedStore {
                 .take(MAX_ROOT_BYTES as u64 + 1)
                 .read_to_end(&mut bytes)?;
             ensure!(bytes.len() <= MAX_ROOT_BYTES, "scan_index_root_size");
-            let mut manifest: Manifest = serde_json::from_slice(&bytes)
+            let manifest: Manifest = serde_json::from_slice(&bytes)
                 .map_err(|_| anyhow::anyhow!("scan_index_manifest_refused"))?;
-            // Compatibility with the earlier, unshipped format-1 encoding:
-            // absence of ALL reference generations AND of the inventory is
-            // its legacy discriminator. New roots always write positive paired
-            // generations and explicit inventories, including known-empty maps.
-            if manifest.maps.is_empty() && manifest.objects.iter().all(|o| o.generation == 0) {
-                for object in &mut manifest.objects {
-                    object.generation = manifest.generation;
-                }
-                manifest.maps = Field::all()
-                    .into_iter()
-                    .map(|field| MapManifest {
-                        field,
-                        generation: manifest.generation,
-                        buckets: manifest
-                            .objects
-                            .iter()
-                            .filter_map(|o| match o.slot {
-                                Slot::Bucket { field: f, bucket } if f == field => Some(bucket),
-                                _ => None,
-                            })
-                            .collect(),
-                    })
-                    .collect();
-            }
             self.validate_manifest(&manifest)?;
             Root::Sharded {
                 digest: root_digest(&bytes),

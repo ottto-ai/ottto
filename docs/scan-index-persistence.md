@@ -228,6 +228,13 @@ The production adapter must supply the existing semantic map decoder through
 `open_with_map_validator`; semantic decoder failure becomes scoped Unknown,
 never a default empty census. Structural `open` is available only in tests; already-serialized publication reconciliation uses a private structural helper. Production load cannot use a public no-op validator.
 
+Unshipped draft roots have no compatibility inference: missing map inventories
+or bucket descriptors remain Unknown, and absent reference generations never
+become current generations. A known-empty map requires its explicit, paired empty
+inventory. Unpaired metadata refuses the root; paired metadata remains readable
+while affected maps block export and publication. Fixtures cover descriptor loss
+for each of the three maps and the rejected unshipped draft shape.
+
 `ReadStats` exposes `index_shard_unavailable{map,cause}` and
 `scanindex_orphan_init_discarded` for the existing diagnostic registry. These are
 fixed map/cause axes, never keys or digests. Shared integration must drain these
@@ -265,3 +272,26 @@ Defaulted maps in the temporary header object never escape as a loaded index.
 Exact refusal: **scan index refused: schema_version**. Neither pinned binary
 resets, quarantines or loads the absent maps empty. No inline-map duplication is
 needed; the strict refusal fence is retained and frozen for both versions.
+
+## Reader N: visible version refusal
+
+A source-aware schema or accepted-ledger version refusal immediately records
+`scan_index_newer_than_app` for that source. The source row is unavailable and
+its source-owned warning makes machine health degraded, preserving other
+sources. Label: **Not collecting: update Ottto**. Hover detail explains that a
+newer Ottto must load the index; preserve local state. No restart, reset,
+quarantine or transcript read is added. A compatible root load clears it;
+missing state or unrelated errors cannot clear an existing version refusal.
+
+Each source transition emits one content-free log. The next daemon status emits
+one `ScanIndexCollectionChanged` event with only source slug, fixed reason,
+blocked-source count and transition count in its payload, advancing projection
+revision. Repeated passes/status reads emit no duplicate transition event.
+Machine-health uploads retain their existing cadence and envelope.
+
+Blocker codes remain open strings. The blocker's existing `source` wire string
+now also admits a source slug; machine-level authority strings remain unchanged.
+Existing backend and companion string decoders preserve unknown codes, with
+known `degraded` / `warning` enums. Updated companion/web consumers provide the
+short label and hover text; older consumers retain a degraded warning and the
+clear-condition text. No field, enum tag, parser or scan-identity bump.

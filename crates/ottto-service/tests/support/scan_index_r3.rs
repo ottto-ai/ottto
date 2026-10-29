@@ -36,7 +36,7 @@ fn each_missing_stale_or_corrupt_map_is_unknown_and_siblings_and_metadata_surviv
         Field::RequestCensus,
     ];
     for (affected, field) in fields.into_iter().enumerate() {
-        for damage in 0..5 {
+        for damage in 0..8 {
             let s = Scratch::new();
             let logical = s.install();
             let mut root = manifest(&s);
@@ -63,6 +63,23 @@ fn each_missing_stale_or_corrupt_map_is_unknown_and_siblings_and_metadata_surviv
                 }
                 4 => {
                     root["maps"].as_array_mut().unwrap().remove(affected);
+                    replace_manifest(&s, &root);
+                }
+                5 | 6 => {
+                    // Lost descriptors cannot establish an empty map, whether
+                    // its paired inventory is also lost or still names a bucket.
+                    fs::remove_file(path).unwrap();
+                    root["objects"].as_array_mut().unwrap().remove(index);
+                    if damage == 5 {
+                        root["maps"].as_array_mut().unwrap().remove(affected);
+                    }
+                    replace_manifest(&s, &root);
+                }
+                7 => {
+                    root["objects"][index]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("generation");
                     replace_manifest(&s, &root);
                 }
                 _ => unreachable!(),
@@ -247,27 +264,57 @@ fn recognized_committed_root_survives_restart_as_prior_state_evidence() {
     );
 }
 #[test]
-fn original_format1_without_reference_generations_still_reads_and_exports_legacy() {
-    let fixture: Value = serde_json::from_str(include_str!(
-        "../fixtures/scan_index/sharded-format1-original.json"
-    ))
-    .unwrap();
-    let s = Scratch::new();
-    let _ = s.install();
-    // Its immutable payloads are the unchanged original synthetic fixture;
-    // only the root encoding predates explicit inventory/reference generations.
-    fs::write(s.root(), fixture["root"].as_str().unwrap()).unwrap();
-    let store = s.store();
-    let (mut logical, root) = opened(&store);
-    assert_eq!(logical, fixture["logical"]);
-    logical["generation"] = json!(8);
-    store
-        .write_legacy(&root, 8, |out| {
-            serde_json::to_writer(out, &logical)?;
-            Ok(())
-        })
+fn unshipped_draft_never_infers_reference_generations_or_empty_inventories() {
+    for affected in 0..3 {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../fixtures/scan_index/sharded-format1-original.json"
+        ))
         .unwrap();
-    assert_eq!(opened(&store).0, logical);
+        let s = Scratch::new();
+        let logical = s.install();
+        let mut root: Value = serde_json::from_str(fixture["root"].as_str().unwrap()).unwrap();
+        let index = affected + 1;
+        fs::remove_file(object_path(&s, &root["objects"][index])).unwrap();
+        root["objects"].as_array_mut().unwrap().remove(index);
+        replace_manifest(&s, &root);
+        // Even metadata is unpaired in the unshipped draft: do not invent it.
+        assert!(s.store().open().is_err());
+        // With metadata explicitly paired, it remains usable, but no absent
+        // inventory (including the descriptor-free map) becomes known empty.
+        root["objects"][0]["generation"] = root["generation"].clone();
+        replace_manifest(&s, &root);
+        let before = fs::read(s.root()).unwrap();
+        let store = s.store();
+        let Opened::Partial(mut partial, witness) = store.open().unwrap() else {
+            panic!("unshipped draft maps must remain unknown")
+        };
+        let metadata: Value = serde_json::from_slice(&bytes(&mut partial.metadata)).unwrap();
+        assert_eq!(metadata["files"], logical["files"]);
+        for (i, field) in [
+            Field::AccountPending,
+            Field::UsagePending,
+            Field::RequestCensus,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(
+                matches!(partial.maps[i], MapAvailability::Unknown(MapUnavailable {
+                map, cause: UnavailableCause::Descriptor,
+            }) if map == field)
+            );
+        }
+        let stats = store.take_read_stats();
+        for counts in stats.index_shard_unavailable {
+            assert_eq!(counts.iter().sum::<u64>(), 1);
+            assert_eq!(counts[UnavailableCause::Descriptor as usize], 1);
+        }
+        assert!(store.compare(&witness).is_err());
+        assert!(store
+            .write_legacy(&witness, 8, |_| panic!("unknown maps must not export"))
+            .is_err());
+        assert_eq!(fs::read(s.root()).unwrap(), before);
+    }
 }
 
 #[test]
