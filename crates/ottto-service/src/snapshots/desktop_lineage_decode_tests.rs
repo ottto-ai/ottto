@@ -19,6 +19,9 @@ fn seed() -> ScanIndex {
 }
 
 fn read_registry(bytes: &[u8], fields: &'static [&'static str]) -> ScanIndex {
+    read_registry_pass(bytes, fields, Pass::Full)
+}
+fn read_registry_pass(bytes: &[u8], fields: &'static [&'static str], pass: Pass) -> ScanIndex {
     let mut reader = std::io::Cursor::new(bytes);
     let census_resources = validate_original(&mut reader).unwrap();
     let mut decoder = Decoder {
@@ -31,7 +34,7 @@ fn read_registry(bytes: &[u8], fields: &'static [&'static str]) -> ScanIndex {
         family_spans: BTreeMap::new(),
         census_resources,
     };
-    decoder.index_fields(Pass::Full, fields).unwrap()
+    decoder.index_fields(pass, fields).unwrap()
 }
 
 #[test]
@@ -223,4 +226,34 @@ fn desktop_lineage_incomplete_page_freezes_projection_and_partial_save_keeps_old
         loaded.claude_desktop_lineage_file_edges,
         previous.claude_desktop_lineage_file_edges
     );
+}
+
+#[test]
+fn desktop_lineage_repair_capture_carries_selectors_without_census_authority() {
+    let seed = seed();
+    let carry = read_registry_pass(
+        &serde_json::to_vec(&seed).unwrap(),
+        FIELDS,
+        Pass::IdentityCarry,
+    );
+    assert_eq!(
+        carry.claude_desktop_completed_lineage,
+        seed.claude_desktop_completed_lineage
+    );
+    assert_eq!(
+        carry.claude_desktop_lineage_file_edges,
+        seed.claude_desktop_lineage_file_edges
+    );
+    let mut repaired = ScanIndex::default();
+    repaired.carry_identity_from(carry).unwrap();
+    assert_eq!(
+        repaired.claude_desktop_completed_lineage,
+        seed.claude_desktop_completed_lineage
+    );
+    assert_eq!(
+        repaired.claude_desktop_lineage_file_edges,
+        seed.claude_desktop_lineage_file_edges
+    );
+    assert!(!repaired.claude_desktop_lineage_census_complete);
+    assert!(repaired.files.is_empty());
 }

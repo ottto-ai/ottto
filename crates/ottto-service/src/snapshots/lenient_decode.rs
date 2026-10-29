@@ -488,6 +488,8 @@ pub(super) const IDENTITY_CARRY_FIELDS: &[&str] = &[
     "claude_retired_family_tombstones_initialized",
     "claude_retired_family_tombstones_uncertain",
     "session_account_bindings",
+    "claude_desktop_completed_lineage",
+    "claude_desktop_lineage_file_edges",
     "claude_account_deferred_holds",
     "claude_request_identity_contract",
     "claude_request_identity_contract_changed",

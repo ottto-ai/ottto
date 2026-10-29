@@ -300,11 +300,13 @@ fn desktop_lineage_selector_canaries_never_reach_diagnostics_or_upload() {
     let f = DesktopFixture::new();
     let canary_child = "00000000-0000-4000-8000-00000000ca01";
     let canary_parent = "00000000-0000-4000-8000-00000000ca02";
-    let mut index = ScanIndex::default();
-    index.claude_desktop_completed_lineage = Some(BTreeMap::from([(
-        canary_child.into(),
-        canary_parent.into(),
-    )]));
+    let mut index = ScanIndex {
+        claude_desktop_completed_lineage: Some(BTreeMap::from([(
+            canary_child.into(),
+            canary_parent.into(),
+        )])),
+        ..ScanIndex::default()
+    };
     DesktopFixture::incomplete(&mut index);
     let (run, rows) = crate::local_resource_diagnostics::capture(|| {
         let mut run = raw_scan_at(
