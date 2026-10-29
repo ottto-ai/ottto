@@ -16,7 +16,16 @@ extern "C" {
 
 struct Charge {
     live: Cell<usize>,
+    peak: Cell<usize>,
+    refusals: Cell<u64>,
     limit: usize,
+}
+
+impl Charge {
+    fn refuse(&self) -> *mut c_void {
+        self.refusals.set(self.refusals.get().saturating_add(1));
+        ptr::null_mut()
+    }
 }
 
 unsafe fn allocated_size(ptr: *const u8, requested: usize) -> usize {
@@ -36,10 +45,10 @@ unsafe extern "C" fn allocate(opaque: *mut c_void, size: usize) -> *mut c_void {
     // SAFETY: Context owns this stable Box until after ZSTD_freeDCtx returns.
     let charge = unsafe { &*opaque.cast::<Charge>() };
     let Some(total) = size.checked_add(HEADER) else {
-        return ptr::null_mut();
+        return charge.refuse();
     };
     let Ok(layout) = Layout::from_size_align(total, HEADER) else {
-        return ptr::null_mut();
+        return charge.refuse();
     };
     #[cfg(target_os = "macos")]
     // Preflight the native size class before allocating; confirm with malloc_size.
@@ -47,14 +56,21 @@ unsafe extern "C" fn allocate(opaque: *mut c_void, size: usize) -> *mut c_void {
     #[cfg(not(target_os = "macos"))]
     let predicted = total;
     if charge.live.get().saturating_add(predicted) > charge.limit {
-        return ptr::null_mut();
+        return charge.refuse();
     }
     // SAFETY: layout is valid; null is reported to zstd without unwinding.
     let base = unsafe { alloc(layout) };
     if base.is_null() {
-        return ptr::null_mut();
+        return charge.refuse();
     }
     let actual = unsafe { allocated_size(base, total) };
+    // Include even an unexpectedly larger size class immediately refused below.
+    charge.peak.set(
+        charge
+            .peak
+            .get()
+            .max(charge.live.get().saturating_add(actual)),
+    );
     let Some(live) = charge
         .live
         .get()
@@ -62,7 +78,7 @@ unsafe extern "C" fn allocate(opaque: *mut c_void, size: usize) -> *mut c_void {
         .filter(|n| *n <= charge.limit)
     else {
         unsafe { dealloc(base, layout) };
-        return ptr::null_mut();
+        return charge.refuse();
     };
     // Store the Rust layout size and actual charge, preserving malloc alignment.
     unsafe {
@@ -104,6 +120,8 @@ impl Context {
     pub(super) fn new(limit: usize) -> Option<Self> {
         let mut charge = Box::new(Charge {
             live: Cell::new(0),
+            peak: Cell::new(0),
+            refusals: Cell::new(0),
             limit,
         });
         let own = unsafe {
@@ -116,6 +134,7 @@ impl Context {
             return None;
         }
         charge.live.set(own);
+        charge.peak.set(own);
         let memory = sys::ZSTD_customMem {
             customAlloc: Some(allocate),
             customFree: Some(release),
@@ -141,6 +160,12 @@ impl Context {
     }
     pub(super) fn sizeof(&self) -> usize {
         self.charge.live.get()
+    }
+    pub(super) fn peak_bytes(&self) -> usize {
+        self.charge.peak.get()
+    }
+    pub(super) fn allocation_refusals(&self) -> u64 {
+        self.charge.refusals.get()
     }
     pub(super) fn decompress(
         &mut self,
@@ -182,6 +207,8 @@ mod tests {
     fn resize_overlap_spends_live_native_bytes_before_admission() {
         let mut charge = Charge {
             live: Cell::new(0),
+            peak: Cell::new(0),
+            refusals: Cell::new(0),
             limit: 16 * 1024,
         };
         let opaque = ptr::addr_of_mut!(charge).cast();
@@ -197,6 +224,8 @@ mod tests {
                 "old + new must fit together"
             );
             assert_eq!(charge.live.get(), live, "refusal creates no charge");
+            assert_eq!(charge.peak.get(), live);
+            assert_eq!(charge.refusals.get(), 1, "preflight is a counted backstop");
             release(opaque, first);
             assert_eq!(charge.live.get(), 0);
             release(opaque, ptr::null_mut());

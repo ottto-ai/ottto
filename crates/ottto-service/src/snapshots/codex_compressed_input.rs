@@ -47,10 +47,15 @@ fn invalid(message: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-// Bundled zstd 1.5.7, WindowLogMax(23), 514 MiB synthetic concatenated
-// archive: CI run 40774588149 measured 8,894,448 bytes peak (native heap +
-// buffers + box, including resize overlap). Add 10%, round up to 64 KiB.
-// Paid inside STATE_BYTES; the fixed primary Tail floor remains unchanged.
+// Darwin receipt: zstd 1.5.7, WindowLogMax(23), 514 MiB decoded fixture,
+// Mac CI run 40942402563 log's decoder_allocation_receipt: actual-size peak
+// 13,009,088 bytes, plus 10%, rounded up to 64 KiB = 14,352,384 bytes.
+// Paid inside unchanged STATE_BYTES; admission preserves the primary Tail floor.
+#[cfg(target_os = "macos")]
+const COMPRESSED_INPUT_CREDIT: usize = 14_352_384;
+// Other platforms retain CI run 40774588149's 8,894,448-byte requested peak
+// plus 10%, rounded up to 64 KiB. No non-Darwin credit change.
+#[cfg(not(target_os = "macos"))]
 const COMPRESSED_INPUT_CREDIT: usize = 9_830_400;
 
 /// Decoder portion of the measured whole-input credit, including input buffer.
@@ -96,6 +101,16 @@ pub(super) fn admission_streak(key: &str, yielded: bool) -> u8 {
     let count = previous.saturating_add(1).min(13);
     slots.insert(hash, count);
     count
+}
+/// Shared body-refusal/header-claim signal; header deferral gates are not claims.
+pub(super) fn record_admission_yield(key: &str) {
+    if admission_streak(key, true) == 12 {
+        crate::local_resource_diagnostics::traversal_point(
+            "codex_zst_admission_alarm",
+            "codex",
+            &serde_json::json!({"consecutive_yields": 12, "admission_starved_count": admission_starved_count(None)}),
+        );
+    }
 }
 /// Count starved tracked keys, optionally scoped to one physical archive.
 pub(super) fn admission_starved_count(key: Option<&str>) -> usize {
@@ -582,6 +597,14 @@ impl<R: Read> Drop for BoundedDecoder<R> {
                 ("codex_zst_compressed_consumed_bytes", self.compressed_bytes),
                 ("codex_zst_decoded_bytes", self.decoded_bytes),
                 ("codex_zst_cpu_micros", self.cpu_micros),
+                (
+                    "codex_zst_decoder_native_peak_bytes",
+                    self.context.peak_bytes() as u64,
+                ),
+                (
+                    "codex_zst_decoder_allocation_refusals",
+                    self.context.allocation_refusals(),
+                ),
             ]),
         );
     }
@@ -945,7 +968,14 @@ impl super::ScanIndex {
         evidence.disposition = ArchiveDisposition::HeaderValidated;
         evidence.decode_attempts = 0;
         let mut input = match cache.map(|cache| OpenedInput::funded(file, cache)) {
-            Some(Ok(input)) => input.context("header admission unavailable")?.header_only(),
+            Some(Ok(Some(input))) => {
+                admission_streak(&key, false);
+                input.header_only()
+            }
+            Some(Ok(None)) => {
+                record_admission_yield(&key);
+                anyhow::bail!("archive header admission unavailable");
+            }
             _ => {
                 codex_zst_refused(CodexZstCause::AdmissionRefused);
                 anyhow::bail!("archive header admission unavailable");
@@ -993,6 +1023,14 @@ impl super::ScanIndex {
                 "codex_zst_inventory_physical_bytes": physical,
                 "codex_zst_inventory_compressed_consumed_bytes": compressed,
                 "codex_zst_inventory_cpu_micros": cpu,
+                "codex_zst_decoder_native_peak_bytes": match &input {
+                    OpenedInput::Compressed(r, _) => r.get_ref().context.peak_bytes(),
+                    _ => 0,
+                },
+                "codex_zst_decoder_allocation_refusals": match &input {
+                    OpenedInput::Compressed(r, _) => r.get_ref().context.allocation_refusals(),
+                    _ => 0,
+                },
             }),
         );
         input.close();
@@ -1086,6 +1124,64 @@ pub(in crate::snapshots) mod tests {
         result
     }
 
+    fn decoder_process_peak_rss_bytes() -> Option<u64> {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        // SAFETY: getrusage initializes the entire struct on success.
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        let usage = unsafe { usage.assume_init() };
+        let peak = u64::try_from(usage.ru_maxrss).ok()?;
+        if cfg!(target_os = "macos") {
+            Some(peak)
+        } else {
+            peak.checked_mul(1024)
+        }
+    }
+
+    #[test]
+    fn decoder_credit_preserves_the_platform_receipt_and_margin() {
+        #[cfg(target_os = "macos")]
+        {
+            let measured_peak = 13_009_088_usize; // Mac run 40942402563, zstd 1.5.7.
+            assert!(
+                compressed_input_credit().unwrap() >= measured_peak + measured_peak.div_ceil(10)
+            );
+            assert_eq!(compressed_input_credit().unwrap(), 14_352_384);
+        }
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(compressed_input_credit().unwrap(), 9_830_400);
+        // The live large-window measurement below independently fails if an
+        // upgraded decoder no longer fits its platform credit plus 10%.
+    }
+
+    #[test]
+    fn decoder_native_peak_is_visible_on_the_existing_input_carrier() {
+        let f = fixture(
+            &zstd::stream::encode_all(&b"synthetic\n"[..], 1).unwrap(),
+            ".jsonl.zst",
+        );
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            let mut input = OpenedInput::compressed(
+                File::open(&f.0).unwrap(),
+                64,
+                compressed_input_credit().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(std::io::copy(&mut input, &mut std::io::sink()).unwrap(), 10);
+            input.close();
+        });
+        let counts = &rows
+            .iter()
+            .find(|r| r["stage"] == "codex_zst_input")
+            .unwrap()["counts"];
+        let peak = counts["codex_zst_decoder_native_peak_bytes"]
+            .as_u64()
+            .unwrap();
+        assert!(peak > 0 && peak <= compressed_input_credit().unwrap() as u64);
+        assert_eq!(counts["codex_zst_decoder_allocation_refusals"], 0);
+    }
+
     #[test]
     fn decoder_production_window_peak_allocation() {
         // Streaming, unknown content size prevents the encoder shrinking the
@@ -1129,6 +1225,7 @@ pub(in crate::snapshots) mod tests {
         assert_eq!(prefix[5], ((WINDOW_LOG - 10) * 8) as u8);
         file.seek(SeekFrom::Start(0)).unwrap();
         let credit = compressed_input_credit().unwrap();
+        let rss_before = decoder_process_peak_rss_bytes();
         let (_, allocation) = crate::retry_allocation_probe::measure(|| {
             let mut input = OpenedInput::compressed(file, 2 * 1024 * 1024 * 1024, credit).unwrap();
             let mut output = [0; BUFFER_BYTES];
@@ -1143,6 +1240,8 @@ pub(in crate::snapshots) mod tests {
             assert_eq!(total, 514 * 1024 * 1024);
             input.close();
         });
+        let rss_after = decoder_process_peak_rss_bytes();
+        eprintln!("decoder_process_rss_receipt before_bytes={rss_before:?} after_bytes={rss_after:?} scope=whole_process_lifetime_high_water not_a_delta_or_gate=true");
         let peak = allocation
             .requested_peak_with_overlap
             .max(allocation.usable_peak_with_overlap);

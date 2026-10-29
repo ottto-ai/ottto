@@ -322,22 +322,63 @@ fn refused_header_admission_does_not_spend_a_decode_attempt() {
         .unwrap()
         .unwrap();
     let mut state = ScanIndex::default();
-    let (_, rows) = crate::local_resource_diagnostics::capture(|| {
-        assert!(state
-            .inventory_archive_header(&f.candidate(), Some(&cache), &mut funded_header_work())
-            .is_err());
-    });
-    assert_eq!(decodes(&rows), 0);
-    assert_eq!(
-        rows.iter()
-            .filter_map(|r| r["counts"]["codex_zst_refused"]["CompressedAdmissionRefused"].as_u64())
-            .count(),
-        1
-    );
-    assert!(!rows.iter().any(|r| r["stage"] == "codex_zst_inventory"));
-    assert!(!state.files.contains_key(&local_index_key(&f.0)));
+    let key = local_index_key(&f.0);
+    admission_streak(&key, false);
+    for attempt in 1..=14 {
+        let mut work = funded_header_work();
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            assert!(state
+                .inventory_archive_header(&f.candidate(), Some(&cache), &mut work)
+                .is_err());
+        });
+        assert_eq!(decodes(&rows), 0);
+        assert_eq!(
+            rows.iter()
+                .filter_map(
+                    |r| r["counts"]["codex_zst_refused"]["CompressedAdmissionRefused"].as_u64()
+                )
+                .count(),
+            1
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r["stage"] == "codex_zst_admission_alarm")
+                .count(),
+            usize::from(attempt == 12)
+        );
+        assert_eq!(
+            admission_starved_count(Some(&key)),
+            usize::from(attempt >= 12)
+        );
+        assert!(!rows.iter().any(|r| r["stage"] == "codex_zst_inventory"));
+        assert!(!state.files.contains_key(&key));
+        assert_eq!((work.physical_bytes, work.decoded_bytes), (0, 0));
+    }
     occupied.close();
-    assert_eq!(decodes(&header_inventory(&f, &mut state, &cache)), 1);
+    let rows = header_inventory(&f, &mut state, &cache);
+    assert_eq!(decodes(&rows), 1);
+    let counts = &rows
+        .iter()
+        .find(|r| r["stage"] == "codex_zst_inventory")
+        .unwrap()["counts"];
+    assert!(
+        counts["codex_zst_decoder_native_peak_bytes"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(counts["codex_zst_decoder_allocation_refusals"], 0);
+    assert_eq!(admission_starved_count(Some(&key)), 0);
+    assert_eq!(
+        admission_streak(&key, true),
+        1,
+        "funded header reset the streak to zero"
+    );
+    admission_streak(&key, false);
+    assert_eq!(
+        state.files[&key].archive.as_ref().unwrap().decode_attempts,
+        0
+    );
 }
 
 #[test]
@@ -1835,4 +1876,52 @@ fn changed_stamp_preserves_historical_logical_identity_but_resets_acquisition_st
         codex_zst_refusal_tests::decoder_construction_count(),
         constructions
     );
+}
+
+#[test]
+fn header_deferred_gates_and_absent_cache_do_not_increment_admission_streak() {
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+    let key = local_index_key(&f.0);
+    admission_streak(&key, false);
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let mut state = ScanIndex::default();
+    let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+        for _ in 0..12 {
+            for mut work in [
+                HeaderWork::default(),
+                HeaderWork {
+                    allowed: true,
+                    cpu_micros: 30_000_000,
+                    ..HeaderWork::default()
+                },
+            ] {
+                assert!(state
+                    .inventory_archive_header(&f.candidate(), Some(&cache), &mut work)
+                    .is_err());
+                assert_eq!((work.physical_bytes, work.decoded_bytes), (0, 0));
+            }
+            assert!(state
+                .inventory_archive_header(&f.candidate(), None, &mut funded_header_work())
+                .is_err());
+            let mut outside_scope = f.candidate();
+            outside_scope.scan_root = f.0.parent().unwrap().join("different-root");
+            assert!(state
+                .inventory_archive_header(&outside_scope, Some(&cache), &mut funded_header_work())
+                .is_err());
+        }
+    });
+    assert_eq!(decodes(&rows), 0);
+    assert!(state.files.is_empty());
+    assert!(!rows
+        .iter()
+        .any(|r| r["stage"] == "codex_zst_admission_alarm"));
+    assert_eq!(
+        admission_streak(&key, true),
+        1,
+        "no actual claim was refused"
+    );
+    admission_streak(&key, false);
 }

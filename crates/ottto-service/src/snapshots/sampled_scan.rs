@@ -3,7 +3,7 @@
 use super::*;
 use crate::heap_layout_bound::{Counter, HeapLayoutBound};
 use crate::local_resource_diagnostics::cache_lifecycle::{record, Event};
-use crate::local_resource_diagnostics::{codex_zst_refused, traversal_point};
+use crate::local_resource_diagnostics::codex_zst_refused;
 use crate::transcript_acquisition::{ReadMode, Scope};
 use crate::transcript_cache::{Release, TranscriptCache, CACHE_BYTES, CACHE_ENTRIES, ENTRY_BYTES};
 use sampled_jsonl::CachedJsonlReduction;
@@ -1985,61 +1985,57 @@ pub(super) fn new_source_parser(
     index: &mut ScanIndex,
     cache: Option<&Arc<SharedCache>>,
 ) -> Result<OwnedJsonlParser> {
-    let input = if source == SnapshotSource::Codex
-        && is_compressed_codex_rollout(Some(&candidate.path), None)
-    {
-        let key = local_index_key(&candidate.path);
-        if let Some(archive) = index.files.get_mut(&key).and_then(|e| e.archive.as_mut()) {
-            anyhow::ensure!(
-                !archive.quiet(&file),
-                "compressed rollout already attempted"
+    let input =
+        if source == SnapshotSource::Codex
+            && is_compressed_codex_rollout(Some(&candidate.path), None)
+        {
+            let key = local_index_key(&candidate.path);
+            if let Some(archive) = index.files.get_mut(&key).and_then(|e| e.archive.as_mut()) {
+                anyhow::ensure!(
+                    !archive.quiet(&file),
+                    "compressed rollout already attempted"
+                );
+                // The driver MUST call persist_archive_reservation before stepping;
+                // only that committed attempt spends the per-stamp decode budget.
+                if archive.matches(&file) && archive.stop_exhausted() {
+                    anyhow::bail!("compressed settlement exhausted");
+                }
+            }
+            index.codex_state_only_blocked_session_ids.extend(
+                codex_session_id_candidates_from_path(&candidate.path.with_extension("")),
             );
-            // The driver MUST call persist_archive_reservation before stepping;
-            // only that committed attempt spends the per-stamp decode budget.
-            if archive.matches(&file) && archive.stop_exhausted() {
-                anyhow::bail!("compressed settlement exhausted");
-            }
-        }
-        index
-            .codex_state_only_blocked_session_ids
-            .extend(codex_session_id_candidates_from_path(
-                &candidate.path.with_extension(""),
-            ));
-        let input = match cache {
-            Some(cache) => OpenedInput::funded(file, cache)?,
-            None => {
-                codex_zst_refused(CodexZstCause::AdmissionRefused);
-                None
-            }
+            let input = match cache {
+                Some(cache) => OpenedInput::funded(file, cache)?,
+                None => {
+                    codex_zst_refused(CodexZstCause::AdmissionRefused);
+                    None
+                }
+            };
+            let Some(input) = input else {
+                codex_compressed_input::record_admission_yield(&key);
+                anyhow::bail!(codex_compressed_input::ArchiveAdmissionYield);
+            };
+            codex_compressed_input::admission_streak(&key, false);
+            let mut evidence = match codex_compressed_input::ArchiveEvidence::begin(
+                input.get_ref(),
+                &candidate.path,
+                index.files.get(&key).and_then(|e| e.archive.as_deref()),
+            ) {
+                Ok(e) => e,
+                Err(e) => {
+                    input.close();
+                    return Err(e.into());
+                }
+            };
+            evidence.user_context = index
+                .active_archive_user_context
+                .clone()
+                .or(evidence.user_context);
+            index.files.entry(key).or_default().archive = Some(Box::new(evidence));
+            input
+        } else {
+            OpenedInput::plain(file)
         };
-        let Some(input) = input else {
-            if codex_compressed_input::admission_streak(&key, true) == 12 {
-                let counts = serde_json::json!({"consecutive_yields": 12, "admission_starved_count": codex_compressed_input::admission_starved_count(None)});
-                traversal_point("codex_zst_admission_alarm", "codex", &counts);
-            }
-            anyhow::bail!(codex_compressed_input::ArchiveAdmissionYield);
-        };
-        codex_compressed_input::admission_streak(&key, false);
-        let mut evidence = match codex_compressed_input::ArchiveEvidence::begin(
-            input.get_ref(),
-            &candidate.path,
-            index.files.get(&key).and_then(|e| e.archive.as_deref()),
-        ) {
-            Ok(e) => e,
-            Err(e) => {
-                input.close();
-                return Err(e.into());
-            }
-        };
-        evidence.user_context = index
-            .active_archive_user_context
-            .clone()
-            .or(evidence.user_context);
-        index.files.entry(key).or_default().archive = Some(Box::new(evidence));
-        input
-    } else {
-        OpenedInput::plain(file)
-    };
     let mut parser = OwnedJsonlParser::new_opened(
         input,
         &candidate.path,
