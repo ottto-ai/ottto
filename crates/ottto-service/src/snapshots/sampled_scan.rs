@@ -403,7 +403,7 @@ pub(super) struct Context {
     pub(super) unchanged_files: usize,
     pub(super) native_bytes: u64,
     pub(super) sample_bytes: u64,
-    pub(super) full_reasons: [usize; 11],
+    pub(super) full_reasons: [usize; 13],
     pub(super) priority_replays: usize,
     pub(super) audits_started: usize,
     pub(super) audits_completed: usize,
@@ -514,6 +514,15 @@ impl OwnedSourceScan {
             self.source,
             SnapshotSource::ClaudeCode | SnapshotSource::Codex
         ) {
+            #[cfg(unix)]
+            if self.source == SnapshotSource::Codex {
+                codex_child_pair_rederive::stage(
+                    &mut self.index,
+                    &cache,
+                    &self.codex_title_metadata,
+                );
+                cache.durable_child_pair_alarm(&self.index, now_seconds());
+            }
             sampled_audit::normalize_marker_storage(&mut self.index);
             if self.source == SnapshotSource::ClaudeCode {
                 sampled_audit::restore_held_audit_deadlines(&mut self.index, now_seconds());
@@ -536,7 +545,7 @@ impl OwnedSourceScan {
                 unchanged_files: 0,
                 native_bytes: 0,
                 sample_bytes: 0,
-                full_reasons: [0; 11],
+                full_reasons: [0; 13],
                 priority_replays: 0,
                 audits_started: 0,
                 audits_completed: 0,

@@ -1517,7 +1517,7 @@ fn hook_context(cache: &Arc<sampled_scan::SharedCache>) -> sampled_scan::Context
         unchanged_files: 0,
         native_bytes: 0,
         sample_bytes: 0,
-        full_reasons: [0; 11],
+        full_reasons: [0; 13],
         priority_replays: 0,
         audits_started: 0,
         audits_completed: 0,

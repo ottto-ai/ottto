@@ -43,6 +43,10 @@ crate::durable_tail_codec::durable_struct!(CachedJsonlReduction {
 #[cfg(unix)]
 pub(super) mod durable;
 impl CachedJsonlReduction {
+    #[cfg(unix)]
+    pub(super) fn child_pair_candidate(&self, metadata: &CodexTitleMetadata) -> bool {
+        codex_child_pair_rederive::eligible(&self.accumulator, metadata)
+    }
     /// The copy's usage witness (`SnapshotAccumulator::usage_witness`), kept
     /// beside a taken copy for P1-RETAIN R0's Q-PR15 guard.
     pub(super) fn usage_witness(&self) -> u64 {

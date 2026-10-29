@@ -216,7 +216,7 @@ pub(super) fn path_requires_verification(
 ) -> bool {
     files
         .get(&local_index_key(path))
-        .is_some_and(ScanIndexEntry::has_unverified_source)
+        .is_some_and(|entry| entry.has_unverified_source())
 }
 
 pub(super) fn normalize_marker_storage(index: &mut ScanIndex) {

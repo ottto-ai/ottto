@@ -754,6 +754,28 @@ impl DurableTailStore {
         held
     }
 
+    /// One-time selector metadata read: bounded by the existing record codec,
+    /// with no restore counters, permission repair, classification mutation or
+    /// process-wide disable on an individual access failure.
+    pub(crate) fn read_selection_metadata(&self, key: &Digest32) -> Option<DurableRecord> {
+        if self.disabled.is_some() {
+            return None;
+        }
+        let dir = fs::symlink_metadata(&self.dir).ok()?;
+        let path = self.record_path(key);
+        let metadata = fs::symlink_metadata(&path).ok()?;
+        if !dir.is_dir()
+            || dir.uid() != our_uid()
+            || dir.permissions().mode() & 0o077 != 0
+            || !metadata.is_file()
+            || metadata.uid() != our_uid()
+        {
+            return None;
+        }
+        let bytes = read_private(&path).ok()??;
+        decode(&bytes).ok()
+    }
+
     pub(crate) fn read(&mut self, key: &Digest32) -> ReadOutcome {
         match self.classify(key, "guard") {
             Err(reason) => return ReadOutcome::Refused(reason),

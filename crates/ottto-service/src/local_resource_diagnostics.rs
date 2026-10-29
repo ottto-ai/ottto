@@ -1250,7 +1250,7 @@ pub(crate) struct IndexState {
 }
 /// Reuse the existing counters; serialize only nonzero closed reason keys.
 #[derive(Debug)]
-pub(crate) struct FullReasons(pub(crate) [usize; 11]);
+pub(crate) struct FullReasons(pub(crate) [usize; 13]);
 impl Serialize for FullReasons {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use crate::transcript_acquisition::FullReason::*;
@@ -1267,6 +1267,11 @@ impl Serialize for FullReasons {
             (HeadChanged, "head_changed"),
             (BoundaryChanged, "boundary_changed"),
             (UnsupportedIdentity, "unsupported_identity"),
+            (CodexChildRederiveFirst, "codex_child_rederive_full_first"),
+            (
+                CodexChildRederiveCrashRetry,
+                "codex_child_rederive_full_crash_retry",
+            ),
         ] {
             let count = self.0[reason.slot()];
             if count != 0 {
@@ -1657,7 +1662,7 @@ mod tests {
             },
             page_events: PageEvents {
                 full_cause: Default::default(),
-                full_reasons: FullReasons([usize::MAX / 11; 11]),
+                full_reasons: FullReasons([usize::MAX / 13; 13]),
                 priority_full_replays: usize::MAX,
                 audits_started: usize::MAX,
                 audits_completed: usize::MAX,
@@ -1987,14 +1992,14 @@ mod tests {
     #[test]
     fn resource_reason_map_is_sparse_and_matches_existing_slots() {
         use crate::transcript_acquisition::FullReason::*;
-        let mut counts = [0; 11];
+        let mut counts = [0; 13];
         counts[StateMissing.slot()] = 2;
         counts[BoundaryChanged.slot()] = 3;
         assert_eq!(
             serde_json::to_value(FullReasons(counts)).unwrap(),
             serde_json::json!({"state_missing": 2, "boundary_changed": 3})
         );
-        let all = serde_json::to_value(FullReasons([1; 11])).unwrap();
+        let all = serde_json::to_value(FullReasons([1; 13])).unwrap();
         let keys: Vec<_> = all
             .as_object()
             .unwrap()
@@ -2007,6 +2012,8 @@ mod tests {
                 "audit_due",
                 "boundary_changed",
                 "clock_changed",
+                "codex_child_rederive_full_crash_retry",
+                "codex_child_rederive_full_first",
                 "head_changed",
                 "invalid_checkpoint",
                 "replaced",

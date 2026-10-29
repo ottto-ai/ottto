@@ -121,7 +121,7 @@ struct Run {
     index: ScanIndex,
     result: SourceScanResult,
     modes: (usize, usize, usize),
-    reasons: [usize; 11],
+    reasons: [usize; 13],
     native_bytes: u64,
 }
 fn raw_scan(
@@ -192,7 +192,7 @@ fn raw_scan_at(
             after_start(&mut scan);
         }
         let (modes, reasons, native_bytes) =
-            scan.sampling.as_ref().map_or(((0, 0, 0), [0; 11], 0), |c| {
+            scan.sampling.as_ref().map_or(((0, 0, 0), [0; 13], 0), |c| {
                 (
                     (c.full_files, c.tail_files, c.unchanged_files),
                     c.full_reasons,
@@ -1350,7 +1350,7 @@ mod durable_restart {
                         index,
                         result: scan,
                         modes,
-                        reasons: [0; 11],
+                        reasons: [0; 13],
                         native_bytes: 0,
                     }
                 }

@@ -350,7 +350,7 @@ struct SelectionCounts {
     tail_files: usize,
     unchanged_files: usize,
     // FullReason::slot() order; numeric counts only, no file identities.
-    full_reasons: [usize; 11],
+    full_reasons: [usize; 13],
     scanned_files: usize,
 }
 #[derive(Default)]
