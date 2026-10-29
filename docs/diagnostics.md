@@ -314,6 +314,17 @@ after the existing decision, are drained by that source's next completed page,
 and count repeated decisions, not distinct files or bytes. They are recorded
 whether or not an observer is registered.
 
+`DiscoveryRetention::owes_with_len` also retains a file whose current length
+exceeds its committed indexed `size_bytes`, using metadata already available at
+the age gate. Grown since committed: retention ends when the growth is committed
+(`size_bytes` catches up). Untouched and truncated files gain no exemption.
+This covers the walk, candidate/open rechecks, Codex roster and opened parent.
+`counts.discovery_retained.grown` counts aged growth-retention decisions by source
+on the #799 page line, drained per page and omitted at zero. It counts one event
+per gate check, even if another retention source also matches; a file may pass
+several gates. Oversized growth stays observed for reconciliation but unread
+under the existing size cap. Retention grants no new Full-read cause.
+
 On Claude pages, `counts.withheld_reparse` counts re-parses of keys withheld for
 an unresolved account: `start` (first in this process), `evidence` (same size,
 but the sampled content, the file object, its api/trace sidecar stamps or the

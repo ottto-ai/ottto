@@ -962,7 +962,7 @@ fn set_old(path: &Path) {
         .unwrap();
 }
 
-fn unselected_page(source: &str) -> Value {
+fn discovery_page(source: &str) -> Value {
     let (_, rows) = capture(|| {
         Probe::start().collection(
             source,
@@ -975,6 +975,10 @@ fn unselected_page(source: &str) -> Value {
         )
     });
     page_counts(&rows)
+}
+
+fn unselected_page(source: &str) -> Value {
+    discovery_page(source)
         .get("line_delivery_unselected")
         .cloned()
         .unwrap_or(Value::Null)
@@ -1297,6 +1301,338 @@ fn candidate_and_open_gates_keep_withheld_account_keys() {
     );
 }
 
+/// Sleep/restart retention is source-neutral: only real positive growth
+/// gains an exemption, including growth beyond the size cap (observed only).
+/// Gate counters are decisions, and overlapping owed arms count only once.
+#[test]
+fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let root = Root::new("ld-grown-gates");
+        let directory = root.projects().join("2026/10/01");
+        fs::create_dir_all(&directory).unwrap();
+        let path = |name: &str| directory.join(format!("rollout-{name}.jsonl"));
+        let mut index = ScanIndex::default();
+        for (name, committed) in [("grown", 2), ("held", 2), ("equal", 3), ("truncated", 4)] {
+            append(&path(name), b"{}\n");
+            set_old(&path(name));
+            let mut entry = super::tests::manifest_index_entry(None);
+            entry.size_bytes = committed;
+            assert!(!entry.has_unverified_source());
+            index.files.insert(local_index_key(&path(name)), entry);
+        }
+        // Both arms apply to the same reverted committed entry.
+        withhold(&mut index, &path("held"));
+        assert!(
+            discovery_retention!(index).owes(&path("held")),
+            "hold arm is live"
+        );
+        assert!(
+            fs::metadata(path("held")).unwrap().len()
+                > index.files[&local_index_key(&path("held"))].size_bytes,
+            "reverted committed entry still owes growth"
+        );
+        let cap = max_jsonl_file_bytes(source);
+        File::create(path("big")).unwrap().set_len(cap + 1).unwrap();
+        set_old(&path("big"));
+        let mut big = super::tests::manifest_index_entry(None);
+        big.size_bytes = cap;
+        index.files.insert(local_index_key(&path("big")), big);
+        ensure_bounded_traversal(source, &[root.projects()], &mut index, NOW, 7);
+        while !index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .pending_directories
+            .is_empty()
+        {
+            advance_bounded_directory_traversal(
+                source,
+                index.traversal.as_mut().unwrap(),
+                7,
+                discovery_retention!(index),
+            );
+        }
+        assert_eq!(candidates(&index), vec![path("grown"), path("held")]);
+        assert_eq!(
+            index.traversal.as_ref().unwrap().observed_index_keys,
+            ["big", "grown", "held"]
+                .map(|name| local_index_key(&path(name)))
+                .into()
+        );
+        let counts = discovery_page(source.api_slug());
+        assert_eq!(counts["discovery_retained"], json!({"grown": 3}));
+        assert_eq!(
+            counts["line_delivery_unselected"],
+            json!({"age": 2, "size": 1})
+        );
+        assert!(reconcile_missing_index_entries_with_limit(
+            &mut index,
+            usize::MAX
+        ));
+        assert_eq!(
+            index.files.keys().cloned().collect::<BTreeSet<_>>(),
+            ["big", "grown", "held"]
+                .map(|name| local_index_key(&path(name)))
+                .into(),
+            "F-INDEX keeps observed growth, including over-cap growth"
+        );
+
+        // Revalidation and opened-object recheck each use their current length.
+        // Restore the equal/truncated controls, retired by complete census above.
+        for (name, size) in [("equal", 3), ("truncated", 4)] {
+            let mut entry = super::tests::manifest_index_entry(None);
+            entry.size_bytes = size;
+            index.files.insert(local_index_key(&path(name)), entry);
+        }
+        for (name, retained) in [
+            ("grown", true),
+            ("held", true),
+            ("equal", false),
+            ("truncated", false),
+        ] {
+            let mut census = ScanCensus::default();
+            let candidate = candidate_from_traversal_path(
+                source,
+                ScanTraversalPath {
+                    scan_root: root.projects(),
+                    path: path(name),
+                    census_member: true,
+                    watcher_hint: false,
+                },
+                &mut census,
+                rfc3339_unix_seconds(NOW),
+                7,
+                discovery_retention!(index),
+            );
+            assert_eq!(candidate.is_some(), retained, "candidate {name}");
+            assert_eq!(
+                census
+                    .observed_index_keys
+                    .contains(&local_index_key(&path(name))),
+                retained
+            );
+            // Obtain a recent-window candidate independently so even the
+            // rejected controls exercise the opened-object age gate.
+            let candidate = candidate_from_traversal_path(
+                source,
+                ScanTraversalPath {
+                    scan_root: root.projects(),
+                    path: path(name),
+                    census_member: true,
+                    watcher_hint: false,
+                },
+                &mut ScanCensus::default(),
+                None,
+                7,
+                discovery_retention!(index),
+            )
+            .unwrap();
+            assert_eq!(
+                open_and_identify_scan_candidate(
+                    source,
+                    candidate,
+                    &mut ScanCensus::default(),
+                    rfc3339_unix_seconds(NOW),
+                    7,
+                    discovery_retention!(index)
+                )
+                .is_some(),
+                retained,
+                "open {name}"
+            );
+            if source == SnapshotSource::Codex {
+                assert_eq!(
+                    codex_parent_outside_window(
+                        discovery_retention!(index),
+                        &path(name),
+                        &File::open(path(name)).unwrap(),
+                        rfc3339_unix_seconds(NOW),
+                        7
+                    ),
+                    !retained,
+                    "Codex parent {name}"
+                );
+            }
+        }
+        let expected = if source == SnapshotSource::Codex {
+            6
+        } else {
+            4
+        };
+        assert_eq!(
+            discovery_page(source.api_slug())["discovery_retained"],
+            json!({"grown": expected}),
+            "one event per aged gate, not per arm"
+        );
+        assert!(
+            discovery_page(source.api_slug())
+                .get("discovery_retained")
+                .is_none(),
+            "page deltas drain to zero"
+        );
+    }
+}
+
+/// A file can be newly noticed by a retained Codex directory roster after
+/// sleep. The roster must use the same committed-size growth exemption.
+#[test]
+fn codex_roster_retains_aged_indexed_growth() {
+    let root = Root::new("ld-grown-roster");
+    let directory = root.projects().join("2026/10/01");
+    fs::create_dir_all(&directory).unwrap();
+    append(&directory.join("rollout-first.jsonl"), b"{}\n");
+    let mut index = ScanIndex::default();
+    ensure_bounded_traversal(
+        SnapshotSource::Codex,
+        &[root.projects()],
+        &mut index,
+        NOW,
+        7,
+    );
+    while !index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .pending_directories
+        .is_empty()
+    {
+        advance_bounded_directory_traversal(
+            SnapshotSource::Codex,
+            index.traversal.as_mut().unwrap(),
+            7,
+            discovery_retention!(index),
+        );
+    }
+    discovery_page("codex");
+    // Match the existing roster fixture's directory-change granularity.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let path = directory.join("rollout-grown.jsonl");
+    append(&path, b"{}\n");
+    set_old(&path);
+    let mut entry = super::tests::manifest_index_entry(None);
+    entry.size_bytes = 2;
+    index.files.insert(local_index_key(&path), entry);
+    assert!(!index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .codex_rollout_paths
+        .contains(&local_index_key(&path)));
+    refresh_retained_codex_roster(
+        SnapshotSource::Codex,
+        index.traversal.as_mut().unwrap(),
+        7,
+        discovery_retention!(index),
+    );
+    assert!(candidates(&index).contains(&path));
+    assert!(index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .observed_index_keys
+        .contains(&local_index_key(&path)));
+    assert_eq!(
+        discovery_page("codex")["discovery_retained"],
+        json!({"grown": 1})
+    );
+}
+
+/// Growth followed by more than W of downtime is still read exactly once.
+/// Committing the new length releases this exemption; generic Tail audit debt
+/// is discharged explicitly before asserting ordinary aging, as in the hold fixture.
+#[test]
+fn grown_indexed_file_is_read_after_sleep_then_ages_after_commit() {
+    let root = Root::new("ld-grown-sleep");
+    let path = root.file(SESSION);
+    let key = local_index_key(&path);
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let page = |index: ScanIndex, days| {
+        let recorder = Recorder::default();
+        let ((index, result, _), _) = capture(|| {
+            finish(
+                OwnedSourceScan::new(
+                    SnapshotSource::ClaudeCode,
+                    &[root.projects()],
+                    index,
+                    &days_from_now(days),
+                    7,
+                    10,
+                    false,
+                    None,
+                    &[],
+                    false,
+                    true,
+                )
+                .with_sampled_acquisition(
+                    cache.clone(),
+                    crate::transcript_acquisition::Scope("ld-grown-sleep".into()),
+                )
+                .with_line_observer("test", Box::new(recorder.clone())),
+            )
+        });
+        (index, result, recorder)
+    };
+    append(&path, &assistant_line("u1"));
+    let (committed, first, _) = page(ScanIndex::default(), 0);
+    assert_eq!(first.scanned_file_count, 1);
+    assert!(committed.claude_account_deferred_holds.is_empty());
+    assert!(!committed.files[&key].has_unverified_source());
+    append(&path, &assistant_line("u2"));
+    let length = fs::metadata(&path).unwrap().len();
+    assert!(length > committed.files[&key].size_bytes);
+    // No in-process pacing or hold witness is needed: only the committed index.
+    let (mut caught_up, result, recorder) = page(committed, 8);
+    let modes = recorder
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::Begin(view) => Some(view.mode),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(modes, vec![held_growth_mode()], "aged growth is read once");
+    assert_eq!(
+        recorder.lines().len(),
+        if held_growth_mode() == DeliveryMode::Tail {
+            1
+        } else {
+            2
+        }
+    );
+    assert_eq!(
+        result
+            .snapshots
+            .iter()
+            .filter(|item| item.source_session_id == SESSION)
+            .count(),
+        1
+    );
+    assert_eq!(
+        caught_up.files[&key].size_bytes, length,
+        "new committed size catches up"
+    );
+    let fingerprint = caught_up.files[&key].source_file_fingerprint.clone();
+    assert_eq!(
+        caught_up.files[&key].has_unverified_source(),
+        held_growth_mode() == DeliveryMode::Tail
+    );
+    if caught_up.files[&key].has_unverified_source() {
+        assert!(caught_up.complete_full_audit(&key, &fingerprint));
+    }
+    assert!(!discovery_retention!(caught_up).owes_with_len(
+        SnapshotSource::ClaudeCode,
+        &path,
+        length
+    ));
+    let (aged, again, recorder) = page(caught_up, 9);
+    assert!(recorder.events().is_empty());
+    assert_eq!(again.scanned_file_count, 0);
+    assert!(
+        !aged.files.contains_key(&key),
+        "normal aging resumes after commit"
+    );
+}
+
 /// A Tail needs the retained reduction, which the RAM cache admits only where
 /// `heap_layout_bound::layout_supported()` holds (macOS on the pinned rustc).
 /// Elsewhere (Linux CI) the cache refuses retention (`retention_bound_refused`),
@@ -1326,10 +1662,12 @@ fn reconciliation_keeps_present_withheld_keys_and_retires_absent_ones() {
     }
     let mut index = ScanIndex::default();
     for name in ["held", "old", "gone"] {
-        index.files.insert(
-            local_index_key(&file(name)),
-            super::tests::manifest_index_entry(Some(name)),
-        );
+        let mut entry = super::tests::manifest_index_entry(Some(name));
+        // Present controls are unchanged, not grown since the committed size.
+        if name != "gone" {
+            entry.size_bytes = fs::metadata(file(name)).unwrap().len();
+        }
+        index.files.insert(local_index_key(&file(name)), entry);
     }
     withhold(&mut index, &file("held"));
     withhold(&mut index, &file("gone"));
