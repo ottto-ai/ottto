@@ -387,15 +387,24 @@ request identity contract changed) and `growth` (the size changed). A withheld
 key whose content and evidence are unchanged is skipped and not counted; an
 mtime, ctime or xattr change alone causes no parse or line delivery; existing
 bounded identity samples still read the opened file. A validated completed parse
-records its content witness immediately. Unknown object generation (including
-missing birth identity) fails closed to the existing counted re-parse path. A
+records its content witness immediately. Equal committed fingerprints never
+grant an ordinary Skip to a recorded hold without that CONTENT witness. Missing,
+refused or poisoned advisory state recovers through the existing counted parse;
+genuine authority/correction/rearm constraints retain priority. Unknown object
+generation (including missing birth identity) fails closed to that same path. A
 past-due sampled audit on such a key is deferred to its next counted re-parse
 (it cannot settle while held). The memo behind that skip is RAM only.
 `counts.withheld_hold_released` counts released holds: `deleted` (the held file
 was proved absent), `deleted_tokens` (its last-known withheld tokens, when
 available), and `resolved` (a parse bound the account). A held audit obligation
-is retired only by `sampled_audit::proven_absent`: NotFound beneath a present
-readable parent and configured readable root. This additionally emits
+is retired only by `sampled_audit::proven_absent`: final-name NotFound beneath
+a readable configured root and a descriptor-relative parent chain opened with
+no-follow directory flags. Every ancestor is revalidated; symlinks, missing
+ancestors and substitutions keep debt. A bounded inventory of up to 4,096
+recorded holds applies the same proof to held-new keys without committed entries.
+Healthy-census retirement finishes that item, preserving audited fingerprint
+incidence and ACK custody rather than falling through ordinary deletion.
+This additionally emits
 `counts.audit_retired_absent.events`; it grants no Full, source-verification or
 census credit. Missing parents, unreadable roots and permission errors keep
 debt. Codex-protected entries keep their separate protected history.

@@ -45,3 +45,12 @@ unusable cannot obtain the ordinary equal-fingerprint Skip. Existing authority,
 audit, correction and genuine rearm rules retain priority; recovery uses the
 existing counted parse path and preserves the committed fingerprint. Real
 Completed/save/reload fixtures cover equal fingerprints and advisory recovery.
+
+Growth fate and current age now report after successful selected-index saves,
+including partial checkpoints. Bounded page metadata observations distinguish
+committed, still-retained and unindexed outcomes across Claude, Codex and Pi.
+Still-retained ages use the last observed mtime and the current wall clock;
+unknown timestamps and observation overflow remain explicit. These snapshots
+are not an exact whole-index population gauge or an ACK. Real refusal fixtures
+retain the old committed extent across two quiet subsequent pages; rewrite
+fixtures keep the existing counted Full-from-zero identity/anchor behavior.
