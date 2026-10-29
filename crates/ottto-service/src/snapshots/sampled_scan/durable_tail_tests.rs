@@ -3144,8 +3144,9 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                 // Certificate source is irrelevant for preservation; it is never restored.
                 let cert_path = root.join("certificate.jsonl");
                 std::fs::write(&cert_path, b"{}\n").unwrap();
-                // A verified known record of a key absent from every index:
-                // production fresh-index cleanup must delete it.
+                // A known record absent from every index. Cold Claude cleanup
+                // has no original-binding mutation proof, so it must preserve
+                // this survivor; Codex retains ordinary selective deletion.
                 let absent_key = store::key_digest(ds, "/synthetic/absent-known.jsonl");
                 let record = |key| PendingRecord {
                     binding: Binding {
@@ -3207,7 +3208,23 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                         &namespace,
                         false,
                     );
-                    assert!(!absent_path.exists(), "fresh cleanup ran");
+                    let claude = source == SnapshotSource::ClaudeCode;
+                    assert_eq!(
+                        absent_path.exists(),
+                        claude,
+                        "cold Claude keeps unproved records; Codex deletes verified absences"
+                    );
+                    let (_, cleanup) = cache.durable_counters(source).unwrap();
+                    assert_eq!(cleanup.gc_records_deleted, u64::from(!claude));
+                    assert_eq!(
+                        cleanup.mutation_unproved,
+                        if claude {
+                            1 + u64::from(kind == "none")
+                        } else {
+                            0
+                        },
+                        "every unproved known Claude survivor remains in custody"
+                    );
                 } else {
                     cache.durable_begin_pass(source, &index_path, &namespace, false);
                     let fingerprint = if bypass == "cleared" { "" } else { "fp" };
@@ -5336,6 +5353,54 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
     // carriers re-arm an immediate current-index audit before any source read.
     // A completed Full whose durable replacement failed has the same state.
     let saved = ScanIndex::load(&index_path).unwrap();
+    // A missing entry must still reach same-context carrier classification.
+    // No entry-derived binding or transcript read is available in either arm.
+    // A foreign namespace supplies no scheduling authority and stays NoEntry.
+    for matching_context in [true, false] {
+        let mut absent = saved.clone();
+        absent.files.remove(&key);
+        let namespace = if matching_context {
+            scope.clone()
+        } else {
+            Scope("foreign-debt-survival".into())
+        };
+        let cache = SharedCache::default();
+        cache.durable_begin_pass(SnapshotSource::ClaudeCode, &index_path, &namespace, true);
+        let interpretation =
+            Interpretation::of(SnapshotSource::ClaudeCode, &key, &absent, true, &namespace);
+        let mut held = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let record_path = dir.join(format!(
+            "{}.rec",
+            record_key
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        ));
+        let before = std::fs::read(&record_path).unwrap();
+        let outcome = cache.durable_restore(
+            SnapshotSource::ClaudeCode,
+            &key,
+            &path,
+            &scope,
+            &mut held,
+            &absent,
+            &interpretation,
+        );
+        assert!(if matching_context {
+            matches!(outcome, RestoreOutcome::Miss(MissClass::AuditCarrier))
+        } else {
+            matches!(outcome, RestoreOutcome::Miss(MissClass::NoEntry))
+        });
+        assert!(!absent.files.contains_key(&key), "no invented membership");
+        assert_eq!(std::fs::read(&record_path).unwrap(), before);
+        let (counts, _) = cache.durable_counters(SnapshotSource::ClaudeCode).unwrap();
+        assert_eq!(
+            counts.ineligible.get("audit_carrier"),
+            matching_context.then_some(&1)
+        );
+        assert_eq!(counts.durable_held, [0; 7]);
+        assert_eq!(counts.restored, 0);
+    }
     for reset in [false, true] {
         let mut missing = saved.clone();
         if reset {
@@ -8191,10 +8256,10 @@ fn b4_near_cap_uses_each_existing_source_cap() {
         let cap = max_jsonl_file_bytes(source);
         assert_eq!(
             cap,
-            if source == SnapshotSource::Codex {
-                2 * 1024 * 1024 * 1024
-            } else {
-                256 * 1024 * 1024
+            match source {
+                SnapshotSource::ClaudeCode => 512 * 1024 * 1024,
+                SnapshotSource::Codex => 2 * 1024 * 1024 * 1024,
+                SnapshotSource::Pi => 256 * 1024 * 1024,
             }
         );
         assert!(!near_source_cap(source, cap - cap / 10 - 1));

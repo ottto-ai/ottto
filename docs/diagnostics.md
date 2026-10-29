@@ -114,6 +114,43 @@ count. Codex/Pi, watcher hints and nonmember candidate losses add none. No new
 filesystem probe, event stream, path/key/name output or authority decision is
 introduced; diagnostics only, no behaviour change.
 
+The `codex_continuation` stage uses the same version 2 `local_resources`
+point carrier, with source `codex` and no CPU/RSS measurement. Each admission
+record has `continuation_pages_run` (1 when a prepared page enters the scan
+step loop, otherwise 0) and a sparse `continuation_held` object whose single
+nonzero count is 1. Its closed reason keys are `roster_changed`,
+`context_changed`, `policy_changed`, `group_job`, and `other`. Sum these point
+counts over the desired window; they are not persisted process totals.
+
+Roster/context/policy holds occur before prepare or transcript reads. Context
+wins if both context and policy changed; missing carried evidence, prepare
+errors/refusals and step-admission refusals use `other`. Group refusals are
+counted at resume or when a group would otherwise mint (exhausted cursor
+budget and accelerated), before taking the job. Ordinary ineligible group
+pauses add no continuation hold. A stepped page can
+later produce an additional hold record; the two counters are not exclusive.
+Timer wakes without a ready page and platform/QoS skips are outside these scan
+admission counts. No path, session id, digest, error text or transcript content
+is included, and the counts grant no authority.
+
+The `codex_continuation_mint` stage uses the same point carrier and source,
+with one sparse `continuation_mint` count: `minted`, `inventory_incomplete`,
+`groups_completed`, `no_remaining`, or `over_bound`. Each record counts one
+mint decision for a paused, accelerated ticket candidate. Completed joins take
+precedence over incomplete/missing inventory. With valid evidence, missing
+rotation allowance is `no_remaining`; unknown/over-limit retained layout is
+`over_bound`; `minted` means inputs were admitted, before ordinary finish,
+contention and cadence may still discard the candidate. These counters grant
+no authority and do not imply a continuation page ran. No raw ticket means no
+mint decision; authority/lifetime refusals remain outside these five outcomes.
+
+The inventory check performs at most one `lstat` per carried rollout path
+(up to 32,768), stopping on the first mismatch. It includes ledger parents and
+the held file. Any changed rollout holds continuation, so active Codex sessions
+usually leave it idle. Additions wait for the ordinary census; an EOF park that
+cannot fit becomes strict StateBound debt for the ordinary pass to disclose,
+keeping the prior body rather than emitting a zero replacement.
+
 A `source_finish` record wraps rotation finish, including its validation,
 post-policy finalization and upload work. It exists exactly when finish was
 called and returned normally, including an error return. It has `counts: {}`
@@ -1049,7 +1086,7 @@ one-day sanity maximum expires toward reading. Codex page/cursor deferral
 consumes no structural allowance; the stamp is enrolled at acquisition start.
 Growth at 90% or more of the source file cap bypasses pacing immediately, under
 the same cause with a `near_cap` annotation. Source caps predate this path:
-256 MiB Claude/Pi, 2 GiB Codex. Above the cap the existing oversized-file
+512 MiB Claude, 256 MiB Pi, 2 GiB Codex. Above the cap the existing oversized-file
 rejection/disclosure still applies; near-cap admission does not expand it.
 
 Workspace re-derivation captures at most 4096 bytes per selected field and
@@ -1059,3 +1096,37 @@ refusals are counted as `not_rederived`; no altered value is published.
 `rederive_input_bytes` counts each actual physical read, including bytes read
 before a later capture/hash refusal. Success receipts count successful restores
 separately; do not add the two byte counters together.
+
+## Codex state-only identity coverage
+
+Prior coverage retains both the uniquely resolved filename identity and the
+existing committed header/counting or protected owner hash, including a header
+outside both filename candidates. Accepted-owner coverage requires nonempty
+exact file incidence whose entities are accepted, not quarantined or decode-held;
+a permanent refusal or local wire-size rejection grants no new coverage.
+
+Checkpoint retention and expiry follow the existing rules; local retention
+changes are deferred. The backend downgrade fence
+(`usage_accounting_authority_downgrade`) protects attributed usage floors against
+an uncontracted state-only successor. Local coverage reduces redundant emission;
+it does not replace that backend money protection.
+
+With a prior snapshot fingerprint, exactly two evidence-supported filename
+identities, and no committed owner coverage, both candidates are withheld from
+state-only output. No fingerprint preserves ordinary fallback; zero supported
+candidates are not counted. The existing `local_resources` carrier emits at most
+one `codex_state_only_ambiguous_identity` line per state-only pass, whose
+`counts.codex_state_only_ambiguous_identity` is the number of ambiguous entry
+observations in that pass. Repeated passes observe the same entries again: this
+is NOT a distinct-entry/file/session count, and sums must not be reported as
+files. Alongside the count, `counts.codex_state_only_ambiguous_identity_tokens`
+is the saturating sum of the supported state threads' `tokens_used` per observed
+ambiguous entry in that pass (units: tokens). The token sum is an UPPER BOUND on
+possibly withheld state-only usage: repeated candidates and already-covered
+usage can contribute again. A zero-token observation reports zero tokens. Only
+aggregate counts and token sums are logged, with no paths, ids or per-session
+values.
+
+A later complete native parse still emits its exclusive body for a session with
+an earlier state-only row. An emitted total alone does not prove a server-side
+overwrite; backend authority rules independently govern successor acceptance.

@@ -3618,7 +3618,7 @@ fn pinned_v1_bootstrap_ordinary_save_then_second_restart_tails_without_a_full() 
             source,
             &index_path,
             &namespace,
-            source == SnapshotSource::ClaudeCode,
+            true, // Match production_scan's cfg(test) identity capture.
         );
         let (mut index, _, modes) = production_scan(
             &fixture,
@@ -3652,7 +3652,7 @@ fn pinned_v1_bootstrap_ordinary_save_then_second_restart_tails_without_a_full() 
             source,
             &index_path,
             &namespace,
-            source == SnapshotSource::ClaudeCode,
+            true, // Match production_scan's cfg(test) identity capture.
         );
         let loaded = ScanIndex::load(&index_path).unwrap();
         let (mut warm, scan, modes) = production_scan(
@@ -3722,7 +3722,7 @@ fn pinned_v1_bootstrap_ordinary_save_then_second_restart_tails_without_a_full() 
             source,
             &index_path,
             &namespace,
-            source == SnapshotSource::ClaudeCode,
+            true, // Match production_scan's cfg(test) identity capture.
         );
         let loaded = ScanIndex::load(&index_path).unwrap();
         let (_, scan, modes) =
@@ -3827,7 +3827,7 @@ fn no_record_keys_keep_existing_full_admission_after_restart() {
             source,
             &index_path,
             &namespace,
-            source == SnapshotSource::ClaudeCode,
+            true, // Match production_scan's cfg(test) identity capture.
         );
         let loaded = ScanIndex::load(&index_path).unwrap();
         let (_, scan, modes) = production_scan(
@@ -3869,7 +3869,7 @@ fn completed_full_audit_before_durable_replacement_recovers_after_restart() {
                 source,
                 &index_path,
                 &namespace,
-                source == SnapshotSource::ClaudeCode,
+                true, // Match production_scan's cfg(test) identity capture.
             );
             cache
         };
@@ -4050,7 +4050,7 @@ fn missing_index_debt_carrier_recovers_by_full_in_one_pass_for_both_sources() {
             source,
             &index_path,
             &namespace,
-            source == SnapshotSource::ClaudeCode,
+            true, // Match production_scan's cfg(test) identity capture.
         );
         begin_durable_pass(
             &cache,
@@ -4059,7 +4059,7 @@ fn missing_index_debt_carrier_recovers_by_full_in_one_pass_for_both_sources() {
             &index_path,
             true,
             &namespace,
-            source == SnapshotSource::ClaudeCode,
+            true, // Match production_scan's cfg(test) identity capture.
         );
         assert_eq!(
             fs::read(&record_path).unwrap(),
@@ -4223,7 +4223,7 @@ fn missing_index_debt_carrier_recovers_by_full_in_one_pass_for_both_sources() {
             source,
             &index_path,
             &namespace,
-            source == SnapshotSource::ClaudeCode,
+            true, // Match production_scan's cfg(test) identity capture.
         );
         let (index, idle, modes, bytes) = production_scan_at(
             &fixture,
@@ -4308,7 +4308,7 @@ fn missing_index_terminal_loss_carries_recovered_debt_until_verified_full_for_bo
             source,
             &index_path,
             &namespace,
-            source == SnapshotSource::ClaudeCode,
+            true, // Match production_scan's cfg(test) identity capture.
         );
         begin_durable_pass(
             &cache,
@@ -4317,7 +4317,7 @@ fn missing_index_terminal_loss_carries_recovered_debt_until_verified_full_for_bo
             &index_path,
             true,
             &namespace,
-            source == SnapshotSource::ClaudeCode,
+            true, // Match production_scan's cfg(test) identity capture.
         );
         assert_eq!(
             fs::read(&record_path).unwrap(),
@@ -4405,7 +4405,7 @@ fn missing_index_terminal_loss_carries_recovered_debt_until_verified_full_for_bo
             source,
             &index_path,
             &namespace,
-            source == SnapshotSource::ClaudeCode,
+            true, // Match production_scan's cfg(test) identity capture.
         );
         let (mut verified, clean, modes, _) = production_scan_at(
             &fixture,
@@ -4546,7 +4546,7 @@ fn missing_carrier_future_debt_clamps_only_in_live_context_for_both_sources() {
                 source,
                 &index_path,
                 &namespace,
-                source == SnapshotSource::ClaudeCode,
+                true, // Match production_scan's cfg(test) identity capture.
             );
             begin_durable_pass(
                 &cache,
@@ -4555,7 +4555,7 @@ fn missing_carrier_future_debt_clamps_only_in_live_context_for_both_sources() {
                 &index_path,
                 true,
                 &namespace,
-                source == SnapshotSource::ClaudeCode,
+                true, // Match production_scan's cfg(test) identity capture.
             );
             assert_eq!(
                 fs::read(&record_path).unwrap(),
