@@ -7010,3 +7010,113 @@ fn s2_unknown_is_same_and_only_independent_replacement_skips_floor() {
     }
     .behind(100));
 }
+
+/// The growth/shrink discovery backstop must never let a warm optional copy
+/// erase S2. Same inode plus unknown/reused birth is not replacement proof.
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "requires qualified native heap layout"
+)]
+fn warm_shortened_old_file_keeps_accepted_body_floor_without_publication() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    use std::io::Write;
+    assert!(crate::heap_layout_bound::layout_supported());
+    let _gate = claude_request_money::e2::GateForTest::set(true);
+    let root = crate::test_scratch::ScratchDir::new("p3-warm-floor");
+    let sessions = root.join("sessions");
+    std::fs::create_dir(&sessions).unwrap();
+    let path = sessions.join("11111111-2222-4333-8444-555555555555.jsonl");
+    native_fixture(&path);
+    let prefix = std::fs::metadata(&path).unwrap().len();
+    let row = serde_json::json!({"type":"assistant","sessionId":"11111111-2222-4333-8444-555555555555",
+        "timestamp":"2026-10-07T10:01:00Z","requestId":"req-p3-warm",
+        "message":{"id":"msg-p3-warm","model":"fixture-model","usage":{"input_tokens":25,"output_tokens":3}}});
+    writeln!(
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap(),
+        "{row}"
+    )
+    .unwrap();
+    let source = SnapshotSource::ClaudeCode;
+    let namespace = Scope("p3-warm-s2".into());
+    let cache = Arc::new(SharedCache::default());
+    let run = |index| {
+        let mut scan = OwnedSourceScan::new_with_identity_capture(
+            source,
+            std::slice::from_ref(&sessions),
+            index,
+            "2026-10-29T12:00:00Z",
+            365,
+            100,
+            false,
+            None,
+            &[],
+            false,
+            true,
+            true,
+        )
+        .with_sampled_acquisition(cache.clone(), namespace.clone());
+        let mut modes = (0, 0, 0);
+        for _ in 0..10_000 {
+            if let Some(context) = scan.sampling.as_ref() {
+                modes = (context.full_files, context.tail_files, context.native_bytes);
+            }
+            match scan.step(None) {
+                OwnedSourceScanStep::Pending(next) => scan = next,
+                OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan, modes),
+            }
+        }
+        panic!("warm S2 fixture did not finish");
+    };
+    let (accepted, first, _) = run(ScanIndex::default());
+    let key = local_index_key(&path);
+    assert_eq!(first.snapshots[0].input_tokens, 125);
+    assert!(
+        cache.retained().unwrap().peek(&key).is_some(),
+        "real warm premise"
+    );
+    let entry = serde_json::to_value(&accepted.files[&key]).unwrap();
+    let census = accepted.claude_request_census.get(&key).unwrap().clone();
+    let witness = accepted.files[&key].last_upload_body_witness.clone();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(prefix)
+        .unwrap();
+    File::open(&path)
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)),
+        )
+        .unwrap();
+    assert!(sampled_audit::path_requires_recovery(
+        source,
+        &accepted.files,
+        &path,
+        prefix
+    ));
+    let (held, body, modes) = run(accepted);
+    assert!(
+        body.snapshots.is_empty(),
+        "cannot publish100 below accepted125"
+    );
+    assert_eq!(
+        body.unreadable_path_count, 0,
+        "known floor is census-neutral"
+    );
+    assert_eq!(
+        modes,
+        (0, 0, 0),
+        "no Full/Tail selection or native body before S2"
+    );
+    assert_eq!(serde_json::to_value(&held.files[&key]).unwrap(), entry);
+    assert_eq!(held.files[&key].last_upload_body_witness, witness);
+    assert_eq!(held.claude_request_census.get(&key), Some(&census));
+}

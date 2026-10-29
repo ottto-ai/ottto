@@ -1,6 +1,6 @@
 # Large-record restore money repairs — 2026-10-29
 
-The cold durable restore route freezes the accepted Claude entry before candidate
+Warm, cold and unsampled publication routes preserve the frozen floor. The durable route freezes the accepted Claude entry before candidate
 mutation. A shorter extent or a newer accepted body revision holds without an
 upload, unread-byte acknowledgment or unreadable-source classification. The
 record is checked before decode and admission, then the actual prepared extent
@@ -26,7 +26,8 @@ removed UpgradeMissing hold. Every refused Codex group member is recorded before
 the group exits; no short-circuit hides later refusals.
 
 Native fixtures cover growth, zero-read paced holding, wall-clock expiry,
-cumulative cold-Full equality and an idle restart. Clock rollback, large forward
+cumulative cold-Full equality and an idle restart. A warm same-inode truncation
+control verifies zero body reads/publication and preserved accepted witness. Clock rollback, large forward
 jumps, map overflow, frozen accepted facts and independent replacement proof
 have separate controls. Existing spent-custody hold controls now explicitly set
 up an interrupted recovery attempt so their zero-read assertions remain bounded

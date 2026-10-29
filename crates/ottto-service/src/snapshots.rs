@@ -31192,6 +31192,9 @@ impl OwnedSourceScan {
                     )
                 })
                 .flatten();
+            // This floor also covers warm and unsampled returned-original paths.
+            #[cfg(unix)]
+            let mut restore_floor = accepted_floor;
             let preflight_source_file_fingerprint =
                 claude_authority_preflight_fingerprint(index, &candidate);
             if let Some(context) = attribution_context {
@@ -32302,8 +32305,6 @@ impl OwnedSourceScan {
                         #[cfg(unix)]
                         context.cache.durable_note_scope(source, &key, &scope);
                         #[cfg(unix)]
-                        let mut restore_floor = None;
-                        #[cfg(unix)]
                         let (mut retained, taken_admission, debt) = match retained {
                             None if allow_sample && !parser.reader.reader.is_compressed() => {
                                 let mut interpretation =
@@ -32660,6 +32661,31 @@ impl OwnedSourceScan {
                     pending!();
                 };
                 planned_mode = Some((mode, None));
+            }
+            // S2 is a publication floor, including warm, census/dependency
+            // fallback and unsampled routes. Only the strict cold-record
+            // replacement proof above may clear it. No plan means use the
+            // actual held extent, never a fabricated zero or a skipped guard.
+            #[cfg(unix)]
+            if restore_floor.is_some_and(|a| {
+                parser.reader.acquisition.as_ref().map_or_else(
+                    || {
+                        parser
+                            .reader
+                            .reader
+                            .get_ref()
+                            .metadata()
+                            .map_or(true, |m| a.behind(m.len()))
+                    },
+                    |plan| a.behind(plan.frozen_length()),
+                )
+            }) {
+                if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
+                    cache.durable_custody_hold(source, "accepted_body_floor", index, &candidate);
+                } else {
+                    claude_request_census::retain_held(index, &candidate);
+                }
+                pending!();
             }
             let mut active = Box::new(OwnedActiveFile {
                 comparison_target,
