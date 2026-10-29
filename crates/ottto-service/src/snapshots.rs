@@ -43486,6 +43486,18 @@ impl ScanIndex {
             let session_id = &item.source_session_id;
             let key = sha256_hex(&["session_owner:v1", machine_id, session_id]);
             let existing = self.session_account_bindings.get(&key);
+            if source == SnapshotSource::ClaudeCode
+                && existing.is_none()
+                && item
+                    .session_account_evidence
+                    .as_ref()
+                    .is_some_and(|evidence| evidence.identity_disposition == Some("conflict"))
+            {
+                // Conflicting native profiles cannot establish a new owner.
+                // Use the existing counted account-deferral/retention path.
+                deferred.insert(session_id.clone());
+                continue;
+            }
             match source {
                 SnapshotSource::Codex => {
                     if !codex_rows_prove_oauth(item) {
@@ -76237,6 +76249,166 @@ mod tests {
         assert_eq!(evidence.identity_disposition, Some("conflict"));
         assert!(evidence.account_identifier_hash.is_none());
         assert!(evidence.provider_workspace_hash.is_none());
+    }
+
+    // Uses the real multi-root metadata sweep and existing native transcript
+    // parser, with the legacy account-row path isolated from request partitions.
+    fn desktop_profile_account_fixture(
+        home: &Path,
+        index: &mut ScanIndex,
+        profile: &str,
+        account: &str,
+        session: &str,
+    ) -> SnapshotItem {
+        let root = home.join("Library/Application Support").join(profile);
+        let bucket = root
+            .join("claude-code-sessions")
+            .join(account)
+            .join("123e4567-e89b-12d3-a456-426614174001");
+        fs::create_dir_all(&bucket).unwrap();
+        fs::write(root.join("config.json"), "{}").unwrap();
+        fs::write(
+            bucket.join("local_session.json"),
+            json!({"cliSessionId":session,"createdAt":"2026-09-30T10:00:00Z"}).to_string(),
+        )
+        .unwrap();
+        let metadata = ClaudeTitleMetadata::load_from_roots_with_index(
+            &[home.join(".claude/projects")],
+            index,
+            "2026-09-30T10:05:00Z",
+            true,
+        );
+        claude_original_carrier_fixture(&metadata, "")
+    }
+
+    #[test]
+    fn desktop_sibling_login_cannot_move_an_accepted_owner() {
+        let _gate = claude_request_money::e2::GateForTest::off();
+        let home = crate::test_scratch::ScratchDir::new("desktop-retained-owner");
+        let mut index = ScanIndex::default();
+        let a = "123e4567-e89b-12d3-a456-426614174000";
+        let b = "223e4567-e89b-12d3-a456-426614174000";
+        let mut accepted =
+            desktop_profile_account_fixture(&home, &mut index, "Claude", a, "native-session");
+        let owner = exact_session_account_hash(&accepted).expect("single native owner");
+        assert!(index
+            .bind_session_accounts(
+                SnapshotSource::ClaudeCode,
+                "machine",
+                std::slice::from_mut(&mut accepted),
+                &[],
+            )
+            .is_empty());
+        index.file_snapshot_fingerprints.insert(
+            "/synthetic/native-session.jsonl".into(),
+            BTreeSet::from([accepted.snapshot_fingerprint.clone()]),
+        );
+        index.record_accepted_snapshot_fingerprints(&BTreeSet::from([accepted
+            .snapshot_fingerprint
+            .clone()]));
+        let accepted_body = serde_json::to_value(&accepted).unwrap();
+        let bindings = index.session_account_bindings.clone();
+        // Restore accepted state before a newly configured, different login.
+        let mut index: ScanIndex =
+            serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
+        let mut same_session = desktop_profile_account_fixture(
+            &home,
+            &mut index,
+            "Claude-ALT",
+            b,
+            "different-session",
+        );
+        assert!(index
+            .bind_session_accounts(
+                SnapshotSource::ClaudeCode,
+                "machine",
+                std::slice::from_mut(&mut same_session),
+                &[],
+            )
+            .is_empty());
+        assert_eq!(
+            exact_session_account_hash(&same_session),
+            Some(owner.clone())
+        );
+        assert_eq!(index.session_account_bindings, bindings);
+        assert_eq!(same_session.model_usage, accepted.model_usage);
+        assert_eq!(same_session.usage_buckets, accepted.usage_buckets);
+        assert_eq!(same_session.cost, accepted.cost);
+
+        // A copied transcript under the other login is contradictory, not
+        // permission to restamp retained money or replace the accepted body.
+        let mut conflicting =
+            desktop_profile_account_fixture(&home, &mut index, "Claude-ALT", b, "native-session");
+        assert!(exact_session_account_hash(&conflicting).is_none());
+        let deferred = index.bind_session_accounts(
+            SnapshotSource::ClaudeCode,
+            "machine",
+            std::slice::from_mut(&mut conflicting),
+            &[],
+        );
+        assert_eq!(
+            deferred,
+            BTreeSet::from([accepted.source_session_id.clone()])
+        );
+        let mut disposition = ClaudeUsageAuthorityDisposition::default();
+        disposition.defer_sessions(deferred);
+        let mut uploads = vec![conflicting];
+        disposition.retain_uploadable(&mut uploads);
+        assert!(
+            uploads.is_empty(),
+            "contradiction cannot replace accepted money"
+        );
+        assert_eq!(index.session_account_bindings, bindings);
+        assert!(index.accepted_snapshot_fingerprint_recorded(&accepted.snapshot_fingerprint));
+        assert_eq!(serde_json::to_value(accepted).unwrap(), accepted_body);
+    }
+
+    #[test]
+    fn desktop_profiles_deduplicate_one_login_and_defer_different_logins() {
+        let _gate = claude_request_money::e2::GateForTest::off();
+        let home = crate::test_scratch::ScratchDir::new("desktop-account-dedup");
+        let mut index = ScanIndex::default();
+        let a = "123e4567-e89b-12d3-a456-426614174000";
+        let b = "223e4567-e89b-12d3-a456-426614174000";
+        let single =
+            desktop_profile_account_fixture(&home, &mut index, "Claude", a, "native-session");
+        let owner = exact_session_account_hash(&single).unwrap();
+        let repeated =
+            desktop_profile_account_fixture(&home, &mut index, "Claude-ALT", a, "native-session");
+        assert_eq!(exact_session_account_hash(&repeated), Some(owner));
+        assert_eq!(repeated.model_usage, single.model_usage);
+        assert_eq!(repeated.usage_buckets, single.usage_buckets);
+        assert_eq!(repeated.cost, single.cost);
+        let mut conflicting =
+            desktop_profile_account_fixture(&home, &mut index, "Claude-B", b, "native-session");
+        assert!(exact_session_account_hash(&conflicting).is_none());
+        assert_eq!(
+            conflicting
+                .session_account_evidence
+                .as_ref()
+                .unwrap()
+                .identity_disposition,
+            Some("conflict")
+        );
+        let deferred = index.bind_session_accounts(
+            SnapshotSource::ClaudeCode,
+            "machine",
+            std::slice::from_mut(&mut conflicting),
+            &[],
+        );
+        assert_eq!(deferred.len(), 1, "one counted account deferral");
+        assert!(index.session_account_bindings.is_empty());
+        let mut disposition = ClaudeUsageAuthorityDisposition::default();
+        disposition.defer_sessions(deferred);
+        assert_eq!(
+            disposition
+                .account_deferred_fingerprints(std::slice::from_ref(&conflicting))
+                .len(),
+            1
+        );
+        let mut uploads = vec![conflicting];
+        disposition.retain_uploadable(&mut uploads);
+        assert!(uploads.is_empty());
     }
 
     #[test]

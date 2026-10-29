@@ -528,12 +528,26 @@ impl Observation {
     }
 }
 
+// Updated only for server-acknowledged stored bodies on this source worker.
+// Drained by the existing finish record; no identifiers reach the log.
+thread_local! {
+    static ACCOUNT_HASH_CHANGED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+pub(crate) fn account_hash_changed() {
+    ACCOUNT_HASH_CHANGED.with(|count| count.set(count.get().saturating_add(1)));
+}
+
 /// Observe only a normally returned finish; move its value/error through unchanged.
 /// A panic drops the probe silently. Outcome reporting remains with the caller.
 pub(crate) fn source_finish<T>(
     source: &str,
     inner: impl FnOnce() -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
+    #[derive(Serialize)]
+    struct Counts {
+        account_hash_changed: u64,
+    }
+    ACCOUNT_HASH_CHANGED.with(|count| count.set(0));
     let probe = Probe::start();
     let result = inner();
     emit(&Record {
@@ -542,7 +556,9 @@ pub(crate) fn source_finish<T>(
         stage: "source_finish",
         source: Source::from_slug(source),
         observation: probe.observation(),
-        counts: EmptyCounts {},
+        counts: Counts {
+            account_hash_changed: ACCOUNT_HASH_CHANGED.with(|count| count.replace(0)),
+        },
     });
     result
 }
@@ -584,9 +600,6 @@ pub(crate) fn codex_census_fence(
         },
     });
 }
-
-#[derive(Serialize)]
-struct EmptyCounts {}
 
 /// Fixed-schema traversal decisions only; no CPU/RSS sample or wire event.
 pub(crate) fn traversal_transition(source: &str, counts: &impl Serialize) {
@@ -1610,7 +1623,10 @@ mod tests {
         assert_eq!(record["schema_version"], SCHEMA_VERSION);
         assert_eq!(record["stage"], "source_finish");
         assert_eq!(record["source"], source);
-        assert_eq!(record["counts"], serde_json::json!({}));
+        assert_eq!(
+            record["counts"],
+            serde_json::json!({"account_hash_changed": 0})
+        );
         assert!(record.get("result").is_none());
         println!("RESOURCE_V2_FINISH_FIXTURE {record}");
     }
