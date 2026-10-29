@@ -6,6 +6,7 @@ use crate::codex_scan_diagnostics::{
 use crate::local_resource_diagnostics::claude_absence::Parent;
 use crate::local_resource_diagnostics::claude_contract;
 use crate::local_resource_diagnostics::claude_reread::IgnoredVeto;
+use crate::local_resource_diagnostics::rearm_cause;
 use crate::local_resource_diagnostics::{line_delivery_unselected, UnselectedReason};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
@@ -6346,6 +6347,7 @@ pub(crate) fn claude_stale_family_carry_refund_uncarries_for_test() -> usize {
 /// its members. Returns false when the walk had passed one, so the caller
 /// starts the traversal again and the uncarry precedes every pass.
 fn refund_claude_stale_family_carry(index: &mut ScanIndex) -> bool {
+    rearm_cause::retain(index);
     let carry = &index.claude_stale_family_carry;
     if carry.roots.is_empty() && carry.capped_roots.is_empty() {
         return true;
@@ -6391,7 +6393,7 @@ fn refund_claude_stale_family_carry(index: &mut ScanIndex) -> bool {
             .is_some_and(|member| carry.contains(member.root))
             && !entry.source_file_fingerprint.is_empty()
         {
-            entry.source_file_fingerprint.clear();
+            rearm_cause::clear(index_key, entry, rearm_cause::Cause::CarryInvalidation);
             rearmed += 1;
         }
     }
@@ -6646,6 +6648,7 @@ fn replay_and_rearm_claude_family(
     page: &VecDeque<CandidateFile>,
     rearm_parsed: bool,
 ) -> (usize, usize) {
+    rearm_cause::retain(index);
     let in_family = |index_key: &str| {
         claude_index_path_member_ref(Path::new(index_key))
             .is_some_and(|member| member.root == root_session_id)
@@ -6681,7 +6684,7 @@ fn replay_and_rearm_claude_family(
             && in_family(index_key)
             && !entry.source_file_fingerprint.is_empty()
         {
-            entry.source_file_fingerprint.clear();
+            rearm_cause::clear(index_key, entry, rearm_cause::Cause::CarryInvalidation);
             rearmed += 1;
         }
     }
@@ -28224,6 +28227,11 @@ impl OwnedSourceScan {
                 if let Some(context) = sampling.as_mut().filter(|_| active.side_origin.is_none()) {
                     if let Some(plan) = active.parser.reader.acquisition.as_ref() {
                         context.record_input(plan.metrics());
+                        resource_probe.rearm_full_completed(
+                            &local_index_key(&active.candidate.path),
+                            plan.mode(),
+                            plan.metrics().native_bytes,
+                        );
                     }
                 }
                 if active.sampling.as_ref().is_some_and(|acquisition| {
@@ -31107,6 +31115,9 @@ impl OwnedSourceScan {
                         },
                     ),
                 };
+                if source == SnapshotSource::ClaudeCode {
+                    rearm_cause::retain(index);
+                }
                 let sampled_acquisition = sampling.as_ref().map(|context| {
                     let audit_now = sampled_scan::now_seconds();
                     let pending = index
@@ -31134,6 +31145,7 @@ impl OwnedSourceScan {
                         completed_guard_bytes: context.sample_bytes,
                         acquisition_admission: context.admission,
                         page_events: crate::local_resource_diagnostics::PageEvents {
+                            full_cause: resource_probe.rearm_fulls(),
                             full_reasons: crate::local_resource_diagnostics::FullReasons(
                                 context.full_reasons,
                             ),
@@ -32611,6 +32623,7 @@ impl OwnedSourceScan {
             }
             if let Some((context, (mode, audit_due))) = sampling.as_mut().zip(planned_mode) {
                 context.record_mode(mode, audit_due);
+                resource_probe.rearm_full_selected(&local_index_key(&active.candidate.path), mode);
             }
             if let Some(delivery) = line_delivery.as_mut() {
                 delivery.arm();
@@ -32835,6 +32848,7 @@ fn append_codex_state_only_snapshots(
     index: &mut ScanIndex,
     blocked_session_ids: &BTreeSet<String>,
 ) -> (usize, usize) {
+    let snapshots_before = snapshots.len();
     let blocked_session_ids = blocked_session_ids
         .union(&index.codex_state_only_blocked_session_ids)
         .map(|session_id| resolve_codex_identity(session_id.as_str()))
@@ -32931,6 +32945,11 @@ fn append_codex_state_only_snapshots(
         // durable state and semantic no-op suppression.
         snapshots.push(snapshot);
     }
+    crate::local_resource_diagnostics::codex_state_only(
+        scanned_session_count,
+        snapshots.len().saturating_sub(snapshots_before),
+        0, // Semantic no-op suppression remains in finalize_scan_after_policy.
+    );
     (scanned_session_count, 0)
 }
 
@@ -35852,17 +35871,26 @@ fn codex_legacy_trigger_turn(value: &Value) -> bool {
             == Some(true)
 }
 
-/// A native child can declare session_id as its parent locator rather than an
-/// alias for its own id. Require both provider relationship declarations; do
-/// not infer that role from a differing alias or a filesystem/state fallback.
+/// A native child can declare session_id as its parent locator, or its root
+/// locator at depth two, rather than an alias for its own id. Require the
+/// provider spawn structure; never infer that role from a differing alias.
 fn codex_session_id_is_native_parent(meta: &Value, session_id: &str) -> bool {
-    string_eq_at(meta, &["thread_source"], "subagent")
-        && resolve_codex_identity_option(codex_identity_at(
-            meta,
-            &["source", "subagent", "thread_spawn", "parent_thread_id"],
-        ))
-        .as_deref()
-            == Some(session_id)
+    if !string_eq_at(meta, &["thread_source"], "subagent") {
+        return false;
+    }
+    let Some(parent) = resolve_codex_identity_option(codex_identity_at(
+        meta,
+        &["source", "subagent", "thread_spawn", "parent_thread_id"],
+    )) else {
+        return false;
+    };
+    parent == session_id
+        || (meta
+            .pointer("/source/subagent/thread_spawn/depth")
+            .and_then(Value::as_u64)
+            == Some(2)
+            && resolve_codex_identity_option(codex_identity_at(meta, &["id"]))
+                .is_some_and(|id| id != parent && id != session_id))
 }
 
 /// Capture the first physical header before applying the ownership boundary.
@@ -35921,6 +35949,24 @@ fn apply_codex_envelope_line(value: &Value, accumulator: &mut SnapshotAccumulato
     let header_id = resolve_codex_identity_option(codex_identity_at(meta, &["id"]));
     let evidence = codex_creator_header_evidence(value, meta);
     if accumulator.codex_session_meta_seen {
+        // Native forks copy the parent's header into their inherited ordinal
+        // prefix. It is neither an own-header claim nor creator evidence for
+        // this child. Both first-header parent declarations must agree.
+        let inherited_parent_header = accumulator.origin.thread_source.as_deref()
+            == Some("subagent")
+            && accumulator.origin.source_subagent == Some(true)
+            && header_id.is_some()
+            && header_id != accumulator.codex_creator_header_id
+            && header_id == accumulator.codex_parent_session_ref
+            && header_id == accumulator.origin.parent_session_ref
+            && matches!(
+                (accumulator.codex_ownership_boundary, u64_at(value, &["ordinal"])),
+                (CodexOwnershipBoundary::Ordinal { start }, Some(ordinal))
+                    if ordinal > 0 && ordinal < start
+            );
+        if inherited_parent_header {
+            return;
+        }
         if header_id != accumulator.codex_creator_header_id
             || evidence != accumulator.codex_creator_evidence
         {
@@ -40819,6 +40865,9 @@ fn ensure_bounded_traversal(
     collected_at: &str,
     backfill_window_days: u64,
 ) -> TraversalProgress {
+    if source == SnapshotSource::ClaudeCode {
+        rearm_cause::retain(index);
+    }
     let context_fingerprint =
         scan_traversal_context_fingerprint(source, roots, index, backfill_window_days);
     let context_observation = (source == SnapshotSource::ClaudeCode).then(|| {
@@ -40906,12 +40955,16 @@ fn ensure_bounded_traversal(
                     retained.roots.contains(member.root)
                         || retained.capped_roots.contains(member.root)
                 }) {
-                    entry.source_file_fingerprint.clear();
+                    rearm_cause::clear(key, entry, rearm_cause::Cause::CarryInvalidation);
                 }
             }
             for candidate in &retained.replay {
                 if let Some(entry) = index.files.get_mut(&local_index_key(&candidate.path)) {
-                    entry.source_file_fingerprint.clear();
+                    rearm_cause::clear(
+                        &local_index_key(&candidate.path),
+                        entry,
+                        rearm_cause::Cause::CarryInvalidation,
+                    );
                 }
             }
             index.traversal = None;
@@ -41327,7 +41380,7 @@ fn ensure_bounded_traversal(
             } else if capped_roots.contains(&root) {
                 capped_file_count += 1;
             } else {
-                entry.source_file_fingerprint.clear();
+                rearm_cause::clear(index_key, entry, transition.rearm_cause());
                 rearmed_file_count += 1;
                 if full_rearm_window_roots.contains(&root) {
                     window_rearmed_file_count += 1;
@@ -49074,6 +49127,7 @@ impl ScanIndex {
 
     fn migrate(&mut self, candidate: CandidateFile) {
         let key = local_index_key(&candidate.path);
+        rearm_cause::reproven(&key);
         let last_snapshot_fingerprint = self
             .files
             .get(&key)
@@ -49127,6 +49181,7 @@ impl ScanIndex {
         parse_outcome: ScanParseOutcome,
     ) {
         let key = local_index_key(&candidate.path);
+        rearm_cause::reproven(&key);
         let last_upload_body_witness = self
             .files
             .get(&key)
@@ -59269,7 +59324,10 @@ mod tests {
                     1,
                     "the other, unowned state row still falls back"
                 );
-                assert!(rows.is_empty(), "a committed owner supplies coverage");
+                assert!(
+                    rows.iter().all(|row| row["stage"] == "codex_state_only"),
+                    "a committed owner supplies coverage"
+                );
                 // Model an already-uploaded exclusive body and apply the new batch.
                 let witness = snapshot_upload_body_witness(&native);
                 let mut uploaded = BTreeMap::from([(owner.to_string(), native.clone())]);
@@ -59383,7 +59441,10 @@ mod tests {
             2,
             "no produced body means both state rows retain main's fallback"
         );
-        assert!(rows.is_empty(), "no replacement risk without a fingerprint");
+        assert!(
+            rows.iter().all(|row| row["stage"] == "codex_state_only"),
+            "no replacement risk without a fingerprint"
+        );
     }
 
     #[test]
@@ -59433,7 +59494,7 @@ mod tests {
                     assert_eq!(replacements[0].source_session_id, owner);
                     assert_eq!(replacements[0].unattributed_total_tokens, 900);
                 }
-                assert!(rows.is_empty());
+                assert!(rows.iter().all(|row| row["stage"] == "codex_state_only"));
             }
         }
     }
@@ -59496,7 +59557,7 @@ mod tests {
                     items.is_empty(),
                     "header and unique filename identities both retain coverage"
                 );
-                assert!(rows.is_empty());
+                assert!(rows.iter().all(|row| row["stage"] == "codex_state_only"));
             }
         }
     }
@@ -59553,7 +59614,7 @@ mod tests {
             )
         });
         assert!(
-            rows.is_empty(),
+            rows.iter().all(|row| row["stage"] == "codex_state_only"),
             "zero supported candidates are not ambiguity observations"
         );
         assert_eq!(items.len(), 1);
@@ -59596,6 +59657,74 @@ mod tests {
             assert!(replacements.iter().any(
                 |item| item.source_session_id == owner && item.unattributed_total_tokens == 900
             ));
+        }
+    }
+
+    #[test]
+    fn codex_state_only_terminal_diagnostic_counts_uncovered_entities() {
+        for n in [0, 1, 3] {
+            let dir = temp_dir("codex-state-only-terminal-counts");
+            let sessions = dir.join("sessions");
+            fs::create_dir_all(&sessions).unwrap();
+            let connection = Connection::open(dir.join("state_5.sqlite")).unwrap();
+            connection.execute(CODEX_THREADS_DDL, []).unwrap();
+            for i in 0..=n {
+                connection
+                    .execute(
+                        CODEX_THREADS_INSERT,
+                        (
+                            format!("019e253c-bbbb-7000-9000-{i:012x}"),
+                            "Synthetic State Thread",
+                            if i < n { 59_i64 } else { 0 },
+                            0_i64,
+                            1_777_777_000_i64,
+                            1_777_777_100_i64,
+                            1_777_777_000_000_i64,
+                            1_777_777_100_000_i64,
+                            "fixture-model",
+                        ),
+                    )
+                    .unwrap();
+            }
+            drop(connection);
+            let mut index = ScanIndex::default();
+            let (scan, rows) = crate::local_resource_diagnostics::capture(|| {
+                scan_source_roots(
+                    SnapshotSource::Codex,
+                    &[sessions],
+                    &mut index,
+                    "2026-05-14T10:04:00Z",
+                    BACKFILL_WINDOW_DAYS,
+                )
+                .unwrap()
+            });
+            assert!(scan.census_complete, "the real terminal append call ran");
+            assert_eq!(scan.snapshots.len(), n);
+            assert_eq!(scan.scanned_session_count, n);
+            assert_eq!(scan.semantic_noop_count, 0);
+            let observations = rows
+                .iter()
+                .filter(|row| row["stage"] == "codex_state_only")
+                .collect::<Vec<_>>();
+            if n == 0 {
+                assert!(observations.is_empty(), "all-zero diagnostic is omitted");
+            } else {
+                assert_eq!(observations.len(), 1, "one record per terminal call");
+                assert_eq!(observations[0]["source"], "codex");
+                assert_eq!(
+                    observations[0]["counts"],
+                    json!({"codex_state_only": {
+                        "scanned": n, "emitted": n, "noops": 0,
+                    }})
+                );
+            }
+            assert!(!serde_json::to_string(&scan.snapshots)
+                .unwrap()
+                .contains("codex_state_only"));
+            assert!(!serde_json::to_string(&index)
+                .unwrap()
+                .contains("\"codex_state_only\":"));
+            fs::remove_dir_all(dir).unwrap();
         }
     }
 
@@ -86685,7 +86814,7 @@ mod tests {
     }
 
     fn codex_fork_creator_items(records: &[Value], path_session_id: &str) -> Vec<SnapshotItem> {
-        let root = temp_dir("codex-fork-creator");
+        let root = crate::test_scratch::ScratchDir::new("codex-fork-creator");
         let path = root.join(format!(
             "rollout-2026-09-30T10-00-00-{path_session_id}.jsonl"
         ));
@@ -86697,9 +86826,268 @@ mod tests {
                 .collect::<String>(),
         )
         .unwrap();
-        let items = parse_codex_jsonl_file(&path, "2026-09-30T10:05:00Z", "f".repeat(64)).unwrap();
-        fs::remove_dir_all(root).unwrap();
-        items
+        parse_codex_jsonl_file(&path, "2026-09-30T10:05:00Z", "f".repeat(64)).unwrap()
+    }
+
+    #[test]
+    fn codex_child_own_creator_survives_native_history_and_reaches_upload() {
+        let mut child = codex_child_creator_header();
+        let id = child["payload"]["id"].as_str().unwrap().to_string();
+        let parent_id = child["payload"]["session_id"].as_str().unwrap().to_string();
+        child["payload"]["forked_from_id"] = json!(parent_id);
+        child["payload"]["history_mode"] = json!("paginated");
+        child["payload"]["subagent_history_start_ordinal"] = json!(3);
+        let mut parent = codex_creator_header();
+        parent["payload"]["id"] = json!(parent_id);
+        parent["payload"]["session_id"] = json!(parent_id);
+        parent["payload"]["creator_user_id"] = json!("synthetic-parent-user");
+        parent["payload"]["creator_account_id"] = json!("synthetic-parent-workspace");
+        let mut copied_parent = parent.clone();
+        copied_parent["ordinal"] = json!(1);
+        let usage = |ordinal, input| {
+            json!({"timestamp":"2026-09-30T10:01:00Z","ordinal":ordinal,
+                "type":"event_msg","payload":{"type":"token_count","info":{
+                    "total_token_usage":{"input_tokens":input,"output_tokens":5},
+                    "model":"gpt-5.5"}}})
+        };
+        let mut missing = child.clone();
+        missing["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("creator_user_id");
+        missing["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("creator_account_id");
+        let mut conflict = child.clone();
+        conflict["ordinal"] = json!(2);
+        conflict["payload"]["creator_user_id"] = json!("synthetic-conflicting-child");
+        let mut grandchild = codex_child_creator_header();
+        grandchild["payload"]["session_id"] = json!("019e253c-3333-7000-9000-cccccccccccc");
+        grandchild["payload"]["source"]["subagent"]["thread_spawn"]["depth"] = json!(2);
+        let mut missing_grandchild = grandchild.clone();
+        missing_grandchild["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("creator_user_id");
+        for (name, records, path_id, expected_pair) in [
+            (
+                "fork_own_pair",
+                vec![
+                    child.clone(),
+                    copied_parent.clone(),
+                    usage(2, 500),
+                    usage(3, 100),
+                ],
+                id.as_str(),
+                Some(("synthetic-user", "synthetic-workspace")),
+            ),
+            (
+                "depth_two_own_pair",
+                vec![grandchild, usage(1, 100)],
+                id.as_str(),
+                Some(("synthetic-user", "synthetic-workspace")),
+            ),
+            (
+                "missing_fork_pair",
+                vec![missing, copied_parent.clone(), usage(2, 500), usage(3, 100)],
+                id.as_str(),
+                None,
+            ),
+            (
+                "missing_depth_two_pair",
+                vec![missing_grandchild, usage(1, 100)],
+                id.as_str(),
+                None,
+            ),
+            (
+                "real_child_conflict",
+                vec![child, copied_parent, conflict, usage(3, 100)],
+                id.as_str(),
+                None,
+            ),
+            (
+                "parent_unchanged",
+                vec![parent, usage(1, 100)],
+                parent_id.as_str(),
+                Some(("synthetic-parent-user", "synthetic-parent-workspace")),
+            ),
+        ] {
+            let mut items = codex_fork_creator_items(&records, path_id);
+            assert_eq!(items.len(), 1, "{name}");
+            assert_eq!(items[0].source_session_id, path_id, "{name}");
+            assert!(items[0].usage_accounting_contract.is_some(), "{name}");
+            assert_eq!(
+                (items[0].input_tokens, items[0].output_tokens),
+                (100, 5),
+                "{name}"
+            );
+            let mut legacy_records = records.clone();
+            for record in &mut legacy_records {
+                let meta = record["payload"].as_object_mut().unwrap();
+                meta.remove("creator_user_id");
+                meta.remove("creator_account_id");
+            }
+            let legacy_items = codex_fork_creator_items(&legacy_records, path_id);
+            let mut without_creator = serde_json::to_value(&items).unwrap();
+            for item in without_creator.as_array_mut().unwrap() {
+                item.as_object_mut()
+                    .unwrap()
+                    .remove("session_account_evidence");
+            }
+            assert_eq!(
+                serde_json::to_vec(&without_creator).unwrap(),
+                serde_json::to_vec(&serde_json::to_value(&legacy_items).unwrap()).unwrap(),
+                "all non-evidence bytes, including tokens and cost, stay identical: {name}"
+            );
+            let mut request = valid_v6_batch_request();
+            request.source = "codex".into();
+            apply_upload_policy(SnapshotSource::Codex, &mut items, request.upload_policy);
+            request.snapshots = items;
+            let wire = serde_json::to_value(&request).unwrap();
+            let head_cas_wire = serde_json::to_value(request.wire_with_head_cas()).unwrap();
+            let expected = expected_pair.map(|(user, workspace)| json!({
+                "provider":"openai",
+                "account_identifier_hash":ottto_core::billing_identity_hash("openai", "account", user).unwrap(),
+                "provider_workspace_hash":ottto_core::billing_identity_hash("openai", "workspace", workspace).unwrap(),
+                "identity_hash_scheme":"provider-sha256:v1",
+                "evidence_source":"codex_creator_header:v1",
+                "source_created_at":"2026-09-30T10:00:00Z"
+            }));
+            assert_eq!(
+                wire["snapshots"][0].get("session_account_evidence"),
+                expected.as_ref(),
+                "{name}"
+            );
+            assert_eq!(
+                head_cas_wire["snapshots"][0].get("session_account_evidence"),
+                expected.as_ref(),
+                "{name}"
+            );
+            let body = wire.to_string();
+            assert!(!body.contains("synthetic-"), "raw creator leaked: {name}");
+            assert!(!body.contains("creator_user_id"), "{name}");
+            assert!(!body.contains("creator_account_id"), "{name}");
+        }
+    }
+
+    #[test]
+    fn codex_fork_copied_header_exception_requires_inherited_declared_parent() {
+        let mut child = codex_child_creator_header();
+        child["payload"]["forked_from_id"] = child["payload"]["session_id"].clone();
+        child["payload"]["history_mode"] = json!("paginated");
+        child["payload"]["subagent_history_start_ordinal"] = json!(3);
+        let mut copied = codex_creator_header();
+        copied["ordinal"] = json!(1);
+        copied["payload"]["id"] = child["payload"]["session_id"].clone();
+        copied["payload"]["session_id"] = copied["payload"]["id"].clone();
+        copied["payload"]["creator_user_id"] = json!("synthetic-parent-user");
+        for (pointer, replacement) in [
+            ("/ordinal", json!(0)),
+            ("/ordinal", json!(3)),
+            ("/ordinal", Value::Null),
+            ("/payload/id", child["payload"]["id"].clone()),
+            ("/payload/id", json!("019e253c-4444-7000-9000-dddddddddddd")),
+            ("/payload/id", Value::Null),
+        ] {
+            let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
+            apply_codex_line(&child, &mut accumulator);
+            assert!(matches!(
+                accumulator.codex_ownership_boundary,
+                CodexOwnershipBoundary::Ordinal { start: 3 }
+            ));
+            let mut altered = copied.clone();
+            *altered.pointer_mut(pointer).unwrap() = replacement;
+            apply_codex_envelope_line(&altered, &mut accumulator);
+            assert!(accumulator.codex_creator_evidence_conflicted, "{pointer}");
+        }
+        for pointer in [
+            "/payload/thread_source",
+            "/payload/forked_from_id",
+            "/payload/source/subagent/thread_spawn/parent_thread_id",
+            "/payload/subagent_history_start_ordinal",
+        ] {
+            let mut altered = child.clone();
+            *altered.pointer_mut(pointer).unwrap() = Value::Null;
+            let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
+            apply_codex_line(&altered, &mut accumulator);
+            apply_codex_envelope_line(&copied, &mut accumulator);
+            assert!(accumulator.codex_creator_evidence_conflicted, "{pointer}");
+        }
+    }
+
+    #[test]
+    fn codex_depth_two_root_locator_requires_native_structure_for_both_callers() {
+        let mut header = codex_child_creator_header();
+        let id = header["payload"]["id"].as_str().unwrap().to_string();
+        let root = "019e253c-3333-7000-9000-cccccccccccc";
+        header["payload"]["session_id"] = json!(root);
+        header["payload"]["source"]["subagent"]["thread_spawn"]["depth"] = json!(2);
+        let mut cases = vec![("valid_depth_two", header.clone(), true)];
+        for (pointer, replacement) in [
+            ("/payload/source/subagent/thread_spawn/depth", Value::Null),
+            ("/payload/source/subagent/thread_spawn/depth", json!(1)),
+            ("/payload/source/subagent/thread_spawn/depth", json!(3)),
+            ("/payload/source/subagent/thread_spawn/depth", json!("2")),
+            ("/payload/thread_source", json!("user")),
+            (
+                "/payload/source/subagent/thread_spawn/parent_thread_id",
+                Value::Null,
+            ),
+            (
+                "/payload/source/subagent/thread_spawn/parent_thread_id",
+                json!(""),
+            ),
+            (
+                "/payload/source/subagent/thread_spawn/parent_thread_id",
+                json!({"id":"parent"}),
+            ),
+            (
+                "/payload/source/subagent/thread_spawn/parent_thread_id",
+                json!(id),
+            ),
+        ] {
+            let mut altered = header.clone();
+            *altered.pointer_mut(pointer).unwrap() = replacement;
+            cases.push((pointer, altered, false));
+        }
+        let mut missing_depth = header.clone();
+        missing_depth["payload"]["source"]["subagent"]["thread_spawn"]
+            .as_object_mut()
+            .unwrap()
+            .remove("depth");
+        cases.push(("missing_depth", missing_depth, false));
+        for (name, header, expected) in cases {
+            assert_eq!(
+                codex_creator_item(std::slice::from_ref(&header), &id)
+                    .session_account_evidence
+                    .is_some(),
+                expected,
+                "{name}"
+            );
+            let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
+            accumulator.codex_path_sidecar_candidates = [id.as_str(), root]
+                .into_iter()
+                .map(|identity| CodexPathSidecarCandidate {
+                    identity: identity.to_string(),
+                    recorded_evidence: false,
+                    created_thread: false,
+                    identity_conflict: false,
+                    detail_incomplete: false,
+                    rollout_file_matches: true,
+                    parent: None,
+                    child_created_at_nanos: None,
+                    projected_next_ordinal: None,
+                })
+                .collect();
+            assert_eq!(accumulator.codex_path_sidecar_candidates.len(), 2);
+            accumulator.resolve_codex_path_sidecar_from_header(&header["payload"]);
+            assert_eq!(
+                accumulator.codex_resolved_path_identity.as_deref(),
+                expected.then_some(id.as_str()),
+                "{name}"
+            );
+        }
     }
 
     #[test]
