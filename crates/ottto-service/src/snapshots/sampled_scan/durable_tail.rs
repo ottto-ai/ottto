@@ -187,7 +187,8 @@ struct Slot {
     namespace: Scope,
     identity_capture: bool,
     /// Keys held (U) by this source, and the totals the last alarm reported:
-    /// [held, t14_rebuild, mode_repaired, disabled, upgrade_state_missing].
+    /// [held, t14_rebuild, mode_repaired, disabled, upgrade_state_missing,
+    /// old_binding_no_match].
     held: u64,
     old_binding_no_match: u64,
     reported: [u64; 6],

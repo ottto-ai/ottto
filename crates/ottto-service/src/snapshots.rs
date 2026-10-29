@@ -31876,8 +31876,6 @@ impl OwnedSourceScan {
                                     sampled_scan::durable_tail::RestoreOutcome::Stale(
                                         "old_binding_no_match",
                                     ) if source == SnapshotSource::ClaudeCode
-                                        && parse_reason
-                                            == Some(CandidateParseReason::TranscriptChanged)
                                         && context
                                             .cache
                                             .no_match_full(
