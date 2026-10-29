@@ -30531,7 +30531,7 @@ impl OwnedSourceScan {
                 let lineage_edge_reoffer_bytes = (source == SnapshotSource::ClaudeCode
                     && index.desktop_lineage_edge_changed(&candidate))
                 .then_some(lineage_native_bytes);
-                let offered_lineage_edge = (source == SnapshotSource::ClaudeCode
+                let reconstructed_lineage_edge = (source == SnapshotSource::ClaudeCode
                     && claude_subagent_identity(&candidate.path).is_none()
                     && candidate
                         .path
@@ -30551,11 +30551,11 @@ impl OwnedSourceScan {
                         }))
                 .then(|| {
                     desktop_lineage::edge_fingerprint(
-                        parsed
-                            .first()
-                            .and_then(|item| {
-                                claude_title_metadata.spawn_lineage(&item.source_session_id)
-                            })
+                        candidate
+                            .path
+                            .file_stem()
+                            .and_then(|value| value.to_str())
+                            .and_then(|session| claude_title_metadata.spawn_lineage(session))
                             .map(|edge| edge.parent_session_id.as_str()),
                     )
                 });
@@ -30641,7 +30641,7 @@ impl OwnedSourceScan {
                         recorded.size_bytes = fragment.offset;
                     }
                     index.record(recorded, last_snapshot_fingerprint, outcome);
-                    if let Some(edge) = offered_lineage_edge {
+                    if let Some(edge) = reconstructed_lineage_edge {
                         index.record_desktop_lineage_file_edge(&index_key, edge);
                     }
                     // The counting version travels in the same entry as the

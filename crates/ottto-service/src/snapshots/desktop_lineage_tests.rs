@@ -334,3 +334,36 @@ fn desktop_lineage_selector_canaries_never_reach_diagnostics_or_upload() {
         assert!(!diagnostics.contains(canary));
     }
 }
+
+#[test]
+fn desktop_lineage_confirmed_empty_child_settles_edge_across_cold_restart() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    let f = DesktopFixture::new();
+    fs::write(
+        &f.native.path,
+        json!({
+            "timestamp":"2026-08-02T06:59:00Z", "type":"user", "sessionId":f.native.session
+        })
+        .to_string()
+            + "\n",
+    )
+    .unwrap();
+    let (first, counts) = f.run(ScanIndex::default(), COLLECTED);
+    assert_eq!(
+        first.result.snapshots.len(),
+        2,
+        "only the usage-bearing parents emit"
+    );
+    assert_eq!(counts, (0, 0));
+    let key = local_index_key(&f.native.path);
+    assert!(first.index.confirmed_empty_files.contains(&key));
+    assert_eq!(
+        first.index.claude_desktop_lineage_file_edges[&key],
+        desktop_lineage::edge_fingerprint(Some(PARENT))
+    );
+    let mut index = settle(first);
+    let path = f.home.join("empty-index.json");
+    index.save(&path).unwrap();
+    let index = ScanIndex::load(&path).unwrap();
+    f.quiet_three(index);
+}
