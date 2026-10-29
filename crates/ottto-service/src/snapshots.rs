@@ -31892,6 +31892,7 @@ impl OwnedSourceScan {
                                         && context
                                             .cache
                                             .no_match_full(
+                                                &key,
                                                 parser.reader.reader.get_ref(),
                                                 durable_accepted,
                                             )
