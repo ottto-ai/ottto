@@ -124,6 +124,15 @@ impl DurableSource {
 
 pub(crate) type Digest32 = [u8; 32];
 
+/// Transitional codec-table row. P2 replaces this parameter with its source-
+/// keyed table; it does not change the directory, envelope, lock or admission.
+#[derive(Clone, Copy)]
+pub(crate) struct CodecRow {
+    pub(crate) source: DurableSource,
+    pub(crate) allowlist: Digest32,
+    pub(crate) verify: fn(&[u8]) -> bool,
+}
+
 fn digest(domain: &str, parts: &[&[u8]]) -> Digest32 {
     let mut hasher = Sha256::new();
     hasher.update((domain.len() as u64).to_le_bytes());
@@ -409,6 +418,7 @@ pub(crate) struct BatchReceipt {
 pub(crate) struct DurableTailStore {
     dir: PathBuf,
     source: DurableSource,
+    codec_row: Option<CodecRow>,
     durable: BTreeMap<Digest32, (Option<Digest32>, Stamp)>,
     counters: StoreCounters,
     /// The store-level fault that made this store memory-only for the process.
@@ -445,12 +455,27 @@ impl DurableTailStore {
             dir,
             durable: BTreeMap::new(),
             source,
+            codec_row: None,
             counters: StoreCounters::default(),
             disabled: None,
             checked: false,
             pass: [0; 2],
             rebuilt: BTreeMap::new(),
         }
+    }
+
+    /// A view of the ONE store through a different codec row. Other record
+    /// kinds remain unknown/protected to this view, including during GC.
+    pub(crate) fn with_codec_row(mut self, row: CodecRow) -> Self {
+        self.codec_row = Some(row);
+        self
+    }
+
+    /// Retry a v1 post-save batch's directory sync after an ambiguous error.
+    /// This confers no write-ahead receipt or index/settlement authority.
+    pub(crate) fn retry_directory_sync<W: SingleWriter>(&self, writer: &W) -> io::Result<()> {
+        self.check_writer(writer)?;
+        sync_dir(&self.dir)
     }
 
     /// A new pass: the directory is checked again and the T14 breaker resets.
@@ -586,7 +611,7 @@ impl DurableTailStore {
                 .map_err(|e| self.read_failure(e, Refusal::Undecodable))?;
             let n = header.len();
             self.counters.guard_header_bytes += n as u64;
-            let binding = decode_header(&header, key, self.source)?;
+            let binding = decode_header(&header, key, self.source, self.codec_row)?;
             // After any repair: its ctime moved.
             let Some(metadata) = self.inspect_file(&file) else {
                 return Ok(None);
@@ -614,7 +639,7 @@ impl DurableTailStore {
                 _ => self.counters.guard_verify_bytes += read,
             }
             self.note_codec(bytes.capacity());
-            verify(&bytes, self.source)?;
+            verify(&bytes, self.source, self.codec_row)?;
             if self.durable.len() < MAX_RECORDS || self.durable.contains_key(key) {
                 self.durable.insert(*key, (None, stamp));
             }
@@ -706,7 +731,7 @@ impl DurableTailStore {
         self.counters.bytes_read += bytes.len() as u64;
         self.counters.max_record_bytes = self.counters.max_record_bytes.max(bytes.len() as u64);
         self.note_codec(bytes.capacity() + bytes.len().saturating_sub(HEADER_BYTES));
-        match decode(&bytes, allowlist) {
+        match decode(&bytes, allowlist, self.codec_row) {
             Ok(record) => {
                 if let Some((content, _)) = self.durable.get_mut(key) {
                     *content = Some(content_digest(&record.record));
@@ -848,7 +873,9 @@ impl DurableTailStore {
                 // A stale record for this key would bind to an older entry
                 // only; drop it so the refusal costs no disk. A T14 record
                 // stays until a rebuild replaces it.
-                if previous != 0 && !corrupt {
+                // The sidecar codec view retains its predecessor for suffix
+                // retry. Native v1 cache behavior remains unchanged.
+                if previous != 0 && !corrupt && self.codec_row.is_none() {
                     remove_if_present(&path)?;
                     on_disk.remove(&key);
                     changed = true;
@@ -1214,7 +1241,12 @@ fn dead_temp(name: &str) -> bool {
                 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH))
 }
 
-fn decode_header(header: &[u8], key: &Digest32, source: DurableSource) -> Result<Binding, Refusal> {
+fn decode_header(
+    header: &[u8],
+    key: &Digest32,
+    source: DurableSource,
+    row: Option<CodecRow>,
+) -> Result<Binding, Refusal> {
     let mut c = Cursor(header);
     if c.array::<8>() != Some(MAGIC) {
         return Err(Refusal::Undecodable);
@@ -1234,7 +1266,11 @@ fn decode_header(header: &[u8], key: &Digest32, source: DurableSource) -> Result
         2 => "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1",
         _ => return Err(Refusal::Unknown),
     };
-    if Some(allowlist) != parse_hex_digest(pin) {
+    let known = match row {
+        Some(row) => DurableSource::from_tag(tag) == Some(row.source) && allowlist == row.allowlist,
+        None => Some(allowlist) == parse_hex_digest(pin),
+    };
+    if !known {
         return Err(Refusal::Unknown);
     }
     let binding = (|| {
@@ -1253,7 +1289,7 @@ fn decode_header(header: &[u8], key: &Digest32, source: DurableSource) -> Result
     Ok(binding)
 }
 
-fn verify(bytes: &[u8], source: DurableSource) -> Result<(), Refusal> {
+fn verify(bytes: &[u8], source: DurableSource, row: Option<CodecRow>) -> Result<(), Refusal> {
     let bad = Refusal::Corrupt;
     if bytes.len() < HEADER_BYTES + TRAILER_BYTES {
         return Err(bad);
@@ -1271,9 +1307,13 @@ fn verify(bytes: &[u8], source: DurableSource) -> Result<(), Refusal> {
     if !matches!(bytes[debt], 0 | 1) || (bytes[debt] == 0 && bytes[debt + 1..debt + 9] != [0; 8]) {
         return Err(bad);
     }
-    crate::snapshots::verify_durable_body(&bytes[HEADER_BYTES..end], source)
-        .then_some(())
-        .ok_or(bad)
+    let body = &bytes[HEADER_BYTES..end];
+    let valid = match row {
+        Some(row) if row.source == source => (row.verify)(body),
+        Some(_) => false,
+        None => crate::snapshots::verify_durable_body(body, source),
+    };
+    valid.then_some(()).ok_or(bad)
 }
 
 fn remove_if_present(path: &Path) -> io::Result<()> {
@@ -1406,7 +1446,11 @@ impl<'a> Cursor<'a> {
 
 /// The version is checked before the trailer: a newer layout is not ours to
 /// judge. Everything else must pass the trailer and decode exactly.
-fn decode(bytes: &[u8], allowlist: &Digest32) -> Result<DurableRecord, Refusal> {
+fn decode(
+    bytes: &[u8],
+    allowlist: &Digest32,
+    row: Option<CodecRow>,
+) -> Result<DurableRecord, Refusal> {
     let source = bytes
         .get(42)
         .and_then(|tag| DurableSource::from_tag(*tag))
@@ -1415,8 +1459,8 @@ fn decode(bytes: &[u8], allowlist: &Digest32) -> Result<DurableRecord, Refusal> 
         .get(43..75)
         .and_then(|b| b.try_into().ok())
         .ok_or(Refusal::Undecodable)?;
-    decode_header(bytes, &key, source)?;
-    verify(bytes, source)?;
+    decode_header(bytes, &key, source, row)?;
+    verify(bytes, source, row)?;
     let body_end = bytes.len() - TRAILER_BYTES;
     let mut cursor = Cursor(&bytes[10..body_end]);
     let record_allowlist = cursor.array::<32>().ok_or(Refusal::Corrupt)?;

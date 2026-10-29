@@ -542,7 +542,11 @@ pub(crate) fn source_finish<T>(
         stage: "source_finish",
         source: Source::from_slug(source),
         observation: probe.observation(),
-        counts: EmptyCounts {},
+        counts: if source == "claude_code" {
+            crate::claude_local_otel::take_sidecar_read_counts()
+        } else {
+            BTreeMap::new()
+        },
     });
     result
 }
@@ -584,9 +588,6 @@ pub(crate) fn codex_census_fence(
         },
     });
 }
-
-#[derive(Serialize)]
-struct EmptyCounts {}
 
 /// Fixed-schema traversal decisions only; no CPU/RSS sample or wire event.
 pub(crate) fn traversal_transition(source: &str, counts: &impl Serialize) {

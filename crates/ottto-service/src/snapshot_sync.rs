@@ -11569,6 +11569,10 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    mod durable_sidecar_tests {
+        include!("snapshot_sync/durable_sidecar_tests.rs");
+    }
     mod terminal_contract_retry_tests {
         include!("snapshot_sync/terminal_contract_retry_tests.rs");
     }

@@ -32,6 +32,17 @@ mod bounded_read;
 mod decoder_tests;
 mod sidecar_read;
 
+pub(crate) fn take_sidecar_read_counts() -> BTreeMap<&'static str, u64> {
+    sidecar_read::take_counts()
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn durable_sidecar_prepared_fixture(
+    check: impl FnOnce(&Path, &(ClaudeLocalOtelLoadReport, ClaudeTraceOwnershipLoadReport)),
+) {
+    sidecar_read::durable::prepared_fixture(check);
+}
+
 pub(crate) const STORE_DIR: &str = "local-otel/claude-code-effort";
 const TRACE_STORE_DIR: &str = "local-otel/claude-code-trace-ownership";
 const MAX_EVIDENCE_FILE_BYTES: u64 = 64 * 1024 * 1024;
@@ -1280,8 +1291,6 @@ fn load_trace_whole_file(
         };
         #[cfg(test)]
         TRACE_READ_RECEIPT.with(|count| count.set(count.get() + 1));
-        #[cfg(all(test, unix))]
-        let file = sidecar_read::durable::CountedTrace(file);
         let mut decoder = TraceSidecarDecoder::new(&session_id, Vec::new());
         decoder.report = report;
         for line in BufReader::new(file).lines() {

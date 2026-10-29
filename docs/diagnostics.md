@@ -116,11 +116,37 @@ introduced; diagnostics only, no behaviour change.
 
 A `source_finish` record wraps rotation finish, including its validation,
 post-policy finalization and upload work. It exists exactly when finish was
-called and returned normally, including an error return. It has `counts: {}`
-and no result field; outcome reporting and transport receipts remain the
+called and returned normally, including an error return. Its sparse `counts`
+are empty when no sidecar acquisition was measured. It has no result field;
+outcome reporting and transport receipts remain the
 existing outcome owners. Prepare failures, prepare returning no frame,
 rotation validation failures before finish, panics, aborts and hard kills
 produce no finish record.
+
+The durable Claude sidecar contract harness contributes flat
+`sidecar_{api,trace}_*` counts to this existing resource carrier. The live
+whole-file loaders are unchanged until the durable path is qualified; absent
+keys currently make no claim about those loaders' I/O. These counters contain
+no identifiers, paths, values, prompts or telemetry bodies.
+
+| Suffix | Unit and scope |
+|---|---|
+| `selected`, `opened` | Per-file read decisions and successful opens, including repeated decisions for a strict or prepared consumer; not unique files. |
+| `bytes_read` | Actual source body-stream bytes, including failed acquisitions; excludes certificate checks, store I/O and fixture/oracle work. |
+| `guard_bytes` | Bytes from successfully completed shared certificate/plan checks. A failed check has no complete byte receipt; its failure is counted separately. |
+| `reuse_hits`, `unchanged_reads` | Accepted continuation checks and decisions requiring no body-stream read. These still perform cheap identity/anchor checks. |
+| `bootstraps`, `bootstrap_deferred` | First acquisitions started and selections deferred by the bounded bootstrap byte allowance. Refused writes retain the acquired continuation. |
+| `rewrite_rebuilds` | Rebuild attempts after shared checks prove replacement, truncation or anchor mismatch; separate from bootstrap and append. |
+| `fragments`, `fragment_reread_bytes` | Incomplete EOF disclosures per decision, and prior unsealed bytes replayed on growth. EOF rows are held until LF; quiet fragments read no body bytes. |
+| `failures`, `persistent_failures` | Refused source acquisitions or paired-store writes; a paired failure can count for both kinds. Persistent means at least three consecutive failures of that operation in the retained process owner. |
+
+Nonzero `sidecar_read_alarm` accompanies persistent failures. Counts accumulate
+between Claude `source_finish` drains, so overlapping owners are process totals,
+not exact per-page attribution. Test counters are thread-isolated. Zero keys
+are omitted; lack of an active measured acquisition is unavailable evidence,
+not proof of zero physical I/O. The v1 store remains post-index-save,
+at-least-once durability; none of these counts grants a write-ahead receipt,
+ACK, census credit or permission to reread a source.
 
 Each `snapshot_batch_call` records the actual serialized body length and the
 encoded/decoded body lengths across attempts passed to HTTP. Gzip refusal adds
