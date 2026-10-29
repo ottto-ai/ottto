@@ -973,6 +973,16 @@ impl SharedCache {
     ) -> Option<store::Refusal> {
         self.durable_hold(source, &local_index_key(&candidate.path))
             .or_else(|| {
+                if source == SnapshotSource::ClaudeCode
+                    && index
+                        .files
+                        .get(&local_index_key(&candidate.path))
+                        .is_some_and(|e| {
+                            e.effective_upload_body_witness_revision > effective_revision(source)
+                        })
+                {
+                    return Some(store::Refusal::BehindAccepted);
+                }
                 self.durable_upgrade_missing(source, candidate, index, consume)
                     .then_some(store::Refusal::UpgradeMissing)
             })
@@ -1023,7 +1033,9 @@ impl SharedCache {
             return false;
         }
         if source == SnapshotSource::ClaudeCode {
-            if candidate.size_bytes <= entry.size_bytes {
+            if candidate.size_bytes <= entry.size_bytes
+                || entry.effective_upload_body_witness_revision > effective_revision(source)
+            {
                 return true;
             }
             let claimed = index.reread_guard.upgrade_growth(&key, candidate, consume);
@@ -1067,7 +1079,17 @@ impl SharedCache {
             return Ok(None);
         }
         let funded = stores.fund_key(key);
-        let m = file.metadata().map_err(|_| RetailHold::Ineligible)?;
+        let metadata = file.metadata();
+        #[cfg(test)]
+        let metadata = if tests::b1_metadata_fails() {
+            Err(std::io::Error::other("injected observer fstat failure"))
+        } else {
+            metadata
+        };
+        let m = metadata.map_err(|_| {
+            Counters::bump(&mut stores.counters.ineligible, "metadata");
+            RetailHold::Ineligible
+        })?;
         let started = if funded {
             Some(
                 stores
