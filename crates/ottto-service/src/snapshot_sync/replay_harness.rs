@@ -858,12 +858,35 @@ fn execute(args: &Args, isolation: Isolation) -> Result<()> {
             }
         }
     }
+    // Count only this harness's own store entries after the real P0 save.
+    // Later quiet passes keep their zero durable-store I/O contract.
+    let durable_records_after_save = if args.pass == Pass::P0 {
+        let mut total = Some(0u64);
+        for &source in &sources {
+            let row = durable_after_save_diagnostics(
+                &daemon.transcript_cache,
+                &isolation.support,
+                source,
+            );
+            total = total
+                .zip(row["records_after_save"].as_u64())
+                .map(|(a, b)| a + b);
+            write_record(
+                &mut *output.lock().map_err(|_| anyhow!("output poisoned"))?,
+                &row,
+            )?;
+        }
+        total
+    } else {
+        None
+    };
     let durable_store_io = durable_store_io(&daemon.transcript_cache, &sources);
     write_record(
         &mut *output.lock().map_err(|_| anyhow!("output poisoned"))?,
         &serde_json::json!({"kind":"pass_totals", "pass":args.pass, "pages":pages,
         "full_reads":(!totals.unknown).then_some(totals.full), "tail_reads":(!totals.unknown).then_some(totals.tail), "restored":totals.restored, "bytes_read":(!totals.unknown).then_some(totals.bytes),
         "index_reuse_skips":totals.index_reuse_skips, "durable_store_io":durable_store_io,
+        "durable_records_after_save":durable_records_after_save,
         "emitted_entities":backend.stats.items.load(std::sync::atomic::Ordering::Relaxed),
         "read_units":"sampled acquisition selections; completed native + guard bytes", "advisory_only":true}),
     )?;
@@ -927,4 +950,96 @@ fn durable_store_io(
             + store.gc_bytes_read;
     }
     observed.then_some(io)
+}
+
+/// Directory metadata only: no store header, body, transcript or key reads.
+/// An inaccessible/unsafe/over-bound inventory is unavailable, never zero.
+fn count_scratch_records(dir: &Path, support: &Path) -> (Option<u64>, &'static str) {
+    if !dir.starts_with(support) {
+        return (None, "outside_scratch");
+    }
+    match fs::symlink_metadata(dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return (Some(0), "directory_absent");
+        }
+        Err(_) => return (None, "metadata_failed"),
+        Ok(_) => {}
+    }
+    if !private_dir(dir).is_ok_and(|path| path.starts_with(support)) {
+        return (None, "unsafe_directory");
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return (None, "inventory_failed");
+    };
+    let mut count = 0u64;
+    for (visited, entry) in entries.enumerate() {
+        if visited >= crate::durable_tail_store::INVENTORY_BOUND * 2 {
+            return (None, "inventory_bound");
+        }
+        let Ok(entry) = entry else {
+            return (None, "entry_failed");
+        };
+        let name = entry.file_name();
+        let Some(digest) = name.to_str().and_then(|name| name.strip_suffix(".rec")) else {
+            continue;
+        };
+        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        match entry.file_type() {
+            Ok(kind) if kind.is_file() => count += 1,
+            _ => return (None, "unsafe_record_entry"),
+        }
+    }
+    (Some(count), "counted")
+}
+
+fn durable_after_save_diagnostics(
+    cache: &crate::snapshots::sampled_scan::SharedCache,
+    support: &Path,
+    source: SnapshotSource,
+) -> serde_json::Value {
+    // Slot inspection does not initialize anything. No cache/store lock is
+    // held during the count, and no path or filesystem error is serialized.
+    let metadata = cache.durable_replay_store(source);
+    let (records, inventory) = metadata.as_ref().map_or((None, "unavailable"), |(dir, _)| {
+        count_scratch_records(dir, support)
+    });
+    let disabled = metadata.as_ref().and_then(|(_, reason)| *reason);
+    let counters = cache.durable_counters(source).map(|(counts, store)| {
+        serde_json::json!({
+            "not_persisted":counts.not_persisted,
+            "write_unlocked":counts.write_unlocked,
+            "write_deferred":counts.write_deferred,
+            "records_written":store.records_written,
+            "records_clean":store.records_clean,
+            "records_deferred":store.records_deferred,
+            "batches":store.batches,
+            "budget_refused":store.budget_refused,
+            "store_write_skipped":store.store_write_skipped,
+            "format_hold":store.format_hold,
+            "t14_rebuild":store.t14_rebuild,
+            "records_invalidated":store.records_invalidated,
+            "gc_records_deleted":store.gc_records_deleted,
+            "disk_records":store.disk_records,
+        })
+    });
+    let layout_supported = crate::heap_layout_bound::layout_supported();
+    let store_state = if metadata.is_none() {
+        "unavailable"
+    } else if disabled.is_some() {
+        "disabled"
+    } else if !layout_supported {
+        "degraded_unsupported_heap_layout"
+    } else {
+        "enabled"
+    };
+    serde_json::json!({
+        "kind":"durable_after_save_diagnostics", "pass":"P0", "source":source.api_slug(),
+        "state_lock_held":crate::locked_state_dir::held_for(support).is_some(),
+        "heap_layout_supported":layout_supported, "store_state":store_state,
+        "store_initialized":metadata.is_some(), "store_disabled":disabled,
+        "records_after_save":records, "inventory":inventory, "write_counters":counters,
+        "counter_scope":"process lifetime; write/refusal totals; source store totals",
+    })
 }

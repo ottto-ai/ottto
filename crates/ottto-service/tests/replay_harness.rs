@@ -156,52 +156,30 @@ fn session(rows: &[Value]) -> &Value {
         .expect("emitted session")
 }
 
-// Pinned R2 transitional rows; these are not aliases for generic plan reasons.
-const PINNED_GROWTH_FULL_CAUSES: &[&str] = &[
-    // flips to 0 when A1b2d lands (old_binding_no_match removal/conversion).
-    "old_binding_no_match",
-    // flips to 0 when A1b2d lands (upgrade_missing_full O3 integration/removal).
-    "upgrade_missing_full",
-];
-
+// Strict disk-restore contract: no transitional cause or missing-record alias.
 fn validate_growth_full_causes(rows: &[Value]) -> Result<(), String> {
-    let full = totals(rows)["full_reads"]
-        .as_u64()
-        .ok_or("P2 Full count unavailable")?;
-    if full > 1 {
-        return Err(format!("P2 Full count exceeds transitional bound: {full}"));
+    if totals(rows)["full_reads"].as_u64() != Some(0) {
+        return Err("P2 requires zero Full reads".into());
     }
-    let mut accounted = 0u64;
+    let mut pages = 0;
     for row in rows
         .iter()
         .filter(|row| row["record"]["stage"] == "native_collection_page")
     {
+        pages += 1;
         let reads = &row["record"]["counts"]["sampled_acquisition"];
-        let selected = reads["full_selections"]
-            .as_u64()
-            .ok_or("P2 page Full count unavailable")?;
+        if reads["full_selections"].as_u64() != Some(0) {
+            return Err("P2 page requires zero Full reads".into());
+        }
         let reasons = reads["page_events"]["full_reasons"]
             .as_object()
             .ok_or("P2 Full causes unavailable")?;
-        let mut page_count = 0u64;
-        for (cause, count) in reasons {
-            let count = count.as_u64().ok_or("P2 malformed Full cause count")?;
-            if !PINNED_GROWTH_FULL_CAUSES.contains(&cause.as_str()) {
-                return Err(format!("UNKNOWN P2 Full cause: {cause}"));
-            }
-            page_count = page_count
-                .checked_add(count)
-                .ok_or("P2 cause count overflow")?;
+        if !reasons.is_empty() {
+            return Err("P2 requires no Full cause".into());
         }
-        if page_count != selected {
-            return Err("P2 Full causes do not cover every page Full".into());
-        }
-        accounted = accounted
-            .checked_add(page_count)
-            .ok_or("P2 pass cause count overflow")?;
     }
-    if accounted != full {
-        return Err("P2 Full causes do not cover the pass".into());
+    if pages == 0 {
+        return Err("P2 page diagnostics unavailable".into());
     }
     Ok(())
 }
@@ -234,16 +212,17 @@ fn growth_full_gate_rejects_unknown_and_unaccounted_causes() {
         ]
     };
     assert!(validate_growth_full_causes(&rows(json!({}), 0)).is_ok());
-    assert!(validate_growth_full_causes(&rows(json!({"old_binding_no_match":1}), 1)).is_ok());
-    assert!(validate_growth_full_causes(&rows(json!({"upgrade_missing_full":1}), 1)).is_ok());
-    assert_eq!(
-        validate_growth_full_causes(&rows(json!({"state_missing":1}), 1)).unwrap_err(),
-        "UNKNOWN P2 Full cause: state_missing"
-    );
-    assert!(validate_growth_full_causes(&rows(json!({"new_unapproved_cause":1}), 1)).is_err());
+    for cause in [
+        "state_missing",
+        "missing",
+        "old_binding_no_match",
+        "upgrade_missing_full",
+        "new_unapproved_cause",
+    ] {
+        assert!(validate_growth_full_causes(&rows(json!({cause:1}), 1)).is_err());
+        assert!(validate_growth_full_causes(&rows(json!({cause:1}), 0)).is_err());
+    }
     assert!(validate_growth_full_causes(&rows(json!({}), 1)).is_err());
-    assert!(validate_growth_full_causes(&rows(json!({"old_binding_no_match":2}), 2)).is_err());
-    assert!(validate_growth_full_causes(&rows(json!({"old_binding_no_match":"1"}), 1)).is_err());
 }
 
 #[test]
@@ -458,6 +437,18 @@ fn refuses_missing_and_external_secret_fallback() {
 fn synthetic_cold_quiet_growth_kill_and_restart() {
     let f = Fixture::new();
     let cold = f.run("P0");
+    for row in &cold {
+        if row["kind"] == "durable_after_save_diagnostics" {
+            eprintln!("P0 durable_after_save={row}");
+        }
+    }
+    assert!(
+        totals(&cold)["durable_records_after_save"]
+            .as_u64()
+            .expect("P0 store inventory unavailable")
+            > 0,
+        "P0 must persist records; inspect write diagnostics before attributing a P2 miss"
+    );
     assert!(totals(&cold)["full_reads"].as_u64().unwrap() > 0);
     assert_eq!(session(&cold)["entity_count"], 1);
     assert_eq!(
@@ -489,7 +480,7 @@ fn synthetic_cold_quiet_growth_kill_and_restart() {
         }
     }
     validate_growth_full_causes(&growth)
-        .expect("P2 cause finding for E1; do not widen the pinned set");
+        .expect("P2 restore finding for E1; no Full cause is allowed");
     assert!(totals(&growth)["tail_reads"].as_u64().unwrap() > 0);
     assert_eq!(
         session(&cold)["blinded_session_hash"],
