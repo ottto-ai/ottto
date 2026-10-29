@@ -582,7 +582,234 @@ fn shared_failed_rename_preserves_predecessor_and_retry_money() {
         let cold = f.emit_bodies(Mode::ColdFull);
         let restarted = f.emit_bodies(Mode::Restart);
         // deferred: M3 D3 store-fault work (E1) adds the deferred-key requeue after write_after_save failure (durable_tail.rs:1113–1125); current behaviour = predecessor preserved, refused by S2 floor on restart (one Full per restart, no money risk)
+        // counted by `store_write_failed_restart_full{files, bytes}` + 24 h alarm (ottto-ai/ottto#904, E1); requeue + restored==1 fixture: M3 D3 (E1)
         money_oracle::assert_equivalent(&cold, &restarted);
+    });
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "M1 requires qualified native heap layout"
+)]
+fn shared_failed_rename_unacked_retry_resends_identical_body_once() {
+    assert!(supported("shared_unacked_rename_retry"));
+    with_e2(|| {
+        let mut f = M1::old_writer("transition-unacked-rename", WRITERS[0]);
+        const SIBLING: &str = "019fa111-2222-7333-8444-555555555556";
+        let sibling = f.c.root(SIBLING, &line(SIBLING, "s1", AT, 70));
+        input_clock(&sibling);
+        let warm = f.emit_bodies(Mode::Ram);
+        assert_eq!(warm.snapshots.len(), 1);
+        assert!(warm.snapshots.contains_key(SIBLING));
+        let warm_page = f.pages.get_mut(&Mode::Ram).unwrap();
+        f.prior = f
+            .disk
+            .commit(&warm_page.cache, SOURCE, &mut warm_page.index);
+        assert_eq!(f.disk.records(), 2);
+        let key = fixture::local_key(&f.path);
+        let sibling_key = fixture::local_key(&sibling);
+        let prior_root_acks = f.prior.file_snapshot_fingerprints[&key].clone();
+        assert!(!prior_root_acks.is_empty());
+        assert!(prior_root_acks
+            .iter()
+            .all(|fp| fixture::accepted_fingerprints(&f.prior).contains(fp)));
+
+        f.grow("r4", 40);
+        append(&sibling, &line(SIBLING, "s2", AT, 80));
+        input_clock(&sibling);
+        f.disk.begin(&f.ram, SOURCE);
+        let mut attempt = f.c.raw(&f.ram, f.prior.clone(), 100, true, &[]);
+        attempt.enrich(&f.c);
+        let holds = attempt.finish();
+        assert!(!holds.any());
+        assert_eq!(attempt.scan.snapshots.len(), 2);
+        let root = attempt
+            .scan
+            .snapshots
+            .iter()
+            .find(|item| item.source_session_id == ROOT)
+            .unwrap()
+            .clone();
+        assert_eq!(root.request_count, 4);
+        assert!(
+            !fixture::accepted_fingerprints(&attempt.index).contains(&root.snapshot_fingerprint)
+        );
+        let mut progress = e2_progress();
+        let mut initial_posts = 0;
+        let (status, batches, _) = upload(&attempt.scan.snapshots, &mut progress, |items| {
+            initial_posts += 1;
+            let mut response = ack(items)?;
+            let at = response
+                .accepted_entities
+                .iter()
+                .position(|entity| entity.source_session_id == ROOT)
+                .unwrap();
+            let mut unacked = response.accepted_entities.remove(at);
+            response.accepted -= 1;
+            unacked.head_etag = None;
+            response.conflict_entities.push(unacked);
+            Ok(response)
+        });
+        assert_eq!(
+            status.unwrap(),
+            ResumableUploadResult::Deferred { count: 1 }
+        );
+        assert_eq!(initial_posts, 1);
+        assert_eq!(progress.accepted_fingerprints.len(), 1);
+        assert!(!progress
+            .accepted_fingerprints
+            .contains(&root.snapshot_fingerprint));
+        let first = RouteResult::emitted(Mode::Ram, SOURCE, batches, &attempt.scan.snapshots);
+        assert!(first.snapshots.contains_key(SIBLING));
+
+        // Native partial settlement keeps the old root, never an unACKed r4.
+        // The independently ACKed sibling supplies a real eligible record
+        // whose rename can fail AFTER the safe partial index save.
+        let mut partial = attempt.index.committable_subset(
+            &attempt.committed,
+            &progress.accepted_fingerprints,
+            &progress.quarantined_fingerprints,
+        );
+        partial.mark_bounded_sweep_unsettled_by(
+            crate::snapshots::UnsettledUploadCause::DeferredConflict,
+        );
+        assert_eq!(
+            serde_json::to_value(&partial.files[&key]).unwrap(),
+            serde_json::to_value(&attempt.committed.files[&key]).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&partial.files[&sibling_key]).unwrap(),
+            serde_json::to_value(&attempt.index.files[&sibling_key]).unwrap()
+        );
+        assert!(prior_root_acks
+            .iter()
+            .all(|fp| fixture::accepted_fingerprints(&partial).contains(fp)));
+        assert!(!fixture::accepted_fingerprints(&partial).contains(&root.snapshot_fingerprint));
+        partial.save(&f.disk.index).unwrap();
+        let before = fixture::native_effects(&partial, &attempt.scan);
+        let fault = fixture::fail_store_at(CrashPoint::BeforeRename, 1);
+        let writer = crate::locked_state_dir::held_for(&f.disk.index).unwrap();
+        assert!(attempt
+            .cache
+            .durable_write_after_save(writer, SOURCE, &partial)
+            .is_none());
+        assert_eq!(fault.hits(), 1);
+        assert_eq!(fixture::native_effects(&partial, &attempt.scan), before);
+        drop(fault);
+        assert!(!fixture::accepted_fingerprints(&partial).contains(&root.snapshot_fingerprint));
+
+        let mut cold_page =
+            f.c.raw(&E2ScanFixture::default(), partial.clone(), 100, true, &[]);
+        cold_page.enrich(&f.c);
+        cold_page.finish();
+        assert_eq!(cold_page.scan.snapshots.len(), 1);
+        assert_eq!(cold_page.scan.snapshots[0].source_session_id, ROOT);
+        let (status, batches, _) = upload(&cold_page.scan.snapshots, &mut e2_progress(), ack);
+        assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+        let cold = RouteResult::emitted(Mode::ColdFull, SOURCE, batches, &cold_page.scan.snapshots);
+
+        // Native RAM re-scan starts at the actual saved partial generation;
+        // no generation copying or existing-ACK reset creates the obligation.
+        let mut retry_page = f.c.raw(&f.ram, partial, 100, true, &[]);
+        retry_page.enrich(&f.c);
+        retry_page.finish();
+        assert_eq!(retry_page.scan.snapshots.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&retry_page.scan.snapshots[0]).unwrap(),
+            serde_json::to_value(&root).unwrap()
+        );
+        assert!(
+            !fixture::accepted_fingerprints(&retry_page.index).contains(&root.snapshot_fingerprint)
+        );
+        let mut retry_posts = 0;
+        let (status, batches, _) = upload(&retry_page.scan.snapshots, &mut progress, |items| {
+            retry_posts += 1;
+            ack(items)
+        });
+        assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+        assert_eq!(retry_posts, 1);
+        let retried = RouteResult::emitted(Mode::Ram, SOURCE, batches, &retry_page.scan.snapshots);
+        assert_eq!(retried.snapshots.len(), 1);
+        assert_eq!(retried.batches.len(), 1);
+        assert_eq!(retried.snapshots[ROOT], first.snapshots[ROOT]);
+        money_oracle::assert_equivalent(&cold, &retried);
+        assert!(progress
+            .accepted_fingerprints
+            .contains(&root.snapshot_fingerprint));
+        retry_page
+            .index
+            .record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+        f.prior = f
+            .disk
+            .commit(&retry_page.cache, SOURCE, &mut retry_page.index);
+        assert!(fixture::accepted_fingerprints(&f.prior).contains(&root.snapshot_fingerprint));
+
+        let committed = [&key, &sibling_key].map(|key| NativeAcceptedState::of(&f.prior, key));
+        let mut quiet_prior = f.prior.clone();
+        assert!(!quiet_prior.file_snapshot_fingerprints.is_empty());
+        assert!(!quiet_prior.snapshot_activity_at.is_empty());
+        quiet_prior.snapshot_activity_at.clear();
+        let mut quiet_cold = f.c.raw(
+            &E2ScanFixture::default(),
+            quiet_prior.clone(),
+            100,
+            true,
+            &[],
+        );
+        let mut quiet_ram = f.c.raw(&f.ram, quiet_prior, 100, true, &[]);
+        let mut raw_bodies = BTreeMap::new();
+        let mut quiet_posts = 0;
+        for (mode, arm) in [
+            (Mode::ColdFull, &mut quiet_cold),
+            (Mode::Ram, &mut quiet_ram),
+        ] {
+            arm.enrich(&f.c);
+            let raw = arm.scan.snapshots.clone();
+            assert!(!raw.is_empty(), "{mode:?}: native body exists");
+            assert_eq!(raw.len(), 2);
+            arm.finish();
+            assert_eq!(arm.scan.semantic_noop_count, raw.len());
+            let (status, batches, _) = upload(&arm.scan.snapshots, &mut progress, |items| {
+                quiet_posts += 1;
+                ack(items)
+            });
+            assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+            let finalized = RouteResult::emitted(mode, SOURCE, batches, &arm.scan.snapshots);
+            assert_eq!(finalized.snapshots.len(), 0);
+            assert_eq!(finalized.batches.len(), 0);
+            assert_eq!(quiet_posts, 0);
+            for (key, before) in [&key, &sibling_key].into_iter().zip(&committed) {
+                assert_eq!(NativeAcceptedState::of(&arm.index, key), *before);
+            }
+            let bodies = raw
+                .iter()
+                .map(|item| {
+                    assert!(item.request_count > 0);
+                    (
+                        item.source_session_id.clone(),
+                        serde_json::to_value(item).unwrap(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(bodies.len(), raw.len());
+            assert!(bodies.contains_key(ROOT) && bodies.contains_key(SIBLING));
+            raw_bodies.insert(mode, bodies);
+        }
+        let cold_raw = &raw_bodies[&Mode::ColdFull];
+        let ram_raw = &raw_bodies[&Mode::Ram];
+        assert_eq!(
+            cold_raw.keys().collect::<Vec<_>>(),
+            ram_raw.keys().collect::<Vec<_>>()
+        );
+        for (entity, cold_body) in cold_raw {
+            for field in money_oracle::FIELDS {
+                assert_eq!(
+                    cold_body[*field], ram_raw[entity][*field],
+                    "raw entity/{entity}/{field}"
+                );
+            }
+        }
     });
 }
 
