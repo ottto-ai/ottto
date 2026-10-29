@@ -10,7 +10,10 @@
 //! discovers durable macros/trait impls and follows local helpers/constants.
 //! Explicit roots cover body encoding, allowlist labels, session-start content
 //! hashes, source slugs and owned-container Deref. See the tool docstring for
-//! the catalog limits: external helpers/import resolution need owner review.
+//! limits and owner-reviewed rebaseline procedure. Runtime tree walking sees
+//! new non-catalog files; cfg(test)-only code is excluded. The adjacent JSON
+//! inventory enumerates helper references, pinned providers and exceptions;
+//! adding a reference requires an explicit inventory review.
 use super::*;
 use sha2::{Digest, Sha256};
 
@@ -53,7 +56,8 @@ pub(crate) fn seed_pinned_v1(
     bytes
 }
 
-// Pin serializer-relevant regions of the 16 baseline compilation units.
+// Pin serializer regions of the baseline units, plus one qualified extent helper.
+// Discovery walks EVERY src/**/*.rs; non-catalog serializer regions must be empty.
 // Hashes are generated with the SAME extractor using --baseline 53d05a43;
 // unrelated source edits are ignored, and new serializer definitions refuse.
 struct SourcePin {
@@ -63,6 +67,11 @@ struct SourcePin {
 }
 const PINNED_SOURCES: &[SourcePin] = &[
     SourcePin {
+        path: "codex_scan_diagnostics.rs",
+        text: include_str!("../../codex_scan_diagnostics.rs"),
+        sha256: "2f1433a7f722a6fed7b0883b6873cc0b9c7b54aed43953ada7b504a8a3a4be34",
+    },
+    SourcePin {
         path: "codex_prelude_footprint.rs",
         text: include_str!("../../codex_prelude_footprint.rs"),
         sha256: "2459e58e5f2bb58ecf30ac8e27a7bb04e42fb059fe7b1164ab5640958c1a47ef",
@@ -70,7 +79,7 @@ const PINNED_SOURCES: &[SourcePin] = &[
     SourcePin {
         path: "durable_tail_codec.rs",
         text: include_str!("../../durable_tail_codec.rs"),
-        sha256: "d74857522993a5c46daf5523d1eaf26edefa51e34c2dbe74ce0952ebc4d4a723",
+        sha256: "dc56bac8c7a9e478df9df2eff82f83f409429a43750bfb1599c14a0190c4f9a6",
     },
     SourcePin {
         path: "snapshots/cache_observations.rs",
@@ -120,7 +129,7 @@ const PINNED_SOURCES: &[SourcePin] = &[
     SourcePin {
         path: "snapshots/sampled_jsonl/durable.rs",
         text: include_str!("../sampled_jsonl/durable.rs"),
-        sha256: "c9f9e6319304086bc0fe97d94d285570f93c24728f5d6c6129f9ffc61447523c",
+        sha256: "6dd31f632b2cf25258a95d346cca8ad12d368715a2be45e88e0f2751bbdd7879",
     },
     SourcePin {
         path: "snapshots/sampled_jsonl.rs",
@@ -140,31 +149,30 @@ const PINNED_SOURCES: &[SourcePin] = &[
     SourcePin {
         path: "owned_heap.rs",
         text: include_str!("../../owned_heap.rs"),
-        sha256: "44d81bb377a95a48f38f5b5c0dc44bcfe3ab92bb5f834e8d5db2ecf491a44af4",
+        sha256: "3c49ce9518959f9408a69a50b03d54ed2f480f27049a57d8c18eb593fc427f2c",
     },
 ];
 
 fn verify_pinned_sources(replacement: Option<(&str, &str)>) -> Result<(), &'static str> {
     use std::io::Write;
     use std::process::{Command, Stdio};
-    let sources = PINNED_SOURCES
-        .iter()
-        .map(|pin| {
-            let text = replacement
-                .filter(|(path, _)| *path == pin.path)
-                .map_or(pin.text, |(_, text)| text);
-            (pin.path, text)
-        })
-        .collect::<BTreeMap<_, _>>();
+    let sources = replacement.into_iter().collect::<BTreeMap<_, _>>();
     let mut child = Command::new("python3")
-        .args(["-c", include_str!("transition_serializer_regions.py")])
+        .args([
+            "-c",
+            include_str!("transition_serializer_regions.py"),
+            "--source-root",
+        ])
+        .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("test serializer extractor requires Python 3");
-    // Python drains the full request before emitting its small response (16 hashes),
-    // so writing snapshots.rs before collecting stdout cannot fill both pipes.
+    // Walking the checkout, rather than embedding a fixed file catalog, notices
+    // future source files. CI and native fixture runs have the source tree.
+    // Python drains the override request before emitting hashes/reference names;
+    // writing the changed snapshots.rs cannot deadlock against a full stdout.
     let mut input = child.stdin.take().unwrap();
     input
         .write_all(&serde_json::to_vec(&sources).unwrap())
@@ -176,11 +184,28 @@ fn verify_pinned_sources(replacement: Option<(&str, &str)>) -> Result<(), &'stat
         "serializer extraction failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let hashes: BTreeMap<String, String> = serde_json::from_slice(&output.stdout).unwrap();
+    #[derive(serde::Deserialize)]
+    struct Extraction {
+        hashes: BTreeMap<String, String>,
+        references: BTreeSet<String>,
+    }
+    let extraction: Extraction = serde_json::from_slice(&output.stdout).unwrap();
+    let hashes = extraction.hashes;
     for pin in PINNED_SOURCES {
         if hashes.get(pin.path).map(String::as_str) != Some(pin.sha256) {
             return Err(pin.path);
         }
+    }
+    if hashes.len() != PINNED_SOURCES.len() {
+        return Err("serializer regions outside baseline catalog");
+    }
+    let inventory: BTreeMap<String, String> =
+        serde_json::from_str(include_str!("transition_serializer_helpers.json")).unwrap();
+    assert!(inventory
+        .values()
+        .all(|status| status.starts_with("pinned: ") || status.starts_with("exception: ")));
+    if extraction.references != inventory.into_keys().collect::<BTreeSet<_>>() {
+        return Err("serializer helper reference inventory changed; owner review required");
     }
     Ok(())
 }
@@ -196,6 +221,12 @@ fn assert_pinned_body_writer() {
 fn pinned_v1_serializer_regions_match_main() {
     // Portable positive control: provenance must also run without native layout.
     assert_pinned_body_writer();
+    // The sole cryptographic dependency exception has the standardized SHA-256
+    // contract; this independent vector checks its concrete implementation.
+    assert_eq!(
+        format!("{:x}", Sha256::digest(b"abc")),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
 }
 
 fn assert_source_drift_refused(path: &str, before: &str, after: &str) {
@@ -275,6 +306,43 @@ fn pinned_v1_refuses_encoding_constant_and_local_helper_drift() {
         "snapshots/sampled_jsonl/durable.rs",
         "let mut e = Enc::hash(domain);",
         "let mut e = Enc::hash(\"different-domain\");",
+    );
+}
+
+#[test]
+fn pinned_v1_refuses_serializer_in_non_catalog_source() {
+    for (path, original) in [
+        ("canonical_json.rs", include_str!("../../canonical_json.rs")),
+        ("fixture_added_source.rs", ""),
+    ] {
+        assert!(!PINNED_SOURCES.iter().any(|pin| pin.path == path));
+        let changed = format!(
+            "{original}\ncrate::durable_tail_codec::durable_struct!(Added {{ N n: u64 }});\n"
+        );
+        assert_eq!(
+            verify_pinned_sources(Some((path, &changed))),
+            Err("serializer regions outside baseline catalog")
+        );
+    }
+}
+
+#[test]
+fn pinned_v1_accepts_test_only_serializers_outside_catalog() {
+    // Inline, file-level and externally declared test modules are excluded.
+    let changed = "#[cfg(all(test, unix))] mod tests { crate::durable_tail_codec::durable_struct!(Added { N n: u64 }); }";
+    assert_eq!(
+        verify_pinned_sources(Some(("fixture_added_source.rs", changed))),
+        Ok(())
+    );
+    let changed = "#![cfg(test)]\ncrate::durable_tail_codec::durable_struct!(Added { N n: u64 });";
+    assert_eq!(
+        verify_pinned_sources(Some(("fixture_added_source.rs", changed))),
+        Ok(())
+    );
+    let changed = "crate::durable_tail_codec::durable_struct!(Added { N n: u64 });";
+    assert_eq!(
+        verify_pinned_sources(Some(("snapshots/sampled_scan/transition_seed.rs", changed))),
+        Ok(())
     );
 }
 
