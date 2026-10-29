@@ -60,6 +60,9 @@ pub(crate) fn rederive_head_bytes_total(source: SnapshotSource) -> u64 {
     })
 }
 
+const PACE_SECS: u64 = 6 * 3600;
+const _: () = assert!(PACE_SECS < 86_400);
+
 /// Content-free outcome counts, by class. Field paths are static names; no
 /// id, path or value is ever counted.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -860,7 +863,7 @@ impl SharedCache {
         };
         #[cfg(test)]
         let now = stores.retail_full_now.unwrap_or(now);
-        let interval = std::time::Duration::from_secs(6 * 3600);
+        let interval = std::time::Duration::from_secs(PACE_SECS);
         stores.retail_full_at.retain(|_, at| {
             now.checked_duration_since(*at)
                 .is_none_or(|age| age < interval)
@@ -870,7 +873,14 @@ impl SharedCache {
             if cause.is_none() {
                 stores.counters.retail_full[1] += 1;
             } else {
-                Counters::bump(&mut stores.counters.ineligible, "stale_full.paced");
+                Counters::bump(
+                    &mut stores.counters.ineligible,
+                    if cause == Some(3) {
+                        "old_binding_no_match.paced"
+                    } else {
+                        "stale_full.paced"
+                    },
+                );
             }
             return false;
         }
@@ -886,7 +896,11 @@ impl SharedCache {
             }
         }
         stores.retail_full_at.insert(key, now);
-        if let Some(cause) = cause {
+        if cause == Some(3) {
+            if let Some(slot) = stores.slot(DurableSource::ClaudeCode).as_mut() {
+                slot.old_binding_no_match += 1;
+            }
+        } else if let Some(cause) = cause {
             stores.counters.stale_full[cause] += 1;
         } else {
             stores.counters.retail_full[0] += 1;
@@ -897,18 +911,19 @@ impl SharedCache {
     fn durable(&self) -> Option<std::sync::MutexGuard<'_, Stores>> {
         self.durable.lock().ok()
     }
-    pub(crate) fn no_match_full(&self, file: &File, a: Option<AcceptedFloor>) -> Option<()> {
+    // R2 transitional old_binding_no_match; A1b2d removes or converts this arm.
+    pub(crate) fn no_match_full(
+        &self,
+        key: &str,
+        file: &File,
+        a: Option<AcceptedFloor>,
+    ) -> Option<()> {
         let a = a?;
-        if a.revision > effective_revision(SnapshotSource::ClaudeCode)
-            || file.metadata().ok()?.len() <= a.end
-        {
+        if a.revision > effective_revision(SnapshotSource::ClaudeCode) {
             return None;
         }
-        self.durable()?
-            .slot(DurableSource::ClaudeCode)
-            .as_mut()?
-            .old_binding_no_match += 1;
-        Some(())
+        self.paced_full(key, file, a.end, std::time::Instant::now(), Some(3))
+            .then_some(())
     }
 
     /// Selects `source`'s store for this pass, the sibling of `index_path`,
