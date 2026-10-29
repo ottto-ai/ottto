@@ -4672,3 +4672,81 @@ fn missing_carrier_future_debt_clamps_only_in_live_context_for_both_sources() {
 }
 
 mod codex_mcp_version_tests;
+
+#[test]
+fn rearm_full_cause_counts_native_bytes_without_changing_selection_or_uploads() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    use rearm_cause::Cause;
+    let source = SnapshotSource::ClaudeCode;
+    for (cause, label) in [
+        (Cause::NoRetainedTraversal, "no_retained_traversal"),
+        (Cause::ContextChanged, "context_changed"),
+        (Cause::TerminalUnhealthyRetry, "terminal_unhealthy_retry"),
+        (Cause::CarryInvalidation, "carry_invalidation"),
+    ] {
+        let f = ScanFixture::new(source);
+        f.file.append(&usage(source, 100, 0, "fixture-model"));
+        let (mut index, _, _) =
+            production_scan(&f, source, ScanIndex::default(), None, "rearm-cause");
+        let key = local_index_key(&f.file.0);
+        rearm_cause::retain(&index);
+        rearm_cause::clear(&key, index.files.get_mut(&key).unwrap(), cause);
+        // The actual sync path reloads an index between pages in one process.
+        let encoded = serde_json::to_vec(&index).unwrap();
+        assert!(!String::from_utf8_lossy(&encoded).contains("rearm_cleared"));
+        let loaded: ScanIndex = serde_json::from_slice(&encoded).unwrap();
+        let ((next, tagged, tagged_modes, tagged_bytes), records) =
+            crate::local_resource_diagnostics::capture(|| {
+                production_scan_with_metrics(
+                    &f,
+                    source,
+                    loaded.clone(),
+                    Some(Arc::new(sampled_scan::SharedCache::default())),
+                    "rearm-cause",
+                )
+            });
+        assert_eq!(tagged_modes, (1, 0, 0));
+        assert_eq!(tagged_bytes.0, fs::metadata(&f.file.0).unwrap().len());
+        let page = records
+            .iter()
+            .find(|row| row["stage"] == "native_collection_page")
+            .unwrap();
+        assert_eq!(
+            page["counts"]["sampled_acquisition"]["page_events"]["full_cause"],
+            json!({format!("rearm_cleared{{{label}}}"): {
+                "count": 1, "completed_native_bytes": tagged_bytes.0,
+            }})
+        );
+        // Completion consumed the process-local tag. Same cleared index,
+        // identical Full selection/read/body, with no clear-cause annotation.
+        let ((plain_next, plain, modes, bytes), records) =
+            crate::local_resource_diagnostics::capture(|| {
+                production_scan_with_metrics(
+                    &f,
+                    source,
+                    loaded,
+                    Some(Arc::new(sampled_scan::SharedCache::default())),
+                    "rearm-cause",
+                )
+            });
+        assert_eq!(modes, tagged_modes);
+        assert_eq!(bytes, tagged_bytes);
+        assert_eq!(
+            serde_json::to_value(next).unwrap(),
+            serde_json::to_value(plain_next).unwrap()
+        );
+        let tagged_body = production_body(source, tagged);
+        assert_eq!(tagged_body, production_body(source, plain));
+        let wire = tagged_body.to_string();
+        assert!(!wire.contains("full_cause") && !wire.contains("rearm_cleared"));
+        let page = records
+            .iter()
+            .find(|row| row["stage"] == "native_collection_page")
+            .unwrap();
+        assert!(page["counts"]["sampled_acquisition"]["page_events"]
+            .get("full_cause")
+            .is_none());
+    }
+}

@@ -7,9 +7,18 @@ rust-version.workspace = true
 authors.workspace = true
 build = "build.rs"
 
+[features]
+default = []
+# Synthetic development tooling. Installed/release builds must not enable this.
+replay-harness = []
+
 [[bin]]
 name = "ottto-service"
 path = "src/main.rs"
+
+[[test]]
+name = "replay_harness"
+required-features = ["replay-harness"]
 
 [dependencies]
 anyhow.workspace = true

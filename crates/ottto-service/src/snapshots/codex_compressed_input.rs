@@ -275,13 +275,16 @@ impl ArchiveEvidence {
     }
     pub(super) fn begin(file: &File, path: &Path, previous: Option<&Self>) -> io::Result<Self> {
         let stamp = crate::transcript_acquisition::FileStamp::capture(file.metadata()?)?;
-        let previous = previous.filter(|old| old.stamp.same_content(&stamp));
         let logical = path.with_extension("");
         let logical_id = super::codex_session_id_candidates_from_path(&logical)
             .into_iter()
             .next()
             .ok_or_else(|| invalid("compressed rollout logical id unavailable"))?;
+        // The retained historical body keeps its validated identity while a
+        // changed stamp waits for acquisition. Current-header and retry facts
+        // below remain scoped to the matching stamp.
         let logical_id = previous.map_or(logical_id, |old| old.logical_id.clone());
+        let previous = previous.filter(|old| old.stamp.same_content(&stamp));
         let correction = previous.is_some_and(|old| old.user_change);
         let attempts = if correction {
             previous.map_or(0, |old| old.decode_attempts)
@@ -923,11 +926,8 @@ impl super::ScanIndex {
         }
         let file = open_candidate_beneath_root(candidate)?;
         let key = local_index_key(&candidate.path);
-        let old = self
-            .files
-            .get(&key)
-            .and_then(|e| e.archive.as_deref())
-            .filter(|a| a.matches(&file));
+        let previous = self.files.get(&key).and_then(|e| e.archive.as_deref());
+        let old = previous.filter(|a| a.matches(&file));
         if let Some(header) = old.and_then(|a| a.header_for(&candidate.path)) {
             return Ok((header.clone(), 0));
         }
@@ -942,7 +942,7 @@ impl super::ScanIndex {
             anyhow::bail!("archive inventory power/QoS/CPU gate");
         }
         let started = thread_cpu_micros();
-        let mut evidence = ArchiveEvidence::begin(&file, &candidate.path, old)?;
+        let mut evidence = ArchiveEvidence::begin(&file, &candidate.path, previous)?;
         evidence.disposition = ArchiveDisposition::HeaderValidated;
         evidence.decode_attempts = 0;
         let mut input = match cache.map(|cache| OpenedInput::funded(file, cache)) {

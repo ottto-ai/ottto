@@ -1619,3 +1619,198 @@ fn denied_only_inventory_hold_reoffers_owed_plain_at_bounded_retry_generation() 
     assert!(index.accepted_snapshot_fingerprints.contains(&historical));
     fs::remove_dir_all(state_root).unwrap();
 }
+
+#[test]
+fn merged_causes_decode_every_precomposition_archive_disposition_label() {
+    use CodexZstCause::*;
+    // Literal labels and indices written by #887 at 11ae5e0a2. Do not derive
+    // them from the current enum, or a rename/reorder would update the oracle.
+    let previous = [
+        ("CompressedReplayNotAuthorized", ReplayNotAuthorized),
+        ("CompressedProofParentUnsupported", ProofParentUnsupported),
+        ("CompressedProofChildUnsupported", ProofChildUnsupported),
+        ("CompressedParentSideUnsupported", ParentSideUnsupported),
+        ("CompressedDurableTailUnsupported", DurableTailUnsupported),
+        ("CompressedGroupProbeUnsupported", GroupProbeUnsupported),
+        ("CompressedGroupReadUnsupported", GroupReadUnsupported),
+        ("CompressedParentLedgerUnbound", ParentLedgerUnbound),
+        (
+            "CompressedPhysicalOffsetUnsupported",
+            PhysicalOffsetUnsupported,
+        ),
+        (
+            "CompressedCompatibilityUnsupported",
+            CompatibilityUnsupported,
+        ),
+        ("CompressedAdmissionRefused", AdmissionRefused),
+        ("CompressedDecodeFailed", DecodeFailed),
+        ("CompressedOwnerUnproven", OwnerUnproven),
+        ("CompressedOutputHeld", OutputHeld),
+        ("CompressedSettlementStuck", SettlementStuck),
+        ("CompressedConstructorUnfunded", ConstructorUnfunded),
+        ("CompressedDecodedOverLimit", DecodedOverLimit),
+        ("CompressedParserStateRequired", ParserStateRequired),
+        ("CompressedHeaderInvalid", HeaderInvalid),
+        ("decode_budget", DecodeBudget),
+        ("admission_starved", AdmissionStarved),
+        ("CompressedCorrectionUnapplied", CorrectionUnapplied),
+    ];
+    for (index, (label, expected)) in previous.into_iter().enumerate() {
+        assert_eq!(expected as usize, index);
+        for disposition in ["Held", "Refused"] {
+            let written = json!({(disposition): {"cause": label}});
+            let restored: ArchiveDisposition = serde_json::from_value(written.clone()).unwrap();
+            assert!(matches!(restored,
+                ArchiveDisposition::Held { cause } | ArchiveDisposition::Refused { cause }
+                if cause == expected));
+            assert_eq!(serde_json::to_value(&restored).unwrap(), written);
+        }
+    }
+    assert_eq!(HeaderUnfunded as usize, 22);
+    assert_eq!(CompatibilityUnfunded as usize, 23);
+    assert_eq!(DecoderRefusedHeaderOccupancy as usize, 24);
+}
+
+#[test]
+fn changed_stamp_preserves_historical_logical_identity_but_resets_acquisition_state() {
+    let id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    let mut f = ArchiveFixture::new(b"old-stamp");
+    let path =
+        f.0.with_file_name(format!("rollout-2026-10-07T12-00-00-{id}.jsonl.zst"));
+    fs::rename(&f.0, &path).unwrap();
+    f.0 = path;
+    let key = local_index_key(&f.0);
+    let mut evidence = ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, None).unwrap();
+    assert_ne!(
+        evidence.logical_id, id,
+        "filename alone has an ambiguous timestamp prefix"
+    );
+    let filename_id = evidence.logical_id.clone();
+    let header = format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\"}}}}\n");
+    evidence.header_validated = ValidatedHeader::from_bytes(header.as_bytes());
+    assert!(evidence.header_validated.is_some());
+    evidence.header_attempted = true;
+    evidence.logical_id = id.into();
+    evidence.owner = Some(id.into());
+    evidence.disposition = ArchiveDisposition::Acquired;
+    evidence.body_witness = Some("b".repeat(64));
+    evidence.decode_attempts = 6;
+    evidence.terminal_failures = 3;
+    evidence.terminal_attempt = 6;
+    evidence.user_change = true;
+    evidence.user_context = Some("c".repeat(64));
+    evidence.user_generation = 7;
+    evidence.user_change_spent = 7;
+    let fingerprint = "a".repeat(64);
+    let body = "b".repeat(64);
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        key.clone(),
+        ScanIndexEntry {
+            last_snapshot_fingerprint: Some(fingerprint.clone()),
+            last_upload_body_witness: Some(body.clone()),
+            archive: Some(Box::new(evidence)),
+            ..Default::default()
+        },
+    );
+    index
+        .file_snapshot_fingerprints
+        .insert(key.clone(), BTreeSet::from([fingerprint.clone()]));
+    index
+        .accepted_snapshot_fingerprints
+        .insert(fingerprint.clone());
+    let saved = f.0.parent().unwrap().join("identity-index.json");
+    let mut metadata = CodexTitleMetadata::default();
+    metadata.state_threads.insert(
+        id.into(),
+        CodexStateThread {
+            tokens_used: 440,
+            ..Default::default()
+        },
+    );
+    let mut control = index.clone();
+    control
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .archive
+        .as_mut()
+        .unwrap()
+        .logical_id = filename_id;
+    let mut replacement = Vec::new();
+    append_codex_state_only_snapshots(
+        &mut replacement,
+        &metadata,
+        NOW,
+        &mut control,
+        &BTreeSet::new(),
+    );
+    assert_eq!(
+        replacement.len(),
+        1,
+        "losing the validated id admits a state-only replacement"
+    );
+    assert_eq!(replacement[0].source_session_id, id);
+    let constructions = codex_zst_refusal_tests::decoder_construction_count();
+    for _ in 0..3 {
+        index.save(&saved).unwrap();
+        let (restored, origin) =
+            ScanIndex::load_inner(&saved, Some(SnapshotSource::Codex)).unwrap();
+        assert!(matches!(origin, LoadOrigin::Loaded(_)));
+        index = restored;
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&f.0)
+            .unwrap()
+            .write_all(b"changed")
+            .unwrap();
+        let previous = index.files[&key].archive.as_deref().unwrap();
+        let file = File::open(&f.0).unwrap();
+        assert!(!previous.matches(&file));
+        let next = ArchiveEvidence::begin(&file, &f.0, Some(previous)).unwrap();
+        assert_eq!(next.logical_id, id);
+        assert!(next.matches(&file));
+        assert!(next.owner.is_none());
+        assert!(next.header_validated.is_none());
+        assert!(!next.header_attempted);
+        assert!(next.body_witness.is_none());
+        assert!(!next.reservation_saved);
+        assert_eq!(next.decode_attempts, 1);
+        assert_eq!(next.terminal_failures, 0);
+        assert_eq!(next.terminal_attempt, 0);
+        assert!(!next.user_change);
+        assert!(next.user_context.is_none());
+        assert_eq!(next.user_generation, 0);
+        assert_eq!(next.user_change_spent, 0);
+        index.files.get_mut(&key).unwrap().archive = Some(Box::new(next));
+        let mut fallback = Vec::new();
+        append_codex_state_only_snapshots(
+            &mut fallback,
+            &metadata,
+            NOW,
+            &mut index,
+            &BTreeSet::new(),
+        );
+        assert!(
+            fallback.is_empty(),
+            "historical exclusive body still covers the real id"
+        );
+        assert_eq!(
+            index.files[&key].last_snapshot_fingerprint.as_ref(),
+            Some(&fingerprint)
+        );
+        assert_eq!(
+            index.files[&key].last_upload_body_witness.as_ref(),
+            Some(&body)
+        );
+        assert_eq!(
+            index.file_snapshot_fingerprints[&key],
+            BTreeSet::from([fingerprint.clone()])
+        );
+        assert!(index.accepted_snapshot_fingerprints.contains(&fingerprint));
+    }
+    assert_eq!(
+        codex_zst_refusal_tests::decoder_construction_count(),
+        constructions
+    );
+}
