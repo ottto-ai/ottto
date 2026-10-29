@@ -70,7 +70,7 @@ fn generation_locked() -> Option<Generation> {
         account.user?.id,
         account.organization?.id,
         account.connected_at,
-        crate::snapshot_sync::snapshot_api_base_url(),
+        crate::snapshot_sync::snapshot_api_base_url().ok()?,
     ))
     .ok()?;
     Some(Generation {
@@ -393,9 +393,10 @@ pub(crate) fn set(
     {
         return finish(Outcome::NotConnected);
     }
-    let client = crate::snapshot_client::SnapshotApiClient::new(
-        crate::snapshot_sync::snapshot_api_base_url(),
-    );
+    let Ok(api_base_url) = crate::snapshot_sync::snapshot_api_base_url() else {
+        return finish(Outcome::Unavailable);
+    };
+    let client = crate::snapshot_client::SnapshotApiClient::new(api_base_url);
     let token = match client.issue_relay_token(&device, &secret, source) {
         Ok(token) => token,
         Err(error) => {

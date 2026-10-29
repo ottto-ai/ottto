@@ -1785,12 +1785,13 @@ impl SnapshotApiClient {
         device_secret: &str,
         source: SnapshotSource,
     ) -> Result<String> {
-        let nickname_generation =
-            if self.matches_api_base(&crate::snapshot_sync::snapshot_api_base_url()) {
-                crate::account_nicknames::generation_for_device(device)
-            } else {
-                None
-            };
+        let nickname_generation = if crate::snapshot_sync::snapshot_api_base_url()
+            .is_ok_and(|base| self.matches_api_base(&base))
+        {
+            crate::account_nicknames::generation_for_device(device)
+        } else {
+            None
+        };
         let token = self.issue_relay_token(device, device_secret, source)?;
         if let Some(generation) = nickname_generation {
             use sha2::Digest;
