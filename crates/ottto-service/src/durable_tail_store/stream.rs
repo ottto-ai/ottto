@@ -377,14 +377,14 @@ impl ResolvePreparation {
             let _ = self.failure.discard();
             let attempt = &self.failure.attempt;
             let current = stamp_at(&attempt.path)?;
+            let Some(stamp) = current else {
+                return Ok(Resolution::Absent);
+            };
             if let Some(identity) = attempt.identity.as_ref() {
                 if let Some(stamp) = verify_stream_candidate(&attempt.path, identity, &mut read)? {
                     return Ok(Resolution::Receipted(stamp));
                 }
             }
-            let Some(stamp) = current else {
-                return Ok(Resolution::Absent);
-            };
             if !attempt.prior_known || Some(stamp) != attempt.prior {
                 return Ok(Resolution::Protected(Refusal::Unbindable));
             }
@@ -1160,6 +1160,45 @@ mod tests {
             }
             assert_eq!(store.counters().resource_pause_checks, 1);
             assert_eq!(store.counters().store_write_cleanup_failed, 1);
+        }
+    }
+    #[test]
+    fn first_complete_stage_failed_rename_is_absent_not_a_survivor() {
+        if !crate::test_isolation::run_here() {
+            return;
+        }
+        for source in [DurableSource::ClaudeCode, DurableSource::Codex] {
+            let scratch = Scratch::new();
+            let lock = crate::locked_state_dir::test_locks::hold(&scratch.root);
+            let mut store = DurableTailStore::new(
+                store_dir_for_index(&scratch.root.join("index.json")),
+                source,
+            );
+            let (header, body) = header(&scratch, source, 1);
+            let prepared = store
+                .prepare_stream(lock, header)
+                .unwrap()
+                .write(|out| {
+                    out.write_all(&body)
+                        .map_err(|_| codec::Refuse::WriteFailed)?;
+                    Ok(body.len())
+                })
+                .unwrap();
+            let failure = prepared
+                .attempt
+                .failure("stream_rename", io::Error::other("rename failed"));
+            assert!(failure.attempt.identity.is_some());
+            assert!(stamp_at(&failure.attempt.path).unwrap().is_none());
+            let plan = store.resolve_failed_stream(lock, failure);
+            assert!(matches!(
+                store.finish_resolution(plan.resolve()),
+                FailureDisposition::PublishDegraded {
+                    strict_rebind: false,
+                    ..
+                }
+            ));
+            assert!(store.disabled().is_none());
+            assert!(store.pending.is_empty());
         }
     }
     #[test]

@@ -386,7 +386,10 @@ impl SharedCache {
         take_back: bool,
     ) -> Result<Option<crate::transcript_cache::Taken<CachedJsonlReduction>>, I> {
         let taken: &crate::transcript_cache::Taken<CachedJsonlReduction> = incoming.borrow();
-        let fits = taken.durable.heap_bound(&mut Counter::new(0)).is_some();
+        let fits = taken
+            .durable
+            .heap_bound(&mut Counter::new(STATE_BYTES))
+            .is_some();
         #[cfg(test)]
         let fits = fits && !sampled_jsonl::preparation_tests::heap_refused();
         if !fits {

@@ -1063,3 +1063,131 @@ fn m3_codex_native_double_fault_commits_only_pre_binding_before_publish() {
         "disabled store drops owed claims"
     );
 }
+
+/// The fault barrier is the upload gate: before its save no ACK is permitted;
+/// after its save every reader, including 0.1.201's selection-cleared gate,
+/// refuses A. Kill an actual native double-fault process on both sides.
+#[test]
+fn m3_d3_sigkill_at_pre_ack_fault_barrier_preserves_pre_facts() {
+    if let Some(root) = std::env::var_os(KILL_ROOT) {
+        let after = std::env::var(KILL_POINT).unwrap() == "after_fault_barrier";
+        let mut rig = Rig::open(SnapshotSource::Codex, PathBuf::from(root));
+        rig.create(CODEX_SESSION, 3);
+        assert_eq!(rig.pass().published(CODEX_SESSION), 1);
+        rig.assert_native_record(CODEX_SESSION);
+        let key = rig.key(CODEX_SESSION);
+        let mut committed = rig.index.clone();
+        fs::write(
+            rig.root.join("pre-entry.json"),
+            serde_json::to_vec(&committed.files[&key]).unwrap(),
+        )
+        .unwrap();
+        fs::copy(
+            rig.record(CODEX_SESSION),
+            rig.root.join("a-after-first-pass"),
+        )
+        .unwrap();
+        rig.append(CODEX_SESSION, 1);
+        fail_rename(rig.record(CODEX_SESSION), libc::EIO);
+        fail_cleanup(Cleanup::NativeStage, rig.record(CODEX_SESSION));
+        rig.cache
+            .durable_begin_pass(rig.source, &rig.index_path, &rig.namespace, true);
+        let (mut working, publications) = scan(
+            rig.source,
+            &rig.sessions,
+            std::mem::take(&mut rig.index),
+            rig.cache.clone(),
+            &rig.namespace,
+        );
+        assert_eq!(publications.len(), 1);
+        assert!(rig.cache.durable_store_faulted(rig.source));
+        let marker = rig.root.join("point-reached");
+        scan_hooks::set(
+            if after {
+                Point::AfterFaultBarrier
+            } else {
+                Point::BeforeFaultBarrier
+            },
+            move || die(&marker),
+        );
+        commit_store_fault_barrier(
+            &rig.cache,
+            rig.source,
+            &mut working,
+            &mut committed,
+            &rig.index_path,
+        )
+        .unwrap();
+        panic!("fault barrier hook was not reached");
+    }
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    let test = std::thread::current().name().unwrap().to_owned();
+    for after in [false, true] {
+        let scratch = crate::test_scratch::ScratchDir::new("m3-d3-barrier-kill");
+        let log = scratch.join("child.log");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([test.as_str(), "--exact", "--test-threads=1", "--nocapture"])
+            .env(KILL_ROOT, &*scratch)
+            .env(
+                KILL_POINT,
+                if after {
+                    "after_fault_barrier"
+                } else {
+                    "before_fault_barrier"
+                },
+            )
+            .stdout(std::process::Stdio::null())
+            .stderr(File::create(&log).unwrap())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("barrier child timeout");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "{}",
+            fs::read_to_string(log).unwrap_or_default()
+        );
+        assert!(scratch.join("point-reached").exists());
+        let mut rig = Rig::open(SnapshotSource::Codex, scratch.to_path_buf());
+        let key = rig.key(CODEX_SESSION);
+        let pre: Value =
+            serde_json::from_slice(&fs::read(scratch.join("pre-entry.json")).unwrap()).unwrap();
+        let mut entry = serde_json::to_value(&rig.index.files[&key]).unwrap();
+        assert_eq!(
+            rig.index.files[&key].source_file_fingerprint.is_empty(),
+            after
+        );
+        entry["source_file_fingerprint"] = pre["source_file_fingerprint"].clone();
+        assert_eq!(
+            entry, pre,
+            "the barrier never fabricates accepted revision/extent/body"
+        );
+        assert_eq!(
+            fs::read(rig.record(CODEX_SESSION)).unwrap(),
+            fs::read(scratch.join("a-after-first-pass")).unwrap()
+        );
+        let recovered = rig.pass();
+        assert_eq!(
+            recovered.witness(CODEX_SESSION),
+            Some(rig.cold(CODEX_SESSION))
+        );
+        assert_eq!(recovered.full(), u64::from(after));
+        assert_eq!(rig.counters().0.restored, u64::from(!after));
+        assert_eq!(rig.counters().1.stale_record_refused, u64::from(after));
+        assert_eq!(rig.pass().published(CODEX_SESSION), 0);
+        assert_eq!(rig.temps(), 0);
+    }
+}

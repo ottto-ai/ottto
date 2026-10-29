@@ -780,6 +780,20 @@ impl SharedCache {
                 Some(store::Refusal::ReceiptPending) if failure.stage() == "stream_prepare" => {
                     WriteOutcome::FailedHeld(HeldCause::ReceiptPending)
                 }
+                Some(store::Refusal::Unbindable)
+                    if failure.stage() == "stream_prepare"
+                        && source == DurableSource::ClaudeCode
+                        && self.durable().is_some_and(|stores| {
+                            stores.hold_content_changed(store::key_digest(source, fences.key()))
+                        }) =>
+                {
+                    // The native edit proof refuses A, but never authorizes
+                    // replacing an unbound predecessor. Re-classify it, leave
+                    // it untouched and publish only the changed native body.
+                    unprepared_write(
+                        self.resolve_unprepared(Unprepared::Degraded(Degraded::Refused), fences),
+                    )
+                }
                 Some(refusal) if failure.stage() == "stream_prepare" => {
                     WriteOutcome::FailedHeld(HeldCause::Protected(refusal))
                 }
@@ -1141,7 +1155,6 @@ impl SharedCache {
         };
         if let Some(mut stores) = self.durable() {
             let digest = store::key_digest(ds, key);
-            stores.mark_hold_content_changed(digest);
             stores.release_hold(digest, HoldRelease::Content);
             stores.clear_owed(digest);
         }
@@ -1230,6 +1243,11 @@ pub(super) struct ClaudeHold {
     content_changed: bool,
     modified: Option<(i64, i64)>,
 }
+impl ClaudeHold {
+    pub(super) fn active(&self) -> bool {
+        !self.content_changed
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum HoldRelease {
@@ -1279,7 +1297,15 @@ impl Stores {
     }
 
     pub(super) fn release_hold(&mut self, digest: store::Digest32, why: HoldRelease) {
-        if self.take_hold(&digest).is_some() {
+        let was_active = self.hold(&digest).is_some();
+        if why == HoldRelease::Content {
+            // Keep the proof with this predecessor until its replacement is
+            // receipted. Publication or another failed write must not re-hold it.
+            self.mark_hold_content_changed(digest);
+        } else {
+            self.take_hold(&digest);
+        }
+        if was_active {
             self.counters.d3[if why == HoldRelease::Write {
                 D3_RELEASED_WRITE
             } else {
@@ -1289,12 +1315,24 @@ impl Stores {
     }
 
     pub(super) fn hold_content_changed(&self, digest: store::Digest32) -> bool {
-        self.hold(&digest).is_some_and(|hold| hold.content_changed)
+        self.hold_proof(&digest)
+            .is_some_and(|hold| hold.content_changed)
     }
 
     pub(super) fn mark_hold_content_changed(&mut self, digest: store::Digest32) {
         if let Some(hold) = self.hold_mut(&digest) {
             hold.content_changed = true;
+        } else {
+            self.place_hold(
+                digest,
+                ClaudeHold {
+                    since: std::time::SystemTime::now(),
+                    object: (0, 0, 0),
+                    length: 0,
+                    content_changed: true,
+                    modified: None,
+                },
+            );
         }
     }
 
@@ -1306,7 +1344,7 @@ impl Stores {
         digest: store::Digest32,
         observed: Option<((u64, u64, u64), u64)>,
     ) -> bool {
-        let Some(hold) = self.hold_mut(&digest) else {
+        let Some(hold) = self.hold_mut(&digest).filter(|hold| hold.active()) else {
             return false;
         };
         let Some((object, length)) = observed else {

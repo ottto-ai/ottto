@@ -2,7 +2,7 @@
 //! existing parser step and finish remain the only semantic implementation.
 use super::*;
 use crate::local_resource_diagnostics::cache_lifecycle::{record, Event};
-use crate::transcript_acquisition::{AuditDebt, Checkpoint, ReadMode, ReadPlan, Scope};
+use crate::transcript_acquisition::{AuditDebt, Checkpoint, FullReason, ReadMode, ReadPlan, Scope};
 use crate::transcript_cache::Retained;
 
 // Cache-only dependency witnesses. A native full reader keeps no extra map;
@@ -453,6 +453,21 @@ impl OwnedJsonlParser {
             }
         }
         let mode = plan.mode();
+        // A proved physical edit supersedes receipt debt and its old graph.
+        // Keep the actual counted edit cause and its already-created byte-zero
+        // plan; returning the old graph here would hold the changed key forever.
+        if matches!(
+            mode,
+            ReadMode::Full(
+                FullReason::Replaced
+                    | FullReason::Shrunk
+                    | FullReason::SameSizeEdit
+                    | FullReason::HeadChanged
+                    | FullReason::BoundaryChanged
+            )
+        ) {
+            taken = None;
+        }
         if preserve
             && matches!(mode, ReadMode::Full(_))
             && taken

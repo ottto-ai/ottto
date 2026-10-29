@@ -35364,9 +35364,17 @@ fn bind_native_chain(
         cache.durable_release_hold(request.source, request.key);
     }
     let custody = &mut completed.durable;
+    if real_edit {
+        custody.take_owed();
+        custody.take_chain();
+    }
     if let Some(mut owed) = custody.owed.take() {
         if custody.ensure_active(cache, request.source, 0).is_ok() {
-            let _ = cache.advance_owed(&mut owed, &completed.checkpoint);
+            let _ = cache.advance_owed(
+                &mut owed,
+                &completed.checkpoint,
+                custody.active.as_mut().expect("lease"),
+            );
             let _ = cache.durable_rebind_chain(
                 custody.active.as_mut().expect("lease"),
                 owed.chain_mut(),
@@ -35407,8 +35415,7 @@ fn bind_native_chain(
         }
         return;
     }
-    let first_read = matches!(request.mode, ReadMode::Full(FullReason::StateMissing))
-        && !request.index.files.contains_key(request.key);
+    let first_read = matches!(request.mode, ReadMode::Full(_));
     let Some(lease) = custody.active.as_mut() else {
         return;
     };

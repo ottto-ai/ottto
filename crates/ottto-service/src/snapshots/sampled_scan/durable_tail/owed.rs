@@ -185,6 +185,9 @@ impl Stores {
 
     /// D3: `digest`'s hold, if any.
     pub(super) fn hold(&self, digest: &store::Digest32) -> Option<&ClaudeHold> {
+        self.hold_proof(digest).filter(|hold| hold.active())
+    }
+    pub(super) fn hold_proof(&self, digest: &store::Digest32) -> Option<&ClaudeHold> {
         self.key_debt
             .get(digest)
             .and_then(|debt| debt.hold.as_ref())
@@ -217,7 +220,10 @@ impl Stores {
     }
     /// Every current D3 hold: a walk of at most `KEY_DEBT_KEYS` nodes.
     pub(super) fn holds(&self) -> impl Iterator<Item = &ClaudeHold> + '_ {
-        self.key_debt.values().filter_map(|debt| debt.hold.as_ref())
+        self.key_debt
+            .values()
+            .filter_map(|debt| debt.hold.as_ref())
+            .filter(|hold| hold.active())
     }
 }
 
@@ -394,6 +400,7 @@ impl SharedCache {
         &self,
         owed: &mut ReceiptOwed,
         checkpoint: &Checkpoint,
+        lease: &mut store::ActiveLease,
     ) -> Result<(), HeldCause> {
         let birth = owed.chain.object().2;
         let old = owed
@@ -409,12 +416,13 @@ impl SharedCache {
         {
             return Err(HeldCause::Incompatible);
         }
-        // Funded in place: the replacement may not exceed the paid copy.
-        if checkpoint_bytes(checkpoint).ok_or(HeldCause::CustodyBound)?
-            > checkpoint_bytes(&owed.checkpoint).ok_or(HeldCause::CustodyBound)?
-        {
-            return Err(HeldCause::CustodyBound);
-        }
+        // Fund the new copy before growth reallocates its sample Vecs. The
+        // old debt's prior-pass lease cannot pay a later Tail's allocation.
+        let bytes = checkpoint_bytes(checkpoint)
+            .ok_or(HeldCause::CustodyBound)?
+            .checked_add(4 * crate::transcript_acquisition::SAMPLE_BYTES as u64)
+            .ok_or(HeldCause::CustodyBound)?;
+        lease.charge(bytes).map_err(|_| HeldCause::CustodyBound)?;
         owed.checkpoint.clone_from(checkpoint);
         owed.candidate = None;
         let ds = durable_source(owed.source()).ok_or(HeldCause::Incompatible)?;
