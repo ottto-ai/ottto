@@ -408,3 +408,21 @@ compare resumed nonzero money and exact emitted bodies with an undamaged control
 and prohibit transcript reads while held and after restoration. The old partial
 view remains unavailable; recovery never clears its flags in place. Writer
 activation remains disabled until the installed-reader release gate is met.
+
+## Reserved future repair filenames
+
+The reader reserves N+1 repair filenames (class L, E7 design) inside the payload
+`.shards` directory: exactly `prior-root-[0-9]{20}-[0-9a-f]{64}.json` and
+`verified-complete.json`. Two prior-root records are tolerated during a crash
+window. These names are opaque: N never opens or validates their contents as
+objects, writes them, or removes them during fresh-init recovery. A directory
+containing only these names does not block the first legacy save and does not
+count as discarded orphan state. A missing previously published root still
+refuses under the existing prior-state guard; these records grant no authority.
+Malformed lookalikes remain unrecognized and refuse fresh-init recovery.
+
+The writer's current-root GC also leaves these names untouched. It does not pin
+objects reachable only from a prior root: a downgrade can lose that future
+restore option while preserving current-root correctness. This reservation
+does not implement retention, restore, an acquisition cause or a repair exit.
+The minimum-N/downgrade-stall release-note requirement above remains binding.

@@ -904,7 +904,10 @@ impl LockedStore {
                     return Ok((None, Root::Missing));
                 }
                 match self.directory(false) {
-                    Ok(_) => bail!("scan_index_root_missing_with_shards"),
+                    Ok(dir) => ensure!(
+                        repair_only_directory(&dir)?,
+                        "scan_index_root_missing_with_shards"
+                    ),
                     Err(e)
                         if e.downcast_ref::<io::Error>()
                             .is_some_and(|e| e.kind() == io::ErrorKind::NotFound) => {}
@@ -1279,6 +1282,13 @@ impl LockedStore {
                     || text == format!("{stem}.lock")
                 {
                     Stamp::capture(&open_at(&self.parent, name, libc::O_RDONLY)?, false)?;
+                } else if text == self.objects_name.to_str()? {
+                    // Recovery may retain N+1's opaque class-L repair files.
+                    // They are not prior-root authority for a fresh legacy save.
+                    ensure!(
+                        repair_only_directory(&self.payload_directory()?)?,
+                        "scan_index_prior_state_requires_repair"
+                    );
                 } else if text.strip_prefix(&temp_prefix).is_some_and(|suffix| {
                     suffix.len() == 32 && suffix.bytes().all(|b| b.is_ascii_hexdigit())
                 }) {
@@ -2489,6 +2499,39 @@ fn visit_storage_directory(
     }
     Ok(())
 }
+/// Reserved N+1 class-L names: opaque to N, never objects or GC candidates.
+/// Equivalent to ^prior-root-[0-9]{20}-[0-9a-f]{64}\.json$ or the fixed marker.
+/// Syntax only: N neither reads their contents nor interprets their generation.
+fn reserved_repair_filename(name: &str) -> bool {
+    if name == "verified-complete.json" {
+        return true;
+    }
+    let Some(stem) = name
+        .strip_prefix("prior-root-")
+        .and_then(|s| s.strip_suffix(".json"))
+    else {
+        return false;
+    };
+    let Some((generation, digest)) = stem.split_once('-') else {
+        return false;
+    };
+    generation.len() == 20 && generation.bytes().all(|b| b.is_ascii_digit()) && valid_digest(digest)
+}
+
+/// Name-only exception for a nonempty directory containing only reserved
+/// repair files. Empty/mixed directories retain their existing missing-root
+/// refusal; prior-root witnesses are still checked by recovery and CAS.
+fn repair_only_directory(dir: &File) -> Result<bool> {
+    let mut any = false;
+    let mut only_reserved = true;
+    visit_storage_directory(dir, |name| {
+        any = true;
+        only_reserved &= name.to_str().is_ok_and(reserved_repair_filename);
+        Ok(())
+    })?;
+    Ok(any && only_reserved)
+}
+
 fn orphan_slot(name: &str) -> Option<(Slot, &str)> {
     let stem = name.strip_suffix(".json")?;
     let (label, digest) = stem.rsplit_once('-')?;
@@ -2606,11 +2649,17 @@ impl LockedStore {
             }
             Err(e) => return Err(e),
         };
+        let mut repair_files = false;
+        let mut orphans = false;
         if let Some(dir) = &dir {
             visit_storage_directory(dir, |name| {
                 let text = name
                     .to_str()
                     .map_err(|_| anyhow::anyhow!("scan_index_orphan_unknown"))?;
+                if reserved_repair_filename(text) {
+                    repair_files = true;
+                    return Ok(());
+                }
                 let file = open_at(dir, name, libc::O_RDONLY)?;
                 let stamp = Stamp::capture(&file, true)?;
                 if let Some((slot, digest)) = orphan_slot(text) {
@@ -2626,27 +2675,37 @@ impl LockedStore {
                 } else {
                     ensure!(owned_payload_temp(text), "scan_index_orphan_unknown");
                 }
+                orphans = true;
                 Ok(())
             })?;
+        }
+        // Opaque repair files alone authorize no deletion and are not a discard.
+        if repair_files && !orphans && !temps {
+            return Ok(());
         }
         // Existing checkpoint flock excludes concurrent index publication.
         if let Some(dir) = dir {
             visit_storage_directory(&dir, |name| {
+                if name.to_str().is_ok_and(reserved_repair_filename) {
+                    return Ok(());
+                }
                 Stamp::capture(&open_at(&dir, name, libc::O_RDONLY)?, true)?;
                 unlink_at(&dir, name)?;
                 Ok(())
             })?;
             dir.sync_all()?;
-            ensure!(
-                unsafe {
-                    libc::unlinkat(
-                        self.parent.as_raw_fd(),
-                        self.objects_name.as_ptr(),
-                        libc::AT_REMOVEDIR,
-                    )
-                } == 0,
-                "scan_index_orphan_directory"
-            );
+            if !repair_files {
+                ensure!(
+                    unsafe {
+                        libc::unlinkat(
+                            self.parent.as_raw_fd(),
+                            self.objects_name.as_ptr(),
+                            libc::AT_REMOVEDIR,
+                        )
+                    } == 0,
+                    "scan_index_orphan_directory"
+                );
+            }
         } else if !temps {
             return Ok(());
         }
@@ -2682,4 +2741,45 @@ pub(crate) fn with_available_space_for_test<T>(limit: u128, operation: impl FnOn
     }
     let _restore = Restore(TEST_AVAILABLE_SPACE.with(|value| value.replace(limit)));
     operation()
+}
+
+#[cfg(test)]
+mod repair_filename_tests {
+    use super::*;
+
+    #[test]
+    fn repair_names_are_exact_and_disjoint_from_slots_and_temps() {
+        let digest = "a".repeat(64);
+        let prior = format!("prior-root-00000000000000000007-{digest}.json");
+        for name in [prior.as_str(), "verified-complete.json"] {
+            assert!(reserved_repair_filename(name));
+            assert!(orphan_slot(name).is_none());
+            assert!(!owned_payload_temp(name));
+        }
+        for bad in [
+            format!("prior-root-{}-{digest}.json", "0".repeat(19)),
+            format!("prior-root-{}-{digest}.json", "0".repeat(21)),
+            format!("prior-root-0000000000000000000x-{digest}.json"),
+            format!("prior-root-00000000000000000007-{}.json", "a".repeat(63)),
+            format!("prior-root-00000000000000000007-{}.json", "a".repeat(65)),
+            format!("prior-root-00000000000000000007-{}.json", "A".repeat(64)),
+            format!("{prior}.tmp"),
+            format!("./{prior}"),
+            format!("x{prior}"),
+            prior.replace(".json", ".JSON"),
+            "verified-complete.json.tmp".into(),
+            "verified-complete.JSON".into(),
+            "./verified-complete.json".into(),
+        ] {
+            assert!(!reserved_repair_filename(&bad), "{bad}");
+        }
+        assert!(!Slot::Metadata.label().starts_with("prior-root-"));
+        for field in Field::all() {
+            for bucket in 0..=255 {
+                assert!(!Slot::Bucket { field, bucket }
+                    .label()
+                    .starts_with("prior-root-"));
+            }
+        }
+    }
 }

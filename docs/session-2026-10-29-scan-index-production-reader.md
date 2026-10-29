@@ -41,3 +41,13 @@ fixture now does the same, stamps that revision, and reproduces the revision-0
 veto on the same emitted body as a negative witness. All exact nonzero money,
 body/manifest equality and zero-transcript-read assertions remain. Runtime
 qualification must use final-head CI; no tests were run locally.
+
+Round 11 reserves the exact N+1 prior-root and verified-complete filenames as
+opaque local repair state. Fresh-init cleanup keeps them and their directory,
+without object validation, and admits the first legacy save when only those
+names remain. Previously seen-root guards and malformed-name refusal remain.
+Complete/UNKNOWN loads, two prior roots, recovery preservation and native layout
+requirements are covered by compiled fixtures; no local tests were run. The
+writer inherits the reader and excludes these names from GC without pinning
+prior-only payloads. No repair behavior or release gate is enabled by reserving
+names; the round-10 source health and repair hold remain unchanged.

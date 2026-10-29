@@ -339,3 +339,187 @@ fn future_representation_version_is_classified_for_the_health_adapter() {
         root[field] = old;
     }
 }
+
+fn future_repair_files(s: &Scratch) -> Vec<(PathBuf, Vec<u8>)> {
+    // Two prior roots model the N+1 crash window. Invalid JSON / non-object
+    // modes prove N treats this class L as opaque, never as payload authority.
+    let dir = s.0.join("scan-index.json.shards");
+    [
+        format!("prior-root-00000000000000000005-{}.json", "a".repeat(64)),
+        format!("prior-root-00000000000000000006-{}.json", "b".repeat(64)),
+        "verified-complete.json".into(),
+    ]
+    .into_iter()
+    .map(|name| {
+        let path = dir.join(name);
+        let bytes = b"opaque future repair state, not a payload".to_vec();
+        fs::write(&path, &bytes).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        (path, bytes)
+    })
+    .collect()
+}
+fn assert_repair_files_kept(files: &[(PathBuf, Vec<u8>)]) {
+    for (path, bytes) in files {
+        assert_eq!(fs::read(path).unwrap(), *bytes);
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+    }
+}
+
+#[test]
+fn reader_future_repair_files_leave_complete_and_each_unknown_map_unchanged() {
+    for map in 0..3 {
+        let control = Scratch::new();
+        let candidate = Scratch::new();
+        let logical = control.install();
+        candidate.install();
+        let files = future_repair_files(&candidate);
+        let control_store = control.store(&logical);
+        let candidate_store = candidate.store(&logical);
+        let complete = |store: &LockedStore| {
+            let Opened::Sharded(mut reader, root) = store.open().unwrap() else {
+                panic!("complete fixture");
+            };
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).unwrap();
+            (root.generation(), bytes)
+        };
+        assert_eq!(complete(&control_store), complete(&candidate_store));
+        let fixture = Scratch::fixture();
+        let root: Value = serde_json::from_str(fixture["root"].as_str().unwrap()).unwrap();
+        let object = &root["objects"][map + 1];
+        let name = format!(
+            "{}-{:02x}-{}.json",
+            ["account", "usage", "census"][map],
+            object["slot"]["bucket"].as_u64().unwrap(),
+            object["digest"].as_str().unwrap()
+        );
+        for s in [&control, &candidate] {
+            fs::write(s.0.join("scan-index.json.shards").join(&name), b"{damaged}").unwrap();
+        }
+        let partial = |store: &LockedStore| {
+            let Opened::Partial(mut view, root) = store.open().unwrap() else {
+                panic!("UNKNOWN fixture");
+            };
+            let mut metadata = Vec::new();
+            view.metadata.read_to_end(&mut metadata).unwrap();
+            let mut states = Vec::new();
+            for availability in view.maps {
+                states.push(match availability {
+                    MapAvailability::Known(mut reader) => {
+                        let mut bytes = Vec::new();
+                        reader.read_to_end(&mut bytes).unwrap();
+                        (None, Some(bytes))
+                    }
+                    MapAvailability::Unknown(unavailable) => (Some(unavailable), None),
+                });
+            }
+            assert_eq!(states[map].0.unwrap().cause, UnavailableCause::Digest);
+            assert_eq!(states.iter().filter(|s| s.0.is_some()).count(), 1);
+            (root.generation(), metadata, states)
+        };
+        assert_eq!(partial(&control_store), partial(&candidate_store));
+        assert_repair_files_kept(&files);
+    }
+}
+
+#[test]
+fn reader_fresh_orphan_cleanup_keeps_repair_files_and_allows_legacy_first_save() {
+    let s = Scratch::new();
+    let mut logical = s.install();
+    fs::remove_file(s.root()).unwrap(); // no root has ever been observed
+    let files = future_repair_files(&s);
+    let store = s.store(&logical);
+    let Opened::Missing(root) = store.open().unwrap() else {
+        panic!("fresh init");
+    };
+    assert_eq!(store.take_read_stats().scanindex_orphan_init_discarded, 1);
+    assert_repair_files_kept(&files);
+    assert_eq!(
+        fs::read_dir(s.0.join("scan-index.json.shards"))
+            .unwrap()
+            .count(),
+        3
+    );
+    assert!(matches!(store.open().unwrap(), Opened::Missing(_)));
+    assert_eq!(store.take_read_stats().scanindex_orphan_init_discarded, 0);
+    logical["generation"] = serde_json::json!(1);
+    let published = store
+        .write_legacy(&root, 1, |out| {
+            serde_json::to_writer(out, &logical)?;
+            Ok(())
+        })
+        .unwrap();
+    assert!(published.is_legacy());
+    assert_repair_files_kept(&files);
+}
+
+#[test]
+fn reader_malformed_repair_lookalikes_still_refuse_fresh_init_without_cleanup() {
+    for name in [
+        format!("prior-root-{}-{}.json", "0".repeat(19), "a".repeat(64)),
+        format!("prior-root-{}-{}.json", "0".repeat(20), "a".repeat(63)),
+        "verified-complete.json.extra".into(),
+    ] {
+        let s = Scratch::new();
+        let logical = s.install();
+        fs::remove_file(s.root()).unwrap();
+        let files = future_repair_files(&s);
+        let dir = s.0.join("scan-index.json.shards");
+        let bad = dir.join(name);
+        fs::write(&bad, b"unknown").unwrap();
+        fs::set_permissions(&bad, fs::Permissions::from_mode(0o600)).unwrap();
+        let before = fs::read_dir(&dir).unwrap().count();
+        let store = s.store(&logical);
+        let error = match store.open() {
+            Err(e) => e,
+            Ok(_) => panic!("lookalike admitted"),
+        };
+        assert!(format!("{error:#}").contains("scan_index_orphan_unknown"));
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), before);
+        assert_repair_files_kept(&files);
+    }
+}
+
+#[test]
+fn reader_reserved_repair_files_do_not_waive_a_missing_previously_seen_root() {
+    let s = Scratch::new();
+    let logical = s.install();
+    let store = s.store(&logical);
+    assert!(matches!(store.open().unwrap(), Opened::Sharded(_, _)));
+    let files = future_repair_files(&s);
+    fs::remove_file(s.root()).unwrap();
+    let error = match s.store(&logical).open() {
+        Err(e) => e,
+        Ok(_) => panic!("prior state reset"),
+    };
+    assert!(format!("{error:#}").contains("scan_index_prior_state_requires_repair"));
+    assert_repair_files_kept(&files);
+}
+
+#[test]
+fn reader_reserved_directory_cas_refuses_intervening_nonrepair_state() {
+    let s = Scratch::new();
+    let logical = s.install();
+    fs::remove_file(s.root()).unwrap();
+    let files = future_repair_files(&s);
+    let store = s.store(&logical);
+    let Opened::Missing(root) = store.open().unwrap() else {
+        panic!("fresh init");
+    };
+    let pending =
+        s.0.join("scan-index.json.shards")
+            .join(format!(".tmp-{}", "0".repeat(32)));
+    fs::write(&pending, b"intervening state").unwrap();
+    fs::set_permissions(&pending, fs::Permissions::from_mode(0o600)).unwrap();
+    let error = store
+        .write_legacy(&root, 1, |_| panic!("CAS must refuse before encoding"))
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("scan_index_root_missing_with_shards"));
+    assert!(!s.root().exists());
+    assert_eq!(fs::read(pending).unwrap(), b"intervening state");
+    assert_repair_files_kept(&files);
+}
