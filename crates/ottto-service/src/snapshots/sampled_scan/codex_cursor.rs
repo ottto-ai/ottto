@@ -1321,15 +1321,10 @@ thread_local! {
     static MAIN_VIEW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// U1a-2a (R2-B3): `bound(value, limit)` as main measures it, with any
-/// suspended proof charged as empty, mirroring `state_for_main`. Copy
-/// measures also leave optional header facts out. One walk under the same `try_lock` discipline as
-/// `bound` (a busy lock still reads as unbounded). Main's copy budget
-/// measures this, so optional proof work never shrinks it; main's
-/// admission and insert retire the proof where its room is needed
-/// (`admit_locked`, ss-6). Copy/shape-F allocation uses the existing
-/// `retire_proof_beside_copy` edge to release optional headers before spending
-/// this view's room. Non-allocating steps retain them.
+/// Main copy view: omit suspended proof and optional header facts, retaining
+/// the usual lock/visit refusal. `copy_budget_step` reclaims headers beside
+/// active progress; `retire_proof_beside_copy` reclaims optional bytes before
+/// copying/shape-F allocation. Measuring alone grants no allocation authority.
 pub(in crate::snapshots) fn bound_for_main<T: HeapLayoutBound>(
     value: &T,
     limit: usize,
@@ -4293,6 +4288,18 @@ impl SharedCache {
             .checked_sub(live_bytes_in)
             .and_then(|room| room.checked_sub(super::side_ledger::SIDE_LEDGER_BYTES));
         self.with_cursor(|cursor| drop_suspended_proof_over(retained, cursor, 0, budget));
+    }
+
+    pub(super) fn retire_headers_over_room(&self, room: usize) {
+        let Ok(_retained) = self.retained() else {
+            return;
+        };
+        self.with_cursor(|cursor| {
+            let bytes = cursor.headers.optional_bytes();
+            if bytes.map_or(true, |bytes| bytes > room) {
+                cursor.headers.clear();
+            }
+        });
     }
 
     /// U1a-2a (R2-B3, r79, fix round 2 DB1): where main allocates against

@@ -1130,6 +1130,9 @@ pub(super) fn copy_budget_step(
     let room = remaining
         .zip(used)
         .and_then(|(remaining, used)| remaining.checked_sub(used));
+    if let Some(room) = room {
+        context.cache.retire_headers_over_room(room);
+    }
     let budget = room.map_or(0, |room| room / 2);
     (
         budget,

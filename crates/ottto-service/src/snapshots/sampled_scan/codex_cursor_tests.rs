@@ -10779,6 +10779,19 @@ fn header_facts_never_shrink_the_main_copy_budget_and_yield_before_allocation() 
         .with_cursor(|cursor| cursor.headers.optional_bytes().unwrap())
         .unwrap();
     assert!(bytes > 0);
+    cache.retire_headers_over_room(bytes);
+    assert_eq!(
+        cache
+            .with_cursor(|cursor| cursor.headers.optional_bytes().unwrap())
+            .unwrap(),
+        bytes
+    );
+    cache.retire_headers_over_room(bytes - 1);
+    assert!(cache
+        .with_cursor(|cursor| cursor.headers.is_empty())
+        .unwrap());
+    let refreshed = codex_file_join::header_cache_tests::page(&root, &paths, &cache);
+    assert_eq!((refreshed.reuse_misses, refreshed.reuse_evictions), (2, 2));
     let context = main_context(&cache);
     let (budget, step) = super::super::copy_budget_step(Some(&context), None, true);
     assert!(budget > 0 && budget < super::super::ENTRY_BYTES);
