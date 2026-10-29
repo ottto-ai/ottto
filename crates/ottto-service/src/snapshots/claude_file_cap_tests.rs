@@ -322,7 +322,7 @@ fn measured_child(root: PathBuf, requests: u64, bytes: u64) {
             "phys_footprint_before_bytes":before.0,"phys_footprint_after_bytes":after.0,
             "phys_footprint_peak_bytes":after.1,"peak_rss_bytes":rss,
             "native_parse_and_finalize":true,"artifacts_enabled":false,"curve_enabled":true,
-            "request_identity_capture":claude_request_identity::capture_by_default()
+            "request_identity_capture":true
         })
     );
 }
