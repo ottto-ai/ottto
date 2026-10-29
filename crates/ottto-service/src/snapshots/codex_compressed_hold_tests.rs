@@ -2524,8 +2524,9 @@ fn historical_census_saved_singleton_schedules_a1_on_reupgrade() {
             false,
             false,
         );
-        scan.index.archive_pass.power = false; // deterministic permission denial on every host
-                                               // A real activated discovery construction, not a typed decoder fixture.
+        // A real activated discovery construction, with deterministic permission
+        // denial rather than a dependency on the host's current power state.
+        scan.index.archive_pass.power = false;
         for _ in 0..100 {
             if scan
                 .identified_candidates
@@ -2549,7 +2550,7 @@ fn historical_census_saved_singleton_schedules_a1_on_reupgrade() {
             CandidateDecision::Parse
         );
         assert!(
-            scan.index.files.get(&key).is_none(),
+            !scan.index.files.contains_key(&key),
             "new object: A1, no fabricated protection"
         );
         assert!(
