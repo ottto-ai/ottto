@@ -718,94 +718,139 @@ mod tests {
         refused(&restored, Refusal::RetryCarryB3);
     }
 
+    fn b1_refuses(index: &ScanIndex, expected: Refusal) {
+        assert_eq!(body_decision(index).unwrap_err(), expected);
+        refused(index, expected);
+    }
+    fn quarantine_entity(index: &mut ScanIndex, disposition: SnapshotQuarantineDisposition) {
+        index.quarantined_snapshot_fingerprints.insert(
+            "1".repeat(64),
+            SnapshotQuarantineRecord {
+                reconstruction_contract: terminal_contract_retry::legacy_contract(),
+                contract_retry_claims: None,
+                witness: snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+                retry_after_unix_seconds: 0,
+                upload_body_witness: Some("3".repeat(64)),
+                failed_reconstruction_count: 1,
+                disposition,
+            },
+        );
+    }
     #[test]
-    fn b1_body_ack_exclusions_are_refused() {
-        for case in [
-            "not_stored",
-            "partial",
-            "lost",
-            "refusal",
-            "quarantined",
-            "unequal_set",
-            "no_body",
-            "malformed_body",
-            "no_usage_proof",
-            "changed_occurrence",
-        ] {
-            let mut index = fixture();
-            let expected = match case {
-                // Transport hold_unstored_body excludes this entity from the
-                // accepted ledger, even if it was offered alongside stored ones.
-                "not_stored" | "partial" => {
-                    index.accepted_snapshot_fingerprints.remove(&"2".repeat(64));
-                    Refusal::Unaccepted
-                }
-                "lost" => {
-                    index.accepted_snapshot_fingerprints.clear();
-                    Refusal::Unaccepted
-                }
-                "refusal" | "quarantined" => {
-                    index.quarantined_snapshot_fingerprints.insert(
-                        "1".repeat(64),
-                        SnapshotQuarantineRecord {
-                            reconstruction_contract: terminal_contract_retry::legacy_contract(),
-                            contract_retry_claims: None,
-                            witness: snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
-                            retry_after_unix_seconds: 0,
-                            upload_body_witness: Some("3".repeat(64)),
-                            failed_reconstruction_count: 1,
-                            disposition: if case == "refusal" {
-                                SnapshotQuarantineDisposition::UnprovenTerminal
-                            } else {
-                                SnapshotQuarantineDisposition::RetryPending
-                            },
-                        },
-                    );
-                    Refusal::Unaccepted
-                }
-                "unequal_set" => {
-                    // Every new entity is ACKed, but the file's committed head
-                    // binds the earlier set. ACK membership alone is insufficient.
-                    index
-                        .file_snapshot_fingerprints
-                        .get_mut(KEY)
-                        .unwrap()
-                        .insert("5".repeat(64));
-                    index.accepted_snapshot_fingerprints.insert("5".repeat(64));
-                    Refusal::Unaccepted
-                }
-                "no_body" => {
-                    index.files.get_mut(KEY).unwrap().last_upload_body_witness = None;
-                    Refusal::Unaccepted
-                }
-                "malformed_body" => {
-                    index.files.get_mut(KEY).unwrap().last_upload_body_witness =
-                        Some("unbound".into());
-                    Refusal::Unaccepted
-                }
-                "no_usage_proof" => {
-                    index.claude_usage_family_witnesses.clear();
-                    Refusal::UsageProof
-                }
-                "changed_occurrence" => {
-                    index
-                        .claude_usage_family_pending
-                        .get_mut(ROOT)
-                        .unwrap()
-                        .member_occurrences
-                        .get_mut(ROOT)
-                        .unwrap()
-                        .values_mut()
-                        .next()
-                        .unwrap()
-                        .output_tokens += 1;
-                    Refusal::UsageProof
-                }
-                _ => unreachable!(),
-            };
-            assert_eq!(body_decision(&index).unwrap_err(), expected, "{case}");
-            refused(&index, expected);
-        }
+    fn b1_refuses_not_stored() {
+        // Transport hold_unstored_body excludes this entity from the accepted
+        // ledger, even if it was offered alongside stored ones.
+        let mut index = fixture();
+        index.accepted_snapshot_fingerprints.remove(&"2".repeat(64));
+        b1_refuses(&index, Refusal::Unaccepted);
+    }
+    #[test]
+    fn b1_refuses_partial_entity_set_digest_mismatch() {
+        // Every entity is stored and ACKed, but the committed head digest
+        // binds only part of the file's entity set.
+        let mut index = fixture();
+        index.files.get_mut(KEY).unwrap().last_snapshot_fingerprint = Some(codex_digest_hex(
+            &snapshot_file_entity_set_digest(&BTreeSet::from(["1".repeat(64)])),
+        ));
+        assert!(index.file_snapshot_fingerprints[KEY]
+            .iter()
+            .all(|entity| index.accepted_snapshot_fingerprints.contains(entity)));
+        b1_refuses(&index, Refusal::Unaccepted);
+    }
+    #[test]
+    fn b1_refuses_lost() {
+        let mut index = fixture();
+        index.accepted_snapshot_fingerprints.clear();
+        b1_refuses(&index, Refusal::Unaccepted);
+    }
+    #[test]
+    fn b1_refuses_permanent_refusal() {
+        let mut index = fixture();
+        quarantine_entity(&mut index, SnapshotQuarantineDisposition::UnprovenTerminal);
+        b1_refuses(&index, Refusal::Unaccepted);
+    }
+    #[test]
+    fn b1_refuses_quarantined() {
+        let mut index = fixture();
+        quarantine_entity(&mut index, SnapshotQuarantineDisposition::RetryPending);
+        b1_refuses(&index, Refusal::Unaccepted);
+    }
+    #[test]
+    fn b1_refuses_unequal_entity_set() {
+        // Every new entity is ACKed, but the file's committed head binds the
+        // earlier set. ACK membership alone is insufficient.
+        let mut index = fixture();
+        index
+            .file_snapshot_fingerprints
+            .get_mut(KEY)
+            .unwrap()
+            .insert("5".repeat(64));
+        index.accepted_snapshot_fingerprints.insert("5".repeat(64));
+        b1_refuses(&index, Refusal::Unaccepted);
+    }
+    #[test]
+    fn b1_refuses_decode_held() {
+        // A family file slot that decoded only leniently is an opaque hold:
+        // nothing about that family's accepted body may be concluded.
+        let mut index = fixture();
+        // Fund the hold metadata with unrelated committed state, as the
+        // lenient decode tests do.
+        let funding = (0..128)
+            .map(|n| format!("{:064x}", 0x10000 + n))
+            .collect::<BTreeSet<_>>();
+        index.files.insert(
+            "/synthetic/funding.jsonl".into(),
+            crate::snapshots::tests::manifest_index_entry(Some(&codex_digest_hex(
+                &snapshot_file_entity_set_digest(&funding),
+            ))),
+        );
+        index
+            .accepted_snapshot_fingerprints
+            .extend(funding.iter().cloned());
+        index
+            .file_snapshot_fingerprints
+            .insert("/synthetic/funding.jsonl".into(), funding);
+        let mut wire = serde_json::to_value(&index).unwrap();
+        wire["files"][KEY]["size_bytes"] = json!([]);
+        let loaded =
+            crate::snapshots::lenient_decode::read_bounded(&serde_json::to_vec(&wire).unwrap())
+                .expect("lenient decode holds the damaged slot");
+        assert!(loaded.decode_holds_family(ROOT));
+        refused(&loaded, Refusal::DecodeHold);
+    }
+    #[test]
+    fn b1_refuses_no_body() {
+        let mut index = fixture();
+        index.files.get_mut(KEY).unwrap().last_upload_body_witness = None;
+        b1_refuses(&index, Refusal::Unaccepted);
+    }
+    #[test]
+    fn b1_refuses_malformed_body() {
+        let mut index = fixture();
+        index.files.get_mut(KEY).unwrap().last_upload_body_witness = Some("unbound".into());
+        b1_refuses(&index, Refusal::Unaccepted);
+    }
+    #[test]
+    fn b1_refuses_no_usage_proof() {
+        let mut index = fixture();
+        index.claude_usage_family_witnesses.clear();
+        b1_refuses(&index, Refusal::UsageProof);
+    }
+    #[test]
+    fn b1_refuses_changed_occurrence() {
+        let mut index = fixture();
+        index
+            .claude_usage_family_pending
+            .get_mut(ROOT)
+            .unwrap()
+            .member_occurrences
+            .get_mut(ROOT)
+            .unwrap()
+            .values_mut()
+            .next()
+            .unwrap()
+            .output_tokens += 1;
+        b1_refuses(&index, Refusal::UsageProof);
     }
 
     #[test]
