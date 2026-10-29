@@ -1769,6 +1769,7 @@ mod absence_parent_counts_tests {
                     scanned_files: 0,
                     semantic_noops: 0,
                     sampled_acquisition: None,
+                    full_causes: Default::default(),
                 },
             )
         });

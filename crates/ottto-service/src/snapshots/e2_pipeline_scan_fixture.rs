@@ -7,10 +7,8 @@ use crate::transcript_acquisition::Scope;
 fn durable_binding(source: SnapshotSource) -> (Scope, bool) {
     match source {
         SnapshotSource::ClaudeCode => (Scope("e2-pipeline".into()), CLAUDE_IDENTITY_CAPTURE),
-        _ => (
-            Scope("money-equivalence".into()),
-            claude_request_identity::capture_by_default(),
-        ),
+        // Outside a sync cycle every scan captures (also in tests).
+        _ => (Scope("money-equivalence".into()), true),
     }
 }
 const CLAUDE_IDENTITY_CAPTURE: bool = false;

@@ -43,6 +43,11 @@ fn main() {
             .file("src/legacy_service_shim.m")
             .flag("-fobjc-arc")
             .compile("ottto_legacy_service_shim");
+        cc::Build::new()
+            .file("src/power_shim.m")
+            .flag("-fobjc-arc")
+            .compile("ottto_power_shim");
+        println!("cargo:rustc-link-lib=framework=IOKit");
         println!("cargo:rustc-link-lib=framework=Foundation");
         println!("cargo:rustc-link-lib=framework=ServiceManagement");
     }

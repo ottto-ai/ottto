@@ -78,7 +78,7 @@ pub(super) fn record(
         // It may have shrunk between discovery's stat and this no-follow
         // sample. Leave that sighting on ordinary recovery, so a small-file
         // marker cannot suppress the parse that is now possible.
-        if size <= MAX_JSONL_FILE_BYTES {
+        if size <= MAX_CLAUDE_JSONL_FILE_BYTES {
             return;
         }
         let key = path_hash(path);
@@ -164,7 +164,7 @@ pub(super) fn retry_changed(traversal: &mut ScanTraversalCheckpoint, collected_a
             continue;
         }
         changed = true;
-        if size > MAX_JSONL_FILE_BYTES {
+        if size > MAX_CLAUDE_JSONL_FILE_BYTES {
             // Retried this file's discovery cap, with the new content witness.
             traversal
                 .oversized_discovery

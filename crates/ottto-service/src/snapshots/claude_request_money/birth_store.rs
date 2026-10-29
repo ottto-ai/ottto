@@ -283,25 +283,6 @@ impl BirthStore {
             (Err(i), marks) => self.2.paths.insert(i, (key, marks)),
         }
     }
-    /// Set or clear one mark of a path, keeping its other marks.
-    pub(crate) fn set_money_mark(&mut self, path: &str, mark: u8, on: bool) {
-        let marks = self.money_marks(location_key(path));
-        self.set_money_marks(path, if on { marks | mark } else { marks & !mark });
-    }
-    /// Paths carrying `mark`.
-    pub(crate) fn money_mark_count(&self, mark: u8) -> u64 {
-        self.2.paths.iter().filter(|m| m.1 & mark != 0).count() as u64
-    }
-    /// E3 permit bit: it describes the stamped body of the entry a save
-    /// keeps, so a restored entry takes the committed table's bit.
-    pub(crate) fn restore_permit_mark(&mut self, path: &str, committed: &Self) {
-        if self.2.paths.is_empty() && committed.2.paths.is_empty() {
-            return;
-        }
-        let mark = super::claude_request_money::e2::money_mark::STAMPED_WITHOUT_PERMIT;
-        let on = committed.money_marks(location_key(path)) & mark != 0;
-        self.set_money_mark(path, mark, on);
-    }
     /// Keep only marks of the given (indexed) paths.
     pub(crate) fn retain_money_marks(&mut self, live: &[LocationKey]) {
         self.2
@@ -539,17 +520,11 @@ impl BirthStore {
     }
     /// Observations survive partial/held save restoration independently of ACKs.
     pub(crate) fn preserve_missing_from(&mut self, previous: &Self) {
-        // A mark only adds a re-read later; keep the newer version. The
-        // permit bit is never revived here: it follows the kept entry
-        // (`restore_permit_mark`), so a consumed bit stays consumed.
+        // A mark only adds a re-read later; keep the newer version.
         self.2.version = self.2.version.max(previous.2.version);
-        let permit = super::claude_request_money::e2::money_mark::STAMPED_WITHOUT_PERMIT;
         for &(key, marks) in &previous.2.paths {
-            if marks & !permit == 0 {
-                continue;
-            }
             if let Err(i) = self.2.paths.binary_search_by_key(&key, |m| m.0) {
-                self.2.paths.insert(i, (key, marks & !permit));
+                self.2.paths.insert(i, (key, marks));
             }
         }
         for old in &previous.0 {

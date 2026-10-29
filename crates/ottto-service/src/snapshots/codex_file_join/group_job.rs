@@ -106,6 +106,7 @@ pub(in crate::snapshots) fn job_key(group: &Group) -> String {
 pub(in crate::snapshots) fn refusal_disclosure(owner: &str) -> cursor::Disclosure {
     cursor::Disclosure {
         reason: cursor::DebtReason::HeldTerminal,
+        cause: ownership::GROUP,
         ownership_incomplete_file_count: 1,
         zero_snapshot_usage_evidence: false,
         state_only_blocked_session_ids: vec![owner.to_owned()],
@@ -122,6 +123,7 @@ pub(in crate::snapshots) fn refusal_disclosure(owner: &str) -> cursor::Disclosur
 fn probe_order_disclosure(owner: &str) -> cursor::Disclosure {
     cursor::Disclosure {
         reason: cursor::DebtReason::ProbeBudgetOrder,
+        cause: ownership::GROUP,
         ownership_incomplete_file_count: 0,
         zero_snapshot_usage_evidence: false,
         state_only_blocked_session_ids: vec![owner.to_owned()],
@@ -172,6 +174,7 @@ pub(in crate::snapshots) fn disclose_strict(
     targets: DisclosureTargets<'_>,
 ) {
     targets.census.ownership_incomplete_file_count += members.len();
+    targets.census.causes.add(ownership::GROUP, members.len());
     targets
         .census
         .record_unreadable(UnreadableCause::AliasParser, 1);
@@ -1007,6 +1010,9 @@ fn member_eof(
             Err(_) => return Err(GroupEnd::Strict),
         }
     }
+    #[cfg(test)]
+    crate::snapshots::sampled_scan::codex_cursor::tests::GROUP_EOF_APPLIED
+        .with(|v| v.set(v.get() + 1));
     if last && paged {
         apply_live_eof_record(active);
     }

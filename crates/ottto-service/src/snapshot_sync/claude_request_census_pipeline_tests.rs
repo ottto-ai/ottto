@@ -19,6 +19,8 @@ fn census_pipeline_window(census_window_end: &str) -> u64 {
 #[test]
 #[serial(source_manifests)]
 fn census_records_keep_the_held_revision_and_cover_it_in_window() {
+    // Subject: the legacy account path contract 5 now leaves to untagged bodies.
+    let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = PipelineFixture::new("claude-census-records-held");
     let baseline = fixture.baseline();
@@ -333,7 +335,6 @@ fn census_pre_hold_bodies(
         SnapshotSource::ClaudeCode,
         &mut scan,
         &mut index,
-        true,
         |item| {
             effective_snapshot_upload_body_witness(
                 item,
