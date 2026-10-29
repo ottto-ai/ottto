@@ -200,3 +200,22 @@ and census flags with one queue walk, avoiding quadratic deferred-tail work.
 New portable fixtures cover joined Codex aliases and a synthetic post-policy
 multi-entity file above the normal aggregate wire allowance, in addition to
 the cold eight-file scan across more than three pages.
+
+Ordinary joined Codex groups are prioritized before the preparation loop spends
+its file allowance; prioritizing only the admitted queue was too late. Existing
+own-page and census-member order remains inside each class. The joined-group
+read-budget fixture now uses a three-file cap for two two-member groups, so it
+also covers early file-limit deferral. A context cursor is charged prior ordinary
+native reads before taking cursor room. Rearm wire bytes count a shared logical
+entity once even when several physical aliases receive receipts.
+
+The conservative wire reservation is1,969,161 B per entity, so an ordinary
+one-entity context file generally takes one otherwise-empty pass. At a hypothetical
+five-minute pass cadence, the measured4305/12261-entity cohorts imply roughly
+14.95/42.57 days of normal pages before ordinary traffic, holds or cursor pacing.
+These are sizing scenarios, not measured completion forecasts. Aliases share an
+entity reservation and oversized logical units retain the explicit alone-pass
+exception. This replaces the historical byte-throughput timing scenario; measured
+wire totals remain estimates from recent POST traffic. Runtime fixtures are run
+in Linux CI, never locally; local validation uses the serialized all-target clippy
+wrapper. No macOS-gated tests were touched.
