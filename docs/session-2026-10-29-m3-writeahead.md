@@ -160,3 +160,12 @@ At the future E2 B/C composition seam, discovery must use one union of
 `DiscoveryRecovery` and `DiscoveryRetention` at directory traversal, retained
 rosters, candidates, opened descriptors, parent windows and absence retirement.
 Both archive retention and M3 receipt/hold obligations must survive that union.
+
+The portable unsupported-layout qualification also reads a genuinely lossy
+transcript against an existing native record carrying #865 debt. It requires
+positive usage and cold semantic/additive equivalence, preserves the record
+when its index debt carrier is missing, and verifies that a failed unlink
+neither changes A nor increments retirement. After the carrier is saved and
+unlink succeeds, restart must retain the debt in the index. This fixture uses
+the production read-settlement and GC paths; it does not qualify the separate
+supported-layout native class-transition matrix.
