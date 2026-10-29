@@ -794,6 +794,8 @@ mod tests {
             unsafe { usage.assume_init() }
         }
         fn cpu_us(usage: &libc::rusage) -> i64 {
+            // i32 on macOS, i64 on Linux.
+            #[allow(clippy::useless_conversion)]
             let micros = |time: libc::timeval| time.tv_sec * 1_000_000 + i64::from(time.tv_usec);
             micros(usage.ru_utime) + micros(usage.ru_stime)
         }
