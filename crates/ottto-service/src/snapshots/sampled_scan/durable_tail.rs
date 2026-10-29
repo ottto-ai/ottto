@@ -73,6 +73,7 @@ pub(crate) struct Counters {
     pub(crate) retail_attempts: u64,
     pub(crate) retail_keys: u64,
     pub(crate) retail_full: [u64; 3],
+    pub(crate) stale_full: [u64; 3],
     pub(crate) missing: u64,
     pub(crate) upgrade_state_missing: u64,
     pub(crate) refused_record: u64,
@@ -193,7 +194,7 @@ struct Slot {
     /// old_binding_no_match].
     held: u64,
     old_binding_no_match: u64,
-    reported: [u64; 9],
+    reported: [u64; 12],
 }
 
 /// Process-lifetime durable state beside the RAM cache.
@@ -747,6 +748,38 @@ impl SharedCache {
         accepted_end: u64,
         now: std::time::Instant,
     ) -> bool {
+        self.paced_full(key, file, accepted_end, now, None)
+    }
+
+    pub(crate) fn stale_full(
+        &self,
+        key: &str,
+        file: &File,
+        accepted: Option<AcceptedFloor>,
+        reason: &str,
+    ) -> bool {
+        let Some(a) =
+            accepted.filter(|a| a.revision <= effective_revision(SnapshotSource::ClaudeCode))
+        else {
+            return false;
+        };
+        let cause = match reason {
+            "context" => 0,
+            "restore_semantics" => 1,
+            "revision_adoption_required" => 2,
+            _ => return false,
+        };
+        self.paced_full(key, file, a.end, std::time::Instant::now(), Some(cause))
+    }
+
+    fn paced_full(
+        &self,
+        key: &str,
+        file: &File,
+        accepted_end: u64,
+        now: std::time::Instant,
+        cause: Option<usize>,
+    ) -> bool {
         if !file.metadata().is_ok_and(|m| m.len() > accepted_end) {
             return false;
         }
@@ -762,7 +795,11 @@ impl SharedCache {
         });
         let key = store::key_digest(DurableSource::ClaudeCode, key);
         if stores.retail_full_at.contains_key(&key) {
-            stores.counters.retail_full[1] += 1;
+            if cause.is_none() {
+                stores.counters.retail_full[1] += 1;
+            } else {
+                Counters::bump(&mut stores.counters.ineligible, "stale_full.paced");
+            }
             return false;
         }
         if stores.retail_full_at.len() < 2 * store::MAX_RECORDS
@@ -771,9 +808,20 @@ impl SharedCache {
         {
             stores.retail_full_at.insert(key, now);
         } else {
-            stores.counters.retail_full[2] += 1;
+            if cause.is_none() {
+                stores.counters.retail_full[2] += 1;
+            } else {
+                Counters::bump(
+                    &mut stores.counters.ineligible,
+                    "stale_full.pacing_overflow",
+                );
+            }
         }
-        stores.counters.retail_full[0] += 1;
+        if let Some(cause) = cause {
+            stores.counters.stale_full[cause] += 1;
+        } else {
+            stores.counters.retail_full[0] += 1;
+        }
         true
     }
 
@@ -821,7 +869,7 @@ impl SharedCache {
                 identity_capture,
                 held: 0,
                 old_binding_no_match: 0,
-                reported: [0; 9],
+                reported: [0; 12],
             });
         }
     }
@@ -1129,6 +1177,10 @@ impl SharedCache {
         let (checkpoint, reduction, receipt) = match restored {
             Ok(restored) => restored,
             Err(class) => {
+                let transient = matches!(
+                    &class,
+                    Failure::NotRederived(Refuse::NotRederivable("descriptor"))
+                );
                 let counters = &mut stores.counters;
                 match class {
                     Failure::Ineligible(reason) => {
@@ -1145,7 +1197,11 @@ impl SharedCache {
                 return if source == DurableSource::ClaudeCode
                     && !matches!(class, Failure::Certificate(_))
                 {
-                    Some(Err(RestoreOutcome::Stale("restore_semantics")))
+                    Some(Err(RestoreOutcome::Stale(if transient {
+                        "descriptor"
+                    } else {
+                        "restore_semantics"
+                    })))
                 } else {
                     None
                 };
@@ -1573,6 +1629,9 @@ impl SharedCache {
         struct Alarm {
             held_keys: [u64; 2],
             old_binding_no_match: [u64; 2],
+            context: [u64; 2],
+            restore_semantics: [u64; 2],
+            revision_adoption_required: [u64; 2],
             retail_exhausted: [u64; 2],
             retail_exhausted_paced: [u64; 2],
             retail_pacing_overflow: [u64; 2],
@@ -1594,6 +1653,11 @@ impl SharedCache {
         } else {
             [0; 3]
         };
+        let stale = if source == DurableSource::ClaudeCode {
+            stores.counters.stale_full
+        } else {
+            [0; 3]
+        };
         let Some(slot) = stores.slot(source).as_mut() else {
             return;
         };
@@ -1608,6 +1672,9 @@ impl SharedCache {
             retail[0],
             retail[1],
             retail[2],
+            stale[0],
+            stale[1],
+            stale[2],
         ];
         let last = std::mem::replace(&mut slot.reported, now);
         drop(stores);
@@ -1618,6 +1685,9 @@ impl SharedCache {
                 &Alarm {
                     held_keys: pair(0),
                     old_binding_no_match: pair(5),
+                    context: pair(9),
+                    restore_semantics: pair(10),
+                    revision_adoption_required: pair(11),
                     retail_exhausted: pair(6),
                     retail_exhausted_paced: pair(7),
                     retail_pacing_overflow: pair(8),
@@ -1640,6 +1710,7 @@ impl SharedCache {
         let mut counters = stores.counters.clone();
         if source != DurableSource::ClaudeCode {
             counters.retail_full = [0; 3];
+            counters.stale_full = [0; 3];
         }
         let store = stores.slot(source).as_ref()?.store.counters();
         Some((counters, store))
