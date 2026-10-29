@@ -515,7 +515,14 @@ fn directory_replacement_after_metadata_refusal_discovers_new_file_without_a_hin
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
-fn rejected_restart_replay_keeps_full_metadata_sweep_debt() {
+fn rejected_restart_replay_keeps_full_metadata_sweep_debt() { rejected_restart_replay(false); }
+
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn preparation_abort_after_claim_save_never_acknowledges_rejected_metadata_replay() { rejected_restart_replay(true); }
+
+fn rejected_restart_replay(abort_after_save: bool) {
     let server = AckScriptedServer::new();
     let mut home = AckFinishHome::new(&server);
     seed_deferred(&home, true);
@@ -535,7 +542,7 @@ fn rejected_restart_replay_keeps_full_metadata_sweep_debt() {
     let (p, i, s) = prepare(&mut home);
     assert_eq!(serde_json::to_value(&i).unwrap()["traversal"]["watcher_hint_seen"], true);
     drop((p, i, s)); // replay learned identity, but its checkpoint was rejected
-    PREPARE_CHECKPOINT_HOOK.with(|slot| slot.set(Some(|index, path| {
+    fn save_claim(index: &mut ScanIndex, path: &Path) -> Result<()> {
         let before = index.generation;
         let fp = format!("{:064x}", 4242);
         let mut record = crate::snapshots::snapshot_quarantine_record(SnapshotSource::ClaudeCode);
@@ -548,7 +555,22 @@ fn rejected_restart_replay_keeps_full_metadata_sweep_debt() {
         progress.save(&path.with_extension("fixture-claim-progress.json")).unwrap();
         save_terminal_contract_claims_for_scan(index, &progress, path).unwrap();
         assert!(index.generation > before, "actual preparatory retry-claim save");
-    })));
+        Ok(())
+    }
+    fn save_then_abort(index: &mut ScanIndex, path: &Path) -> Result<()> {
+        save_claim(index, path)?;
+        anyhow::bail!("synthetic preparation failure after the actual claim save")
+    }
+    PREPARE_CHECKPOINT_HOOK.with(|slot| slot.set(Some(if abort_after_save { save_then_abort } else { save_claim })));
+    if abort_after_save {
+        home.cadence.next_due_cycle();
+        let error = crate::agent_status_refresh::with_test_collection(AckFinishHome::collection(), || {
+            prepare_sync_source(&home.client, &home.device, "device-secret", SnapshotSource::ClaudeCode,
+                "otm_test", &home.fixture.home, &home.support, &home.daemon, &mut home.transport,
+                home.daemon.snapshot_scan_account_witness().unwrap(), false)
+        }).err().expect("preparation aborted after saving without constructing a scanner");
+        assert!(error.to_string().contains("synthetic preparation failure"));
+    }
     let (p, i, s) = prepare(&mut home);
     let value = serde_json::to_value(&i).unwrap();
     assert_eq!(value["traversal"]["watcher_hint_seen"], true, "rejected replay never spends full-sweep debt");

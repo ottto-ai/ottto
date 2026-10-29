@@ -49,10 +49,17 @@ fn parked_rewalk_active(traversal: &ScanTraversalCheckpoint) -> bool {
     traversal.pending_directories.front().is_some_and(|directory| !directory.census_member)
 }
 
+fn parked_rewalk_readers() -> &'static Mutex<BTreeMap<String, ParkedDirectoryReader>> {
+    static READERS: std::sync::OnceLock<Mutex<BTreeMap<String, ParkedDirectoryReader>>> = std::sync::OnceLock::new();
+    READERS.get_or_init(Default::default)
+}
+fn parked_rewalk_key(traversal: &ScanTraversalCheckpoint) -> String {
+    let key = format!("{}:{}", traversal.context_fingerprint, traversal.census_window_end);
+    #[cfg(test)]
+    let key = format!("{key}:{}", PARKED_REWALK_TEST_EPOCH.with(std::cell::Cell::get));
+    key
+}
 fn recover_parked_claude_metadata(index: &mut ScanIndex, overflowed: bool) {
-    use std::sync::OnceLock;
-    static READERS: OnceLock<Mutex<BTreeMap<String, ParkedDirectoryReader>>> = OnceLock::new();
-    let loaded_generation = index.claude_full_rearm_progress.parked_rewalk_loaded_generation.unwrap_or(index.generation);
     let checkpoint_generation = index.generation;
     let Some(traversal) = index.traversal.as_mut() else { return; };
     let active = parked_rewalk_active(traversal);
@@ -60,10 +67,8 @@ fn recover_parked_claude_metadata(index: &mut ScanIndex, overflowed: bool) {
         || (!overflowed && traversal.pending_candidates.iter().any(|path| path.census_member))) {
         return;
     }
-    let key = format!("{}:{}", traversal.context_fingerprint, traversal.census_window_end);
-    #[cfg(test)]
-    let key = format!("{key}:{}", PARKED_REWALK_TEST_EPOCH.with(std::cell::Cell::get));
-    let mut readers = READERS.get_or_init(Default::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let key = parked_rewalk_key(traversal);
+    let mut readers = parked_rewalk_readers().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if !readers.contains_key(&key) && readers.len() >= 64 {
         // Only cached iterators/cadence are evicted; durable directory/offset
         // demand stays in its existing traversal. Restart recovery is identical.
@@ -82,12 +87,10 @@ fn recover_parked_claude_metadata(index: &mut ScanIndex, overflowed: bool) {
         state.reader = None;
         traversal.watcher_hint_seen = false; // this sweep covers the triggering loss
     }
-    if active && loaded_generation <= state.checkpoint_generation {
-        // Compare the generation loaded BEFORE preparatory claims/saves with
-        // the generation at the previous scan's issue boundary. Preparatory
-        // writes cannot acknowledge a rejected metadata page. No advance means
-        // replay/identity debt was not
-        // accepted; never use a merely learned identity to skip old demand.
+    if active && checkpoint_generation <= state.checkpoint_generation {
+        // Scanner-only callers also obey the durable checkpoint. Preparation
+        // invalidates before any intermediate save in observe_parked_rewalk_load.
+        // No advance means replay/identity debt was not accepted.
         state.reader = None;
         state.identity = None;
         state.path = PathBuf::new();
@@ -274,7 +277,17 @@ pub(crate) fn parked_metadata_refusal_consumed_for_test() -> bool {
 }
 
 impl ScanIndex {
-    pub(crate) fn observe_parked_rewalk_load(&mut self, generation: u64) {
-        self.claude_full_rearm_progress.parked_rewalk_loaded_generation = Some(generation);
+    pub(crate) fn observe_parked_rewalk_load(&self) {
+        let Some(traversal) = self.traversal.as_ref().filter(|traversal| parked_rewalk_active(traversal)) else { return; };
+        let mut readers = parked_rewalk_readers().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(state) = readers.get_mut(&parked_rewalk_key(traversal)) {
+            if self.generation <= state.checkpoint_generation {
+                // Invalidate BEFORE preparatory writes. Even a successful claim
+                // save followed by an error must not acknowledge rejected replay.
+                state.reader = None;
+                state.identity = None;
+                state.path = PathBuf::new();
+            }
+        }
     }
 }

@@ -1845,11 +1845,12 @@ mod round7_parking_tests {
     include!("round7_parking_tests.rs");
 }
 
-type PrepareCheckpointHook = fn(&mut ScanIndex, &Path);
+type PrepareCheckpointHook = fn(&mut ScanIndex, &Path) -> Result<()>;
 
 thread_local! {
     static PREPARE_CHECKPOINT_HOOK: std::cell::Cell<Option<PrepareCheckpointHook>> = const { std::cell::Cell::new(None) };
 }
-pub(crate) fn prepare_checkpoint_hook_for_test(index: &mut ScanIndex, path: &Path) {
-    if let Some(hook) = PREPARE_CHECKPOINT_HOOK.with(|slot| slot.take()) { hook(index, path); }
+pub(crate) fn prepare_checkpoint_hook_for_test(index: &mut ScanIndex, path: &Path) -> Result<()> {
+    if let Some(hook) = PREPARE_CHECKPOINT_HOOK.with(|slot| slot.take()) { hook(index, path)?; }
+    Ok(())
 }

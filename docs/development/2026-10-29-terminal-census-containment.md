@@ -133,8 +133,9 @@ iterator progress are discarded and replay debt is re-established. A rejected
 checkpoint cannot turn newly learned identity into permission to skip an older
 cursor. No persisted acknowledgement or generation field is added.
 
-Metadata acknowledgement compares the generation loaded before ANY preparatory
-claim, retirement or adoption save against the previous metadata scan's issue
-generation. The loaded observation is serde(skip); preparatory saves cannot
-acknowledge rejected replay debt. The rejected-restart fixture executes a real
-terminal-contract retry-claim save before the next native scan.
+Immediately after loading the index, before ANY preparatory claim, retirement
+or adoption write, compare its generation to the previous metadata scan's issue
+generation and invalidate unacknowledged cached replay. No observation member is
+needed. Preparatory saves, including a save followed by a preparation error,
+cannot acknowledge rejected replay debt. Fixtures execute a real terminal-contract
+retry-claim save both with and without a subsequent preparation abort.

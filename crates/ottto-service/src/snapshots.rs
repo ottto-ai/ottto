@@ -2275,8 +2275,6 @@ struct ClaudeFullRearmProgress {
     terminal_fold_checked: bool,
     #[serde(skip)]
     terminal_effects: Option<ClaudeTerminalEffects>,
-    #[serde(skip)]
-    parked_rewalk_loaded_generation: Option<u64>,
 
     // Process-local proof: every decode drops it. A restart between read and
     // close therefore fails closed, even if persisted scheduling survives.
@@ -90630,7 +90628,7 @@ crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_mem
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarry; origin, roots, capped_roots, replay);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarryOrigin; context_fingerprint, process, full_rearm_window, admission);
 crate::heap_layout_bound::fields!(ClaudeRetryAdmission; after_root, upper_root, complete, roots_complete, progressed, served_before, due_through, due_after_path, due_upper_path, due_complete, oversized_root, oversized_after_path, storage_deferred);
-crate::heap_layout_bound::fields!(ClaudeFullRearmProgress; terminal_fold_deferred, terminal_fold_checked, terminal_effects, parked_rewalk_loaded_generation, rebuild_read_full, complete_rebuild_read, observed_window, structural_roots, other_invalidation_observed, ignored_vetoes, structural_rearm_owed, structural_record, traversal_origin, full_rearm_window_next, full_rearm_window, stale_rearm_fence_deadline, stale_rearms_at_deadline, first_proof_hold_since_full_rearm, held_family_roots, contract_cutover);
+crate::heap_layout_bound::fields!(ClaudeFullRearmProgress; terminal_fold_deferred, terminal_fold_checked, terminal_effects, rebuild_read_full, complete_rebuild_read, observed_window, structural_roots, other_invalidation_observed, ignored_vetoes, structural_rearm_owed, structural_record, traversal_origin, full_rearm_window_next, full_rearm_window, stale_rearm_fence_deadline, stale_rearms_at_deadline, first_proof_hold_since_full_rearm, held_family_roots, contract_cutover);
 crate::heap_layout_bound::fields!(ClaudeCompleteRebuildRead; origin, members_digest);
 crate::heap_layout_bound::fields!(ClaudeStructuralInvalidRecord; basis, families, suppressed_since_unix_seconds, skipped_full_rearms);
 crate::heap_layout_bound::fields!(ClaudeFullRearmWindow; context_fingerprint, process, window_ends, member_digests);
