@@ -107,6 +107,7 @@ fn failed_immediate_cleanup_is_retried_by_same_process_gc() {
     };
     assert_eq!(temps(), 1, "both cleanup attempts were refused");
     assert!(store.counters().temp_discard_failed >= 2);
+    assert_eq!(store.counters().store_write_cleanup_failed, 1);
     store
         .gc(
             case.writer,

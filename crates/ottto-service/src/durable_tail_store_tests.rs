@@ -4485,3 +4485,90 @@ fn completed_batch_entries_defer_at_capacity_without_disabling_store() {
     assert_eq!(retry.written, 1);
     assert_eq!(store.disabled(), None);
 }
+
+/// Distinguish the D3 input from a write failure whose fallback really cleaned
+/// up. This exercises the I/O boundary only, not native publication authority.
+#[test]
+fn atomic_write_reports_double_failure_only_after_both_cleanup_boundaries_fail() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            test_hooks::set_before_rename(None);
+            test_hooks::set_before_unlink(None);
+        }
+    }
+    for predecessor in [false, true] {
+        for failed_cleanups in 0..=2 {
+            let _reset = Reset;
+            let scratch = Scratch::new();
+            let writer = LockedStateDir::acquire(&scratch.root).unwrap();
+            let transcript = scratch.transcript("source.jsonl", b"{}\n");
+            let b = binding("account", "scope", ("fp-a", None));
+            let mut store = scratch.store();
+            if predecessor {
+                store
+                    .write_after_save(
+                        &writer,
+                        1,
+                        0,
+                        vec![pending(b.clone(), certificate(&transcript), 1)],
+                    )
+                    .unwrap();
+            } else {
+                ensure_private_dir(&store.dir).unwrap();
+            }
+            let path = record_file(&store, &b.key);
+            let before = fs::read(&path).ok();
+            let prior = stamp_at(&path).unwrap();
+            let cleanup = Arc::new(TempCleanupCounts::default());
+            let calls = Rc::new(Cell::new(0));
+            let observed = Rc::clone(&calls);
+            test_hooks::set_before_rename(Some(Box::new(|_, _| {
+                Err(io::Error::from_raw_os_error(libc::ENOSPC))
+            })));
+            test_hooks::set_before_unlink(Some(Box::new(move |_| {
+                observed.set(observed.get() + 1);
+                if observed.get() <= failed_cleanups {
+                    Err(io::Error::from_raw_os_error(libc::ENOSPC))
+                } else {
+                    Ok(())
+                }
+            })));
+            let error = write_atomic(
+                &writer,
+                &store.dir,
+                &path,
+                b"candidate",
+                prior,
+                Arc::clone(&cleanup),
+            )
+            .unwrap_err();
+            test_hooks::set_before_rename(None);
+            test_hooks::set_before_unlink(None);
+            assert_eq!(write_cleanup_failed(&error), failed_cleanups == 2);
+            assert_eq!(calls.get(), if failed_cleanups == 0 { 1 } else { 2 });
+            assert_eq!(cleanup.failed.load(Ordering::Relaxed), failed_cleanups);
+            assert_eq!(
+                cleanup.verified.load(Ordering::Relaxed),
+                u64::from(failed_cleanups != 2)
+            );
+            assert_eq!(
+                cleanup.fallback.load(Ordering::Relaxed),
+                u64::from(failed_cleanups != 0)
+            );
+            assert_eq!(
+                fs::read(&path).ok(),
+                before,
+                "a failed write never replaces its predecessor"
+            );
+            assert_eq!(stamp_at(&path).unwrap(), prior);
+            if failed_cleanups == 2 {
+                assert!(!error
+                    .to_string()
+                    .contains(&scratch.root.to_string_lossy().to_string()));
+            }
+        }
+    }
+}

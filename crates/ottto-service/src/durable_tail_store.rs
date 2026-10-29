@@ -553,6 +553,9 @@ pub(crate) struct StoreCounters {
     pub(crate) receipt_pending_held: u64,
     pub(crate) receipt_pending_records: u64,
     pub(crate) durable_write_failed_published: u64,
+    /// A write failed and neither the explicit nor fallback temp cleanup
+    /// established absence. Separate from integrity and receipt mismatch.
+    pub(crate) store_write_cleanup_failed: u64,
     /// Owned temps verified absent after directory sync, counted once.
     pub(crate) temp_discard_verified: u64,
     /// Failed explicit/fallback temp cleanup attempts, per pass.
@@ -1712,6 +1715,9 @@ impl DurableTailStore {
                     content,
                 }))
             });
+            if attempt.as_ref().is_err_and(write_cleanup_failed) {
+                self.counters.store_write_cleanup_failed += 1;
+            }
             let outcome = attempt.or_else(|_| self.reconcile_pending(writer, &key));
             let proof = match outcome {
                 Ok(ReconcileOutcome::Receipted(proof)) if proof.identity == candidate => proof,
@@ -2553,10 +2559,50 @@ fn write_atomic<W: SingleWriter>(
         attempt.temp.sync()?;
         attempt.temp.commit(path, prior)
     })();
-    if result.is_err() {
-        let _ = attempt.temp.discard();
+    if let Err(write) = result {
+        if let Err(cleanup) = attempt.temp.discard() {
+            // The fallback may establish absence after a transient failure.
+            // Try it explicitly so the disposition depends on the actual final
+            // cleanup result, rather than a sampled global counter.
+            attempt
+                .temp
+                .cleanup
+                .fallback
+                .fetch_add(1, Ordering::Relaxed);
+            if attempt.temp.discard().is_err() {
+                // Both cleanup boundaries have run. Closing the descriptor
+                // leaves only the proven temp name for the existing GC owner;
+                // do not attempt a third cleanup from Drop.
+                attempt.temp.file.take();
+                return Err(io::Error::other(WriteCleanupFailure { write, cleanup }));
+            }
+        }
+        return Err(write);
     }
     result
+}
+
+#[derive(Debug)]
+struct WriteCleanupFailure {
+    write: io::Error,
+    cleanup: io::Error,
+}
+impl std::fmt::Display for WriteCleanupFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // No paths or provider data enter the diagnostics carrier.
+        write!(
+            f,
+            "record write and cleanup failed ({:?}, {:?})",
+            self.write.kind(),
+            self.cleanup.kind()
+        )
+    }
+}
+impl std::error::Error for WriteCleanupFailure {}
+fn write_cleanup_failed(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|error| error.is::<WriteCleanupFailure>())
 }
 
 fn sync_dir(dir: &Path) -> io::Result<()> {
