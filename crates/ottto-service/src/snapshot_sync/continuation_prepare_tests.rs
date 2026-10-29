@@ -883,7 +883,7 @@ fn ordinary_durable_continuation_to_eof(
     crate::snapshots::with_test_limits_for_test(2048, 1024, 64, || {
         let mut ordinary = OwnedSourceScan::new(
             SnapshotSource::Codex,
-            &[root.clone()],
+            std::slice::from_ref(&root),
             index,
             &at,
             30,
@@ -960,7 +960,7 @@ fn ordinary_durable_continuation_to_eof(
                     let (mut index, scan) = state.finish_ordinary_eof(|| {
                         let mut ordinary = OwnedSourceScan::new(
                             SnapshotSource::Codex,
-                            &[root.clone()],
+                            std::slice::from_ref(&root),
                             ScanIndex::load(&fixture.index_path).unwrap(),
                             &at,
                             30,
