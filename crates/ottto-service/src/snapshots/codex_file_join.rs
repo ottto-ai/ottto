@@ -2678,11 +2678,19 @@ pub(super) mod tests {
         index: ScanIndex,
         hints: &[PathBuf],
     ) -> (ScanIndex, SourceScanResult) {
+        retained_page_at(root, index, hints, RETAINED_AT)
+    }
+    fn retained_page_at(
+        root: &Path,
+        index: ScanIndex,
+        hints: &[PathBuf],
+        collected_at: &str,
+    ) -> (ScanIndex, SourceScanResult) {
         let mut owned = OwnedSourceScan::new(
             SnapshotSource::Codex,
             &[root.join("sessions")],
             index,
-            RETAINED_AT,
+            collected_at,
             7,
             10,
             false,
@@ -2973,6 +2981,56 @@ pub(super) mod tests {
         );
         assert_eq!(retry_deadline(&index), deadline, "no re-walk was forced");
         assert!(inventory_hold(&index).is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+    /// RFC 3339 for the real clock plus `days`: fixture files carry real
+    /// mtimes, so this is when they have idled `days` days.
+    fn days_from_now(days: u64) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        time::OffsetDateTime::from_unix_timestamp((now + days * 86_400) as i64)
+            .unwrap()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    }
+    #[test]
+    fn inventory_held_growth_outlives_the_retry_walk_past_the_window() {
+        // Hold rule (E3 Codex owed keys): a candidate an incomplete inventory
+        // held grows while held, then idles past the 7-day window. The
+        // bounded retry's fresh walk still selects it, once its blocker is
+        // gone, and its whole usage is emitted exactly once.
+        let (root, held_index, unreadable, new, _) = held_behind_unreadable_header();
+        let key = local_index_key(&new);
+        crate::local_resource_diagnostics::take_codex_owed_for_test();
+        let mut text = fs::read_to_string(&new).unwrap();
+        for row in &member(UNRELATED, "n-2", 90, 160)[1..] {
+            text.push_str(&(serde_json::to_string(row).unwrap() + "\n"));
+        }
+        fs::write(&new, text).unwrap();
+        let mut held_index = held_index;
+        // The blocker goes and a partially settled upload makes the bounded
+        // retry due; the retry walks 8 days later, with `new` aged out.
+        fs::remove_file(&unreadable).unwrap();
+        held_index.mark_bounded_sweep_unsettled();
+        let (index, page) = retained_page_at(&root, held_index, &[], &days_from_now(8));
+        // Before this slice the retry's fresh traversal dropped the hold and
+        // its walk aged `new` out: nothing was emitted, ever.
+        assert_eq!(
+            page.snapshots
+                .iter()
+                .filter(|item| item.source_session_id == UNRELATED)
+                .map(|item| item.input_tokens)
+                .collect::<Vec<_>>(),
+            vec![160],
+            "the held growth is emitted once, whole"
+        );
+        assert_eq!(page.scanned_file_count, 1, "only the owed key is read");
+        assert!(index.files.contains_key(&key));
+        assert!(inventory_hold(&index).map_or(true, |hold| !hold.owed.contains(&key)));
+        let (_, released) = crate::local_resource_diagnostics::take_codex_owed_for_test();
+        assert_eq!(released.get("caught_up"), Some(&1));
         fs::remove_dir_all(root).unwrap();
     }
     #[test]

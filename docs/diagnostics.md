@@ -261,10 +261,24 @@ discoverable and observed whatever its age while it is owed, so reconciliation
 never prunes it. Its growth goes through the counted Tail path. Only a validated
 catch-up or a proven, counted removal releases it, and it is never a Full cause.
 File-size caps still apply. Registered sources today are the unverified
-sampled-generation marker (any source) and Claude withheld-account holds. A new
-owed source (a Codex owed-residue set, a compressed hold) registers as one field
-plus its lines in `discovery_retention!`, `unverified` and `owes`; it adds no
-separate exemption.
+sampled-generation marker (any source), Claude withheld-account holds and the
+Codex owed keys of a `CodexInventoryHold`. A new owed source (a compressed
+hold) registers as one field plus its lines in `discovery_retention!`,
+`unverified` and `owes`; it adds no separate exemption.
+
+Codex owed keys are candidates held by an incomplete header inventory or
+refused at a cursor start for want of reduction inputs (`Reduction`
+unreadable). They stay owed across the bounded retry and restarts until a
+parse to completion settles them, a clean close proves them caught up, or
+their absence is proved. While owed, unmoved evidence re-reads nothing until
+the traversal's bounded retry deadline, when they are queued once and the
+deadline re-arms. On Codex pages, `counts.codex_owed` counts `held` (keys that
+became owed), `overflow` (past the 10,000-key bound a new key keeps only the
+window), `oversized` (an owed key over the size cap, kept observed and unread)
+and `dropped` (owed keys lost when a red restart closes a partially settled
+sweep; an open gap that should stay zero), and
+`counts.codex_owed_released` counts `caught_up` and `removed`. Both are
+drained like `line_delivery_unselected`.
 
 `counts.line_delivery_unselected` counts discovery skip decisions for the
 page's source: `age` (outside the backfill window, not held for verification

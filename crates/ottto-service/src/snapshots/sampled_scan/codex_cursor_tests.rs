@@ -13819,3 +13819,240 @@ fn ownership_disclosure_replays_preserve_cause_and_group_strict_uses_group_bucke
         assert_eq!(c[..6].iter().sum::<usize>() + unknown, 3);
     }
 }
+
+// ---- E3: Codex owed keys after a cursor-start InputsUnavailable (N1) ----
+
+/// One page with a 7-day request, finalized like `page_selections`.
+fn owed_page(
+    fixture: &ScanRoot,
+    index: ScanIndex,
+    cache: &Arc<SharedCache>,
+    collected_at: &str,
+) -> (ScanIndex, SourceScanResult, Modes) {
+    let mut scan = OwnedSourceScan::new(
+        SnapshotSource::Codex,
+        std::slice::from_ref(&fixture.root),
+        index,
+        collected_at,
+        7,
+        10,
+        false,
+        None,
+        &[],
+        false,
+        true,
+    )
+    .with_sampled_acquisition(Arc::clone(cache), Scope("owed-inputs".into()));
+    let mut modes = (0, 0);
+    loop {
+        if let Some(context) = scan.sampling.as_ref() {
+            modes = (context.full_files, context.tail_files);
+        }
+        match scan.step(None) {
+            OwnedSourceScanStep::Pending(next) => scan = next,
+            OwnedSourceScanStep::Complete {
+                mut index, scan, ..
+            } => {
+                let mut projected = scan.clone();
+                apply_upload_policy(
+                    SnapshotSource::Codex,
+                    &mut projected.snapshots,
+                    SnapshotUploadPolicy::default(),
+                );
+                finalize_scan_after_policy(SnapshotSource::Codex, &mut projected, &mut index);
+                let accepted = projected
+                    .snapshots
+                    .iter()
+                    .map(|snapshot| snapshot.snapshot_fingerprint.clone())
+                    .collect();
+                index.record_accepted_snapshot_fingerprints(&accepted);
+                return (index, scan, modes);
+            }
+        }
+    }
+}
+
+/// Hold rule, N1 variant. A committed large rollout grows while its
+/// reduction inputs are unavailable: each cursor start is refused and the key
+/// is owed. Unmoved evidence before the retry deadline reads nothing. It
+/// idles past the 7-day window and the bounded retry walks it anyway. Once
+/// the inputs return it is caught up by exactly one Tail from the retained
+/// prefix (zero Full), emitted once and equal to a cold Full.
+#[test]
+fn reduction_refused_growth_stays_owed_and_catches_up_by_one_tail() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    struct Refuse;
+    impl Refuse {
+        fn set(&self, on: bool) {
+            super::super::TEST_REFUSE_REDUCTION_DEPENDENCIES.with(|v| v.set(on));
+        }
+    }
+    impl Drop for Refuse {
+        fn drop(&mut self) {
+            self.set(false);
+        }
+    }
+    let refuse = Refuse;
+    let start = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let at = |secs: u64| {
+        time::OffsetDateTime::from_unix_timestamp((start + secs) as i64)
+            .unwrap()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    };
+    let day = 86_400;
+    let t0 = std::time::Instant::now();
+    let fixture = ScanRoot::new(80);
+    let key = local_index_key(&fixture.file(SESSION));
+    let owed = |index: &ScanIndex| {
+        index
+            .traversal
+            .as_ref()
+            .and_then(|traversal| traversal.residue.codex_inventory_hold.as_ref())
+            .is_some_and(|hold| hold.owed.contains(&key))
+    };
+    let cache = Arc::new(SharedCache::default());
+    // Each page runs with the pace clock `days` ahead, so no start is paced.
+    let page = |index: ScanIndex, days: u64, secs: u64| {
+        with_pace_clock(
+            Some(t0 + std::time::Duration::from_secs(days * day)),
+            false,
+            || owed_page(&fixture, index, &cache, &at(secs)),
+        )
+    };
+    let deferred = || counter(&cache, |c| c.jobs_deferred_inputs);
+    let (tail, tail_index) = with_test_limits(2048, 1024, 64, || {
+        let mut index = ScanIndex::default();
+        for step in 0..64 {
+            index = page(index, 0, step).0;
+            if counter(&cache, |c| c.jobs_certified) == 1 {
+                break;
+            }
+        }
+        assert_eq!(
+            counter(&cache, |c| c.jobs_certified),
+            1,
+            "{}",
+            counters(&cache)
+        );
+        assert!(cache.retained_checkpoint(&key).is_some(), "a sealed prefix");
+        crate::local_resource_diagnostics::take_codex_owed_for_test();
+        // Growth while the inputs are missing: refused at the cursor start,
+        // owed, nothing read or emitted.
+        refuse.set(true);
+        fixture.append(SESSION, &token_line(81));
+        let (index, held, modes) = page(index, 1, 100);
+        assert_eq!(deferred(), 1, "premise: N1 refused the start");
+        assert_eq!((modes, held.snapshots.len()), ((0, 0), 0));
+        // Before this slice the refusal recorded nothing.
+        assert!(owed(&index), "the refused key is owed");
+        fixture.append(SESSION, &token_line(82));
+        let (index, held, modes) = page(index, 2, 400);
+        assert_eq!(deferred(), 2, "moved evidence retries once");
+        assert_eq!((modes, held.snapshots.len()), ((0, 0), 0));
+        assert!(owed(&index));
+        // Unmoved evidence before the re-armed retry deadline: no read.
+        let (index, quiet, _) = page(index, 3, 410);
+        assert_eq!(deferred(), 2, "unchanged owed key: no attempt");
+        assert_eq!(quiet.scanned_file_count, 0);
+        // Idle past the window; a partially settled sweep makes the bounded
+        // retry walk at day 8 with the inputs still missing.
+        let mut index = index;
+        index.mark_bounded_sweep_unsettled();
+        let (index, held, _) = page(index, 8, 8 * day);
+        // Before this slice the retry's walk aged the key out: no attempt.
+        assert_eq!(deferred(), 3, "the aged owed key is still walked");
+        assert!(held.snapshots.is_empty());
+        assert!(owed(&index));
+        assert!(index.files.contains_key(&key), "its entry is kept");
+        // The inputs return while the file idles: the bounded retry queues it
+        // once and it is caught up by one Tail.
+        refuse.set(false);
+        let (index, tail, modes) = page(index, 9, 9 * day);
+        assert_eq!(modes, (0, 1), "one Tail, zero Full");
+        assert_eq!(counter(&cache, |c| c.jobs_started), 1, "no new cursor job");
+        assert_eq!(
+            tail.snapshots
+                .iter()
+                .filter(|snapshot| snapshot.source_session_id == SESSION)
+                .count(),
+            1,
+            "emitted once"
+        );
+        assert!(!owed(&index), "released by the catch-up");
+        assert_eq!(
+            crate::local_resource_diagnostics::take_codex_owed_for_test(),
+            (
+                BTreeMap::from([("held", 1)]),
+                BTreeMap::from([("caught_up", 1)])
+            )
+        );
+        (tail, index)
+    });
+    // Nothing is read again, and the catch-up equals a cold Full.
+    let (_, again, modes) = with_test_limits(2048, 1024, 64, || page(tail_index, 10, 10 * day));
+    assert_eq!((modes, again.snapshots.len()), ((0, 0), 0));
+    let (_, full) = page_fixture_full(&fixture);
+    assert_eq!(fingerprints(&tail), fingerprints(&full));
+}
+
+fn page_fixture_full(fixture: &ScanRoot) -> (ScanIndex, SourceScanResult) {
+    page(fixture, ScanIndex::default(), None)
+}
+
+/// N1 variant, removal: an owed key whose file is deleted is released and
+/// counted, never read.
+#[test]
+fn reduction_refused_owed_key_is_released_when_removed() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(80);
+    let key = local_index_key(&fixture.file(SESSION));
+    let cache = Arc::new(SharedCache::default());
+    let t0 = std::time::Instant::now();
+    let page = |index: ScanIndex, days: u64, step: u64| {
+        with_pace_clock(
+            Some(t0 + std::time::Duration::from_secs(days * 86_400)),
+            false,
+            || owed_page(&fixture, index, &cache, &collected_at(step)),
+        )
+    };
+    with_test_limits(2048, 1024, 64, || {
+        let mut index = ScanIndex::default();
+        for step in 0..64 {
+            index = page(index, 0, step).0;
+            if counter(&cache, |c| c.jobs_certified) == 1 {
+                break;
+            }
+        }
+        crate::local_resource_diagnostics::take_codex_owed_for_test();
+        super::super::TEST_REFUSE_REDUCTION_DEPENDENCIES.with(|v| v.set(true));
+        fixture.append(SESSION, &token_line(81));
+        let (index, _, _) = page(index, 1, 100);
+        super::super::TEST_REFUSE_REDUCTION_DEPENDENCIES.with(|v| v.set(false));
+        let hold = |index: &ScanIndex| {
+            index
+                .traversal
+                .as_ref()
+                .and_then(|traversal| traversal.residue.codex_inventory_hold.clone())
+        };
+        assert!(hold(&index).is_some_and(|hold| hold.owed.contains(&key)));
+        fs::remove_file(fixture.file(SESSION)).unwrap();
+        let (index, gone, modes) = page(index, 2, 101);
+        assert_eq!((modes, gone.scanned_file_count), ((0, 0), 0));
+        assert!(hold(&index).map_or(true, |hold| !hold.owed.contains(&key)));
+        assert_eq!(
+            crate::local_resource_diagnostics::take_codex_owed_for_test(),
+            (
+                BTreeMap::from([("held", 1)]),
+                BTreeMap::from([("removed", 1)])
+            )
+        );
+    });
+}

@@ -1242,6 +1242,7 @@ fn candidate_and_open_gates_keep_withheld_account_keys() {
             crate::snapshots::DiscoveryRetention {
                 files: &BTreeMap::new(),
                 account_holds: holds,
+                codex_owed: None,
             },
         )
         .map(|candidate| {
@@ -1254,6 +1255,7 @@ fn candidate_and_open_gates_keep_withheld_account_keys() {
                 crate::snapshots::DiscoveryRetention {
                     files: &BTreeMap::new(),
                     account_holds: holds,
+                    codex_owed: None,
                 },
             )
             .is_some()
@@ -2116,4 +2118,90 @@ fn codex_live_observer_skips_an_actual_overlong_row_before_terminal_usage() {
         "777 must not terminate the live observer"
     );
     assert_eq!(metric(&feed, "codex_prelude_gap_dropped"), 0);
+}
+
+// ---- E3: Codex owed keys stay discoverable until they catch up ----
+
+/// A 7-day request walked with and without a hold owing `owed` and `big`:
+/// an owed key is discovered and observed whatever its age, an oversized one
+/// is observed, kept unread and counted, and a completed reconciliation keeps
+/// both while it prunes the aged key nobody owes. Without the hold all three
+/// age out (the walk before this slice ignored the hold the same way).
+#[test]
+fn codex_owed_keys_stay_discoverable_and_unpruned_while_owed() {
+    let root = Root::new("ld-codex-owed-walk");
+    for name in ["owed", "old"] {
+        append(&root.file(name), b"{}\n");
+        set_old(&root.file(name));
+    }
+    fs::File::create(root.file("big"))
+        .unwrap()
+        .set_len(MAX_CODEX_JSONL_FILE_BYTES + 1)
+        .unwrap();
+    set_old(&root.file("big"));
+    let key = |name: &str| local_index_key(&root.file(name));
+    let hold = CodexInventoryHold {
+        owed: BTreeSet::from([key("owed"), key("big")]),
+        ..CodexInventoryHold::default()
+    };
+    let walk = |hold: Option<&CodexInventoryHold>| {
+        let mut index = ScanIndex::default();
+        for name in ["owed", "old", "big"] {
+            index
+                .files
+                .insert(key(name), super::tests::manifest_index_entry(Some(name)));
+        }
+        ensure_bounded_traversal(
+            SnapshotSource::Codex,
+            &[root.projects()],
+            &mut index,
+            NOW,
+            7,
+        );
+        unselected_page("codex");
+        crate::local_resource_diagnostics::take_codex_owed_for_test();
+        while !index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .pending_directories
+            .is_empty()
+        {
+            advance_bounded_directory_traversal(
+                SnapshotSource::Codex,
+                index.traversal.as_mut().unwrap(),
+                7,
+                discovery_retention!(index).with_codex_hold(hold),
+            );
+        }
+        let observed = index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .observed_index_keys
+            .clone();
+        let decided = (candidates(&index), observed);
+        let counted = (
+            unselected_page("codex"),
+            crate::local_resource_diagnostics::take_codex_owed_for_test().0,
+        );
+        assert!(reconcile_missing_index_entries_with_limit(
+            &mut index,
+            usize::MAX
+        ));
+        let kept = index.files.keys().cloned().collect::<BTreeSet<_>>();
+        (decided, counted, kept)
+    };
+    let owed = BTreeSet::from([key("owed"), key("big")]);
+    let (decided, counted, kept) = walk(Some(&hold));
+    assert_eq!(decided, (vec![root.file("owed")], owed.clone()));
+    assert_eq!(counted.0, json!({"age": 1, "size": 1}));
+    assert_eq!(counted.1, BTreeMap::from([("oversized", 1)]));
+    assert_eq!(kept, owed, "census completion keeps every owed entry");
+    // Control: nobody owes them, so the window applies to all three.
+    let (decided, counted, kept) = walk(None);
+    assert_eq!(decided, (Vec::new(), BTreeSet::new()));
+    assert_eq!(counted.0, json!({"age": 3}));
+    assert_eq!(counted.1, BTreeMap::new());
+    assert_eq!(kept, BTreeSet::new());
 }

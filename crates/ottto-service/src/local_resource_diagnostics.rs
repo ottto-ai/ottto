@@ -136,8 +136,9 @@ pub(crate) enum UnselectedReason {
     /// The subset of size skips whose key holds a withheld-account revision.
     WithheldOversized,
 }
-/// The three reasons, then the four `WithheldEvent` slots.
-const UNSELECTED_REASONS: usize = 7;
+/// The three reasons, the four `WithheldEvent` slots, then the six
+/// `CodexOwedEvent` slots.
+const UNSELECTED_REASONS: usize = 13;
 /// Claude, Codex, Pi x reason, drained by that source's page line.
 #[cfg(not(test))]
 static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
@@ -189,6 +190,43 @@ fn drain(source: &str, slots: &[(&'static str, usize)]) -> BTreeMap<&'static str
         .map(|&(key, slot)| (key, line_unselected(source, slot, |n| n.swap(0, Relaxed))))
         .filter(|(_, count)| *count > 0)
         .collect()
+}
+/// E3: Codex keys owed after a held input (`CodexInventoryHold`).
+#[derive(Clone, Copy)]
+pub(crate) enum CodexOwedEvent {
+    /// A key became owed.
+    Held = 7,
+    /// Past the owed-key bound a new key was not retained (it keeps only
+    /// the window); owed keys are never evicted.
+    Overflow,
+    /// An owed key over the file-size cap was kept observed and unread.
+    Oversized,
+    /// Released after a validated catch-up, or by a proven removal.
+    CaughtUp,
+    Removed,
+    /// Lost by a red restart of a partially settled sweep (an open gap).
+    Dropped,
+}
+/// Recorded after the decision; never a gate input.
+pub(crate) fn codex_owed_event(event: CodexOwedEvent, count: u64) {
+    line_unselected("codex", event as usize, |slot| {
+        slot.fetch_add(count, Relaxed)
+    });
+}
+const CODEX_OWED: [(&str, usize); 4] = [
+    ("held", 7),
+    ("overflow", 8),
+    ("oversized", 9),
+    ("dropped", 12),
+];
+const CODEX_OWED_RELEASED: [(&str, usize); 2] = [("caught_up", 10), ("removed", 11)];
+#[cfg(test)]
+pub(crate) fn take_codex_owed_for_test(
+) -> (BTreeMap<&'static str, u64>, BTreeMap<&'static str, u64>) {
+    (
+        drain("codex", &CODEX_OWED),
+        drain("codex", &CODEX_OWED_RELEASED),
+    )
 }
 const WITHHELD_RELEASED: [(&str, usize); 1] = [("deleted", 3)];
 const WITHHELD_REPARSE: [(&str, usize); 3] = [("start", 4), ("evidence", 5), ("growth", 6)];
@@ -457,6 +495,10 @@ impl Probe {
             withheld_reparse: BTreeMap<&'static str, u64>,
             #[serde(skip_serializing_if = "Option::is_none")]
             withheld_memo: Option<crate::snapshots::withheld_account::Census>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            codex_owed: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            codex_owed_released: BTreeMap<&'static str, u64>,
         }
         let claude = source == "claude_code";
         let counts = Counts {
@@ -473,6 +515,8 @@ impl Probe {
             withheld_memo: claude
                 .then(crate::snapshots::withheld_account::census)
                 .flatten(),
+            codex_owed: drain(source, &CODEX_OWED),
+            codex_owed_released: drain(source, &CODEX_OWED_RELEASED),
             reread: if claude {
                 self.page_events.with_current().without_terminal_rearm()
             } else {
