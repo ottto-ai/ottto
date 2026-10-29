@@ -6441,7 +6441,7 @@ fn held_roster_has_extra(
                 .codex_state_only_blocked_by_file
                 .get(key)
                 .is_some_and(|owners| owners.contains(owner))
-            && home.is_none_or(|home| {
+            && home.map_or(true, |home| {
                 traversal
                     .owning_scan_root(Path::new(key))
                     .is_some_and(|root| codex_file_join::member_home_ref(root) == home)
