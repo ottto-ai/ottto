@@ -4,6 +4,10 @@ use serde::de::{MapAccess, Visitor};
 
 pub(super) const MAX_EDGES: usize = 4096;
 pub(super) const MAX_DECODE_BYTES: u64 = 1024 * 1024;
+// Each canonical UUID pair occupies 78 bytes including its comma. The final
+// comma is replaced by the closing brace; this maximum always fits our reader.
+pub(super) const MAX_PROJECTION_JSON_BYTES: usize = MAX_EDGES * 78 + 1;
+const _: () = assert!(MAX_PROJECTION_JSON_BYTES as u64 <= MAX_DECODE_BYTES);
 
 #[derive(Default, Deserialize)]
 pub(super) struct Projection(

@@ -3936,7 +3936,7 @@ pub struct ScanIndex {
     /// Appended to preserve every older positional index slot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     claude_desktop_store_inventory: Option<String>,
-    /// Last complete Desktop graph, local selector state only. Never attribution,
+    /// Class PL: last complete Desktop graph, local selector state only. Never attribution,
     /// request/owner/ACK/money authority. None is legacy/unknown; Some(empty)
     /// certifies no edges. Root metadata, independent of file shards. Appended
     /// to preserve every older positional slot; frozen during incomplete scans.
@@ -3946,7 +3946,7 @@ pub struct ScanIndex {
         deserialize_with = "desktop_lineage::deserialize_projection"
     )]
     claude_desktop_completed_lineage: Option<BTreeMap<String, String>>,
-    /// Per-file hash-only selector baselines. Root metadata keeps the 480-byte
+    /// Class L/H: per-file hash-only selector baselines. Root metadata keeps the 480-byte
     /// file-entry layout unchanged; committable subsets copy only safe keys.
     #[serde(
         default,

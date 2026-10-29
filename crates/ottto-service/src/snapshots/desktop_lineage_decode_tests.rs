@@ -61,9 +61,18 @@ fn desktop_lineage_old_201_202_203_name_registries_ignore_and_drop_new_root_fiel
             seed.files["/synthetic/child.jsonl"].source_file_fingerprint
         );
         let old_save = serde_json::to_vec(&old).unwrap();
-        assert!(!String::from_utf8_lossy(&old_save).contains("claude_desktop_completed_lineage"));
+        for key in [
+            "claude_desktop_completed_lineage",
+            "claude_desktop_lineage_file_edges",
+        ] {
+            assert!(
+                !String::from_utf8_lossy(&old_save).contains(key),
+                "{version}: {key}"
+            );
+        }
         let upgraded = read(std::io::Cursor::new(old_save), "load", "claude_code").unwrap();
         assert!(upgraded.claude_desktop_completed_lineage.is_none());
+        assert!(upgraded.claude_desktop_lineage_file_edges.is_empty());
     }
 }
 
@@ -176,7 +185,7 @@ fn desktop_lineage_projection_cap_is_enforced_on_decode_and_complete_write() {
     );
     let bytes = serde_json::to_vec(&index.claude_desktop_completed_lineage).unwrap();
     assert!(
-        bytes.len() <= 319_489,
+        bytes.len() <= desktop_lineage::MAX_PROJECTION_JSON_BYTES,
         "4096 canonical UUID pairs fit the stated compact JSON bound"
     );
 }
@@ -194,6 +203,24 @@ fn desktop_lineage_incomplete_page_freezes_projection_and_partial_save_keeps_old
     // its own previous baseline, even after save and restart.
     working.claude_desktop_lineage_census_complete = true;
     metadata.install_completed_lineage(&mut working);
+    // Commit and reload root metadata BEFORE reaching the unchanged child.
+    let root_committed = working.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
+    assert_eq!(
+        root_committed.claude_desktop_completed_lineage,
+        Some(BTreeMap::new())
+    );
+    assert_eq!(
+        root_committed.claude_desktop_lineage_file_edges,
+        previous.claude_desktop_lineage_file_edges
+    );
+    let root_committed = read(
+        std::io::Cursor::new(serde_json::to_vec(&root_committed).unwrap()),
+        "load",
+        "claude_code",
+    )
+    .unwrap();
+    let mut working = root_committed.clone();
+    // The walk now reaches the child, but its replacement is unaccepted.
     working
         .files
         .get_mut("/synthetic/child.jsonl")
@@ -207,11 +234,18 @@ fn desktop_lineage_incomplete_page_freezes_projection_and_partial_save_keeps_old
         "/synthetic/child.jsonl".into(),
         desktop_lineage::edge_fingerprint(None),
     );
-    let subset = working.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
+    let subset = working.committable_subset(&root_committed, &BTreeSet::new(), &BTreeMap::new());
     assert_eq!(
         subset.claude_desktop_completed_lineage,
         Some(BTreeMap::new())
     );
+    assert_eq!(
+        subset.files["/synthetic/child.jsonl"].last_snapshot_fingerprint,
+        previous.files["/synthetic/child.jsonl"].last_snapshot_fingerprint
+    );
+    assert!(!subset
+        .accepted_snapshot_fingerprints
+        .contains(&"b".repeat(64)));
     assert_eq!(
         subset.claude_desktop_lineage_file_edges,
         previous.claude_desktop_lineage_file_edges
@@ -256,4 +290,138 @@ fn desktop_lineage_repair_capture_carries_selectors_without_census_authority() {
     );
     assert!(!repaired.claude_desktop_lineage_census_complete);
     assert!(repaired.files.is_empty());
+}
+
+#[test]
+fn desktop_lineage_malformed_file_baselines_default_empty_and_count_without_losing_projection() {
+    let over_count: BTreeMap<_, _> = (0..=desktop_lineage::MAX_EDGES)
+        .map(|n| (format!("/synthetic/{n}.jsonl"), "a".repeat(64)))
+        .collect();
+    for bad in [
+        json!(["wrong shape"]),
+        json!({"/synthetic/child.jsonl":"not-a-digest"}),
+        json!({"/synthetic/child.jsonl":3}),
+        json!({("k".repeat(8193)):"a".repeat(64)}),
+        json!({"/synthetic/child.jsonl":"a".repeat(desktop_lineage::MAX_DECODE_BYTES as usize)}),
+        serde_json::to_value(over_count).unwrap(),
+    ] {
+        let original = seed();
+        let mut value = serde_json::to_value(&original).unwrap();
+        value["claude_desktop_lineage_file_edges"] = bad;
+        let (loaded, rows) = crate::local_resource_diagnostics::capture(|| {
+            read(
+                std::io::Cursor::new(serde_json::to_vec(&value).unwrap()),
+                "load",
+                "claude_code",
+            )
+            .unwrap()
+        });
+        assert!(loaded.claude_desktop_lineage_file_edges.is_empty());
+        assert_eq!(
+            loaded.claude_desktop_completed_lineage,
+            original.claude_desktop_completed_lineage
+        );
+        assert_eq!(loaded.files.len(), original.files.len());
+        assert_eq!(selector_drops(&rows), 1);
+    }
+}
+
+fn selector_drops(rows: &[Value]) -> u64 {
+    rows.iter()
+        .filter_map(|row| row["counts"]["desktop_metadata"]["lineage_selector_drops"].as_u64())
+        .sum()
+}
+
+#[test]
+fn desktop_lineage_full_record_budget_refuses_only_new_baseline_on_existing_diagnostic_line() {
+    let mut index = seed();
+    index.claude_desktop_lineage_file_edges.clear();
+    let entry = index.files["/synthetic/child.jsonl"].clone();
+    let edge = desktop_lineage::edge_fingerprint(Some(PARENT));
+    for n in 0..desktop_lineage::MAX_EDGES {
+        let key = format!("/synthetic/{n}.jsonl");
+        index.files.insert(key.clone(), entry.clone());
+        index
+            .claude_desktop_lineage_file_edges
+            .insert(key, edge.clone());
+    }
+    let previous = index.claude_desktop_lineage_file_edges.clone();
+    let key = "/synthetic/child.jsonl";
+    let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+        index.record_desktop_lineage_file_edge(key, edge.clone())
+    });
+    assert_eq!(index.claude_desktop_lineage_file_edges, previous);
+    assert_eq!(selector_drops(&rows), 1);
+    assert!(rows
+        .iter()
+        .any(|row| row["stage"] == "native_collection_page"));
+    let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+        index.record_desktop_lineage_file_edge(
+            "/synthetic/0.jsonl",
+            desktop_lineage::edge_fingerprint(None),
+        )
+    });
+    assert_eq!(
+        selector_drops(&rows),
+        0,
+        "existing baselines remain updateable at capacity"
+    );
+    assert_eq!(
+        index.claude_desktop_lineage_file_edges.len(),
+        desktop_lineage::MAX_EDGES
+    );
+}
+
+#[test]
+fn desktop_lineage_file_byte_budget_roundtrips_and_refuses_one_more_without_eviction() {
+    let mut index = seed();
+    index.claude_desktop_lineage_file_edges.clear();
+    let entry = index.files["/synthetic/child.jsonl"].clone();
+    // Escaped path bytes discriminate the JSON budget from raw key lengths.
+    let keys: Vec<_> = (0..128)
+        .map(|n| format!("/synthetic/{n:03}/{}", "\\".repeat(8000)))
+        .collect();
+    for key in &keys {
+        index.files.insert(key.clone(), entry.clone());
+    }
+    let edge = desktop_lineage::edge_fingerprint(Some(PARENT));
+    let mut refused = false;
+    for key in &keys {
+        let before = index.claude_desktop_lineage_file_edges.clone();
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            index.record_desktop_lineage_file_edge(key, edge.clone())
+        });
+        if !index.claude_desktop_lineage_file_edges.contains_key(key) {
+            assert_eq!(index.claude_desktop_lineage_file_edges, before);
+            assert_eq!(selector_drops(&rows), 1);
+            assert!(rows
+                .iter()
+                .any(|row| row["stage"] == "native_collection_page"));
+            refused = true;
+            break;
+        }
+        assert_eq!(selector_drops(&rows), 0);
+    }
+    assert!(refused, "byte budget must bind before the record cap");
+    assert!(index.claude_desktop_lineage_file_edges.len() < desktop_lineage::MAX_EDGES);
+    let map_bytes = serde_json::to_vec(&index.claude_desktop_lineage_file_edges).unwrap();
+    assert!(map_bytes.len() as u64 <= desktop_lineage::MAX_DECODE_BYTES);
+    assert!(
+        map_bytes.len() > desktop_lineage::MAX_DECODE_BYTES as usize - 20_000,
+        "the accepted map reaches the byte budget within one escaped record"
+    );
+    let scratch = crate::test_scratch::ScratchDir::new("desktop-lineage-byte-budget");
+    let path = scratch.join("index.json");
+    index.save(&path).unwrap();
+    let (loaded, rows) =
+        crate::local_resource_diagnostics::capture(|| ScanIndex::load(&path).unwrap());
+    assert_eq!(selector_drops(&rows), 0);
+    assert_eq!(
+        loaded.claude_desktop_lineage_file_edges,
+        index.claude_desktop_lineage_file_edges
+    );
+    assert_eq!(
+        loaded.claude_desktop_completed_lineage,
+        index.claude_desktop_completed_lineage
+    );
 }
