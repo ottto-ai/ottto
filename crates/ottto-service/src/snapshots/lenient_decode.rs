@@ -2342,7 +2342,7 @@ pub(super) fn read_bounded(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
     validate_original(&mut std::io::Cursor::new(bytes)).inspect_err(|error| {
         note_refusal(error, "cas", "unattributed");
     })?;
-    let (normalized, duplicate_census, duplicate_shadow) =
+    let (normalized, duplicate_census, duplicate_shadow, duplicate_upgrade) =
         claude_request_census::normalized_bounded_bytes(bytes)?;
     bounded_shape(&normalized).inspect_err(|_| {
         note_refusal(
@@ -2357,6 +2357,9 @@ pub(super) fn read_bounded(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
     }
     if duplicate_shadow {
         index.claude_request_census_shadow = ClaudeRequestCensusShadowState::default();
+    }
+    if duplicate_upgrade {
+        index.o3_replay = upgrade_replay::State::refused();
     }
     Ok(index)
 }

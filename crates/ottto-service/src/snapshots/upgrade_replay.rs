@@ -65,6 +65,31 @@ impl Clone for State {
     }
 }
 
+fn unique_spends<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<String, BTreeSet<KeyHash>>, D::Error> {
+    struct Unique;
+    impl<'de> serde::de::Visitor<'de> for Unique {
+        type Value = BTreeMap<String, BTreeSet<KeyHash>>;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("unique release keys")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut spends = BTreeMap::new();
+            while let Some((key, value)) = map.next_entry::<String, BTreeSet<KeyHash>>()? {
+                if spends.insert(key, value).is_some() {
+                    return Err(serde::de::Error::custom("duplicate O3 release key"));
+                }
+            }
+            Ok(spends)
+        }
+    }
+    deserializer.deserialize_map(Unique)
+}
+
 impl<'de> Deserialize<'de> for State {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
@@ -72,13 +97,16 @@ impl<'de> Deserialize<'de> for State {
         #[derive(Default, Deserialize)]
         #[serde(default)]
         struct Wire {
+            #[serde(deserialize_with = "unique_spends")]
             replayed: BTreeMap<String, BTreeSet<KeyHash>>,
             closed: bool,
         }
-        let value = serde_json::Value::deserialize(deserializer)?;
+        // Preserve duplicate members until the typed decoder can reject them;
+        // a Value would silently keep the last member and erase negative proof.
+        let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
         // Old malformed diagnostic state must not poison the whole index.
         // It may only refuse O3 authority; the paced fallback remains usable.
-        let Ok(mut wire) = serde_json::from_value::<Wire>(value) else {
+        let Ok(mut wire) = serde_json::from_str::<Wire>(raw.get()) else {
             return Ok(Self {
                 closed: true,
                 ..Self::default()
@@ -209,7 +237,7 @@ mod tests {
         let mut restarted = ScanIndex::load(&path).unwrap();
         assert!(!restarted.o3_replay.upgrade_missing("file", true));
         let encoded = std::fs::read(&path).unwrap();
-        let mut native = claude_request_census::decode_index(&encoded).unwrap();
+        let mut native = claude_request_census::decode_index(encoded.as_slice()).unwrap();
         assert!(!native.o3_replay.upgrade_missing("file", true));
         let mut bounded = lenient_decode::read_bounded(&encoded).unwrap();
         assert!(!bounded.o3_replay.upgrade_missing("file", true));

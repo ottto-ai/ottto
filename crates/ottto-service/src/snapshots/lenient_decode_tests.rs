@@ -4731,7 +4731,7 @@ fn o3_negative_spend_crosses_full_positional_and_named_readers() {
     );
     for form in [named, array] {
         let bytes = serde_json::to_vec(&form).unwrap();
-        let native = claude_request_census::decode_index(&bytes).unwrap();
+        let native = claude_request_census::decode_index(bytes.as_slice()).unwrap();
         let bounded = lenient_decode::read_bounded(&bytes).unwrap();
         let streaming =
             lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
@@ -4741,6 +4741,45 @@ fn o3_negative_spend_crosses_full_positional_and_named_readers() {
                 serde_json::to_vec(&decoded).unwrap(),
                 serde_json::to_vec(&seed).unwrap()
             );
+        }
+    }
+}
+
+#[test]
+fn o3_ambiguous_negative_evidence_refuses_through_every_reader() {
+    let release = format!(
+        "upgrade_state_missing:{}",
+        ottto_core::compiled_release_version()
+    );
+    let spent = format!("{{\"{}\":[\"{}\"]}}", release, "a".repeat(32));
+    let forms = [
+        r#""reread_guard":{},"reread_guard":{"closed":true}"#.to_owned(),
+        r#""reread_guard":{"closed":true,"closed":false}"#.to_owned(),
+        format!(r#""reread_guard":{{"replayed":{spent},"replayed":{{}}}}"#),
+        format!(
+            r#""reread_guard":{{"replayed":{{"{release}":["{}"],"{release}":[]}}}}"#,
+            "a".repeat(32)
+        ),
+    ];
+    for fields in forms {
+        let bytes = format!("{{{fields}}}").into_bytes();
+        let native = claude_request_census::decode_index(bytes.as_slice()).unwrap();
+        let bounded = lenient_decode::read_bounded(&bytes).unwrap();
+        let streaming =
+            lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
+        for mut decoded in [native, bounded, streaming] {
+            assert!(
+                !decoded.o3_replay.upgrade_missing("never-seen-key", true),
+                "{fields}"
+            );
+            assert!(
+                !decoded.o3_replay.needs_save(),
+                "refusal cannot reserve a fresh ticket: {fields}"
+            );
+            let saved = serde_json::to_vec(&decoded).unwrap();
+            let mut reopened = lenient_decode::read_bounded(&saved).unwrap();
+            assert!(!reopened.o3_replay.upgrade_missing("another-key", true));
+            assert!(!reopened.o3_replay.needs_save());
         }
     }
 }

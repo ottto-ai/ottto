@@ -20,7 +20,8 @@ Mtime alone cannot grant this bypass. Accepted-prefix and future-revision floors
 remain, and acquisition does not authorize rewriting the old record. New native
 fixtures compare the updated body to cold acquisition, check no manufactured ACK,
 perform an explicit exact-body ACK, retain an unproved predecessor through save,
-and check a quiet restart past the activity window.
+start after idle beyond the activity window on a fresh owner/reloaded index,
+and check a second quiet restart.
 
 Clock anomalies expire Full pace toward reading and have a pace_anomaly alarm
 separate from pace_evicted. The spent Tail grant is never refunded.

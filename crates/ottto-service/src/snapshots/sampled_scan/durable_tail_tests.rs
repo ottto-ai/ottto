@@ -7810,6 +7810,9 @@ impl O3Fixture {
         Self::from_rows(&a1a_row("accepted", 100), true)
     }
     fn from_rows(rows: &str, no_match: bool) -> Self {
+        Self::from_rows_at(rows, no_match, None)
+    }
+    fn from_rows_at(rows: &str, no_match: bool, modified: Option<std::time::SystemTime>) -> Self {
         use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
         let root = crate::test_scratch::private_dir("ottto-o3-termination");
         let lock = test_locks::hold(&root);
@@ -7817,6 +7820,14 @@ impl O3Fixture {
         std::fs::create_dir_all(&projects).unwrap();
         let path = projects.join("1338a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl");
         std::fs::write(&path, rows).unwrap();
+        if let Some(modified) = modified {
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+        }
         let key = local_index_key(&path);
         let roots = vec![projects];
         let index_path = root.join("index.json");
@@ -8966,13 +8977,22 @@ fn stale_binding_cannot_mask_equal_head_edit_or_shorter_replacement_across_resta
     let _gate = claude_request_money::e2::GateForTest::set(true);
     for binding in ["context", "no_match"] {
         for edit in ["equal_head", "shorter_object"] {
-            let mut f = O3Fixture::from_rows(&a1a_row("accepted-with-long-id", 100), false);
+            let old_unix = 1_785_657_600 - 3 * 86400;
+            let old_mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(old_unix);
+            let mut f = O3Fixture::from_rows_at(
+                &a1a_row("accepted-with-long-id", 100),
+                false,
+                Some(old_mtime),
+            );
+            assert!(
+                !is_recent_enough_at(old_unix, 1_785_657_600 + 8 * 3600, 1),
+                "accepted object was idle beyond W before the new edit/restart"
+            );
             if binding == "context" {
                 f.rewrite_survivor(|r| r.record.binding.context = [93; 32]);
             } else if binding == "no_match" {
                 f.rewrite_survivor(|r| r.record.binding.scope = [91; 32]);
             }
-            let old_stamp = std::fs::metadata(&f.path).unwrap().modified().unwrap();
             let old_length = f.prior.files[&f.key].size_bytes;
             if edit == "equal_head" {
                 let text = std::fs::read_to_string(&f.path).unwrap();
@@ -8990,14 +9010,14 @@ fn stale_binding_cannot_mask_equal_head_edit_or_shorter_replacement_across_resta
                 .write(true)
                 .open(&f.path)
                 .unwrap()
-                .set_modified(old_stamp + std::time::Duration::from_secs(2))
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_785_657_600))
                 .unwrap();
             let owner = f.owner();
-            let mut prior = f.prior.clone();
+            let mut prior = ScanIndex::load(&f.index_path).unwrap();
             let accepted_witness = prior.files[&f.key].last_upload_body_witness.clone();
             let before = prior.clone();
             let ((mut index, mut scan, mode), bytes) =
-                observe_consumed(|| f.scan(&owner, &mut prior));
+                observe_consumed(|| f.scan_at(&owner, &mut prior, "2026-08-02T08:00:00Z", 1));
             assert_eq!(mode.0, 1, "{binding}/{edit}: independent A2 Full");
             assert_eq!(bytes, std::fs::metadata(&f.path).unwrap().len());
             assert!(!scan.snapshots.is_empty());
@@ -9032,9 +9052,13 @@ fn stale_binding_cannot_mask_equal_head_edit_or_shorter_replacement_across_resta
             drop(owner);
             let restarted = f.owner();
             let mut loaded = ScanIndex::load(&f.index_path).unwrap();
-            let ((held, later, modes), bytes) =
-                observe_consumed(|| f.scan_at(&restarted, &mut loaded, "2026-08-04T08:00:00Z", 1));
-            assert_eq!(bytes, 0, "idle > W does not manufacture another read");
+            let ((held, later, modes), bytes) = observe_consumed(|| {
+                f.scan_at(&restarted, &mut loaded, "2026-08-04T08:00:00Z", 183)
+            });
+            assert_eq!(
+                bytes, 0,
+                "quiet second restart does not manufacture another read"
+            );
             assert_eq!(modes.0, 0);
             assert!(later.snapshots.is_empty());
             assert_eq!(
