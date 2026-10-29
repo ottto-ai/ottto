@@ -15313,6 +15313,7 @@ mod tests {
     #[test]
     fn account_change_counter_updates_only_for_stored_body_acks() {
         use crate::local_resource_diagnostics::{capture, source_finish};
+        use serde_json::{json, Value};
         let mut progress = test_upload_progress();
         let mut accepted = 0;
         let mut send =
@@ -15323,7 +15324,7 @@ mod tests {
                     "snapshot_fingerprint":fingerprint,
                     "model_usage":[{"account_identifier_hash":account}]
                 })];
-                let (_, lines) = capture(|| {
+                let (result, lines) = capture(|| {
                     source_finish("claude_code", || {
                         attempt_snapshot_page(
                             &items,
@@ -15350,6 +15351,7 @@ mod tests {
                         )
                     })
                 });
+                assert!(result.is_ok(), "{result:?}");
                 lines.last().unwrap()["counts"]["account_hash_changed"]
                     .as_u64()
                     .unwrap()
@@ -15357,6 +15359,7 @@ mod tests {
         assert_eq!(send(1, "account-a", true, &mut progress), 0);
         let saved = serde_json::to_vec(&progress).unwrap();
         progress = serde_json::from_slice(&saved).unwrap();
+        progress.active_quarantine_witness = Some(test_quarantine_witness());
         assert_eq!(send(2, "account-b", false, &mut progress), 0);
         assert_eq!(
             send(3, "account-a", true, &mut progress),
