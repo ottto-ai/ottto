@@ -23797,12 +23797,90 @@ mod tests {
             );
         }
     }
+    struct DesktopUploadRevisionEvidence {
+        first_admitted_at: OffsetDateTime,
+        offers: Vec<serde_json::Value>,
+        requests: Vec<String>,
+    }
+
     #[test]
     #[serial(source_manifests)]
     fn desktop_incomplete_discovery_uploads_new_session_unbound_then_clean_sweep_binds() {
+        desktop_unbound_upload_revision_fixture("2026-09-30");
+    }
+
+    #[test]
+    #[serial(source_manifests)]
+    fn desktop_forward_cohort_binding_uses_new_upload_revision() {
+        let evidence = desktop_unbound_upload_revision_fixture("2026-10-30");
+        let cutoff = OffsetDateTime::parse("2026-10-30T00:00:00Z", &Rfc3339).unwrap();
+        assert!(
+            evidence.first_admitted_at >= cutoff,
+            "server admission, not producer time"
+        );
+        let old = &evidence.offers[0]["snapshots"][0];
+        let new = &evidence.offers[1]["snapshots"][0];
+        assert_eq!(old["source_session_id"], new["source_session_id"]);
+        assert_eq!(
+            old["session_account_evidence"]["identity_disposition"],
+            "missing"
+        );
+        assert_eq!(
+            new["session_account_evidence"]["identity_disposition"],
+            "complete"
+        );
+        let account = &new["session_account_evidence"]["account_identifier_hash"];
+        assert!(account.as_str().is_some_and(|hash| hash.len() == 64));
+        for row in new["model_usage"].as_array().unwrap() {
+            assert_eq!(&row["account_identifier_hash"], account);
+        }
+        // Both released revision contracts must identify the second accepted
+        // upload as a successor, while the usage/money component is identical.
+        for key in ["revision_hash", "revision_v2_hash"] {
+            assert_ne!(old["semantic_envelope"][key], new["semantic_envelope"][key]);
+        }
+        assert_eq!(
+            old["semantic_envelope"]["component_hashes"]["usage_accounting"],
+            new["semantic_envelope"]["component_hashes"]["usage_accounting"]
+        );
+        assert_eq!(old["cost"], new["cost"]);
+        assert_ne!(
+            old["semantic_envelope"]["component_hashes"]["attribution"],
+            new["semantic_envelope"]["component_hashes"]["attribution"],
+            "the bind itself changes attribution, independently of physical file selection"
+        );
+    }
+
+    #[test]
+    #[serial(source_manifests)]
+    fn desktop_forward_cohort_binding_has_no_late_naming_write() {
+        let evidence = desktop_unbound_upload_revision_fixture("2026-10-30");
+        // Capture EVERY request, not just batch callbacks. No status, weak
+        // naming, reconciliation or alternate endpoint carries the bind.
+        assert_eq!(
+            evidence.requests,
+            vec![
+                "POST /api/v1/agent-session-snapshots/batches HTTP/1.1",
+                "POST /api/v1/agent-session-snapshots/batches HTTP/1.1",
+            ]
+        );
+        assert_eq!(evidence.offers.len(), 2);
+        assert!(evidence.offers[0]["snapshots"][0]["model_usage"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row.get("account_identifier_hash").is_none()));
+        assert_eq!(
+            evidence.offers[1]["snapshots"][0]["session_account_evidence"]["identity_disposition"],
+            "complete"
+        );
+    }
+
+    fn desktop_unbound_upload_revision_fixture(day: &str) -> DesktopUploadRevisionEvidence {
         // Exercise the legacy owner path, real scan/evidence fold, hold filter,
-        // wire validation, HTTP POST and entity ACK. Money is an explicit
-        // nonzero input at the owner seam; this does not test money derivation.
+        // resumable upload driver, wire validation, HTTP POST and entity ACK.
+        // Money is explicit nonzero input at the owner seam; this does not
+        // test money derivation.
         let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let home = crate::test_scratch::ScratchDir::new("desktop-unbound-upload");
@@ -23819,7 +23897,7 @@ mod tests {
         std::fs::write(
             store.join("local_session.json"),
             serde_json::json!({
-                "cliSessionId":session,"createdAt":"2026-09-30T10:00:00Z",
+                "cliSessionId":session,"createdAt":format!("{day}T10:00:00Z"),
                 "spawnedFrom":{"sessionId":"local_missing_parent"}
             })
             .to_string(),
@@ -23838,7 +23916,7 @@ mod tests {
             )
             .unwrap()
         };
-        assert!(scan(&mut index, "2026-09-30T09:55:00Z")
+        assert!(scan(&mut index, &format!("{day}T09:55:00Z"))
             .snapshots
             .is_empty());
         assert_eq!(
@@ -23852,7 +23930,7 @@ mod tests {
         std::fs::write(&support, "synthetic enumeration failure").unwrap();
         let path = projects.join(format!("{session}.jsonl"));
         let transcript = serde_json::json!({"type":"assistant","sessionId":session,
-            "timestamp":"2026-09-30T10:00:00Z","requestId":"req-owned",
+            "timestamp":format!("{day}T10:00:00Z"),"requestId":"req-owned",
             "message":{"id":"message-owned","model":"claude-haiku-4-5",
                 "usage":{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":3,
                     "cache_creation_input_tokens":7,
@@ -23860,18 +23938,40 @@ mod tests {
         std::fs::write(&path, format!("{transcript}\n")).unwrap();
         let offered = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
         let captured = offered.clone();
-        let backend = loopback_backend::Backend::with_listener(
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured_requests = requests.clone();
+        // This is the synthetic sink's acceptance clock. The daemon sends no
+        // first_admitted_at/cohort flag; the real backend owns that marker.
+        let admission_clock = OffsetDateTime::parse(&format!("{day}T10:05:00Z"), &Rfc3339).unwrap();
+        let first_admitted_at = Arc::new(Mutex::new(None));
+        let captured_admission = first_admitted_at.clone();
+        let backend = loopback_backend::Backend::with_request_observer(
             TcpListener::bind("127.0.0.1:0").unwrap(),
             Some(Arc::new(move |wire| {
+                captured_admission
+                    .lock()
+                    .unwrap()
+                    .get_or_insert(admission_clock);
                 captured.lock().unwrap().push(wire.clone());
                 Ok(())
             })),
+            Arc::new(move |head, _| {
+                captured_requests.lock().unwrap().push(head.to_string());
+                Ok(())
+            }),
         )
         .unwrap();
         let client = SnapshotApiClient::new(&backend.url)
             .with_receipt_state_dir(home.join("receipts"))
             .with_receipt_destination_namespace("a".repeat(64));
-        for (cycle, at) in ["2026-09-30T10:05:00Z", "2026-09-30T10:20:00Z"]
+        let namespace = "a".repeat(64);
+        let progress_path = home.join("upload-progress.json");
+        let poison_scope = unique_poison_scope();
+        let mut progress = SnapshotUploadProgress::new(
+            namespace.clone(),
+            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+        );
+        for (cycle, at) in [format!("{day}T10:05:00Z"), format!("{day}T10:20:00Z")]
             .into_iter()
             .enumerate()
         {
@@ -23882,7 +23982,7 @@ mod tests {
                 // read. Census flaps alone must not select unchanged bodies.
                 std::fs::write(&path, format!("{transcript}\n\n")).unwrap();
             }
-            let mut page = scan(&mut index, at);
+            let mut page = scan(&mut index, &at);
             assert_eq!(page.snapshots.len(), 1, "cycle {cycle}: native read");
             assert_eq!(
                 serde_json::to_value(&index).unwrap()["claude_desktop_identity_census_complete"],
@@ -24053,23 +24153,54 @@ mod tests {
                 .iter()
                 .chain(item.usage_buckets.iter().flat_map(|b| b.model_usage.iter()))
                 .all(|r| r.account_identifier_hash.is_some() == (cycle == 1)));
-            let request = SnapshotBatchRequest {
-                schema_version: SNAPSHOT_SCHEMA_VERSION,
-                source: "claude_code".into(),
-                machine_id: "a".repeat(64),
-                collector_version: Some(collector_version()),
-                snapshots: page.snapshots.clone(),
-                upload_policy: SnapshotUploadPolicy::default(),
-                client_report: crate::client_report::ClientReport::empty(),
-            };
-            validate_snapshot_batch_request(&request).unwrap();
-            let response = client
-                .upload_batch("synthetic-relay", &request, false)
+            for repeat in [false, true] {
+                let mut accepted = 0;
+                let result = upload_resumable_batches_with_literal_families(
+                    &page.snapshots,
+                    &poison_scope,
+                    &mut progress,
+                    &mut accepted,
+                    |snapshot| snapshot.snapshot_fingerprint.as_str(),
+                    snapshot_upload_body_witness,
+                    |snapshot| Some(snapshot.source_session_id.as_str()),
+                    |_| false,
+                    crate::snapshots::claude_request_money::request_owned_family_root,
+                    &mut InplaceRetryBudget::default(),
+                    |snapshots| {
+                        let request = SnapshotBatchRequest {
+                            schema_version: SNAPSHOT_SCHEMA_VERSION,
+                            source: "claude_code".into(),
+                            machine_id: "a".repeat(64),
+                            collector_version: Some(collector_version()),
+                            snapshots,
+                            upload_policy: SnapshotUploadPolicy::default(),
+                            client_report: crate::client_report::ClientReport::empty(),
+                        };
+                        validate_snapshot_batch_request(&request).unwrap();
+                        let response = client.upload_batch("synthetic-relay", &request, false)?;
+                        response.validate_entity_ack(&request)?;
+                        Ok(response)
+                    },
+                    |progress| progress.save(&progress_path),
+                )
                 .unwrap();
-            assert_eq!(
-                response.accepted, 1,
-                "real HTTP upload and validated entity ACK"
-            );
+                assert!(matches!(result, ResumableUploadResult::Completed));
+                assert_eq!(
+                    accepted,
+                    u64::from(!repeat),
+                    "new revision posts; exact ACKed repeat stays quiet"
+                );
+                assert!(progress.contains_body(
+                    &item.snapshot_fingerprint,
+                    &snapshot_upload_body_witness(item)
+                ));
+                progress = SnapshotUploadProgress::load(
+                    &progress_path,
+                    &namespace,
+                    snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+                )
+                .unwrap();
+            }
             let wire = offered.lock().unwrap();
             assert_eq!(wire.len(), cycle + 1);
             assert_eq!(wire[cycle]["snapshots"].as_array().unwrap().len(), 1);
@@ -24085,6 +24216,18 @@ mod tests {
                 body["usage_buckets"],
                 serde_json::to_value(&expected.usage_buckets).unwrap()
             );
+        }
+        drop(backend);
+        let offers = offered.lock().unwrap().clone();
+        let requests = requests.lock().unwrap().clone();
+        let first_admitted_at = first_admitted_at
+            .lock()
+            .unwrap()
+            .expect("sink accepted a first upload");
+        DesktopUploadRevisionEvidence {
+            first_admitted_at,
+            offers,
+            requests,
         }
     }
 
