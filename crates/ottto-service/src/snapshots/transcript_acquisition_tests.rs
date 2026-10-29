@@ -1114,6 +1114,35 @@ fn production_scan_at_with_setup(
     (usize, usize, usize),
     (u64, u64),
 ) {
+    let (index, raw, _, modes, metrics) = production_scan_page_at_with_setup(
+        fixture,
+        source,
+        index,
+        cache,
+        namespace,
+        collected_at,
+        setup,
+    );
+    (index, raw, modes, metrics)
+}
+
+// Keep native output and the finalized upload candidates distinct. Production
+// applies policy and body-witness no-op suppression before offering a POST.
+fn production_scan_page_at_with_setup(
+    fixture: &ScanFixture,
+    source: SnapshotSource,
+    index: ScanIndex,
+    cache: Option<Arc<sampled_scan::SharedCache>>,
+    namespace: &str,
+    collected_at: &str,
+    setup: impl FnOnce(&mut OwnedSourceScan),
+) -> (
+    ScanIndex,
+    SourceScanResult,
+    SourceScanResult,
+    (usize, usize, usize),
+    (u64, u64),
+) {
     let mut scan = OwnedSourceScan::new(
         source,
         std::slice::from_ref(&fixture.root),
@@ -1163,7 +1192,7 @@ fn production_scan_at_with_setup(
                     .map(|snapshot| snapshot.snapshot_fingerprint.clone())
                     .collect();
                 index.record_accepted_snapshot_fingerprints(&accepted);
-                return (index, scan, modes, metrics);
+                return (index, scan, projected, modes, metrics);
             }
         }
     }
@@ -2071,13 +2100,14 @@ fn overdue_durable_cursor_tail_publishes_and_next_restart_reads_no_suffix() {
             let mut published = None;
             for page in 1..=32 {
                 let collected_at = format!("2026-10-07T12:00:{page:02}Z");
-                let (next, result, modes, _) = production_scan_at(
+                let (next, _, result, modes, _) = production_scan_page_at_with_setup(
                     &fixture,
                     source,
                     index,
                     Some(second.clone()),
                     &namespace.0,
                     &collected_at,
+                    |_| {},
                 );
                 index = next;
                 assert_eq!(modes.0, 0, "no forced Full");
@@ -2115,17 +2145,35 @@ fn overdue_durable_cursor_tail_publishes_and_next_restart_reads_no_suffix() {
             assert_eq!(checkpoint.sealed_offset(), length);
             assert_eq!(checkpoint.last_full_verified(), START);
             assert_eq!(checkpoint.audit_debt().unwrap().due_unix_seconds, due);
-            let (_, cold, _, _) = production_scan_at(
+            let (_, _, cold, _, _) = production_scan_page_at_with_setup(
                 &fixture,
                 source,
                 cold_index,
                 None,
                 &namespace.0,
                 &published_at,
+                |_| {},
             );
+            let published_fingerprints = published
+                .snapshots
+                .iter()
+                .map(|snapshot| snapshot.snapshot_fingerprint.clone())
+                .collect::<BTreeSet<_>>();
             assert_eq!(
                 production_body(source, published),
                 production_body(source, cold)
+            );
+            let accepted = index.accepted_snapshot_fingerprints.clone();
+            let group = index.files[&key].last_snapshot_fingerprint.clone();
+            let witness = index.files[&key].last_upload_body_witness.clone();
+            assert!(!published_fingerprints.is_empty());
+            assert!(
+                published_fingerprints.is_subset(&accepted),
+                "Tail publication was acknowledged"
+            );
+            assert!(
+                group.is_some() && witness.is_some(),
+                "accepted body is bound"
             );
             index.save(&index_path).unwrap();
             assert_eq!(
@@ -2143,17 +2191,49 @@ fn overdue_durable_cursor_tail_publishes_and_next_restart_reads_no_suffix() {
             drop(second);
             let third = Arc::new(sampled_scan::SharedCache::default());
             third.durable_begin_pass(source, &index_path, &namespace, true);
-            let (next, result, modes, bytes) = production_scan_with_metrics(
+            let restart_index = ScanIndex::load(&index_path).unwrap();
+            let mut correction_index = restart_index.clone();
+            let (next, raw, result, modes, bytes) = production_scan_page_at_with_setup(
                 &fixture,
                 source,
-                ScanIndex::load(&index_path).unwrap(),
+                restart_index,
                 Some(third.clone()),
                 &namespace.0,
+                NOW,
+                |_| {},
             );
             assert_eq!(third.durable_counters(source).unwrap().0.restored, 1);
             assert_eq!(modes, (0, 0, 1));
             assert_eq!(bytes.0, 0, "second restart reads zero native suffix bytes");
+            assert!(
+                !raw.snapshots.is_empty(),
+                "retained native body is replayed"
+            );
             assert!(result.snapshots.is_empty(), "no duplicate publication");
+            assert_eq!(result.semantic_noop_count, raw.snapshots.len());
+            assert_eq!(next.accepted_snapshot_fingerprints, accepted);
+            assert_eq!(next.files[&key].last_snapshot_fingerprint, group);
+            assert_eq!(next.files[&key].last_upload_body_witness, witness);
+            // Negative control: a changed additive body at this same boundary
+            // must still be offered, even when semantic identity is unchanged.
+            let mut correction = raw.clone();
+            apply_upload_policy(
+                source,
+                &mut correction.snapshots,
+                SnapshotUploadPolicy::default(),
+            );
+            let item = &mut correction.snapshots[0];
+            let fingerprint = snapshot_fingerprint(source, item);
+            let prior_witness = snapshot_upload_body_witness(item);
+            item.tool_usage_truncated = !item.tool_usage_truncated;
+            assert_ne!(snapshot_upload_body_witness(item), prior_witness);
+            assert_eq!(snapshot_fingerprint(source, item), fingerprint);
+            finalize_scan_after_policy(source, &mut correction, &mut correction_index);
+            assert!(
+                !correction.snapshots.is_empty(),
+                "changed body still publishes"
+            );
+            assert_eq!(correction.snapshots[0].snapshot_fingerprint, fingerprint);
             assert_eq!(third.counters_for_test().jobs_started, 0);
             assert_eq!(next.files[&key].unverified_deadline(), Some(due));
             let reused = third.retained_checkpoint(&key).unwrap();

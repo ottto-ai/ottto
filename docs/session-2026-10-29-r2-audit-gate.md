@@ -72,4 +72,25 @@ certificate fixture. It now round-trips through main's actual binary durable
 store writer/reader before exercising the same FD/read/debt assertions. Existing
 proof-horizon and rotating-cursor tests now distinguish ordinary acquisition
 from exact-stamp proof expiry: both rotating files must publish overdue Tails
-in a later generation without resetting verification or debt.
+without resetting verification or debt; this can occur within the same census
+generation.
+
+Round 4 repairs four macOS-only test expectations; production is unchanged.
+The rotating-file test now requires a later completed Tail and a strictly larger
+sealed offset for each file, since audit age does not rotate the census token.
+The converged cursor test proves that a one-row suffix fits the singleton budget,
+completes/publishes without another cursor job, and keeps the original Full time
+and its deadline.
+
+The durable restart test now observes both raw native output and the finalized
+upload candidates. It requires the changed Tail to emit the same production
+body as cold Full, then requires zero finalized candidates at the next restart,
+with identical accepted fingerprints, semantic group and body witness. A changed
+additive-body negative control still emits under the same semantic identity. Raw
+Unchanged output alone is not a publication: production suppresses identical
+bodies during post-policy finalization before constructing the upload batch.
+The audit-capacity refusal test retains its no-output/no-checkpoint/no-marker
+requirements and pins ScopeObject as the sole refusal: a frozen read with growth
+and no H3c grant fails completion object revalidation. No local Cargo execution;
+E1 must rerun Linux, native macOS contracts and money, then obtain exact-head
+review. Prior money and review receipts do not qualify the new head.
