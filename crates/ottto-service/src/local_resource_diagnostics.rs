@@ -136,7 +136,8 @@ pub(crate) enum UnselectedReason {
     /// The subset of size skips whose key holds a withheld-account revision.
     WithheldOversized,
 }
-const UNSELECTED_REASONS: usize = 3;
+/// The three reasons, then the four `WithheldEvent` slots.
+const UNSELECTED_REASONS: usize = 7;
 /// Claude, Codex, Pi x reason, drained by that source's page line.
 #[cfg(not(test))]
 static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
@@ -163,6 +164,42 @@ fn line_unselected(source: &str, reason: usize, f: impl FnOnce(&AtomicU64) -> u6
 /// One skip decision, recorded after the gate decided; never a gate input.
 pub(crate) fn line_delivery_unselected(source: &str, reason: UnselectedReason) {
     line_unselected(source, reason as usize, |slot| slot.fetch_add(1, Relaxed));
+}
+
+/// E3: Claude withheld-account hold events, in the slots after the reasons.
+#[derive(Clone, Copy)]
+pub(crate) enum WithheldEvent {
+    /// A held key's file was proved absent and its hold released.
+    ReleasedDeleted = 3,
+    /// A held key re-parsed: first time in this process, after an account
+    /// evidence change, or after its transcript stamp changed.
+    ReparseStart,
+    ReparseEvidence,
+    ReparseGrowth,
+}
+/// Recorded after the decision; never a gate input.
+pub(crate) fn withheld_event(event: WithheldEvent) {
+    line_unselected("claude_code", event as usize, |slot| {
+        slot.fetch_add(1, Relaxed)
+    });
+}
+fn drain(source: &str, slots: &[(&'static str, usize)]) -> BTreeMap<&'static str, u64> {
+    slots
+        .iter()
+        .map(|&(key, slot)| (key, line_unselected(source, slot, |n| n.swap(0, Relaxed))))
+        .filter(|(_, count)| *count > 0)
+        .collect()
+}
+const WITHHELD_RELEASED: [(&str, usize); 1] = [("deleted", 3)];
+const WITHHELD_REPARSE: [(&str, usize); 3] = [("start", 4), ("evidence", 5), ("growth", 6)];
+#[cfg(test)]
+pub(crate) fn take_withheld_for_test() -> (BTreeMap<&'static str, u64>, BTreeMap<&'static str, u64>)
+{
+    let claude = "claude_code";
+    (
+        drain(claude, &WITHHELD_RELEASED),
+        drain(claude, &WITHHELD_REPARSE),
+    )
 }
 
 const SCHEMA_VERSION: u8 = 2;
@@ -414,6 +451,10 @@ impl Probe {
             line_delivery: Option<BTreeMap<&'static str, LineDeliveryCounts>>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             line_delivery_unselected: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            withheld_hold_released: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            withheld_reparse: BTreeMap<&'static str, u64>,
         }
         let claude = source == "claude_code";
         let counts = Counts {
@@ -421,11 +462,12 @@ impl Probe {
                 .line_delivery
                 .filter(|(_, counts)| *counts != LineDeliveryCounts::default())
                 .map(|(observer, counts)| BTreeMap::from([(observer, counts)])),
-            line_delivery_unselected: [("age", 0), ("size", 1), ("withheld_oversized", 2)]
-                .into_iter()
-                .map(|(key, reason)| (key, line_unselected(source, reason, |n| n.swap(0, Relaxed))))
-                .filter(|(_, count)| *count > 0)
-                .collect(),
+            line_delivery_unselected: drain(
+                source,
+                &[("age", 0), ("size", 1), ("withheld_oversized", 2)],
+            ),
+            withheld_hold_released: drain(source, &WITHHELD_RELEASED),
+            withheld_reparse: drain(source, &WITHHELD_REPARSE),
             reread: if claude {
                 self.page_events.with_current().without_terminal_rearm()
             } else {

@@ -152,6 +152,7 @@ mod stale_carry_diagnostics;
 #[cfg(test)]
 mod transcript_acquisition_tests;
 mod traversal_transition;
+mod withheld_account;
 use stale_carry_diagnostics::{
     Counts as StaleCarryRejectionCounts, Rejection as StaleCarryRejection,
 };
@@ -4997,7 +4998,8 @@ impl ClaudeUsageAuthorityDisposition {
     ///   retry is due; the held key keeps its committed revision;
     /// - an account deferral, whose verdict depends on the body and the local
     ///   request evidence rather than on traversal completeness. Its key keeps
-    ///   the committed revision and is reparsed by every later generation.
+    ///   the committed revision and is reparsed once per process and when its
+    ///   stamp or account evidence changes (`withheld_account`).
     ///
     /// Everything else stays progress-blocking. Without a durable disclosure
     /// for every account deferral (`account_holds_recorded == false`), account
@@ -30317,7 +30319,12 @@ impl OwnedSourceScan {
                         } else if source != SnapshotSource::Codex
                             || codex_counting_version::tombstone_before_retire(index, index_key)
                         {
+                            let held = index.claude_account_deferred_holds.contains_key(index_key);
                             index.remove_file_entry_unless_held(index_key, vanished);
+                            if held && !index.claude_account_deferred_holds.contains_key(index_key)
+                            {
+                                withheld_account::released_deleted(index_key);
+                            }
                         }
                         if census_record && index.claude_request_census.get(index_key).is_none() {
                             disappearance_diagnostics::vanished(
@@ -42085,7 +42092,9 @@ fn reconcile_missing_index_entries_with_side(
             index.files.remove(key);
             index.confirmed_empty_files.remove(key);
             index.file_snapshot_fingerprints.remove(key);
-            index.claude_account_deferred_holds.remove(key);
+            if index.claude_account_deferred_holds.remove(key).is_some() {
+                withheld_account::released_deleted(key);
+            }
             index.drop_codex_proof_items(key, codex_side_drop);
         }
     }
@@ -47223,6 +47232,7 @@ impl ScanIndex {
     ) -> bool {
         let mut recorded = true;
         for (index_key, source_file_fingerprint) in completed_parses {
+            let was_held = self.claude_account_deferred_holds.contains_key(index_key);
             let held = self
                 .file_snapshot_fingerprints
                 .get(index_key)
@@ -47239,6 +47249,7 @@ impl ScanIndex {
             } else {
                 recorded = false;
             }
+            self.note_withheld_account_parse(index_key, source_file_fingerprint, was_held);
         }
         recorded
     }
@@ -47251,8 +47262,13 @@ impl ScanIndex {
     /// is neither indexed nor observed is proved absent.
     fn retain_observed_claude_account_deferred_holds(&mut self, observed: &BTreeSet<String>) {
         let files = &self.files;
-        self.claude_account_deferred_holds
-            .retain(|index_key, _| files.contains_key(index_key) || observed.contains(index_key));
+        self.claude_account_deferred_holds.retain(|index_key, _| {
+            let present = files.contains_key(index_key) || observed.contains(index_key);
+            if !present {
+                withheld_account::released_deleted(index_key);
+            }
+            present
+        });
     }
 
     /// Keys whose scanned entity set or head names a held revision.
@@ -48543,6 +48559,9 @@ impl ScanIndex {
             if self.claude_retired_family_member(&candidate.path) {
                 return self.claude_returning_member_decision(candidate);
             }
+            if self.withheld_account_unchanged(&key, candidate) {
+                return (CandidateDecision::Skip, None);
+            }
             return (
                 CandidateDecision::Parse,
                 Some(CandidateParseReason::NewFile),
@@ -48608,6 +48627,13 @@ impl ScanIndex {
                 CandidateDecision::Parse,
                 Some(CandidateParseReason::ActivityOrQuarantineRetry),
             );
+        }
+        // A withheld key keeps its old committed revision; unless re-armed it
+        // re-parses only once per process or on a stamp/evidence change.
+        if !entry.source_file_fingerprint.is_empty()
+            && self.withheld_account_unchanged(&key, candidate)
+        {
+            return (CandidateDecision::Skip, None);
         }
         let transcript_changed = entry.size_bytes != candidate.size_bytes
             || entry.modified_unix_seconds != candidate.modified_unix_seconds

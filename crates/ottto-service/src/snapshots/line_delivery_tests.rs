@@ -1319,6 +1319,8 @@ fn reconciliation_keeps_present_withheld_keys_and_retires_absent_ones() {
         &mut index,
         usize::MAX
     ));
+    // The gone key is never a candidate: its release reads nothing.
+    assert_eq!(candidates(&index), vec![file("held")]);
     let observed = index
         .traversal
         .as_ref()
@@ -1326,6 +1328,11 @@ fn reconciliation_keeps_present_withheld_keys_and_retires_absent_ones() {
         .observed_index_keys
         .clone();
     index.retain_observed_claude_account_deferred_holds(&observed);
+    // Lead A round 2: "deleted held file: hold released, counted".
+    assert_eq!(
+        crate::local_resource_diagnostics::take_withheld_for_test().0,
+        BTreeMap::from([("deleted", 1)])
+    );
     let held = BTreeSet::from([local_index_key(&file("held"))]);
     // Before the exemption both sets were empty: the aged held key was not
     // observed, so reconciliation dropped its entry and hold.
@@ -1456,6 +1463,111 @@ fn withheld_account_growth_is_read_after_idling_past_the_window() {
     assert_eq!(recorder.events(), Vec::new(), "aged and no longer held");
     assert_eq!(again.scanned_file_count, 0);
     assert!(!after.files.contains_key(&key), "ordinary aging retires it");
+}
+
+/// Option C (Lead A, round 2) and fixture (c): within a process a held key
+/// whose stamp and account evidence are unchanged is skipped with zero
+/// bytes over many passes. It re-parses exactly once after an account
+/// evidence change, at most once after a restart, and as a Tail on growth;
+/// each re-parse is counted by trigger.
+#[test]
+fn withheld_account_reparses_only_on_start_evidence_or_growth() {
+    use crate::local_resource_diagnostics::take_withheld_for_test;
+    let root = Root::new("ld-withheld-memo");
+    let support = root.0.join("support");
+    let sidecars = support.join(crate::claude_local_otel::STORE_DIR);
+    fs::create_dir_all(&sidecars).unwrap();
+    let api_sidecar = sidecars.join(format!("{:x}.jsonl", Sha256::digest(SESSION.as_bytes())));
+    let path = root.file(SESSION);
+    let key = local_index_key(&path);
+    let today = days_from_now(0);
+    let page = |index: ScanIndex, cache: &Arc<sampled_scan::SharedCache>| {
+        let recorder = Recorder::default();
+        let ((index, result, _), _) = capture(|| {
+            finish(
+                OwnedSourceScan::new(
+                    SnapshotSource::ClaudeCode,
+                    &[root.projects()],
+                    index,
+                    &today,
+                    7,
+                    10,
+                    false,
+                    Some(support.as_path()),
+                    &[],
+                    false,
+                    true,
+                )
+                .with_sampled_acquisition(
+                    cache.clone(),
+                    crate::transcript_acquisition::Scope("ld-withheld-memo".into()),
+                )
+                .with_line_observer("test", Box::new(recorder.clone())),
+            )
+        });
+        let reads = recorder
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::Begin(view) => Some(view.mode),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        (index, result, reads)
+    };
+    // The resolver withholds the parse, as ScanSettlement records it; only the
+    // hold commits, so the key keeps its committed revision.
+    let withhold = |committed: &mut ScanIndex, mut parsed: ScanIndex, result: &SourceScanResult| {
+        let deferred = parsed.file_snapshot_fingerprints[&key].clone();
+        assert!(parsed.record_claude_account_deferred_holds(result.completed_parses(), &deferred));
+        assert!(parsed.claude_account_deferred_holds.contains_key(&key));
+        committed.claude_account_deferred_holds = parsed.claude_account_deferred_holds;
+    };
+    let reparses = || take_withheld_for_test().1;
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    append(&path, &assistant_line("u1"));
+    let (mut committed, _, reads) = page(ScanIndex::default(), &cache);
+    assert_eq!(reads.len(), 1);
+    append(&path, &assistant_line("u2"));
+    let (parsed, result, reads) = page(committed.clone(), &cache);
+    assert_eq!(reads.len(), 1);
+    withhold(&mut committed, parsed, &result);
+    assert_eq!(reparses(), BTreeMap::new(), "a new hold is no re-parse");
+
+    // Before round 2 every pass re-read the key (TranscriptChanged against
+    // its old committed revision).
+    for pass in 0..3 {
+        let (_, _, reads) = page(committed.clone(), &cache);
+        assert_eq!(reads, Vec::new(), "unchanged pass {pass}: Skip, zero bytes");
+    }
+    assert_eq!(reparses(), BTreeMap::new());
+
+    // Account evidence arrives (the api sidecar the resolver reads).
+    fs::write(&api_sidecar, b"{}\n").unwrap();
+    let (parsed, result, reads) = page(committed.clone(), &cache);
+    assert_eq!(reads.len(), 1, "one re-parse on an evidence change");
+    withhold(&mut committed, parsed, &result);
+    assert_eq!(reparses(), BTreeMap::from([("evidence", 1)]));
+    assert_eq!(page(committed.clone(), &cache).2, Vec::new());
+
+    // A restart: an empty process memo and RAM cache.
+    super::withheld_account::restart_for_test(&key);
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let (parsed, result, reads) = page(committed.clone(), &cache);
+    assert_eq!(reads.len(), 1, "at most one re-parse per held key");
+    withhold(&mut committed, parsed, &result);
+    assert_eq!(reparses(), BTreeMap::from([("start", 1)]));
+    assert_eq!(page(committed.clone(), &cache).2, Vec::new());
+
+    append(&path, &assistant_line("u3"));
+    let (parsed, result, reads) = page(committed.clone(), &cache);
+    assert_eq!(
+        reads,
+        vec![DeliveryMode::Tail],
+        "growth is a Tail, never Full"
+    );
+    withhold(&mut committed, parsed, &result);
+    assert_eq!(reparses(), BTreeMap::from([("growth", 1)]));
 }
 
 /// An unplanned reader from zero includes malformed, invalid and paused-overlong
