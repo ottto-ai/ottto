@@ -343,7 +343,7 @@ impl SharedCache {
             assert!(poisoner.join().is_err());
         });
     }
-    #[cfg(test)]
+    #[cfg(all(unix, test))]
     pub(super) fn durable_touch_for_test(&self, key: &str) {
         self.durable_touch(key);
     }

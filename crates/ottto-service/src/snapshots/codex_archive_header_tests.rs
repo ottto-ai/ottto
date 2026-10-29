@@ -2404,38 +2404,47 @@ fn sibling_inventory_at_population_cap_counts_shared_physical_keys_once() {
 )]
 fn changed_archive_stamp_resets_header_bound_and_decodes_one_bounded_prefix() {
     let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
-    let bytes = zstd::stream::encode_all(&large_header_rollout()[..], 1).unwrap();
-    let f = ArchiveFixture::new(&bytes);
-    let cache = Arc::new(sampled_scan::SharedCache::default());
-    let key = local_index_key(&f.0);
-    let mut index = ScanIndex::default();
-    assert!(matches!(
-        index
-            .inventory_archive_header(&f.candidate(), Some(&cache), &mut funded_header_work())
-            .unwrap(),
-        HeaderRead::BoundReached
-    ));
-    let old = index.files[&key].archive.as_ref().unwrap().clone();
-    assert!(old.header_bound_reached);
-    // Atomic replacement changes the object even with byte-identical content.
-    let replacement = f.0.with_extension("replacement");
-    fs::write(&replacement, bytes).unwrap();
-    fs::rename(replacement, &f.0).unwrap();
-    let reset = ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, Some(&old)).unwrap();
-    assert!(!reset.header_bound_reached);
-    let mut work = funded_header_work();
-    let (_, rows) = crate::local_resource_diagnostics::capture(|| {
-        for _ in 0..3 {
-            assert!(matches!(
-                index
-                    .inventory_archive_header(&f.candidate(), Some(&cache), &mut work)
-                    .unwrap(),
-                HeaderRead::BoundReached
-            ));
+    for replace in [false, true] {
+        let bytes = zstd::stream::encode_all(&large_header_rollout()[..], 1).unwrap();
+        let f = ArchiveFixture::new(&bytes);
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let key = local_index_key(&f.0);
+        let mut index = ScanIndex::default();
+        assert!(matches!(
+            index
+                .inventory_archive_header(&f.candidate(), Some(&cache), &mut funded_header_work())
+                .unwrap(),
+            HeaderRead::BoundReached
+        ));
+        let old = index.files[&key].archive.as_ref().unwrap().clone();
+        assert!(old.header_bound_reached);
+        if replace {
+            // New object, byte-identical contents.
+            let replacement = f.0.with_extension("replacement");
+            fs::write(&replacement, bytes).unwrap();
+            fs::rename(replacement, &f.0).unwrap();
+        } else {
+            // Real bytes change on the same object.
+            let mut changed = large_header_rollout();
+            changed.extend_from_slice(b"{\"type\":\"synthetic_change\"}\n");
+            fs::write(&f.0, zstd::stream::encode_all(&changed[..], 1).unwrap()).unwrap();
         }
-    });
-    assert_eq!(decodes(&rows), 1);
-    assert_eq!(work.decoded_bytes, codex_file_join::MAX_HEADER_BYTES as u64);
+        let reset = ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, Some(&old)).unwrap();
+        assert!(!reset.header_bound_reached);
+        let mut work = funded_header_work();
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            for _ in 0..3 {
+                assert!(matches!(
+                    index
+                        .inventory_archive_header(&f.candidate(), Some(&cache), &mut work)
+                        .unwrap(),
+                    HeaderRead::BoundReached
+                ));
+            }
+        });
+        assert_eq!(decodes(&rows), 1);
+        assert_eq!(work.decoded_bytes, codex_file_join::MAX_HEADER_BYTES as u64);
+    }
 }
 
 #[test]

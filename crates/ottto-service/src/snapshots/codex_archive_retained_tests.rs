@@ -102,10 +102,14 @@ fn evicted_archive_retries_once_with_counted_bounded_decode() {
     assert_eq!(first.snapshots.len(), 1);
     assert!(cache.retained_checkpoint(&key).is_some());
     // Exercise the cache's actual budget-eviction path, not an explicit take.
-    let _ = cache
-        .retained()
-        .unwrap()
-        .release_until_for(0, crate::transcript_cache::Release::CopyAdmission);
+    let (_, eviction) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
+        cache
+            .retained()
+            .unwrap()
+            .release_until_for(0, crate::transcript_cache::Release::CopyAdmission)
+    });
+    assert_eq!(eviction.copy_refusal_admission_evicted, 1);
+    assert!(eviction.copy_refusal_bytes_released > 0);
     assert!(cache.retained_checkpoint(&key).is_none());
     retry_due(&mut index, &key);
     let ((index, resent), rows) = crate::local_resource_diagnostics::capture(|| {
@@ -605,6 +609,7 @@ fn unavailable_retained_archive_scope_keeps_copy_and_defers_without_decode_credi
     );
 }
 
+#[cfg(unix)]
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
