@@ -550,15 +550,23 @@ impl SharedCache {
     ) -> Option<store::Refusal> {
         let ram = !restore_recheck && self.retained().is_ok_and(|ram| ram.peek(key).is_some());
         let source = durable_source(snapshot_source)?;
-        let held = self
-            .durable()?
+        let mut stores = self.durable()?;
+        let held = match stores
             .slot(source)
             .as_mut()?
             .store
-            .hold_with_carrier(&store::key_digest(source, key), has_index);
+            .guard_with_carrier(&store::key_digest(source, key), has_index)
+        {
+            Ok(true) => {
+                Counters::bump(&mut stores.counters.ineligible, "audit_carrier");
+                return None; // No entry: ordinary acquisition must create it by Full.
+            }
+            Ok(false) => None,
+            Err(reason) => Some(reason),
+        };
         if held == Some(store::Refusal::Corrupt) && ram {
             Counters::bump(
-                &mut self.durable()?.counters.not_persisted,
+                &mut stores.counters.not_persisted,
                 "known_corrupt_memory_only",
             );
             return None;
@@ -644,9 +652,7 @@ impl SharedCache {
             interpretation,
         ) {
             Ok(taken) => RestoreOutcome::Restored(Box::new(taken)),
-            Err(MissClass::AuditCarrier) if !index.files.contains_key(key) => {
-                RestoreOutcome::Held(store::Refusal::Unbindable)
-            }
+            Err(class @ MissClass::AuditCarrier) => RestoreOutcome::Miss(class),
             Err(class) => self
                 .durable_guard(snapshot_source, key, true, index.files.contains_key(key))
                 .map_or(RestoreOutcome::Miss(class), RestoreOutcome::Held),

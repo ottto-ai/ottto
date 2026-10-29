@@ -3987,11 +3987,11 @@ fn completed_full_audit_before_durable_replacement_recovers_after_restart() {
     }
 }
 
-/// Portable production path: missing index membership disables sampling, so
-/// the common guard must hold before that admission gate, not only in restore.
+/// Missing carrier is a counted miss before sampling admission: real Full
+/// publishes, establishes custody and permits ordinary post-save replacement.
 #[cfg(unix)]
 #[test]
-fn missing_index_debt_carrier_holds_in_the_production_scanner_for_both_sources() {
+fn missing_index_debt_carrier_recovers_by_full_in_one_pass_for_both_sources() {
     use crate::durable_tail_store as store;
     use crate::transcript_acquisition::ReadPlan;
     use std::io::Read;
@@ -4066,113 +4066,160 @@ fn missing_index_debt_carrier_holds_in_the_production_scanner_for_both_sources()
             original,
             "fresh-index cleanup preserves missing debt carrier"
         );
-        let (index, scan, modes) = production_scan(
+        // Append after the predecessor was written: the reset must not lose it.
+        fixture.file.append(&usage(source, 130, 1, "fixture-model"));
+        let reset = ScanIndex::default();
+        cache.durable_gc(lock, source, &reset).unwrap();
+        assert_eq!(
+            fs::read(&record_path).unwrap(),
+            original,
+            "GC before Full preserves evidence"
+        );
+        assert!(!reset.files.contains_key(&key));
+        let (mut index, scan, modes, bytes) = production_scan_with_metrics(
             &fixture,
             source,
-            ScanIndex::default(),
+            reset,
             Some(cache.clone()),
             &namespace.0,
         );
-        assert_eq!(modes, (0, 0, 0));
-        assert!(
-            !index.files.contains_key(&key),
-            "hold never recreates index membership"
+        assert_eq!(
+            modes,
+            (1, 0, 0),
+            "missing custody requires Full, never restore"
         );
-        assert!(scan.snapshots.is_empty());
-        assert!(!scan.census_complete);
-        let (counts, store) = cache.durable_counters(source).unwrap();
-        assert_eq!(counts.durable_held[store::Refusal::Unbindable as usize], 1);
+        assert_eq!(bytes.0, fixture.file.0.metadata().unwrap().len());
+        assert!(scan.census_complete, "one pass completes the census");
+        assert!(
+            !scan.snapshots.is_empty(),
+            "Full publishes the growing file"
+        );
+        assert!(
+            index.files.contains_key(&key),
+            "only the actual Full creates membership"
+        );
+        assert!(
+            !index.files[&key].has_unverified_source(),
+            "completed Full satisfies debt"
+        );
+        let (_, cold, _) =
+            production_scan(&fixture, source, ScanIndex::default(), None, &namespace.0);
+        assert_eq!(production_body(source, scan), production_body(source, cold));
+        let (counts, _) = cache.durable_counters(source).unwrap();
+        assert_eq!(counts.ineligible.get("audit_carrier"), Some(&1));
+        assert_eq!(counts.durable_held, [0; 5]);
         assert_eq!(
             counts.restore_attempts, 0,
-            "production admission never reaches restore"
+            "missing membership never reaches restore"
         );
-        assert!(store.format_hold[store::Refusal::Unbindable as usize] > 0);
-        assert_eq!(fs::read(&record_path).unwrap(), original);
-        // Production saves incomplete censuses too: preserve the hold/evidence
-        // through the actual post-save callback and two process/index reloads.
-        let mut saved = index;
-        let mut active = cache;
-        for _ in 0..2 {
-            saved.save(&index_path).unwrap();
-            let before_gc = active.durable_counters(source).unwrap().1.gc_records_read;
-            durable_after_save(&active, &fixture.dir, source, &saved);
-            assert!(
-                active.durable_counters(source).unwrap().1.gc_records_read > before_gc,
-                "actual post-save GC ran"
-            );
-            assert_eq!(
-                fs::read(&record_path).unwrap(),
-                original,
-                "post-save GC preserves held debt"
-            );
-            assert_eq!(
-                active
-                    .durable_counters(source)
-                    .unwrap()
-                    .1
-                    .gc_records_deleted,
-                0
-            );
-            let restart = Arc::new(sampled_scan::SharedCache::default());
-            restart.durable_begin_pass(
-                source,
-                &index_path,
-                &namespace,
-                source == SnapshotSource::ClaudeCode,
-            );
-            let loaded = ScanIndex::load(&index_path).unwrap();
-            // An incomplete census persists a real retry delay. Advance that
-            // scheduler clock to its due edge; never erase traversal custody.
-            let retry_at = loaded
-                .traversal
-                .as_ref()
-                .and_then(|traversal| traversal.unhealthy_retry_not_before_unix_seconds)
-                .expect("held census scheduled its next walk");
-            let collected_at = time::OffsetDateTime::from_unix_timestamp(retry_at as i64)
-                .unwrap()
-                .format(&time::format_description::well_known::Rfc3339)
-                .unwrap();
-            let (next, scan, modes, _) = production_scan_at(
-                &fixture,
-                source,
-                loaded,
-                Some(restart.clone()),
-                &namespace.0,
-                &collected_at,
-            );
-            assert_eq!(modes, (0, 0, 0));
-            assert!(!next.files.contains_key(&key));
-            assert!(scan.snapshots.is_empty());
-            assert!(!scan.census_complete);
-            assert_eq!(
-                restart.durable_counters(source).unwrap().0.durable_held
-                    [store::Refusal::Unbindable as usize],
-                1
-            );
-            saved = next;
-            active = restart;
+        assert_eq!(counts.restored, 0);
+        assert_eq!(
+            fs::read(&record_path).unwrap(),
+            original,
+            "no pre-save replacement"
+        );
+        // Linux also exercises the real Full/census/counter path above. Native
+        // cache retention and disk replacement require a supported heap layout.
+        if !crate::heap_layout_bound::layout_supported() {
+            continue;
         }
-        // Discriminating no-record control: same real scanner now publishes.
-        fs::remove_file(&record_path).unwrap();
-        let control = Arc::new(sampled_scan::SharedCache::default());
-        control.durable_begin_pass(
+        index.save(&index_path).unwrap();
+        let before = cache.durable_counters(source).unwrap().1.records_written;
+        durable_after_save(&cache, &fixture.dir, source, &index);
+        assert_eq!(
+            cache.durable_counters(source).unwrap().1.records_written - before,
+            1
+        );
+        assert_ne!(
+            fs::read(&record_path).unwrap(),
+            original,
+            "Full replaces the predecessor"
+        );
+        let mut disk = store::DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+        let store::ReadOutcome::Found(replacement) = disk.read(&record_key) else {
+            panic!("Full replacement must remain on disk");
+        };
+        assert_eq!(replacement.envelope_audit_debt, None);
+        assert_eq!(
+            replacement.record.certificate.length,
+            fixture.file.0.metadata().unwrap().len()
+        );
+        drop(disk);
+        drop(replacement);
+        // The next append Tails normally. Its new audit deadline is independent
+        // of the retired missing-carrier debt and cannot re-trigger recovery.
+        fixture.file.append(&usage(source, 160, 2, "fixture-model"));
+        let (mut index, scan, modes, bytes) = production_scan_with_metrics(
+            &fixture,
+            source,
+            index,
+            Some(cache.clone()),
+            &namespace.0,
+        );
+        assert_eq!(modes, (0, 1, 0));
+        assert!(bytes.0 > 0);
+        let (_, cold, _) =
+            production_scan(&fixture, source, ScanIndex::default(), None, &namespace.0);
+        assert_eq!(production_body(source, scan), production_body(source, cold));
+        assert_eq!(
+            cache
+                .durable_counters(source)
+                .unwrap()
+                .0
+                .ineligible
+                .get("audit_carrier"),
+            Some(&1)
+        );
+        index.save(&index_path).unwrap();
+        durable_after_save(&cache, &fixture.dir, source, &index);
+        // Advance discovery beyond its age window without advancing the audit
+        // clock: the acquired suffix remains indexed and idle needs no reads.
+        let idle_at = (time::OffsetDateTime::now_utc()
+            + time::Duration::days(BACKFILL_WINDOW_DAYS as i64 + 1))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+        let (mut index, idle, modes, bytes) = production_scan_at(
+            &fixture,
+            source,
+            index,
+            Some(cache.clone()),
+            &namespace.0,
+            &idle_at,
+        );
+        assert_eq!(modes, (0, 0, 0));
+        assert_eq!(
+            bytes,
+            (0, 0),
+            "idle has zero native and sample transcript bytes"
+        );
+        assert!(idle.snapshots.is_empty());
+        assert!(idle.census_complete);
+        assert!(index.files.contains_key(&key));
+        index.save(&index_path).unwrap();
+        drop(cache);
+        let restart = Arc::new(sampled_scan::SharedCache::default());
+        restart.durable_begin_pass(
             source,
             &index_path,
             &namespace,
             source == SnapshotSource::ClaudeCode,
         );
-        let (index, scan, _) = production_scan(
+        let (index, idle, modes, bytes) = production_scan_at(
             &fixture,
             source,
-            ScanIndex::default(),
-            Some(control.clone()),
+            ScanIndex::load(&index_path).unwrap(),
+            Some(restart.clone()),
             &namespace.0,
+            &idle_at,
         );
+        assert_eq!(modes, (0, 0, 0));
+        assert_eq!(bytes, (0, 0), "quiet restart has zero transcript reads");
+        assert!(idle.snapshots.is_empty());
+        assert!(idle.census_complete);
         assert!(index.files.contains_key(&key));
-        assert!(!scan.snapshots.is_empty());
-        assert_eq!(
-            control.durable_counters(source).unwrap().0.durable_held,
-            [0; 5]
-        );
+        let (counts, _) = restart.durable_counters(source).unwrap();
+        assert_eq!(counts.ineligible.get("audit_carrier"), None);
+        assert_eq!(counts.restore_attempts, 0);
+        assert_eq!(counts.durable_held, [0; 5]);
     }
 }

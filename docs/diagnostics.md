@@ -164,7 +164,7 @@ calling these measurements installed evidence.
 A `durable_tail_alarm` record (schema 2 additive) follows a post-save pass
 whose durable-store counts for that source changed. Each count is
 `[since the last alarm, process total]`: `held_keys` (unknown, newer,
-undecodable or unbindable records, including debt with a missing index entry), `t14_rebuild` (known corrupt records
+undecodable or unbindable records), `t14_rebuild` (known corrupt records
 read Full once and replaced after the save) and `mode_repaired` (store
 directory or records restored to owner-only). `store_disabled` appears once,
 with `foreign_owner`, `not_directory`, `mode_unrepairable` or `t14_breaker`
@@ -181,21 +181,23 @@ and the v1 writer takes compatibility debt from the current committed index at
 write time, including after a restore dropped the envelope field. Unknown debt
 tags, absent-with-nonzero deadlines and present-with-zero deadlines are
 `unbindable` holds, preserved byte for byte. A debt-bearing record whose index
-entry is absent is held by the common acquisition guard before sampling
-admission, including when sampling is disabled, without inventing membership.
-That guard uses the already classified store header, adds no read, and counts
-`format_hold.unbindable`; the normal held exit counts `durable_held.unbindable`.
-A direct restore refusal also counts `ineligible.audit_carrier`. Post-save GC
-preserves same-context debt-bearing records whose key is absent from the index;
-fresh-index cleanup (without a trusted context) preserves their debt evidence
-too. These preservation decisions count `format_hold.unbindable`. Proven
-foreign-context records remain ordinary GC candidates. An existing entry with reset/postponed debt instead
-re-arms an immediate index audit and plans Full(`audit_due`); this also recovers
-an index-new/record-old crash after a successful audit. `ineligible.audit_carrier`
-counts direct restore refusals; only the missing-entry held exit increments the
-`durable_held` unbindable slot and held-key alarm. Re-arming changes no accepted
-body, witness or ACK, and completion alone can clear the obligation. No record
-means no carrier hold.
+entry is absent is a miss counted once by the common acquisition guard as
+`ineligible.audit_carrier`, including when sampling admission skips restore.
+It does not increment `durable_held` or the held-key alarm. The guard uses the
+already classified store header and adds no read. The old reduction is never
+restored as audit-clean: normal acquisition reads Full, successful native
+completion creates the index entry and satisfies the audit, and the post-save
+writer replaces the predecessor. No index membership is inferred from a record.
+Post-save GC preserves same-context debt-bearing records whose key is absent
+from the index; fresh-index cleanup without a trusted context preserves their
+debt evidence too, until acquisition establishes custody. These preservation
+decisions keep counting `format_hold.unbindable`. Proven foreign-context
+records remain ordinary GC candidates. An existing entry with reset/postponed
+debt instead re-arms an immediate index audit and plans Full(`audit_due`), also
+recovering an index-new/record-old crash after a successful audit. Direct restore
+misses also count `ineligible.audit_carrier`, without becoming held exits.
+Re-arming changes no accepted body, witness or ACK; native completion alone can
+clear the obligation. No record means ordinary Full-on-miss admission.
 The `format_hold` and `durable_held` arrays keep five slots:
 `newer,unknown,undecodable,unbindable,known_corrupt`.
 

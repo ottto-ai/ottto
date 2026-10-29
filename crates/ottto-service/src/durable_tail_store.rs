@@ -683,12 +683,16 @@ impl DurableTailStore {
 
     /// U holds. T14 permits one rebuild; the adapter checks RAM before holding.
     pub(crate) fn hold(&mut self, key: &Digest32) -> Option<Refusal> {
-        self.hold_with_carrier(key, true)
+        self.guard_with_carrier(key, true).err()
     }
 
-    /// The common acquisition guard supplies current index membership. A
-    /// debt-bearing record without its carrier is U; no record remains a miss.
-    pub(crate) fn hold_with_carrier(&mut self, key: &Digest32, has_index: bool) -> Option<Refusal> {
+    /// Ok(true) is missing audit custody: acquire Full, never restore clean.
+    /// Invalid records remain holds; the caller counts the carrier miss.
+    pub(crate) fn guard_with_carrier(
+        &mut self,
+        key: &Digest32,
+        has_index: bool,
+    ) -> Result<bool, Refusal> {
         let result = self.classify(key, "guard");
         self.pass[0] += u64::from(!matches!(result, Ok(None)));
         match result {
@@ -702,15 +706,13 @@ impl DurableTailStore {
                     self.counters.t14_rebuild += 1;
                     self.rebuilt.insert(*key, Rebuild::Authorized);
                 }
-                None
+                Ok(false)
             }
-            Err(Refusal::Corrupt) if self.rebuilt[key] == Rebuild::Authorized => None,
-            Ok(Some(header)) if !has_index && header.audit_debt.is_some() => {
-                self.counters.format_hold[Refusal::Unbindable as usize] += 1;
-                Some(Refusal::Unbindable)
+            Err(Refusal::Corrupt) if self.rebuilt[key] == Rebuild::Authorized => Ok(false),
+            Ok(header) => {
+                Ok(!has_index && header.is_some_and(|header| header.audit_debt.is_some()))
             }
-            Ok(_) => None,
-            Err(reason) => Some(reason),
+            Err(reason) => Err(reason),
         }
     }
 

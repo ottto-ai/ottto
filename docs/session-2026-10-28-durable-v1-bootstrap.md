@@ -9,12 +9,17 @@ bytes are checked and dropped on decode without changing their wire offsets.
 The v1 writer takes that field from the current committed index obligation,
 so a decoded checkpoint cannot erase debt needed by downgrade readers. Invalid
 debt tags or inconsistent flag/deadline pairs are preserved as Unbindable holds.
-A debt-bearing record with an absent index entry is held by the common
-pre-acquisition guard, before sampling admission can skip restore. This uses
-the existing classified header and performs no additional read. Post-save GC
-preserves same-context missing-carrier debt records; fresh-index cleanup also
-retains debt evidence without a trusted context. Portable production tests keep
-the hold and byte-identical record across save/GC and two reloads. An existing entry with a reset/postponed carrier re-arms an immediate
+A debt-bearing record with an absent index entry is a counted acquisition miss
+before sampling admission can skip restore. The existing classified header adds
+no read; the old reduction is never restored as audit-clean. Normal Full creates
+real index membership on completion, satisfies the audit and supplies the
+post-save replacement. Post-save GC preserves same-context missing-carrier debt
+records; fresh-index cleanup retains evidence without a trusted context until
+that acquisition. Both-source production tests require one-pass census
+completion and publication with exactly one `ineligible.audit_carrier` miss.
+Supported native layouts additionally verify replacement, append/Tail, idle
+beyond the discovery window and a quiet restart with zero transcript bytes.
+An existing entry with a reset/postponed carrier re-arms an immediate
 index audit, recovering the normal completed-audit/index-saved/record-old crash
 window through Full(AuditDue). The envelope never restores checkpoint debt;
 the index remains deadline authority and later offers cannot postpone it.
@@ -35,7 +40,7 @@ Fixed v1 scope/replay digests, headers and complete writer-output literals
 (nonzero and zero audit debt, both sources) pin the historical serializers.
 The full writer goldens use an opaque fixed body; production body decoding and
 restoration are covered separately. A two-reload debt fixture rewrites from the
-current index, checks downgrade-visible bytes, holds absent entries and re-arms
+current index, checks downgrade-visible bytes, misses absent entries and re-arms
 reset carriers. A native crash-window fixture audits, saves without replacing,
 restarts, completes the re-armed audit and proves replacement permits Tail.
 GC representation lookup is bounded to store-header bytes, charged to GC, and

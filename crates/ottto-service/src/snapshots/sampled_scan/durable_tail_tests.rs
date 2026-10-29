@@ -2937,7 +2937,7 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
             ReadMode::Full(FullReason::AuditDue)
         );
     }
-    // Third case: absent entries hold without inventing membership. Reset
+    // Third case: absent entries miss without inventing membership. Reset
     // carriers re-arm an immediate current-index audit before any source read.
     // A completed Full whose durable replacement failed has the same state.
     let saved = ScanIndex::load(&index_path).unwrap();
@@ -3021,7 +3021,7 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
         } else {
             assert!(matches!(
                 outcome,
-                RestoreOutcome::Held(store::Refusal::Unbindable)
+                RestoreOutcome::Miss(MissClass::AuditCarrier)
             ));
             assert!(!missing.files.contains_key(&key));
         }
