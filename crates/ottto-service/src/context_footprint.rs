@@ -7,6 +7,9 @@
 //! `AgentContextStatus`/`context_live`, which reflects active session load from
 //! statusLine `context_window`.
 
+#[cfg(test)]
+use crate::snapshots::line_delivery::{DeliveryMode, TestObserverBoundary};
+
 use crate::context_file_counts::{load_or_create_salt, measure_file, FileCounts};
 use crate::instruction_inventory::{
     build_instruction_inventory, default_login_claude_mode, InstructionInventory, InventoryPaths,
@@ -16,7 +19,7 @@ use crate::snapshot_client::{
     SnapshotApiClient,
 };
 use crate::snapshots::line_delivery::{
-    DeliveryEnd, DeliveryMode, FileView, LineObserver, PhysicalLine, Want,
+    DeliveryEnd, FileView, LineObserver, ObserverBoundary, PhysicalLine, Want,
 };
 use crate::snapshots::SnapshotSource;
 use crate::transcript_acquisition::FileObject;
@@ -1349,13 +1352,13 @@ impl CwdProjection {
         // process never saw (restart, durable restore or eviction): partial,
         // like an interrupted read, and counted once since the file is then
         // remembered even with no cwds.
-        let unseen_prefix = old.is_none() && file.mode != DeliveryMode::Full;
+        let unseen_prefix = old.is_none() && !file.mode.is_full();
         projection.incomplete_files += u64::from(incomplete || unseen_prefix);
         let mut known = Vec::new();
         if let Some(old) = old {
             projection.bytes -= projected_bytes(&old);
             // A Full read starts at offset 0 and replaces what was known.
-            if file.mode != DeliveryMode::Full {
+            if !file.mode.is_full() {
                 known = old.cwds;
             }
         }
@@ -1449,10 +1452,15 @@ impl LineObserver for CwdObserver {
         }
     }
 
-    fn end(&mut self, file: &FileView, end: &DeliveryEnd) {
+    fn end(&mut self, _: &FileView, _: &DeliveryEnd) {}
+
+    fn boundary(&mut self, event: ObserverBoundary<'_>) {
+        let ObserverBoundary::End(file, end) = event else {
+            return;
+        };
         if file.source == SnapshotSource::ClaudeCode {
             let cwds = std::mem::take(&mut self.cwds);
-            let incomplete = *end == DeliveryEnd::Incomplete;
+            let incomplete = !end.is_complete();
             self.projection.merge(file, cwds, self.dropped, incomplete);
         }
     }
@@ -2546,25 +2554,36 @@ mod tests {
     fn project_transcripts(projection: &Arc<CwdProjection>, files: &[(PathBuf, SystemTime)]) {
         let mut observer = projection.observer();
         for (path, mtime) in files {
-            let view = claude_view(path, *mtime, DeliveryMode::Full);
-            assert_eq!(observer.begin(&view), Want::Lines);
+            let view = claude_view(path, *mtime, DeliveryMode::Full { cause: None });
+            assert_eq!(observer.begin_at_boundary(&view), Want::Lines);
             for line in fs::read_to_string(path).unwrap().lines() {
                 let value = serde_json::from_str::<Value>(line).ok();
                 observer.line(
                     &view,
                     &PhysicalLine {
+                        start: 0,
+                        bytes: &[],
+                        overlong: false,
                         end: 0,
                         value: value.as_ref(),
                     },
                 );
             }
-            observer.end(&view, &DeliveryEnd::Complete);
+            observer.end_at_boundary(
+                &view,
+                &DeliveryEnd::Complete {
+                    sealed_x: 0,
+                    fragment: None,
+                },
+            );
         }
     }
 
     fn claude_view(path: &Path, mtime: SystemTime, mode: DeliveryMode) -> FileView {
         let (object, _) = FileObject::of(&File::open(path).unwrap()).unwrap();
         FileView {
+            key: None,
+            redelivery: false,
             source: SnapshotSource::ClaudeCode,
             root: Some(0),
             start: 0,
@@ -2914,12 +2933,15 @@ mod tests {
     }
 
     fn deliver(observer: &mut CwdObserver, view: &FileView, lines: &[Value], end: DeliveryEnd) {
-        let want = observer.begin(view);
+        let want = observer.begin_at_boundary(view);
         if want == Want::Lines {
             for value in lines {
                 observer.line(
                     view,
                     &PhysicalLine {
+                        start: 0,
+                        bytes: &[],
+                        overlong: false,
                         end: 0,
                         value: Some(value),
                     },
@@ -2928,12 +2950,15 @@ mod tests {
             observer.line(
                 view,
                 &PhysicalLine {
+                    start: 0,
+                    bytes: &[],
+                    overlong: false,
                     end: 0,
                     value: None,
                 },
             );
         }
-        observer.end(view, &end);
+        observer.end_at_boundary(view, &end);
     }
 
     fn projected(projection: &CwdProjection, view: &FileView) -> Option<Vec<String>> {
@@ -2949,7 +2974,7 @@ mod tests {
         fs::write(&path, "").unwrap();
         let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
         let projection = Arc::new(CwdProjection::default());
-        let full = claude_view(&path, at, DeliveryMode::Full);
+        let full = claude_view(&path, at, DeliveryMode::Full { cause: None });
         let tail = FileView {
             mode: DeliveryMode::Tail,
             ..full
@@ -2966,7 +2991,10 @@ mod tests {
             &mut projection.observer(),
             &full,
             &lines,
-            DeliveryEnd::Complete,
+            DeliveryEnd::Complete {
+                sealed_x: 0,
+                fragment: None,
+            },
         );
         assert_eq!(projected(&projection, &full).unwrap(), ["/b", "/c", "/a"]);
 
@@ -2975,7 +3003,10 @@ mod tests {
             &mut projection.observer(),
             &tail,
             &more,
-            DeliveryEnd::Complete,
+            DeliveryEnd::Complete {
+                sealed_x: 0,
+                fragment: None,
+            },
         );
         let mut expected = vec!["/a".to_string()];
         expected.extend((0..7).map(|i| format!("/t{i}")));
@@ -2989,7 +3020,10 @@ mod tests {
             &mut projection.observer(),
             &unchanged,
             &[],
-            DeliveryEnd::Complete,
+            DeliveryEnd::Complete {
+                sealed_x: 0,
+                fragment: None,
+            },
         );
         assert_eq!(projected(&projection, &full).unwrap(), expected);
 
@@ -2997,7 +3031,10 @@ mod tests {
             &mut projection.observer(),
             &full,
             &[json!({"cwd": "/z"})],
-            DeliveryEnd::Complete,
+            DeliveryEnd::Complete {
+                sealed_x: 0,
+                fragment: None,
+            },
         );
         assert_eq!(projected(&projection, &full).unwrap(), ["/z"]);
         assert_eq!(projection.lock().passes, 4);
@@ -3011,14 +3048,16 @@ mod tests {
         fs::write(&path, "").unwrap();
         let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
         let projection = Arc::new(CwdProjection::default());
-        let view = claude_view(&path, at, DeliveryMode::Full);
+        let view = claude_view(&path, at, DeliveryMode::Full { cause: None });
         let long = format!("/{}", "x".repeat(OBSERVED_CWD_MAX_BYTES));
         let at_cap = format!("/{}", "y".repeat(OBSERVED_CWD_MAX_BYTES - 1));
         deliver(
             &mut projection.observer(),
             &view,
             &[json!({"cwd": long}), json!({"cwd": at_cap})],
-            DeliveryEnd::Incomplete,
+            DeliveryEnd::Incomplete {
+                gaps: Default::default(),
+            },
         );
         assert_eq!(projected(&projection, &view).unwrap(), [at_cap]);
         let state = projection.lock();
@@ -3030,8 +3069,13 @@ mod tests {
             ..view
         };
         let mut observer = projection.observer();
-        assert_eq!(observer.begin(&codex), Want::Skip);
-        observer.end(&codex, &DeliveryEnd::Incomplete);
+        assert_eq!(observer.begin_at_boundary(&codex), Want::Skip);
+        observer.end_at_boundary(
+            &codex,
+            &DeliveryEnd::Incomplete {
+                gaps: Default::default(),
+            },
+        );
         assert_eq!(projection.lock().incomplete_files, 1);
 
         // A Tail of a file this process never projected missed its prefix.
@@ -3042,7 +3086,10 @@ mod tests {
             &mut projection.observer(),
             &tail,
             &[json!({"cwd": "/short"})],
-            DeliveryEnd::Complete,
+            DeliveryEnd::Complete {
+                sealed_x: 0,
+                fragment: None,
+            },
         );
         assert_eq!(projection.lock().incomplete_files, 2);
         // Short cwds are charged their slots and capacity, not only text.
@@ -3055,12 +3102,15 @@ mod tests {
         // Unchanged reads are no missed prefix.
         let empty = root.join("empty.jsonl");
         fs::write(&empty, "").unwrap();
-        let empty = claude_view(&empty, at, DeliveryMode::Full);
+        let empty = claude_view(&empty, at, DeliveryMode::Full { cause: None });
         deliver(
             &mut projection.observer(),
             &empty,
             &[json!({})],
-            DeliveryEnd::Complete,
+            DeliveryEnd::Complete {
+                sealed_x: 0,
+                fragment: None,
+            },
         );
         assert_eq!(
             projected(&projection, &empty).unwrap(),
@@ -3074,7 +3124,10 @@ mod tests {
             &mut projection.observer(),
             &unchanged,
             &[],
-            DeliveryEnd::Complete,
+            DeliveryEnd::Complete {
+                sealed_x: 0,
+                fragment: None,
+            },
         );
         assert_eq!(projection.lock().incomplete_files, 2);
 
@@ -3088,7 +3141,10 @@ mod tests {
                 &mut projection.observer(),
                 &restored,
                 &[],
-                DeliveryEnd::Complete,
+                DeliveryEnd::Complete {
+                    sealed_x: 0,
+                    fragment: None,
+                },
             );
         }
         assert_eq!(projection.lock().incomplete_files, 3);
@@ -3116,8 +3172,20 @@ mod tests {
         for index in 0..fits + 3 {
             let path = root.join(format!("session-{index:03}.jsonl"));
             fs::write(&path, "").unwrap();
-            let view = claude_view(&path, start + day * index as u32, DeliveryMode::Full);
-            deliver(&mut observer, &view, &lines, DeliveryEnd::Complete);
+            let view = claude_view(
+                &path,
+                start + day * index as u32,
+                DeliveryMode::Full { cause: None },
+            );
+            deliver(
+                &mut observer,
+                &view,
+                &lines,
+                DeliveryEnd::Complete {
+                    sealed_x: 0,
+                    fragment: None,
+                },
+            );
             views.push(view);
         }
         {
@@ -3171,8 +3239,16 @@ mod tests {
         for index in 0..2_000 {
             let path = root.join(format!("short-{index:04}.jsonl"));
             fs::write(&path, "").unwrap();
-            let view = claude_view(&path, start, DeliveryMode::Full);
-            deliver(&mut observer, &view, &short, DeliveryEnd::Complete);
+            let view = claude_view(&path, start, DeliveryMode::Full { cause: None });
+            deliver(
+                &mut observer,
+                &view,
+                &short,
+                DeliveryEnd::Complete {
+                    sealed_x: 0,
+                    fragment: None,
+                },
+            );
             assert!(within_charge(&projection.lock()));
         }
         assert_eq!(projection.lock().files.len(), 2_000);
@@ -3188,9 +3264,17 @@ mod tests {
             let view = claude_view(
                 &path,
                 start + Duration::from_secs(index + 1),
-                DeliveryMode::Full,
+                DeliveryMode::Full { cause: None },
             );
-            deliver(&mut observer, &view, &large, DeliveryEnd::Complete);
+            deliver(
+                &mut observer,
+                &view,
+                &large,
+                DeliveryEnd::Complete {
+                    sealed_x: 0,
+                    fragment: None,
+                },
+            );
             assert!(within_charge(&projection.lock()));
         }
         let state = projection.lock();

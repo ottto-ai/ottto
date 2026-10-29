@@ -274,8 +274,8 @@ paths, identifiers, hashes or line content. Missing keys mean zero in that
 observation; an absent object also means zero, or a page line that was not
 written. Counts saturate at `u64::MAX`.
 
-`counts.line_delivery` is keyed by the fixed name of the page's one registered
-line observer, for example `{"footprint": {...}}`. The observer receives the
+`counts.line_delivery` is keyed by each registered observer's fixed name,
+for example `{"footprint": {...}}`. The observer receives the
 physical lines the page's primary reads already consumed; proof, parent, side,
 group, native-comparison and one-shot reads deliver nothing. All values are
 page events, not gauges, and are never summed across observers:
@@ -285,10 +285,27 @@ page events, not gauges, and are never summed across observers:
   not a line until its newline arrives in a later read.
 - `bytes`: physical bytes of those lines, newline and skipped overlong bytes
   included. These are bytes the read already consumed, never extra reads.
+- `redelivered_bytes`: physical bytes traversed on a native singleton resume,
+  including lines suppressed by the subscriber's accounted prefix. A resume
+  flags redelivery even when its suffix does not overlap earlier lines.
+- `observer_us` / `boundary_us`: callback and feature-boundary time, separately,
+  in microseconds. No transcript I/O is added by delivery.
+- `incomplete_by_cause`: seven fixed counters in order: restored prefix,
+  process start, native held/refused, read failure, yield, observer budget,
+  commit failure. A conservative enclosing gap is not an exact lost-byte count.
 - `incomplete`: files whose delivery ended before their read completed: removed
   unfinished by a hold or refusal, a read failure, a paged job pausing, or the
   page ending or being dropped mid-file. A file the observer skipped is not
-  counted. A later page can count the same file again.
+  counted. A later page can count the same file again. Existing footprint and
+  prelude registrations retain this fresh-read policy. Opt-in singleton job
+  observers keep their state with the native job: a yield is nonterminal and
+  only completion/cancellation ends that logical delivery. Counters drain per
+  page, including while their state is parked.
+
+The completion boundary is traversed even with no registered observers.
+Certified write-ahead cuts, pending receipt outcome custody and durable
+subscriber publication require the native write-ahead integration; these
+transport counters do not establish receipt ordering or move/re-key support.
 
 `counts.line_delivery_unselected` counts discovery skip decisions for the
 page's source: `age` (outside the backfill window and not held for

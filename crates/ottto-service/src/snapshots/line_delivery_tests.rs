@@ -1,6 +1,10 @@
 //! LD: the physical-line hook at the one reader, the per-pass lifecycle,
 //! excluded reads, K10 counters and E3's selection-identity conditions.
-use super::line_delivery::{DeliveryEnd, DeliveryMode, FileView, LineObserver, PhysicalLine, Want};
+use crate::snapshots::line_delivery::TestObserverBoundary;
+
+use super::line_delivery::{
+    DeliveryEnd as Outcome, DeliveryMode, FileView, LineObserver, PhysicalLine, Want,
+};
 use super::*;
 use crate::codex_prelude_footprint::tests::metric;
 use crate::local_resource_diagnostics::{capture, CollectionCounts, Probe};
@@ -8,6 +12,13 @@ use crate::transcript_acquisition::FileObject;
 use std::cell::RefCell;
 use std::io::Cursor;
 
+// Original RAM assertions retain their Complete/Incomplete classification;
+// LD2's detailed cuts and gaps have separate assertions below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeliveryEnd {
+    Complete,
+    Incomplete,
+}
 const NOW: &str = "2026-10-07T12:00:00Z";
 const SESSION: &str = "5e551011-0000-4000-8000-00000000d1d1";
 
@@ -50,7 +61,11 @@ impl Recorder {
 }
 impl LineObserver for Recorder {
     fn begin(&mut self, file: &FileView) -> Want {
-        self.push(Event::Begin(*file));
+        let mut view = *file;
+        if view.mode.is_full() {
+            view.mode = DeliveryMode::Full { cause: None };
+        }
+        self.push(Event::Begin(view));
         if self.skip {
             Want::Skip
         } else {
@@ -61,8 +76,12 @@ impl LineObserver for Recorder {
         self.offsets.lock().unwrap().push((file.start, line.end));
         self.push(Event::Line(line.value.cloned()));
     }
-    fn end(&mut self, _: &FileView, end: &DeliveryEnd) {
-        self.push(Event::End(*end));
+    fn end(&mut self, _: &FileView, end: &Outcome) {
+        self.push(Event::End(if end.is_complete() {
+            DeliveryEnd::Complete
+        } else {
+            DeliveryEnd::Incomplete
+        }));
     }
 }
 
@@ -448,10 +467,15 @@ fn unplanned_claude_read_delivers_all_lines_from_zero_and_counts_them() {
 
     let held = fs::metadata(&path).unwrap();
     let mut expected = vec![Event::Begin(FileView {
+        key: Some(crate::durable_tail_store::key_digest(
+            crate::durable_tail_store::DurableSource::ClaudeCode,
+            &local_index_key(&path),
+        )),
+        redelivery: false,
         source: SnapshotSource::ClaudeCode,
         object: FileObject::of(&fs::File::open(&path).unwrap()).unwrap().0,
         mtime: held.modified().ok(),
-        mode: DeliveryMode::Full,
+        mode: DeliveryMode::Full { cause: None },
         root: Some(0),
         start: 0,
     })];
@@ -599,7 +623,7 @@ fn side_read_calls_no_observer() {
     scan.line_delivery
         .as_mut()
         .unwrap()
-        .begin_armed(scan.active_file.as_deref().unwrap(), &scan.roots);
+        .begin_armed(scan.active_file.as_deref_mut().unwrap(), &scan.roots);
     let active = scan.active_file.as_deref_mut().unwrap();
     active.side_origin.take().unwrap().end();
     finish(scan);
@@ -765,7 +789,7 @@ fn planned_tail_delivers_absolute_offsets_on_linux() {
     reader.set_extent_limit(tail.frozen_length() - start);
     reader.acquisition = Some(tail);
     let delivery = scan.line_delivery.as_mut().unwrap();
-    delivery.begin_armed(&active, &scan.roots);
+    delivery.begin_armed(&mut active, &scan.roots);
     let Some(Event::Begin(view)) = recorder.events().first().cloned() else {
         panic!("expected begin");
     };
@@ -774,7 +798,7 @@ fn planned_tail_delivers_absolute_offsets_on_linux() {
 
     let mut consumed = 0;
     for (n, bytes) in bytes.iter().enumerate() {
-        assert!(!delivery.step(&mut active.parser).unwrap());
+        assert!(!delivery.step(&mut active).unwrap());
         consumed += bytes.len() as u64;
         assert_eq!(active.parser.reader.consumed_bytes(), consumed);
         let offsets = recorder.offsets.lock().unwrap();
@@ -782,7 +806,7 @@ fn planned_tail_delivers_absolute_offsets_on_linux() {
         assert_eq!(offsets[n], (start, start + consumed));
         assert_ne!(offsets[n].1, consumed, "end must be absolute");
     }
-    assert!(delivery.step(&mut active.parser).unwrap());
+    assert!(delivery.step(&mut active).unwrap());
     assert_eq!(
         recorder.lines(),
         rows.map(|value| Event::Line(Some(value))),
@@ -824,7 +848,7 @@ fn sampled_full_tail_unchanged_and_reset_deliver_by_mode() {
     let Some(Event::Begin(view)) = first.events().first().cloned() else {
         panic!("no begin: {:?}", first.events());
     };
-    assert_eq!(view.mode, DeliveryMode::Full);
+    assert_eq!(view.mode, DeliveryMode::Full { cause: None });
     assert_eq!(first.ends(), vec![DeliveryEnd::Complete]);
     assert_eq!(delivered(&rows), sealed, "from 0, fragment withheld");
 
@@ -841,7 +865,7 @@ fn sampled_full_tail_unchanged_and_reset_deliver_by_mode() {
     };
     match view.mode {
         DeliveryMode::Tail => assert_eq!(delivered(&rows), total - sealed, "from sealed"),
-        DeliveryMode::Full => assert_eq!(delivered(&rows), total),
+        DeliveryMode::Full { .. } => assert_eq!(delivered(&rows), total),
         DeliveryMode::Unchanged => panic!("grown file"),
     }
     let late_lines = grown
@@ -862,7 +886,7 @@ fn sampled_full_tail_unchanged_and_reset_deliver_by_mode() {
     let Some(Event::Begin(view)) = rewritten.events().first().cloned() else {
         panic!("no begin: {:?}", rewritten.events());
     };
-    assert_eq!(view.mode, DeliveryMode::Full);
+    assert_eq!(view.mode, DeliveryMode::Full { cause: None });
     assert_eq!(rewritten.lines().len(), 1);
     assert_eq!(delivered(&rows), rewrite.len() as u64, "from 0");
 }
@@ -930,7 +954,7 @@ fn in_place_full_fallback_after_tail_is_one_fresh_full_delivery() {
         .collect();
     assert_eq!(
         modes,
-        [DeliveryMode::Tail, DeliveryMode::Full],
+        [DeliveryMode::Tail, DeliveryMode::Full { cause: None }],
         "{events:?}"
     );
     let line = |value: &Value| Event::Line(Some(value.clone()));
@@ -1507,17 +1531,19 @@ fn codex_live_observer_waits_for_the_physical_newline_then_observes_once() {
     .unwrap();
     let (object, held) = FileObject::of(&fs::File::open(&path).unwrap()).unwrap();
     let view = FileView {
+        key: None,
+        redelivery: false,
         source: SnapshotSource::Codex,
         object,
         mtime: held.modified().ok(),
-        mode: DeliveryMode::Full,
+        mode: DeliveryMode::Full { cause: None },
         root: Some(0),
         start: 0,
     };
     let roots = [root.projects()];
     let feed = Arc::new(crate::codex_prelude_footprint::CodexPreludeFeed::default());
     let mut observer = feed.observer(&roots);
-    assert_eq!(observer.begin(&view), Want::Lines);
+    assert_eq!(observer.begin_at_boundary(&view), Want::Lines);
     let mut reader = BoundedJsonlReader::new(
         std::io::BufReader::new(fs::File::open(&path).unwrap()),
         1024,
@@ -1538,7 +1564,13 @@ fn codex_live_observer_waits_for_the_physical_newline_then_observes_once() {
             break;
         }
     }
-    observer.end(&view, &DeliveryEnd::Complete);
+    observer.end_at_boundary(
+        &view,
+        &Outcome::Complete {
+            sealed_x: 0,
+            fragment: None,
+        },
+    );
     let complete_end = meta.len() as u64 + 1;
     assert_eq!(
         delivered,
@@ -1555,7 +1587,7 @@ fn codex_live_observer_waits_for_the_physical_newline_then_observes_once() {
         ..view
     };
     let mut observer = feed.observer(&roots);
-    assert_eq!(observer.begin(&tail), Want::Lines);
+    assert_eq!(observer.begin_at_boundary(&tail), Want::Lines);
     let mut reader = BoundedJsonlReader::new(std::io::BufReader::new(file), 1024, false);
     let mut appended = Vec::new();
     loop {
@@ -1566,6 +1598,9 @@ fn codex_live_observer_waits_for_the_physical_newline_then_observes_once() {
                     // An unplanned test reader starts at zero; LD adds ReadPlan.start
                     // in production. Supply that same absolute origin for this Tail.
                     let line = PhysicalLine {
+                        start: 0,
+                        bytes: &[],
+                        overlong: false,
                         end: complete_end + line.end,
                         ..*line
                     };
@@ -1578,7 +1613,13 @@ fn codex_live_observer_waits_for_the_physical_newline_then_observes_once() {
             break;
         }
     }
-    observer.end(&tail, &DeliveryEnd::Complete);
+    observer.end_at_boundary(
+        &tail,
+        &Outcome::Complete {
+            sealed_x: 0,
+            fragment: None,
+        },
+    );
     assert_eq!(
         appended,
         vec![Some(serde_json::from_slice(&usage).unwrap())]
@@ -1590,13 +1631,19 @@ fn codex_live_observer_waits_for_the_physical_newline_then_observes_once() {
     assert_eq!(metric(&feed, "codex_prelude_gap_dropped"), 0);
     let mut observer = feed.observer(&roots);
     assert_eq!(
-        observer.begin(&FileView {
+        observer.begin_at_boundary(&FileView {
             start: fs::metadata(&path).unwrap().len(),
             ..tail
         }),
         Want::Skip
     );
-    observer.end(&tail, &DeliveryEnd::Complete);
+    observer.end_at_boundary(
+        &tail,
+        &Outcome::Complete {
+            sealed_x: 0,
+            fragment: None,
+        },
+    );
     assert_eq!(feed.done_for_test().len(), 1);
 }
 
@@ -1626,16 +1673,18 @@ fn codex_live_observer_skips_an_actual_overlong_row_before_terminal_usage() {
     .unwrap();
     let (object, held) = FileObject::of(&fs::File::open(&path).unwrap()).unwrap();
     let view = FileView {
+        key: None,
+        redelivery: false,
         source: SnapshotSource::Codex,
         object,
         mtime: held.modified().ok(),
-        mode: DeliveryMode::Full,
+        mode: DeliveryMode::Full { cause: None },
         root: Some(0),
         start: 0,
     };
     let feed = Arc::new(crate::codex_prelude_footprint::CodexPreludeFeed::default());
     let mut observer = feed.observer(&[root.projects()]);
-    assert_eq!(observer.begin(&view), Want::Lines);
+    assert_eq!(observer.begin_at_boundary(&view), Want::Lines);
     let mut reader = BoundedJsonlReader::new(
         std::io::BufReader::with_capacity(64, fs::File::open(&path).unwrap()),
         1024,
@@ -1657,7 +1706,13 @@ fn codex_live_observer_skips_an_actual_overlong_row_before_terminal_usage() {
             break report;
         }
     };
-    observer.end(&view, &DeliveryEnd::Complete);
+    observer.end_at_boundary(
+        &view,
+        &Outcome::Complete {
+            sealed_x: 0,
+            fragment: None,
+        },
+    );
     assert_eq!(report.over_line_cap_count, 1);
     assert_eq!(delivered.len(), 3);
     assert_eq!(delivered[0].1.as_ref().unwrap()["type"], "session_meta");
@@ -1675,4 +1730,486 @@ fn codex_live_observer_skips_an_actual_overlong_row_before_terminal_usage() {
         "777 must not terminate the live observer"
     );
     assert_eq!(metric(&feed, "codex_prelude_gap_dropped"), 0);
+}
+
+// LD2 transport tests use the existing native scan helpers above. The shared
+// old-writer/crash/receipt matrix remains owned by the transition fixture.
+#[derive(Default)]
+struct ManifestTrace {
+    begins: usize,
+    resumes: usize,
+    yields: usize,
+    lines: u64,
+    last_end: u64,
+    redelivered: usize,
+    ends: Vec<Outcome>,
+    order: Vec<&'static str>,
+    unavailable: Vec<line_delivery::UnavailableView>,
+}
+struct ManifestProbe {
+    path: PathBuf,
+    trace: Arc<Mutex<ManifestTrace>>,
+}
+impl LineObserver for ManifestProbe {
+    fn begin(&mut self, _: &FileView) -> Want {
+        self.trace.lock().unwrap().begins += 1;
+        Want::Lines
+    }
+    fn line(&mut self, file: &FileView, line: &PhysicalLine<'_>) {
+        let mut trace = self.trace.lock().unwrap();
+        trace.lines += 1;
+        trace.last_end = line.end;
+        trace.redelivered += usize::from(file.redelivery);
+        trace.order.push("line");
+    }
+    fn resume(&mut self, file: &FileView) {
+        assert!(file.redelivery);
+        self.trace.lock().unwrap().resumes += 1;
+    }
+    fn status(&mut self, _: &FileView, cause: line_delivery::GapCause) {
+        assert_eq!(cause, line_delivery::GapCause::Yielded);
+        self.trace.lock().unwrap().yields += 1;
+    }
+    fn unavailable(&mut self, status: &line_delivery::UnavailableView) {
+        self.trace.lock().unwrap().unavailable.push(*status);
+    }
+    fn end(&mut self, _: &FileView, end: &Outcome) {
+        let mut trace = self.trace.lock().unwrap();
+        trace.ends.push(*end);
+        trace.order.push("end");
+    }
+    fn boundary(&mut self, event: line_delivery::ObserverBoundary<'_>) {
+        if let line_delivery::ObserverBoundary::Native(
+            _,
+            line_delivery::NativeRoute::ResolveUnprepared,
+        ) = event
+        {
+            let mut trace = self.trace.lock().unwrap();
+            // Synthetic feature output only. This is a test adapter at the
+            // reached seam, not a certified native acquisition cut or receipt.
+            let bytes =
+                serde_json::to_vec(&json!({"lines":trace.lines,"observed_end":trace.last_end}))
+                    .unwrap();
+            let temp = self.path.with_extension("tmp");
+            fs::write(&temp, bytes).unwrap();
+            fs::rename(temp, &self.path).unwrap();
+            trace.order.push("native_boundary");
+        }
+    }
+}
+fn manifest_observer(path: &Path, trace: &Arc<Mutex<ManifestTrace>>) -> Box<ManifestProbe> {
+    Box::new(ManifestProbe {
+        path: path.to_path_buf(),
+        trace: Arc::clone(trace),
+    })
+}
+fn singleton_spec() -> line_delivery::ObserverSpec {
+    line_delivery::ObserverSpec::named("test", line_delivery::Continuity::SingletonJob).unwrap()
+}
+
+#[test]
+fn ld2_manifest_adapter_and_ram_recorder_use_the_live_native_boundary() {
+    let root = Root::new("ld2-manifest");
+    let path = root.file(SESSION);
+    append(
+        &path,
+        &[raw(&row("/w/a", "u1")), b"\n\n{malformed\n".to_vec()].concat(),
+    );
+    let manifest = root.0.join("manifest.json");
+    let trace = Arc::new(Mutex::new(ManifestTrace::default()));
+    let recorder = Recorder::default();
+    let (_, bare, bare_steps) = finish(new_scan(&root.projects(), ScanIndex::default()));
+    let scan = new_scan(&root.projects(), ScanIndex::default())
+        .try_with_line_observer(singleton_spec(), manifest_observer(&manifest, &trace))
+        .unwrap_or_else(|e| panic!("registration: {e:?}"))
+        .with_line_observer("test_second", Box::new(recorder.clone()));
+    let (_, seen, seen_steps) = finish(scan);
+    assert_eq!(bare_steps, seen_steps);
+    assert_eq!(
+        serde_json::to_value(&bare.snapshots).unwrap(),
+        serde_json::to_value(&seen.snapshots).unwrap()
+    );
+    assert_eq!(recorder.lines().len(), 3);
+    assert_eq!(recorder.ends(), [DeliveryEnd::Complete]);
+    let output: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+    assert_eq!(output["lines"], 3);
+    assert_eq!(output["observed_end"], fs::metadata(&path).unwrap().len());
+    let trace = trace.lock().unwrap();
+    assert_eq!(trace.begins, 1);
+    assert_eq!(trace.resumes, 0);
+    assert_eq!(trace.ends.len(), 1);
+    assert_eq!(
+        trace.ends[0],
+        Outcome::Complete {
+            sealed_x: fs::metadata(&path).unwrap().len(),
+            fragment: None
+        }
+    );
+    assert_eq!(
+        &trace.order[trace.order.len() - 2..],
+        ["native_boundary", "end"]
+    );
+}
+
+#[test]
+fn ld2_source_filter_precedes_hydration_and_the_empty_inventory_is_reached() {
+    let root = Root::new("ld2-empty");
+    append(
+        &root.file(SESSION),
+        &[raw(&row("/w/a", "u1")), b"\n".to_vec()].concat(),
+    );
+    line_delivery::take_native_routes();
+    let (_, bare, _) = finish(new_scan(&root.projects(), ScanIndex::default()));
+    assert!(line_delivery::take_native_routes()
+        .contains(&line_delivery::NativeRoute::ResolveUnprepared));
+    let recorder = Recorder::default();
+    let scan = new_scan(&root.projects(), ScanIndex::default())
+        .with_line_observer("codex_prelude", Box::new(recorder.clone()));
+    let (_, filtered, _) = finish(scan);
+    assert!(recorder.events().is_empty());
+    assert_eq!(
+        serde_json::to_value(&bare.snapshots).unwrap(),
+        serde_json::to_value(&filtered.snapshots).unwrap()
+    );
+}
+
+#[test]
+fn ld2_borrowed_raw_bytes_keep_cr_and_one_parse_with_absolute_bounds() {
+    let bytes = b"{\"n\":1}\r\n\n\xff\n{bad\n";
+    let physical = RefCell::new(Vec::new());
+    let pointers = RefCell::new(Vec::new());
+    let mut reader = BoundedJsonlReader::new(Cursor::new(bytes), 1024, false);
+    loop {
+        let step = reader
+            .step_lines(
+                |value| {
+                    pointers
+                        .borrow_mut()
+                        .push(("money", value as *const Value as usize))
+                },
+                Some(&mut |length, line: &PhysicalLine<'_>| {
+                    assert_eq!(length, line.end - line.start);
+                    assert!(!line.overlong);
+                    physical
+                        .borrow_mut()
+                        .push((line.start, line.end, line.bytes.to_vec()));
+                    if let Some(value) = line.value {
+                        pointers
+                            .borrow_mut()
+                            .push(("tap", value as *const Value as usize));
+                    }
+                }),
+            )
+            .unwrap();
+        if matches!(step, JsonlReaderStep::Complete(_)) {
+            break;
+        }
+    }
+    assert_eq!(
+        *physical.borrow(),
+        [
+            (0, 9, b"{\"n\":1}\r".to_vec()),
+            (9, 10, vec![]),
+            (10, 12, vec![0xff]),
+            (12, 17, b"{bad".to_vec()),
+        ]
+    );
+    let pointers = pointers.borrow();
+    assert_eq!(pointers.len(), 2);
+    assert_eq!(pointers[0].0, "tap");
+    assert_eq!(pointers[1].0, "money");
+    assert_eq!(pointers[0].1, pointers[1].1);
+}
+
+fn ld2_cursor_fixture(label: &str) -> (Root, PathBuf, PathBuf) {
+    let root = Root::new(label);
+    let sessions = root.0.join("sessions");
+    fs::create_dir(&sessions).unwrap();
+    let id = "019fa111-2222-7333-8444-555555555555";
+    let path = sessions.join(format!("rollout-2026-10-07T10-00-00-{id}.jsonl"));
+    append(&path,&[raw(&json!({"type":"session_meta","timestamp":"2026-10-07T10:00:00Z","payload":{"id":id,"cwd":root.0}})),b"\n".to_vec()].concat());
+    for _ in 0..60 {
+        append(
+            &path,
+            &[raw(&json!({"padding":"x".repeat(100)})), b"\n".to_vec()].concat(),
+        );
+    }
+    append(&path,&[raw(&json!({"type":"event_msg","timestamp":"2026-10-07T10:00:01Z","payload":{"type":"token_count","info":{"model":"gpt-5","last_token_usage":{"input_tokens":100,"output_tokens":2},"total_token_usage":{"input_tokens":100,"output_tokens":2}}}})),b"\n".to_vec()].concat());
+    (root, sessions, path)
+}
+
+#[test]
+fn ld2_singleton_job_carries_one_begin_and_end_across_real_cursor_pages() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let (root, sessions, path) = ld2_cursor_fixture("ld2-resume");
+    let manifest = root.0.join("manifest.json");
+    let trace = Arc::new(Mutex::new(ManifestTrace::default()));
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    sampled_scan::codex_cursor::with_test_limits(2048, 1024, 64, || {
+        let mut index = ScanIndex::default();
+        let mut finished = false;
+        for page in 0..20 {
+            let scan = OwnedSourceScan::new(
+                SnapshotSource::Codex,
+                std::slice::from_ref(&sessions),
+                index,
+                NOW,
+                BACKFILL_WINDOW_DAYS,
+                10,
+                false,
+                None,
+                &[],
+                false,
+                true,
+            )
+            .with_sampled_acquisition(
+                Arc::clone(&cache),
+                crate::transcript_acquisition::Scope("ld2-resume".into()),
+            )
+            .try_with_line_observer(singleton_spec(), manifest_observer(&manifest, &trace))
+            .unwrap_or_else(|e| panic!("registration: {e:?}"));
+            let (next, result, _) = finish(scan);
+            index = next;
+            if !result.snapshots.is_empty() {
+                assert!(page > 0, "fixture must really pause");
+                finished = true;
+                break;
+            }
+            assert!(
+                trace.lock().unwrap().ends.is_empty(),
+                "yield is nonterminal"
+            );
+        }
+        assert!(finished, "cursor did not finish");
+    });
+    let trace = trace.lock().unwrap();
+    assert_eq!(trace.begins, 1);
+    assert!(trace.yields > 0);
+    assert!(trace.resumes > 0);
+    assert!(
+        trace.redelivered > 0,
+        "nonoverlapping resumes also flag redelivery"
+    );
+    assert_eq!(trace.lines, 62);
+    assert_eq!(trace.last_end, fs::metadata(&path).unwrap().len());
+    assert_eq!(trace.ends.len(), 1);
+    assert!(trace.ends[0].is_complete(), "{:?}", trace.ends);
+    assert!(manifest.is_file());
+}
+
+#[test]
+fn ld2_paused_overlong_line_uses_the_same_buffer_and_waits_for_newline() {
+    let root = Root::new("ld2-partial");
+    let path = root.file(SESSION);
+    append(&path, b"12345678901234567890\n{}\n");
+    let trace = Arc::new(Mutex::new(ManifestTrace::default()));
+    let manifest = root.0.join("manifest.json");
+    let scan = new_scan(&root.projects(), ScanIndex::default())
+        .try_with_line_observer(singleton_spec(), manifest_observer(&manifest, &trace))
+        .unwrap_or_else(|e| panic!("registration: {e:?}"));
+    let mut scan = step_until(scan, |s| s.active_file.is_some());
+    let mut active = scan.active_file.take().unwrap();
+    active.parser.reader.max_line_bytes = 4;
+    active.parser.reader.set_chunked_skip(2);
+    let mut first = scan.line_delivery.take().unwrap();
+    first.begin_armed(&mut active, &scan.roots);
+    assert!(!first.step(&mut active).unwrap());
+    assert!(active.parser.reader.consumed_bytes() > 0);
+    assert_eq!(active.parser.reader.last_complete_line_end(), 0);
+    assert_eq!(trace.lock().unwrap().lines, 0);
+    first.pause(&mut active);
+    drop(first);
+    let mut next = line_delivery::LineDelivery::default();
+    next.begin_armed(&mut active, &scan.roots);
+    assert_eq!(trace.lock().unwrap().begins, 1);
+    assert_eq!(trace.lock().unwrap().resumes, 1);
+    *scan.active_file = Some(active);
+    scan.line_delivery = Some(next);
+    finish(scan);
+    let trace = trace.lock().unwrap();
+    assert_eq!(trace.lines, 2);
+    assert_eq!(trace.last_end, 24);
+    assert_eq!(trace.ends.len(), 1);
+    assert!(trace.ends[0].is_complete());
+}
+
+#[test]
+fn ld2_singleton_registration_survives_each_file_and_read_failure() {
+    for fail_first in [false, true] {
+        let root = Root::new("ld2-multiple");
+        let other = "5e551011-0000-4000-8000-00000000d1d2";
+        for session in [SESSION, other] {
+            append(
+                &root.file(session),
+                &[raw(&session_row(session, "/w/a", "u1")), b"\n".to_vec()].concat(),
+            );
+        }
+        let trace = Arc::new(Mutex::new(ManifestTrace::default()));
+        let manifest = root.0.join("manifest.json");
+        let scan = new_scan(&root.projects(), ScanIndex::default())
+            .try_with_line_observer(singleton_spec(), manifest_observer(&manifest, &trace))
+            .unwrap_or_else(|e| panic!("registration: {e:?}"));
+        let mut scan = step_until(scan, |s| s.active_file.is_some());
+        if fail_first {
+            scan.active_file.as_mut().unwrap().parser.reader.failure =
+                Some(std::io::ErrorKind::Other);
+        }
+        finish(scan);
+        let trace = trace.lock().unwrap();
+        assert_eq!(
+            trace.begins, 2,
+            "registration must survive the first native exit"
+        );
+        assert_eq!(trace.ends.len(), 2);
+        assert_eq!(
+            trace.ends.iter().filter(|end| end.is_complete()).count(),
+            if fail_first { 1 } else { 2 }
+        );
+        assert_eq!(trace.lines, if fail_first { 1 } else { 2 });
+    }
+}
+
+#[test]
+fn ld2_frame_return_resumes_existing_subscriber_and_flags_the_suffix() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let (root, sessions, _) = ld2_cursor_fixture("ld2-frame-return");
+    let trace = Arc::new(Mutex::new(ManifestTrace::default()));
+    let manifest = root.0.join("manifest.json");
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let make_scan = |index| {
+        OwnedSourceScan::new(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&sessions),
+            index,
+            NOW,
+            BACKFILL_WINDOW_DAYS,
+            10,
+            false,
+            None,
+            &[],
+            false,
+            true,
+        )
+        .with_sampled_acquisition(
+            Arc::clone(&cache),
+            crate::transcript_acquisition::Scope("ld2-frame-return".into()),
+        )
+        .try_with_line_observer(singleton_spec(), manifest_observer(&manifest, &trace))
+        .unwrap_or_else(|e| panic!("registration: {e:?}"))
+    };
+    sampled_scan::codex_cursor::with_test_limits(2048, 4096, 64, || {
+        let scan = step_until(make_scan(ScanIndex::default()), |s| {
+            s.active_file
+                .as_ref()
+                .is_some_and(|a| a.cursor.is_some() && a.parser.reader.consumed_bytes() > 0)
+        });
+        assert_eq!(
+            trace.lock().unwrap().yields,
+            0,
+            "frame return must precede explicit pause"
+        );
+        assert_eq!(trace.lock().unwrap().begins, 1);
+        drop(scan);
+        assert!(
+            trace.lock().unwrap().ends.is_empty(),
+            "cursor still owns the open observer"
+        );
+        assert!(cache.cursor_charge() > 0, "the job was really retained");
+        let mut index = ScanIndex::default();
+        let mut finished = false;
+        for _ in 0..20 {
+            let (next, result, _) = finish(make_scan(index));
+            index = next;
+            if !result.snapshots.is_empty() {
+                finished = true;
+                break;
+            }
+        }
+        assert!(finished);
+    });
+    let trace = trace.lock().unwrap();
+    assert_eq!(trace.begins, 1);
+    assert!(trace.resumes > 0);
+    assert!(trace.redelivered > 0);
+    assert_eq!(trace.lines, 62);
+    assert_eq!(trace.ends.len(), 1);
+    assert!(trace.ends[0].is_complete());
+}
+
+#[test]
+fn ld2_scoped_owner_retains_the_native_heap_charge() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let root = Root::new("ld2-guard-funding");
+    append(
+        &root.file(SESSION),
+        &[raw(&row("/w/a", "u1")), b"\n".to_vec()].concat(),
+    );
+    let trace = Arc::new(Mutex::new(ManifestTrace::default()));
+    let scan = new_scan(&root.projects(), ScanIndex::default())
+        .try_with_line_observer(
+            singleton_spec(),
+            manifest_observer(&root.0.join("manifest.json"), &trace),
+        )
+        .unwrap_or_else(|e| panic!("registration: {e:?}"));
+    let mut scan = step_until(scan, |s| s.active_file.is_some());
+    let mut active = scan.active_file.take().unwrap();
+    let mut delivery = scan.line_delivery.take().unwrap();
+    delivery.begin_armed(&mut active, &scan.roots);
+    let before = crate::heap_layout_bound::completed_bound(&*active, usize::MAX).unwrap();
+    let mut guard = line_delivery::ActiveDelivery::new(Some(&mut delivery), &mut active);
+    let detached = crate::heap_layout_bound::completed_bound(&*active, usize::MAX).unwrap();
+    assert_eq!(
+        before, detached,
+        "native walks must count the guard-owned observer"
+    );
+    guard.attach(&mut active);
+    let attached = crate::heap_layout_bound::completed_bound(&*active, usize::MAX).unwrap();
+    assert_eq!(
+        before, attached,
+        "moving back must not double-charge the graph"
+    );
+}
+
+#[test]
+fn ld2_selected_unchanged_without_an_open_discloses_unknown_prefix() {
+    let root = Root::new("ld2-no-line");
+    append(
+        &root.file(SESSION),
+        &[raw(&row("/w/a", "u1")), b"\n".to_vec()].concat(),
+    );
+    append(&root.file(SESSION), &[raw(&json!({
+        "type":"assistant", "sessionId":SESSION, "uuid":"a1", "requestId":"req-ld2-quiet",
+        "timestamp":"2026-10-06T10:01:00Z", "message":{"id":"msg-ld2-quiet", "role":"assistant",
+        "model":"claude-opus-4-1", "usage":{"input_tokens":1,"output_tokens":1}, "content":[]}
+    })), b"\n".to_vec()].concat());
+    let (index, initial, _) = finish(new_scan(&root.projects(), ScanIndex::default()));
+    assert!(!initial.snapshots.is_empty());
+    let trace = Arc::new(Mutex::new(ManifestTrace::default()));
+    let manifest = root.0.join("manifest.json");
+    let scan = new_scan(&root.projects(), index)
+        .try_with_line_observer(singleton_spec(), manifest_observer(&manifest, &trace))
+        .unwrap_or_else(|e| panic!("registration: {e:?}"));
+    let (_, quiet, _) = finish(scan);
+    assert_eq!(quiet.scanned_file_count, 0, "fixture must take native Skip");
+    let trace = trace.lock().unwrap();
+    assert_eq!(trace.begins, 0);
+    assert!(trace.ends.is_empty(), "no invented logical begin/end");
+    assert_eq!(trace.unavailable.len(), 1);
+    let status = trace.unavailable[0];
+    assert!(status.key.is_some());
+    assert_eq!(status.gap.cause, line_delivery::GapCause::RestoredPrefix);
+    assert_eq!(
+        (status.gap.from, status.gap.to, status.gap.conservative),
+        (0, 0, true)
+    );
+    assert!(
+        !manifest.exists(),
+        "no catch-up or retrospective feature commit"
+    );
 }

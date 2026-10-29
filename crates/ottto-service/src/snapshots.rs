@@ -25569,6 +25569,9 @@ struct OwnedActiveFile {
     /// U1a-2a (row 16): present while this file is P's side read. Every
     /// main write on its path is gated; it ends at the side exit.
     side_origin: Option<SideOrigin>,
+    line_delivery: line_delivery::ParkedDelivery,
+    delivery_full_cause: Option<&'static str>,
+    delivery_reservation: line_delivery::DeliveryReservation,
 }
 #[allow(clippy::large_enum_variant)] // One active context moves between native collection steps.
 pub(crate) enum OwnedSourceScanStep {
@@ -26076,7 +26079,7 @@ impl OwnedSourceScan {
             codex_selected_flags: Default::default(),
             codex_side_pass: None,
             continuation_ticket: None,
-            line_delivery: None,
+            line_delivery: Some(line_delivery::LineDelivery::default()),
             codex_versions: None,
         }
     }
@@ -26772,7 +26775,7 @@ impl OwnedSourceScan {
             codex_selected_flags,
             codex_side_pass: None,
             continuation_ticket: None,
-            line_delivery: None,
+            line_delivery: Some(line_delivery::LineDelivery::default()),
             codex_versions: None,
         }
     }
@@ -27918,8 +27921,10 @@ impl OwnedSourceScan {
             }
             if let Some(mut active) = active_file.take() {
                 if let Some(delivery) = line_delivery.as_mut() {
-                    delivery.begin_armed(&active, &roots);
+                    delivery.begin_armed(&mut active, &roots);
                 }
+                let mut active_delivery =
+                    line_delivery::ActiveDelivery::new(line_delivery.as_mut(), &mut active);
                 let mut group_end = None;
                 let stepped = if active.group.is_some() {
                     // A group job: one record of the current member, or one
@@ -27958,10 +27963,8 @@ impl OwnedSourceScan {
                             Ok(false)
                         }
                     }
-                } else if let Some(delivery) = line_delivery.as_mut() {
-                    delivery.step(&mut active.parser)
                 } else {
-                    active.parser.step()
+                    active_delivery.step(&mut active)
                 };
                 if source == SnapshotSource::Codex {
                     let consumed = active.parser.reader.consumed_bytes();
@@ -28024,8 +28027,10 @@ impl OwnedSourceScan {
                                 if let sampled_scan::codex_cursor::PauseEnd::StateBound(
                                     job,
                                     disclosure,
-                                ) = lease.pause(active)
-                                {
+                                ) = {
+                                    active_delivery.pause(&mut active);
+                                    lease.pause(active)
+                                } {
                                     // No unbounded fallback: `JoinStateBound`
                                     // debt, prior body kept, file parked.
                                     sampled_scan::codex_cursor::disclose_job_debt(
@@ -28059,6 +28064,7 @@ impl OwnedSourceScan {
                             }
                             pending!();
                         }
+                        active_delivery.attach(&mut active);
                         active_file = Some(active);
                         pending!();
                     }
@@ -28114,6 +28120,7 @@ impl OwnedSourceScan {
                         if let Some(lease) = codex_cursor_lease.take() {
                             #[cfg(test)]
                             sampled_scan::codex_cursor::tests::constrain_eof_park(&mut active);
+                            active_delivery.pause(&mut active);
                             drop(lease.pause(active)); // StateBound: ordinary disclosure only.
                         }
                         pending!();
@@ -28174,6 +28181,7 @@ impl OwnedSourceScan {
                     );
                     match context.prepare_launch_step(&workers) {
                         Ok(false) => {
+                            active_delivery.attach(&mut active);
                             active_file = Some(active);
                             pending!();
                         }
@@ -28286,9 +28294,10 @@ impl OwnedSourceScan {
                         pending!();
                     }
                     // LD: the replay is a fresh Full delivery from 0.
-                    if let Some(delivery) = line_delivery.as_mut() {
+                    if let Some(delivery) = active_delivery.delivery() {
                         delivery.arm();
                     }
+                    active_delivery.attach(&mut active);
                     active_file = Some(active);
                     pending!();
                 }
@@ -28600,6 +28609,9 @@ impl OwnedSourceScan {
                     hold_offset: _,
                     group,
                     side_origin,
+                    line_delivery: _,
+                    delivery_full_cause: _,
+                    delivery_reservation: _,
                 } = *active;
                 if let Some(mut group) = group {
                     codex_legacy_join_baselines.extend(group.take_legacy_baselines());
@@ -29059,6 +29071,11 @@ impl OwnedSourceScan {
                         twins: history_upgrade.twin_groups(),
                     }),
                 );
+                active_delivery.before_acquisition_commit(if parsed_file.is_ok() {
+                    line_delivery::NativeRoute::ResolveUnprepared
+                } else {
+                    line_delivery::NativeRoute::NativeError
+                });
                 // A committed cursor attempt counts as published only now (M4).
                 if let Some((context, publication)) =
                     sampling.as_ref().zip(cursor_publication.take())
@@ -31466,6 +31483,15 @@ impl OwnedSourceScan {
             }
             match decision {
                 CandidateDecision::Skip => {
+                    if side_plan.is_none() && !comparison_target {
+                        if let Some(delivery) = line_delivery.as_mut() {
+                            delivery.unavailable(
+                                source,
+                                &local_index_key(&candidate.path),
+                                line_delivery::NativeRoute::Unchanged,
+                            );
+                        }
+                    }
                     if let Some(phase) = native_comparison.as_mut() {
                         if let Some(credit) = capture_credit.as_deref_mut() {
                             phase.record_actual_skip_paid(
@@ -31495,6 +31521,15 @@ impl OwnedSourceScan {
                     if let Some(reason) =
                         cache.durable_hold(source, &local_index_key(&candidate.path))
                     {
+                        if !comparison_target {
+                            if let Some(delivery) = line_delivery.as_mut() {
+                                delivery.unavailable(
+                                    source,
+                                    &local_index_key(&candidate.path),
+                                    line_delivery::NativeRoute::FenceOrHeld,
+                                );
+                            }
+                        }
                         cache.durable_hold_exit(source, reason, index, &candidate, &mut census);
                         pending!();
                     }
@@ -32117,6 +32152,15 @@ impl OwnedSourceScan {
                                         (None, taken_admission)
                                     }
                                     sampled_scan::durable_tail::RestoreOutcome::Held(reason) => {
+                                        if !comparison_target {
+                                            if let Some(delivery) = line_delivery.as_mut() {
+                                                delivery.unavailable(
+                                                    source,
+                                                    &key,
+                                                    line_delivery::NativeRoute::FenceOrHeld,
+                                                );
+                                            }
+                                        }
                                         context.cache.durable_hold_exit(
                                             source,
                                             reason,
@@ -32303,6 +32347,9 @@ impl OwnedSourceScan {
                 hold_offset: None,
                 group: None,
                 side_origin,
+                line_delivery: line_delivery::ParkedDelivery::default(),
+                delivery_full_cause: parse_reason.map(|r| CANDIDATE_PARSE_REASON_NAMES[r as usize]),
+                delivery_reservation: line_delivery::DeliveryReservation::default(),
             });
             if let Some(context) = sampling
                 .as_ref()
@@ -32458,6 +32505,15 @@ impl OwnedSourceScan {
                         &local_index_key(&active.candidate.path),
                         true,
                     ) {
+                        if active.is_primary_for(source) {
+                            if let Some(delivery) = line_delivery.as_mut() {
+                                delivery.unavailable(
+                                    source,
+                                    &local_index_key(&active.candidate.path),
+                                    line_delivery::NativeRoute::FenceOrHeld,
+                                );
+                            }
+                        }
                         cache.durable_hold_exit(
                             source,
                             reason,
@@ -34632,7 +34688,16 @@ fn apply_physical_line(
         report.over_line_cap_count += 1;
         if let Some((length, end, tap)) = deliver {
             // Never a salvaged envelope.
-            tap(length, &line_delivery::PhysicalLine { end, value: None });
+            tap(
+                length,
+                &line_delivery::PhysicalLine {
+                    start: end.saturating_sub(length),
+                    end,
+                    bytes: &[],
+                    value: None,
+                    overlong: true,
+                },
+            );
         }
         // Codex created-thread ownership requires a gap-free ordinal and
         // timestamp stream. Image-bearing response/compaction rows carry
@@ -34678,7 +34743,16 @@ fn apply_physical_line(
     };
     if let Some((length, end, tap)) = deliver {
         let value = value.as_ref();
-        tap(length, &line_delivery::PhysicalLine { end, value });
+        tap(
+            length,
+            &line_delivery::PhysicalLine {
+                start: end.saturating_sub(length),
+                end,
+                bytes: buf.as_slice(),
+                value,
+                overlong: false,
+            },
+        );
     }
     if let Some(value) = value {
         on_value(&value);
@@ -89547,7 +89621,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_ledger_identity_used, codex_parent_resolution_pending, codex_parent_ownership_ledger,
     codex_parent_unresolvable, codex_parent_ledger_unusable, codex_parent_ledger_consulted,
     codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
-crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
+crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin, line_delivery, delivery_full_cause, delivery_reservation);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
 crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery; shared codex_versions);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);

@@ -705,6 +705,9 @@ impl GroupBoot {
                 walked: None,
                 consumed_before: 0,
             })),
+            line_delivery: super::super::line_delivery::ParkedDelivery::default(),
+            delivery_full_cause: None,
+            delivery_reservation: super::super::line_delivery::DeliveryReservation::default(),
         }))
     }
 }

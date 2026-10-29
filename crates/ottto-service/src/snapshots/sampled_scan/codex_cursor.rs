@@ -4131,7 +4131,7 @@ impl SharedCache {
 
     /// Requested-layout charge of the paused job.
     #[cfg(test)]
-    pub(super) fn cursor_charge(&self) -> usize {
+    pub(in crate::snapshots) fn cursor_charge(&self) -> usize {
         self.with_cursor(|cursor| match cursor.slot {
             Slot::Paused(_) => cursor.slot_charge,
             Slot::Empty | Slot::ActiveElsewhere { .. } => 0,
@@ -5823,6 +5823,8 @@ pub(in crate::snapshots) fn resume_paused_job(
                     requeue(index, context.flags, file);
                 }
             }
+            // Includes frame-return cancellation as well as explicit pauses.
+            job.line_delivery.mark_resumed();
             return Resumed::Active(job, lease);
         }
         // Unavailable evidence is not a member change: the job waits in the

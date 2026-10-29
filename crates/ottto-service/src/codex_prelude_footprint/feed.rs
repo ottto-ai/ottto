@@ -1,7 +1,7 @@
 use super::*;
 use crate::heap_layout_bound::{Counter, HeapLayoutBound};
 use crate::snapshots::line_delivery::{
-    DeliveryEnd, DeliveryMode, FileView, LineObserver, PhysicalLine, Want,
+    DeliveryEnd, DeliveryMode, FileView, LineObserver, ObserverBoundary, PhysicalLine, Want,
 };
 use crate::transcript_acquisition::FileObject;
 use std::collections::HashMap;
@@ -169,6 +169,8 @@ impl CodexPreludeFeed {
             feed: Arc::clone(self),
             roots,
             active: None,
+            prepared_want: Want::Skip,
+            gap: false,
         })
     }
     pub(super) fn snapshot(&self, now: SystemTime) -> (Vec<Start>, Scopes) {
@@ -235,6 +237,8 @@ struct Observer {
     feed: Arc<CodexPreludeFeed>,
     roots: Arc<[(PathBuf, PathBuf)]>,
     active: Option<(PathBuf, Observation)>,
+    prepared_want: Want,
+    gap: bool,
 }
 impl LineObserver for Observer {
     fn declared_heap_bytes(&self) -> usize {
@@ -246,8 +250,43 @@ impl LineObserver for Observer {
             .position(|(configured, resolved)| root == configured || root == resolved)
             .and_then(|i| u16::try_from(i).ok())
     }
-    fn begin(&mut self, file: &FileView) -> Want {
+    fn boundary(&mut self, event: ObserverBoundary<'_>) {
+        match event {
+            ObserverBoundary::Begin(file) => self.prepared_want = self.hydrate(file),
+            ObserverBoundary::End(file, end) => self.publish(file, end),
+            ObserverBoundary::Native(file, route) => {
+                let _ = (file.source, route);
+            }
+        }
+    }
+    fn begin(&mut self, _: &FileView) -> Want {
+        self.prepared_want
+    }
+    fn line(&mut self, _: &FileView, line: &PhysicalLine<'_>) {
+        let Some((_, o)) = self.active.as_mut() else {
+            return;
+        };
+        if self.gap || o.terminal {
+            return;
+        }
+        if line.end <= o.next {
+            self.gap = true;
+            return;
+        }
+        o.next = line.end;
+        o.rows += 1;
+        let (step, capped) = o
+            .parser
+            .observe_bounded(line.value.unwrap_or(&Value::Null), SKILLS_BYTES);
+        o.capped |= capped || o.parser.prelude().agents_md_capped;
+        o.terminal = step == PreludeStep::Done || o.rows == MAX_PRELUDE_LINES;
+    }
+    fn end(&mut self, _: &FileView, _: &DeliveryEnd) {}
+}
+impl Observer {
+    fn hydrate(&mut self, file: &FileView) -> Want {
         self.active = None;
+        self.gap = false;
         if file.source != SnapshotSource::Codex {
             return Want::Skip;
         }
@@ -265,7 +304,7 @@ impl LineObserver for Observer {
         };
         let home = home.to_path_buf();
         let observation = match (file.mode, old) {
-            (DeliveryMode::Full, _) => Observation {
+            (DeliveryMode::Full { .. }, _) => Observation {
                 parser: CodexPreludeParser {
                     agents_md_cap: AGENTS_BYTES,
                     ..CodexPreludeParser::default()
@@ -292,41 +331,22 @@ impl LineObserver for Observer {
         self.active = Some((home, observation));
         Want::Lines
     }
-    fn line(&mut self, file: &FileView, line: &PhysicalLine<'_>) {
-        let Some((_, o)) = self.active.as_mut() else {
-            return;
-        };
-        if o.terminal {
-            return;
-        }
-        if line.end <= o.next {
-            let (home, _) = self.active.take().expect("active observation");
-            let mut f = self.feed.lock();
-            f.gaps += 1;
-            f.put(file, home, State::Unseen);
-            return;
-        }
-        o.next = line.end;
-        o.rows += 1;
-        let (step, capped) = o
-            .parser
-            .observe_bounded(line.value.unwrap_or(&Value::Null), SKILLS_BYTES);
-        o.capped |= capped || o.parser.prelude().agents_md_capped;
-        o.terminal = step == PreludeStep::Done || o.rows == MAX_PRELUDE_LINES;
-    }
-    fn end(&mut self, file: &FileView, end: &DeliveryEnd) {
+    fn publish(&mut self, file: &FileView, end: &DeliveryEnd) {
         let Some((home, o)) = self.active.take() else {
             return;
         };
         let mut f = self.feed.lock();
-        let state = if o.terminal {
+        let state = if self.gap {
+            f.gaps += 1;
+            State::Unseen
+        } else if o.terminal {
             f.text_capped += u64::from(o.capped);
             let mut p = o.parser.finish();
             if o.capped {
                 (p.agents_md, p.skills_body) = (None, None);
             }
             State::Done(Box::new(p), o.capped)
-        } else if *end == DeliveryEnd::Complete {
+        } else if end.is_complete() {
             State::Pending(Box::new(o))
         } else {
             f.gaps += 1;

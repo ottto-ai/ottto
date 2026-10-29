@@ -1,5 +1,6 @@
 use crate::adaptive_collector::{CadenceConfig, SourceCadence};
 use crate::agent_status::AgentStatusCollection;
+
 #[cfg(test)]
 use crate::backfill::save_backfill_state;
 use crate::backfill::{
@@ -5726,6 +5727,25 @@ fn prepare_sync_source(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn register_line_observers(
+    mut scan: crate::snapshots::OwnedSourceScan,
+    source: SnapshotSource,
+    roots: &[PathBuf],
+    footprint: Option<&std::sync::Arc<crate::context_footprint::CwdProjection>>,
+    prelude: &std::sync::Arc<crate::codex_prelude_footprint::CodexPreludeFeed>,
+) -> crate::snapshots::OwnedSourceScan {
+    // Filter before constructing/hydrating feature state; FreshRead is the
+    // explicit RAM compatibility policy for both existing observers.
+    if source == SnapshotSource::ClaudeCode {
+        if let Some(footprint) = footprint {
+            scan = scan.with_line_observer("footprint", footprint.observer());
+        }
+    } else if source == SnapshotSource::Codex {
+        scan = scan.with_line_observer("codex_prelude", prelude.observer(roots));
+    }
+    scan
+}
+
 fn prepare_sync_source_inner(
     client: &SnapshotApiClient,
     device: &LocalDeviceBinding,
@@ -6221,11 +6241,13 @@ fn prepare_sync_source_inner(
     .with_sampled_acquisition(daemon.transcript_cache.clone(), sampled_scope.clone())
     .with_codex_side_pass(codex_side_pass)
     .with_codex_versions(daemon.codex_versions.clone());
-    if source == SnapshotSource::ClaudeCode {
-        scan = scan.with_line_observer("footprint", daemon.footprint_cwds.observer());
-    } else if source == SnapshotSource::Codex {
-        scan = scan.with_line_observer("codex_prelude", daemon.codex_preludes.observer(&roots));
-    }
+    scan = register_line_observers(
+        scan,
+        source,
+        &roots,
+        Some(&daemon.footprint_cwds),
+        &daemon.codex_preludes,
+    );
     if crate::snapshots::claude_native_comparison::enabled() {
         scan.enable_native_comparison();
     }
@@ -6640,8 +6662,14 @@ fn prepare_continuation_source(
         ),
     )
     .with_codex_side_pass(Some(codex_side_pass))
-    .with_line_observer("codex_prelude", inputs.codex_preludes.observer(&roots))
     .with_codex_versions(inputs.codex_versions.clone());
+    let scan = register_line_observers(
+        scan,
+        SnapshotSource::Codex,
+        &roots,
+        None,
+        &inputs.codex_preludes,
+    );
     Ok(Ok(SourcePreparation {
         native_comparison_reservation: None,
         native_comparison_lease: None,

@@ -127,6 +127,36 @@ pub(crate) struct LineDeliveryCounts {
     pub(crate) bytes: u64,
     #[serde(skip_serializing_if = "is_zero")]
     pub(crate) incomplete: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) redelivered_bytes: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) observer_us: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) boundary_us: u64,
+    #[serde(skip_serializing_if = "gap_counts_empty")]
+    pub(crate) incomplete_by_cause: [u64; 7],
+}
+impl LineDeliveryCounts {
+    pub(crate) fn add(&mut self, other: Self) {
+        self.lines = self.lines.saturating_add(other.lines);
+        self.bytes = self.bytes.saturating_add(other.bytes);
+        self.incomplete = self.incomplete.saturating_add(other.incomplete);
+        self.redelivered_bytes = self
+            .redelivered_bytes
+            .saturating_add(other.redelivered_bytes);
+        self.observer_us = self.observer_us.saturating_add(other.observer_us);
+        self.boundary_us = self.boundary_us.saturating_add(other.boundary_us);
+        for (count, delta) in self
+            .incomplete_by_cause
+            .iter_mut()
+            .zip(other.incomplete_by_cause)
+        {
+            *count = count.saturating_add(delta);
+        }
+    }
+}
+fn gap_counts_empty(counts: &[u64; 7]) -> bool {
+    counts.iter().all(|n| *n == 0)
 }
 
 /// K10 (LD): why a discovery gate left a file unselected.
@@ -362,7 +392,7 @@ pub(crate) struct Probe {
     process: Option<ProcessSample>,
     pub(crate) page_events: claude_reread::Counts,
     pub(crate) full_causes: FullCauses,
-    pub(crate) line_delivery: Option<(&'static str, LineDeliveryCounts)>,
+    pub(crate) line_delivery: Option<BTreeMap<&'static str, LineDeliveryCounts>>,
 }
 impl Probe {
     pub(crate) fn start() -> Self {
@@ -414,8 +444,15 @@ impl Probe {
         let counts = Counts {
             line_delivery: self
                 .line_delivery
-                .filter(|(_, counts)| *counts != LineDeliveryCounts::default())
-                .map(|(observer, counts)| BTreeMap::from([(observer, counts)])),
+                .as_ref()
+                .map(|counts| {
+                    counts
+                        .iter()
+                        .map(|(&name, &counts)| (name, counts))
+                        .filter(|(_, counts)| *counts != LineDeliveryCounts::default())
+                        .collect::<BTreeMap<_, _>>()
+                })
+                .filter(|counts| !counts.is_empty()),
             line_delivery_unselected: [("age", 0), ("size", 1)]
                 .into_iter()
                 .map(|(key, reason)| (key, line_unselected(source, reason, |n| n.swap(0, Relaxed))))

@@ -9,10 +9,12 @@ fn views(dir: &Path, count: usize) -> Vec<FileView> {
             fs::write(&path, b"").unwrap();
             let (object, _) = FileObject::of(&fs::File::open(path).unwrap()).unwrap();
             FileView {
+                key: None,
+                redelivery: false,
                 source: SnapshotSource::Codex,
                 object,
                 mtime: Some(SystemTime::now()),
-                mode: DeliveryMode::Full,
+                mode: DeliveryMode::Full { cause: None },
                 root: Some(0),
                 start: 0,
             }
