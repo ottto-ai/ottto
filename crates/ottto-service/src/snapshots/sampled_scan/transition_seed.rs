@@ -86,12 +86,12 @@ const PINNED_SOURCES: &[SourcePin] = &[
     SourcePin {
         path: "snapshots/sampled_scan/durable_tail.rs",
         text: include_str!("durable_tail.rs"),
-        sha256: "1c3650f6d8d61697ef8e88f5ff803bb4e565d86e9197e9fa4e388d20e77a6640",
+        sha256: "5166e50e0a290f5f512253c89557ea29f3e2ef64472dbd3fcf4cedf3b4fc2f54",
     },
     SourcePin {
         path: "durable_tail_store.rs",
         text: include_str!("../../durable_tail_store.rs"),
-        sha256: "fb9c44d7bedaf31bd7da8b069efb3fb8374a006413d587b22f311cd4ab614912",
+        sha256: "1a20538d2cd8cdafb44e6cdc093313cf877ff54cda37f6f79a4168339d4e6fb9",
     },
     SourcePin {
         path: "codex_scan_diagnostics.rs",
