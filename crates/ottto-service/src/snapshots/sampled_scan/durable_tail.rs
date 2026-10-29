@@ -1218,3 +1218,7 @@ pub(crate) enum Failure {
 #[cfg(test)]
 #[path = "durable_tail_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "transition_seed.rs"]
+pub(crate) mod transition_seed;

@@ -34,7 +34,7 @@ pub(crate) fn seed_old_writer(
     index: &super::super::ScanIndex,
     pin: &str,
 ) -> Vec<u8> {
-    super::durable_tail::seed_pinned_v1(cache, source, key, index, pin)
+    super::durable_tail::transition_seed::seed_pinned_v1(cache, source, key, index, pin)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

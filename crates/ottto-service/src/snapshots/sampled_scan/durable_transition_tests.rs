@@ -8,7 +8,7 @@ use crate::snapshots::sampled_scan::transition_fixture::{
 };
 
 const SOURCE: SnapshotSource = SnapshotSource::ClaudeCode;
-const WRITERS: [&str; 2] = ["72205c6c", "ffc6c846"];
+const WRITERS: [&str; 1] = ["53d05a43"];
 
 struct M1 {
     c: Corpus,
@@ -73,8 +73,7 @@ impl M1 {
         );
         let prior = disk.commit(&warm.cache, SOURCE, &mut warm.index);
         assert_eq!(disk.records(), 1, "native warm reduction must be persisted");
-        // Reuse the checked historical serializer, not current encode(). Both
-        // pins' original v1 serializers/formulas are source-identical (5a2a).
+        // Check the actual pinned main-writer v1 artifact without relabeling it.
         let key = fixture::local_key(&path);
         let old = fixture::seed_old_writer(&ram.cache, SOURCE, &key, &prior, pin);
         assert_eq!(&old[..8], b"ottto-dt");
@@ -376,20 +375,63 @@ fn shared_unknown_record_holds_last_accepted_body_and_survives_gc() {
     }
     with_e2(|| {
         let mut f = M1::old_writer("transition-unknown-hold", WRITERS[0]);
+        const SIBLING: &str = "019fa111-2222-7333-8444-555555555556";
+        let sibling = f.c.root(SIBLING, &line(SIBLING, "s1", AT, 70));
+        input_clock(&sibling);
+        f.disk.begin(&f.ram, SOURCE);
+        let mut warm = f.c.raw(&f.ram, f.prior.clone(), 100, true, &[]);
+        warm.enrich(&f.c);
+        warm.finish();
+        assert!(warm
+            .scan
+            .snapshots
+            .iter()
+            .any(|s| s.source_session_id == SIBLING));
+        warm.index.record_accepted_snapshot_fingerprints(
+            &warm
+                .scan
+                .snapshots
+                .iter()
+                .map(|s| s.snapshot_fingerprint.clone())
+                .collect(),
+        );
+        f.prior = f.disk.commit(&warm.cache, SOURCE, &mut warm.index);
+        assert_eq!(f.disk.records(), 2);
+        grow(&sibling, "s2", 80);
         f.grow("r4", 40);
         let cold = f.emit_bodies(Mode::ColdFull);
         let prior_bodies = stored_bodies(&f.prior);
-        let (path, mut unknown) = f.disk.record_bytes().into_iter().next().unwrap();
+        let digest = crate::durable_tail_store::key_digest(
+            crate::durable_tail_store::DurableSource::ClaudeCode,
+            &fixture::local_key(&f.path),
+        );
+        let name = digest
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+            + ".rec";
+        let (path, mut unknown) = f
+            .disk
+            .record_bytes()
+            .into_iter()
+            .find(|(path, _)| path.file_name().unwrap() == name.as_str())
+            .unwrap();
+        assert!(cold.snapshots.contains_key(ROOT));
+        assert!(cold.snapshots[SIBLING]["request_count"].as_u64().unwrap() > 0);
         unknown[8..10].copy_from_slice(&u16::MAX.to_le_bytes());
         std::fs::write(&path, &unknown).unwrap();
         for _ in 0..5 {
             let held = f.emit_bodies(Mode::DiskRestore);
-            assert_eq!(held.modes, (0, 0, 0));
-            assert_eq!(held.restored, 0);
+            assert_eq!(held.modes, (0, 1, 0));
+            assert_eq!(held.restored, 1);
+            assert_eq!(held.snapshots[SIBLING], cold.snapshots[SIBLING]);
             money_oracle::assert_held(ROOT, &cold, &held, &cold);
             money_oracle::assert_no_smaller_reemit(ROOT, &cold, &held, &cold, true);
             let page = &f.pages[&Mode::DiskRestore];
-            assert_eq!(stored_bodies(&page.index), prior_bodies);
+            assert_eq!(
+                stored_bodies(&page.index)[&fixture::local_key(&f.path)],
+                prior_bodies[&fixture::local_key(&f.path)]
+            );
             let writer = crate::locked_state_dir::held_for(&f.disk.index).unwrap();
             page.cache.durable_gc(writer, SOURCE, &page.index).unwrap();
             assert_eq!(std::fs::read(&path).unwrap(), unknown);
@@ -719,4 +761,179 @@ fn shared_money_oracle_reports_each_field_and_rejects_false_holds() {
             "an emitted body can never pass hold semantics"
         );
     });
+}
+
+/// First consumer: 24b observes the restored native state at the real EOF seam.
+/// Main still has the approved card-F content re-derivation: record it separately
+/// and leave the strict zero-old-byte target visibly unexecuted below.
+struct Codex24b {
+    c: Corpus,
+    disk: Disk,
+    prior: ScanIndex,
+    pages: BTreeMap<Mode, (E2ScanFixture, ScanIndex)>,
+}
+impl TransitionDriver for Codex24b {
+    fn emit_bodies(&mut self, mode: Mode) -> RouteResult {
+        use crate::snapshots::codex_version::CodexVersionFeed;
+        let source = SnapshotSource::Codex;
+        let feed = Arc::new(CodexVersionFeed::new(Some(&self.c.base)));
+        assert!(
+            feed.snapshot().0.is_none(),
+            "new process has no version seed"
+        );
+        let mut scanner = if mode == Mode::ColdFull {
+            E2ScanFixture::default()
+        } else {
+            self.disk.owner(source)
+        };
+        scanner.versions = Some(feed.clone());
+        let ((index, scan, modes), consumed) =
+            fixture::observe_consumed(|| other_page(&self.c, &scanner, source, self.prior.clone()));
+        let (sample, observed, rejected) = feed.snapshot();
+        let sample = sample.expect("production EOF observes restored SessionStartState");
+        assert_eq!(sample.version(), Some("0.148.9"));
+        assert_eq!(
+            sample.started_at.unix_timestamp_nanos(),
+            nanos("2026-10-27T07:00:00Z")
+        );
+        assert_eq!((observed, rejected), (1, 0));
+        crate::mcp_inventory::transition_fixture::assert_version(&self.c.base, &feed, "0.148.9");
+        let mut result = RouteResult::emitted(
+            mode,
+            source,
+            vec![other_wire(source, &scan)],
+            &scan.snapshots,
+        );
+        result.modes = modes;
+        result.io.consumed = consumed;
+        if mode != Mode::ColdFull {
+            let (counters, _) = scanner.cache.durable_counters(source).unwrap();
+            result.restored = counters.restored;
+            result.io.rederive_head = counters.rederive_head_bytes;
+            result.io.rederive_named = counters.rederive_line_bytes;
+        }
+        result.codex_evidence = json!({
+            "receipts": index.files.iter().map(|(k,e)| (k.clone(), json!({
+                "applied":e.codex_applied_tier_receipt,
+                "required":e.codex_applied_tier_receipt_required,
+                "captured":e.codex_captured_tier_receipt,
+                "owner":e.codex_protected_owner, "v2":e.codex_counting_v2
+            }))).collect::<BTreeMap<_,_>>(),
+            "token_count": scan.snapshots.iter().map(|s| (s.source_session_id.clone(),
+                json!([s.input_tokens,s.output_tokens,s.request_count])))
+                .collect::<BTreeMap<_,_>>()
+        });
+        self.pages.insert(mode, (scanner, index));
+        result
+    }
+    fn save_gc(&mut self, mode: Mode) {
+        let (scanner, index) = self.pages.get_mut(&mode).unwrap();
+        self.prior = self
+            .disk
+            .commit(&scanner.cache, SnapshotSource::Codex, index);
+        assert_eq!(self.disk.records(), 1);
+    }
+    fn restart(&mut self) {
+        self.pages.clear();
+        self.prior = ScanIndex::load(&self.disk.index).unwrap();
+    }
+}
+
+fn codex_24b_old_writer_row(require_zero_old_bytes: bool) {
+    let mut c = corpus("transition-codex-24b");
+    c.root = c.base.join(".codex/sessions");
+    std::fs::create_dir_all(&c.root).unwrap();
+    let path = c.root.join("rollout.jsonl");
+    let header = json!({"type":"session_meta","timestamp":"2026-10-27T07:00:00Z",
+        "payload":{"id":ROOT,"timestamp":"2026-10-27T07:00:00Z","cli_version":"0.148.9"}})
+    .to_string()
+        + "\n";
+    std::fs::write(&path, header + &codex_rows("initial", 10)).unwrap();
+    input_clock(&path);
+    let disk = Disk::new(&c);
+    let source = SnapshotSource::Codex;
+    let _cutover = crate::snapshots::TestCutover::set(0);
+    let writer = disk.owner(source);
+    let (mut index, scan, modes) = other_page(&c, &writer, source, ScanIndex::default());
+    assert_eq!(modes, (1, 0, 0));
+    assert!(scan.snapshots[0].request_count > 0);
+    index.record_accepted_snapshot_fingerprints(
+        &scan
+            .snapshots
+            .iter()
+            .map(|s| s.snapshot_fingerprint.clone())
+            .collect(),
+    );
+    let prior = disk.commit(&writer.cache, source, &mut index);
+    let old = fixture::seed_old_writer(
+        &writer.cache,
+        source,
+        &fixture::local_key(&path),
+        &prior,
+        WRITERS[0],
+    );
+    assert_eq!(disk.record_bytes().values().next().unwrap(), &old);
+    drop(writer);
+    let mut driver = Codex24b {
+        c,
+        disk,
+        prior,
+        pages: BTreeMap::new(),
+    };
+    for restart in 0..2 {
+        let suffix = codex_rows(&format!("appended-{restart}"), 20 + restart);
+        assert!(!suffix.contains("session_meta"));
+        assert!(!suffix.contains("cli_version"));
+        let old_size = std::fs::metadata(&path).unwrap().len();
+        append(&path, &suffix);
+        input_clock(&path);
+        let cold = driver.emit_bodies(Mode::ColdFull);
+        assert_eq!(cold.modes, (1, 0, 0));
+        let tail = driver.emit_bodies(Mode::DiskRestore);
+        assert_eq!(tail.modes, (0, 1, 0));
+        assert_eq!(tail.restored, 1);
+        assert_eq!(tail.io.rederive_named, 0);
+        assert_eq!(
+            tail.io.consumed,
+            suffix.len() as u64 + tail.io.rederive_head
+        );
+        assert!(tail.io.rederive_head <= old_size);
+        if require_zero_old_bytes {
+            assert_eq!(
+                tail.io.rederive_head, 0,
+                "card-F zero-byte target remains unmet"
+            );
+        }
+        money_oracle::assert_equivalent(&cold, &tail);
+        driver.save_gc(Mode::DiskRestore);
+        driver.restart();
+        let quiet = driver.emit_bodies(Mode::Restart);
+        assert_eq!(quiet.modes, (0, 0, 1));
+        assert_eq!(quiet.restored, 1);
+        assert_eq!(quiet.io.rederive_named, 0);
+        assert_eq!(quiet.io.consumed, quiet.io.rederive_head);
+        assert!(quiet.io.rederive_head <= old_size);
+        if require_zero_old_bytes {
+            assert_eq!(quiet.io.consumed, 0);
+        }
+        money_oracle::assert_equivalent(&cold, &quiet);
+        driver.save_gc(Mode::Restart);
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "M1 requires qualified native heap layout"
+)]
+fn shared_24b_old_writer_restored_version_tail_and_unchanged_restart_twice() {
+    assert!(supported("shared_24b"));
+    codex_24b_old_writer_row(false);
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+#[ignore = "needs card-F retirement: main v1 restore re-derives SessionStartState prelude (DoD 6)"]
+fn shared_24b_old_writer_zero_old_bytes_target() {
+    codex_24b_old_writer_row(true);
 }
