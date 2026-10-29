@@ -2807,6 +2807,10 @@ impl SharedCache {
                     Ok(Some(taken)) => {
                         if let Some(mut stores) = self.durable() {
                             stores.counters.restored += 1;
+                            #[cfg(test)]
+                            super::transition_fixture::reach(
+                                super::transition_fixture::CrashPoint::Restore,
+                            );
                             stores.counters.durable_restore_after_selection_clear += u64::from(
                                 snapshot_source == SnapshotSource::ClaudeCode
                                     && index
@@ -4332,6 +4336,7 @@ impl SharedCache {
         struct StoreAlarm {
             #[serde(flatten)]
             store: store::StoreCounters,
+            owed_overflow_discovery_only: bool,
             #[serde(skip_serializing_if = "Option::is_none")]
             d3_claude_hold: Option<HoldAlarm>,
         }
@@ -4402,6 +4407,7 @@ impl SharedCache {
             [0, 0]
         };
         let hold_alarm = claude && stores.take_hold_alarm();
+        let owed_overflow_discovery_only = stores.owed_overflow[source.slot()];
         let Some(slot) = stores.slot(source).as_mut() else {
             return;
         };
@@ -4444,6 +4450,7 @@ impl SharedCache {
                 snapshot_source.api_slug(),
                 &StoreAlarm {
                     store,
+                    owed_overflow_discovery_only,
                     d3_claude_hold: (claude && (hold_keys > 0 || hold_alarm || hold_changed))
                         .then_some(HoldAlarm {
                             keys: hold_keys,
@@ -4793,6 +4800,10 @@ pub(crate) fn record_consumed(bytes: u64) {
 #[cfg(test)]
 #[path = "durable_tail_tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(test)]
+#[path = "transition_seed.rs"]
+pub(crate) mod transition_seed;
 
 #[cfg(test)]
 pub(crate) use tests::seed_pinned_v1;

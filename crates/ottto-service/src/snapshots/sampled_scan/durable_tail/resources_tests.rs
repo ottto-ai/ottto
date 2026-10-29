@@ -496,3 +496,26 @@ fn native_debt_reservation_refuses_before_io_and_preserves_every_funded_hold() {
     stores.set_owed(key, OwedMark::Hold(DurableSource::ClaudeCode));
     assert!(stores.hold(&key).is_some());
 }
+
+#[test]
+fn overflow_preserves_discovery_without_forcing_quiet_keys_to_parse() {
+    use super::owed::{OwedMark, OwedQuery};
+    let cache = SharedCache::default();
+    {
+        let mut stores = cache.durable().unwrap();
+        for n in 0..store::MAX_RECORDS {
+            stores.set_owed(
+                digest(&format!("overflow-{n}")),
+                OwedMark::Owed(DurableSource::Codex),
+            );
+        }
+        stores.set_owed(digest("unfunded"), OwedMark::Hold(DurableSource::Codex));
+        assert!(stores.owed_overflow[DurableSource::Codex.slot()]);
+    }
+    assert!(matches!(
+        cache.owed_before_skip(SnapshotSource::Codex, "quiet-unrelated"),
+        OwedQuery::None
+    ));
+    assert!(cache.owes_discovery(SnapshotSource::Codex, "quiet-unrelated"));
+    assert!(cache.owes_discovery(SnapshotSource::Codex, "unfunded"));
+}

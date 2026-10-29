@@ -4147,3 +4147,7 @@ done
     }
     include!("mcp_inventory_version_tests.rs");
 }
+
+#[cfg(test)]
+#[path = "mcp_inventory_transition_fixture.rs"]
+pub(crate) mod transition_fixture;

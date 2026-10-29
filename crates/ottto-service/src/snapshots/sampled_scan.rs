@@ -37,6 +37,8 @@ mod m3_format_tests;
 #[cfg(all(test, unix))]
 mod m3_write_ahead_tests;
 pub(super) mod side_ledger;
+#[cfg(all(test, unix))]
+pub(crate) mod transition_fixture;
 
 /// The retained-copy cache behind `SharedCache::retained`.
 pub(super) type RetainedCache = TranscriptCache<CachedJsonlReduction>;

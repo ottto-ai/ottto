@@ -60,3 +60,45 @@ and pass flush do not. M1 zero-old-byte pending authority uses lazy refresh/24-h
 reclaim rather than exact batch-receipt release. The DailyGrant clock still uses
 Instant (separate from wall-clock Full pacing). These are explicit follow-ups,
 not a qualification or merge-ready claim. No PR was opened.
+
+Round 9 adds the compressed-input guard before native descriptor/chain
+acquisition, plus a failed post-save rename retry from retained RAM on a quiet
+selected pass. The failed rename preserves the exact verified predecessor.
+The retry reconstructs scope from the retained checkpoint after `begin_pass`
+clears per-pass decisions. PR #904 owns the separate
+`store_write_after_save_failed` / `store_write_failed_restart_full` counters;
+this branch does not duplicate them.
+
+Native pass and debt-capacity limits return counted `NotPersisted::PassBudget`
+before an unstarted write can create an unfunded Claude hold. The bounded
+verification memo can turn over non-pending entries, including allowed entries:
+eviction revokes that optimization and requires fresh verification before a
+later mutation; spent grants and original witnesses remain in their own owner.
+The 257-record fixture exercises a cold-memo reread and a later update.
+Batch receipts stay pending until the bounded directory flush and final path
+checks succeed; a flush fault requeues without issuing a clean acknowledgement.
+
+Codex group inventory records a class exclusion before member acquisition.
+Completed excluded classes also record it for same-pass restore refusal and GC.
+GC retires only verified native format-3 write-ahead records in the live context;
+#865 envelope debt must already have an equal-or-earlier index carrier, otherwise
+the record stays parked. Side reads alone do not change a singleton's class.
+Post-read proof/compatibility transitions remain unqualified across passes when
+GC has not retired the old record. Class changes never clear pending or owed
+claims by themselves. Overflow retains discovery conservatively and does not
+force unrelated quiet files into parsing.
+
+The shared #882 transition fixture is composed by merge, with a draft M3
+`TransitionDriver` using its one emitted-money comparator and an observer at the
+real pre-effects boundary. Its frozen `53d05a43` writer provenance deliberately
+remains unchanged. M3 replaced a pinned envelope entry point and can persist v3
+before that seed expects v1. This is a blocker requiring the fixture owner to
+choose an archived exact v1 producer or a separately versioned M3 seed; current
+hashes must not be substituted as old-writer proof. The inherited `FileSynced`
+crash name also lacks a production traversal in the plain-flush M3 engine;
+existing vocabulary is retained without claiming that boundary was executed.
+
+At the future E2 B/C composition seam, discovery must use one union of
+`DiscoveryRecovery` and `DiscoveryRetention` at directory traversal, retained
+rosters, candidates, opened descriptors, parent windows and absence retirement.
+Both archive retention and M3 receipt/hold obligations must survive that union.

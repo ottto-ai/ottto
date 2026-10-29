@@ -1340,7 +1340,7 @@ impl Stores {
         if let Some(hold) = self.hold_mut(&digest) {
             hold.content_changed = true;
         } else {
-            self.place_hold(
+            if !self.place_hold(
                 digest,
                 ClaudeHold {
                     since: std::time::SystemTime::now(),
@@ -1349,7 +1349,9 @@ impl Stores {
                     content_changed: true,
                     modified: None,
                 },
-            );
+            ) {
+                Counters::bump(&mut self.counters.ineligible, "d3_content_proof_unfunded");
+            }
         }
     }
 

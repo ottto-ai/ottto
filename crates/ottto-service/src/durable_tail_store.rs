@@ -32,6 +32,8 @@
 //!   (`SingleWriter`); this layer adds no lock of its own.
 #![cfg_attr(not(test), allow(dead_code))] // First production caller: the M1 restore hook.
 
+#[cfg(test)]
+use crate::snapshots::sampled_scan::transition_fixture::{reach, CrashPoint};
 use crate::transcript_acquisition::DurableCertificate;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -2089,13 +2091,21 @@ impl DurableTailStore {
                     .flatten()
                     .is_some_and(|header| self.authorized(key, header.format));
             if allowed {
+                #[cfg(test)]
+                test_hooks::transition_edge(CrashPoint::BeforeRetireUnlink, &path)?;
                 remove_if_present(&path)?;
+                #[cfg(test)]
+                test_hooks::transition_edge(CrashPoint::RetiredUnlink, &path)?;
                 removed += 1;
             }
             self.durable.remove(key);
         }
         if removed > 0 {
+            #[cfg(test)]
+            test_hooks::transition_edge(CrashPoint::BeforeRetireSync, &self.dir)?;
             self.sync_store()?;
+            #[cfg(test)]
+            test_hooks::transition_edge(CrashPoint::RetiredSynced, &self.dir)?;
             self.counters.records_invalidated += removed as u64;
             let (on_disk, unlisted) = self.scan_disk()?;
             self.set_disk_level(&on_disk, unlisted);
@@ -2234,8 +2244,13 @@ pub(crate) fn parse_hex_digest(text: &str) -> Option<Digest32> {
 fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     #[cfg(test)]
     test_hooks::write_failure("setup")?;
+    #[cfg(test)]
+    test_hooks::transition_edge(CrashPoint::BeforeDirectoryCreate, dir)?;
     match fs::DirBuilder::new().mode(0o700).create(dir) {
-        Ok(()) => {}
+        Ok(()) => {
+            #[cfg(test)]
+            test_hooks::transition_edge(CrashPoint::DirectoryCreated, dir)?;
+        }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error),
     }
@@ -2721,7 +2736,11 @@ fn write_atomic<W: SingleWriter>(
         writer,
     };
     let result = (|| {
+        #[cfg(test)]
+        reach(CrashPoint::BeforeTempWrite);
         attempt.temp.write_all(bytes)?;
+        #[cfg(test)]
+        reach(CrashPoint::TempWritten);
         attempt.temp.flush()?;
         attempt.temp.commit(path, prior)
     })();
@@ -2938,6 +2957,7 @@ fn decode(bytes: &[u8]) -> Result<DurableRecord, Refusal> {
 /// Test-only filesystem faults and deterministic GC ordering.
 #[cfg(test)]
 pub(crate) mod test_hooks {
+    use super::{reach, CrashPoint};
     use std::cell::RefCell;
     use std::io;
     use std::path::Path;
@@ -2945,8 +2965,10 @@ pub(crate) mod test_hooks {
     type Hook = Box<dyn FnMut(&Path, &Path) -> io::Result<()>>;
     type DirHook = Box<dyn FnMut(&Path) -> io::Result<()>>;
     type AccessHook = Box<dyn FnMut(&Path, &str) -> io::Result<()>>;
+    pub(crate) type TransitionHook = Box<dyn FnMut(CrashPoint, &Path) -> io::Result<()>>;
 
     thread_local! {
+        static TRANSITION: RefCell<Option<TransitionHook>> = const { RefCell::new(None) };
         static WRITE_FAILURE: RefCell<Option<&'static str>> = const { RefCell::new(None) };
         static BEFORE_RENAME: RefCell<Option<Hook>> = const { RefCell::new(None) };
         static BEFORE_DIR_SYNC: RefCell<Option<DirHook>> = const { RefCell::new(None) };
@@ -3003,6 +3025,17 @@ pub(crate) mod test_hooks {
         })
     }
 
+    pub(crate) fn replace_transition_hook(hook: Option<TransitionHook>) -> Option<TransitionHook> {
+        TRANSITION.with(|slot| slot.replace(hook))
+    }
+    pub(crate) fn transition_edge(point: CrashPoint, path: &Path) -> io::Result<()> {
+        reach(point);
+        TRANSITION.with(|slot| match slot.borrow_mut().as_mut() {
+            Some(hook) => hook(point, path),
+            None => Ok(()),
+        })
+    }
+
     /// The uid the store treats as its own (a foreign owner without root).
     pub(crate) fn set_uid(uid: Option<u32>) {
         UID.with(|slot| slot.set(uid));
@@ -3018,12 +3051,14 @@ pub(crate) mod test_hooks {
         BEFORE_DIR_SYNC.with(|slot| *slot.borrow_mut() = hook);
     }
     pub(super) fn before_rename(temp: &Path, path: &Path) -> io::Result<()> {
+        transition_edge(CrashPoint::BeforeRename, path)?;
         BEFORE_RENAME.with(|slot| match slot.borrow_mut().as_mut() {
             Some(hook) => hook(temp, path),
             None => Ok(()),
         })
     }
     pub(super) fn before_dir_sync(dir: &Path) -> io::Result<()> {
+        transition_edge(CrashPoint::BeforeDirectorySync, dir)?;
         BEFORE_DIR_SYNC.with(|slot| match slot.borrow_mut().as_mut() {
             Some(hook) => hook(dir),
             None => Ok(()),

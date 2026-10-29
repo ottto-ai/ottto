@@ -254,7 +254,11 @@ impl SharedCache {
         match stores.owed_mark(&digest) {
             OwedMark::Hold(_) => OwedQuery::Hold(HeldCause::ReceiptPending),
             OwedMark::Owed(_) => OwedQuery::Owed,
-            OwedMark::None if pending || stores.owed_overflow[ds.slot()] => OwedQuery::Owed,
+            OwedMark::None if pending => OwedQuery::Owed,
+            // The overflow bit preserves discovery only. An unfunded Hold
+            // has no ACK/index advance, so its actual changed candidate or
+            // existing selection cause retries it; quiet unrelated keys do
+            // not acquire a synthetic Parse or store probe every pass.
             OwedMark::None => OwedQuery::None,
         }
     }
@@ -517,10 +521,28 @@ impl SharedCache {
         }
     }
 
+    /// An actual remove/rename observation could not retire an owed key.
+    /// Count conservative parking without changing its body, debt or member.
+    pub(in crate::snapshots) fn note_owed_absence_parked(&self, source: SnapshotSource) {
+        if let (Some(ds), Some(mut stores)) = (durable_source(source), self.durable()) {
+            super::Counters::bump(
+                &mut stores.counters.ineligible,
+                match ds {
+                    DurableSource::ClaudeCode => "wa.debt_absence_parked.claude",
+                    DurableSource::Codex => "wa.debt_absence_parked.codex",
+                },
+            );
+        }
+    }
+
     /// Age-independent: debt, a pending receipt, a D3 hold or the source-wide
     /// conservative bit keeps the key discoverable.
     pub(in crate::snapshots) fn owes_discovery(&self, source: SnapshotSource, key: &str) -> bool {
-        !matches!(self.owed_before_skip(source, key), OwedQuery::None)
+        let overflow = durable_source(source).is_some_and(|ds| {
+            self.durable()
+                .is_some_and(|stores| stores.owed_overflow[ds.slot()])
+        });
+        overflow || !matches!(self.owed_before_skip(source, key), OwedQuery::None)
     }
 }
 
