@@ -1548,7 +1548,6 @@ mod tests {
         let mut labels = std::collections::BTreeSet::new();
         assert_eq!(CatchupTooLarge as usize + 1, super::CODEX_ZST_CAUSES);
 
-
         for (index, cause) in ALL.iter().enumerate() {
             assert_eq!(*cause as usize, index);
             let label = serde_json::to_string(cause).unwrap();

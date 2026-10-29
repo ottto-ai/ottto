@@ -834,7 +834,11 @@ impl HeaderInventory {
                         .map(codex_compressed_input::HeaderRead::Validated)
                         .unwrap_or(codex_compressed_input::HeaderRead::Deferred))
                 } else {
-                    index.inventory_archive_header(&candidate, archive_cache, &mut self.archive_work)
+                    index.inventory_archive_header(
+                        &candidate,
+                        archive_cache,
+                        &mut self.archive_work,
+                    )
                 };
                 excluded = index
                     .files
@@ -908,8 +912,6 @@ impl HeaderInventory {
                     }
                     (facts, witness)
                 }
-
-
             };
             Ok(Some(HeaderWitness {
                 custody_cause: None,
@@ -1040,10 +1042,6 @@ impl HeaderInventory {
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
 crate::heap_layout_bound::fields!(HeaderWitness; plain_twin, custody_cause, candidate, owner, home, created_unix_ms, metadata, stamp);
 crate::heap_layout_bound::fields!(HeaderInventory; cached_archives_only, feed_prepared, feed_after, feed_peak, custody_next, absence_held, custody_unknown, custody_after, custody_done, custody_peak, custody_refused, roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, archive_work, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, bounded_out, first_read_archives, deferred_archives, family_held);
-
-
-
-
 
 #[derive(Clone, Debug)]
 pub(super) struct Group {
@@ -4717,13 +4715,13 @@ pub(in crate::snapshots) mod header_cache_tests {
         };
         // Same-stamp ArchiveEvidence, independently of the warm plain cache,
         // can supply metadata before the fresh-decode CPU gate.
-        assert_eq!(
+        assert!(matches!(
             index
                 .inventory_archive_header(&candidate, Some(&cache), &mut work)
-                .unwrap()
-                .1,
-            0
-        );
+                .unwrap(),
+            codex_compressed_input::HeaderRead::Validated(_)
+        ));
+        assert_eq!((work.physical_bytes, work.decoded_bytes), (0, 0));
         assert!(index.archive_header(&archive).is_some());
         let mut all = paths.clone();
         all.insert(key.clone());
@@ -4734,9 +4732,9 @@ pub(in crate::snapshots) mod header_cache_tests {
             let mut inventory = HeaderInventory::new(&[sessions], &all, Some(&census));
             inventory.archive_work.allowed = true;
             inventory.archive_work.cpu_micros = 30_000_000;
-            while !inventory.step_with_archive(&CodexTitleMetadata::default(), index, Some(&cache))
-            {
-            }
+            while inventory.step_with_archive(&CodexTitleMetadata::default(), index, Some(&cache))
+                != HeaderStep::Complete
+            {}
             inventory
         };
         let constructions = codex_zst_refusal_tests::decoder_construction_count();
@@ -4766,12 +4764,20 @@ pub(in crate::snapshots) mod header_cache_tests {
             .matches(&File::open(&archive).unwrap()));
         // FD mismatch must reach the CPU refusal rather than return the stale
         // ArchiveEvidence header or any warm plain-cache fact; no decoder paid.
-        assert!(index
-            .inventory_archive_header(&candidate, Some(&cache), &mut work)
-            .is_err());
+        assert!(matches!(
+            index
+                .inventory_archive_header(&candidate, Some(&cache), &mut work)
+                .unwrap(),
+            codex_compressed_input::HeaderRead::Deferred
+        ));
         let changed = run(&mut index);
-        assert!(!changed.complete);
-        assert!(changed.refused.contains_key(&key));
+        assert!(
+            changed.complete,
+            "permission deferral does not make the whole census red"
+        );
+        assert!(!changed.complete_for(Some(&"cached-archive".to_owned())));
+        assert!(changed.deferred_archives.contains(&key));
+        assert!(!changed.refused.contains_key(&key));
         assert!(changed.headers.iter().all(|h| h.candidate.path != archive));
         assert_eq!(changed.reuse_hits, paths.len());
         assert_eq!(changed.reuse_misses, 0);
@@ -4809,12 +4815,13 @@ pub(in crate::snapshots) mod header_cache_tests {
         let mut inventory = HeaderInventory::new(&[sessions], &paths, Some(&census));
         READ_CALLS.with(|calls| calls.set(0));
         let (_, operations) = cache_operations(|| {
-            while !inventory.step_with_archive(
+            while inventory.step_with_archive(
                 &CodexTitleMetadata::default(),
                 &mut index,
                 Some(&cache),
-            ) {}
+            ) != HeaderStep::Complete {}
         });
+
         assert!(
             inventory.complete,
             "cold headers restore parent inventory semantics"
@@ -4941,11 +4948,11 @@ pub(in crate::snapshots) mod header_cache_tests {
                         if let Some(inventory) = owned.codex_join_inventory.as_mut() {
                             let before = serde_json::to_value(&owned.index).unwrap();
                             let (_, operations) = cache_operations(|| {
-                                while !inventory.step_with_archive(
+                                while inventory.step_with_archive(
                                     &CodexTitleMetadata::default(),
                                     &mut owned.index,
                                     Some(&cache),
-                                ) {}
+                                ) != HeaderStep::Complete {}
                             });
                             assert_eq!(serde_json::to_value(&owned.index).unwrap(), before);
                             assert!(inventory.complete);
@@ -5035,9 +5042,9 @@ pub(in crate::snapshots) mod header_cache_tests {
         census.observe(&sessions, &fs::metadata(&sessions).unwrap());
         let mut inventory = HeaderInventory::new(&[sessions], &paths, Some(&census));
         READ_CALLS.with(|calls| calls.set(0));
-        while !inventory.step_with_archive(&CodexTitleMetadata::default(), &mut index, Some(&cache))
-        {
-        }
+        while inventory.step_with_archive(&CodexTitleMetadata::default(), &mut index, Some(&cache))
+            != HeaderStep::Complete
+        {}
         assert_eq!(inventory.reuse_hits, paths.len() - 1);
         assert_eq!(inventory.reuse_misses, 0);
         assert!(inventory
