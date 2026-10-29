@@ -1128,6 +1128,14 @@ fn production_scan_at_with_setup(
 
 // Keep native output and the finalized upload candidates distinct. Production
 // applies policy and body-witness no-op suppression before offering a POST.
+type ProductionScanPage = (
+    ScanIndex,
+    SourceScanResult,
+    SourceScanResult,
+    (usize, usize, usize),
+    (u64, u64),
+);
+
 fn production_scan_page_at_with_setup(
     fixture: &ScanFixture,
     source: SnapshotSource,
@@ -1136,13 +1144,7 @@ fn production_scan_page_at_with_setup(
     namespace: &str,
     collected_at: &str,
     setup: impl FnOnce(&mut OwnedSourceScan),
-) -> (
-    ScanIndex,
-    SourceScanResult,
-    SourceScanResult,
-    (usize, usize, usize),
-    (u64, u64),
-) {
+) -> ProductionScanPage {
     let mut scan = OwnedSourceScan::new(
         source,
         std::slice::from_ref(&fixture.root),
