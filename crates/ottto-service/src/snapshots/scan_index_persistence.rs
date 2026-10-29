@@ -771,7 +771,11 @@ impl LockedStore {
         Ok(dir)
     }
     fn payload_directory(&self) -> Result<File> {
+<<<<<<< HEAD
         self.directory(false)
+=======
+        self.directory()
+>>>>>>> e1/scanindex-reader
     }
     fn current(&self) -> Result<(Option<File>, Root)> {
         let mut file = match open_at(&self.parent, &self.root_name, libc::O_RDONLY) {
@@ -1356,6 +1360,7 @@ impl LockedStore {
         output.sync_all()?;
         observe(Edge::RootSync)?;
         rename_at(&self.parent, &temp.name, &self.parent, &self.root_name)?;
+<<<<<<< HEAD
         // From here on an error MUST carry the candidate generation. Never
         // return an ordinary precommit error that rolls RAM generation back.
         let publication = (|| -> Result<()> {
@@ -1365,6 +1370,15 @@ impl LockedStore {
             observe(Edge::ParentSync)?;
             observe(Edge::BeforeReturn)?;
             Ok(())
+=======
+        let result = (|| -> Result<LoadedRoot> {
+            self.note_prior_root()?;
+            self.parent.sync_all()?;
+            match self.open_structural()? {
+                Opened::Legacy(_, root) if root.generation() == Some(generation) => Ok(root),
+                _ => bail!("scan_index_legacy_output_refused"),
+            }
+>>>>>>> e1/scanindex-reader
         })();
         if publication.is_err() {
             // Verify exact candidate bytes and every payload. An immutable root
@@ -2140,6 +2154,7 @@ impl Seek for LogicalReader {
     }
 }
 
+<<<<<<< HEAD
 impl LockedStore {
     /// Release N always writes the existing legacy format, including after a
     /// sharded load. Caller retains the existing normalization, semantic CAS,
@@ -2197,6 +2212,8 @@ impl LockedStore {
     }
 }
 
+=======
+>>>>>>> e1/scanindex-reader
 // Uses directory handles throughout; never follows manifest/provider paths.
 fn visit_storage_directory(
     dir: &File,

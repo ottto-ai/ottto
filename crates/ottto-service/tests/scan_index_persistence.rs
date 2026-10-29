@@ -1024,6 +1024,139 @@ impl Scratch {
         fixture["logical"].clone()
     }
 }
+<<<<<<< HEAD
+=======
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        fs::remove_dir_all(&self.0).unwrap();
+    }
+}
+fn opened(store: &LockedStore) -> (Value, LoadedRoot) {
+    let (mut input, root): (Box<dyn Read>, _) = match store.open().unwrap() {
+        Opened::Sharded(reader, root) => (Box::new(reader), root),
+        Opened::Legacy(file, root) => (Box::new(file), root),
+        Opened::Missing(_) => panic!("missing"),
+        Opened::Partial(_, _) => panic!("unknown maps are not a complete index"),
+    };
+    let mut bytes = Vec::new();
+    input.read_to_end(&mut bytes).unwrap();
+    (serde_json::from_slice(&bytes).unwrap(), root)
+}
+#[test]
+fn frozen_sharded_generation_is_seekable_and_next_save_is_legacy() {
+    let s = Scratch::new();
+    let mut expected = s.install();
+    let store = s.store();
+    let (actual, root) = opened(&store);
+    assert_eq!(actual, expected);
+    assert_eq!(root.generation(), Some(7));
+    assert!(!root.is_legacy());
+    let Opened::Sharded(mut reader, _) = store.open().unwrap() else {
+        panic!()
+    };
+    let end = reader.seek(SeekFrom::End(0)).unwrap();
+    reader.seek(SeekFrom::Start(end / 2)).unwrap();
+    let mut tail = Vec::new();
+    reader.read_to_end(&mut tail).unwrap();
+    reader.seek(SeekFrom::Start(0)).unwrap();
+    let mut all = Vec::new();
+    reader.read_to_end(&mut all).unwrap();
+    assert_eq!(tail, all[(end / 2) as usize..]);
+    drop(reader);
+    expected["generation"] = json!(8);
+    let next = store
+        .write_legacy(&root, 8, |out| {
+            serde_json::to_writer(out, &expected)?;
+            Ok(())
+        })
+        .unwrap();
+    assert!(next.is_legacy());
+    assert_eq!(opened(&store).0, expected);
+    assert_eq!(opened(&store).0, expected);
+    assert!(store.compare(&root).is_err());
+    // N writes no immutable shard files and does not remove predecessor shards.
+    assert_eq!(
+        fs::read_dir(s.0.join("scan-index.json.shards"))
+            .unwrap()
+            .count(),
+        4
+    );
+}
+#[test]
+fn equal_generation_root_change_missing_and_bad_encoder_refuse() {
+    let s = Scratch::new();
+    s.install();
+    let store = s.store();
+    let (_, root) = opened(&store);
+    let before = fs::read(s.root()).unwrap();
+    assert!(store
+        .write_legacy(&root, 8, |out| {
+            std::io::Write::write_all(
+                out,
+                b"{\"schema_version\":3,\"files\":{},\"generation\":8}",
+            )?;
+            Ok(())
+        })
+        .is_err());
+    assert_eq!(fs::read(s.root()).unwrap(), before);
+    let mut manifest: Value = serde_json::from_slice(&before).unwrap();
+    manifest["padding_bytes"] = json!(1);
+    fs::write(s.root(), serde_json::to_vec(&manifest).unwrap()).unwrap();
+    assert!(store.compare(&root).is_err());
+    fs::remove_file(s.root()).unwrap();
+    assert!(store.compare(&root).is_err());
+}
+#[test]
+fn corrupt_missing_shard_and_future_manifest_never_rebuild() {
+    for action in 0..3 {
+        let s = Scratch::new();
+        s.install();
+        let store = s.store();
+        let object = fs::read_dir(s.0.join("scan-index.json.shards"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        match action {
+            0 => fs::write(object, b"{corrupt}").unwrap(),
+            1 => fs::remove_file(object).unwrap(),
+            _ => {
+                let mut manifest: Value =
+                    serde_json::from_slice(&fs::read(s.root()).unwrap()).unwrap();
+                manifest["storage_format"] = json!(999);
+                fs::write(s.root(), serde_json::to_vec(&manifest).unwrap()).unwrap();
+            }
+        }
+        let before = fs::read(s.root()).unwrap();
+        assert!(matches!(store.open(), Err(_) | Ok(Opened::Partial(_, _))));
+        assert_eq!(fs::read(s.root()).unwrap(), before);
+        assert!(fs::read_dir(&s.0).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("corrupt")));
+    }
+}
+#[test]
+fn missing_then_legacy_write_uses_existing_format() {
+    let s = Scratch::new();
+    let store = s.store();
+    let Opened::Missing(root) = store.open().unwrap() else {
+        panic!()
+    };
+    let value = json!({"schema_version":2,"generation":1,"files":{}});
+    let root = store
+        .write_legacy(&root, 1, |out| {
+            serde_json::to_writer(out, &value)?;
+            Ok(())
+        })
+        .unwrap();
+    assert!(root.is_legacy());
+    assert_eq!(opened(&store).0, value);
+    assert!(ottto_service::snapshots::ScanIndex::load(&s.root()).is_ok());
+}
+>>>>>>> e1/scanindex-reader
 
 #[path = "support/scan_index_v201.rs"]
 mod v201;
@@ -1172,6 +1305,7 @@ fn syntax_failure_never_erases_an_observed_storage_fence() {
     }
 }
 
+<<<<<<< HEAD
 fn opened(store: &LockedStore) -> (Value, LoadedRoot) {
     let (mut input, root): (Box<dyn Read>, _) = match store.open().unwrap() {
         Opened::Sharded(reader, root) => (Box::new(reader), root),
@@ -1250,5 +1384,7 @@ fn gc_cursor_restarts_payload_sweep_after_root_change() {
     assert_eq!(load(&store).0, Fixture::new(2, 0).logical(2));
 }
 
+=======
+>>>>>>> e1/scanindex-reader
 #[path = "support/scan_index_r3.rs"]
 mod r3;
