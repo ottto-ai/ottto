@@ -26867,6 +26867,9 @@ impl OwnedSourceScan {
                     let selected_count = identified_candidates.len();
                     for _ in 0..selected_count {
                         let candidate = identified_candidates.pop_front().expect("selected count");
+                        if inventory.plain_twin(&candidate.path) {
+                            continue;
+                        }
                         if inventory.member_held(&candidate.path) {
                             if !index
                                 .files
@@ -26950,6 +26953,7 @@ impl OwnedSourceScan {
                         index,
                         &current_owners,
                         absence_coverage,
+                        &inventory.absence_held,
                     );
                     let mut repurposed_protected_paths = BTreeSet::new();
                     let mut missing_protected_owners = BTreeSet::new();

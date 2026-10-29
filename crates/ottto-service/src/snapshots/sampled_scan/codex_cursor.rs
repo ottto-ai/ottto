@@ -6146,7 +6146,10 @@ pub(in crate::snapshots) fn revalidate(
     let members = inventory
         .headers
         .iter()
-        .filter(|header| Some(&header.owner) == meta.owner.as_ref())
+        .filter(|header| {
+            Some(&header.owner) == meta.owner.as_ref()
+                && !inventory.member_held(&header.candidate.path)
+        })
         .count();
     if meta.owner.is_some() && members > 1 {
         // A continuation appeared: the owner is now a group, never a singleton.
@@ -6216,7 +6219,11 @@ fn revalidate_group(job: &mut OwnedActiveFile, inputs: ResumeInputs<'_>) -> Resu
     let current = inventory
         .headers
         .iter()
-        .filter(|header| header.owner == group.owner && header.home == group.home)
+        .filter(|header| {
+            header.owner == group.owner
+                && header.home == group.home
+                && !inventory.member_held(&header.candidate.path)
+        })
         .map(|header| local_index_key(&header.candidate.path))
         .collect::<BTreeSet<_>>();
     let members = group

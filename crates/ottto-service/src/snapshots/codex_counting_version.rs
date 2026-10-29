@@ -401,10 +401,8 @@ pub(super) fn absence_coverage_complete(
     inventory: &codex_file_join::HeaderInventory,
 ) -> bool {
     inventory.complete
-        && !index
-            .files
-            .values()
-            .any(|entry| entry.codex_compressed_hold.is_some())
+        && !inventory.custody_refused
+        && !inventory.custody_unknown
         && index.legacy_unresolved_root_file_witnesses.is_empty()
         && index.traversal.as_ref().is_some_and(|traversal| {
             !traversal.counts.has_errors()
@@ -468,6 +466,7 @@ fn collect_tombstones(
     index: &mut ScanIndex,
     owners: &BTreeMap<String, String>,
     absence_coverage: bool,
+    held: &BTreeSet<String>,
 ) {
     if index.codex_counting_tombstones.is_empty() {
         return;
@@ -496,6 +495,7 @@ fn collect_tombstones(
                 *evidence != AckEvidence::None && evidence.combine(tombstone.evidence) == *evidence
             });
             let absent = absence_coverage
+                && !held.contains(*owner)
                 && !present.contains(owner)
                 && census.is_some_and(|census| census != tombstone.retired_in);
             absorbed || absent
@@ -516,6 +516,7 @@ pub(super) fn prepare_moved_evidence(
     index: &mut ScanIndex,
     owners: &BTreeMap<String, String>,
     absence_coverage: bool,
+    held: &BTreeSet<String>,
 ) {
     index.codex_counting_moved_evidence.clear();
     // A restored Legacy carrier absorbs the loss. A V2 carrier absorbs it
@@ -561,7 +562,7 @@ pub(super) fn prepare_moved_evidence(
             .owners
             .retain(|_| !absorbed.next().unwrap());
     }
-    collect_tombstones(index, owners, absence_coverage);
+    collect_tombstones(index, owners, absence_coverage, held);
     if cutover_unix_ms().is_none() {
         return;
     }

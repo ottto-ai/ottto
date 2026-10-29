@@ -64,7 +64,7 @@ fn member(root: &Path, directory: &str, owner: &str, archive: bool) -> PathBuf {
     .unwrap();
     path
 }
-fn seed_archive(index: &mut ScanIndex, path: &Path, owner: &str) {
+pub(super) fn seed_archive(index: &mut ScanIndex, path: &Path, owner: &str) {
     let mut evidence = ArchiveEvidence::begin(&File::open(path).unwrap(), path, None).unwrap();
     evidence.header_validated = Some(
         ValidatedHeader::from_line(
@@ -534,6 +534,11 @@ fn write_codex_zst_downgrade_fixture() {
             .scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
         latch(&mut index, path);
     }
+    index
+        .files
+        .get_mut(&local_index_key(&archive))
+        .unwrap()
+        .codex_compressed_hold = Some(CodexZstCause::FamilyUnproven);
     let out = std::env::var_os("OTTTO_ZST_DOWNGRADE_FIXTURE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| root.join("out"));
@@ -1736,4 +1741,275 @@ fn proven_local_fork_boundaries_publish_without_parent_custody() {
             .is_none());
         fs::remove_dir_all(root).unwrap();
     }
+}
+
+fn home_inventory(
+    roots: &[PathBuf],
+    paths: &[PathBuf],
+    index: &mut ScanIndex,
+) -> codex_file_join::HeaderInventory {
+    let mut dirs = codex_file_join::DirectoryCensus::new();
+    for root in roots {
+        dirs.observe(root, &fs::metadata(root).unwrap());
+    }
+    let mut inv = codex_file_join::HeaderInventory::new(
+        roots,
+        &paths.iter().map(|p| local_index_key(p)).collect(),
+        Some(&dirs),
+    );
+    while !inv.step_with_archive(&CodexTitleMetadata::default(), index, None) {}
+    assert!(inv.complete);
+    assert!(inv.refused.is_empty());
+    inv
+}
+
+fn prepared(inv: &mut codex_file_join::HeaderInventory, index: &mut ScanIndex) -> usize {
+    let mut steps = 0;
+    while !inv.prepare_custody(index) {
+        steps += 1;
+        assert!(steps <= index.codex_state_only_blocked_by_file.len() + 2);
+    }
+    inv.hold_custodied_siblings(index);
+    steps
+}
+
+#[test]
+fn distinct_home_two_archive_family_holds_every_archive() {
+    let root = crate::test_scratch::private_dir("family-two-archives");
+    let a = member(&root, "left/sessions", OWNER, true);
+    let b = member(&root, "right/sessions", OWNER, true);
+    let roots = [root.join("left/sessions"), root.join("right/sessions")];
+    let mut index = ScanIndex::default();
+    seed_archive(&mut index, &a, OWNER);
+    seed_archive(&mut index, &b, OWNER);
+    let inv = home_inventory(&roots, &[a.clone(), b.clone()], &mut index);
+    assert_eq!(
+        inv.headers
+            .iter()
+            .map(|h| h.home.clone())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        2
+    );
+    let mut scan = staged(&root, index, &[a.clone(), b.clone()]);
+    scan.codex_join_inventory = Some(inv);
+    assert!(!scan.codex_join_prepared);
+    let ((mut index, result), rows) = capture(|| no_open(&a, || run(scan)));
+    assert_no_red(&result, &rows);
+    for path in [&a, &b] {
+        assert_eq!(
+            index.files[&local_index_key(path)].codex_compressed_hold,
+            Some(CodexZstCause::FamilyUnproven)
+        );
+    }
+    assert!(rows
+        .iter()
+        .any(|r| r["counts"]["codex_zst_held"]["CompressedFamilyUnproven"] == 2));
+    let saved = root.join("index.json");
+    index.save(&saved).unwrap();
+    fs::remove_file(&b).unwrap();
+    let ((mut index, result), rows) = capture(|| {
+        normal(
+            &root.join("right"),
+            ScanIndex::load(&saved).unwrap(),
+            std::slice::from_ref(&b),
+        )
+    });
+    assert_no_red(&result, &rows);
+    assert_eq!(
+        index.files[&local_index_key(&b)].codex_compressed_hold,
+        Some(CodexZstCause::FamilyUnproven)
+    );
+    index.save(&saved).unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn mixed_family_plain_money_matches_plain_reader_and_only_archive_is_sticky() {
+    for distinct in [false, true] {
+        let root = crate::test_scratch::private_dir("family-plain-money");
+        let plain = member(&root, "left/sessions", OWNER, false);
+        let (_, control) = run(staged(
+            &root,
+            ScanIndex::default(),
+            std::slice::from_ref(&plain),
+        ));
+        assert_eq!(control.snapshots.len(), 1);
+        assert!(control.snapshots[0].input_tokens > 0);
+        let expected = serde_json::to_vec(&control.snapshots[0]).unwrap();
+        let dir = if distinct {
+            "right/sessions"
+        } else {
+            "left/sessions"
+        };
+        let old = member(&root, dir, OWNER, true);
+        let archive = old.with_file_name(format!("rollout-2026-10-01T10-00-00-{OWNER}.jsonl.zst"));
+        fs::rename(old, &archive).unwrap();
+        let roots = if distinct {
+            vec![root.join("left/sessions"), root.join("right/sessions")]
+        } else {
+            vec![root.join("left/sessions")]
+        };
+        let paths = [plain.clone(), archive.clone()];
+        let mut index = ScanIndex::default();
+        seed_archive(&mut index, &archive, OWNER);
+        let decodes = codex_zst_refusal_tests::activity().0;
+        for pass in 0..3 {
+            let inv = no_open(&archive, || home_inventory(&roots, &paths, &mut index));
+            let mut scan = staged(&root, index, &paths);
+            scan.codex_join_inventory = Some(inv);
+            let ((mut next, result), rows) = capture(|| no_open(&archive, || run(scan)));
+            assert_eq!(result.unreadable_path_count, 0);
+            assert_eq!(result.snapshots.len(), 1);
+            assert_eq!(serde_json::to_vec(&result.snapshots[0]).unwrap(), expected);
+            assert_eq!(
+                codex_zst_refusal_tests::activity().0,
+                decodes,
+                "zero archive decodes"
+            );
+            assert!(next.files[&local_index_key(&plain)]
+                .codex_compressed_hold
+                .is_none());
+            assert_eq!(
+                next.files[&local_index_key(&archive)].codex_compressed_hold,
+                Some(CodexZstCause::FamilyUnproven)
+            );
+            let archive_entry = &next.files[&local_index_key(&archive)];
+            assert!(archive_entry.last_snapshot_fingerprint.is_none());
+            if pass > 0 {
+                assert!(!rows.iter().any(|r| r["stage"] == "codex_zst_held"));
+            }
+            let saved = root.join("index.json");
+            next.save(&saved).unwrap();
+            index = ScanIndex::load(&saved).unwrap();
+            // Re-offer the unchanged plain body through its ordinary reader;
+            // custody on its archive sibling must not change emitted bytes.
+            index.files.remove(&local_index_key(&plain));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn validated_plain_archive_twins_count_once_and_plain_body_is_unchanged() {
+    let root = crate::test_scratch::private_dir("family-twins");
+    let plain = member(&root, "left/sessions", OWNER, false);
+    let archive = member(&root, "right/sessions", OWNER, true);
+    let roots = [root.join("left/sessions"), root.join("right/sessions")];
+    let (_, cold) = codex_file_join::tests::scan(&root.join("left"), ScanIndex::default(), 10);
+    assert_eq!(cold.snapshots.len(), 1);
+    let mut index = ScanIndex::default();
+    seed_archive(&mut index, &archive, OWNER);
+    let mut inv = home_inventory(&roots, &[plain.clone(), archive.clone()], &mut index);
+    while !inv.prepare_custody(&index) {}
+    assert!(!inv.plain_twin(&plain));
+    assert!(inv.plain_twin(&archive));
+    let decodes = codex_zst_refusal_tests::activity().0;
+    let mut scan = staged(&root, index, &[plain.clone(), archive.clone()]);
+    scan.codex_join_inventory = Some(inv);
+    let ((index, result), rows) = capture(|| run(scan));
+    assert_eq!(result.unreadable_path_count, 0);
+    assert_eq!(result.ownership_incomplete_file_count, 0);
+    assert_eq!(result.census_residue_index_key_count, 0);
+    assert_eq!(result.census_residue_archived_rollout_count, 0);
+    assert_eq!(result.census_residue_blocked_session_count, 0);
+    assert_eq!(codex_zst_refusal_tests::activity().0, decodes);
+    assert_eq!(result.scanned_file_count, 1);
+    assert_eq!(result.snapshots.len(), 1);
+    assert_eq!(
+        snapshot_upload_body_witness(&result.snapshots[0]),
+        snapshot_upload_body_witness(&cold.snapshots[0])
+    );
+    assert!(index
+        .files
+        .values()
+        .all(|e| e.codex_compressed_hold.is_none()));
+    assert!(!rows
+        .iter()
+        .any(|r| r["stage"] == "codex_zst_input" || r["stage"] == "codex_zst_inventory"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn plain_only_family_and_single_archive_controls_are_unheld() {
+    let root = crate::test_scratch::private_dir("family-controls");
+    let a = member(&root, "left/sessions", OWNER, false);
+    let b = member(&root, "right/sessions", OWNER, false);
+    let mut index = ScanIndex::default();
+    let mut inv = home_inventory(
+        &[root.join("left/sessions"), root.join("right/sessions")],
+        &[a, b],
+        &mut index,
+    );
+    prepared(&mut inv, &mut index);
+    assert!(inv.headers.iter().all(|h| h.custody_cause.is_none()));
+    assert!(index.files.is_empty());
+    let archive = member(&root, "single/sessions", PARENT, true);
+    seed_archive(&mut index, &archive, PARENT);
+    let mut inv = home_inventory(
+        &[root.join("single/sessions")],
+        std::slice::from_ref(&archive),
+        &mut index,
+    );
+    prepared(&mut inv, &mut index);
+    assert!(inv.headers.iter().all(|h| h.custody_cause.is_none()));
+    assert!(!inv.plain_twin(&archive));
+    assert!(index.files[&local_index_key(&archive)]
+        .codex_compressed_hold
+        .is_none());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn present_family_archive_keeps_legacy_tombstone_across_two_censuses() {
+    use codex_counting_version::{AckEvidence, CountingTombstone};
+    let root = crate::test_scratch::private_dir("family-present-tombstone");
+    let archive = member(&root, "sessions", OWNER, true);
+    let plain = member(&root, "sessions", PARENT, false);
+    let held = codex_protected_owner(OWNER);
+    let other = codex_protected_owner("unrelated-absent");
+    let mut index = ScanIndex::default();
+    for owner in [&held, &other] {
+        index.codex_counting_tombstones.insert(
+            owner.clone(),
+            CountingTombstone {
+                evidence: AckEvidence::LegacyAcked,
+                retired_in: "prior-generation".into(),
+                created_unix_ms: None,
+            },
+        );
+    }
+    seed_archive(&mut index, &archive, OWNER);
+    index.hold_compressed(
+        &archive,
+        BTreeSet::from([OWNER.into()]),
+        CodexZstCause::FamilyUnproven,
+    );
+    let saved = root.join("index.json");
+    for _ in 0..2 {
+        let paths = [archive.clone(), plain.clone()];
+        let inv = no_open(&archive, || inventory(&root, &paths, &mut index));
+        assert_eq!(inv.headers.len(), 1);
+        assert_eq!(inv.headers[0].owner, PARENT);
+        let mut scan = staged(&root, index, std::slice::from_ref(&plain));
+        scan.index
+            .traversal
+            .as_mut()
+            .unwrap()
+            .codex_rollout_paths
+            .insert(local_index_key(&archive));
+        scan.index.known_configured_scan_roots = BTreeSet::from([local_index_key(&root)]);
+        scan.codex_join_inventory = Some(inv);
+        let ((mut next, result), _) = capture(|| no_open(&archive, || run(scan)));
+        assert_eq!(result.unreadable_path_count, 0);
+        assert!(result.census_complete);
+        assert_eq!(
+            next.codex_counting_tombstones[&held].evidence,
+            AckEvidence::LegacyAcked
+        );
+        assert!(!next.codex_counting_tombstones.contains_key(&other));
+        next.save(&saved).unwrap();
+        index = ScanIndex::load(&saved).unwrap();
+    }
+    fs::remove_dir_all(root).unwrap();
 }

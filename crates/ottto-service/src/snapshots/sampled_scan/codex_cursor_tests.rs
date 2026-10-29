@@ -15081,3 +15081,82 @@ fn ordinary_custody_recovery_counts_a1_or_named_full_once_then_never_repeats() {
         }
     });
 }
+
+#[test]
+fn plain_cursor_resumes_unchanged_when_its_archive_sibling_is_family_held() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(80);
+    let (_, control) = page(&fixture, ScanIndex::default(), None);
+    assert_eq!(control.snapshots.len(), 1);
+    let expected = serde_json::to_vec(&control.snapshots[0]).unwrap();
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        let (mut index, members) = paused_singleton(&fixture, &cache);
+        let archive = fixture
+            .root
+            .join(format!("rollout-2026-10-07T11-00-00-{SESSION}.jsonl.zst"));
+        let bytes = fs::read(fixture.file(SESSION)).unwrap();
+        fs::write(
+            &archive,
+            zstd::stream::encode_all(bytes.as_slice(), 1).unwrap(),
+        )
+        .unwrap();
+        crate::snapshots::codex_compressed_hold_tests::seed_archive(&mut index, &archive, SESSION);
+        let mut dirs = codex_file_join::DirectoryCensus::new();
+        dirs.observe(&fixture.root, &fs::metadata(&fixture.root).unwrap());
+        let paths = BTreeSet::from([
+            local_index_key(&fixture.file(SESSION)),
+            local_index_key(&archive),
+        ]);
+        let mut inv = codex_file_join::HeaderInventory::new(
+            std::slice::from_ref(&fixture.root),
+            &paths,
+            Some(&dirs),
+        );
+        while !inv.step_with_archive(&CodexTitleMetadata::default(), &mut index, Some(&cache)) {}
+        while !inv.prepare_custody(&index) {}
+        inv.hold_custodied_siblings(&mut index);
+        assert!(inv.complete_for(Some(&SESSION.to_owned())));
+        assert!(inv.complete_for(Some(&SESSION.to_owned())));
+        assert!(inv.member_held(&archive));
+        assert!(index
+            .files
+            .get(&local_index_key(&fixture.file(SESSION)))
+            .map_or(true, |entry| entry.codex_compressed_hold.is_none()));
+        assert_eq!(
+            index.files[&local_index_key(&archive)].codex_compressed_hold,
+            Some(CodexZstCause::FamilyUnproven)
+        );
+        let started = counter(&cache, |c| c.jobs_started);
+        let decodes = crate::snapshots::codex_zst_refusal_tests::activity().0;
+        let mut emitted = None;
+        for _ in 0..64 {
+            let resumed = counter(&cache, |c| c.jobs_resumed);
+            let (next, scan) = continuation_page(&fixture, index, &cache, &members, |scan| {
+                scan.codex_join_inventory = Some(inv.clone());
+                scan.codex_join_prepared = false;
+            });
+            index = next;
+            assert_eq!(counter(&cache, |c| c.jobs_resumed), resumed + 1);
+            assert_eq!(
+                counter(&cache, |c| c.jobs_started),
+                started,
+                "no replacement Full"
+            );
+            assert_eq!(
+                crate::snapshots::codex_zst_refusal_tests::activity().0,
+                decodes
+            );
+            if !scan.snapshots.is_empty() {
+                emitted = Some(scan);
+                break;
+            }
+        }
+        let emitted = emitted.expect("the retained plain reader completes");
+        assert_eq!(emitted.snapshots.len(), 1);
+        assert_eq!(serde_json::to_vec(&emitted.snapshots[0]).unwrap(), expected);
+        assert!(cache.cursor_slot_free());
+    });
+}

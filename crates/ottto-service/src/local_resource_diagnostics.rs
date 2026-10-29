@@ -58,6 +58,8 @@ pub(crate) enum CodexZstCause {
     DecodeBudget,
     #[serde(rename = "admission_starved")]
     AdmissionStarved,
+    #[serde(rename = "CompressedFamilyUnproven")]
+    FamilyUnproven,
     /// Diagnostics only; never written to an archive or custody entry.
     #[serde(rename = "custody_group_progress_dropped")]
     CustodyGroupProgressDropped,
@@ -1294,6 +1296,7 @@ mod tests {
             HeaderInvalid,
             DecodeBudget,
             AdmissionStarved,
+            FamilyUnproven,
             CustodyGroupProgressDropped,
         ];
         assert_eq!(ALL.len(), super::CODEX_ZST_CAUSES);
