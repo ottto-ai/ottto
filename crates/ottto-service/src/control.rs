@@ -12159,16 +12159,27 @@ struct ConfigPatchResult {
 }
 
 fn local_relay_base_url_for_daemon(daemon: &LocalDaemon) -> String {
-    daemon
-        .status_for_trusted_client()
-        .map(|status| crate::otlp_relay::local_relay_base_url_from_state(&status.relay))
-        .unwrap_or_else(|_| crate::otlp_relay::default_local_relay_base_url())
+    crate::otlp_relay::local_relay_base_url_for_port(local_relay_port_for_daemon(daemon))
 }
 
+/// The port settings writers record. Only a relay bound and serving right now
+/// (Connected) supplies its live port. While unbound or mid-rebind the
+/// endpoint settings already approve stays, so a transient never moves it.
 fn local_relay_port_for_daemon(daemon: &LocalDaemon) -> u16 {
     daemon
         .status_for_trusted_client()
-        .map(|status| crate::otlp_relay::local_relay_port_from_state(&status.relay))
+        .ok()
+        .filter(|status| status.relay.state == ottto_protocol::RelayRuntimeState::Connected)
+        .and_then(|status| status.relay.endpoint)
+        .as_deref()
+        .and_then(crate::otlp_relay::local_relay_port_from_endpoint)
+        .or_else(|| {
+            approved_managed_claude_relay_endpoint()
+                .ok()
+                .flatten()
+                .as_deref()
+                .and_then(crate::otlp_relay::local_relay_port_from_endpoint)
+        })
         .unwrap_or(crate::otlp_relay::LOCAL_RELAY_DEFAULT_PORT)
 }
 
@@ -31807,6 +31818,61 @@ X-API-Key = "otel_redacted"
     fn startup_relay_candidates() -> Vec<u16> {
         // SAFETY: getuid has no preconditions.
         crate::otlp_relay::candidate_relay_ports(unsafe { libc::getuid() })
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn settings_port_follows_only_a_bound_relay() {
+        let (root, _guards) = managed_claude_relay_fixture();
+        let settings = root.join(".claude/settings.json");
+        let daemon = daemon().with_account(connected_account());
+        let relay = |state, port: u16| ottto_protocol::RelayState {
+            state,
+            endpoint: Some(crate::otlp_relay::local_relay_base_url_for_port(port)),
+            last_connected_at: None,
+            last_error: None,
+        };
+        use ottto_protocol::RelayRuntimeState::{Connected, Failed, Unknown};
+        // Not bound, or a rebind in flight: the approved 48123 stays.
+        for state in [Unknown, Failed] {
+            daemon
+                .set_relay_state_for_trusted_client(relay(state, 43119))
+                .unwrap();
+            assert_eq!(local_relay_port_for_daemon(&daemon), 48123);
+        }
+        // Bound on the approved port: writing it changes nothing.
+        daemon
+            .set_relay_state_for_trusted_client(relay(Connected, 48123))
+            .unwrap();
+        assert_eq!(local_relay_port_for_daemon(&daemon), 48123);
+        // Bound on a fallback: it is written, and the mismatch then clears.
+        daemon
+            .set_relay_state_for_trusted_client(relay(Connected, 43119))
+            .unwrap();
+        for _ in 0..2 {
+            daemon.status_for_trusted_client().unwrap();
+        }
+        assert!(daemon
+            .status_for_trusted_client()
+            .unwrap()
+            .relay
+            .last_error
+            .is_some());
+        assert_eq!(local_relay_port_for_daemon(&daemon), 43119);
+        write_startup_relay_settings(&root, &local_relay_base_url_for_daemon(&daemon));
+        let status = daemon.status_for_trusted_client().unwrap();
+        assert!(status.relay.last_error.is_none());
+        assert!(status
+            .canonical_health
+            .unwrap()
+            .blockers
+            .iter()
+            .all(|blocker| blocker.code != "claude_relay_endpoint_mismatch"));
+        assert!(fs::read_to_string(&settings)
+            .unwrap()
+            .contains("127.0.0.1:43119"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn write_startup_relay_settings(root: &Path, base: &str) {
