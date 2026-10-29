@@ -2577,13 +2577,33 @@ fn human_summary(payload: &serde_json::Value) -> String {
     if let Some(message) = payload
         .get("message")
         .and_then(|value| value.get("text"))
-        .or_else(|| payload.pointer("/canonical_health/blockers/0/clear_condition"))
         .and_then(|value| value.as_str())
     {
         return sanitize_for_terminal(message);
     }
+    // The port-bearing local detail follows any canonical guidance, which
+    // never carries ports itself.
+    let with_relay_mismatch = |mut summary: String| {
+        if payload["relay"]["last_error"]["code"].as_str() == Some("claude_relay_endpoint_mismatch")
+        {
+            if let Some(message) = payload["relay"]["last_error"]["text"].as_str() {
+                summary.push('\n');
+                summary.push_str(&sanitize_for_terminal(message));
+            }
+        }
+        summary
+    };
+    if let Some(guidance) = payload
+        .pointer("/canonical_health/blockers/0/clear_condition")
+        .and_then(|value| value.as_str())
+    {
+        return with_relay_mismatch(sanitize_for_terminal(guidance));
+    }
     if let Some(daemon) = payload.get("daemon").and_then(|value| value.as_str()) {
-        return format!("Ottto local daemon: {}", sanitize_for_terminal(daemon));
+        return with_relay_mismatch(format!(
+            "Ottto local daemon: {}",
+            sanitize_for_terminal(daemon)
+        ));
     }
     if let Some(source) = payload.get("source").and_then(|value| value.as_str()) {
         return format!(
@@ -3217,6 +3237,35 @@ mod tests {
         .expect("fixture parses");
         assert_eq!(actual, expected);
         assert!(!output.contains("Ottto local daemon"));
+    }
+
+    #[test]
+    fn doctor_human_summary_shows_relay_endpoint_mismatch_only_when_present() {
+        let mut payload = status_response().payload.unwrap();
+        let normal = human_summary(&payload);
+        let message =
+            "Relay connected (127.0.0.1:43119) but Claude settings point at 127.0.0.1:44621.";
+        payload["relay"]["last_error"] = serde_json::json!({
+            "code": "claude_relay_endpoint_mismatch", "text": message,
+        });
+        assert_eq!(human_summary(&payload), format!("{normal}\n{message}"));
+        // The daemon also raises a canonical blocker; its guidance leads, and
+        // the port detail still follows (also behind a higher-priority blocker).
+        let guidance = "Claude telemetry port mismatch: restart Ottto, or reconnect Claude Code in Ottto and restart Claude Code sessions";
+        for blockers in [
+            serde_json::json!([{"code":"claude_relay_endpoint_mismatch", "clear_condition":guidance}]),
+            serde_json::json!([
+                {"code":"stale_heartbeat", "clear_condition":"restart ottto-service"},
+                {"code":"claude_relay_endpoint_mismatch", "clear_condition":guidance},
+            ]),
+        ] {
+            let first = blockers[0]["clear_condition"].as_str().unwrap().to_string();
+            payload["canonical_health"] = serde_json::json!({"blockers": blockers});
+            assert_eq!(human_summary(&payload), format!("{first}\n{message}"));
+        }
+        payload["canonical_health"] = serde_json::Value::Null;
+        payload["relay"]["last_error"] = serde_json::Value::Null;
+        assert_eq!(human_summary(&payload), normal);
     }
 
     #[test]
