@@ -66,7 +66,7 @@ impl AckFixture {
         // Each fixture call requests a new metadata walk at a fixed clock.
         // Feed the real rediscovery input; retained traversal is not authority.
         let relist = index.scan_traversal_exhausted_for_test();
-        crate::snapshots::scan_source_roots_with_attribution_and_hints(
+        let mut scan = crate::snapshots::scan_source_roots_with_attribution_and_hints(
             SnapshotSource::ClaudeCode,
             &[root.to_owned()],
             index,
@@ -77,7 +77,10 @@ impl AckFixture {
             &[],
             relist,
         )
-        .unwrap()
+        .unwrap();
+        // Preserve the finalized convenience entry's exact file/body custody.
+        finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, index);
+        scan
     }
 
     fn load(&self) -> (ScanIndex, SnapshotUploadProgress) {
