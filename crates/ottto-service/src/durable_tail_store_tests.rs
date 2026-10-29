@@ -1052,6 +1052,27 @@ fn every_binding_mismatch_refuses() {
 }
 
 #[test]
+fn private_temp_explicit_cleanup_counts_once_after_verified_absence() {
+    let scratch = Scratch::new();
+    let path = scratch.root.join("stage.rec");
+    let mut counters = StoreCounters::default();
+    let mut temp = TempRecord::prepare(&scratch.root, &path, &mut counters).unwrap();
+    let temp_path = temp.path.clone();
+    assert!(temp_path.exists());
+    assert_eq!(temp.counters.temp_discard_verified, 0);
+    temp.discard().unwrap();
+    assert!(!temp_path.exists());
+    assert!(temp.file.is_none());
+    assert_eq!(temp.counters.temp_discard_verified, 1);
+    temp.discard().unwrap();
+    assert_eq!(temp.counters.temp_discard_verified, 1);
+    drop(temp);
+    assert_eq!(counters.temp_discard_verified, 1);
+    assert_eq!(counters.temp_discard_failed, 0);
+    assert_eq!(counters.temp_drop_fallback, 0);
+}
+
+#[test]
 fn private_temp_commit_and_discard_never_grant_a_receipt() {
     let scratch = Scratch::new();
     let path = scratch.root.join("stage.rec");
@@ -1067,6 +1088,7 @@ fn private_temp_commit_and_discard_never_grant_a_receipt() {
     drop(temp);
     assert_eq!(fs::read(&path).unwrap(), b"synthetic");
     assert!(!temp_path.exists());
+    assert_eq!(counters.temp_discard_verified, 0);
     assert_eq!(counters.temp_drop_fallback, 0);
     assert_eq!(counters.temp_discard_failed, 0);
     assert_eq!(counters.records_written, 0, "only the store can receipt");
@@ -1088,6 +1110,7 @@ fn private_temp_replacement_cannot_be_committed_or_discarded() {
     assert!(!path.exists());
     drop(temp);
     assert_eq!(fs::read(&temp_path).unwrap(), b"replacement");
+    assert_eq!(counters.temp_discard_verified, 0);
     assert_eq!(counters.temp_discard_failed, 2);
     assert_eq!(counters.temp_drop_fallback, 1);
 }
@@ -1106,10 +1129,15 @@ fn private_temp_discard_retries_directory_sync_without_unlinking_records() {
     assert!(failed.is_err());
     assert!(!temp_path.exists());
     assert!(temp.file.is_some(), "unverified cleanup remains owned");
+    assert_eq!(temp.counters.temp_discard_verified, 0);
     temp.discard().unwrap();
     assert!(temp.file.is_none());
+    assert_eq!(temp.counters.temp_discard_verified, 1);
+    temp.discard().unwrap();
+    assert_eq!(temp.counters.temp_discard_verified, 1);
     drop(temp);
     assert_eq!(fs::read(&path).unwrap(), b"predecessor");
+    assert_eq!(counters.temp_discard_verified, 1);
     assert_eq!(counters.temp_discard_failed, 1);
     assert_eq!(counters.temp_drop_fallback, 0);
 }
