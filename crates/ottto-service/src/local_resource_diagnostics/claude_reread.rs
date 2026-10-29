@@ -232,12 +232,66 @@ pub(crate) struct DesktopMetadata {
     pub(crate) recovered_hold_body_rereads: u64,
     #[serde(skip_serializing_if = "super::is_zero")]
     pub(crate) scoped_acquisition_attempts: u64,
+    #[serde(skip_serializing_if = "LineageEdgeReoffer::is_empty")]
+    pub(crate) lineage_edge_reoffer: LineageEdgeReoffer,
+    #[serde(skip_serializing_if = "super::is_zero")]
+    pub(crate) lineage_selector_drops: u64,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct LineageEdgeReoffer {
+    pub(crate) files: u64,
+    pub(crate) bytes: u64,
+}
+impl LineageEdgeReoffer {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+pub(crate) fn desktop_lineage_edge_reoffer(bytes: u64) {
+    if active() {
+        update(|counts| {
+            let c = &mut counts.desktop_metadata.lineage_edge_reoffer;
+            c.files = c.files.saturating_add(1);
+            c.bytes = c.bytes.saturating_add(bytes);
+        });
+    } else {
+        // Policy/no-op finalization can run outside the scan's step scope.
+        // Reuse the existing count-only emitter; no session ids or paths.
+        let mut counts = Counts::default();
+        counts.desktop_metadata.lineage_edge_reoffer = LineageEdgeReoffer { files: 1, bytes };
+        super::rearm_collection(counts);
+    }
+}
+pub(crate) fn desktop_lineage_selector_drop() {
+    if active() {
+        update(|counts| {
+            counts.desktop_metadata.lineage_selector_drops = counts
+                .desktop_metadata
+                .lineage_selector_drops
+                .saturating_add(1)
+        });
+    } else {
+        let mut counts = Counts::default();
+        counts.desktop_metadata.lineage_selector_drops = 1;
+        super::rearm_collection(counts);
+    }
 }
 impl DesktopMetadata {
     fn is_empty(&self) -> bool {
         *self == Self::default()
     }
     fn merge(&mut self, other: Self) {
+        self.lineage_selector_drops = self
+            .lineage_selector_drops
+            .saturating_add(other.lineage_selector_drops);
+        self.lineage_edge_reoffer.files = self
+            .lineage_edge_reoffer
+            .files
+            .saturating_add(other.lineage_edge_reoffer.files);
+        self.lineage_edge_reoffer.bytes = self
+            .lineage_edge_reoffer
+            .bytes
+            .saturating_add(other.lineage_edge_reoffer.bytes);
         self.inventory_restarts = self
             .inventory_restarts
             .saturating_add(other.inventory_restarts);

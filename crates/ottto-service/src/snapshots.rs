@@ -1,3 +1,6 @@
+#[path = "snapshots/desktop_lineage.rs"]
+mod desktop_lineage;
+
 use crate::codex_scan_diagnostics::{
     self, CensusGates, CodexScanDiagnostics, FileReason, IdentityConflictTaxonomy, IncompleteShape,
     ParentUnresolvableCauses, RecoveryLineage, StateRowFieldDiffs, UnreadableCause,
@@ -3933,6 +3936,24 @@ pub struct ScanIndex {
     /// Appended to preserve every older positional index slot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     claude_desktop_store_inventory: Option<String>,
+    /// Last complete Desktop graph, local selector state only. Never attribution,
+    /// request/owner/ACK/money authority. None is legacy/unknown; Some(empty)
+    /// certifies no edges. Root metadata, independent of file shards. Appended
+    /// to preserve every older positional slot; frozen during incomplete scans.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "desktop_lineage::deserialize_projection"
+    )]
+    claude_desktop_completed_lineage: Option<BTreeMap<String, String>>,
+    /// Per-file hash-only selector baselines. Root metadata keeps the 480-byte
+    /// file-entry layout unchanged; committable subsets copy only safe keys.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "desktop_lineage::deserialize_file_edges"
+    )]
+    claude_desktop_lineage_file_edges: BTreeMap<String, String>,
 }
 
 /// The production paths that set `bounded_sweep_had_unsettled_upload`.
@@ -4135,6 +4156,8 @@ impl Default for ScanIndex {
             claude_request_identity_contract: None,
             claude_request_identity_contract_changed: false,
             claude_desktop_store_inventory: None,
+            claude_desktop_completed_lineage: None,
+            claude_desktop_lineage_file_edges: BTreeMap::new(),
             claude_desktop_store_cursor: None,
             claude_desktop_store_upper_bound: None,
             claude_desktop_store_sweep_had_errors: false,
@@ -7656,6 +7679,7 @@ impl SourceScanResult {
 #[derive(Debug, Clone)]
 struct PendingIndexFinalization {
     sampled_audit_verified: bool,
+    lineage_edge_reoffer_bytes: Option<u64>,
     codex_pending_recovery: bool,
     index_key: String,
     source_file_fingerprint: String,
@@ -8156,6 +8180,25 @@ pub fn finalize_scan_after_policy_with_body_witness(
                 .map(|source_file| !noop_source_files.contains(source_file))
                 .unwrap_or(true)
     });
+
+    if source == SnapshotSource::ClaudeCode {
+        for pending in &mut result.pending_finalization {
+            if let Some(bytes) = pending
+                .lineage_edge_reoffer_bytes
+                .take()
+                .filter(|_| pending.parse_complete)
+            {
+                if result.snapshots.iter().any(|item| {
+                    item.source_file_fingerprint.as_deref()
+                        == Some(pending.source_file_fingerprint.as_str())
+                }) {
+                    crate::local_resource_diagnostics::claude_reread::desktop_lineage_edge_reoffer(
+                        bytes,
+                    );
+                }
+            }
+        }
+    }
 
     // State-only Codex entities do not have a source-file fingerprint, so they
     // cannot use the file finalization table above. Rebind their durable map to
@@ -16058,6 +16101,7 @@ struct ClaudeTitleMetadata {
     spawn_lineage: BTreeMap<String, ClaudeDesktopSpawnLineage>,
     /// Metadata dependencies, independent of census coverage and transcript IO.
     lineage_revisions: BTreeMap<String, BTreeSet<String>>,
+    completed_lineage: Option<BTreeMap<String, String>>,
     /// Only ambiguous stores need transcript-window resolution. Defer it until
     /// an independently selected file finalizes, never during the census.
     deferred_lineage_stores: Vec<Vec<ClaudeDesktopTitleIndexEntry>>,
@@ -16227,12 +16271,21 @@ impl ClaudeTitleMetadata {
                 serde_json::to_string(revisions).expect("lineage revisions serialize")
             });
         if let Some(revision) = &lineage_revision {
-            parts.extend(["desktop_spawn_metadata:v1", revision]);
-        } else if let Some(lineage) = self.spawn_lineage.get(source_session_id) {
             parts.extend([
-                "desktop_spawn_lineage:v1",
-                lineage.parent_session_id.as_str(),
+                if self.completed_lineage.is_some() {
+                    "desktop_spawn_metadata:v2"
+                } else {
+                    "desktop_spawn_metadata:v1"
+                },
+                revision,
             ]);
+        }
+        if let Some(parent) = self
+            .completed_lineage
+            .as_ref()
+            .and_then(|edges| edges.get(source_session_id))
+        {
+            parts.extend(["desktop_spawn_lineage:v1", parent.as_str()]);
         }
         sha256_hex(&parts)
     }
@@ -16254,7 +16307,7 @@ impl ClaudeTitleMetadata {
         }
     }
 
-    fn resolve_deferred_lineage(&mut self, index: &ScanIndex) {
+    fn resolve_deferred_lineage(&mut self, index: &mut ScanIndex) {
         if self.deferred_lineage_stores.is_empty() || self.deferred_lineage_attempted {
             return;
         }
@@ -16288,6 +16341,10 @@ impl ClaudeTitleMetadata {
                     })
                     .collect::<Vec<_>>()
             }));
+        // Missing windows mean no edge, as in the existing resolver. This
+        // projection comes only from a complete metadata census; window IO
+        // remains on the independently selected file path.
+        self.install_completed_lineage(index);
         if !missing_window {
             self.deferred_lineage_stores.clear();
         }
@@ -16323,7 +16380,7 @@ impl ClaudeTitleMetadata {
         let mut index = ScanIndex::default();
         let mut metadata =
             Self::load_from_roots_with_index(roots, &mut index, "2026-07-31T00:00:00Z", true);
-        metadata.resolve_deferred_lineage(&index);
+        metadata.resolve_deferred_lineage(&mut index);
         metadata
     }
 
@@ -16550,8 +16607,9 @@ impl ClaudeTitleMetadata {
 
     #[cfg(test)]
     fn from_durable_index(index: &ScanIndex, sidecar_census_incomplete: bool) -> Self {
+        let mut index = index.clone();
         let mut metadata = Self::from_durable_index_with_metadata(
-            index,
+            &mut index,
             Self {
                 sidecar_census_incomplete,
                 original_identity_census_incomplete: sidecar_census_incomplete,
@@ -16559,15 +16617,16 @@ impl ClaudeTitleMetadata {
             },
             None,
         );
-        metadata.resolve_deferred_lineage(index);
+        metadata.resolve_deferred_lineage(&mut index);
         metadata
     }
 
     fn from_durable_index_with_metadata(
-        index: &ScanIndex,
+        index: &mut ScanIndex,
         mut metadata: Self,
         store_dirs: Option<&BTreeSet<PathBuf>>,
     ) -> Self {
+        metadata.completed_lineage = index.claude_desktop_completed_lineage.clone();
         for entry in index.claude_desktop_title_files.values() {
             if let Some(original_identity) = &entry.original_identity {
                 metadata
@@ -16731,6 +16790,9 @@ impl ClaudeTitleMetadata {
                     .map(|entries| entries.into_iter().cloned().collect())
                     .collect();
             }
+        }
+        if index.claude_desktop_lineage_census_complete && !needs_windows {
+            metadata.install_completed_lineage(index);
         }
         let sidecar_parts = metadata
             .titles
@@ -22154,6 +22216,7 @@ fn codex_parent_candidate_match(
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
+        fingerprint_opened_identity: String::new(),
     };
     Ok(candidate)
 }
@@ -22282,6 +22345,7 @@ fn codex_parent_locate(
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
+        fingerprint_opened_identity: String::new(),
     };
     let file = open_candidate_beneath_root(&candidate).map_err(|_| Absent)?;
     let opened = file.metadata().map_err(|_| Absent)?;
@@ -29013,19 +29077,20 @@ impl OwnedSourceScan {
                     });
                     Some((digest, live, stamp, sidecar))
                 });
-                if source == SnapshotSource::ClaudeCode {
-                    claude_title_metadata.resolve_deferred_lineage(index);
-                }
+                let lineage_native_bytes = active.parser.reader.acquisition.as_ref().map_or_else(
+                    || active.parser.reader.consumed_bytes(),
+                    |plan| plan.metrics().native_bytes,
+                );
                 let OwnedActiveFile {
                     comparison_target,
                     sampling: file_sampling,
                     recovered_audit_due,
-                    candidate,
+                    mut candidate,
                     decision,
                     previous_snapshot_fingerprint,
                     previous_upload_body_witness,
                     projection_adoption_required,
-                    source_file_fingerprint,
+                    mut source_file_fingerprint,
                     parser,
                     aliases,
                     mut applied_receipts,
@@ -29480,6 +29545,50 @@ impl OwnedSourceScan {
                 };
                 let claude_grown_prefix =
                     source == SnapshotSource::ClaudeCode && parser.reader.sealed_prefix.is_some();
+                if source == SnapshotSource::ClaudeCode {
+                    // Validate the acquired scope first. Resolving bounded windows
+                    // changes only this local projection, never the native input.
+                    let session = candidate
+                        .path
+                        .file_stem()
+                        .and_then(|v| v.to_str())
+                        .unwrap_or("");
+                    let before = claude_title_metadata.session_sidecar_fingerprint(session);
+                    claude_title_metadata.resolve_deferred_lineage(index);
+                    if before != claude_title_metadata.session_sidecar_fingerprint(session) {
+                        prepare_owned_scan_candidate(
+                            source,
+                            &mut candidate,
+                            &codex_title_metadata,
+                            &claude_title_metadata,
+                            claude_effort_support_dir_ref,
+                        );
+                        candidate.source_file_fingerprint =
+                            scan_file_fingerprint_with_opened_identity(
+                                &candidate.path,
+                                candidate.size_bytes,
+                                candidate.modified_unix_nanos,
+                                &candidate_scan_identity(source, candidate.modified_unix_nanos),
+                                &candidate.source_file_fingerprint,
+                                &candidate.fingerprint_opened_identity,
+                            );
+                        if let Some(context) = attribution_context {
+                            let workers = launch_workers_for_candidate(
+                                source,
+                                &candidate,
+                                codex_join_inventory.as_ref(),
+                            );
+                            if let Some(witness) = context.launch_witness(&workers) {
+                                candidate.source_file_fingerprint = sha256_hex(&[
+                                    "launcher_worker_context:v1",
+                                    &candidate.source_file_fingerprint,
+                                    &witness,
+                                ]);
+                            }
+                        }
+                        source_file_fingerprint = candidate.source_file_fingerprint.clone();
+                    }
+                }
                 let parsed_file = parser.finish_with_repository_identity(
                     &candidate.opened_object_identity,
                     &candidate.path,
@@ -30359,6 +30468,7 @@ impl OwnedSourceScan {
                         let alias_fingerprint = alias.source_file_fingerprint.clone();
                         pending_finalization.push(PendingIndexFinalization {
                             sampled_audit_verified: false,
+                            lineage_edge_reoffer_bytes: None,
                             codex_pending_recovery: index
                                 .files
                                 .get(&local_index_key(&alias.path))
@@ -30418,8 +30528,40 @@ impl OwnedSourceScan {
                         );
                     }
                 }
+                let lineage_edge_reoffer_bytes = (source == SnapshotSource::ClaudeCode
+                    && index.desktop_lineage_edge_changed(&candidate))
+                .then_some(lineage_native_bytes);
+                let offered_lineage_edge = (source == SnapshotSource::ClaudeCode
+                    && claude_subagent_identity(&candidate.path).is_none()
+                    && candidate
+                        .path
+                        .file_stem()
+                        .and_then(|v| v.to_str())
+                        .is_some_and(|session| {
+                            claude_title_metadata
+                                .lineage_revisions
+                                .contains_key(session)
+                                || index
+                                    .claude_desktop_completed_lineage
+                                    .as_ref()
+                                    .is_some_and(|edges| edges.contains_key(session))
+                                || index
+                                    .claude_desktop_lineage_file_edges
+                                    .contains_key(&index_key)
+                        }))
+                .then(|| {
+                    desktop_lineage::edge_fingerprint(
+                        parsed
+                            .first()
+                            .and_then(|item| {
+                                claude_title_metadata.spawn_lineage(&item.source_session_id)
+                            })
+                            .map(|edge| edge.parent_session_id.as_str()),
+                    )
+                });
                 pending_finalization.push(PendingIndexFinalization {
                     sampled_audit_verified,
+                    lineage_edge_reoffer_bytes,
                     codex_pending_recovery: index
                         .files
                         .get(&index_key)
@@ -30499,6 +30641,9 @@ impl OwnedSourceScan {
                         recorded.size_bytes = fragment.offset;
                     }
                     index.record(recorded, last_snapshot_fingerprint, outcome);
+                    if let Some(edge) = offered_lineage_edge {
+                        index.record_desktop_lineage_file_edge(&index_key, edge);
+                    }
                     // The counting version travels in the same entry as the
                     // fingerprint it describes; no separate save can split them.
                     if let Some(entry) = index.files.get_mut(&index_key) {
@@ -39071,6 +39216,7 @@ struct CandidateFile {
     fingerprint_changed_nanos: u64,
     /// The live file birth (unix nanos) of that open; zero if unavailable.
     fingerprint_birth_nanos: u64,
+    fingerprint_opened_identity: String,
 }
 
 /// The object inputs of one opened-object identity (unix device, inode and
@@ -42800,6 +42946,7 @@ fn candidate_from_traversal_path_at(
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
+        fingerprint_opened_identity: String::new(),
     })
 }
 
@@ -42993,6 +43140,7 @@ fn collect_recent_jsonl_files(
             opened_object_identity: String::new(),
             fingerprint_changed_nanos: 0,
             fingerprint_birth_nanos: 0,
+            fingerprint_opened_identity: String::new(),
         });
     }
 }
@@ -43291,15 +43439,15 @@ fn open_and_identify_scan_candidate_with_rescue(
         return None;
     };
     let session_sidecar_fingerprint = std::mem::take(&mut candidate.source_file_fingerprint);
+    candidate.fingerprint_opened_identity =
+        adopted_identity.unwrap_or_else(|| candidate.opened_object_identity.clone());
     candidate.source_file_fingerprint = scan_file_fingerprint_with_opened_identity(
         &candidate.path,
         candidate.size_bytes,
         candidate.modified_unix_nanos,
         &candidate_scan_identity(source, candidate.modified_unix_nanos),
         &session_sidecar_fingerprint,
-        adopted_identity
-            .as_deref()
-            .unwrap_or(&candidate.opened_object_identity),
+        &candidate.fingerprint_opened_identity,
     );
     Some((candidate, opened_file))
 }
@@ -48687,6 +48835,10 @@ impl ScanIndex {
                 &self.codex_parent_prefix_proofs,
             ),
             claude_desktop_title_files: self.claude_desktop_title_files.clone(),
+            claude_desktop_completed_lineage: self.claude_desktop_completed_lineage.clone(),
+            claude_desktop_lineage_file_edges: desktop_lineage::committable_file_edges(
+                self, previous, &safe_keys,
+            ),
             claude_account_family_witnesses: self.claude_account_family_witnesses.clone(),
             claude_account_family_pending: self.claude_account_family_pending.clone(),
             claude_usage_family_witnesses: self.claude_usage_family_witnesses.clone(),
@@ -49446,6 +49598,12 @@ impl ScanIndex {
                     Some(CandidateParseReason::LegacyIdentity),
                 )
             };
+        }
+        if self.desktop_lineage_edge_changed(candidate) {
+            return (
+                CandidateDecision::Parse,
+                Some(CandidateParseReason::SourceChanged),
+            );
         }
         if entry.source_file_fingerprint != candidate.source_file_fingerprint {
             let reason = if entry.source_file_fingerprint.is_empty() {
@@ -53673,6 +53831,7 @@ mod tests {
             opened_object_identity: String::new(),
             fingerprint_changed_nanos: 0,
             fingerprint_birth_nanos: 0,
+            fingerprint_opened_identity: String::new(),
         }
     }
 
@@ -54184,6 +54343,7 @@ mod tests {
             opened_object_identity: "opened".to_string(),
             fingerprint_changed_nanos: 0,
             fingerprint_birth_nanos: 0,
+            fingerprint_opened_identity: String::new(),
         };
         let mut stale_witness = snapshot_quarantine_witness(SnapshotSource::Codex);
         stale_witness.collector_version.push_str("-old");
@@ -54802,6 +54962,7 @@ mod tests {
             opened_object_identity: "opened".to_string(),
             fingerprint_changed_nanos: 0,
             fingerprint_birth_nanos: 0,
+            fingerprint_opened_identity: String::new(),
         };
         let index = ScanIndex {
             files: BTreeMap::from([(
@@ -54856,6 +55017,7 @@ mod tests {
             opened_object_identity: "opened".to_string(),
             fingerprint_changed_nanos: 0,
             fingerprint_birth_nanos: 0,
+            fingerprint_opened_identity: String::new(),
         };
         let index = ScanIndex {
             files: BTreeMap::from([(
@@ -54907,6 +55069,7 @@ mod tests {
             opened_object_identity: "opened".to_string(),
             fingerprint_changed_nanos: 0,
             fingerprint_birth_nanos: 0,
+            fingerprint_opened_identity: String::new(),
         };
         let index = ScanIndex {
             files: BTreeMap::from([(
@@ -76757,15 +76920,15 @@ mod tests {
             0
         );
         let scope = Scope::begin(true);
-        metadata.resolve_deferred_lineage(&index);
+        metadata.resolve_deferred_lineage(&mut index);
         assert_eq!(
             metadata.spawn_lineage(&ids[2]).unwrap().parent_session_id,
             ids[0]
         );
-        assert_eq!(
+        assert_ne!(
             metadata.session_sidecar_fingerprint(&ids[2]),
             fingerprint,
-            "window resolution never changes metadata selection"
+            "a newly resolved edge revises only this child"
         );
         assert_eq!(
             scope.finish().desktop_metadata.lineage_window_read_attempts,
@@ -91525,7 +91688,7 @@ crate::durable_tail_codec::durable_struct!(BucketRowAccumulator {
     N usage: UsageTotals,
     U reasoning_effort: Option<String>,
 });
-crate::heap_layout_bound::fields!(CandidateFile; physical_identity, scan_root, path, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, legacy_source_file_fingerprint, legacy_config_reconciliation_required, opened_object_identity, fingerprint_changed_nanos, fingerprint_birth_nanos);
+crate::heap_layout_bound::fields!(CandidateFile; physical_identity, scan_root, path, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, legacy_source_file_fingerprint, legacy_config_reconciliation_required, opened_object_identity, fingerprint_changed_nanos, fingerprint_birth_nanos, fingerprint_opened_identity);
 crate::heap_layout_bound::fields!(ClaudeAccountFamilyPending; current, previous_windows, confirmed_absent_members);
 crate::heap_layout_bound::fields!(ClaudeAccountFamilyPendingWindow; version, census_window_end, account_identifier_hash, evidence_request_count, census_complete, members, member_requests, invalid);
 crate::heap_layout_bound::fields!(ClaudeAccountRequestSet; prefixes, fingerprint, identity_revision);
@@ -91560,7 +91723,7 @@ crate::durable_tail_codec::durable_struct!(ClaudeResponseObservation {
     N desktop_request: bool,
 });
 crate::heap_layout_bound::fields!(ClaudeTitleCandidate; title, user_set);
-crate::heap_layout_bound::fields!(ClaudeTitleMetadata; titles, account_identifier_hashes, original_identity_evidence, spawn_lineage, lineage_revisions, deferred_lineage_stores, deferred_lineage_attempted, recovered_account_holds, legacy_sidecar_fingerprint, sidecar_census_incomplete, original_identity_census_incomplete);
+crate::heap_layout_bound::fields!(ClaudeTitleMetadata; titles, account_identifier_hashes, original_identity_evidence, spawn_lineage, lineage_revisions, completed_lineage, deferred_lineage_stores, deferred_lineage_attempted, recovered_account_holds, legacy_sidecar_fingerprint, sidecar_census_incomplete, original_identity_census_incomplete);
 crate::heap_layout_bound::fields!(ClaudeTranscriptUsageOccurrence; sequence, usage, model, selector, reasoning_effort, timestamp, event_clock_complete, desktop_request, effective_input_context, telemetry_attached, e2_inherited);
 crate::heap_layout_bound::fields!(ClaudeTranscriptUsageOccurrenceWitness; sequence, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, model, speed_mode, reasoning_effort);
 crate::heap_layout_bound::fields!(ClaudeUsageAuthorityQuarantineRecord; contract, proven_witness_fingerprint, member_source_file_fingerprints, failed_reconstruction_count, disposition, retry_after_unix_seconds, proof_correction);
@@ -91597,7 +91760,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, recovered_audit_due, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
 crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery; shared codex_versions);
-crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
+crate::heap_layout_bound::fields!(PendingIndexFinalization; lineage_edge_reoffer_bytes, sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::durable_tail_codec::durable_struct!(key RowKey {
@@ -91614,7 +91777,7 @@ crate::durable_tail_codec::durable_struct!(key RowKey {
     U subscription_product: Option<String>,
 });
 crate::heap_layout_bound::fields!(ScanCensus; causes, oversized_discovery, #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, parse_reasons, codex_selections, codex_counting_v2, claude_compaction_unlinked_parent_count);
-crate::heap_layout_bound::fields!(ScanIndex; decode_holds, claude_account_window_retention, schema_version, generation, upload_ack_retirement_handoff, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_retired_family_tombstones, claude_retired_family_tombstones_initialized, claude_retired_family_tombstones_uncertain, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_full_rearm_progress, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, codex_counting_moved_evidence, codex_counting_tombstones, codex_counting_evicted_legacy, codex_counting_evictions, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_move_not_full, claude_history_move_released, accepted_incidence_pending_census, accepted_rebuild_incidence, accepted_rebuild_pending_since_unix_seconds, accepted_rebuild_last_alarm_unix_seconds, claude_no_list_policy, claude_history_emission, reason_reoffer_retries, terminal_contract_retries, claude_history_unverified_in_process, claude_rebuild_read_load_eligible, reason_reoffer_cooldowns, retired_reread_guard, held_audit_progress, claude_money_birth_store, claude_desktop_store_inventory);
+crate::heap_layout_bound::fields!(ScanIndex; decode_holds, claude_account_window_retention, schema_version, generation, upload_ack_retirement_handoff, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_retired_family_tombstones, claude_retired_family_tombstones_initialized, claude_retired_family_tombstones_uncertain, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_full_rearm_progress, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, codex_counting_moved_evidence, codex_counting_tombstones, codex_counting_evicted_legacy, codex_counting_evictions, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_move_not_full, claude_history_move_released, accepted_incidence_pending_census, accepted_rebuild_incidence, accepted_rebuild_pending_since_unix_seconds, accepted_rebuild_last_alarm_unix_seconds, claude_no_list_policy, claude_history_emission, reason_reoffer_retries, terminal_contract_retries, claude_history_unverified_in_process, claude_rebuild_read_load_eligible, reason_reoffer_cooldowns, retired_reread_guard, held_audit_progress, claude_money_birth_store, claude_desktop_store_inventory, claude_desktop_completed_lineage, claude_desktop_lineage_file_edges);
 crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);

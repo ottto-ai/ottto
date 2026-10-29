@@ -830,6 +830,7 @@ fn held_entity_finalization_keeps_file_membership_and_never_confirms_empty() {
     scan.snapshots = vec![snapshot];
     scan.pending_finalization.push(PendingIndexFinalization {
         sampled_audit_verified: false,
+        lineage_edge_reoffer_bytes: None,
         codex_pending_recovery: false,
         index_key: key.clone(),
         source_file_fingerprint: "source".into(),
@@ -2002,6 +2003,12 @@ fn every_persisted_field_fixture() -> ScanIndex {
                 "parsed":{"dev":1,"ino":2,"extent":1,"modified":[1,0],"changed":[1,0]},
                 "seal":{"stamp":{"length":1,"device":1,"inode":2,"modified":[1,0],"changed":[1,0]},
                     "scope":codex_parent_side_scope().0,"sample_len":1,"head_sha256":"a".repeat(64),"boundary_sha256":"b".repeat(64),"verified_unix_seconds":1,"sealed_unix_seconds":1}}}),
+            "claude_desktop_lineage_file_edges" => {
+                serde_json::json!({"/synthetic/child.jsonl":"a".repeat(64)})
+            }
+            "claude_desktop_completed_lineage" => serde_json::json!({
+                "00000000-0000-4000-8000-000000000001":"00000000-0000-4000-8000-000000000002"
+            }),
             "claude_desktop_title_files" => {
                 serde_json::json!({"sidecar":{"cli_session_id":"session","title":"title","user_set":true}})
             }
@@ -2309,6 +2316,7 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
                 opened_object_identity: String::new(),
                 fingerprint_changed_nanos: 0,
                 fingerprint_birth_nanos: 0,
+                fingerprint_opened_identity: String::new(),
             };
             assert_eq!(
                 loaded.candidate_decision_with_reason(&candidate),
@@ -4664,6 +4672,7 @@ fn retired_reread_guard_keeps_legacy_map_and_full_array_custody() {
                     opened_object_identity: String::new(),
                     fingerprint_changed_nanos: 0,
                     fingerprint_birth_nanos: 0,
+                    fingerprint_opened_identity: String::new(),
                 };
                 assert_eq!(
                     decoded.candidate_decision_with_reason_at(&candidate, 0),
