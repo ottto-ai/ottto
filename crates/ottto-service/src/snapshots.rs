@@ -32848,6 +32848,7 @@ fn append_codex_state_only_snapshots(
     index: &mut ScanIndex,
     blocked_session_ids: &BTreeSet<String>,
 ) -> (usize, usize) {
+    let snapshots_before = snapshots.len();
     let blocked_session_ids = blocked_session_ids
         .union(&index.codex_state_only_blocked_session_ids)
         .map(|session_id| resolve_codex_identity(session_id.as_str()))
@@ -32944,6 +32945,11 @@ fn append_codex_state_only_snapshots(
         // durable state and semantic no-op suppression.
         snapshots.push(snapshot);
     }
+    crate::local_resource_diagnostics::codex_state_only(
+        scanned_session_count,
+        snapshots.len().saturating_sub(snapshots_before),
+        0, // Semantic no-op suppression remains in finalize_scan_after_policy.
+    );
     (scanned_session_count, 0)
 }
 
@@ -59287,7 +59293,10 @@ mod tests {
                     1,
                     "the other, unowned state row still falls back"
                 );
-                assert!(rows.is_empty(), "a committed owner supplies coverage");
+                assert!(
+                    rows.iter().all(|row| row["stage"] == "codex_state_only"),
+                    "a committed owner supplies coverage"
+                );
                 // Model an already-uploaded exclusive body and apply the new batch.
                 let witness = snapshot_upload_body_witness(&native);
                 let mut uploaded = BTreeMap::from([(owner.to_string(), native.clone())]);
@@ -59401,7 +59410,10 @@ mod tests {
             2,
             "no produced body means both state rows retain main's fallback"
         );
-        assert!(rows.is_empty(), "no replacement risk without a fingerprint");
+        assert!(
+            rows.iter().all(|row| row["stage"] == "codex_state_only"),
+            "no replacement risk without a fingerprint"
+        );
     }
 
     #[test]
@@ -59451,7 +59463,7 @@ mod tests {
                     assert_eq!(replacements[0].source_session_id, owner);
                     assert_eq!(replacements[0].unattributed_total_tokens, 900);
                 }
-                assert!(rows.is_empty());
+                assert!(rows.iter().all(|row| row["stage"] == "codex_state_only"));
             }
         }
     }
@@ -59514,7 +59526,7 @@ mod tests {
                     items.is_empty(),
                     "header and unique filename identities both retain coverage"
                 );
-                assert!(rows.is_empty());
+                assert!(rows.iter().all(|row| row["stage"] == "codex_state_only"));
             }
         }
     }
@@ -59571,7 +59583,7 @@ mod tests {
             )
         });
         assert!(
-            rows.is_empty(),
+            rows.iter().all(|row| row["stage"] == "codex_state_only"),
             "zero supported candidates are not ambiguity observations"
         );
         assert_eq!(items.len(), 1);
@@ -59614,6 +59626,74 @@ mod tests {
             assert!(replacements.iter().any(
                 |item| item.source_session_id == owner && item.unattributed_total_tokens == 900
             ));
+        }
+    }
+
+    #[test]
+    fn codex_state_only_terminal_diagnostic_counts_uncovered_entities() {
+        for n in [0, 1, 3] {
+            let dir = temp_dir("codex-state-only-terminal-counts");
+            let sessions = dir.join("sessions");
+            fs::create_dir_all(&sessions).unwrap();
+            let connection = Connection::open(dir.join("state_5.sqlite")).unwrap();
+            connection.execute(CODEX_THREADS_DDL, []).unwrap();
+            for i in 0..=n {
+                connection
+                    .execute(
+                        CODEX_THREADS_INSERT,
+                        (
+                            format!("019e253c-bbbb-7000-9000-{i:012x}"),
+                            "Synthetic State Thread",
+                            if i < n { 59_i64 } else { 0 },
+                            0_i64,
+                            1_777_777_000_i64,
+                            1_777_777_100_i64,
+                            1_777_777_000_000_i64,
+                            1_777_777_100_000_i64,
+                            "fixture-model",
+                        ),
+                    )
+                    .unwrap();
+            }
+            drop(connection);
+            let mut index = ScanIndex::default();
+            let (scan, rows) = crate::local_resource_diagnostics::capture(|| {
+                scan_source_roots(
+                    SnapshotSource::Codex,
+                    &[sessions],
+                    &mut index,
+                    "2026-05-14T10:04:00Z",
+                    BACKFILL_WINDOW_DAYS,
+                )
+                .unwrap()
+            });
+            assert!(scan.census_complete, "the real terminal append call ran");
+            assert_eq!(scan.snapshots.len(), n);
+            assert_eq!(scan.scanned_session_count, n);
+            assert_eq!(scan.semantic_noop_count, 0);
+            let observations = rows
+                .iter()
+                .filter(|row| row["stage"] == "codex_state_only")
+                .collect::<Vec<_>>();
+            if n == 0 {
+                assert!(observations.is_empty(), "all-zero diagnostic is omitted");
+            } else {
+                assert_eq!(observations.len(), 1, "one record per terminal call");
+                assert_eq!(observations[0]["source"], "codex");
+                assert_eq!(
+                    observations[0]["counts"],
+                    json!({"codex_state_only": {
+                        "scanned": n, "emitted": n, "noops": 0,
+                    }})
+                );
+            }
+            assert!(!serde_json::to_string(&scan.snapshots)
+                .unwrap()
+                .contains("codex_state_only"));
+            assert!(!serde_json::to_string(&index)
+                .unwrap()
+                .contains("\"codex_state_only\":"));
+            fs::remove_dir_all(dir).unwrap();
         }
     }
 

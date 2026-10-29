@@ -75,6 +75,20 @@ pub(crate) fn codex_state_only_ambiguous_identity(observations: u64, tokens: u64
     }
 }
 
+/// One terminal append call, before later policy/no-op suppression; never wire data.
+pub(crate) fn codex_state_only(scanned: usize, emitted: usize, noops: usize) {
+    if scanned != 0 || emitted != 0 || noops != 0 {
+        traversal_point(
+            "codex_state_only",
+            "codex",
+            &BTreeMap::from([(
+                "codex_state_only",
+                BTreeMap::from([("scanned", scanned), ("emitted", emitted), ("noops", noops)]),
+            )]),
+        );
+    }
+}
+
 /// Nonzero-only counters on the existing native_collection_page line.
 #[derive(Default, Serialize)]
 struct ClaudeRecordCaps {

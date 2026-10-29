@@ -19,3 +19,11 @@ Synthetic fixtures cover start-reason mapping, carry causes, completed byte
 attribution, unlabelled other Fulls, process-local loss, tag consumption, page
 cleanup, and identical selections, index serialization and upload bodies with
 and without tagging. Local clippy compiles fixtures; tests remain CI-only.
+
+Codex terminal state-only append calls also log a nonzero-only
+`codex_state_only` traversal record with `{scanned, emitted, noops}`.
+`scanned` and `noops` preserve the append function's existing return counts;
+`emitted` is its output-vector length increase. These are provisional append
+entities, before later policy filtering or semantic no-op suppression, not
+network attempts or accepted uploads. A synthetic terminal fixture checks
+0, 1 and 3 uncovered state threads plus a filtered zero-token thread.
