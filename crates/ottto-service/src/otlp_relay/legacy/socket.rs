@@ -1,5 +1,7 @@
-//! Exclusive legacy binds: std enables SO_REUSEADDR on Unix, which can claim
-//! loopback traffic beside a same-user wildcard listener on macOS.
+//! Probe wildcard holders before the loopback bind: reuse lets our own
+//! connected sockets/TIME_WAIT survive replacement without sharing a listener.
+#[cfg(unix)]
+use std::net::Ipv4Addr;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::{io, net::TcpListener};
@@ -22,8 +24,19 @@ fn new_socket(domain: libc::c_int) -> io::Result<OwnedFd> {
     }
     // SAFETY: raw is a new, uniquely owned socket descriptor.
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-    // SAFETY: fcntl sets flags on our live descriptor. No reuse flag is set.
+    // SAFETY: fcntl sets flags on our live descriptor.
     checked(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) })?;
+    let reuse: libc::c_int = 1;
+    // SAFETY: setsockopt reads a live c_int of the supplied size.
+    checked(unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            (&reuse as *const libc::c_int).cast(),
+            std::mem::size_of_val(&reuse) as libc::socklen_t,
+        )
+    })?;
     Ok(fd)
 }
 
@@ -78,8 +91,9 @@ pub(super) fn bind_with_probe(
     port: u16,
     probe: impl FnOnce(u16) -> io::Result<OwnedFd>,
 ) -> io::Result<TcpListener> {
-    // No reuse on the probe either: an existing dual-stack wildcard holder
-    // must veto this port. Drop the probe before the real IPv4 bind.
+    // Reuse ignores connected/TIME_WAIT sockets, while an exact live wildcard
+    // listener still vetoes its wildcard probe. Close both probes immediately.
+    drop(bind_ipv4(port, Ipv4Addr::UNSPECIFIED)?);
     match probe(port) {
         Ok(fd) => drop(fd),
         // These mean IPv6 cannot serve here, not that another holder owns the
@@ -91,12 +105,22 @@ pub(super) fn bind_with_probe(
             ) => {}
         Err(error) => return Err(error),
     }
+    let fd = bind_ipv4(port, Ipv4Addr::LOCALHOST)?;
+    // SAFETY: listen operates on our uniquely owned, bound socket.
+    checked(unsafe { libc::listen(fd.as_raw_fd(), 128) })?;
+    let listener = TcpListener::from(fd);
+    listener.set_nonblocking(true)?;
+    Ok(listener)
+}
+
+#[cfg(unix)]
+fn bind_ipv4(port: u16, ip: Ipv4Addr) -> io::Result<OwnedFd> {
     let fd = new_socket(libc::AF_INET)?;
     // SAFETY: zero is valid for every sockaddr_in field.
     let mut address: libc::sockaddr_in = unsafe { std::mem::zeroed() };
     address.sin_family = libc::AF_INET as libc::sa_family_t;
     address.sin_port = port.to_be();
-    address.sin_addr.s_addr = u32::from_ne_bytes([127, 0, 0, 1]);
+    address.sin_addr.s_addr = u32::from_ne_bytes(ip.octets());
     let length = std::mem::size_of_val(&address) as libc::socklen_t;
     #[cfg(any(
         target_os = "macos",
@@ -117,11 +141,7 @@ pub(super) fn bind_with_probe(
             length,
         )
     })?;
-    // SAFETY: listen operates on our uniquely owned, bound socket.
-    checked(unsafe { libc::listen(fd.as_raw_fd(), 128) })?;
-    let listener = TcpListener::from(fd);
-    listener.set_nonblocking(true)?;
-    Ok(listener)
+    Ok(fd)
 }
 
 #[cfg(not(unix))]

@@ -2107,7 +2107,6 @@ pub(crate) fn remove_claude_registration_with_relay_cleanup(
             .and_then(|slot| slot.config_dir.as_deref())
         {
             validate_managed_claude_settings_root(root)?;
-            crate::otlp_relay::legacy::revoke_now();
             crate::agent_configs::claude_managed_settings::disable_settings(Path::new(root), false)
                 .map_err(|_| LocalApiError::LocalOperationFailed("managed Claude relay settings must be safely cleared before removing registration".into()))?;
         }
@@ -32671,6 +32670,38 @@ X-API-Key = "otel_redacted"
         assert_eq!(provisional["env"], json!({}));
         assert!(!provision_managed_claude_relay_settings(&roots[0]).unwrap());
         crate::claude_browser_auth::release_ceremony(operation_id);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn secondary_claude_removal_preserves_legacy_listeners_but_disable_retires_them() {
+        let (root, _guards) = managed_claude_relay_fixture();
+        let store = FileClaudeConfigSlotSettingsStore::default();
+        let prepared = store
+            .prepare_managed_account_target(
+                1,
+                "claude_setup_99999999999999999999999999999999".into(),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let slot = &prepared.managed_slots[0];
+        provision_managed_claude_relay_settings(slot.config_dir.as_ref().unwrap()).unwrap();
+        let default_settings = root.join(".claude/settings.json");
+        let approval = fs::read(&default_settings).unwrap();
+        let (open, retired) = crate::otlp_relay::legacy::with_running_listener_for_test(|| {
+            remove_claude_registration_with_relay_cleanup(1, &slot.slot_id).unwrap();
+        });
+        assert_eq!((open, retired), (1, 0));
+        assert_eq!(fs::read(&default_settings).unwrap(), approval);
+        let (open, retired) = crate::otlp_relay::legacy::with_running_listener_for_test(|| {
+            assert!(disable_managed_claude_relay_settings().unwrap());
+        });
+        assert_eq!((open, retired), (0, 1));
+        assert_ne!(fs::read(&default_settings).unwrap(), approval);
         fs::remove_dir_all(root).unwrap();
     }
 

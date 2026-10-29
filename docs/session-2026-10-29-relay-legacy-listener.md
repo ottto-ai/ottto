@@ -22,9 +22,14 @@ Legacy requests recheck current approval and their live listener generation
 before capture; refused requests return 403 without evidence or request activity.
 Approval reads distinguish approved, definitely revoked and unknown. Unknown
 reads preserve history and listeners; polling requires two consecutive definite
-revocations before retirement. Explicit disable/removal hooks remain immediate.
-Claude disable/removal hooks invalidate workers synchronously and request
-persisted retirement/socket closure with a two-second acknowledgement bound.
+revocations before retirement. Explicit consent/approval revoke hooks remain
+immediate; secondary account
+removal and browser cleanup preserve default approval and legacy listeners.
+Claude telemetry disable/default-approval removal and setup opt-out hooks
+invalidate workers synchronously and request
+persisted retirement/socket closure with a two-second acknowledgement bound,
+without holding the settings lock. Ticks snapshot the generation before reading
+approval; new and refreshed listeners cannot inherit a concurrent revoke.
 Previously accepted connections are fenced, and already-admitted exports drain
 before a successful acknowledgement. Periodic revocation remains a fallback. Idle expiry also
 retires ports. Retirement persists across restarts and re-seeding; only a fresh
@@ -36,8 +41,10 @@ unlink stale state; loading the tombstone masks replayed old allowlists.
 If both state and tombstone persistence fail, supervision exits and logs the
 residual risk of losing retirement across restart.
 
-Busy ports use exclusive native IPv4 binds without reuse and a dual-stack
-wildcard probe; unavailable IPv6 still permits IPv4. Empty supervision waits until its next tick; active sockets
+Busy ports use IPv4 and dual-stack IPv6 wildcard probes followed by a loopback
+bind, all with reuse: live holders veto the port, while connected sockets and
+TIME_WAIT permit immediate rebind. Unavailable IPv6 still permits IPv4.
+Empty supervision waits until its next tick; active sockets
 drain up to 16 accepts, back off resource errors and close unusable sockets for
 tick rebind, retaining recent activity and checking descriptor ownership before
 release, with at most one accept-error log per minute per socket.

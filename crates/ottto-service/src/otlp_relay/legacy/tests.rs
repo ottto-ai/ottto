@@ -96,18 +96,18 @@ fn busy_port_is_counted_untouched_and_retried_and_primary_is_excluded() {
     let busy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = busy.local_addr().unwrap().port();
     supervisor
-        .reconcile(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
+        .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
         .unwrap();
     assert!(supervisor.open.is_empty());
     assert_eq!(supervisor.counters.bind_skipped.load(Ordering::Relaxed), 1);
     assert_eq!(supervisor.record.ports[0].idle_since, Some(100));
     drop(busy);
     supervisor
-        .reconcile(160, Some(APPROVED), port, &[APPROVED, port], &[port])
+        .reconcile_current(160, Some(APPROVED), port, &[APPROVED, port], &[port])
         .unwrap();
     assert!(supervisor.open.is_empty(), "primary port is never opened");
     supervisor
-        .reconcile(220, Some(APPROVED), 0, &[APPROVED, port], &[port])
+        .reconcile_current(220, Some(APPROVED), 0, &[APPROVED, port], &[port])
         .unwrap();
     assert_eq!(supervisor.open.len(), 1);
     assert_eq!(supervisor.counters.open.load(Ordering::Relaxed), 1);
@@ -123,7 +123,7 @@ fn idle_clock_persists_across_restart_and_requests_flush_only_every_ten_minutes(
     let (_dir, mut supervisor) = scratch();
     let port = spare_port();
     supervisor
-        .reconcile(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
+        .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
         .unwrap();
     let activity = supervisor.open[&port].activity.clone();
     activity.accepted_at(500);
@@ -139,11 +139,11 @@ fn idle_clock_persists_across_restart_and_requests_flush_only_every_ten_minutes(
     drop(supervisor);
     let mut restarted = Supervisor::load(path, counters, 1000).unwrap();
     restarted
-        .reconcile(1000, Some(APPROVED), 0, &[APPROVED, port], &[port])
+        .reconcile_current(1000, Some(APPROVED), 0, &[APPROVED, port], &[port])
         .unwrap();
     assert_eq!(restarted.record.ports[0].idle_since, Some(500));
     restarted
-        .reconcile(
+        .reconcile_current(
             500 + IDLE_SECONDS - 1,
             Some(APPROVED),
             0,
@@ -153,7 +153,7 @@ fn idle_clock_persists_across_restart_and_requests_flush_only_every_ten_minutes(
         .unwrap();
     assert_eq!(restarted.open.len(), 1);
     restarted
-        .reconcile(
+        .reconcile_current(
             500 + IDLE_SECONDS,
             Some(APPROVED),
             0,
@@ -167,7 +167,7 @@ fn idle_clock_persists_across_restart_and_requests_flush_only_every_ten_minutes(
     assert_eq!(restarted.counters.open.load(Ordering::Relaxed), 0);
     let _released = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
     restarted
-        .reconcile(
+        .reconcile_current(
             500 + IDLE_SECONDS + 60,
             Some(APPROVED),
             0,
@@ -183,13 +183,13 @@ fn idle_expiry_uses_unflushed_request_and_quiet_listener_closes_after_one_day() 
     let (_dir, mut supervisor) = scratch();
     let port = spare_port();
     supervisor
-        .reconcile(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
+        .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
         .unwrap();
     supervisor.open[&port]
         .activity
         .accepted_at(100 + IDLE_SECONDS - 1);
     supervisor
-        .reconcile(
+        .reconcile_current(
             100 + IDLE_SECONDS,
             Some(APPROVED),
             0,
@@ -203,7 +203,7 @@ fn idle_expiry_uses_unflushed_request_and_quiet_listener_closes_after_one_day() 
         "latest in-memory request prevents expiry"
     );
     supervisor
-        .reconcile(
+        .reconcile_current(
             100 + 2 * IDLE_SECONDS - 1,
             Some(APPROVED),
             0,
@@ -215,10 +215,10 @@ fn idle_expiry_uses_unflushed_request_and_quiet_listener_closes_after_one_day() 
 
     let (_dir, mut quiet) = scratch();
     quiet
-        .reconcile(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
+        .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
         .unwrap();
     quiet
-        .reconcile(
+        .reconcile_current(
             100 + IDLE_SECONDS,
             Some(APPROVED),
             0,
@@ -234,10 +234,10 @@ fn becoming_approved_closes_socket_and_drops_record_before_primary_bind() {
     let (_dir, mut supervisor) = scratch();
     let port = spare_port();
     supervisor
-        .reconcile(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
+        .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
         .unwrap();
     supervisor
-        .reconcile(101, Some(port), APPROVED, &[APPROVED, port], &[port])
+        .reconcile_current(101, Some(port), APPROVED, &[APPROVED, port], &[port])
         .unwrap();
     assert_eq!(ports(&supervisor.record), vec![APPROVED]);
     assert!(!ports(&supervisor.record).contains(&port));
@@ -251,7 +251,7 @@ fn primary_handoff_removes_legacy_socket_synchronously() {
     let (_dir, mut supervisor) = scratch();
     let port = spare_port();
     supervisor
-        .reconcile(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
+        .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
         .unwrap();
     supervisor.remove(port).unwrap();
     assert!(supervisor.record.ports.is_empty());
@@ -263,7 +263,7 @@ fn restricted_handler_rejects_control_health_and_non_otlp_and_shares_export_resp
     let (_dir, mut supervisor) = scratch();
     let port = spare_port();
     supervisor
-        .reconcile(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
+        .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
         .unwrap();
     let request = |method: &str, path: &str| {
         let open = &supervisor.open[&port];
@@ -329,6 +329,7 @@ fn recent_request_window_expires_at_one_hour() {
         2,
         APPROVED,
         100,
+        0,
         counters.clone(),
         Arc::new(Admission::default()),
     );
@@ -509,11 +510,11 @@ fn revoke_closes_all_and_retired_ports_require_fresh_approval_then_supersession(
     assert_ne!(b, c);
     let candidates = [APPROVED, b, c];
     supervisor
-        .reconcile(100, Some(APPROVED), 0, &candidates, &[c, b])
+        .reconcile_current(100, Some(APPROVED), 0, &candidates, &[c, b])
         .unwrap();
     assert_eq!(supervisor.open.len(), 2);
     supervisor
-        .reconcile(101, None, 0, &candidates, &[])
+        .reconcile_current(101, None, 0, &candidates, &[])
         .unwrap();
     assert!(supervisor.open.is_empty());
     assert!(supervisor.record.ports.is_empty());
@@ -529,11 +530,11 @@ fn revoke_closes_all_and_retired_ports_require_fresh_approval_then_supersession(
         Supervisor::load(supervisor.path.clone(), supervisor.counters.clone(), 200).unwrap();
     restarted.record.seeded = false; // even re-seeding cannot restore retired authority
     restarted
-        .reconcile(200, Some(APPROVED), 0, &candidates, &[c, b])
+        .reconcile_current(200, Some(APPROVED), 0, &candidates, &[c, b])
         .unwrap();
     assert!(restarted.open.is_empty());
     restarted
-        .reconcile(201, Some(b), APPROVED, &candidates, &[])
+        .reconcile_current(201, Some(b), APPROVED, &candidates, &[])
         .unwrap();
     assert!(
         !restarted.open.contains_key(&b),
@@ -541,7 +542,7 @@ fn revoke_closes_all_and_retired_ports_require_fresh_approval_then_supersession(
     );
     assert_eq!(restarted.record.last_approved, Some(b));
     restarted
-        .reconcile(202, Some(APPROVED), APPROVED, &candidates, &[])
+        .reconcile_current(202, Some(APPROVED), APPROVED, &candidates, &[])
         .unwrap();
     assert!(
         restarted.open.contains_key(&b),
@@ -556,17 +557,17 @@ fn idle_retirement_is_durable_and_cannot_be_reseeded() {
     let port = spare_port();
     let candidates = [APPROVED, port];
     supervisor
-        .reconcile(100, Some(APPROVED), 0, &candidates, &[port])
+        .reconcile_current(100, Some(APPROVED), 0, &candidates, &[port])
         .unwrap();
     supervisor
-        .reconcile(100 + IDLE_SECONDS, Some(APPROVED), 0, &candidates, &[])
+        .reconcile_current(100 + IDLE_SECONDS, Some(APPROVED), 0, &candidates, &[])
         .unwrap();
     assert!(supervisor.record.retired.contains(&port));
     let mut restarted =
         Supervisor::load(supervisor.path.clone(), supervisor.counters.clone(), 1000).unwrap();
     restarted.record.seeded = false;
     restarted
-        .reconcile(
+        .reconcile_current(
             100 + IDLE_SECONDS + 60,
             Some(APPROVED),
             0,
@@ -629,7 +630,7 @@ fn synchronous_hook_retires_without_tick_and_fences_disable_reenable() {
     let port = spare_port();
     let candidates = [APPROVED, port];
     supervisor
-        .reconcile(100, Some(APPROVED), 0, &candidates, &[port])
+        .reconcile_current(100, Some(APPROVED), 0, &candidates, &[port])
         .unwrap();
     let accepted_before_revoke = supervisor.open[&port].activity.clone();
     let (endpoint, worker) = hook_supervisor(supervisor);
@@ -644,7 +645,7 @@ fn synchronous_hook_retires_without_tick_and_fences_disable_reenable() {
     drop(released);
     // Consent returns to exactly the same approval before a periodic tick.
     supervisor
-        .reconcile(101, Some(APPROVED), 0, &candidates, &[port])
+        .reconcile_current(101, Some(APPROVED), 0, &candidates, &[port])
         .unwrap();
     assert!(supervisor.open.is_empty());
     with_request_approval(Some(APPROVED), || {
@@ -653,10 +654,10 @@ fn synchronous_hook_retires_without_tick_and_fences_disable_reenable() {
             .is_none());
     });
     supervisor
-        .reconcile(102, Some(port), APPROVED, &candidates, &[])
+        .reconcile_current(102, Some(port), APPROVED, &candidates, &[])
         .unwrap();
     supervisor
-        .reconcile(103, Some(APPROVED), APPROVED, &candidates, &[])
+        .reconcile_current(103, Some(APPROVED), APPROVED, &candidates, &[])
         .unwrap();
     assert!(supervisor.open.contains_key(&port));
     with_request_approval(Some(APPROVED), || {
@@ -683,7 +684,7 @@ fn revoked_approval_refuses_preaccepted_request_before_tick_without_capture_or_a
         let (_dir, mut supervisor) = scratch();
         let port = spare_port();
         supervisor
-            .reconcile(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
+            .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
             .unwrap();
         let open = &supervisor.open[&port];
         let mut client =
@@ -760,7 +761,7 @@ fn failed_revoke_save_closes_and_tombstone_blocks_replayed_old_allowlist() {
     let port = spare_port();
     let candidates = [APPROVED, port];
     supervisor
-        .reconcile(100, Some(APPROVED), 0, &candidates, &[port])
+        .reconcile_current(100, Some(APPROVED), 0, &candidates, &[port])
         .unwrap();
     let old_disk = std::fs::read(&supervisor.path).unwrap();
     supervisor.fail_save.set(true);
@@ -779,7 +780,7 @@ fn failed_revoke_save_closes_and_tombstone_blocks_replayed_old_allowlist() {
     let mut restarted =
         Supervisor::load(supervisor.path.clone(), supervisor.counters.clone(), 101).unwrap();
     restarted
-        .reconcile(101, Some(APPROVED), 0, &candidates, &[port])
+        .reconcile_current(101, Some(APPROVED), 0, &candidates, &[port])
         .unwrap();
     assert!(restarted.open.is_empty());
     assert!(restarted.record.retired.contains(&port));
@@ -792,12 +793,12 @@ fn failed_idle_save_also_retires_before_fail_closed_cleanup() {
     let port = spare_port();
     let candidates = [APPROVED, port];
     supervisor
-        .reconcile(100, Some(APPROVED), 0, &candidates, &[port])
+        .reconcile_current(100, Some(APPROVED), 0, &candidates, &[port])
         .unwrap();
     let old_disk = std::fs::read(&supervisor.path).unwrap();
     supervisor.fail_save.set(true);
     assert!(supervisor
-        .reconcile(100 + IDLE_SECONDS, Some(APPROVED), 0, &candidates, &[])
+        .reconcile_current(100 + IDLE_SECONDS, Some(APPROVED), 0, &candidates, &[])
         .is_err());
     assert!(supervisor.open.is_empty());
     std::fs::write(&supervisor.path, old_disk).unwrap();
@@ -808,7 +809,7 @@ fn failed_idle_save_also_retires_before_fail_closed_cleanup() {
     )
     .unwrap();
     restarted
-        .reconcile(100 + IDLE_SECONDS, Some(APPROVED), 0, &candidates, &[port])
+        .reconcile_current(100 + IDLE_SECONDS, Some(APPROVED), 0, &candidates, &[port])
         .unwrap();
     assert!(restarted.open.is_empty());
     assert!(restarted.record.retired.contains(&port));
@@ -821,7 +822,7 @@ fn unknown_ticks_preserve_state_and_revocation_requires_two_consecutive_ticks() 
     let port = spare_port();
     let candidates = [APPROVED, port];
     supervisor
-        .reconcile(100, Some(APPROVED), 0, &candidates, &[port])
+        .reconcile_current(100, Some(APPROVED), 0, &candidates, &[port])
         .unwrap();
     let before = std::fs::read(&supervisor.path).unwrap();
     for read in [
@@ -831,7 +832,9 @@ fn unknown_ticks_preserve_state_and_revocation_requires_two_consecutive_ticks() 
     ] {
         let approval = approval_from_settings(read, &candidates);
         assert_eq!(approval, Approval::Unknown);
-        supervisor.tick(160, approval, 0, &candidates, &[]).unwrap();
+        supervisor
+            .tick_current(160, approval, 0, &candidates, &[])
+            .unwrap();
         assert!(supervisor.open.contains_key(&port));
         assert!(!supervisor.record.retired.contains(&port));
         assert_eq!(std::fs::read(&supervisor.path).unwrap(), before);
@@ -855,21 +858,21 @@ fn unknown_ticks_preserve_state_and_revocation_requires_two_consecutive_ticks() 
         Approval::Revoked
     );
     supervisor
-        .tick(200, Approval::Revoked, 0, &candidates, &[])
+        .tick_current(200, Approval::Revoked, 0, &candidates, &[])
         .unwrap();
     assert!(supervisor.open.contains_key(&port));
     supervisor
-        .tick(260, Approval::Unknown, 0, &candidates, &[])
+        .tick_current(260, Approval::Unknown, 0, &candidates, &[])
         .unwrap();
     supervisor
-        .tick(320, Approval::Revoked, 0, &candidates, &[])
+        .tick_current(320, Approval::Revoked, 0, &candidates, &[])
         .unwrap();
     assert!(
         supervisor.open.contains_key(&port),
         "Unknown breaks the consecutive streak"
     );
     supervisor
-        .tick(380, Approval::Revoked, 0, &candidates, &[])
+        .tick_current(380, Approval::Revoked, 0, &candidates, &[])
         .unwrap();
     assert!(supervisor.open.is_empty());
     assert!(supervisor.record.retired.contains(&port));
@@ -883,7 +886,7 @@ fn wildcard_ipv4_owner_is_not_stolen_or_shared() {
     owner.set_nonblocking(true).unwrap();
     let port = owner.local_addr().unwrap().port();
     supervisor
-        .reconcile(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
+        .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
         .unwrap();
     assert!(supervisor.open.is_empty());
     assert_eq!(supervisor.counters.bind_skipped.load(Ordering::Relaxed), 1);
@@ -915,7 +918,7 @@ fn dual_stack_ipv6_owner_vetoes_ipv4_legacy_bind() {
     let port = owner.local_addr().unwrap().port();
     let (_dir, mut supervisor) = scratch();
     supervisor
-        .reconcile(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
+        .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
         .unwrap();
     assert!(supervisor.open.is_empty());
     assert_eq!(supervisor.counters.bind_skipped.load(Ordering::Relaxed), 1);
@@ -926,7 +929,7 @@ fn dual_stack_ipv6_owner_vetoes_ipv4_legacy_bind() {
 }
 
 #[test]
-fn native_legacy_listener_does_not_enable_reuseaddr() {
+fn native_legacy_listener_enables_reuseaddr_after_wildcard_probes() {
     let listener = socket::bind(0).unwrap();
     let mut reuse: libc::c_int = -1;
     let mut length = std::mem::size_of_val(&reuse) as libc::socklen_t;
@@ -941,7 +944,7 @@ fn native_legacy_listener_does_not_enable_reuseaddr() {
         )
     };
     assert_eq!(result, 0);
-    assert_eq!(reuse, 0);
+    assert_eq!(reuse, 1);
     assert_eq!(
         listener.local_addr().unwrap().ip(),
         IpAddr::V4(Ipv4Addr::LOCALHOST)
@@ -955,25 +958,25 @@ fn busy_never_bound_entry_expires_without_counting_a_close() {
     let port = owner.local_addr().unwrap().port();
     let candidates = [APPROVED, port];
     supervisor
-        .reconcile(100, Some(APPROVED), 0, &candidates, &[port])
+        .reconcile_current(100, Some(APPROVED), 0, &candidates, &[port])
         .unwrap();
     assert!(supervisor.open.is_empty());
     assert_eq!(supervisor.record.ports[0].idle_since, Some(100));
     let mut restarted =
         Supervisor::load(supervisor.path.clone(), supervisor.counters.clone(), 200).unwrap();
     restarted
-        .reconcile(100 + IDLE_SECONDS - 1, Some(APPROVED), 0, &candidates, &[])
+        .reconcile_current(100 + IDLE_SECONDS - 1, Some(APPROVED), 0, &candidates, &[])
         .unwrap();
     assert_eq!(restarted.record.ports[0].idle_since, Some(100));
     restarted
-        .reconcile(100 + IDLE_SECONDS, Some(APPROVED), 0, &candidates, &[])
+        .reconcile_current(100 + IDLE_SECONDS, Some(APPROVED), 0, &candidates, &[])
         .unwrap();
     assert!(restarted.record.ports.is_empty());
     assert!(restarted.record.retired.contains(&port));
     assert_eq!(restarted.counters.closed.load(Ordering::Relaxed), 0);
     drop(owner);
     restarted
-        .reconcile(200 + IDLE_SECONDS, Some(APPROVED), 0, &candidates, &[port])
+        .reconcile_current(200 + IDLE_SECONDS, Some(APPROVED), 0, &candidates, &[port])
         .unwrap();
     assert!(restarted.open.is_empty());
     let _released = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
@@ -985,7 +988,7 @@ fn empty_supervisor_waits_until_tick_and_live_socket_drains_sixteen_at_once() {
     assert_eq!(supervisor.wait_duration(100, 160), Duration::from_secs(60));
     let port = spare_port();
     supervisor
-        .reconcile(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
+        .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
         .unwrap();
     assert_eq!(
         supervisor.wait_duration(100, 160),
@@ -1024,11 +1027,22 @@ fn accept_errors_back_off_rate_limit_and_drop_for_tick_rebind() {
         state.failed(now + Duration::from_secs(60), &resource),
         (AcceptErrorAction::Backoff, true)
     );
+    let retry = io::Error::from_raw_os_error(libc::ECONNABORTED);
+    assert_eq!(
+        state.failed(now + Duration::from_secs(61), &retry).0,
+        AcceptErrorAction::Retry
+    );
+    assert_eq!(state.failures, 0);
+    state.failed(now + Duration::from_secs(62), &resource);
+    assert_eq!(
+        state.retry_at,
+        Some(now + Duration::from_secs(62) + RELAY_ACCEPT_BACKOFF_START)
+    );
     let (_dir, mut supervisor) = scratch();
     let port = spare_port();
     let candidates = [APPROVED, port];
     supervisor
-        .reconcile(100, Some(APPROVED), 0, &candidates, &[port])
+        .reconcile_current(100, Some(APPROVED), 0, &candidates, &[port])
         .unwrap();
     supervisor.accept_failed(port, now, &resource);
     supervisor.accept_ready(now, |_, _| panic!("accept during backoff"));
@@ -1037,7 +1051,7 @@ fn accept_errors_back_off_rate_limit_and_drop_for_tick_rebind() {
     assert!(supervisor.open.is_empty());
     assert_eq!(supervisor.counters.closed.load(Ordering::Relaxed), 1);
     supervisor
-        .reconcile(160, Some(APPROVED), 0, &candidates, &[])
+        .reconcile_current(160, Some(APPROVED), 0, &candidates, &[])
         .unwrap();
     assert!(supervisor.open.contains_key(&port));
 }
@@ -1048,7 +1062,7 @@ fn rebind_preserves_unflushed_activity_and_the_normal_flush_deadline() {
     let port = spare_port();
     let candidates = [APPROVED, port];
     supervisor
-        .reconcile(100, Some(APPROVED), 0, &candidates, &[port])
+        .reconcile_current(100, Some(APPROVED), 0, &candidates, &[port])
         .unwrap();
     let recent = 100 + IDLE_SECONDS - 1;
     supervisor.open[&port].activity.accepted_at(recent);
@@ -1062,7 +1076,7 @@ fn rebind_preserves_unflushed_activity_and_the_normal_flush_deadline() {
     let disk: Record = load_private_record(&supervisor.path).unwrap();
     assert_eq!(disk.ports[0].idle_since, Some(100));
     supervisor
-        .reconcile(recent + 2, Some(APPROVED), 0, &candidates, &[])
+        .reconcile_current(recent + 2, Some(APPROVED), 0, &candidates, &[])
         .unwrap();
     assert!(supervisor.open.contains_key(&port));
     assert!(!supervisor.record.retired.contains(&port));
@@ -1081,7 +1095,7 @@ fn rebind_abandons_a_descriptor_replaced_by_an_unrelated_file() {
     let (dir, mut supervisor) = scratch();
     let port = spare_port();
     supervisor
-        .reconcile(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
+        .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
         .unwrap();
     let descriptor = supervisor.open[&port]
         .listener
@@ -1140,7 +1154,7 @@ fn rebind_drains_an_export_and_its_success_bookkeeping_before_snapshot() {
     let port = spare_port();
     let candidates = [APPROVED, port];
     supervisor
-        .reconcile(100, Some(APPROVED), 0, &candidates, &[port])
+        .reconcile_current(100, Some(APPROVED), 0, &candidates, &[port])
         .unwrap();
     let activity = supervisor.open[&port].activity.clone();
     let recent = 100 + IDLE_SECONDS - 1;
@@ -1181,11 +1195,154 @@ fn rebind_drains_an_export_and_its_success_bookkeeping_before_snapshot() {
     assert!(matches!(premature, Err(mpsc::RecvTimeoutError::Timeout)));
     assert_eq!(supervisor.record.ports[0].idle_since, Some(recent));
     supervisor
-        .reconcile(recent + 2, Some(APPROVED), 0, &candidates, &[])
+        .reconcile_current(recent + 2, Some(APPROVED), 0, &candidates, &[])
         .unwrap();
     assert!(supervisor.open.contains_key(&port));
     assert!(!supervisor.record.retired.contains(&port));
     supervisor.flush_activity(recent + 2).unwrap();
     let restored: Record = load_private_record(&supervisor.path).unwrap();
     assert_eq!(restored.ports[0].idle_since, Some(recent));
+}
+
+pub(crate) fn with_running_listener_for_test(run: impl FnOnce()) -> (usize, usize) {
+    let (_dir, mut supervisor) = scratch();
+    let port = spare_port();
+    supervisor
+        .reconcile_current(100, Some(APPROVED), 0, &[APPROVED, port], &[port])
+        .unwrap();
+    assert_eq!(supervisor.open.len(), 1);
+    let (sender, receiver) = mpsc::channel();
+    let endpoint = Endpoint {
+        sender,
+        admission: supervisor.admission.clone(),
+    };
+    let worker = thread::spawn(move || {
+        while let Ok(command) = receiver.recv() {
+            supervisor.handle_command(command).unwrap();
+        }
+        supervisor
+    });
+    with_endpoint(endpoint, run);
+    let supervisor = worker.join().unwrap();
+    (supervisor.open.len(), supervisor.record.retired.len())
+}
+
+#[test]
+fn legacy_listener_rebinds_immediately_after_a_server_first_close() {
+    let listener = socket::bind(0).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+    apply_relay_io_timeouts(&client);
+    let (mut server, _) = listener.accept().unwrap();
+    server.set_nonblocking(false).unwrap();
+    apply_relay_io_timeouts(&server);
+    let request = b"POST /v1/metrics HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}";
+    client.write_all(request).unwrap();
+    let mut received = vec![0; request.len()];
+    server.read_exact(&mut received).unwrap();
+    assert_eq!(received, request);
+    let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+    server.write_all(response).unwrap();
+    server.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut received = Vec::new();
+    client.read_to_end(&mut received).unwrap();
+    assert_eq!(received, response); // server FIN arrived before the client FIN
+    client.shutdown(std::net::Shutdown::Write).unwrap();
+    assert_eq!(server.read_to_end(&mut Vec::new()).unwrap(), 0);
+    drop(server);
+    drop(client);
+    drop(listener);
+    let replacement = socket::bind(port).expect("our TIME_WAIT must not block rebind");
+    assert_eq!(replacement.local_addr().unwrap().port(), port);
+}
+
+// Existing fixtures inject an already-read approval. New race fixtures pass
+// an explicitly earlier generation to the production methods below.
+impl Supervisor {
+    fn reconcile_current(
+        &mut self,
+        now: u64,
+        approved: Option<u16>,
+        primary: u16,
+        candidates: &[u16],
+        seed: &[u16],
+    ) -> Result<()> {
+        let generation = self.admission.generation.load(Ordering::SeqCst);
+        self.reconcile(now, approved, primary, candidates, seed, generation)
+    }
+
+    fn tick_current(
+        &mut self,
+        now: u64,
+        approval: Approval,
+        primary: u16,
+        candidates: &[u16],
+        seed: &[u16],
+    ) -> Result<()> {
+        let generation = self.admission.generation.load(Ordering::SeqCst);
+        self.tick(now, approval, primary, candidates, seed, generation)
+    }
+}
+
+#[test]
+fn revoke_between_approval_read_and_bind_fences_the_new_listener() {
+    let (_dir, mut supervisor) = scratch();
+    let busy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = busy.local_addr().unwrap().port();
+    let candidates = [APPROVED, port];
+    supervisor
+        .reconcile_current(100, Some(APPROVED), 0, &candidates, &[port])
+        .unwrap();
+    assert!(supervisor.open.is_empty());
+    // Same order as the production tick: snapshot, read, then an injected
+    // synchronous revoke phase before reconcile gets to bind the freed port.
+    let generation = supervisor.admission.generation.load(Ordering::SeqCst);
+    let approval = Approval::Approved(APPROVED);
+    supervisor
+        .admission
+        .generation
+        .fetch_add(1, Ordering::SeqCst);
+    drop(busy);
+    supervisor
+        .tick(160, approval, 0, &candidates, &[], generation)
+        .unwrap();
+    let activity = &supervisor.open[&port].activity;
+    assert_eq!(activity.generation, generation);
+    with_request_approval(Some(APPROVED), || {
+        assert!(activity
+            .export_if_approved(|| panic!("mid-tick revoke allowed export"))
+            .is_none());
+    });
+}
+
+#[test]
+fn changed_approval_tick_cannot_adopt_a_concurrent_revokes_generation() {
+    let (_dir, mut supervisor) = scratch();
+    let port = spare_port();
+    let next = 2;
+    let candidates = [APPROVED, next, port];
+    supervisor
+        .reconcile_current(100, Some(APPROVED), 0, &candidates, &[port])
+        .unwrap();
+    let activity = supervisor.open[&port].activity.clone();
+    let generation = supervisor.admission.generation.load(Ordering::SeqCst);
+    let approval = Approval::Approved(next);
+    supervisor
+        .admission
+        .generation
+        .fetch_add(1, Ordering::SeqCst);
+    supervisor
+        .tick(160, approval, 0, &candidates, &[], generation)
+        .unwrap();
+    assert_eq!(supervisor.record.last_approved, Some(APPROVED));
+    assert_eq!(supervisor.open[&port].activity.generation, generation);
+    assert_eq!(
+        supervisor.admission.generation.load(Ordering::SeqCst),
+        generation + 1
+    );
+    with_request_approval(Some(APPROVED), || {
+        assert!(activity
+            .export_if_approved(|| panic!("refreshed a revoked generation"))
+            .is_none());
+    });
 }

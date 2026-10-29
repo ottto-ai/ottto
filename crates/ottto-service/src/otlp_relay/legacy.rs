@@ -166,6 +166,7 @@ impl Activity {
         port: u16,
         approved: u16,
         last: u64,
+        generation: u64,
         counters: Arc<Counters>,
         admission: Arc<Admission>,
     ) -> Self {
@@ -174,7 +175,7 @@ impl Activity {
             counters,
             port,
             approved,
-            generation: admission.generation.load(Ordering::SeqCst),
+            generation,
             live: Arc::new(AtomicBool::new(true)),
             admission,
         }
@@ -422,10 +423,13 @@ impl AcceptState {
     }
 
     fn failed(&mut self, now: Instant, error: &io::Error) -> (AcceptErrorAction, bool) {
-        self.failures = self.failures.saturating_add(1);
         let action = classify_accept_error(error);
         if action == AcceptErrorAction::Backoff {
+            self.failures = self.failures.saturating_add(1);
             self.retry_at = Some(now + relay_accept_backoff(self.failures));
+        } else {
+            self.failures = 0;
+            self.retry_at = None;
         }
         let log = self.log_at.map_or(true, |deadline| now >= deadline);
         if log {
@@ -611,14 +615,27 @@ impl Supervisor {
         primary: u16,
         candidates: &[u16],
         seed: &[u16],
+        generation: u64,
     ) -> Result<()> {
         let approved = approved.filter(|port| candidates.contains(port));
         self.durable_retired
             .retain(|port| candidates.contains(port));
         let changed_approval = self.record.last_approved != approved;
-        if changed_approval || approved.is_none() {
-            self.admission.generation.fetch_add(1, Ordering::SeqCst);
-        }
+        let generation = if changed_approval || approved.is_none() {
+            // Advance only the generation whose approval this tick read. A
+            // concurrent revoke must not donate its newer generation to us.
+            match self.admission.generation.compare_exchange(
+                generation,
+                generation.wrapping_add(1),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(previous) => previous.wrapping_add(1),
+                Err(_) => return Ok(()),
+            }
+        } else {
+            generation
+        };
         let admission = self.admission.clone();
         let _exports = admission
             .exports
@@ -658,7 +675,7 @@ impl Supervisor {
             if let Some(approved) = approved {
                 for open in self.open.values_mut() {
                     open.activity.approved = approved;
-                    open.activity.generation = admission.generation.load(Ordering::SeqCst);
+                    open.activity.generation = generation;
                 }
             }
         }
@@ -674,6 +691,7 @@ impl Supervisor {
                         entry.port,
                         approved.expect("eligible legacy port requires approval"),
                         first,
+                        generation,
                         self.counters.clone(),
                         admission.clone(),
                     );
@@ -708,6 +726,7 @@ impl Supervisor {
         primary: u16,
         candidates: &[u16],
         seed: &[u16],
+        generation: u64,
     ) -> Result<()> {
         let approved = match approval {
             Approval::Unknown => {
@@ -726,7 +745,7 @@ impl Supervisor {
                 Some(port)
             }
         };
-        self.reconcile(now, approved, primary, candidates, seed)
+        self.reconcile(now, approved, primary, candidates, seed, generation)
     }
 
     fn accept_failed(&mut self, port: u16, now: Instant, error: &io::Error) {
@@ -878,6 +897,7 @@ pub(super) fn spawn(daemon: LocalDaemon, source: SnapshotSource, primary: Arc<At
                 loop {
                     let now = now_seconds();
                     if now >= next_tick {
+                        let generation = admission.generation.load(Ordering::SeqCst);
                         let approval = read_approval();
                         let approved = match approval {
                             Approval::Approved(port) => Some(port),
@@ -899,6 +919,7 @@ pub(super) fn spawn(daemon: LocalDaemon, source: SnapshotSource, primary: Arc<At
                             primary.load(Ordering::Relaxed),
                             &candidates,
                             &seed,
+                            generation,
                         )?;
                         next_tick = now.saturating_add(RETRY_SECONDS);
                     }
@@ -927,6 +948,9 @@ pub(super) fn spawn(daemon: LocalDaemon, source: SnapshotSource, primary: Arc<At
         relay_log!("could not spawn legacy OTLP supervisor: {error}");
     }
 }
+
+#[cfg(all(test, unix))]
+pub(crate) use tests::with_running_listener_for_test;
 
 #[cfg(all(test, unix))]
 mod tests;
