@@ -99,10 +99,11 @@ impl Fixture {
         });
         (index, result, reads, rows)
     }
-    fn save_and_report(&self, index: &ScanIndex, scan: &SourceScanResult) -> Value {
+    fn save_and_report(&self, index: &mut ScanIndex, scan: &SourceScanResult) -> Value {
         let path = self.root.join("index.json");
-        let mut checkpoint = index.clone();
-        checkpoint.save(&path).unwrap();
+        // Preserve the production save's updated optimistic-concurrency stamp
+        // in the index passed into the next real page.
+        index.save(&path).unwrap();
         let saved = ScanIndex::load(&path).unwrap();
         let (_, rows) = capture(|| scan.report_discovery_growth_after_save(&saved));
         assert_eq!(rows.len(), 1, "one saved-page observation row");
@@ -169,11 +170,11 @@ fn grown_refused_then_two_unchanged_passes_read_no_extra_body_bytes() {
         crate::snapshot_sync::settle_withheld_for_test(&baseline, parsed, scan.clone());
     assert_eq!(committed.files[&key].size_bytes, committed_size);
     assert!(committed.claude_account_deferred_holds.contains_key(&key));
-    let counts = f.save_and_report(&committed, &scan);
+    let counts = f.save_and_report(&mut committed, &scan);
     fate(&counts, 0, 1); // a working parse is not a committed catch-up
     assert_eq!(counts["discovery_retained_grown_age"]["gt_90d"], 1);
     for pass in 0..2 {
-        let (idle, scan, reads, rows) = f.page(source, committed);
+        let (mut idle, scan, reads, rows) = f.page(source, committed);
         assert!(
             reads.0.lock().unwrap().0.is_empty(),
             "pass {pass}: no acquisition"
@@ -191,7 +192,7 @@ fn grown_refused_then_two_unchanged_passes_read_no_extra_body_bytes() {
         );
         assert_eq!(idle.files[&key].size_bytes, committed_size);
         assert!(idle.claude_account_deferred_holds.contains_key(&key));
-        let counts = f.save_and_report(&idle, &scan);
+        let counts = f.save_and_report(&mut idle, &scan);
         fate(&counts, 0, 1);
         assert_eq!(counts["discovery_retained_grown_age"]["gt_90d"], 1);
         committed = ScanIndex::load(&f.root.join("index.json")).unwrap();
@@ -205,9 +206,9 @@ fn grown_catchup_reports_committed_only_against_saved_extent() {
     let (baseline, _, _, _) = f.page(SnapshotSource::ClaudeCode, ScanIndex::default());
     f.append("second");
     f.age(31);
-    let (caught_up, scan, reads, _) = f.page(SnapshotSource::ClaudeCode, baseline);
+    let (mut caught_up, scan, reads, _) = f.page(SnapshotSource::ClaudeCode, baseline);
     assert_eq!(reads.0.lock().unwrap().0, vec![growth_mode()]);
-    let counts = f.save_and_report(&caught_up, &scan);
+    let counts = f.save_and_report(&mut caught_up, &scan);
     fate(&counts, 1, 0);
     assert_eq!(
         counts["discovery_retained_grown_age"],
@@ -231,11 +232,11 @@ fn oversized_grown_age_is_disclosed_for_every_source_without_body_reads() {
         let mut entry = super::tests::manifest_index_entry(None);
         entry.size_bytes = cap;
         index.files.insert(key.clone(), entry);
-        let (next, scan, reads, _) = f.page(source, index);
+        let (mut next, scan, reads, _) = f.page(source, index);
         assert_eq!(next.files[&key].size_bytes, cap);
         assert!(reads.0.lock().unwrap().0.is_empty());
         assert_eq!(scan.scanned_file_count, 0);
-        let counts = f.save_and_report(&next, &scan);
+        let counts = f.save_and_report(&mut next, &scan);
         fate(&counts, 0, 1);
         assert_eq!(counts["discovery_retained_grown_age"]["gt_90d"], 1);
     }
@@ -256,7 +257,7 @@ fn truncate_then_regrow_past_committed_extent_rebuilds_from_zero() {
     f.append("new-tail");
     f.age(31);
     assert!(fs::metadata(&f.path).unwrap().len() > prior);
-    let (rewritten, scan, reads, _) = f.page(SnapshotSource::ClaudeCode, baseline);
+    let (mut rewritten, scan, reads, _) = f.page(SnapshotSource::ClaudeCode, baseline);
     assert_eq!(
         reads.0.lock().unwrap().0,
         vec![DeliveryMode::Full],
@@ -267,5 +268,5 @@ fn truncate_then_regrow_past_committed_extent_rebuilds_from_zero() {
         2,
         "rebuild delivers the entire rewritten file"
     );
-    fate(&f.save_and_report(&rewritten, &scan), 1, 0);
+    fate(&f.save_and_report(&mut rewritten, &scan), 1, 0);
 }

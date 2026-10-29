@@ -42335,7 +42335,8 @@ fn reconcile_missing_index_entries_with_side(
             .as_ref()
             .is_some_and(|traversal| traversal.observed_index_keys.contains(key));
         // The existing reconciliation page bounds these index-driven absence
-        // probes. Missing parents/roots keep the hold, even without audit debt.
+        // probes. Missing roots or unsafe ancestors keep the hold; a missing
+        // intermediate component beneath the validated root proves absence.
         if !observed && index.claude_account_deferred_holds.contains_key(key) {
             index.retire_absent_account_hold(key);
             if !index.files.contains_key(key) {
@@ -47630,7 +47631,7 @@ impl ScanIndex {
     /// Census absence is only a prompt to prove removal. Hold-only keys have
     /// no committed entry to visit during reconciliation, but own the same
     /// debt. Inventory at most the existing 4,096-hold cap; no transcript read
-    /// or second directory walk, and missing/uncertain ancestors keep the hold.
+    /// or second directory walk; unreadable or unsafe ancestors keep the hold.
     fn retain_observed_claude_account_deferred_holds(&mut self, observed: &BTreeSet<String>) {
         let unobserved = self
             .claude_account_deferred_holds

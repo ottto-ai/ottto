@@ -305,8 +305,9 @@ pub(crate) fn discard_retained() {
     });
 }
 /// Other retained graphs may be unsupported without affecting this known
-/// bounded graph. The owner must charge this graph FIRST, then use this hook
-/// when discarding the others; only our own refusal/poison loses the memo.
+/// bounded graph. Sibling graphs are charged first; this graph is independently
+/// refused from the remainder. Unrelated sibling refusal alone cannot erase a
+/// fitting memo; only our own refusal/poison loses it.
 pub(crate) fn discard_if_refused() {
     with_mutex(|mutex| {
         let (mut state, poisoned) = match mutex.lock() {

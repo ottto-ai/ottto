@@ -1073,8 +1073,13 @@ fn bound_terminal_hold_skips_until_family_changes() {
 // parse or proved absence.
 #[test]
 fn claude_account_deferred_holds_are_durable_bounded_and_pruned_by_proof() {
-    let held_key = "/opaque/deferred.jsonl";
-    let other_key = "/opaque/other.jsonl";
+    let dir = crate::test_scratch::ScratchDir::new("account-hold-rooted-proof");
+    let scan_root = fs::canonicalize(dir.to_path_buf()).unwrap();
+    let held_path = scan_root.join("deferred.jsonl");
+    let other_path = scan_root.join("other.jsonl");
+    fs::write(&held_path, b"owed\n").unwrap();
+    let held_key = held_path.to_str().unwrap();
+    let other_key = other_path.to_str().unwrap();
     let mut index = ScanIndex::default();
     index.file_snapshot_fingerprints.insert(
         held_key.to_string(),
@@ -1118,8 +1123,8 @@ fn claude_account_deferred_holds_are_durable_bounded_and_pruned_by_proof() {
     let [released, _, _] = crate::local_resource_diagnostics::take_withheld_for_test();
     assert_eq!(released, BTreeMap::from([("resolved", 1)]));
 
-    // A complete traversal proves absence only for keys neither indexed nor
-    // observed.
+    // Census absence prompts a rooted proof; absence of index/observation
+    // membership alone is never enough to release owed usage.
     let mut observed = index.clone();
     observed.retain_observed_claude_account_deferred_holds(&BTreeSet::from([held_key.to_string()]));
     assert_eq!(observed.claude_account_deferred_hold_count(), 1);
@@ -1130,6 +1135,24 @@ fn claude_account_deferred_holds_are_durable_bounded_and_pruned_by_proof() {
     indexed.retain_observed_claude_account_deferred_holds(&BTreeSet::new());
     assert_eq!(indexed.claude_account_deferred_hold_count(), 1);
     let mut absent = index.clone();
+    absent.retain_observed_claude_account_deferred_holds(&BTreeSet::new());
+    assert_eq!(
+        absent.claude_account_deferred_hold_count(),
+        1,
+        "no configured proof root"
+    );
+    ensure_bounded_traversal(
+        SnapshotSource::ClaudeCode,
+        std::slice::from_ref(&scan_root),
+        &mut absent,
+        "2026-10-07T12:00:00Z",
+        7,
+    );
+    fs::remove_file(&held_path).unwrap();
+    assert!(sampled_audit::proven_absent(
+        &held_path,
+        std::slice::from_ref(&scan_root)
+    ));
     absent.retain_observed_claude_account_deferred_holds(&BTreeSet::new());
     assert_eq!(absent.claude_account_deferred_hold_count(), 0);
 

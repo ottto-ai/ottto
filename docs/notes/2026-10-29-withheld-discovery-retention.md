@@ -12,9 +12,10 @@ Validated parses carry an immediate RAM content witness; metadata-only touches
 cause no parse or line delivery, while existing bounded identity samples remain.
 Known generation identity is required to Skip. One bounded advisory map carries
 memo, last-parsed tokens and process-first-seen wall-clock age estimates. Its
-portable charge precedes other daemon graphs and survives an unrelated layout
-fallback. Its own budget refusal explicitly reports held count and unavailable
-details. Positive absence requires NotFound under readable parent/root; this
+portable charge follows admitted sibling graphs, is independently refusable,
+and survives an unrelated layout fallback when it fits. Its own budget refusal explicitly reports held count and unavailable
+details. Positive absence requires a securely validated readable root and nearest
+existing ancestor, with nofollow ENOENT at the first missing component; this
 retires audit debt without source-verification credit and preserves Codex
 protection. Deletion counts events and last-known withheld tokens.
 
@@ -34,9 +35,10 @@ version bump, upload authority, or production configuration change.
 Round 17 repairs both absence exits: reconciliation completes account retirement
 without falling through into ordinary incidence deletion, and a bounded inventory
 also checks hold-only checkpoints. The common absence proof opens each parent
-beneath a configured root without following links, checks final-name absence,
-then revalidates the directory chain. Missing ancestors or uncertain identity
-retain debt. Healthy-census deletion tests keep the original fingerprint set and
+beneath a configured root without following links, checks the first missing component,
+then revalidates the directory chain. A missing configured root or uncertain
+ancestor identity retains debt; a missing intermediate directory beneath a
+validated root permits release (Round18 ruling). Healthy-census deletion tests keep the original fingerprint set and
 ACK state through real Completed settlement. A watcher hint through an
 intermediate symlink grants no removal authority.
 

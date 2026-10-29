@@ -2638,7 +2638,7 @@ fn completed_withheld_sampled_deletion_releases_debt_with_and_without_hint() {
         append(&path, &assistant_line("u1"));
         let (previous, _, _, _) = page(ScanIndex::default(), &[]);
         append(&path, &assistant_line("u2"));
-        let (parsed, scan, recorder, _) = page(previous.clone(), &[]);
+        let (mut parsed, scan, recorder, _) = page(previous.clone(), &[]);
         let modes: Vec<_> = recorder
             .events()
             .into_iter()
@@ -2648,7 +2648,15 @@ fn completed_withheld_sampled_deletion_releases_debt_with_and_without_hint() {
             })
             .collect();
         assert_eq!(modes, vec![held_growth_mode()]);
+        // `finish` normally simulates accepted upload for reader tests. This
+        // page instead enters account classification BEFORE upload, so only
+        // the baseline's real ACKs exist at this production seam.
+        parsed.accepted_snapshot_fingerprints = previous.accepted_snapshot_fingerprints.clone();
         let mut held = crate::snapshot_sync::settle_withheld_for_test(&previous, parsed, scan);
+        assert_eq!(
+            held.accepted_snapshot_fingerprints, previous.accepted_snapshot_fingerprints,
+            "account-held acquisition grants no ACK"
+        );
         assert!(held.claude_account_deferred_holds.contains_key(&key));
         // Linux refuses the native cache layout; still exercise the same audit
         // obligation in CI without pretending it performed a Tail there.
@@ -2773,8 +2781,16 @@ fn withheld_removed_project_releases_account_and_audit_debt() {
         append(&path, &assistant_line("u1"));
         let (previous, _, _) = finish(new_scan(&root.projects(), ScanIndex::default()));
         append(&path, &assistant_line("u2"));
-        let (parsed, scan, _) = finish(new_scan(&root.projects(), previous.clone()));
+        let (mut parsed, scan, _) = finish(new_scan(&root.projects(), previous.clone()));
+        // `finish` normally simulates accepted upload for reader tests. This
+        // page instead enters account classification BEFORE upload, so only
+        // the baseline's real ACKs exist at this production seam.
+        parsed.accepted_snapshot_fingerprints = previous.accepted_snapshot_fingerprints.clone();
         let mut held = crate::snapshot_sync::settle_withheld_for_test(&previous, parsed, scan);
+        assert_eq!(
+            held.accepted_snapshot_fingerprints, previous.accepted_snapshot_fingerprints,
+            "account-held acquisition grants no ACK"
+        );
         assert!(held.claude_account_deferred_holds.contains_key(&key));
         let fp = held.files[&key].source_file_fingerprint.clone();
         assert!(held.stage_sampled_audit(

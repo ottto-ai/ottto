@@ -407,17 +407,19 @@ past-due sampled audit on such a key is deferred to its next counted re-parse
 `counts.withheld_hold_released` counts released holds: `deleted` (the held file
 was proved absent), `deleted_tokens` (its last-known withheld tokens, when
 available), and `resolved` (a parse bound the account). A held audit obligation
-is retired only by `sampled_audit::proven_absent`: final-name NotFound beneath
-a readable configured root and a descriptor-relative parent chain opened with
-no-follow directory flags. Every ancestor is revalidated; symlinks, missing
-ancestors and substitutions keep debt. A bounded inventory of up to 4,096
-recorded holds applies the same proof to held-new keys without committed entries.
-Healthy-census retirement finishes that item, preserving audited fingerprint
-incidence and ACK custody rather than falling through ordinary deletion.
-This additionally emits
-`counts.audit_retired_absent.events`; it grants no Full, source-verification or
-census credit. Missing parents, unreadable roots and permission errors keep
-debt. Codex-protected entries keep their separate protected history.
+is retired only by `sampled_audit::proven_absent`: ENOENT of the file or a missing
+intermediate directory beneath a readable configured root. The chain to the
+nearest existing ancestor uses descriptor-relative nofollow opens, is readable,
+and is revalidated before accepting absence. Symlink/non-directory ancestors,
+permission errors, substitutions, or a missing/unreadable configured root keep
+debt; a removed `projects/<p>` directory under a healthy projects root permits
+release. A bounded inventory of up to 4,096 recorded holds applies this same proof
+to held-new keys without committed entries. Healthy-census retirement finishes
+that item, preserving audited fingerprint incidence and existing ACK custody
+rather than falling through ordinary deletion. This additionally emits
+`counts.audit_retired_absent.events` and, when a request-census record was
+removed, `Vanished::RequestCensusRemoved`; no Full/source/census credit is granted.
+Codex-protected entries keep their separate protected history.
 `counts.withheld_hold_unrecorded` counts refused admission attempts past the
 4,096-hold cap (`events`) and their withheld `tokens`; these are attempts, never
 unique keys. Admission follows the completed-parse order; existing holds remain
@@ -427,8 +429,12 @@ Unknown; no $0 is invented. All three are drained like
 `entries` (at most 4,096) and `retained_bytes`, the bytes charged to the sync
 owner's process-retained bound using a conservative layout-independent allowance
 (1,536 bytes per possible B-tree node per entry, plus a root and state header).
-This charge is admitted before other resident graphs; an unsupported sibling
-graph does not discard it. Its own refused charge drops the advisory details.
+Codex-version, native-comparison and continuation graphs are admitted first;
+this memo is charged only from the remainder. Its own refusal drops only the
+memo details and cannot discard those admitted sibling graphs or BASE-exit
+native comparison. An unsupported sibling alone does not discard a memo that
+fits the available allowance. Persistently refused memo details remain unknown
+and require the existing counted recovery path until they can be retained.
 Omitted while empty. `counts.withheld_held_tokens` is a gauge of the withheld
 tokens across recorded holds (each key's tokens at its last parse), and
 `counts.withheld_held_age` counts those held keys by wall-clock estimates since
