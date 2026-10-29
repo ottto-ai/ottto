@@ -31676,6 +31676,7 @@ impl OwnedSourceScan {
             // Counted once the page actually reads the file (R2-M3): a fence
             // or deferral below does not inflate the read diagnostics.
             let mut planned_mode = None;
+            let mut returned_refusal = None;
             // U1a-2a G7: a side read's acquisition is a fresh `Full` read
             // under the side scope: no retained take, no admission observes
             // or counters, no debt. Failures are its charged attempt.
@@ -31732,7 +31733,8 @@ impl OwnedSourceScan {
                 // The original and its funding move together if ordinary cache
                 // admission refuses. The active frame retries before any read.
                 macro_rules! return_original {
-                    ($taken:expr) => {{
+                    ($taken:expr, $reason:expr) => {{
+                        let reason: Option<&'static str> = $reason;
                         match context.cache.return_prepared_taken(key.clone(), $taken) {
                             Ok(()) =>
                             {
@@ -31766,9 +31768,15 @@ impl OwnedSourceScan {
                                     group: None,
                                     side_origin,
                                 }));
+                                pending!();
                             }
                         }
-                        pending!();
+                        if let Some(reason) = reason {
+                            returned_refusal = Some(reason);
+                            retained_offset = None;
+                        } else {
+                            pending!();
+                        }
                     }};
                 }
                 // Kept beside the moved copy for R0's completion decision.
@@ -31825,7 +31833,7 @@ impl OwnedSourceScan {
                         if source == SnapshotSource::ClaudeCode {
                             claude_request_census::retain_held(index, &candidate);
                         }
-                        return_original!(taken);
+                        return_original!(taken, Some("census"));
                     }
                 }
                 if owning_header_is_current && state_census_complete && sidecar_census_complete {
@@ -31844,7 +31852,7 @@ impl OwnedSourceScan {
                         if source == SnapshotSource::ClaudeCode {
                             claude_request_census::retain_held(index, &candidate);
                         }
-                        return_original!(retained.take().expect("present"));
+                        return_original!(retained.take().expect("present"), Some("dependency"));
                     }
                     if let Some(reduction_sidecar) = reduction_sidecar {
                         let debt =
@@ -32007,7 +32015,7 @@ impl OwnedSourceScan {
                                 if source == SnapshotSource::ClaudeCode {
                                     claude_request_census::retain_held(index, &candidate);
                                 }
-                                return_original!(taken);
+                                return_original!(taken, Some("eligibility"));
                             }
                         }
                         let old = retained;
@@ -32023,24 +32031,45 @@ impl OwnedSourceScan {
                             Err(rejected) => {
                                 context.admission.prepare_failed =
                                     context.admission.prepare_failed.saturating_add(1);
+                                let refusal = match rejected.refusal {
+                                    sampled_jsonl::PreparationRefusal::Transient => None,
+                                    sampled_jsonl::PreparationRefusal::NonTransient(reason) => {
+                                        Some(reason)
+                                    }
+                                };
                                 if let Some(taken) = rejected.taken {
                                     if source == SnapshotSource::ClaudeCode {
                                         claude_request_census::retain_held(index, &candidate);
                                     }
-                                    return_original!(taken);
+                                    return_original!(taken, refusal);
                                 }
-                                #[cfg(unix)]
-                                if let Some(lease) = preparation_lease.take() {
-                                    lease.release();
+                                if refusal.is_some() {
+                                    match parser.prepare_acquisition_owned(
+                                        None,
+                                        &scope,
+                                        debt,
+                                        sampled_scan::now_seconds(),
+                                    ) {
+                                        Ok(mode) => mode,
+                                        Err(_) => {
+                                            census.record_unreadable(UnreadableCause::Reduction, 1);
+                                            pending!();
+                                        }
+                                    }
+                                } else {
+                                    #[cfg(unix)]
+                                    if let Some(lease) = preparation_lease.take() {
+                                        lease.release();
+                                    }
+                                    if source == SnapshotSource::ClaudeCode {
+                                        claude_request_census::invalidate_claude_request_census(
+                                            index,
+                                            &candidate.path,
+                                        );
+                                    }
+                                    census.record_unreadable(UnreadableCause::Reduction, 1);
+                                    pending!();
                                 }
-                                if source == SnapshotSource::ClaudeCode {
-                                    claude_request_census::invalidate_claude_request_census(
-                                        index,
-                                        &candidate.path,
-                                    );
-                                }
-                                census.record_unreadable(UnreadableCause::Reduction, 1);
-                                pending!();
                             }
                         };
                         #[cfg(unix)]
@@ -32179,6 +32208,21 @@ impl OwnedSourceScan {
                         });
                     }
                 }
+            }
+            // MAIN reads even when optional reduction dependencies/census refuse
+            // reuse. This plan counts that raw Full; it grants no retention.
+            if returned_refusal.is_some() && planned_mode.is_none() {
+                let context = sampling.as_ref().expect("returned sampled original");
+                let Ok(mode) = parser.prepare_acquisition_owned(
+                    None,
+                    &context.namespace,
+                    None,
+                    sampled_scan::now_seconds(),
+                ) else {
+                    census.record_unreadable(UnreadableCause::Reduction, 1);
+                    pending!();
+                };
+                planned_mode = Some((mode, None));
             }
             let mut active = Box::new(OwnedActiveFile {
                 comparison_target,
@@ -32342,6 +32386,14 @@ impl OwnedSourceScan {
             }
             if let Some((context, (mode, audit_due))) = sampling.as_mut().zip(planned_mode) {
                 context.record_mode(mode, audit_due);
+                if matches!(mode, crate::transcript_acquisition::ReadMode::Full(_)) {
+                    if let Some(reason) = returned_refusal {
+                        crate::local_resource_diagnostics::durable_tail_alarm(
+                            source.api_slug(),
+                            &serde_json::json!({"returned_original_full": {(reason): 1}}),
+                        );
+                    }
+                }
             }
             if let Some(delivery) = line_delivery.as_mut() {
                 delivery.arm();
