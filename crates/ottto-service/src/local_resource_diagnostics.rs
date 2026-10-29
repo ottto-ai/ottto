@@ -599,12 +599,29 @@ impl Observation {
     }
 }
 
+// Final upload candidates compared with their retained accepted bodies on this worker.
+// Drained by the existing finish record; no identifiers reach the log.
+thread_local! {
+    static ACCOUNT_HASH_CHANGED: std::cell::RefCell<std::collections::BTreeSet<String>> =
+        const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
+}
+pub(crate) fn account_hash_changed(session_key: &str) {
+    ACCOUNT_HASH_CHANGED.with(|sessions| {
+        sessions.borrow_mut().insert(session_key.to_string());
+    });
+}
+
 /// Observe only a normally returned finish; move its value/error through unchanged.
 /// A panic drops the probe silently. Outcome reporting remains with the caller.
 pub(crate) fn source_finish<T>(
     source: &str,
     inner: impl FnOnce() -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
+    #[derive(Serialize)]
+    struct Counts {
+        account_hash_changed: u64,
+    }
+    ACCOUNT_HASH_CHANGED.with(|sessions| sessions.borrow_mut().clear());
     let probe = Probe::start();
     let result = inner();
     emit(&Record {
@@ -613,7 +630,13 @@ pub(crate) fn source_finish<T>(
         stage: "source_finish",
         source: Source::from_slug(source),
         observation: probe.observation(),
-        counts: EmptyCounts {},
+        counts: Counts {
+            account_hash_changed: ACCOUNT_HASH_CHANGED.with(|sessions| {
+                let count = sessions.borrow().len() as u64;
+                sessions.borrow_mut().clear();
+                count
+            }),
+        },
     });
     result
 }
@@ -655,9 +678,6 @@ pub(crate) fn codex_census_fence(
         },
     });
 }
-
-#[derive(Serialize)]
-struct EmptyCounts {}
 
 /// Fixed-schema traversal decisions only; no CPU/RSS sample or wire event.
 pub(crate) fn traversal_transition(source: &str, counts: &impl Serialize) {
@@ -1700,7 +1720,10 @@ mod tests {
         assert_eq!(record["schema_version"], SCHEMA_VERSION);
         assert_eq!(record["stage"], "source_finish");
         assert_eq!(record["source"], source);
-        assert_eq!(record["counts"], serde_json::json!({}));
+        assert_eq!(
+            record["counts"],
+            serde_json::json!({"account_hash_changed": 0})
+        );
         assert!(record.get("result").is_none());
         println!("RESOURCE_V2_FINISH_FIXTURE {record}");
     }
@@ -2495,3 +2518,50 @@ mod continuation_tests {
         }
     }
 }
+
+/// Fixed low-cardinality storage observations on the existing #799 envelope.
+pub(crate) fn scan_index_storage(source: &'static str, orphans: u64, unavailable: [[u64; 6]; 3]) {
+    #[cfg(test)]
+    SCAN_INDEX_STORAGE_OBSERVATIONS.with(|v| v.borrow_mut().push((orphans, unavailable)));
+
+    static TOTAL_ORPHANS: AtomicU64 = AtomicU64::new(0);
+    static UNAVAILABLE: [[AtomicU64; 6]; 3] = [const { [const { AtomicU64::new(0) }; 6] }; 3];
+    let add = |counter: &AtomicU64, n: u64| {
+        counter
+            .fetch_update(Relaxed, Relaxed, |v| Some(v.saturating_add(n)))
+            .unwrap_or_else(|v| v)
+            .saturating_add(n)
+    };
+    let total = add(&TOTAL_ORPHANS, orphans);
+    for (map, counts) in unavailable.into_iter().enumerate() {
+        for (cause, n) in counts.into_iter().enumerate() {
+            let count = add(&UNAVAILABLE[map][cause], n);
+            if n != 0 {
+                traversal_point(
+                    "scan_index_storage",
+                    source,
+                    &serde_json::json!({"index_shard_unavailable": {"map": (["account_pending", "usage_pending", "request_census"][map]), "cause": ([crate::snapshots::scan_index_persistence::UnavailableCause::Missing, crate::snapshots::scan_index_persistence::UnavailableCause::Generation, crate::snapshots::scan_index_persistence::UnavailableCause::Digest, crate::snapshots::scan_index_persistence::UnavailableCause::Decode, crate::snapshots::scan_index_persistence::UnavailableCause::Descriptor, crate::snapshots::scan_index_persistence::UnavailableCause::Unsafe][cause].label()), "count": count}}),
+                );
+            }
+        }
+    }
+    if orphans != 0 {
+        traversal_point(
+            "scan_index_storage",
+            source,
+            &BTreeMap::from([("scanindex_orphan_init_discarded", total)]),
+        );
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static SCAN_INDEX_STORAGE_OBSERVATIONS: std::cell::RefCell<Vec<StorageReadObservation>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+#[cfg(test)]
+pub(crate) fn take_scan_index_storage_observations() -> Vec<StorageReadObservation> {
+    SCAN_INDEX_STORAGE_OBSERVATIONS.with(|v| std::mem::take(&mut *v.borrow_mut()))
+}
+
+#[cfg(test)]
+type StorageReadObservation = (u64, [[u64; 6]; 3]);

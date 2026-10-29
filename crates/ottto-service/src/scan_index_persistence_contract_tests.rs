@@ -1,8 +1,7 @@
 //! Uses the real ScanIndex serializer and real #865 durable store in lib tests.
-#[allow(dead_code)] // Remaining component APIs are exercised by the standalone target.
-#[path = "snapshots/scan_index_persistence.rs"]
-mod persistence;
 use crate::durable_tail_store as durable;
+#[allow(dead_code)] // Remaining component APIs are exercised by the standalone target.
+use crate::snapshots::scan_index_persistence as persistence;
 use crate::snapshots::ScanIndex;
 use persistence::*;
 use serde_json::Value;

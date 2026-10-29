@@ -6,10 +6,11 @@ writes legacy. N+1 adds immutable shard writes and migration on the first
 existing synchronous save. Downgrade N+1 to N loads shards and the next successful
 save rewrites legacy. The writer does not lengthen a durability interval.
 
-Production registration, load/save/field-table routing, baseline-control custody,
-heap admission and diagnostics remain separate integration-owner patches. This
-component alone does not activate shard writes in the installed daemon. Keep the
-writer draft until reader N is published, installed on the M4 with at least one successful save cycle, and integration qualification is green.
+The production reader registers the private storage adapter, existing semantic
+map codecs, availability, bounded custody charging and local counters. It still
+writes legacy. The separately admitted N+1 writer remains disabled until reader
+N is published AND installed on M4 with at least one successful save; the release
+owner must supply actual numeric version and commit before switching it on.
 
 ## SOURCE packet: candidate representation
 
@@ -295,3 +296,43 @@ Existing backend and companion string decoders preserve unknown codes, with
 known `degraded` / `warning` enums. Updated companion/web consumers provide the
 short label and hover text; older consumers retain a degraded warning and the
 clear-condition text. No field, enum tag, parser or scan-identity bump.
+
+## Production reader integration
+
+Each map is validated by its existing record decoder and admission policy. Held,
+repaired or discarded records make the entire map unavailable; census validation
+uses the same index visitor with its actual dropped-record count. Metadata and
+known siblings are decoded together, preserving held-file family scopes.
+Partial views retain their schema-3 fence until this typed adapter attaches the
+three-map availability state. Clone, selected subsets and captured recovery keep
+that state and an unavailable root witness. No partial view can be exported.
+
+Any unavailable map leaves Claude family proof unproven, retains file/entity
+holds, and refuses source acquisition before restoration, cleanup or selection.
+Retirement, history release, tombstone/family-fence opening, retry admission and
+native/money fold boundaries also fail closed. Known sibling maps and metadata
+remain readable; no partial load becomes a quarantine, default index or global
+reset. Only the fixed representation-version refusal maps to the newer-app
+class; other storage shape/IO/repair errors stay repair refusals. A partial load
+cannot clear an existing newer-app blocker.
+
+Binding, root descriptor custody, the availability array, immutable held/raw
+controls and exact retry-claim maxima are charged through the ordinary heap
+visitor, including Arc headers and Clone custody. A separate preflight bounds
+additional retained baseline allocations by the shared 8 MiB parked budget.
+Root descriptors remain capped at 256 KiB / 769 objects. No field is added to
+ScanIndexEntry; its native 480-byte pin remains authoritative. Existing namespace
+directories may be owner-readable 0755 if owned and not writable by others;
+shard directories remain 0700 and new payloads/root/markers remain 0600.
+
+`take_read_stats()` is drained after every storage open, including errors, and
+after publication. The existing local_resources envelope reports cumulative
+`scanindex_orphan_init_discarded` and `index_shard_unavailable` counts with only
+the three fixed map labels and six fixed causes. No key, path or digest is a
+dimension. Storage versions, logical schema, parser and scan identity are unchanged.
+
+Integrated fixtures cover every map/cause, metadata/known-sibling retention,
+Clone/subset/recovery, no retirement/release/fence/re-read/export, fresh orphans,
+error-path stats draining, legacy rewrite/generation and admission/heap custody.
+Runtime and macOS layout results are CI evidence, not inferred from compilation.
+The N+1 release pairing and actual downgrade-stall release notes remain required.

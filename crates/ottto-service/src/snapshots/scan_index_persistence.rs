@@ -194,6 +194,60 @@ impl LoadedRoot {
             _ => None,
         }
     }
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn unavailable(&self) -> Self {
+        Self(Arc::new(Root::Unavailable {
+            generation: self.generation().unwrap_or(0),
+        }))
+    }
+    /// Conservative retained allocation charge, including shared Arc custody.
+    /// At most 769 descriptors; never walks logical payload entries.
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn retained_bytes(&self) -> Option<usize> {
+        let mut n = std::mem::size_of::<Root>()
+            + std::mem::align_of::<Root>()
+            + 2 * std::mem::size_of::<usize>();
+        let mut add = |bytes: usize| {
+            n = n.checked_add(bytes)?;
+            Some(())
+        };
+        match &*self.0 {
+            Root::Legacy { digest, .. } => add(digest.capacity())?,
+            Root::Sharded {
+                digest,
+                manifest,
+                stamps,
+            } => {
+                add(digest.capacity())?;
+                add(manifest.binding.namespace_hash.capacity())?;
+                add(std::mem::align_of::<MapManifest>()
+                    + std::mem::align_of::<Object>()
+                    + std::mem::align_of::<Stamp>())?;
+                add(manifest
+                    .maps
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<MapManifest>())?)?;
+                for map in &manifest.maps {
+                    add(map
+                        .buckets
+                        .capacity()
+                        .checked_add(std::mem::align_of::<u8>())?)?;
+                }
+                add(manifest
+                    .objects
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<Object>())?)?;
+                for object in &manifest.objects {
+                    add(object.digest.capacity())?;
+                }
+                add(stamps
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<Stamp>())?)?;
+            }
+            _ => {}
+        }
+        Some(n)
+    }
     pub(crate) fn is_legacy(&self) -> bool {
         matches!(&*self.0, Root::Legacy { .. })
     }
@@ -246,6 +300,36 @@ pub(crate) enum MapAvailability {
 pub(crate) struct PartialIndex {
     pub metadata: LogicalReader,
     pub maps: [MapAvailability; 3],
+}
+impl PartialIndex {
+    /// Internal typed partial view: retain schema 3 and explicit availability.
+    /// All known siblings share one decoder pass with metadata/held scopes.
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn into_reader(self) -> Result<(LogicalReader, [Option<MapUnavailable>; 3])> {
+        let mut reader = self.metadata;
+        reader.spans.pop(); // final root brace
+        while matches!(reader.spans.last().map(|s| &s.piece), Some(Piece::Spaces)) {
+            reader.spans.pop();
+        }
+        reader.length = reader.spans.iter().map(|s| s.len).sum();
+        let mut unavailable = [None; 3];
+        for (i, map) in self.maps.into_iter().enumerate() {
+            match map {
+                MapAvailability::Unknown(cause) => unavailable[i] = Some(cause),
+                MapAvailability::Known(mut known) => {
+                    known.spans.pop(); // final root brace
+                    for span in known.spans.into_iter().skip(1) {
+                        // own header
+                        if !matches!(span.piece, Piece::Spaces) {
+                            reader.push(span.len, span.piece)?;
+                        }
+                    }
+                }
+            }
+        }
+        reader.push_bytes(b"}".to_vec())?;
+        Ok((reader, unavailable))
+    }
 }
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ReadStats {
@@ -737,7 +821,13 @@ impl LockedStore {
         };
         ensure!(fd >= 0, "scan_index_parent_open");
         let parent = unsafe { File::from_raw_fd(fd) };
-        check_directory(&parent)?;
+        let metadata = parent.metadata()?;
+        ensure!(
+            metadata.is_dir()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.mode() & 0o022 == 0,
+            "scan_index_unsafe_parent"
+        );
         let root = path.file_name().context("scan_index_root_name")?.as_bytes();
         let root_name = cstring(root)?;
         let mut object_name = root.to_vec();
@@ -785,7 +875,7 @@ impl LockedStore {
                     Err(e)
                         if e.downcast_ref::<io::Error>()
                             .is_some_and(|e| e.kind() == io::ErrorKind::NotFound) => {}
-                    Err(_) => bail!("scan_index_representation_refused"),
+                    Err(_) => bail!("scan_index_storage_requires_repair"),
                 }
                 return Ok((None, Root::Missing));
             }
@@ -812,7 +902,7 @@ impl LockedStore {
                     {
                         (LOGICAL_SCHEMA, 0)
                     }
-                    Err(_) => bail!("scan_index_representation_refused"),
+                    Err(_) => bail!("scan_index_storage_requires_repair"),
                 }
             }
             Err(error) => return Err(error),
