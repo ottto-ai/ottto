@@ -135,7 +135,14 @@ pub(super) struct LiveReductionInputs {
     parents: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::snapshots) enum PreparationRefusal {
+    Transient,
+    NonTransient(&'static str),
+}
+
 pub(in crate::snapshots) struct PrepareRejected {
+    pub(in crate::snapshots) refusal: PreparationRefusal,
     pub(in crate::snapshots) error: anyhow::Error,
     pub(in crate::snapshots) taken:
         Option<Box<crate::transcript_cache::Taken<CachedJsonlReduction>>>,
@@ -204,7 +211,11 @@ impl OwnedJsonlParser {
         #[cfg(test)]
         if let Some(original) = taken.as_ref() {
             if let Err(error) = preparation_tests::check(original) {
-                return Err(PrepareRejected { error, taken });
+                return Err(PrepareRejected {
+                    error,
+                    taken,
+                    refusal: PreparationRefusal::Transient,
+                });
             }
         }
         self.prepare_acquisition_inner(taken, scope, debt, now, true)
@@ -240,7 +251,11 @@ impl OwnedJsonlParser {
             Ok(())
         })();
         if let Err(error) = checked {
-            return Err(PrepareRejected { error, taken });
+            return Err(PrepareRejected {
+                error,
+                taken,
+                refusal: PreparationRefusal::Transient,
+            });
         }
         let reusable = taken
             .as_ref()
@@ -279,6 +294,7 @@ impl OwnedJsonlParser {
             if preserve {
                 return Err(PrepareRejected {
                     error: anyhow::anyhow!("incompatible acquisition"),
+                    refusal: PreparationRefusal::NonTransient("prepare_incompatible"),
                     taken,
                 });
             }
@@ -291,6 +307,7 @@ impl OwnedJsonlParser {
         {
             return Err(PrepareRejected {
                 error: anyhow::anyhow!("incompatible acquisition scope"),
+                refusal: PreparationRefusal::NonTransient("prepare_scope"),
                 taken,
             });
         }
@@ -306,6 +323,7 @@ impl OwnedJsonlParser {
             Err(error) => {
                 return Err(PrepareRejected {
                     error: error.into(),
+                    refusal: PreparationRefusal::Transient,
                     taken,
                 })
             }
@@ -319,6 +337,7 @@ impl OwnedJsonlParser {
         {
             return Err(PrepareRejected {
                 error: anyhow::anyhow!("retained acquisition refused"),
+                refusal: PreparationRefusal::NonTransient("prepare_full"),
                 taken,
             });
         }
