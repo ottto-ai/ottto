@@ -413,8 +413,7 @@ impl GroupBoot {
             0,
             // The entry's stored ctime lets a ctime-only change keep the
             // stored fingerprint (fresh samples hashed, no re-read).
-            &index.files,
-            &index.claude_account_deferred_holds,
+            discovery_retention!(index),
             false,
             cache,
         ) else {

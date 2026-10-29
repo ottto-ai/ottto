@@ -944,8 +944,7 @@ fn walk_gate_counts_age_and_size_skips_without_changing_selection() {
                 SnapshotSource::ClaudeCode,
                 index.traversal.as_mut().unwrap(),
                 30,
-                &index.files,
-                &index.claude_account_deferred_holds,
+                discovery_retention!(index),
             );
         }
         let counts = &index.traversal.as_ref().unwrap().counts;
@@ -994,8 +993,7 @@ fn roster_gate_counts_age_and_size_skips_without_changing_selection() {
             SnapshotSource::Codex,
             index.traversal.as_mut().unwrap(),
             30,
-            &index.files,
-            &index.claude_account_deferred_holds,
+            discovery_retention!(index),
         );
     }
     unselected_page("codex");
@@ -1016,7 +1014,7 @@ fn roster_gate_counts_age_and_size_skips_without_changing_selection() {
             SnapshotSource::Codex,
             index.traversal.as_mut().unwrap(),
             30,
-            &index.files,
+            discovery_retention!(index),
         );
         let counts = &index.traversal.as_ref().unwrap().counts;
         let decided = (
@@ -1035,8 +1033,7 @@ fn roster_gate_counts_age_and_size_skips_without_changing_selection() {
     assert_eq!(counted, json!({"age": 1, "size": 1}));
     assert_eq!(recounted, counted);
 }
-                &index.claude_account_deferred_holds,
-            &index.claude_account_deferred_holds,
+
 // ---- E3: withheld-account holds stay discoverable until they resolve ----
 
 /// The key holds a parsed revision withheld for an unresolved account.
@@ -1058,8 +1055,7 @@ fn walk_all(index: &mut ScanIndex, days: u64) {
             SnapshotSource::ClaudeCode,
             index.traversal.as_mut().unwrap(),
             days,
-            &index.files,
-            &index.claude_account_deferred_holds,
+            discovery_retention!(index),
         );
     }
 }
@@ -1159,8 +1155,10 @@ fn candidate_and_open_gates_keep_withheld_account_keys() {
             &mut census,
             census_at,
             7,
-            &BTreeMap::new(),
-            holds,
+            crate::snapshots::DiscoveryRetention {
+                files: &BTreeMap::new(),
+                account_holds: holds,
+            },
         )
         .map(|candidate| {
             open_and_identify_scan_candidate(
@@ -1169,8 +1167,10 @@ fn candidate_and_open_gates_keep_withheld_account_keys() {
                 &mut census,
                 census_at,
                 7,
-                &BTreeMap::new(),
-                holds,
+                crate::snapshots::DiscoveryRetention {
+                    files: &BTreeMap::new(),
+                    account_holds: holds,
+                },
             )
             .is_some()
         });
@@ -1374,4 +1374,3 @@ fn withheld_account_growth_is_read_after_idling_past_the_window() {
     assert_eq!(again.scanned_file_count, 0);
     assert!(!after.files.contains_key(&key), "ordinary aging retires it");
 }
-
