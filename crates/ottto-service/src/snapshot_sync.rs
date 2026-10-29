@@ -8461,14 +8461,21 @@ impl PreparedClaudeLocalEvidence {
         support_dir: &Path,
         snapshots: &[SnapshotItem],
         index: &ScanIndex,
+        census_complete: bool,
         mut prepared: Option<Self>,
     ) -> Self {
         let sessions = crate::snapshots::claude_terminal_cohort(index, snapshots);
+        // Preserve the baseline permissive map's error boundary. Incomplete
+        // offers attach only the current page; retained strict reads fail per
+        // family and cannot poison healthy page/history evidence.
+        let permissive = if census_complete {
+            sessions.clone()
+        } else {
+            claude_evidence_session_ids(snapshots).into_iter().collect()
+        };
         let loaded = match prepared.as_mut() {
-            Some(read) => read.take_api_for_sessions(support_dir, &sessions),
-            None => {
-                crate::claude_local_otel::ClaudeApiEvidenceRead::load(support_dir, sessions.clone())
-            }
+            Some(read) => read.take_api_for_sessions(support_dir, &permissive),
+            None => crate::claude_local_otel::ClaudeApiEvidenceRead::load(support_dir, permissive),
         };
         let api_failed = loaded.is_err();
         let mut api = loaded.unwrap_or_default();
@@ -8500,16 +8507,33 @@ impl PreparedClaudeLocalEvidence {
                     == crate::claude_local_otel::claude_trace_read_generation(support_dir, root)
                         .as_ref()
             });
-            if report.is_complete()
-                && generation.is_some()
-                && api.strict_generation_matches(support_dir, root)
-            {
-                healthy_roots.insert(root.clone());
-            }
             if let Some(rows) = report.evidence.remove(root) {
                 trace_rows.insert(root.clone(), rows);
             }
             traces.insert(root.clone(), PreparedTraceRead { generation, report });
+        }
+        // A failed/unknown generation is incomplete even when the decoder's
+        // rows look healthy. Freeze that veto; consuming frozen rows must not
+        // erase it. No retry or fallback may occur after raw effects commit.
+        for root in &sessions {
+            let api_valid = api.strict_generation_matches(support_dir, root);
+            if !api_valid {
+                api.invalidate_frozen_root(root);
+            }
+            if let Some(read) = traces.get_mut(root) {
+                let trace_valid = read.generation.is_some()
+                    && read.generation
+                        == crate::claude_local_otel::claude_trace_read_generation(
+                            support_dir,
+                            root,
+                        );
+                if !trace_valid {
+                    read.report.unreadable_lines = read.report.unreadable_lines.saturating_add(1);
+                }
+                if api_valid && trace_valid && read.report.is_complete() {
+                    healthy_roots.insert(root.clone());
+                }
+            }
         }
         Self {
             sessions,
@@ -8791,6 +8815,9 @@ impl PreparedClaudeLocalEvidence {
         root: &str,
     ) -> crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
         if let Some(mut read) = self.traces.remove(root) {
+            if self.terminal_frozen && read.generation.is_none() {
+                read.report.unreadable_lines = read.report.unreadable_lines.saturating_add(1);
+            }
             if self.terminal_frozen
                 || (read.generation.is_some()
                     && read.generation
@@ -8897,6 +8924,7 @@ fn prepare_claude_terminal_read(
         support_dir,
         &scan.snapshots,
         index,
+        scan.census_complete,
         prepared.take(),
     );
     if budget.exceeded() {

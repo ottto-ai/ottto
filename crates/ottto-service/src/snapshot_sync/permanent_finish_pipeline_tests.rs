@@ -1755,7 +1755,7 @@ fn frozen_terminal_readset_is_consumed_once_without_a_second_allowance() {
     let support = test_dir("frozen-terminal-one-allowance");
     let mut index = ScanIndex::default();
     let snapshots = Vec::new();
-    let frozen = PreparedClaudeLocalEvidence::freeze_terminal(&support, &snapshots, &index, None);
+    let frozen = PreparedClaudeLocalEvidence::freeze_terminal(&support, &snapshots, &index, true, None);
     let mut prepared = Some(frozen);
     let mut scan = crate::snapshots::scan_source_roots(
         SnapshotSource::ClaudeCode, &[], &mut index, "2026-08-02T07:10:00Z", 183,

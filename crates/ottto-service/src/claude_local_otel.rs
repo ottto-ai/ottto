@@ -962,11 +962,23 @@ impl ClaudeApiEvidenceRead {
         complete
     }
 
+    pub(crate) fn invalidate_frozen_root(&mut self, root: &str) {
+        if let Some(witness) = self.reads.get_mut(root) {
+            witness.health.unreadable_lines = witness.health.unreadable_lines.saturating_add(1);
+            witness.generation = None;
+        }
+    }
+
     pub(crate) fn take_frozen_report(&mut self, session_id: &str) -> ClaudeLocalOtelLoadReport {
         let health = self
             .reads
             .remove(session_id)
-            .map(|witness| witness.health)
+            .map(|mut witness| {
+                if witness.generation.is_none() && witness.health.is_complete() {
+                    witness.health.unreadable_lines += 1;
+                }
+                witness.health
+            })
             .unwrap_or_else(|| ClaudeLocalOtelLoadHealth {
                 unreadable_lines: 1,
                 ..Default::default()
