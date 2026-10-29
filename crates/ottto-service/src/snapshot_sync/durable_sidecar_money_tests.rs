@@ -632,6 +632,8 @@ fn durable_sidecar_money_newer_format_waits_without_downgrade_then_reupgrade_equ
         let accepted = settle_route(&c, &ScanIndex::default(), page, &mut progress, holds);
         let before = stored_bodies(&accepted);
         slots.save(&mut reader);
+        let api_end = std::fs::metadata(sidecar_path(&c, false)).unwrap().len();
+        let trace_end = std::fs::metadata(sidecar_path(&c, true)).unwrap().len();
         drop(reader);
         append(&native, &line(ROOT, "r2", "2026-08-02T07:01:00Z", 20));
         // A never-accepted dependent also waits: Unknown cannot become $0 or
@@ -679,6 +681,14 @@ fn durable_sidecar_money_newer_format_waits_without_downgrade_then_reupgrade_equ
             render(&c, held_index, Mode::DiskRestore)
         });
         assert_eq!(reader.restored_records(), 1);
+        assert_eq!(
+            reader.body_bytes(),
+            [
+                std::fs::metadata(sidecar_path(&c, false)).unwrap().len() - api_end,
+                std::fs::metadata(sidecar_path(&c, true)).unwrap().len() - trace_end,
+            ],
+            "re-upgrade consumes only the appended suffix"
+        );
         money_oracle::assert_equivalent(&expected, &recovered);
         assert_reported(&recovered, 2);
     });

@@ -1,5 +1,5 @@
 //! v1 at-least-once sidecar acquisition. Compiled in the contract harness until
-//! SOURCE approves persistence and the real end-to-end path is proven.
+//! P2 integration and the native end-to-end path are proven.
 use super::*;
 use crate::durable_tail_store::{
     self as store, CodecRow, DurableSource, DurableTailStore, ReadOutcome, SingleWriter,
@@ -280,7 +280,7 @@ impl Reader {
     }
     fn repair_pair(&mut self, session: &str, reason: RestoreFailure) -> Option<Pair> {
         let lengths = self.lengths(session);
-        if lengths.into_iter().flatten().sum::<u64>() > self.bootstrap_left {
+        if self.bootstrap_left == 0 {
             return None;
         }
         if let Some(previous) = self.repairs.get(session) {
@@ -430,10 +430,15 @@ impl Reader {
                 ..Default::default()
             };
         }
-        if failed
-            && self.repairs.contains_key(session)
-            && (entry.pair.api.certificate.is_none() || entry.pair.trace.certificate.is_none())
-        {
+        let cursorless_failure = (api.is_err()
+            && entry.pair.api.certificate.is_none()
+            && self.counts[0].bootstrap_deferred == before_counts[0].bootstrap_deferred)
+            || (trace.is_err()
+                && entry.pair.trace.certificate.is_none()
+                && self.counts[1].bootstrap_deferred == before_counts[1].bootstrap_deferred);
+        if self.repairs.contains_key(session) && cursorless_failure {
+            // A failed physical acquisition has spent this repair attempt.
+            // A paced slot has not: retain its sibling and continue next pass.
             self.entries.remove(session);
             self.protected.entry(session.into()).or_default();
         }

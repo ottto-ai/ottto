@@ -1,6 +1,6 @@
 //! Sidecar acquisition boundary shared by ordinary and paid loaders.
 //! The live path delegates to existing whole-file readers until the durable
-//! contract harness is executed and SOURCE approves activation.
+//! native contract path is proven and activation is authorized.
 use super::*;
 use crate::source_rotation::PaidReservation;
 mod counts;

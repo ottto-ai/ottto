@@ -1207,3 +1207,33 @@ fn s2_hold_age_keeps_unselected_entities_and_clears_only_healthy_selected_entiti
     let (_, ()) = with_reader(r, || record_holds(&BTreeSet::new(), &a));
     assert!(take_counts().is_empty(), "recovery clears the gauges");
 }
+
+#[test]
+fn state_fix_can_span_bootstrap_passes_without_renewing_grant() {
+    let mut f = Fixture::new("sidecar-repair-paced-pair");
+    let (api, trace) = bytes("first");
+    f.write("scope", &api, &trace);
+    let (mut r, _) = load(f.reader(), &f.dir);
+    f.save(&mut r);
+    let path = record_path(&r, "scope");
+    let mut bad = fs::read(&path).unwrap();
+    *bad.last_mut().unwrap() ^= 1;
+    fs::write(path, bad).unwrap();
+    drop(r);
+    let mut r = f.restart();
+    r.bootstrap_left = api.len() as u64;
+    let (mut r, _) = load(r, &f.dir);
+    assert_eq!(r.body_bytes(), [api.len() as u64, 0]);
+    assert_eq!(r.entries["scope"].pair.api.state.rows.len(), 1);
+    assert!(r.entries["scope"].pair.trace.certificate.is_none());
+    assert_eq!(take_counts()["sidecar_state_fix_rebuilds"], 1);
+    r.begin_pass();
+    let (mut r, report) = load(r, &f.dir);
+    assert_eq!(r.body_bytes(), [0, trace.len() as u64]);
+    assert_eq!(report, frozen(&api, &trace));
+    assert!(!take_counts().contains_key("sidecar_state_fix_rebuilds"));
+    f.save(&mut r);
+    let (r, report) = load(f.restart(), &f.dir);
+    assert_eq!(r.body_bytes(), [0, 0]);
+    assert_eq!(report, frozen(&api, &trace));
+}
