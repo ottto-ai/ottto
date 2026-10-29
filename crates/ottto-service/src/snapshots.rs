@@ -197,12 +197,12 @@ use claude_response_records::{
 };
 use codex_compressed_input::{refuse_compressed_codex, OpenedInput};
 pub(crate) use pi_retry_inputs::PiRetryInputs;
-#[cfg(all(test, unix))]
-pub(crate) use sampled_scan::durable_tail::tests::ContinuationDurableState;
 #[cfg(test)]
 pub(crate) use sampled_scan::codex_cursor::{cursor_limit_for_test, with_test_limits_for_test};
 #[allow(unused_imports)]
 pub(crate) use sampled_scan::codex_cursor::{CodexCursorPort, CodexCursorTicket};
+#[cfg(all(test, unix))]
+pub(crate) use sampled_scan::durable_tail::tests::ContinuationDurableState;
 
 pub(crate) use context_curve::CONTEXT_CURVE_CONTRACT_VERSION;
 use context_curve::{
@@ -32584,6 +32584,12 @@ impl OwnedSourceScan {
                                 &candidate,
                                 &mut census,
                             );
+                            // Preparation moved the graph into this parser. Drop it
+                            // before returning its active funding to another source.
+                            drop(parser);
+                            if let Some(lease) = preparation_lease.take() {
+                                lease.release();
+                            }
                             pending!();
                         }
                         #[cfg(unix)]

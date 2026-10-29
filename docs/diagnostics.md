@@ -282,8 +282,8 @@ recovering an index-new/record-old crash after a successful audit. Direct restor
 misses also count `ineligible.audit_carrier`, without becoming held exits.
 Re-arming changes no accepted body, witness or ACK; native completion alone can
 clear the obligation. No record means ordinary Full-on-miss admission.
-The `format_hold` and `durable_held` arrays keep seven slots:
-`newer,unknown,undecodable,unbindable,known_corrupt,retired_upgrade_missing,receipt_pending`.
+The `format_hold` and `durable_held` arrays keep eight slots:
+`newer,unknown,undecodable,unbindable,known_corrupt,retired_upgrade_missing,receipt_pending,behind_accepted`.
 The retired coordinate (slot 5) stays zero; the removed hold is not restored.
 ReceiptPending remains slot 6.
 

@@ -3291,7 +3291,7 @@ fn batch_ack_is_key_specific_and_bound_to_the_written_target_stamp() {
 }
 
 #[test]
-fn batch_ack_never_escapes_failed_or_ambiguous_writes_or_a_clean_retry() {
+fn batch_ack_requires_durable_reconciliation_and_never_a_clean_retry() {
     for edge in ["pre_rename", "post_rename", "dir_sync"] {
         let scratch = Scratch::new();
         let lock = LockedStateDir::acquire(&scratch.root).unwrap();
@@ -3326,21 +3326,44 @@ fn batch_ack_never_escapes_failed_or_ambiguous_writes_or_a_clean_retry() {
                 Err(io::Error::other("injected rename edge"))
             })));
         }
-        let failed =
-            store.write_after_save(&lock, 2, 0, vec![pending(b.clone(), certificate(&path), 2)]);
+        let receipt = store
+            .write_after_save(&lock, 2, 0, vec![pending(b.clone(), certificate(&path), 2)])
+            .unwrap();
         test_hooks::set_before_rename(None);
         test_hooks::set_before_dir_sync(None);
         assert!(reached.get(), "actual {edge} reached");
-        assert!(failed.is_err(), "no receipt before successful batch sync");
-        assert_eq!(fs::read(&disk).unwrap() == before, edge == "pre_rename");
-        assert_eq!(store.witness_current(&proof), edge == "pre_rename");
+        assert_eq!(receipt.written, usize::from(edge == "post_rename"));
+        assert_eq!(
+            store.replacement_committed(&proof, &receipt),
+            edge == "post_rename",
+            "only a verified, durably reconciled replacement acknowledges custody"
+        );
+        assert!(
+            !store.witness_current(&proof),
+            "old target was replaced or conditionally retired"
+        );
         if edge == "pre_rename" {
+            assert!(
+                !disk.exists(),
+                "failed candidate retires only its verified predecessor"
+            );
             let retry = store
                 .write_after_save(&lock, 3, 0, vec![pending(b.clone(), certificate(&path), 2)])
                 .unwrap();
             assert_eq!(retry.written, 1);
             assert!(store.replacement_committed(&proof, &retry));
         } else {
+            assert_ne!(fs::read(&disk).unwrap(), before);
+            if edge == "dir_sync" {
+                assert_eq!(receipt.deferred_keys, vec![b.key]);
+                assert!(
+                    store.receipt_pending(&b.key),
+                    "unresolved sync remains an obligation"
+                );
+                assert!(store.reconcile_pending(&lock, &b.key).unwrap());
+            } else {
+                assert_eq!(store.counters().receipt_reconciled, 1);
+            }
             // Re-authorize the ACTUAL current strict record, then mix its clean
             // retry with a real write for another key. Aggregate written=1 is
             // deliberately insufficient to acknowledge this original witness.
