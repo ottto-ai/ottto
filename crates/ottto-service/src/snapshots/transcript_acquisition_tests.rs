@@ -221,7 +221,9 @@ fn oracle(fixture: &Fixture, source: SnapshotSource) -> Value {
             false,
         )
         .unwrap(),
-        _ => unreachable!(),
+        SnapshotSource::Pi => {
+            parse_pi_jsonl_file(&fixture.0, NOW, "native-fixture".into()).unwrap()
+        }
     };
     apply_upload_policy(source, &mut items, SnapshotUploadPolicy::default());
     serde_json::to_value(items).unwrap()
@@ -546,6 +548,44 @@ fn sampled_native_hidden_middle_edit_remains_an_accepted_sampled_residual() {
         assert_ne!(later, oracle(&fixture, source));
     }
 }
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn pi_hidden_middle_edit_remains_an_accepted_sampled_residual() {
+    let source = SnapshotSource::Pi;
+    let fixture = Fixture::new(source);
+    fixture.append(&json!({"type":"ignored", "padding":"a".repeat(12 * 1024)}));
+    fixture.append(&usage(source, 100, 0, "fixture-model"));
+    fixture.append(&json!({"type":"ignored", "padding":"b".repeat(12 * 1024)}));
+    let (old, mode, _, initial) = acquire(&fixture, source, None, 100);
+    assert!(old.is_some());
+    assert!(matches!(mode, ReadMode::Full(_)));
+    assert_eq!(initial, oracle(&fixture, source));
+    let original = fs::read_to_string(&fixture.0).unwrap();
+    let edited = original.replace("\"input\":100", "\"input\":900");
+    assert_ne!(original, edited);
+    assert_eq!(original.len(), edited.len());
+    fs::write(&fixture.0, edited).unwrap();
+    fixture.append(&usage(source, 140, 1, "fixture-model"));
+    let (tail, mode, _, interim) = acquire(&fixture, source, old, 101);
+    assert_eq!(mode, ReadMode::Tail);
+    assert!(tail.is_some());
+    let full = oracle(&fixture, source);
+    assert_eq!(interim[0]["input_tokens"], 240);
+    assert_eq!(full[0]["input_tokens"], 1040);
+    assert_ne!(interim, full, "accepted sampled limitation must be visible");
+    let (_, mode, guards, later) = acquire(
+        &fixture,
+        source,
+        tail,
+        101 + crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS,
+    );
+    assert_eq!(mode, ReadMode::Unchanged);
+    assert_eq!(guards, 0);
+    assert_eq!(later, interim);
+    assert_ne!(later, full);
+}
+
 #[test]
 fn cache_lifecycle_native_retention_preserves_body_and_audit_debt() {
     use crate::local_resource_diagnostics::cache_lifecycle::observe;

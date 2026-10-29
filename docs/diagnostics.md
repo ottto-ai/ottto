@@ -1060,6 +1060,9 @@ explicit release, including real durable I/O paths.
 
 Pi joins the shared sampled RAM reader. Its `native_collection_page` acquisition
 counts report Full, Tail and Unchanged decisions with the actual planner reasons.
+Pi inherits the accepted sampled residual: an interior same-length rewrite plus
+growth can Tail a stale prefix until the next Full; Pi's writer is append-only,
+and its header rewrite reads Full.
 Age and clock changes do not invalidate checkpoints. Admission of a new sampled
 obligation follows the shared audit cap: with no slot left, an unmarked change
 reads a counted cap Full (or waits); already-marked files keep Tailing.
