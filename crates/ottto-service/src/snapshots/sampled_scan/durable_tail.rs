@@ -49,7 +49,8 @@ pub(crate) const WRITE_PASS_BYTES: usize = 8 * 1024 * 1024;
 /// Upper bound of both stores' resident digest maps (two sources).
 /// Pin history: Lead A approved 65,536 -> 401,408 bytes on 2026-10-29:
 /// memo 2*256*256 = 131,072; pending 2*(32+1)*4096 = 270,336 bytes.
-/// Total also includes A0's 525,312-byte retail reserve: 926,720 bytes.
+/// The spent ledger and shared recovery pacer each reserve 525,312 bytes,
+/// carved from the existing cache budget: total 1,452,032 bytes.
 /// Any further growth requires a new owner decision. Native/container evidence
 /// remains required; this pin is not enforcement by the cache's heap walk.
 #[cfg(test)]
@@ -60,6 +61,7 @@ pub(crate) const STORES_RESIDENT_BOUND: usize =
 /// Existing class-X re-derivation is bounded at `HEAD_BOUND`, on a RAM
 /// miss only, so the census pass line reports it beside the guard's own
 /// counters (SOURCE N1).
+
 static REDERIVE_HEAD_BYTES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
 pub(crate) fn rederive_head_bytes_total(source: SnapshotSource) -> u64 {
@@ -285,6 +287,8 @@ pub(crate) fn durable_source(source: SnapshotSource) -> Option<DurableSource> {
     DurableSource::from_snapshot(source)
 }
 
+/// S2: freeze accepted facts before working-index mutation. Unknown object
+/// identity keeps this floor; only independently proved replacement may skip it.
 #[derive(Clone, Copy)]
 pub(crate) struct AcceptedFloor {
     pub(crate) end: u64,
@@ -315,6 +319,30 @@ impl AcceptedFloor {
             ),
         })
     }
+    pub(crate) fn behind(self, length: u64) -> bool {
+        length < self.end || effective_revision(SnapshotSource::ClaudeCode) < self.revision
+    }
+}
+
+/// A different inode alone is ambiguous (copies/hard links/reuse). Births
+/// must independently disagree, and the original must bind the frozen entry.
+fn accepted_object_changed(
+    record: &store::DurableRecord,
+    a: AcceptedFloor,
+    device: u64,
+    inode: u64,
+    birth: u64,
+) -> bool {
+    let c = &record.record.certificate;
+    record.format == 1
+        && a.strict
+        && record.record.binding.entry == a.entry
+        && record.index_generation <= a.generation
+        && a.birth != 0
+        && a.birth == c.birth_nanos
+        && birth != 0
+        && birth != a.birth
+        && (c.device, c.inode) != (device, inode)
 }
 
 /// The interpretation inputs a record binds to beyond the file scope.
@@ -977,7 +1005,7 @@ impl SharedCache {
         accepted_end: u64,
         now: std::time::SystemTime,
     ) -> bool {
-        self.paced_full(key, file, accepted_end, now, None)
+        self.paced_growth_full(SnapshotSource::ClaudeCode, key, file, accepted_end, now)
     }
 
     pub(crate) fn stale_full(
@@ -1009,13 +1037,43 @@ impl SharedCache {
         now: std::time::SystemTime,
         cause: Option<usize>,
     ) -> bool {
+        self.paced_full_for(
+            SnapshotSource::ClaudeCode,
+            key,
+            file,
+            accepted_end,
+            now,
+            cause,
+        )
+    }
+
+    fn paced_growth_full(
+        &self,
+        source: SnapshotSource,
+        key: &str,
+        file: &File,
+        accepted_end: u64,
+        now: SystemTime,
+    ) -> bool {
+        self.paced_full_for(source, key, file, accepted_end, now, None)
+    }
+
+    fn paced_full_for(
+        &self,
+        source: SnapshotSource,
+        key: &str,
+        file: &File,
+        accepted_end: u64,
+        now: std::time::SystemTime,
+        cause: Option<usize>,
+    ) -> bool {
         let Ok(metadata) = file.metadata() else {
             return false;
         };
         if metadata.len() <= accepted_end {
             return false;
         }
-        let cap = max_jsonl_file_bytes(SnapshotSource::ClaudeCode);
+        let cap = max_jsonl_file_bytes(source);
         let near_cap = metadata.len() >= cap - cap / 10;
         let Some(mut stores) = self.durable() else {
             return true;
@@ -1026,7 +1084,10 @@ impl SharedCache {
             now.duration_since(*at)
                 .is_ok_and(|age| age.as_secs() <= PACE_SANITY_SECS && age.as_secs() < PACE_SECS)
         });
-        let key = store::key_digest(DurableSource::ClaudeCode, key);
+        let Some(ds) = durable_source(source) else {
+            return true;
+        };
+        let key = store::key_digest(ds, key);
         if !near_cap && stores.retail_full_at.contains_key(&key) {
             if cause.is_none() {
                 stores.counters.retail_full[1] += 1;
@@ -1057,7 +1118,11 @@ impl SharedCache {
                 stores.counters.retail_full[2] += 1;
             }
         }
-        stores.retail_full_at.insert(key, now);
+        if crate::heap_layout_bound::tree_node_bytes::<store::Digest32, SystemTime>()
+            .is_some_and(|n| n <= 1024)
+        {
+            stores.retail_full_at.insert(key, now);
+        }
         if near_cap {
             stores.counters.near_cap += 1;
         }
@@ -1546,6 +1611,9 @@ impl SharedCache {
         index: &ScanIndex,
         interpretation: &Interpretation<'_>,
     ) -> RestoreOutcome {
+        let floor_behind = interpretation
+            .accepted
+            .is_some_and(|a| held.metadata().map_or(true, |m| a.behind(m.len())));
         if snapshot_source == SnapshotSource::Codex
             && refuse_compressed_codex(Some(path), None, CodexZstCause::DurableTailUnsupported)
                 .is_err()
@@ -1572,6 +1640,9 @@ impl SharedCache {
             .map_or(true, |bytes| lease.charge(bytes).is_err())
         {
             lease.release();
+            if floor_behind {
+                return RestoreOutcome::FloorHeld;
+            }
             return self.restore_resource_pending(
                 snapshot_source,
                 "cache_key",
@@ -1619,7 +1690,22 @@ impl SharedCache {
             }
             Ok(Err(phase)) => {
                 lease.release();
+                if floor_behind {
+                    return RestoreOutcome::FloorHeld;
+                }
                 self.restore_resource_pending(snapshot_source, phase, grown(held, index, key))
+            }
+            Err(RestoreOutcome::Miss(MissClass::AcceptedFloor)) => {
+                lease.release();
+                RestoreOutcome::FloorHeld
+            }
+            Err(RestoreOutcome::Miss(class @ MissClass::RealEdit)) => {
+                lease.release();
+                RestoreOutcome::Miss(class)
+            }
+            Err(_) if floor_behind => {
+                lease.release();
+                RestoreOutcome::FloorHeld
             }
             Err(RestoreOutcome::Miss(class @ MissClass::AuditCarrier)) => {
                 lease.release();
@@ -1747,6 +1833,39 @@ impl SharedCache {
                 }
             }
         };
+        if let Some(a) = interpretation.accepted {
+            let metadata = held.metadata().map_err(|_| MissClass::AcceptedFloor)?;
+            if a.revision <= effective_revision(SnapshotSource::ClaudeCode)
+                && record.record.binding.source == source
+                && record.record.binding.key == store_key
+                && record.record.binding.context
+                    == store::context_digest(
+                        &interpretation.namespace.0,
+                        index.active_upload_context_fingerprint.as_deref(),
+                    )
+                && accepted_object_changed(
+                    &record,
+                    a,
+                    metadata.dev(),
+                    metadata.ino(),
+                    birth_unix_nanos(&metadata),
+                )
+            {
+                if let Some(mut stores) = self.durable() {
+                    Counters::bump(
+                        &mut stores.counters.ineligible,
+                        "s2_skipped_real_edit.replaced",
+                    );
+                }
+                return Err(MissClass::RealEdit.into());
+            }
+            if a.behind(metadata.len()) {
+                if let Some(mut stores) = self.durable() {
+                    Counters::bump(&mut stores.counters.ineligible, "accepted_body_floor");
+                }
+                return Err(MissClass::AcceptedFloor.into());
+            }
+        }
         if record.record.binding.context
             == store::context_digest(
                 &interpretation.namespace.0,
@@ -1881,6 +2000,13 @@ impl SharedCache {
                 return Err(MissClass::Failure(class).into());
             }
         };
+        if interpretation
+            .accepted
+            .is_some_and(|a| held.metadata().map_or(true, |m| a.behind(m.len())))
+        {
+            Counters::bump(&mut stores.counters.ineligible, "accepted_body_floor");
+            return Err(MissClass::AcceptedFloor.into());
+        }
         if let Some(slot) = stores.slot(source).as_mut() {
             slot.store.authorize(&record, &expected);
         }
@@ -2557,6 +2683,8 @@ impl SharedCache {
 /// The class returned by the attempted restore, never reconstructed from totals.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum MissClass {
+    AcceptedFloor,
+    RealEdit,
     Unavailable,
     NoEntry,
     AuditCarrier,
@@ -2606,6 +2734,8 @@ impl MissClass {
             };
         }
         match self {
+            Self::AcceptedFloor => "accepted_body_floor",
+            Self::RealEdit => "s2_skipped_real_edit.replaced",
             Self::Unavailable => "unavailable",
             Self::NoEntry => "no_entry",
             Self::AuditCarrier => "ineligible.audit_carrier",
@@ -2689,6 +2819,8 @@ pub(crate) enum RestoreOutcome {
     Restored(Box<Taken<CachedJsonlReduction>>, store::ActiveLease),
     Pending,
     Miss(MissClass),
+    /// Known correctness hold, census-neutral; never a Full fallback.
+    FloorHeld,
     Held(store::Refusal),
     Stale(&'static str),
 }
@@ -2772,6 +2904,7 @@ mod restore_test {
                     lease: Some(lease),
                 }),
                 Self::Miss(_) | Self::Stale(_) | Self::Held(store::Refusal::BehindAccepted) => None,
+                Self::FloorHeld => None,
                 Self::Pending if !crate::heap_layout_bound::layout_supported() => None,
                 Self::Pending => panic!("ordinary restore unexpectedly Pending"),
                 Self::Held(reason) => panic!("ordinary restore unexpectedly Held: {reason:?}"),

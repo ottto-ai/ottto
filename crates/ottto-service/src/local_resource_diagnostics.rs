@@ -902,7 +902,7 @@ impl RestoreCounts {
         use crate::snapshots::sampled_scan::RestoreOutcome;
         let count = match outcome {
             RestoreOutcome::Restored(..) => &mut self.restored,
-            RestoreOutcome::Held(_) => &mut self.held,
+            RestoreOutcome::Held(_) | RestoreOutcome::FloorHeld => &mut self.held,
             RestoreOutcome::Pending => &mut self.pending,
             RestoreOutcome::Miss(class) => self.miss.entry(class.label()).or_default(),
             RestoreOutcome::Stale(reason) => self.stale.entry(reason).or_default(),
