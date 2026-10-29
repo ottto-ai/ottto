@@ -4092,6 +4092,23 @@ fn a0h_native_exhaustion_growth_pacing_reselection_and_restart_body() {
             .unwrap();
         let file = File::open(&path).unwrap();
         let now = std::time::Instant::now();
+        // Fill BEFORE restore: B1 restore itself tries to enroll target custody.
+        if overflow {
+            for n in 0..2 * store::MAX_RECORDS {
+                owner
+                    .cache
+                    .begin_retail(
+                        source,
+                        &format!("other{n}"),
+                        &checkpoint,
+                        &file,
+                        accepted,
+                        now,
+                    )
+                    .unwrap()
+                    .finish();
+            }
+        }
         // Real cold restore before guard loss: record C, held file H, committed C.
         let namespace = Scope("e2-pipeline".into());
         let interpretation = Interpretation::of(source, &key, &prior, false, &namespace);
@@ -4112,22 +4129,7 @@ fn a0h_native_exhaustion_growth_pacing_reselection_and_restart_body() {
         let high = file.metadata().unwrap().len();
         assert!(high > accepted);
         let ((), pre_spend_io) = a0h_observe(|| {
-            if overflow {
-                for n in 0..2 * store::MAX_RECORDS {
-                    owner
-                        .cache
-                        .begin_retail(
-                            source,
-                            &format!("other{n}"),
-                            &checkpoint,
-                            &file,
-                            accepted,
-                            now,
-                        )
-                        .unwrap()
-                        .finish();
-                }
-            } else {
+            if !overflow {
                 let guard = owner
                     .cache
                     .begin_retail(
