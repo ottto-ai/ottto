@@ -231,6 +231,7 @@ fn cache_head_probe(item: &SnapshotItem) -> SnapshotItem {
     let mut probe = item.clone();
     probe.cache_observations = None;
     probe.cache_observations_state = None;
+    probe.cache_conflict_answer = None;
     probe
 }
 
@@ -1060,6 +1061,47 @@ fn prepare_snapshot_cache_for_upload(
     );
 }
 
+/// Answer each owed head-CAS challenge on the outgoing body of its session,
+/// at most once per quarantine retry window after a refused answer. Only a
+/// body that would otherwise send the stale base under the head-CAS contract
+/// carries the answer; the body itself, its fingerprint and its witness are
+/// unchanged.
+fn attach_head_conflict_answers(
+    snapshots: &mut [SnapshotItem],
+    progress: &SnapshotUploadProgress,
+    now: u64,
+) -> usize {
+    let mut attached = 0usize;
+    for snapshot in snapshots {
+        snapshot.cache_conflict_answer = None;
+        // A withheld cache patch keeps its base but sends no CAS contract, so
+        // the request and its ACK validation would not admit a handshake.
+        if snapshot.cache_base_head_etag.is_none() || snapshot.cache_observations.is_none() {
+            continue;
+        }
+        let Some(record) = progress
+            .head_conflict_challenges
+            .get(&cache_session_key(&snapshot.source_session_id))
+        else {
+            continue;
+        };
+        if record.answer_attempts > 0
+            && now
+                < record
+                    .last_answer_unix
+                    .saturating_add(crate::snapshots::SNAPSHOT_QUARANTINE_RETRY_SECONDS)
+        {
+            continue;
+        }
+        snapshot.cache_conflict_answer = Some((
+            record.challenge.clone(),
+            record.stale_revision_v2_hash.clone(),
+        ));
+        attached = attached.saturating_add(1);
+    }
+    attached
+}
+
 fn effective_snapshot_upload_body_witness(
     snapshot: &SnapshotItem,
     progress: &SnapshotUploadProgress,
@@ -1166,6 +1208,24 @@ struct PendingCacheHeadFile {
     settled_entities: BTreeSet<String>,
 }
 
+/// A server head-CAS challenge this session still owes an answer. The
+/// challenge binds the server's current head to the exact refused revision v2
+/// hash, so the next upload can replace the stale base through the backend's
+/// existing rescan handshake instead of conflicting on it forever.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct HeadConflictChallenge {
+    challenge: String,
+    stale_revision_v2_hash: String,
+    /// Answers the server refused again. Counted and logged; never terminal,
+    /// so an unrecovered session keeps today's retryable conflict hold.
+    #[serde(default)]
+    answer_attempts: u32,
+    /// When the last refused answer was observed. The next answer waits one
+    /// quarantine retry window after it.
+    #[serde(default)]
+    last_answer_unix: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PermanentSnapshotRejection {
     body_witness: String,
@@ -1222,6 +1282,10 @@ struct SnapshotUploadProgress {
     accepted_cache_heads: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pending_cache_heads: BTreeMap<String, PendingCacheHeadFile>,
+    /// Head-CAS conflict challenges keyed like `accepted_cache_heads`. Any
+    /// accepted or unchanged ACK for the session clears its entry.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    head_conflict_challenges: BTreeMap<String, HeadConflictChallenge>,
     #[serde(default)]
     quarantined_fingerprints: BTreeMap<String, SnapshotQuarantineRecord>,
     /// Exact server-permanent refusals. Same destination, entity and body only;
@@ -1280,6 +1344,7 @@ impl SnapshotUploadProgress {
             accepted_cache_states: BTreeMap::new(),
             accepted_cache_heads: BTreeMap::new(),
             pending_cache_heads: BTreeMap::new(),
+            head_conflict_challenges: BTreeMap::new(),
             quarantined_fingerprints: BTreeMap::new(),
             permanent_rejections: BTreeMap::new(),
             active_quarantine_witness: Some(active_quarantine_witness),
@@ -1349,6 +1414,14 @@ impl SnapshotUploadProgress {
                                 is_snapshot_fingerprint(entity) && is_snapshot_fingerprint(session)
                             })
                     })
+                    && progress
+                        .head_conflict_challenges
+                        .iter()
+                        .all(|(key, record)| {
+                            is_snapshot_fingerprint(key)
+                                && is_snapshot_fingerprint(&record.challenge)
+                                && is_snapshot_fingerprint(&record.stale_revision_v2_hash)
+                        })
                     && progress.accepted_cache_states.iter().all(|(key, state)| {
                         is_snapshot_fingerprint(key)
                             && state
@@ -1928,6 +2001,46 @@ impl SnapshotUploadProgress {
         self.quarantined_fingerprints.remove(fingerprint);
         self.active_quarantine_retries.remove(fingerprint);
         self.active_reason_reoffers.remove(fingerprint);
+    }
+
+    /// Keep the newest challenge for this session. A refused answer counts one
+    /// attempt and restarts the answer window; an unanswered conflict keeps
+    /// the existing count. Returns the attempt count for diagnostics.
+    fn record_head_conflict_challenge(
+        &mut self,
+        session_id: &str,
+        challenge: &str,
+        rescan: &crate::snapshot_client::SnapshotConflictRescan,
+        now: u64,
+    ) -> Option<u32> {
+        if !is_snapshot_fingerprint(challenge) || !is_snapshot_fingerprint(&rescan.revision_v2_hash)
+        {
+            return None;
+        }
+        let key = cache_session_key(session_id);
+        let previous = self.head_conflict_challenges.get(&key);
+        let (answer_attempts, last_answer_unix) = if rescan.answered {
+            (
+                previous
+                    .map_or(0, |record| record.answer_attempts)
+                    .saturating_add(1),
+                now,
+            )
+        } else {
+            previous.map_or((0, 0), |record| {
+                (record.answer_attempts, record.last_answer_unix)
+            })
+        };
+        self.head_conflict_challenges.insert(
+            key,
+            HeadConflictChallenge {
+                challenge: challenge.to_string(),
+                stale_revision_v2_hash: rescan.revision_v2_hash.clone(),
+                answer_attempts,
+                last_answer_unix,
+            },
+        );
+        Some(answer_attempts)
     }
 
     fn record_cache_state<T: Serialize>(
@@ -4392,6 +4505,7 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
         cache_observations: item.cache_observations.clone(),
         cache_observations_state: None,
         cache_base_head_etag: None,
+        cache_conflict_answer: None,
         cache_requests: Vec::new(),
         cache_requests_complete: false,
         avg_duration_ms: item.avg_duration_ms,
@@ -7388,6 +7502,18 @@ fn finish_sync_source(
     }
     // The same hook every resend path calls; nothing held is left by now.
     index.retain_claude_history_emission_permitted(&mut scan_result.snapshots);
+    // After bootstrap set each base, so an answer never borrows a fresh head.
+    let head_conflict_answers = attach_head_conflict_answers(
+        &mut scan_result.snapshots,
+        &upload_progress,
+        current_unix_seconds(),
+    );
+    if head_conflict_answers > 0 {
+        eprintln!(
+            "local snapshot upload answers {head_conflict_answers} head-CAS conflict challenge(s) for {} through the rescan handshake",
+            source.api_slug()
+        );
+    }
     let projected_pending_head_file_witnesses =
         upload_progress.pending_cache_head_file_witnesses(&index);
     let mut accepted = 0;
@@ -7443,9 +7569,10 @@ fn finish_sync_source(
                 let upload_relay_token = client.issue_relay_token(device, device_secret, source)?;
                 ensure_authority()?;
                 validate_joined(&request.snapshots)?;
-                let response =
+                let mut response =
                     client.upload_batch(&upload_relay_token, &request, reconcile_class)?;
                 response.validate_entity_ack_with_head_cas(&request, reconcile_class)?;
+                response.bind_conflict_rescans(&request);
                 let request_fingerprints = request
                     .snapshots
                     .iter()
@@ -9733,6 +9860,8 @@ where
         return Ok(SnapshotPageOutcome::Disabled(response.disabled_reason));
     }
     let mut conflicted_entities = 0usize;
+    let mut head_conflicts_recovered = Vec::new();
+    let mut head_conflicts_recorded = Vec::new();
     let entity_ack = match response.entity_ack_contract.as_deref() {
         None => false,
         Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT) => true,
@@ -9769,6 +9898,42 @@ where
                 progress
                     .accepted_cache_heads
                     .insert(cache_session_key(&entity.source_session_id), head.clone());
+            }
+        }
+        // Any settled ref for the session resolves its owed challenge: the
+        // saved head is now current or removed. A conflict in the same page
+        // for an already-settled session records nothing.
+        let mut settled_sessions = BTreeSet::new();
+        for entity in response
+            .accepted_entities
+            .iter()
+            .chain(&response.unchanged_entities)
+        {
+            let key = cache_session_key(&entity.source_session_id);
+            if let Some(record) = progress.head_conflict_challenges.remove(&key) {
+                head_conflicts_recovered.push((key.clone(), record.answer_attempts));
+            }
+            settled_sessions.insert(key);
+        }
+        let now = current_unix_seconds();
+        for entity in &response.conflict_entities {
+            let key = cache_session_key(&entity.source_session_id);
+            if settled_sessions.contains(&key) {
+                continue;
+            }
+            let (Some(challenge), Some(rescan)) = (
+                entity.head_challenge.as_deref(),
+                response.conflict_rescans.get(&entity.snapshot_fingerprint),
+            ) else {
+                continue;
+            };
+            if let Some(attempts) = progress.record_head_conflict_challenge(
+                &entity.source_session_id,
+                challenge,
+                rescan,
+                now,
+            ) {
+                head_conflicts_recorded.push((key, attempts, rescan.answered));
             }
         }
         // An unchanged ref with `unchanged_basis` means the server did not
@@ -9863,6 +10028,20 @@ where
             operation: "save upload checkpoint",
         })
     })?;
+    for (key, answer_attempts) in &head_conflicts_recovered {
+        eprintln!(
+            "local snapshot head-CAS conflict resolved for {poison_scope}: session_hash={} \
+             refused_answers={answer_attempts}; saved head replaced by the server's",
+            &key[..8],
+        );
+    }
+    for (key, answer_attempts, answered) in &head_conflicts_recorded {
+        eprintln!(
+            "local snapshot head-CAS conflict for {poison_scope}: session_hash={} answered={answered} \
+             refused_answers={answer_attempts}; challenge saved, the next eligible upload answers it",
+            &key[..8],
+        );
+    }
     if entity_ack {
         for entity in &response.rejected_entities {
             record_poison_loss_once(poison_scope, &entity.snapshot_fingerprint);
@@ -14373,6 +14552,7 @@ mod tests {
             client_report: crate::client_report::ClientReport::empty(),
         };
         let mut response = crate::snapshot_client::SnapshotBatchResponse {
+            conflict_rescans: Default::default(),
             accepted: 1,
             sessions_reconciled: 1,
             session_ids: Vec::new(),
@@ -14806,6 +14986,7 @@ mod tests {
                     unchanged_basis: None,
                 };
                 let response = crate::snapshot_client::SnapshotBatchResponse {
+                    conflict_rescans: Default::default(),
                     accepted: 1,
                     sessions_reconciled: 0,
                     session_ids: Vec::new(),
@@ -15037,6 +15218,7 @@ mod tests {
             String::as_str,
             |_| {
                 Ok(crate::snapshot_client::SnapshotBatchResponse {
+                    conflict_rescans: Default::default(),
                     accepted: 0,
                     sessions_reconciled: 0,
                     session_ids: Vec::new(),
@@ -15279,6 +15461,7 @@ mod tests {
 
     fn accepted_batch(count: usize) -> crate::snapshot_client::SnapshotBatchResponse {
         crate::snapshot_client::SnapshotBatchResponse {
+            conflict_rescans: Default::default(),
             accepted: count as u64,
             sessions_reconciled: count as u64,
             session_ids: Vec::new(),
@@ -15371,6 +15554,7 @@ mod tests {
         conflicted: &[String],
     ) -> crate::snapshot_client::SnapshotBatchResponse {
         crate::snapshot_client::SnapshotBatchResponse {
+            conflict_rescans: Default::default(),
             accepted: accepted.len().saturating_add(unchanged.len()) as u64,
             sessions_reconciled: accepted.len().saturating_add(unchanged.len()) as u64,
             session_ids: Vec::new(),
@@ -15472,6 +15656,7 @@ mod tests {
             String::as_str,
             |_| {
                 Ok(crate::snapshot_client::SnapshotBatchResponse {
+                    conflict_rescans: Default::default(),
                     accepted: 1,
                     sessions_reconciled: 1,
                     session_ids: Vec::new(),
@@ -15739,6 +15924,7 @@ mod tests {
             String::as_str,
             |_| {
                 Ok(crate::snapshot_client::SnapshotBatchResponse {
+                    conflict_rescans: Default::default(),
                     accepted: 0,
                     sessions_reconciled: 0,
                     session_ids: Vec::new(),
@@ -24162,7 +24348,7 @@ mod tests {
 
 crate::heap_layout_bound::fields!(SourcePreparation; native_comparison_reservation, native_comparison_lease, prepared_claude_evidence, terminal_native_traversal, native_comparison_controller, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
 
-crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_account_hashes, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save);
+crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_account_hashes, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_cache_heads, pending_cache_heads, head_conflict_challenges, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save);
 
 crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint, group_fingerprint, entities, reselected_heads, settled_entities);
 
@@ -24170,7 +24356,12 @@ crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint,
 #[path = "snapshot_sync/h357_ack_tests.rs"]
 mod h357_ack_tests;
 
+#[cfg(test)]
+#[path = "snapshot_sync/head_conflict_answer_tests.rs"]
+mod head_conflict_answer_tests;
+
 crate::heap_layout_bound::fields!(PermanentSnapshotRejection; body_witness, reason, reoffer);
+crate::heap_layout_bound::fields!(HeadConflictChallenge; challenge, stale_revision_v2_hash, answer_attempts, last_answer_unix);
 
 crate::heap_layout_bound::fields!(PreparedTraceRead; generation, report);
 crate::heap_layout_bound::fields!(PreparedClaudeLocalEvidence; sessions, api, api_failed, trace_rows, traces, healthy_roots);
