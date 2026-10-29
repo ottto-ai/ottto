@@ -14109,3 +14109,127 @@ fn mcp_version_waits_for_resumed_cursor_eof() {
         panic!("cursor never completed");
     });
 }
+
+/// R1 singleton: a paged cursor job starts while its file is indexed, so it
+/// captures no missing-carrier due, then parks; the per-pass index loses the
+/// entry. On completion settlement re-probes the record read-only (live
+/// context, once-clamped) and stages the marker, counting the miss and the
+/// staged transition once each. The job is not invalidated.
+#[test]
+fn parked_singleton_across_fresh_index_reprobes_record_debt() {
+    use crate::durable_tail_store as store;
+    use std::io::Read;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(40);
+    let path = fixture.file(SESSION);
+    let key = local_index_key(&path);
+    let incomplete = |scan: &mut OwnedSourceScan| scan.sidecar_census_complete = false;
+    let (mut index, _, _) = page_with(
+        &fixture,
+        ScanIndex::default(),
+        None,
+        "cursor-fixture",
+        NOW,
+        incomplete,
+    );
+    assert!(index.files.contains_key(&key));
+    // A same-context debt record for the indexed file.
+    let state = fixture.root.parent().unwrap().to_path_buf();
+    let index_path = state.join("index.json");
+    let scope = Scope("cursor-fixture".into());
+    let now = crate::snapshots::sampled_scan::now_seconds();
+    let due = now - 90;
+    let mut file = fs::File::open(&path).unwrap();
+    let mut plan =
+        crate::transcript_acquisition::ReadPlan::prepare(&mut file, None, &scope, None, now)
+            .unwrap();
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).unwrap();
+    plan.observe_complete_records(&bytes).unwrap();
+    let mut certificate = plan
+        .commit_after_native_completion(&file, &scope, now)
+        .unwrap()
+        .durable_certificate(0)
+        .unwrap();
+    certificate.audit_debt_unix_seconds = Some(due);
+    let ds = store::DurableSource::Codex;
+    let lock = crate::locked_state_dir::test_locks::hold(&state);
+    let mut disk = store::DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+    let pending = store::PendingRecord {
+        binding: store::Binding {
+            source: ds,
+            key: store::key_digest(ds, &key),
+            context: store::context_digest(&scope.0, None),
+            scope: [0; 32],
+            entry: [0; 32],
+        },
+        certificate,
+        body: crate::snapshots::durable_store_fixture_body(SnapshotSource::Codex, 0, 0),
+        allowlist: crate::snapshots::sampled_jsonl::durable::allowlist_digest(
+            SnapshotSource::Codex,
+        ),
+    };
+    assert_eq!(
+        disk.write_after_save(lock, 1, vec![pending])
+            .unwrap()
+            .written,
+        1
+    );
+    drop(disk);
+    fixture.append(SESSION, &token_line(41));
+    index.traversal = None;
+    let cache = Arc::new(SharedCache::default());
+    cache.durable_begin_pass(SnapshotSource::Codex, &index_path, &scope, false);
+    let index = with_test_limits(2048, 1024, 64, || {
+        let mut index = index;
+        let mut cleared = false;
+        for _ in 0..64 {
+            let (next, _, _) = page_with(
+                &fixture,
+                index,
+                Some(Arc::clone(&cache)),
+                "cursor-fixture",
+                NOW,
+                incomplete,
+            );
+            index = next;
+            let done =
+                counter(&cache, |c| c.jobs_certified) + counter(&cache, |c| c.jobs_uncertified);
+            if done > 0 {
+                break;
+            }
+            if !cleared && counter(&cache, |c| c.jobs_paused) > 0 {
+                // The per-pass index loads without the parked file's entry.
+                index.files.remove(&key);
+                cleared = true;
+            }
+        }
+        assert!(cleared, "the job parked: {}", counters(&cache));
+        assert_eq!(
+            counter(&cache, |c| c.jobs_invalidated),
+            0,
+            "{}",
+            counters(&cache)
+        );
+        index
+    });
+    assert_eq!(
+        index.files[&key].unverified_deadline(),
+        Some(due),
+        "staged from the record at settlement"
+    );
+    let (durable, _) = cache.durable_counters(SnapshotSource::Codex).unwrap();
+    // A start-time restore attempt on the then-indexed entry may count its
+    // own carrier miss (A's existing-entry rearm); the re-probe adds one.
+    assert!(durable
+        .ineligible
+        .get("audit_carrier")
+        .is_some_and(|n| *n >= 1));
+    assert_eq!(
+        durable.ineligible.get("audit_carrier_staged_unverified"),
+        Some(&1)
+    );
+    assert_eq!(durable.restored, 0);
+}
