@@ -170,7 +170,7 @@ fn read_header_bytes(candidate: &CandidateFile) -> Result<(Vec<u8>, String, usiz
     anyhow::ensure!(before.is_file(), "Codex header is not a regular file");
     let mut reader = BufReader::with_capacity(1024, file.take((MAX_HEADER_BYTES + 1) as u64));
     let mut bytes = Vec::new();
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     header_cache_tests::READ_CALLS.with(|calls| calls.set(calls.get() + 1));
     reader.read_until(b'\n', &mut bytes)?;
     anyhow::ensure!(
@@ -4041,7 +4041,7 @@ pub(super) mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod header_cache_tests {
     use super::*;
     thread_local! {
