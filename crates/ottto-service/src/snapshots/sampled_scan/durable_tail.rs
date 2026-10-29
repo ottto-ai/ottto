@@ -537,8 +537,9 @@ impl SharedCache {
         snapshot_source: SnapshotSource,
         key: &str,
         has_index: bool,
+        recovered_audit_due: &mut Option<u64>,
     ) -> Option<store::Refusal> {
-        self.durable_guard(snapshot_source, key, false, has_index)
+        self.durable_guard(snapshot_source, key, false, has_index, recovered_audit_due)
     }
 
     fn durable_guard(
@@ -547,6 +548,7 @@ impl SharedCache {
         key: &str,
         restore_recheck: bool,
         has_index: bool,
+        recovered_audit_due: &mut Option<u64>,
     ) -> Option<store::Refusal> {
         let ram = !restore_recheck && self.retained().is_ok_and(|ram| ram.peek(key).is_some());
         let source = durable_source(snapshot_source)?;
@@ -557,11 +559,12 @@ impl SharedCache {
             .store
             .guard_with_carrier(&store::key_digest(source, key), has_index)
         {
-            Ok(true) => {
+            Ok(Some(due)) => {
                 Counters::bump(&mut stores.counters.ineligible, "audit_carrier");
-                return None; // No entry: ordinary acquisition must create it by Full.
+                *recovered_audit_due = Some(due);
+                return None; // Native completion alone may discharge this debt.
             }
-            Ok(false) => None,
+            Ok(None) => None,
             Err(reason) => Some(reason),
         };
         if held == Some(store::Refusal::Corrupt) && ram {
@@ -654,7 +657,13 @@ impl SharedCache {
             Ok(taken) => RestoreOutcome::Restored(Box::new(taken)),
             Err(class @ MissClass::AuditCarrier) => RestoreOutcome::Miss(class),
             Err(class) => self
-                .durable_guard(snapshot_source, key, true, index.files.contains_key(key))
+                .durable_guard(
+                    snapshot_source,
+                    key,
+                    true,
+                    index.files.contains_key(key),
+                    &mut None,
+                )
                 .map_or(RestoreOutcome::Miss(class), RestoreOutcome::Held),
         }
     }
@@ -1085,6 +1094,9 @@ impl SharedCache {
                     continue;
                 }
                 let scope = slot.decided.get(key).and_then(|scope| {
+                    if index.files[key].has_unverified_source() {
+                        return None; // Keep the predecessor until a verified Full replaces it.
+                    }
                     let interpretation = Interpretation::of(
                         snapshot_source,
                         key,

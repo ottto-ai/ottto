@@ -12,12 +12,21 @@ debt tags or inconsistent flag/deadline pairs are preserved as Unbindable holds.
 A debt-bearing record with an absent index entry is a counted acquisition miss
 before sampling admission can skip restore. The existing classified header adds
 no read; the old reduction is never restored as audit-clean. Normal Full creates
-real index membership on completion, satisfies the audit and supplies the
-post-save replacement. Post-save GC preserves same-context missing-carrier debt
+real index membership on native settlement. The validated envelope deadline
+travels in the acquisition independently of sampling admission. Source-verified
+Full completion satisfies the audit and supplies the post-save replacement;
+terminal-loss publication instead stages the existing unverified-source marker
+and recovered deadline on the native-created entry. Save/restart preserves that
+marker for age-independent discovery and the next verified Full. GC keeps the
+same-context predecessor while that entry owes verification, including when its
+decided scope differs. No debt is discharged by publication alone. Post-save GC preserves same-context missing-carrier debt
 records; fresh-index cleanup retains evidence without a trusted context until
 that acquisition. Both-source production tests require one-pass census
 completion and publication with exactly one `ineligible.audit_carrier` miss.
-Supported native layouts additionally verify replacement, append/Tail, idle
+A separate both-source terminal-loss fixture requires disclosed publication,
+recovered deadline/marker survival across save/restart and GC, selection beyond
+the age window, and verified-Full retirement. Native layouts also check its
+post-save replacement. Supported native layouts additionally verify replacement, append/Tail, idle
 beyond the discovery window and a quiet restart with zero transcript bytes.
 An existing entry with a reset/postponed carrier re-arms an immediate
 index audit, recovering the normal completed-audit/index-saved/record-old crash

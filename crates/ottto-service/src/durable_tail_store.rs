@@ -686,13 +686,13 @@ impl DurableTailStore {
         self.guard_with_carrier(key, true).err()
     }
 
-    /// Ok(true) is missing audit custody: acquire Full, never restore clean.
+    /// Ok(Some(due)) is missing audit custody: acquire Full, never restore clean.
     /// Invalid records remain holds; the caller counts the carrier miss.
     pub(crate) fn guard_with_carrier(
         &mut self,
         key: &Digest32,
         has_index: bool,
-    ) -> Result<bool, Refusal> {
+    ) -> Result<Option<u64>, Refusal> {
         let result = self.classify(key, "guard");
         self.pass[0] += u64::from(!matches!(result, Ok(None)));
         match result {
@@ -706,12 +706,12 @@ impl DurableTailStore {
                     self.counters.t14_rebuild += 1;
                     self.rebuilt.insert(*key, Rebuild::Authorized);
                 }
-                Ok(false)
+                Ok(None)
             }
-            Err(Refusal::Corrupt) if self.rebuilt[key] == Rebuild::Authorized => Ok(false),
-            Ok(header) => {
-                Ok(!has_index && header.is_some_and(|header| header.audit_debt.is_some()))
-            }
+            Err(Refusal::Corrupt) if self.rebuilt[key] == Rebuild::Authorized => Ok(None),
+            Ok(header) => Ok(header
+                .filter(|_| !has_index)
+                .and_then(|header| header.audit_debt)),
             Err(reason) => Err(reason),
         }
     }

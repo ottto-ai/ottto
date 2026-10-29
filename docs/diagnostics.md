@@ -185,14 +185,22 @@ entry is absent is a miss counted once by the common acquisition guard as
 `ineligible.audit_carrier`, including when sampling admission skips restore.
 It does not increment `durable_held` or the held-key alarm. The guard uses the
 already classified store header and adds no read. The old reduction is never
-restored as audit-clean: normal acquisition reads Full, successful native
-completion creates the index entry and satisfies the audit, and the post-save
-writer replaces the predecessor. No index membership is inferred from a record.
+restored as audit-clean: normal acquisition reads Full. The validated envelope
+deadline travels with that acquisition independently of sampling admission.
+Native parsing creates the index entry; only source-verified Full completion
+satisfies the audit and supplies the post-save replacement. Terminal row loss
+may publish without verification: the native-created entry then receives the
+existing unverified-source marker with the recovered deadline. That marker
+survives save/restart and keeps discovery eligible beyond the age window until
+a verified Full retires the obligation. No index membership is inferred from a
+record, and no new deadline, persisted field or acquisition cause is introduced.
 Post-save GC preserves same-context debt-bearing records whose key is absent
 from the index; fresh-index cleanup without a trusted context preserves their
 debt evidence too, until acquisition establishes custody. These preservation
-decisions keep counting `format_hold.unbindable`. Proven foreign-context
-records remain ordinary GC candidates. An existing entry with reset/postponed
+decisions keep counting `format_hold.unbindable`. Once the real entry carries
+unverified-source debt, GC keeps its same-context predecessor regardless of a
+decided scope change until verification permits ordinary replacement/collection.
+Proven foreign-context records remain ordinary GC candidates. An existing entry with reset/postponed
 debt instead re-arms an immediate index audit and plans Full(`audit_due`), also
 recovering an index-new/record-old crash after a successful audit. Direct restore
 misses also count `ineligible.audit_carrier`, without becoming held exits.

@@ -25373,6 +25373,8 @@ pub(crate) struct OwnedSourceScan {
 struct OwnedActiveFile {
     comparison_target: bool,
     sampling: Option<sampled_scan::Active>,
+    // Survives paging and missing preparation; only source verification retires it.
+    recovered_audit_due: Option<u64>,
     candidate: CandidateFile,
     decision: CandidateDecision,
     previous_snapshot_fingerprint: Option<String>,
@@ -28359,6 +28361,7 @@ impl OwnedSourceScan {
                 let OwnedActiveFile {
                     comparison_target,
                     sampling: file_sampling,
+                    recovered_audit_due,
                     candidate,
                     decision,
                     previous_snapshot_fingerprint,
@@ -29828,7 +29831,14 @@ impl OwnedSourceScan {
                                     due_unix_seconds,
                                 },
                             ),
-                    };
+                    }
+                    .or(recovered_audit_due
+                        .filter(|_| !source_verified)
+                        .map(
+                            |due_unix_seconds| crate::transcript_acquisition::AuditDebt {
+                                due_unix_seconds,
+                            },
+                        ));
                     if let Some(debt) = obligation {
                         let was_pending = index
                             .files
@@ -31213,12 +31223,19 @@ impl OwnedSourceScan {
                 CandidateDecision::ReconcileLegacy | CandidateDecision::Parse => {}
             }
             #[cfg(unix)]
+            let mut recovered_audit_due = None;
+            #[cfg(not(unix))]
+            let recovered_audit_due = None;
+            #[cfg(unix)]
             if side_plan.is_none() {
                 if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
                     let key = local_index_key(&candidate.path);
-                    if let Some(reason) =
-                        cache.durable_hold(source, &key, index.files.contains_key(&key))
-                    {
+                    if let Some(reason) = cache.durable_hold(
+                        source,
+                        &key,
+                        index.files.contains_key(&key),
+                        &mut recovered_audit_due,
+                    ) {
                         cache.durable_hold_exit(source, reason, index, &candidate, &mut census);
                         pending!();
                     }
@@ -31737,7 +31754,10 @@ impl OwnedSourceScan {
                         .observe(reduction_sidecar.is_some());
                     if let Some(reduction_sidecar) = reduction_sidecar {
                         let debt =
-                            sampled_audit::debt_for_key(index, &key, sampled_scan::now_seconds());
+                            sampled_audit::debt_for_key(index, &key, sampled_scan::now_seconds())
+                                .or(recovered_audit_due.map(|due_unix_seconds| {
+                                    crate::transcript_acquisition::AuditDebt { due_unix_seconds }
+                                }));
                         let protected_entry = index.files.get(&key);
                         context
                             .admission
@@ -31912,6 +31932,7 @@ impl OwnedSourceScan {
                             .acquisition
                             .as_ref()
                             .and_then(|plan| plan.metrics().audit_due)
+                            .or(recovered_audit_due)
                             .or_else(|| {
                                 // A grown Full without an older obligation
                                 // still owes a quiet audit. Prepare its bound
@@ -32005,12 +32026,12 @@ impl OwnedSourceScan {
                             }
                         };
                         sampled_scan::configure_tier_replay(&mut parser, &candidate, index);
-                        planned_mode = Some((mode, None));
+                        planned_mode = Some((mode, recovered_audit_due));
                         file_sampling = Some(sampled_scan::Active {
                             key,
                             scope,
                             mode,
-                            audit_due: None,
+                            audit_due: recovered_audit_due,
                             retained_hint: None,
                             retained_finalization_charge: 0,
                             retained_usage: None,
@@ -32022,6 +32043,7 @@ impl OwnedSourceScan {
             let mut active = Box::new(OwnedActiveFile {
                 comparison_target,
                 sampling: file_sampling,
+                recovered_audit_due,
                 candidate,
                 decision,
                 previous_snapshot_fingerprint,
@@ -89213,7 +89235,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_ledger_identity_used, codex_parent_resolution_pending, codex_parent_ownership_ledger,
     codex_parent_unresolvable, codex_parent_ledger_unusable, codex_parent_ledger_consulted,
     codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
-crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
+crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, recovered_audit_due, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
 crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
