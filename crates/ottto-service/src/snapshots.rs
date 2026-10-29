@@ -26858,26 +26858,34 @@ impl OwnedSourceScan {
                     if !done {
                         pending!();
                     }
-                    inventory.refresh_custody(index);
-                    if inventory.custody_incomplete
-                        || index
-                            .files
-                            .values()
-                            .any(|entry| entry.codex_compressed_hold.is_some())
-                    {
-                        inventory.complete = false;
-                        if let Some(traversal) = index.traversal.as_mut() {
-                            for candidate in identified_candidates.drain(..) {
-                                traversal.pending_candidates.push_back(ScanTraversalPath {
-                                    scan_root: candidate.scan_root,
-                                    path: candidate.path,
-                                    census_member: true,
-                                    watcher_hint: false,
-                                });
-                            }
-                        }
-                        codex_join_prepared = true;
+                    if !inventory.prepare_custody(index) {
                         pending!();
+                    }
+                    if !inventory.hold_custodied_siblings(index) {
+                        pending!();
+                    }
+                    let selected_count = identified_candidates.len();
+                    for _ in 0..selected_count {
+                        let candidate = identified_candidates.pop_front().expect("selected count");
+                        if inventory.member_held(&candidate.path) {
+                            if !index
+                                .files
+                                .get(&local_index_key(&candidate.path))
+                                .is_some_and(|e| e.codex_compressed_hold.is_some())
+                            {
+                                if let Some(traversal) = index.traversal.as_mut() {
+                                    traversal.pending_candidates.push_back(ScanTraversalPath {
+                                        scan_root: candidate.scan_root,
+                                        path: candidate.path,
+                                        census_member: true,
+                                        watcher_hint: false,
+                                    });
+                                }
+                                index.mark_bounded_sweep_unsettled();
+                            }
+                        } else {
+                            identified_candidates.push_back(candidate);
+                        }
                     }
 
                     let unresolved = &inventory.held_owners;
@@ -26915,7 +26923,11 @@ impl OwnedSourceScan {
                         .collect::<BTreeSet<_>>();
                     inventory.complete &= selected.is_subset(&inventoried);
                     let mut owners = BTreeMap::<String, BTreeSet<PathBuf>>::new();
-                    for header in &inventory.headers {
+                    for header in inventory
+                        .headers
+                        .iter()
+                        .filter(|h| !inventory.member_held(&h.candidate.path))
+                    {
                         owners
                             .entry(header.owner.clone())
                             .or_default()

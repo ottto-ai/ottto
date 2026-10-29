@@ -261,7 +261,12 @@ pub(super) struct HeaderInventory {
     pub(super) headers: Vec<HeaderWitness>,
     pub(super) directories: DirectoryCensus,
     pub(super) complete: bool,
-    pub(super) custody_incomplete: bool,
+    pub(super) custody_next: usize,
+    pub(super) custody_after: Option<String>,
+    pub(super) custody_done: bool,
+    pub(super) custody_peak: usize,
+    pub(super) custody_refused: bool,
+    pub(super) custody_unknown: bool,
     pub(super) read_bytes: usize,
     pub(super) held_archives: BTreeSet<String>,
     pub(super) held_owners: BTreeSet<String>,
@@ -293,12 +298,6 @@ impl HeaderInventory {
             }
         }
     }
-    pub(super) fn member_held(&self, path: &Path) -> bool {
-        self.headers
-            .binary_search_by(|h| h.candidate.path.as_os_str().cmp(path.as_os_str()))
-            .is_ok_and(|at| self.headers[at].custody_cause.is_some())
-    }
-
     pub(super) fn complete_for(&self, owner: Option<&String>) -> bool {
         self.complete
             && !owner.is_some_and(|owner| {
@@ -326,7 +325,12 @@ impl HeaderInventory {
             complete: paths.len() <= MAX_HEADER_FILES
                 && directories.is_some_and(|value| value.stable),
             read_bytes: 0,
-            custody_incomplete: false,
+            custody_next: 0,
+            custody_after: None,
+            custody_done: false,
+            custody_peak: 0,
+            custody_refused: false,
+            custody_unknown: false,
             held_archives: BTreeSet::new(),
             held_owners: BTreeSet::new(),
             archive_work: codex_compressed_input::HeaderWork::default(),
@@ -380,8 +384,6 @@ impl HeaderInventory {
             .get(&key)
             .is_some_and(|entry| entry.codex_compressed_hold.is_some())
         {
-            self.custody_incomplete = true;
-            self.complete = false;
             return false;
         }
         let compressed = is_compressed_codex_rollout(Some(&path), None);
@@ -550,7 +552,7 @@ impl HeaderInventory {
 }
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
 crate::heap_layout_bound::fields!(HeaderWitness; custody_cause, candidate, owner, home, created_unix_ms, metadata, archive_stamp);
-crate::heap_layout_bound::fields!(HeaderInventory; custody_incomplete, roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, archive_work, refused, bounded_out);
+crate::heap_layout_bound::fields!(HeaderInventory; custody_next, custody_unknown, custody_after, custody_done, custody_peak, custody_refused, roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, archive_work, refused, bounded_out);
 
 #[derive(Clone, Debug)]
 pub(super) struct Group {
