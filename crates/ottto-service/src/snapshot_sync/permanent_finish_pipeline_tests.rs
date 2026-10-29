@@ -1341,7 +1341,8 @@ impl AckFinishHome {
         .unwrap()
         .expect("actual due source preparation");
         let (preparation, index, mut scan) = collect_native_preparation_with_rotation(frame, false);
-        assert!(scan.census_complete, "{cycle}: the real scan is clean");
+        assert!(scan.census_complete || index.claude_terminal_fold_deferred().is_some(),
+            "{cycle}: the real scan is clean or its oversized terminal cohort is demoted");
         assert_eq!(
             scan.snapshots.len(),
             1,
@@ -1614,4 +1615,242 @@ fn ack_huge_file_real_finish_converges_after_transport_failure_with_full_debt() 
         progress.accepted_fingerprints, debt_set,
         "only the unrelated debt remains"
     );
+}
+
+/// B1: the real finish boundary must keep healthy uploads moving while a
+/// terminal fold is deferred. All input, ACKs and server responses are local.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn deferred_terminal_uploads_and_saves_parked_traversal_across_passes() {
+    let server = AckScriptedServer::new();
+    let mut home = AckFinishHome::new(&server);
+    let source = SnapshotSource::ClaudeCode;
+    let namespace = snapshot_upload_destination_namespace(&home.device, "device-secret");
+    let index_path = snapshot_v3_index_path(&snapshot_destination_scoped_index_path(
+        &snapshot_index_path(&home.support, source),
+        &namespace,
+    ));
+    let mut seed = serde_json::to_value(ScanIndex::default()).unwrap();
+    let pending = (0..65)
+        .map(|n| {
+            (
+                format!("20000000-0000-4000-8000-{n:012}"),
+                serde_json::json!({
+                    "census_window_end": "2026-01-01T00:00:00Z",
+                    "member_request_id_hashes": {}, "member_occurrences": {}, "invalid": false
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    seed["claude_usage_family_pending"] = pending.clone().into();
+    seed["claude_retired_family_tombstones_uncertain"] = true.into();
+    let mut index: ScanIndex = serde_json::from_value(seed).unwrap();
+    index.save(&index_path).unwrap();
+    let pending = serde_json::to_value(ScanIndex::load(&index_path).unwrap()).unwrap()
+        ["claude_usage_family_pending"]
+        .as_object()
+        .unwrap()
+        .clone();
+    let mut window = None;
+    for pass in 1..=3 {
+        home.cadence.next_due_cycle();
+        if pass > 1 {
+            use std::io::Write;
+            let path = home
+                .fixture
+                .home
+                .join(".claude/projects/-synthetic-repo")
+                .join(format!("{IDENTITY_PIPELINE_ROOT}.jsonl"));
+            let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(file, "{}", serde_json::json!({
+                "timestamp": current_rfc3339(), "type": "assistant", "sessionId": IDENTITY_PIPELINE_ROOT,
+                "requestId": format!("req_deferred_{pass}"), "message": {
+                    "id": format!("m_deferred_{pass}"), "model": "claude-haiku-4-5",
+                    "usage": {"input_tokens": 10, "output_tokens": pass}
+                }
+            })).unwrap();
+            crate::snapshot_watcher::hint_snapshot_path_for_test(source, path);
+        }
+        let frame =
+            crate::agent_status_refresh::with_test_collection(AckFinishHome::collection(), || {
+                prepare_sync_source(
+                    &home.client,
+                    &home.device,
+                    "device-secret",
+                    source,
+                    "otm_test",
+                    &home.fixture.home,
+                    &home.support,
+                    &home.daemon,
+                    &mut home.transport,
+                    home.daemon.snapshot_scan_account_witness().unwrap(),
+                    false,
+                )
+            })
+            .unwrap()
+            .expect("due ordinary preparation");
+        let (preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
+        assert!(!scan.census_complete);
+        assert!(scan.scan_cap_hit);
+        assert!(index.claude_terminal_fold_deferred().unwrap().stat_skipped);
+        let previous_offers = server.offered.lock().unwrap().len();
+        let progress_path = preparation.upload_progress_path.clone();
+        let (result, lines) =
+            crate::local_resource_diagnostics::capture(|| home.finish(preparation, index, scan));
+        result.expect("deferred terminal is an ordinary successful page");
+        let stats = TERMINAL_FIXTURE_STATS.with(|slot| slot.take().unwrap());
+        assert_eq!(stats.terminal_fold_deferred.unwrap().cause, "preflight");
+        assert!(!stats.duplicate_census.census_complete);
+        let offered = server.offered.lock().unwrap();
+        assert!(
+            offered.len() > previous_offers,
+            "pass {pass}: healthy changed body uploaded"
+        );
+        let fingerprint = offered.last().unwrap()["snapshot_fingerprint"]
+            .as_str()
+            .unwrap();
+        let saved = ScanIndex::load(&index_path).unwrap();
+        assert!(saved.accepted_snapshot_fingerprint_recorded(fingerprint));
+        let progress = SnapshotUploadProgress::load(
+            &progress_path,
+            &namespace,
+            snapshot_quarantine_witness(source),
+        )
+        .unwrap();
+        assert!(progress.accepted_body_witnesses.contains_key(fingerprint)
+            || saved.files.iter().any(|(key, entry)| key.ends_with(&format!("{IDENTITY_PIPELINE_ROOT}.jsonl")) && entry.last_upload_body_witness.is_some()),
+            "exact accepted body witness is retained in progress or the settled index");
+        let value = serde_json::to_value(&saved).unwrap();
+        let traversal = &value["traversal"];
+        assert!(traversal.is_object(), "parked traversal saved");
+        let current_window = traversal["census_window_end"].clone();
+        assert_eq!(
+            window.get_or_insert_with(|| current_window.clone()),
+            &current_window,
+            "no traversal restart/re-arm across deferred passes"
+        );
+        for (root, record) in &pending {
+            assert_eq!(
+                &value["claude_usage_family_pending"][root], record,
+                "unread retained family cannot retire or change"
+            );
+        }
+        assert_eq!(value["claude_retired_family_tombstones_uncertain"], true);
+        assert!(value
+            .get("claude_retired_family_tombstones")
+            .is_none_or(|v| v.as_object().unwrap().is_empty()));
+        assert!(cached_source_manifest(&namespace, source).is_none());
+        if pass == 3 {
+            assert!(lines
+                .iter()
+                .any(|line| line["stage"] == "terminal_fold_deferred_consecutive"
+                    && line["counts"]["passes"].as_u64().is_some_and(|n| n >= 3)));
+        }
+    }
+}
+
+#[test]
+fn frozen_terminal_readset_is_consumed_once_without_a_second_allowance() {
+    let support = test_dir("frozen-terminal-one-allowance");
+    let mut index = ScanIndex::default();
+    let snapshots = Vec::new();
+    let frozen = PreparedClaudeLocalEvidence::freeze_terminal(&support, &snapshots, &index, true, None);
+    let mut prepared = Some(frozen);
+    let mut scan = crate::snapshots::scan_source_roots(
+        SnapshotSource::ClaudeCode, &[], &mut index, "2026-08-02T07:10:00Z", 183,
+    ).unwrap();
+    scan.census_complete = true;
+    let (second_budget, terminal) = prepare_claude_terminal_read(&support, &mut scan, &mut index, &mut prepared, false);
+    assert!(second_budget.is_none());
+    assert!(terminal.is_none());
+    assert!(prepared.unwrap().terminal_frozen);
+    let _ = std::fs::remove_dir_all(support);
+}
+
+thread_local! {
+    static TERMINAL_FIXTURE_STATS: std::cell::RefCell<Option<ClaudeLocalEvidenceStats>> = const { std::cell::RefCell::new(None) };
+}
+pub(crate) fn record_terminal_fixture_stats(stats: &ClaudeLocalEvidenceStats) {
+    TERMINAL_FIXTURE_STATS.with(|slot| slot.replace(Some(stats.clone())));
+}
+
+/// Late API/trace growth must use B1's real POST/ACK/settlement path. In
+/// particular, refusing the terminal read never spends the staged raw effects.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn read_allowance_growth_demotes_terminal_and_uploads_and_settles_current_page() {
+    for during_trace in [false, true] {
+        let server = AckScriptedServer::new();
+        let mut home = AckFinishHome::new(&server);
+        let source = SnapshotSource::ClaudeCode;
+        let namespace = snapshot_upload_destination_namespace(&home.device, "device-secret");
+        let index_path = snapshot_v3_index_path(&snapshot_destination_scoped_index_path(
+            &snapshot_index_path(&home.support, source), &namespace,
+        ));
+        let extra = "20000000-0000-4000-8000-000000000001";
+        let mut seed = serde_json::to_value(ScanIndex::default()).unwrap();
+        seed["claude_usage_family_pending"][extra] = serde_json::json!({
+            "census_window_end": "2026-01-01T00:00:00Z",
+            "member_request_id_hashes": {}, "member_occurrences": {}, "invalid": false
+        });
+        seed["claude_retired_family_tombstones_uncertain"] = true.into();
+        let mut index: ScanIndex = serde_json::from_value(seed).unwrap();
+        index.save(&index_path).unwrap();
+        let pending = serde_json::to_value(&index).unwrap()["claude_usage_family_pending"][extra].clone();
+        let (api, trace) = crate::claude_local_otel::terminal_sidecar_paths_for_test(&home.support, extra);
+        std::fs::create_dir_all(api.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(trace.parent().unwrap()).unwrap();
+        std::fs::write(&api, b"").unwrap();
+        std::fs::write(&trace, b"\n").unwrap();
+        let (preparation, index, mut scan) = home.prepare("reader growth");
+        assert!(index.claude_terminal_effects_staged());
+        assert!(index.claude_terminal_fold_deferred().is_none());
+        assert!(!scan.snapshots.is_empty());
+        // The helper deliberately lowers its flag for ACK-capacity fixtures;
+        // this case offers the scanner's admitted terminal instead.
+        scan.census_complete = true;
+        let window = serde_json::to_value(&index).unwrap()["traversal"]["census_window_end"].clone();
+        let _hook = crate::claude_local_otel::terminal_growth_hook_for_test(during_trace, |path| {
+            let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            file.set_len(crate::snapshots::CLAUDE_TERMINAL_MAX_INPUT_BYTES + 1).unwrap();
+        });
+        let (result, lines) = crate::local_resource_diagnostics::capture(|| home.finish(preparation, index, scan));
+        result.expect("late reader refusal still uploads the ordinary page");
+        let stats = TERMINAL_FIXTURE_STATS.with(|slot| slot.take().unwrap());
+        assert_eq!(stats.terminal_fold_deferred.unwrap().cause, "read_allowance");
+        assert!(!stats.duplicate_census.census_complete, "zero terminal usage folds");
+        let offered = server.offered.lock().unwrap();
+        assert!(!offered.is_empty(), "current page actually POSTed");
+        let saved = ScanIndex::load(&index_path).unwrap();
+        for body in offered.iter() {
+            assert!(saved.accepted_snapshot_fingerprint_recorded(body["snapshot_fingerprint"].as_str().unwrap()),
+                "the real ACK settled into the saved index");
+        }
+        let value = serde_json::to_value(&saved).unwrap();
+        assert_eq!(value["traversal"]["census_window_end"], window);
+        assert_eq!(value["claude_usage_family_pending"][extra], pending);
+        assert_eq!(value["claude_retired_family_tombstones_uncertain"], true);
+        assert!(cached_source_manifest(&namespace, source).is_none());
+        assert!(lines.iter().any(|line| line["stage"] == "terminal_fold_deferred"
+            && line["counts"]["cause"] == "read_allowance"));
+        assert!(crate::claude_local_otel::terminal_last_read_bytes_for_test()
+            <= crate::snapshots::CLAUDE_TERMINAL_MAX_INPUT_BYTES);
+    }
+}
+
+mod round7_parking_tests {
+    use super::*;
+    include!("round7_parking_tests.rs");
+}
+
+type PrepareCheckpointHook = fn(&mut ScanIndex, &Path) -> Result<()>;
+
+thread_local! {
+    static PREPARE_CHECKPOINT_HOOK: std::cell::Cell<Option<PrepareCheckpointHook>> = const { std::cell::Cell::new(None) };
+}
+pub(crate) fn prepare_checkpoint_hook_for_test(index: &mut ScanIndex, path: &Path) -> Result<()> {
+    if let Some(hook) = PREPARE_CHECKPOINT_HOOK.with(|slot| slot.take()) { hook(index, path)?; }
+    Ok(())
 }

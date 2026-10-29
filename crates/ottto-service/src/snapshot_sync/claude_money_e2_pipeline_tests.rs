@@ -816,12 +816,13 @@ fn twins(reverse: bool) {
         let expected = canonical(&first.scan.snapshots);
         first.finish();
         let prior = c.reload(&mut first.index);
+        let stored = stored_bodies(&prior);
         let repeated = ready(&c, &scanner, prior, 100, false);
-        assert_eq!(
-            canonical(&repeated.scan.snapshots),
-            expected,
-            "repeated page cannot add money"
-        );
+        // Containment 2 intentionally disables the automatic full replay.
+        // Keep the exact first money body and its stored settlement unchanged.
+        assert_eq!(canonical(&first.scan.snapshots), expected);
+        assert!(repeated.scan.snapshots.is_empty(), "no corpus-wide replay");
+        assert_eq!(stored_bodies(&repeated.index), stored);
     });
 }
 #[test]
@@ -917,6 +918,15 @@ fn e2_pipeline_off_page_twin_hold_preserves_complete_history() {
             .unwrap();
         let mut page = c.raw(&scanner, prior, 1, false, std::slice::from_ref(&twin));
         page.enrich(&c);
+        if page.scan.snapshots.is_empty() {
+            // With the full replay disabled an unchanged census member may
+            // consume the reserved first slot. Service the next bounded page;
+            // the changed twin still must co-schedule its complete history.
+            page.finish();
+            let prior = c.reload(&mut page.index);
+            page = c.raw(&scanner, prior, 1, false, &[]);
+            page.enrich(&c);
+        }
         assert!(
             !page.scan.snapshots.is_empty(),
             "both twins must co-schedule at the file-count boundary"
@@ -2002,9 +2012,14 @@ fn overlapping_restored(reverse: bool) {
         assert_eq!(first.scan.snapshots[0].input_tokens, 30);
         assert_eq!(first.scan.snapshots[0].removed_request_count, Some(1));
         let prior = settle(&c, &old, first, &mut progress);
+        let stored = stored_bodies(&prior);
+        let accepted = progress.accepted_fingerprints.clone();
         let again = ready(&c, &E2ScanFixture::default(), prior, 100, false);
-        literal(&again);
-        assert_eq!(total(&again), 2, "settled and re-read: unchanged");
+        // Containment 2: settled histories keep their exact bodies/ACKs;
+        // there is no new upload solely to recover a full-rearm fence.
+        assert!(again.scan.snapshots.is_empty());
+        assert_eq!(stored_bodies(&again.index), stored);
+        assert_eq!(progress.accepted_fingerprints, accepted);
     });
 }
 #[test]

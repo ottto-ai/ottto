@@ -637,13 +637,22 @@ fn sidecar_cap_loss_matches_full_and_keeps_prior_authority_quarantine() {
     assert!(!cached.index.claude_usage_authority_quarantine.is_empty());
     let held = settle(cached);
     f.evidence(2);
-    let recovered = enriched(&f, raw_scan(&f, held.clone(), Some(cache), |_| {}));
+    let mut oracle_prior = held.clone();
+    let mut recovered = enriched(&f, raw_scan(&f, held.clone(), Some(cache.clone()), |_| {}));
+    if recovered.modes == (0, 0, 0) {
+        // Containment 1 parks the refused terminal. The repaired reader first
+        // commits that terminal; the next ordinary walk services quarantine.
+        // Retain the exact Full, authority and oracle assertions below.
+        let parked = settle(recovered);
+        oracle_prior = parked.clone();
+        recovered = enriched(&f, raw_scan(&f, parked, Some(cache), |_| {}));
+    }
     assert_eq!(
         recovered.modes,
         (1, 0, 0),
         "quarantine still forces native Full"
     );
-    assert_oracle(&f, &recovered, held);
+    assert_oracle(&f, &recovered, oracle_prior);
 }
 
 #[test]

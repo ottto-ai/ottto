@@ -370,15 +370,11 @@ fn claude_duplicate_fence_reopens_only_after_full_coverage() {
             fence_after: true,
             pending_occurrence_count: 5,
             coverage_missing_member_count: 1,
-            full_rearm: true,
-            rearm_attempt: 1,
-            full_rearm_deferred_until: Some(
-                CENSUS_CLOCK + CLAUDE_DUPLICATE_FENCE_REARM_BASE_SECONDS
-            ),
+            rearm_full_suppressed: 1,
             ..Default::default()
         }
     );
-    assert!(after.files[unobserved].source_file_fingerprint.is_empty());
+    assert!(!after.files[unobserved].source_file_fingerprint.is_empty());
 
     // Inside the backoff the same closed census does not replay again.
     let mut deferred = after.clone();
@@ -396,11 +392,8 @@ fn claude_duplicate_fence_reopens_only_after_full_coverage() {
     );
     assert!(deferred_after.claude_duplicate_request_witness_overflowed);
     assert!(!counts.full_rearm);
-    assert_eq!(counts.rearm_attempt, 1);
-    assert_eq!(
-        counts.full_rearm_deferred_until,
-        Some(CENSUS_CLOCK + CLAUDE_DUPLICATE_FENCE_REARM_BASE_SECONDS)
-    );
+    assert_eq!(counts.rearm_attempt, 0);
+    assert_eq!(counts.full_rearm_deferred_until, None);
     assert_eq!(
         deferred_after.files[unobserved].source_file_fingerprint,
         "source"
@@ -420,7 +413,7 @@ fn claude_duplicate_fence_reopens_only_after_full_coverage() {
         MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
     );
     assert!(lost_after.claude_duplicate_request_witness_overflowed);
-    assert!(counts.full_rearm);
+    assert_eq!(counts.rearm_full_suppressed, 1);
 
     // An open fence is not closed by coverage alone.
     let mut open = closed.clone();
@@ -449,7 +442,7 @@ fn claude_duplicate_fence_reopens_only_after_full_coverage() {
     );
     assert!(!covered_after.claude_duplicate_request_witness_overflowed);
     assert!(counts.coverage_complete);
-    assert!(counts.full_rearm);
+    assert_eq!(counts.rearm_full_suppressed, 1);
     assert_eq!(covered_after.claude_duplicate_fence_rearm_attempt, 0);
     assert_eq!(
         covered_after.claude_duplicate_fence_next_full_rearm_unix_seconds,
