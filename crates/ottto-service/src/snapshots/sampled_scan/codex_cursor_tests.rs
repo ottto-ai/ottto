@@ -16013,10 +16013,12 @@ fn deferred_custody_tail_priority_eof_never_reopens_as_full() {
             assert!(output.snapshots.is_empty());
             paused = cache
                 .with_cursor(|cursor| match &cursor.slot {
-                    Slot::Paused(job) => job
-                        .sampling
-                        .as_ref()
-                        .is_some_and(|acquisition| matches!(acquisition.mode, ReadMode::Tail)),
+                    Slot::Paused(job) => job.sampling.as_ref().is_some_and(|acquisition| {
+                        matches!(
+                            acquisition.mode,
+                            crate::transcript_acquisition::ReadMode::Tail
+                        )
+                    }),
                     _ => false,
                 })
                 .unwrap();
@@ -16045,36 +16047,66 @@ fn deferred_custody_tail_priority_eof_never_reopens_as_full() {
         index = scan.index;
         let started = counter(&cache, |c| c.jobs_started);
         let eof_before = counter(&cache, |c| c.eof_record_applied);
-        for number in 65..=192 {
-            let (next, output, modes) = page_at(
-                &fixture,
-                index,
-                Some(Arc::clone(&cache)),
-                "cursor-fixture",
-                &collected_at(number),
-            );
-            index = next;
-            assert_eq!(modes.0, 0, "custody must veto protected-tier Full replay");
-            assert!(output.snapshots.is_empty());
-            assert_eq!(index.files[&key].size_bytes, prior.size_bytes);
-            assert_eq!(
-                index.files[&key].last_snapshot_fingerprint,
-                prior.last_snapshot_fingerprint
-            );
-            assert_eq!(
-                index.files[&key].last_upload_body_witness,
-                prior.last_upload_body_witness
-            );
-            if cache.cursor_slot_free() {
-                break;
-            }
-        }
+        let reached = std::rc::Rc::new(std::cell::Cell::new(false));
+        let observed = std::rc::Rc::clone(&reached);
+        let expected_path = path.clone();
+        with_after_reader_eof(
+            move |active| {
+                assert_eq!(active.candidate.path, expected_path);
+                assert!(active.cursor.is_some());
+                assert!(active.sampling.as_ref().is_some_and(|acquisition| matches!(
+                    acquisition.mode,
+                    crate::transcript_acquisition::ReadMode::Tail
+                )));
+                assert!(
+                    eof_record_due(active),
+                    "frozen physical EOF with buffered priority record before E1"
+                );
+                assert!(
+                    !active
+                        .parser
+                        .accumulator
+                        .codex_tier_replay
+                        .as_ref()
+                        .is_some_and(codex_file_join::TierReplay::has_protected_tiers),
+                    "the buffered record adds the first protected tier"
+                );
+                observed.set(true);
+            },
+            || {
+                for number in 65..=192 {
+                    let (next, output, modes) = page_at(
+                        &fixture,
+                        index,
+                        Some(Arc::clone(&cache)),
+                        "cursor-fixture",
+                        &collected_at(number),
+                    );
+                    index = next;
+                    assert_eq!(modes.0, 0, "custody must veto protected-tier Full replay");
+                    assert!(output.snapshots.is_empty());
+                    assert_eq!(index.files[&key].size_bytes, prior.size_bytes);
+                    assert_eq!(
+                        index.files[&key].last_snapshot_fingerprint,
+                        prior.last_snapshot_fingerprint
+                    );
+                    assert_eq!(
+                        index.files[&key].last_upload_body_witness,
+                        prior.last_upload_body_witness
+                    );
+                    if cache.cursor_slot_free() {
+                        break;
+                    }
+                }
+            },
+        );
+        assert!(reached.get(), "held Tail reached genuine priority EOF");
         assert!(cache.cursor_slot_free());
         assert_eq!(counter(&cache, |c| c.jobs_started), started);
         assert_eq!(
             counter(&cache, |c| c.eof_record_applied),
-            eof_before + 1,
-            "priority EOF reached the replay gate"
+            eof_before,
+            "withheld EOF never gains publication credit"
         );
         let cold = Arc::new(SharedCache::default());
         codex_compressed_hold_tests::no_open(&path, || {
