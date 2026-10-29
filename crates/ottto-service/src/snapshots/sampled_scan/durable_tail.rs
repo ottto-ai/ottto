@@ -211,6 +211,7 @@ pub(crate) struct Stores {
     // Source+key only: never clear on passes, scope changes or cache eviction.
     retail_spent: BTreeMap<store::Digest32, Box<KeyCustody>>,
     upgrade_reads: std::sync::Arc<AtomicU64>,
+    upgrade_claims: [u64; 2],
 }
 
 #[derive(Default)]
@@ -920,7 +921,7 @@ impl SharedCache {
         {
             return true;
         }
-        stores.counters.upgrade_claimed += u64::from(consume);
+        stores.upgrade_claims[ds as usize] += u64::from(consume);
         // Codex retains its existing claim-based observation until its owned slice.
         stores.counters.upgrade_state_missing +=
             u64::from(consume && source == SnapshotSource::Codex);
@@ -1736,6 +1737,7 @@ impl SharedCache {
         let source = durable_source(snapshot_source)?;
         let mut stores = self.durable()?;
         let mut counters = stores.counters.clone();
+        counters.upgrade_claimed = stores.upgrade_claims[source as usize];
         if source == DurableSource::ClaudeCode {
             counters.upgrade_state_missing = stores.upgrade_reads.load(Ordering::Relaxed);
         }

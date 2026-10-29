@@ -2906,6 +2906,35 @@ pub(super) fn observe_upgrade_read() {
 }
 
 #[test]
+fn b1_upgrade_diagnostics_separate_sources_and_observation_units() {
+    let root = crate::test_scratch::private_dir("ottto-b1-counter-source");
+    let cache = SharedCache::default();
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        cache.durable_begin_pass(source, &root.join("index.json"), &Scope("b1".into()), false);
+    }
+    {
+        let mut stores = cache.durable().unwrap();
+        stores.upgrade_claims = [7, 11];
+        stores.upgrade_reads.store(3, Ordering::Relaxed);
+        stores.counters.upgrade_state_missing = 11;
+    }
+    for (source, claims, reads, basis) in [
+        (SnapshotSource::ClaudeCode, 7, 3, "native_read"),
+        (SnapshotSource::Codex, 11, 11, "legacy_claim"),
+    ] {
+        let (c, s) = cache.durable_counters(source).unwrap();
+        assert_eq!(
+            (c.upgrade_claimed, c.upgrade_state_missing),
+            (claims, reads)
+        );
+        assert!(c
+            .summary(source, &s)
+            .contains(&format!("upgrade_count_basis={basis}")));
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn b1_native_upgrade_observation_is_once_and_below_buffering() {
     use crate::snapshots::codex_compressed_input::OpenedInput;
     use std::io::{BufRead, Seek};
