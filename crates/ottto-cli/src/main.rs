@@ -1,3 +1,5 @@
+mod launch_check;
+
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use ottto_core::{
     client_control_token, default_socket_path, execute_local_uninstall,
@@ -95,6 +97,8 @@ enum Command {
     Verify(VerifyArgs),
     #[command(hide = true)]
     ClaudeCodeStatusline(JsonArgs),
+    #[command(hide = true)]
+    LaunchCheck(launch_check::Args),
     #[command(about = "Collect local-only or approved support diagnostics")]
     Diagnostics {
         #[command(subcommand)]
@@ -908,6 +912,14 @@ fn main() {
         Command::Setup(args) | Command::Login(args) => Some(args.clone()),
         _ => None,
     };
+    if let Command::LaunchCheck(args) = &cli.command {
+        let code = launch_check::run(
+            args,
+            cli.socket.clone().unwrap_or_else(default_socket_path),
+            cli.token.as_deref(),
+        );
+        std::process::exit(code);
+    }
     if let Command::ClaudeCodeStatusline(args) = &cli.command {
         let code = run_claude_code_statusline(args.json);
         std::process::exit(code);
@@ -2261,6 +2273,7 @@ fn local_command(command: Command) -> LocalControlCommand {
             query: args.query(),
         },
         Command::ClaudeCodeStatusline(_) => unreachable!("statusLine helper is handled directly"),
+        Command::LaunchCheck(_) => unreachable!("session handoff is handled directly"),
         Command::ProviderRequests(_) => unreachable!("provider-requests is handled directly"),
         Command::Setup(args) | Command::Login(args) => LocalControlCommand::Setup {
             sources: Vec::new(),
@@ -2343,6 +2356,7 @@ fn command_json(command: &Command) -> bool {
             Some(UpdateCommand::Check(args)) => args.json,
         },
         Command::ClaudeCodeStatusline(args) => args.json,
+        Command::LaunchCheck(_) => false,
     }
 }
 
@@ -2423,6 +2437,14 @@ fn final_error_event(request_id: &str, exit_code: i32, error: CliError) -> serde
 
 fn local_command_name(command: &LocalControlCommand) -> &'static str {
     match command {
+        LocalControlCommand::SessionLaunchPrepare { .. } => "session_launch_prepare",
+        LocalControlCommand::SessionLaunchConsume { .. } => "session_launch_consume",
+        LocalControlCommand::SessionLaunchReport { .. } => "session_launch_report",
+        LocalControlCommand::SessionLaunchStatus { .. } => "session_launch_status",
+        LocalControlCommand::SessionLaunchCancel { .. } => "session_launch_cancel",
+        LocalControlCommand::SessionLaunchRecentFolders { .. } => "session_launch_recent_folders",
+        LocalControlCommand::AccountNicknames => "account_nicknames",
+        LocalControlCommand::AccountNicknameSet { .. } => "account_nickname_set",
         LocalControlCommand::Status { .. } => "status",
         LocalControlCommand::Receipts { .. } => "receipts",
         LocalControlCommand::AuthStatus => "auth_status",
@@ -2555,6 +2577,7 @@ fn human_summary(payload: &serde_json::Value) -> String {
     if let Some(message) = payload
         .get("message")
         .and_then(|value| value.get("text"))
+        .or_else(|| payload.pointer("/canonical_health/blockers/0/clear_condition"))
         .and_then(|value| value.as_str())
     {
         return sanitize_for_terminal(message);
@@ -3194,6 +3217,20 @@ mod tests {
         .expect("fixture parses");
         assert_eq!(actual, expected);
         assert!(!output.contains("Ottto local daemon"));
+    }
+
+    #[test]
+    fn doctor_human_output_surfaces_reconnect_finding_before_daemon_running() {
+        let guidance = "Connection binding is unreadable; get a fresh claim code from Ottto Apps, then run `ottto login --claim-code <code>` to reconnect this Mac and resume uploads";
+        let mut payload = status_response().payload.unwrap();
+        payload["canonical_health"] = serde_json::json!({"blockers":[{
+            "code":"connection_binding_unreadable", "clear_condition":guidance
+        }]});
+        assert_eq!(human_summary(&payload), guidance);
+        let json = pretty_json(&payload);
+        assert_eq!(parse_json_output(&json), payload);
+        payload["canonical_health"]["blockers"] = serde_json::json!([]);
+        assert_eq!(human_summary(&payload), "Ottto local daemon: running");
     }
 
     #[test]

@@ -5,6 +5,8 @@ use super::{
     ScanTraversalCheckpoint, ScanTraversalCounts, SnapshotSource, UnsettledUploadCause,
 };
 use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -41,6 +43,8 @@ pub(super) struct Starting {
     context_matches: bool,
     retry_due: Option<bool>,
     prior_unsettled_upload: bool,
+    prior_held_family_roots: usize,
+    prior_held_family_set_digest: Option<String>,
     /// Fixed names of the paths that set `prior_unsettled_upload`. Empty
     /// exactly when it is false.
     prior_unsettled_causes: Vec<&'static str>,
@@ -90,7 +94,14 @@ impl Starting {
             unsettled_residue: t.counts.has_unsettled_residue(),
             counts: t.counts.clone(),
         });
+        let (prior_held_family_roots, prior_held_family_set_digest) = prior_held_family_observation(
+            (source == SnapshotSource::ClaudeCode)
+                .then_some(index.claude_full_rearm_progress.held_family_roots.as_ref())
+                .flatten(),
+        );
         Self {
+            prior_held_family_roots,
+            prior_held_family_set_digest,
             disappearance_process_totals_v1: disappearance_diagnostics::snapshot(source),
             event: "starting",
             reason: match (previous.is_some(), matches) {
@@ -122,6 +133,22 @@ impl Starting {
     pub(super) fn emit(&self, source: SnapshotSource) {
         crate::local_resource_diagnostics::traversal_transition(source.api_slug(), self);
     }
+}
+
+/// Hash only the persisted canonical digest set, never raw roots. BTreeSet
+/// supplies sorted order; fixed-width entries need no separator. Invalid or
+/// unknown scope has no digest, matching the existing scope reader's trust.
+fn prior_held_family_observation(roots: Option<&BTreeSet<String>>) -> (usize, Option<String>) {
+    let Some(roots) = roots.filter(|roots| super::held_family_scope_has_writer_shape(roots)) else {
+        return (0, None);
+    };
+    let mut digest = Sha256::new();
+    for root in roots {
+        digest.update(root.as_bytes());
+    }
+    let mut hex = format!("{:x}", digest.finalize());
+    hex.truncate(16);
+    (roots.len(), Some(hex))
 }
 
 #[derive(Serialize)]
@@ -233,6 +260,46 @@ mod tests {
 
     fn start(index: &mut ScanIndex, now: &str, days: u64) -> Vec<Value> {
         capture(|| ensure_bounded_traversal(SnapshotSource::Pi, &[], index, now, days)).1
+    }
+
+    #[test]
+    fn prior_held_family_digest_tracks_only_the_canonical_set() {
+        let a = "a".repeat(32);
+        let b = "b".repeat(32);
+        let first = BTreeSet::from([a.clone(), b.clone()]);
+        let reversed = BTreeSet::from([b, a.clone()]);
+        let observed = prior_held_family_observation(Some(&first));
+        assert_eq!(observed.0, 2);
+        assert_eq!(observed.1.as_ref().unwrap().len(), 16);
+        assert_eq!(observed, prior_held_family_observation(Some(&reversed)));
+        assert_ne!(
+            observed.1,
+            prior_held_family_observation(Some(&BTreeSet::from([a]))).1
+        );
+        assert_eq!(prior_held_family_observation(None), (0, None));
+        assert_eq!(
+            prior_held_family_observation(Some(&BTreeSet::new())),
+            (0, None)
+        );
+        assert_eq!(
+            prior_held_family_observation(Some(&BTreeSet::from(["not canonical".into()]))),
+            (0, None)
+        );
+        let mut index = ScanIndex::default();
+        index.claude_full_rearm_progress.held_family_roots = Some(first);
+        let row = serde_json::to_value(Starting::capture(
+            SnapshotSource::ClaudeCode,
+            &index,
+            T1,
+            true,
+            1,
+        ))
+        .unwrap();
+        assert_eq!(row["prior_held_family_roots"], 2);
+        assert_eq!(row["prior_held_family_set_digest"], observed.1.unwrap());
+        let other = Starting::capture(SnapshotSource::Pi, &index, T1, true, 1);
+        assert_eq!(other.prior_held_family_roots, 0);
+        assert!(other.prior_held_family_set_digest.is_none());
     }
 
     #[test]
@@ -518,7 +585,6 @@ mod tests {
             SnapshotSource::Pi,
             &mut scan,
             &mut index,
-            true,
             |_| String::new(),
         );
         assert!(!index.bounded_sweep_had_unsettled_upload);
@@ -682,7 +748,6 @@ mod tests {
                     SnapshotSource::Pi,
                     &mut scan,
                     index,
-                    true,
                     |_| String::new(),
                 );
             }
@@ -806,9 +871,15 @@ mod tests {
 
     fn max_traversal_counts() -> ScanTraversalCounts {
         let mut value = serde_json::to_value(ScanTraversalCounts::default()).unwrap();
+        value["causes"] = json!({"contributions": vec![u64::MAX; 8]});
         for (name, value) in value.as_object_mut().unwrap() {
             if let Some(object) = value.as_object_mut() {
-                for counter in object.get_mut("counts").unwrap().as_array_mut().unwrap() {
+                let field = if name == "causes" {
+                    "contributions"
+                } else {
+                    "counts"
+                };
+                for counter in object.get_mut(field).unwrap().as_array_mut().unwrap() {
                     *counter = json!(u64::MAX);
                 }
             } else {

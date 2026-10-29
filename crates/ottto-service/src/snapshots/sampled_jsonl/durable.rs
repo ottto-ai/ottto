@@ -207,6 +207,7 @@ pub(crate) struct RederiveReceipt {
 }
 
 impl CachedJsonlReduction {
+    #[cfg(test)]
     pub(in crate::snapshots) fn durable_counting(&self) -> Option<(Option<i64>, u8, u8)> {
         self.accumulator
             .codex_counting
@@ -215,6 +216,15 @@ impl CachedJsonlReduction {
     }
 }
 impl Decoded {
+    pub(crate) fn cutover(&self) -> Option<Option<i64>> {
+        self.reduction
+            .accumulator
+            .codex_counting
+            .as_deref()
+            .map(|c| c.durable_cutover())
+    }
+
+    #[cfg(test)]
     pub(crate) fn counting(&self) -> Option<(Option<i64>, u8, u8)> {
         self.reduction.durable_counting()
     }
@@ -373,6 +383,9 @@ pub(crate) fn rederive_parser(
     path: &Path,
     decoded: &Decoded,
 ) -> Result<OwnedJsonlParser> {
+    if decoded.reduction.accumulator.source == SnapshotSource::Codex {
+        refuse_compressed_codex(Some(path), None, CodexZstCause::DurableTailUnsupported)?;
+    }
     // A duplicated descriptor shares the held one's offset: start at 0.
     file.seek(SeekFrom::Start(0))?;
     let acc = &decoded.reduction.accumulator;

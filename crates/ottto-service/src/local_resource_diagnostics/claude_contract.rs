@@ -16,12 +16,6 @@ macro_rules! counters {
         }
     };
 }
-counters!(Permit {
-    permitted,
-    denied,
-    fetch_failed,
-    hint_failed
-});
 counters!(Transition {
     from_empty,
     to_empty,
@@ -29,6 +23,8 @@ counters!(Transition {
     mid_traversal_placeholder
 });
 counters!(Latch { set, cleared });
+// Lead A ruling (a): the one cutover terminal (`runs`) and the files and bytes it re-armed.
+counters!(CutoverRearm { runs, files, bytes });
 counters!(ContextChange {
     backfill_changed,
     active_upload_context_changed,
@@ -41,12 +37,12 @@ counters!(ContextChange {
 });
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct Counts {
-    #[serde(skip_serializing_if = "Permit::is_empty")]
-    pub(crate) request_identity_permit: Permit,
     #[serde(skip_serializing_if = "Transition::is_empty")]
     pub(crate) identity_contract_transition: Transition,
     #[serde(skip_serializing_if = "Latch::is_empty")]
     pub(crate) identity_contract_latch: Latch,
+    #[serde(skip_serializing_if = "CutoverRearm::is_empty")]
+    pub(crate) contract_cutover_rearm: CutoverRearm,
     #[serde(skip_serializing_if = "ContextChange::is_empty")]
     pub(crate) traversal_context_change: ContextChange,
     #[serde(skip_serializing_if = "super::is_zero")]
@@ -56,12 +52,12 @@ pub(crate) struct Counts {
 }
 impl Counts {
     pub(crate) fn merge(&mut self, other: Self) {
-        self.request_identity_permit
-            .merge(other.request_identity_permit);
         self.identity_contract_transition
             .merge(other.identity_contract_transition);
         self.identity_contract_latch
             .merge(other.identity_contract_latch);
+        self.contract_cutover_rearm
+            .merge(other.contract_cutover_rearm);
         self.traversal_context_change
             .merge(other.traversal_context_change);
         self.deferred_by_contract_debt = self

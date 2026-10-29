@@ -963,7 +963,9 @@ fn edits_after_the_checkpoint_refuse_restore() {
         certificate
             .restore(&mut File::open(&path).unwrap(), scope())
             .err(),
-        Some(FullReason::Shrunk)
+        Some(crate::transcript_acquisition::CertificateRefusal::Changed(
+            FullReason::Shrunk
+        ))
     );
 
     let scratch = Scratch::new("replace");
@@ -974,7 +976,9 @@ fn edits_after_the_checkpoint_refuse_restore() {
         certificate
             .restore(&mut File::open(&path).unwrap(), scope())
             .err(),
-        Some(FullReason::Replaced)
+        Some(crate::transcript_acquisition::CertificateRefusal::Changed(
+            FullReason::Replaced
+        ))
     );
 
     let scratch = Scratch::new("head-edit");
@@ -984,7 +988,9 @@ fn edits_after_the_checkpoint_refuse_restore() {
         certificate
             .restore(&mut File::open(&path).unwrap(), scope())
             .err(),
-        Some(FullReason::HeadChanged)
+        Some(crate::transcript_acquisition::CertificateRefusal::Changed(
+            FullReason::HeadChanged
+        ))
     );
 
     let scratch = Scratch::new("prompt-edit");
@@ -1484,4 +1490,30 @@ fn structural_verifier_large_body_still_allocates_nothing() {
         verified_without_allocation(&body[..body.len() - 1]),
         Err(Corrupt)
     );
+}
+
+#[test]
+fn compressed_rederive_refuses_before_seek_or_jsonl_parse() {
+    let scratch = Scratch::new("zst-refusal");
+    let plain = scratch.write(
+        "plain.jsonl",
+        &[format!(
+            r#"{{"type":"session_meta","payload":{{"id":"{CODEX_SESSION}"}}}}"#
+        )],
+    );
+    let (reduction, _) = full_read(&plain, SnapshotSource::Codex);
+    let body = encode(&reduction, 8 * 1024 * 1024, jsonl_line_cap() as u64).unwrap();
+    let decoded = decode(&body, SnapshotSource::Codex).unwrap();
+    let archive = scratch.0.join("rollout.jsonl.zst");
+    fs::write(&archive, b"synthetic archive bytes").unwrap();
+    let mut file = File::open(&archive).unwrap();
+    file.seek(SeekFrom::Start(3)).unwrap();
+    codex_zst_refusal_tests::assert_refused(CodexZstCause::DurableTailUnsupported, || {
+        assert!(rederive_parser(file.try_clone().unwrap(), &archive, &decoded).is_err());
+        assert_eq!(
+            file.stream_position().unwrap(),
+            3,
+            "refused before offset use"
+        );
+    });
 }

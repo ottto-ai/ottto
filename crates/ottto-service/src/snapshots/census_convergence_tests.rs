@@ -536,20 +536,31 @@ fn claude_progress_blocking_holds_exclude_only_non_progressing_revisions() {
     demoted
         .quarantined_source_session_ids
         .insert(held.source_session_id.clone());
+    use crate::local_resource_diagnostics::claude_reread::Scope;
     for settled in [&terminal, &retry] {
+        let scope = Scope::begin(true);
         assert!(demoted
             .progress_blocking_held_fingerprints(&snapshots, settled, true)
             .is_empty());
+        assert_eq!(
+            serde_json::to_value(scope.finish()).unwrap(),
+            serde_json::json!({})
+        );
     }
-    for blocking in [
-        &retry_correction,
-        &other_revision,
-        &unbound_witness,
-        &ScanIndex::default(),
+    for (blocking, reason) in [
+        (&retry_correction, "authority_correction_pending"),
+        (&other_revision, "authority_unbound_revision"),
+        (&unbound_witness, "authority_unbound_revision"),
+        (&ScanIndex::default(), "authority_unbound_revision"),
     ] {
+        let scope = Scope::begin(true);
         assert_eq!(
             demoted.progress_blocking_held_fingerprints(&snapshots, blocking, true),
             BTreeSet::from([held.snapshot_fingerprint.clone()])
+        );
+        assert_eq!(
+            serde_json::to_value(scope.finish()).unwrap()["claude_reread"]["held_reason"],
+            serde_json::json!({reason: 1})
         );
     }
     assert!(demoted.account_deferred_fingerprints(&snapshots).is_empty());
@@ -568,9 +579,14 @@ fn claude_progress_blocking_holds_exclude_only_non_progressing_revisions() {
         .progress_blocking_held_fingerprints(&snapshots, &ScanIndex::default(), true)
         .is_empty());
     // Without a durable disclosure an account deferral keeps blocking.
+    let scope = Scope::begin(true);
     assert_eq!(
         deferred.progress_blocking_held_fingerprints(&snapshots, &ScanIndex::default(), false),
         BTreeSet::from([held.snapshot_fingerprint.clone()])
+    );
+    assert_eq!(
+        serde_json::to_value(scope.finish()).unwrap()["claude_reread"]["held_reason"],
+        serde_json::json!({"account_hold_unrecorded": 1})
     );
     let mut retained = snapshots.clone();
     deferred.retain_uploadable(&mut retained);

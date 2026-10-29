@@ -23,6 +23,10 @@ const STATE_BYTES: usize = CACHE_BYTES
 pub(super) mod codex_cursor;
 #[cfg(unix)]
 pub(super) mod durable_tail;
+#[cfg(all(unix, test))]
+pub(crate) use durable_tail::MissClass;
+#[cfg(unix)]
+pub(crate) use durable_tail::RestoreOutcome;
 pub(super) mod side_ledger;
 
 /// The retained-copy cache behind `SharedCache::retained`.
@@ -1997,7 +2001,6 @@ pub(super) fn new_source_parser(
         artifacts,
         curve,
     )?;
-    parser.bind_reread(index, candidate);
     parser.accumulator.claude_request_identity_capture = identity_capture;
     if source == SnapshotSource::Codex {
         configure_tier_replay(&mut parser, candidate, index);

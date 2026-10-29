@@ -40,17 +40,18 @@ pub(crate) const COLLECTOR: &str = "claude_code_jsonl:own_request_identity_rows:
 pub(crate) const E2_GROUPING: &str =
     "claude_code_jsonl:own_request_identity_rows:v1/e2_grouping:v1";
 
-/// The contract a sync cycle builds Claude bodies under: the full collector
-/// token, which names its version, under a permit, and `""` without one.
+/// The contract a scan builds Claude bodies under: the full collector token,
+/// which names its version, when it captures (every Claude cycle), and `""`
+/// otherwise (records written by permit-era builds without a permit).
 #[cfg(not(test))]
-pub(crate) const fn cycle_contract(permitted: bool) -> &'static str {
-    compiled_cycle_contract(permitted, super::claude_request_money::e2::GATE)
+pub(crate) const fn cycle_contract(captured: bool) -> &'static str {
+    compiled_cycle_contract(captured, super::claude_request_money::e2::GATE)
 }
 
 // Durable grouping version shares the existing identity-contract rearm. The
 // wire collector stays v1; gate-off contracts and uploads stay byte-identical.
-const fn compiled_cycle_contract(permitted: bool, request_owned: bool) -> &'static str {
-    if !permitted {
+const fn compiled_cycle_contract(captured: bool, request_owned: bool) -> &'static str {
+    if !captured {
         ""
     } else if request_owned {
         E2_GROUPING
@@ -67,8 +68,8 @@ std::thread_local! {
 }
 
 #[cfg(test)]
-pub(crate) fn cycle_contract(permitted: bool) -> &'static str {
-    if permitted {
+pub(crate) fn cycle_contract(captured: bool) -> &'static str {
+    if captured {
         TEST_CYCLE_CONTRACT.with(|contract| contract.get().unwrap_or(COLLECTOR))
     } else {
         ""
@@ -90,15 +91,45 @@ pub(crate) fn with_cycle_contract_for_test<T>(
     run()
 }
 
-/// Compiled on. Each cycle still emits only under that cycle's exact cohort
-/// hint token (`emission_permit`); without it the body is today's.
-pub(crate) const EMISSION_ENABLED: bool = true;
+/// Contract 5 is always on for Claude Code: every Claude sync cycle captures
+/// markers and builds identity evidence. The activity hint's
+/// `session_request_identity_contract` is still decoded for compatibility
+/// but never read. Codex and Pi cycles never capture, so their sampled scope
+/// and durable bindings keep their bytes. Outside a cycle the flag only
+/// gates the Claude marker parser and is always on.
+pub(crate) const fn captures(source: SnapshotSource) -> bool {
+    matches!(source, SnapshotSource::ClaudeCode)
+}
 
-/// Marker capture and the census witness run only in a scan whose sync cycle
-/// holds an emission permit. Outside a cycle nothing captures in a released
-/// build; tests capture by default so parser fixtures see markers.
-pub(crate) const fn capture_by_default() -> bool {
-    cfg!(test)
+/// Every Claude sync cycle builds contract-5 evidence. A test may model a
+/// pre-cutover daemon's unpermitted page, or pin the legacy account path
+/// (D1 qualification, mixed bodies, owner holds) that production now
+/// reaches only for bodies contract 5 leaves untagged.
+pub(crate) fn builds_evidence() -> bool {
+    #[cfg(test)]
+    if PRE_CUTOVER.with(std::cell::Cell::get) {
+        return false;
+    }
+    true
+}
+#[cfg(test)]
+thread_local! { static PRE_CUTOVER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+/// Runs this thread's sync evidence stage without contract-5 evidence until
+/// dropped, as every unpermitted cycle did before the cutover. Only for
+/// fixtures that model that daemon or whose subject is the legacy path.
+#[cfg(test)]
+pub(crate) struct PreCutoverEvidenceForTest(bool);
+#[cfg(test)]
+impl PreCutoverEvidenceForTest {
+    pub(crate) fn enter() -> Self {
+        Self(PRE_CUTOVER.with(|v| v.replace(true)))
+    }
+}
+#[cfg(test)]
+impl Drop for PreCutoverEvidenceForTest {
+    fn drop(&mut self) {
+        PRE_CUTOVER.with(|v| v.set(self.0));
+    }
 }
 
 /// `transcript_email` (and its status-coverage feed) needs its own review and
@@ -107,7 +138,7 @@ pub(crate) const fn capture_by_default() -> bool {
 pub(crate) const TRANSCRIPT_EMAIL_ENABLED: bool = false;
 
 pub(crate) const fn transcript_email_enabled() -> bool {
-    (EMISSION_ENABLED && TRANSCRIPT_EMAIL_ENABLED) || cfg!(test)
+    TRANSCRIPT_EMAIL_ENABLED || cfg!(test)
 }
 
 /// `transcript_sole_login` needs the receiver's time-scoped sole-login body
@@ -116,54 +147,6 @@ pub(crate) const fn transcript_email_enabled() -> bool {
 /// email gate does not cover this basis. Flipping this is a separate,
 /// parent-owned change.
 pub(crate) const TRANSCRIPT_SOLE_LOGIN_ENABLED: bool = false;
-
-/// The activity-hint token (`session_request_identity_contract`) the server
-/// sends only to the approved cohort on the accepted-log route. It is not the
-/// collector name.
-pub(crate) const COHORT_HINT_TOKEN: &str = "own_request_identity_rows:v1";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CohortDenial {
-    EmissionDisabled,
-    OtherSource,
-    NoToken,
-    UnknownToken,
-}
-
-/// Proof that this sync cycle may capture identity evidence and build
-/// contract-5 bodies. Only `emission_permit` makes one (`permit_when` takes
-/// the emission constant as an argument, for tests).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct EmissionPermit(());
-
-/// The current cycle's permit, from the activity hint fetched for it with
-/// this device's credential. A missing, null or unknown token denies; nothing
-/// is persisted, so a revoked token denies from the next fetched cycle and a
-/// restart or account switch starts from that cycle's hint.
-pub(crate) fn emission_permit(
-    source: SnapshotSource,
-    hint_token: Option<&str>,
-) -> Result<EmissionPermit, CohortDenial> {
-    permit_when(EMISSION_ENABLED, source, hint_token)
-}
-
-pub(super) fn permit_when(
-    emission_enabled: bool,
-    source: SnapshotSource,
-    hint_token: Option<&str>,
-) -> Result<EmissionPermit, CohortDenial> {
-    if !emission_enabled {
-        return Err(CohortDenial::EmissionDisabled);
-    }
-    if source != SnapshotSource::ClaudeCode {
-        return Err(CohortDenial::OtherSource);
-    }
-    match hint_token {
-        None => Err(CohortDenial::NoToken),
-        Some(COHORT_HINT_TOKEN) => Ok(EmissionPermit(())),
-        Some(_) => Err(CohortDenial::UnknownToken),
-    }
-}
 
 pub(crate) const MAX_EVIDENCE_ENTRIES: usize = 16;
 pub(crate) const MAX_AUTHORITY_KEYS: usize = 16;
@@ -3438,11 +3421,7 @@ fn transcript_requests(item: &SnapshotItem, mut place: impl FnMut(Request<'_>)) 
     Some(())
 }
 
-/// Scheduling-only qualification before the native fold's terminal decision.
-/// Reuse reported classifications, including telemetry-only requests, and the
-/// canonical transcript sink for other items. Missing identity remains healthy;
-/// every refusal kind and grouping failure keeps the due rearm enabled. This
-/// neither tags an item nor changes attribution/ownership settlement.
+/// Diagnostic-only query; never consumed by a scheduling or attribution gate.
 pub(super) fn full_rearm_requests_refused(
     item: &SnapshotItem,
     evidence: &ScanEvidence<'_>,

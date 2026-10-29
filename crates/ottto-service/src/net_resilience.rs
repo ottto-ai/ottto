@@ -909,7 +909,7 @@ fn out_of_process_tcp_probe() -> bool {
 /// `(host, port)` of the configured API base URL, for the TCP-connect probe.
 #[cfg(all(target_os = "macos", not(test)))]
 fn api_probe_target() -> Option<(String, u16)> {
-    parse_probe_target(&crate::snapshot_sync::snapshot_api_base_url())
+    parse_probe_target(&crate::snapshot_sync::snapshot_api_base_url().ok()?)
 }
 
 #[cfg(target_os = "macos")]

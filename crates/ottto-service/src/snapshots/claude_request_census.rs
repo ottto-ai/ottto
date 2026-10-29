@@ -1414,7 +1414,7 @@ pub(super) fn decode_bounded_index(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
 /// Derive positional slots from Serde's own field metadata rather than pinning
 /// offsets to ScanIndex's declaration order. JSON struct sequences are accepted
 /// by the old reader too; they need the same evidence bounds as object fields.
-fn sequence_fields() -> (usize, usize) {
+fn sequence_fields() -> (usize, usize, usize) {
     struct Fields<'a>(&'a mut Option<&'static [&'static str]>);
     impl<'de> Deserializer<'de> for Fields<'_> {
         type Error = serde::de::value::Error;
@@ -1436,7 +1436,7 @@ fn sequence_fields() -> (usize, usize) {
             tuple_struct map enum identifier ignored_any
         }
     }
-    static SLOTS: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    static SLOTS: std::sync::OnceLock<(usize, usize, usize)> = std::sync::OnceLock::new();
     *SLOTS.get_or_init(|| {
         let mut fields = None;
         let _ = ScanIndex::deserialize(Fields(&mut fields));
@@ -1455,6 +1455,7 @@ fn sequence_fields() -> (usize, usize) {
         (
             slot("claude_request_census"),
             slot("claude_request_census_shadow"),
+            slot("reread_guard"),
         )
     })
 }
@@ -1475,7 +1476,8 @@ struct CensusRead<R> {
     depth: usize,
     root_array: bool,
     array_index: usize,
-    sequence_fields: (usize, usize),
+    sequence_fields: (usize, usize, usize),
+    retired_guard: bool,
     quoted: bool,
     escaped: bool,
     expect_key: bool,
@@ -1503,6 +1505,7 @@ impl<R: std::io::Read> CensusRead<R> {
             root_array: false,
             array_index: 0,
             sequence_fields: sequence_fields(),
+            retired_guard: false,
             quoted: false,
             escaped: false,
             expect_key: false,
@@ -1559,6 +1562,7 @@ impl<R: std::io::Read> CensusRead<R> {
             }
         }
         self.shadow_key = false;
+        self.retired_guard = false;
         if !self.quoted {
             if let Ok(name) = serde_json::from_slice::<String>(&key) {
                 let duplicate = match name.as_str() {
@@ -1577,6 +1581,11 @@ impl<R: std::io::Read> CensusRead<R> {
                         self.seen_shadow = true;
                         self.duplicate_shadow |= duplicate;
                         duplicate
+                    }
+                    "reread_guard" => {
+                        self.shadow_key = true;
+                        self.retired_guard = true;
+                        return Ok(b"\"_ignored_retired_reread_guard\"".to_vec());
                     }
                     _ => false,
                 };
@@ -1614,7 +1623,7 @@ impl<R: std::io::Read> CensusRead<R> {
         // Original admitted evidence was grammar-checked by the lexical
         // boundary. The syntax-only pass substitutes null without buffering
         // or interpreting census records, even before header controls run.
-        let mut overflow = self.syntax_only;
+        let mut overflow = self.syntax_only || self.retired_guard;
         while let Some(byte) = self.byte()? {
             if !quoted && depth == 0 && matches!(byte, b',' | b'}' | b']') {
                 self.replay = Some(byte);
@@ -1697,9 +1706,11 @@ impl<R: std::io::Read> CensusRead<R> {
             && !byte.is_ascii_whitespace()
             && !matches!(byte, b',' | b']')
             && (self.array_index == self.sequence_fields.0
-                || self.array_index == self.sequence_fields.1)
+                || self.array_index == self.sequence_fields.1
+                || self.array_index == self.sequence_fields.2)
         {
             self.shadow_state = self.array_index == self.sequence_fields.1;
+            self.retired_guard = self.array_index == self.sequence_fields.2;
             self.replay = Some(byte);
             self.output = std::io::Cursor::new(self.evidence()?);
             return self.next();

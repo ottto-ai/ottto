@@ -2111,7 +2111,11 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
         serde_json::from_slice(&bytes).unwrap();
     assert_eq!(
         encoded.keys().map(String::as_str).collect::<BTreeSet<_>>(),
-        lenient_decode::FIELDS.iter().copied().collect()
+        lenient_decode::FIELDS
+            .iter()
+            .copied()
+            .filter(|name| *name != "reread_guard")
+            .collect()
     );
     let decoded =
         lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
@@ -4511,8 +4515,6 @@ fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
         let counts = &loaded.traversal.as_ref().unwrap().counts;
         assert_eq!(serde_json::to_value(counts).unwrap(), expected);
         assert_eq!(counts.discovered_file_count, 7);
-        assert_eq!(counts.unchanged_reread_admitted, 0);
-        assert_eq!(counts.reread_budget_refused, 0);
         assert_eq!(counts.has_retryable_problems(), full);
         loaded
             .save(&path)
@@ -4523,4 +4525,196 @@ fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
             expected
         );
     }
+}
+
+/// Retired evidence cannot reset live census, move slots or select another read.
+#[test]
+fn retired_reread_guard_keeps_legacy_map_and_full_array_custody() {
+    let seed = every_persisted_field_fixture();
+    let expected = serde_json::to_vec(&seed).unwrap();
+    let census = serde_json::to_vec(&seed.claude_request_census).unwrap();
+    let fields = lenient_decode::FIELDS;
+    assert_eq!(fields[81], "reread_guard");
+    assert_eq!(fields[82], "codex_counting_evicted_legacy");
+    assert_eq!(fields[83], "upload_ack_retirement_handoff");
+    assert_eq!(fields[84], "held_audit_progress");
+    assert_eq!(fields[85], "claude_money_birth_store");
+    let count_fields = [
+        "discovered_file_count",
+        "directory_entry_cap_exceeded_count",
+        "symlink_rejected_count",
+        "unreadable_path_count",
+        "unreadable_causes",
+        "parent_unresolvable",
+        "oversized_file_count",
+        "disappeared_file_count",
+        "malformed_json_line_count",
+        "invalid_utf8_line_count",
+        "over_line_cap_count",
+        "recognized_usage_drop_count",
+        "ownership_incomplete_file_count",
+        "zero_snapshot_usage_evidence_count",
+        "dropped_usage_record_count",
+        "terminal_over_line_cap_count",
+        "terminal_recognized_usage_drop_count",
+        "terminal_dropped_usage_record_count",
+        "terminal_ownership_incomplete_file_count",
+        "terminal_zero_snapshot_usage_evidence_count",
+        "unchanged_reread_admitted",
+        "reread_budget_refused",
+    ];
+    let mut old = serde_json::to_value(&seed).unwrap();
+    old["reread_guard"] = serde_json::json!({
+        "closed":true, "observed_reads":999, "wall_high_water":u64::MAX,
+        "tripwire":{"indexed":1,"planned":999,"cause_counts":[1,2,3]},
+        "refused":{"legacy": [1,2]}, "growth_full":{"legacy":9}
+    });
+    old["traversal"]["counts"]["unchanged_reread_admitted"] = serde_json::json!(41);
+    old["traversal"]["counts"]["reread_budget_refused"] = serde_json::json!(43);
+    let mut forms = vec![serde_json::to_string(&old).unwrap()];
+    // Full nested counter sequence, including nonzero retired slots 20/21.
+    old["traversal"]["counts"] = Value::Array(
+        count_fields
+            .iter()
+            .map(|name| old["traversal"]["counts"][*name].clone())
+            .collect(),
+    );
+    forms.push(
+        serde_json::to_string(&Value::Array(
+            fields.iter().map(|name| old[*name].clone()).collect(),
+        ))
+        .unwrap(),
+    );
+    let prefix = forms[0].strip_suffix('}').unwrap().to_owned();
+    for key in ["reread_guard", "\\u0072eread_guard"] {
+        forms.push(format!("{prefix},\"{key}\":\"wrong shape\"}}"));
+    }
+    for depth in [65, 300] {
+        forms.push(format!(
+            "{prefix},\"reread_guard\":{}0{}}}",
+            "[".repeat(depth),
+            "]".repeat(depth)
+        ));
+    }
+    forms.push(format!(
+        "{prefix},\"reread_guard\":\"{}\"}}",
+        "x".repeat(claude_request_census::MAX_RAW_BYTES + 1)
+    ));
+    let scratch = crate::test_scratch::ScratchDir::new("retired-reread-custody");
+    for (number, form) in forms.iter().enumerate() {
+        let bytes = form.as_bytes();
+        let path = scratch.join(format!("old-{number}.json"));
+        fs::write(&path, bytes).unwrap();
+        let native = claude_request_census::decode_index(bytes).expect("native legacy decode");
+        let streaming = lenient_decode::read(std::io::Cursor::new(bytes), "load", "unattributed")
+            .expect("no extra positional field");
+        let bounded = lenient_decode::read_bounded(bytes).unwrap();
+        let disk = ScanIndex::load(&path).expect("no reset");
+        for mut decoded in [native, streaming, bounded, disk] {
+            assert!(decoded.decode_holds.is_empty(), "no quarantine");
+            assert_eq!(
+                serde_json::to_vec(&decoded.claude_request_census).unwrap(),
+                census
+            );
+            assert_eq!(
+                serde_json::to_vec(&decoded).unwrap(),
+                expected,
+                "every surviving selection, hold, checkpoint and successor field unchanged"
+            );
+            for (key, entry) in &seed.files {
+                let candidate = CandidateFile {
+                    physical_identity: None,
+                    scan_root: PathBuf::from("/synthetic"),
+                    path: PathBuf::from(key),
+                    size_bytes: entry.size_bytes,
+                    modified_unix_seconds: entry.modified_unix_seconds,
+                    modified_unix_nanos: entry.modified_unix_nanos.unwrap_or_default(),
+                    source_file_fingerprint: entry.source_file_fingerprint.clone(),
+                    legacy_source_file_fingerprint: String::new(),
+                    legacy_config_reconciliation_required: false,
+                    opened_object_identity: String::new(),
+                    fingerprint_changed_nanos: 0,
+                    fingerprint_birth_nanos: 0,
+                };
+                assert_eq!(
+                    decoded.candidate_decision_with_reason_at(&candidate, 0),
+                    seed.candidate_decision_with_reason_at(&candidate, 0),
+                    "retired over-budget/bad-clock evidence cannot select a reread"
+                );
+            }
+            assert!(
+                !decoded
+                    .traversal
+                    .as_ref()
+                    .unwrap()
+                    .counts
+                    .has_retryable_problems(),
+                "nonzero retired refusal must not request another read"
+            );
+            assert_eq!(
+                decoded.files.keys().collect::<Vec<_>>(),
+                seed.files.keys().collect::<Vec<_>>()
+            );
+            fs::write(&path, bytes).unwrap();
+            decoded.save(&path).expect("CAS keeps generation custody");
+            let reloaded = ScanIndex::load(&path).unwrap();
+            assert_eq!(
+                serde_json::to_vec(&reloaded.claude_request_census).unwrap(),
+                census
+            );
+            let saved = fs::read_to_string(&path).unwrap();
+            for retired in [
+                "reread_guard",
+                "unchanged_reread_admitted",
+                "reread_budget_refused",
+            ] {
+                assert!(!saved.contains(&format!("\"{retired}\":")));
+            }
+        }
+    }
+    assert_eq!(corrupt_count(scratch.as_ref()), 0);
+}
+
+/// Previous (0.1.201) ScanIndex and ScanTraversalCounts both use serde(default).
+/// Pin the absent-field downgrade contract while preserving the census bytes.
+#[test]
+fn retired_reread_new_writer_keeps_previous_default_contract() {
+    #[derive(Default, serde::Deserialize)]
+    #[serde(default)]
+    struct PreviousCounts {
+        discovered_file_count: usize,
+        unchanged_reread_admitted: u64,
+        reread_budget_refused: u64,
+    }
+    #[derive(Default, serde::Deserialize)]
+    #[serde(default)]
+    struct PreviousTraversal {
+        counts: PreviousCounts,
+    }
+    #[derive(Default, serde::Deserialize)]
+    #[serde(default)]
+    struct PreviousIndex {
+        claude_request_census: claude_request_census::ClaudeRequestCensus,
+        reread_guard: Option<Value>,
+        traversal: Option<PreviousTraversal>,
+    }
+    let seed = every_persisted_field_fixture();
+    let bytes = serde_json::to_vec(&seed).unwrap();
+    let old: PreviousIndex = serde_json::from_slice(&bytes).expect("old defaults accept new map");
+    assert!(old.reread_guard.is_none());
+    let counts = old.traversal.unwrap().counts;
+    assert_eq!(
+        counts.discovered_file_count,
+        seed.traversal
+            .as_ref()
+            .unwrap()
+            .counts
+            .discovered_file_count
+    );
+    assert_eq!(counts.unchanged_reread_admitted, 0);
+    assert_eq!(counts.reread_budget_refused, 0);
+    assert_eq!(
+        serde_json::to_vec(&old.claude_request_census).unwrap(),
+        serde_json::to_vec(&seed.claude_request_census).unwrap()
+    );
 }

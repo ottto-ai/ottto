@@ -9,6 +9,10 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use crate::codex_scan_diagnostics::PARENT_UNRESOLVABLE_CAUSES;
 use crate::transcript_cache::ENTRY_BYTES;
 
+fn plain_path() -> &'static Path {
+    Path::new("fixture.jsonl")
+}
+
 const NOW: &str = "2026-10-07T12:00:00Z";
 const SESSION: &str = "019fa111-2222-7333-8444-555555555555";
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -280,7 +284,7 @@ fn grew_past_exact_needs_growth_and_wakes_keep_the_qualified_stamp() {
     let entry = |exact: bool| {
         MemoEntry::new(
             "digest".into(),
-            LiveWitness::read(&file, 8).unwrap(),
+            LiveWitness::read(plain_path(), &file, 8).unwrap(),
             opened.clone(),
             None,
             None,
@@ -308,13 +312,15 @@ fn grew_past_exact_needs_growth_and_wakes_keep_the_qualified_stamp() {
     let chmodded = OpenStamp::capture(&file).unwrap();
     assert!(chmodded != opened && chmodded.same_content(&opened));
     assert_eq!(
-        entry(true).grew_past_exact("digest", &file, None, ""),
+        entry(true).grew_past_exact(plain_path(), "digest", &file, None, ""),
         None,
         "a ctime-only change never only grew"
     );
     for exact in [true, false] {
         assert!(
-            entry(exact).matches("digest", &file, None, "").is_none(),
+            entry(exact)
+                .matches(plain_path(), "digest", &file, None, "")
+                .is_none(),
             "memo, exact={exact}: unqualified live ctime"
         );
         park_with(exact);
@@ -330,7 +336,7 @@ fn grew_past_exact_needs_growth_and_wakes_keep_the_qualified_stamp() {
     };
     for exact in [true, false] {
         assert!(entry(exact)
-            .matches_stamp("digest", &file, None, "", qualified.clone())
+            .matches_stamp(plain_path(), "digest", &file, None, "", qualified.clone())
             .is_some());
         park_with(exact);
         assert!(cache
@@ -345,17 +351,24 @@ fn grew_past_exact_needs_growth_and_wakes_keep_the_qualified_stamp() {
         .unwrap()
         .set_modified(std::time::UNIX_EPOCH)
         .unwrap();
-    assert_eq!(entry(true).grew_past_exact("digest", &file, None, ""), None);
+    assert_eq!(
+        entry(true).grew_past_exact(plain_path(), "digest", &file, None, ""),
+        None
+    );
 
     // Growth: an exact entry misses and reports the grown extent; a
     // non-exact one still hits.
     temp.append(b"{\"n\":3}\n");
-    assert!(entry(true).matches("digest", &file, None, "").is_none());
+    assert!(entry(true)
+        .matches(plain_path(), "digest", &file, None, "")
+        .is_none());
     assert_eq!(
-        entry(true).grew_past_exact("digest", &file, None, ""),
+        entry(true).grew_past_exact(plain_path(), "digest", &file, None, ""),
         Some(24)
     );
-    assert!(entry(false).matches("digest", &file, None, "").is_some());
+    assert!(entry(false)
+        .matches(plain_path(), "digest", &file, None, "")
+        .is_some());
 }
 
 fn reader_input() -> (Vec<u8>, u64, u64) {
@@ -727,6 +740,7 @@ fn parentless_created_thread_hold_is_monotone_only_when_append_incurable() {
 fn disclosure() -> Disclosure {
     Disclosure {
         reason: DebtReason::HeldTerminal,
+        cause: ownership::PARSER,
         ownership_incomplete_file_count: 1,
         zero_snapshot_usage_evidence: false,
         state_only_blocked_session_ids: vec![SESSION.into()],
@@ -741,6 +755,7 @@ fn disclosure() -> Disclosure {
 fn strict(reason: DebtReason) -> Disclosure {
     Disclosure {
         reason,
+        cause: ownership::GROUP,
         ownership_incomplete_file_count: 0,
         zero_snapshot_usage_evidence: false,
         state_only_blocked_session_ids: vec![SESSION.into()],
@@ -858,7 +873,7 @@ fn held_singleton_memo_woken_by_sidecar_change() {
     let entry = |sidecar: Option<String>| {
         MemoEntry::new(
             "digest".into(),
-            LiveWitness::read(&file, 8).unwrap(),
+            LiveWitness::read(plain_path(), &file, 8).unwrap(),
             OpenStamp::capture(&file).unwrap(),
             None,
             sidecar,
@@ -866,7 +881,9 @@ fn held_singleton_memo_woken_by_sidecar_change() {
         )
     };
     let created = entry(sidecar_wakes(&held).then(|| recorded.clone()));
-    assert!(created.matches("digest", &file, None, &recorded).is_some());
+    assert!(created
+        .matches(plain_path(), "digest", &file, None, &recorded)
+        .is_some());
     // The sidecar rollout extent catches up with the file: the cure is
     // visible, the entry wakes and the file is re-read.
     codex.rollout_extents.insert(
@@ -878,7 +895,9 @@ fn held_singleton_memo_woken_by_sidecar_change() {
     );
     let caught_up = sidecar_fingerprint(&codex, &path);
     assert_ne!(caught_up, recorded);
-    assert!(created.matches("digest", &file, None, &caught_up).is_none());
+    assert!(created
+        .matches(plain_path(), "digest", &file, None, &caught_up)
+        .is_none());
     // An identity conflict on the path's session also wakes it.
     let mut conflicted = codex.clone();
     conflicted.identity_conflicts.insert(SESSION.into());
@@ -886,18 +905,22 @@ fn held_singleton_memo_woken_by_sidecar_change() {
     assert_ne!(conflict, caught_up);
     let caught_up_entry = entry(Some(caught_up.clone()));
     assert!(caught_up_entry
-        .matches("digest", &file, None, &conflict)
+        .matches(plain_path(), "digest", &file, None, &conflict)
         .is_none());
     // R1-H1: a missing projection may also mean the sidecar extent is ahead
     // of the flushed file, which an append cures: that entry hits only on
     // its exact stamp, and any growth re-reads it.
     assert!(growth_may_cure(&held));
     let ahead = entry(Some(caught_up.clone())).growth_may_cure(growth_may_cure(&held));
-    assert!(ahead.matches("digest", &file, None, &caught_up).is_some());
+    assert!(ahead
+        .matches(plain_path(), "digest", &file, None, &caught_up)
+        .is_some());
     temp.append(b"{\"n\":3}\n");
-    assert!(ahead.matches("digest", &file, None, &caught_up).is_none());
+    assert!(ahead
+        .matches(plain_path(), "digest", &file, None, &caught_up)
+        .is_none());
     assert!(caught_up_entry
-        .matches("digest", &file, None, &caught_up)
+        .matches(plain_path(), "digest", &file, None, &caught_up)
         .is_some());
     // An ordinary (not created-thread) fork hold is cured by peer parent
     // evidence only.
@@ -906,7 +929,9 @@ fn held_singleton_memo_woken_by_sidecar_change() {
     assert!(!growth_may_cure(&held));
     assert!(!sidecar_wakes(&held));
     let fork = entry(sidecar_wakes(&held).then(|| recorded.clone()));
-    assert!(fork.matches("digest", &file, None, &caught_up).is_some());
+    assert!(fork
+        .matches(plain_path(), "digest", &file, None, &caught_up)
+        .is_some());
 }
 
 /// C2: no time-based expiry. A memo entry wakes on cheap changed evidence
@@ -922,9 +947,9 @@ fn held_singleton_memo_woken_by_sidecar_change() {
 fn memo_entry_matches_growth_but_not_prefix_or_parent_change() {
     let temp = Temp::new("memo", b"{\"n\":1}\n{\"n\":2}\n");
     let file = File::open(&temp.0).unwrap();
-    assert!(LiveWitness::read(&file, 0).is_none());
-    assert!(LiveWitness::read(&file, 10_000).is_none());
-    let live = LiveWitness::read(&file, 8).unwrap();
+    assert!(LiveWitness::read(plain_path(), &file, 0).is_none());
+    assert!(LiveWitness::read(plain_path(), &file, 10_000).is_none());
+    let live = LiveWitness::read(plain_path(), &file, 8).unwrap();
     let stamp = OpenStamp::capture(&file).unwrap();
     let parent = Some(ParentDep {
         id: "parent".into(),
@@ -940,18 +965,35 @@ fn memo_entry_matches_growth_but_not_prefix_or_parent_change() {
     let now_1 = now("ledger-1", "p-1");
     let entry = MemoEntry::new("digest".into(), live, stamp, parent, None, disclosure());
     assert_eq!(entry.parent_ref(), Some("parent"));
-    assert!(entry.matches("digest", &file, Some(&now_1), "").is_some());
-    assert!(entry.matches("other", &file, Some(&now_1), "").is_none());
+    assert!(entry
+        .matches(plain_path(), "digest", &file, Some(&now_1), "")
+        .is_some());
+    assert!(entry
+        .matches(plain_path(), "other", &file, Some(&now_1), "")
+        .is_none());
     // PR-1 L4: a changed ledger and, separately, a changed parent object
     // each miss.
     assert!(entry
-        .matches("digest", &file, Some(&now("ledger-2", "p-1")), "")
-        .is_none());
-    assert!(entry
-        .matches("digest", &file, Some(&now("ledger-1", "p-2")), "")
+        .matches(
+            plain_path(),
+            "digest",
+            &file,
+            Some(&now("ledger-2", "p-1")),
+            ""
+        )
         .is_none());
     assert!(entry
         .matches(
+            plain_path(),
+            "digest",
+            &file,
+            Some(&now("ledger-1", "p-2")),
+            ""
+        )
+        .is_none());
+    assert!(entry
+        .matches(
+            plain_path(),
             "digest",
             &file,
             Some(&ParentNow {
@@ -962,19 +1004,21 @@ fn memo_entry_matches_growth_but_not_prefix_or_parent_change() {
             ""
         )
         .is_none());
-    assert!(entry.matches("digest", &file, None, "").is_none());
+    assert!(entry
+        .matches(plain_path(), "digest", &file, None, "")
+        .is_none());
     // Growth past the refused offset cannot cure the hold: still a hit, and
     // the hit returns the grown stamp for the entry to keep.
     temp.append(b"{\"n\":3}\n");
     let grown = entry
-        .matches("digest", &file, Some(&now_1), "")
+        .matches(plain_path(), "digest", &file, Some(&now_1), "")
         .expect("growth is a hit");
     assert!(grown.extent > entry.stamp.extent);
     let mut refreshed = entry.clone();
     refreshed.stamp = grown;
     // No timer: an entry whose evidence is unchanged keeps matching.
     assert!(refreshed
-        .matches("digest", &file, Some(&now_1), "")
+        .matches(plain_path(), "digest", &file, Some(&now_1), "")
         .is_some());
     // A same-length stamp change (an in-place write elsewhere) wakes it.
     OpenOptions::new()
@@ -984,11 +1028,13 @@ fn memo_entry_matches_growth_but_not_prefix_or_parent_change() {
         .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1))
         .unwrap();
     assert!(refreshed
-        .matches("digest", &file, Some(&now_1), "")
+        .matches(plain_path(), "digest", &file, Some(&now_1), "")
         .is_none());
     // A rewritten prefix is a miss (re-read).
     fs::write(&temp.0, b"{\"n\":9}\n{\"n\":2}\n{\"n\":3}\n").unwrap();
-    assert!(entry.matches("digest", &file, Some(&now_1), "").is_none());
+    assert!(entry
+        .matches(plain_path(), "digest", &file, Some(&now_1), "")
+        .is_none());
 }
 
 #[test]
@@ -1000,7 +1046,7 @@ fn singleton_memo_is_bounded_lru_with_frozen_charges() {
     let file = File::open(&temp.0).unwrap();
     let entry = MemoEntry::new(
         "digest".into(),
-        LiveWitness::read(&file, 8).unwrap(),
+        LiveWitness::read(plain_path(), &file, 8).unwrap(),
         OpenStamp::capture(&file).unwrap(),
         None,
         None,
@@ -6296,7 +6342,7 @@ fn durable_restore_then_tail_beside_a_held_fork_memo_and_parent_ledger_matches_c
     const SINGLE: &str = "019fa111-2222-7333-8444-cccccccccccc";
     let source = SnapshotSource::Codex;
     let namespace = Scope("cursor-fixture".into());
-    let capture = crate::snapshots::claude_request_identity::capture_by_default();
+    let capture = true; // Outside a sync cycle every scan captures.
     let home = ForkHome::new(&ForkHome::diverging_child(3));
     fs::write(
         home.fixture.file(SINGLE),
@@ -13067,26 +13113,14 @@ fn continuation_page_past_its_deadline_pauses_without_a_ticket() {
     });
 }
 
-/// K5.2/K5.3: Codex holds no request-identity permit (`OtherSource`), so
-/// the ordinary Codex page never captures; neither does its continuation,
-/// in tests too, where capture would otherwise be the default.
+/// K5.2/K5.3: the ordinary Codex page never captures
+/// (`claude_request_identity::captures`); neither does its continuation, in
+/// tests too, where a scan outside a sync cycle captures.
 #[test]
 fn continuation_capture_mode_is_the_ordinary_codex_mode() {
-    use crate::snapshots::claude_request_identity::{
-        capture_by_default, permit_when, CohortDenial, COHORT_HINT_TOKEN,
-    };
-    for token in [None, Some(COHORT_HINT_TOKEN)] {
-        assert!(matches!(
-            permit_when(true, SnapshotSource::Codex, token),
-            Err(CohortDenial::OtherSource)
-        ));
-    }
     let ordinary_capture =
-        permit_when(true, SnapshotSource::Codex, Some(COHORT_HINT_TOKEN)).is_ok();
-    assert!(
-        capture_by_default(),
-        "the default the continuation must not use"
-    );
+        crate::snapshots::claude_request_identity::captures(SnapshotSource::Codex);
+    assert!(!ordinary_capture);
     let fixture = ScanRoot::new(4);
     let scan = OwnedSourceScan::new_continuation(
         std::slice::from_ref(&fixture.root),
@@ -13497,4 +13531,460 @@ fn retained_open_samples_cannot_be_reused_after_another_live_ctime_change() {
         qualified.changed, now.changed,
         "a fresh equal-content sample pass can qualify the stored ctime"
     );
+}
+
+#[test]
+fn compressed_memo_rechecks_refuse_decoded_offsets() {
+    let temp = Temp::new("zst-memo", b"{\"n\":1}\n");
+    let file = File::open(&temp.0).unwrap();
+    let live = LiveWitness::read(plain_path(), &file, 8).unwrap();
+    let stamp = OpenStamp::capture(&file).unwrap();
+    let entry = MemoEntry::new(
+        "digest".into(),
+        live,
+        stamp.clone(),
+        None,
+        None,
+        disclosure(),
+    );
+    let path = Path::new("rollout.jsonl.zst");
+    codex_zst_refusal_tests::assert_refused(CodexZstCause::PhysicalOffsetUnsupported, || {
+        assert!(entry
+            .matches_stamp(path, "digest", &file, None, "", stamp)
+            .is_none());
+    });
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
+fn decoder_floor_preserves_a_real_primary_tail_and_other_retained_copy() {
+    let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let clock = TestClock;
+    clock.set(1_900_000_000);
+    with_test_limits(2048, 8192, 64, || {
+        let primary = ScanRoot::new(40);
+        let peer = ScanRoot::new(40);
+        let cache = Arc::new(SharedCache::default());
+        let key = local_index_key(&primary.file(SESSION));
+        let peer_key = local_index_key(&peer.file(SESSION));
+        let mut index = ScanIndex::default();
+        for fixture in [&primary, &peer] {
+            let mut warm = ScanIndex::default();
+            for _ in 0..64 {
+                let (next, _) = page(fixture, warm, Some(Arc::clone(&cache)));
+                warm = next;
+                if cache
+                    .retained_checkpoint(&local_index_key(&fixture.file(SESSION)))
+                    .is_some()
+                {
+                    break;
+                }
+            }
+            if std::ptr::eq(fixture, &primary) {
+                index = warm;
+            }
+        }
+        assert!(cache.retained_checkpoint(&key).is_some());
+        assert!(cache.retained_checkpoint(&peer_key).is_some());
+        let bytes = zstd::stream::encode_all(&b"synthetic archive"[..], 1).unwrap();
+        let archive = Temp::new("decoder-floor", &bytes);
+        let credit = codex_compressed_input::compressed_input_credit().unwrap();
+        let floor = ENTRY_BYTES + super::super::side_ledger::SIDE_LEDGER_BYTES;
+        let budget = cache.cursor_resident()
+            + retained_floor(&cache)
+            + credit
+            + floor
+            + super::super::side_ledger::SIDE_LEDGER_BYTES;
+        with_test_state_budget(budget - 1, || {
+            assert!(OpenedInput::funded(File::open(&archive.0).unwrap(), &cache)
+                .unwrap()
+                .is_none());
+            assert_eq!(cache.cursor_reserved(), 0);
+        });
+        with_test_state_budget(budget, || {
+            let mut input = OpenedInput::funded(File::open(&archive.0).unwrap(), &cache)
+                .unwrap()
+                .unwrap();
+            input.read_exact(&mut [0; 1]).unwrap();
+            primary.append(SESSION, &token_line(41));
+            index.traversal = None;
+            let (_, scan, modes) =
+                page_in(&primary, index, Some(Arc::clone(&cache)), "cursor-fixture");
+            assert_eq!(
+                modes,
+                (0, 1),
+                "a real primary Tail progresses during the decode"
+            );
+            assert_eq!(scan.snapshots.len(), 1);
+            assert!(
+                cache.retained_checkpoint(&peer_key).is_some(),
+                "decoder causes no extra eviction"
+            );
+            assert!(cache.retained_checkpoint(&key).is_some());
+            assert_eq!(cache.cursor_reserved(), credit);
+            input.close();
+        });
+        assert_eq!(cache.cursor_reserved(), 0);
+    });
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
+fn decoder_release_and_unwind_follow_the_production_stores_guard() {
+    let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for unwind in [false, true] {
+        let cache = Arc::new(SharedCache::default());
+        let f = Temp::new(
+            "stores-owner",
+            &zstd::stream::encode_all(&b"synthetic"[..], 1).unwrap(),
+        );
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            let mut input = OpenedInput::funded(File::open(&f.0).unwrap(), &cache)
+                .unwrap()
+                .unwrap();
+            input.read_exact(&mut [0; 1]).unwrap();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let stores = cache.durable().unwrap();
+                assert!(super::super::durable_tail::stores_held());
+                if unwind {
+                    panic!("synthetic durable operation failure");
+                }
+                drop(stores);
+            }));
+            assert_eq!(result.is_err(), unwind);
+            assert!(!super::super::durable_tail::stores_held());
+            input.close();
+        });
+        assert_eq!(cache.cursor_reserved(), 0);
+        assert!(!rows.iter().any(|r| r["stage"] == "codex_zst_owner"));
+    }
+    #[cfg(debug_assertions)]
+    {
+        let cache = Arc::new(SharedCache::default());
+        let guard = cache.durable().unwrap();
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| DecoderOwner::acquire(
+                &cache, 1
+            )))
+            .is_err()
+        );
+        drop(guard);
+        DecoderOwner::acquire(&cache, 1).unwrap().release();
+    }
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
+fn decoder_fixed_floor_admits_a_warm_cache_without_evicting_it() {
+    let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let clock = TestClock;
+    clock.set(1_900_000_000);
+    with_test_limits(2048, 8192, 64, || {
+        let fixture = ScanRoot::new(40);
+        let cache = Arc::new(SharedCache::default());
+        let key = local_index_key(&fixture.file(SESSION));
+        let mut index = ScanIndex::default();
+        for _ in 0..64 {
+            let (next, _) = page(&fixture, index, Some(Arc::clone(&cache)));
+            index = next;
+            if cache.retained_checkpoint(&key).is_some() {
+                break;
+            }
+        }
+        let copy = cache.take(&key).expect("real retained reduction").retained;
+        // Two real reductions with large synthetic keys warm > 8 MiB, while
+        // each entry remains under ENTRY_BYTES. The graph is measured normally.
+        let warm_key = "a".repeat(5 * 1024 * 1024);
+        let peer_key = "b".repeat(5 * 1024 * 1024);
+        for key in [&warm_key, &peer_key] {
+            assert!(cache.retained().unwrap().insert(
+                key.clone(),
+                crate::transcript_cache::Retained {
+                    checkpoint: copy.checkpoint.clone(),
+                    state: copy.state.clone(),
+                }
+            ));
+        }
+        let warm = retained_floor(&cache);
+        assert!(warm > ENTRY_BYTES);
+        let credit = codex_compressed_input::compressed_input_credit().unwrap();
+        let side = super::super::side_ledger::SIDE_LEDGER_BYTES;
+        let budget = cache.cursor_resident() + warm + credit + ENTRY_BYTES + 2 * side;
+        // An explicit budget isolates the floor rule from zstd version sizing.
+        // The prior retained-sized floor would reject this same warm graph.
+        assert!(cache.cursor_resident() + 2 * warm + credit + 2 * side > budget);
+        with_test_state_budget(budget, || {
+            let owner = DecoderOwner::acquire(&cache, credit).expect("warm cache admits");
+            assert!(cache.retained_checkpoint(&warm_key).is_some());
+            assert!(cache.retained_checkpoint(&peer_key).is_some());
+            owner.release();
+        });
+        assert_eq!(cache.cursor_reserved(), 0);
+    });
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
+fn decoder_drop_under_cursor_strands_credit_without_relocking() {
+    let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let cache = Arc::new(SharedCache::default());
+    let owner = DecoderOwner::acquire(&cache, 4096).unwrap();
+    let ((), rows) = crate::local_resource_diagnostics::capture(|| {
+        cache.with_cursor(|_| drop(owner)).unwrap();
+    });
+    assert_eq!(
+        cache.cursor_reserved(),
+        4096,
+        "stranded, never under-accounted"
+    );
+    assert!(DECODER_LIVE.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(rows.iter().any(|r| r["counts"]["leaked_release"] == 1));
+    // Only the test repairs the intentionally stranded impossible-path state.
+    cache.with_cursor(|c| settle_claim(c, c.id, 4096)).unwrap();
+    DECODER_LIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+    DecoderOwner::acquire(&cache, 4096).unwrap().release();
+}
+
+#[test]
+fn ownership_disclosure_replays_preserve_cause_and_group_strict_uses_group_bucket() {
+    let candidate = CandidateFile {
+        path: PathBuf::from("/synthetic/ownership-same.jsonl"),
+        scan_root: PathBuf::from("/synthetic"),
+        physical_identity: None,
+        size_bytes: 0,
+        modified_unix_seconds: 0,
+        modified_unix_nanos: 0,
+        source_file_fingerprint: "synthetic".into(),
+        legacy_source_file_fingerprint: String::new(),
+        legacy_config_reconciliation_required: false,
+        opened_object_identity: String::new(),
+        fingerprint_changed_nanos: 0,
+        fingerprint_birth_nanos: 0,
+    };
+    for cause in [ownership::CREATED, ownership::PARENT, ownership::PARSER] {
+        let mut index = ScanIndex::default();
+        let mut census = ScanCensus::default();
+        census.causes = census.causes.page(Some(77));
+        let mut residue = BTreeSet::new();
+        let mut blocked = BTreeSet::new();
+        let mut residue_blocked = BTreeSet::new();
+        let mut pending = Vec::new();
+        let mut debt = disclosure();
+        debt.cause = cause;
+        for _ in 0..2 {
+            disclose_terminal_codex_debt(
+                &debt,
+                &candidate,
+                (None, None),
+                &mut index,
+                DisclosureTargets {
+                    census: &mut census,
+                    residue_index_keys: &mut residue,
+                    residue_blocked_session_ids: &mut residue_blocked,
+                    codex_state_only_blocked_session_ids: &mut blocked,
+                    pending_finalization: &mut pending,
+                },
+            );
+        }
+        let (c, [unknown, _, _]) = census
+            .causes
+            .summary(census.ownership_incomplete_file_count);
+        assert_eq!(census.ownership_incomplete_file_count, 2);
+        assert_eq!(c[cause], 2);
+        assert_eq!(c[..6].iter().sum::<usize>() + unknown, 2);
+        assert_eq!(residue.len(), 1);
+        codex_file_join::disclose_strict(
+            "synthetic-owner",
+            std::slice::from_ref(&candidate),
+            DisclosureTargets {
+                census: &mut census,
+                residue_index_keys: &mut residue,
+                residue_blocked_session_ids: &mut residue_blocked,
+                codex_state_only_blocked_session_ids: &mut blocked,
+                pending_finalization: &mut pending,
+            },
+        );
+        let (c, [unknown, _, _]) = census
+            .causes
+            .summary(census.ownership_incomplete_file_count);
+        assert_eq!(c[ownership::GROUP], 1);
+        assert_eq!(c[..6].iter().sum::<usize>() + unknown, 3);
+    }
+}
+
+#[test]
+fn mcp_version_waits_for_resumed_cursor_eof() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(80);
+    let path = fixture.file(SESSION);
+    let text = fs::read_to_string(&path).unwrap();
+    let (first, rest) = text.split_once('\n').unwrap();
+    let mut meta: Value = serde_json::from_str(first).unwrap();
+    meta["payload"]["cli_version"] = json!("0.148.9");
+    fs::write(&path, meta.to_string() + "\n" + rest).unwrap();
+    let home = fixture.root.parent().unwrap().parent().unwrap();
+    let projection = Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(
+        Some(home),
+    ));
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        let mut index = ScanIndex::default();
+        for _ in 0..64 {
+            let (next, _, _) = page_with(
+                &fixture,
+                index,
+                Some(cache.clone()),
+                "mcp-cursor",
+                NOW,
+                |s| s.codex_versions = Some(projection.clone()),
+            );
+            index = next;
+            let completed = cache.with_cursor(|c| c.counters.jobs_certified).unwrap();
+            if completed > 0 {
+                assert!(cache.with_cursor(|c| c.counters.jobs_resumed).unwrap() > 0);
+                assert_eq!(projection.snapshot().0.unwrap().version(), Some("0.148.9"));
+                assert_eq!(projection.snapshot().1, 1, "publish only at completed EOF");
+                return;
+            }
+            assert!(
+                projection.snapshot().0.is_none(),
+                "paused cursors publish nothing"
+            );
+        }
+        panic!("cursor never completed");
+    });
+}
+
+/// R1 singleton: a paged cursor job starts while its file is indexed, so it
+/// captures no missing-carrier due, then parks; the per-pass index loses the
+/// entry. On completion settlement re-probes the record read-only (live
+/// context, once-clamped) and stages the marker, counting the miss and the
+/// staged transition once each. The job is not invalidated.
+#[test]
+fn parked_singleton_across_fresh_index_reprobes_record_debt() {
+    use crate::durable_tail_store as store;
+    use std::io::Read;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(40);
+    let path = fixture.file(SESSION);
+    let key = local_index_key(&path);
+    let incomplete = |scan: &mut OwnedSourceScan| scan.sidecar_census_complete = false;
+    let (mut index, _, _) = page_with(
+        &fixture,
+        ScanIndex::default(),
+        None,
+        "cursor-fixture",
+        NOW,
+        incomplete,
+    );
+    assert!(index.files.contains_key(&key));
+    // A same-context debt record for the indexed file.
+    let state = fixture.root.parent().unwrap().to_path_buf();
+    let index_path = state.join("index.json");
+    let scope = Scope("cursor-fixture".into());
+    let now = crate::snapshots::sampled_scan::now_seconds();
+    let due = now - 90;
+    let mut file = fs::File::open(&path).unwrap();
+    let mut plan =
+        crate::transcript_acquisition::ReadPlan::prepare(&mut file, None, &scope, None, now)
+            .unwrap();
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).unwrap();
+    plan.observe_complete_records(&bytes).unwrap();
+    let mut certificate = plan
+        .commit_after_native_completion(&file, &scope, now)
+        .unwrap()
+        .durable_certificate(0)
+        .unwrap();
+    certificate.audit_debt_unix_seconds = Some(due);
+    let ds = store::DurableSource::Codex;
+    let lock = crate::locked_state_dir::test_locks::hold(&state);
+    let mut disk = store::DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+    let pending = store::PendingRecord {
+        binding: store::Binding {
+            source: ds,
+            key: store::key_digest(ds, &key),
+            context: store::context_digest(&scope.0, None),
+            scope: [0; 32],
+            entry: [0; 32],
+        },
+        certificate,
+        body: crate::snapshots::durable_store_fixture_body(SnapshotSource::Codex, 0, 0),
+        allowlist: crate::snapshots::sampled_jsonl::durable::allowlist_digest(
+            SnapshotSource::Codex,
+        ),
+    };
+    assert_eq!(
+        disk.write_after_save(lock, 1, vec![pending])
+            .unwrap()
+            .written,
+        1
+    );
+    drop(disk);
+    fixture.append(SESSION, &token_line(41));
+    index.traversal = None;
+    let cache = Arc::new(SharedCache::default());
+    cache.durable_begin_pass(SnapshotSource::Codex, &index_path, &scope, false);
+    let index = with_test_limits(2048, 1024, 64, || {
+        let mut index = index;
+        let mut cleared = false;
+        for _ in 0..64 {
+            let (next, _, _) = page_with(
+                &fixture,
+                index,
+                Some(Arc::clone(&cache)),
+                "cursor-fixture",
+                NOW,
+                incomplete,
+            );
+            index = next;
+            let done =
+                counter(&cache, |c| c.jobs_certified) + counter(&cache, |c| c.jobs_uncertified);
+            if done > 0 {
+                break;
+            }
+            if !cleared && counter(&cache, |c| c.jobs_paused) > 0 {
+                // The per-pass index loads without the parked file's entry.
+                index.files.remove(&key);
+                cleared = true;
+            }
+        }
+        assert!(cleared, "the job parked: {}", counters(&cache));
+        assert_eq!(
+            counter(&cache, |c| c.jobs_invalidated),
+            0,
+            "{}",
+            counters(&cache)
+        );
+        index
+    });
+    assert_eq!(
+        index.files[&key].unverified_deadline(),
+        Some(due),
+        "staged from the record at settlement"
+    );
+    let (durable, _) = cache.durable_counters(SnapshotSource::Codex).unwrap();
+    // A start-time restore attempt on the then-indexed entry may count its
+    // own carrier miss (A's existing-entry rearm); the re-probe adds one.
+    assert!(durable
+        .ineligible
+        .get("audit_carrier")
+        .is_some_and(|n| *n >= 1));
+    assert_eq!(
+        durable.ineligible.get("audit_carrier_staged_unverified"),
+        Some(&1)
+    );
+    assert_eq!(durable.restored, 0);
 }

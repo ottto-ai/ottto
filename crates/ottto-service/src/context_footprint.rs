@@ -241,6 +241,7 @@ pub fn spawn_context_footprint_sync(daemon: &crate::LocalDaemon) -> Result<()> {
     let home = crate::snapshot_sync::home_dir()?;
     let support_dir = default_support_dir();
     let projection = Arc::clone(&daemon.footprint_cwds);
+    let codex_preludes = Arc::clone(&daemon.codex_preludes);
     std::thread::Builder::new()
         .name("ottto-context-footprint-sync".to_string())
         .spawn(move || loop {
@@ -255,7 +256,9 @@ pub fn spawn_context_footprint_sync(daemon: &crate::LocalDaemon) -> Result<()> {
                 }
             };
             // Codex session starts share this thread: no extra background job.
-            if let Err(error) = crate::codex_prelude_footprint::harvest_once(&home, &support_dir) {
+            if let Err(error) =
+                crate::codex_prelude_footprint::harvest_once(&home, &support_dir, &codex_preludes)
+            {
                 eprintln!(
                     "codex session start harvest skipped: {}",
                     crate::snapshot_sync::safe_error(&error)
@@ -285,7 +288,7 @@ fn harvest_all_once(
     let Some(machine_id) = crate::snapshot_sync::snapshot_machine_id(&device)? else {
         return Err(anyhow!("machine identity is missing"));
     };
-    let api_base_url = crate::snapshot_sync::snapshot_api_base_url();
+    let api_base_url = crate::snapshot_sync::snapshot_api_base_url()?;
     let client = SnapshotApiClient::new(api_base_url.clone());
     harvest_source(
         &client,
@@ -1512,33 +1515,6 @@ fn dedupe_workspace_candidates_by_repository(
     out
 }
 
-pub(crate) fn collect_recent_jsonl_files(
-    dir: &Path,
-    now: SystemTime,
-    out: &mut Vec<(PathBuf, SystemTime)>,
-) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        if metadata.is_dir() {
-            collect_recent_jsonl_files(&path, now, out);
-            continue;
-        }
-        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-        if now.duration_since(mtime).unwrap_or(Duration::ZERO) <= RECENT_WORKSPACE_WINDOW {
-            out.push((path, mtime));
-        }
-    }
-}
-
 fn string_at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
     let mut current = value;
     for key in path {
@@ -1749,6 +1725,46 @@ pub(crate) fn workspace_label(workspace: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// Recent plain `.jsonl` transcripts under `dir`. Recent `.jsonl.zst` archives
+    /// are counted in `compressed` and never opened.
+    fn collect_recent_jsonl_files(
+        dir: &Path,
+        now: SystemTime,
+        out: &mut Vec<(PathBuf, SystemTime)>,
+        compressed: &mut usize,
+    ) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if metadata.is_dir() {
+                collect_recent_jsonl_files(&path, now, out, compressed);
+                continue;
+            }
+            let plain = path.extension().and_then(|value| value.to_str()) == Some("jsonl");
+            let archive = !plain
+                && path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|name| name.ends_with(".jsonl.zst"));
+            if !plain && !archive {
+                continue;
+            }
+            let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            if now.duration_since(mtime).unwrap_or(Duration::ZERO) <= RECENT_WORKSPACE_WINDOW {
+                if plain {
+                    out.push((path, mtime));
+                } else {
+                    *compressed += 1;
+                }
+            }
+        }
+    }
+
     use super::*;
     use std::fs::File;
     use std::io::{BufRead, BufReader};
@@ -1949,6 +1965,25 @@ mod tests {
 
     fn temp_dir(name: &str) -> PathBuf {
         test_scratch::private_dir(&format!("ottto-context-footprint-{name}"))
+    }
+
+    #[test]
+    fn recent_archives_are_counted_and_never_listed() {
+        let root = temp_dir("collector-archives");
+        let day = root.join("2026/10/28");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(day.join("rollout-a.jsonl"), b"{}\n").unwrap();
+        fs::write(day.join("rollout-b.jsonl.zst"), b"not zstd").unwrap();
+        fs::write(day.join("notes.zst"), b"other").unwrap();
+        let (mut files, mut compressed) = (Vec::new(), 0);
+        collect_recent_jsonl_files(&root, SystemTime::now(), &mut files, &mut compressed);
+        let names: Vec<_> = files
+            .iter()
+            .map(|(path, _)| path.file_name().unwrap().to_owned())
+            .collect();
+        assert_eq!(names, [std::ffi::OsString::from("rollout-a.jsonl")]);
+        assert_eq!(compressed, 1);
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn run_git(repo: &Path, args: &[&str]) {
@@ -2428,7 +2463,12 @@ mod tests {
     /// then deduplicated by repository and truncated to one cycle.
     fn discover_all_files_oracle(home: &Path, now: SystemTime) -> Vec<WorkspaceCandidate> {
         let mut files = Vec::new();
-        collect_recent_jsonl_files(&home.join(".claude").join("projects"), now, &mut files);
+        collect_recent_jsonl_files(
+            &home.join(".claude").join("projects"),
+            now,
+            &mut files,
+            &mut 0,
+        );
         files.sort_by_key(|item| std::cmp::Reverse(item.1));
         let mut by_path: BTreeMap<String, WorkspaceCandidate> = BTreeMap::new();
         for (file, mtime) in files {
@@ -2513,6 +2553,7 @@ mod tests {
                 observer.line(
                     &view,
                     &PhysicalLine {
+                        end: 0,
                         value: value.as_ref(),
                     },
                 );
@@ -2525,6 +2566,8 @@ mod tests {
         let (object, _) = FileObject::of(&File::open(path).unwrap()).unwrap();
         FileView {
             source: SnapshotSource::ClaudeCode,
+            root: Some(0),
+            start: 0,
             object,
             mtime: Some(mtime),
             mode,
@@ -2533,7 +2576,12 @@ mod tests {
 
     fn discover_with_counts(home: &Path, now: SystemTime) -> (Vec<WorkspaceCandidate>, usize) {
         let mut files = Vec::new();
-        collect_recent_jsonl_files(&home.join(".claude").join("projects"), now, &mut files);
+        collect_recent_jsonl_files(
+            &home.join(".claude").join("projects"),
+            now,
+            &mut files,
+            &mut 0,
+        );
         let projection = Arc::new(CwdProjection::default());
         project_transcripts(&projection, &files);
         let mut path_scopes = 0;
@@ -2869,9 +2917,21 @@ mod tests {
         let want = observer.begin(view);
         if want == Want::Lines {
             for value in lines {
-                observer.line(view, &PhysicalLine { value: Some(value) });
+                observer.line(
+                    view,
+                    &PhysicalLine {
+                        end: 0,
+                        value: Some(value),
+                    },
+                );
             }
-            observer.line(view, &PhysicalLine { value: None });
+            observer.line(
+                view,
+                &PhysicalLine {
+                    end: 0,
+                    value: None,
+                },
+            );
         }
         observer.end(view, &end);
     }

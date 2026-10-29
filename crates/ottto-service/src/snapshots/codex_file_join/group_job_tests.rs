@@ -1539,7 +1539,6 @@ fn group_with_legacy_tee_is_byte_charged() {
         }
     }
     let metadata = CodexTitleMetadata::default();
-    boot.admit_for_test(&previous);
     let mut job = boot
         .into_job(JobInputs {
             metadata: &metadata,
@@ -1553,7 +1552,6 @@ fn group_with_legacy_tee_is_byte_charged() {
     assert!(job.group.as_ref().unwrap().tee.is_some());
     let no_scope = |_: &CandidateFile| None;
     let inputs = StepInputs {
-        index: &previous,
         metadata: &metadata,
         attribution: None,
         artifacts: false,
@@ -1691,7 +1689,6 @@ fn group_overflow_evicts_at_most_overflow_plus_one_entry() {
         }
     }
     let metadata = CodexTitleMetadata::default();
-    boot.admit_for_test(&previous);
     let mut job = boot
         .into_job(JobInputs {
             metadata: &metadata,
@@ -1704,7 +1701,6 @@ fn group_overflow_evicts_at_most_overflow_plus_one_entry() {
         .unwrap();
     let no_scope = |_: &CandidateFile| None;
     let inputs = StepInputs {
-        index: &previous,
         metadata: &metadata,
         attribution: None,
         artifacts: false,
@@ -2888,6 +2884,135 @@ fn retained_parked_group_and_sealed_dependencies_ignore_ctime_only_changes() {
     }
 }
 
+/// B1: a spent T14 member holds its whole joined acquisition through the
+/// production exit WITHOUT making its source census unreadable. An unrelated
+/// session still publishes; the held group's accepted witnesses stay intact.
+#[cfg(unix)]
+#[test]
+fn spent_known_corrupt_group_keeps_census_healthy_and_peer_progresses() {
+    use crate::durable_tail_store::{self as store, SingleWriter};
+    use std::io::Read;
+    let (root, _) = fixture();
+    let source = SnapshotSource::Codex;
+    let cache = Arc::new(SharedCache::default());
+    let (index, seed) = sampled(&root, ScanIndex::default(), 10, &cache);
+    assert!(seed.census_complete);
+    let key = local_index_key(&root.join("sessions/a.jsonl"));
+    let accepted = index.files[&key].last_snapshot_fingerprint.clone();
+    assert!(accepted.is_some());
+    let index_path = root.join("index.json");
+    let scope = Scope("group-fixture".into());
+    let path = root.join("sessions/a.jsonl");
+    let mut file = fs::File::open(&path).unwrap();
+    let mut plan = crate::transcript_acquisition::ReadPlan::prepare(
+        &mut file,
+        None,
+        &scope,
+        None,
+        1_800_000_000,
+    )
+    .unwrap();
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).unwrap();
+    plan.observe_complete_records(&bytes).unwrap();
+    let checkpoint = plan
+        .commit_after_native_completion(&file, &scope, 1_800_000_000)
+        .unwrap();
+    let certificate = checkpoint
+        .durable_certificate(crate::transcript_acquisition::birth_unix_nanos(
+            &file.metadata().unwrap(),
+        ))
+        .unwrap();
+    struct Writer(PathBuf);
+    impl SingleWriter for Writer {
+        fn state_dir(&self) -> &Path {
+            &self.0
+        }
+    }
+    let writer = Writer(root.clone());
+    let mut disk = store::DurableTailStore::new(
+        store::store_dir_for_index(&index_path),
+        store::DurableSource::Codex,
+    );
+    let digest = store::key_digest(store::DurableSource::Codex, &key);
+    disk.write_after_save(
+        &writer,
+        1,
+        vec![store::PendingRecord {
+            binding: store::Binding {
+                source: store::DurableSource::Codex,
+                key: digest,
+                context: [0; 32],
+                scope: [0; 32],
+                entry: [0; 32],
+            },
+            certificate,
+            body: crate::snapshots::durable_store_fixture_body(source, 0, 0),
+            allowlist: sampled_jsonl::durable::allowlist_digest(source),
+        }],
+    )
+    .unwrap();
+    let record = disk.dir().join(format!(
+        "{}.rec",
+        digest
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    ));
+    let mut corrupt = fs::read(&record).unwrap();
+    *corrupt.last_mut().unwrap() ^= 1;
+    fs::write(&record, &corrupt).unwrap();
+    let cache = Arc::new(SharedCache::default());
+    cache.durable_begin_pass(source, &index_path, &scope, false);
+    assert_eq!(
+        cache.durable_full_hold(source, &key, true),
+        None,
+        "initial group rebuild attempt"
+    );
+    assert_eq!(
+        cache
+            .durable_counters(source)
+            .unwrap()
+            .1
+            .t14_rebuild_full_started,
+        1
+    );
+    cache.durable_begin_pass(source, &index_path, &scope, false);
+    // A healthy, unrelated singleton is selected in the same terminal pass.
+    let peer_owner = "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    write_rows(
+        &root.join("sessions/peer.jsonl"),
+        &member(peer_owner, "r-peer", 90, 90),
+    );
+    // A size change invalidates the joined witness (clearing only the
+    // singleton fingerprint does not force a joined acquisition).
+    use std::io::Write;
+    writeln!(fs::OpenOptions::new().append(true).open(&path).unwrap()).unwrap();
+    // A later timestamp alone retains the prior traversal; start a fresh walk
+    // so both existing group members reach the production acquisition guard.
+    let (index, result) = next_generation(&root, index, &cache, 1);
+    assert!(
+        result.census_complete,
+        "a known_corrupt group must not make source census red"
+    );
+    assert_eq!(result.unreadable_path_count, 0);
+    assert_eq!(index.files[&key].last_snapshot_fingerprint, accepted);
+    assert!(!result
+        .snapshots
+        .iter()
+        .any(|item| item.source_session_id == OWNER));
+    assert!(result
+        .snapshots
+        .iter()
+        .any(|item| item.source_session_id == peer_owner));
+    let (counts, stats) = cache.durable_counters(source).unwrap();
+    assert_eq!(counts.durable_held, [0; 6]);
+    assert_eq!(counts.not_persisted.get("known_corrupt_held"), Some(&1));
+    assert_eq!(stats.t14_rebuild_full_started, 1);
+    assert_eq!(fs::read(&record).unwrap(), corrupt);
+    fs::remove_dir_all(root).unwrap();
+}
+
 /// L23/F1: grouped members never reach the per-candidate guard, so a held
 /// member (here a newer binary's record) holds its whole joined group before
 /// acquisition: no member read, no POST body, the record byte-identical.
@@ -2926,7 +3051,7 @@ fn durable_hold_on_one_member_holds_the_joined_group() {
             assert_eq!(fs::read(&record).unwrap(), bytes);
             assert!(durable.durable_held[store::Refusal::NewerFormat as usize] >= 1);
         } else {
-            assert_eq!(durable.durable_held, [0; 7]);
+            assert_eq!(durable.durable_held, [0; 6]);
         }
         scanned.push(result.scanned_file_count);
         fs::remove_dir_all(root).unwrap();
@@ -2937,122 +3062,489 @@ fn durable_hold_on_one_member_holds_the_joined_group() {
     );
 }
 
-#[cfg(unix)]
 #[test]
-fn two_missing_group_members_keep_both_tickets_until_the_group_can_acquire() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let (root, _) = fixture();
-    fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
-    let _lock = crate::locked_state_dir::test_locks::hold(&root);
-    let index_path = root.join("index.json");
-    let source = SnapshotSource::Codex;
-    let mut committed = ScanIndex::default();
-    for name in ["a", "b"] {
-        committed.files.insert(local_index_key(&root.join(format!("sessions/{name}.jsonl"))),serde_json::from_value(json!({"size_bytes":0,"modified_unix_seconds":0,"source_file_fingerprint":"prior-native","last_snapshot_fingerprint":"prior-accepted"})).unwrap());
-    }
-    committed.save(&index_path).unwrap();
-    let cache = Arc::new(SharedCache::default());
-    let namespace = Scope("group-missing-upgrade".into());
-    cache.durable_begin_pass(source, &index_path, &namespace, false);
-    let mut owned = OwnedSourceScan::new(
-        source,
-        &[root.join("sessions")],
-        committed.clone(),
-        "2026-10-06T23:00:00Z",
-        7,
-        10,
-        false,
-        None,
-        &[],
-        false,
-        false,
-    )
-    .with_sampled_acquisition(cache.clone(), namespace);
-    let mut saves = 0;
-    let result = loop {
-        match owned.step(None) {
-            OwnedSourceScanStep::Pending(mut next) => {
-                if next.index.reread_guard.needs_save() {
-                    saves += 1;
-                }
-                next.persist_reread_reservations(&mut committed, &index_path)
-                    .unwrap();
-                assert!(saves <= 2, "no additional per-release grant");
-                owned = next;
-            }
-            OwnedSourceScanStep::Complete { scan, .. } => break scan,
+fn compressed_group_probe_initial_swap_and_legacy_tee_never_read() {
+    use codex_zst_refusal_tests::assert_refused;
+    let (root, inventory) = fixture();
+    let index = ScanIndex::default();
+    let group = inventory.groups().into_values().next().unwrap();
+    let mut boot = GroupBoot::new(group.clone(), &index);
+    let plain = group.members[0].clone();
+    let mut compressed = plain.clone();
+    compressed.path.set_extension("jsonl.zst");
+    fs::copy(&plain.path, &compressed.path).unwrap();
+    boot.group.members[0] = compressed.clone();
+    assert_refused(CodexZstCause::GroupProbeUnsupported, || {
+        assert!(matches!(boot.probe(0), Boot::Strict));
+        assert_eq!(boot.charge, 0);
+    });
+    let metadata = CodexTitleMetadata::default();
+    assert_refused(CodexZstCause::GroupReadUnsupported, || {
+        assert!(open_member_file(&mut compressed).is_err());
+        assert!(new_group_parser(
+            File::open(&compressed.path).unwrap(),
+            &compressed,
+            &metadata,
+            None,
+            None,
+            false,
+            false,
+            codex_counting_version::AckEvidence::None
+        )
+        .is_err());
+        let expected =
+            BTreeMap::from([(local_index_key(&compressed.path), "accepted-body".into())]);
+        assert!(legacy_tee(
+            &expected,
+            &compressed,
+            &File::open(&compressed.path).unwrap(),
+            &metadata,
+            None,
+            None,
+            false,
+            false
+        )
+        .is_err());
+    });
+    let mut boot = GroupBoot::new(group, &index);
+    loop {
+        match boot.step(None, &index) {
+            Boot::Pending => {}
+            Boot::Ready => break,
+            _ => panic!("plain group boots"),
         }
+    }
+    let mut active = boot
+        .into_job(JobInputs {
+            metadata: &metadata,
+            traces: None,
+            ledgers: None,
+            artifacts: false,
+            context_curve: false,
+            index: &index,
+        })
+        .unwrap();
+    let before = active.parser.reader.consumed_bytes();
+    let group = active.group.as_deref_mut().unwrap();
+    group.current = 1;
+    group.members[1] = compressed;
+    let join = active
+        .parser
+        .accumulator
+        .codex_tier_replay
+        .as_mut()
+        .unwrap()
+        .join
+        .take()
+        .unwrap();
+    let no_scope = |_: &CandidateFile| None;
+    let inputs = StepInputs {
+        metadata: &metadata,
+        attribution: None,
+        artifacts: false,
+        context_curve: false,
+        live_scope: &no_scope,
     };
-    assert_eq!(saves, 2, "one receipt for each member");
-    assert!(result.scanned_file_count >= 2);
-    assert!(!result.snapshots.is_empty());
-    let (counts, _) = cache.durable_counters(source).unwrap();
-    assert_eq!(counts.upgrade_state_missing, 2);
-    assert_eq!(counts.durable_held.iter().sum::<u64>(), 0);
+    assert_refused(CodexZstCause::GroupReadUnsupported, || {
+        assert!(matches!(
+            open_member(&mut active, join, &inputs),
+            Err(GroupEnd::Strict)
+        ));
+        assert_eq!(
+            active.parser.reader.consumed_bytes(),
+            before,
+            "swap never reset the reader"
+        );
+    });
+    active.candidate.path.set_extension("jsonl.zst");
+    let cache = Arc::new(SharedCache::default());
+    assert_refused(CodexZstCause::PhysicalOffsetUnsupported, || {
+        assert!(matches!(
+            cache.cursor_start(&mut active, &Scope("zst".into()), None, None, true, &index),
+            Err(cursor::StartRefusal::Unstartable)
+        ));
+    });
     fs::remove_dir_all(root).unwrap();
 }
 
-/// A successful joined scan has no per-file durable reductions by design.
-/// Appending only the live member must still admit its unchanged sealed peer.
+/// A valid debt-bearing v1 record per `(member, due, upload context)` and no
+/// index membership: the reset state the grouped missing-carrier handoff
+/// recovers. Returns each member path with its record path.
+#[cfg(unix)]
+fn seed_member_debts<W: crate::durable_tail_store::SingleWriter>(
+    root: &Path,
+    writer: &W,
+    debts: &[(&str, u64, Option<&str>)],
+) -> Vec<(PathBuf, PathBuf)> {
+    use crate::durable_tail_store as store;
+    use std::io::Read;
+    let scope = Scope("group-fixture".into());
+    let now = sampled_scan::now_seconds();
+    let ds = store::DurableSource::Codex;
+    let dir = store::store_dir_for_index(&root.join("index.json"));
+    let mut seeded = Vec::new();
+    let mut pending = Vec::new();
+    for (name, due, context) in debts {
+        let path = root.join(format!("sessions/{name}.jsonl"));
+        let mut file = fs::File::open(&path).unwrap();
+        let mut plan =
+            crate::transcript_acquisition::ReadPlan::prepare(&mut file, None, &scope, None, now)
+                .unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        plan.observe_complete_records(&bytes).unwrap();
+        let mut certificate = plan
+            .commit_after_native_completion(&file, &scope, now)
+            .unwrap()
+            .durable_certificate(0)
+            .unwrap();
+        certificate.audit_debt_unix_seconds = Some(*due);
+        let digest = store::key_digest(ds, &local_index_key(&path));
+        let hex = digest
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        seeded.push((path, dir.join(format!("{hex}.rec"))));
+        pending.push(store::PendingRecord {
+            binding: store::Binding {
+                source: ds,
+                key: digest,
+                context: store::context_digest(&scope.0, *context),
+                scope: [0; 32],
+                entry: [0; 32],
+            },
+            certificate,
+            body: crate::snapshots::durable_store_fixture_body(SnapshotSource::Codex, 0, 0),
+            allowlist: sampled_jsonl::durable::allowlist_digest(SnapshotSource::Codex),
+        });
+    }
+    let mut disk = store::DurableTailStore::new(dir, ds);
+    let written = disk.write_after_save(writer, 1, pending).unwrap().written;
+    assert_eq!(written, debts.len());
+    seeded
+}
+
+/// One scan of `root` through its group's completion: a single unpaged page,
+/// or cursor pages under the scaled singleton budget.
+#[cfg(unix)]
+fn group_pass(
+    root: &Path,
+    index: ScanIndex,
+    cache: &Arc<SharedCache>,
+    collected_at: &str,
+    paged: bool,
+) -> (ScanIndex, SourceScanResult) {
+    if !paged {
+        return sampled_at(root, index, 10, cache, collected_at);
+    }
+    let before = completions(cache);
+    with_test_limits(2048, 1024, 64, || {
+        let (index, result, _) = pages_at(root, index, cache, collected_at, || {
+            completions(cache) > before
+        });
+        (index, result)
+    })
+}
+
+/// #865 P1 / SOURCE Addendum 6: reset + debt-bearing joined members (the
+/// non-live alias `a` and the live member `b`) + complete join inventory +
+/// incomplete sidecar census. The group publishes unverified; each member's
+/// own native entry carries its own deadline through save, post-save GC and
+/// restart, is selected past W, and a later verified Full retires both with
+/// the existing completion counter. Paged and unpaged reads share the one
+/// job-start capture and the one settlement; both are exercised.
+#[cfg(unix)]
+fn grouped_missing_carriers_mark_each_member_until_verified(paged: bool) {
+    let source = SnapshotSource::Codex;
+    let root = if paged {
+        paged_corpus("missing-carrier")
+    } else {
+        fixture().0
+    };
+    let lock = crate::locked_state_dir::test_locks::hold(&root);
+    let index_path = root.join("index.json");
+    let namespace = Scope("group-fixture".into());
+    let now = sampled_scan::now_seconds();
+    let dues = [now - 120, now - 60];
+    let seeded = seed_member_debts(&root, lock, &[("a", dues[0], None), ("b", dues[1], None)]);
+    let originals = seeded
+        .iter()
+        .map(|(_, record)| fs::read(record).unwrap())
+        .collect::<Vec<_>>();
+    fs::write(root.join("session_index.jsonl"), "{not valid json}\n").unwrap();
+    let cache = Arc::new(SharedCache::default());
+    cache.durable_begin_pass(source, &index_path, &namespace, false);
+    let (mut index, result) = group_pass(
+        &root,
+        ScanIndex::default(),
+        &cache,
+        "2026-10-06T23:00:00Z",
+        paged,
+    );
+    assert!(!result.sidecar_census_complete);
+    assert!(
+        result
+            .snapshots
+            .iter()
+            .any(|item| item.source_session_id == OWNER),
+        "the unverified group publishes"
+    );
+    for ((path, _), due) in seeded.iter().zip(dues) {
+        let entry = &index.files[&local_index_key(path)];
+        assert!(entry.has_unverified_source(), "{path:?}");
+        assert_eq!(
+            entry.unverified_deadline(),
+            Some(due),
+            "each member keeps its own recovered debt"
+        );
+    }
+    let (counts, _) = cache.durable_counters(source).unwrap();
+    assert_eq!(
+        counts.ineligible.get("audit_carrier"),
+        Some(&2),
+        "counted once per recovered member"
+    );
+    assert_eq!(
+        counts.ineligible.get("audit_carrier_staged_unverified"),
+        Some(&2)
+    );
+    assert_eq!(counts.restored, 0);
+    assert_eq!(counts.durable_held, [0; 6]);
+    // Actual save and post-save GC keep both predecessors while debt is owed.
+    index.save(&index_path).unwrap();
+    crate::snapshots::durable_after_save(&cache, &root, source, &index);
+    assert_eq!(
+        cache.durable_counters(source).unwrap().1.gc_records_deleted,
+        0
+    );
+    for ((_, record), original) in seeded.iter().zip(&originals) {
+        assert_eq!(&fs::read(record).unwrap(), original);
+    }
+    drop(cache);
+    let mut loaded = ScanIndex::load(&index_path).unwrap();
+    for ((path, _), due) in seeded.iter().zip(dues) {
+        assert_eq!(
+            loaded.files[&local_index_key(path)].unverified_deadline(),
+            Some(due)
+        );
+        assert!(crate::snapshots::sampled_audit::path_requires_verification(
+            &loaded.files,
+            path
+        ));
+    }
+    // Later: the sidecar census is repaired; discovery runs past W on a
+    // fresh cache, and only the markers select the idle members.
+    fs::remove_file(root.join("session_index.jsonl")).unwrap();
+    loaded.traversal = None;
+    let aged = (::time::OffsetDateTime::now_utc() + ::time::Duration::days(8))
+        .format(&::time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let restart = Arc::new(SharedCache::default());
+    restart.durable_begin_pass(source, &index_path, &namespace, false);
+    let ((verified, clean), rows) = crate::local_resource_diagnostics::capture(|| {
+        group_pass(&root, loaded, &restart, &aged, paged)
+    });
+    assert!(clean.sidecar_census_complete);
+    assert!(clean
+        .snapshots
+        .iter()
+        .any(|item| item.source_session_id == OWNER));
+    for (path, _) in &seeded {
+        let entry = &verified.files[&local_index_key(path)];
+        assert!(!entry.has_unverified_source(), "{path:?}");
+        assert_eq!(entry.unverified_deadline(), None);
+    }
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row["stage"] == "native_collection_page")
+            .map(|row| {
+                row["counts"]["sampled_acquisition"]["page_events"]["audits_completed"]
+                    .as_u64()
+                    .expect("production page_events exposes the completion counter")
+            })
+            .sum::<u64>(),
+        2,
+        "the existing completion counter retires each member once"
+    );
+    let (counts, _) = restart.durable_counters(source).unwrap();
+    assert_eq!(
+        counts.ineligible.get("audit_carrier"),
+        None,
+        "verifying a marked member is not a new miss"
+    );
+    assert_eq!(
+        counts.ineligible.get("audit_carrier_staged_unverified"),
+        None
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[cfg(unix)]
 #[test]
-fn completed_joined_members_are_not_missing_upgrade_state() {
+fn grouped_missing_carriers_mark_each_unpaged_member_until_verified() {
+    grouped_missing_carriers_mark_each_member_until_verified(false);
+}
+
+#[cfg(unix)]
+#[test]
+fn grouped_missing_carriers_mark_each_paged_member_until_verified() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    let (root, _) = fixture();
+    grouped_missing_carriers_mark_each_member_until_verified(true);
+}
+
+/// Grouped controls: a valid foreign-context record on the alias contributes
+/// no obligation or count; the live member's future envelope deadline clamps
+/// once to the recovery boundary's now, and later offers cannot renew it.
+#[cfg(unix)]
+#[test]
+fn grouped_missing_carrier_requires_live_context_and_clamps_future_debt() {
     let source = SnapshotSource::Codex;
-    let cache = Arc::new(SharedCache::default());
-    let namespace = Scope("group-fixture".into());
-    cache.durable_begin_pass(source, &root.join("index.json"), &namespace, false);
-    let (mut index, first) = sampled(&root, ScanIndex::default(), 10, &cache);
-    assert!(!first.snapshots.is_empty());
-    for name in ["a", "b"] {
-        let entry = &index.files[&local_index_key(&root.join(format!("sessions/{name}.jsonl")))];
-        assert!(
-            entry.codex_joined_member_set.is_some()
-                || entry.codex_captured_joined_member_set.is_some()
-        );
-    }
-    let sealed = root.join("sessions/a.jsonl");
-    let before = fs::read(&sealed).unwrap();
-    append_rows(
-        &root.join("sessions/b.jsonl"),
+    let (root, _) = fixture();
+    let lock = crate::locked_state_dir::test_locks::hold(&root);
+    let now = sampled_scan::now_seconds();
+    let seeded = seed_member_debts(
+        &root,
+        lock,
         &[
-            turn("66666666-aaaa-4aaa-8aaa-666666666666"),
-            native(OWNER, "new-response", 5, 305),
+            ("a", now - 60, Some("foreign-account")),
+            ("b", now + 600, Some("live-account")),
         ],
     );
-    let cold = Arc::new(SharedCache::default());
-    cold.durable_begin_pass(source, &root.join("index.json"), &namespace, false);
-    for n in 0..2 {
-        if n != 0 {
-            append_rows(
-                &root.join("sessions/b.jsonl"),
-                &[native(OWNER, "newer-response", 5, 310)],
-            );
+    fs::write(root.join("session_index.jsonl"), "{not valid json}\n").unwrap();
+    let cache = Arc::new(SharedCache::default());
+    cache.durable_begin_pass(
+        source,
+        &root.join("index.json"),
+        &Scope("group-fixture".into()),
+        false,
+    );
+    let live = ScanIndex {
+        active_upload_context_fingerprint: Some("live-account".into()),
+        ..ScanIndex::default()
+    };
+    let before = sampled_scan::now_seconds();
+    let (mut index, result) = sampled(&root, live, 10, &cache);
+    let after = sampled_scan::now_seconds();
+    assert!(!result.sidecar_census_complete);
+    assert!(result
+        .snapshots
+        .iter()
+        .any(|item| item.source_session_id == OWNER));
+    let alias = local_index_key(&seeded[0].0);
+    let member = local_index_key(&seeded[1].0);
+    assert!(
+        !index.files[&alias].has_unverified_source(),
+        "a foreign envelope contributes no obligation"
+    );
+    assert_eq!(index.files[&alias].unverified_deadline(), None);
+    let due = index.files[&member].unverified_deadline().unwrap();
+    assert!(
+        (before..=after).contains(&due),
+        "clamped at the recovery boundary"
+    );
+    assert!(due < now + 600, "the future envelope cannot postpone audit");
+    let (counts, _) = cache.durable_counters(source).unwrap();
+    assert_eq!(counts.ineligible.get("audit_carrier"), Some(&1));
+    assert_eq!(
+        counts.ineligible.get("audit_carrier_staged_unverified"),
+        Some(&1)
+    );
+    let fingerprint = index.files[&member].source_file_fingerprint.clone();
+    assert!(index.stage_sampled_audit(
+        &member,
+        &fingerprint,
+        crate::transcript_acquisition::AuditDebt {
+            due_unix_seconds: now + 1200
         }
-        let (next, scan) = sampled_at(
-            &root,
-            index,
-            10,
-            &cold,
-            if n == 0 {
-                "2026-10-06T23:01:00Z"
-            } else {
-                "2026-10-06T23:02:00Z"
-            },
-        );
-        assert!(scan.scanned_file_count >= 2, "joined updates must progress");
-        assert!(!scan.snapshots.is_empty());
-        assert!(!next.reread_guard.needs_save());
-        index = next;
+    ));
+    assert_eq!(
+        index.files[&member].unverified_deadline(),
+        Some(due),
+        "later offers cannot renew the clamped debt"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// R1: a paged group captures its dues while both members are indexed (none
+/// owed), then parks; the per-pass index loses their entries (a fresh load).
+/// On resume the job keeps its progress, and settlement re-probes each absent
+/// member's record and stages its own marker, counted once. The singleton
+/// paged re-probe is the same settlement block (`dues.1`, via the singleton
+/// guard), so this group fixture covers the shared path.
+#[cfg(unix)]
+#[test]
+fn parked_group_across_fresh_index_reprobes_member_debt_on_resume() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
     }
-    assert_eq!(fs::read(sealed).unwrap(), before);
-    let (counts, _) = cold.durable_counters(source).unwrap();
-    assert_eq!(counts.upgrade_state_missing, 0);
-    assert_eq!(counts.durable_held.iter().sum::<u64>(), 0);
+    let source = SnapshotSource::Codex;
+    let root = paged_corpus("missing-carrier-r1");
+    fs::write(root.join("session_index.jsonl"), "{not valid json}\n").unwrap();
+    let (mut index, seed) = sampled(
+        &root,
+        ScanIndex::default(),
+        10,
+        &Arc::new(SharedCache::default()),
+    );
+    assert!(seed
+        .snapshots
+        .iter()
+        .any(|item| item.source_session_id == OWNER));
+    let lock = crate::locked_state_dir::test_locks::hold(&root);
+    let now = sampled_scan::now_seconds();
+    let dues = [now - 120, now - 60];
+    let seeded = seed_member_debts(&root, lock, &[("a", dues[0], None), ("b", dues[1], None)]);
+    append_rows(
+        &root.join("sessions/b.jsonl"),
+        &chain_rows(OWNER, "b2", "2026-10-01T10:30:00Z", 600, 5)[1..],
+    );
+    let cache = Arc::new(SharedCache::default());
+    cache.durable_begin_pass(
+        source,
+        &root.join("index.json"),
+        &Scope("group-fixture".into()),
+        false,
+    );
+    index.traversal = None;
+    let collected_at = "2026-10-06T23:01:00Z";
+    let (fresh, done) = with_test_limits(2048, 1024, 64, || {
+        let (mut index, _, _) = pages_at(&root, index, &cache, collected_at, || {
+            cache.paused_group_position().is_some()
+        });
+        assert!(seeded
+            .iter()
+            .all(|(path, _)| index.files.contains_key(&local_index_key(path))));
+        // The per-pass index loads without the members' entries.
+        index.files.clear();
+        let (index, result, _) = pages_at(&root, index, &cache, collected_at, || {
+            completions(&cache) > 0
+        });
+        (index, result)
+    });
+    assert!(done
+        .snapshots
+        .iter()
+        .any(|item| item.source_session_id == OWNER));
+    let counted = counters(&cache);
+    assert_eq!(
+        counted.groups_started, 1,
+        "resumed, not rebooted: {counted:?}"
+    );
+    assert_eq!(counted.jobs_invalidated, 0, "{counted:?}");
+    for ((path, _), due) in seeded.iter().zip(dues) {
+        assert_eq!(
+            fresh.files[&local_index_key(path)].unverified_deadline(),
+            Some(due),
+            "{path:?}: staged from the record on resume"
+        );
+    }
+    let (durable, _) = cache.durable_counters(source).unwrap();
+    assert_eq!(durable.ineligible.get("audit_carrier"), Some(&2));
+    assert_eq!(
+        durable.ineligible.get("audit_carrier_staged_unverified"),
+        Some(&2)
+    );
     fs::remove_dir_all(root).unwrap();
 }

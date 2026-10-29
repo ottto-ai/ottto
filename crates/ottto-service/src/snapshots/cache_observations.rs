@@ -11,6 +11,7 @@ pub(crate) fn event_id(session_ref: &str, request_ref: &str) -> String {
 }
 
 pub const MAX_OPERATIONS: usize = 64;
+pub const MAX_ROWS: usize = 128;
 pub const MAX_WIRE_BYTES: usize = 128 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -63,9 +64,21 @@ pub struct CacheObservations {
 
 impl CacheObservations {
     pub fn validate(&self) -> bool {
+        let mut ids = BTreeSet::new();
         self.schema_version == 1
+            && matches!(self.coverage.as_str(), "complete" | "partial" | "unknown")
+            && (self.omitted_observation_count.unwrap_or(0) == 0 || self.coverage == "partial")
             && self.operations.len() <= MAX_OPERATIONS
-            && serde_json::to_vec(self).is_ok_and(|bytes| bytes.len() <= MAX_WIRE_BYTES)
+            && self.operations.iter().all(|operation| {
+                ids.insert(match operation {
+                    Operation::Upsert { observation } => &observation.event_id,
+                    Operation::Retract { event_id } => event_id,
+                })
+            })
+            && serde_json::to_value(self).is_ok_and(|value| {
+                crate::canonical_json::canonicalize(&value)
+                    .is_ok_and(|bytes| bytes.len() <= MAX_WIRE_BYTES)
+            })
     }
 }
 
@@ -141,13 +154,37 @@ pub(crate) fn detect_bounded(
     requests: &[OwnedRequest],
     limit: usize,
 ) -> (BTreeMap<String, Observation>, u64) {
-    let mut rows = BTreeMap::new();
+    let (rows, omitted) = detect_prefix(session_ref, requests, limit, true);
+    (
+        rows.into_iter()
+            .map(|row| (row.event_id.clone(), row))
+            .collect(),
+        omitted,
+    )
+}
+
+/// Input has already passed the adapter's existing duplicate/conflict check.
+/// Selection and ordering retain at most 64 rows, with no request-sized index.
+pub(crate) fn detect_unique_prefix(
+    session_ref: &str,
+    requests: &[OwnedRequest],
+) -> (Vec<Observation>, u64) {
+    detect_prefix(session_ref, requests, MAX_OPERATIONS, false)
+}
+
+fn detect_prefix(
+    session_ref: &str,
+    requests: &[OwnedRequest],
+    limit: usize,
+    deduplicate: bool,
+) -> (Vec<Observation>, u64) {
+    let mut rows = Vec::with_capacity(limit.min(requests.len()));
     let mut omitted = 0;
     let mut baseline: Option<&OwnedRequest> = None;
     let mut episode: Option<String> = None;
     let mut seen = BTreeSet::new();
     for (index, request) in requests.iter().enumerate() {
-        if !seen.insert(request.slot.request_ref.clone()) {
+        if deduplicate && !seen.insert(request.slot.request_ref.clone()) {
             continue;
         }
         let previous = index.checked_sub(1).map(|i| &requests[i]);
@@ -167,6 +204,13 @@ pub(crate) fn detect_bounded(
                 baseline = Some(request);
                 episode = None;
             }
+            continue;
+        }
+        if loss && request.ordering != "ambiguous" && episode.is_none() {
+            episode = Some(request.slot.request_ref.clone());
+        }
+        if rows.len() == limit {
+            omitted += 1;
             continue;
         }
         let model_change = previous.is_some_and(|prior| prior.slot.model != request.slot.model);
@@ -224,9 +268,6 @@ pub(crate) fn detect_bounded(
         } else {
             "cold_start"
         };
-        if loss && request.ordering != "ambiguous" && episode.is_none() {
-            episode = Some(request.slot.request_ref.clone());
-        }
         // Provider identity plus existing session identity; no counter, offset or version digest.
         let event_id = event_id(session_ref, &request.slot.request_ref);
         let recovery_comparable = next.is_some_and(|next| comparable(request, next));
@@ -255,11 +296,7 @@ pub(crate) fn detect_bounded(
             report_gap_seconds: report_gap,
             detector_version: "v1".into(),
         };
-        if rows.len() < limit {
-            rows.insert(event_id, observation);
-        } else {
-            omitted += 1;
-        }
+        rows.push(observation);
     }
     (rows, omitted)
 }

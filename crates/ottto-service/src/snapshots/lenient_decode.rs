@@ -317,7 +317,6 @@ impl Serialize for ScanIndex {
         field!(accepted_rebuild_pending_since_unix_seconds, Option::is_none);
         field!(accepted_rebuild_last_alarm_unix_seconds, Option::is_none);
         field!(codex_counting_tombstones, BTreeMap::is_empty);
-        field!(reread_guard, reread_guard::State::is_empty);
         field!(
             codex_counting_evicted_legacy,
             codex_counting_version::EvictedLegacyOwners::is_empty
@@ -414,7 +413,7 @@ pub(super) const FIELDS: &[&str] = &[
     "accepted_rebuild_pending_since_unix_seconds",
     "accepted_rebuild_last_alarm_unix_seconds",
     "codex_counting_tombstones",
-    "reread_guard",
+    "reread_guard", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
     "codex_counting_evicted_legacy",
     "upload_ack_retirement_handoff",
     "held_audit_progress",
@@ -820,7 +819,10 @@ fn validate_original<R: BufRead + Seek>(reader: &mut R) -> std::result::Result<[
             }
             let value = lexical_span(reader, optional, 1)?;
             if optional {
-                if optional_census(name) {
+                if matches!(
+                    name,
+                    Some("claude_request_census" | "claude_request_census_shadow")
+                ) {
                     resources[usize::from(name == Some("claude_request_census_shadow"))] |=
                         value.resource;
                 }
@@ -859,7 +861,7 @@ fn validate_original<R: BufRead + Seek>(reader: &mut R) -> std::result::Result<[
 fn optional_census(name: Option<&str>) -> bool {
     matches!(
         name,
-        Some("claude_request_census" | "claude_request_census_shadow")
+        Some("claude_request_census" | "claude_request_census_shadow" | "reread_guard")
     )
 }
 
@@ -1554,7 +1556,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                     } else if name == "claude_request_census_shadow" {
                         index.claude_request_census_shadow =
                             ClaudeRequestCensusShadowState::default();
-                    } else {
+                    } else if name != "reread_guard" {
                         return Err(Error::Refused("duplicate index field"));
                     }
                 } else {
@@ -1568,7 +1570,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                         } => {}
                         "schema_version" => index.schema_version = self.typed(value)?,
                         "generation" => index.generation = self.typed(value)?,
-                        "reread_guard" => index.reread_guard = self.typed(value)?,
+                        "reread_guard" => {} // TOMBSTONE: decode-and-drop.
                         "upload_ack_retirement_handoff" => {
                             // Damaged cleanup authority delays retirement; it must
                             // never discard identity custody or pause ingestion.

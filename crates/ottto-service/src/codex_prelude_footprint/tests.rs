@@ -1,6 +1,11 @@
 use super::*;
+use crate::snapshots::line_delivery::{
+    DeliveryEnd, DeliveryMode, FileView, LineObserver, PhysicalLine, Want,
+};
 use crate::test_scratch::ScratchDir;
+use crate::transcript_acquisition::FileObject;
 use serde_json::json;
+use std::sync::Arc;
 
 fn rollout(records: &[Value]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -631,8 +636,21 @@ fn window_after_the_first_usage_record_is_still_read() {
     assert_eq!(prelude.started_at, Some(1_792_310_400));
 }
 
-fn write_rollout(dir: &Path, name: &str, records: &[Value]) {
-    fs::write(dir.join(name), rollout(records)).unwrap();
+fn write_rollout(
+    feed: &Arc<CodexPreludeFeed>,
+    roots: &[PathBuf],
+    dir: &Path,
+    name: &str,
+    records: &[Value],
+) {
+    let path = dir.join(name);
+    fs::write(&path, rollout(records)).unwrap();
+    let mut view = fixture_view(&path, DeliveryMode::Full, 0);
+    view.root = roots
+        .iter()
+        .position(|root| root == dir)
+        .and_then(|i| u16::try_from(i).ok());
+    deliver(feed, roots, view, records, DeliveryEnd::Complete);
 }
 
 #[test]
@@ -643,6 +661,7 @@ fn newest_session_start_wins_over_recent_activity() {
     let slot_sessions = slot_home.join("sessions");
     fs::create_dir(&slot_sessions).unwrap();
     let roots = [sessions.to_path_buf(), slot_sessions.clone()];
+    let feed = Arc::new(CodexPreludeFeed::default());
     let support = ScratchDir::new("codex-session-start-support");
     let workspace = ScratchDir::new("codex-session-start-workspace");
     let cwd = workspace.to_string_lossy().into_owned();
@@ -653,35 +672,40 @@ fn newest_session_start_wins_over_recent_activity() {
         ]
     };
     write_rollout(
+        &feed,
+        &roots,
         &slot_sessions,
         "rollout-newer.jsonl",
         &start("newer", "2026-10-18T09:00:00Z"),
     );
     // Written last (newest mtime) but started earlier: a resumed old session.
     write_rollout(
+        &feed,
+        &roots,
         &sessions,
         "rollout-older.jsonl",
         &start("older", "2026-10-17T09:00:00Z"),
     );
     write_rollout(
+        &feed,
+        &roots,
         &sessions,
         "rollout-fork.jsonl",
         &[
-            json!({"type": "session_meta", "payload": {"id": "fork", "cwd": cwd, "timestamp": "2026-10-18T10:00:00Z", "forked_from_id": "newer"}}),
+            json!({"type": "session_meta", "payload": {"id": "fork", "cwd": cwd, "timestamp": "2026-10-18T10:00:00Z", "forked_from_id": "newer", "context_window": 1000}}),
             usage(10),
         ],
     );
     let deadline = Instant::now() + Duration::from_secs(60);
-    let chosen = select_candidates(&roots, &support, "dest", deadline);
+    let chosen = select_candidates(&feed, &roots, &support, "dest", deadline);
     assert_eq!(chosen.len(), 1);
-    assert!(chosen[0].0.ends_with("rollout-newer.jsonl"));
+    assert_eq!(chosen[0].0.started_at, Some(1_792_314_000));
     // Read against the home that wrote it (its user file, skills, config).
     assert_eq!(chosen[0].2, slot_home.to_path_buf());
-    // The index makes the next cycle read nothing new and choose the same.
-    let index = read_index(&support);
-    assert_eq!(index.files.len(), 3);
+    // A second snapshot chooses the same observation with no reader.
+    assert_eq!(feed.snapshot(SystemTime::now()).0.len(), 3);
     assert_eq!(
-        select_candidates(&roots, &support, "dest", deadline),
+        select_candidates(&feed, &roots, &support, "dest", deadline),
         chosen
     );
     // Once that start is sent it is one observation: a week later it is
@@ -698,27 +722,31 @@ fn newest_session_start_wins_over_recent_activity() {
             started_at: Some(1_792_314_000),
         },
     );
-    assert!(select_candidates(&roots, &support, "dest", deadline).is_empty());
+    assert!(select_candidates(&feed, &roots, &support, "dest", deadline).is_empty());
     // An older session resuming later is no newer observation either.
     write_rollout(
+        &feed,
+        &roots,
         &sessions,
         "rollout-older.jsonl",
         &start("older", "2026-10-17T09:00:00Z"),
     );
-    assert!(select_candidates(&roots, &support, "dest", deadline).is_empty());
+    assert!(select_candidates(&feed, &roots, &support, "dest", deadline).is_empty());
     assert_eq!(
-        select_candidates(&roots, &support, "other", deadline),
+        select_candidates(&feed, &roots, &support, "other", deadline),
         chosen
     );
     // A genuinely newer start is a new observation.
     write_rollout(
+        &feed,
+        &roots,
         &sessions,
         "rollout-newest.jsonl",
         &start("newest", "2026-10-18T11:00:00Z"),
     );
-    let newer = select_candidates(&roots, &support, "dest", deadline);
+    let newer = select_candidates(&feed, &roots, &support, "dest", deadline);
     assert_eq!(newer.len(), 1);
-    assert!(newer[0].0.ends_with("rollout-newest.jsonl"));
+    assert_eq!(newer[0].0.started_at, Some(1_792_321_200));
 }
 
 #[test]
@@ -728,4 +756,1145 @@ fn existing_footprint_disable_file_also_disables_codex() {
     fs::create_dir(support.join("context_footprint")).unwrap();
     fs::write(support.join("context_footprint").join("disabled"), "").unwrap();
     assert!(local_harvest_disabled(&support));
+}
+
+fn fixture_view(path: &Path, mode: DeliveryMode, start: u64) -> FileView {
+    if !path.exists() {
+        fs::write(path, b"").unwrap();
+    }
+    let (object, held) = FileObject::of(&fs::File::open(path).unwrap()).unwrap();
+    FileView {
+        source: SnapshotSource::Codex,
+        object,
+        mtime: held.modified().ok(),
+        mode,
+        root: Some(0),
+        start,
+    }
+}
+fn deliver(
+    feed: &Arc<CodexPreludeFeed>,
+    roots: &[PathBuf],
+    view: FileView,
+    rows: &[Value],
+    end: DeliveryEnd,
+) -> (Want, u64) {
+    let mut observer = feed.observer(roots);
+    let want = observer.begin(&view);
+    let mut offset = view.start;
+    if want == Want::Lines {
+        for value in rows {
+            offset += serde_json::to_vec(value).unwrap().len() as u64 + 1;
+            observer.line(
+                &view,
+                &PhysicalLine {
+                    end: offset,
+                    value: Some(value),
+                },
+            );
+        }
+    }
+    observer.end(&view, &end);
+    (want, offset)
+}
+fn observed(rows: &[Value]) -> CodexPrelude {
+    let dir = ScratchDir::new("prelude-oracle");
+    let roots = [dir.join("sessions")];
+    let feed = Arc::new(CodexPreludeFeed::default());
+    let view = fixture_view(&dir.join("fixture"), DeliveryMode::Full, 0);
+    deliver(&feed, &roots, view, rows, DeliveryEnd::Complete);
+    // Oracle returns a partial at EOF; LD holds that partial until terminal.
+    let mut done = feed.snapshot(SystemTime::now()).0;
+    assert_eq!(done.len(), 1);
+    done.remove(0).1
+}
+fn request_json(prelude: &CodexPrelude, home: &Path, workspace: &Path) -> Option<Vec<u8>> {
+    build_request(RequestInputs {
+        prelude,
+        workspace,
+        identity: RepositoryIdentity {
+            repository_hash: None,
+            repository_label: None,
+            repository_label_source: None,
+            repository_identity_source: None,
+            workspace_kind: Some("non_git".into()),
+        },
+        machine_id: "otm_fixture",
+        labels_enabled: false,
+        codex_home: &home.join(".codex"),
+        home,
+        salt: None,
+    })
+    .map(|request| serde_json::to_vec(&request).unwrap())
+}
+
+#[test]
+fn observer_oracle_requests_and_none_outcomes() {
+    let home = ScratchDir::new("prelude-parity-home");
+    let workspace = home.join("repo");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(home.join(".codex")).unwrap();
+    fs::write(workspace.join("AGENTS.md"), "project").unwrap();
+    fs::write(home.join(".codex/AGENTS.md"), "user").unwrap();
+    for text in ["project", "user", "user\n\n--- project-doc ---\n\nproject"] {
+        for flags in [
+            json!({}),
+            json!({"context_window": 0}),
+            json!({"timestamp": null}),
+        ] {
+            let mut m = meta(json!({"cwd": workspace, "timestamp": "2026-10-18T08:00:00Z"}));
+            for (k, v) in flags.as_object().unwrap() {
+                m["payload"][k] = v.clone();
+            }
+            let records = vec![
+                m,
+                json!({"type":"world_state","payload":{"state":{
+                "agents_md":{"directory":workspace,"text":text},
+                "host_skills":{"body":SKILLS_BODY}}}}),
+                message("developer", Some("hooks.additional_context"), "hook"),
+                usage(0),
+                usage(123),
+            ];
+            let oracle = parse(&records);
+            let actual = observed(&records);
+            assert_eq!(actual, oracle);
+            let actual_json = request_json(&actual, &home, &workspace);
+            let oracle_json = request_json(&oracle, &home, &workspace);
+            assert_eq!(actual_json, oracle_json);
+            assert_eq!(actual_json.is_some(), flags == json!({}));
+            assert_eq!(oracle_json.is_some(), flags == json!({}));
+            assert_eq!(actual_json.is_none(), flags != json!({}));
+            assert_eq!(
+                !actual_json.unwrap_or_default().is_empty(),
+                flags == json!({})
+            );
+        }
+    }
+}
+
+#[test]
+fn observer_forks_and_delayed_windows_match_oracle() {
+    for n in [0, 7, 8, 9] {
+        let mut rows = vec![meta(json!({"context_window":null})), usage(0), usage(31)];
+        rows.extend(std::iter::repeat(Value::Null).take(n));
+        rows.push(json!({"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":999},"model_context_window":12345}}}));
+        let p = observed(&rows);
+        assert_eq!(p, parse(&rows));
+        assert_eq!(p.first_input_tokens, Some(31));
+        assert_eq!(p.context_window, (n < 8).then_some(12345));
+    }
+    for input in [Value::Null, json!(-1), json!("bad")] {
+        let rows = [
+            meta(json!({})),
+            json!({"type":"token_usage_record","payload":{"usage":{"input_tokens":input}}}),
+        ];
+        assert_eq!(observed(&rows), parse(&rows));
+    }
+    let rows = [
+        meta(json!({"context_window":null})),
+        json!({"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":9}}}}),
+    ];
+    assert_eq!(observed(&rows), parse(&rows));
+    let rows = [meta(json!({})), usage(4), meta(json!({"id":"later"}))];
+    assert!(!observed(&rows).is_fork);
+}
+
+#[test]
+fn contiguous_tail_keeps_the_first_input_unconditionally() {
+    let dir = ScratchDir::new("prelude-first-input");
+    let roots = [dir.join("sessions")];
+    let feed = Arc::new(CodexPreludeFeed::default());
+    let full = fixture_view(&dir.join("fixture"), DeliveryMode::Full, 0);
+    let (want, next) = deliver(
+        &feed,
+        &roots,
+        full,
+        &[meta(json!({"context_window":null})), usage(7)],
+        DeliveryEnd::Complete,
+    );
+    assert_eq!(want, Want::Lines);
+    assert_eq!(metric(&feed, "pending"), 1);
+    let window = json!({"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":99},"model_context_window":555}}});
+    assert_eq!(
+        deliver(
+            &feed,
+            &roots,
+            FileView {
+                mode: DeliveryMode::Tail,
+                start: next,
+                ..full
+            },
+            &[window],
+            DeliveryEnd::Incomplete
+        )
+        .0,
+        Want::Lines
+    );
+    let done = feed.snapshot(SystemTime::now()).0;
+    assert_eq!(done.len(), 1);
+    assert_eq!(done[0].1.first_input_tokens, Some(7));
+    assert_eq!(done[0].1.context_window, Some(555));
+    assert_eq!(metric(&feed, "codex_prelude_gap_dropped"), 0);
+}
+
+#[test]
+fn flag_only_forks_and_null_empty_nonforks_discriminate_selection() {
+    let dir = ScratchDir::new("prelude-fork-flags");
+    let roots = [dir.join("sessions")];
+    let support = ScratchDir::new("prelude-fork-support");
+    let cases = [
+        (json!({"thread_source":"agent_created_thread"}), true),
+        (json!({"forked_from_id":"parent"}), true),
+        (json!({"history_base":0}), true),
+        (json!({"subagent_history_start_ordinal":0}), true),
+        (json!({"forked_from_id":""}), false),
+        (json!({"forked_from_id":null}), false),
+        (json!({"history_base":null}), false),
+        (json!({"subagent_history_start_ordinal":null}), false),
+        (json!({"thread_source":""}), false),
+        (json!({"thread_source":null}), false),
+        (json!({}), false),
+    ];
+    for (flags, fork) in cases {
+        let feed = Arc::new(CodexPreludeFeed::default());
+        let mut m = meta(flags);
+        m["payload"]["cwd"] = json!(dir.to_path_buf());
+        let rows = [m, usage(99)]; // Exactly one meta: flags are the only fork cause.
+        let view = fixture_view(&dir.join("fixture"), DeliveryMode::Full, 0);
+        assert_eq!(
+            deliver(&feed, &roots, view, &rows, DeliveryEnd::Complete).0,
+            Want::Lines
+        );
+        let done = feed.snapshot(SystemTime::now()).0;
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].1, parse(&rows));
+        assert_eq!(done[0].1.is_fork, fork);
+        assert_eq!(done[0].1.is_owned_fresh_start(), !fork);
+        assert_eq!(
+            select_candidates(
+                &feed,
+                &roots,
+                &support,
+                "dest",
+                Instant::now() + Duration::from_secs(60)
+            )
+            .len(),
+            usize::from(!fork)
+        );
+    }
+}
+
+#[test]
+fn distinct_second_meta_across_tail_is_a_fork_but_same_id_is_not() {
+    let dir = ScratchDir::new("prelude-second-meta");
+    let roots = [dir.join("sessions")];
+    let support = ScratchDir::new("prelude-second-meta-support");
+    for (id, fork) in [("s1", false), ("second", true)] {
+        let feed = Arc::new(CodexPreludeFeed::default());
+        let first = meta(json!({"cwd":dir.to_path_buf()}));
+        let rest = [meta(json!({"id":id,"cwd":dir.to_path_buf()})), usage(99)];
+        let full = fixture_view(&dir.join("fixture"), DeliveryMode::Full, 0);
+        let (want, next) = deliver(
+            &feed,
+            &roots,
+            full,
+            std::slice::from_ref(&first),
+            DeliveryEnd::Complete,
+        );
+        assert_eq!(want, Want::Lines);
+        assert_eq!(metric(&feed, "pending"), 1);
+        assert_eq!(
+            deliver(
+                &feed,
+                &roots,
+                FileView {
+                    mode: DeliveryMode::Tail,
+                    start: next,
+                    ..full
+                },
+                &rest,
+                DeliveryEnd::Complete
+            )
+            .0,
+            Want::Lines
+        );
+        let done = feed.snapshot(SystemTime::now()).0;
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].1, parse(&[vec![first], rest.to_vec()].concat()));
+        assert_eq!(done[0].1.is_fork, fork);
+        assert_eq!(
+            select_candidates(
+                &feed,
+                &roots,
+                &support,
+                "dest",
+                Instant::now() + Duration::from_secs(60)
+            )
+            .len(),
+            usize::from(!fork)
+        );
+    }
+}
+
+#[test]
+fn pending_continuity_unchanged_wrong_offsets_restart_and_incomplete() {
+    let dir = ScratchDir::new("prelude-continuity");
+    let roots = [dir.join("sessions")];
+    for delta in [-1i64, 0, 1] {
+        let feed = Arc::new(CodexPreludeFeed::default());
+        let full = fixture_view(&dir.join("fixture"), DeliveryMode::Full, 0);
+        let (_, next) = deliver(
+            &feed,
+            &roots,
+            full,
+            &[meta(json!({"context_window":null})), usage(7)],
+            DeliveryEnd::Complete,
+        );
+        assert_eq!(metric(&feed, "pending"), 1);
+        let unchanged = FileView {
+            mode: DeliveryMode::Unchanged,
+            start: next,
+            ..full
+        };
+        assert_eq!(
+            deliver(&feed, &roots, unchanged, &[], DeliveryEnd::Complete).0,
+            Want::Skip
+        );
+        let tail = FileView {
+            mode: DeliveryMode::Tail,
+            start: (next as i64 + delta) as u64,
+            ..full
+        };
+        let window = json!({"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":99},"model_context_window":555}}});
+        deliver(&feed, &roots, tail, &[window], DeliveryEnd::Incomplete);
+        let done = feed.snapshot(SystemTime::now()).0;
+        assert_eq!(done.len(), usize::from(delta == 0));
+        assert_eq!(
+            metric(&feed, "codex_prelude_gap_dropped"),
+            usize::from(delta != 0)
+        );
+        // Restart with a warm acquisition prefix never manufactures a parser.
+        let restarted = Arc::new(CodexPreludeFeed::default());
+        for _ in 0..2 {
+            deliver(&restarted, &roots, tail, &[], DeliveryEnd::Complete);
+        }
+        assert_eq!(metric(&restarted, "codex_prelude_unseen_prefix"), 1);
+        // Full replaces Done as well as Pending, even when replacement fails.
+        deliver(
+            &feed,
+            &roots,
+            full,
+            &[meta(json!({}))],
+            DeliveryEnd::Incomplete,
+        );
+        assert!(feed.snapshot(SystemTime::now()).0.is_empty());
+        deliver(
+            &feed,
+            &roots,
+            full,
+            &[meta(json!({})), usage(1)],
+            DeliveryEnd::Incomplete,
+        );
+        assert_eq!(feed.snapshot(SystemTime::now()).0.len(), 1);
+        assert_eq!(
+            deliver(&feed, &roots, tail, &[], DeliveryEnd::Complete).0,
+            Want::Skip
+        );
+    }
+}
+
+#[test]
+fn two_hundred_rows_are_total_across_tails_and_terminal_even_without_done() {
+    let dir = ScratchDir::new("prelude-row-limit");
+    let roots = [dir.join("sessions")];
+    for completion in [199, 200, 201] {
+        let feed = Arc::new(CodexPreludeFeed::default());
+        let full = fixture_view(&dir.join("fixture"), DeliveryMode::Full, 0);
+        let mut rows = vec![meta(json!({"context_window":null}))];
+        rows.extend(std::iter::repeat(Value::Null).take(completion - 2));
+        rows.push(usage(33));
+        let (_, next) = deliver(&feed, &roots, full, &rows[..100], DeliveryEnd::Complete);
+        let tail = FileView {
+            mode: DeliveryMode::Tail,
+            start: next,
+            ..full
+        };
+        let (_, next) = deliver(&feed, &roots, tail, &rows[100..], DeliveryEnd::Complete);
+        if completion == 199 {
+            // row 200 is still More, but exhausts the bound.
+            deliver(
+                &feed,
+                &roots,
+                FileView {
+                    start: next,
+                    ..tail
+                },
+                &[Value::Null],
+                DeliveryEnd::Complete,
+            );
+        }
+        let p = feed.snapshot(SystemTime::now()).0.remove(0).1;
+        assert_eq!(p.complete, completion <= 200);
+        assert_eq!(
+            deliver(
+                &feed,
+                &roots,
+                FileView {
+                    start: next,
+                    ..tail
+                },
+                &[usage(22)],
+                DeliveryEnd::Complete
+            )
+            .0,
+            Want::Skip
+        );
+    }
+}
+
+#[test]
+fn root_snapshot_registration_filter_and_ties_precede_winner_selection() {
+    let dir = ScratchDir::new("prelude-roots");
+    let registered = dir.join("registered");
+    let process = dir.join("process");
+    let third = dir.join("third");
+    let roots = [
+        registered.join("sessions"),
+        process.join("sessions"),
+        third.join("archived_sessions"),
+    ];
+    let workspace = dir.join("repo");
+    fs::create_dir(&workspace).unwrap();
+    let support = dir.join("support");
+    let feed = Arc::new(CodexPreludeFeed::default());
+    let records = |at: &str| [meta(json!({"cwd":workspace,"timestamp":at})), usage(7)];
+    for (i, at) in [
+        "2026-10-18T08:00:00Z",
+        "2026-10-18T09:00:00Z",
+        "2026-10-18T08:00:00Z",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let mut view = fixture_view(&dir.join(format!("file{i}")), DeliveryMode::Full, 0);
+        view.root = Some(i as u16);
+        deliver(&feed, &roots, view, &records(at), DeliveryEnd::Complete);
+    }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let chosen = select_candidates(&feed, &[roots[0].clone()], &support, "dest", deadline);
+    assert_eq!(chosen.len(), 1);
+    assert_eq!(chosen[0].2, registered);
+    let all = feed.snapshot(SystemTime::now()).0;
+    let expected = all
+        .iter()
+        .filter(|(_, _, h, _, _)| h != &process)
+        .min_by_key(|r| r.0)
+        .unwrap()
+        .2
+        .clone();
+    let chosen = select_candidates(
+        &feed,
+        &[roots[2].clone(), roots[0].clone()],
+        &support,
+        "dest",
+        deadline,
+    );
+    assert_eq!(chosen[0].2, expected);
+    // The stored home survives process-root reorder/removal at upload.
+    assert_eq!(feed.snapshot(SystemTime::now()).0.len(), 3);
+    for ordinal in [None, Some(99)] {
+        let mut view = fixture_view(&dir.join("missing"), DeliveryMode::Full, 0);
+        view.root = ordinal;
+        assert_eq!(
+            deliver(
+                &feed,
+                &roots,
+                view,
+                &records("2026-10-18T08:00:00Z"),
+                DeliveryEnd::Complete
+            )
+            .0,
+            Want::Skip
+        );
+    }
+    assert_eq!(metric(&feed, "root_missing"), 2);
+}
+
+#[test]
+fn text_caps_are_utf8_safe_and_unuploadable_newest_still_suppresses_old() {
+    let dir = ScratchDir::new("prelude-caps");
+    let roots = [dir.join("sessions")];
+    let workspace = dir.join("repo");
+    fs::create_dir(&workspace).unwrap();
+    let feed = Arc::new(CodexPreludeFeed::default());
+    for (n, at) in ["2026-10-18T08:00:00Z", "2026-10-18T09:00:00Z"]
+        .iter()
+        .enumerate()
+    {
+        let full = fixture_view(&dir.join(format!("file{n}")), DeliveryMode::Full, 0);
+        let text = if n == 0 {
+            "ok".into()
+        } else {
+            "€".repeat(65536)
+        };
+        let rows = [
+            meta(json!({"cwd":workspace,"timestamp":at})),
+            json!({"type":"world_state","payload":{"state":{"agents_md":{"text":text},"host_skills":{"body":if n==0 { String::from("small") } else { "€".repeat(40000) }}}}}),
+            usage(7),
+        ];
+        deliver(&feed, &roots, full, &rows, DeliveryEnd::Complete);
+    }
+    assert_eq!(metric(&feed, "text_capped"), 1);
+    assert!(select_candidates(
+        &feed,
+        &roots,
+        &dir.join("support"),
+        "dest",
+        Instant::now() + Duration::from_secs(60)
+    )
+    .is_empty());
+    let old = Arc::new(CodexPreludeFeed::default());
+    let full = fixture_view(&dir.join("expired"), DeliveryMode::Full, 0);
+    deliver(
+        &old,
+        &roots,
+        FileView {
+            mtime: Some(SystemTime::UNIX_EPOCH),
+            ..full
+        },
+        &[meta(json!({})), usage(2)],
+        DeliveryEnd::Complete,
+    );
+    assert!(old.snapshot(SystemTime::now()).0.is_empty());
+}
+
+#[test]
+fn dropped_byte_bound_and_newline_and_overlong_differences_are_explicit() {
+    use std::io::Read;
+    let rows = [
+        meta(json!({})),
+        json!({"padding":"x".repeat(2*1024*1024)}),
+        usage(11),
+    ];
+    let oracle = parse_prelude(std::io::Cursor::new(rollout(&rows)).take(2 * 1024 * 1024)).unwrap();
+    assert!(!oracle.complete);
+    assert!(observed(&rows).complete);
+    let mut bytes = rollout(&[meta(json!({})), usage(11)]);
+    bytes.pop();
+    assert!(
+        parse_prelude(std::io::Cursor::new(&bytes))
+            .unwrap()
+            .complete
+    );
+    let dir = ScratchDir::new("prelude-differences");
+    let roots = [dir.join("sessions")];
+    let feed = Arc::new(CodexPreludeFeed::default());
+    let view = fixture_view(&dir.join("fixture"), DeliveryMode::Full, 0);
+    let (_, next) = deliver(
+        &feed,
+        &roots,
+        view,
+        &[meta(json!({}))],
+        DeliveryEnd::Complete,
+    );
+    assert!(
+        feed.snapshot(SystemTime::now()).0.is_empty(),
+        "unterminated usage is not delivered"
+    );
+    deliver(
+        &feed,
+        &roots,
+        FileView {
+            start: next,
+            mode: DeliveryMode::Tail,
+            ..view
+        },
+        &[usage(11)],
+        DeliveryEnd::Complete,
+    );
+    assert!(feed.snapshot(SystemTime::now()).0[0].1.complete);
+    // LD delivers an overlong usage as Null; the unlimited oracle accepts it.
+    let rows = [meta(json!({})), usage(11)];
+    assert!(parse(&rows).complete);
+    let fresh = Arc::new(CodexPreludeFeed::default());
+    deliver(
+        &fresh,
+        &roots,
+        view,
+        &[rows[0].clone(), Value::Null],
+        DeliveryEnd::Complete,
+    );
+    assert!(fresh.snapshot(SystemTime::now()).0.is_empty());
+}
+
+pub(crate) fn metric(feed: &CodexPreludeFeed, key: &str) -> usize {
+    feed.metrics()
+        .split_whitespace()
+        .find_map(|field| {
+            field
+                .strip_prefix(&format!("{key}="))
+                .and_then(|s| s.parse().ok())
+        })
+        .unwrap()
+}
+#[test]
+fn pending_eviction_capacity_and_repeated_unseen_streams_stay_bounded() {
+    let dir = ScratchDir::new("prelude-heap");
+    let roots = [dir.join("sessions")];
+    let feed = Arc::new(CodexPreludeFeed::default());
+    let rows = [
+        meta(json!({})),
+        json!({"type":"world_state","payload":{"state":{"agents_md":{"text":"a".repeat(128*1024)},"host_skills":{"body":"s".repeat(96*1024)}}}}),
+    ];
+    let first = fixture_view(&dir.join("file0"), DeliveryMode::Full, 0);
+    let (_, next) = deliver(&feed, &roots, first, &rows, DeliveryEnd::Complete);
+    for i in 1..40 {
+        let view = fixture_view(&dir.join(format!("file{i}")), DeliveryMode::Full, 0);
+        deliver(&feed, &roots, view, &rows, DeliveryEnd::Complete);
+        assert!(metric(&feed, "feed_bytes") <= 4 * 1024 * 1024);
+    }
+    assert!(metric(&feed, "evicted") > 0);
+    assert_eq!(
+        deliver(
+            &feed,
+            &roots,
+            FileView {
+                mode: DeliveryMode::Tail,
+                start: next,
+                ..first
+            },
+            &[usage(5)],
+            DeliveryEnd::Complete
+        )
+        .0,
+        Want::Skip
+    );
+    assert!(metric(&feed, "codex_prelude_unseen_prefix") > 0);
+    // Repeated insert/remove must not hide retained container slots.
+    for i in 0..200 {
+        let view = fixture_view(&dir.join(format!("unseen{i}")), DeliveryMode::Tail, 9);
+        deliver(&feed, &roots, view, &[], DeliveryEnd::Complete);
+        deliver(
+            &feed,
+            &roots,
+            FileView {
+                mode: DeliveryMode::Full,
+                start: 0,
+                ..view
+            },
+            &[usage(2)],
+            DeliveryEnd::Complete,
+        );
+        assert!(metric(&feed, "feed_bytes") <= 4 * 1024 * 1024);
+    }
+}
+
+/// Same-build observe/observe_bounded parity and a pinned durable schema;
+/// this is not a comparison against a pre-change binary.
+#[test]
+fn matching_only_bytes_hash_and_shape_remain_the_same_with_observer_limits() {
+    use crate::durable_tail_codec::{Durable, Enc, Shape};
+    let rows = [
+        meta(json!({})),
+        json!({"type":"world_state","payload":{"state":{"agents_md":{"text":"€".repeat(100)},"host_skills":{"body":SKILLS_BODY}}}}),
+        usage(3),
+    ];
+    let mut old = CodexPreludeParser::matching_only(128);
+    let mut bounded = CodexPreludeParser::matching_only(128);
+    for row in &rows {
+        let expected = old.observe(row);
+        let (step, capped) = bounded.observe_bounded(row, 0);
+        assert_eq!(expected, step);
+        assert!(!capped);
+    }
+    assert_eq!(old.prelude(), bounded.prelude());
+    let bytes = |p: &CodexPreludeParser| {
+        let mut e = Enc::bytes(65536);
+        p.put(&mut e).unwrap();
+        e.into_bytes()
+    };
+    let hash = |p: &CodexPreludeParser| {
+        let mut e = Enc::hash("ottto-dt-rederive:session_start:v2");
+        p.put(&mut e).unwrap();
+        e.finish_hash()
+    };
+    assert_eq!(bytes(&old), bytes(&bounded));
+    assert_eq!(hash(&old), hash(&bounded));
+    let mut shape = Shape::default();
+    CodexPreludeParser::shape(&mut shape);
+    // This exact allowlist is the pre-slice schema, including E skills_body.
+    assert_eq!(shape.text(), concat!(
+        "CodexPreludeParser;{X prelude;CodexPrelude;{X cwd;Option<;String;>;N started_at;Option<;i64;>;N is_fork;bool;N complete;bool;U model;Option<;String;>;",
+        "N context_window;Option<;u64;>;N first_input_tokens;Option<;u64;>;N base_instructions_chars;u64;N other_harness_chars;u64;N hook_chars;u64;N block_chars;[8];u64;N blocks_incomplete;bool;N input_closed;bool;N world_state_seen;bool;",
+        "X agents_md;Option<;LoadedAgentsMd;{X directory;Option<;String;>;X text;String;}>;N agents_md_capped;bool;E skills_body: Option<String>;}",
+        "U session_id;Option<;String;>;N rows_after_first_request;usize;N agents_md_cap;usize;N keep_skills_body;bool;}"));
+}
+
+#[test]
+fn scope_dedup_cap_ties_and_missing_start_preserve_phase_two_order() {
+    let dir = ScratchDir::new("prelude-ranking");
+    let roots = [dir.join("sessions")];
+    let support = dir.join("support");
+    let feed = Arc::new(CodexPreludeFeed::default());
+    for i in 0..15 {
+        let workspace = dir.join(format!("repo{i}"));
+        fs::create_dir(&workspace).unwrap();
+        let view = fixture_view(&dir.join(format!("file{i}")), DeliveryMode::Full, 0);
+        deliver(
+            &feed,
+            &roots,
+            view,
+            &[
+                meta(json!({"cwd":workspace,"timestamp":"2026-10-18T08:00:00Z"})),
+                usage(9),
+            ],
+            DeliveryEnd::Complete,
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut starts = feed.snapshot(SystemTime::now()).0;
+    starts.sort_by_key(|s| s.0);
+    let chosen = select_candidates(&feed, &roots, &support, "dest", deadline);
+    assert_eq!(chosen.len(), 12);
+    assert_eq!(
+        chosen.iter().map(|c| c.0.cwd.clone()).collect::<Vec<_>>(),
+        starts[..12]
+            .iter()
+            .map(|c| c.1.cwd.clone())
+            .collect::<Vec<_>>()
+    );
+    // One cached repository scope suppresses its later directories, even when
+    // the newest directory's start has already been sent.
+    feed.remember_scopes(
+        starts
+            .iter()
+            .map(|s| (s.1.cwd.clone().unwrap(), "one-scope".into()))
+            .collect(),
+    );
+    assert_eq!(
+        select_candidates(&feed, &roots, &support, "dest", deadline).len(),
+        1
+    );
+    let cwd = starts[0].1.cwd.as_ref().unwrap();
+    write_json_atomic(
+        &upload_cache_path(&support, &sha256_hex(&[cwd])),
+        &UploadCacheEntry {
+            identity: "dest".into(),
+            request_sha256: "h".into(),
+            posted_at: "2026-10-18T08:00:00Z".into(),
+            started_at: starts[0].1.started_at,
+        },
+    );
+    assert!(select_candidates(&feed, &roots, &support, "dest", deadline).is_empty());
+    let missing = Arc::new(CodexPreludeFeed::default());
+    let view = fixture_view(&dir.join("missing-start"), DeliveryMode::Full, 0);
+    deliver(
+        &missing,
+        &roots,
+        view,
+        &[meta(json!({"cwd":cwd})), usage(9)],
+        DeliveryEnd::Complete,
+    );
+    let chosen = select_candidates(&missing, &roots, &support, "other", deadline);
+    assert_eq!(chosen.len(), 1);
+    assert_eq!(chosen[0].0.started_at, None);
+    assert!(
+        request_json(&chosen[0].0, &dir, Path::new(cwd)).is_none(),
+        "mtime is ranking only"
+    );
+}
+
+#[test]
+fn callback_skip_mtime_scope_pruning_and_monotonic_end_guards() {
+    let dir = ScratchDir::new("prelude-skips");
+    let roots = [dir.join("sessions")];
+    let feed = Arc::new(CodexPreludeFeed::default());
+    let view = fixture_view(&dir.join("fixture"), DeliveryMode::Full, 0);
+    let rows = [meta(json!({})), usage(9)];
+    deliver(&feed, &roots, view, &rows, DeliveryEnd::Complete);
+    let later = view.mtime.unwrap() + Duration::from_secs(1);
+    let unchanged = FileView {
+        mode: DeliveryMode::Unchanged,
+        mtime: Some(later),
+        ..view
+    };
+    assert_eq!(
+        deliver(&feed, &roots, unchanged, &[], DeliveryEnd::Complete).0,
+        Want::Skip
+    );
+    assert_eq!(feed.snapshot(SystemTime::now()).0[0].4, later);
+    feed.remember_scopes(vec![("/absent".into(), "scope".into())]);
+    assert!(feed.snapshot(SystemTime::now()).1.is_empty());
+    let wrong_source = FileView {
+        source: SnapshotSource::Pi,
+        ..view
+    };
+    assert_eq!(
+        deliver(&feed, &roots, wrong_source, &rows, DeliveryEnd::Complete).0,
+        Want::Skip
+    );
+    let mut observer = feed.observer(&roots);
+    assert_eq!(observer.begin(&view), Want::Lines);
+    observer.line(
+        &view,
+        &PhysicalLine {
+            end: 0,
+            value: Some(&rows[0]),
+        },
+    );
+    observer.end(&view, &DeliveryEnd::Complete);
+    assert!(feed.snapshot(SystemTime::now()).0.is_empty());
+    assert_eq!(metric(&feed, "codex_prelude_gap_dropped"), 1);
+}
+
+#[test]
+fn nonzero_tail_uses_absolute_physical_end_on_linux() {
+    let dir = ScratchDir::new("prelude-absolute-tail");
+    let roots = [dir.join("sessions")];
+    let feed = Arc::new(CodexPreludeFeed::default());
+    let full = fixture_view(&dir.join("fixture"), DeliveryMode::Full, 0);
+    let k = 1000;
+    let mut observer = feed.observer(&roots);
+    assert_eq!(observer.begin(&full), Want::Lines);
+    let meta = meta(json!({"context_window":12345}));
+    observer.line(
+        &full,
+        &PhysicalLine {
+            end: k,
+            value: Some(&meta),
+        },
+    );
+    observer.end(&full, &DeliveryEnd::Complete);
+    let tail = FileView {
+        mode: DeliveryMode::Tail,
+        start: k,
+        ..full
+    };
+    assert_eq!(observer.begin(&tail), Want::Lines);
+    let usage = usage(17);
+    observer.line(
+        &tail,
+        &PhysicalLine {
+            end: k + 100,
+            value: Some(&usage),
+        },
+    );
+    observer.end(&tail, &DeliveryEnd::Complete);
+    let done = feed.snapshot(SystemTime::now()).0;
+    assert_eq!(done.len(), 1);
+    assert_eq!(done[0].1.first_input_tokens, Some(17));
+    assert_eq!(metric(&feed, "codex_prelude_gap_dropped"), 0);
+}
+
+#[test]
+fn unavailable_roots_and_nonmonotonic_ends_leave_unseen_markers() {
+    let dir = ScratchDir::new("prelude-gap-markers");
+    let roots = [dir.join("sessions")];
+    let feed = Arc::new(CodexPreludeFeed::default());
+    let full = fixture_view(&dir.join("fixture"), DeliveryMode::Full, 0);
+    deliver(
+        &feed,
+        &roots,
+        full,
+        &[meta(json!({})), usage(3)],
+        DeliveryEnd::Complete,
+    );
+    let missing = FileView {
+        root: None,
+        mode: DeliveryMode::Tail,
+        start: 1000,
+        ..full
+    };
+    deliver(&feed, &roots, missing, &[], DeliveryEnd::Complete);
+    deliver(
+        &feed,
+        &roots,
+        FileView {
+            root: Some(0),
+            ..missing
+        },
+        &[],
+        DeliveryEnd::Complete,
+    );
+    assert_eq!(metric(&feed, "codex_prelude_unseen_prefix"), 0);
+    let mut observer = feed.observer(&roots);
+    assert_eq!(observer.begin(&full), Want::Lines);
+    observer.line(
+        &full,
+        &PhysicalLine {
+            end: 0,
+            value: None,
+        },
+    );
+    observer.end(&full, &DeliveryEnd::Complete);
+    deliver(
+        &feed,
+        &roots,
+        FileView {
+            root: Some(0),
+            ..missing
+        },
+        &[],
+        DeliveryEnd::Complete,
+    );
+    assert_eq!(metric(&feed, "codex_prelude_unseen_prefix"), 0);
+    assert_eq!(metric(&feed, "feed_files"), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn root_alias_snapshot_keeps_the_configured_codex_home() {
+    let dir = ScratchDir::new("prelude-root-alias-home");
+    let home = dir.join("home");
+    let real = dir.join("elsewhere");
+    fs::create_dir(&home).unwrap();
+    fs::create_dir(&real).unwrap();
+    let root = home.join("sessions");
+    std::os::unix::fs::symlink(&real, &root).unwrap();
+    let feed = Arc::new(CodexPreludeFeed::default());
+    let roots = [root.clone()];
+    let mut observer = feed.observer(&roots);
+    assert_eq!(
+        observer.root_ordinal(&fs::canonicalize(&real).unwrap(), &roots),
+        Some(0)
+    );
+    let view = fixture_view(&dir.join("fixture"), DeliveryMode::Full, 0);
+    assert_eq!(observer.begin(&view), Want::Lines);
+    let m = meta(json!({}));
+    let u = usage(3);
+    observer.line(
+        &view,
+        &PhysicalLine {
+            end: 100,
+            value: Some(&m),
+        },
+    );
+    observer.line(
+        &view,
+        &PhysicalLine {
+            end: 200,
+            value: Some(&u),
+        },
+    );
+    observer.end(&view, &DeliveryEnd::Complete);
+    assert_eq!(feed.snapshot(SystemTime::now()).0[0].2, home);
+    assert_eq!(metric(&feed, "root_missing"), 0);
+}
+
+#[test]
+fn daemon_owned_feed_has_no_ticket_heap_charge() {
+    use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+    let feed = CodexPreludeFeed::default();
+    let mut c = Counter::new(100);
+    c.add(7).unwrap();
+    feed.heap_bound(&mut c).unwrap();
+    assert_eq!(c.bytes, 7);
+}
+
+#[test]
+fn index_survives_swap_removal_and_replacement_order() {
+    let dir = ScratchDir::new("prelude-index");
+    let roots = [dir.join("sessions")];
+    let feed = Arc::new(CodexPreludeFeed::default());
+    let mut views = Vec::new();
+    for i in 0..32 {
+        let view = fixture_view(&dir.join(format!("file{i}")), DeliveryMode::Full, 0);
+        deliver(
+            &feed,
+            &roots,
+            view,
+            &[meta(json!({"cwd":format!("/cwd/{i}")})), usage(i + 1)],
+            DeliveryEnd::Complete,
+        );
+        views.push(view);
+    }
+    for i in (0..32).rev() {
+        deliver(
+            &feed,
+            &roots,
+            views[i],
+            &[
+                meta(json!({"cwd":format!("/new/{i}")})),
+                usage(i as u64 + 100),
+            ],
+            DeliveryEnd::Complete,
+        );
+        assert_eq!(metric(&feed, "feed_files"), 32);
+    }
+    let done = feed.snapshot(SystemTime::now()).0;
+    assert_eq!(done.len(), 32);
+    for (i, view) in views.iter().enumerate().take(32) {
+        let p = &done.iter().find(|s| s.0 == view.object).unwrap().1;
+        assert_eq!(p.cwd, Some(format!("/new/{i}")));
+        assert_eq!(p.first_input_tokens, Some(i as u64 + 100));
+    }
+}
+
+/// The existing probe intercepts OwnedJsonlParser's first acquisition step,
+/// not arbitrary File::open. Missing source files additionally make a former
+/// uploader re-read unable to reproduce the nonempty selected request.
+#[test]
+fn uploader_selection_and_request_do_not_acquire_sources_after_eviction_or_feed_restart() {
+    use crate::snapshots::{
+        scan_source_roots, terminal_contract_retry::source_acquisitions, ScanIndex,
+    };
+    let dir = ScratchDir::new("prelude-uploader-no-acquisition");
+    let sessions = dir.join("sessions");
+    fs::create_dir(&sessions).unwrap();
+    let roots = [sessions.clone()];
+    let support = ScratchDir::new("prelude-no-acquisition-support");
+    let path =
+        sessions.join("rollout-2026-10-07T10-00-00-019fa111-2222-7333-8444-555555555555.jsonl");
+    let rows = [
+        meta(
+            json!({"id":"019fa111-2222-7333-8444-555555555555", "cwd":dir.to_path_buf(), "timestamp":"2026-10-07T10:00:00Z"}),
+        ),
+        usage(17),
+    ];
+    fs::write(&path, rollout(&rows)).unwrap();
+    let mut full = fixture_view(&path, DeliveryMode::Full, 0);
+    full.mtime = Some(SystemTime::now() - Duration::from_secs(3600));
+    let feed = Arc::new(CodexPreludeFeed::default());
+    assert_eq!(
+        deliver(&feed, &roots, full, &rows, DeliveryEnd::Complete).0,
+        Want::Lines
+    );
+    assert_eq!(feed.done_for_test().len(), 1);
+    let (scan, acquisitions) = source_acquisitions(|| {
+        scan_source_roots(
+            SnapshotSource::Codex,
+            &roots,
+            &mut ScanIndex::default(),
+            "2026-10-07T12:00:00Z",
+            14,
+        )
+        .unwrap()
+    });
+    assert_eq!(scan.scanned_file_count, 1);
+    assert_eq!(acquisitions.get(&path), Some(&1), "probe positive control");
+    let select = |feed: &CodexPreludeFeed| {
+        source_acquisitions(|| {
+            select_candidates(
+                feed,
+                &roots,
+                &support,
+                "dest",
+                Instant::now() + Duration::from_secs(60),
+            )
+        })
+    };
+    let (chosen, acquired) = select(&feed);
+    assert_eq!(chosen.len(), 1);
+    assert!(acquired.is_empty());
+    assert!(!request_json(&chosen[0].0, &dir, &dir).unwrap().is_empty());
+    let pending = [
+        meta(json!({})),
+        json!({"type":"world_state","payload":{"state":{
+        "agents_md":{"text":"a".repeat(128*1024)},"host_skills":{"body":"s".repeat(96*1024)}}}}),
+    ];
+    for i in 0..48 {
+        let view = fixture_view(&dir.join(format!("pressure{i}")), DeliveryMode::Full, 0);
+        deliver(&feed, &roots, view, &pending, DeliveryEnd::Complete);
+    }
+    assert!(metric(&feed, "evicted") > 0);
+    assert!(feed.done_for_test().is_empty(), "original Done was evicted");
+    let (chosen, acquired) = select(&feed);
+    assert!(chosen.is_empty());
+    assert!(acquired.is_empty());
+    let restarted = CodexPreludeFeed::default(); // Feed-only warm-RAM reset.
+    let (chosen, acquired) = select(&restarted);
+    assert!(chosen.is_empty());
+    assert!(acquired.is_empty());
+    assert_eq!(
+        deliver(&feed, &roots, full, &rows, DeliveryEnd::Complete).0,
+        Want::Lines
+    );
+    fs::remove_file(&path).unwrap();
+    assert!(!path.exists());
+    let ((chosen, bytes), acquired) = source_acquisitions(|| {
+        let chosen = select_candidates(
+            &feed,
+            &roots,
+            &support,
+            "dest",
+            Instant::now() + Duration::from_secs(60),
+        );
+        assert_eq!(chosen.len(), 1);
+        let bytes = request_json(&chosen[0].0, &dir, &dir).unwrap();
+        (chosen, bytes)
+    });
+    assert_eq!(chosen[0].0.first_input_tokens, Some(17));
+    assert!(!bytes.is_empty());
+    assert!(acquired.is_empty());
+}
+
+#[test]
+fn obsolete_index_cleanup_counts_once_and_never_sweeps_a_directory() {
+    for (case, expected) in [
+        ("removed", [1, 0, 0]),
+        ("absent", [0, 1, 0]),
+        ("failed", [0, 0, 1]),
+    ] {
+        let support = ScratchDir::new("prelude-index-cleanup");
+        let state_dir = support.join(STATE_DIR);
+        fs::create_dir(&state_dir).unwrap();
+        fs::create_dir(support.join("context_footprint")).unwrap();
+        fs::write(support.join("context_footprint/disabled"), b"").unwrap();
+        let index = state_dir.join("index.json");
+        let sibling = state_dir.join("upload-cache.json");
+        fs::write(&sibling, b"preserve-upload-cache").unwrap();
+        match case {
+            "removed" => fs::write(&index, b"obsolete-not-decoded").unwrap(),
+            "failed" => {
+                fs::create_dir(&index).unwrap();
+                fs::write(index.join("canary"), b"never-sweep").unwrap();
+            }
+            _ => {}
+        }
+        let feed = CodexPreludeFeed::default();
+        assert_eq!(metric(&feed, "index_cleanup_removed"), 0);
+        assert_eq!(metric(&feed, "index_cleanup_absent"), 0);
+        assert_eq!(metric(&feed, "index_cleanup_failed"), 0);
+        // The disabled gate keeps this real uploader entry point away from
+        // credentials/network; cleanup runs before that gate.
+        harvest_once(&support, &support, &feed).unwrap();
+        assert_eq!(
+            [
+                metric(&feed, "index_cleanup_removed"),
+                metric(&feed, "index_cleanup_absent"),
+                metric(&feed, "index_cleanup_failed")
+            ],
+            expected
+        );
+        assert_eq!(index.exists(), case == "failed");
+        assert_eq!(index.is_dir(), case == "failed");
+        assert_eq!(
+            fs::read(index.join("canary")).ok(),
+            (case == "failed").then(|| b"never-sweep".to_vec())
+        );
+        assert_eq!(fs::read(&sibling).unwrap(), b"preserve-upload-cache");
+        assert!(!feed.metrics().contains("index.json"));
+        if case != "failed" {
+            fs::write(&index, b"later-file-stays").unwrap();
+        }
+        harvest_once(&support, &support, &feed).unwrap();
+        assert_eq!(
+            [
+                metric(&feed, "index_cleanup_removed"),
+                metric(&feed, "index_cleanup_absent"),
+                metric(&feed, "index_cleanup_failed")
+            ],
+            expected,
+            "one attempt per daemon feed"
+        );
+        assert_eq!(
+            fs::read(&index).ok(),
+            (case != "failed").then(|| b"later-file-stays".to_vec())
+        );
+        assert_eq!(fs::read(&sibling).unwrap(), b"preserve-upload-cache");
+        assert_eq!(
+            fs::read(index.join("canary")).ok(),
+            (case == "failed").then(|| b"never-sweep".to_vec())
+        );
+    }
 }
