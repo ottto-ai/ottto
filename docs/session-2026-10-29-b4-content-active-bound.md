@@ -39,9 +39,50 @@ Codex job completing without optional retention. These are synthetic fixtures.
 The shared transition fixture is still a draft; its API must replace the local
 transition driver at integration after it lands.
 
-Validation in this source-only round is static formatting and diff checks plus
-fresh-context code review. No Cargo, test, native or money lane was run locally.
+Round 2 validation used static formatting and diff checks plus fresh-context
+code review; no Cargo, test, native or money lane ran in that round.
 Linux, macOS Rust contracts, emitted-money equality and owner reviews remain
 qualification gates for the folded large-record PR. Its size above the roughly
 1000-line guideline is intentional: one active-lease/retail-custody contract;
 splitting recreates coupled release boundaries.
+
+
+Round 3 repairs the parallel core/edge review findings. The shared map now
+uses wall-clock stamps with a one-day sanity bound: backwards or excessive
+forward jumps expire toward reading. Growth at >=90% of the existing source
+cap bypasses the pace with `near_cap`; the pre-existing source SIZE rejection
+still discloses loss above 256 MiB Claude/Pi or 2 GiB Codex. A scaled-cap
+native fixture covers accepted prefix, ordinary paced suffix, immediate near-cap
+read and subsequent oversized disclosure. The normal six-hour catch-up/restart
+fixture remains separate. No pacing policy can recover input already beyond
+the existing source cap between observations.
+
+Structural restore now probes eligibility; it spends/enrols only after Codex
+page/cursor start checks have passed. A production two-file restore fixture
+asserts a budget Defer spends no allowance and the next page reads. Warm
+transfer Busy inserts residue after the successful guard, preserving real aged
+nonempty census hashes through terminal settlement and competing-source lease
+release/catch-up. Evictions have one immediate emitter with per-source totals;
+a fixture overflows then runs both sources' post-save alarms twice.
+
+Other review dispositions remain conservative: unsupported obligation classes
+still refuse, malformed/duplicate/over-cap captures never bypass the workspace
+digest, and ignored JSON scratch is funded for the pinned serde implementation
+rather than assumed allocation-free. This does not claim universal malformed
+JSON acceptance equivalence. Lead B remains extractor/attribution reviewer.
+P2/A0-h integration must carry the identical shared-map wall-clock, near-cap and
+single-emitter policy; #865 UpgradeMissing removal and #882 fixture adaptation
+remain predecessor/integration items. E2/E3/native/money qualification remains
+outstanding; no local tests are authorized. Round 3 uses the explicitly
+authorized serialized exact-head ottto-service clippy gate before push.
+
+
+The first exact-head clippy invocation exposed inherited compile/lint failures
+that earlier static reviews missed. The same round-3 commit repairs stale test
+helper imports, record-write length and seven-class hold assertions, private-field
+test access, mutable save fixtures, Rust 1.80-compatible Option predicates,
+platform-width statvfs casts and unused imports. The native-only opening-content
+adopter is test-gated with its oracle. Inline error custody has a documented
+large-error lint exception to avoid an unfunded box. A test-only physical sample
+byte observer restores the inherited certificate-I/O assertion without changing
+production I/O. These are validation repairs; persisted fields/caps stay unchanged.

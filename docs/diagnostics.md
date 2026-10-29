@@ -162,11 +162,19 @@ The shared six-hour Full pace also owns structural active-budget fallback.
 `degraded_no_record.active_bound` and `active_bound_delay.active_bound` are
 `[event delta, source process total]` on the same alarm carrier. The source
 leaf is `claude_code`, `codex`, or `pi`; missing means zero events, never a
-successful restore. `pace_evicted` has its own alarm record and process total:
+successful restore. `pace_evicted` has one immediate alarm owner and a per-source
+process total; post-save alarms never emit its delta again:
 at capacity the oldest stamp is evicted, the new key is enrolled and the read
 is allowed. A busy FIFO lease remains `active_wait_busy`, a transient delay.
 These are RAM-only counters and stamps; restart can admit one extra growth
 Full. Structural Full publishes without a replacement retained/durable record.
+The pace uses `SystemTime`: backwards time or an elapsed interval beyond the
+one-day sanity maximum expires toward reading. Codex page/cursor deferral
+consumes no structural allowance; the stamp is enrolled at acquisition start.
+Growth at 90% or more of the source file cap bypasses pacing immediately, under
+the same cause with a `near_cap` annotation. Source caps predate this path:
+256 MiB Claude/Pi, 2 GiB Codex. Above the cap the existing oversized-file
+rejection/disclosure still applies; near-cap admission does not expand it.
 
 Workspace re-derivation captures at most 4096 bytes per selected field and
 requires the original digest. Unsupported first-prompt, title, agent-label

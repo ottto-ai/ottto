@@ -13617,3 +13617,85 @@ fn active_bound_no_record_cursor_preserves_scope_resumes_and_publishes() {
         panic!("no-record cursor never completed");
     });
 }
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "validated native durable layout")]
+fn structural_restore_page_defer_does_not_spend_full_pace() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    use crate::durable_tail_store as store;
+    struct ResetBudget;
+    impl Drop for ResetBudget {
+        fn drop(&mut self) {
+            store::active::set_active_budget_for_test(None);
+        }
+    }
+    let _reset = ResetBudget;
+    let fixture = ScanRoot::with_sessions(&[(SESSION, 8), (SESSION_B, 8)]);
+    let state = fixture._dir.0.join("state");
+    fs::create_dir(&state).unwrap();
+    let lock = crate::locked_state_dir::test_locks::hold(&state);
+    let index_path = state.join("index.json");
+    let source = SnapshotSource::Codex;
+    let cache = Arc::new(SharedCache::default());
+    cache.durable_begin_pass(source, &index_path, &Scope("cursor-fixture".into()), true);
+    let (mut index, prefix) = page(&fixture, ScanIndex::default(), Some(cache.clone()));
+    assert_eq!(prefix.snapshots.len(), 2);
+    index.save(&index_path).unwrap();
+    assert_eq!(
+        cache
+            .durable_write_after_save(lock, source, &index)
+            .unwrap()
+            .written,
+        2
+    );
+    cache.retained().unwrap().clear();
+    for session in [SESSION, SESSION_B] {
+        fixture.append(session, &token_line(9));
+    }
+    let key_bytes = local_index_key(&fixture.file(SESSION)).len() as u64;
+    let limit = store::RESTORE_INPUT_BYTES
+        + (store::RECORD_BYTES + super::super::AUDIT_AND_SCRATCH_BYTES) as u64
+        + 4 * key_bytes;
+    store::active::set_active_budget_for_test(Some(limit));
+    let size = fixture.len(SESSION).max(fixture.len(SESSION_B));
+    with_test_limits(1 << 20, size + size / 2, 64, || {
+        let (index, first, modes) = page_in(&fixture, index, Some(cache.clone()), "cursor-fixture");
+        assert_eq!(modes, (1, 0));
+        assert_eq!(first.snapshots.len(), 1);
+        assert_eq!(
+            counter(&cache, |c| c.deferred),
+            1,
+            "real planner budget Defer"
+        );
+        assert_eq!(
+            cache.durable_counters(source).unwrap().0.active_bound[1],
+            [1, 0],
+            "only the starting Full spends"
+        );
+        let deferred = [SESSION, SESSION_B]
+            .into_iter()
+            .find(|session| pending_hint(&index, &fixture.file(session)).is_some())
+            .expect("deferred growth");
+        let end = index.files[&local_index_key(&fixture.file(deferred))].size_bytes;
+        assert!(end < fixture.len(deferred));
+        let (caught, second, modes) =
+            page_in(&fixture, index, Some(cache.clone()), "cursor-fixture");
+        assert_eq!(
+            modes,
+            (1, 0),
+            "next page reads within the six-hour interval"
+        );
+        assert_eq!(second.snapshots.len(), 1);
+        assert_eq!(
+            cache.durable_counters(source).unwrap().0.active_bound[1],
+            [2, 0]
+        );
+        assert_eq!(
+            caught.files[&local_index_key(&fixture.file(deferred))].size_bytes,
+            fixture.len(deferred)
+        );
+        assert!(pending_hint(&caught, &fixture.file(deferred)).is_none());
+    });
+}

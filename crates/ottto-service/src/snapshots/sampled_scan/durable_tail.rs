@@ -81,6 +81,8 @@ pub(in crate::snapshots) fn record_rederive_input(source: SnapshotSource, bytes:
 }
 
 const PACE_SECS: u64 = 6 * 3600;
+// Civil-time anomalies expire authority toward reading, never toward holding.
+const PACE_SANITY_SECS: u64 = 86_400;
 const _: () = assert!(PACE_SECS < 86_400);
 
 /// Content-free outcome counts, by class. Field paths are static names; no
@@ -92,6 +94,8 @@ pub(crate) struct Counters {
     pub(crate) retail_attempts: u64,
     pub(crate) retail_keys: u64,
     pub(crate) retail_full: [u64; 3],
+    /// Immediate emission owns these per-source eviction totals exclusively.
+    pub(crate) pace_evicted: [u64; 3],
     /// [Full, paced] per Claude/Codex/Pi; process-lifetime, not store-owned.
     pub(crate) active_bound: [[u64; 2]; 3],
     pub(crate) missing: u64,
@@ -214,14 +218,14 @@ struct Slot {
     /// Keys held (U) by this source, and the totals the last alarm reported:
     /// [held, t14_rebuild, mode_repaired, disabled, upgrade_state_missing].
     held: u64,
-    reported: [u64; 8],
+    reported: [u64; 7],
 }
 
 /// Fixed-size stamp in the existing paid pacing node. Remember structural
 /// classification after the first no-record publication changes index binding.
 #[derive(Clone, Copy)]
 struct FullPace {
-    at: std::time::Instant,
+    at: std::time::SystemTime,
     structural: bool,
 }
 fn full_pace_key(source: SnapshotSource, key: &str) -> store::Digest32 {
@@ -229,6 +233,11 @@ fn full_pace_key(source: SnapshotSource, key: &str) -> store::Digest32 {
         Some(ds) => store::key_digest(ds, key),
         None => store::context_digest(source.api_slug(), Some(key)),
     }
+}
+
+fn near_source_cap(source: SnapshotSource, length: u64) -> bool {
+    let cap = max_jsonl_file_bytes(source);
+    length >= cap - cap / 10
 }
 
 /// Process-lifetime durable state beside the RAM cache.
@@ -249,7 +258,7 @@ pub(crate) struct Stores {
     // Independently paid pacing, never used to renew Q11 spent authority.
     retail_full_at: BTreeMap<store::Digest32, FullPace>,
     #[cfg(test)]
-    retail_full_now: Option<std::time::Instant>,
+    retail_full_now: Option<std::time::SystemTime>,
 }
 
 impl Stores {
@@ -652,7 +661,7 @@ impl SharedCache {
         now: std::time::Instant,
     ) -> Result<RetailAttempt, RetailHold> {
         if crate::heap_layout_bound::tree_node_bytes::<store::Digest32, (u64, std::time::Instant)>()
-            .is_none_or(|n| n > 1024)
+            .map_or(true, |n| n > 1024)
         {
             return Err(RetailHold::AccountingLost);
         }
@@ -706,35 +715,57 @@ impl SharedCache {
         key: &str,
         file: &File,
         accepted_end: u64,
-        now: std::time::Instant,
+        now: std::time::SystemTime,
     ) -> bool {
-        if !file.metadata().is_ok_and(|m| m.len() > accepted_end) {
+        let Ok(metadata) = file.metadata() else {
+            return false;
+        };
+        if metadata.len() <= accepted_end {
             return false;
         }
-        self.paced_full(SnapshotSource::ClaudeCode, key, now, false)
+        self.paced_full(
+            SnapshotSource::ClaudeCode,
+            key,
+            now,
+            false,
+            near_source_cap(SnapshotSource::ClaudeCode, metadata.len()),
+            true,
+        )
     }
 
-    /// The ONE shared Full pacing map. A full map evicts oldest and reads.
-    /// Cause is deliberately absent from the key: switching causes cannot
-    /// refresh a same-source/key allowance. Pi uses the same paid owner.
+    /// The ONE paid map, keyed by source/file across causes. A probe may count
+    /// a delay, but only a starting acquisition enrols or spends an allowance.
     fn paced_full(
         &self,
         source: SnapshotSource,
         key: &str,
-        now: std::time::Instant,
+        now: std::time::SystemTime,
         active_bound: bool,
+        near_cap: bool,
+        start: bool,
     ) -> bool {
         let Some(mut stores) = self.durable() else {
-            return false; // no accounted owner; cannot manufacture a paced grant
+            return false;
         };
         #[cfg(test)]
         let now = stores.retail_full_now.unwrap_or(now);
-        let interval = std::time::Duration::from_secs(PACE_SECS);
         let key = full_pace_key(source, key);
-        let delayed = stores.retail_full_at.get(&key).is_some_and(|stamp| {
-            now.checked_duration_since(stamp.at)
-                .is_none_or(|age| age < interval)
-        });
+        let delayed = !near_cap
+            && stores.retail_full_at.get(&key).is_some_and(|stamp| {
+                // Backwards and implausibly large forwards jumps both EXPIRE.
+                now.duration_since(stamp.at).is_ok_and(|age| {
+                    age.as_secs() <= PACE_SANITY_SECS
+                        && age < std::time::Duration::from_secs(PACE_SECS)
+                })
+            });
+        if !delayed && !start {
+            return true;
+        }
+        let source_slot = match source {
+            SnapshotSource::ClaudeCode => 0,
+            SnapshotSource::Codex => 1,
+            SnapshotSource::Pi => 2,
+        };
         let mut evicted = false;
         if !delayed {
             if stores.retail_full_at.len() >= 2 * store::MAX_RECORDS
@@ -748,6 +779,7 @@ impl SharedCache {
                 if let Some(oldest) = oldest {
                     stores.retail_full_at.remove(&oldest);
                     stores.counters.retail_full[2] += 1;
+                    stores.counters.pace_evicted[source_slot] += 1;
                     evicted = true;
                 }
             }
@@ -768,21 +800,16 @@ impl SharedCache {
             stamp.structural = true;
         }
         let total = if active_bound {
-            let slot = match source {
-                SnapshotSource::ClaudeCode => 0,
-                SnapshotSource::Codex => 1,
-                SnapshotSource::Pi => 2,
-            };
-            stores.counters.active_bound[slot][usize::from(delayed)] += 1;
-            stores.counters.active_bound[slot][usize::from(delayed)]
+            stores.counters.active_bound[source_slot][usize::from(delayed)] += 1;
+            stores.counters.active_bound[source_slot][usize::from(delayed)]
         } else {
             stores.counters.retail_full[usize::from(delayed)] += 1;
             stores.counters.retail_full[usize::from(delayed)]
         };
-        let eviction_total = stores.counters.retail_full[2];
+        let eviction_total = stores.counters.pace_evicted[source_slot];
         drop(stores);
         if evicted {
-            // Its OWN alarm, independent of any normal growth-read counter.
+            // ONE emission owner: post-save durable_alarm never repeats this.
             crate::local_resource_diagnostics::durable_tail_alarm(
                 source.api_slug(),
                 &serde_json::json!({"pace_evicted": [1, eviction_total]}),
@@ -796,14 +823,20 @@ impl SharedCache {
             };
             crate::local_resource_diagnostics::durable_tail_alarm(
                 source.api_slug(),
-                &serde_json::json!({(class): {"active_bound": [1, total]}}),
+                &serde_json::json!({(class): {"active_bound": [1, total]},
+                    "near_cap": u64::from(near_cap)}),
+            );
+        } else if near_cap {
+            // An annotation, not a second [delta,total] admission emission.
+            crate::local_resource_diagnostics::durable_tail_alarm(
+                source.api_slug(),
+                &serde_json::json!({"near_cap": {"retail_exhausted": 1}}),
             );
         }
         !delayed
     }
 
-    /// Resource hold: growth only. Committed end stays old while paced, so
-    /// selection remains Parse; 6h < minimum 1-day discovery window.
+    /// Eligibility only: Codex can still defer before its Full starts.
     pub(in crate::snapshots) fn active_bound_full(
         &self,
         source: SnapshotSource,
@@ -811,7 +844,36 @@ impl SharedCache {
         file: &File,
         index: &ScanIndex,
     ) -> bool {
-        grown(file, index, key) && self.paced_full(source, key, std::time::Instant::now(), true)
+        grown(file, index, key) && self.active_bound_pace(source, key, file, false)
+    }
+
+    pub(in crate::snapshots) fn start_active_bound_full(
+        &self,
+        source: SnapshotSource,
+        key: &str,
+        file: &File,
+    ) -> bool {
+        self.active_bound_pace(source, key, file, true)
+    }
+
+    fn active_bound_pace(
+        &self,
+        source: SnapshotSource,
+        key: &str,
+        file: &File,
+        start: bool,
+    ) -> bool {
+        let Ok(metadata) = file.metadata() else {
+            return false;
+        };
+        self.paced_full(
+            source,
+            key,
+            std::time::SystemTime::now(),
+            true,
+            near_source_cap(source, metadata.len()),
+            start,
+        )
     }
 
     fn durable(&self) -> Option<std::sync::MutexGuard<'_, Stores>> {
@@ -852,7 +914,7 @@ impl SharedCache {
                 namespace: namespace.clone(),
                 identity_capture,
                 held: 0,
-                reported: [0; 8],
+                reported: [0; 7],
             });
         }
         if let Some(slot) = slot.as_mut() {
@@ -930,7 +992,7 @@ impl SharedCache {
             if stores
                 .slot(ds)
                 .as_ref()
-                .is_none_or(|slot| slot.store.disabled().is_some())
+                .map_or(true, |slot| slot.store.disabled().is_some())
             {
                 return Ok(None); // Disabled stores never hold native acquisition.
             }
@@ -1102,7 +1164,7 @@ impl SharedCache {
             .len()
             .checked_mul(4)
             .and_then(|n| u64::try_from(n).ok())
-            .is_none_or(|bytes| lease.charge(bytes).is_err())
+            .map_or(true, |bytes| lease.charge(bytes).is_err())
         {
             lease.release();
             return self.restore_resource_pending(
@@ -1459,6 +1521,8 @@ impl SharedCache {
         if self.retained().is_ok_and(|cache| cache.peek(key).is_none()) {
             return Ok(None);
         }
+        #[cfg(test)]
+        tests::before_warm_transfer();
         let store::LeaseWait::Granted(lease) = self.acquire_prepared_transfer(source) else {
             return Err(());
         };
@@ -1834,7 +1898,6 @@ impl SharedCache {
             held_keys: [u64; 2],
             retail_exhausted: [u64; 2],
             retail_exhausted_paced: [u64; 2],
-            pace_evicted: [u64; 2],
             upgrade_state_missing: [u64; 2],
             t14_rebuild: [u64; 2],
             mode_repaired: [u64; 2],
@@ -1865,7 +1928,6 @@ impl SharedCache {
             upgrade,
             retail[0],
             retail[1],
-            retail[2],
         ];
         let last = std::mem::replace(&mut slot.reported, now);
         drop(stores);
@@ -1878,7 +1940,6 @@ impl SharedCache {
                     held_keys: pair(0),
                     retail_exhausted: pair(5),
                     retail_exhausted_paced: pair(6),
-                    pace_evicted: pair(7),
                     upgrade_state_missing: pair(4),
                     t14_rebuild: pair(1),
                     mode_repaired: pair(2),
@@ -1899,6 +1960,7 @@ impl SharedCache {
         if source != DurableSource::ClaudeCode {
             counters.retail_full = [0; 3];
         }
+        counters.retail_full[2] = counters.pace_evicted[source as usize];
         let store = stores.slot(source).as_ref()?.store.counters();
         Some((counters, store))
     }
@@ -1907,7 +1969,7 @@ impl SharedCache {
 pub(crate) enum RestoreOutcome {
     Restored(Box<Taken<CachedJsonlReduction>>, store::ActiveLease),
     Pending,
-    /// Explicit structural grant: ordinary Full, no retained/new durable graph.
+    /// Structural eligibility: caller spends the pace only after page deferral.
     Degraded,
     Miss,
     Held(store::Refusal),

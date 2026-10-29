@@ -264,7 +264,7 @@ impl OwnedJsonlParser {
         let reusable = taken
             .as_ref()
             .map(|taken| &taken.retained)
-            .is_none_or(|old| {
+            .map_or(true, |old| {
                 old.state.accumulator.source == self.source
                 // Marker state covers the whole file only in the capture mode
                 // it was built in: a non-capture prefix holds no markers, which

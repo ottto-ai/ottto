@@ -31715,6 +31715,7 @@ impl OwnedSourceScan {
                     Ok(Some((taken, lease))) => (Some(taken), Some(lease)),
                     Ok(None) => (None, None),
                     Err(()) => {
+                        residue_index_keys.insert(key.clone());
                         context.cache.durable_custody_hold(
                             source,
                             "prepared_funding_pending",
@@ -31966,7 +31967,7 @@ impl OwnedSourceScan {
                                                         &key,
                                                         parser.reader.reader.get_ref(),
                                                         accepted_end,
-                                                        std::time::Instant::now(),
+                                                        std::time::SystemTime::now(),
                                                     )
                                                     {
                                                         // Ordinary Full: no grant, no guardless copy.
@@ -32415,6 +32416,23 @@ impl OwnedSourceScan {
                         &active.candidate,
                     );
                     pending!();
+                }
+            }
+            #[cfg(unix)]
+            if active_bound_degraded {
+                if let Some(context) = sampling.as_ref() {
+                    let key = local_index_key(&active.candidate.path);
+                    if !context.cache.start_active_bound_full(
+                        source,
+                        &key,
+                        active.parser.reader.reader.get_ref(),
+                    ) {
+                        residue_index_keys.insert(key);
+                        // A concurrent same-key start can win after the probe.
+                        // Return any pre-input cursor slot before retrying.
+                        drop(codex_cursor_lease.take());
+                        pending!();
+                    }
                 }
             }
             if let Some((context, (mode, audit_due))) = sampling.as_mut().zip(planned_mode) {
@@ -42365,7 +42383,17 @@ fn effective_backfill_window_days(requested_backfill_window_days: u64) -> u64 {
     requested_backfill_window_days.min(BACKFILL_WINDOW_DAYS)
 }
 
+#[cfg(test)]
+thread_local! {
+    // Scale the existing SIZE boundary in synthetic transition fixtures only.
+    static TEST_JSONL_FILE_CAP: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
 fn max_jsonl_file_bytes(source: SnapshotSource) -> u64 {
+    #[cfg(test)]
+    if let Some(cap) = TEST_JSONL_FILE_CAP.get() {
+        return cap;
+    }
     match source {
         SnapshotSource::Codex => MAX_CODEX_JSONL_FILE_BYTES,
         SnapshotSource::ClaudeCode | SnapshotSource::Pi => MAX_JSONL_FILE_BYTES,

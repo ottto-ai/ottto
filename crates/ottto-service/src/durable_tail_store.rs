@@ -34,7 +34,7 @@
 use crate::transcript_acquisition::DurableCertificate;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -1342,8 +1342,15 @@ fn above_floor(dir: &Path, encoded: u64, index_len: u64) -> io::Result<bool> {
     }
     // SAFETY: statvfs succeeded and initialized the structure.
     let stat = unsafe { stat.assume_init() };
-    let available = (stat.f_bavail as u64).checked_mul(stat.f_frsize as u64);
-    let volume = (stat.f_blocks as u64).checked_mul(stat.f_frsize as u64);
+    // libc typedef widths vary by target; keep the checked product in u64.
+    #[allow(clippy::unnecessary_cast)]
+    let (fragment_bytes, available_blocks, volume_blocks) = (
+        stat.f_frsize as u64,
+        stat.f_bavail as u64,
+        stat.f_blocks as u64,
+    );
+    let available = available_blocks.checked_mul(fragment_bytes);
+    let volume = volume_blocks.checked_mul(fragment_bytes);
     Ok(floor_allows(available, volume, encoded, index_len))
 }
 fn floor_allows(available: Option<u64>, volume: Option<u64>, encoded: u64, index_len: u64) -> bool {

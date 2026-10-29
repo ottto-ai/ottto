@@ -393,6 +393,8 @@ impl SharedCache {
             }
         })
     }
+    // Return original custody inline; boxing would allocate before admission.
+    #[allow(clippy::result_large_err)]
     fn insert_with_custody(
         &self,
         key: String,

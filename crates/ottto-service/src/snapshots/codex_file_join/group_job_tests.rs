@@ -2923,7 +2923,7 @@ fn durable_hold_on_one_member_holds_the_joined_group() {
             assert_eq!(fs::read(&record).unwrap(), bytes);
             assert!(durable.durable_held[store::Refusal::NewerFormat as usize] >= 1);
         } else {
-            assert_eq!(durable.durable_held, [0; 6]);
+            assert_eq!(durable.durable_held, [0; 7]);
         }
         scanned.push(result.scanned_file_count);
         fs::remove_dir_all(root).unwrap();

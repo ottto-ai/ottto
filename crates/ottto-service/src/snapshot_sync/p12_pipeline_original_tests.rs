@@ -576,9 +576,9 @@ impl RearmFixture {
             apply_claude_local_evidence_to_scan(&self.support, &mut scan, &mut index)
         };
         assert!(
-            comparison_completion
-                .as_ref()
-                .is_none_or(|completion| { !completion.ordinary_terminal_retained_for_test() }),
+            comparison_completion.as_ref().map_or(true, |completion| {
+                !completion.ordinary_terminal_retained_for_test()
+            }),
             "ordinary terminal graph is retired by the actual evidence/fold stage before upload"
         );
         let comparison_after_fold = comparison_requested(&comparison_completion);
@@ -688,7 +688,7 @@ impl RearmFixture {
             snapshot_upload_body_witness,
             |items| {
                 offered.extend(items.iter().map(|item| item.snapshot_fingerprint.clone()));
-                actual_upload = if target.is_none_or(|session| {
+                actual_upload = if target.map_or(true, |session| {
                     items.iter().any(|item| item.source_session_id == session)
                 }) {
                     upload
