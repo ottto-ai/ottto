@@ -32240,8 +32240,12 @@ impl OwnedSourceScan {
                 }
             } else if let Some(context) = sampling.as_mut() {
                 let key = local_index_key(&candidate.path);
-                indexed_pi_entry = source == SnapshotSource::Pi && index.files.contains_key(&key);
                 let taken = context.cache.take(&key);
+                // The `pi` leaf counts a change without a RAM reduction; a
+                // discarded copy (e.g. the audit cap) has its own counter.
+                indexed_pi_entry = source == SnapshotSource::Pi
+                    && taken.is_none()
+                    && index.files.contains_key(&key);
                 // Kept beside the moved copy for R0's completion decision.
                 let taken_admission = taken.as_ref().map(|taken| {
                     (

@@ -5445,7 +5445,7 @@ fn pi_h_keys_preserve_the_legacy_reducer_body() {
 
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
-fn pi_ram_tail_ignores_age_clock_and_audit_slot_pressure() {
+fn pi_ram_tail_ignores_age_and_clock_and_audit_cap_reads_full() {
     use crate::local_resource_diagnostics::cache_lifecycle::observe;
     struct Reset;
     impl Drop for Reset {
@@ -5507,13 +5507,20 @@ fn pi_ram_tail_ignores_age_clock_and_audit_slot_pressure() {
                 },
             )
         });
-        assert_eq!(
-            modes,
-            (0, 1, 0),
-            "{label}: no AuditDue or ClockChanged Full"
-        );
-        assert_eq!(bytes.0, suffix, "only appended body bytes are consumed");
-        assert_eq!(counts.pi, 0);
+        if pending == 0 {
+            assert_eq!(
+                modes,
+                (0, 1, 0),
+                "{label}: no AuditDue or ClockChanged Full"
+            );
+            assert_eq!(bytes.0, suffix, "only appended body bytes are consumed");
+        } else {
+            // #870's shared audit cap: with no audit slot left, an unmarked
+            // change funds no new debt and reads Full instead of Tail.
+            assert_eq!(modes, (1, 0, 0), "{label}: cap Full, not Tail");
+            assert!(bytes.0 > suffix, "{label}: the whole file is read");
+        }
+        assert_eq!(counts.pi, 0, "{label}: a RAM copy existed; not the pi leaf");
         let (_, full, _) = production_scan(&fixture, source, quiet, None, label);
         assert_eq!(production_body(source, tail), production_body(source, full));
     }
