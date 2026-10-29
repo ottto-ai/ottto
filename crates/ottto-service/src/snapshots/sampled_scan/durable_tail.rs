@@ -1762,29 +1762,28 @@ impl SharedCache {
         // Missing membership is itself missing audit custody. Check the verified
         // same-context carrier before the entry-dependent binding; indexed keys
         // retain their existing real-edit and accepted-floor precedence below.
-        if !index.files.contains_key(key) {
-            if record.record.binding.context
+        if !index.files.contains_key(key)
+            && record.record.binding.context
                 == store::context_digest(
                     &interpretation.namespace.0,
                     index.active_upload_context_fingerprint.as_deref(),
                 )
-                && !audit_carrier_matches(
-                    &record,
-                    index,
-                    key,
-                    unix_seconds(SystemTime::now()).unwrap_or(0),
-                )
-            {
-                Counters::bump(
-                    &mut self
-                        .durable()
-                        .ok_or(MissClass::Unavailable)?
-                        .counters
-                        .ineligible,
-                    "audit_carrier",
-                );
-                return Err(MissClass::AuditCarrier);
-            }
+            && !audit_carrier_matches(
+                &record,
+                index,
+                key,
+                unix_seconds(SystemTime::now()).unwrap_or(0),
+            )
+        {
+            Counters::bump(
+                &mut self
+                    .durable()
+                    .ok_or(MissClass::Unavailable)?
+                    .counters
+                    .ineligible,
+                "audit_carrier",
+            );
+            return Err(MissClass::AuditCarrier);
         }
         let expected = expected(
             source,
