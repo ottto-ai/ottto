@@ -31831,7 +31831,7 @@ impl OwnedSourceScan {
                                     index,
                                     &interpretation,
                                 ) {
-                                    sampled_scan::durable_tail::RestoreOutcome::Restored(taken) => {
+                                    sampled_scan::durable_tail::RestoreOutcome::Restored(taken) => 'restored: {
                                         if source == SnapshotSource::ClaudeCode {
                                             let accepted_end =
                                                 index.files.get(&key).map_or(0, |e| e.size_bytes);
@@ -31845,6 +31845,19 @@ impl OwnedSourceScan {
                                             ) {
                                                 Ok(attempt) => retail_attempt = Some(attempt),
                                                 Err(reason) => {
+                                                    if matches!(
+                                                        reason,
+                                                        sampled_scan::durable_tail::RetailHold::Exhausted
+                                                            | sampled_scan::durable_tail::RetailHold::AccountingLost
+                                                    ) && context.cache.retail_full(
+                                                        &key,
+                                                        parser.reader.reader.get_ref(),
+                                                        accepted_end,
+                                                        std::time::Instant::now(),
+                                                    )
+                                                    {
+                                                        break 'restored (None, taken_admission);
+                                                    }
                                                     context.cache.durable_retail_hold(
                                                         source, reason, index, &candidate,
                                                     );
