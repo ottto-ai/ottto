@@ -27569,6 +27569,8 @@ impl OwnedSourceScan {
                             ),
                         )
                     });
+                    let mut ordinary_singleton_slots = None;
+                    let mut context_group_admitted = false;
                     for (own, group) in groups {
                         if group
                             .members
@@ -27677,6 +27679,26 @@ impl OwnedSourceScan {
                             codex_state_only_blocked_session_ids.insert(group.owner.clone());
                             continue;
                         }
+                        // A settled receipt removes only context read debt. Keep
+                        // every ordinary/recovery gate and let skipped members
+                        // follow the ordinary census accounting below.
+                        let member_set = codex_file_join::member_set_witness(&group.members);
+                        if index.file_upload_context_enabled
+                            && group.members.iter().all(|member| {
+                                let key = local_index_key(&member.path);
+                                index.files.get(&key).is_some_and(|entry| {
+                                    entry.upload_context_receipt.is_some()
+                                        && entry.codex_joined_member_set.as_deref()
+                                            == Some(member_set.as_str())
+                                }) && !index.file_upload_context_requires_adoption(&key)
+                                    && index.candidate_decision(member) == CandidateDecision::Skip
+                            })
+                        {
+                            for member in &group.members {
+                                grouped_paths.remove(&local_index_key(&member.path));
+                            }
+                            continue;
+                        }
                         // G1: a group whose attempt already ended in this
                         // generation is fenced at its pop (M-5 b) and reads
                         // nothing. Decide it here, so it takes no file
@@ -27713,7 +27735,38 @@ impl OwnedSourceScan {
                                 waiting > 0
                                     && (own || used + group.members.len() + waiting > file_limit)
                             };
-                        if rereads_crowd_members
+                        // Ordinary groups have already spent their slots. Before
+                        // the first context group, reserve the remaining ordinary
+                        // singletons too; catch-up must never evict one below.
+                        let context_group = index.file_upload_context_enabled
+                            && group
+                                .members
+                                .iter()
+                                .all(|member| index.context_only_read(member));
+                        let waiting_ordinary = if context_group {
+                            *ordinary_singleton_slots.get_or_insert_with(|| {
+                                identified_candidates
+                                    .iter()
+                                    .filter(|candidate| {
+                                        !grouped_paths.contains(&local_index_key(&candidate.path))
+                                            && !index.context_only_read(candidate)
+                                            && index.candidate_decision(candidate)
+                                                != CandidateDecision::Skip
+                                    })
+                                    .count()
+                            })
+                        } else {
+                            0
+                        };
+                        let context_crowds_ordinary = !fenced
+                            && waiting_ordinary > 0
+                            && (own
+                                || used
+                                    .saturating_add(group.members.len())
+                                    .saturating_add(waiting_ordinary)
+                                    > file_limit);
+                        if context_crowds_ordinary
+                            || rereads_crowd_members
                             || (!fenced
                                 && used > 0
                                 && (own || used + group.members.len() > file_limit))
@@ -27740,6 +27793,7 @@ impl OwnedSourceScan {
                             continue;
                         }
                         if !fenced {
+                            context_group_admitted |= context_group;
                             used += group.members.len();
                             if own {
                                 // Nothing else joins its page.
@@ -27819,13 +27873,33 @@ impl OwnedSourceScan {
                         && used + identified_candidates.len() > file_limit
                     {
                         // G1: re-reads leave before any census member.
-                        let evict = identified_candidates
-                            .iter()
-                            .rposition(|candidate| {
-                                !sampled_scan::codex_cursor::selected_census_member(
-                                    &codex_selected_flags,
-                                    &candidate.path,
-                                )
+                        let context_evict = context_group_admitted
+                            .then(|| {
+                                let disposable = |candidate: &CandidateFile| {
+                                    index.context_only_read(candidate)
+                                        || index.candidate_decision(candidate)
+                                            == CandidateDecision::Skip
+                                };
+                                identified_candidates
+                                    .iter()
+                                    .rposition(|candidate| {
+                                        disposable(candidate)
+                                            && !sampled_scan::codex_cursor::selected_census_member(
+                                                &codex_selected_flags,
+                                                &candidate.path,
+                                            )
+                                    })
+                                    .or_else(|| identified_candidates.iter().rposition(disposable))
+                            })
+                            .flatten();
+                        let evict = context_evict
+                            .or_else(|| {
+                                identified_candidates.iter().rposition(|candidate| {
+                                    !sampled_scan::codex_cursor::selected_census_member(
+                                        &codex_selected_flags,
+                                        &candidate.path,
+                                    )
+                                })
                             })
                             .unwrap_or(identified_candidates.len() - 1);
                         if let Some(candidate) = identified_candidates.remove(evict) {

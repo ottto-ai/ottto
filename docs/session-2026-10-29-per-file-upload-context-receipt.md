@@ -219,3 +219,27 @@ exception. This replaces the historical byte-throughput timing scenario; measure
 wire totals remain estimates from recent POST traffic. Runtime fixtures are run
 in Linux CI, never locally; local validation uses the serialized all-target clippy
 wrapper. No macOS-gated tests were touched.
+
+Round 10 reserves ordinary singleton file slots before any context-only joined
+Codex group spends the remaining page allowance, including census-member and
+oversized own-page groups. Ordinary own-page/census ordering remains inside its
+class. Slot eviction prefers context-only/skip work over an ordinary singleton.
+The existing native/wire read-budget implementation is unchanged. Two portable
+real-scan/uploader fixtures cover an unhinted new file and a same-size mtime-only
+rewrite at file limit two, with two- and three-member context groups deferred
+unparsed and settled on a later pass.
+
+Linux runtime evidence also exposed an oversized transport override being applied
+when final projection contained ordinary work. The override now requires no
+ordinary pending body and no earlier catch-up admission, and is consumed once.
+The unchanged tight-wire fixture failed on the previous head with four POSTed
+items where only two fit; it retains that assertion and now measures received
+catch-up bytes each pass. The cold multi-pass scanner fixture checks both actual
+wire remainder and native read allowance. The alias fixture's previous expected
+sum counted both scanner aliases; transport deduplicates the fingerprint before
+POSTing one representative. Its counter assertion now uses bytes received by
+the fake transport. Resend entity classification remains once per cycle while
+wire bytes charge each actual POST attempt. Settled receipt groups take the normal
+candidate skip path so unchanged aliases stop reparsing on subsequent relists;
+ordinary recovery gates and protected census assertions remain intact. No local
+Cargo tests; all-target wrapper clippy and Linux CI provide validation.

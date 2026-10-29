@@ -326,6 +326,9 @@ pub(crate) struct Uploader {
     progress: SnapshotUploadProgress,
     scratch: crate::test_scratch::ScratchDir,
     pub posts: Vec<Vec<serde_json::Value>>,
+    // Bytes observed at the receiving boundary, excluding the request envelope.
+    pub received_item_bytes: u64,
+    pub received_catchup_bytes: u64,
     pub not_stored: bool,
     pub refuse: bool,
     pub fail_after: Option<usize>,
@@ -339,6 +342,8 @@ impl Uploader {
             ),
             scratch: crate::test_scratch::ScratchDir::new("context-real-uploader"),
             posts: Vec::new(),
+            received_item_bytes: 0,
+            received_catchup_bytes: 0,
             not_stored: false,
             refuse: false,
             fail_after: None,
@@ -362,7 +367,18 @@ impl Uploader {
         self.progress
             .prepare_context_receipt_candidates(index, previous, items);
         let path = self.scratch.join("progress.json");
+        let catchup = items
+            .iter()
+            .filter(|item| {
+                self.progress
+                    .context_resend
+                    .is_catchup(&item.snapshot_fingerprint)
+            })
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect::<BTreeSet<_>>();
         let posts = &mut self.posts;
+        let received_item_bytes = &mut self.received_item_bytes;
+        let received_catchup_bytes = &mut self.received_catchup_bytes;
         let fail_after = self.fail_after;
         let not_stored = self.not_stored;
         let refuse = self.refuse;
@@ -376,6 +392,13 @@ impl Uploader {
             |batch| {
                 if fail_after == Some(posts.len()) {
                     return Err(anyhow!("synthetic transport failure"));
+                }
+                for item in &batch {
+                    let bytes = serde_json::to_vec(item).unwrap().len() as u64;
+                    *received_item_bytes += bytes;
+                    if catchup.contains(&item.snapshot_fingerprint) {
+                        *received_catchup_bytes += bytes;
+                    }
                 }
                 posts.push(
                     batch

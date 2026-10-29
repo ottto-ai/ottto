@@ -974,6 +974,7 @@ fn real_uploader_context_catchup_spends_only_budget_left_after_new_usage() {
         f.uploader.activate(source, "e".repeat(64), &mut f.index);
         f.uploader.set_byte_allowance(ordinary_bytes + old_bytes);
         let first = f.uploader.posts.len();
+        let received_before = f.uploader.received_catchup_bytes;
         f.uploader
             .send(source, &mut f.index, &previous, &scan.snapshots)
             .unwrap();
@@ -986,6 +987,7 @@ fn real_uploader_context_catchup_spends_only_budget_left_after_new_usage() {
             "only one catch-up fits the remainder"
         );
         assert_eq!(f.uploader.counts().2, 1);
+        assert!(f.uploader.received_catchup_bytes - received_before <= old_bytes as u64);
         let reacked = posts
             .iter()
             .flatten()
@@ -995,6 +997,7 @@ fn real_uploader_context_catchup_spends_only_budget_left_after_new_usage() {
         f.uploader.activate(source, "e".repeat(64), &mut f.index);
         f.uploader.set_byte_allowance(2 * old_bytes);
         let next = f.uploader.posts.len();
+        let received_before = f.uploader.received_catchup_bytes;
         f.uploader
             .send(source, &mut f.index, &previous, &scan.snapshots)
             .unwrap();
@@ -1011,6 +1014,7 @@ fn real_uploader_context_catchup_spends_only_budget_left_after_new_usage() {
             .iter()
             .all(|item| !reacked.contains(&item["snapshot_fingerprint"])));
         assert_eq!(f.uploader.counts().2, 2);
+        assert!(f.uploader.received_catchup_bytes - received_before <= (2 * old_bytes) as u64);
     }
 }
 
@@ -1118,6 +1122,8 @@ fn real_scan_context_catchup_reads_each_file_once_across_many_passes() {
             }
             f.uploader.activate(source, "e".repeat(64), &mut f.index);
             let before = f.uploader.posts.len();
+            let catchup_before = f.uploader.received_catchup_bytes;
+            let received_before = f.uploader.received_item_bytes;
             let emitted = f
                 .uploader
                 .send(source, &mut f.index, &previous, &scan.snapshots)
@@ -1133,6 +1139,14 @@ fn real_scan_context_catchup_reads_each_file_once_across_many_passes() {
                     .map(Vec::len)
                     .sum::<usize>(),
                 order.len()
+            );
+            let catchup_wire = f.uploader.received_catchup_bytes - catchup_before;
+            let ordinary_wire = f.uploader.received_item_bytes - received_before - catchup_wire;
+            assert!(
+                catchup_wire
+                    <= (crate::snapshot_sync::SNAPSHOT_BATCH_MAX_BYTES as u64)
+                        .saturating_sub(ordinary_wire),
+                "actual catch-up wire stays under the remaining allowance on every page"
             );
             passes += 1;
             if paths.iter().all(|path| {
@@ -1194,16 +1208,14 @@ fn real_scan_joined_codex_context_catchup_admits_the_whole_alias_unit() {
     let (scan, _) = f.walk(true);
     assert_eq!(scan.scanned_file_count, 2, "joined aliases are admitted atomically, not permanently deferred after the first reservation");
     f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
+    let received_before = f.uploader.received_item_bytes;
     let (files, rearm_bytes) = f
         .uploader
         .send(f.source, &mut f.index, &previous, &scan.snapshots)
         .unwrap();
     assert_eq!(files, 2);
-    let wire_bytes = scan
-        .snapshots
-        .iter()
-        .map(|item| crate::snapshot_sync::snapshot_packing_json_length(item).unwrap() as u64)
-        .sum::<u64>();
+    let wire_bytes = f.uploader.received_item_bytes - received_before;
+    assert_eq!(f.uploader.counts().1, wire_bytes);
     assert_eq!(
         rearm_bytes, wire_bytes,
         "joined aliases do not double-count wire bodies"
@@ -1260,6 +1272,13 @@ fn real_scan_oversized_context_unit_gets_all_fresh_acks_without_reparse() {
     finalize_scan_after_policy(f.source, &mut scan, &mut f.index);
     f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
     let first = f.uploader.posts.len();
+    let received_before = f.uploader.received_catchup_bytes;
+    let allowance = f.index.context_read_counts.wire_allowance as u64;
+    assert_eq!(
+        f.index.context_read_counts.files, 1,
+        "the oversized exception admits one logical file alone"
+    );
+    assert!(f.index.context_read_counts.local_bytes <= fs::metadata(&f.path).unwrap().len());
     assert_eq!(
         f.uploader
             .send(f.source, &mut f.index, &previous, &scan.snapshots)
@@ -1279,6 +1298,10 @@ fn real_scan_oversized_context_unit_gets_all_fresh_acks_without_reparse() {
         .iter()
         .all(|post| serde_json::to_vec(post).unwrap().len()
             <= crate::snapshot_sync::SNAPSHOT_BATCH_MAX_BYTES));
+    let received = f.uploader.received_catchup_bytes - received_before;
+    assert!(received > crate::snapshot_sync::SNAPSHOT_BATCH_MAX_BYTES as u64);
+    assert!(received <= allowance);
+    assert_eq!(f.uploader.counts().1, received);
     f.assert_quiet();
 }
 
@@ -1367,4 +1390,171 @@ fn real_scan_ordinary_codex_group_precedes_context_group_under_read_cap() {
         2
     );
     f.assert_quiet();
+}
+
+// Real scanner and transport; a context census member must not consume the
+// ordinary singleton's slot, including an oversized own-page alias group.
+fn ordinary_singleton_precedes_context_group(same_size_rewrite: bool) {
+    for members in [2, 3] {
+        let (root, _) = codex_file_join::tests::counting_v2_fixture();
+        let _cutover = codex_counting_version::TestCutover::set(0);
+        let mut f = Fixture::new(SnapshotSource::Codex);
+        let singleton = f.root.join("z.jsonl");
+        fs::rename(&f.path, &singleton).unwrap();
+        f.path = singleton.clone();
+        let original = fs::read(&singleton).unwrap();
+        if !same_size_rewrite {
+            fs::remove_file(&singleton).unwrap();
+        }
+        let names = if members == 2 {
+            vec!["a", "b"]
+        } else {
+            vec!["a", "b", "c"]
+        };
+        for name in &names {
+            let original_name = if *name == "c" { "a" } else { name };
+            let body =
+                fs::read_to_string(root.join("sessions").join(format!("{original_name}.jsonl")))
+                    .unwrap();
+            fs::write(
+                f.root.join(format!("{name}.jsonl")),
+                body.replace("2026-10-01", "2026-10-29"),
+            )
+            .unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+        let previous = f.index.clone();
+        let (scan, _) = f.walk(true);
+        f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
+        assert_eq!(
+            f.uploader
+                .send(f.source, &mut f.index, &previous, &scan.snapshots)
+                .unwrap()
+                .0,
+            members + u64::from(same_size_rewrite)
+        );
+        let prior_modified =
+            same_size_rewrite.then(|| fs::metadata(&singleton).unwrap().modified().unwrap());
+        fs::write(&singleton, &original).unwrap();
+        if let Some(prior) = prior_modified {
+            fs::File::options()
+                .write(true)
+                .open(&singleton)
+                .unwrap()
+                .set_times(
+                    fs::FileTimes::new().set_modified(prior + std::time::Duration::from_secs(2)),
+                )
+                .unwrap();
+            assert_eq!(
+                fs::metadata(&singleton).unwrap().len(),
+                original.len() as u64
+            );
+        }
+        f.index
+            .activate_file_upload_context(f.source, "e".repeat(64));
+        // Use the scanner's real discovery, then place the reachable traversal
+        // shape from the review at the front: one context alias and an unhinted
+        // ordinary singleton. Inventory still supplies the remaining aliases.
+        ensure_bounded_traversal(
+            f.source,
+            std::slice::from_ref(&f.root),
+            &mut f.index,
+            "2026-10-29T12:00:00Z",
+            BACKFILL_WINDOW_DAYS,
+        );
+        let traversal = f.index.traversal.as_mut().unwrap();
+        advance_bounded_directory_traversal(
+            f.source,
+            traversal,
+            BACKFILL_WINDOW_DAYS,
+            &f.index.files,
+        );
+        let a = f.root.join("a.jsonl");
+        traversal
+            .pending_candidates
+            .make_contiguous()
+            .sort_by_key(|pending| {
+                if pending.path == a {
+                    0
+                } else if pending.path == singleton {
+                    1
+                } else {
+                    2
+                }
+            });
+        assert!(traversal
+            .pending_candidates
+            .iter()
+            .all(|pending| !pending.watcher_hint));
+        assert_eq!(traversal.pending_candidates[0].path, a);
+        assert_eq!(traversal.pending_candidates[1].path, singleton);
+        f.cache = Arc::default();
+        let previous = f.index.clone();
+        let ((scan, _), reads) =
+            terminal_contract_retry::source_acquisitions(|| f.walk_with_file_limit(true, 2));
+        assert_eq!(
+            scan.scanned_file_count, 1,
+            "ordinary singleton owns its slot"
+        );
+        assert_eq!(
+            reads,
+            BTreeMap::from([(singleton.clone(), 1)]),
+            "context group stays unparsed"
+        );
+        for name in &names {
+            let key = local_index_key(&f.root.join(format!("{name}.jsonl")));
+            assert!(
+                f.index.file_upload_context_requires_adoption(&key),
+                "group remains owed"
+            );
+            assert!(f
+                .index
+                .traversal
+                .as_ref()
+                .unwrap()
+                .pending_candidates
+                .iter()
+                .any(|pending| local_index_key(&pending.path) == key));
+        }
+        f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
+        let first = f.uploader.posts.len();
+        assert_eq!(
+            f.uploader
+                .send(f.source, &mut f.index, &previous, &scan.snapshots)
+                .unwrap()
+                .0,
+            1
+        );
+        assert!(f.uploader.posts[first..]
+            .iter()
+            .flatten()
+            .all(|item| item["source_session_id"] == SESSION));
+        f.cache = Arc::default();
+        let previous = f.index.clone();
+        let ((scan, _), reads) =
+            terminal_contract_retry::source_acquisitions(|| f.walk_with_file_limit(true, 2));
+        assert_eq!(
+            scan.scanned_file_count as u64, members,
+            "context group runs on its later page"
+        );
+        assert_eq!(reads.len() as u64, members);
+        assert!(reads.values().all(|count| *count == 1));
+        f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
+        assert_eq!(
+            f.uploader
+                .send(f.source, &mut f.index, &previous, &scan.snapshots)
+                .unwrap()
+                .0,
+            members
+        );
+        f.assert_quiet();
+    }
+}
+#[test]
+fn real_scan_new_unhinted_singleton_precedes_context_group_at_file_limit_two() {
+    ordinary_singleton_precedes_context_group(false);
+}
+#[test]
+fn real_scan_same_size_rewrite_precedes_context_group_at_file_limit_two() {
+    ordinary_singleton_precedes_context_group(true);
 }

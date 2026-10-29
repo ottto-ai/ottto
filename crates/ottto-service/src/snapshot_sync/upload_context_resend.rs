@@ -25,6 +25,8 @@ pub(super) struct Cycle {
     // stamp-only catch-up is capped by the existing packing byte target.
     remaining_bytes: usize,
     alone_allowance: usize,
+    alone_allowance_used: bool,
+    catchup_admitted: bool,
     ordinary_pending: BTreeSet<String>,
     pub deferred: BTreeSet<String>,
     pub bootstrap_blocks_catchup: bool,
@@ -58,7 +60,17 @@ impl Cycle {
         // Selection admits at most one oversized logical unit. Its complete
         // ACK set must fit this pass; each POST retains the normal size cap.
         if self.alone_allowance > 0 {
-            self.remaining_bytes = self.remaining_bytes.max(self.alone_allowance);
+            // Selection can reserve an oversized file before final projection
+            // reveals ordinary revisions. That is no longer an alone pass.
+            // Never refill the allowance on a later uploader/bootstrap call.
+            if !self.alone_allowance_used
+                && !self.catchup_admitted
+                && bytes == 0
+                && self.ordinary_pending.is_empty()
+            {
+                self.remaining_bytes = self.remaining_bytes.max(self.alone_allowance);
+            }
+            self.alone_allowance_used = true;
             self.alone_allowance = 0;
         }
     }
@@ -67,6 +79,7 @@ impl Cycle {
             return false;
         }
         self.remaining_bytes -= bytes;
+        self.catchup_admitted = true;
         true
     }
     #[cfg(test)]
@@ -98,9 +111,11 @@ impl Cycle {
             self.ordinary_pending.remove(entity);
         }
         if let Some(identical) = self.resends.get(entity) {
+            // Entity classification is once/cycle; bytes charge every actual
+            // POST attempt, including an additional bootstrap/retry body.
+            self.counts.bytes = self.counts.bytes.saturating_add(bytes);
             if self.attempted.insert(entity.to_string()) {
                 self.counts.entities += 1;
-                self.counts.bytes = self.counts.bytes.saturating_add(bytes);
                 if *identical {
                     self.counts.identical += 1;
                 } else {
@@ -192,7 +207,7 @@ impl SnapshotUploadProgress {
     }
 }
 crate::heap_layout_bound::fields!(ResendCounts; entities, bytes, files, local_bytes, identical, changed);
-crate::heap_layout_bound::fields!(Cycle; active, source_matches, candidates, resends, attempted, files, not_stored, counts, remaining_bytes, alone_allowance, ordinary_pending, deferred, bootstrap_blocks_catchup);
+crate::heap_layout_bound::fields!(Cycle; active, source_matches, candidates, resends, attempted, files, not_stored, counts, remaining_bytes, alone_allowance, alone_allowance_used, catchup_admitted, ordinary_pending, deferred, bootstrap_blocks_catchup);
 
 #[cfg(test)]
 thread_local! { static LAST_COUNTS: std::cell::Cell<(u64,u64)> = const { std::cell::Cell::new((0,0)) }; }
