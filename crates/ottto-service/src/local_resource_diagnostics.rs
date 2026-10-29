@@ -892,6 +892,8 @@ pub(crate) struct RestoreCounts {
     miss: BTreeMap<&'static str, u64>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     stale: BTreeMap<&'static str, u64>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    stale_attribution: BTreeMap<&'static str, u64>,
 }
 impl RestoreCounts {
     #[cfg(unix)]
@@ -902,6 +904,15 @@ impl RestoreCounts {
             RestoreOutcome::Held(_) => &mut self.held,
             RestoreOutcome::Miss(class) => self.miss.entry(class.label()).or_default(),
             RestoreOutcome::Stale(reason) => self.stale.entry(reason).or_default(),
+            RestoreOutcome::StaleUnregistered(reason, obligation) => {
+                let label = crate::snapshots::sampled_scan::durable_tail::MissClass::Unregistered(
+                    *obligation,
+                )
+                .label();
+                let attribution = self.stale_attribution.entry(label).or_default();
+                *attribution = attribution.saturating_add(1);
+                self.stale.entry(reason).or_default()
+            }
         };
         *count = count.saturating_add(1);
     }

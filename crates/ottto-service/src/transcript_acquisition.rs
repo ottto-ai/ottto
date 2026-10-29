@@ -1576,6 +1576,41 @@ impl DurableCertificate {
         Ok((checkpoint, admission))
     }
 
+    /// A stale interpretation cannot hide independent physical/content edits.
+    /// Mtime alone is deliberately excluded: compare the existing bounded
+    /// samples even when the unchanged-length mtime moved.
+    pub(crate) fn independent_edit(
+        &self,
+        file: &mut File,
+    ) -> Result<Option<FullReason>, CertificateRefusal> {
+        let stamp = file
+            .metadata()
+            .and_then(FileStamp::capture)
+            .map_err(|_| CertificateRefusal::ReadError)?;
+        if stamp.device == self.device
+            && stamp.inode == self.inode
+            && stamp.length == self.length
+            && stamp.modified == self.modified
+            && (self.birth_nanos == 0
+                || birth_unix_nanos(&file.metadata().map_err(|_| CertificateRefusal::ReadError)?)
+                    == self.birth_nanos)
+        {
+            return Ok(None);
+        }
+        let mut probe = self.clone();
+        probe.modified = stamp.modified;
+        match probe.admit_samples(file) {
+            Err(CertificateRefusal::Changed(
+                reason @ (FullReason::Replaced
+                | FullReason::Shrunk
+                | FullReason::HeadChanged
+                | FullReason::BoundaryChanged),
+            )) => Ok(Some(reason)),
+            Ok(_) | Err(CertificateRefusal::Changed(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     #[allow(clippy::type_complexity)]
     fn admit_samples(
         &self,

@@ -80,9 +80,11 @@ pub(crate) struct Counters {
     pub(crate) retail_full: [u64; 3],
     pub(crate) stale_full: [u64; 3],
     pub(crate) near_cap: u64,
+    pub(crate) pace_anomaly: u64,
     pub(crate) upgrade_missing_full: u64,
     pub(crate) missing: u64,
     pub(crate) upgrade_state_missing: u64,
+    pub(crate) migration: [u64; 4], // held, awaiting save, claimed, durably replaced
     pub(crate) refused_record: u64,
     pub(crate) durable_held: [u64; 6],
     pub(crate) held_census: [u64; 2],
@@ -122,7 +124,7 @@ impl Counters {
         };
         format!(
             "ottto-service: durable_tail source={} original_v1_mapped={} durable_restore_after_selection_clear={} objects[same,unknown,changed]={:?} s2_skipped_object_changed={} \
-             retail_attempts={} retail_keys={} near_cap={} upgrade_missing_full={} retail_exhausted[full,paced,pace_evicted]={:?} tail_read_bytes={} budget_refused_retail_old_bytes={} repeated_physical_old_bytes={} upgrade_state_missing={} \
+             retail_attempts={} retail_keys={} near_cap={} pace_anomaly={} upgrade_missing_full={} migration[held,await_save,claimed,replaced]={:?} retail_exhausted[full,paced,pace_evicted]={:?} tail_read_bytes={} budget_refused_retail_old_bytes={} repeated_physical_old_bytes={} upgrade_state_missing={} \
              rederive_head_bytes={} rederive_named_lines={} rederive_line_bytes={} not_persisted={{{}}} ineligible={{{}}} \
              write_deferred={} write_unlocked={} peak_body_bytes={} disk_records={} disk_bytes={} \
              bytes_written={} records_written={} records_clean={} store_budget_refused={} \
@@ -139,7 +141,9 @@ impl Counters {
             self.retail_attempts,
             self.retail_keys,
             self.near_cap,
+            self.pace_anomaly,
             self.upgrade_missing_full,
+            self.migration,
             self.retail_full,
             retail_bytes(source, 0),
             retail_bytes(source, 1),
@@ -195,7 +199,71 @@ struct Slot {
     /// upgrade_state_missing, old_binding_no_match, retail_exhausted[3], stale_full[3]].
     held: u64,
     old_binding_no_match: u64,
-    reported: [u64; 15],
+    reported: [u64; 20],
+}
+
+impl Slot {
+    fn migration_record(
+        &mut self,
+        key: &str,
+        index: &ScanIndex,
+    ) -> Result<(Box<store::DurableRecord>, Expected), &'static str> {
+        if index.effective_upload_body_witness_revision_requires_adoption(key)
+            || index.files.get(key).is_some_and(|e| {
+                e.effective_upload_body_witness_revision
+                    > effective_revision(SnapshotSource::ClaudeCode)
+            })
+            || index.active_effective_upload_body_witness_revision
+                > effective_revision(SnapshotSource::ClaudeCode)
+        {
+            return Err("o3.replay");
+        }
+        let digest = store::key_digest(DurableSource::ClaudeCode, key);
+        let record = match self.store.read(&digest) {
+            ReadOutcome::Found(record) => record,
+            ReadOutcome::Refused(
+                store::Refusal::NewerFormat
+                | store::Refusal::Unknown
+                | store::Refusal::Undecodable
+                | store::Refusal::Unbindable,
+            ) => return Err("o3.protected_record"),
+            _ => return Err("o3.record"),
+        };
+        if record.record.binding.context
+            != store::context_digest(
+                &self.namespace.0,
+                index.active_upload_context_fingerprint.as_deref(),
+            )
+        {
+            return Err("o3.context");
+        }
+        let scope = self.decided.get(key).ok_or("o3.scope_missing")?;
+        let i = Interpretation::of(
+            SnapshotSource::ClaudeCode,
+            key,
+            index,
+            self.identity_capture,
+            &self.namespace,
+        );
+        match claude_expected(key, scope, index, &i, &record) {
+            Err("old_binding_no_match") => {}
+            Err("context" | "revision_downgrade" | "revision_adoption_required") => {
+                return Err("o3.context")
+            }
+            _ => return Err("o3.binding"),
+        }
+        let current = expected(
+            DurableSource::ClaudeCode,
+            SnapshotSource::ClaudeCode,
+            key,
+            scope,
+            index,
+            &i,
+            None,
+        )
+        .ok_or("o3.accepted_missing")?;
+        Ok((record, current))
+    }
 }
 
 /// Process-lifetime durable state beside the RAM cache.
@@ -828,7 +896,8 @@ fn authorize_strict(
     snapshot_source: SnapshotSource,
     key: &str,
     index: &ScanIndex,
-    prior: &mut Option<store::MutationWitness>,
+    custody: &mut KeyCustody,
+    replacement: &PendingRecord,
 ) {
     slot.store
         .revoke(&store::key_digest(DurableSource::ClaudeCode, key));
@@ -848,18 +917,35 @@ fn authorize_strict(
         &slot.namespace,
     );
     if let Ok((expected, _)) = claude_expected(key, scope, index, &interpretation, &record) {
-        if prior.is_none() {
-            *prior = slot.store.mutation_witness(&record, &expected);
+        if custody.original.is_none() {
+            custody.original = slot.store.mutation_witness(&record, &expected);
         }
         // An ambiguous prior receipt still owns its unresolved custody. It is
         // not permission for the freshly verified current record: prove that
         // record independently so later dirty writes can make progress.
-        if let Some(proof) = prior.as_ref().filter(|p| slot.store.witness_current(p)) {
+        if let Some(proof) = custody
+            .original
+            .as_ref()
+            .filter(|p| slot.store.witness_current(p))
+        {
             // A current predecessor witness also survives verification-memo
             // turnover; rebuilding permission must not require a memo slot.
             slot.store.authorize_witness(&record, &expected, proof);
         } else {
             slot.store.authorize(&record, &expected);
+        }
+    } else if custody
+        .upgrade_started
+        .as_ref()
+        .is_some_and(|s| s.load(Ordering::Relaxed))
+    {
+        if let (Some(proof), Ok((record, current))) =
+            (custody.original.as_ref(), slot.migration_record(key, index))
+        {
+            if replacement.binding == current.binding {
+                slot.store
+                    .authorize_migration(&record, &current, &replacement.certificate, proof);
+            }
         }
     }
 }
@@ -981,10 +1067,17 @@ impl SharedCache {
         };
         #[cfg(test)]
         let now = stores.retail_full_now.unwrap_or(now);
-        stores.retail_full_at.retain(|_, at| {
-            now.duration_since(*at)
-                .is_ok_and(|age| age.as_secs() <= PACE_SANITY_SECS && age.as_secs() < PACE_SECS)
-        });
+        let mut anomalies = 0;
+        stores
+            .retail_full_at
+            .retain(|_, at| match now.duration_since(*at) {
+                Ok(age) if age.as_secs() <= PACE_SANITY_SECS => age.as_secs() < PACE_SECS,
+                _ => {
+                    anomalies += 1;
+                    false
+                }
+            });
+        stores.counters.pace_anomaly += anomalies;
         let key = store::key_digest(DurableSource::ClaudeCode, key);
         if !near_cap && stores.retail_full_at.contains_key(&key) {
             if cause.is_none() {
@@ -1040,14 +1133,23 @@ impl SharedCache {
         STORES_HELD.with(|held| held.set(true));
         Some(StoresGuard(guard))
     }
-    // R2 transitional old_binding_no_match; A1b2d removes or converts this arm.
-    pub(crate) fn no_match_full(
+    /// Option (i) is independent of O3: only committed growth controls this
+    /// paced read. It never grants migration/replacement authority.
+    pub(in crate::snapshots) fn no_match_full(
         &self,
         key: &str,
         file: &File,
-        a: Option<AcceptedFloor>,
+        accepted: Option<AcceptedFloor>,
     ) -> Option<()> {
-        let a = a?;
+        if let Some(mut stores) = self.durable() {
+            if let Some(c) = stores
+                .retail_spent
+                .get_mut(&store::key_digest(DurableSource::ClaudeCode, key))
+            {
+                c.upgrade_started = None;
+            }
+        }
+        let a = accepted?;
         if a.revision > effective_revision(SnapshotSource::ClaudeCode) {
             return None;
         }
@@ -1085,7 +1187,7 @@ impl SharedCache {
                 identity_capture,
                 held: 0,
                 old_binding_no_match: 0,
-                reported: [0; 15],
+                reported: [0; 20],
             });
         }
     }
@@ -1258,19 +1360,191 @@ impl SharedCache {
         )
     }
 
+    pub(in crate::snapshots) fn migration_start(
+        &self,
+        key: &str,
+        file: &File,
+        index: &mut ScanIndex,
+        accepted: Option<AcceptedFloor>,
+    ) -> Result<MigrationStart, &'static str> {
+        let result = (|| {
+            let a = accepted.ok_or("o3.accepted_missing")?;
+            let m = file.metadata().map_err(|_| "o3.metadata")?;
+            if a.revision > effective_revision(SnapshotSource::ClaudeCode)
+                || index.active_effective_upload_body_witness_revision
+                    > effective_revision(SnapshotSource::ClaudeCode)
+                || index.effective_upload_body_witness_revision_requires_adoption(key)
+            {
+                return Err("o3.revision");
+            }
+            if m.len() <= a.end {
+                return Err("o3.idle");
+            }
+            if self
+                .retained()
+                .map_err(|_| "o3.custody")?
+                .peek(key)
+                .is_some()
+            {
+                return Err("o3.ram");
+            }
+            let digest = store::key_digest(DurableSource::ClaudeCode, key);
+            let mut stores = self.durable().ok_or("o3.custody")?;
+            let (record, current) = stores.slots[DurableSource::ClaudeCode.slot()]
+                .as_mut()
+                .ok_or("o3.store")?
+                .migration_record(key, index)?;
+            let r = &record.record.certificate;
+            if record.index_generation > a.generation {
+                return Err("o3.generation");
+            }
+            if !migration_object(r, &m) {
+                return Err("o3.object");
+            }
+            if m.len() <= r.length {
+                return Err("o3.certificate_extent");
+            }
+            if !stores.fund_key(digest) {
+                return Err("o3.custody");
+            }
+            let stores = &mut *stores;
+            let slot = stores.slots[DurableSource::ClaudeCode.slot()]
+                .as_mut()
+                .ok_or("o3.store")?;
+            let custody = stores.retail_spent.get_mut(&digest).ok_or("o3.custody")?;
+            if custody.original.is_none() {
+                custody.original = slot.store.migration_witness(&record, &current, m.len());
+            }
+            if !custody
+                .original
+                .as_ref()
+                .is_some_and(|p| slot.store.migration_matches(p, &record, &current))
+            {
+                return Err("o3.survivor");
+            }
+            let floor = custody
+                .original
+                .as_ref()
+                .and_then(|p| p.migration_floor())
+                .ok_or("o3.survivor")?;
+            if m.len() < floor {
+                return Err("o3.floor");
+            }
+            let claimed = index.o3_replay.upgrade_missing(key, true);
+            if !claimed {
+                if index.o3_replay.needs_save() {
+                    stores.counters.migration[1] += 1;
+                    return Ok(MigrationStart::AwaitSave);
+                }
+                // A consumed/crashed grant cannot be refunded. Rule 6 still
+                // requires progress: use the existing paced resource read.
+                return Err("o3.spent");
+            }
+            stores
+                .retail_spent
+                .get_mut(&digest)
+                .expect("funded")
+                .upgrade_started = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )));
+
+            stores.counters.migration[2] += 1;
+            Ok(MigrationStart::Full(floor))
+        })();
+        // Only genuine idle/correctness barriers can suppress option (i).
+        if let Err(reason) = result {
+            if !matches!(
+                reason,
+                "o3.idle" | "o3.revision" | "o3.replay" | "o3.context" | "o3.protected_record"
+            ) && self.no_match_full(key, file, accepted).is_some()
+            {
+                return Ok(MigrationStart::Fallback);
+            }
+        }
+        if let Err(reason) = result {
+            if let Some(mut stores) = self.durable() {
+                stores.counters.migration[0] += 1;
+                Counters::bump(&mut stores.counters.ineligible, reason);
+            }
+        }
+        result
+    }
+
     pub(in crate::snapshots) fn upgrade_read(
         &self,
         key: &str,
         file: &File,
     ) -> Result<Option<UpgradeRead>, RetailHold> {
+        self.upgrade_reader(key, file, None)
+    }
+    pub(in crate::snapshots) fn migration_read(
+        &self,
+        key: &str,
+        file: &File,
+        index: &ScanIndex,
+    ) -> Result<Option<UpgradeRead>, RetailHold> {
+        if self.durable().is_some_and(|s| {
+            s.slots[DurableSource::ClaudeCode.slot()]
+                .as_ref()
+                .is_some_and(|c| {
+                    c.store
+                        .absent(&store::key_digest(DurableSource::ClaudeCode, key))
+                })
+        }) {
+            self.upgrade_read(key, file)
+        } else {
+            self.upgrade_reader(key, file, Some(index))
+        }
+    }
+    fn upgrade_reader(
+        &self,
+        name: &str,
+        file: &File,
+        index: Option<&ScanIndex>,
+    ) -> Result<Option<UpgradeRead>, RetailHold> {
+        let key = name;
         let key = store::key_digest(DurableSource::ClaudeCode, key);
         let mut stores = self.durable().ok_or(RetailHold::AccountingLost)?;
-        if !stores
-            .slot(DurableSource::ClaudeCode)
+        if !stores.slots[DurableSource::ClaudeCode.slot()]
             .as_ref()
             .is_some_and(|s| s.store.absent(&key))
         {
-            return Ok(None);
+            if !stores
+                .retail_spent
+                .get(&key)
+                .and_then(|c| c.original.as_ref())
+                .is_some_and(|p| p.is_migration())
+            {
+                return Ok(None);
+            }
+            let Some(index) = index else {
+                return Ok(None);
+            };
+            if !stores
+                .retail_spent
+                .get(&key)
+                .is_some_and(|c| c.upgrade_started.is_some())
+            {
+                return Ok(None);
+            }
+            let stores = &mut *stores;
+            let slot = stores.slots[DurableSource::ClaudeCode.slot()]
+                .as_mut()
+                .ok_or(RetailHold::Ineligible)?;
+            let (record, current) = slot
+                .migration_record(name, index)
+                .map_err(|_| RetailHold::Ineligible)?;
+            if !migration_object(
+                &record.record.certificate,
+                &file.metadata().map_err(|_| RetailHold::Ineligible)?,
+            ) || !stores
+                .retail_spent
+                .get(&key)
+                .and_then(|c| c.original.as_ref())
+                .is_some_and(|p| slot.store.migration_matches(p, &record, &current))
+            {
+                return Err(RetailHold::Ineligible);
+            }
         }
         let funded = stores.fund_key(key);
         let metadata = file.metadata();
@@ -1343,6 +1617,31 @@ impl SharedCache {
                 }
             }
         }
+    }
+
+    pub(in crate::snapshots) fn migration_failure(
+        &self,
+        index: &mut ScanIndex,
+        candidate: &CandidateFile,
+    ) -> bool {
+        let key = local_index_key(&candidate.path);
+        let hold = self.durable().is_some_and(|mut s| {
+            s.retail_spent
+                .get_mut(&store::key_digest(DurableSource::ClaudeCode, &key))
+                .is_some_and(|c| {
+                    if c.original.as_ref().is_some_and(|p| p.is_migration()) {
+                        c.upgrade_started = None;
+                        true
+                    } else {
+                        false
+                    }
+                })
+        });
+        if hold {
+            self.stale("o3.native_failure");
+            self.durable_stale_hold(SnapshotSource::ClaudeCode, index, candidate);
+        }
+        hold
     }
 
     pub(in crate::snapshots) fn durable_hold_exit(
@@ -1548,7 +1847,62 @@ impl SharedCache {
             let (original, revision) =
                 match claude_expected(key, scope, index, interpretation, &record) {
                     Ok(proof) => proof,
-                    Err(reason) => return Err(self.stale(reason)),
+                    Err(reason) => {
+                        // Probe before the early stale return, outside Stores.
+                        let owed = unregistered_scope(
+                            snapshot_source,
+                            scope,
+                            index,
+                            interpretation,
+                            record.record.binding.scope,
+                        );
+                        if matches!(
+                            reason,
+                            "context"
+                                | "old_binding_no_match"
+                                | "restore_semantics"
+                                | "revision_adoption_required"
+                        ) {
+                            if let Some(a) = interpretation
+                                .accepted
+                                .filter(|a| a.revision <= effective_revision(snapshot_source))
+                            {
+                                if let Ok(metadata) = held.metadata() {
+                                    let object = accepted_object(
+                                        &record,
+                                        &a,
+                                        metadata.dev(),
+                                        metadata.ino(),
+                                        birth_unix_nanos(&metadata),
+                                    );
+                                    // Same/Unknown accepted objects must retain the
+                                    // accepted prefix. A proved replacement is A2.
+                                    if metadata.len() >= a.end || object == ObjectVerdict::Changed {
+                                        if let Ok(Some(edit)) =
+                                            record.record.certificate.independent_edit(held)
+                                        {
+                                            if let Some(mut stores) = self.durable() {
+                                                Counters::bump(
+                                                    &mut stores.counters.certificate_refused,
+                                                    full_reason_class(edit),
+                                                );
+                                            }
+                                            return Err(MissClass::Failure(Failure::Certificate(
+                                                CertificateRefusal::Changed(edit),
+                                            ))
+                                            .into());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        return Err(match (self.stale(reason), owed) {
+                            (RestoreOutcome::Stale(reason), Some(owed)) => {
+                                RestoreOutcome::StaleUnregistered(reason, owed)
+                            }
+                            (outcome, _) => outcome,
+                        });
+                    }
                 };
             let Some(a) = interpretation.accepted else {
                 return Err(self.stale("accepted_floor_missing"));
@@ -1922,7 +2276,8 @@ impl SharedCache {
                     snapshot_source,
                     key,
                     index,
-                    &mut stores.retail_spent.get_mut(&digest)?.original,
+                    stores.retail_spent.get_mut(&digest)?,
+                    pending.iter().find(|r| r.binding.key == digest)?,
                 );
             }
         }
@@ -1961,6 +2316,8 @@ impl SharedCache {
                             .store
                             .replacement_committed(p, &receipt)
                     }) {
+                        stores.counters.migration[3] +=
+                            u64::from(c.original.as_ref().is_some_and(|p| p.is_migration()));
                         c.original = None;
                     }
                 }
@@ -2123,6 +2480,9 @@ impl SharedCache {
             upgrade_state_missing: [u64; 2],
             upgrade_missing_full: [u64; 2],
             near_cap: [u64; 2],
+            pace_anomaly: [u64; 2],
+            upgrade_count_basis: &'static str,
+            migration: [[u64; 2]; 4],
             t14_rebuild: [u64; 2],
             t14_rebuild_full_started: u64,
             mode_repaired: [u64; 2],
@@ -2153,10 +2513,20 @@ impl SharedCache {
             [0; 3]
         };
         let near_cap = if claude { stores.counters.near_cap } else { 0 };
+        let anomaly = if claude {
+            stores.counters.pace_anomaly
+        } else {
+            0
+        };
         let upgrade_full = if claude {
             stores.counters.upgrade_missing_full
         } else {
             0
+        };
+        let migration = if source == DurableSource::ClaudeCode {
+            stores.counters.migration
+        } else {
+            [0; 4]
         };
         let Some(slot) = stores.slot(source).as_mut() else {
             return;
@@ -2178,6 +2548,11 @@ impl SharedCache {
             stale[2],
             near_cap,
             upgrade_full,
+            migration[0],
+            migration[1],
+            migration[2],
+            migration[3],
+            anomaly,
         ];
         let last = std::mem::replace(&mut slot.reported, now);
         drop(stores);
@@ -2197,6 +2572,9 @@ impl SharedCache {
                     upgrade_state_missing: pair(5),
                     near_cap: pair(13),
                     upgrade_missing_full: pair(14),
+                    migration: [pair(15), pair(16), pair(17), pair(18)],
+                    pace_anomaly: pair(19),
+                    upgrade_count_basis: "native_read",
                     t14_rebuild: pair(1),
                     t14_rebuild_full_started: store.t14_rebuild_full_started,
                     mode_repaired: pair(2),
@@ -2216,11 +2594,14 @@ impl SharedCache {
         let mut counters = stores.counters.clone();
         if source == DurableSource::ClaudeCode {
             counters.upgrade_state_missing = stores.upgrade_reads.load(Ordering::Relaxed);
+        } else {
+            counters.migration = [0; 4];
         }
         if source != DurableSource::ClaudeCode {
             counters.retail_full = [0; 3];
             counters.stale_full = [0; 3];
             counters.near_cap = 0;
+            counters.pace_anomaly = 0;
             counters.upgrade_missing_full = 0;
         }
         let store = stores.slot(source).as_ref()?.store.counters();
@@ -2354,11 +2735,23 @@ pub(crate) enum RestoreOutcome {
     Miss(MissClass),
     Held(store::Refusal),
     Stale(&'static str),
+    StaleUnregistered(&'static str, Obligation),
 }
 impl From<MissClass> for RestoreOutcome {
     fn from(class: MissClass) -> Self {
         Self::Miss(class)
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::snapshots) enum MigrationStart {
+    AwaitSave,
+    Full(u64),
+    Fallback,
+}
+fn migration_object(r: &DurableCertificate, m: &std::fs::Metadata) -> bool {
+    (r.device, r.inode) == (m.dev(), m.ino())
+        && (r.birth_nanos == 0 || birth_unix_nanos(m) == 0 || r.birth_nanos == birth_unix_nanos(m))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

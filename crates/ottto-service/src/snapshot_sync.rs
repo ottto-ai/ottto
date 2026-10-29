@@ -5200,6 +5200,17 @@ impl SourcePreparation {
     }
     fn step_inner(mut self) -> SourcePreparationStep {
         let mut state = self.scan.take().expect("active source preparation");
+        if state
+            .persist_upgrade_reservations(&mut self.committed_index, &self.index_path)
+            .is_err()
+        {
+            self.scan = Some(state);
+            return SourcePreparationStep::Refused(
+                self,
+                crate::source_rotation::LocalRefusal("upgrade reservation save failed"),
+            );
+        }
+
         if state.native_capture_active() {
             let initialize = self
                 .native_comparison_reservation
