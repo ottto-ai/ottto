@@ -99,8 +99,8 @@ fn cpu_budget_survives_scan_completion_partial_commit_and_continuation_pages() {
     let ordinary = discovered_scan(&f, next.index, 1);
     assert_eq!(ordinary.index.archive_pass.cpu, 0);
     assert!(
-        !ordinary.index.archive_pass.power,
-        "temporary adapter is unknown, not AC detection"
+        !ordinary.index.archive_pass.started,
+        "ordinary pass renews CPU accounting"
     );
 }
 

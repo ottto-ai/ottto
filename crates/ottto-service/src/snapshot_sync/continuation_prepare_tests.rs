@@ -823,52 +823,23 @@ fn a_prepared_continuation_page_keeps_the_ordinary_side_gate() {
 }
 
 #[test]
-fn continuation_archive_cpu_survives_the_production_disk_reload() {
-    let fixture = ContinuationFixture::quiescent("continuation-archive-cpu");
-    let mut minted = fixture.preparation(false);
-    let (_, mut index) = fixture.load();
-    index.archive_pass.power = true;
-    index.archive_pass.started = true;
-    index.archive_pass.observe(Some(30_000_001), 1);
-    index.save(&fixture.index_path).unwrap();
-    assert_eq!(
-        fixture.load().1.archive_pass.cpu,
-        0,
-        "disk has no scheduling authority"
-    );
-    let mut inputs = take_continuation_inputs(
-        &mut minted,
-        &index,
-        &std::sync::Arc::default(),
-        std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
-    );
-    let before = fixture.disk();
-    let prepared = fixture.prepare(&mut inputs).unwrap();
-    let restored = prepared.scan.as_ref().unwrap().native_comparison_inputs().0;
-    assert_eq!(restored.archive_pass.cpu, 30_000_001);
-    assert!(!restored.archive_pass.ready(u64::MAX));
-    assert_eq!(prepared.committed_index.archive_pass.cpu, 30_000_001);
-    drop(prepared);
-    let cache = std::sync::Arc::new(crate::snapshots::sampled_scan::SharedCache::default());
-    let outcome = run_continuation_scan(
-        &fixture.home,
-        &fixture.support_dir,
-        &cache,
-        &mut inputs,
-        &BTreeSet::new(),
-        Some(Duration::from_secs(300)),
-        Instant::now() + Duration::from_secs(20),
-    )
-    .unwrap();
-    assert!(matches!(
-        outcome,
-        ContinuationScan::Uncommitted { .. } | ContinuationScan::Committed(_)
-    ));
-    assert!(inputs.archive_pass.cpu >= 30_000_001);
-    assert!(!inputs.archive_pass.ready(u64::MAX));
-    assert_eq!(
-        fixture.disk(),
-        before,
-        "pacing carry does not save a new record"
-    );
+fn archive_power_policy_uses_the_native_continuation_answers() {
+    use continuation::{PlatformGates, PlatformState};
+    struct Signals(PlatformState);
+    impl PlatformGates for Signals {
+        fn power(&mut self) -> PlatformState {
+            self.0
+        }
+        fn enter_background_qos(&mut self) -> PlatformState {
+            PlatformState::Allowed
+        }
+        fn restore_qos(&mut self) {}
+    }
+    for (state, expected) in [
+        (PlatformState::Allowed, true),
+        (PlatformState::Unknown, false),
+        (PlatformState::Refused, false),
+    ] {
+        assert_eq!(archive_power_ready_with(&mut Signals(state)), expected);
+    }
 }

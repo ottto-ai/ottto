@@ -6410,7 +6410,8 @@ fn continuation_finish_inputs<'a>(
 {
     move |ticket| {
         let evidence = scan.take_continuation_evidence()?;
-        let mut inputs = take_continuation_inputs(preparation, index, codex_preludes, codex_versions);
+        let mut inputs =
+            take_continuation_inputs(preparation, index, codex_preludes, codex_versions);
         inputs.evidence = Some(evidence);
         let refusal = remaining.map_or("no_remaining", |_| "over_bound");
         let ticket = remaining.and_then(|limit| ticket.with_inputs(inputs, limit));
@@ -24325,13 +24326,16 @@ fn archive_residue_receipt_discloses_terminal_loss_without_retryable_error() {
     }
 }
 
-/// Temporary fail-closed adapter: unknown power does not authorize archive work.
+/// Use the same native power policy as continuation pages; unknown denies work.
 pub(crate) fn archive_power_ready() -> bool {
-    use continuation::{NoPlatformSignals, PlatformGates, PlatformState};
-    NoPlatformSignals.power() == PlatformState::Allowed
+    archive_power_ready_with(&mut continuation::MacPlatformSignals::default())
 }
 
 /// Share continuation's work threshold with archive admission.
 pub(crate) fn archive_work_ready(micros: u64) -> bool {
     std::time::Duration::from_micros(micros) <= continuation::CONTENTION_WORK
+}
+
+fn archive_power_ready_with(signals: &mut impl continuation::PlatformGates) -> bool {
+    signals.power() == continuation::PlatformState::Allowed
 }

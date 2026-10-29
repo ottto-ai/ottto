@@ -1586,7 +1586,14 @@ pub(in crate::snapshots) mod tests {
                     Scope("archive-test".into()),
                 );
             }
-            scan.index.archive_pass.power = true; // synthetic pacing permission
+            // Deterministic A1 permission; corrections need the explicit A3
+            // permission fixture, independently of the host's actual power.
+            scan.index.archive_pass.power = !scan
+                .index
+                .files
+                .get(&local_index_key(&f.0))
+                .and_then(|e| e.archive.as_ref())
+                .is_some_and(|a| a.user_change && a.matches(&File::open(&f.0).unwrap()));
             scan.identified_candidates = VecDeque::from([f.candidate()]);
             scan.census
                 .observed_index_keys

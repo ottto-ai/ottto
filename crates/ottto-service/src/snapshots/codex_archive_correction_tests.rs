@@ -30,6 +30,7 @@ fn user_context(label: &str) -> String {
     )
 }
 fn synthetic_permission(scan: &mut OwnedSourceScan) {
+    scan.index.archive_pass.power = true;
     let mut inventory = codex_file_join::HeaderInventory::new(&[], &BTreeSet::new(), None);
     inventory.archive_work.allowed = true; // synthetic AC + utility QoS, never production activation
     scan.codex_join_inventory = Some(inventory);

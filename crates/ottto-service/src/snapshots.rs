@@ -32936,9 +32936,9 @@ impl OwnedSourceScan {
                 .get(&local_index_key(&candidate.path))
                 .and_then(|e| e.archive.as_ref())
                 .is_some_and(|a| a.user_change && a.matches(&opened_file))
-                && !codex_join_inventory.as_ref().is_some_and(|i| {
-                    i.archive_work.allowed && i.archive_work.cpu_micros < 30_000_000
-                })
+                && !index.archive_pass.ready(
+                    codex_page.singleton_remaining(sampled_scan::codex_cursor::Limits::current()),
+                )
             {
                 let archive = index
                     .files
