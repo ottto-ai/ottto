@@ -236,17 +236,20 @@ inventory. Unpaired metadata refuses the root; paired metadata remains readable
 while affected maps block export and publication. Fixtures cover descriptor loss
 for each of the three maps and the rejected unshipped draft shape.
 
-`ReadStats` exposes `index_shard_unavailable{map,cause}` and
-`scanindex_orphan_init_discarded` for the existing diagnostic registry. These are
-fixed map/cause axes, never keys or digests. Shared integration must drain these
-counts and carry Unknown state through semantic readers and Clone/subsets;
-these component PRs do not claim activated production diagnostic wiring.
+`ReadStats` exposes `index_shard_unavailable{map,cause}`,
+`scanindex_orphan_init_discarded` and `root_missing_reserved_only` on the existing
+storage diagnostics envelope. These are fixed map/cause axes or scalar counts,
+never keys, paths or digests. Integration drains counts on successful and failed
+loads/publications and carries Unknown through semantic readers and Clone/subsets.
+The reserved-root refusal adds one inline u64 to transient store read statistics
+and one process-wide AtomicU64; it adds no retained ScanIndex or entry fields.
 
 A new private `<index>.storage-prior` marker (`scan_index_prior_root_v1` plus
 newline, 0600) retains negative evidence after root recognition or successful publication. It grants
 no acceptance/acquisition/receipt authority. Missing root plus marker, legacy or
-quarantine sibling stays fail-closed. No-root recovery makes two directory walks:
-validate all owned names/binding/digests before unlinking owned fresh-init debris.
+quarantine sibling stays fail-closed. No-root recovery first checks payload names
+for reserved repair evidence, then validates all owned names/binding/digests
+before unlinking owned fresh-init debris.
 No transcripts or durable-tail files are traversed or removed.
 
 The byte fixture runs the SAME real legacy ScanIndex serializer before and after
@@ -415,10 +418,14 @@ The reader reserves N+1 repair filenames (class L, E7 design) inside the payload
 `.shards` directory: exactly `prior-root-[0-9]{20}-[0-9a-f]{64}.json` and
 `verified-complete.json`. Two prior-root records are tolerated during a crash
 window. These names are opaque: N never opens or validates their contents as
-objects, writes them, or removes them during fresh-init recovery. A directory
-containing only these names does not block the first legacy save and does not
-count as discarded orphan state. A missing previously published root still
-refuses under the existing prior-state guard; these records grant no authority.
+objects, writes them, or removes them during recovery. With a valid current
+root they do not change loading. With a missing root, ANY reserved repair file
+keeps the `scan_index_root_missing_with_shards` refusal, before orphan cleanup,
+empty initialization or publication. This counts `root_missing_reserved_only`
+on the storage diagnostics line, including mixed orphan/control directories.
+Absent prior-state markers cannot prove first installation; opaque controls
+are evidence of possible history, never authority for a fresh index. With no
+store at all, true first installation still initializes normally.
 Malformed lookalikes remain unrecognized and refuse fresh-init recovery.
 
 The writer's current-root GC also leaves these names untouched. It does not pin

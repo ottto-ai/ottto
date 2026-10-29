@@ -177,14 +177,14 @@ fn integrated_each_map_and_cause_retains_custody_without_release_retirement_fenc
             assert_eq!(
                 stats
                     .iter()
-                    .flat_map(|(_, counts)| counts.iter().flatten())
+                    .flat_map(|(_, counts, _)| counts.iter().flatten())
                     .sum::<u64>(),
                 1
             );
             assert_eq!(
                 stats
                     .iter()
-                    .map(|(_, c)| c[map][cause as usize])
+                    .map(|(_, c, _)| c[map][cause as usize])
                     .sum::<u64>(),
                 1
             );
@@ -291,7 +291,7 @@ fn integrated_fresh_init_orphans_are_discarded_and_failure_observations_are_drai
     assert!(loaded.persistence_available());
     assert!(!fixture.shards.exists());
     let observations = crate::local_resource_diagnostics::take_scan_index_storage_observations();
-    assert_eq!(observations.iter().map(|(n, _)| n).sum::<u64>(), 1);
+    assert_eq!(observations.iter().map(|(n, _, _)| n).sum::<u64>(), 1);
     let fixture = Fixture::new();
     fs::remove_file(fixture.shards.join(format!(
         "metadata-{}.json",
@@ -748,4 +748,69 @@ fn integrated_each_damaged_map_holds_then_restores_equal_money_without_transcrip
         );
         assert_eq!(restored.generation, healthy.generation);
     }
+}
+
+#[test]
+fn integrated_missing_root_reserved_only_stalls_before_default_save_or_transcript_read() {
+    let fixture = Fixture::new();
+    fs::remove_file(&fixture.root).unwrap();
+    fs::remove_dir_all(&fixture.shards).unwrap();
+    fs::create_dir(&fixture.shards).unwrap();
+    fs::set_permissions(&fixture.shards, fs::Permissions::from_mode(0o700)).unwrap();
+    let files = [
+        fixture
+            .shards
+            .join(format!("prior-root-{:020}-{}.json", 5, "a".repeat(64))),
+        fixture.shards.join("verified-complete.json"),
+    ];
+    for path in &files {
+        fs::write(path, b"opaque future control").unwrap();
+    }
+    crate::local_resource_diagnostics::take_scan_index_storage_observations();
+    let (result, reads) = terminal_contract_retry::source_acquisitions(|| {
+        with_transcript_io_denied(|| {
+            ScanIndex::load_for_snapshot_source_with_origin(
+                &fixture.root,
+                SnapshotSource::ClaudeCode,
+                &fixture.scratch,
+            )
+        })
+    });
+    assert!(reads.is_empty());
+    let error = result.expect_err("missing root must refuse before default index");
+    assert!(format!("{error:#}").contains("scan_index_root_missing_with_shards"));
+    assert!(!fixture.root.exists(), "no fresh save");
+    assert_eq!(fs::read_dir(&fixture.shards).unwrap().count(), 2);
+    for path in files {
+        assert_eq!(fs::read(path).unwrap(), b"opaque future control");
+    }
+    let observations = crate::local_resource_diagnostics::take_scan_index_storage_observations();
+    assert_eq!(observations.iter().map(|(_, _, n)| n).sum::<u64>(), 1);
+    assert_eq!(observations.iter().map(|(n, _, _)| n).sum::<u64>(), 0);
+}
+
+#[test]
+fn integrated_no_store_true_first_install_still_initializes_without_transcript_reads() {
+    let fixture = Fixture::new();
+    fs::remove_file(&fixture.root).unwrap();
+    fs::remove_dir_all(&fixture.shards).unwrap();
+    crate::local_resource_diagnostics::take_scan_index_storage_observations();
+    let ((), reads) = terminal_contract_retry::source_acquisitions(|| {
+        with_transcript_io_denied(|| {
+            let (mut index, origin) = ScanIndex::load_for_snapshot_source_with_origin(
+                &fixture.root,
+                SnapshotSource::ClaudeCode,
+                &fixture.scratch,
+            )
+            .unwrap();
+            assert!(matches!(origin, ScanIndexLoadOrigin::Missing));
+            assert_eq!(index.generation, 0);
+            assert!(index.files.is_empty());
+            index.save(&fixture.root).unwrap();
+            assert!(fixture.root.exists());
+        })
+    });
+    assert!(reads.is_empty());
+    let observations = crate::local_resource_diagnostics::take_scan_index_storage_observations();
+    assert_eq!(observations.iter().map(|(_, _, n)| n).sum::<u64>(), 0);
 }

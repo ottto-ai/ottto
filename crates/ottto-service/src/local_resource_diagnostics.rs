@@ -2526,11 +2526,17 @@ mod continuation_tests {
 }
 
 /// Fixed low-cardinality storage observations on the existing #799 envelope.
-pub(crate) fn scan_index_storage(source: &'static str, orphans: u64, unavailable: [[u64; 6]; 3]) {
+pub(crate) fn scan_index_storage(
+    source: &'static str,
+    orphans: u64,
+    reserved: u64,
+    unavailable: [[u64; 6]; 3],
+) {
     #[cfg(test)]
-    SCAN_INDEX_STORAGE_OBSERVATIONS.with(|v| v.borrow_mut().push((orphans, unavailable)));
+    SCAN_INDEX_STORAGE_OBSERVATIONS.with(|v| v.borrow_mut().push((orphans, unavailable, reserved)));
 
     static TOTAL_ORPHANS: AtomicU64 = AtomicU64::new(0);
+    static ROOT_MISSING_RESERVED_ONLY: AtomicU64 = AtomicU64::new(0);
     static UNAVAILABLE: [[AtomicU64; 6]; 3] = [const { [const { AtomicU64::new(0) }; 6] }; 3];
     let add = |counter: &AtomicU64, n: u64| {
         counter
@@ -2538,6 +2544,14 @@ pub(crate) fn scan_index_storage(source: &'static str, orphans: u64, unavailable
             .unwrap_or_else(|v| v)
             .saturating_add(n)
     };
+    let reserved_total = add(&ROOT_MISSING_RESERVED_ONLY, reserved);
+    if reserved != 0 {
+        traversal_point(
+            "scan_index_storage",
+            source,
+            &BTreeMap::from([("root_missing_reserved_only", reserved_total)]),
+        );
+    }
     let total = add(&TOTAL_ORPHANS, orphans);
     for (map, counts) in unavailable.into_iter().enumerate() {
         for (cause, n) in counts.into_iter().enumerate() {
@@ -2570,7 +2584,7 @@ pub(crate) fn take_scan_index_storage_observations() -> Vec<StorageReadObservati
 }
 
 #[cfg(test)]
-type StorageReadObservation = (u64, [[u64; 6]; 3]);
+type StorageReadObservation = (u64, [[u64; 6]; 3], u64);
 
 /// One content-free alarm on entry to a shard-unavailable source episode.
 pub(crate) fn scan_index_shard_alarm(source: &'static str, unavailable: usize, transitions: u64) {

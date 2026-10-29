@@ -106,7 +106,7 @@ pub(super) fn read_scan_index_representation(
         }
     }
     if semantic_stats.iter().flatten().any(|n| *n != 0) {
-        crate::local_resource_diagnostics::scan_index_storage(source, 0, semantic_stats);
+        crate::local_resource_diagnostics::scan_index_storage(source, 0, 0, semantic_stats);
     }
     if !index.persistence_available() {
         root = root.unavailable();
@@ -133,6 +133,7 @@ fn drain_stats(store: &scan_index_persistence::LockedStore, source: &'static str
     crate::local_resource_diagnostics::scan_index_storage(
         source,
         stats.scanindex_orphan_init_discarded,
+        stats.root_missing_reserved_only,
         stats.index_shard_unavailable,
     );
 }

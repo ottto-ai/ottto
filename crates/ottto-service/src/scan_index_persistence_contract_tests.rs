@@ -427,34 +427,67 @@ fn reader_future_repair_files_leave_complete_and_each_unknown_map_unchanged() {
 }
 
 #[test]
-fn reader_fresh_orphan_cleanup_keeps_repair_files_and_allows_legacy_first_save() {
+fn reader_missing_root_with_any_reserved_control_stalls_without_cleanup() {
+    for only_controls in [false, true] {
+        for keep in [0, 1, 2] {
+            let s = Scratch::new();
+            let logical = s.install();
+            fs::remove_file(s.root()).unwrap();
+            if only_controls {
+                fs::remove_dir_all(s.0.join("scan-index.json.shards")).unwrap();
+                fs::create_dir(s.0.join("scan-index.json.shards")).unwrap();
+                fs::set_permissions(
+                    s.0.join("scan-index.json.shards"),
+                    fs::Permissions::from_mode(0o700),
+                )
+                .unwrap();
+            }
+            let mut files = future_repair_files(&s);
+            // One prior root, the fixed marker alone, or all controls suffice.
+            if keep < 2 {
+                let retained = if keep == 0 { 0 } else { 2 };
+                for (i, (path, _)) in files.iter().enumerate() {
+                    if i != retained {
+                        fs::remove_file(path).unwrap();
+                    }
+                }
+                files = vec![files.remove(retained)];
+            }
+            let dir = s.0.join("scan-index.json.shards");
+            let before = fs::read_dir(&dir).unwrap().count();
+            let store = s.store(&logical);
+            let error = store
+                .open()
+                .err()
+                .expect("history must never become Missing");
+            assert!(format!("{error:#}").contains("scan_index_root_missing_with_shards"));
+            let stats = store.take_read_stats();
+            assert_eq!(stats.root_missing_reserved_only, 1);
+            assert_eq!(stats.scanindex_orphan_init_discarded, 0);
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), before);
+            assert!(!s.root().exists());
+            assert_repair_files_kept(&files);
+        }
+    }
+}
+
+#[test]
+fn reader_no_store_allows_true_first_install_and_legacy_first_save() {
     let s = Scratch::new();
-    let mut logical = s.install();
-    fs::remove_file(s.root()).unwrap(); // no root has ever been observed
-    let files = future_repair_files(&s);
+    let mut logical = Scratch::fixture()["logical"].clone();
     let store = s.store(&logical);
     let Opened::Missing(root) = store.open().unwrap() else {
-        panic!("fresh init");
+        panic!("true first install");
     };
-    assert_eq!(store.take_read_stats().scanindex_orphan_init_discarded, 1);
-    assert_repair_files_kept(&files);
-    assert_eq!(
-        fs::read_dir(s.0.join("scan-index.json.shards"))
-            .unwrap()
-            .count(),
-        3
-    );
-    assert!(matches!(store.open().unwrap(), Opened::Missing(_)));
-    assert_eq!(store.take_read_stats().scanindex_orphan_init_discarded, 0);
+    assert_eq!(store.take_read_stats().root_missing_reserved_only, 0);
     logical["generation"] = serde_json::json!(1);
-    let published = store
+    assert!(store
         .write_legacy(&root, 1, |out| {
             serde_json::to_writer(out, &logical)?;
             Ok(())
         })
-        .unwrap();
-    assert!(published.is_legacy());
-    assert_repair_files_kept(&files);
+        .unwrap()
+        .is_legacy());
 }
 
 #[test]
@@ -467,7 +500,6 @@ fn reader_malformed_repair_lookalikes_still_refuse_fresh_init_without_cleanup() 
         let s = Scratch::new();
         let logical = s.install();
         fs::remove_file(s.root()).unwrap();
-        let files = future_repair_files(&s);
         let dir = s.0.join("scan-index.json.shards");
         let bad = dir.join(name);
         fs::write(&bad, b"unknown").unwrap();
@@ -480,7 +512,6 @@ fn reader_malformed_repair_lookalikes_still_refuse_fresh_init_without_cleanup() 
         };
         assert!(format!("{error:#}").contains("scan_index_orphan_unknown"));
         assert_eq!(fs::read_dir(&dir).unwrap().count(), before);
-        assert_repair_files_kept(&files);
     }
 }
 
@@ -496,30 +527,27 @@ fn reader_reserved_repair_files_do_not_waive_a_missing_previously_seen_root() {
         Err(e) => e,
         Ok(_) => panic!("prior state reset"),
     };
-    assert!(format!("{error:#}").contains("scan_index_prior_state_requires_repair"));
+    assert!(format!("{error:#}").contains("scan_index_root_missing_with_shards"));
     assert_repair_files_kept(&files);
 }
 
 #[test]
-fn reader_reserved_directory_cas_refuses_intervening_nonrepair_state() {
+fn reader_reserved_directory_cas_refuses_intervening_repair_state() {
     let s = Scratch::new();
-    let logical = s.install();
-    fs::remove_file(s.root()).unwrap();
-    let files = future_repair_files(&s);
+    let logical = Scratch::fixture()["logical"].clone();
     let store = s.store(&logical);
     let Opened::Missing(root) = store.open().unwrap() else {
         panic!("fresh init");
     };
-    let pending =
-        s.0.join("scan-index.json.shards")
-            .join(format!(".tmp-{}", "0".repeat(32)));
-    fs::write(&pending, b"intervening state").unwrap();
-    fs::set_permissions(&pending, fs::Permissions::from_mode(0o600)).unwrap();
+    let dir = s.0.join("scan-index.json.shards");
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let files = future_repair_files(&s);
     let error = store
         .write_legacy(&root, 1, |_| panic!("CAS must refuse before encoding"))
         .unwrap_err();
     assert!(format!("{error:#}").contains("scan_index_root_missing_with_shards"));
+    assert_eq!(store.take_read_stats().root_missing_reserved_only, 1);
     assert!(!s.root().exists());
-    assert_eq!(fs::read(pending).unwrap(), b"intervening state");
     assert_repair_files_kept(&files);
 }
