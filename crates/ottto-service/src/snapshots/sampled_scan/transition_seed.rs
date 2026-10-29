@@ -520,6 +520,20 @@ fn pinned_v1_accepts_negative_and_higher_ranked_self_type_headers() {
 }
 
 #[test]
+fn pinned_v1_refuses_projected_self_type_and_body_drift() {
+    // E1's concrete projection must select Durable independently of the
+    // unrelated Select impl; changing put must change this unit's digest.
+    assert_added_source_and_body_refused(&format!(
+        "use crate::durable_tail_codec::{{Corrupt, Dec, Durable, Enc, Refuse, Shape}};\nstruct Added; struct Carrier;\ntrait Select {{ type Output; }}\nimpl Select for Carrier {{ type Output = Added; }}\nimpl Durable for <Carrier as Select>::Output {{ {ADDED_DURABLE_METHODS} }}"
+    ));
+}
+
+#[test]
+fn pinned_v1_refuses_where_clause_hrtb_impl_and_body_drift() {
+    assert_added_impl_and_body_refused("impl<F> Durable for Wrap<F> where F: for<'a> Fn(&'a u8)");
+}
+
+#[test]
 fn pinned_v1_refuses_impl_with_opaque_header_tokens() {
     // Each form must independently select the impl and its changed put body;
     // a second serializer must not mask an omitted impl.
@@ -565,6 +579,11 @@ fn pinned_v1_unparseable_headers_fail_loudly() {
             "unsupported item header",
         ),
         ("impl Durable for Added;", "unsupported impl header"),
+        ("impl for<'a> Added {}", "ambiguous trait/self type"),
+        (
+            "impl Durable for for<Carrier as Select>::Output {}",
+            "unclassifiable higher-ranked binder",
+        ),
         (
             "impl Durable::<>: for Added {}",
             "unclassifiable trait TypePath",

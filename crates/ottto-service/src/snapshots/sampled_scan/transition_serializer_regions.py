@@ -12,6 +12,11 @@ Implemented TypePaths retain their segment names across optional ::<...>,
 qualified prefixes and negative-impl markers. Raw identifiers remain distinct
 from keywords; identifier comparisons normalize their r# prefix. Inherent dyn
 impls are not trait impls; unsafe/lifetime headers follow the same classifier.
+The first top-level for must follow a classifiable trait path, even when its
+self type starts with <T as Trait>::Output. Only subsequent for<lifetimes>
+tokens in the self type are binders. Where-clause/generic-bound binders are
+outside separator discovery; unsupported binder headers raise, never become
+inherent impls merely because their for tokens were discarded.
 Attributes belong before impl (or inside generic parameters), not between impl
 and its trait. Literal impls inside macro_rules! bodies are visible, but expansion
 through a metavariable trait name or token construction is not Rust resolution:
@@ -170,6 +175,17 @@ def type_path_name(t, ends, start, end):
     raise ValueError("unsupported impl header: missing trait path segment")
 
 
+def lifetime_binder(t, ends, start, limit):
+    """Recognize only lifetime parameters/bounds in a self-type for<...>."""
+    if t[start + 1:start + 2] != ["<"]:
+        return False
+    end = angle_end(t, ends, start + 1, limit)
+    lifetime = r"'[A-Za-z_][A-Za-z_0-9]*"
+    parameter = lifetime + r"(?::" + lifetime + r"(?:\+" + lifetime + r")*\+?)?"
+    return re.fullmatch(parameter + r"(?:," + parameter + r")*,?",
+                        "".join(t[start + 2:end - 1])) is not None
+
+
 def body_start(t, ends, start, field=False):
     """Find an item body after all generic/where-clause bounds, or fail closed.
 
@@ -227,16 +243,22 @@ def impl_header(t, ends, start):
         at = ends.get(at, at + 1)
     if not top or any(part in ("=", ";", "#") for part, _ in top):
         raise ValueError("unsupported impl header: cannot classify implementation")
-    # `for<'a> fn(...)` is a higher-ranked self type, not TraitImpl's separator.
-    fors = [n for n, (part, at) in enumerate(top)
-            if part == "for" and t[at + 1:at + 2] != ["<"]]
-    if len(fors) > 1 or (fors and (not fors[0] or fors[0] == len(top) - 1)):
-        raise ValueError("unsupported impl header: ambiguous trait/self type")
+    # Separator POSITION comes first: `Trait for <T as Select>::Output` is a
+    # trait impl, regardless of the token following its first top-level `for`.
+    # Never discard all `for <` candidates and fall through as inherent.
+    fors = [n for n, (part, _) in enumerate(top) if part == "for"]
     if not fors:
         return body, set()
+    if not fors[0] or fors[0] == len(top) - 1:
+        raise ValueError("unsupported impl header: ambiguous trait/self type")
     if t[first] == "!":
         first += 1
-    return body, {type_path_name(t, ends, first, top[fors[0]][1])}
+    trait = type_path_name(t, ends, first, top[fors[0]][1])
+    # A later `for<'a> fn(...)` is in self-type position, not another separator.
+    # Qualified projections/type parameters are not lifetime-only binders.
+    if any(not lifetime_binder(t, ends, top[n][1], body) for n in fors[1:]):
+        raise ValueError("unsupported impl header: unclassifiable higher-ranked binder")
+    return body, {trait}
 
 
 def definitions(t, ends):
