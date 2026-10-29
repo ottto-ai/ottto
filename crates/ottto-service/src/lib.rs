@@ -8,6 +8,7 @@ mod app_bundle_version;
 pub mod backfill;
 pub mod canonical_json;
 pub mod claude_browser_auth;
+mod claude_desktop;
 pub mod claude_local_otel;
 pub(crate) mod claude_refresher;
 mod claude_session_registrations;
@@ -256,6 +257,7 @@ pub struct LocalDaemon {
     codex_preludes: Arc<codex_prelude_footprint::CodexPreludeFeed>,
     codex_versions: Arc<snapshots::codex_version::CodexVersionFeed>,
     native_comparison: Arc<snapshots::claude_native_comparison::lifecycle::Lifecycle>,
+    relay_mismatch: Arc<otlp_relay::RelayMismatchDebounce>,
     inner: Arc<Mutex<DaemonState>>,
     control_token: ControlToken,
 }
@@ -479,6 +481,7 @@ impl LocalDaemon {
             native_comparison: Arc::new(
                 snapshots::claude_native_comparison::lifecycle::Lifecycle::default(),
             ),
+            relay_mismatch: Arc::default(),
             inner: Arc::new(Mutex::new(DaemonState {
                 machine,
                 relay: RelayState {
@@ -634,9 +637,21 @@ impl LocalDaemon {
     }
 
     fn status_for_authorized_client(&self) -> Result<DaemonStatus, LocalApiError> {
+        // Response-only finding: never alter saved relay/account state or
+        // perform settings I/O while holding the daemon state lock.
+        let relay = self.state()?.relay.clone();
+        let observed = otlp_relay::approved_endpoint_mismatch(&relay);
         let mut status = {
             let state = self.state()?;
-            status_from_state(&state)
+            // Keep it only for the relay this status reports. It enters the one
+            // canonical projection, so a set or cleared blocker gets the same
+            // revision and an upload can never clear with a lower one.
+            // A relay error or a relay change between the locks also ends the
+            // streak, so a recovered listener starts a fresh one.
+            let finding = self.relay_mismatch.observe(
+                observed.filter(|_| state.relay == relay && state.relay.last_error.is_none()),
+            );
+            status_from_state_with_relay_finding(&state, finding)
         };
         if snapshots::claude_native_comparison::enabled() {
             status.native_comparison = Some(self.native_comparison.status());
@@ -1978,7 +1993,10 @@ impl LocalDaemon {
                 #[cfg(unix)]
                 diagnostics_section(
                     "claude_local_evidence",
-                    claude_local_otel::support_health::diagnostics_items(&default_support_dir()),
+                    claude_local_otel::support_health::diagnostics_items(
+                        &default_support_dir(),
+                        &status.relay,
+                    ),
                 ),
             ],
         })
@@ -2163,7 +2181,10 @@ impl Drop for RepairLease {
     }
 }
 
-fn status_from_state(state: &DaemonState) -> DaemonStatus {
+fn status_from_state_with_relay_finding(
+    state: &DaemonState,
+    relay_finding: Option<StableMessage>,
+) -> DaemonStatus {
     let mut status = empty_status(state.machine.clone(), current_rfc3339_timestamp());
     status.account = state.account.clone();
     // Legacy builds could start a second browser claim over a fully bound
@@ -2189,6 +2210,9 @@ fn status_from_state(state: &DaemonState) -> DaemonStatus {
         DaemonRuntimeState::Running
     };
     status.relay = state.relay.clone();
+    if status.relay.last_error.is_none() {
+        status.relay.last_error = relay_finding;
+    }
     status.sources = state.sources.clone();
     for health in &mut status.sources {
         let source = match health.source {
@@ -3045,6 +3069,23 @@ fn local_health_blockers_for_status(
             LocalHealthAuthority::Runtime,
             &observed_at,
             "restart ottto-service (or restore its DNS resolution); usage snapshot sync is stalled while other uploads succeed",
+        ));
+    }
+    // New Claude Code processes export to a port nobody binds: their usage
+    // loses its telemetry login. Pure: reads status()'s response-only finding.
+    if status
+        .relay
+        .last_error
+        .as_ref()
+        .is_some_and(|error| error.code == otlp_relay::RELAY_ENDPOINT_MISMATCH_CODE)
+    {
+        blockers.push(blocker(
+            otlp_relay::RELAY_ENDPOINT_MISMATCH_CODE,
+            LocalHealthSeverity::Warning,
+            "source",
+            LocalHealthAuthority::Runtime,
+            &status.generated_at,
+            "Claude telemetry port mismatch: restart Ottto, or reconnect Claude Code in Ottto and restart Claude Code sessions",
         ));
     }
     if account.state == LocalHealthAccountState::Connected {
