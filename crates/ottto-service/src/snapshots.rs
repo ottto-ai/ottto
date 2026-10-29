@@ -32522,8 +32522,13 @@ impl OwnedSourceScan {
                 // fence reuse; unrelated inventory coverage cannot force a Full
                 // on growth. Coverage/identity/publication gates below remain
                 // unchanged, and Codex still needs its closed-world sidecars.
-                let scoped_claude_metadata =
-                    source == SnapshotSource::ClaudeCode && !sidecar_census_complete;
+                // Partial Desktop coverage permits continuing a known native
+                // session, not admitting a new cold file to sampled acquisition.
+                // Without an index entry or its own held-new certificate, keep
+                // main's unsampled read and copy-refusal exemption.
+                let scoped_claude_metadata = source == SnapshotSource::ClaudeCode
+                    && !sidecar_census_complete
+                    && (index.files.contains_key(&key) || e2_held_new_file);
                 if owning_header_is_current
                     && state_census_complete
                     && (sidecar_census_complete || scoped_claude_metadata)

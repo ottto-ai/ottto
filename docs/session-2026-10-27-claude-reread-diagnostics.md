@@ -93,6 +93,9 @@ never clears source fingerprints, the accepted body ledger or the owner map.
 
 `scoped_acquisition_attempts` counts Claude acquisition attempts whose inventory
 coverage is incomplete but whose per-session reduction dependencies are checked.
+This continuation requires an existing native index entry or that file's own
+held-new certificate. A new cold file under incomplete coverage keeps the
+unsampled native read and its existing copy-refusal exemption.
 Claude captures native reductions before applying Desktop metadata at finish;
 exact file scope, object/prefix samples, audit debt, copy limits and family gates
 still decide reuse. An unrelated inventory restart therefore does not convert a
