@@ -274,6 +274,10 @@ const LIFECYCLE_COUNTERS: &[(&str, CounterClass)] = &[
     ("insert_poisoned_lock", CounterClass::NonLayoutFailure),
     // transcript_cache.rs::admit_at_rank: capacity victim action; not refusal.
     ("insert_entries_evicted", CounterClass::Observation),
+    // snapshots/sampled_jsonl.rs insertion: Claude/Codex victims of a Pi
+    // insertion, a subset of insert_entries_evicted.
+    ("cache_evicted_by_pi_claude_code", CounterClass::Observation),
+    ("cache_evicted_by_pi_codex", CounterClass::Observation),
     // transcript_cache.rs::evict_until: cursor reservation victim action.
     (
         "cursor_reservation_entries_evicted",
@@ -323,6 +327,21 @@ const LIFECYCLE_COUNTERS: &[(&str, CounterClass)] = &[
     // snapshots/sampled_jsonl.rs::retain_reduction/retain_after_release:
     // retention_bound failed; qualified only with real unsupported layout flag.
     ("retention_bound_refused", CounterClass::LayoutWitness),
+    // snapshots/sampled_jsonl.rs::record_retention_bound_refusal: Pi count and
+    // byte annotations, always beside retention_bound_refused; never a layout
+    // witness on their own.
+    ("retention_bound_refused_pi", CounterClass::Observation),
+    (
+        "retention_bound_refused_pi_bytes",
+        CounterClass::Observation,
+    ),
+    (
+        "retention_bound_refused_pi_bytes_unavailable",
+        CounterClass::Observation,
+    ),
+    // snapshots.rs native acquisition: transitional Pi Full on change without
+    // a RAM record (no durable Pi yet); a counted read, not a failure.
+    ("pi", CounterClass::Observation),
     // snapshots/sampled_jsonl.rs::retain_reduction/retain_after_release: no plan.
     ("retention_no_plan", CounterClass::NonLayoutFailure),
     // snapshots/sampled_jsonl.rs::retain_reduction/retain_after_release:
