@@ -63,9 +63,10 @@ pub(crate) fn durable_sidecar_held_roots(
         .iter()
         .filter_map(|item| {
             let root = crate::snapshots::claude_request_money::request_owned_family_root(item)?;
-            if healthy.contains(root)
-                || !crate::snapshots::durable_sidecar_has_accepted_body(index, root)
-            {
+            // A cohort refusal can leave strict reads healthy while the
+            // finalizer still discloses an incomplete candidate body.
+            let complete = healthy.contains(root) && item.telemetry_owned_complete == Some(true);
+            if complete || !crate::snapshots::durable_sidecar_has_accepted_body(index, root) {
                 None
             } else {
                 Some(root.to_owned())

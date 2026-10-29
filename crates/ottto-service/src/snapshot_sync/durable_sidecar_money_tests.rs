@@ -48,6 +48,9 @@ impl Slots {
     }
 }
 fn sidecar_path(corpus: &Corpus, trace: bool) -> PathBuf {
+    sidecar_path_for(corpus, trace, ROOT)
+}
+fn sidecar_path_for(corpus: &Corpus, trace: bool, session: &str) -> PathBuf {
     corpus
         .support
         .join("local-otel")
@@ -56,7 +59,7 @@ fn sidecar_path(corpus: &Corpus, trace: bool) -> PathBuf {
         } else {
             "claude-code-effort"
         })
-        .join(format!("{:x}.jsonl", Sha256::digest(ROOT.as_bytes())))
+        .join(format!("{:x}.jsonl", Sha256::digest(session.as_bytes())))
 }
 fn finish_route(page: &mut Page, mode: Mode) -> (RouteResult, LocalHoldSettlement) {
     // Classification consumes held items. Carry its actual result through
@@ -358,5 +361,90 @@ fn durable_sidecar_money_quiet_restart_shared_oracle() {
         // None honestly discloses guard accounting absent from the oracle API.
         quiet.io.cheap_checks = None;
         money_oracle::assert_quiet_restart_zero_bytes(&quiet);
+    });
+}
+
+#[test]
+fn durable_sidecar_money_cohort_refusal_cannot_downgrade_healthy_strict_root() {
+    with_e2(|| {
+        const BROKEN: &str = "0338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+        let mut c = Corpus::new("sidecar-money-cohort-floor");
+        let native = c.root(ROOT, &line(ROOT, "r1", AT, 10));
+        c.evidence(&[api("r1", 10, 100)], &[]);
+        let mut slots = Slots::new(&c);
+        let (mut reader, (page, mut prior, prior_holds)) =
+            with_durable_sidecar_reader(slots.reader(&c), || {
+                render(&c, ScanIndex::default(), Mode::Ram)
+            });
+        assert_reported(&prior, 1);
+        prior.accepted.insert(
+            ROOT.into(),
+            Accepted {
+                body: prior.snapshots[ROOT].clone(),
+                witness: snapshot_upload_body_witness(&page.scan.snapshots[0]),
+            },
+        );
+        let mut progress = e2_progress();
+        let accepted = settle_route(&c, &ScanIndex::default(), page, &mut progress, prior_holds);
+        let before = stored_bodies(&accepted);
+        assert_eq!(before.len(), 1);
+        slots.save(&mut reader);
+        append(&native, &line(ROOT, "r2", "2026-08-02T07:01:00Z", 20));
+        c.root(BROKEN, &line(BROKEN, "broken", AT, 1));
+        c.evidence_for(BROKEN, &[], &[]);
+        let broken_api = sidecar_path_for(&c, false, BROKEN);
+        std::fs::remove_file(&broken_api).unwrap();
+        std::fs::create_dir(&broken_api).unwrap();
+        let expected = cold(&c);
+        reader.begin_pass();
+        let (mut reader, (page, mut held, holds)) = with_durable_sidecar_reader(reader, || {
+            // Prove the mixed premise through the real public loaders: the
+            // permissive cohort fails, but this accepted root's strict API
+            // report is independently healthy. Neither grants body acceptance.
+            assert!(crate::claude_local_otel::ClaudeApiEvidenceRead::load(
+                &c.support,
+                [BROKEN.to_owned(), ROOT.to_owned()]
+            )
+            .is_err());
+            let mut strict = crate::claude_local_otel::ClaudeApiEvidenceRead::load(
+                &c.support,
+                [ROOT.to_owned()],
+            )
+            .unwrap();
+            assert!(strict
+                .take_strict_report(&c.support, ROOT)
+                .health
+                .is_complete());
+            render(&c, accepted.clone(), Mode::Ram)
+        });
+        assert!(
+            !held.snapshots.contains_key(ROOT),
+            "accepted complete body must hold despite healthy strict rows"
+        );
+        assert!(holds.held_entity_count > 0);
+        assert!(!holds.held_fingerprints.is_empty());
+        let held_index = settle_route(&c, &accepted, page, &mut progress, holds);
+        let after = stored_bodies(&held_index);
+        for (key, tuple) in &before {
+            assert_eq!(
+                after.get(key),
+                Some(tuple),
+                "accepted ROOT body/witness survives mixed-cohort refusal"
+            );
+        }
+        held.accepted = prior.accepted.clone();
+        money_oracle::assert_held(ROOT, &prior, &held, &expected);
+        std::fs::remove_dir(&broken_api).unwrap();
+        c.evidence_for(BROKEN, &[api_for(BROKEN, "broken", 1, 10)], &[]);
+        append(
+            &sidecar_path(&c, false),
+            &(serde_json::to_string(&api("r2", 20, 200)).unwrap() + "\n"),
+        );
+        let expected = cold(&c);
+        reader.begin_pass();
+        let (_, (_, recovered, _)) =
+            with_durable_sidecar_reader(reader, || render(&c, held_index, Mode::Ram));
+        money_oracle::assert_equivalent(&expected, &recovered);
+        assert_reported(&recovered, 2);
     });
 }
