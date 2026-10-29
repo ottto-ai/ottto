@@ -1063,8 +1063,9 @@ fn prepare_snapshot_cache_for_upload(
 
 /// Answer each owed head-CAS challenge on the outgoing body of its session,
 /// at most once per quarantine retry window after a refused answer. Only a
-/// body that would otherwise send the stale base carries the answer; the
-/// body itself, its fingerprint and its witness are unchanged.
+/// body that would otherwise send the stale base under the head-CAS contract
+/// carries the answer; the body itself, its fingerprint and its witness are
+/// unchanged.
 fn attach_head_conflict_answers(
     snapshots: &mut [SnapshotItem],
     progress: &SnapshotUploadProgress,
@@ -1073,7 +1074,9 @@ fn attach_head_conflict_answers(
     let mut attached = 0usize;
     for snapshot in snapshots {
         snapshot.cache_conflict_answer = None;
-        if snapshot.cache_base_head_etag.is_none() {
+        // A withheld cache patch keeps its base but sends no CAS contract, so
+        // the request and its ACK validation would not admit a handshake.
+        if snapshot.cache_base_head_etag.is_none() || snapshot.cache_observations.is_none() {
             continue;
         }
         let Some(record) = progress

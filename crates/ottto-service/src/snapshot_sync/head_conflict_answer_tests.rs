@@ -393,6 +393,28 @@ fn healthy_sessions_send_the_unchanged_wire_and_keep_no_challenge() {
     assert_eq!(progress.accepted_cache_heads[&key], "2".repeat(64));
     assert!(progress.head_conflict_challenges.is_empty());
 
+    // A body whose cache patch was withheld sends no CAS contract, so it
+    // keeps today's wire even while a challenge is owed.
+    progress.head_conflict_challenges.insert(
+        key.clone(),
+        HeadConflictChallenge {
+            challenge: challenge(0xc),
+            stale_revision_v2_hash: revision_v2(&item),
+            answer_attempts: 0,
+            last_answer_unix: 0,
+        },
+    );
+    let mut withheld = vec![item.clone()];
+    withheld[0].cache_base_head_etag = Some("2".repeat(64));
+    withheld[0].cache_observations = None;
+    withheld[0].cache_observations_state = None;
+    assert_eq!(
+        attach_head_conflict_answers(&mut withheld, &progress, 1_000),
+        0
+    );
+    assert!(withheld[0].cache_conflict_answer.is_none());
+    progress.head_conflict_challenges.clear();
+
     // A conflict without a challenge or a bound request body records nothing.
     let mut unbound = item.clone();
     unbound.cache_base_head_etag = Some("2".repeat(64));
