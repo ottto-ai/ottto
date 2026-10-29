@@ -1,7 +1,7 @@
 //! Opportunistic, process-local Desktop request activity. No acquisition or
 //! persistence: the existing request fold publishes only validated event clocks.
 use ottto_protocol::{AgentStatusSnapshot, SourceKind};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
@@ -47,9 +47,9 @@ impl RecentActivity {
         health: &AgentStatusSnapshot,
         now: OffsetDateTime,
     ) {
-        // This is the EXISTING config-selected account observation, independent
+        // Each Desktop root has its own config-selected account, independent
         // of CLI login and the Desktop collector's inferred current org.
-        let mut selected = health
+        let accounts: BTreeSet<&str> = health
             .plan_observations
             .iter()
             .filter(|o| {
@@ -57,11 +57,8 @@ impl RecentActivity {
                     && o.evidence_method.as_deref() == Some("claude_desktop_session_bucket")
                     && o.is_current == Some(true)
             })
-            .filter_map(|o| o.account_identifier_hash.as_deref());
-        let first = selected.next();
-        let account = first
-            .filter(|first| selected.all(|other| other == *first))
-            .map(str::to_owned);
+            .filter_map(|o| o.account_identifier_hash.as_deref())
+            .collect();
         for snapshot in snapshots {
             for row in &mut snapshot.plan_observations {
                 // Clear even an old decoded/stored value: only process memory
@@ -70,10 +67,10 @@ impl RecentActivity {
                 if snapshot.source != SourceKind::ClaudeCode {
                     continue;
                 }
-                let Some(account) = account.as_deref() else {
+                let Some(account) = row.account_identifier_hash.as_deref() else {
                     continue;
                 };
-                if row.account_identifier_hash.as_deref() != Some(account) {
+                if !accounts.contains(account) {
                     continue;
                 }
                 let Some(org) = row.organization_identifier_hash.as_deref() else {
@@ -207,6 +204,59 @@ mod tests {
         assert!(snapshots[0].plan_observations[0]
             .desktop_recent_at
             .is_some());
+    }
+
+    #[test]
+    fn desktop_recent_marks_each_selected_desktop_account() {
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let c = "c".repeat(64);
+        let x = "d".repeat(64);
+        let y = "e".repeat(64);
+        let mut activity = RecentActivity::default();
+        for (account, org) in [(&a, &x), (&a, &y), (&b, &x), (&c, &x)] {
+            activity.note(account, org, t(1000), t(1000));
+        }
+        let health = snapshot(vec![
+            row(&a, None, true),
+            row(&b, None, true),
+            row(&a, Some(&x), true), // repeated observation from the same root
+            row(&c, None, false),    // old bucket, not a selected Desktop account
+        ]);
+        let mut snapshots = vec![snapshot(vec![
+            row(&a, Some(&x), false),
+            row(&a, Some(&y), false),
+            row(&b, Some(&x), false),
+            row(&b, Some(&y), false), // no request under this org
+            row(&c, Some(&x), false),
+        ])];
+        activity.overlay(&mut snapshots, &health, t(1000));
+        assert_eq!(
+            snapshots[0]
+                .plan_observations
+                .iter()
+                .map(|r| r.desktop_recent_at.is_some())
+                .collect::<Vec<_>>(),
+            vec![true, true, true, false, false]
+        );
+        assert!(snapshots[0]
+            .clone()
+            .redacted_for_backend()
+            .plan_observations
+            .iter()
+            .all(|r| r.desktop_recent_at.is_none()));
+        snapshots[0].source = SourceKind::Pi;
+        activity.overlay(&mut snapshots, &health, t(1000));
+        assert!(snapshots[0]
+            .plan_observations
+            .iter()
+            .all(|r| r.desktop_recent_at.is_none()));
+        snapshots[0].source = SourceKind::ClaudeCode;
+        activity.overlay(&mut snapshots, &health, t(1901));
+        assert!(snapshots[0]
+            .plan_observations
+            .iter()
+            .all(|r| r.desktop_recent_at.is_none()));
     }
 
     #[test]

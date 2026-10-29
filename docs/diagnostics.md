@@ -639,6 +639,34 @@ directory at most 32 MiB; a day that reaches its bound ends with one
 `log_full` line and the summary marks it. Logging is best effort: it never
 fails a provider call, and a line it cannot write promptly is dropped.
 
+## Claude Relay Endpoint Mismatch
+
+When the relay is connected but approved Claude telemetry settings name a
+different loopback port, `ottto doctor` reports both ports. `ottto status --json`
+and `ottto doctor --json` expose `relay.last_error.code` as
+`claude_relay_endpoint_mismatch`; `relay.state` remains `connected`. The
+`claude_local_evidence` diagnostics section includes the same finding.
+Canonical local health carries it as a `Warning` blocker with the same code
+(owner `source`), so the machine reads `degraded` and the existing machine-health
+upload reports it to Ottto the same day. Its uploaded text carries no ports.
+To avoid flapping on a restart or rebind, the finding and blocker appear only
+once the same mismatch is seen again at least 60 seconds after first sight; the
+first agreeing check clears both. The support diagnostics item is not delayed.
+
+This compares current approved settings with the daemon's listener state; it
+does not probe exporters or prove that a running Claude process reloaded its
+settings. It clears when ports agree or Claude telemetry approval is absent
+or disabled. It does not rewrite settings or change account identity.
+
+After a listener failure, the relay re-reads approved settings on each retry
+and tries an approved candidate port up to three times using its existing
+capped backoff. If all three attempts fail, recovery immediately uses the
+old-port, default-port and per-user fallback order so control, health and all
+OTLP sources can serve again. A busy approved port can then produce the mismatch
+finding above. Without an approved candidate, the fallback chain applies immediately.
+Startup retains its existing behavior of falling back if the approved port is
+busy.
+
 ## Common Diagnostics Flow
 
 ```bash
