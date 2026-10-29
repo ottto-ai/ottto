@@ -437,7 +437,8 @@ fn rotating_admission_starvation_is_per_archive_and_alarm_reports_source_count()
 }
 
 #[test]
-fn discovery_stays_plain_only_before_11b_activation() {
+fn activation_discovers_exact_archive_beside_plain_without_decoding() {
+    let before = super::super::codex_zst_refusal_tests::activity().0;
     let f = correction_archive();
     let plain = f.0.with_extension("");
     fs::write(&plain, synthetic_rollout()).unwrap();
@@ -460,14 +461,15 @@ fn discovery_stays_plain_only_before_11b_activation() {
         .map(|c| &c.path)
         .collect::<BTreeSet<_>>();
     assert!(paths.contains(&plain));
-    assert!(!paths.contains(&f.0));
-    assert!(!scan
+    assert!(paths.contains(&f.0));
+    assert!(scan
         .index
         .traversal
         .as_mut()
         .unwrap()
         .codex_rollout_paths
         .contains(&local_index_key(&f.0)));
+    assert_eq!(super::super::codex_zst_refusal_tests::activity().0, before);
 }
 
 #[test]
