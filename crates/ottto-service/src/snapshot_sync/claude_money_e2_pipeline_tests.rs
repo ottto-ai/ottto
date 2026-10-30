@@ -3904,22 +3904,25 @@ fn org_shares(item: &SnapshotItem) -> BTreeMap<String, u64> {
 fn e2_pipeline_switch_on_invalidates_identity_a_copied_marker_lent() {
     copy_lent_fixture(&[false, true], 6);
 }
-// DIAGNOSTIC (temporary): CI reports failing test names only; these locate
-// the failing stage and mode, then fold back into the single test above.
+// DIAGNOSTIC (temporary): CI reports failing test names only. Stages 1-5
+// and the retained mode pass (run 41133168382); these probes read the #909
+// late phase's values, then fold back into the single test above.
 #[test]
-fn diag_copy_lent_stage1_off_ack() { copy_lent_fixture(&[false, true], 1); }
+fn diag_copy_lent_late_909_body_present() { copy_lent_fixture(&[false], 10); }
 #[test]
-fn diag_copy_lent_stage2_today() { copy_lent_fixture(&[false, true], 2); }
+fn diag_copy_lent_late_909_share_changed_1() { copy_lent_fixture(&[false], 11); }
 #[test]
-fn diag_copy_lent_stage3_first_pass() { copy_lent_fixture(&[false, true], 3); }
+fn diag_copy_lent_late_909_share_changed_0() { copy_lent_fixture(&[false], 12); }
 #[test]
-fn diag_copy_lent_stage4_second_pass() { copy_lent_fixture(&[false, true], 4); }
+fn diag_copy_lent_late_909_share_changed_2() { copy_lent_fixture(&[false], 13); }
 #[test]
-fn diag_copy_lent_stage5_own_early() { copy_lent_fixture(&[false, true], 5); }
+fn diag_copy_lent_late_909_invalidated_null() { copy_lent_fixture(&[false], 14); }
 #[test]
-fn diag_copy_lent_mode_909_only() { copy_lent_fixture(&[false], 6); }
+fn diag_copy_lent_late_909_refusals_1() { copy_lent_fixture(&[false], 15); }
 #[test]
-fn diag_copy_lent_mode_retained_only() { copy_lent_fixture(&[true], 6); }
+fn diag_copy_lent_late_909_refusals_0() { copy_lent_fixture(&[false], 16); }
+#[test]
+fn diag_copy_lent_late_909_refusals_2() { copy_lent_fixture(&[false], 17); }
 fn copy_lent_fixture(modes: &[bool], upto: u8) {
     for &retained in modes {
         with_e2(|| {
@@ -4015,9 +4018,24 @@ fn copy_lent_fixture(modes: &[bool], upto: u8) {
             take_identity_counts();
             page.enrich_with(&c, Some(&mut ledger));
             let counts = serde_json::to_value(take_identity_counts()).unwrap();
-            assert_eq!(counts["identity_cap"]["accepted_share_changed"], json!(1));
-            assert!(counts["identity_cap"]["copy_derived_proof_invalidated"].is_null());
-            assert_eq!(body(&page, COPY).unwrap().request_identity_refusals, u64::from(!retained));
+            let changed = counts["identity_cap"]["accepted_share_changed"].as_u64().unwrap_or(0);
+            let invalidated = counts["identity_cap"]["copy_derived_proof_invalidated"].is_null();
+            let refusals = body(&page, COPY).map(|copy| copy.request_identity_refusals);
+            match upto {
+                10 => assert!(refusals.is_some()),
+                11 => assert_eq!(changed, 1),
+                12 => assert_eq!(changed, 0),
+                13 => assert_eq!(changed, 2),
+                14 => assert!(invalidated),
+                15 => assert_eq!(refusals, Some(1)),
+                16 => assert_eq!(refusals, Some(0)),
+                17 => assert_eq!(refusals, Some(2)),
+                _ => {
+                    assert_eq!(changed, 1);
+                    assert!(invalidated);
+                    assert_eq!(refusals, Some(u64::from(!retained)));
+                }
+            }
         });
     }
 }
