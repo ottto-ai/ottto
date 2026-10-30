@@ -5681,69 +5681,6 @@ fn pi_recordless_restart_and_eviction_full_only_on_change() {
     }
 }
 
-#[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
-fn pi_retention_refusal_is_cache_only_and_counts_bytes() {
-    use crate::local_resource_diagnostics::cache_lifecycle::observe;
-    let source = SnapshotSource::Pi;
-    let fixture = Fixture::new(source);
-    let (mut parser, _, scope) = native_parser(&fixture, source);
-    parser
-        .prepare_acquisition(None, &scope, None, 1_800_000_000)
-        .unwrap();
-    while !parser.step().unwrap() {}
-    for n in 0..8_000 {
-        parser
-            .accumulator
-            .seen_pi_usage_keys
-            .insert(format!("{n:064x}"), PiUsageDedupState::default());
-    }
-    let charge = crate::heap_layout_bound::completed_bound(&parser.accumulator, usize::MAX)
-        .unwrap()
-        + std::mem::size_of::<sampled_jsonl::CachedJsonlReduction>()
-        - std::mem::size_of::<SnapshotAccumulator>();
-    assert!(charge > crate::transcript_cache::ENTRY_BYTES);
-    assert!(parser
-        .retention_bound(crate::transcript_cache::ENTRY_BYTES)
-        .is_none());
-    let (completed, counts) = observe(|| {
-        parser
-            .retain_reduction(
-                &scope,
-                1_800_000_000,
-                sampled_scan::RetainBudget::granted_unclassified(usize::MAX),
-            )
-            .unwrap()
-            .unwrap()
-    });
-    assert!(completed.reduction.is_none());
-    assert_eq!(counts.retention_bound_refused, 1);
-    assert_eq!(counts.retention_bound_refused_pi, 1);
-    assert_eq!(counts.retention_bound_refused_pi_bytes, charge as u64);
-    assert!(sampled_scan::SharedCache::default()
-        .durable_counters(source)
-        .is_none());
-    let control_fixture = Fixture::new(SnapshotSource::ClaudeCode);
-    let (mut control, _, control_scope) =
-        native_parser(&control_fixture, SnapshotSource::ClaudeCode);
-    control
-        .prepare_acquisition(None, &control_scope, None, 1_800_000_000)
-        .unwrap();
-    while !control.step().unwrap() {}
-    let (_, counts) = observe(|| {
-        control
-            .retain_reduction(
-                &control_scope,
-                1_800_000_000,
-                sampled_scan::RetainBudget::granted_unclassified(0),
-            )
-            .unwrap()
-    });
-    assert_eq!(counts.retention_bound_refused, 1);
-    assert_eq!(counts.retention_bound_refused_pi, 0);
-    assert_eq!(counts.retention_bound_refused_pi_bytes, 0);
-}
-
 mod codex_mcp_version_tests;
 
 #[test]

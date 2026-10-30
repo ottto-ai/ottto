@@ -1334,17 +1334,15 @@ This is a staged exception; it does not turn a cache miss into a first-read
 authorization.
 
 The same #799 page line (source `pi`) reports cache-only
-`retention_bound_refused_pi` events and `retention_bound_refused_pi_bytes`:
-the completed reduction's measured allocation charge, summed across refusals.
-`retention_bound_refused_pi_bytes_unavailable` counts refusals whose charge could
-not be measured; zero bytes with that count is unavailable, not a zero-sized
-copy. These counters do not mean a durable write was attempted or refused.
+`retention_bound_refused_pi` events, a subset of `retention_bound_refused`.
+The refusal count reuses the retention decision without another heap walk.
+It does not mean a durable write was attempted or refused.
 `cache_evicted_by_pi_claude_code` and `cache_evicted_by_pi_codex` count respective
 insert-time capacity victims (excludes `Release::CopyAdmission` releases).
 They also appear on the existing
 `process_retained_cache_lifecycle_totals` line (source `unknown`): cumulative,
 saturating process totals since startup, shared across namespaces. They are
-counts and bytes only, with no file names, response ids or content.
+counts only, with no file names, response ids or content.
 
 The tag-1 audit-safe bootstrap core is a hard release pair with the grouped
 custody and stored-representation binding completion. The first part preserves

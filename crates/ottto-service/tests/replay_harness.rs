@@ -330,18 +330,9 @@ const LIFECYCLE_COUNTERS: &[(&str, CounterClass)] = &[
     // snapshots/sampled_jsonl.rs::retain_reduction/retain_after_release:
     // retention_bound failed; qualified only with real unsupported layout flag.
     ("retention_bound_refused", CounterClass::LayoutWitness),
-    // snapshots/sampled_jsonl.rs::record_retention_bound_refusal: Pi count and
-    // byte annotations, always beside retention_bound_refused; never a layout
-    // witness on their own.
+    // snapshots/sampled_jsonl.rs::record_retention_bound_refusal: Pi subset
+    // of retention_bound_refused; never a layout witness on its own.
     ("retention_bound_refused_pi", CounterClass::Observation),
-    (
-        "retention_bound_refused_pi_bytes",
-        CounterClass::Observation,
-    ),
-    (
-        "retention_bound_refused_pi_bytes_unavailable",
-        CounterClass::Observation,
-    ),
     // snapshots.rs native acquisition: transitional Pi Full on change without
     // a RAM record (no durable Pi yet); a counted read, not a failure.
     ("pi", CounterClass::Observation),

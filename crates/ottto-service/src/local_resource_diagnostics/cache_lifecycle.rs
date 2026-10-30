@@ -79,8 +79,6 @@ counters! {
     retention_incompatible: RetentionIncompatible,
     retention_bound_refused: RetentionBoundRefused,
     retention_bound_refused_pi: RetentionBoundRefusedPi,
-    retention_bound_refused_pi_bytes: RetentionBoundRefusedPiBytes,
-    retention_bound_refused_pi_bytes_unavailable: RetentionBoundRefusedPiBytesUnavailable,
     // Transitional Pi Full on change without a RAM record (no durable Pi yet).
     pi: Pi,
     retention_no_plan: RetentionNoPlan,
