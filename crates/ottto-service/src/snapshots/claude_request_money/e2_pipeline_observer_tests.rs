@@ -112,7 +112,6 @@ pub(crate) fn releasing(fold: &FileFold) {
         if let Some(mut page) = counts.get() {
             page.root_fallbacks += fold.root_fallbacks;
             page.disclosed += fold.disclosed;
-            page.removed_requests += fold.entity.removed_requests;
             counts.set(Some(page));
         }
     });
@@ -151,6 +150,17 @@ pub(crate) fn capture_identity_counts<T>(run: impl FnOnce() -> T) -> (T, serde_j
     (result, counts)
 }
 pub(crate) fn before_release(items: &[SnapshotItem]) {
+    RELEASED.with(|counts| {
+        if let Some(mut page) = counts.get() {
+            // Observe final native bodies before the caller's history veto,
+            // including disclosing folds that keep inline marks at release.
+            page.removed_requests = items
+                .iter()
+                .map(|item| item.removed_request_count.unwrap_or(0))
+                .sum();
+            counts.set(Some(page));
+        }
+    });
     IDENTITY.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_some() {
