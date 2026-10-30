@@ -312,6 +312,7 @@ impl ApcFixture {
             retain_native_terminal: std::cell::Cell::new(false),
             native_terminal_seen: std::cell::Cell::new(false),
             census_before_fold: std::cell::Cell::new(false),
+            audit_release: std::cell::Cell::new(false),
         };
         let mut current = ScanIndex::default();
         current.initialize_current_claude_contract_for_test();
@@ -1242,7 +1243,7 @@ impl ApcFixture {
         // Production order: exact upload progress is durable before this seam,
         // and the following save commits both body state and correction
         // progress, or neither.
-        index.settle_claude_proof_corrections(
+        let mut body_drains = index.settle_claude_proof_corrections(
             &committed_index,
             &candidates,
             &progress.accepted_fingerprints,
@@ -1253,7 +1254,7 @@ impl ApcFixture {
             progress
                 .save(&self.progress_path)
                 .expect("persist upload progress");
-            checkpoint_partial_snapshot_index(
+            checkpoint_partial_snapshot_index_with_audit_release(
                 &index,
                 &committed_index,
                 &progress,
@@ -1263,6 +1264,11 @@ impl ApcFixture {
                 &self.index_path,
                 &self.progress_path,
                 || Ok(()),
+                None,
+                None,
+                None,
+                None,
+                body_drains,
             )
             .expect("checkpoint shed page");
             if !persist_refusal {
@@ -1300,7 +1306,7 @@ impl ApcFixture {
         };
         let mut index = settlement.index;
         settle_index_after_upload(&mut index, &committed_index, &progress);
-        let fully_settled = settle_upload_corrections_after_selection(
+        let mut fully_settled = settle_upload_corrections_after_selection(
             &mut index,
             &scan,
             &committed_index,
@@ -1308,7 +1314,24 @@ impl ApcFixture {
             &candidates,
             &cutoff_candidates,
             settlement.fully_settled,
+            &mut body_drains,
         );
+        if self.audit_release.get() {
+            // Production order: the account-audit release runs after native
+            // restore and before the body-drain restore. The empty cache has
+            // no retained custody, so a released hold's entry is cleared and
+            // queued for retry.
+            scan.preserve_released_account_audits(
+                &mut index,
+                &committed_index,
+                &crate::snapshots::sampled_scan::SharedCache::default(),
+                std::slice::from_ref(&self.root),
+                183,
+            );
+        }
+        if index.restore_unselected_claude_proof_body_drains(body_drains) {
+            fully_settled = false;
+        }
         let census_complete = scan.census_complete;
         settle_context_curve_replay_state(
             &mut index,
@@ -3756,6 +3779,8 @@ fn terminal_off_new_cohort_correction_evidence_waits_durably_for_reconstruction(
     // Demonstrate evidence was not lost: a controlled old-reader reconstruction
     // input can still be formed; the release did not earn this proof itself.
     fixture.restore_historical_proof(false);
+}
+
 /// The R2 invariant, strictly: every member this page drained certifies the
 /// exact revision its saved file entry has, the re-arm marker included (which
 /// `check` skips). Returns the owed set before the page.
