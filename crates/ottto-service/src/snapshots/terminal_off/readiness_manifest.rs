@@ -101,6 +101,7 @@ const READINESS_MANIFEST: &[(&str, &str, &str)] = &[
     ("snapshots/p12_base_exit_tests.rs", "terminal_off_on_p12_experimental_base_exit_claude_pending_census_recovers_without_releasing_future_quarantine", "C1-X"),
     ("snapshots/p12_base_exit_tests.rs", "terminal_off_on_p12_experimental_base_exit_claude_stable_owned_start_recovers_after_partial_conflict", "C1-X"),
     ("snapshots/sampled_scan/durable_tail_tests.rs", "terminal_off_on_store_io_failures_emit_cold_production_body_without_holds", "r25-code-unclassified"),
+    ("snapshots/terminal_off/readiness_manifest.rs", "terminal_off_on_money_equivalence_receipts", "R10"),
     ("snapshots/upload_context_receipt_tests.rs", "terminal_off_on_real_uploader_not_stored_backs_off_but_growth_earns_receipt", "C5"),
 ];
 
@@ -581,7 +582,7 @@ fn terminal_off_on_readiness_ignores_equal_the_checked_in_manifest() {
     assert_eq!(expected, sorted, "keep the manifest sorted");
     assert_eq!(ignored_for_readiness(), expected);
     // The count is the ON gate: it must reach 0 before ON anywhere.
-    assert_eq!(READINESS_MANIFEST.len(), 90);
+    assert_eq!(READINESS_MANIFEST.len(), 91);
 }
 
 /// F4: an ON test's ignore is readiness debt (manifest above) unless it is
@@ -768,4 +769,12 @@ fn every_wrapper_of_an_ignored_twin_carries_its_readiness_cluster() {
             );
         }
     }
+}
+
+// Removed only after the unchanged ON harness and head-ON/base-OFF receipts
+// pass on macOS. Linux's UNEXECUTED harness cannot discharge R10.
+#[test]
+#[ignore = "terminal-off ON-readiness: R10"]
+fn terminal_off_on_money_equivalence_receipts() {
+    panic!("R10 needs native ON harness and cross-build money receipts");
 }
