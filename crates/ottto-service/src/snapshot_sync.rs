@@ -2189,6 +2189,7 @@ impl SnapshotUploadProgress {
         );
         self.accepted_fingerprints.remove(fingerprint);
         self.accepted_body_witnesses.remove(fingerprint);
+        self.accepted_body_contexts.remove(fingerprint);
         self.active_quarantine_retries.remove(fingerprint);
     }
 
@@ -2347,11 +2348,11 @@ impl SnapshotUploadProgress {
     }
 
     fn save(&mut self, path: &Path) -> Result<()> {
-        self.accepted_body_contexts
-            .retain(|fp, _| self.accepted_body_witnesses.contains_key(fp));
         self.save_with_read_limit(path, None)
     }
     fn save_with_read_limit(&mut self, path: &Path, read_limit: Option<usize>) -> Result<()> {
+        self.accepted_body_contexts
+            .retain(|fp, _| self.accepted_body_witnesses.contains_key(fp));
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).context("create snapshot upload progress directory")?;
         }
