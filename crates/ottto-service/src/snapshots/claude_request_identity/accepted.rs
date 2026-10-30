@@ -1,4 +1,5 @@
-//! Class L hints: bucket starts and non-reversible accepted share fingerprints.
+//! Class L hints: bucket starts and non-reversible accepted share fingerprints,
+//! plus option (ii)'s witnessed proved rows and bounded class H marker grains.
 use super::*;
 use hmac::{Hmac, Mac};
 use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
@@ -9,6 +10,11 @@ use zeroize::Zeroizing;
 pub(crate) const MAX_SESSIONS: usize = 16;
 pub(crate) const MAX_BUCKETS: usize = 5_000;
 const MAX_SHARES: usize = 1_536;
+pub(crate) const MAX_PROVED_ROWS: usize = 1_024;
+/// Tombstone for a proof superseded before upload: a keyed digest is never zero.
+const REPLACED_PROOF: [u8; 16] = [0; 16];
+/// Pending `retained_proof_missing` buckets feed one diagnostic only.
+const MAX_PENDING_MISSING: usize = 64;
 
 // Runtime keys never serialize and Debug must never expose their bytes.
 #[derive(Clone, PartialEq, Eq)]
@@ -18,12 +24,12 @@ impl std::fmt::Debug for FingerprintKey {
         f.write_str("FingerprintKey([redacted])")
     }
 }
-/// The third member is runtime only: this pass's bind discarded hints of a
-/// different key epoch.
+/// Third field: epoch changed this pass; fourth: per-cycle retained capability.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AcceptedBuckets(
     BTreeMap<String, AcceptedSession>,
     Option<FingerprintKey>,
+    bool,
     bool,
 );
 /// Why a tagging attempt had no complete accepted state (local diagnostics).
@@ -62,6 +68,86 @@ pub(crate) struct AcceptedSession {
     shares: Vec<AcceptedShare>,
     #[serde(default)]
     pub(super) incomplete: bool,
+    /// Option (ii): rows whose positive tags a witnessed stored-body ACK
+    /// covered, with the keyed digest of that proof; the latest proof wins.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", with = "proved_hex")]
+    proved: Vec<ProvedRow>,
+    /// Buckets the server listed in `retained_proof_missing`, until a
+    /// witnessed body re-proves them. Local diagnostics only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    missing: Vec<i64>,
+}
+/// Truncated keyed digests: the (bucket, row) grain and its exact proof.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ProvedRow {
+    bucket: i64,
+    row: [u8; 16],
+    proof: [u8; 16],
+    // Class H: ACK-bound grain only, bounded and erased with this session.
+    account: Option<[u8; 32]>,
+}
+// Class H must remain private even through derived Debug on containing state.
+impl std::fmt::Debug for ProvedRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProvedRow")
+            .field("bucket", &self.bucket)
+            .field("row", &self.row)
+            .field("proof", &self.proof)
+            .field("account", &"[redacted]")
+            .finish()
+    }
+}
+/// Versioned base64 of fixed 73-byte records: bucket, row, proof, optional
+/// ACKed account hash. Old hex hints have no grain provenance and fail closed.
+mod proved_hex {
+    use super::*;
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    const RECORD: usize = 73;
+    pub(super) fn serialize<S: Serializer>(
+        rows: &[ProvedRow],
+        encoder: S,
+    ) -> Result<S::Ok, S::Error> {
+        let mut bytes = Vec::with_capacity(rows.len() * RECORD);
+        for row in rows {
+            bytes.extend_from_slice(&row.bucket.to_be_bytes());
+            bytes.extend_from_slice(&row.row);
+            bytes.extend_from_slice(&row.proof);
+            bytes.push(u8::from(row.account.is_some()));
+            bytes.extend_from_slice(&row.account.unwrap_or([0; 32]));
+        }
+        encoder.serialize_str(&format!("v2:{}", STANDARD.encode(bytes)))
+    }
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        decoder: D,
+    ) -> Result<Vec<ProvedRow>, D::Error> {
+        let encoded = String::deserialize(decoder)?;
+        let invalid = || serde::de::Error::custom("invalid proved rows");
+        if encoded.len() > 3 + (MAX_PROVED_ROWS * RECORD).div_ceil(3) * 4 {
+            return Err(invalid());
+        }
+        let bytes = STANDARD
+            .decode(encoded.strip_prefix("v2:").ok_or_else(invalid)?)
+            .map_err(|_| invalid())?;
+        if bytes.len() % RECORD != 0 {
+            return Err(invalid());
+        }
+        bytes
+            .chunks_exact(RECORD)
+            .map(|record| {
+                let account = match record[40] {
+                    0 if record[41..].iter().all(|byte| *byte == 0) => None,
+                    1 => Some(record[41..].try_into().expect("32 bytes")),
+                    _ => return Err(invalid()),
+                };
+                Ok(ProvedRow {
+                    bucket: i64::from_be_bytes(record[..8].try_into().expect("8 bytes")),
+                    row: record[8..24].try_into().expect("16 bytes"),
+                    proof: record[24..40].try_into().expect("16 bytes"),
+                    account,
+                })
+            })
+            .collect()
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(super) struct AcceptedShare {
@@ -194,6 +280,68 @@ fn session_key(key: &FingerprintKey, session: &str) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }
+fn truncated(digest: [u8; 32]) -> [u8; 16] {
+    digest[..16].try_into().expect("16-byte prefix")
+}
+fn proved_row_hash(key: &FingerprintKey, row: &RowKey) -> [u8; 16] {
+    truncated(row_hash(key, row))
+}
+/// Keyed digest of one wire row's identity shares: each share's authority
+/// and exact eight counts and five costs. `None` without a positive tag.
+fn row_proof(key: &FingerprintKey, row: &Value, evidence: &Value) -> Option<[u8; 16]> {
+    const COUNTS: [&str; 8] = [
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_creation_5m_tokens",
+        "cache_creation_1h_tokens",
+        "reasoning_output_tokens",
+        "unattributed_total_tokens",
+        "request_count",
+    ];
+    const COSTS: [&str; 5] = [
+        "cost_usd",
+        "input_cost_usd",
+        "output_cost_usd",
+        "cache_read_cost_usd",
+        "cache_creation_cost_usd",
+    ];
+    if row.get("identity_retained").is_some() {
+        return None;
+    }
+    let parts = row["identity_parts"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(std::slice::from_ref(row));
+    let mut shares = Vec::with_capacity(parts.len());
+    for part in parts {
+        let authority = match part.get("evidence_ref") {
+            None => None,
+            Some(reference) => {
+                let entry = evidence.get(usize::try_from(reference.as_u64()?).ok()?)?;
+                Some(authority_hash(
+                    key,
+                    &AuthorityKey {
+                        login: part["account_identifier_hash"].as_str().map(str::to_owned),
+                        org: entry["provider_workspace_hash"].as_str().map(str::to_owned),
+                        basis: entry["identity_basis"].as_str().and_then(basis_token)?,
+                    },
+                ))
+            }
+        };
+        let counts = COUNTS.map(|name| part[name].as_u64().unwrap_or(0));
+        let costs = COSTS.map(|name| part[name].as_str().map(str::to_owned));
+        shares.push((authority, counts, costs));
+    }
+    if shares.iter().all(|(authority, _, _)| authority.is_none()) {
+        return None;
+    }
+    shares.sort();
+    Some(truncated(digest(
+        key,
+        json!(["claude_retained_row_proof:v1", shares]),
+    )))
+}
 pub(super) fn bucket_key(start: &str) -> Option<i64> {
     OffsetDateTime::parse(start, &Rfc3339)
         .ok()
@@ -234,6 +382,41 @@ impl AcceptedSession {
             .map(|share| share.authority)
             .collect()
     }
+    fn bound_key(&self) -> &FingerprintKey {
+        self.key.as_ref().expect("bound accepted epoch")
+    }
+    /// The keyed proof a witnessed stored body last carried for this row.
+    pub(super) fn proved_row(&self, bucket: i64, row: &RowKey) -> Option<[u8; 16]> {
+        let row = proved_row_hash(self.bound_key(), row);
+        self.proved
+            .binary_search_by(|entry| (entry.bucket, entry.row).cmp(&(bucket, row)))
+            .ok()
+            .map(|index| self.proved[index].proof)
+            .filter(|proof| *proof != REPLACED_PROOF)
+    }
+    /// A replacement's reply never settled, so the server may hold either
+    /// proof. Kept here because the share hints are evicted independently.
+    pub(super) fn replacement_unsettled(&self, bucket: i64, row: &RowKey) -> bool {
+        let row = proved_row_hash(self.bound_key(), row);
+        self.proved
+            .binary_search_by_key(&(bucket, row), |entry| (entry.bucket, entry.row))
+            .is_ok_and(|index| self.proved[index].proof == REPLACED_PROOF)
+    }
+    /// ACKed row hash, for grain only; never an identity authority.
+    pub(super) fn proved_account(&self, bucket: i64, row: &RowKey) -> Option<String> {
+        let row = proved_row_hash(self.bound_key(), row);
+        self.proved
+            .binary_search_by_key(&(bucket, row), |entry| (entry.bucket, entry.row))
+            .ok()
+            .and_then(|index| self.proved[index].account.as_ref().map(digest_hex::encode))
+    }
+    /// Today's proof digest for a row in its fresh-tag wire form.
+    pub(super) fn row_proof(&self, row: &Value, evidence: &Value) -> Option<[u8; 16]> {
+        row_proof(self.bound_key(), row, evidence)
+    }
+    pub(super) fn proof_missing(&self, bucket: i64) -> bool {
+        self.missing.binary_search(&bucket).is_ok()
+    }
 }
 impl<'de> Deserialize<'de> for AcceptedBuckets {
     fn deserialize<D: Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
@@ -256,9 +439,17 @@ impl<'de> Deserialize<'de> for AcceptedBuckets {
                     let Ok(mut state) = serde_json::from_value::<AcceptedSession>(value) else {
                         continue;
                     };
-                    if state.starts.len() > MAX_BUCKETS || state.shares.len() > MAX_SHARES {
+                    if state.starts.len() > MAX_BUCKETS
+                        || state.shares.len() > MAX_SHARES
+                        || state.proved.len() > MAX_PROVED_ROWS
+                        || state.missing.len() > MAX_PENDING_MISSING
+                    {
                         continue;
                     }
+                    state.proved.sort_unstable();
+                    state.proved.dedup_by_key(|entry| (entry.bucket, entry.row));
+                    state.missing.sort_unstable();
+                    state.missing.dedup();
                     state.starts.sort_unstable();
                     state.starts.dedup();
                     state.shares.sort_unstable();
@@ -272,9 +463,11 @@ impl<'de> Deserialize<'de> for AcceptedBuckets {
                     }
                     state.starts = state.starts.into_boxed_slice().into_vec();
                     state.shares = state.shares.into_boxed_slice().into_vec();
+                    state.proved = state.proved.into_boxed_slice().into_vec();
+                    state.missing = state.missing.into_boxed_slice().into_vec();
                     states.insert(session, state);
                 }
-                Ok(AcceptedBuckets(states, None, false))
+                Ok(AcceptedBuckets(states, None, false, false))
             }
             fn visit_seq<S: SeqAccess<'de>>(self, mut seq: S) -> Result<Self::Value, S::Error> {
                 while seq.next_element::<IgnoredAny>()?.is_some() {}
@@ -305,7 +498,7 @@ impl<'de> Deserialize<'de> for AcceptedBuckets {
 impl AcceptedBuckets {
     #[cfg(test)]
     pub(crate) fn for_test() -> Self {
-        Self(BTreeMap::new(), Some(fixture_key()), false)
+        Self(BTreeMap::new(), Some(fixture_key()), false, false)
     }
     #[cfg(test)]
     pub(crate) fn maximum_for_test() -> Self {
@@ -333,6 +526,15 @@ impl AcceptedBuckets {
                             key_epoch: key_epoch(&key),
                             key: Some(key.clone()),
                             last_ack: u64::MAX,
+                            proved: (0..MAX_PROVED_ROWS)
+                                .map(|n| ProvedRow {
+                                    bucket: starts[n],
+                                    row: [255; 16],
+                                    proof: [255; 16],
+                                    account: Some([255; 32]),
+                                })
+                                .collect(),
+                            missing: starts[..MAX_PENDING_MISSING].to_vec(),
                             starts,
                             shares,
                             incomplete: true,
@@ -341,6 +543,7 @@ impl AcceptedBuckets {
                 })
                 .collect(),
             Some(key),
+            false,
             false,
         )
     }
@@ -379,15 +582,15 @@ impl AcceptedBuckets {
     pub(crate) fn adopt_runtime_from(&mut self, live: &Self) {
         self.bind_key(live.1.clone());
         self.2 = live.2;
+        self.3 = live.3;
     }
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
-    pub(crate) fn get(&self, session: &str) -> Option<&AcceptedSession> {
-        let key = self.1.as_ref()?;
-        self.0
-            .get(&session_key(key, session))
-            .filter(|state| state.key_epoch == key_epoch(key))
+    /// Option (ii) activation for this cycle: only the server's exact
+    /// capability token turns on `identity_retained` rows and recent order.
+    pub(crate) fn set_retained_enabled(&mut self, enabled: bool) {
+        self.3 = enabled;
     }
     /// Why `get(session)` found no state; meaningful only when it returned `None`.
     pub(crate) fn miss_cause(&self) -> UnknownCause {
@@ -397,24 +600,63 @@ impl AcceptedBuckets {
             (Some(_), false) => UnknownCause::UntrackedSession,
         }
     }
-    /// Record only the body actually stored. A stripped ACK preserves prior
-    /// fingerprints while the bucket is present; fingerprints never restore tags.
-    pub(crate) fn record(&mut self, body: &Value) {
-        let Some(fingerprint_key) = self.1.as_ref() else {
-            return;
-        };
-        if body["provenance"]["collector"].as_str() != Some(COLLECTOR) {
+    pub(crate) fn retained_enabled(&self) -> bool {
+        self.3
+    }
+    #[cfg(test)]
+    pub(crate) fn forget_share_hints_for_test(&mut self, session: &str) {
+        let entry = self.session_mut(session).expect("session");
+        entry.shares = Vec::new();
+    }
+    #[cfg(test)]
+    pub(crate) fn proved_rows_for_test(&self, session: &str) -> Option<(usize, usize)> {
+        self.get(session).map(|state| {
+            let live = state
+                .proved
+                .iter()
+                .filter(|row| row.proof != REPLACED_PROOF);
+            (live.count(), state.missing.len())
+        })
+    }
+    fn has_retained(&self) -> bool {
+        self.0
+            .values()
+            .any(|state| !state.proved.is_empty() || !state.missing.is_empty())
+    }
+    /// A destination namespace or historical replay generation change: the
+    /// server's retained proof is not known for the new scope.
+    pub(crate) fn clear_retained(&mut self) {
+        if !self.has_retained() {
             return;
         }
-        let Some(session) = body["source_session_id"].as_str() else {
-            return;
-        };
-        let Some(buckets) = body["usage_buckets"].as_array() else {
-            return;
-        };
-        if buckets.len() > MAX_BUCKETS {
-            return;
+        for state in self.0.values_mut() {
+            state.proved = Vec::new();
+            state.missing = Vec::new();
         }
+        Self::count_retained_cleared();
+    }
+    pub(crate) fn count_retained_cleared_if_any(&self) {
+        if self.has_retained() {
+            Self::count_retained_cleared();
+        }
+    }
+    fn count_retained_cleared() {
+        super::budget::record(&super::budget::Counts {
+            retained_set_cleared: 1,
+            ..Default::default()
+        });
+    }
+    fn session_mut(&mut self, session: &str) -> Option<&mut AcceptedSession> {
+        let key = self.1.as_ref()?;
+        let epoch = key_epoch(key);
+        self.0
+            .get_mut(&session_key(key, session))
+            .filter(|state| state.key_epoch == epoch)
+    }
+    /// The session's entry, refreshed as the last ACK; a full ledger evicts
+    /// its least recently ACKed session (#909 LRU).
+    fn session_entry(&mut self, session: &str) -> Option<&mut AcceptedSession> {
+        let fingerprint_key = self.1.as_ref()?;
         let key = session_key(fingerprint_key, session);
         let last_ack = self
             .0
@@ -442,6 +684,196 @@ impl AcceptedBuckets {
             ..Default::default()
         });
         entry.last_ack = last_ack;
+        Some(entry)
+    }
+    /// Option (ii) settlement for one stored-body entity ACK. A row enters
+    /// only when the ACK carries the exact local body witness and the row had
+    /// a positive tag; later positive proof replaces it. Marker and untagged
+    /// rows keep the server-held proof. `retained_proof_missing` buckets lose
+    /// their marked rows, so a later revision re-tags them if proof remains.
+    /// Before an upload: a row this body freshly tags with a different proof
+    /// may replace the server's retained proof even if the ACK is lost, so the
+    /// superseded entry becomes a tombstone first; a later ACK replaces it.
+    /// Returns whether anything changed; the caller persists before the
+    /// request. Independent of the capability.
+    pub(crate) fn invalidate_replaced(&mut self, body: &Value) -> bool {
+        if body["provenance"]["collector"].as_str() != Some(COLLECTOR) {
+            return false;
+        }
+        let Some(session) = body["source_session_id"].as_str() else {
+            return false;
+        };
+        let Some(entry) = self.session_mut(session) else {
+            return false;
+        };
+        if entry.proved.is_empty() {
+            return false;
+        }
+        let key = entry.bound_key().clone();
+        let mut replaced = BTreeSet::new();
+        for bucket in body["usage_buckets"].as_array().into_iter().flatten() {
+            let Some(start) = bucket["bucket_start"].as_str().and_then(bucket_key) else {
+                continue;
+            };
+            for row in bucket["model_usage"].as_array().into_iter().flatten() {
+                let (Some(row_key), Some(proof)) = (
+                    wire_row_key(row),
+                    row_proof(&key, row, &body["request_evidence"]),
+                ) else {
+                    continue;
+                };
+                let row_hash = proved_row_hash(&key, &row_key);
+                if entry.proved.iter().any(|held| {
+                    held.bucket == start
+                        && held.row == row_hash
+                        && held.proof != proof
+                        && held.proof != REPLACED_PROOF
+                }) {
+                    replaced.insert((start, row_hash));
+                }
+            }
+        }
+        for held in &mut entry.proved {
+            if replaced.contains(&(held.bucket, held.row)) {
+                held.proof = REPLACED_PROOF;
+                held.account = None;
+            }
+        }
+        !replaced.is_empty()
+    }
+    pub(crate) fn record_proved(&mut self, body: &Value, witnessed: bool, missing: &[String]) {
+        if body["provenance"]["collector"].as_str() != Some(COLLECTOR) {
+            return;
+        }
+        let Some(session) = body["source_session_id"].as_str() else {
+            return;
+        };
+        let Some(buckets) = body["usage_buckets"].as_array() else {
+            return;
+        };
+        if buckets.len() > MAX_BUCKETS {
+            return;
+        }
+        // `record` normally settled (and LRU-refreshed) this ACK's session;
+        // refreshing again would only churn persisted bytes.
+        if self.session_mut(session).is_none() {
+            self.session_entry(session);
+        }
+        let Some(entry) = self.session_mut(session) else {
+            return;
+        };
+        let key = entry.bound_key().clone();
+        let mut proved = std::mem::take(&mut entry.proved)
+            .into_iter()
+            .map(|entry| ((entry.bucket, entry.row), (entry.proof, entry.account)))
+            .collect::<BTreeMap<_, _>>();
+        let mut pending = std::mem::take(&mut entry.missing)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let mut present = BTreeSet::new();
+        let mut marked = BTreeSet::new();
+        for bucket in buckets {
+            let Some(start) = bucket["bucket_start"].as_str().and_then(bucket_key) else {
+                continue;
+            };
+            present.insert(start);
+            for row in bucket["model_usage"].as_array().into_iter().flatten() {
+                let Some(row_key) = wire_row_key(row) else {
+                    continue;
+                };
+                let row_hash = proved_row_hash(&key, &row_key);
+                if row["identity_retained"] == json!(true) {
+                    marked.insert((start, row_hash));
+                    continue;
+                }
+                if !witnessed {
+                    continue;
+                }
+                if let Some(proof) = row_proof(&key, row, &body["request_evidence"]) {
+                    let account = match row["account_identifier_hash"].as_str() {
+                        Some(hash) => match digest_hex::decode::<serde::de::value::Error>(hash) {
+                            Ok(hash) => Some(hash),
+                            Err(_) => continue,
+                        },
+                        None => None,
+                    };
+                    proved.insert((start, row_hash), (proof, account));
+                    pending.remove(&start);
+                }
+            }
+        }
+        proved.retain(|(bucket, _), _| present.contains(bucket));
+        pending.retain(|bucket| present.contains(bucket));
+        let mut received = 0u64;
+        for start in missing.iter().filter_map(|start| bucket_key(start)) {
+            received += 1;
+            proved.retain(|row, _| row.0 != start || !marked.contains(row));
+            if marked.iter().any(|(bucket, _)| *bucket == start) {
+                pending.insert(start);
+            }
+        }
+        let mut capped = 0u64;
+        // Evict whole oldest buckets: a lost row only means fresh tags later.
+        while proved.len() > MAX_PROVED_ROWS {
+            let oldest = proved.keys().next().expect("nonempty").0;
+            let before = proved.len();
+            proved.retain(|(bucket, _), _| *bucket != oldest);
+            capped += (before - proved.len()) as u64;
+        }
+        while pending.len() > MAX_PENDING_MISSING {
+            pending.pop_first();
+        }
+        entry.proved = proved
+            .into_iter()
+            .map(|((bucket, row), (proof, account))| ProvedRow {
+                bucket,
+                row,
+                proof,
+                account,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+            .into_vec();
+        entry.missing = pending
+            .into_iter()
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+            .into_vec();
+        if received > 0 || capped > 0 {
+            super::budget::record(&super::budget::Counts {
+                retained_proof_missing_received: received,
+                proved_rows_capped: capped,
+                ..Default::default()
+            });
+        }
+    }
+    pub(crate) fn get(&self, session: &str) -> Option<&AcceptedSession> {
+        let key = self.1.as_ref()?;
+        self.0
+            .get(&session_key(key, session))
+            .filter(|state| state.key_epoch == key_epoch(key))
+    }
+    /// Record only the body actually stored. A stripped ACK preserves prior
+    /// fingerprints while the bucket is present; fingerprints never restore tags.
+    pub(crate) fn record(&mut self, body: &Value) {
+        let Some(fingerprint_key) = self.1.as_ref() else {
+            return;
+        };
+        if body["provenance"]["collector"].as_str() != Some(COLLECTOR) {
+            return;
+        }
+        let Some(session) = body["source_session_id"].as_str() else {
+            return;
+        };
+        let Some(buckets) = body["usage_buckets"].as_array() else {
+            return;
+        };
+        if buckets.len() > MAX_BUCKETS {
+            return;
+        }
+        let fingerprint_key = fingerprint_key.clone();
+        let fingerprint_key = &fingerprint_key;
+        let entry = self.session_entry(session).expect("bound fingerprint key");
         let mut shares = std::mem::take(&mut entry.shares)
             .into_iter()
             .collect::<BTreeSet<_>>();
@@ -541,6 +973,16 @@ impl crate::heap_layout_bound::HeapLayoutBound for AcceptedSession {
             self.shares
                 .capacity()
                 .checked_mul(std::mem::size_of::<AcceptedShare>())?,
+        )?;
+        c.add(
+            self.proved
+                .capacity()
+                .checked_mul(std::mem::size_of::<ProvedRow>())?,
+        )?;
+        c.add(
+            self.missing
+                .capacity()
+                .checked_mul(std::mem::size_of::<i64>())?,
         )
     }
 }
@@ -631,11 +1073,14 @@ mod heap_tests {
                                 MAX_SHARES
                             ],
                             incomplete: false,
+                            proved: Vec::new(),
+                            missing: Vec::new(),
                         },
                     )
                 })
                 .collect(),
             None,
+            false,
             false,
         );
         let mut counter = Counter::new(3 * 1024 * 1024);
@@ -831,11 +1276,26 @@ mod eviction_tests {
         };
         super::super::take_identity_counts();
         for session in 0..MAX_SESSIONS {
-            state.record(&body(session));
+            let body = body(session);
+            state.record(&body);
+            state.record_proved(&body, true, &[]);
         }
         state.record(&body(0)); // refresh the oldest before restart
         let mut restored = AcceptedBuckets::restore_for_test(&serde_json::to_vec(&state).unwrap());
         restored.record(&body(MAX_SESSIONS));
+        restored.record_proved(&body(MAX_SESSIONS), true, &[]);
+        assert_eq!(
+            restored.get("lru-0").unwrap().proved[0].account,
+            Some([0xaa; 32])
+        );
+        assert_eq!(
+            restored
+                .0
+                .values()
+                .map(|entry| entry.proved.len())
+                .sum::<usize>(),
+            MAX_SESSIONS
+        );
         assert!(restored.get("lru-0").is_some());
         assert!(restored.get("lru-1").is_none());
         assert!(restored.get(&format!("lru-{MAX_SESSIONS}")).is_some());
@@ -844,5 +1304,238 @@ mod eviction_tests {
         assert_eq!(counts["identity_cap"]["accepted_state_evicted"], 1);
         assert_eq!(counts["identity_cap"]["accepted_state_unknown"], 0);
         assert_eq!(restored.0.len(), MAX_SESSIONS);
+    }
+}
+
+#[cfg(test)]
+mod retained_tests {
+    use super::*;
+    fn body(row: Value) -> Value {
+        json!({"source_session_id":"synthetic", "provenance":{"collector":COLLECTOR},
+            "request_evidence":[{"identity_basis":TELEMETRY_LOGIN}],
+            "usage_buckets":[{"bucket_start":"2026-09-01T10:00:00Z","model_usage":[row]}]})
+    }
+    fn tagged(login: &str, requests: u64) -> Value {
+        json!({"model":"claude-synthetic","request_count":requests,"evidence_ref":0,
+            "account_identifier_hash":login})
+    }
+    fn proof(state: &AcceptedBuckets) -> Option<[u8; 16]> {
+        let row = wire_row_key(&json!({"model":"claude-synthetic"})).unwrap();
+        state
+            .get("synthetic")?
+            .proved_row(bucket_key("2026-09-01T10:00:00Z").unwrap(), &row)
+    }
+    #[test]
+    fn witnessed_positive_tags_enter_latest_proof_wins_and_markers_keep_it() {
+        let mut state = AcceptedBuckets::for_test();
+        let a = body(tagged(&"a".repeat(64), 1));
+        state.record_proved(&a, false, &[]);
+        assert_eq!(proof(&state), None, "unwitnessed ACK never adds");
+        assert!(state.get("synthetic").unwrap().proved.is_empty());
+        state.record_proved(&a, true, &[]);
+        assert_eq!(
+            state.get("synthetic").unwrap().proved[0].account,
+            Some([0xaa; 32])
+        );
+        let first = proof(&state).unwrap();
+        let b = body(tagged(&"b".repeat(64), 1));
+        state.record_proved(&b, true, &[]);
+        let second = proof(&state).unwrap();
+        assert_ne!(first, second, "a different positive proof replaces");
+        state.record_proved(&body(tagged(&"b".repeat(64), 2)), true, &[]);
+        assert_ne!(
+            proof(&state).unwrap(),
+            second,
+            "amounts are part of the proof"
+        );
+        state.record_proved(&b, true, &[]);
+        for untagged in [
+            json!({"model":"claude-synthetic","request_count":1}),
+            json!({"model":"claude-synthetic","request_count":1,"identity_retained":true}),
+        ] {
+            state.record_proved(&body(untagged), true, &[]);
+            assert_eq!(proof(&state), Some(second), "server keeps proof");
+        }
+        // A replacement upload drops a different held proof before the POST;
+        // equal proof, markers and untagged rows never do.
+        let mut sent = state.clone();
+        assert!(!sent.invalidate_replaced(&b));
+        assert!(!sent.invalidate_replaced(&body(
+            json!({"model":"claude-synthetic","request_count":1,"identity_retained":true})
+        )));
+        assert!(sent.invalidate_replaced(&a));
+        assert_eq!(sent.proved_rows_for_test("synthetic"), Some((0, 0)));
+        // The tombstone outlives a restart, re-sends do not churn it, and it
+        // holds no class H hash; the replacement's ACK settles it.
+        let held = &sent.get("synthetic").unwrap().proved;
+        assert_eq!((held[0].proof, held[0].account), (REPLACED_PROOF, None));
+        let mut restored = AcceptedBuckets::restore_for_test(&serde_json::to_vec(&sent).unwrap());
+        assert_eq!(restored.proved_rows_for_test("synthetic"), Some((0, 0)));
+        let (row, start) = (
+            wire_row_key(&json!({"model":"claude-synthetic"})).unwrap(),
+            bucket_key("2026-09-01T10:00:00Z").unwrap(),
+        );
+        let settled = |state: &AcceptedBuckets| {
+            state
+                .get("synthetic")
+                .unwrap()
+                .replacement_unsettled(start, &row)
+        };
+        assert!(settled(&restored));
+        assert!(!restored.invalidate_replaced(&a));
+        restored.record_proved(&a, true, &[]);
+        assert!(!settled(&restored));
+        assert_eq!(
+            restored.get("synthetic").unwrap().proved[0].account,
+            Some([0xaa; 32])
+        );
+        assert_eq!(restored.proved_rows_for_test("synthetic"), Some((1, 0)));
+        // retained_proof_missing removes only rows this body marked.
+        state.record_proved(&b, true, &["2026-09-01T10:00:00Z".into()]);
+        assert_eq!(proof(&state), Some(second));
+        let marked =
+            body(json!({"model":"claude-synthetic","request_count":1,"identity_retained":true}));
+        state.record_proved(&marked, true, &["2026-09-01T10:00:00Z".into()]);
+        assert_eq!(proof(&state), None);
+        assert_eq!(state.proved_rows_for_test("synthetic"), Some((0, 1)));
+        assert!(
+            state.get("synthetic").unwrap().proved.is_empty(),
+            "missing grain drops class H too"
+        );
+        state.record_proved(&b, true, &[]);
+        assert_eq!(state.proved_rows_for_test("synthetic"), Some((1, 0)));
+        // A bucket the body no longer has leaves with it; legacy bodies never touch.
+        let mut legacy = b.clone();
+        legacy["provenance"]["collector"] = json!("legacy");
+        legacy["usage_buckets"] = json!([]);
+        state.record_proved(&legacy, true, &[]);
+        assert_eq!(state.proved_rows_for_test("synthetic"), Some((1, 0)));
+        let mut gone = b.clone();
+        gone["usage_buckets"] = json!([]);
+        state.record_proved(&gone, true, &[]);
+        assert_eq!(state.proved_rows_for_test("synthetic"), Some((0, 0)));
+    }
+    #[test]
+    fn gate_off_state_bytes_are_unchanged_and_proved_rows_survive_restart() {
+        let mut off = AcceptedBuckets::for_test();
+        off.record(&body(tagged(&"a".repeat(64), 1)));
+        let bytes = serde_json::to_string(&off).unwrap();
+        assert!(!bytes.contains("proved") && !bytes.contains("missing"));
+        let mut on = off.clone();
+        on.record_proved(&body(tagged(&"a".repeat(64), 1)), true, &[]);
+        let encoded = serde_json::to_vec(&on).unwrap();
+        assert!(!String::from_utf8_lossy(&encoded).contains(&"a".repeat(64)));
+        let restored = AcceptedBuckets::restore_for_test(&encoded);
+        assert_eq!(restored, on);
+        assert!(
+            !restored.retained_enabled(),
+            "capability is never persisted"
+        );
+        let compact: Value = serde_json::from_slice(&encoded).unwrap();
+        let session = compact.as_object().unwrap().values().next().unwrap();
+        assert_eq!(session["proved"].as_str().unwrap().len(), 103);
+        for corrupt in [json!("0".repeat(79)), json!("G".repeat(80)), json!([1])] {
+            let mut bad = compact.clone();
+            for state in bad.as_object_mut().unwrap().values_mut() {
+                state["proved"] = corrupt.clone();
+            }
+            let mut dropped: AcceptedBuckets = serde_json::from_value(bad).unwrap();
+            dropped.bind_test_key(Some([0x42; 32]));
+            assert!(
+                dropped.is_empty(),
+                "malformed proved rows drop only the hint"
+            );
+        }
+        let mut rotated: AcceptedBuckets = serde_json::from_slice(&encoded).unwrap();
+        rotated.bind_test_key(Some([0x43; 32]));
+        assert!(rotated.is_empty(), "a rotated key drops proved rows too");
+        let mut cleared = restored;
+        cleared.clear_retained();
+        assert_eq!(cleared.proved_rows_for_test("synthetic"), Some((0, 0)));
+        assert_eq!(serde_json::to_string(&cleared).unwrap(), bytes);
+    }
+    #[test]
+    fn proved_rows_evict_whole_oldest_buckets_at_the_bound() {
+        let start = OffsetDateTime::parse("2026-09-01T00:00:00Z", &Rfc3339).unwrap();
+        let mut value = body(Value::Null);
+        value["usage_buckets"] = json!((0..MAX_PROVED_ROWS / 2 + 1)
+            .map(|hour| json!({
+                "bucket_start":(start + time::Duration::hours(hour as i64)).format(&Rfc3339).unwrap(),
+                "model_usage":[tagged(&"a".repeat(64), 1), {
+                    "model":"claude-other","request_count":1,"evidence_ref":0,
+                    "account_identifier_hash":"a".repeat(64)}]
+            }))
+            .collect::<Vec<_>>());
+        let mut state = AcceptedBuckets::for_test();
+        super::super::take_identity_counts();
+        state.record_proved(&value, true, &[]);
+        assert_eq!(
+            super::super::take_identity_counts()
+                .identity_cap
+                .proved_rows_capped,
+            2
+        );
+        let known = state.get("synthetic").unwrap();
+        assert_eq!(known.proved.len(), MAX_PROVED_ROWS);
+        assert_eq!(known.proved.capacity(), MAX_PROVED_ROWS);
+        assert!(known
+            .proved
+            .iter()
+            .all(|row| row.bucket != start.unix_timestamp()));
+    }
+}
+
+#[cfg(all(test, target_pointer_width = "64"))]
+mod retained_heap_tests {
+    use super::*;
+    use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+    #[test]
+    fn maximum_ledger_with_proved_rows_has_a_four_mib_heap_bound() {
+        let state = AcceptedBuckets(
+            (0..MAX_SESSIONS)
+                .map(|n| {
+                    (
+                        format!("{n:064x}"),
+                        AcceptedSession {
+                            key_epoch: [0; 32],
+                            key: None,
+                            last_ack: 0,
+                            starts: (0..MAX_BUCKETS as i64).collect(),
+                            shares: vec![
+                                AcceptedShare {
+                                    bucket: 1,
+                                    row: [0; 32],
+                                    authority: Some([0; 32])
+                                };
+                                MAX_SHARES
+                            ],
+                            incomplete: false,
+                            proved: vec![
+                                ProvedRow {
+                                    bucket: 1,
+                                    row: [0; 16],
+                                    proof: [0; 16],
+                                    account: Some([255; 32]),
+                                };
+                                MAX_PROVED_ROWS
+                            ],
+                            missing: (0..MAX_PENDING_MISSING as i64).collect(),
+                        },
+                    )
+                })
+                .collect(),
+            None,
+            false,
+            false,
+        );
+        let mut counter = Counter::new(4 * 1024 * 1024);
+        counter.add(std::mem::size_of_val(&state)).unwrap();
+        state.heap_bound(&mut counter).unwrap();
+        assert_eq!(std::mem::size_of::<ProvedRow>(), 80);
+        assert!(counter.bytes <= 4_010_000, "layout={}", counter.bytes);
+        eprintln!(
+            "accepted-share+proved-row requested-layout maximum={} bytes",
+            counter.bytes
+        );
     }
 }

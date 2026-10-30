@@ -152,6 +152,7 @@ fn exact_ack(items: Vec<SnapshotItem>) -> Result<crate::snapshot_client::Snapsho
                 head_etag: item.cache_observations.as_ref().map(|_| "a".repeat(64)),
                 head_challenge: None,
                 unchanged_basis: None,
+                retained_proof_missing: Vec::new(),
             });
     }
     response.validate_entity_ack_with_head_cas(&request, false)?;
@@ -830,6 +831,7 @@ fn partial_checkpoint_ignores_the_ledger_binding_of_this_cycle() {
             let f = AckFixture::new(true);
             let (index, mut progress) = f.load();
             progress.accepted_identity_buckets.bind_test_key(saved_key);
+            progress.accepted_identity_buckets.set_retained_enabled(true);
             if record {
                 progress.accepted_identity_buckets.record(&hint);
                 assert!(!progress.accepted_identity_buckets.is_empty(), "{case}");

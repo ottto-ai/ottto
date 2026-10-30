@@ -1447,3 +1447,53 @@ buckets; already stripped proof cannot be recovered from the hint ledger.
 Upstream authority-key allocation loss remains fail-closed: inherited partitions
 are not reclassified as request proof by budget recovery or a uniform starting-account
 retry. Only an intact current grouping can enter the cap allocator.
+
+### Option (ii): `identity_retained` bucket rows
+
+Off unless the activity hint carries exactly
+`session_request_identity_retained_contract: "session_request_identity_retained:v1"`;
+any other value keeps the bodies above byte-identical. When on, the backend
+retains per-row proof, so the accepted priority is not used: fresh tags take
+the plain newest-first order within the unchanged caps.
+
+A bucket row enters the local proved-row ledger only when a stored-body entity
+ACK (no `unchanged_basis`) covers a body where that row carried a positive tag,
+only while the capability is on, and only when that ACK declares a body witness
+version and its digest equals the local body witness of a body that has a
+public witness version (context curve, session account evidence or cache
+observations), so the ACK validator also checked the exact version. The
+ledger keeps truncated keyed digests of the row key and of that proof
+(authorities plus the eight counts and five costs); later positive proof
+replaces it. Per revision, a proved row whose current proof equals the ACKed
+proof in a closed hour, or whose transcript no longer proves it, is sent
+untagged with full amounts and `identity_retained: true`; it is not a refusal.
+Different proof, the open hour and never-proved rows get fresh tags. A row is
+never both tagged and marked; top-level rows are never marked. If the
+untagged fallback cannot fit every marker beside the stripped body, it keeps
+the newest that fit and counts each dropped proved row as a refusal.
+
+Before any upload, a proved row that the outgoing body freshly tags with a
+different proof becomes a proof-free tombstone, and progress is saved before
+the request, so a lost reply cannot leave a stale proof that a later marker
+would honour. While that tombstone stands, a row the transcript no longer
+proves is a counted refusal; the replacement's ACK replaces it.
+A stored-body ACK's optional `retained_proof_missing` bucket starts remove that
+body's marked rows, so a later revision re-tags them through the same
+allocator. A destination namespace or historical replay generation change
+clears all proved rows, as do key rotation and session eviction (the class L
+last-ACK LRU above). Limits: 1,024 proved rows per session, persisted as
+versioned base64 of 73-byte records, and 64 pending missing buckets (diagnostic
+only). Each proved record also stores the proving revision's optional row-level
+account hash (class H, bounded and erased with the session). Login markers resend
+that ACK-bound hash for grain only; parts markers have no hash. Old records without
+hash provenance fail closed to fresh tags. Markers require contract 6
+(`claude_request_owned_usage:v1`); contract-5-only bodies send fresh tags.
+Rows evicted at the proof cap also send fresh tags through the usual caps. At every cap the progress JSON stays below 8 MiB and the
+requested-layout maximum below 4 MiB.
+
+Sparse `identity_cap` counters, omitted while zero: `retained_marker_rows`,
+`retained_proof_missing_received`, `retained_set_cleared`, `proved_rows_capped`
+(rows not retained at the proof cap), and
+`retained_missing_unfit` (a missing-proof bucket whose fresh proof did not fit
+and kept today's untagged/refused rule). `accepted_share_changed` also counts
+proved rows sent with different proof.

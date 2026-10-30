@@ -683,6 +683,7 @@ mod tests {
                     evidence_ref: None,
                     identity_parts: None,
                     copy_unproven: false,
+                    identity_retained: false,
                     model: model.to_string(),
                     input_tokens: 0,
                     output_tokens: 0,
