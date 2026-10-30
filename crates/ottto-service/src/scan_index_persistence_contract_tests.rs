@@ -176,7 +176,8 @@ fn durable_round_trip(s: &Scratch, index: &ScanIndex, generation: u64) {
     };
     assert_eq!(restored.index_generation, generation);
     assert_eq!(restored.record, record);
-    // The actual #865 admission seam checks entry/context/scope AND generation.
+    // The actual admission seam: a write-ahead record may lead its index, so
+    // only V1 Codex keeps the generation gate; context and scope always refuse.
     let expected = durable::Expected {
         binding: binding.clone(),
         committed_generation: root["generation"].as_u64().unwrap(),
@@ -186,6 +187,15 @@ fn durable_round_trip(s: &Scratch, index: &ScanIndex, generation: u64) {
         .eligible(&durable::Expected {
             binding: binding.clone(),
             committed_generation: generation - 1
+        })
+        .is_ok());
+    assert!(restored
+        .eligible(&durable::Expected {
+            binding: durable::Binding {
+                scope: [9; 32],
+                ..binding.clone()
+            },
+            committed_generation: generation
         })
         .is_err());
     assert!(restored

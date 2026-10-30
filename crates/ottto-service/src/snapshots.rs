@@ -34182,6 +34182,14 @@ impl OwnedSourceScan {
                                         active_bound_degraded = true;
                                         (None, taken_admission, debt)
                                     }
+                                    // #870 retired debt as a reason to skip a reusable
+                                    // record. A stale one still cannot hold a due audit.
+                                    sampled_scan::durable_tail::RestoreOutcome::Stale(_)
+                                    | sampled_scan::durable_tail::RestoreOutcome::StaleUnregistered(..)
+                                        if debt.is_some_and(|owed| audit_now >= owed.due_unix_seconds) =>
+                                    {
+                                        (None, taken_admission, debt)
+                                    }
                                     sampled_scan::durable_tail::RestoreOutcome::StaleUnregistered(reason, _) => {
                                         let granted = source == SnapshotSource::ClaudeCode
                                             && if reason == "old_binding_no_match" {
