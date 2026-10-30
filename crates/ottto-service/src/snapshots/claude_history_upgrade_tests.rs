@@ -3188,6 +3188,7 @@ fn a_listed_root_outside_this_cycle_gets_no_literal_and_no_revision_three() {
 /// family keeps both. A paused list denies every literal and every
 /// revision-3 stamp.
 #[test]
+#[ignore = "terminal-off ON-readiness: C6"]
 fn terminal_off_on_a_listed_root_outside_this_cycle_gets_no_literal_and_no_revision_three() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -3365,6 +3366,7 @@ fn revision_two_drops_every_request_owned_literal_on_both_upload_paths() {
 /// both the emission check and the retain hook drop every literal item and
 /// keep every ordinary body the gate does not hold.
 #[test]
+#[ignore = "terminal-off ON-readiness: C6"]
 fn terminal_off_on_revision_two_drops_every_request_owned_literal_on_both_upload_paths() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 

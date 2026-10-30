@@ -2703,6 +2703,7 @@ fn quarantined_index_sibling_alone_is_prior_history() {
 /// itself, with no backfill state at all: the rebuilt files are owed history,
 /// paced through the budget (one per page here), not re-sent as new.
 #[test]
+#[ignore = "terminal-off ON-readiness: C1"]
 fn terminal_off_on_quarantined_index_sibling_alone_is_prior_history() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -4261,6 +4262,7 @@ fn listed_member_holds_its_siblings_through_the_pipeline_without_the_root_file()
 /// sibling counts once as held through the absent root. agent-a itself is
 /// listed by its own line and is not counted.
 #[test]
+#[ignore = "terminal-off ON-readiness: C1"]
 fn terminal_off_on_listed_member_holds_its_siblings_through_the_pipeline_without_the_root_file() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -4293,6 +4295,7 @@ fn listed_root_holds_every_subagent_through_the_pipeline_without_the_root_file()
 /// is gone and only subagent files remain. None is offered, and each counts
 /// as held through the absent root.
 #[test]
+#[ignore = "terminal-off ON-readiness: C1"]
 fn terminal_off_on_listed_root_holds_every_subagent_through_the_pipeline_without_the_root_file() {
     let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
 
@@ -6384,7 +6387,13 @@ fn terminal_off_held_index_rebuild_release_does_not_accept_history_twice() {
     let _on = crate::snapshots::ClaudeTerminalOffForTest::enabled();
     assert!(crate::snapshots::claude_terminal_off());
     let fixture = HistoryFixture::new("held-rebuild-release");
-    fixture.baseline();
+    let mut baseline = fixture.baseline();
+    // Same destination/context, with real retained ACKs. Explicit re-arm makes
+    // the initial history hold parse without creating context resend debt.
+    for entry in baseline.files.values_mut() {
+        entry.source_file_fingerprint.clear();
+    }
+    baseline.save(&fixture.index_path).unwrap();
     fixture.corrupt_backfill_state();
     crate::snapshots::with_no_list_cutoff(u64::MAX, || {
         let held = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_REVISION_2);

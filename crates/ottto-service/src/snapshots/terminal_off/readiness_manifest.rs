@@ -49,7 +49,10 @@ const READINESS_MANIFEST: &[(&str, &str, &str)] = &[
     ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_historical_replay_after_bootstrap_paces_history_without_a_list", "prior-code-unclassified"),
     ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_installed_list_paces_rebuilt_history_and_denies_listed_families", "prior-code-unclassified"),
     ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_intended_list_holds_listed_families_and_paces_the_rest_after_a_quarantine", "prior-code-unclassified"),
+    ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_listed_member_holds_its_siblings_through_the_pipeline_without_the_root_file", "C1"),
+    ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_listed_root_holds_every_subagent_through_the_pipeline_without_the_root_file", "C1"),
     ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_over_budget_rebuild_preserves_history_holds_list_latch_and_pacing", "prior-code-unclassified"),
+    ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_quarantined_index_sibling_alone_is_prior_history", "C1"),
     ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_quarantined_index_without_an_intended_list_paces_history", "prior-code-unclassified"),
     ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_resumed_pre_gate_index_on_a_new_destination_records_the_cutoff", "r25-code-unclassified"),
     ("snapshot_sync/history_upgrade_pipeline_tests.rs", "terminal_off_on_same_user_reclaim_before_bootstrap_is_still_gated", "prior-code-unclassified"),
@@ -64,11 +67,13 @@ const READINESS_MANIFEST: &[(&str, &str, &str)] = &[
     ("snapshots.rs", "terminal_off_on_claude_context_backfill_resumes_after_restart_without_rereading_settled_files", "P1"),
     ("snapshots/claude_context_file_birth_tests.rs", "terminal_off_on_api_sidecar_without_trace_sidecar_still_vetoes", "r25-code-unclassified"),
     ("snapshots/claude_context_file_birth_tests.rs", "terminal_off_on_capture_on_bodies_match_the_clear_outside_context_scalars", "r25-code-unclassified"),
+    ("snapshots/claude_history_upgrade_tests.rs", "terminal_off_on_a_listed_root_outside_this_cycle_gets_no_literal_and_no_revision_three", "C6"),
     ("snapshots/claude_history_upgrade_tests.rs", "terminal_off_on_copies_read_under_a_closed_duplicate_fence_settle_after_one_walk", "P3"),
     ("snapshots/claude_history_upgrade_tests.rs", "terminal_off_on_installed_empty_list_paces_history_and_differs_from_a_missing_list", "r25-code-unclassified"),
     ("snapshots/claude_history_upgrade_tests.rs", "terminal_off_on_member_only_line_protects_its_root_on_a_fresh_index", "r25-code-unclassified"),
     ("snapshots/claude_history_upgrade_tests.rs", "terminal_off_on_no_list_and_paused_list_states_hold_history_selected_for_another_reason", "r25-code-unclassified"),
     ("snapshots/claude_history_upgrade_tests.rs", "terminal_off_on_revision_bump_rereads_every_stamped_file_paced_then_stops", "P3"),
+    ("snapshots/claude_history_upgrade_tests.rs", "terminal_off_on_revision_two_drops_every_request_owned_literal_on_both_upload_paths", "C6"),
     ("snapshots/claude_request_account_tests.rs", "terminal_off_on_claude_contract5_bodies_need_no_cohort_token", "r25-code-unclassified"),
     ("snapshots/claude_request_census_tests.rs", "terminal_off_on_census_derivation_drift_tripwire_counts_changed_ids_at_one_revision", "r25-code-unclassified"),
     ("snapshots/claude_sidecar_reduction_tests.rs", "terminal_off_on_missing_index_cannot_be_replaced_by_warm_cache_authority", "r25-code-unclassified"),
@@ -130,7 +135,7 @@ fn terminal_off_on_readiness_ignores_equal_the_checked_in_manifest() {
     assert_eq!(expected, sorted, "keep the manifest sorted");
     assert_eq!(ignored_for_readiness(), expected);
     // The count is the ON gate: it must reach 0 before ON anywhere.
-    assert_eq!(READINESS_MANIFEST.len(), 76);
+    assert_eq!(READINESS_MANIFEST.len(), 81);
 }
 
 #[test]

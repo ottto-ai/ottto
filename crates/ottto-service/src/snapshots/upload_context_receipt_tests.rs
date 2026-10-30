@@ -4102,9 +4102,10 @@ fn terminal_off_held_history_without_body_witness_does_not_force_rediscovery() {
         "witness debt is retained"
     );
     assert!(
-        f.index.file_upload_context_requires_adoption(&f.key()),
-        "no fake receipt/empty memo"
+        !f.index.file_upload_context_requires_adoption(&f.key()),
+        "R5 suppresses only UploadContext selection after a complete held parse"
     );
+    assert!(terminal_off_held_context_seen(&f.index, &f.key()));
     assert!(!terminal_off_empty_context_seen(&f.index, &f.key()));
     b1_quiet_preparations(&mut f, now);
     assert!(f.entry().upload_context_receipt.is_none());
