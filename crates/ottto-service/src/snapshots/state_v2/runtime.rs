@@ -270,7 +270,6 @@ fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Optio
             .flatten();
         if let Some((identity, db_path)) = pair {
             state.latched = true;
-            telemetry::pass_start();
             if !switched {
                 telemetry::event("switch_off_ignored", &1);
             }

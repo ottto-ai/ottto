@@ -93370,6 +93370,9 @@ fn candidate_from_traversal_path_at(
 pub(crate) use state_v2::ack::ProgressRecovery;
 // OPS diagnostics bridges; the private storage module stays private.
 pub(crate) use state_v2::state_v2_growth_retention_active;
+pub(crate) fn state_v2_pass_start() {
+    state_v2::telemetry::pass_start();
+}
 pub(crate) fn state_v2_prepare_observed() {
     state_v2::telemetry::phase("prepare");
 }

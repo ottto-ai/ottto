@@ -6118,6 +6118,11 @@ fn load_source_checkpoints(
 )> {
     let custody = source == SnapshotSource::ClaudeCode
         && crate::snapshots::state_v2_custody_published(index_path)?;
+    if custody {
+        // Begin once at preparation admission. Claim-only nested loads must
+        // preserve the pass's measurements rather than start another pass.
+        crate::snapshots::state_v2_pass_start();
+    }
     let progress = if custody {
         None
     } else {

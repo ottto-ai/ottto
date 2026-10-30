@@ -498,7 +498,10 @@ pub(super) fn hydrate_txn(
     ensure!(
         cx.presence
             .keys()
-            .all(|s| super::super::lenient_decode::FIELDS.contains(&s.as_str())),
+            // Older authenticated v2 imports recorded this name even when
+            // absent in v1. Its metadata remains valid only in this store.
+            .all(|s| s == "growth_retention"
+                || super::super::lenient_decode::FIELDS.contains(&s.as_str())),
         "state_v2_unknown_presence_field"
     );
     macro_rules! load {

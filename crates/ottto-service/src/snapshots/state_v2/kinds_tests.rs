@@ -360,27 +360,39 @@ fn streamed_cas_merges_retry_and_growth_maxima_without_resurrecting_removed_quar
 /// [money] growth raw hold survives composed hydration and cas cannot release it.
 #[test]
 fn growth_raw_hold_survives_composed_hydration_and_cas_cannot_release_it() {
-    let (_scratch, mut db) = Scratch::store();
-    let mut index = fixture();
-    index
-        .decode_holds
-        .v2_insert(
-            "growth_retention",
-            "/synthetic/grown".into(),
-            br#""opaque-clock""#.to_vec(),
-            None,
-            256,
-        )
-        .unwrap();
-    index.decode_holds.v2_finish((19, 3));
-    commit_populate(&mut db, &index);
-    let (mut working, _) = hydrate(&mut db, Scratch::binding()).unwrap();
-    assert!(working.decode_holds.same_as(&index.decode_holds));
-    assert_eq!(working.decode_holds.v2_provenance(), (19, 3));
-    let mut tx = db.begin(TxnMode::Read).unwrap();
-    kinds_misc::merge_cas(&mut tx, &mut working).unwrap();
-    working.decode_holds = Default::default();
-    assert!(kinds_misc::merge_cas(&mut tx, &mut working).is_err());
+    for present in [false, true] {
+        let (_scratch, mut db) = Scratch::store();
+        let mut index = fixture();
+        index
+            .decode_holds
+            .v2_insert(
+                "growth_retention",
+                "/synthetic/grown".into(),
+                br#""opaque-clock""#.to_vec(),
+                None,
+                256,
+            )
+            .unwrap();
+        index.decode_holds.v2_finish((19, 3));
+        index.v2_mut().growth_retention.insert(
+            "/synthetic/claim".into(),
+            serde_json::from_value(serde_json::json!({"last_growth_full_unix": 100})).unwrap(),
+        );
+        commit_populate(&mut db, &index);
+        let mut presence: BTreeMap<String, bool> =
+            db.read_control("field_presence").unwrap().unwrap();
+        presence.insert("growth_retention".into(), present);
+        db.control("field_presence", &presence).unwrap();
+        let (mut working, cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+        assert_eq!(cx.presence.get("growth_retention"), Some(&present));
+        assert_eq!(working.v2().growth_retention, index.v2().growth_retention);
+        assert!(working.decode_holds.same_as(&index.decode_holds));
+        assert_eq!(working.decode_holds.v2_provenance(), (19, 3));
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        kinds_misc::merge_cas(&mut tx, &mut working).unwrap();
+        working.decode_holds = Default::default();
+        assert!(kinds_misc::merge_cas(&mut tx, &mut working).is_err());
+    }
 }
 
 /// [format] whole delta stages before begin and calls gc only after commit.

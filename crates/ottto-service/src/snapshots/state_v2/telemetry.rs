@@ -568,6 +568,41 @@ pub(super) fn save_work(rows: u64, bytes: u64) {
 mod ops_tests {
     use super::*;
 
+    /// [regress] Nested growth custody loads preserve measurements already
+    /// accumulated by the enclosing preparation/acquisition pass.
+    #[test]
+    fn nested_load_preserves_enclosing_pass_diagnostics() {
+        let root = crate::test_scratch::private_dir("nested-v2-pass");
+        let parent = root.join("snapshots/destinations").join("a".repeat(64));
+        std::fs::create_dir_all(&parent).unwrap();
+        let path = parent.join("claude_code-test-scan-index.json");
+        let progress = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 3,
+            "destination_namespace_hash": "a".repeat(64),
+        }))
+        .unwrap();
+        let index =
+            super::super::money_test_support::publish(&ScanIndex::default(), &path, &progress);
+        pass_start();
+        phase("prepare");
+        decoded(13, 0, 0);
+        let (_, records) = crate::local_resource_diagnostics::capture(|| {
+            ScanIndex::load(&path).unwrap();
+            plateau();
+        });
+        let record = records
+            .iter()
+            .rev()
+            .find(|record| record["stage"] == "claude_state_v2")
+            .unwrap();
+        assert!(record["counts"]["decoded_per_pass"]["rows"]
+            .as_u64()
+            .is_some_and(|rows| rows >= 13));
+        drop(index);
+        super::super::erase_tree(&root).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     /// [off=main] OFF Claude passes preserve even stale active v2 telemetry state.
     #[test]
     fn off_claude_passes_do_not_touch_v2_telemetry() {
