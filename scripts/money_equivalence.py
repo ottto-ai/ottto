@@ -129,6 +129,7 @@ def decode_receipt(data):
 
     Return the decoded tree and the exact paths of its batch envelopes. Never
     recursively decode payload arrays: they are content, even if byte-shaped.
+    An empty page stays an empty list, distinct from any emitted envelope.
     """
     receipt = _load_json(data, "")
     if not isinstance(receipt, list) or not receipt:
@@ -146,7 +147,7 @@ def decode_receipt(data):
         value = body(encoded, path)
         if isinstance(value, dict):
             envelopes.add(path)
-        elif isinstance(value, list) and value:
+        elif isinstance(value, list):
             batches = []
             for j, encoded_batch in enumerate(value):
                 batch_path = f"{path}/{j}"

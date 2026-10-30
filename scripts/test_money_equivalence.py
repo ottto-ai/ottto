@@ -334,9 +334,21 @@ class MoneyEquivalenceTests(unittest.TestCase):
         for private in ("cost", "total_cost_usd", "PRIVATE_BEFORE", "PRIVATE_AFTER"):
             self.assertNotIn(private, json.dumps(self.compare()))
 
+    def test_empty_pages_remain_distinct_from_emitted_envelopes(self):
+        """[regress] Empty Pi pages were rejected by the receipt decoder."""
+        empty = receipt([], claude=False)
+        self.assertEqual(decode_receipt(empty), ([[]], set()))
+        self.assertFalse(has_forbidden_diff(receipt_diff(empty, empty)))
+        emitted = receipt(self.base, claude=False)
+        for left, right in ((empty, emitted), (emitted, empty)):
+            with self.subTest(empty_on_left=left == empty):
+                diff = receipt_diff(left, right)
+                self.assertTrue(has_forbidden_diff(diff))
+                self.assertEqual(diff["changed"], ["/0"])
+
     def test_invalid_receipts_fail_closed_without_values(self):
         for invalid in (b'[]', b'{}', b'[[true]]', b'[[256]]', b'[[255]]',
-                        b'[[123]]', json.dumps([encode([])]),
+                        b'[[123]]',
                         json.dumps([encode([encode(42)])]),
                         json.dumps([list(b'{"x":1,"x":2}')]),
                         json.dumps([list(b'{"x":NaN}')]),
