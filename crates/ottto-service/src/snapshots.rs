@@ -39192,9 +39192,8 @@ enum PiCostParseError {
 fn usd_picos_at(value: &Value, keys: &[&str]) -> Result<(u128, bool), PiCostParseError> {
     let raw = keys.iter().find_map(|key| value.get(*key));
     match raw {
-        // Without serde_json's workspace-wide arbitrary_precision feature,
-        // integers are exact; floating numbers are exact only to f64's shortest
-        // round-trip Display representation. Strings retain the original lexeme.
+        // serde_json has no arbitrary_precision feature here; integers remain exact.
+        // The number form is exact only to f64's shortest round-trip representation; the string form is exact to its lexeme.
         Some(Value::Number(number)) => parse_pi_usd_picos(&number.to_string()),
         Some(Value::String(text)) => parse_pi_usd_picos(text),
         _ => Err(PiCostParseError::Invalid),
@@ -80166,6 +80165,29 @@ mod tests {
                 Err(PiCostParseError::Invalid),
                 "{text}"
             );
+        }
+    }
+
+    #[test]
+    fn pi_cost_number_display_matches_realistic_decimal_strings() {
+        // Every pair has at most 15 significant digits. Include precision
+        // rounding and half-even ties as well as ordinary multi-dollar costs.
+        for (text, picos, rounded) in [
+            ("0.000123456789012", 123_456_789, true),
+            ("12.3456789", 12_345_678_900_000, false),
+            ("99999.999999", 99_999_999_999_000_000, false),
+            ("0.0000000000015", 2, true),
+            ("0.0000000000025", 2, true),
+            ("0.0000000000035", 4, true),
+        ] {
+            for raw in [serde_json::from_str::<Value>(text).unwrap(), json!(text)] {
+                let (costs, observations) = pi_usage_costs_with_observations(&json!({
+                    "cost": {"total": raw}
+                }));
+                assert_eq!(costs.total, Some(picos), "{raw}");
+                assert_eq!(observations.rounded, u64::from(rounded), "{raw}");
+                assert_eq!(observations.refused, 0, "{raw}");
+            }
         }
     }
 
