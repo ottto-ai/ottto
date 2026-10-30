@@ -29,12 +29,20 @@ pub(super) enum OwedMark {
 #[derive(Default)]
 pub(super) struct KeyDebt {
     owed: OwedMark,
+    pub(super) rederive_hold: Option<DurableSource>,
+    pub(super) head_extent: Option<u32>,
+    pub(super) extra_head: bool,
+    pub(super) retire_source: Option<DurableSource>,
+    pub(super) retire_sync: bool,
     /// D3: this Claude key's stale predecessor survived a failed write.
     hold: Option<ClaudeHold>,
 }
 impl KeyDebt {
     pub(super) fn is_empty(&self) -> bool {
-        self.owed == OwedMark::None && self.hold.is_none()
+        self.owed == OwedMark::None
+            && self.hold.is_none()
+            && self.rederive_hold.is_none()
+            && self.retire_source.is_none()
     }
 }
 /// Funded nodes per map: owed/hold keys need no more than the RAM cache's
@@ -135,6 +143,12 @@ impl Stores {
         }
         Some(self.key_debt.entry(digest).or_default().as_mut())
     }
+    pub(super) fn clear_rederive_hold(&mut self, digest: &store::Digest32) {
+        if let Some(debt) = self.key_debt.get_mut(digest) {
+            debt.rederive_hold = None;
+        }
+        self.release_idle_debt(digest);
+    }
     /// Frees an empty debt node, so a discharged key never pins a slot.
     fn release_idle_debt(&mut self, digest: &store::Digest32) {
         if self
@@ -173,6 +187,11 @@ impl Stores {
         for debt in self.key_debt.values_mut() {
             if matches!(debt.owed, OwedMark::Owed(s) | OwedMark::Hold(s) if s == source) {
                 debt.owed = OwedMark::None;
+            }
+        }
+        for debt in self.key_debt.values_mut() {
+            if debt.rederive_hold == Some(source) {
+                debt.rederive_hold = None;
             }
         }
         self.key_debt.retain(|_, debt| !debt.is_empty());
@@ -543,6 +562,16 @@ impl SharedCache {
     pub(in crate::snapshots) fn owes_discovery(&self, source: SnapshotSource, key: &str) -> bool {
         if !crate::snapshots::restart_restore::enabled() {
             return false;
+        }
+        if durable_source(source).is_some_and(|ds| {
+            self.durable().is_some_and(|stores| {
+                stores
+                    .key_debt
+                    .get(&store::key_digest(ds, key))
+                    .is_some_and(|d| d.rederive_hold == Some(ds))
+            })
+        }) {
+            return true;
         }
         let overflow = durable_source(source).is_some_and(|ds| {
             self.durable()

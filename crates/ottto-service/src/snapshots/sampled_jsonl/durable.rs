@@ -5,9 +5,9 @@
 //! The body holds the allowlisted fields (`N`/`H`/`U`/`L`/`PL`, see
 //! `durable_tail_codec`) and, for each re-derived content field, the digest of
 //! its value. The marks (`DurableMarks`, `SessionStartState::content_end`) say
-//! where in the file each was last assigned. Production restore funds the
-//! bounded typed workspace extractor before input. Other content obligations
-//! still refuse before input. Empty obligations move the paid decoded graph.
+//! where in the file each was last assigned. Growth-only M3 restore prepays a
+//! bounded native content replay and fences every X field before adoption.
+//! Empty obligations move the paid decoded graph.
 //! The native parser also serves the default-OFF M1 warm-restore route.
 #![cfg_attr(not(test), allow(dead_code))]
 

@@ -1608,7 +1608,7 @@ impl DurableCertificate {
     /// FD; the caller's read plan positions it again before any native read.
     #[cfg(test)]
     pub(crate) fn admits(&self, file: &mut File) -> Result<DurableAdmission, FullReason> {
-        self.admit_samples(file)
+        self.admit_samples(file, false)
             .map(|(admission, ..)| admission)
             .map_err(|refusal| match refusal {
                 CertificateRefusal::Changed(reason) => reason,
@@ -1626,7 +1626,26 @@ impl DurableCertificate {
         file: &mut File,
         scope: Scope,
     ) -> Result<(Checkpoint, DurableAdmission), CertificateRefusal> {
-        let (admission, head, boundary, current) = self.admit_samples(file)?;
+        self.restore_with_append(file, scope, false)
+    }
+
+    /// M3's grown path permits concurrent appends outside the certified prefix.
+    /// The M1/OFF entry above keeps its exact metadata guard.
+    pub(crate) fn restore_grown(
+        &self,
+        file: &mut File,
+        scope: Scope,
+    ) -> Result<(Checkpoint, DurableAdmission), CertificateRefusal> {
+        self.restore_with_append(file, scope, true)
+    }
+
+    fn restore_with_append(
+        &self,
+        file: &mut File,
+        scope: Scope,
+        allow_append: bool,
+    ) -> Result<(Checkpoint, DurableAdmission), CertificateRefusal> {
+        let (admission, head, boundary, current) = self.admit_samples(file, allow_append)?;
         let checkpoint = Checkpoint {
             stamp: FileStamp {
                 length: self.length,
@@ -1675,7 +1694,7 @@ impl DurableCertificate {
         }
         let mut probe = self.clone();
         probe.modified = stamp.modified;
-        match probe.admit_samples(file) {
+        match probe.admit_samples(file, false) {
             Err(CertificateRefusal::Changed(
                 reason @ (FullReason::Replaced
                 | FullReason::Shrunk
@@ -1722,6 +1741,7 @@ impl DurableCertificate {
     fn admit_samples(
         &self,
         file: &mut File,
+        allow_append: bool,
     ) -> Result<(DurableAdmission, Vec<u8>, Vec<u8>, FileStamp), CertificateRefusal> {
         let stamp = self.checked_stamp(file)?;
         let unchanged = stamp.length == self.length;
@@ -1750,11 +1770,11 @@ impl DurableCertificate {
             .metadata()
             .and_then(FileStamp::capture)
             .map_err(|_| CertificateRefusal::ReadError)?;
-        if after.device != stamp.device
-            || after.inode != stamp.inode
-            || after.length != stamp.length
-            || after.modified != stamp.modified
-        {
+        if if allow_append {
+            !append_compatible(&stamp, &after)
+        } else {
+            !stamp.same_content(&after)
+        } {
             return Err(CertificateRefusal::Changed(FullReason::Replaced));
         }
         Ok((

@@ -371,6 +371,14 @@ pub(crate) struct DurableRecord {
     pub(crate) wire: Option<WireIdentity>,
 }
 
+/// Writer-owned retirement distinguishes absence/verified replacement from
+/// unknown survivors and I/O. No outcome is an ACK or a receipt.
+pub(crate) enum RetireOutcome {
+    Retired,
+    Superseded,
+    Retry,
+}
+
 /// Exact verified predecessor; no caller can manufacture or clone its authority.
 pub(crate) struct MutationWitness {
     key: Digest32,
@@ -2243,6 +2251,89 @@ impl DurableTailStore {
         Ok(report)
     }
 
+    /// Retire exactly the verified predecessor. `sync_due` belongs to writer
+    /// custody: once unlink succeeds, absence never cancels the sync barrier.
+    pub(crate) fn retire_exact<W: SingleWriter>(
+        &mut self,
+        writer: &W,
+        proof: &MutationWitness,
+        sync_due: &mut bool,
+    ) -> RetireOutcome {
+        let result = (|| -> io::Result<RetireOutcome> {
+            self.check_writer(writer)?;
+            if !self.usable(Some(writer))
+                || self.pending.contains_key(&proof.key)
+                || self.receipt_pending(&proof.key)
+            {
+                return Ok(RetireOutcome::Retry);
+            }
+            let path = self.record_path(&proof.key);
+            let before = stamp_at(&path)?;
+            match before {
+                None => {
+                    // Also covers a prior unlink whose sync returned an error.
+                    #[cfg(test)]
+                    test_hooks::transition_edge(CrashPoint::BeforeRetireSync, &self.dir)?;
+                    self.sync_store()?;
+                    #[cfg(test)]
+                    test_hooks::transition_edge(CrashPoint::RetiredSynced, &self.dir)?;
+                    if stamp_at(&path)?.is_some() {
+                        return Ok(RetireOutcome::Retry);
+                    }
+                    self.durable.remove(&proof.key);
+                    *sync_due = false;
+                    self.counters.records_invalidated += 1;
+                    return Ok(RetireOutcome::Retired);
+                }
+                Some(stamp) if stamp != proof.stamp => {
+                    if *sync_due {
+                        self.sync_store()?;
+                    }
+                    // A boolean witness miss is NOT supersession. Force a full
+                    // survivor verification, preserving newer/unknown formats.
+                    self.durable.remove(&proof.key);
+                    let verified = self.read_known(&proof.key, Some(writer), false);
+                    return Ok(
+                        if matches!(verified, Ok(Some(_))) && stamp_at(&path)? == before {
+                            *sync_due = false;
+                            RetireOutcome::Superseded
+                        } else {
+                            RetireOutcome::Retry
+                        },
+                    );
+                }
+                Some(_) => {}
+            }
+            let header = self
+                .classify(&proof.key, "delete", Some(writer))
+                .map_err(|_| io::Error::other("retirement classification"))?
+                .ok_or_else(|| io::Error::other("retirement unknown survivor"))?;
+            if !self.authorized(&proof.key, header.format) || stamp_at(&path)? != Some(proof.stamp)
+            {
+                return Ok(RetireOutcome::Retry);
+            }
+            #[cfg(test)]
+            test_hooks::transition_edge(CrashPoint::BeforeRetireUnlink, &path)?;
+            remove_if_present(&path)?;
+            *sync_due = true;
+            #[cfg(test)]
+            test_hooks::transition_edge(CrashPoint::RetiredUnlink, &path)?;
+            #[cfg(test)]
+            test_hooks::transition_edge(CrashPoint::BeforeRetireSync, &self.dir)?;
+            self.sync_store()?;
+            #[cfg(test)]
+            test_hooks::transition_edge(CrashPoint::RetiredSynced, &self.dir)?;
+            if stamp_at(&path)?.is_some() {
+                return Ok(RetireOutcome::Retry);
+            }
+            self.durable.remove(&proof.key);
+            *sync_due = false;
+            self.counters.records_invalidated += 1;
+            Ok(RetireOutcome::Retired)
+        })();
+        result.unwrap_or(RetireOutcome::Retry)
+    }
+
     /// Deletes the records of `keys` (held or reverted selections): a stale
     /// record for them must never restore.
     pub(crate) fn remove_keys<W: SingleWriter>(
@@ -2344,6 +2435,10 @@ impl DurableTailStore {
 }
 
 impl MutationWitness {
+    pub(crate) fn same_predecessor(&self, other: &Self) -> bool {
+        self.key == other.key && self.content == other.content && self.stamp == other.stamp
+    }
+
     pub(crate) fn migration_floor(&self) -> Option<u64> {
         self.migration_floor.map(|floor| floor.get())
     }
