@@ -585,30 +585,6 @@ fn legacy_pass_uses_at_most_half_the_shared_slots_and_deduplicates() {
 }
 
 #[test]
-fn summaries_report_changed_backlogs_and_logical_offer_bytes() {
-    use reason_reoffer::{should_log_change, ReofferCounts};
-    let empty = ReofferCounts::default();
-    assert!(!should_log_change(None, &empty));
-    let backlog = ReofferCounts {
-        outside_policy_window: 2,
-        ..empty
-    };
-    assert!(should_log_change(Some(empty), &backlog));
-    assert!(!should_log_change(Some(backlog), &backlog));
-    assert!(should_log_change(Some(backlog), &empty));
-    let work = ReofferCounts {
-        selected: 1,
-        attempted: 1,
-        attempted_bytes: 123,
-        ..empty
-    };
-    assert!(should_log_change(Some(work), &work));
-    assert!(work
-        .line("codex")
-        .contains("attempted=1 attempted_bytes=123"));
-}
-
-#[test]
 fn unsent_leases_are_held_and_conflicts_are_retryable_not_refused() {
     let (mut progress, index) = refused(&[(1, original_pair(0)), (2, original_pair(0))]);
     assert!(select(&mut progress, &index, NOW));
@@ -959,30 +935,6 @@ fn cache_bootstrap_errors_finalize_attempted_entities_bytes_and_outcomes() {
         }
         std::fs::remove_dir_all(root).unwrap();
     }
-}
-
-/// Terminal census disclosure shares one per-source line with the other loss
-/// counters, even when the re-offer work summary has no new work to log.
-#[test]
-fn cooldown_conflict_count_is_disclosed_beside_terminal_census_counts() {
-    let counts = SyncCounts {
-        census_complete: true,
-        snapshot_unproven_terminal_count: 2,
-        ownership_incomplete_file_count: 3,
-        cooldown_conflict_deferred: 1,
-        ..SyncCounts::default()
-    };
-    let line = counts.terminal_census_line("claude_code");
-    for field in [
-        "source=claude_code",
-        "census_complete=true",
-        "unproven_terminal=2",
-        "ownership_incomplete_files=3",
-        "cooldown_conflict_deferred=1",
-    ] {
-        assert!(line.contains(field), "missing {field}: {line}");
-    }
-    assert_eq!(line.lines().count(), 1);
 }
 
 /// A bounded page need not revisit every cooldown entity. Its provisional

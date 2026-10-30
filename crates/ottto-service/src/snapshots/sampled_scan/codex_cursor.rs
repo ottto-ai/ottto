@@ -148,13 +148,6 @@ pub(crate) fn with_test_limits_for_test<T>(
     with_test_limits(cursor, singleton, skip_chunk, run)
 }
 
-/// Stage 1 K8, tests only: the cursor byte budget in force on this thread,
-/// so a test can tell which thread's test limits a page sees (W10).
-#[cfg(test)]
-pub(crate) fn cursor_limit_for_test() -> u64 {
-    Limits::current().cursor
-}
-
 #[cfg(test)]
 thread_local! {
     static TEST_STATE_BUDGET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };

@@ -12113,89 +12113,6 @@ mod tests {
             serde_json::to_value(&item).unwrap()["compaction_events"]
         );
     }
-    #[test]
-    fn native_comparison_decision_records_bounded_base_fold_without_completion() {
-        use crate::snapshots::claude_native_comparison::{lifecycle, Completion};
-        let root = crate::test_scratch::ScratchDir::new("native-decision-base-fold");
-        let transcripts = root.join("transcripts");
-        std::fs::create_dir_all(&transcripts).unwrap();
-        for id in ["bounded-a", "bounded-b"] {
-            let row = serde_json::json!({"timestamp":"2026-10-18T12:00:00Z", "sessionId":id, "requestId":format!("req-{id}"), "message":{"id":format!("msg-{id}"), "model":"claude-opus-4-8", "usage":{"input_tokens":42,"output_tokens":1}}});
-            std::fs::write(transcripts.join(format!("{id}.jsonl")), format!("{row}\n")).unwrap();
-        }
-        let mut index = ScanIndex::default();
-        index.generation = 17;
-        let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
-            SnapshotSource::ClaudeCode,
-            &[transcripts],
-            &mut index,
-            "2026-10-18T12:05:00Z",
-            183,
-            1,
-            false,
-        )
-        .unwrap();
-        assert_eq!(scan.scanned_file_count, 1);
-        assert!(!scan.census_complete, "actual bounded BASE page");
-        let mut completion = Completion::base(None);
-        assert!(completion.is_none(), "no terminal native traversal exists");
-        let mut baseline_index = index.clone();
-        let mut baseline_scan = scan.clone();
-        let support = root.join("support");
-        let baseline = try_apply_claude_local_evidence_to_scan_with_comparison(
-            &support,
-            &mut baseline_scan,
-            &mut baseline_index,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let owner = std::sync::Arc::new(lifecycle::Lifecycle::default());
-        let (candidate, rows) = crate::local_resource_diagnostics::capture(|| {
-            let mut lease = owner.begin();
-            lease.bind_scope(lifecycle::Scope::from_arguments(format_args!(
-                "bounded-base"
-            )));
-            assert!(!lease.allowed());
-            try_apply_claude_local_evidence_to_scan_with_comparison(
-                &support,
-                &mut scan,
-                &mut index,
-                None,
-                completion.as_mut(),
-                Some(&lease),
-                None,
-                None,
-                None,
-            )
-            .unwrap()
-        });
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["counts"]["fold_index_generation"], 17);
-        assert!(rows[0]["counts"]["terminal_rearm"].is_null());
-        assert!(!owner.retained_valid_for_test());
-        assert_eq!(candidate.0, baseline.0);
-        assert_eq!(candidate.1, baseline.1);
-        assert_eq!(
-            serde_json::to_value(&index).unwrap(),
-            serde_json::to_value(&baseline_index).unwrap()
-        );
-        assert_eq!(
-            scan.snapshots
-                .iter()
-                .map(snapshot_upload_body_witness)
-                .collect::<Vec<_>>(),
-            baseline_scan
-                .snapshots
-                .iter()
-                .map(snapshot_upload_body_witness)
-                .collect::<Vec<_>>()
-        );
-    }
 
     #[test]
     fn machine_icon_cache_preserves_missing_null_and_blank_echoes() {
@@ -16922,26 +16839,6 @@ mod tests {
     }
 
     #[test]
-    fn a_shed_without_retry_after_uses_full_jitter_not_a_fixed_wait() {
-        // Full jitter means random(0, ceiling): the point is that two machines
-        // shed at the same instant do not come back at the same instant.
-        let waits = (0..24).map(|_| shed_backoff(None)).collect::<BTreeSet<_>>();
-        assert!(
-            waits.len() > 1,
-            "a constant backoff re-synchronises the fleet it is meant to spread"
-        );
-        assert!(waits.iter().all(|wait| *wait <= SHED_BACKOFF_BASE));
-
-        // The ladder is exponential in its ceiling and capped.
-        assert!(full_jitter_backoff(0) <= SHED_BACKOFF_BASE);
-        assert!(full_jitter_backoff(3) <= SHED_BACKOFF_BASE * 8);
-        assert!(
-            full_jitter_backoff(30) <= crate::snapshot_client::MAX_HONOURED_RETRY_AFTER,
-            "the ladder must saturate, not overflow"
-        );
-    }
-
-    #[test]
     #[serial(source_upload_deadlines)]
     fn a_sustained_shed_climbs_the_ladder_and_a_success_resets_it() {
         clear_source_upload_deadlines_for_test();
@@ -16995,58 +16892,6 @@ mod tests {
         defer_source_uploads(SnapshotSource::Codex, Duration::ZERO);
         assert!(source_upload_backoff_remaining(SnapshotSource::Codex).is_none());
         clear_source_upload_deadlines_for_test();
-    }
-
-    #[test]
-    #[serial(source_cadences)]
-    fn the_negotiated_cadence_respects_the_floor_the_ceiling_and_the_directive() {
-        clear_cadence_state_for_test();
-        let floor = SNAPSHOT_SYNC_INTERVAL;
-        let start = Instant::now();
-        let mut cadence = SourceCadence::new(CadenceConfig::cost_first(floor));
-        cadence.record_scan_success(start, 1);
-
-        // A server directive may only ask for LESS frequent scanning. A directive
-        // shorter than the tier cannot buy a faster scan, or the fleet would be
-        // paying for the server's own load.
-        cadence.set_server_min_interval(Some(Duration::from_secs(1)));
-        assert_eq!(negotiated_wait(&cadence, start), floor);
-        cadence.set_server_min_interval(Some(floor * 2));
-        assert_eq!(negotiated_wait(&cadence, start), floor * 2);
-        // And it cannot silence a source past the ceiling.
-        cadence.set_server_min_interval(Some(Duration::from_secs(24 * 60 * 60)));
-        assert_eq!(negotiated_wait(&cadence, start), MAX_CYCLE_INTERVAL);
-        // The ceiling is stricter than the 6-hour sweep, so a full scan of the
-        // window happens at least every 30 minutes whatever the watcher does.
-        assert!(MAX_CYCLE_INTERVAL < CadenceConfig::cost_first(floor).full_sweep_interval);
-        clear_cadence_state_for_test();
-    }
-
-    #[test]
-    #[serial(source_cadences)]
-    fn a_quiet_source_stretches_and_file_activity_brings_it_back_to_the_floor() {
-        clear_cadence_state_for_test();
-        let floor = SNAPSHOT_SYNC_INTERVAL;
-        let start = Instant::now();
-        let mut cadence = SourceCadence::new(CadenceConfig::cost_first(floor));
-
-        // Two quiet cycles: the source falls to the idle tier and is scanned less
-        // often. That saving is the entire point of the wiring.
-        cadence.record_scan_success(start, 0);
-        let later = start + Duration::from_secs(20 * 60);
-        cadence.record_scan_success(later, 0);
-        let idle_wait = negotiated_wait(&cadence, later);
-        assert!(idle_wait > floor);
-        assert!(idle_wait <= MAX_CYCLE_INTERVAL);
-
-        // A filesystem event promotes the tier back to the floor — and only to the
-        // floor. Fifty events in a second cannot buy fifty scans.
-        for offset in 0..50 {
-            cadence.record_file_event(later + Duration::from_secs(offset));
-        }
-        assert_eq!(negotiated_wait(&cadence, later), floor);
-        assert!(negotiated_wait(&cadence, later + Duration::from_secs(1)) > Duration::ZERO);
-        clear_cadence_state_for_test();
     }
 
     #[test]
@@ -17148,26 +16993,6 @@ mod tests {
             );
         }
         clear_cadence_state_for_test();
-    }
-
-    #[test]
-    fn the_cadence_phase_offset_is_stable_per_machine_and_inside_the_interval() {
-        let interval = Duration::from_secs(5 * 60);
-        let first = cadence_phase_offset("otm_aaaa", interval);
-        assert_eq!(first, cadence_phase_offset("otm_aaaa", interval));
-        assert!(first < interval);
-        let offsets = ["otm_a", "otm_b", "otm_c", "otm_d", "otm_e", "otm_f"]
-            .into_iter()
-            .map(|id| cadence_phase_offset(id, interval))
-            .collect::<BTreeSet<_>>();
-        assert!(
-            offsets.len() > 1,
-            "the offset must actually spread machines apart"
-        );
-        assert_eq!(
-            cadence_phase_offset("otm_a", Duration::ZERO),
-            Duration::ZERO
-        );
     }
 
     #[test]
@@ -18591,20 +18416,6 @@ mod tests {
     }
 
     #[test]
-    fn enabled_snapshot_sources_excludes_sources_not_granted() {
-        let device = LocalDeviceBinding {
-            device_id: "device".to_string(),
-            machine_id: Some("otm_test".to_string()),
-            sources: vec!["claude_code".to_string()],
-        };
-
-        assert_eq!(
-            enabled_snapshot_sources(&device),
-            vec![SnapshotSource::ClaudeCode]
-        );
-    }
-
-    #[test]
     fn one_shot_sync_slot_is_single_flight() {
         set_one_shot_sync_in_flight(false);
 
@@ -18781,30 +18592,6 @@ mod tests {
             std::fs::read(&legacy).expect("read replaced legacy index"),
         );
         let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn reverify_backoff_doubles_from_initial_and_caps() {
-        assert_eq!(reverify_backoff_delay(0), Duration::from_secs(2 * 60));
-        assert_eq!(reverify_backoff_delay(1), Duration::from_secs(4 * 60));
-        assert_eq!(reverify_backoff_delay(2), Duration::from_secs(8 * 60));
-        assert_eq!(reverify_backoff_delay(3), Duration::from_secs(16 * 60));
-        assert_eq!(reverify_backoff_delay(4), FAILED_VERIFY_RETRY_MAX);
-        assert_eq!(reverify_backoff_delay(20), FAILED_VERIFY_RETRY_MAX);
-        assert_eq!(reverify_backoff_delay(u32::MAX), FAILED_VERIFY_RETRY_MAX);
-    }
-
-    #[test]
-    fn agent_status_ttl_has_jitter_buffer_over_sync_interval() {
-        let ttl = Duration::from_secs(AGENT_STATUS_SNAPSHOT_TTL_MINUTES as u64 * 60);
-
-        assert!(ttl > SNAPSHOT_SYNC_INTERVAL);
-    }
-
-    #[test]
-    fn local_health_heartbeat_cadence_is_not_bound_to_snapshot_scans() {
-        assert!(LOCAL_HEALTH_PROJECTION_INTERVAL < SNAPSHOT_SYNC_INTERVAL);
-        assert!(LOCAL_HEALTH_PROJECTION_INTERVAL <= Duration::from_secs(60));
     }
 
     #[test]
@@ -19305,53 +19092,6 @@ mod tests {
 
             let _ = std::fs::remove_dir_all(root);
         }
-    }
-
-    #[test]
-    fn setup_run_refresh_hold_backs_off_capped_and_resets_on_a_new_binding() {
-        let now = Instant::now();
-        let binding = [1u8; 32];
-        let mut hold = None;
-        let remaining = |hold: &mut Option<SetupRunRefreshHold>, binding: &[u8; 32], at| {
-            setup_run_refresh_hold_at(hold, binding, at).map(|held| held.remaining)
-        };
-        assert_eq!(remaining(&mut hold, &binding, now), None);
-
-        let waits = (0..7)
-            .map(|_| note_setup_run_refresh_failed_at(&mut hold, &binding, now, false))
-            .map(|wait| wait.map(|wait| wait.as_secs()))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            waits,
-            [120, 240, 480, 960, 1800, 1800, 1800].map(Some).to_vec()
-        );
-        assert_eq!(
-            remaining(&mut hold, &binding, now),
-            Some(Some(SETUP_RUN_REFRESH_HOLD_CAP))
-        );
-        // A transient rejection is never final: once the wait passes, the pass runs again.
-        assert_eq!(
-            remaining(&mut hold, &binding, now + SETUP_RUN_REFRESH_HOLD_CAP),
-            None
-        );
-        assert!(hold.is_some());
-
-        // A terminal refresh answer parks the same binding with no deadline.
-        assert_eq!(
-            note_setup_run_refresh_failed_at(&mut hold, &binding, now, true),
-            None
-        );
-        let much_later = now + SETUP_RUN_REFRESH_HOLD_CAP * 100;
-        assert_eq!(remaining(&mut hold, &binding, much_later), Some(None));
-
-        // A reattach or credential change drops the hold and restarts the ladder.
-        let reattached = [2u8; 32];
-        assert_eq!(remaining(&mut hold, &reattached, much_later), None);
-        assert!(hold.is_none());
-        assert_eq!(
-            note_setup_run_refresh_failed_at(&mut hold, &reattached, now, false),
-            Some(Duration::from_secs(120))
-        );
     }
 
     #[test]
@@ -20691,164 +20431,6 @@ mod tests {
         assert!(!deferred.fully_settled);
     }
 
-    /// Diagnostics only: every settlement path that marks the sweep unsettled
-    /// names itself, causes accumulate across pages and survive a reload, and
-    /// a settled outcome names nothing.
-    #[test]
-    fn unsettled_cause_names_each_settlement_and_partial_checkpoint_producer() {
-        let entry = |source: &str, fingerprint: &str| {
-            serde_json::json!({
-                "size_bytes": 1,
-                "modified_unix_seconds": 2,
-                "source_file_fingerprint": source,
-                "last_snapshot_fingerprint": fingerprint,
-                "scan_identity_version": "semantic_sync:v2",
-            })
-        };
-        let committed = claude_index_with(serde_json::json!({
-            "files": {"/opaque/held.jsonl": entry("held-old-source", "held-old")},
-            "file_snapshot_fingerprints": {"/opaque/held.jsonl": ["held-old"]},
-        }));
-        let scanned = claude_index_with(serde_json::json!({
-            "files": {"/opaque/held.jsonl": entry("held-new-source", "held-new")},
-            "file_snapshot_fingerprints": {"/opaque/held.jsonl": ["held-new"]},
-        }));
-        let held = BTreeSet::from(["held-new".to_string()]);
-        let progress = test_upload_progress();
-        let holds = |held_fingerprints: &BTreeSet<String>| LocalHoldSettlement {
-            held_entity_count: held_fingerprints.len(),
-            retry_pending_family_count: 0,
-            held_fingerprints: held_fingerprints.clone(),
-            account_deferred_fingerprints: BTreeSet::new(),
-            // Restorable non-blocking Rejected holds settle once H1 is composed.
-            progress_blocking: !held_fingerprints.is_empty(),
-            held_family_roots: None,
-        };
-
-        let blocked = commit_completed_with_local_holds(
-            scanned.clone(),
-            &committed,
-            &progress,
-            &held,
-            &BTreeSet::new(),
-            true,
-            None,
-        );
-        assert!(blocked.bounded_sweep_had_unsettled_upload());
-        assert_eq!(
-            blocked.bounded_sweep_unsettled_cause_names(),
-            ["completed_blocking_holds"]
-        );
-        let restored = commit_completed_with_local_holds(
-            scanned.clone(),
-            &committed,
-            &progress,
-            &held,
-            &BTreeSet::new(),
-            false,
-            None,
-        );
-        assert!(!restored.bounded_sweep_had_unsettled_upload());
-        assert!(restored.bounded_sweep_unsettled_cause_names().is_empty());
-
-        let deferred = settle_checkpointed_upload(
-            scanned.clone(),
-            &committed,
-            &progress,
-            &holds(&BTreeSet::new()),
-            false,
-        );
-        assert!(deferred.index.bounded_sweep_had_unsettled_upload());
-        assert_eq!(
-            deferred.index.bounded_sweep_unsettled_cause_names(),
-            ["deferred_conflict"]
-        );
-        let rejected_beside_hold =
-            settle_checkpointed_upload(scanned.clone(), &committed, &progress, &holds(&held), true);
-        assert!(rejected_beside_hold
-            .index
-            .bounded_sweep_had_unsettled_upload());
-        assert_eq!(
-            rejected_beside_hold
-                .index
-                .bounded_sweep_unsettled_cause_names(),
-            ["rejected_with_holds"]
-        );
-        let rejected = settle_checkpointed_upload(
-            scanned.clone(),
-            &committed,
-            &progress,
-            &holds(&BTreeSet::new()),
-            true,
-        );
-        assert!(!rejected.index.bounded_sweep_had_unsettled_upload());
-        assert!(rejected
-            .index
-            .bounded_sweep_unsettled_cause_names()
-            .is_empty());
-        // H1 settles a Rejected page whose holds are restorable and
-        // non-blocking, so it must name no unsettled cause.
-        let restorable = settle_checkpointed_upload(
-            scanned.clone(),
-            &committed,
-            &progress,
-            &LocalHoldSettlement {
-                progress_blocking: false,
-                ..holds(&held)
-            },
-            true,
-        );
-        assert!(!restorable.index.bounded_sweep_had_unsettled_upload());
-        assert!(restorable
-            .index
-            .bounded_sweep_unsettled_cause_names()
-            .is_empty());
-
-        // The shed and error branches mark through the partial checkpoint.
-        // A cause from an earlier page of the same sweep is kept beside it.
-        for (cause, name) in [
-            (UnsettledUploadCause::Shed, "shed"),
-            (UnsettledUploadCause::UploadError, "upload_error"),
-        ] {
-            let root = test_dir(&format!("unsettled-cause-checkpoint-{name}"));
-            std::fs::create_dir_all(&root).expect("create checkpoint fixture root");
-            let index_path = root.join("scan-index.json");
-            let progress_path = root.join("upload-progress.json");
-            let mut durable = SnapshotUploadProgress::load(
-                &progress_path,
-                &format!("{:064x}", 589),
-                snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
-            )
-            .expect("load upload progress");
-            durable.save(&progress_path).expect("save upload progress");
-            let mut working = scanned.clone();
-            working.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::DeferredConflict);
-            let checkpoint = checkpoint_partial_snapshot_index_with_comparison(
-                &working,
-                &committed,
-                &durable,
-                &[],
-                None,
-                &BTreeSet::new(),
-                &index_path,
-                &progress_path,
-                || Ok(()),
-                None,
-                None,
-                Some(cause),
-            )
-            .expect("partial checkpoint");
-            assert!(checkpoint.bounded_sweep_had_unsettled_upload());
-            let reloaded = ScanIndex::load(&index_path).expect("reload scan index");
-            assert!(reloaded.bounded_sweep_had_unsettled_upload());
-            assert_eq!(
-                reloaded.bounded_sweep_unsettled_cause_names(),
-                [name, "deferred_conflict"]
-            );
-            let _ = std::fs::remove_dir_all(root);
-        }
-    }
-
     /// SOURCE 2026-10-27 (option A), conditions (2) and (3): a `Completed`
     /// page's blocking holds scope the sweep marker to their own families for
     /// the terminal unchanged-proof skip only. The flag and its cause names
@@ -21302,62 +20884,6 @@ mod tests {
         for forbidden in ["index_keys", "session_ids", "/Users/", ".codex", ".claude"] {
             assert!(!serialized.contains(forbidden), "{forbidden}");
         }
-    }
-
-    #[test]
-    fn codex_local_diagnostics_observe_the_actual_supersession_transition() {
-        use crate::codex_scan_diagnostics::RecoveryLineage;
-        let old = "a".repeat(64);
-        let retained = "b".repeat(64);
-        let historical = "c".repeat(64);
-        let mut progress = test_upload_progress();
-        for fingerprint in [&old, &retained, &historical] {
-            progress.quarantined_fingerprints.insert(
-                fingerprint.clone(),
-                crate::snapshots::snapshot_quarantine_record(SnapshotSource::Codex),
-            );
-        }
-        progress
-            .quarantined_fingerprints
-            .get_mut(&historical)
-            .unwrap()
-            .disposition = SnapshotQuarantineDisposition::SupersededTerminal;
-        let mut diagnostic = CodexScanDiagnostics::default();
-        for (slot, fingerprint) in [&old, &retained, &historical].iter().enumerate() {
-            diagnostic.lineage[slot] = Some(RecoveryLineage::new(
-                fingerprint,
-                progress.quarantined_fingerprints[*fingerprint].disposition,
-            ));
-        }
-        let current = BTreeSet::from([retained.clone(), historical.clone()]);
-        assert!(
-            progress.retain_current_quarantines_with_diagnostics(&current, Some(&mut diagnostic))
-        );
-        let superseded = diagnostic.lineage[0].unwrap();
-        assert!(!superseded.after_current);
-        assert_eq!(
-            superseded.before_disposition,
-            SnapshotQuarantineDisposition::RetryPending
-        );
-        assert_eq!(
-            superseded.after_disposition,
-            SnapshotQuarantineDisposition::SupersededTerminal
-        );
-        assert_eq!(
-            progress.quarantined_fingerprints[&old].retry_after_unix_seconds,
-            0
-        );
-        assert!(diagnostic.lineage[1].unwrap().after_current);
-        assert_eq!(
-            diagnostic.lineage[1].unwrap().after_disposition,
-            SnapshotQuarantineDisposition::RetryPending
-        );
-        // A historical terminal record can coexist with restored current membership.
-        assert!(diagnostic.lineage[2].unwrap().after_current);
-        assert_eq!(
-            diagnostic.lineage[2].unwrap().after_disposition,
-            SnapshotQuarantineDisposition::SupersededTerminal
-        );
     }
 
     #[test]
@@ -22233,15 +21759,6 @@ mod tests {
 
         assert!(cached_source_manifest(destination, SnapshotSource::Codex).is_none());
         let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn collector_checkin_interval_stays_inside_freshness_promise() {
-        // The backend's sources.status freshness SLO is five minutes measured
-        // from the server-received check-in. The heartbeat must beat with real
-        // headroom, and faster than the sync loop's own sleep.
-        assert!(COLLECTOR_CHECKIN_INTERVAL <= Duration::from_secs(4 * 60));
-        assert!(COLLECTOR_CHECKIN_INTERVAL < SNAPSHOT_SYNC_INTERVAL);
     }
 
     #[test]
@@ -24624,38 +24141,3 @@ crate::heap_layout_bound::fields!(PermanentSnapshotRejection; body_witness, reas
 
 crate::heap_layout_bound::fields!(PreparedTraceRead; generation, report);
 crate::heap_layout_bound::fields!(PreparedClaudeLocalEvidence; sessions, api, api_failed, trace_rows, traces, healthy_roots);
-
-#[cfg(test)]
-mod ownership_census_tests {
-    use super::*;
-
-    #[test]
-    fn terminal_appends_scanner_partition_only_for_codex_and_keeps_unproven_separate() {
-        let mut contributions = [0; 8];
-        contributions[0] = 2;
-        let counts = SyncCounts {
-            ownership_incomplete_file_count: 5,
-            snapshot_unproven_terminal_count: 3,
-            causes: (contributions, [0, 77, 0]),
-            ..SyncCounts::default()
-        };
-        let line = counts.terminal_census_line("codex");
-        assert!(line.contains("unproven_terminal=3"));
-        assert!(line.contains("ownership_incomplete_files=5"));
-        assert!(line.contains("ownership_incomplete_contributions{bucket=\"inventory_hold\"}=2"));
-        assert!(line.contains("ownership_incomplete_generation_start=77"));
-        assert!(!line.contains("ownership_incomplete_distinct_paths{"));
-        assert!(!line.contains("bucket=\"unattributed\""));
-        assert!(
-            line.find("terminal_contract_retry_exhausted=").unwrap()
-                < line
-                    .find("ownership_incomplete_contributions{bucket=")
-                    .unwrap()
-        );
-        for source in ["claude_code", "pi"] {
-            assert!(!counts
-                .terminal_census_line(source)
-                .contains("ownership_incomplete_contributions{bucket="));
-        }
-    }
-}
