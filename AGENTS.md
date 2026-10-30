@@ -36,7 +36,9 @@
   macOS `Rust contracts` job runs only in the merge queue, on `main` pushes and
   on manual dispatch. Build locally only when
   no CI path works: one changed crate, one build at a time, on an idle machine,
-  and say why in your report. A Linux green is fast feedback, not Mac evidence;
+  and say why in your report. Linux unit-test builds also run the heap-layout
+  (`layout_supported()`) paths; macOS APIs, tools and `cfg(target_os = "macos")`
+  tests still run only on the Mac. A Linux green is fast feedback, not Mac evidence;
   the macOS `Rust contracts` job in the merge queue stays the merge gate.
 - CI runs on pull requests. Push to the PR branch; do not also start Public CI by
   hand on a branch whose PR is open and mergeable. GitHub starts no pull-request
