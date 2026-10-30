@@ -821,12 +821,13 @@ fn terminal_off_real_hold_renews_floor_and_three_pages_do_not_requeue_it() {
         historical_replay: true,
         ..PIPELINE_HOLD_CYCLE
     };
-    let at = time::OffsetDateTime::parse(
-        "2026-08-02T09:00:00Z",
-        &time::format_description::well_known::Rfc3339,
-    )
-    .unwrap()
-    .unix_timestamp() as u64;
+    // Lead B B1: use the actual captured admission clock. The real seeded
+    // quarantine uses SystemTime; a historical audit clock would keep its D
+    // artificially in the future and would not exercise a renewing hold.
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let pages_at = |now: u64, count: usize| {
         (0..count)
             .map(|_| {
