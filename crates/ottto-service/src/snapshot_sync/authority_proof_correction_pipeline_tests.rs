@@ -5515,7 +5515,7 @@ fn terminal_off_new_cohort_correction_evidence_waits_durably_for_reconstruction(
         let pages = fixture.generation(hour, |_| ApcUpload::Accept);
         let last = pages.last().unwrap();
         if hour == 8 {
-            accepted.extend(pages.iter().flat_map(|page| page.offered_bodies.values().cloned()));
+            accepted.extend(pages.iter().flat_map(|page| page.offered_bodies.values().map(|(fingerprint, _)| fingerprint.clone())));
         } else {
             let family = apc_family_sessions();
             assert!(pages.iter().all(|page| page.parsed.is_disjoint(&family)
