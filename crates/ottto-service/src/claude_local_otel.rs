@@ -1335,7 +1335,7 @@ pub fn load_claude_trace_ownership_evidence(
         }
         // A concurrent writer must not extend the read past the opened
         // length; one extra byte is the growth sentinel.
-        let limit = strict_budget::allowance().min(opened.len() + 1);
+        let limit = strict_budget::allowance().min(opened.len().saturating_add(1));
         #[cfg(test)]
         TRACE_BEFORE_READ.with(|hook| {
             if let Some(hook) = hook.borrow_mut().take() {
