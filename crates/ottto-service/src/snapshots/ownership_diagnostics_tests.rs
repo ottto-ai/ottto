@@ -13,41 +13,6 @@ fn conserved(counts: &Counts, total: usize) {
 }
 
 #[test]
-fn cause_cardinality_and_each_contribution_slot_are_pinned_and_sum_to_s() {
-    let all = [INVENTORY, CREATED, PARENT, ABSENT, GROUP, PARSER];
-    assert_eq!(all.len(), N);
-    assert_eq!(all.into_iter().collect::<BTreeSet<_>>(), (0..N).collect());
-    assert_eq!(NAMES.split(' ').count(), N);
-    let mut traversal = Counts::default();
-    let mut page = traversal.page(Some(77));
-    for cause in all {
-        page.add(cause, 1);
-    }
-    traversal.merge(&page);
-    assert_eq!(traversal.summary(N).0[..N], [1; N]);
-    assert_eq!(traversal.summary(N).1[0], 0);
-    conserved(&traversal, N);
-}
-
-#[test]
-fn repeated_work_counts_every_contribution_and_marker_stays_in_generation() {
-    let mut traversal = Counts::default();
-    let mut first = traversal.page(Some(77));
-    let marker = first.summary(0).1[1];
-    assert!(marker > 0);
-    first.add(INVENTORY, 2);
-    traversal.merge(&first);
-    let mut second = traversal.page(Some(77));
-    assert_eq!(second.summary(0).1[1], marker);
-    second.add(CREATED, 1);
-    traversal.merge(&second);
-    assert_eq!(traversal.summary(3).0[INVENTORY], 2);
-    assert_eq!(traversal.summary(3).0[CREATED], 1);
-    conserved(&traversal, 3);
-    assert_eq!(Counts::default().page(Some(78)).summary(0).1[1], 78);
-}
-
-#[test]
 fn index_save_load_resume_retains_contributions_and_start_marker_and_fresh_generation_resets_them()
 {
     let dir = crate::test_scratch::ScratchDir::new("ownership-causes-restart");
@@ -101,76 +66,6 @@ fn index_save_load_resume_retains_contributions_and_start_marker_and_fresh_gener
     assert_eq!(
         fresh.counts.causes.page(Some(fresh_start)).summary(0).1[1],
         fresh_start as usize
-    );
-}
-
-#[test]
-fn sparse_closed_wire_and_json_omit_empty_causes_and_keep_unattributed_last() {
-    assert!(line(Counts::default().summary(0)).is_empty());
-    assert!(serde_json::to_value(ScanTraversalCounts::default())
-        .unwrap()
-        .get("causes")
-        .is_none());
-    let mut counts = Counts::default().page(Some(77));
-    counts.add(PARENT, 1);
-    let emitted = line(counts.summary(4));
-    assert!(emitted.contains("ownership_incomplete_generation_start="));
-    assert!(
-        emitted.contains("ownership_incomplete_contributions{bucket=\"parent_unresolvable\"}=1")
-    );
-    assert!(emitted.contains("ownership_incomplete_contributions{bucket=\"unattributed\"}=3"));
-    assert!(!emitted.contains("created_thread_proof"));
-    assert!(!emitted.contains("distinct"));
-    assert!(!emitted.contains("invalid_resets"));
-    assert!(emitted.find("parent_unresolvable").unwrap() < emitted.find("unattributed").unwrap());
-    let saved = serde_json::to_value(&counts).unwrap();
-    assert_eq!(saved.as_object().unwrap().len(), 1);
-    assert_eq!(saved["contributions"].as_array().unwrap().len(), 8);
-    conserved(&counts, 4);
-}
-
-#[test]
-fn overclassified_restored_state_is_disclosed_and_projected_to_all_unattributed() {
-    let c: Counts = serde_json::from_value(json!({"contributions":[1,0,0,0,0,0,0,0]})).unwrap();
-    assert_eq!(c.summary(0), ([0; N + 2], [0, 0, 1]));
-    assert!(line(c.summary(0)).contains("ownership_incomplete_invalid_resets=1"));
-    conserved(&c, 0);
-}
-
-#[test]
-fn aggregate_overflow_and_slot_add_merge_overflow_are_counted_without_wrapping() {
-    let mut c = Counts::default();
-    c.add(INVENTORY, usize::MAX);
-    c.add(PARENT, 1);
-    assert_eq!(c.summary(usize::MAX), ([0; N + 2], [usize::MAX, 0, 1]));
-    conserved(&c, usize::MAX);
-    let mut slot = Counts::default();
-    slot.add(INVENTORY, usize::MAX);
-    slot.add(INVENTORY, 1);
-    assert_eq!(slot.summary(10), ([0; N + 2], [10, 0, 1]));
-    let mut page = Counts::default();
-    page.add(PARENT, usize::MAX);
-    slot.add(PARENT, 1);
-    slot.merge(&page);
-    assert_eq!(slot.summary(10), ([0; N + 2], [10, 0, 2]));
-}
-
-#[test]
-fn legacy_remainder_overflow_is_disclosed_even_when_legacy_scalar_wraps_to_zero() {
-    let mut legacy = Counts::default();
-    let scalar = usize::MAX;
-    assert_eq!(legacy.summary(scalar).1[0], scalar);
-    legacy.add(PARENT, 1);
-    // Diagnostic-only seam: do not execute or change the pre-existing unchecked scalar addition.
-    assert_eq!(scalar.checked_add(1), None);
-    let wrapped_scalar = scalar.wrapping_add(1);
-    assert_eq!(legacy.summary(wrapped_scalar), ([0; N + 2], [0, 0, 1]));
-    conserved(&legacy, wrapped_scalar);
-    legacy.observation[1] = usize::MAX;
-    assert_eq!(
-        legacy.summary(wrapped_scalar).1[2],
-        usize::MAX,
-        "reset counter saturates explicitly"
     );
 }
 

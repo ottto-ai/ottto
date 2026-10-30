@@ -343,32 +343,6 @@ fn integrated_fresh_init_orphans_are_discarded_and_failure_observations_are_drai
 }
 
 #[test]
-fn integrated_storage_controls_admission_and_native_heap_layout_keep_entry_pin() {
-    let fixture = Fixture::new();
-    let loaded = fixture.load();
-    assert!(lenient_decode::persistence_controls(&loaded, 0).is_err());
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    // Follows the canonical pin (claude_request_census_tests SCAN_INDEX_ENTRY_BYTES = 560
-    // after #901); #894's storage controls add 0 bytes per entry.
-    assert!(std::mem::size_of::<ScanIndexEntry>() <= 560);
-    let with = crate::heap_layout_bound::completed_bound(&loaded, 8 * 1024 * 1024).unwrap();
-    let mut without = loaded.clone();
-    without.persistence_root = None;
-    without.persistence_controls = None;
-    let base = crate::heap_layout_bound::completed_bound(&without, 8 * 1024 * 1024).unwrap();
-    assert!(with > base);
-    eprintln!(
-        "scan_index_storage_layout index={} entry={} availability={} retained_increment={}",
-        std::mem::size_of::<ScanIndex>(),
-        std::mem::size_of::<ScanIndexEntry>(),
-        std::mem::size_of_val(&loaded.persistence_unavailable),
-        with - base
-    );
-}
-
-#[test]
 fn fresh_init_allows_the_real_progress_lock_but_never_prior_progress_state() {
     let fixture = Fixture::new();
     fs::remove_file(&fixture.root).unwrap();

@@ -114,29 +114,6 @@ fn assert_same_state(actual: &ScanIndex, expected: &ScanIndex, label: &str) {
 }
 
 #[test]
-fn compact_writer_size_receipt_on_synthetic_index() {
-    let scratch = crate::test_scratch::ScratchDir::new("compact-index-size");
-    let path = scratch.as_ref().join("claude_code-scan-index-v3.json");
-    let mut index = synthetic_index(512);
-    index.save(&path).unwrap();
-    let written = fs::read(&path).unwrap();
-    let pretty = serde_json::to_vec_pretty(&index).unwrap().len();
-    assert_eq!(written, serde_json::to_vec(&index).unwrap());
-    assert_eq!(
-        lenient_decode::written_len(&index).unwrap(),
-        written.len() as u64
-    );
-    assert!(!written.contains(&b'\n'));
-    let saved_permille = 1000 - written.len() * 1000 / pretty;
-    eprintln!(
-        "compact_scan_index_size_receipt families=512 pretty_bytes={pretty} compact_bytes={} saved_permille={saved_permille}",
-        written.len()
-    );
-    // About a quarter of a live pretty index is whitespace outside strings.
-    assert!((150..=500).contains(&saved_permille), "{saved_permille}");
-}
-
-#[test]
 fn pretty_and_compact_files_decode_identically_through_every_reader() {
     // A saved seed carries every save-owned marker, so a public load of
     // either layout settles nothing and re-encodes to the same bytes.

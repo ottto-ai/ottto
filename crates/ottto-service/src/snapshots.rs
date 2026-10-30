@@ -16312,12 +16312,6 @@ struct ClaudeTitleMetadata {
     original_identity_census_incomplete: bool,
 }
 
-#[cfg(test)]
-thread_local! {
-    // true = transcript-window open, false = Desktop metadata open.
-    static CLAUDE_DESKTOP_READ_FOR_TEST: std::cell::Cell<Option<fn(bool)>> = const { std::cell::Cell::new(None) };
-}
-
 /// A launched session's direct starting session. No root or depth: the child
 /// is a separate top-level session whose usage family is its own transcript.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16975,12 +16969,6 @@ fn read_claude_transcript_live_window(
     struct Stamp {
         timestamp: Option<String>,
     }
-    #[cfg(test)]
-    CLAUDE_DESKTOP_READ_FOR_TEST.with(|hook| {
-        if let Some(observe) = hook.get() {
-            observe(true);
-        }
-    });
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -17249,12 +17237,6 @@ fn load_claude_desktop_session_title(
     account_identifier_hash: Option<String>,
     mut original_identity: Option<ClaudeDesktopIdentityEvidence>,
 ) -> Result<Option<ClaudeDesktopTitleIndexEntry>> {
-    #[cfg(test)]
-    CLAUDE_DESKTOP_READ_FOR_TEST.with(|hook| {
-        if let Some(observe) = hook.get() {
-            observe(false);
-        }
-    });
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
