@@ -1068,7 +1068,6 @@ struct MaRun {
     /// The shared cache's charge besides its retained entries (cursor state
     /// and side ledger), before and after the tail's scan.
     cursor_before: usize,
-    cursor_after: usize,
 }
 impl MaRun {
     fn receipt(&self) -> String {
@@ -1240,7 +1239,6 @@ fn m_a_tail_with(
         tail_key,
         snapshots: tail.snapshots,
         cursor_before,
-        cursor_after: cursor_charge(&cache),
     };
     sampled_scan::test_hooks::clear();
     eprintln!("CACHE_POLICY M-a {source:?} {}", run.receipt());
