@@ -2453,6 +2453,104 @@ fn e2_pipeline_branch_naming_an_unindexed_session_counts_and_discloses() {
     );
 }
 
+/// E7 stopgap, demo chain: the copy-only resume `COPY` repeats requests its
+/// original `ROOT` still holds. When both records are past 35 days, a
+/// complete terminal keeps both (they share ids), so a later re-read of the
+/// copy still proves its copies against the original instead of counting
+/// them again (as a retired original would:
+/// `e2_pipeline_branch_of_a_retired_original_without_a_fork_line_counts_and_discloses`).
+#[test]
+fn e2_pipeline_aged_original_sharing_ids_with_its_copy_keeps_the_copy_proven() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-pipeline-aged-original-kept");
+        let second = "2026-08-02T07:00:20Z";
+        c.root(
+            ROOT,
+            &(line(ROOT, "first", AT, 10) + &line(ROOT, "second", second, 10)),
+        );
+        let scanner = E2ScanFixture::default();
+        let mut progress = e2_progress();
+        let old = ScanIndex::default();
+        let original = ready(&c, &scanner, old.clone(), 100, false);
+        assert_eq!(total(&original), 2, "the original counts its requests");
+        let prior = settle(&c, &old, original, &mut progress);
+        let copy = c.write_at(
+            &format!("{COPY}.jsonl"),
+            &line(COPY, "first", AT, 10),
+            "2026-08-02T07:03:00Z",
+        );
+        let branch = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
+        literal(&branch);
+        let found = body(&branch, COPY).expect("the copy publishes its body");
+        assert_eq!(
+            (found.request_count, found.removed_request_count),
+            (0, Some(1))
+        );
+        let mut prior = settle(&c, &prior, branch, &mut progress);
+
+        // A complete terminal 36 days after both files were last written.
+        let window = (OffsetDateTime::now_utc() + TimeDuration::days(36))
+            .format(&Rfc3339)
+            .unwrap();
+        let keys = prior.files.keys().cloned().collect::<BTreeSet<_>>();
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
+                &mut prior,
+                &keys,
+                &BTreeSet::new(),
+                &window,
+            )
+        });
+        let kept = rows
+            .iter()
+            .find(|row| row["stage"] == "claude_census_retire_kept_overlap")
+            .expect("the terminal reports the kept records");
+        assert_eq!(kept["counts"]["census_retire_kept_overlap_records"], 2);
+        assert_eq!(kept["counts"]["census_retire_kept_overlap_hashes"], 3);
+        assert_eq!(kept["counts"]["census_retire_kept_overlap_overflow"], 0);
+        let census = prior.claude_request_census_for_test();
+        let record = |session: &str| {
+            let name = format!("{session}.jsonl");
+            let key = keys
+                .iter()
+                .find(|key| key.ends_with(&name))
+                .expect("an indexed file");
+            census.record_for_test(key).expect("a census record")
+        };
+        assert_eq!(
+            record(ROOT).retired_for_test(),
+            None,
+            "the original keeps its ids"
+        );
+        assert_eq!(record(ROOT).request_hashes_for_test().len(), 2);
+        assert!(record(ROOT).proves_scan());
+        assert_eq!(
+            record(COPY).retired_for_test(),
+            None,
+            "the copy keeps its id"
+        );
+
+        // The copy is re-read with a second copied request: both stay proven.
+        std::fs::write(
+            &copy,
+            line(COPY, "first", AT, 10) + &line(COPY, "second", second, 10),
+        )
+        .unwrap();
+        let reread = ready(&c, &E2ScanFixture::default(), prior, 100, false);
+        literal(&reread);
+        let found = body(&reread, COPY).expect("the re-read copy publishes its body");
+        assert_eq!(
+            (found.request_count, found.removed_request_count),
+            (0, Some(2)),
+            "the kept original still proves every copied request"
+        );
+        assert_eq!(
+            e2::pipeline_test_observer::disclosed(&reread.scan.snapshots),
+            0
+        );
+    });
+}
+
 /// PR C (c) and (d): the copy is read while its holder `LATE`, changed
 /// since its last read, is still queued by the traversal. `stale_record`:
 /// the holder keeps a census record of its old content (rewritten in place

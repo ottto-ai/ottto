@@ -2799,8 +2799,8 @@ pub(crate) fn settle_claude_request_census_terminal(
         .claude_request_census
         .retain_keys(|key| files.contains_key(key) || observed_index_keys.contains(key));
     let window = rfc3339_unix_seconds(census_window_end).unwrap_or_default();
-    let aged = retire_claude_transcript_records(index, window);
-    note_transcript_retirements(aged, vanished);
+    let retirement = retire_claude_transcript_records(index, window);
+    note_transcript_retirements(retirement, vanished);
     let join = ClaudeRequestCensusJoin::new(index, window, residue_index_keys);
     let mut counts = join.counts(true);
     let state = &mut index.claude_request_census_shadow;
@@ -2830,10 +2830,17 @@ static TRANSCRIPT_RETIRED: [std::sync::atomic::AtomicU64; 2] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
-fn note_transcript_retirements(aged: u64, vanished: u64) {
+fn note_transcript_retirements(retirement: TranscriptRetirement, vanished: u64) {
     use std::sync::atomic::Ordering;
-    TRANSCRIPT_RETIRED[0].fetch_add(aged, Ordering::Relaxed);
+    TRANSCRIPT_RETIRED[0].fetch_add(retirement.aged, Ordering::Relaxed);
     TRANSCRIPT_RETIRED[1].fetch_add(vanished, Ordering::Relaxed);
+    if retirement.kept_overlap_records > 0 || retirement.kept_overlap_overflow > 0 {
+        crate::local_resource_diagnostics::claude_census_retire_kept_overlap(
+            retirement.kept_overlap_records,
+            retirement.kept_overlap_hashes,
+            retirement.kept_overlap_overflow,
+        );
+    }
 }
 
 /// Transcript records retired since the process started: (aged, vanished).
@@ -2845,6 +2852,21 @@ pub(crate) fn transcript_retirements() -> (u64, u64) {
     )
 }
 
+/// Hashes an aged record may keep through overlap (E7 stopgap): a quarter
+/// of the census hash budget.
+const MAX_CLAUDE_RETIRE_KEPT_OVERLAP_HASHES: usize = MAX_CLAUDE_REQUEST_CENSUS_HASHES / 4;
+
+/// One terminal's transcript retirement: records retired by age, and the
+/// aged records kept because they share a request id with another unretired
+/// record (their hashes, and those retired anyway past the cap).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TranscriptRetirement {
+    aged: u64,
+    kept_overlap_records: u64,
+    kept_overlap_hashes: u64,
+    kept_overlap_overflow: u64,
+}
+
 /// P1 ledger transcript retirement, by the record's own mtime (never the
 /// index entry's): a record whose file was last modified more than 35 days
 /// before this window keeps its hash count and drops its hashes. A later
@@ -2852,38 +2874,58 @@ pub(crate) fn transcript_retirements() -> (u64, u64) {
 /// `owned_after_retirement` (an overcount risk the ledger discloses: the
 /// copy is counted although the original already was).
 ///
+/// E7 stopgap: an aged record that shares a request id with another
+/// unretired record is kept, so a resumed copy keeps its cross-session proof
+/// while both files are indexed. Kept hashes are capped at a quarter of the
+/// budget; past it the oldest overlapping records retire anyway (counted as
+/// overflow). The next terminal re-decides, so a survivor whose partner was
+/// pruned or retired retires then.
+///
 /// A vanished file (StateMissing's red producer removes its index entry at
 /// page end) is not retired here: the terminal prune drops its record and
 /// counts it, so a copy elsewhere owns those ids under the approved rule
 /// (telemetry owner first, else the copy). Retirement edits records in
 /// place: nothing is cloned.
-fn retire_claude_transcript_records(index: &mut ScanIndex, window: u64) -> u64 {
+fn retire_claude_transcript_records(index: &mut ScanIndex, window: u64) -> TranscriptRetirement {
+    let mut retirement = TranscriptRetirement::default();
     if window == 0 {
-        return 0;
+        return retirement;
     }
     let cutoff = window.saturating_sub(CLAUDE_TRANSCRIPT_RETIREMENT_SECONDS);
     let files = &index.files;
     let census = &mut index.claude_request_census;
-    let mut aged = 0_u64;
+    // (record mtime, position in the census, hash count) of every record
+    // past the cutoff, in census order.
+    let mut aged = census
+        .records
+        .iter()
+        .enumerate()
+        .filter_map(|(position, (key, record))| {
+            if record.is_birth_stub() || record.retired.is_some() || record.hash_count() == 0 {
+                return None;
+            }
+            // Not dirty: the indexed revision is still the one the record
+            // (and its mtime) describes.
+            let entry = files.get(key.as_str()).filter(|entry| {
+                decode_fingerprint(&entry.source_file_fingerprint)
+                    .is_some_and(|fingerprint| fingerprint == record.source_file_fingerprint)
+            })?;
+            // A record written before `m` (#664) takes the entry's mtime: the
+            // equal fingerprint hashes that same mtime.
+            let modified = record
+                .modified
+                .or((entry.modified_unix_seconds > 0).then_some(entry.modified_unix_seconds))
+                .filter(|modified| *modified < cutoff)?;
+            Some((modified, position, record.hash_count()))
+        })
+        .collect::<Vec<_>>();
+    if !aged.is_empty() {
+        keep_overlapping_records(census, &mut aged, &mut retirement);
+    }
+    let mut retire = aged.iter().map(|&(_, position, _)| position).peekable();
     let mut freed = (0_usize, 0_usize);
-    for (key, record) in census.records.iter_mut() {
-        if record.is_birth_stub() || record.retired.is_some() || record.hash_count() == 0 {
-            continue;
-        }
-        // Not dirty: the indexed revision is still the one the record (and
-        // its mtime) describes.
-        let Some(entry) = files.get(key.as_str()).filter(|entry| {
-            decode_fingerprint(&entry.source_file_fingerprint)
-                .is_some_and(|fingerprint| fingerprint == record.source_file_fingerprint)
-        }) else {
-            continue;
-        };
-        // A record written before `m` (#664) takes the entry's mtime: the
-        // equal fingerprint hashes that same mtime.
-        let modified = record
-            .modified
-            .or((entry.modified_unix_seconds > 0).then_some(entry.modified_unix_seconds));
-        if !modified.is_some_and(|modified| modified < cutoff) {
+    for (position, (key, record)) in census.records.iter_mut().enumerate() {
+        if retire.next_if_eq(&position).is_none() {
             continue;
         }
         let before = (record.hash_count(), entry_serialized_bytes(key, record));
@@ -2891,11 +2933,89 @@ fn retire_claude_transcript_records(index: &mut ScanIndex, window: u64) -> u64 {
         let after = entry_serialized_bytes(key, record);
         freed.0 += before.0;
         freed.1 += before.1.saturating_sub(after);
-        aged += 1;
+        retirement.aged += 1;
     }
     census.hash_total -= freed.0;
     census.serialized_total = census.serialized_total.saturating_sub(freed.1);
-    aged
+    retirement
+}
+
+/// Removes from `aged` (census order, kept that way) every record that shares
+/// a request hash with another unretired record, up to the kept-hash cap: the
+/// oldest by mtime retire first past it. One transient sorted copy of the
+/// census hashes (at most the budget, 16 MiB) is freed before returning.
+fn keep_overlapping_records(
+    census: &ClaudeRequestCensus,
+    aged: &mut Vec<(u64, usize, usize)>,
+    retirement: &mut TranscriptRetirement,
+) {
+    let shared = shared_request_hashes(census);
+    if shared.is_empty() {
+        return;
+    }
+    let mut records = census.records.values().enumerate();
+    let mut overlapping = Vec::new();
+    aged.retain(|&candidate| {
+        let overlaps = records
+            .find(|(position, _)| *position == candidate.1)
+            .is_some_and(|(_, record)| {
+                record
+                    .request_hashes()
+                    .iter()
+                    .any(|hash| shared.binary_search(hash).is_ok())
+            });
+        if overlaps {
+            overlapping.push(candidate);
+        }
+        !overlaps
+    });
+    drop(shared);
+    overlapping.sort_unstable();
+    let mut kept_hashes = overlapping
+        .iter()
+        .map(|&(_, _, hashes)| hashes)
+        .sum::<usize>();
+    let mut kept = overlapping.as_slice();
+    while kept_hashes > MAX_CLAUDE_RETIRE_KEPT_OVERLAP_HASHES {
+        let Some((&oldest, rest)) = kept.split_first() else {
+            break;
+        };
+        kept_hashes -= oldest.2;
+        aged.push(oldest);
+        retirement.kept_overlap_overflow += 1;
+        kept = rest;
+    }
+    retirement.kept_overlap_records = kept.len() as u64;
+    retirement.kept_overlap_hashes = kept_hashes as u64;
+    aged.sort_unstable_by_key(|&(_, position, _)| position);
+}
+
+/// Every request hash held by at least two unretired records, sorted, once
+/// each. Request hashes are unique within a record.
+fn shared_request_hashes(census: &ClaudeRequestCensus) -> Vec<u64> {
+    let mut hashes = Vec::with_capacity(census.hash_total);
+    for record in census.records.values() {
+        if !record.is_birth_stub() && record.retired.is_none() {
+            hashes.extend_from_slice(record.request_hashes());
+        }
+    }
+    hashes.sort_unstable();
+    let mut shared = 0;
+    let mut at = 0;
+    while at < hashes.len() {
+        let hash = hashes[at];
+        let run = hashes[at..]
+            .iter()
+            .take_while(|&&next| next == hash)
+            .count();
+        if run > 1 {
+            hashes[shared] = hash;
+            shared += 1;
+        }
+        at += run;
+    }
+    hashes.truncate(shared);
+    hashes
 }
 
 fn serialized_bytes(census: &ClaudeRequestCensus) -> usize {

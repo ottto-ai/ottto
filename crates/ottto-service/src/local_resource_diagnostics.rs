@@ -845,6 +845,56 @@ pub(crate) fn claude_reemission_family_closure_root_absent_excluded(members: u64
         },
     );
 }
+static CENSUS_RETIRE_KEPT_OVERLAP_TOTAL: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+#[derive(Serialize)]
+struct CensusRetireKeptOverlap {
+    census_retire_kept_overlap_records: u64,
+    census_retire_kept_overlap_hashes: u64,
+    census_retire_kept_overlap_overflow: u64,
+    census_retire_kept_overlap_records_total: u64,
+    census_retire_kept_overlap_hashes_total: u64,
+    census_retire_kept_overlap_overflow_total: u64,
+}
+
+/// Local counter (E7 stopgap): aged Claude transcript census records a
+/// complete terminal kept because they share a request id with another
+/// unretired record, their hashes, and those retired anyway past the kept
+/// cap. This terminal's counts and saturating process totals. A positive
+/// overflow also emits `claude_census_retire_kept_overlap_alarm`. Counts
+/// only; no path, id or wire event.
+pub(crate) fn claude_census_retire_kept_overlap(records: u64, hashes: u64, overflow: u64) {
+    let add = |slot: usize, count: u64| {
+        CENSUS_RETIRE_KEPT_OVERLAP_TOTAL[slot]
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |total| Some(total.saturating_add(count)),
+            )
+            .unwrap_or(u64::MAX)
+            .saturating_add(count)
+    };
+    let counts = CensusRetireKeptOverlap {
+        census_retire_kept_overlap_records: records,
+        census_retire_kept_overlap_hashes: hashes,
+        census_retire_kept_overlap_overflow: overflow,
+        census_retire_kept_overlap_records_total: add(0, records),
+        census_retire_kept_overlap_hashes_total: add(1, hashes),
+        census_retire_kept_overlap_overflow_total: add(2, overflow),
+    };
+    traversal_point("claude_census_retire_kept_overlap", "claude_code", &counts);
+    if overflow > 0 {
+        traversal_point(
+            "claude_census_retire_kept_overlap_alarm",
+            "claude_code",
+            &counts,
+        );
+    }
+}
 /// Local alarm: the one-time Claude history re-read latched its stop until
 /// the daemon restarts (SOURCE Amendment 10), once when it sets and at most
 /// hourly as a reminder. Counts and hashed root refs only; no wire event.

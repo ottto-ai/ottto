@@ -374,6 +374,21 @@ on the durable pass summary are process totals; `take_pass` store receipts reset
 their flows while retaining disk levels. Alarm counts retain the delta/total
 contract above.
 
+### Claude Census Retirement Overlap
+
+A complete Claude terminal retires transcript census records whose file was
+last modified more than 35 days before the census window. An aged record that
+shares a request id with another unretired census record is kept instead, so a
+resumed copy keeps its cross-session copy proof while both files stay indexed.
+The terminal then emits `claude_census_retire_kept_overlap` with
+`census_retire_kept_overlap_records`, `census_retire_kept_overlap_hashes` and
+`census_retire_kept_overlap_overflow`, each with a `_total` process total.
+Kept hashes are capped at a quarter of the census hash budget (524,288); past
+it, the oldest overlapping records retire anyway and count as overflow. A
+positive overflow also emits `claude_census_retire_kept_overlap_alarm` with
+the same counts. Each terminal decides again, so a kept record retires once
+its partner is pruned or retired. Counts only; no path, id or wire event.
+
 ## Credential File Cap Refusals
 
 Schema 2 adds `credential_file_cap_refusal` point records on the same
