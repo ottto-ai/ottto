@@ -41130,22 +41130,6 @@ impl CodexConfigDefaults {
     }
 }
 
-/// Read Codex `config.toml` into display-safe runtime defaults. Returns `None`
-/// when the file is missing, unparseable, or carries no relevant keys.
-#[cfg(test)]
-pub(crate) fn load_codex_config_defaults(path: &Path) -> Option<CodexConfigDefaults> {
-    // Read line-by-line to satisfy the streaming guard (no whole-file reads in
-    // this module); config.toml is small, so the accumulated string is fine.
-    let file = File::open(path).ok()?;
-    let mut raw = String::new();
-    for line in BufReader::new(file).lines() {
-        let line = line.ok()?;
-        raw.push_str(line.as_str());
-        raw.push('\n');
-    }
-    parse_codex_config_defaults(&raw)
-}
-
 pub(crate) fn parse_codex_config_defaults(raw: &str) -> Option<CodexConfigDefaults> {
     let document = raw.parse::<DocumentMut>().ok()?;
     let read_top_str = |key: &str| {
@@ -50583,23 +50567,6 @@ fn source_file_fingerprint_with_context(
     ])
 }
 
-#[cfg(test)]
-fn scan_file_fingerprint_with_context(
-    path: &Path,
-    size_bytes: u64,
-    modified_unix_nanos: u64,
-    scan_identity_version: &str,
-    session_sidecar_fingerprint: &str,
-) -> String {
-    sha256_hex(&[
-        &path.to_string_lossy(),
-        &size_bytes.to_string(),
-        &modified_unix_nanos.to_string(),
-        scan_identity_version,
-        session_sidecar_fingerprint,
-    ])
-}
-
 fn scan_file_fingerprint_with_opened_identity(
     path: &Path,
     size_bytes: u64,
@@ -51744,117 +51711,6 @@ mod tests {
     use super::*;
     use base64::Engine as _;
 
-    /// Synthetic-only counterpart to snapshot-audit: exercises the same scan,
-    /// policy and finalization seams and hashes every serialized SnapshotItem field.
-    /// Persisted state is an offline audit acknowledgement, never a server ACK.
-    #[test]
-    #[ignore]
-    fn measure_synthetic_snapshots() {
-        let root = PathBuf::from(std::env::var("OTTTO_COMPOSITION_FIXTURE_ROOT").unwrap());
-        assert_eq!(
-            fs::read(root.join("synthetic-only")).unwrap(),
-            b"collector-fixture-v1\n"
-        );
-        let source = match std::env::var("OTTTO_COMPOSITION_FIXTURE_SOURCE")
-            .unwrap()
-            .as_str()
-        {
-            "codex" => SnapshotSource::Codex,
-            "claude_code" => SnapshotSource::ClaudeCode,
-            _ => panic!("unsupported synthetic source"),
-        };
-        let state = root.join("snapshot-index.json");
-        let mut index = ScanIndex::load(&state).unwrap();
-        let collected_at = if std::env::var_os("OTTTO_FIXTURE_RETRY_DUE").is_some() {
-            let deadline = index
-                .traversal
-                .as_ref()
-                .and_then(|t| t.unhealthy_retry_not_before_unix_seconds)
-                .expect("partial fixture must have armed a retry deadline");
-            OffsetDateTime::from_unix_timestamp(deadline as i64 + 1)
-                .unwrap()
-                .format(&Rfc3339)
-                .unwrap()
-        } else {
-            "2026-09-22T12:00:00Z".to_string()
-        };
-        let mut scan = scan_source_roots_with_limit_and_attribution_and_curve(
-            source,
-            &[root.join("transcripts")],
-            &mut index,
-            &collected_at,
-            BACKFILL_WINDOW_DAYS,
-            MAX_BACKFILL_FILES_PER_SOURCE,
-            false,
-            None,
-            None,
-            &[],
-            false,
-            true,
-        )
-        .unwrap();
-        apply_upload_policy(
-            source,
-            &mut scan.snapshots,
-            SnapshotUploadPolicy {
-                session_titles_enabled: false,
-                workspace_labels_enabled: false,
-                session_artifacts_enabled: false,
-                session_attribution_enabled: false,
-                session_attribution_labels_enabled: false,
-            },
-        );
-        finalize_scan_after_policy(source, &mut scan, &mut index);
-        let mut snapshots = serde_json::to_value(&scan.snapshots).unwrap();
-        let snapshots_array = snapshots.as_array_mut().unwrap();
-        snapshots_array.sort_by(|a, b| {
-            a["source_session_id"]
-                .as_str()
-                .cmp(&b["source_session_id"].as_str())
-        });
-        for snapshot in snapshots_array.iter_mut() {
-            // Named volatile-field allowlist: wall-clock capture and identities
-            // derived from the temporary fixture path, inode or file mtime.
-            for key in [
-                "collected_at",
-                "snapshot_fingerprint",
-                "source_file_fingerprint",
-                "workspace_hash",
-            ] {
-                snapshot.as_object_mut().unwrap().remove(key);
-            }
-        }
-        let payload = serde_json::to_vec(&snapshots).unwrap();
-        fs::write(root.join("snapshot-output.json"), &payload).unwrap();
-        let totals = |key: &str| {
-            snapshots
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|s| s[key].as_u64().unwrap_or_default())
-                .sum::<u64>()
-        };
-        println!(
-            "MEASUREMENT {}",
-            json!({
-                "payload_sha256": format!("{:x}", Sha256::digest(&payload)),
-                "serialized_bytes": payload.len(), "emitted_session_count": scan.snapshots.len(),
-                "input_tokens": totals("input_tokens"), "output_tokens": totals("output_tokens"),
-                "cache_read_tokens": totals("cache_read_tokens"),
-                "cache_creation_5m_tokens": totals("cache_creation_5m_tokens"),
-                "cache_creation_1h_tokens": totals("cache_creation_1h_tokens"),
-                "request_count": totals("request_count"),
-            "scanned_file_count": scan.scanned_file_count, "census_complete": scan.census_complete,
-            "skipped_file_count_due_to_limit": scan.skipped_file_count_due_to_limit,
-            "semantic_noop_count": scan.semantic_noop_count, "scan_cap_hit": scan.scan_cap_hit,
-                "over_line_cap_count": scan.over_line_cap_count,
-                "dropped_usage_record_count": scan.dropped_usage_record_count,
-            })
-        );
-        // Like snapshot-audit, only settle the local index after output succeeds.
-        index.save(&state).unwrap();
-    }
-
     fn temp_file(name: &str) -> PathBuf {
         let unique = crate::test_scratch::unique_name(&format!("ottto-{name}"));
         std::env::temp_dir().join(format!("{unique}.jsonl"))
@@ -51954,43 +51810,6 @@ mod tests {
             &traversal,
             "malformed",
         ));
-    }
-
-    #[test]
-    fn scan_root_lookups_keep_deepest_and_first_match_rules_under_nested_roots() {
-        let outer = PathBuf::from("/synthetic/projects");
-        let nested = outer.join("team").join("projects");
-        let sibling = PathBuf::from("/synthetic/projects-other");
-        let nested_file = nested.join("p").join("session.jsonl");
-        let outer_file = outer.join("p").join("session.jsonl");
-        let sibling_file = sibling.join("session.jsonl");
-        let elsewhere = Path::new("/elsewhere/s.jsonl");
-        for (roots, first_for_nested_file) in [
-            (vec![outer.clone(), nested.clone(), sibling.clone()], &outer),
-            (
-                vec![sibling.clone(), nested.clone(), outer.clone()],
-                &nested,
-            ),
-        ] {
-            let mut traversal = terminal_unhealthy_traversal(String::new());
-            traversal.scan_roots = roots;
-            // The two rules differ only for a file under a nested root: the
-            // deepest root regardless of order, or whichever is listed first.
-            assert_eq!(traversal.owning_scan_root(&nested_file), Some(&nested));
-            assert_eq!(
-                traversal.first_matching_scan_root(&nested_file),
-                Some(first_for_nested_file)
-            );
-            for lookup in [
-                ScanTraversalCheckpoint::owning_scan_root,
-                ScanTraversalCheckpoint::first_matching_scan_root,
-            ] {
-                assert_eq!(lookup(&traversal, &outer_file), Some(&outer));
-                // Component prefixes, not string prefixes.
-                assert_eq!(lookup(&traversal, &sibling_file), Some(&sibling));
-                assert_eq!(lookup(&traversal, elsewhere), None);
-            }
-        }
     }
 
     #[test]
@@ -52781,54 +52600,6 @@ mod tests {
     }
 
     #[test]
-    fn skill_md_references_name_every_layout_and_flag_unnamed_ones() {
-        let refs = |material: &str| {
-            let mut names = Vec::new();
-            let named_all = for_each_skill_md_reference(material, |name| names.push(name));
-            (names, named_all)
-        };
-        let named = |names: &[&str]| {
-            (
-                names
-                    .iter()
-                    .map(|name| name.to_string())
-                    .collect::<Vec<_>>(),
-                true,
-            )
-        };
-        let unnamed = (Vec::<String>::new(), false);
-        for (material, expected) in [
-            (".agents/skills/x/SKILL.md", named(&["x"])),
-            (
-                "/u/.claude/plugins/cache/mkt/plugin/1.2.0/skills/review/SKILL.md",
-                named(&["review"]),
-            ),
-            (
-                "/u/.codex/skills/.system/imagegen/SKILL.md",
-                named(&["imagegen"]),
-            ),
-            (
-                "/u/.claude/skills/synced/b1/MySkill/SKILL.md",
-                named(&["MySkill"]),
-            ),
-            ("cat skills/x/SKILL.md", named(&["x"])),
-            ("sed -n 1,40p r0/x/SKILL.md", named(&["x"])),
-            ("cat /skills/a/README.md /skills/b/SKILL.md", named(&["b"])),
-            ("a/SKILL.md/b/SKILL.md", named(&["a", "b"])),
-            ("cp /s/x/SKILL.md /s/x/SKILL.md.backup", named(&["x"])),
-            ("{\"cmd\":\"cat '/r/skills/a/SKILL.md'\"}", named(&["a"])),
-            ("cat\u{a0}x/SKILL.md", named(&["x"])),
-            ("cat /s/x/SKILL.mdx MY_SKILL.md", named(&[])),
-            ("cat SKILL.md", unnamed.clone()),
-            ("ls skills/*/SKILL.md", unnamed.clone()),
-            ("cat \"$D/SKILL.md\"", unnamed.clone()),
-            ("cat ../SKILL.md", unnamed.clone()),
-        ] {
-            assert_eq!(refs(material), expected, "{material}");
-        }
-    }
-
-    #[test]
     fn claude_skill_evidence_separates_invocations_from_references() {
         let tool_use = |id: &str, name: &str, input: Value| json!({"type":"assistant","sessionId":"claude-skills","timestamp":"2026-10-18T06:00:00Z","message":{"id":format!("msg-{id}"),"role":"assistant","content":[{"type":"tool_use","id":id,"name":name,"input":input}]}});
         let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
@@ -53030,39 +52801,6 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(home);
-    }
-
-    #[test]
-    fn codex_unnamed_skill_reference_keeps_capability_marker_v1() {
-        let path = temp_file("codex-unnamed-skill");
-        let lines = [
-            json!({"timestamp":"2026-08-02T06:00:00Z","type":"session_meta","payload":{"id":"unnamed-skill-session"}}),
-            json!({"timestamp":"2026-08-02T06:00:01Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cat skills/*/SKILL.md /c/skills/pdf/SKILL.md\"}"}}),
-            json!({"timestamp":"2026-08-02T06:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":2,"request_count":1},"model":"gpt-5.6"}}}),
-        ];
-        fs::write(
-            &path,
-            lines
-                .iter()
-                .map(Value::to_string)
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
-        .expect("write transcript");
-
-        let item = parse_codex_jsonl_file(&path, "2026-08-02T06:02:00Z", "fp".to_string())
-            .expect("parse")
-            .into_iter()
-            .next()
-            .expect("snapshot");
-        let summary = item.activity_summary.as_ref().expect("activity summary");
-        assert_eq!(summary.skills, vec!["pdf"]);
-        assert_eq!(summary.shell_commands, 1);
-        assert_eq!(
-            summary.capability_collection_version.as_deref(),
-            Some("agent_capability_usage:v1")
-        );
-        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -53336,80 +53074,92 @@ mod tests {
     }
 
     #[test]
-    fn codex_tool_usage_caps_distinct_names_and_marks_truncation() {
-        let path = temp_file("codex-tool-usage-cap");
-        let mut lines = vec![
-            json!({"timestamp":"2026-08-02T06:00:00Z","type":"session_meta","payload":{"id":"codex-tool-cap-session"}}),
-        ];
-        // The most-used name must survive the cap.
-        for _ in 0..3 {
-            lines.push(json!({"timestamp":"2026-08-02T06:00:01Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"never-upload\"}"}}));
-        }
-        for index in 0..MAX_TOOL_USAGE_NAMES {
-            lines.push(json!({"timestamp":"2026-08-02T06:00:02Z","type":"event_msg","payload":{"type":"mcp_tool_call_end","invocation":{"server":"fixture","tool":format!("tool_{index}"),"arguments":{"secret":"never-upload"}}}}));
-        }
-        lines.push(json!({"timestamp":"2026-08-02T06:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":2,"request_count":1},"model":"gpt-5.6"}}}));
-        fs::write(
-            &path,
-            lines
-                .into_iter()
-                .map(|line| line.to_string())
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
-        .expect("write transcript");
-
-        let item = parse_codex_jsonl_file(&path, "2026-08-02T06:02:00Z", "fp".to_string())
-            .expect("parse")
-            .into_iter()
-            .next()
-            .expect("snapshot");
-        let tool_usage = item.tool_usage.as_deref().expect("Codex tool contract");
-        assert_eq!(tool_usage.len(), MAX_TOOL_USAGE_NAMES);
-        assert!(item.tool_usage_truncated);
-        assert_eq!(
-            tool_usage[0],
-            SnapshotToolUsage {
-                name: "exec_command".to_string(),
-                count: 3,
+    fn tool_usage_wire_contract_per_source() {
+        for source in [SnapshotSource::Codex, SnapshotSource::ClaudeCode] {
+            for capped in [false, true] {
+                let path = temp_file("tool-usage-wire");
+                let lines = if source == SnapshotSource::Codex {
+                    let mut lines = vec![
+                        json!({"timestamp":"2026-08-02T06:00:00Z","type":"session_meta","payload":{"id":"codex-tool-cap-session"}}),
+                    ];
+                    if capped {
+                        for _ in 0..3 {
+                            lines.push(json!({"timestamp":"2026-08-02T06:00:01Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"never-upload\"}"}}));
+                        }
+                        for index in 0..MAX_TOOL_USAGE_NAMES {
+                            lines.push(json!({"timestamp":"2026-08-02T06:00:02Z","type":"event_msg","payload":{"type":"mcp_tool_call_end","invocation":{"server":"fixture","tool":format!("tool_{index}"),"arguments":{"secret":"never-upload"}}}}));
+                        }
+                    }
+                    lines.push(json!({"timestamp":"2026-08-02T06:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":2,"request_count":1},"model":"gpt-5.6"}}}));
+                    lines
+                } else {
+                    let mut lines = vec![json!({
+                        "timestamp": "2026-08-02T06:00:00Z",
+                        "type": "user",
+                        "sessionId": "claude-tool-cap-session",
+                        "message": {"role": "user", "content": "exercise tools"}
+                    })];
+                    for index in 0..if capped { MAX_TOOL_USAGE_NAMES + 1 } else { 1 } {
+                        lines.push(json!({
+                            "timestamp": "2026-08-02T06:01:00Z",
+                            "type": "assistant",
+                            "sessionId": "claude-tool-cap-session",
+                            "requestId": format!("req-{index}"),
+                            "message": {
+                                "id": format!("msg-{index}"),
+                                "role": "assistant",
+                                "model": "claude-opus-4-1",
+                                "usage": {"input_tokens": 1, "output_tokens": 1},
+                                "content": if capped { json!([{
+                                    "type": "tool_use",
+                                    "id": format!("tool-{index}"),
+                                    "name": format!("mcp__fixture__tool_{index}"),
+                                    "input": {"secret": format!("never-upload-{index}")}
+                                }]) } else { json!([]) }
+                            }
+                        }));
+                    }
+                    lines
+                };
+                fs::write(
+                    &path,
+                    lines
+                        .into_iter()
+                        .map(|line| line.to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+                .expect("transcript");
+                let items = if source == SnapshotSource::Codex {
+                    parse_codex_jsonl_file(&path, "2026-08-02T07:02:00Z", "fp".into())
+                } else {
+                    parse_claude_code_jsonl_file(&path, "2026-08-02T07:02:00Z", "fp".into())
+                }
+                .expect("parse");
+                let item = &items[0];
+                let usage = item.tool_usage.as_deref().expect("tool contract");
+                assert_eq!(usage.len(), if capped { MAX_TOOL_USAGE_NAMES } else { 0 });
+                assert_eq!(item.tool_usage_truncated, capped);
+                if capped && source == SnapshotSource::Codex {
+                    assert_eq!(
+                        usage[0],
+                        SnapshotToolUsage {
+                            name: "exec_command".into(),
+                            count: 3
+                        }
+                    );
+                }
+                assert!(usage
+                    .iter()
+                    .all(|row| row.name.chars().count() <= MAX_TOOL_USAGE_NAME_LENGTH));
+                let wire = serde_json::to_string(item).expect("wire");
+                assert!(!wire.contains("never-upload"));
+                if !capped {
+                    assert!(wire.contains("\"tool_usage\":[]"));
+                }
+                let _ = fs::remove_file(path);
             }
-        );
-        assert!(tool_usage
-            .iter()
-            .all(|row| row.name.chars().count() <= MAX_TOOL_USAGE_NAME_LENGTH));
-        assert!(!serde_json::to_string(&item)
-            .expect("serialize snapshot item")
-            .contains("never-upload"));
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn codex_tool_usage_emits_explicit_empty_contract() {
-        let path = temp_file("codex-tool-usage-empty");
-        fs::write(
-            &path,
-            [
-                json!({"timestamp":"2026-08-02T06:00:00Z","type":"session_meta","payload":{"id":"codex-tool-empty-session"}}),
-                json!({"timestamp":"2026-08-02T06:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":2,"request_count":1},"model":"gpt-5.6"}}}),
-            ]
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        )
-        .expect("write transcript");
-
-        let item = parse_codex_jsonl_file(&path, "2026-08-02T06:02:00Z", "fp".to_string())
-            .expect("parse")
-            .into_iter()
-            .next()
-            .expect("snapshot");
-        assert_eq!(item.tool_usage, Some(Vec::new()));
-        assert!(!item.tool_usage_truncated);
-        assert!(serde_json::to_string(&item)
-            .expect("serialize snapshot item")
-            .contains("\"tool_usage\":[]"));
-        let _ = fs::remove_file(path);
+        }
     }
 
     #[test]
@@ -53540,90 +53290,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_tool_usage_caps_distinct_names_and_marks_truncation() {
-        let path = temp_file("claude-tool-usage-cap");
-        let mut lines = vec![json!({
-            "timestamp": "2026-08-02T06:00:00Z",
-            "type": "user",
-            "sessionId": "claude-tool-cap-session",
-            "message": {"role": "user", "content": "exercise tools"}
-        })];
-        for index in 0..=MAX_TOOL_USAGE_NAMES {
-            lines.push(json!({
-                "timestamp": "2026-08-02T06:01:00Z",
-                "type": "assistant",
-                "sessionId": "claude-tool-cap-session",
-                "requestId": format!("req-{index}"),
-                "message": {
-                    "id": format!("msg-{index}"),
-                    "role": "assistant",
-                    "model": "claude-opus-4-1",
-                    "usage": {"input_tokens": 1, "output_tokens": 1},
-                    "content": [{
-                        "type": "tool_use",
-                        "id": format!("tool-{index}"),
-                        "name": format!("mcp__fixture__tool_{index}"),
-                        "input": {"secret": format!("never-upload-{index}")}
-                    }]
-                }
-            }));
-        }
-        fs::write(
-            &path,
-            lines
-                .into_iter()
-                .map(|line| line.to_string())
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
-        .expect("write transcript");
-
-        let item = parse_claude_code_jsonl_file(&path, "2026-08-02T07:02:00Z", "fp".to_string())
-            .expect("parse")
-            .into_iter()
-            .next()
-            .expect("snapshot");
-        let tool_usage = item.tool_usage.as_deref().expect("Claude tool contract");
-        assert_eq!(tool_usage.len(), MAX_TOOL_USAGE_NAMES);
-        assert!(item.tool_usage_truncated);
-        assert!(tool_usage
-            .iter()
-            .all(|row| row.name.chars().count() <= MAX_TOOL_USAGE_NAME_LENGTH));
-        assert!(!serde_json::to_string(&item)
-            .expect("serialize snapshot item")
-            .contains("never-upload"));
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn claude_tool_usage_emits_explicit_empty_contract() {
-        let path = temp_file("claude-tool-usage-empty");
-        fs::write(
-            &path,
-            [
-                json!({"timestamp":"2026-08-02T06:00:00Z","type":"user","sessionId":"claude-tool-empty-session","message":{"role":"user","content":"hello"}}),
-                json!({"timestamp":"2026-08-02T06:01:00Z","type":"assistant","sessionId":"claude-tool-empty-session","requestId":"req-1","message":{"id":"msg-1","role":"assistant","model":"claude-opus-4-1","usage":{"input_tokens":10,"output_tokens":2},"content":[{"type":"text","text":"hello"}]}}),
-            ]
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        )
-        .expect("write transcript");
-
-        let item = parse_claude_code_jsonl_file(&path, "2026-08-02T07:02:00Z", "fp".to_string())
-            .expect("parse")
-            .into_iter()
-            .next()
-            .expect("snapshot");
-        assert_eq!(item.tool_usage, Some(Vec::new()));
-        assert!(serde_json::to_string(&item)
-            .expect("serialize snapshot item")
-            .contains("\"tool_usage\":[]"));
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
     fn scan_index_recovers_from_truncated_json_and_replaces_it_atomically() {
         let root = temp_dir("scan-index-recovery");
         let path = root.join("codex-scan-index.json");
@@ -53641,22 +53307,9 @@ mod tests {
                     modified_unix_nanos: Some(1_700_000_000_000_000_000),
                     source_file_fingerprint: "sha256:test".to_string(),
                     last_snapshot_fingerprint: Some("sha256:snapshot".to_string()),
-                    last_upload_body_witness: None,
-                    effective_upload_body_witness_revision: 0,
+
                     scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
-                    codex_joined_member_set: None,
-                    codex_captured_joined_member_set: None,
-                    codex_protected_owner: None,
-                    codex_applied_tier_receipt: None,
-                    codex_applied_tier_receipt_required: false,
-                    codex_captured_tier_receipt: None,
-                    codex_captured_tier_receipt_required: false,
-                    codex_captured_uncommitted: false,
-                    codex_counting_v2: false,
-                    codex_counting_owner: None,
-                    opened_changed_nanos: 0,
-                    opened_birth_nanos: 0,
-                    upload_context_receipt: None,
+                    ..manifest_index_entry(None)
                 },
             )]),
             ..ScanIndex::default()
@@ -54434,29 +54087,6 @@ mod tests {
     }
 
     #[test]
-    fn scan_index_compare_and_swap_rejects_a_stale_overlapping_daemon() {
-        let root = temp_dir("scan-index-cas");
-        let path = root.join("codex-scan-index-v2.json");
-        let mut initial = ScanIndex::default();
-        initial.save(&path).expect("save initial generation");
-        assert_eq!(initial.generation, 1);
-
-        let mut stale = ScanIndex::load(&path).expect("load stale view");
-        let mut winner = ScanIndex::load(&path).expect("load winning view");
-        winner.resume_after_path = Some("winner".to_string());
-        winner.save(&path).expect("winner advances generation");
-        stale.resume_after_path = Some("stale".to_string());
-        stale
-            .save(&path)
-            .expect_err("stale generation must not clobber winner");
-
-        let observed = ScanIndex::load(&path).expect("load winner");
-        assert_eq!(observed.generation, 2);
-        assert_eq!(observed.resume_after_path.as_deref(), Some("winner"));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn large_scan_index_save_preserves_bytes_and_generation_fence() {
         let root = temp_dir("large-scan-index-durability");
         let path = root.join("scan-index.json");
@@ -54715,78 +54345,6 @@ mod tests {
         assert_eq!(settled.context_curve_replay_epoch(), 2);
         settled.mark_context_curve_capability_disabled();
         assert_eq!(settled.context_curve_replay_epoch(), 2);
-    }
-
-    #[test]
-    fn every_context_curve_derivation_revision_rearms_exactly_one_replay() {
-        let base = context_curve_derivation_revision_key(
-            "parser:v1",
-            "ownership:v1",
-            "sampling:v1",
-            "model:v1",
-        );
-        let variants = [
-            context_curve_derivation_revision_key(
-                "parser:v2",
-                "ownership:v1",
-                "sampling:v1",
-                "model:v1",
-            ),
-            context_curve_derivation_revision_key(
-                "parser:v1",
-                "ownership:v2",
-                "sampling:v1",
-                "model:v1",
-            ),
-            context_curve_derivation_revision_key(
-                "parser:v1",
-                "ownership:v1",
-                "sampling:v2",
-                "model:v1",
-            ),
-            context_curve_derivation_revision_key(
-                "parser:v1",
-                "ownership:v1",
-                "sampling:v1",
-                "model:v2",
-            ),
-        ];
-        let mut settled = ScanIndex::default();
-        settled.mark_context_curve_replay_complete(base.clone());
-        assert!(!settled.context_curve_replay_needed(&base));
-        for variant in variants {
-            assert!(settled.context_curve_replay_needed(&variant));
-            settled.mark_context_curve_replay_complete(variant.clone());
-            assert!(!settled.context_curve_replay_needed(&variant));
-        }
-
-        let codex = context_curve_derivation_revision(SnapshotSource::Codex).expect("Codex curve");
-        assert!(codex.contains(CODEX_SNAPSHOT_PARSER_VERSION));
-        assert!(codex.contains(CODEX_CONTEXT_CURVE_OWNERSHIP_REVISION));
-        assert!(codex.contains(CONTEXT_CURVE_SAMPLING_REVISION));
-        assert!(codex.contains(CODEX_CONTEXT_CURVE_MODEL_EVIDENCE_REVISION));
-        let claude =
-            context_curve_derivation_revision(SnapshotSource::ClaudeCode).expect("Claude curve");
-        assert!(claude.contains(CLAUDE_CODE_SNAPSHOT_PARSER_VERSION));
-        assert!(claude.contains(CLAUDE_CONTEXT_CURVE_OWNERSHIP_REVISION));
-        assert!(claude.contains(CONTEXT_CURVE_SAMPLING_REVISION));
-        assert!(claude.contains(CLAUDE_CONTEXT_CURVE_MODEL_EVIDENCE_REVISION));
-        assert_eq!(context_curve_derivation_revision(SnapshotSource::Pi), None);
-    }
-
-    #[test]
-    fn opened_object_identity_moves_when_same_inode_content_sample_changes() {
-        let root = temp_dir("opened-object-sample");
-        let path = root.join("session.jsonl");
-        fs::write(&path, b"aaaaaaaa\n").expect("write first content");
-        let mut first = test_candidate(path.clone());
-        open_candidate_file(SnapshotSource::ClaudeCode, &mut first).expect("open first content");
-
-        fs::write(&path, b"bbbbbbbb\n").expect("replace content on same inode");
-        let mut second = test_candidate(path);
-        open_candidate_file(SnapshotSource::ClaudeCode, &mut second).expect("open second content");
-        assert_ne!(first.opened_object_identity, second.opened_object_identity);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -55887,26 +55445,6 @@ mod tests {
         assert_eq!(retry.snapshots[0].snapshot_fingerprint, fingerprint);
 
         let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn backfill_window_defaults_to_two_years_and_starts_from_now_when_zero() {
-        let now = 1_800_000_000;
-        let day_seconds = 24 * 60 * 60;
-
-        assert_eq!(BACKFILL_WINDOW_DAYS, 730);
-        assert!(is_recent_enough_at(
-            now - BACKFILL_WINDOW_DAYS * day_seconds,
-            now,
-            BACKFILL_WINDOW_DAYS,
-        ));
-        assert!(!is_recent_enough_at(
-            now - BACKFILL_WINDOW_DAYS * day_seconds - 1,
-            now,
-            BACKFILL_WINDOW_DAYS,
-        ));
-        assert!(is_recent_enough_at(now, now, 0));
-        assert!(!is_recent_enough_at(now - 1, now, 0));
     }
 
     #[test]
@@ -58234,31 +57772,6 @@ mod tests {
     }
 
     #[test]
-    fn bounded_reader_skips_oversized_line_and_keeps_neighbors() {
-        // One pathological line that exceeds the (tiny test) cap sits between two
-        // valid lines. The oversized line must be dropped while both neighbors
-        // still parse and accumulate in order.
-        let cap = 32;
-        let huge = "x".repeat(cap * 4);
-        let input = format!("{{\"n\":1}}\n{{\"big\":\"{huge}\"}}\n{{\"n\":2}}\n",);
-        assert!(input.len() > cap * 4, "oversized line must exceed the cap");
-
-        let mut seen = Vec::new();
-        let report = read_bounded_jsonl_lines(input.as_bytes(), cap, |value| {
-            seen.push(value.clone());
-        })
-        .expect("bounded read");
-
-        assert_eq!(seen.len(), 2, "only the two valid lines survive");
-        assert_eq!(seen[0], json!({ "n": 1 }));
-        assert_eq!(seen[1], json!({ "n": 2 }));
-        // The dropped line never reaches the callback as a (truncated) value.
-        assert!(seen.iter().all(|value| value.get("big").is_none()));
-        assert_eq!(report.over_line_cap_count, 1);
-        assert!(!report.complete());
-    }
-
-    #[test]
     fn bounded_reader_step_moves_without_replay_and_discloses_every_line() {
         let mut input = b"{\"n\":1}\r\n\nnot json\n\xff\n".to_vec();
         input.extend_from_slice(format!("{{\"big\":\"{}\"}}\n", "x".repeat(256)).as_bytes());
@@ -58404,45 +57917,6 @@ mod tests {
     }
 
     #[test]
-    fn bounded_reader_parses_normal_transcript_unchanged() {
-        // A normal multi-line transcript (no line near the cap) parses exactly
-        // as the old `lines()` loop would, including a final line without a
-        // trailing newline.
-        let input = "{\"type\":\"a\",\"v\":1}\n{\"type\":\"b\",\"v\":2}\n{\"type\":\"c\",\"v\":3}";
-        let mut seen = Vec::new();
-        let report = read_bounded_jsonl_lines(input.as_bytes(), MAX_JSONL_LINE_BYTES, |value| {
-            seen.push(value.clone());
-        })
-        .expect("bounded read");
-
-        assert_eq!(
-            seen,
-            vec![
-                json!({ "type": "a", "v": 1 }),
-                json!({ "type": "b", "v": 2 }),
-                json!({ "type": "c", "v": 3 }),
-            ]
-        );
-        assert!(report.complete());
-    }
-
-    #[test]
-    fn bounded_reader_preserves_empty_and_malformed_line_semantics() {
-        // Blank/whitespace lines and unparseable lines are skipped exactly as
-        // before; a trailing newline does not emit a spurious empty value.
-        let input = "\n   \n{\"ok\":true}\nnot json at all\n\n{\"ok\":false}\n";
-        let mut seen = Vec::new();
-        let report = read_bounded_jsonl_lines(input.as_bytes(), MAX_JSONL_LINE_BYTES, |value| {
-            seen.push(value.clone());
-        })
-        .expect("bounded read");
-
-        assert_eq!(seen, vec![json!({ "ok": true }), json!({ "ok": false })],);
-        assert_eq!(report.malformed_json_line_count, 1);
-        assert!(!report.complete());
-    }
-
-    #[test]
     fn scan_policy_skips_oversized_non_codex_transcript_files() {
         let root = temp_dir("scan-policy-oversized");
         // Sparse file: logical length over the cap, negligible bytes on disk.
@@ -58481,66 +57955,45 @@ mod tests {
     }
 
     #[test]
-    fn bounded_traversal_uses_frozen_census_time_for_age_cutoff() {
-        let root = temp_dir("bounded-frozen-age-cutoff");
-        fs::write(
-            root.join("session.jsonl"),
-            "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{\"input\":1,\"output\":1}}}\n",
-        )
-        .expect("write age-cutoff fixture");
-        let future_boundary = (OffsetDateTime::now_utc() + time::Duration::days(365))
-            .format(&Rfc3339)
-            .expect("format future frozen boundary");
-        let mut index = ScanIndex::default();
-
-        let scan = scan_source_roots(
-            SnapshotSource::Pi,
-            std::slice::from_ref(&root),
-            &mut index,
-            &future_boundary,
-            1,
-        )
-        .expect("scan against frozen future boundary");
-
-        assert!(scan.census_complete);
-        assert_eq!(scan.discovered_file_count, 0);
-        assert!(scan.snapshots.is_empty());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn watcher_hint_cannot_widen_the_frozen_age_scope() {
-        let root = temp_dir("bounded-watcher-age-cutoff");
-        let path = root.join("session.jsonl");
-        fs::write(
+    fn bounded_traversal_and_watcher_keep_frozen_age_scope() {
+        for hinted in [false, true] {
+            let root = temp_dir("bounded-watcher-age-cutoff");
+            let path = root.join("session.jsonl");
+            fs::write(
             &path,
             "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{\"input\":1,\"output\":1}}}\n",
         )
         .expect("write watcher age-cutoff fixture");
-        let future_boundary = (OffsetDateTime::now_utc() + time::Duration::days(365))
-            .format(&Rfc3339)
-            .expect("format future frozen boundary");
-        let mut index = ScanIndex::default();
+            let future_boundary = (OffsetDateTime::now_utc() + time::Duration::days(365))
+                .format(&Rfc3339)
+                .expect("format future frozen boundary");
+            let mut index = ScanIndex::default();
 
-        let scan = scan_source_roots_with_limit_and_attribution(
-            SnapshotSource::Pi,
-            std::slice::from_ref(&root),
-            &mut index,
-            &future_boundary,
-            1,
-            1,
-            true,
-            None,
-            None,
-            std::slice::from_ref(&path),
-            false,
-        )
-        .expect("scan out-of-scope watcher hint");
+            let scan = scan_source_roots_with_limit_and_attribution(
+                SnapshotSource::Pi,
+                std::slice::from_ref(&root),
+                &mut index,
+                &future_boundary,
+                1,
+                1,
+                true,
+                None,
+                None,
+                if hinted {
+                    std::slice::from_ref(&path)
+                } else {
+                    &[]
+                },
+                false,
+            )
+            .expect("scan out-of-scope watcher hint");
 
-        assert!(scan.census_complete);
-        assert!(scan.snapshots.is_empty());
-        assert!(index.files.is_empty());
-        let _ = fs::remove_dir_all(root);
+            assert!(scan.census_complete);
+            assert_eq!(scan.discovered_file_count, 0);
+            assert!(scan.snapshots.is_empty());
+            assert!(index.files.is_empty());
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]
@@ -59281,94 +58734,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_allows_larger_streaming_transcripts_than_other_sources() {
-        assert!(max_jsonl_file_bytes(SnapshotSource::Codex) > MAX_JSONL_FILE_BYTES);
-        assert_eq!(
-            max_jsonl_file_bytes(SnapshotSource::ClaudeCode),
-            MAX_CLAUDE_JSONL_FILE_BYTES,
-        );
-        assert_eq!(
-            max_jsonl_file_bytes(SnapshotSource::Pi),
-            MAX_JSONL_FILE_BYTES,
-        );
-    }
-
-    #[test]
-    fn scan_policy_never_expands_past_default_window() {
-        assert_eq!(
-            effective_backfill_window_days(BACKFILL_WINDOW_DAYS + 30),
-            BACKFILL_WINDOW_DAYS,
-        );
-        assert_eq!(effective_backfill_window_days(30), 30);
-    }
-
-    #[test]
-    fn codex_default_roots_include_active_and_archived_sessions() {
-        let home = temp_dir("codex-default-roots");
-        let roots = SnapshotSource::Codex.default_roots(&home);
-
-        assert_eq!(
-            roots,
-            vec![
-                home.join(".codex").join("sessions"),
-                home.join(".codex").join("archived_sessions"),
-            ]
-        );
-
-        let _ = fs::remove_dir_all(home);
-    }
-
-    #[test]
-    fn codex_scan_reads_active_and_archived_session_roots() {
-        let codex_dir = temp_dir("codex-active-archived");
-        let sessions_dir = codex_dir.join("sessions");
-        let archived_dir = codex_dir.join("archived_sessions");
-        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
-        fs::create_dir_all(&archived_dir).expect("create archived dir");
-        fs::write(
-            sessions_dir.join(
-                "rollout-2026-05-14T10-00-00-019e253c-aaaa-7000-9000-aaaaaaaaaaaa.jsonl",
-            ),
-            concat!(
-                "{\"timestamp\":\"2026-05-14T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e253c-aaaa-7000-9000-aaaaaaaaaaaa\"}}\n",
-                "{\"timestamp\":\"2026-05-14T10:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":20,\"output_tokens\":5},\"model\":\"gpt-5.5\"}}}\n"
-            ),
-        )
-        .expect("write active fixture");
-        fs::write(
-            archived_dir.join(
-                "rollout-2026-05-14T11-00-00-019e253c-bbbb-7000-9000-bbbbbbbbbbbb.jsonl",
-            ),
-            concat!(
-                "{\"timestamp\":\"2026-05-14T11:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e253c-bbbb-7000-9000-bbbbbbbbbbbb\"}}\n",
-                "{\"timestamp\":\"2026-05-14T11:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":30,\"output_tokens\":6},\"model\":\"gpt-5.5\"}}}\n"
-            ),
-        )
-        .expect("write archived fixture");
-
-        let mut index = ScanIndex::default();
-        let scan = scan_source_roots(
-            SnapshotSource::Codex,
-            &[sessions_dir.clone(), archived_dir.clone()],
-            &mut index,
-            "2026-05-14T12:00:00Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("scan");
-
-        let session_ids: BTreeSet<_> = scan
-            .snapshots
-            .iter()
-            .map(|snapshot| snapshot.source_session_id.as_str())
-            .collect();
-        assert_eq!(scan.snapshots.len(), 2);
-        assert!(session_ids.contains("019e253c-aaaa-7000-9000-aaaaaaaaaaaa"));
-        assert!(session_ids.contains("019e253c-bbbb-7000-9000-bbbbbbbbbbbb"));
-
-        let _ = fs::remove_dir_all(codex_dir);
-    }
-
-    #[test]
     fn codex_parser_extracts_current_jsonl_shape_without_prompts() {
         let path = temp_file("codex");
         fs::write(
@@ -59439,104 +58804,49 @@ mod tests {
     }
 
     #[test]
-    fn codex_parser_forwards_raw_session_origin() {
-        // session_meta.payload carries thread_source/source/originator/agent_role
-        // (siblings of id). The backend re-derives the initiator from these.
-        let path = temp_file("codex");
-        fs::write(
-            &path,
-            concat!(
-                "{\"timestamp\":\"2026-05-06T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019dfb9a-origin-codex\",\"source\":\"vscode\",\"originator\":\"Codex Desktop\",\"thread_source\":\"user\",\"agent_role\":\"explorer\"}}\n",
-                "{\"timestamp\":\"2026-05-06T10:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":10,\"output_tokens\":5,\"request_count\":1},\"model\":\"gpt-5.5\"}}}\n"
-            ),
-        )
-        .expect("write fixture");
-
-        let item = parse_codex_jsonl_file(&path, "2026-05-06T10:04:00Z", "fp".to_string())
-            .expect("parse")
-            .into_iter()
-            .next()
-            .expect("snapshot");
-        let origin = item.origin.expect("origin forwarded");
-        assert_eq!(origin.thread_source.as_deref(), Some("user"));
-        assert_eq!(origin.source.as_deref(), Some("vscode"));
-        assert_eq!(origin.originator.as_deref(), Some("Codex Desktop"));
-        assert_eq!(origin.agent_role.as_deref(), Some("explorer"));
-        assert_eq!(origin.source_subagent, None);
-        assert!(item
-            .attribution_facts
-            .iter()
-            .any(|fact| { fact.field == "provider_surface" && fact.value == "codex_desktop" }));
-        assert!(!item
-            .attribution_facts
-            .iter()
-            .any(|fact| fact.value == "vscode" || fact.field == "origin_kind"));
-
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn codex_parser_forwards_top_level_originator_for_chatgpt_work() {
-        // The unified ChatGPT desktop app writes its local "Work" sessions as
-        // normal Codex rollout JSONLs with session_meta.originator ==
-        // "codex_work_desktop". The daemon forwards that verbatim on the
-        // forward-looking top-level `originator` field (the backend derives the
-        // display sub-surface). The raw value must also stay on
-        // `origin.originator` for the fallback path.
-        let path = temp_file("codex-originator-work");
-        fs::write(
-            &path,
-            concat!(
-                "{\"timestamp\":\"2026-07-21T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019dfb9a-work-codex\",\"source\":\"exec\",\"originator\":\"codex_work_desktop\",\"thread_source\":\"user\"}}\n",
-                "{\"timestamp\":\"2026-07-21T10:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":10,\"output_tokens\":5,\"request_count\":1},\"model\":\"gpt-5.5\"}}}\n"
-            ),
-        )
-        .expect("write fixture");
-
-        let item = parse_codex_jsonl_file(&path, "2026-07-21T10:04:00Z", "fp".to_string())
-            .expect("parse")
-            .into_iter()
-            .next()
-            .expect("snapshot");
-        assert_eq!(item.originator.as_deref(), Some("codex_work_desktop"));
-        assert_eq!(
-            item.origin.as_ref().and_then(|o| o.originator.as_deref()),
-            Some("codex_work_desktop")
-        );
-        // Serializes as a top-level `originator` string (what the backend reads).
-        let wire = serde_json::to_value(&item).expect("serialize");
-        assert_eq!(wire["originator"], serde_json::json!("codex_work_desktop"));
-
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn codex_parser_omits_originator_when_session_meta_lacks_it() {
-        // Backward compat: a Codex session_meta with no `originator` yields None,
-        // and the field is skipped on the wire (additive/optional).
-        let path = temp_file("codex-originator-absent");
-        fs::write(
-            &path,
-            concat!(
-                "{\"timestamp\":\"2026-07-21T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019dfb9a-noorig-codex\",\"source\":\"cli\",\"thread_source\":\"user\"}}\n",
-                "{\"timestamp\":\"2026-07-21T10:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":10,\"output_tokens\":5,\"request_count\":1},\"model\":\"gpt-5.5\"}}}\n"
-            ),
-        )
-        .expect("write fixture");
-
-        let item = parse_codex_jsonl_file(&path, "2026-07-21T10:04:00Z", "fp".to_string())
-            .expect("parse")
-            .into_iter()
-            .next()
-            .expect("snapshot");
-        assert_eq!(item.originator, None);
-        let wire = serde_json::to_value(&item).expect("serialize");
-        assert!(
-            wire.get("originator").is_none(),
-            "None originator must be skipped on the wire"
-        );
-
-        let _ = fs::remove_file(path);
+    fn codex_parser_origin_wire_variants() {
+        for (source, originator, role) in [
+            ("vscode", Some("Codex Desktop"), Some("explorer")),
+            ("exec", Some("codex_work_desktop"), None),
+            ("cli", None, None),
+        ] {
+            let path = temp_file("codex-origin");
+            let mut payload =
+                json!({"id":"019dfb9a-origin-codex", "source":source, "thread_source":"user"});
+            if let Some(value) = originator {
+                payload["originator"] = json!(value);
+            }
+            if let Some(value) = role {
+                payload["agent_role"] = json!(value);
+            }
+            fs::write(&path, [json!({"timestamp":"2026-07-21T10:00:00Z","type":"session_meta","payload":payload}), json!({"timestamp":"2026-07-21T10:03:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":5,"request_count":1},"model":"gpt-5.5"}}})].into_iter().map(|l|l.to_string()).collect::<Vec<_>>().join("\n")).unwrap();
+            let item = parse_codex_jsonl_file(&path, "2026-07-21T10:04:00Z", "fp".into())
+                .unwrap()
+                .remove(0);
+            let origin = item.origin.as_ref().unwrap();
+            assert_eq!(origin.thread_source.as_deref(), Some("user"));
+            assert_eq!(origin.source.as_deref(), Some(source));
+            assert_eq!(origin.originator.as_deref(), originator);
+            assert_eq!(origin.agent_role.as_deref(), role);
+            assert_eq!(origin.source_subagent, None);
+            assert_eq!(item.originator.as_deref(), originator);
+            let wire = serde_json::to_value(&item).unwrap();
+            assert_eq!(
+                wire.get("originator"),
+                originator.map(|value| json!(value)).as_ref()
+            );
+            if role.is_some() {
+                assert!(item
+                    .attribution_facts
+                    .iter()
+                    .any(|f| f.field == "provider_surface" && f.value == "codex_desktop"));
+                assert!(!item
+                    .attribution_facts
+                    .iter()
+                    .any(|f| f.value == "vscode" || f.field == "origin_kind"));
+            }
+            let _ = fs::remove_file(path);
+        }
     }
 
     #[test]
@@ -59802,37 +59112,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_parser_aggregates_task_complete_latency_per_session() {
-        let path = temp_file("codex-latency");
-        fs::write(
-            &path,
-            concat!(
-                "{\"timestamp\":\"2026-06-07T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019ea3b2-2186-7c93-b560-bf587a080094\"}}\n",
-                "{\"timestamp\":\"2026-06-07T10:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":100,\"output_tokens\":25},\"model\":\"gpt-5.5\"}}}\n",
-                "{\"timestamp\":\"2026-06-07T10:05:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"t1\",\"duration_ms\":2000,\"time_to_first_token_ms\":100}}\n",
-                "{\"timestamp\":\"2026-06-07T10:09:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"t2\",\"duration_ms\":4000,\"time_to_first_token_ms\":300}}\n"
-            ),
-        )
-        .expect("write fixture");
-
-        let item = parse_codex_jsonl_file(&path, "2026-06-07T10:10:00Z", "fp".to_string())
-            .expect("parse")
-            .into_iter()
-            .next()
-            .expect("snapshot");
-
-        // Session-level averages across the two task_complete turns:
-        // duration (2000 + 4000) / 2 = 3000; ttft (100 + 300) / 2 = 200.
-        assert_eq!(item.avg_duration_ms, Some(3000));
-        assert_eq!(item.avg_time_to_first_token_ms, Some(200));
-        // Max (slowest turn): duration max(2000, 4000) = 4000; ttft max(100, 300) = 300.
-        assert_eq!(item.max_duration_ms, Some(4000));
-        assert_eq!(item.max_time_to_first_token_ms, Some(300));
-
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
     fn claude_code_parser_derives_turn_duration_latency_per_session() {
         // Claude Code has no `task_complete` latency event, but every record
         // carries an ms-precision RFC3339 timestamp. A turn's wall-clock
@@ -59928,91 +59207,82 @@ mod tests {
     }
 
     #[test]
-    fn codex_transcript_title_wins_over_sidecar_titles() {
-        let path = temp_file("codex-title-priority");
-        fs::write(
-            &path,
-            concat!(
-                "{\"timestamp\":\"2026-05-14T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e253c-1111-7000-9000-aaaaaaaaaaaa\"}}\n",
-                "{\"timestamp\":\"2026-05-14T10:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_name_updated\",\"thread_name\":\"Transcript title wins\"}}\n",
-                "{\"timestamp\":\"2026-05-14T10:02:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"First prompt fallback should not win\"}}\n",
-                "{\"timestamp\":\"2026-05-14T10:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":10,\"output_tokens\":4},\"model\":\"gpt-5.5\"}}}\n"
+    fn codex_title_source_precedence() {
+        let root = temp_dir("codex-title-precedence");
+        let sessions = root.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let db = Connection::open(root.join("state_5.sqlite")).unwrap();
+        db.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT NOT NULL, tokens_used INTEGER NOT NULL DEFAULT 0, thread_source TEXT, first_user_message TEXT)", []).unwrap();
+        let cases = [
+            (
+                "019e253c-1111-7000-9000-aaaaaaaaaaaa",
+                true,
+                "Transcript title wins",
+                "transcript_title",
             ),
-        )
-        .expect("write fixture");
-        let mut metadata = CodexTitleMetadata::default();
-        insert_codex_sidecar_title(
-            &mut metadata.titles,
-            "019e253c-1111-7000-9000-aaaaaaaaaaaa".to_string(),
-            Some("Sidecar title loses".to_string()),
-            "session_index",
-            true,
-        );
-
-        let item = parse_codex_jsonl_file_with_title_metadata(
-            &path,
-            "2026-05-14T10:04:00Z",
-            "file-fingerprint".to_string(),
-            &metadata,
-            None,
-        )
-        .expect("parse")
-        .into_iter()
-        .next()
-        .expect("snapshot");
-
-        assert_eq!(
-            item.session_display_name.as_deref(),
-            Some("Transcript title wins")
-        );
-        assert_eq!(
-            item.session_display_name_source.as_deref(),
-            Some("transcript_title")
-        );
-
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn codex_session_index_sidecar_supplies_title_without_jsonl_title() {
-        let codex_dir = temp_dir("codex-session-index");
-        let sessions_dir = codex_dir.join("sessions");
-        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
-        let path = sessions_dir
-            .join("rollout-2026-05-14T10-00-00-019e253c-2222-7000-9000-bbbbbbbbbbbb.jsonl");
-        fs::write(
-            &path,
-            concat!(
-                "{\"timestamp\":\"2026-05-14T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e253c-2222-7000-9000-bbbbbbbbbbbb\"}}\n",
-                "{\"timestamp\":\"2026-05-14T10:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":20,\"output_tokens\":5},\"model\":\"gpt-5.5\"}}}\n"
+            (
+                "019e253c-2222-7000-9000-bbbbbbbbbbbb",
+                false,
+                "Daily bug scan",
+                "session_index",
             ),
-        )
-        .expect("write fixture");
-        fs::write(
-            codex_dir.join("session_index.jsonl"),
-            "{\"id\":\"019e253c-2222-7000-9000-bbbbbbbbbbbb\",\"thread_name\":\"Daily bug scan\",\"updated_at\":1777777777}\n",
-        )
-        .expect("write session index");
-
-        let mut index = ScanIndex::default();
+            (
+                "019e253c-3333-7000-9000-cccccccccccc",
+                false,
+                "Pricing Review Guarded Autopilot",
+                "session_index",
+            ),
+        ];
+        let mut sidecars = Vec::new();
+        for (position, (id, transcript_title, title, _)) in cases.iter().enumerate() {
+            let mut lines = vec![
+                json!({"timestamp":"2026-05-14T10:00:00Z","type":"session_meta","payload":{"id":id}}),
+            ];
+            if *transcript_title {
+                lines.push(json!({"timestamp":"2026-05-14T10:01:00Z","type":"event_msg","payload":{"type":"thread_name_updated","thread_name":title}}));
+                lines.push(json!({"timestamp":"2026-05-14T10:02:00Z","type":"event_msg","payload":{"type":"user_message","message":"First prompt fallback should not win"}}));
+            }
+            lines.push(json!({"timestamp":"2026-05-14T10:03:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10*(position+1),"output_tokens":4+position},"model":"gpt-5.5"}}}));
+            fs::write(
+                sessions.join(format!("rollout-{id}.jsonl")),
+                lines
+                    .into_iter()
+                    .map(|l| l.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .unwrap();
+            if position < 2 {
+                sidecars.push(json!({"id":id,"thread_name":if *transcript_title {"Sidecar title loses"} else {title},"updated_at":1777777777}).to_string());
+            } else {
+                db.execute(
+                    "INSERT INTO threads (id,title) VALUES (?1,?2)",
+                    [*id, *title],
+                )
+                .unwrap();
+            }
+        }
+        drop(db);
+        fs::write(root.join("session_index.jsonl"), sidecars.join("\n")).unwrap();
         let scan = scan_source_roots(
             SnapshotSource::Codex,
-            &[sessions_dir],
-            &mut index,
+            &[sessions],
+            &mut ScanIndex::default(),
             "2026-05-14T10:04:00Z",
             BACKFILL_WINDOW_DAYS,
         )
-        .expect("scan");
-
-        assert_eq!(scan.snapshots.len(), 1);
-        let item = &scan.snapshots[0];
-        assert_eq!(item.session_display_name.as_deref(), Some("Daily bug scan"));
-        assert_eq!(
-            item.session_display_name_source.as_deref(),
-            Some("session_index")
-        );
-
-        let _ = fs::remove_dir_all(codex_dir);
+        .unwrap();
+        assert_eq!(scan.snapshots.len(), cases.len());
+        for (id, _, title, source) in cases {
+            let item = scan
+                .snapshots
+                .iter()
+                .find(|item| item.source_session_id == id)
+                .unwrap();
+            assert_eq!(item.session_display_name.as_deref(), Some(title));
+            assert_eq!(item.session_display_name_source.as_deref(), Some(source));
+        }
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -60078,66 +59348,6 @@ mod tests {
             index.upload_context_fingerprint.as_deref(),
             Some("prior-context")
         );
-        let _ = fs::remove_dir_all(codex_dir);
-    }
-
-    #[test]
-    fn codex_state_sqlite_sidecar_supplies_title_when_session_index_has_none() {
-        let codex_dir = temp_dir("codex-state-sqlite");
-        let sessions_dir = codex_dir.join("sessions");
-        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
-        let path = sessions_dir
-            .join("rollout-2026-05-14T10-00-00-019e253c-3333-7000-9000-cccccccccccc.jsonl");
-        fs::write(
-            &path,
-            concat!(
-                "{\"timestamp\":\"2026-05-14T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e253c-3333-7000-9000-cccccccccccc\"}}\n",
-                "{\"timestamp\":\"2026-05-14T10:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":30,\"output_tokens\":6},\"model\":\"gpt-5.5\"}}}\n"
-            ),
-        )
-        .expect("write fixture");
-        let connection = Connection::open(codex_dir.join("state_5.sqlite")).expect("open sqlite");
-        connection
-            .execute(
-                "CREATE TABLE threads (\
-                    id TEXT PRIMARY KEY, title TEXT NOT NULL, tokens_used INTEGER NOT NULL DEFAULT 0,\
-                    thread_source TEXT, first_user_message TEXT\
-                )",
-                [],
-            )
-            .expect("create threads");
-        connection
-            .execute(
-                "INSERT INTO threads (id, title) VALUES (?1, ?2)",
-                [
-                    "019e253c-3333-7000-9000-cccccccccccc",
-                    "Pricing Review Guarded Autopilot",
-                ],
-            )
-            .expect("insert thread");
-        drop(connection);
-
-        let mut index = ScanIndex::default();
-        let scan = scan_source_roots(
-            SnapshotSource::Codex,
-            &[sessions_dir],
-            &mut index,
-            "2026-05-14T10:04:00Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("scan");
-
-        assert_eq!(scan.snapshots.len(), 1);
-        let item = &scan.snapshots[0];
-        assert_eq!(
-            item.session_display_name.as_deref(),
-            Some("Pricing Review Guarded Autopilot")
-        );
-        assert_eq!(
-            item.session_display_name_source.as_deref(),
-            Some("session_index")
-        );
-
         let _ = fs::remove_dir_all(codex_dir);
     }
 
@@ -61501,67 +60711,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_census_line_counts_every_parse_reason_and_selection() {
-        let mut census = ScanCensus::default();
-        assert_eq!(census.codex_parse_reasons_line(true), None, "silent page");
-        for reason in [
-            CandidateParseReason::TerminalDisposition,
-            CandidateParseReason::NewFile,
-            CandidateParseReason::AuthorityQuarantine,
-            CandidateParseReason::Audit,
-            CandidateParseReason::BodyWitnessAdoption,
-            CandidateParseReason::UploadContext,
-            CandidateParseReason::ActivityOrQuarantineRetry,
-            CandidateParseReason::TranscriptChanged,
-            CandidateParseReason::CodexCapture,
-            CandidateParseReason::UnknownOutcome,
-            CandidateParseReason::LegacyActivity,
-            CandidateParseReason::LegacyIdentity,
-            CandidateParseReason::Rearmed,
-            CandidateParseReason::SourceChanged,
-            CandidateParseReason::ForcedFamily,
-        ] {
-            census.note_codex_selection(CandidateDecision::Parse, Some(reason), None);
-        }
-        census.note_codex_selection(CandidateDecision::Skip, None, None);
-        // A budget-held adoption-only candidate is skipped with its reason.
-        census.note_codex_selection(
-            CandidateDecision::Skip,
-            Some(CandidateParseReason::BodyWitnessAdoption),
-            None,
-        );
-        census.note_codex_selection(CandidateDecision::Migrate, None, None);
-        census.note_codex_selection(CandidateDecision::ReconcileLegacy, None, None);
-        // Only a comparison target parses without a reason or an override.
-        census.note_codex_selection(CandidateDecision::Parse, None, None);
-        // An override names the selection, never the skipped file's reason.
-        census.note_codex_selection(
-            CandidateDecision::Parse,
-            Some(CandidateParseReason::BodyWitnessAdoption),
-            Some(CodexSelection::OwedParent),
-        );
-        census.note_codex_selection(
-            CandidateDecision::Parse,
-            None,
-            Some(CodexSelection::SideRead),
-        );
-        census.note_codex_group(CodexSelection::GroupUnchanged, 3);
-        census.note_codex_group(CodexSelection::GroupSelected, 2);
-        assert_eq!(
-            census.codex_parse_reasons_line(false).as_deref(),
-            Some(concat!(
-                "local snapshot census codex parse reasons: upload_context_matches=false ",
-                "terminal_disposition=1 new_file=1 authority_quarantine=1 audit=1 ",
-                "body_witness_adoption=1 upload_context=1 activity_or_quarantine_retry=1 ",
-                "transcript_changed=1 codex_capture=1 unknown_outcome=1 legacy_activity=1 ",
-                "legacy_identity=1 rearmed=1 source_changed=1 forced_family=1 ",
-                "skip=2 migrate=1 reconcile_legacy=1 comparison_target=1 owed_parent=1 ",
-                "side_read=1 group_unchanged=3 group_selected=2",
-            ))
-        );
-    }
-
-    #[test]
     fn codex_scan_logs_selection_reasons_on_the_census_line() {
         fn line(upload_context_matches: bool, counts: &[(&str, usize)]) -> String {
             let field = |name: &str| {
@@ -62038,22 +61187,9 @@ mod tests {
             modified_unix_nanos: None,
             source_file_fingerprint: v6_key.clone(),
             last_snapshot_fingerprint: None,
-            last_upload_body_witness: None,
-            effective_upload_body_witness_revision: 0,
+
             scan_identity_version: None,
-            codex_joined_member_set: None,
-            codex_captured_joined_member_set: None,
-            codex_protected_owner: None,
-            codex_applied_tier_receipt: None,
-            codex_applied_tier_receipt_required: false,
-            codex_captured_tier_receipt: None,
-            codex_captured_tier_receipt_required: false,
-            codex_captured_uncommitted: false,
-            codex_counting_v2: false,
-            codex_counting_owner: None,
-            opened_changed_nanos: 0,
-            opened_birth_nanos: 0,
-            upload_context_receipt: None,
+            ..manifest_index_entry(None)
         };
 
         let mut index = ScanIndex {
@@ -62186,124 +61322,32 @@ mod tests {
     }
 
     #[test]
-    fn codex_agent_role_prompt_has_a_bounded_title() {
-        assert_eq!(
-            first_prompt_display_title(
-                SnapshotSource::Codex,
-                "You are the LANDING OWNER AGENT for ottto-ai/coding-agents-observability — \
-                 coordinate the queue and keep the full operating contract private."
-                    .to_string()
-            )
-            .as_deref(),
-            Some("Landing owner agent")
-        );
-        assert_eq!(
-            first_prompt_display_title(
-                SnapshotSource::Codex,
-                "You are a PR REPAIR AGENT for ottto-ai/coding-agents-observability.".to_string()
-            )
-            .as_deref(),
-            Some("PR repair agent")
-        );
-        assert_eq!(
-            first_prompt_display_title(
-                SnapshotSource::Codex,
-                "You are a Phase-2 projector implementation worker (GPT-5.6 Sol via Codex CLI)."
-                    .to_string()
-            )
-            .as_deref(),
-            Some("Phase-2 projector implementation worker")
-        );
+    fn codex_agent_role_prompt_titles() {
+        for (source, prompt, expected) in [
+            (SnapshotSource::Codex, "You are the LANDING OWNER AGENT for ottto-ai/coding-agents-observability — coordinate the queue and keep the full operating contract private.", Some("Landing owner agent")),
+            (SnapshotSource::Codex, "You are a PR REPAIR AGENT for ottto-ai/coding-agents-observability.", Some("PR repair agent")),
+            (SnapshotSource::Codex, "You are a Phase-2 projector implementation worker (GPT-5.6 Sol via Codex CLI).", Some("Phase-2 projector implementation worker")),
+            (SnapshotSource::Codex, "You are the extraordinarily detailed multi-stage cross-repository production incident response coordination agent for this task.", None),
+            (SnapshotSource::Codex, "You are the /root repair agent for this task.", None),
+            (SnapshotSource::Codex, "You are the diligent agentless helper.", None),
+            (SnapshotSource::ClaudeCode, "You are the LANDING OWNER AGENT for this task.", None),
+        ] {
+            assert_eq!(first_prompt_display_title(source, prompt.into()).as_deref(), expected, "{prompt}");
+        }
     }
 
     #[test]
-    fn codex_agent_role_prompt_rejects_unbounded_or_path_like_roles() {
-        assert_eq!(
-            first_prompt_display_title(
-                SnapshotSource::Codex,
-                "You are the extraordinarily detailed multi-stage cross-repository production \
-                 incident response coordination agent for this task."
-                    .to_string()
-            ),
-            None
-        );
-        assert_eq!(
-            first_prompt_display_title(
-                SnapshotSource::Codex,
-                "You are the /root repair agent for this task.".to_string()
-            ),
-            None
-        );
-        assert_eq!(
-            first_prompt_display_title(
-                SnapshotSource::Codex,
-                "You are the diligent agentless helper.".to_string()
-            ),
-            None
-        );
-        assert_eq!(
-            first_prompt_display_title(
-                SnapshotSource::ClaudeCode,
-                "You are the LANDING OWNER AGENT for this task.".to_string()
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn first_prompt_material_skips_injected_scaffolding() {
-        let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
-        accumulator.set_first_prompt_title(Some(
-            "# AGENTS.md instructions for /repo\n\
-             <INSTRUCTIONS>Shared setup</INSTRUCTIONS>\n\
-             <environment_context><cwd>/repo</cwd></environment_context>"
-                .to_string(),
-        ));
-        accumulator.set_first_prompt_title(Some("Investigate the upload timeout".to_string()));
-
-        assert_eq!(
-            accumulator.first_prompt_material.as_deref(),
-            Some("Investigate the upload timeout")
-        );
-        assert_eq!(
-            accumulator.first_prompt_title.as_deref(),
-            Some("Investigate the upload timeout")
-        );
-    }
-
-    #[test]
-    fn first_prompt_material_keeps_human_marker_mentions() {
-        let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
-        accumulator.set_first_prompt_title(Some(
-            "Update the AGENTS.md instructions and parse the current date: field".to_string(),
-        ));
-
-        assert_eq!(
-            accumulator.first_prompt_material.as_deref(),
-            Some("Update the AGENTS.md instructions and parse the current date: field")
-        );
-    }
-
-    #[test]
-    fn first_prompt_material_keeps_task_after_injected_prefix() {
-        let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
-        accumulator.set_first_prompt_title(Some(
-            "<recommended_plugins>Plugins</recommended_plugins>\n\
-             # AGENTS.md instructions for /repo\n\
-             <INSTRUCTIONS>Shared setup</INSTRUCTIONS>\n\
-             <environment_context><cwd>/repo</cwd></environment_context>\n\
-             Explain how this XML is parsed"
-                .to_string(),
-        ));
-
-        assert_eq!(
-            accumulator.first_prompt_material.as_deref(),
-            Some("Explain how this XML is parsed")
-        );
-        assert_eq!(
-            accumulator.first_prompt_title.as_deref(),
-            Some("Explain how this XML is parsed")
-        );
+    fn first_prompt_material_filters_only_injected_scaffolding() {
+        for (prompts, expected, check_title) in [
+            (vec!["# AGENTS.md instructions for /repo\n<INSTRUCTIONS>Shared setup</INSTRUCTIONS>\n<environment_context><cwd>/repo</cwd></environment_context>", "Investigate the upload timeout"], "Investigate the upload timeout", true),
+            (vec!["Update the AGENTS.md instructions and parse the current date: field"], "Update the AGENTS.md instructions and parse the current date: field", false),
+            (vec!["<recommended_plugins>Plugins</recommended_plugins>\n# AGENTS.md instructions for /repo\n<INSTRUCTIONS>Shared setup</INSTRUCTIONS>\n<environment_context><cwd>/repo</cwd></environment_context>\nExplain how this XML is parsed"], "Explain how this XML is parsed", true),
+        ] {
+            let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
+            for prompt in prompts { accumulator.set_first_prompt_title(Some(prompt.into())); }
+            assert_eq!(accumulator.first_prompt_material.as_deref(), Some(expected));
+            if check_title { assert_eq!(accumulator.first_prompt_title.as_deref(), Some(expected)); }
+        }
     }
 
     #[test]
@@ -62468,65 +61512,20 @@ mod tests {
     }
 
     #[test]
-    fn extract_session_artifacts_collects_clean_pr_issue_commit() {
-        let text = concat!(
-            "Created PR: https://github.com/ottto-ai/repo/pull/42\n",
-            "MR https://gitlab.com/group/sub/proj/-/merge_requests/7 ",
-            "and https://bitbucket.org/team/repo/pull-requests/3\n",
-            "Issue: https://github.com/ottto-ai/repo/issues/9.\n",
-            "[main a1b2c3d] commit message\n",
-        );
-        let pairs: BTreeSet<(String, String)> = extract_session_artifacts(text)
-            .into_iter()
-            .map(|artifact| (artifact.kind, artifact.value))
-            .collect();
-        assert!(pairs.contains(&(
-            "pull_request".to_string(),
-            "https://github.com/ottto-ai/repo/pull/42".to_string()
-        )));
-        assert!(pairs.contains(&(
-            "pull_request".to_string(),
-            "https://gitlab.com/group/sub/proj/-/merge_requests/7".to_string()
-        )));
-        assert!(pairs.contains(&(
-            "pull_request".to_string(),
-            "https://bitbucket.org/team/repo/pull-requests/3".to_string()
-        )));
-        assert!(pairs.contains(&(
-            "issue".to_string(),
-            "https://github.com/ottto-ai/repo/issues/9".to_string()
-        )));
-        assert!(pairs.contains(&("commit".to_string(), "a1b2c3d".to_string())));
-    }
-
-    #[test]
     fn extract_session_artifacts_canonicalizes_and_rejects_unclean() {
-        // Trailing path suffix and query string are dropped to the id.
-        let canon = extract_session_artifacts(
-            "https://github.com/o/r/pull/42/files https://github.com/o/r/pull/7?w=1",
-        );
-        let values: BTreeSet<String> = canon.into_iter().map(|a| a.value).collect();
-        assert!(values.contains("https://github.com/o/r/pull/42"));
-        assert!(values.contains("https://github.com/o/r/pull/7"));
-        assert!(values
-            .iter()
-            .all(|value| !value.contains('?') && !value.contains("/files")));
-
-        // Embedded credentials, percent-encoded local paths, and non-http
-        // schemes never produce an artifact (so the batch can never be rejected).
-        for unclean in [
-            "https://user:pass@github.com/o/r/pull/1",
-            "https://github.com/o/%2Fusers%2Fron/pull/1",
-            "ftp://github.com/o/r/pull/1",
-            "https://github.com/o/r/tree/main",
+        for (text, expected) in [
+            (concat!("Created PR: https://github.com/ottto-ai/repo/pull/42\n", "MR https://gitlab.com/group/sub/proj/-/merge_requests/7 and https://bitbucket.org/team/repo/pull-requests/3\n", "Issue: https://github.com/ottto-ai/repo/issues/9.\n", "[main a1b2c3d] commit message\n"), vec![("pull_request", "https://github.com/ottto-ai/repo/pull/42"), ("pull_request", "https://gitlab.com/group/sub/proj/-/merge_requests/7"), ("pull_request", "https://bitbucket.org/team/repo/pull-requests/3"), ("issue", "https://github.com/ottto-ai/repo/issues/9"), ("commit", "a1b2c3d")]),
+            ("https://github.com/o/r/pull/42/files https://github.com/o/r/pull/7?w=1", vec![("pull_request", "https://github.com/o/r/pull/42"), ("pull_request", "https://github.com/o/r/pull/7")]),
+            ("https://user:pass@github.com/o/r/pull/1", vec![]),
+            ("https://github.com/o/%2Fusers%2Fron/pull/1", vec![]),
+            ("ftp://github.com/o/r/pull/1", vec![]),
+            ("https://github.com/o/r/tree/main", vec![]),
+            ("[INFO 1234567] starting", vec![]),
         ] {
-            assert!(
-                extract_session_artifacts(unclean).is_empty(),
-                "expected no artifact for {unclean}"
-            );
+            let actual: BTreeSet<_> = extract_session_artifacts(text).into_iter().map(|a| (a.kind, a.value)).collect();
+            let expected: BTreeSet<_> = expected.into_iter().map(|(kind, value)| (kind.to_string(), value.to_string())).collect();
+            assert_eq!(actual, expected, "{text}");
         }
-        // All-numeric bracketed log lines are not commits (require an a-f digit).
-        assert!(extract_session_artifacts("[INFO 1234567] starting").is_empty());
     }
 
     #[test]
@@ -62918,31 +61917,6 @@ mod tests {
     }
 
     #[test]
-    fn scan_identity_is_decoupled_from_parser_build_version() {
-        let path = Path::new("/redacted/session.jsonl");
-        let before_parser_upgrade = scan_file_fingerprint_with_context(
-            path,
-            100,
-            1_777_777_777_123_456_789,
-            SnapshotSource::Codex.scan_identity_version(),
-            "session-sidecar",
-        );
-        let after_parser_upgrade = scan_file_fingerprint_with_context(
-            path,
-            100,
-            1_777_777_777_123_456_789,
-            CODEX_SCAN_IDENTITY_VERSION,
-            "session-sidecar",
-        );
-
-        assert_eq!(before_parser_upgrade, after_parser_upgrade);
-        assert_ne!(
-            CODEX_SNAPSHOT_PARSER_VERSION,
-            "codex_jsonl:future-parser-build"
-        );
-    }
-
-    #[test]
     fn codex_parser_ignores_function_call_names_as_titles() {
         let path = temp_file("codex-tool-name");
         fs::write(
@@ -63116,8 +62090,9 @@ mod tests {
     }
 
     #[test]
-    fn claude_attribution_capture_lifts_all_five_markers_when_enabled() {
-        let line: Value = serde_json::from_str(concat!(
+    fn claude_attribution_capture_respects_opt_in_and_present_markers() {
+        for (line, enabled, expected) in [
+(serde_json::from_str(concat!(
             "{\"type\":\"assistant\",\"sessionId\":\"attr-session\",",
             "\"attributionAgent\":\"general-purpose\",",
             "\"attributionSkill\":\"design-sync\",",
@@ -63126,62 +62101,35 @@ mod tests {
             "\"attributionMcpTool\":\"tabs_context_mcp\",",
             "\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":100,\"output_tokens\":30}}}"
         ))
-        .expect("parse line");
-
-        let mut selector = SelectorCapture::default();
-        capture_claude_attribution(&line, &mut selector, true);
-
-        // Subagent is the priority dimension.
-        assert_eq!(
-            selector
-                .context
-                .get("attribution_subagent")
-                .map(String::as_str),
-            Some("general-purpose")
-        );
-        assert_eq!(
-            selector
-                .context
-                .get("attribution_skill")
-                .map(String::as_str),
-            Some("design-sync")
-        );
-        assert_eq!(
-            selector
-                .context
-                .get("attribution_plugin")
-                .map(String::as_str),
-            Some("anthropic-skills")
-        );
-        assert_eq!(
-            selector
-                .context
-                .get("attribution_mcp_server")
-                .map(String::as_str),
-            Some("claude-in-chrome")
-        );
-        assert_eq!(
-            selector
-                .context
-                .get("attribution_mcp_tool")
-                .map(String::as_str),
-            Some("tabs_context_mcp")
-        );
-        // Source tag is uniform for all captured attribution keys.
-        assert_eq!(
-            selector
-                .sources
-                .get("attribution_subagent")
-                .map(String::as_str),
-            Some("claude_code_attribution_field")
-        );
-        assert_eq!(
-            selector
-                .sources
-                .get("attribution_mcp_tool")
-                .map(String::as_str),
-            Some("claude_code_attribution_field")
-        );
+        .expect("parse line"), true, vec![("attribution_subagent", "general-purpose"), ("attribution_skill", "design-sync"), ("attribution_plugin", "anthropic-skills"), ("attribution_mcp_server", "claude-in-chrome"), ("attribution_mcp_tool", "tabs_context_mcp")]),
+(serde_json::from_str(concat!(
+            "{\"type\":\"assistant\",\"attributionAgent\":\"general-purpose\",",
+            "\"attributionMcpServer\":\"claude-in-chrome\",",
+            "\"attributionMcpTool\":\"tabs_context_mcp\",",
+            "\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}"
+        ))
+        .expect("parse line"), false, vec![]),
+(serde_json::from_str(concat!(
+            "{\"type\":\"assistant\",\"attributionAgent\":\"   \",",
+            "\"attributionSkill\":42,",
+            "\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}"
+        ))
+        .expect("parse line"), true, vec![]),
+(serde_json::from_str(concat!(
+            "{\"type\":\"assistant\",\"sessionId\":\"attr-top-level\",",
+            "\"attributionSkill\":\"design-sync\",",
+            "\"attributionMcpServer\":\"claude-in-chrome\",",
+            "\"attributionMcpTool\":\"tabs_context_mcp\",",
+            "\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":120,\"output_tokens\":48}}}"
+        ))
+        .expect("parse line"), true, vec![("attribution_skill", "design-sync"), ("attribution_mcp_server", "claude-in-chrome"), ("attribution_mcp_tool", "tabs_context_mcp")])
+        ] {
+            let mut selector = SelectorCapture::default();
+            capture_claude_attribution(&line, &mut selector, enabled);
+            let expected: BTreeMap<_, _> = expected.into_iter().map(|(key, value)| (key.to_string(), value.to_string())).collect();
+            assert_eq!(selector.context, expected);
+            assert_eq!(selector.sources, expected.keys().map(|key| (key.clone(), "claude_code_attribution_field".into())).collect());
+        }
     }
 
     #[test]
@@ -63492,222 +62440,32 @@ mod tests {
     }
 
     #[test]
-    fn claude_attribution_capture_is_noop_when_disabled() {
-        let line: Value = serde_json::from_str(concat!(
-            "{\"type\":\"assistant\",\"attributionAgent\":\"general-purpose\",",
-            "\"attributionMcpServer\":\"claude-in-chrome\",",
-            "\"attributionMcpTool\":\"tabs_context_mcp\",",
-            "\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}"
-        ))
-        .expect("parse line");
-
-        let mut selector = SelectorCapture::default();
-        capture_claude_attribution(&line, &mut selector, false);
-
-        assert_eq!(
-            selector,
-            SelectorCapture::default(),
-            "attribution must not be captured while the opt-in flag is off"
-        );
-    }
-
-    #[test]
-    fn claude_attribution_capture_skips_absent_or_blank_markers() {
-        // Enabled, but the line carries no usable attribution: blank string and
-        // a non-string value are both ignored (string_at trims + rejects empty).
-        let line: Value = serde_json::from_str(concat!(
-            "{\"type\":\"assistant\",\"attributionAgent\":\"   \",",
-            "\"attributionSkill\":42,",
-            "\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}"
-        ))
-        .expect("parse line");
-
-        let mut selector = SelectorCapture::default();
-        capture_claude_attribution(&line, &mut selector, true);
-
-        assert!(
-            selector.is_empty(),
-            "blank/non-string attribution markers must be skipped"
-        );
-    }
-
-    #[test]
     fn claude_attribution_contract_allows_all_five_keys() {
-        // All five attribution keys cross the wire inside selector_context when
-        // attribution capture is enabled; MCP tool has no separate opt-in.
-        for key in [
-            "attribution_subagent",
-            "attribution_skill",
-            "attribution_plugin",
-            "attribution_mcp_server",
-            "attribution_mcp_tool",
-        ] {
-            assert!(
-                SELECTOR_CONTEXT_ALLOWED.contains(&key),
-                "{key} must be on SELECTOR_CONTEXT_ALLOWED"
-            );
-        }
-
+        let keys = [
+            ("attribution_subagent", "general-purpose"),
+            ("attribution_skill", "design-sync"),
+            ("attribution_plugin", "anthropic-skills"),
+            ("attribution_mcp_server", "claude-in-chrome"),
+            ("attribution_mcp_tool", "tabs_context_mcp"),
+        ];
         let mut merged = SelectorCapture::default();
-        merged.insert("context_bucket", "long".to_string(), "test");
-        merged.insert(
-            "attribution_subagent",
-            "general-purpose".to_string(),
-            "claude_code_attribution_field",
-        );
-        merged.insert(
-            "attribution_mcp_server",
-            "claude-in-chrome".to_string(),
-            "claude_code_attribution_field",
-        );
-        merged.insert(
-            "attribution_skill",
-            "design-sync".to_string(),
-            "claude_code_attribution_field",
-        );
-        merged.insert(
-            "attribution_plugin",
-            "anthropic-skills".to_string(),
-            "claude_code_attribution_field",
-        );
-        merged.insert(
-            "attribution_mcp_tool",
-            "tabs_context_mcp".to_string(),
-            "claude_code_attribution_field",
-        );
-
-        let (_, reduced_context, reduced_sources) =
-            build_row_identity("claude-opus-4-8", &merged, None);
-
+        merged.insert("context_bucket", "long".into(), "test");
+        for (key, value) in keys {
+            assert!(SELECTOR_CONTEXT_ALLOWED.contains(&key));
+            merged.insert(key, value.into(), "claude_code_attribution_field");
+        }
+        let (_, context, sources) = build_row_identity("claude-opus-4-8", &merged, None);
         assert_eq!(
-            reduced_context.get("context_bucket").map(String::as_str),
+            context.get("context_bucket").map(String::as_str),
             Some("long")
         );
-        assert_eq!(
-            reduced_context
-                .get("attribution_subagent")
-                .map(String::as_str),
-            Some("general-purpose")
-        );
-        assert_eq!(
-            reduced_context
-                .get("attribution_mcp_server")
-                .map(String::as_str),
-            Some("claude-in-chrome")
-        );
-        assert_eq!(
-            reduced_context.get("attribution_skill").map(String::as_str),
-            Some("design-sync")
-        );
-        assert_eq!(
-            reduced_context
-                .get("attribution_plugin")
-                .map(String::as_str),
-            Some("anthropic-skills")
-        );
-        assert_eq!(
-            reduced_context
-                .get("attribution_mcp_tool")
-                .map(String::as_str),
-            Some("tabs_context_mcp")
-        );
-        assert_eq!(
-            reduced_sources
-                .get("attribution_mcp_tool")
-                .map(String::as_str),
-            Some("claude_code_attribution_field")
-        );
-    }
-
-    #[test]
-    fn claude_attribution_capture_lifts_only_present_markers_mixed() {
-        // Real-world top-level (non-subagent) transcript shape: the line carries
-        // MCP-server/MCP-tool + skill attribution but NO `attributionAgent`
-        // (subagent attribution lives in the child `subagents/*.jsonl`
-        // transcripts, which the daemon walk already ingests as standalone
-        // sidechain sessions). Assert capture lifts exactly the present markers
-        // and invents nothing for the absent ones — complements the
-        // all-five-present and none-present cases above with the realistic
-        // partial shape.
-        let line: Value = serde_json::from_str(concat!(
-            "{\"type\":\"assistant\",\"sessionId\":\"attr-top-level\",",
-            "\"attributionSkill\":\"design-sync\",",
-            "\"attributionMcpServer\":\"claude-in-chrome\",",
-            "\"attributionMcpTool\":\"tabs_context_mcp\",",
-            "\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":120,\"output_tokens\":48}}}"
-        ))
-        .expect("parse line");
-
-        let mut selector = SelectorCapture::default();
-        capture_claude_attribution(&line, &mut selector, true);
-
-        assert_eq!(
-            selector
-                .context
-                .get("attribution_skill")
-                .map(String::as_str),
-            Some("design-sync")
-        );
-        assert_eq!(
-            selector
-                .context
-                .get("attribution_mcp_server")
-                .map(String::as_str),
-            Some("claude-in-chrome")
-        );
-        assert_eq!(
-            selector
-                .context
-                .get("attribution_mcp_tool")
-                .map(String::as_str),
-            Some("tabs_context_mcp")
-        );
-        // No subagent / plugin markers on this line: they must be absent, not
-        // empty-string placeholders.
-        assert!(
-            !selector.context.contains_key("attribution_subagent"),
-            "absent attributionAgent must not synthesize an attribution_subagent key"
-        );
-        assert!(
-            !selector.context.contains_key("attribution_plugin"),
-            "absent attributionPlugin must not synthesize an attribution_plugin key"
-        );
-    }
-
-    #[test]
-    fn claude_attribution_capture_is_per_turn_isolated() {
-        // Core per-turn discipline: capture runs on the per-LINE selector, so an
-        // attribution marker on one turn's line must NOT bleed onto a later
-        // turn's line. Each line gets its own SelectorCapture; the second
-        // (unattributed) line must surface no attribution from the first.
-        let attributed: Value = serde_json::from_str(concat!(
-            "{\"type\":\"assistant\",\"attributionAgent\":\"general-purpose\",",
-            "\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":80,\"output_tokens\":20}}}"
-        ))
-        .expect("parse attributed line");
-        let unattributed: Value = serde_json::from_str(concat!(
-            "{\"type\":\"assistant\",",
-            "\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":80,\"output_tokens\":20}}}"
-        ))
-        .expect("parse unattributed line");
-
-        let mut first = SelectorCapture::default();
-        capture_claude_attribution(&attributed, &mut first, true);
-        let mut second = SelectorCapture::default();
-        capture_claude_attribution(&unattributed, &mut second, true);
-
-        assert_eq!(
-            first
-                .context
-                .get("attribution_subagent")
-                .map(String::as_str),
-            Some("general-purpose"),
-            "the attributed turn must carry its own subagent"
-        );
-        assert!(
-            second.is_empty(),
-            "a later unattributed turn must not inherit the prior turn's subagent attribution"
-        );
+        for (key, value) in keys {
+            assert_eq!(context.get(key).map(String::as_str), Some(value));
+            assert_eq!(
+                sources.get(key).map(String::as_str),
+                Some("claude_code_attribution_field")
+            );
+        }
     }
 
     #[test]
@@ -63914,34 +62672,26 @@ mod tests {
     }
 
     #[test]
-    fn codex_parser_captures_max_reasoning_effort_round_trip() {
-        let path = temp_file("codex-effort-max");
-        fs::write(
-            &path,
-            concat!(
+    fn codex_parser_reasoning_effort_sources_round_trip() {
+        for (body, effort) in [
+(concat!(
                 "{\"timestamp\":\"2026-05-20T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e2700-cafe-7000-9000-555555555555\"}}\n",
                 "{\"timestamp\":\"2026-05-20T10:01:00Z\",\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5.5\"}}\n",
                 "{\"timestamp\":\"2026-05-20T10:02:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"reasoning_effort\":\"max\",\"total_token_usage\":{\"input_tokens\":50,\"output_tokens\":12,\"request_count\":1},\"model\":\"gpt-5.5\"}}}\n"
-            ),
-        )
-        .expect("write fixture");
-
-        let item = parse_codex_jsonl_file(
-            &path,
-            "2026-05-20T10:04:00Z",
-            "file-fingerprint".to_string(),
-        )
-        .expect("parse")
-        .into_iter()
-        .next()
-        .expect("snapshot");
-
-        assert_eq!(item.model_usage[0].reasoning_effort.as_deref(), Some("max"));
-        // Round-trips through serde under the exact wire key the backend reads.
-        let value = serde_json::to_value(&item.model_usage[0]).expect("serialize row");
-        assert_eq!(value["reasoning_effort"], json!("max"));
-
-        let _ = fs::remove_file(path);
+            ), "max"),
+(concat!(
+                "{\"timestamp\":\"2026-05-21T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e2700-cafe-7000-9000-666666666666\"}}\n",
+                "{\"timestamp\":\"2026-05-21T10:01:00Z\",\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5.5\",\"collaboration_mode\":{\"settings\":{\"reasoning_effort\":\"low\"}}}}\n",
+                "{\"timestamp\":\"2026-05-21T10:02:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":40,\"output_tokens\":8,\"request_count\":1},\"model\":\"gpt-5.5\"}}}\n"
+            ), "low")
+        ] {
+            let path = temp_file("codex-effort");
+            fs::write(&path, body).expect("fixture");
+            let item = parse_codex_jsonl_file(&path, "2026-05-21T10:04:00Z", "fp".into()).expect("parse").remove(0);
+            assert_eq!(item.model_usage[0].reasoning_effort.as_deref(), Some(effort));
+            assert_eq!(serde_json::to_value(&item.model_usage[0]).unwrap()["reasoning_effort"], json!(effort));
+            let _ = fs::remove_file(path);
+        }
     }
 
     #[test]
@@ -63973,38 +62723,6 @@ mod tests {
             .iter()
             .any(|row| row.reasoning_effort.as_deref() == Some("low") && row.input_tokens == 60));
         validate_snapshot_item(0, &item).expect("mixed effort validates");
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn codex_parser_reads_reasoning_effort_from_turn_context_collaboration_mode() {
-        // No usage-co-located effort; falls back to the turn_context
-        // collaboration_mode.settings.reasoning_effort path. The turn_context
-        // line precedes the token_count line so latest_reasoning_effort is set
-        // before the usage row is built.
-        let path = temp_file("codex-effort-collab");
-        fs::write(
-            &path,
-            concat!(
-                "{\"timestamp\":\"2026-05-21T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e2700-cafe-7000-9000-666666666666\"}}\n",
-                "{\"timestamp\":\"2026-05-21T10:01:00Z\",\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5.5\",\"collaboration_mode\":{\"settings\":{\"reasoning_effort\":\"low\"}}}}\n",
-                "{\"timestamp\":\"2026-05-21T10:02:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":40,\"output_tokens\":8,\"request_count\":1},\"model\":\"gpt-5.5\"}}}\n"
-            ),
-        )
-        .expect("write fixture");
-
-        let item = parse_codex_jsonl_file(
-            &path,
-            "2026-05-21T10:04:00Z",
-            "file-fingerprint".to_string(),
-        )
-        .expect("parse")
-        .into_iter()
-        .next()
-        .expect("snapshot");
-
-        assert_eq!(item.model_usage[0].reasoning_effort.as_deref(), Some("low"));
-
         let _ = fs::remove_file(path);
     }
 
@@ -64051,85 +62769,30 @@ mod tests {
 
     #[test]
     fn codex_config_defaults_capture_service_tier_model_and_selectors() {
-        let root = temp_dir("codex-config-defaults");
-        let codex_dir = root.join(".codex");
-        fs::create_dir_all(&codex_dir).expect("create .codex");
-        fs::write(
-            codex_dir.join("config.toml"),
-            concat!(
-                "model = \"gpt-5.5\"\n",
-                "service_tier = \"default\"\n",
-                "model_reasoning_effort = \"high\"\n",
-                "fast_default_opt_out = true\n",
-                "[features]\n",
-                "fast_mode = true\n",
-            ),
-        )
-        .expect("write config");
-
-        let defaults = load_codex_config_defaults(&codex_dir.join("config.toml"))
-            .expect("config defaults present");
-        assert_eq!(defaults.model.as_deref(), Some("gpt-5.5"));
-        assert_eq!(defaults.service_tier.as_deref(), Some("default"));
-        assert_eq!(defaults.reasoning_effort.as_deref(), Some("high"));
-        assert_eq!(defaults.fast_mode, Some(true));
-        assert!(defaults.fast_default_opt_out);
-        // Top-level scalar keeps the raw config value; selector_context
-        // canonicalizes "default" -> "standard" with its config provenance.
-        assert_eq!(
-            defaults
-                .selector_context
-                .get("service_tier")
-                .map(String::as_str),
-            Some("standard")
-        );
-        assert_eq!(
-            defaults
-                .selector_sources
-                .get("service_tier")
-                .map(String::as_str),
-            Some("codex.config.service_tier")
-        );
-        // service_tier=default is authoritative: the effective default is
-        // Standard even though the legacy [features].fast_mode flag is set.
-        assert_eq!(defaults.display_fast_mode(), Some(false));
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn codex_config_defaults_fast_when_service_tier_priority() {
-        let root = temp_dir("codex-config-defaults-priority");
-        let codex_dir = root.join(".codex");
-        fs::create_dir_all(&codex_dir).expect("create .codex");
-        fs::write(
-            codex_dir.join("config.toml"),
-            "service_tier = \"priority\"\n",
-        )
-        .expect("write config");
-
-        let defaults = load_codex_config_defaults(&codex_dir.join("config.toml"))
-            .expect("config defaults present");
-        assert_eq!(defaults.service_tier.as_deref(), Some("priority"));
-        assert_eq!(defaults.display_fast_mode(), Some(true));
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn codex_config_defaults_absent_without_relevant_keys() {
-        let root = temp_dir("codex-config-defaults-empty");
-        let codex_dir = root.join(".codex");
-        fs::create_dir_all(&codex_dir).expect("create .codex");
-        fs::write(
-            codex_dir.join("config.toml"),
-            "personality = \"pragmatic\"\n",
-        )
-        .expect("write config");
-
-        assert!(load_codex_config_defaults(&codex_dir.join("config.toml")).is_none());
-
-        let _ = fs::remove_dir_all(root);
+        for (raw, tier, fast) in [
+            ("model = \"gpt-5.5\"\nservice_tier = \"default\"\nmodel_reasoning_effort = \"high\"\nfast_default_opt_out = true\n[features]\nfast_mode = true\n", Some("default"), Some(false)),
+            ("service_tier = \"priority\"\n", Some("priority"), Some(true)),
+            ("personality = \"pragmatic\"\n", None, None),
+            ("model = \"gpt-5.5\"\n", None, None),
+            ("model = \"gpt-5.5\"\n[features]\nfast_mode = false\n", None, Some(false)),
+            ("model = \"gpt-5.5\"\n[features]\nfast_mode = true\n", None, Some(true)),
+        ] {
+            let Some(defaults) = parse_codex_config_defaults(raw) else {
+                assert_eq!(raw, "personality = \"pragmatic\"\n");
+                continue;
+            };
+            assert_eq!(defaults.service_tier.as_deref(), tier);
+            assert_eq!(defaults.display_fast_mode(), fast);
+            if tier == Some("default") {
+                assert_eq!(defaults.model.as_deref(), Some("gpt-5.5"));
+                assert_eq!(defaults.reasoning_effort.as_deref(), Some("high"));
+                assert_eq!(defaults.fast_mode, Some(true));
+                assert!(defaults.fast_default_opt_out);
+                assert_eq!(defaults.selector_context.get("service_tier").map(String::as_str), Some("standard"));
+                assert_eq!(defaults.selector_sources.get("service_tier").map(String::as_str), Some("codex.config.service_tier"));
+            }
+            if raw == "model = \"gpt-5.5\"\n" { assert!(!defaults.selector_context.contains_key("mode")); }
+        }
     }
 
     /// Build the ordered Claude Code settings chain for a fake home directory.
@@ -64286,38 +62949,6 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn claude_settings_defaults_prefer_local_effort_level_over_user() {
-        let root = temp_dir("claude-settings-effort-precedence");
-        let claude_dir = root.join(".claude");
-        fs::create_dir_all(&claude_dir).expect("create .claude");
-        fs::write(
-            claude_dir.join("settings.json"),
-            "{\"effortLevel\": \"low\"}\n",
-        )
-        .expect("write user settings");
-        fs::write(
-            claude_dir.join("settings.local.json"),
-            "{\"effortLevel\": \"high\"}\n",
-        )
-        .expect("write local settings");
-
-        let paths = claude_settings_chain(&claude_dir, &root.join("managed-settings.json"));
-        let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(&paths) else {
-            panic!("expected configured Claude defaults");
-        };
-        assert_eq!(defaults.reasoning_effort.as_deref(), Some("high"));
-        assert_eq!(
-            defaults
-                .selector_sources
-                .get("reasoning_effort")
-                .map(String::as_str),
-            Some("claude_code.settings_local.effortLevel")
-        );
-
-        let _ = fs::remove_dir_all(root);
-    }
-
     /// Effort and its `selector_sources` key, or `None` when not reported.
     fn claude_effort_with_source(paths: &[(String, PathBuf)]) -> Option<(String, String)> {
         let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(paths) else {
@@ -64442,30 +63073,6 @@ mod tests {
             Some("claude_code.settings.modelSettings")
         );
 
-        // A pathological file is capped, keeping the first keys in sort order.
-        let entries = (10..30)
-            .map(|index| format!("\"claude-test-{index}\": {{\"effortLevel\": \"low\"}}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        fs::write(
-            claude_dir.join("settings.json"),
-            format!("{{\"modelSettings\": {{{entries}}}}}\n"),
-        )
-        .expect("rewrite settings");
-        let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(&paths) else {
-            panic!("expected configured Claude defaults");
-        };
-        assert_eq!(
-            defaults.reasoning_effort_by_model.len(),
-            MAX_CLAUDE_EFFORT_BY_MODEL_ENTRIES
-        );
-        assert!(defaults
-            .reasoning_effort_by_model
-            .contains_key("claude-test-25"));
-        assert!(!defaults
-            .reasoning_effort_by_model
-            .contains_key("claude-test-26"));
-
         let _ = fs::remove_dir_all(root);
     }
 
@@ -64562,114 +63169,54 @@ mod tests {
     }
 
     #[test]
-    fn claude_model_settings_key_matches_claude_code_canonical_key() {
-        for (model, key) in [
-            ("claude-opus-5-5", "claude-opus-5-5"),
-            (" Claude-Opus-4-7[1m] ", "claude-opus-4-7"),
-            ("claude-sonnet-4-5-20250929", "claude-sonnet-4-5"),
-            ("claude-opus-4-1@20250805", "claude-opus-4-1"),
-            ("us.anthropic.claude-opus-4-1-20250805-v1:0", "claude-opus-4-1"),
-            ("anthropic.claude-haiku-4-5-20251001-v1:0", "claude-haiku-4-5"),
+    fn claude_settings_defaults_keep_only_safe_scalars() {
+        for (file, body, model, effort, fast) in [
             (
-                "arn:aws:bedrock:us-east-1:000000000000:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0",
-                "claude-sonnet-4-5",
+                "settings.local.json",
+                json!({"effortLevel":"max"}),
+                None,
+                Some("max"),
+                Some(false),
             ),
-            ("claude-opus-5-latest", "claude-opus-5"),
-            ("claude-3-5-sonnet-20241022", "claude-3-5-sonnet"),
-            // Aliases resolve per Claude Code version and plan; left as written.
-            ("opus", "opus"),
-            ("opus[1m]", "opus"),
+            (
+                "settings.json",
+                json!({"effortLevel":"/Users/someone/.claude/effort-profile", "model":"claude-opus-4-7"}),
+                Some("claude-opus-4-7"),
+                None,
+                Some(false),
+            ),
+            (
+                "settings.json",
+                json!({"effortLevel":4,"model":"claude-opus-4-7"}),
+                Some("claude-opus-4-7"),
+                None,
+                Some(false),
+            ),
+            (
+                "settings.json",
+                json!({"model":"/Users/someone/models/local.gguf","fastMode":false}),
+                None,
+                None,
+                Some(false),
+            ),
         ] {
-            assert_eq!(claude_model_settings_key(model), key, "model {model}");
+            let root = temp_dir("claude-settings-scalars");
+            let claude_dir = root.join(".claude");
+            fs::create_dir_all(&claude_dir).unwrap();
+            fs::write(claude_dir.join(file), body.to_string()).unwrap();
+            let paths = claude_settings_chain(&claude_dir, &root.join("managed-settings.json"));
+            let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(&paths)
+            else {
+                panic!("configured defaults");
+            };
+            assert_eq!(defaults.model.as_deref(), model);
+            assert_eq!(defaults.reasoning_effort.as_deref(), effort);
+            assert_eq!(defaults.fast_mode_enabled, fast);
+            if effort.is_none() {
+                assert!(!defaults.selector_context.contains_key("reasoning_effort"));
+            }
+            let _ = fs::remove_dir_all(root);
         }
-    }
-
-    /// The Configuration tab's contract is "what your config file says", so an
-    /// effort value is forwarded verbatim rather than normalized against a
-    /// known-value list. `max` is session-only in Claude Code unless the
-    /// environment sets it, but if the settings file says `max` then that is
-    /// what the file says.
-    #[test]
-    fn claude_settings_defaults_report_effort_level_verbatim() {
-        let root = temp_dir("claude-settings-effort-verbatim");
-        let claude_dir = root.join(".claude");
-        fs::create_dir_all(&claude_dir).expect("create .claude");
-        fs::write(
-            claude_dir.join("settings.local.json"),
-            "{\"effortLevel\": \"max\"}\n",
-        )
-        .expect("write settings");
-
-        let paths = claude_settings_chain(&claude_dir, &root.join("managed-settings.json"));
-        let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(&paths) else {
-            panic!("expected configured Claude defaults");
-        };
-        assert_eq!(defaults.reasoning_effort.as_deref(), Some("max"));
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn claude_settings_defaults_reject_unsafe_effort_level_values() {
-        let root = temp_dir("claude-settings-effort-unsafe");
-        let claude_dir = root.join(".claude");
-        fs::create_dir_all(&claude_dir).expect("create .claude");
-        // A path-shaped effort value fails the display-safe scalar guard, so it
-        // is dropped while a sibling key still resolves.
-        fs::write(
-            claude_dir.join("settings.json"),
-            "{\"effortLevel\": \"/Users/someone/.claude/effort-profile\", \"model\": \"claude-opus-4-7\"}\n",
-        )
-        .expect("write settings");
-
-        let paths = claude_settings_chain(&claude_dir, &root.join("managed-settings.json"));
-        let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(&paths) else {
-            panic!("expected configured Claude defaults");
-        };
-        assert_eq!(defaults.reasoning_effort, None);
-        assert!(!defaults.selector_context.contains_key("reasoning_effort"));
-        assert_eq!(defaults.model.as_deref(), Some("claude-opus-4-7"));
-
-        // A non-string effort value is also ignored rather than coerced.
-        fs::write(
-            claude_dir.join("settings.json"),
-            "{\"effortLevel\": 4, \"model\": \"claude-opus-4-7\"}\n",
-        )
-        .expect("rewrite settings");
-        let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(&paths) else {
-            panic!("expected configured Claude defaults");
-        };
-        assert_eq!(defaults.reasoning_effort, None);
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn claude_settings_defaults_treat_per_session_fast_opt_in_as_off() {
-        let root = temp_dir("claude-settings-fast-opt-in");
-        let claude_dir = root.join(".claude");
-        fs::create_dir_all(&claude_dir).expect("create .claude");
-        fs::write(
-            claude_dir.join("settings.json"),
-            "{\"fastMode\": true, \"fastModePerSessionOptIn\": true}\n",
-        )
-        .expect("write settings");
-
-        let paths = claude_settings_chain(&claude_dir, &root.join("managed-settings.json"));
-        let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(&paths) else {
-            panic!("expected configured Claude defaults");
-        };
-        // Fast does not persist across sessions, so the durable default is off.
-        assert_eq!(defaults.fast_mode_enabled, Some(false));
-        assert_eq!(
-            defaults
-                .selector_sources
-                .get("fast_mode_enabled")
-                .map(String::as_str),
-            Some("claude_code.settings.fastModePerSessionOptIn")
-        );
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -64722,41 +63269,28 @@ mod tests {
         assert_eq!(defaults.approval_policy, None);
         assert_eq!(defaults.sandbox_mode, None);
 
-        // An explicit `fastMode: false` keeps its key as the source.
-        fs::write(claude_dir.join("settings.json"), "{\"fastMode\": false}\n")
-            .expect("write settings");
-        let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(&paths) else {
-            panic!("expected configured Claude defaults");
-        };
-        assert_eq!(defaults.fast_mode_enabled, Some(false));
-        assert_eq!(
-            defaults
-                .selector_sources
-                .get("fast_mode_enabled")
-                .map(String::as_str),
-            Some("claude_code.settings.fastMode")
-        );
-
+        for (body, source) in [
+            (r#"{"fastMode":false}"#, "claude_code.settings.fastMode"),
+            (
+                r#"{"fastMode":true,"fastModePerSessionOptIn":true}"#,
+                "claude_code.settings.fastModePerSessionOptIn",
+            ),
+        ] {
+            fs::write(claude_dir.join("settings.json"), body).unwrap();
+            let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(&paths)
+            else {
+                panic!("configured defaults");
+            };
+            assert_eq!(defaults.fast_mode_enabled, Some(false));
+            assert_eq!(
+                defaults
+                    .selector_sources
+                    .get("fast_mode_enabled")
+                    .map(String::as_str),
+                Some(source)
+            );
+        }
         let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn codex_config_without_fast_keys_leaves_fast_mode_unknown() {
-        // Codex may default to Fast on some plans (hence `fast_default_opt_out`),
-        // so a config without a tier or Fast key does not mean Fast is off.
-        let defaults =
-            parse_codex_config_defaults("model = \"gpt-5.5\"\n").expect("config defaults present");
-        assert_eq!(defaults.display_fast_mode(), None);
-        assert!(!defaults.selector_context.contains_key("mode"));
-
-        let defaults =
-            parse_codex_config_defaults("model = \"gpt-5.5\"\n[features]\nfast_mode = false\n")
-                .expect("config defaults present");
-        assert_eq!(defaults.display_fast_mode(), Some(false));
-        let defaults =
-            parse_codex_config_defaults("model = \"gpt-5.5\"\n[features]\nfast_mode = true\n")
-                .expect("config defaults present");
-        assert_eq!(defaults.display_fast_mode(), Some(true));
     }
 
     #[test]
@@ -64819,27 +63353,6 @@ mod tests {
                     || lowered.contains("bypass")
             });
         assert_eq!(leaked, None, "no path or secret text may ride along");
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn claude_settings_defaults_reject_path_shaped_model_values() {
-        let root = temp_dir("claude-settings-model-path");
-        let claude_dir = root.join(".claude");
-        fs::create_dir_all(&claude_dir).expect("create .claude");
-        fs::write(
-            claude_dir.join("settings.json"),
-            "{\"model\": \"/Users/someone/models/local.gguf\", \"fastMode\": false}\n",
-        )
-        .expect("write settings");
-
-        let paths = claude_settings_chain(&claude_dir, &root.join("managed-settings.json"));
-        let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(&paths) else {
-            panic!("expected configured Claude defaults");
-        };
-        assert_eq!(defaults.model, None);
-        assert_eq!(defaults.fast_mode_enabled, Some(false));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -64975,7 +63488,8 @@ mod tests {
             concat!(
                 "{\"timestamp\":\"2026-08-04T10:00:00Z\",\"sessionId\":\"transcript-effort-1\",\"summary\":\"t\"}\n",
                 "{\"timestamp\":\"2026-08-04T10:01:00Z\",\"sessionId\":\"transcript-effort-1\",\"type\":\"assistant\",\"effort\":\"xhigh\",\"requestId\":\"req_A\",\"message\":{\"id\":\"msg_A\",\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n",
-                "{\"timestamp\":\"2026-08-04T10:02:00Z\",\"sessionId\":\"transcript-effort-1\",\"type\":\"assistant\",\"effort\":\"low\",\"requestId\":\"req_B\",\"message\":{\"id\":\"msg_B\",\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":20,\"output_tokens\":7}}}\n"
+                "{\"timestamp\":\"2026-08-04T10:02:00Z\",\"sessionId\":\"transcript-effort-1\",\"type\":\"assistant\",\"effort\":\"low\",\"requestId\":\"req_B\",\"message\":{\"id\":\"msg_B\",\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":20,\"output_tokens\":7}}}\n",
+                "{\"timestamp\":\"2026-08-04T13:01:00Z\",\"sessionId\":\"transcript-effort-1\",\"type\":\"assistant\",\"effort\":\"hyper\",\"message\":{\"id\":\"msg_C\",\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n"
             ),
         )
         .expect("write fixture");
@@ -64995,34 +63509,11 @@ mod tests {
         assert_eq!(
             split,
             vec![
+                (None, 10),
                 (Some("low".to_string()), 20),
                 (Some("xhigh".to_string()), 10)
             ]
         );
-        let _ = fs::remove_file(&path);
-    }
-
-    #[test]
-    fn claude_transcript_effort_rejects_an_unknown_tier() {
-        // A tier this build does not know must degrade to unknown, never widen
-        // the vocabulary the backend stores.
-        let path = temp_file("claude-effort-unknown-tier");
-        fs::write(
-            &path,
-            concat!(
-                "{\"timestamp\":\"2026-08-04T13:00:00Z\",\"sessionId\":\"tier-1\",\"summary\":\"t\"}\n",
-                "{\"timestamp\":\"2026-08-04T13:01:00Z\",\"sessionId\":\"tier-1\",\"type\":\"assistant\",\"effort\":\"hyper\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n"
-            ),
-        )
-        .expect("write fixture");
-
-        let item = parse_claude_code_jsonl_file(&path, "2026-08-04T13:04:00Z", "fp".to_string())
-            .expect("parse")
-            .into_iter()
-            .next()
-            .expect("snapshot");
-
-        assert_eq!(item.model_usage[0].reasoning_effort, None);
         let _ = fs::remove_file(&path);
     }
 
@@ -67063,49 +65554,6 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn claude_duplicate_census_counts_encoding_is_bounded() {
-        let max = ClaudeDuplicateCensusCounts {
-            census_complete: true,
-            fence_before: true,
-            fence_after: true,
-            census_invalid: true,
-            invalid_current_window_family_count: usize::MAX,
-            pending_occurrence_count: usize::MAX,
-            page_invalidated_identity_count: usize::MAX,
-            page_invalidated_occurrence_mismatch_count: usize::MAX,
-            page_invalidated_cap_count: usize::MAX,
-            page_invalidated_member_changed_count: usize::MAX,
-            coverage_complete: true,
-            coverage_missing_member_count: usize::MAX,
-            full_rearm: true,
-            rearm_attempt: u8::MAX,
-            full_rearm_deferred_until: Some(u64::MAX),
-            request_census: None,
-        };
-        let encoded = serde_json::to_string(&max).expect("encode counters");
-        assert!(encoded.len() <= 589, "{} bytes", encoded.len());
-
-        let stats = crate::snapshot_sync::ClaudeLocalEvidenceStats {
-            duplicate_census: max,
-            ..Default::default()
-        };
-        let line = serde_json::to_string(&stats).expect("encode stats");
-        let mut without = serde_json::to_value(&stats).expect("stats value");
-        let nested = without
-            .as_object_mut()
-            .expect("stats object")
-            .remove("duplicate_census")
-            .expect("nested counters");
-        assert_eq!(nested, serde_json::to_value(max).expect("counters value"));
-        let baseline = serde_json::to_string(&without).expect("encode baseline");
-        assert!(
-            line.len() - baseline.len() <= 589 + r#","duplicate_census":"#.len(),
-            "line grew by {} bytes",
-            line.len() - baseline.len()
-        );
     }
 
     #[test]
@@ -69386,48 +67834,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_account_pending_m4_synthetic_serialized_size() {
-        let families = 6_398usize;
-        let requests = 347_187usize;
-        let mut legacy = serde_json::Map::new();
-        let mut cursor = 0usize;
-        for family in 0..families {
-            let count = requests / families + usize::from(family < requests % families);
-            let hashes = (cursor..cursor + count)
-                .map(|request| format!("{:x}", Sha256::digest(request.to_be_bytes())))
-                .collect::<BTreeSet<_>>();
-            cursor += count;
-            legacy.insert(format!("{family:036x}"), json!({"census_window_end":"2026-08-02T07:10:00Z", "account_identifier_hash":"a".repeat(64),
-                "evidence_request_count":count, "members":{format!("{family:036x}"):count}, "member_request_id_hashes":{format!("{family:036x}"):hashes}, "invalid":false}));
-        }
-        let legacy = json!({"claude_account_family_pending": legacy});
-        let old_bytes = serde_json::to_vec_pretty(&legacy).unwrap().len();
-        let mut converted: BTreeMap<String, ClaudeAccountFamilyPending> =
-            serde_json::from_value(legacy["claude_account_family_pending"].clone()).unwrap();
-        let new_bytes =
-            serde_json::to_vec_pretty(&json!({"claude_account_family_pending":&converted}))
-                .unwrap()
-                .len();
-        println!("D2_SIZE families={families} requests={requests} old_bytes={old_bytes} new_bytes={new_bytes}");
-        assert!(new_bytes < old_bytes / 4);
-        assert!(new_bytes < 8_000_000);
-        for pending in converted.values_mut() {
-            pending.census_complete = true;
-            for requests in pending.member_requests.values_mut() {
-                requests.identity_revision = Some("f".repeat(64));
-            }
-        }
-        let populated_bytes =
-            serde_json::to_vec_pretty(&json!({"claude_account_family_pending":&converted}))
-                .unwrap()
-                .len();
-        println!(
-            "D2_SIZE_POPULATED families={families} requests={requests} bytes={populated_bytes}"
-        );
-        assert!(populated_bytes < old_bytes / 3);
-    }
-
-    #[test]
     fn claude_account_family_legacy_witness_schedules_reparse_and_rebuilds() {
         let (root, parent, items) = claude_account_family_fixture();
         let account_hash = "a".repeat(64);
@@ -70033,110 +68439,51 @@ mod tests {
     }
 
     #[test]
-    fn claude_nested_subagent_parent_ref_points_at_the_spawning_agent() {
-        // spawnDepth>1 with a recorded `parentAgentId`: the DIRECT parent is the
-        // spawning agent's own re-keyed session, while the root stays the human
-        // session so the rollup key is unambiguous.
-        let root = temp_dir("claude-nested-subagent");
-        let parent_session = "abeeabab-6bc0-4bc3-8a95-e5d967c6e9a1";
-        let subagents_dir = root.join(parent_session).join("subagents");
-        fs::create_dir_all(&subagents_dir).expect("create subagents dir");
-        let path = subagents_dir.join("agent-abadf13e89f0b1c4c.jsonl");
-        fs::write(
-            &path,
-            concat!(
-                "{\"timestamp\":\"2026-07-24T10:00:00.000Z\",\"type\":\"user\",\"sessionId\":\"abeeabab-6bc0-4bc3-8a95-e5d967c6e9a1\",\"isSidechain\":true,\"entrypoint\":\"cli\",\"message\":{\"role\":\"user\",\"content\":\"trace\"}}\n",
-                "{\"timestamp\":\"2026-07-24T10:00:05.000Z\",\"type\":\"assistant\",\"sessionId\":\"abeeabab-6bc0-4bc3-8a95-e5d967c6e9a1\",\"isSidechain\":true,\"requestId\":\"req_N\",\"message\":{\"id\":\"msg_N\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":11,\"output_tokens\":2}}}\n"
-            ),
-        )
-        .expect("write fixture");
-        fs::write(
-            subagents_dir.join("agent-abadf13e89f0b1c4c.meta.json"),
-            "{\"agentType\":\"Explore\",\"spawnDepth\":2,\"parentAgentId\":\"a665ed7d7731771a8\"}",
-        )
-        .expect("write sidecar");
-
-        let item = parse_claude_code_jsonl_file(&path, "2026-07-24T10:10:00Z", "fp".to_string())
-            .expect("parse")
-            .into_iter()
-            .next()
-            .expect("snapshot");
-
-        let fact = |field: &str| {
-            item.attribution_facts
-                .iter()
-                .find(|fact| fact.field == field)
-                .map(|fact| fact.value.clone())
-        };
-        assert_eq!(
-            fact("parent_session_ref").as_deref(),
-            Some("abeeabab-6bc0-4bc3-8a95-e5d967c6e9a1_agent-a665ed7d7731771a8")
-        );
-        assert_eq!(fact("root_session_ref").as_deref(), Some(parent_session));
-        assert_eq!(fact("agent_kind").as_deref(), Some("Explore"));
-        assert_eq!(fact("spawn_depth").as_deref(), Some("2"));
-        // Not under `workflows/`, so no workflow edge is claimed.
-        assert_eq!(fact("workflow_ref"), None);
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn claude_subagent_without_meta_sidecar_degrades_to_path_facts() {
-        // A missing or malformed sidecar must leave the derived facts absent and
-        // never drop the session.
-        let root = temp_dir("claude-subagent-no-meta");
-        let parent_session = "52c34dcb-44e4-428f-8def-979dd43b7259";
-        let subagents_dir = root.join(parent_session).join("subagents");
-        fs::create_dir_all(&subagents_dir).expect("create subagents dir");
-        let missing = subagents_dir.join("agent-a35bc3648272bc00c.jsonl");
-        let malformed = subagents_dir.join("agent-b11111111111111c.jsonl");
-        for (path, agent) in [
-            (&missing, "a35bc3648272bc00c"),
-            (&malformed, "b11111111111111c"),
-        ] {
-            fs::write(
-                path,
-                format!(
-                    "{{\"timestamp\":\"2026-07-24T11:00:00.000Z\",\"type\":\"assistant\",\"sessionId\":\"{parent_session}\",\"agentId\":\"{agent}\",\"isSidechain\":true,\"requestId\":\"req_{agent}\",\"message\":{{\"id\":\"msg_{agent}\",\"model\":\"claude-sonnet-4-6\",\"usage\":{{\"input_tokens\":5,\"output_tokens\":1}}}}}}\n"
+    fn claude_subagent_sidecar_lineage_cases() {
+        let parent = "abeeabab-6bc0-4bc3-8a95-e5d967c6e9a1";
+        for (sidecar, parent_ref, kind, depth) in [
+            (
+                Some(
+                    r#"{"agentType":"Explore","spawnDepth":2,"parentAgentId":"a665ed7d7731771a8"}"#,
                 ),
-            )
-            .expect("write fixture");
-        }
-        fs::write(
-            subagents_dir.join("agent-b11111111111111c.meta.json"),
-            "{not json at all",
-        )
-        .expect("write malformed sidecar");
-
-        for (path, agent) in [
-            (&missing, "a35bc3648272bc00c"),
-            (&malformed, "b11111111111111c"),
+                format!("{parent}_agent-a665ed7d7731771a8"),
+                Some("Explore"),
+                Some("2"),
+            ),
+            (None, parent.to_string(), None, None),
+            (Some("{not json at all"), parent.to_string(), None, None),
         ] {
-            let item = parse_claude_code_jsonl_file(path, "2026-07-24T11:10:00Z", "fp".to_string())
-                .expect("parse")
-                .into_iter()
-                .next()
-                .expect("snapshot");
-            assert_eq!(
-                item.source_session_id,
-                format!("{parent_session}_agent-{agent}")
-            );
+            let root = temp_dir("claude-sidecar-lineage");
+            let dir = root.join(parent).join("subagents");
+            fs::create_dir_all(&dir).unwrap();
+            let agent = "abadf13e89f0b1c4c";
+            let path = dir.join(format!("agent-{agent}.jsonl"));
+            fs::write(&path,json!({"timestamp":"2026-07-24T11:00:00Z","type":"assistant","sessionId":parent,"agentId":agent,"isSidechain":true,"requestId":"req_N","message":{"id":"msg_N","model":"claude-sonnet-4-6","usage":{"input_tokens":5,"output_tokens":1}}}).to_string()).unwrap();
+            if let Some(body) = sidecar {
+                fs::write(dir.join(format!("agent-{agent}.meta.json")), body).unwrap();
+            }
+            let item = parse_claude_code_jsonl_file(&path, "2026-07-24T11:10:00Z", "fp".into())
+                .unwrap()
+                .remove(0);
             let fact = |field: &str| {
                 item.attribution_facts
                     .iter()
-                    .find(|fact| fact.field == field)
-                    .map(|fact| fact.value.clone())
+                    .find(|f| f.field == field)
+                    .map(|f| f.value.as_str())
             };
-            // Path-derived facts survive; sidecar-derived ones are simply absent.
-            assert_eq!(fact("parent_session_ref").as_deref(), Some(parent_session));
-            assert_eq!(fact("root_session_ref").as_deref(), Some(parent_session));
-            assert_eq!(fact("agent_ref").as_deref(), Some(agent));
-            assert_eq!(fact("agent_kind"), None);
-            assert_eq!(fact("spawn_depth"), None);
+            assert_eq!(item.source_session_id, format!("{parent}_agent-{agent}"));
+            for (field, expected) in [
+                ("parent_session_ref", Some(parent_ref.as_str())),
+                ("root_session_ref", Some(parent)),
+                ("agent_ref", Some(agent)),
+                ("agent_kind", kind),
+                ("spawn_depth", depth),
+                ("workflow_ref", None),
+            ] {
+                assert_eq!(fact(field), expected, "{field}");
+            }
+            let _ = fs::remove_dir_all(root);
         }
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -70226,183 +68573,6 @@ mod tests {
         .is_empty());
 
         let _ = fs::remove_dir_all(root);
-    }
-
-    /// READ-ONLY audit of the v20 keying against this machine's real
-    /// `~/.claude/projects` tree.
-    ///
-    /// Ignored by default because it depends on local state that CI does not
-    /// have. It opens nothing, writes nothing, uploads nothing, and never
-    /// touches the daemon: it walks directory entries and classifies each
-    /// transcript path. Run it with:
-    ///
-    /// ```text
-    /// cargo test -p ottto-service --lib claude_real_tree_rekey_audit -- --ignored --nocapture
-    /// ```
-    #[test]
-    #[ignore = "reads the developer's real ~/.claude/projects tree"]
-    fn claude_real_tree_rekey_audit() {
-        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-            eprintln!("no HOME; skipping");
-            return;
-        };
-        let root = home.join(".claude").join("projects");
-        if !root.exists() {
-            eprintln!("no {} ; skipping", root.display());
-            return;
-        }
-
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(entries) = fs::read_dir(dir) else {
-                return;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                match entry.metadata() {
-                    Ok(metadata) if metadata.is_dir() => walk(&path, out),
-                    Ok(metadata)
-                        if metadata.is_file()
-                            && path.extension().and_then(|value| value.to_str())
-                                == Some("jsonl") =>
-                    {
-                        out.push(path)
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        let mut files = Vec::new();
-        walk(&root, &mut files);
-
-        let (mut layout1, mut layout2, mut layout3, mut layout4) = (0usize, 0usize, 0usize, 0usize);
-        let mut excluded = 0usize;
-        // re-keyed id -> the paths that produced it, so any collision is visible.
-        let mut ids: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
-        let mut top_level_ids: BTreeSet<String> = BTreeSet::new();
-        let mut meta_present = 0usize;
-        let mut meta_agent_kind = 0usize;
-        let mut nested_parent_refs = 0usize;
-
-        for path in &files {
-            if claude_transcript_excluded_from_snapshots(path) {
-                excluded += 1;
-                layout4 += 1;
-                continue;
-            }
-            match claude_subagent_identity(path) {
-                None => {
-                    layout1 += 1;
-                    if let Some(stem) = path.file_stem().and_then(|value| value.to_str()) {
-                        top_level_ids.insert(stem.to_string());
-                    }
-                }
-                Some(identity) => {
-                    if identity.workflow_ref.is_some() {
-                        layout3 += 1;
-                    } else {
-                        layout2 += 1;
-                    }
-                    let meta = read_claude_agent_meta(path);
-                    if meta != ClaudeAgentMeta::default() {
-                        meta_present += 1;
-                    }
-                    if meta.agent_kind.is_some() {
-                        meta_agent_kind += 1;
-                    }
-                    if meta.parent_agent_id.is_some() {
-                        nested_parent_refs += 1;
-                    }
-                    ids.entry(identity.source_session_id())
-                        .or_default()
-                        .push(path.clone());
-                }
-            }
-        }
-
-        // Blast radius of the v19 bug: every layout 3/4 file uploaded a snapshot
-        // claiming to BE its parent human session. Count the distinct parents
-        // that were therefore overwritable.
-        let mut poisoned_parents: BTreeSet<String> = BTreeSet::new();
-        let mut previously_miskeyed = 0usize;
-        for path in &files {
-            if claude_transcript_excluded_from_snapshots(path) {
-                // Journals carry no usage rows, so they never overwrote anything
-                // even under v19; they are excluded here to keep the blast
-                // radius honest.
-                continue;
-            }
-            let Some(identity) = claude_subagent_identity(path) else {
-                continue;
-            };
-            let immediate_parent_is_subagents = path
-                .parent()
-                .and_then(Path::file_name)
-                .and_then(|value| value.to_str())
-                == Some("subagents");
-            if !immediate_parent_is_subagents {
-                previously_miskeyed += 1;
-                poisoned_parents.insert(identity.root_session_id.clone());
-            }
-        }
-
-        let collisions: Vec<_> = ids.iter().filter(|(_, paths)| paths.len() > 1).collect();
-        let overlap: Vec<_> = ids
-            .keys()
-            .filter(|id| top_level_ids.contains(id.as_str()))
-            .collect();
-
-        println!("--- v20 re-key audit over {} ---", root.display());
-        println!("total .jsonl files:            {}", files.len());
-        println!("layout 1 (top-level session):  {layout1}");
-        println!("layout 2 (task subagent):      {layout2}");
-        println!("layout 3 (workflow subagent):  {layout3}");
-        println!("layout 4 (workflow journal):   {layout4} (excluded: {excluded})");
-        println!("re-keyed subagent sessions:    {}", ids.len());
-        println!("  with a readable meta.json:   {meta_present}");
-        println!("  with agentType:              {meta_agent_kind}");
-        println!("  with parentAgentId (nested): {nested_parent_refs}");
-        println!("v19 mis-keyed onto a parent:   {previously_miskeyed}");
-        println!("distinct parents overwritable: {}", poisoned_parents.len());
-        println!("re-keyed id collisions:        {}", collisions.len());
-        println!("re-key vs top-level id clash:  {}", overlap.len());
-        for (id, paths) in &collisions {
-            println!("  COLLISION {id}: {paths:?}");
-        }
-
-        // The canonical case from the incident.
-        let canonical = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5";
-        let family: Vec<_> = ids
-            .keys()
-            .filter(|id| id.starts_with(&format!("{canonical}_")))
-            .collect();
-        if !family.is_empty() {
-            println!("canonical parent {canonical}: {} children", family.len());
-            for id in &family {
-                println!("  {id}");
-            }
-            assert!(
-                top_level_ids.contains(canonical),
-                "the canonical parent must still key to itself"
-            );
-            assert!(
-                !ids.contains_key(canonical),
-                "no child may re-key onto the parent's own id"
-            );
-        }
-
-        assert!(
-            collisions.is_empty(),
-            "two transcripts re-keyed to one session id"
-        );
-        assert!(
-            overlap.is_empty(),
-            "a re-keyed subagent id collided with a real top-level session id"
-        );
-        assert_eq!(
-            excluded, layout4,
-            "every workflow journal must be excluded from emission"
-        );
     }
 
     #[test]
@@ -70707,30 +68877,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_subagent_file_stems_are_unique_within_a_parent_session() {
-        // The `<parentSessionId>_<fileStem>` scheme is only collision-free
-        // because Claude mints agent ids that are unique across ALL of one
-        // parent session's subagent directories. Pin that assumption: the same
-        // stem is never expected in two workflow directories, and two DIFFERENT
-        // stems in different workflow directories must stay distinct.
-        let a = Path::new("/p/proj/S/subagents/agent-a1.jsonl");
-        let b = Path::new("/p/proj/S/subagents/workflows/wf_x/agent-a2.jsonl");
-        let c = Path::new("/p/proj/S/subagents/workflows/wf_y/agent-a3.jsonl");
-        let ids: BTreeSet<String> = [a, b, c]
-            .into_iter()
-            .map(|path| claude_subagent_source_session_id(path).expect("subagent id"))
-            .collect();
-        assert_eq!(ids.len(), 3);
-        // The workflow directory deliberately does NOT enter the id: an agent id
-        // is already unique per parent session, and folding the directory in
-        // would have changed every id already minted for layout 2.
-        assert_eq!(
-            claude_subagent_source_session_id(b).as_deref(),
-            Some("S_agent-a2")
-        );
-    }
-
-    #[test]
     fn claude_agent_meta_sidecar_rejects_unsafe_values() {
         // Provider identifiers only. Anything that could smuggle a local path or
         // free text into an attribution fact is dropped, not sanitized.
@@ -70810,221 +68956,87 @@ mod tests {
     }
 
     #[test]
-    fn claude_subagent_never_inherits_the_parent_desktop_title() {
-        // The desktop title store is keyed by CLI session id. A subagent
-        // transcript's file stem is an agent id, so a lookup would either miss
-        // or hand the subagent its parent's title. Both layouts must refuse.
-        let root = temp_dir("claude-subagent-title");
-        let parent_session = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5";
-        let task_dir = root.join(parent_session).join("subagents");
-        let workflow_dir = task_dir.join("workflows").join("wf_ffe2de5a-c85");
-        fs::create_dir_all(&workflow_dir).expect("create dirs");
-        let mut metadata = ClaudeTitleMetadata::default();
-        metadata.titles.insert(
-            parent_session.to_string(),
-            ClaudeTitleCandidate {
-                title: "Parent orchestrator session".to_string(),
-                user_set: true,
-            },
-        );
-
-        for path in [
-            task_dir.join("agent-a1f7743a82e5fe4e9.jsonl"),
-            workflow_dir.join("agent-a4d1585d310070d0f.jsonl"),
-        ] {
-            fs::write(
-                &path,
-                format!(
-                    "{{\"timestamp\":\"2026-07-24T13:00:00.000Z\",\"type\":\"assistant\",\"sessionId\":\"{parent_session}\",\"isSidechain\":true,\"requestId\":\"req_T\",\"message\":{{\"id\":\"msg_T\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":6,\"output_tokens\":2}}}}}}\n"
+    fn claude_subagent_title_precedence() {
+        let parent = "58e9c6bc-c733-4946-b9e4-aa57c707dbf2";
+        let agent = "a09c3096ec4de4f11";
+        for (workflow, manifest, sidecar, title) in [
+            (false, false, None, None),
+            (true, false, None, None),
+            (
+                true,
+                true,
+                Some(
+                    r#"{"agentType":"workflow-subagent","spawnDepth":1,"description":"should lose to label"}"#,
                 ),
-            )
-            .expect("write fixture");
-            let item = parse_claude_code_jsonl_file_with_title_metadata(
-                &path,
-                "2026-07-24T13:10:00Z",
-                "fp".to_string(),
-                &metadata,
-                true,
-            )
-            .expect("parse")
-            .into_iter()
-            .next()
-            .expect("snapshot");
-            assert_ne!(
-                item.session_display_name.as_deref(),
-                Some("Parent orchestrator session"),
-                "{} inherited its parent's desktop title",
-                path.display()
-            );
+                Some("probe:data-model"),
+            ),
+            (
+                false,
+                false,
+                Some(
+                    r#"{"agentType":"Explore","description":"Fix 2 failing backend integration tests","spawnDepth":1}"#,
+                ),
+                Some("Fix 2 failing backend integration tests"),
+            ),
+            (
+                false,
+                false,
+                Some(r#"{"agentType":"Explore","spawnDepth":1}"#),
+                Some("Explore"),
+            ),
+        ] {
+            let root = temp_dir("claude-subagent-title");
+            let session = root.join(parent);
+            let task = session.join("subagents");
+            let dir = if workflow {
+                task.join("workflows/wf_f7ae7a92-02b")
+            } else {
+                task
+            };
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(format!("agent-{agent}.jsonl"));
+            fs::write(&path,json!({"timestamp":"2026-07-24T13:00:00Z","type":"assistant","sessionId":parent,"isSidechain":true,"requestId":"req_T","message":{"id":"msg_T","model":"claude-opus-4-8","usage":{"input_tokens":6,"output_tokens":2}}}).to_string()).unwrap();
+            if let Some(body) = sidecar {
+                fs::write(dir.join(format!("agent-{agent}.meta.json")), body).unwrap();
+            }
+            if manifest {
+                fs::create_dir_all(session.join("workflows")).unwrap();
+                fs::write(session.join("workflows/wf_f7ae7a92-02b.json"),json!({"runId":"wf_f7ae7a92-02b","workflowProgress":[{"type":"workflow_phase","index":1,"title":"Investigate"},{"type":"workflow_agent","agentId":agent,"label":"probe:data-model","promptPreview":"CONTEXT (established facts)"},{"type":"workflow_agent","agentId":"a747add886fd90cd8","label":"verify:data-model"}]}).to_string()).unwrap();
+            }
+            for parent_title in [None, Some(false), Some(true)] {
+                let mut metadata = ClaudeTitleMetadata::default();
+                if let Some(user_set) = parent_title {
+                    metadata.titles.insert(
+                        parent.into(),
+                        ClaudeTitleCandidate {
+                            title: "Parent orchestrator session".into(),
+                            user_set,
+                        },
+                    );
+                }
+                let item = parse_claude_code_jsonl_file_with_title_metadata(
+                    &path,
+                    "2026-07-24T13:10:00Z",
+                    "fp".into(),
+                    &metadata,
+                    true,
+                )
+                .unwrap()
+                .remove(0);
+                assert_ne!(
+                    item.session_display_name.as_deref(),
+                    Some("Parent orchestrator session")
+                );
+                if let Some(title) = title {
+                    assert_eq!(item.session_display_name.as_deref(), Some(title));
+                    assert_eq!(
+                        item.session_display_name_source.as_deref(),
+                        Some("agent_label")
+                    );
+                }
+            }
+            let _ = fs::remove_dir_all(root);
         }
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn claude_workflow_label_titles_workflow_subagent_sessions() {
-        // The prize path: a Workflow agent is named from the run manifest's
-        // `workflowProgress[].label`. Parent provenance remains a separate
-        // relationship field rather than being duplicated in the child title.
-        let root = temp_dir("claude-wf-agent-label");
-        let parent_session = "58e9c6bc-c733-4946-b9e4-aa57c707dbf2";
-        let session_dir = root.join(parent_session);
-        let workflow_dir = session_dir
-            .join("subagents")
-            .join("workflows")
-            .join("wf_f7ae7a92-02b");
-        fs::create_dir_all(&workflow_dir).expect("create dirs");
-        fs::create_dir_all(session_dir.join("workflows")).expect("create manifest dir");
-        fs::write(
-            session_dir.join("workflows").join("wf_f7ae7a92-02b.json"),
-            "{\"runId\":\"wf_f7ae7a92-02b\",\"workflowProgress\":[\
-             {\"type\":\"workflow_phase\",\"index\":1,\"title\":\"Investigate\"},\
-             {\"type\":\"workflow_agent\",\"agentId\":\"a09c3096ec4de4f11\",\"label\":\"probe:data-model\",\"promptPreview\":\"CONTEXT (established facts)\"},\
-             {\"type\":\"workflow_agent\",\"agentId\":\"a747add886fd90cd8\",\"label\":\"verify:data-model\"}]}",
-        )
-        .expect("write manifest");
-        let transcript = workflow_dir.join("agent-a09c3096ec4de4f11.jsonl");
-        fs::write(
-            &transcript,
-            format!(
-                "{{\"timestamp\":\"2026-07-24T13:00:00.000Z\",\"type\":\"assistant\",\"sessionId\":\"{parent_session}\",\"isSidechain\":true,\"requestId\":\"req_L\",\"message\":{{\"id\":\"msg_L\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":6,\"output_tokens\":2}}}}}}\n"
-            ),
-        )
-        .expect("write transcript");
-        // Sidecar exists too, with a lower-precedence description: the
-        // workflow label must win over it.
-        fs::write(
-            workflow_dir.join("agent-a09c3096ec4de4f11.meta.json"),
-            "{\"agentType\":\"workflow-subagent\",\"spawnDepth\":1,\"description\":\"should lose to label\"}",
-        )
-        .expect("write sidecar");
-        let mut metadata = ClaudeTitleMetadata::default();
-        metadata.titles.insert(
-            parent_session.to_string(),
-            ClaudeTitleCandidate {
-                title: "Two Claude accounts research".to_string(),
-                user_set: false,
-            },
-        );
-
-        let item = parse_claude_code_jsonl_file_with_title_metadata(
-            &transcript,
-            "2026-07-24T13:10:00Z",
-            "fp".to_string(),
-            &metadata,
-            true,
-        )
-        .expect("parse")
-        .into_iter()
-        .next()
-        .expect("snapshot");
-        assert_eq!(
-            item.session_display_name.as_deref(),
-            Some("probe:data-model")
-        );
-        assert_eq!(
-            item.session_display_name_source.as_deref(),
-            Some("agent_label")
-        );
-
-        // Without a parent title candidate the label stands alone.
-        let bare = parse_claude_code_jsonl_file_with_title_metadata(
-            &transcript,
-            "2026-07-24T13:10:00Z",
-            "fp".to_string(),
-            &ClaudeTitleMetadata::default(),
-            true,
-        )
-        .expect("parse")
-        .into_iter()
-        .next()
-        .expect("snapshot");
-        assert_eq!(
-            bare.session_display_name.as_deref(),
-            Some("probe:data-model")
-        );
-        assert_eq!(
-            bare.session_display_name_source.as_deref(),
-            Some("agent_label")
-        );
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn claude_task_agent_description_and_agent_type_title_fallbacks() {
-        // A Task-tool agent has no workflow manifest; its sidecar
-        // `description` (the 3-8 word task summary) names it, and a sidecar
-        // with only `agentType` still yields that as the last-resort label.
-        let root = temp_dir("claude-task-agent-label");
-        let parent_session = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5";
-        let task_dir = root.join(parent_session).join("subagents");
-        fs::create_dir_all(&task_dir).expect("create dirs");
-        let transcript = task_dir.join("agent-abadf13e89f0b1c4c.jsonl");
-        fs::write(
-            &transcript,
-            format!(
-                "{{\"timestamp\":\"2026-07-24T13:00:00.000Z\",\"type\":\"assistant\",\"sessionId\":\"{parent_session}\",\"isSidechain\":true,\"requestId\":\"req_D\",\"message\":{{\"id\":\"msg_D\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":6,\"output_tokens\":2}}}}}}\n"
-            ),
-        )
-        .expect("write transcript");
-        fs::write(
-            task_dir.join("agent-abadf13e89f0b1c4c.meta.json"),
-            "{\"agentType\":\"Explore\",\"description\":\"Fix 2 failing backend integration tests\",\"spawnDepth\":1}",
-        )
-        .expect("write sidecar");
-
-        let parse = |metadata: &ClaudeTitleMetadata| {
-            parse_claude_code_jsonl_file_with_title_metadata(
-                &transcript,
-                "2026-07-24T13:10:00Z",
-                "fp".to_string(),
-                metadata,
-                true,
-            )
-            .expect("parse")
-            .into_iter()
-            .next()
-            .expect("snapshot")
-        };
-        let item = parse(&ClaudeTitleMetadata::default());
-        assert_eq!(
-            item.session_display_name.as_deref(),
-            Some("Fix 2 failing backend integration tests")
-        );
-        assert_eq!(
-            item.session_display_name_source.as_deref(),
-            Some("agent_label")
-        );
-
-        // A parent title does not alter the child task title.
-        let mut metadata = ClaudeTitleMetadata::default();
-        metadata.titles.insert(
-            parent_session.to_string(),
-            ClaudeTitleCandidate {
-                title: "Lightweight data collection and ingestion".to_string(),
-                user_set: false,
-            },
-        );
-        assert_eq!(
-            parse(&metadata).session_display_name.as_deref(),
-            Some("Fix 2 failing backend integration tests")
-        );
-
-        // agentType-only sidecar -> the agent kind is still a usable name.
-        fs::write(
-            task_dir.join("agent-abadf13e89f0b1c4c.meta.json"),
-            "{\"agentType\":\"Explore\",\"spawnDepth\":1}",
-        )
-        .expect("rewrite sidecar");
-        let item = parse(&ClaudeTitleMetadata::default());
-        assert_eq!(item.session_display_name.as_deref(), Some("Explore"));
-        assert_eq!(
-            item.session_display_name_source.as_deref(),
-            Some("agent_label")
-        );
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -71094,53 +69106,6 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn safe_claude_agent_display_label_allowlist_and_truncation() {
-        // Real observed values survive unchanged.
-        for value in [
-            "probe:data-model",
-            "verify:daemon-scan-claim",
-            "map:collector-daemon",
-            "Fix 2 failing + 1 flaky backend integration tests",
-        ] {
-            // `+` is allowlisted; everything observed must round-trip.
-            assert_eq!(
-                safe_claude_agent_display_label(value.to_string()).as_deref(),
-                Some(value),
-                "{value} must survive"
-            );
-        }
-        // Whitespace collapses like every other title path.
-        assert_eq!(
-            safe_claude_agent_display_label("  probe:\n desktop-path ".to_string()).as_deref(),
-            Some("probe: desktop-path")
-        );
-        // Truncated at the cap, not rejected.
-        let long = "a".repeat(200);
-        assert_eq!(
-            safe_claude_agent_display_label(long)
-                .expect("truncated")
-                .chars()
-                .count(),
-            MAX_CLAUDE_AGENT_LABEL_CHARS
-        );
-        // Paths, home fragments, non-ASCII, and control smuggling are dropped.
-        for hostile in [
-            "/Users/someone/secret",
-            "see /home/user/notes",
-            "read ~/.claude/settings",
-            "café découverte",
-            "line\u{7}bell",
-            "back\\slash",
-        ] {
-            assert_eq!(
-                safe_claude_agent_display_label(hostile.to_string()),
-                None,
-                "{hostile:?} must be dropped"
-            );
-        }
     }
 
     #[test]
@@ -71243,37 +69208,6 @@ mod tests {
         assert_ne!(with_meta, with_effort);
 
         let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn claude_parser_detects_workflow_orchestration_footprint() {
-        // The Workflow tool (dynamic orchestration, e.g. `ultracode`) leaves a
-        // local manifest at `<projectDir>/<sessionId>/workflows/wf_*.json`, a
-        // sibling of the `<sessionId>.jsonl` we parse. Presence -> Some(true).
-        let dir = temp_dir("claude-wf");
-        let path = dir.join("claude-wf-session.jsonl");
-        fs::write(
-            &path,
-            concat!(
-                "{\"timestamp\":\"2026-05-06T10:00:00Z\",\"sessionId\":\"claude-wf-session\",\"entrypoint\":\"cli\",\"summary\":\"t\"}\n",
-                "{\"timestamp\":\"2026-05-06T10:01:00Z\",\"sessionId\":\"claude-wf-session\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":8,\"output_tokens\":3}}}\n"
-            ),
-        )
-        .expect("write fixture");
-        let workflows_dir = path.with_extension("").join("workflows");
-        fs::create_dir_all(&workflows_dir).expect("create workflows dir");
-        // Manifest filenames are truncated in practice (e.g. wf_60f3dab6-4fa.json).
-        fs::write(workflows_dir.join("wf_60f3dab6-4fa.json"), "{}").expect("write manifest");
-
-        let item = parse_claude_code_jsonl_file(&path, "2026-05-06T10:04:00Z", "fp".to_string())
-            .expect("parse")
-            .into_iter()
-            .next()
-            .expect("snapshot");
-        let origin = item.origin.expect("origin forwarded");
-        assert_eq!(origin.used_workflow_orchestration, Some(true));
-
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -72100,124 +70034,132 @@ mod tests {
     }
 
     #[test]
-    fn claude_compaction_matching_preserves_greedy_ties_and_curve_order() {
-        let observation =
-            |kind, timestamp: &str, response_count_before| ClaudeCompactionObservation {
-                kind,
-                timestamp: Some(timestamp.to_string()),
-                pre_tokens: None,
-                post_tokens: None,
-                cumulative_dropped_tokens: None,
-                duration_ms: None,
-                response_count_before,
-                pair_key: None,
-                has_parent_link: false,
-                trigger: None,
-                id_less_before: false,
-                id_less_after: false,
-            };
-        let legacy = ClaudeCompactionKind::LegacySummary;
-        let current = ClaudeCompactionKind::CurrentBoundary;
-        let observations = vec![
-            observation(legacy, "2026-07-01T11:00:00Z", 5),
-            observation(legacy, "2026-07-01T11:00:00.100Z", 4),
-            // Equal distance consumes index 0, even though its ordinal is later.
-            observation(current, "2026-07-01T11:00:00.050Z", 3),
-            // The nearer remaining legacy (100 ms) wins over the farther one.
-            observation(current, "2026-07-01T11:00:00Z", 2),
-            observation(legacy, "2026-07-01T11:00:02.051Z", 1),
-            // Repeated currents are retained; 2,001 ms is outside tolerance.
-            observation(current, "2026-07-01T11:00:00.050Z", 3),
-        ];
-        let (count, timestamps, metrics) = claude_compaction_summary(&observations);
-        assert_eq!(count, 4);
-        assert_eq!(metrics.metrics_count, 0);
-        assert_eq!(
-            timestamps,
-            vec![
-                "2026-07-01T11:00:00.050Z",
-                "2026-07-01T11:00:00Z",
-                "2026-07-01T11:00:02.051Z",
-            ]
-        );
-        let boundaries = canonical_claude_curve_boundaries(&observations);
-        assert_eq!(
-            boundaries
-                .iter()
-                .map(|boundary| boundary.response_count_before)
-                .collect::<Vec<_>>(),
-            vec![1, 2, 3, 3]
-        );
-        assert_eq!(
-            format!("{:?}", boundaries[2]),
-            format!("{:?}", observations[2])
-        );
-        assert_eq!(
-            format!("{:?}", boundaries[3]),
-            format!("{:?}", observations[5])
-        );
+    fn claude_compaction_matching_cases() {
+        for (case, (observations, expected_count, expected_timestamps)) in [
+            (
+                {
+                    let observation = |kind, timestamp: &str, response_count_before| {
+                        ClaudeCompactionObservation {
+                            kind,
+                            timestamp: Some(timestamp.to_string()),
+                            pre_tokens: None,
+                            post_tokens: None,
+                            cumulative_dropped_tokens: None,
+                            duration_ms: None,
+                            response_count_before,
+                            pair_key: None,
+                            has_parent_link: false,
+                            trigger: None,
+                            id_less_before: false,
+                            id_less_after: false,
+                        }
+                    };
+                    let legacy = ClaudeCompactionKind::LegacySummary;
+                    let current = ClaudeCompactionKind::CurrentBoundary;
+                    let observations = vec![
+                        observation(legacy, "2026-07-01T11:00:00Z", 5),
+                        observation(legacy, "2026-07-01T11:00:00.100Z", 4),
+                        // Equal distance consumes index 0, even though its ordinal is later.
+                        observation(current, "2026-07-01T11:00:00.050Z", 3),
+                        // The nearer remaining legacy (100 ms) wins over the farther one.
+                        observation(current, "2026-07-01T11:00:00Z", 2),
+                        observation(legacy, "2026-07-01T11:00:02.051Z", 1),
+                        // Repeated currents are retained; 2,001 ms is outside tolerance.
+                        observation(current, "2026-07-01T11:00:00.050Z", 3),
+                    ];
+
+                    observations
+                },
+                4,
+                vec![
+                    "2026-07-01T11:00:00.050Z",
+                    "2026-07-01T11:00:00Z",
+                    "2026-07-01T11:00:02.051Z",
+                ],
+            ),
+            (
+                {
+                    let observation =
+                        |kind, timestamp: Option<&str>, pre_tokens| ClaudeCompactionObservation {
+                            kind,
+                            timestamp: timestamp.map(str::to_string),
+                            pre_tokens,
+                            post_tokens: Some(2),
+                            cumulative_dropped_tokens: Some(3),
+                            duration_ms: Some(4),
+                            response_count_before: 0,
+                            pair_key: None,
+                            has_parent_link: false,
+                            trigger: None,
+                            id_less_before: false,
+                            id_less_after: false,
+                        };
+                    let legacy = ClaudeCompactionKind::LegacySummary;
+                    let current = ClaudeCompactionKind::CurrentBoundary;
+                    let observations = vec![
+                        observation(legacy, Some("1969-12-31T23:59:59.9999Z"), Some(50)),
+                        observation(current, Some("1970-01-01T01:00:00+01:00"), Some(u64::MAX)),
+                        observation(current, Some("1970-01-01T00:00:00Z"), Some(1)),
+                        observation(current, Some("malformed"), Some(u64::MAX)),
+                        observation(current, None, Some(u64::MAX)),
+                        observation(legacy, Some("malformed"), None),
+                        observation(legacy, None, None),
+                    ];
+
+                    observations
+                },
+                6,
+                vec![
+                    "1970-01-01T00:00:00Z",
+                    "1970-01-01T01:00:00+01:00",
+                    "malformed",
+                ],
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (count, timestamps, metrics) = claude_compaction_summary(&observations);
+            assert_eq!(count, expected_count);
+            assert_eq!(timestamps, expected_timestamps);
+            let boundaries = canonical_claude_curve_boundaries(&observations);
+            if case == 0 {
+                assert_eq!(metrics.metrics_count, 0);
+                assert_eq!(
+                    boundaries
+                        .iter()
+                        .map(|b| b.response_count_before)
+                        .collect::<Vec<_>>(),
+                    vec![1, 2, 3, 3]
+                );
+                assert_eq!(
+                    format!("{:?}", boundaries[2]),
+                    format!("{:?}", observations[2])
+                );
+                assert_eq!(
+                    format!("{:?}", boundaries[3]),
+                    format!("{:?}", observations[5])
+                );
+            } else {
+                assert_eq!(metrics.metrics_count, 2);
+                assert_eq!(metrics.total_pre_tokens, u64::MAX);
+                assert_eq!(metrics.total_post_tokens, 4);
+                assert_eq!(metrics.total_cumulative_dropped_tokens, 6);
+                assert_eq!(metrics.total_duration_ms, 8);
+                assert_eq!(boundaries.len(), 6);
+                assert_eq!(boundaries[0].timestamp, None);
+                assert_eq!(boundaries[1].timestamp, None);
+                assert_eq!(boundaries[4].kind, ClaudeCompactionKind::CurrentBoundary);
+                assert_eq!(boundaries[5].kind, ClaudeCompactionKind::LegacySummary);
+            }
+        }
     }
 
     #[test]
-    fn claude_compaction_matching_keeps_invalid_timestamps_and_valid_metrics() {
-        let observation = |kind, timestamp: Option<&str>, pre_tokens| ClaudeCompactionObservation {
-            kind,
-            timestamp: timestamp.map(str::to_string),
-            pre_tokens,
-            post_tokens: Some(2),
-            cumulative_dropped_tokens: Some(3),
-            duration_ms: Some(4),
-            response_count_before: 0,
-            pair_key: None,
-            has_parent_link: false,
-            trigger: None,
-            id_less_before: false,
-            id_less_after: false,
-        };
-        let legacy = ClaudeCompactionKind::LegacySummary;
-        let current = ClaudeCompactionKind::CurrentBoundary;
-        let observations = vec![
-            observation(legacy, Some("1969-12-31T23:59:59.9999Z"), Some(50)),
-            observation(current, Some("1970-01-01T01:00:00+01:00"), Some(u64::MAX)),
-            observation(current, Some("1970-01-01T00:00:00Z"), Some(1)),
-            observation(current, Some("malformed"), Some(u64::MAX)),
-            observation(current, None, Some(u64::MAX)),
-            observation(legacy, Some("malformed"), None),
-            observation(legacy, None, None),
-        ];
-        let (count, timestamps, metrics) = claude_compaction_summary(&observations);
-        assert_eq!(count, 6);
-        assert_eq!(
-            timestamps,
-            vec![
-                "1970-01-01T00:00:00Z",
-                "1970-01-01T01:00:00+01:00",
-                "malformed"
-            ]
-        );
-        assert_eq!(metrics.metrics_count, 2);
-        assert_eq!(metrics.total_pre_tokens, u64::MAX);
-        assert_eq!(metrics.total_post_tokens, 4);
-        assert_eq!(metrics.total_cumulative_dropped_tokens, 6);
-        assert_eq!(metrics.total_duration_ms, 8);
-        let boundaries = canonical_claude_curve_boundaries(&observations);
-        assert_eq!(boundaries.len(), 6);
-        assert_eq!(boundaries[0].timestamp, None);
-        assert_eq!(boundaries[1].timestamp, None);
-        // Stable sorting keeps equal malformed timestamps in their input order.
-        assert_eq!(boundaries[4].kind, current);
-        assert_eq!(boundaries[5].kind, legacy);
-    }
-
-    #[test]
-    fn claude_code_parser_pairs_current_and_legacy_compaction_records() {
-        let path = temp_file("claude-compaction-count");
-        fs::write(
-            &path,
-            concat!(
-                "{\"timestamp\":\"2026-07-01T11:00:00Z\",\"sessionId\":\"claude-compact-1\",\"requestId\":\"req_011AAA\",\"message\":{\"id\":\"msg_011AAA\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":50,\"output_tokens\":5}}}\n",
-                // Real provider order: boundary first, then its legacy summary
-                // with a timestamp three milliseconds earlier.
+    fn claude_compaction_pairing_cases() {
+        type Case<'a> = (&'a [&'a str], u64, Vec<String>, Option<u64>);
+        let cases: [Case<'_>; 5] = [
+(&[                "{\"timestamp\":\"2026-07-01T11:00:00Z\",\"sessionId\":\"claude-compact-1\",\"requestId\":\"req_011AAA\",\"message\":{\"id\":\"msg_011AAA\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":50,\"output_tokens\":5}}}\n",
                 "{\"timestamp\":\"2026-07-01T11:01:00.003Z\",\"sessionId\":\"claude-compact-1\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\"}}\n",
                 "{\"timestamp\":\"2026-07-01T11:01:00Z\",\"sessionId\":\"claude-compact-1\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}\n",
                 "{\"timestamp\":\"2026-07-01T11:02:00Z\",\"sessionId\":\"claude-compact-1\",\"type\":\"user\",\"isCompactSummary\":false,\"message\":{\"role\":\"user\",\"content\":\"regular prompt\"}}\n",
@@ -72226,37 +70168,151 @@ mod tests {
                 "{\"timestamp\":\"2026-07-01T11:05:00Z\",\"sessionId\":\"claude-compact-1\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\"}}\n",
                 "{\"timestamp\":\"2026-07-01T11:06:00Z\",\"sessionId\":\"claude-compact-1\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"manual\"}}\n",
                 "{\"timestamp\":\"2026-07-01T11:07:00Z\",\"sessionId\":\"claude-compact-1\",\"type\":\"system\",\"subtype\":\"status\"}\n"
-            ),
-        )
-        .expect("write fixture");
-
-        let item = parse_claude_code_jsonl_file(
-            &path,
-            "2026-07-01T11:08:00Z",
-            "file-fingerprint".to_string(),
-        )
-        .expect("parse")
-        .into_iter()
-        .next()
-        .expect("snapshot");
-
-        assert_eq!(item.compaction_count, Some(4));
-        assert_eq!(
-            (item.input_tokens, item.output_tokens, item.request_count),
-            (50, 5, 1)
-        );
-        assert_eq!(item.usage_accounting_contract, None);
-        assert_eq!(
-            item.compaction_timestamps,
-            vec![
+], 4, vec![
                 "2026-07-01T11:01:00.003Z".to_string(),
                 "2026-07-01T11:03:00Z".to_string(),
                 "2026-07-01T11:05:00Z".to_string(),
                 "2026-07-01T11:06:00Z".to_string(),
-            ]
-        );
-
-        let _ = fs::remove_file(path);
+            ], None),
+(&[
+                "{\"timestamp\":\"2026-10-20T09:00:00Z\",\"sessionId\":\"claude-pair\",\"requestId\":\"req_pair_1\",\"message\":{\"id\":\"msg_pair_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":50,\"output_tokens\":5}}}",
+                // Current provider shape: boundary, attachment chain, then the
+                // summary 600 ms earlier than the boundary it descends from.
+                "{\"timestamp\":\"2026-10-20T09:01:00.600Z\",\"uuid\":\"boundary-1\",\"parentUuid\":null,\"logicalParentUuid\":\"msg-1\",\"sessionId\":\"claude-pair\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":900000,\"postTokens\":100000,\"durationMs\":20}}",
+                "{\"timestamp\":\"2026-10-20T09:01:00.601Z\",\"uuid\":\"attachment-1\",\"parentUuid\":\"boundary-1\",\"sessionId\":\"claude-pair\",\"type\":\"attachment\"}",
+                "{\"timestamp\":\"2026-10-20T09:01:00.602Z\",\"uuid\":\"attachment-2\",\"parentUuid\":\"attachment-1\",\"sessionId\":\"claude-pair\",\"type\":\"attachment\"}",
+                "{\"timestamp\":\"2026-10-20T09:01:00Z\",\"uuid\":\"summary-1\",\"parentUuid\":\"attachment-2\",\"sessionId\":\"claude-pair\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
+                // Ten minutes later: a second compaction whose summary links
+                // directly and sits 5 s away, outside the time fallback.
+                "{\"timestamp\":\"2026-10-20T09:11:05Z\",\"uuid\":\"boundary-2\",\"parentUuid\":null,\"logicalParentUuid\":\"msg-2\",\"sessionId\":\"claude-pair\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":800000,\"postTokens\":90000,\"durationMs\":30}}",
+                "{\"timestamp\":\"2026-10-20T09:11:00Z\",\"uuid\":\"summary-2\",\"parentUuid\":\"boundary-2\",\"sessionId\":\"claude-pair\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
+            ], 2, vec![
+                "2026-10-20T09:01:00.600Z".to_string(),
+                "2026-10-20T09:11:05Z".to_string(),
+            ], Some(1700000)),
+(&[
+                "{\"timestamp\":\"2026-10-20T10:00:00Z\",\"sessionId\":\"claude-fallback\",\"requestId\":\"req_fallback_1\",\"message\":{\"id\":\"msg_fallback_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":50,\"output_tokens\":5}}}",
+                // No link field at all: the pair rests on the 1.5 s time fallback.
+                "{\"timestamp\":\"2026-10-20T10:01:01.500Z\",\"uuid\":\"boundary-fallback\",\"sessionId\":\"claude-fallback\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":700000}}",
+                "{\"timestamp\":\"2026-10-20T10:01:00Z\",\"uuid\":\"summary-fallback\",\"sessionId\":\"claude-fallback\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
+                // A summary whose parent lies outside the boundary's chain is
+                // not paired by time, even 1.5 s away: two events.
+                "{\"timestamp\":\"2026-10-20T10:05:01.500Z\",\"uuid\":\"boundary-elsewhere\",\"sessionId\":\"claude-fallback\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":500000}}",
+                "{\"timestamp\":\"2026-10-20T10:05:00Z\",\"uuid\":\"summary-elsewhere\",\"parentUuid\":\"unrelated\",\"sessionId\":\"claude-fallback\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
+                // A boundary alone still counts once.
+                "{\"timestamp\":\"2026-10-20T10:11:00Z\",\"uuid\":\"boundary-alone\",\"sessionId\":\"claude-fallback\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"manual\",\"preTokens\":600000}}",
+                "{\"timestamp\":\"2026-10-20T10:12:00Z\",\"uuid\":\"prompt-1\",\"parentUuid\":\"boundary-alone\",\"sessionId\":\"claude-fallback\",\"type\":\"user\",\"isCompactSummary\":false,\"message\":{\"role\":\"user\",\"content\":\"regular prompt\"}}",
+                // A legacy summary alone still counts once.
+                "{\"timestamp\":\"2026-10-20T10:21:00Z\",\"uuid\":\"summary-alone\",\"parentUuid\":\"prompt-1\",\"sessionId\":\"claude-fallback\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
+            ], 5, vec![
+                "2026-10-20T10:01:01.500Z".to_string(),
+                "2026-10-20T10:05:00Z".to_string(),
+                "2026-10-20T10:05:01.500Z".to_string(),
+                "2026-10-20T10:11:00Z".to_string(),
+                "2026-10-20T10:21:00Z".to_string(),
+            ], Some(1800000)),
+(&[
+            "{\"timestamp\":\"2026-10-20T13:00:00Z\",\"sessionId\":\"claude-unlinked\",\"requestId\":\"req_unlinked_1\",\"message\":{\"id\":\"msg_unlinked_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":50,\"output_tokens\":5}}}",
+            // Linked through an attachment: one event, not counted.
+            "{\"timestamp\":\"2026-10-20T13:01:01Z\",\"uuid\":\"boundary-linked\",\"parentUuid\":null,\"sessionId\":\"claude-unlinked\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":700000}}",
+            "{\"timestamp\":\"2026-10-20T13:01:01.001Z\",\"uuid\":\"attachment-linked\",\"parentUuid\":\"boundary-linked\",\"sessionId\":\"claude-unlinked\",\"type\":\"attachment\"}",
+            "{\"timestamp\":\"2026-10-20T13:01:00Z\",\"uuid\":\"summary-linked\",\"parentUuid\":\"attachment-linked\",\"sessionId\":\"claude-unlinked\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
+            // An unknown record type inside the chain breaks the link: the
+            // summary names a parent, stays its own event and is counted.
+            "{\"timestamp\":\"2026-10-20T13:05:01Z\",\"uuid\":\"boundary-broken\",\"parentUuid\":null,\"sessionId\":\"claude-unlinked\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":500000}}",
+            "{\"timestamp\":\"2026-10-20T13:05:01.001Z\",\"uuid\":\"future-record\",\"parentUuid\":\"boundary-broken\",\"sessionId\":\"claude-unlinked\",\"type\":\"future_record_type\"}",
+            "{\"timestamp\":\"2026-10-20T13:05:00.500Z\",\"uuid\":\"summary-broken\",\"parentUuid\":\"future-record\",\"sessionId\":\"claude-unlinked\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
+            // A summary with no parent at all is not this counter's case.
+            "{\"timestamp\":\"2026-10-20T13:21:00Z\",\"uuid\":\"summary-parentless\",\"sessionId\":\"claude-unlinked\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
+        ], 4, vec![
+                "2026-10-20T13:01:01Z".to_string(),
+                "2026-10-20T13:05:00.500Z".to_string(),
+                "2026-10-20T13:05:01Z".to_string(),
+                "2026-10-20T13:21:00Z".to_string(),
+            ], Some(1200000)),
+(&[
+                "{\"timestamp\":\"2026-10-20T11:00:00Z\",\"sessionId\":\"claude-beside\",\"requestId\":\"req_beside_1\",\"message\":{\"id\":\"msg_beside_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":50,\"output_tokens\":5}}}",
+                // A boundary without a uuid cannot be linked to.
+                "{\"timestamp\":\"2026-10-20T11:01:00.500Z\",\"sessionId\":\"claude-beside\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":400000}}",
+                "{\"timestamp\":\"2026-10-20T11:01:03Z\",\"uuid\":\"boundary-linked\",\"parentUuid\":null,\"sessionId\":\"claude-beside\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":300000}}",
+                // Linked to the second boundary, yet 10 ms from the first: the
+                // first boundary's fallback must skip it.
+                "{\"timestamp\":\"2026-10-20T11:01:00.490Z\",\"uuid\":\"summary-linked\",\"parentUuid\":\"boundary-linked\",\"sessionId\":\"claude-beside\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
+                // The first boundary's own unlinked summary, 1 s away.
+                "{\"timestamp\":\"2026-10-20T11:01:01.500Z\",\"uuid\":\"summary-unlinked\",\"sessionId\":\"claude-beside\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
+            ], 2, vec![
+                "2026-10-20T11:01:00.500Z".to_string(),
+                "2026-10-20T11:01:03Z".to_string(),
+            ], Some(700000))
+        ];
+        for (case, (lines, count, timestamps, pre)) in cases.into_iter().enumerate() {
+            let path = temp_file("claude-compaction-pairing");
+            fs::write(&path, lines.join("\n")).unwrap();
+            let mut file = File::open(&path).unwrap();
+            let identity = opened_object_identity(SnapshotSource::ClaudeCode, &mut file).unwrap();
+            let parsed = parse_opened_jsonl_file(
+                file,
+                &identity,
+                &path,
+                "2026-10-20T13:30:00Z",
+                "fp".into(),
+                SnapshotSource::ClaudeCode,
+                apply_claude_code_line,
+                None,
+                Some(&ClaudeTitleMetadata::default()),
+                None,
+                None,
+                true,
+                None,
+                true,
+            )
+            .unwrap();
+            let item = &parsed.snapshots[0];
+            assert_eq!(item.compaction_count, Some(count), "case {case}");
+            assert_eq!(item.compaction_timestamps, timestamps, "case {case}");
+            if let Some(pre) = pre {
+                assert_eq!(item.compaction_total_pre_tokens, Some(pre));
+            }
+            if case == 0 {
+                assert_eq!(
+                    (item.input_tokens, item.output_tokens, item.request_count),
+                    (50, 5, 1)
+                );
+                assert_eq!(item.usage_accounting_contract, None);
+            }
+            if case == 1 {
+                assert_eq!(item.compaction_total_post_tokens, Some(190_000));
+                assert_eq!(item.compaction_total_duration_ms, Some(50));
+                let curve =
+                    canonical_claude_curve_boundaries(&item.claude_context_curve_boundaries);
+                assert_eq!(
+                    curve
+                        .iter()
+                        .map(|b| (b.kind, b.timestamp.as_deref()))
+                        .collect::<Vec<_>>(),
+                    vec![
+                        (
+                            ClaudeCompactionKind::CurrentBoundary,
+                            Some("2026-10-20T09:01:00.600Z")
+                        ),
+                        (
+                            ClaudeCompactionKind::CurrentBoundary,
+                            Some("2026-10-20T09:11:05Z")
+                        )
+                    ]
+                );
+            }
+            if case == 3 {
+                assert_eq!(parsed.claude_compaction_unlinked_parent_count, 1);
+            }
+            if case == 4 {
+                assert_eq!(
+                    canonical_claude_curve_boundaries(&item.claude_context_curve_boundaries).len(),
+                    2
+                );
+            }
+            let _ = fs::remove_file(path);
+        }
     }
 
     fn parse_claude_compaction_fixture(name: &str, lines: &[&str]) -> SnapshotItem {
@@ -72280,187 +70336,6 @@ mod tests {
         .expect("snapshot");
         let _ = fs::remove_file(path);
         item
-    }
-
-    #[test]
-    fn claude_code_parser_pairs_compaction_summary_through_its_parent_chain() {
-        let item = parse_claude_compaction_fixture(
-            "claude-compaction-structural-pair",
-            &[
-                "{\"timestamp\":\"2026-10-20T09:00:00Z\",\"sessionId\":\"claude-pair\",\"requestId\":\"req_pair_1\",\"message\":{\"id\":\"msg_pair_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":50,\"output_tokens\":5}}}",
-                // Current provider shape: boundary, attachment chain, then the
-                // summary 600 ms earlier than the boundary it descends from.
-                "{\"timestamp\":\"2026-10-20T09:01:00.600Z\",\"uuid\":\"boundary-1\",\"parentUuid\":null,\"logicalParentUuid\":\"msg-1\",\"sessionId\":\"claude-pair\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":900000,\"postTokens\":100000,\"durationMs\":20}}",
-                "{\"timestamp\":\"2026-10-20T09:01:00.601Z\",\"uuid\":\"attachment-1\",\"parentUuid\":\"boundary-1\",\"sessionId\":\"claude-pair\",\"type\":\"attachment\"}",
-                "{\"timestamp\":\"2026-10-20T09:01:00.602Z\",\"uuid\":\"attachment-2\",\"parentUuid\":\"attachment-1\",\"sessionId\":\"claude-pair\",\"type\":\"attachment\"}",
-                "{\"timestamp\":\"2026-10-20T09:01:00Z\",\"uuid\":\"summary-1\",\"parentUuid\":\"attachment-2\",\"sessionId\":\"claude-pair\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
-                // Ten minutes later: a second compaction whose summary links
-                // directly and sits 5 s away, outside the time fallback.
-                "{\"timestamp\":\"2026-10-20T09:11:05Z\",\"uuid\":\"boundary-2\",\"parentUuid\":null,\"logicalParentUuid\":\"msg-2\",\"sessionId\":\"claude-pair\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":800000,\"postTokens\":90000,\"durationMs\":30}}",
-                "{\"timestamp\":\"2026-10-20T09:11:00Z\",\"uuid\":\"summary-2\",\"parentUuid\":\"boundary-2\",\"sessionId\":\"claude-pair\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
-            ],
-        );
-
-        assert_eq!(item.compaction_count, Some(2));
-        // Time and sizes come from each boundary, never its summary.
-        assert_eq!(
-            item.compaction_timestamps,
-            vec![
-                "2026-10-20T09:01:00.600Z".to_string(),
-                "2026-10-20T09:11:05Z".to_string(),
-            ]
-        );
-        assert_eq!(item.compaction_total_pre_tokens, Some(1_700_000));
-        assert_eq!(item.compaction_total_post_tokens, Some(190_000));
-        assert_eq!(item.compaction_total_duration_ms, Some(50));
-        // The curve sees the same events: one boundary per pair, including the
-        // pair linked 5 s apart that the time window alone would split.
-        let curve = canonical_claude_curve_boundaries(&item.claude_context_curve_boundaries);
-        assert_eq!(
-            curve
-                .iter()
-                .map(|boundary| (boundary.kind, boundary.timestamp.as_deref()))
-                .collect::<Vec<_>>(),
-            vec![
-                (
-                    ClaudeCompactionKind::CurrentBoundary,
-                    Some("2026-10-20T09:01:00.600Z")
-                ),
-                (
-                    ClaudeCompactionKind::CurrentBoundary,
-                    Some("2026-10-20T09:11:05Z")
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn claude_code_parser_pairs_only_parentless_compaction_summary_by_time() {
-        let item = parse_claude_compaction_fixture(
-            "claude-compaction-fallback-pair",
-            &[
-                "{\"timestamp\":\"2026-10-20T10:00:00Z\",\"sessionId\":\"claude-fallback\",\"requestId\":\"req_fallback_1\",\"message\":{\"id\":\"msg_fallback_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":50,\"output_tokens\":5}}}",
-                // No link field at all: the pair rests on the 1.5 s time fallback.
-                "{\"timestamp\":\"2026-10-20T10:01:01.500Z\",\"uuid\":\"boundary-fallback\",\"sessionId\":\"claude-fallback\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":700000}}",
-                "{\"timestamp\":\"2026-10-20T10:01:00Z\",\"uuid\":\"summary-fallback\",\"sessionId\":\"claude-fallback\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
-                // A summary whose parent lies outside the boundary's chain is
-                // not paired by time, even 1.5 s away: two events.
-                "{\"timestamp\":\"2026-10-20T10:05:01.500Z\",\"uuid\":\"boundary-elsewhere\",\"sessionId\":\"claude-fallback\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":500000}}",
-                "{\"timestamp\":\"2026-10-20T10:05:00Z\",\"uuid\":\"summary-elsewhere\",\"parentUuid\":\"unrelated\",\"sessionId\":\"claude-fallback\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
-                // A boundary alone still counts once.
-                "{\"timestamp\":\"2026-10-20T10:11:00Z\",\"uuid\":\"boundary-alone\",\"sessionId\":\"claude-fallback\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"manual\",\"preTokens\":600000}}",
-                "{\"timestamp\":\"2026-10-20T10:12:00Z\",\"uuid\":\"prompt-1\",\"parentUuid\":\"boundary-alone\",\"sessionId\":\"claude-fallback\",\"type\":\"user\",\"isCompactSummary\":false,\"message\":{\"role\":\"user\",\"content\":\"regular prompt\"}}",
-                // A legacy summary alone still counts once.
-                "{\"timestamp\":\"2026-10-20T10:21:00Z\",\"uuid\":\"summary-alone\",\"parentUuid\":\"prompt-1\",\"sessionId\":\"claude-fallback\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
-            ],
-        );
-
-        assert_eq!(item.compaction_count, Some(5));
-        assert_eq!(
-            item.compaction_timestamps,
-            vec![
-                "2026-10-20T10:01:01.500Z".to_string(),
-                "2026-10-20T10:05:00Z".to_string(),
-                "2026-10-20T10:05:01.500Z".to_string(),
-                "2026-10-20T10:11:00Z".to_string(),
-                "2026-10-20T10:21:00Z".to_string(),
-            ]
-        );
-        assert_eq!(item.compaction_total_pre_tokens, Some(1_800_000));
-    }
-
-    #[test]
-    fn claude_code_parser_counts_a_summary_whose_parent_chain_misses_its_boundary() {
-        let path = temp_file("claude-compaction-unlinked-parent");
-        let lines = [
-            "{\"timestamp\":\"2026-10-20T13:00:00Z\",\"sessionId\":\"claude-unlinked\",\"requestId\":\"req_unlinked_1\",\"message\":{\"id\":\"msg_unlinked_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":50,\"output_tokens\":5}}}",
-            // Linked through an attachment: one event, not counted.
-            "{\"timestamp\":\"2026-10-20T13:01:01Z\",\"uuid\":\"boundary-linked\",\"parentUuid\":null,\"sessionId\":\"claude-unlinked\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":700000}}",
-            "{\"timestamp\":\"2026-10-20T13:01:01.001Z\",\"uuid\":\"attachment-linked\",\"parentUuid\":\"boundary-linked\",\"sessionId\":\"claude-unlinked\",\"type\":\"attachment\"}",
-            "{\"timestamp\":\"2026-10-20T13:01:00Z\",\"uuid\":\"summary-linked\",\"parentUuid\":\"attachment-linked\",\"sessionId\":\"claude-unlinked\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
-            // An unknown record type inside the chain breaks the link: the
-            // summary names a parent, stays its own event and is counted.
-            "{\"timestamp\":\"2026-10-20T13:05:01Z\",\"uuid\":\"boundary-broken\",\"parentUuid\":null,\"sessionId\":\"claude-unlinked\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":500000}}",
-            "{\"timestamp\":\"2026-10-20T13:05:01.001Z\",\"uuid\":\"future-record\",\"parentUuid\":\"boundary-broken\",\"sessionId\":\"claude-unlinked\",\"type\":\"future_record_type\"}",
-            "{\"timestamp\":\"2026-10-20T13:05:00.500Z\",\"uuid\":\"summary-broken\",\"parentUuid\":\"future-record\",\"sessionId\":\"claude-unlinked\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
-            // A summary with no parent at all is not this counter's case.
-            "{\"timestamp\":\"2026-10-20T13:21:00Z\",\"uuid\":\"summary-parentless\",\"sessionId\":\"claude-unlinked\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
-        ];
-        fs::write(
-            &path,
-            lines
-                .iter()
-                .map(|line| format!("{line}\n"))
-                .collect::<String>(),
-        )
-        .expect("write fixture");
-        let mut file = File::open(&path).expect("open fixture");
-        let identity =
-            opened_object_identity(SnapshotSource::ClaudeCode, &mut file).expect("identify");
-        let parsed = parse_opened_jsonl_file(
-            file,
-            &identity,
-            &path,
-            "2026-10-20T13:30:00Z",
-            "file-fingerprint".to_string(),
-            SnapshotSource::ClaudeCode,
-            apply_claude_code_line,
-            None,
-            Some(&ClaudeTitleMetadata::default()),
-            None,
-            None,
-            true,
-            None,
-            true,
-        )
-        .expect("parse");
-        let _ = fs::remove_file(path);
-
-        assert_eq!(parsed.claude_compaction_unlinked_parent_count, 1);
-        let item = parsed.snapshots.first().expect("snapshot");
-        assert_eq!(item.compaction_count, Some(4));
-        assert_eq!(
-            item.compaction_timestamps,
-            vec![
-                "2026-10-20T13:01:01Z".to_string(),
-                "2026-10-20T13:05:00.500Z".to_string(),
-                "2026-10-20T13:05:01Z".to_string(),
-                "2026-10-20T13:21:00Z".to_string(),
-            ]
-        );
-        assert_eq!(item.compaction_total_pre_tokens, Some(1_200_000));
-    }
-
-    #[test]
-    fn claude_code_parser_time_fallback_never_claims_a_linked_summary() {
-        let item = parse_claude_compaction_fixture(
-            "claude-compaction-unlinked-beside-linked",
-            &[
-                "{\"timestamp\":\"2026-10-20T11:00:00Z\",\"sessionId\":\"claude-beside\",\"requestId\":\"req_beside_1\",\"message\":{\"id\":\"msg_beside_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":50,\"output_tokens\":5}}}",
-                // A boundary without a uuid cannot be linked to.
-                "{\"timestamp\":\"2026-10-20T11:01:00.500Z\",\"sessionId\":\"claude-beside\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":400000}}",
-                "{\"timestamp\":\"2026-10-20T11:01:03Z\",\"uuid\":\"boundary-linked\",\"parentUuid\":null,\"sessionId\":\"claude-beside\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":300000}}",
-                // Linked to the second boundary, yet 10 ms from the first: the
-                // first boundary's fallback must skip it.
-                "{\"timestamp\":\"2026-10-20T11:01:00.490Z\",\"uuid\":\"summary-linked\",\"parentUuid\":\"boundary-linked\",\"sessionId\":\"claude-beside\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
-                // The first boundary's own unlinked summary, 1 s away.
-                "{\"timestamp\":\"2026-10-20T11:01:01.500Z\",\"uuid\":\"summary-unlinked\",\"sessionId\":\"claude-beside\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
-            ],
-        );
-
-        assert_eq!(item.compaction_count, Some(2));
-        assert_eq!(
-            item.compaction_timestamps,
-            vec![
-                "2026-10-20T11:01:00.500Z".to_string(),
-                "2026-10-20T11:01:03Z".to_string(),
-            ]
-        );
-        assert_eq!(item.compaction_total_pre_tokens, Some(700_000));
-        assert_eq!(
-            canonical_claude_curve_boundaries(&item.claude_context_curve_boundaries).len(),
-            2
-        );
     }
 
     #[test]
@@ -72757,17 +70632,6 @@ mod tests {
             .all(|event| event.trigger.as_deref() == Some("auto")));
         // Last activity is 100 minutes before collection: no local points.
         assert!(item.local_context_points.is_empty());
-    }
-
-    #[test]
-    fn claude_compaction_observation_keeps_its_size_with_the_trigger() {
-        // The trigger and the two id-less flags sit in existing padding:
-        // retained boundaries do not grow (120 B on today's 64-bit targets).
-        assert!(std::mem::size_of::<ClaudeCompactionObservation>() <= 120);
-        assert_eq!(
-            std::mem::size_of::<Option<super::compaction_events::ClaudeCompactionTrigger>>(),
-            1
-        );
     }
 
     #[test]
@@ -73078,73 +70942,33 @@ mod tests {
     }
 
     #[test]
-    fn claude_context_curve_missing_request_identity_fails_closed() {
-        let path = temp_file("claude-context-curve-no-request-id");
-        fs::write(
-            &path,
-            "{\"timestamp\":\"2026-08-20T11:01:00Z\",\"sessionId\":\"claude-curve-missing-id\",\"type\":\"assistant\",\"message\":{\"id\":\"msg_curve_missing\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\n",
-        )
-        .expect("write fixture");
-        let mut items = parse_claude_code_jsonl_file(
-            &path,
-            "2026-08-20T11:04:00Z",
-            "curve-fingerprint".to_string(),
-        )
-        .expect("parse");
-        let api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
-            evidence: BTreeMap::new(),
-            health: Default::default(),
-        };
-        let trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
-        apply_claude_reported_usage_with_index(
-            &mut items,
-            &api_report,
-            &trace_report,
-            &mut ScanIndex::default(),
-            true,
-            "2026-08-20T11:04:00Z",
-        );
-        let curve = items[0].context_curve.as_ref().expect("coverage object");
-        assert_eq!(curve.coverage, "ownership_unresolved");
-        assert_eq!(curve.total_owned_request_count, 0);
-        assert!(curve.points.is_empty());
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn claude_context_curve_duplicate_request_identity_fails_closed() {
-        let path = temp_file("claude-context-curve-duplicate-request-id");
-        fs::write(
-            &path,
-            concat!(
+    fn claude_context_curve_incomplete_evidence_cases() {
+        let root_timestamp = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+        for (body, coverage) in [
+("{\"timestamp\":\"2026-08-20T11:01:00Z\",\"sessionId\":\"claude-curve-missing-id\",\"type\":\"assistant\",\"message\":{\"id\":\"msg_curve_missing\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\n".to_string(), "ownership_unresolved"),
+(concat!(
                 "{\"timestamp\":\"2026-08-20T11:01:00Z\",\"sessionId\":\"claude-curve-duplicate\",\"type\":\"assistant\",\"requestId\":\"req_curve_duplicate\",\"message\":{\"id\":\"msg_curve_first\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\n",
                 "{\"timestamp\":\"2026-08-20T11:02:00Z\",\"sessionId\":\"claude-curve-duplicate\",\"type\":\"assistant\",\"requestId\":\"req_curve_duplicate\",\"message\":{\"id\":\"msg_curve_second\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":20,\"output_tokens\":3}}}\n"
-            ),
-        )
-        .expect("write fixture");
-        let mut items = parse_claude_code_jsonl_file(
-            &path,
-            "2026-08-20T11:04:00Z",
-            "curve-fingerprint".to_string(),
-        )
-        .expect("parse");
-        apply_claude_reported_usage_with_index(
-            &mut items,
-            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
-                evidence: BTreeMap::new(),
-                health: Default::default(),
-            },
-            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
-            &mut ScanIndex::default(),
-            true,
-            "2026-08-20T11:04:00Z",
-        );
-
-        let curve = items[0].context_curve.as_ref().expect("coverage object");
-        assert_eq!(curve.coverage, "ownership_unresolved");
-        assert_eq!(curve.total_owned_request_count, 0);
-        assert!(curve.points.is_empty());
-        let _ = fs::remove_file(path);
+            ).to_string(), "ownership_unresolved"),
+("{\"timestamp\":\"2026-08-20T11:01:00Z\",\"sessionId\":\"claude-curve-multi\",\"type\":\"assistant\",\"requestId\":\"req_curve_multi\",\"message\":{\"id\":\"msg_curve_multi\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":3,\"output_tokens\":20,\"iterations\":[{\"input_tokens\":10,\"cache_read_input_tokens\":100},{\"input_tokens\":20,\"cache_read_input_tokens\":200}]}}}\n".to_string(), "parser_unsupported"),
+(format!(
+                "{{\"type\":\"custom-title\",\"customTitle\":\"Native root\"}}\n{{\"type\":\"mode\",\"mode\":\"default\"}}\n{{\"type\":\"queue-operation\",\"operation\":\"dequeue\"}}\n{{\"timestamp\":\"{root_timestamp}\",\"sessionId\":\"claude-native-root\",\"type\":\"user\",\"parentUuid\":null,\"isCompactSummary\":false,\"message\":{{\"role\":\"user\",\"content\":\"hello\"}}}}\n{{\"timestamp\":\"{root_timestamp}\",\"sessionId\":\"claude-native-root\",\"type\":\"assistant\",\"requestId\":\"req_native_root\",\"message\":{{\"id\":\"msg_native_root\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":10,\"cache_read_input_tokens\":100,\"output_tokens\":2}}}}}}\n"
+            ).to_string(), "scalars_file_birth_only")
+        ] {
+            let path = temp_file("claude-curve-incomplete");
+            fs::write(&path, body).unwrap();
+            let at = if coverage == "scalars_file_birth_only" { &root_timestamp } else { "2026-08-20T11:04:00Z" };
+            let mut items = parse_claude_code_jsonl_file(&path, at, "curve-fingerprint".into()).unwrap();
+            if coverage == "parser_unsupported" { assert_eq!(items[0].peak_context_fill_tokens, Some(220)); }
+            if coverage == "scalars_file_birth_only" { assert!(!items[0].claude_context_curve_owned_start_proven); }
+            apply_claude_reported_usage_with_index(&mut items, &crate::claude_local_otel::ClaudeLocalOtelLoadReport {evidence: BTreeMap::new(),health:Default::default()}, &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(), &mut ScanIndex::default(), true, at);
+            let curve = items[0].context_curve.as_ref().unwrap();
+            assert_eq!(curve.coverage,coverage);
+            assert_eq!(curve.total_owned_request_count,0);
+            assert!(curve.points.is_empty());
+            if coverage == "scalars_file_birth_only" { assert_eq!(items[0].claude_file_birth_verdict(),Some(ClaudeFileBirthVerdict::Admitted)); }
+            let _ = fs::remove_file(path);
+        }
     }
 
     #[test]
@@ -73735,40 +71559,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_context_curve_multi_iteration_response_is_not_request_indexed() {
-        let path = temp_file("claude-context-curve-multi-iteration");
-        fs::write(
-            &path,
-            "{\"timestamp\":\"2026-08-20T11:01:00Z\",\"sessionId\":\"claude-curve-multi\",\"type\":\"assistant\",\"requestId\":\"req_curve_multi\",\"message\":{\"id\":\"msg_curve_multi\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":3,\"output_tokens\":20,\"iterations\":[{\"input_tokens\":10,\"cache_read_input_tokens\":100},{\"input_tokens\":20,\"cache_read_input_tokens\":200}]}}}\n",
-        )
-        .expect("write fixture");
-        let mut items = parse_claude_code_jsonl_file(
-            &path,
-            "2026-08-20T11:04:00Z",
-            "curve-fingerprint".to_string(),
-        )
-        .expect("parse");
-        assert_eq!(items[0].peak_context_fill_tokens, Some(220));
-        let api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
-            evidence: BTreeMap::new(),
-            health: Default::default(),
-        };
-        apply_claude_reported_usage_with_index(
-            &mut items,
-            &api_report,
-            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
-            &mut ScanIndex::default(),
-            true,
-            "2026-08-20T11:04:00Z",
-        );
-        let curve = items[0].context_curve.as_ref().expect("coverage object");
-        assert_eq!(curve.coverage, "parser_unsupported");
-        assert_eq!(curve.total_owned_request_count, 0);
-        assert!(curve.points.is_empty());
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
     fn claude_context_curve_missing_predecessor_does_not_own_copied_prefix() {
         let path = temp_file("claude-context-curve-missing-predecessor");
         fs::write(
@@ -73820,70 +71610,6 @@ mod tests {
         assert_eq!(items[0].avg_duration_ms, Some(1_000));
         assert_eq!(items[0].max_duration_ms, Some(1_000));
         let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn claude_fresh_root_without_provider_marker_remains_unresolved() {
-        let path = temp_file("claude-context-curve-native-root");
-        let root_timestamp = OffsetDateTime::now_utc()
-            .format(&Rfc3339)
-            .expect("format root timestamp");
-        fs::write(
-            &path,
-            format!(
-                "{{\"type\":\"custom-title\",\"customTitle\":\"Native root\"}}\n{{\"type\":\"mode\",\"mode\":\"default\"}}\n{{\"type\":\"queue-operation\",\"operation\":\"dequeue\"}}\n{{\"timestamp\":\"{root_timestamp}\",\"sessionId\":\"claude-native-root\",\"type\":\"user\",\"parentUuid\":null,\"isCompactSummary\":false,\"message\":{{\"role\":\"user\",\"content\":\"hello\"}}}}\n{{\"timestamp\":\"{root_timestamp}\",\"sessionId\":\"claude-native-root\",\"type\":\"assistant\",\"requestId\":\"req_native_root\",\"message\":{{\"id\":\"msg_native_root\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":10,\"cache_read_input_tokens\":100,\"output_tokens\":2}}}}}}\n"
-            ),
-        )
-        .expect("write fixture");
-        let mut items =
-            parse_claude_code_jsonl_file(&path, &root_timestamp, "curve-fingerprint".to_string())
-                .expect("parse");
-        assert!(!items[0].claude_context_curve_owned_start_proven);
-        apply_claude_reported_usage_with_index(
-            &mut items,
-            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
-                evidence: BTreeMap::new(),
-                health: Default::default(),
-            },
-            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
-            &mut ScanIndex::default(),
-            true,
-            &root_timestamp,
-        );
-        let curve = items[0].context_curve.as_ref().expect("coverage object");
-        assert_eq!(
-            items[0].claude_file_birth_verdict(),
-            Some(ClaudeFileBirthVerdict::Admitted)
-        );
-        assert_eq!(curve.coverage, "scalars_file_birth_only");
-        assert_eq!(curve.total_owned_request_count, 0);
-        assert!(curve.points.is_empty());
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn compaction_timeline_keeps_newest_64_for_snapshot_upload() {
-        let mut timestamps = (0..72)
-            .map(|index| {
-                let day = index / 24 + 1;
-                let hour = index % 24;
-                format!("2026-07-{day:02}T{hour:02}:00:00Z")
-            })
-            .collect::<Vec<_>>();
-        timestamps.reverse();
-        timestamps.push("2026-07-03T23:00:00Z".to_string());
-
-        let bounded = bounded_compaction_timestamps(timestamps);
-
-        assert_eq!(bounded.len(), MAX_COMPACTION_TIMESTAMPS);
-        assert_eq!(
-            bounded.first().map(String::as_str),
-            Some("2026-07-01T08:00:00Z")
-        );
-        assert_eq!(
-            bounded.last().map(String::as_str),
-            Some("2026-07-03T23:00:00Z")
-        );
     }
 
     #[test]
@@ -74019,130 +71745,55 @@ mod tests {
     }
 
     #[test]
-    fn codex_sessions_without_per_turn_usage_claim_no_context() {
-        // A rollout whose `token_count` events carry no `last_token_usage`
-        // yields no context reading rather than a guess derived from the
-        // cumulative. `compaction_count` is still Some(0): the parser DID read
-        // this transcript's compaction records and saw none, which is an
-        // observation, not a gap.
-        let path = temp_file("codex-no-last-token-usage");
-        fs::write(
-            &path,
-            concat!(
+    fn context_posture_source_contracts() {
+        for (source,body,peak,compaction) in [
+(SnapshotSource::Codex,concat!(
                 "{\"timestamp\":\"2026-07-01T12:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e253c-7777-7000-9000-aaaaaaaaaaaa\"}}\n",
                 "{\"timestamp\":\"2026-07-01T12:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":50,\"output_tokens\":9},\"model\":\"gpt-5.5\"}}}\n"
-            ),
-        )
-        .expect("write fixture");
-
-        let item = parse_codex_jsonl_file(
-            &path,
-            "2026-07-01T12:04:00Z",
-            "file-fingerprint".to_string(),
-        )
-        .expect("parse")
-        .into_iter()
-        .next()
-        .expect("snapshot");
-
-        assert_eq!(item.peak_context_fill_tokens, None);
-        assert_eq!(item.first_turn_context_tokens, None);
-        assert_eq!(item.compaction_count, Some(0));
-        let serialized = serde_json::to_value(&item).expect("serialize");
-        assert!(serialized.get("peak_context_fill_tokens").is_none());
-        assert!(serialized.get("first_turn_context_tokens").is_none());
-        let curve = item
-            .context_curve
-            .as_ref()
-            .expect("explicit curve coverage");
-        assert_eq!(curve.coverage, "pre_capture");
-        assert_eq!(curve.total_owned_request_count, 0);
-        assert!(curve.points.is_empty());
-
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn codex_context_posture_fields_change_snapshot_fingerprint() {
-        // Codex posture joins the fingerprint payload on purpose: that is what
-        // re-uploads every already-collected Codex session once, so the backend
-        // can backfill posture for history rather than only new sessions.
-        let path = temp_file("codex-posture-fingerprint");
-        fs::write(
-            &path,
-            concat!(
+            ),None,Some(0)),
+(SnapshotSource::Codex,concat!(
                 "{\"timestamp\":\"2026-07-01T12:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e253c-8888-7000-9000-cccccccccccc\"}}\n",
                 "{\"timestamp\":\"2026-07-01T12:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":5000,\"cached_input_tokens\":1000,\"output_tokens\":9},\"last_token_usage\":{\"input_tokens\":5000,\"cached_input_tokens\":1000,\"output_tokens\":9},\"model\":\"gpt-5.5\"}}}\n"
-            ),
-        )
-        .expect("write fixture");
-
-        let item = parse_codex_jsonl_file(
-            &path,
-            "2026-07-01T12:04:00Z",
-            "file-fingerprint".to_string(),
-        )
-        .expect("parse")
-        .into_iter()
-        .next()
-        .expect("snapshot");
-
-        assert_eq!(item.peak_context_fill_tokens, Some(5000));
-        let mut without_posture = item.clone();
-        without_posture.peak_context_fill_tokens = None;
-        without_posture.first_turn_context_tokens = None;
-        without_posture.compaction_count = None;
-        without_posture.compaction_timestamps.clear();
-        assert_ne!(
-            snapshot_fingerprint(SnapshotSource::Codex, &item),
-            snapshot_fingerprint(SnapshotSource::Codex, &without_posture)
-        );
-
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn pi_sessions_emit_no_context_posture_fields() {
-        // Pi derives no posture, so all three fields stay None and serialize
-        // away — and posture must not be a Pi fingerprint dimension, or every
-        // Pi session would re-upload on upgrade carrying nothing new.
-        let path = temp_file("pi-no-context-posture");
-        fs::write(
-            &path,
-            concat!(
+            ),Some(5000),Some(0)),
+(SnapshotSource::Pi,concat!(
                 "{\"type\":\"session\",\"session_id\":\"019e2700-eeee-7000-9000-444444444444\",\"cwd\":\"/Users/example/work\",\"timestamp\":\"2026-05-19T11:00:00Z\"}\n",
                 "{\"type\":\"message_end\",\"message\":{\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"api\":\"responses\",\"timestamp\":1779234002000,\"usage\":{\"input\":80,\"output\":20,\"cacheRead\":10,\"cacheWrite\":0}}}\n"
-            ),
-        )
-        .expect("write fixture");
-
-        let item = parse_pi_jsonl_file(&path, "2026-05-19T11:05:00Z", "fp".to_string())
-            .expect("parse")
-            .into_iter()
-            .next()
-            .expect("snapshot");
-
-        assert_eq!(item.peak_context_fill_tokens, None);
-        assert_eq!(item.first_turn_context_tokens, None);
-        assert_eq!(item.compaction_count, None);
-        assert!(item.compaction_timestamps.is_empty());
-        let serialized = serde_json::to_value(&item).expect("serialize");
-        assert!(serialized.get("peak_context_fill_tokens").is_none());
-        assert!(serialized.get("first_turn_context_tokens").is_none());
-        assert!(serialized.get("compaction_count").is_none());
-        assert!(serialized.get("compaction_timestamps").is_none());
-
-        let fingerprint = snapshot_fingerprint(SnapshotSource::Pi, &item);
-        let mut mutated = item.clone();
-        mutated.peak_context_fill_tokens = Some(10);
-        mutated.first_turn_context_tokens = Some(5);
-        mutated.compaction_count = Some(1);
-        assert_eq!(
-            snapshot_fingerprint(SnapshotSource::Pi, &mutated),
-            fingerprint
-        );
-
-        let _ = fs::remove_file(path);
+            ),None,None)
+        ] {
+            let path = temp_file("posture-source");
+            fs::write(&path,body).unwrap();
+            let item = if source == SnapshotSource::Codex {parse_codex_jsonl_file(&path,"2026-07-01T12:04:00Z","fp".into())} else {parse_pi_jsonl_file(&path,"2026-07-01T12:04:00Z","fp".into())}.unwrap().remove(0);
+            assert_eq!(item.peak_context_fill_tokens,peak);
+            assert_eq!(item.compaction_count,compaction);
+            let wire = serde_json::to_value(&item).unwrap();
+            if peak.is_none() {
+                assert_eq!(item.first_turn_context_tokens,None);
+                assert!(wire.get("peak_context_fill_tokens").is_none());
+                assert!(wire.get("first_turn_context_tokens").is_none());
+            }
+            let mut changed = item.clone();
+            if source == SnapshotSource::Pi {
+                assert!(item.compaction_timestamps.is_empty());
+                assert!(wire.get("compaction_count").is_none());
+                assert!(wire.get("compaction_timestamps").is_none());
+                changed.peak_context_fill_tokens=Some(10);
+                changed.first_turn_context_tokens=Some(5);
+                changed.compaction_count=Some(1);
+                assert_eq!(snapshot_fingerprint(source,&changed),snapshot_fingerprint(source,&item));
+            } else if peak.is_some() {
+                changed.peak_context_fill_tokens=None;
+                changed.first_turn_context_tokens=None;
+                changed.compaction_count=None;
+                changed.compaction_timestamps.clear();
+                assert_ne!(snapshot_fingerprint(source,&changed),snapshot_fingerprint(source,&item));
+            } else {
+                let curve=item.context_curve.as_ref().unwrap();
+                assert_eq!(curve.coverage,"pre_capture");
+                assert_eq!(curve.total_owned_request_count,0);
+                assert!(curve.points.is_empty());
+            }
+            let _=fs::remove_file(path);
+        }
     }
 
     /// Pins the `context_posture` semantic-envelope component.
@@ -75567,96 +73218,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_local_diagnostics_distinguish_loader_faults_and_identity_conflicts() {
-        use crate::codex_scan_diagnostics::LoaderReason;
-        let home = temp_dir("codex-local-loader-diagnostics");
-        let root = home.join("sessions");
-        fs::create_dir_all(&root).unwrap();
-        let roots = std::slice::from_ref(&root);
-        let empty = CodexTitleMetadata::load_from_roots(roots);
-        assert!(!empty.state_census_incomplete && !empty.sidecar_census_incomplete);
-        assert_eq!(
-            empty.local_diagnostics.state_titles.reason,
-            LoaderReason::Complete
-        );
-        assert_eq!(empty.local_diagnostics.session_index.completed_roots, 1);
-        let db = Connection::open(home.join("state_5.sqlite")).unwrap();
-        db.execute_batch("CREATE TABLE threads (id TEXT, title, tokens_used INTEGER, thread_source TEXT, first_user_message TEXT); INSERT INTO threads VALUES ('session', X'01', 1, 'user', NULL);").unwrap();
-        drop(db);
-        let malformed_row = CodexTitleMetadata::load_from_roots(roots);
-        assert_eq!(
-            malformed_row.local_diagnostics.state_titles.reason,
-            LoaderReason::SqliteRowDecode
-        );
-        assert_eq!(
-            malformed_row.local_diagnostics.state_threads.reason,
-            LoaderReason::SqliteRowDecode
-        );
-        assert_eq!(
-            malformed_row.local_diagnostics.spawn_edges.reason,
-            LoaderReason::Complete
-        );
-        assert!(malformed_row.state_census_incomplete);
-        fs::remove_file(home.join("state_5.sqlite")).unwrap();
-        let db = Connection::open(home.join("state_5.sqlite")).unwrap();
-        db.execute_batch("CREATE TABLE threads (id TEXT, title TEXT);")
-            .unwrap();
-        drop(db);
-        let schema = CodexTitleMetadata::load_from_roots(roots);
-        assert_eq!(
-            schema.local_diagnostics.state_threads.reason,
-            LoaderReason::IncompleteShape
-        );
-        assert_eq!(
-            schema.local_diagnostics.spawn_edges.reason,
-            LoaderReason::IncompleteShape
-        );
-        fs::remove_file(home.join("state_5.sqlite")).unwrap();
-        // Untitled cased aliases inside one state DB are an alias, not a row
-        // conflict, and the threads loader is the first to see them.
-        let db = Connection::open(home.join("state_5.sqlite")).unwrap();
-        db.execute_batch(concat!(
-            "CREATE TABLE threads (id TEXT, title TEXT, tokens_used INTEGER, ",
-            "thread_source TEXT, first_user_message TEXT); INSERT INTO threads VALUES ",
-            "('ABCDEF00-0000-7000-8000-000000000002', NULL, 1, 'user', NULL), ",
-            "('abcdef00-0000-7000-8000-000000000002', NULL, 2, 'user', NULL);"
-        ))
-        .unwrap();
-        drop(db);
-        let alias = CodexTitleMetadata::load_from_roots(roots);
-        assert!(alias.local_diagnostics.state_threads.identity_conflict);
-        assert!(!alias.local_diagnostics.state_titles.identity_conflict);
-        let taxonomy = alias.local_diagnostics.identity_conflict_taxonomy;
-        assert_eq!(
-            (
-                taxonomy.state_alias_keys,
-                taxonomy.state_intra_root_row_keys,
-                taxonomy.state_cross_root_keys,
-                taxonomy.conflict_keys_total,
-            ),
-            (1, 0, 0, 1)
-        );
-        fs::remove_file(home.join("state_5.sqlite")).unwrap();
-        // Differently cased UUIDs collapse to the same comparison key.
-        fs::write(
-            home.join("session_index.jsonl"),
-            concat!(
-                "{\"id\":\"ABCDEF00-0000-7000-8000-000000000001\",\"title\":\"old\"}\n",
-                "{\"id\":\"abcdef00-0000-7000-8000-000000000001\",\"title\":\"new\"}\n"
-            ),
-        )
-        .unwrap();
-        let conflict = CodexTitleMetadata::load_from_roots(roots);
-        assert!(conflict.local_diagnostics.session_index.identity_conflict);
-        assert_eq!(
-            conflict.local_diagnostics.session_index.reason,
-            LoaderReason::Complete
-        );
-        assert!(!conflict.state_census_incomplete && conflict.sidecar_census_incomplete);
-        fs::remove_dir_all(home).unwrap();
-    }
-
-    #[test]
     fn codex_local_diagnostics_bind_failed_root_and_sqlite_operation() {
         let home = temp_dir("codex-local-root-fault");
         let good = home.join("good");
@@ -75697,85 +73258,6 @@ mod tests {
             assert!(diagnostics[loader]["first_failure_stage"].is_null());
         }
 
-        // The same ids in two homes: `progress` differs only in tokens_used,
-        // `locator` in rollout_path, and the 0-token copy of `idle` is never
-        // loaded. `progress` is also created and the parent of a `bad` edge.
-        let progress = "abcdef00-0000-7000-8000-000000000011";
-        let locator = "abcdef00-0000-7000-8000-000000000012";
-        let idle = "abcdef00-0000-7000-8000-000000000013";
-        let child = "abcdef00-0000-7000-8000-000000000014";
-        let schema = concat!(
-            "CREATE TABLE threads (id TEXT, title TEXT, tokens_used INTEGER, model TEXT, ",
-            "rollout_path TEXT, thread_source TEXT, first_user_message TEXT); ",
-            "CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT);"
-        );
-        for (codex_dir, progress_tokens, progress_source, locator_path, idle_tokens) in [
-            (&bad, 5, "agent_created_thread", "a.jsonl", 3),
-            (&good, 7, "user", "b.jsonl", 0),
-        ] {
-            let db = Connection::open(codex_dir.join("state_5.sqlite")).unwrap();
-            db.execute_batch(schema).unwrap();
-            for (id, tokens, source, rollout_path) in [
-                (progress, progress_tokens, progress_source, "p.jsonl"),
-                (locator, 1, "user", locator_path),
-                (idle, idle_tokens, "user", "i.jsonl"),
-            ] {
-                db.execute(
-                    "INSERT INTO threads VALUES (?1, 'same', ?2, 'm', ?3, ?4, NULL)",
-                    rusqlite::params![id, tokens, rollout_path, source],
-                )
-                .unwrap();
-            }
-        }
-        let db = Connection::open(bad.join("state_5.sqlite")).unwrap();
-        db.execute(
-            "INSERT INTO thread_spawn_edges VALUES (?1, ?2)",
-            rusqlite::params![progress, child],
-        )
-        .unwrap();
-        drop(db);
-        let mut cross = CodexTitleMetadata::load_from_roots(&roots);
-        assert!(cross.local_diagnostics.state_threads.identity_conflict);
-        assert!(cross.state_census_incomplete && cross.sidecar_census_incomplete);
-        assert!(!cross.state_census_unscoped_incomplete);
-        assert!(!cross.sidecar_census_unscoped_incomplete);
-        let mut index = ScanIndex::default();
-        index
-            .codex_state_only_snapshot_fingerprints
-            .insert(locator.to_string(), "prior".to_string());
-        cross.count_prior_state_only_conflicts(&index);
-        let taxonomy = cross.local_diagnostics.identity_conflict_taxonomy;
-        assert_eq!(
-            (
-                taxonomy.state_alias_keys,
-                taxonomy.state_intra_root_row_keys,
-                taxonomy.state_cross_root_keys,
-                taxonomy.state_cross_root_progress_only_keys,
-                taxonomy.state_cross_root_identity_field_keys,
-            ),
-            (0, 0, 2, 1, 1)
-        );
-        assert_eq!(
-            taxonomy.state_cross_root_field_differs,
-            StateRowFieldDiffs {
-                tokens_used: 1,
-                rollout_path: 1,
-                ..Default::default()
-            }
-        );
-        assert_eq!(
-            (
-                taxonomy.conflict_keys_total,
-                taxonomy.conflict_keys_state_created,
-                taxonomy.conflict_keys_prior_state_only,
-                taxonomy.conflict_parent_child_edges,
-            ),
-            (2, 1, 1, 1)
-        );
-        let serialized = serde_json::to_string(&cross.local_diagnostics).unwrap();
-        for id in [progress, locator, idle, child, "p.jsonl", "a.jsonl"] {
-            assert!(!serialized.contains(id));
-        }
         fs::remove_dir_all(home).unwrap();
     }
 
@@ -75859,40 +73341,6 @@ mod tests {
                 fs::remove_dir_all(home).unwrap();
             }
         }
-    }
-
-    #[test]
-    fn codex_local_diagnostics_rotate_only_four_quarantines() {
-        let (home, root, mut index) = projection_adoption_fixture("codex-local-rotation", 7);
-        let quarantines: BTreeMap<_, _> = index
-            .current_snapshot_fingerprints()
-            .iter()
-            .map(|fingerprint| {
-                (
-                    fingerprint.clone(),
-                    snapshot_quarantine_record(SnapshotSource::Codex),
-                )
-            })
-            .collect();
-        index.activate_effective_upload_body_witness_revision(1);
-        let mut scan = projection_adoption_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
-        let mut observed = BTreeSet::new();
-        for generation in 0..7 {
-            scan.local_codex_diagnostics.as_mut().unwrap().generation = generation;
-            prepare_codex_recovery_diagnostics(&mut scan, &index, &quarantines);
-            let diagnostic = scan.local_codex_diagnostics.unwrap();
-            assert_eq!(diagnostic.quarantine_count, 7);
-            assert_eq!(diagnostic.lineage.iter().flatten().count(), 4);
-            observed.extend(
-                diagnostic
-                    .lineage
-                    .iter()
-                    .flatten()
-                    .map(|sample| sample.fingerprint_digest),
-            );
-        }
-        assert_eq!(observed.len(), 7);
-        fs::remove_dir_all(home).unwrap();
     }
 
     fn projection_adoption_scan(
@@ -76969,36 +74417,6 @@ mod tests {
     }
 
     #[test]
-    fn body_witness_finalizer_default_wrapper_preserves_bytes_and_noops() {
-        let root = temp_dir("body-witness-finalizer-default");
-        let mut index = ScanIndex::default();
-        for (revision, expected_count) in [(1, 1), (2, 0)] {
-            let mut wrapped = body_witness_finalizer_scan(&root, &mut index, revision);
-            let mut explicit = wrapped.clone();
-            let mut explicit_index = index.clone();
-            finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut wrapped, &mut index);
-            finalize_scan_after_policy_with_body_witness(
-                SnapshotSource::ClaudeCode,
-                &mut explicit,
-                &mut explicit_index,
-                snapshot_upload_body_witness,
-            );
-            assert_eq!(wrapped.snapshots.len(), expected_count);
-            assert_eq!(wrapped.semantic_noop_count, 1 - expected_count);
-            assert_eq!(format!("{wrapped:?}"), format!("{explicit:?}"));
-            assert_eq!(
-                serde_json::to_vec(&wrapped.snapshots).unwrap(),
-                serde_json::to_vec(&explicit.snapshots).unwrap()
-            );
-            assert_eq!(
-                serde_json::to_vec(&index).unwrap(),
-                serde_json::to_vec(&explicit_index).unwrap()
-            );
-        }
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn body_witness_finalizer_effective_projection_changes_only_delivery() {
         let root = temp_dir("body-witness-finalizer-effective");
         let mut index = ScanIndex::default();
@@ -77170,73 +74588,48 @@ mod tests {
     }
 
     #[test]
-    fn context_posture_fields_change_snapshot_fingerprint() {
-        // The posture fields are part of the fingerprint payload on purpose
-        // (same one-time backfill rationale as `origin`): a daemon that starts
-        // deriving them re-uploads every already-collected Claude session once.
-        let path = temp_file("claude-posture-fingerprint");
-        fs::write(
-            &path,
-            "{\"timestamp\":\"2026-07-01T13:00:00Z\",\"sessionId\":\"claude-posture-fp\",\"requestId\":\"req_011AAA\",\"message\":{\"id\":\"msg_011AAA\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":100,\"output_tokens\":5}}}\n",
-        )
-        .expect("write fixture");
-
-        let item = parse_claude_code_jsonl_file(
-            &path,
-            "2026-07-01T13:04:00Z",
-            "file-fingerprint".to_string(),
-        )
-        .expect("parse")
-        .into_iter()
-        .next()
-        .expect("snapshot");
-
-        let mut without_posture = item.clone();
-        without_posture.peak_context_fill_tokens = None;
-        without_posture.first_turn_context_tokens = None;
-        without_posture.compaction_count = None;
-        assert_ne!(
-            snapshot_fingerprint(SnapshotSource::ClaudeCode, &item),
-            snapshot_fingerprint(SnapshotSource::ClaudeCode, &without_posture)
-        );
-
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn claude_code_parser_prefers_ai_title_rows() {
-        let path = temp_file("claude-ai-title");
-        fs::write(
-            &path,
-            concat!(
+    fn claude_title_precedence() {
+        for (session, desktop, transcript, title, source) in [
+("claude-session-title", "{}", concat!(
                 "{\"type\":\"ai-title\",\"sessionId\":\"claude-session-title\",\"aiTitle\":\"Tighten dashboard activity feed\"}\n",
                 "{\"timestamp\":\"2026-05-06T10:00:00Z\",\"sessionId\":\"claude-session-title\",\"summary\":\"Claude Code session\"}\n",
                 "{\"timestamp\":\"2026-05-06T10:01:00Z\",\"sessionId\":\"claude-session-title\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":35,\"output_tokens\":8}}}\n"
-            ),
-        )
-        .expect("write fixture");
-
-        let item = parse_claude_code_jsonl_file(
-            &path,
-            "2026-05-06T10:04:00Z",
-            "file-fingerprint".to_string(),
-        )
-        .expect("parse")
-        .into_iter()
-        .next()
-        .expect("snapshot");
-
-        assert_eq!(item.source_session_id, "claude-session-title");
-        assert_eq!(
-            item.session_display_name.as_deref(),
-            Some("Tighten dashboard activity feed")
-        );
-        assert_eq!(
-            item.session_display_name_source.as_deref(),
-            Some("ai_title")
-        );
-
-        let _ = fs::remove_file(path);
+            ), "Tighten dashboard activity feed", "ai_title"),
+("s-1", "{\"cliSessionId\":\"s-1\",\"title\":\"Desktop auto title\",\"titleSource\":\"auto\"}", concat!(
+                "{\"type\":\"ai-title\",\"sessionId\":\"s-1\",\"aiTitle\":\"Transcript ai title\"}\n",
+                "{\"timestamp\":\"2026-07-10T10:01:00Z\",\"sessionId\":\"s-1\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n",
+            ), "Transcript ai title", "ai_title"),
+("s-2", "{\"cliSessionId\":\"s-2\",\"title\":\"My renamed session\",\"titleSource\":\"user\"}", concat!(
+                "{\"timestamp\":\"2026-07-10T10:00:00Z\",\"sessionId\":\"s-2\",\"summary\":\"Stale summary title\"}\n",
+                "{\"timestamp\":\"2026-07-10T10:01:00Z\",\"sessionId\":\"s-2\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n",
+            ), "My renamed session", "desktop_title"),
+("s-4", "{}", concat!(
+                // Harness wrappers and tool_result user records never title.
+                "{\"type\":\"user\",\"sessionId\":\"s-4\",\"message\":{\"role\":\"user\",\"content\":\"<command-name>/model</command-name>\"}}\n",
+                "{\"type\":\"user\",\"sessionId\":\"s-4\",\"isMeta\":true,\"message\":{\"role\":\"user\",\"content\":\"Caveat: the messages below were generated by the user while running local commands\"}}\n",
+                "{\"type\":\"user\",\"sessionId\":\"s-4\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"content\":[{\"type\":\"text\",\"text\":\"file contents here\"}]}]}}\n",
+                "{\"type\":\"user\",\"sessionId\":\"s-4\",\"timestamp\":\"2026-07-10T10:00:00Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"fix the flaky sessions table sort\"}]}}\n",
+                "{\"timestamp\":\"2026-07-10T10:01:00Z\",\"sessionId\":\"s-4\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n",
+            ), "fix the flaky sessions table sort", "first_prompt"),
+("37227cb3-9bd5-41c9-9fbc-85652afe8793", "{}", concat!(
+                "{\"type\":\"user\",\"sessionId\":\"37227cb3-9bd5-41c9-9fbc-85652afe8793\",\"message\":{\"role\":\"user\",\"content\":\"repair this pull request\"}}\n",
+                "{\"type\":\"custom-title\",\"customTitle\":\"pr-fixer-3532-37227cb3\"}\n",
+                "{\"timestamp\":\"2026-07-29T10:33:00Z\",\"sessionId\":\"37227cb3-9bd5-41c9-9fbc-85652afe8793\",\"message\":{\"model\":\"claude-sonnet-5\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n",
+            ), "Fix PR #3532", "transcript_title"),
+("s-5", "{}", concat!(
+                "{\"type\":\"user\",\"sessionId\":\"s-5\",\"message\":{\"role\":\"user\",\"content\":\"rename all the things\"}}\n",
+                "{\"timestamp\":\"2026-07-10T10:00:00Z\",\"sessionId\":\"s-5\",\"summary\":\"Rename cleanup pass\"}\n",
+                "{\"timestamp\":\"2026-07-10T10:01:00Z\",\"sessionId\":\"s-5\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n",
+            ), "Rename cleanup pass", "summary")
+        ] {
+            let (home, path, projects) = claude_desktop_fixture("claude-title-precedence", session, desktop, transcript);
+            let metadata = ClaudeTitleMetadata::load_from_roots(std::slice::from_ref(&projects));
+            let item = parse_claude_code_jsonl_file_with_title_metadata(&path, "2026-07-29T10:34:00Z", "fp".into(), &metadata, true).expect("parse").remove(0);
+            assert_eq!(item.source_session_id, session);
+            assert_eq!(item.session_display_name.as_deref(), Some(title), "{session}");
+            assert_eq!(item.session_display_name_source.as_deref(), Some(source), "{session}");
+            let _ = fs::remove_dir_all(home);
+        }
     }
 
     /// Build a fake home with one Claude transcript and one desktop-store
@@ -78403,131 +75796,94 @@ mod tests {
     }
 
     #[test]
-    fn claude_desktop_spawn_lineage_resolves_each_direct_parent() {
-        let entries = [
-            desktop_spawn_entry("root", "local_root", None),
-            desktop_spawn_entry("mid", "local_mid", Some("local_root")),
-            desktop_spawn_entry("leaf", "local_leaf", Some("local_mid")),
-            // The parent's store file is gone: nothing to resolve the link to.
-            desktop_spawn_entry("orphan", "local_orphan", Some("local_missing")),
-        ];
-        let lineage = claude_desktop_spawn_lineage(entries.iter(), |_| None);
-
-        assert_eq!(spawn_parent(&lineage, "mid"), Some(spawn_cli("root")));
-        // Each child names only its direct starting session, never the top.
-        assert_eq!(spawn_parent(&lineage, "leaf"), Some(spawn_cli("mid")));
-        assert_eq!(spawn_parent(&lineage, "root"), None);
-        assert_eq!(spawn_parent(&lineage, "orphan"), None);
-        assert_eq!(lineage.len(), 2);
-    }
-
-    #[test]
-    fn claude_desktop_spawn_lineage_refuses_ambiguous_and_cyclic_links() {
-        let entries = [
-            // Two store files for one child disagree on who started it.
-            desktop_spawn_entry("parent-a", "local_a", None),
-            desktop_spawn_entry("parent-b", "local_b", None),
-            desktop_spawn_entry("split-child", "local_split_1", Some("local_a")),
-            desktop_spawn_entry("split-child", "local_split_2", Some("local_b")),
-            // One desktop id claimed by two transcripts.
-            desktop_spawn_entry("dup-1", "local_dup", None),
-            desktop_spawn_entry("dup-2", "local_dup", None),
-            desktop_spawn_entry("dup-child", "local_dup_child", Some("local_dup")),
-            // A cycle is not a real edge.
-            desktop_spawn_entry("cycle-1", "local_c1", Some("local_c2")),
-            desktop_spawn_entry("cycle-2", "local_c2", Some("local_c1")),
-            desktop_spawn_entry("self", "local_self", Some("local_self")),
-        ];
-        let lineage = claude_desktop_spawn_lineage(entries.iter(), |_| None);
-        assert!(lineage.is_empty(), "{lineage:?}");
-    }
-
-    #[test]
-    fn claude_desktop_spawn_lineage_keeps_the_edge_below_an_unresolved_ancestor() {
-        let entries = [
-            // P names a parent the store cannot resolve: C -> P is still exact.
-            desktop_spawn_entry("p-missing", "local_p_missing", Some("local_gone")),
-            desktop_spawn_entry("c-missing", "local_c_missing", Some("local_p_missing")),
-            // P points at itself.
-            desktop_spawn_entry("p-self", "local_p_self", Some("local_p_self")),
-            desktop_spawn_entry("c-self", "local_c_self", Some("local_p_self")),
-            // P's own files disagree on whether anyone started it.
-            desktop_spawn_entry("p-mixed", "local_p_mixed_1", None),
-            desktop_spawn_entry("p-mixed", "local_p_mixed_2", Some("local_p_missing")),
-            desktop_spawn_entry("c-mixed", "local_c_mixed", Some("local_p_mixed_1")),
-            // A cycle above the child, not through it.
-            desktop_spawn_entry("x1", "local_x1", Some("local_x2")),
-            desktop_spawn_entry("x2", "local_x2", Some("local_x1")),
-            desktop_spawn_entry("c-cycle", "local_c_cycle", Some("local_x1")),
-        ];
-        let lineage = claude_desktop_spawn_lineage(entries.iter(), |_| None);
-        for (child, parent) in [
-            ("c-missing", "p-missing"),
-            ("c-self", "p-self"),
-            ("c-mixed", "p-mixed"),
-            ("c-cycle", "x1"),
+    fn claude_desktop_spawn_lineage_static_cases() {
+        for (rows, expected, malformed) in [
+            (
+                vec![
+                    ("root", "local_root", None),
+                    ("mid", "local_mid", Some("local_root")),
+                    ("leaf", "local_leaf", Some("local_mid")),
+                    ("orphan", "local_orphan", Some("local_missing")),
+                ],
+                vec![("mid", "root"), ("leaf", "mid")],
+                false,
+            ),
+            (
+                vec![
+                    ("parent-a", "local_a", None),
+                    ("parent-b", "local_b", None),
+                    ("split-child", "local_split_1", Some("local_a")),
+                    ("split-child", "local_split_2", Some("local_b")),
+                    ("dup-1", "local_dup", None),
+                    ("dup-2", "local_dup", None),
+                    ("dup-child", "local_dup_child", Some("local_dup")),
+                    ("cycle-1", "local_c1", Some("local_c2")),
+                    ("cycle-2", "local_c2", Some("local_c1")),
+                    ("self", "local_self", Some("local_self")),
+                ],
+                vec![],
+                false,
+            ),
+            (
+                vec![
+                    ("p-missing", "local_p_missing", Some("local_gone")),
+                    ("c-missing", "local_c_missing", Some("local_p_missing")),
+                    ("p-self", "local_p_self", Some("local_p_self")),
+                    ("c-self", "local_c_self", Some("local_p_self")),
+                    ("p-mixed", "local_p_mixed_1", None),
+                    ("p-mixed", "local_p_mixed_2", Some("local_p_missing")),
+                    ("c-mixed", "local_c_mixed", Some("local_p_mixed_1")),
+                    ("x1", "local_x1", Some("local_x2")),
+                    ("x2", "local_x2", Some("local_x1")),
+                    ("c-cycle", "local_c_cycle", Some("local_x1")),
+                ],
+                vec![
+                    ("c-missing", "p-missing"),
+                    ("c-self", "p-self"),
+                    ("c-mixed", "p-mixed"),
+                    ("c-cycle", "x1"),
+                ],
+                false,
+            ),
+            (
+                vec![
+                    ("p-bad", "local_p_bad", None),
+                    ("c-bad", "local_c_bad", Some("local_p_bad")),
+                ],
+                vec![("c-bad", "p-bad")],
+                true,
+            ),
         ] {
-            assert_eq!(
-                spawn_parent(&lineage, child),
-                Some(spawn_cli(parent)),
-                "{child}"
-            );
+            let mut entries = rows
+                .into_iter()
+                .map(|(cli, local, parent)| desktop_spawn_entry(cli, local, parent))
+                .collect::<Vec<_>>();
+            entries[0].spawned_from_unresolved = malformed;
+            let lineage = claude_desktop_spawn_lineage(entries.iter(), |_| None);
+            assert_eq!(lineage.len(), expected.len());
+            for (child, parent) in expected {
+                assert_eq!(spawn_parent(&lineage, child), Some(spawn_cli(parent)));
+            }
         }
-        // The cycle members themselves get no edge at all.
-        assert_eq!(spawn_parent(&lineage, "x1"), None);
-        assert_eq!(spawn_parent(&lineage, "x2"), None);
-    }
-
-    #[test]
-    fn claude_desktop_spawn_lineage_treats_malformed_spawned_from_as_unknown() {
-        let mut malformed = desktop_spawn_entry("p-bad", "local_p_bad", None);
-        malformed.spawned_from_unresolved = true;
-        let entries = [
-            malformed,
-            desktop_spawn_entry("c-bad", "local_c_bad", Some("local_p_bad")),
-        ];
-        let lineage = claude_desktop_spawn_lineage(entries.iter(), |_| None);
-        assert_eq!(spawn_parent(&lineage, "c-bad"), Some(spawn_cli("p-bad")));
-        assert_eq!(spawn_parent(&lineage, "p-bad"), None);
-    }
-
-    #[test]
-    fn claude_desktop_spawn_lineage_refuses_cycles_of_any_length() {
-        let length = 11;
-        let entries = (0..length)
-            .map(|position| {
-                let parent = format!("local_a{}", (position + 1) % length);
-                desktop_spawn_entry(
-                    &format!("a{position}"),
-                    &format!("local_a{position}"),
-                    Some(&parent),
-                )
-            })
-            .collect::<Vec<_>>();
-        let lineage = claude_desktop_spawn_lineage(entries.iter(), |_| None);
-        assert!(lineage.is_empty(), "{lineage:?}");
-
-        // A long acyclic chain keeps every direct edge.
-        let chain = (0..length)
-            .map(|position| {
-                let parent = (position > 0).then(|| format!("local_b{}", position - 1));
-                desktop_spawn_entry(
-                    &format!("b{position}"),
-                    &format!("local_b{position}"),
-                    parent.as_deref(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let lineage = claude_desktop_spawn_lineage(chain.iter(), |_| None);
-        assert_eq!(lineage.len(), length - 1);
-        assert_eq!(spawn_parent(&lineage, "b10"), Some(spawn_cli("b9")));
-    }
-
-    #[test]
-    fn claude_desktop_spawn_lineage_never_exports_a_non_uuid_transcript_id() {
+        for cycle in [true, false] {
+            let entries = (0..11)
+                .map(|i| {
+                    let parent = if cycle {
+                        Some(format!("local_b{}", (i + 1) % 11))
+                    } else {
+                        (i > 0).then(|| format!("local_b{}", i - 1))
+                    };
+                    desktop_spawn_entry(&format!("b{i}"), &format!("local_b{i}"), parent.as_deref())
+                })
+                .collect::<Vec<_>>();
+            let lineage = claude_desktop_spawn_lineage(entries.iter(), |_| None);
+            assert_eq!(lineage.len(), if cycle { 0 } else { 10 });
+            if !cycle {
+                assert_eq!(spawn_parent(&lineage, "b10"), Some(spawn_cli("b9")));
+            }
+        }
         let child = spawn_cli("child");
-        let mut entries = vec![
-            // A path-valued or malformed `cliSessionId` cannot be anyone's parent.
+        let entries = [
             desktop_spawn_entry_raw("/Users/example/project", "local_path", None),
             desktop_spawn_entry_raw(&child, "local_child", Some("local_path")),
             desktop_spawn_entry_raw("not a session", "local_bad", None),
@@ -78538,30 +75894,19 @@ mod tests {
                 None,
             ),
             desktop_spawn_entry("child-of-upper", "local_child_upper", Some("local_upper")),
+            desktop_spawn_entry("valid-parent", "local_valid", None),
+            desktop_spawn_entry_raw("../escape", "local_escape", Some("local_valid")),
         ];
-        // Nor can a non-UUID child carry an edge to a valid parent.
-        entries.push(desktop_spawn_entry("valid-parent", "local_valid", None));
-        entries.push(desktop_spawn_entry_raw(
-            "../escape",
-            "local_escape",
-            Some("local_valid"),
-        ));
-        let lineage = claude_desktop_spawn_lineage(entries.iter(), |_| None);
-        assert!(lineage.is_empty(), "{lineage:?}");
-
-        // The same shapes with a canonical parent id keep the edge.
-        let lineage = claude_desktop_spawn_lineage(
-            [
-                desktop_spawn_entry("valid-parent", "local_valid", None),
-                desktop_spawn_entry_raw(&child, "local_child", Some("local_valid")),
-            ]
-            .iter(),
-            |_| None,
-        );
+        assert!(claude_desktop_spawn_lineage(entries.iter(), |_| None).is_empty());
+        let entries = [
+            desktop_spawn_entry("valid-parent", "local_valid", None),
+            desktop_spawn_entry_raw(&child, "local_child", Some("local_valid")),
+        ];
         assert_eq!(
-            lineage
-                .get(&child)
-                .map(|lineage| lineage.parent_session_id.clone()),
+            spawn_parent(
+                &claude_desktop_spawn_lineage(entries.iter(), |_| None),
+                "child"
+            ),
             Some(spawn_cli("valid-parent"))
         );
     }
@@ -78644,129 +75989,135 @@ mod tests {
     }
 
     #[test]
-    fn claude_desktop_spawn_lineage_picks_the_transcript_live_when_the_child_was_created() {
-        // One desktop session switched transcripts: old ran 09-09..09-26, new
-        // 09-27..09-28. Each store copy names a different `cliSessionId`.
-        let entries = [
-            desktop_spawn_entry_created("old", "local_owner", None, Some("2026-09-09T18:31:51Z")),
-            desktop_spawn_entry_created("new", "local_owner", None, Some("2026-09-09T18:31:51Z")),
-            // Created while the old transcript was live, before the switch.
-            desktop_spawn_entry_created(
-                "before-switch",
-                "local_before_1",
-                Some("local_owner"),
-                Some("2026-09-18T11:29:54.915Z"),
-            ),
-            desktop_spawn_entry_created(
-                "before-switch",
-                "local_before_2",
-                Some("local_owner"),
-                Some("2026-09-18T11:29:54.915Z"),
-            ),
-            // Created after the switch.
-            desktop_spawn_entry_created(
-                "after-switch",
-                "local_after",
-                Some("local_owner"),
-                Some("2026-09-28T10:00:00Z"),
-            ),
-            // Created in the gap between the two: neither was live.
-            desktop_spawn_entry_created(
-                "in-gap",
-                "local_gap",
-                Some("local_owner"),
-                Some("2026-09-27T02:00:00Z"),
-            ),
-            // An ordinary single-transcript parent never needs a window.
-            desktop_spawn_entry_created("solo", "local_solo", None, None),
-            desktop_spawn_entry_created("solo-child", "local_solo_child", Some("local_solo"), None),
-        ];
-        let (lineage, asked) = spawn_lineage_with_windows(
-            &entries,
-            &[
-                (
-                    "old",
-                    live_window("2026-09-09T18:31:55.158Z", "2026-09-26T14:31:52.136Z"),
-                ),
-                (
-                    "new",
-                    live_window("2026-09-27T18:26:48.551Z", "2026-09-28T15:10:20.064Z"),
-                ),
-            ],
-        );
-        assert_eq!(
-            spawn_parent(&lineage, "before-switch"),
-            Some(spawn_cli("old"))
-        );
-        assert_eq!(
-            spawn_parent(&lineage, "after-switch"),
-            Some(spawn_cli("new"))
-        );
-        assert_eq!(spawn_parent(&lineage, "in-gap"), None);
-        assert_eq!(
-            spawn_parent(&lineage, "solo-child"),
-            Some(spawn_cli("solo"))
-        );
-        assert_eq!(lineage.len(), 3, "{lineage:?}");
-        assert_eq!(asked, BTreeSet::from([spawn_cli("old"), spawn_cli("new")]));
-    }
+    fn claude_desktop_spawn_lineage_window_cases() {
+        let mut cases = vec![
+            {
+                let entries = [
+                    desktop_spawn_entry_created(
+                        "old",
+                        "local_owner",
+                        None,
+                        Some("2026-09-09T18:31:51Z"),
+                    ),
+                    desktop_spawn_entry_created(
+                        "new",
+                        "local_owner",
+                        None,
+                        Some("2026-09-09T18:31:51Z"),
+                    ),
+                    // Created while the old transcript was live, before the switch.
+                    desktop_spawn_entry_created(
+                        "before-switch",
+                        "local_before_1",
+                        Some("local_owner"),
+                        Some("2026-09-18T11:29:54.915Z"),
+                    ),
+                    desktop_spawn_entry_created(
+                        "before-switch",
+                        "local_before_2",
+                        Some("local_owner"),
+                        Some("2026-09-18T11:29:54.915Z"),
+                    ),
+                    // Created after the switch.
+                    desktop_spawn_entry_created(
+                        "after-switch",
+                        "local_after",
+                        Some("local_owner"),
+                        Some("2026-09-28T10:00:00Z"),
+                    ),
+                    // Created in the gap between the two: neither was live.
+                    desktop_spawn_entry_created(
+                        "in-gap",
+                        "local_gap",
+                        Some("local_owner"),
+                        Some("2026-09-27T02:00:00Z"),
+                    ),
+                    // An ordinary single-transcript parent never needs a window.
+                    desktop_spawn_entry_created("solo", "local_solo", None, None),
+                    desktop_spawn_entry_created(
+                        "solo-child",
+                        "local_solo_child",
+                        Some("local_solo"),
+                        None,
+                    ),
+                ];
 
-    #[test]
-    fn claude_desktop_spawn_lineage_refuses_overlapping_copied_history() {
-        // The later transcript copied the earlier one's history, so both start
-        // with the same stamps; only the earlier one's last event separates them.
-        let windows = [
-            (
-                "earlier",
-                live_window("2026-10-09T14:33:34.213Z", "2026-10-09T20:26:26.825Z"),
-            ),
-            (
-                "forked",
-                live_window("2026-10-09T14:33:34.213Z", "2026-10-20T20:09:43.795Z"),
-            ),
-        ];
-        let entries = [
-            desktop_spawn_entry_created(
-                "earlier",
-                "local_fork",
-                None,
-                Some("2026-10-09T14:33:31Z"),
-            ),
-            desktop_spawn_entry_created("forked", "local_fork", None, Some("2026-10-09T14:33:31Z")),
-            // After the earlier transcript's last event: only the fork was live.
-            desktop_spawn_entry_created(
-                "after-last",
-                "local_after_last",
-                Some("local_fork"),
-                Some("2026-10-11T12:37:29.831Z"),
-            ),
-            // Inside the copied span: both windows hold it.
-            desktop_spawn_entry_created(
-                "inside-copy",
-                "local_inside_copy",
-                Some("local_fork"),
-                Some("2026-10-09T18:00:00Z"),
-            ),
-            // Within the margin of the earlier transcript's last event.
-            desktop_spawn_entry_created(
-                "at-boundary",
-                "local_at_boundary",
-                Some("local_fork"),
-                Some("2026-10-09T20:27:00Z"),
-            ),
-        ];
-        let (lineage, _) = spawn_lineage_with_windows(&entries, &windows);
-        assert_eq!(
-            spawn_parent(&lineage, "after-last"),
-            Some(spawn_cli("forked"))
-        );
-        assert_eq!(spawn_parent(&lineage, "inside-copy"), None);
-        assert_eq!(spawn_parent(&lineage, "at-boundary"), None);
-        assert_eq!(lineage.len(), 1, "{lineage:?}");
-    }
+                (
+                    entries.to_vec(),
+                    [
+                        (
+                            "old",
+                            live_window("2026-09-09T18:31:55.158Z", "2026-09-26T14:31:52.136Z"),
+                        ),
+                        (
+                            "new",
+                            live_window("2026-09-27T18:26:48.551Z", "2026-09-28T15:10:20.064Z"),
+                        ),
+                    ]
+                    .to_vec(),
+                    vec![
+                        ("before-switch", "old"),
+                        ("after-switch", "new"),
+                        ("solo-child", "solo"),
+                    ],
+                    true,
+                )
+            },
+            {
+                let windows = [
+                    (
+                        "earlier",
+                        live_window("2026-10-09T14:33:34.213Z", "2026-10-09T20:26:26.825Z"),
+                    ),
+                    (
+                        "forked",
+                        live_window("2026-10-09T14:33:34.213Z", "2026-10-20T20:09:43.795Z"),
+                    ),
+                ];
+                let entries = [
+                    desktop_spawn_entry_created(
+                        "earlier",
+                        "local_fork",
+                        None,
+                        Some("2026-10-09T14:33:31Z"),
+                    ),
+                    desktop_spawn_entry_created(
+                        "forked",
+                        "local_fork",
+                        None,
+                        Some("2026-10-09T14:33:31Z"),
+                    ),
+                    // After the earlier transcript's last event: only the fork was live.
+                    desktop_spawn_entry_created(
+                        "after-last",
+                        "local_after_last",
+                        Some("local_fork"),
+                        Some("2026-10-11T12:37:29.831Z"),
+                    ),
+                    // Inside the copied span: both windows hold it.
+                    desktop_spawn_entry_created(
+                        "inside-copy",
+                        "local_inside_copy",
+                        Some("local_fork"),
+                        Some("2026-10-09T18:00:00Z"),
+                    ),
+                    // Within the margin of the earlier transcript's last event.
+                    desktop_spawn_entry_created(
+                        "at-boundary",
+                        "local_at_boundary",
+                        Some("local_fork"),
+                        Some("2026-10-09T20:27:00Z"),
+                    ),
+                ];
 
-    #[test]
-    fn claude_desktop_spawn_lineage_refuses_a_switched_parent_without_evidence() {
+                (
+                    entries.to_vec(),
+                    windows.to_vec(),
+                    vec![("after-last", "forked")],
+                    false,
+                )
+            },
+        ];
         let windows = [
             (
                 "old",
@@ -78795,6 +76146,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
+
         for created in [
             // No creation time at all.
             vec![None],
@@ -78805,26 +76157,35 @@ mod tests {
             // Unparseable.
             vec![Some("yesterday")],
         ] {
-            let entries = owner
-                .iter()
-                .cloned()
-                .chain(child(&created[..]))
-                .collect::<Vec<_>>();
-            let (lineage, _) = spawn_lineage_with_windows(&entries, &windows);
-            assert!(lineage.is_empty(), "{created:?}: {lineage:?}");
+            cases.push((
+                owner.iter().cloned().chain(child(&created)).collect(),
+                windows.to_vec(),
+                vec![],
+                false,
+            ));
         }
-
-        // A dated child still refuses when one candidate transcript is
-        // missing, even though the other one is live.
-        let entries = owner
+        let dated = owner
             .iter()
             .cloned()
-            .chain(child(&[Some("2026-09-18T11:29:54Z")][..]))
+            .chain(child(&[Some("2026-09-18T11:29:54Z")]))
             .collect::<Vec<_>>();
-        let (lineage, _) = spawn_lineage_with_windows(&entries, &windows[..1]);
-        assert!(lineage.is_empty(), "{lineage:?}");
-        let (lineage, _) = spawn_lineage_with_windows(&entries, &windows);
-        assert_eq!(spawn_parent(&lineage, "child"), Some(spawn_cli("old")));
+        cases.push((dated.clone(), windows[..1].to_vec(), vec![], false));
+        cases.push((dated, windows.to_vec(), vec![("child", "old")], false));
+        for (entries, windows, expected, check_asked) in cases {
+            let (lineage, asked) = spawn_lineage_with_windows(&entries, &windows);
+            let actual: BTreeMap<_, _> = lineage
+                .into_iter()
+                .map(|(child, edge)| (child, edge.parent_session_id))
+                .collect();
+            let expected: BTreeMap<_, _> = expected
+                .into_iter()
+                .map(|(child, parent)| (spawn_cli(child), spawn_cli(parent)))
+                .collect();
+            assert_eq!(actual, expected);
+            if check_asked {
+                assert_eq!(asked, BTreeSet::from([spawn_cli("old"), spawn_cli("new")]));
+            }
+        }
     }
 
     #[test]
@@ -79454,80 +76815,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_desktop_auto_title_does_not_override_transcript_title() {
-        let (home, transcript_path, projects_root) = claude_desktop_fixture(
-            "claude-desktop-auto-vs-transcript",
-            "s-1",
-            "{\"cliSessionId\":\"s-1\",\"title\":\"Desktop auto title\",\"titleSource\":\"auto\"}",
-            concat!(
-                "{\"type\":\"ai-title\",\"sessionId\":\"s-1\",\"aiTitle\":\"Transcript ai title\"}\n",
-                "{\"timestamp\":\"2026-07-10T10:01:00Z\",\"sessionId\":\"s-1\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n",
-            ),
-        );
-        let metadata = ClaudeTitleMetadata::load_from_roots(std::slice::from_ref(&projects_root));
-
-        let item = parse_claude_code_jsonl_file_with_title_metadata(
-            &transcript_path,
-            "2026-07-10T10:04:00Z",
-            "fp".to_string(),
-            &metadata,
-            true,
-        )
-        .expect("parse")
-        .into_iter()
-        .next()
-        .expect("snapshot");
-
-        assert_eq!(
-            item.session_display_name.as_deref(),
-            Some("Transcript ai title")
-        );
-        assert_eq!(
-            item.session_display_name_source.as_deref(),
-            Some("ai_title")
-        );
-
-        let _ = fs::remove_dir_all(home);
-    }
-
-    #[test]
-    fn claude_desktop_user_title_overrides_transcript_title() {
-        let (home, transcript_path, projects_root) = claude_desktop_fixture(
-            "claude-desktop-user-override",
-            "s-2",
-            "{\"cliSessionId\":\"s-2\",\"title\":\"My renamed session\",\"titleSource\":\"user\"}",
-            concat!(
-                "{\"timestamp\":\"2026-07-10T10:00:00Z\",\"sessionId\":\"s-2\",\"summary\":\"Stale summary title\"}\n",
-                "{\"timestamp\":\"2026-07-10T10:01:00Z\",\"sessionId\":\"s-2\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n",
-            ),
-        );
-        let metadata = ClaudeTitleMetadata::load_from_roots(std::slice::from_ref(&projects_root));
-
-        let item = parse_claude_code_jsonl_file_with_title_metadata(
-            &transcript_path,
-            "2026-07-10T10:04:00Z",
-            "fp".to_string(),
-            &metadata,
-            true,
-        )
-        .expect("parse")
-        .into_iter()
-        .next()
-        .expect("snapshot");
-
-        assert_eq!(
-            item.session_display_name.as_deref(),
-            Some("My renamed session")
-        );
-        assert_eq!(
-            item.session_display_name_source.as_deref(),
-            Some("desktop_title")
-        );
-
-        let _ = fs::remove_dir_all(home);
-    }
-
-    #[test]
     fn claude_subagent_transcript_never_inherits_parent_desktop_title() {
         let (home, transcript_path, projects_root) = claude_desktop_fixture(
             "claude-desktop-subagent",
@@ -79613,83 +76900,6 @@ mod tests {
             changed.session_sidecar_fingerprint("unrelated-session")
         );
 
-        let _ = fs::remove_dir_all(home);
-    }
-
-    #[test]
-    fn claude_desktop_store_pages_past_five_thousand_and_resumes_correction() {
-        let session_id = "late-prefix-session";
-        let (home, _transcript_path, projects_root) = claude_desktop_fixture(
-            "claude-desktop-paged-title",
-            session_id,
-            "{}",
-            "{\"timestamp\":\"2026-07-10T10:01:00Z\",\"sessionId\":\"late-prefix-session\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":35,\"output_tokens\":8}}}\n",
-        );
-        let store_dir = home
-            .join("Library")
-            .join("Application Support")
-            .join("Claude")
-            .join("claude-code-sessions")
-            .join("account-ctx")
-            .join("workspace");
-        fs::remove_file(store_dir.join("local_desktop-1.json")).expect("remove base sidecar");
-        for value in 0..MAX_CLAUDE_DESKTOP_SESSION_FILES {
-            fs::write(store_dir.join(format!("{value:05}.json")), b"{}")
-                .expect("write bounded filler sidecar");
-        }
-        fs::write(
-            store_dir.join("zzzzz-late.json"),
-            format!(
-                "{{\"cliSessionId\":\"{session_id}\",\"title\":\"Recovered late desktop title\",\"titleSource\":\"user\"}}"
-            ),
-        )
-        .expect("write late-prefix title");
-
-        let mut index = ScanIndex::default();
-        let first = scan_source_roots(
-            SnapshotSource::ClaudeCode,
-            std::slice::from_ref(&projects_root),
-            &mut index,
-            "2026-07-10T10:04:00Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("first bounded sidecar page");
-        assert!(!first.sidecar_census_complete);
-        assert_eq!(first.snapshots.len(), 1);
-        assert_ne!(
-            first.snapshots[0].session_display_name.as_deref(),
-            Some("Recovered late desktop title")
-        );
-
-        let checkpoint = home.join("scanner-index.json");
-        index
-            .save(&checkpoint)
-            .expect("persist sidecar page cursor");
-        let mut resumed = ScanIndex::load(&checkpoint).expect("resume sidecar page cursor");
-        let second = scan_source_roots(
-            SnapshotSource::ClaudeCode,
-            std::slice::from_ref(&projects_root),
-            &mut resumed,
-            "2026-07-10T10:05:00Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("second bounded sidecar page");
-        assert!(second.sidecar_census_complete);
-        assert_eq!(second.snapshots.len(), 1);
-        assert_eq!(
-            second.snapshots[0].session_display_name.as_deref(),
-            Some("Recovered late desktop title")
-        );
-
-        let third = scan_source_roots(
-            SnapshotSource::ClaudeCode,
-            std::slice::from_ref(&projects_root),
-            &mut resumed,
-            "2026-07-10T10:06:00Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("unchanged correction is a semantic no-op");
-        assert!(third.snapshots.is_empty());
         let _ = fs::remove_dir_all(home);
     }
 
@@ -79871,40 +77081,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_first_prompt_falls_back_when_no_title_exists() {
-        let path = temp_file("claude-first-prompt");
-        fs::write(
-            &path,
-            concat!(
-                // Harness wrappers and tool_result user records never title.
-                "{\"type\":\"user\",\"sessionId\":\"s-4\",\"message\":{\"role\":\"user\",\"content\":\"<command-name>/model</command-name>\"}}\n",
-                "{\"type\":\"user\",\"sessionId\":\"s-4\",\"isMeta\":true,\"message\":{\"role\":\"user\",\"content\":\"Caveat: the messages below were generated by the user while running local commands\"}}\n",
-                "{\"type\":\"user\",\"sessionId\":\"s-4\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"content\":[{\"type\":\"text\",\"text\":\"file contents here\"}]}]}}\n",
-                "{\"type\":\"user\",\"sessionId\":\"s-4\",\"timestamp\":\"2026-07-10T10:00:00Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"fix the flaky sessions table sort\"}]}}\n",
-                "{\"timestamp\":\"2026-07-10T10:01:00Z\",\"sessionId\":\"s-4\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n",
-            ),
-        )
-        .expect("write fixture");
-
-        let item = parse_claude_code_jsonl_file(&path, "2026-07-10T10:04:00Z", "fp".to_string())
-            .expect("parse")
-            .into_iter()
-            .next()
-            .expect("snapshot");
-
-        assert_eq!(
-            item.session_display_name.as_deref(),
-            Some("fix the flaky sessions table sort")
-        );
-        assert_eq!(
-            item.session_display_name_source.as_deref(),
-            Some("first_prompt")
-        );
-
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
     fn claude_custom_title_keeps_dated_word_slugs() {
         for title in [
             "codex-completeness-owner-oct18",
@@ -79925,18 +77101,6 @@ mod tests {
                 Some(title),
                 "registration custom title: {title}"
             );
-        }
-    }
-
-    #[test]
-    fn claude_custom_title_dated_slugs_survive_parser_normalization() {
-        for title in [
-            "codex-completeness-owner-oct18",
-            "daemon-codex-counting-implementation-20261018",
-            "landing-owner-20261018T090555Z",
-            "cc-delta-admission-597-head3-oct18",
-            "autofix-i-ab719c5071-a3-review2c",
-        ] {
             let path = temp_file("claude-dated-custom-title");
             let records = [
                 serde_json::json!({
@@ -79969,37 +77133,6 @@ mod tests {
                 Some("transcript_title")
             );
         }
-    }
-
-    #[test]
-    fn claude_custom_title_rejects_identifiers_and_secret_shapes() {
-        let titles = [
-            "12345678-abcd-1234-abcd-123456789abc".to_string(),
-            "rollout-20261018-abc".to_string(),
-            "ROLLOUT-20261018-abc".to_string(),
-            "rollout-20261018-12345678-abcd-1234-abcd-123456789abc".to_string(),
-            "session_helper_review_20261018".to_string(),
-            "sess_helper_review_20261018".to_string(),
-            "a1".repeat(16),
-            "a1".repeat(20),
-            "a1".repeat(32),
-            "a".repeat(40),
-            format!("ghp_{}", "a1".repeat(18)),
-            format!("ghp_{}", "a".repeat(36)),
-            format!("sk-ant-api03-{}", "a1".repeat(20)),
-            format!("sk-ant-api03-{}", "a".repeat(40)),
-            "opaque12345678901234567890".to_string(),
-            "ab12-cd34-ef56-123456789012".to_string(),
-            "helper-review-12345678901234567".to_string(),
-        ];
-        for title in titles {
-            assert_eq!(claude_custom_title_display_title(title.clone()), None);
-            assert_eq!(claude_registration_display_title(title), None);
-        }
-    }
-
-    #[test]
-    fn claude_custom_title_relaxation_does_not_change_other_sources() {
         let title = "codex-completeness-owner-oct18";
         for source in [
             "first_prompt",
@@ -80029,59 +77162,30 @@ mod tests {
     }
 
     #[test]
-    fn claude_transcript_custom_title_beats_first_prompt() {
-        let path = temp_file("claude-custom-title");
-        fs::write(
-            &path,
-            concat!(
-                "{\"type\":\"user\",\"sessionId\":\"37227cb3-9bd5-41c9-9fbc-85652afe8793\",\"message\":{\"role\":\"user\",\"content\":\"repair this pull request\"}}\n",
-                "{\"type\":\"custom-title\",\"customTitle\":\"pr-fixer-3532-37227cb3\"}\n",
-                "{\"timestamp\":\"2026-07-29T10:33:00Z\",\"sessionId\":\"37227cb3-9bd5-41c9-9fbc-85652afe8793\",\"message\":{\"model\":\"claude-sonnet-5\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n",
-            ),
-        )
-        .expect("write fixture");
-
-        let item = parse_claude_code_jsonl_file(&path, "2026-07-29T10:34:00Z", "fp".to_string())
-            .expect("parse")
-            .into_iter()
-            .next()
-            .expect("snapshot");
-
-        assert_eq!(item.session_display_name.as_deref(), Some("Fix PR #3532"));
-        assert_eq!(
-            item.session_display_name_source.as_deref(),
-            Some("transcript_title")
-        );
-
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn claude_transcript_title_beats_first_prompt_fallback() {
-        let path = temp_file("claude-first-prompt-vs-summary");
-        fs::write(
-            &path,
-            concat!(
-                "{\"type\":\"user\",\"sessionId\":\"s-5\",\"message\":{\"role\":\"user\",\"content\":\"rename all the things\"}}\n",
-                "{\"timestamp\":\"2026-07-10T10:00:00Z\",\"sessionId\":\"s-5\",\"summary\":\"Rename cleanup pass\"}\n",
-                "{\"timestamp\":\"2026-07-10T10:01:00Z\",\"sessionId\":\"s-5\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n",
-            ),
-        )
-        .expect("write fixture");
-
-        let item = parse_claude_code_jsonl_file(&path, "2026-07-10T10:04:00Z", "fp".to_string())
-            .expect("parse")
-            .into_iter()
-            .next()
-            .expect("snapshot");
-
-        assert_eq!(
-            item.session_display_name.as_deref(),
-            Some("Rename cleanup pass")
-        );
-        assert_eq!(item.session_display_name_source.as_deref(), Some("summary"));
-
-        let _ = fs::remove_file(path);
+    fn claude_custom_title_rejects_identifiers_and_secret_shapes() {
+        let titles = [
+            "12345678-abcd-1234-abcd-123456789abc".to_string(),
+            "rollout-20261018-abc".to_string(),
+            "ROLLOUT-20261018-abc".to_string(),
+            "rollout-20261018-12345678-abcd-1234-abcd-123456789abc".to_string(),
+            "session_helper_review_20261018".to_string(),
+            "sess_helper_review_20261018".to_string(),
+            "a1".repeat(16),
+            "a1".repeat(20),
+            "a1".repeat(32),
+            "a".repeat(40),
+            format!("ghp_{}", "a1".repeat(18)),
+            format!("ghp_{}", "a".repeat(36)),
+            format!("sk-ant-api03-{}", "a1".repeat(20)),
+            format!("sk-ant-api03-{}", "a".repeat(40)),
+            "opaque12345678901234567890".to_string(),
+            "ab12-cd34-ef56-123456789012".to_string(),
+            "helper-review-12345678901234567".to_string(),
+        ];
+        for title in titles {
+            assert_eq!(claude_custom_title_display_title(title.clone()), None);
+            assert_eq!(claude_registration_display_title(title), None);
+        }
     }
 
     #[test]
@@ -81425,53 +78529,6 @@ mod tests {
         assert!(model_names.contains(&"gemini-2.5-pro"));
 
         let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn pi_parser_returns_none_for_empty_session() {
-        let path = temp_file("pi-empty");
-        fs::write(
-            &path,
-            "{\"type\":\"session\",\"session_id\":\"019e2700-cccc-7000-9000-333333333333\",\"cwd\":\"/tmp\",\"timestamp\":\"2026-05-14T22:20:00Z\"}\n",
-        )
-        .expect("write fixture");
-
-        let item =
-            parse_pi_jsonl_file(&path, "2026-05-14T22:21:00Z", "fp".to_string()).expect("parse");
-
-        assert!(item.is_empty());
-
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn pi_ms_timestamp_formats_bounded_rfc3339() {
-        // Anchor on epoch 0 and a verifiable mid-2024 date.
-        assert_eq!(
-            bounded_rfc3339_millis(0).as_deref(),
-            Some("1970-01-01T00:00:00.000Z")
-        );
-        // 2024-01-01T00:00:00.000Z = 1_704_067_200 s = 1_704_067_200_000 ms
-        assert_eq!(
-            bounded_rfc3339_millis(1_704_067_200_000).as_deref(),
-            Some("2024-01-01T00:00:00.000Z")
-        );
-        // Sub-second granularity is preserved.
-        assert_eq!(
-            bounded_rfc3339_millis(1_704_067_200_123).as_deref(),
-            Some("2024-01-01T00:00:00.123Z")
-        );
-        assert_eq!(bounded_rfc3339_millis(i64::MIN), None);
-        assert_eq!(bounded_rfc3339_millis(i64::MAX), None);
-    }
-
-    #[test]
-    fn snapshot_parser_streaming_guard() {
-        let source = include_str!("snapshots.rs");
-        let forbidden_std_call = ["fs::", "read", "_to", "_string"].concat();
-        let forbidden_reader_call = [".", "read", "_to", "_string("].concat();
-        assert!(!source.contains(&forbidden_std_call));
-        assert!(!source.contains(&forbidden_reader_call));
     }
 
     #[test]
@@ -84750,28 +81807,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn ownership_created_and_other_parser_sites_keep_their_original_scalar() {
-        let clock = ParentlessClock::now();
-        let values = parentless_created_thread_values(&clock, PARENTLESS_CHILD);
-        let parsed = parse_parentless_created_thread(
-            "ownership-created",
-            PARENTLESS_CHILD,
-            &clock,
-            &jsonl_body(&values),
-            |metadata, _| metadata.state_created_threads.clear(),
-        );
-        assert_eq!(parsed.ownership_incomplete_file_count, 1);
-        assert_eq!(parsed.cause, ownership::CREATED);
-        let root = temp_dir("ownership-other-parser");
-        let path = root.join(format!("rollout-{PARENTLESS_CHILD}.jsonl"));
-        fs::write(&path, "").unwrap();
-        let parsed = parse_codex_test_with_ledgers(&path, BTreeMap::new());
-        assert_eq!(parsed.ownership_incomplete_file_count, 1);
-        assert_eq!(parsed.cause, ownership::PARSER);
-        fs::remove_dir_all(root).unwrap();
-    }
-
     fn assert_parentless_held(parsed: &ParsedJsonlFile, case: &str, session_id: &str) {
         assert!(parsed.snapshots.is_empty(), "{case}: {parsed:#?}");
         assert_eq!(parsed.ownership_incomplete_file_count, 1, "{case}");
@@ -87069,68 +84104,6 @@ mod tests {
         assert_attribution_blocked(&index);
     }
 
-    /// SB-T16 (fixture check, not a universal heap bound): the attribution
-    /// of 50 complete zero-usage forks and 50 held forks beside 1,000
-    /// published forks (no entry) costs at most 256 serialized bytes per
-    /// `by_file` entry. Prints the measured serialized cost, the accounted
-    /// heap cost (`heap_layout_bound`, the bytes `fields!(ScanIndex)` charges;
-    /// `None` on an unsupported layout) and the projections of both for the
-    /// C-1 counts. Only the serialized figure is asserted.
-    #[test]
-    fn l_sb_by_file_entry_cost_fixture() {
-        let key = |n: usize| {
-            format!(
-                "/Users/synthetic-user/.codex/sessions/2026/10/20/rollout-2026-10-20T10-00-00-019fa111-2222-7333-8444-{n:012}.jsonl"
-            )
-        };
-        let id = |n: usize| format!("019fa111-2222-7333-8444-{n:012}");
-        let mut index = sb_cold(&[]);
-        for n in 0..1_000 {
-            sb_publish(&mut index, &key(n), &id(n));
-        }
-        for n in 1_000..1_050 {
-            sb_disclose(&mut index, &key(n), &[id(n).as_str()]);
-        }
-        for n in 1_050..1_100 {
-            // A held fork blocks its own id and one ambiguous candidate.
-            let candidate = id(n + 10_000);
-            sb_disclose(&mut index, &key(n), &[id(n).as_str(), candidate.as_str()]);
-        }
-        // Nothing is deleted. A deleted held fork is never pruned, so its
-        // entry costs what a present one does.
-        let entries = index.codex_state_only_blocked_by_file.len();
-        assert_eq!(entries, 100);
-        assert!(index
-            .codex_state_only_blocked_by_file
-            .keys()
-            .all(|stored| (1_000..1_100).any(|n| *stored == key(n))));
-        let by_file = serde_json::to_string(&index.codex_state_only_blocked_by_file)
-            .unwrap()
-            .len();
-        let fields = serde_json::to_string(&serde_json::json!({
-            "codex_state_only_blocked_by_file": index.codex_state_only_blocked_by_file,
-            "codex_state_only_blocked_unattributed": index.codex_state_only_blocked_unattributed,
-            "codex_state_only_blocked_legacy": index.codex_state_only_blocked_legacy,
-            "codex_state_only_blocked_attributed": index.codex_state_only_blocked_attributed,
-        }))
-        .unwrap()
-        .len();
-        let per_entry = by_file / entries;
-        let accounted =
-            crate::heap_layout_bound::bound(&index.codex_state_only_blocked_by_file, usize::MAX);
-        let accounted_per_entry = accounted.map(|bytes| bytes / entries);
-        println!(
-            "SB_T16 by_file_entries={entries} by_file_bytes={by_file} four_fields_bytes={fields} \
-             per_entry_bytes={per_entry} projected_bytes_49_entries={} projected_bytes_4189_entries={} \
-             accounted_heap_bytes={accounted:?} accounted_per_entry_bytes={accounted_per_entry:?} \
-             accounted_projected_bytes_4189_entries={:?}",
-            per_entry * 49,
-            per_entry * 4_189,
-            accounted_per_entry.map(|bytes| bytes * 4_189)
-        );
-        assert!(per_entry <= 256, "{per_entry} B per entry");
-    }
-
     #[test]
     fn codex_north_star_sized_legacy_prefix_emits_only_child_responses() {
         const INHERITED_TURNS: u64 = 15_359;
@@ -87906,60 +84879,59 @@ mod tests {
     }
 
     #[test]
-    fn v6_snapshot_preflight_rejects_oversized_compaction_timeline() {
-        let mut request = valid_v6_batch_request();
-        request.snapshots[0].compaction_timestamps =
-            vec!["2026-07-20T12:00:00Z".to_string(); MAX_COMPACTION_TIMESTAMPS + 1];
-
-        let error = validate_snapshot_batch_request(&request).expect_err("preflight rejects");
-
-        assert!(
-            error.contains("more than 64 compaction_timestamps"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn v6_snapshot_preflight_rejects_oversized_compaction_events() {
-        let mut request = valid_v6_batch_request();
-        request.snapshots[0].compaction_events = vec![
-            SnapshotCompactionEvent {
-                at: "2026-07-20T12:00:00Z".to_string(),
-                before: Some(1),
-                after: None,
-                trigger: None,
-            };
-            MAX_COMPACTION_TIMESTAMPS + 1
+    fn v6_snapshot_preflight_rejects_invalid_compaction_and_curve() {
+        type Case = (fn(&mut SnapshotBatchRequest), &'static str);
+        let cases: [Case; 3] = [
+            (
+                |request: &mut SnapshotBatchRequest| {
+                    request.snapshots[0].compaction_timestamps =
+                        vec!["2026-07-20T12:00:00Z".to_string(); MAX_COMPACTION_TIMESTAMPS + 1];
+                },
+                "more than 64 compaction_timestamps",
+            ),
+            (
+                |request: &mut SnapshotBatchRequest| {
+                    request.snapshots[0].compaction_events = vec![
+                        SnapshotCompactionEvent {
+                            at: "2026-07-20T12:00:00Z".to_string(),
+                            before: Some(1),
+                            after: None,
+                            trigger: None,
+                        };
+                        MAX_COMPACTION_TIMESTAMPS + 1
+                    ];
+                },
+                "more than 64 compaction_events",
+            ),
+            (
+                |request: &mut SnapshotBatchRequest| {
+                    request.source = SnapshotSource::Codex.api_slug().to_string();
+                    let item = &mut request.snapshots[0];
+                    item.provenance.collector = "codex_state_sqlite".to_string();
+                    item.context_curve = Some(build_context_curve(
+                        CODEX_SNAPSHOT_PARSER_VERSION,
+                        "codex_owned_rollout_occurrences:v1",
+                        "codex_token_count_model_context_window:v1",
+                        &[ContextCurveCandidatePoint {
+                            observed_at: Some("2026-08-20T12:00:01Z".to_string()),
+                            effective_input_tokens: 10,
+                            model: Some("gpt-5.5".to_string()),
+                            context_window_tokens: Some(258_400),
+                        }],
+                        &[],
+                        "pre_capture",
+                    ));
+                    item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::Codex, item);
+                },
+                "state-only Codex evidence",
+            ),
         ];
-
-        let error = validate_snapshot_batch_request(&request).expect_err("preflight rejects");
-
-        assert!(error.contains("more than 64 compaction_events"), "{error}");
-    }
-
-    #[test]
-    fn v6_snapshot_preflight_rejects_available_curve_for_state_only_codex() {
-        let mut request = valid_v6_batch_request();
-        request.source = SnapshotSource::Codex.api_slug().to_string();
-        let item = &mut request.snapshots[0];
-        item.provenance.collector = "codex_state_sqlite".to_string();
-        item.context_curve = Some(build_context_curve(
-            CODEX_SNAPSHOT_PARSER_VERSION,
-            "codex_owned_rollout_occurrences:v1",
-            "codex_token_count_model_context_window:v1",
-            &[ContextCurveCandidatePoint {
-                observed_at: Some("2026-08-20T12:00:01Z".to_string()),
-                effective_input_tokens: 10,
-                model: Some("gpt-5.5".to_string()),
-                context_window_tokens: Some(258_400),
-            }],
-            &[],
-            "pre_capture",
-        ));
-        item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::Codex, item);
-
-        let error = validate_snapshot_batch_request(&request).expect_err("preflight rejects");
-        assert!(error.contains("state-only Codex evidence"), "{error}");
+        for (mutate, expected) in cases {
+            let mut request = valid_v6_batch_request();
+            mutate(&mut request);
+            let error = validate_snapshot_batch_request(&request).expect_err("preflight rejects");
+            assert!(error.contains(expected), "{error}");
+        }
     }
 
     #[test]
@@ -88313,39 +85285,6 @@ mod tests {
             .into_iter()
             .next()
             .expect("usage snapshot")
-    }
-
-    #[test]
-    fn codex_creator_parallel_fixtures_keep_their_own_identity() {
-        let start = std::sync::Barrier::new(8);
-        std::thread::scope(|scope| {
-            let handles = (0..8)
-                .map(|worker| {
-                    let start = &start;
-                    scope.spawn(move || {
-                        start.wait();
-                        for iteration in 0..64 {
-                            let creator = format!("synthetic-worker-{worker}-{iteration}");
-                            let mut header = codex_creator_header();
-                            header["payload"]["creator_user_id"] = json!(creator);
-                            let id = header["payload"]["id"].as_str().unwrap();
-                            let item = codex_creator_item(std::slice::from_ref(&header), id);
-                            assert_eq!(item.source_session_id, id);
-                            assert_eq!(
-                                item.session_account_evidence
-                                    .as_ref()
-                                    .expect("isolated creator evidence")
-                                    .account_identifier_hash,
-                                ottto_core::billing_identity_hash("openai", "account", &creator)
-                            );
-                        }
-                    })
-                })
-                .collect::<Vec<_>>();
-            for handle in handles {
-                handle.join().expect("parallel creator fixture");
-            }
-        });
     }
 
     fn codex_child_creator_header() -> Value {
@@ -90039,59 +86978,6 @@ mod tests {
     }
 
     #[test]
-    fn revision_v2_projection_is_explicit_non_recursive_and_version_sensitive() {
-        let source = SnapshotSource::Codex;
-        let policy = SnapshotUploadPolicy::default();
-        let item = valid_v6_batch_request()
-            .snapshots
-            .into_iter()
-            .next()
-            .expect("fixture snapshot");
-        let hashes = snapshot_semantic_component_hashes(source, &item);
-        let body = snapshot_revision_v2_body(source, &item, policy, &hashes);
-        let object = body.as_object().expect("revision body object");
-        assert_eq!(
-            object.keys().map(String::as_str).collect::<BTreeSet<_>>(),
-            BTreeSet::from([
-                "canonicalization",
-                "component_hashes",
-                "contract",
-                "lifecycle",
-                "parser_version",
-                "provenance",
-                "scan_identity_version",
-                "source",
-                "source_file_fingerprint",
-                "source_session_id",
-                "upload_policy",
-            ])
-        );
-        let encoded = serde_json::to_string(&body).expect("revision body JSON");
-        for forbidden in [
-            "semantic_envelope",
-            "revision_hash",
-            "content_hash",
-            "snapshot_fingerprint",
-            "collected_at",
-            "source_file_count",
-            "challenge",
-        ] {
-            assert!(!encoded.contains(forbidden), "forbidden field {forbidden}");
-        }
-
-        let mut changed_parser = body;
-        changed_parser["parser_version"] = json!("codex_jsonl:future");
-        let canonical = crate::canonical_json::canonicalize(&changed_parser)
-            .expect("changed parser body canonicalizes");
-        let mut digest = Sha256::new();
-        digest.update(canonical);
-        assert_ne!(
-            format!("{:x}", digest.finalize()),
-            snapshot_revision_v2_hash(source, &item, policy, &hashes)
-        );
-    }
-
-    #[test]
     fn content_hash_moves_with_every_policy_neutral_component() {
         let source = SnapshotSource::ClaudeCode;
         let base = valid_v6_batch_request()
@@ -90214,62 +87100,6 @@ mod tests {
         assert!(!json.contains("PRIVATE"));
         assert!(!json.contains(&"a".repeat(64)));
         assert_eq!(serde_json::to_vec(&index).unwrap(), before);
-    }
-
-    #[test]
-    fn fenced_census_aggregate_caps_and_absent_traversal_stay_unknown() {
-        let mut index = ScanIndex::default();
-        let empty = index.local_codex_census_aggregates();
-        assert!(!empty.traversal_present);
-        assert_eq!(empty.pending_directories, None);
-        assert_eq!(empty.directory_census_stable, None);
-        assert_eq!(empty.protected_absent_from_observed_rollouts, None);
-        assert_eq!(empty.protected_history, Some(0));
-        let entry = manifest_index_entry(None);
-        for i in 0..=codex_scan_diagnostics::MAX_FENCED_CENSUS_ENTRIES {
-            index.files.insert(i.to_string(), entry.clone());
-        }
-        let capped = index.local_codex_census_aggregates();
-        assert!(!capped.protected_aggregation_complete);
-        assert_eq!(capped.protected_history, None);
-        index.files.clear();
-        let mut traversal = terminal_unhealthy_traversal("private".into());
-        for i in 0..=codex_scan_diagnostics::MAX_FENCED_CENSUS_ENTRIES {
-            traversal.codex_rollout_paths.insert(i.to_string());
-        }
-        index.traversal = Some(traversal);
-        let capped = index.local_codex_census_aggregates();
-        assert!(!capped.protected_aggregation_complete);
-        assert_eq!(capped.protected_absent_from_observed_rollouts, None);
-    }
-
-    #[test]
-    #[ignore = "bounded synthetic aggregate allocation and latency measurement"]
-    fn fenced_census_aggregate_native_measurement() {
-        let mut index = ScanIndex::default();
-        let mut traversal = terminal_unhealthy_traversal("private".into());
-        let mut entry = manifest_index_entry(None);
-        entry.codex_protected_owner = Some("a".repeat(64));
-        for i in 0..codex_scan_diagnostics::MAX_FENCED_CENSUS_ENTRIES {
-            let key = format!("synthetic/{i:05}");
-            traversal.codex_rollout_paths.insert(key.clone());
-            index.files.insert(key, entry.clone());
-        }
-        index.traversal = Some(traversal);
-        let started = std::time::Instant::now();
-        let (result, allocations) =
-            crate::retry_allocation_probe::measure(|| index.local_codex_census_aggregates());
-        let elapsed = started.elapsed();
-        assert_eq!(result.protected_history, Some(32_768));
-        assert_eq!(
-            allocations.allocations, 0,
-            "projection must not clone index/keys"
-        );
-        println!(
-            "fenced_census_aggregate entries=32768 elapsed_us={} heap_allocations={}",
-            elapsed.as_micros(),
-            allocations.allocations
-        );
     }
 
     #[test]
@@ -91391,30 +88221,6 @@ mod tests {
         assert!(envelope.get("forced_full_rescan").is_none());
     }
 
-    #[test]
-    fn content_identity_body_stays_canonicalizable() {
-        // Guards the `expect` inside `snapshot_content_hash`: if a future field
-        // brings a fractional number into the identity body, this fails here
-        // instead of panicking on a customer's machine.
-        for source in [
-            SnapshotSource::Pi,
-            SnapshotSource::Codex,
-            SnapshotSource::ClaudeCode,
-        ] {
-            let item = valid_v6_batch_request()
-                .snapshots
-                .into_iter()
-                .next()
-                .expect("fixture snapshot");
-            let body = snapshot_content_identity_body(
-                source,
-                &item.source_session_id,
-                &snapshot_semantic_component_hashes(source, &item),
-            );
-            assert!(crate::canonical_json::is_canonicalizable(&body));
-        }
-    }
-
     /// The exact on-disk shape of an index written before the accepted-ledger
     /// version field existed: the accepted set is present, because
     /// `record_accepted_snapshot_fingerprints` recorded real entity ACKs, and
@@ -91689,7 +88495,7 @@ mod tests {
     /// or reconciliation still holds it open.
     #[test]
     fn f2_traversal_reset_is_scoped_to_the_terminal_unhealthy_shape() {
-        let retained: [(&str, ScanTraversalCheckpoint); 3] = [
+        let retained: [(&str, ScanTraversalCheckpoint); 4] = [
             (
                 "mid-walk and healthy",
                 traversal_reset_scope_checkpoint(
@@ -91710,6 +88516,16 @@ mod tests {
             (
                 "discovery complete and healthy",
                 traversal_reset_scope_checkpoint(VecDeque::new(), ScanTraversalCounts::default()),
+            ),
+            (
+                "terminal unhealthy",
+                traversal_reset_scope_checkpoint(
+                    VecDeque::new(),
+                    ScanTraversalCounts {
+                        symlink_rejected_count: 1,
+                        ..ScanTraversalCounts::default()
+                    },
+                ),
             ),
         ];
 
@@ -91734,30 +88550,9 @@ mod tests {
                 ("mid-walk and healthy", true),
                 ("mid-walk with errors already recorded", true),
                 ("discovery complete and healthy", true),
+                ("terminal unhealthy", false),
             ],
             "only a terminal-unhealthy traversal is reset by arming"
-        );
-    }
-
-    /// The complement: the shape the reset exists for is still reset. This is
-    /// the persisted traversal `ensure_bounded_traversal` refuses to rebuild
-    /// while its independent retry is not due, so nothing else would clear it.
-    #[test]
-    fn f2_traversal_reset_still_happens_for_the_terminal_unhealthy_shape() {
-        let mut index = traversal_reset_scope_index(traversal_reset_scope_checkpoint(
-            VecDeque::new(),
-            ScanTraversalCounts {
-                symlink_rejected_count: 1,
-                ..ScanTraversalCounts::default()
-            },
-        ));
-
-        let (armed, _) = index.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
-
-        assert!(!armed.is_empty(), "the page must arm");
-        assert!(
-            index.traversal.is_none(),
-            "a terminal-unhealthy traversal is still dropped so discovery restarts"
         );
     }
 }
