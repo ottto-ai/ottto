@@ -1189,8 +1189,13 @@ fn sticky_cache_retractions_are_budgeted_before_retaining_identity_parts() {
         coverage: "complete".into(),
         omitted_observation_count: Some(0),
     });
-    let prior = json!({"observations":(0..32)
-        .map(|n| json!({"event_id":format!("cache:{n:064x}")})).collect::<Vec<_>>()});
+    let cache_fixture = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+    let observation = cache_fixture.cache_observations_state.unwrap()["observations"][0].clone();
+    let prior = json!({"observations":(0..32).map(|n| {
+        let mut row = observation.clone();
+        row["event_id"] = json!(format!("cache:{n:064x}"));
+        row
+    }).collect::<Vec<_>>()});
     let accepted = identity::AcceptedBuckets::default();
     identity::apply_with_accepted_for_test(&mut item, &proof, &accepted).unwrap();
     let clean = stripped(&item);
@@ -1201,6 +1206,17 @@ fn sticky_cache_retractions_are_budgeted_before_retaining_identity_parts() {
     identity::apply_with_accepted_for_test(&mut unreserved, &proof, &accepted).unwrap();
     assert_eq!(identity::item_bytes(&unreserved), identity::MAX_ITEM_BYTES);
     prepare_cache_observations(&mut unreserved, Some(&prior));
+    assert_eq!(
+        unreserved
+            .cache_observations
+            .as_ref()
+            .unwrap()
+            .operations
+            .len(),
+        32,
+        "reconciled patch: {:?}",
+        unreserved.cache_observations
+    );
     assert!(identity::item_bytes(&unreserved) > identity::MAX_ITEM_BYTES);
 
     let mut projected = padded.clone();

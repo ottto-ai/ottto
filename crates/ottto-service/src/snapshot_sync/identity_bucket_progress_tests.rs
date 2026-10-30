@@ -112,6 +112,7 @@ fn only_a_stored_body_ack_records_bucket_keys() {
 fn identity_budget_reserves_predecessor_retractions_without_mutating_local_patch() {
     use crate::snapshots::cache_observations::CacheObservations;
     let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+    let observation = item.cache_observations_state.as_ref().unwrap()["observations"][0].clone();
     item.cache_observations = Some(CacheObservations {
         schema_version: 1,
         operations: vec![],
@@ -122,10 +123,13 @@ fn identity_budget_reserves_predecessor_retractions_without_mutating_local_patch
     let mut progress = progress();
     progress.accepted_cache_states.insert(
         cache_session_key(&item.source_session_id),
-        json!({"observations":(0..32).map(|n| json!({"event_id":format!("cache:{n:064x}")})).collect::<Vec<_>>()}),
+        json!({"observations":(0..32).map(|n| {
+            let mut row = observation.clone();
+            row["event_id"] = json!(format!("cache:{n:064x}"));
+            row
+        }).collect::<Vec<_>>()}),
     );
     let reserved = identity_cache_wire_reserve(&item, &progress);
-    assert!(reserved > 2_000);
     assert_eq!(item.cache_observations, before);
     let mut projected = item.clone();
     prepare_snapshot_cache_for_upload(&mut projected, &progress, true, false, &BTreeSet::new());
@@ -136,8 +140,11 @@ fn identity_budget_reserves_predecessor_retractions_without_mutating_local_patch
             .unwrap()
             .operations
             .len(),
-        32
+        32,
+        "reconciled patch: {:?}",
+        projected.cache_observations,
     );
+    assert!(reserved > 2_000, "reserved={reserved}");
     assert_eq!(
         crate::snapshots::claude_request_identity::item_bytes(&projected),
         crate::snapshots::claude_request_identity::item_bytes(&item) + reserved,
