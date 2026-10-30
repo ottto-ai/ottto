@@ -573,8 +573,10 @@ fn fork_round_trip_keeps_only_local_cutoff_fields_and_funds_the_box() {
 #[test]
 fn non_pi_fork_refuses_instead_of_silently_dropping_and_default_is_empty() {
     use crate::durable_tail_codec::DurableEmpty;
-    let mut ledger = PiLedger::default();
-    ledger.fork = Some(Box::default());
+    let ledger = PiLedger {
+        fork: Some(Box::default()),
+        ..PiLedger::default()
+    };
     assert!(ledger.durable_empty());
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let mut acc = SnapshotAccumulator::new(source);
