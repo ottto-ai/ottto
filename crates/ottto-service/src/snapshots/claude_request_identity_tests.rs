@@ -82,6 +82,7 @@ fn typed_part(part: &Value) -> SnapshotIdentityPart {
 
 fn typed_row(row: &Value) -> SnapshotModelUsage {
     SnapshotModelUsage {
+        copy_unproven: row.get("copy_unproven").and_then(Value::as_bool).unwrap_or(false),
         model: opt_string(row, "model").unwrap(),
         input_tokens: count(row, "input_tokens"),
         output_tokens: count(row, "output_tokens"),

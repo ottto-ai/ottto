@@ -4636,6 +4636,7 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
         removed_usage: item.removed_usage,
         telemetry_owned_complete: item.telemetry_owned_complete,
         resolver_conflict_count: item.resolver_conflict_count,
+        copy_unproven_counts: item.copy_unproven_counts,
         claude_money: None,
         claude_usage_request_ids: BTreeSet::new(),
         claude_usage_occurrences: BTreeMap::new(),
@@ -6202,11 +6203,18 @@ fn prepare_sync_source_inner(
     let checkpoint_namespace = attribution_context
         .as_ref()
         .map(SessionAttributionContext::checkpoint_namespace);
-    let upload_context = cycle_upload_context(
+    let mut upload_context = cycle_upload_context(
         upload_policy,
         checkpoint_namespace.as_deref(),
         cache_observations_enabled,
     );
+    let copy_unproven_enabled = source == SnapshotSource::ClaudeCode
+        && activity_hint.copy_unproven_contract.as_deref() == Some("copy_unproven:v1");
+    // Context adoption invalidates stale pending pages on capability downgrade.
+    // OFF preserves the exact released context and body bytes.
+    if copy_unproven_enabled {
+        upload_context.push_str(":copy_unproven:v1");
+    }
     let legacy_policy_index_path = legacy_policy_scoped_snapshot_index_path(
         support_dir,
         source,
@@ -6288,6 +6296,7 @@ fn prepare_sync_source_inner(
     }
     continuation::observe(source, &upload_context, upload_policy);
     activate_source_upload_context(source, upload_context, &mut index, &mut upload_progress);
+    index.copy_unproven_enabled = copy_unproven_enabled;
     if !context_curve_enabled {
         // Stamp the off transition before taking the partial-commit baseline.
         // If an ordinary no-curve upload is partially accepted and then shed,

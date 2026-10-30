@@ -682,6 +682,7 @@ mod tests {
                 vec![crate::snapshots::SnapshotModelUsage {
                     evidence_ref: None,
                     identity_parts: None,
+                    copy_unproven: false,
                     model: model.to_string(),
                     input_tokens: 0,
                     output_tokens: 0,
@@ -731,6 +732,7 @@ mod tests {
             removed_usage: None,
             telemetry_owned_complete: None,
             resolver_conflict_count: None,
+            copy_unproven_counts: None,
             claude_money: None,
             session_account_evidence: None,
             claude_usage_request_ids: std::collections::BTreeSet::new(),

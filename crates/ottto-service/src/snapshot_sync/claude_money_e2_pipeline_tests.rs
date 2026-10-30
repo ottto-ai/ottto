@@ -3233,3 +3233,45 @@ fn e2_pipeline_lost_removal_metadata_rederives_or_emits_flagged_without_delaying
         }
     }
 }
+
+
+#[test]
+fn e2_pipeline_copy_unproven_wire_is_capability_gated_and_partitions_own_rows() {
+    for sampled in [false, true] {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-pipeline-copy-wire-gate");
+        let scanner = E2ScanFixture::default();
+        c.root(ROOT, &resumed(ROOT, &[A, B]));
+        let old = ScanIndex::default();
+        let original = ready(&c, &scanner, old.clone(), 100, sampled);
+        let mut prior = settle(&c, &old, original, &mut e2_progress());
+        e2::pipeline_test_observer::retire_census(&mut prior, &file(ROOT));
+        c.write_at(&file(COPY), &resumed(COPY, &[A, B, C]), "2026-08-02T07:03:00Z");
+        // Same bucket/model/account: the prefix must not contaminate own rows,
+        // including shared telemetry placement memo entries.
+        c.evidence_for(COPY, &[api_for(COPY, "a", 10, 250), api_for(COPY, "c", 10, 400)], &[]);
+        let off = ready(&c, &scanner, prior.clone(), 100, sampled);
+        let off_body = body(&off, COPY).unwrap();
+        let legacy = serde_json::to_value(off_body).unwrap();
+        assert!(legacy.get("copy_unproven_counts").is_none());
+        assert!(off_body.usage_buckets.iter().flat_map(|b| &b.model_usage).all(|r| !r.copy_unproven));
+        assert!(!serde_json::to_string(&legacy).unwrap().contains("copy_unproven"));
+        let again = ready(&c, &scanner, prior.clone(), 100, sampled);
+        assert_eq!(canonical(off_body), canonical(body(&again, COPY).unwrap()), "gate-off unchanged input preserves complete body bytes");
+        assert_eq!(off_body.snapshot_fingerprint, body(&again, COPY).unwrap().snapshot_fingerprint);
+        prior.copy_unproven_enabled = true;
+        e2::take_diag();
+        let on = ready(&c, &scanner, prior, 100, sampled);
+        let on_body = body(&on, COPY).unwrap();
+        assert_eq!((on_body.request_count, on_body.input_tokens, &on_body.cost), (off_body.request_count, off_body.input_tokens, &off_body.cost));
+        assert_eq!(on_body.copy_unproven_counts, Some(crate::snapshots::CopyUnprovenCounts { rows: 2, requests: 2 }));
+        let rows = on_body.usage_buckets.iter().flat_map(|b| &b.model_usage).collect::<Vec<_>>();
+        assert_eq!(rows.iter().filter(|r| r.copy_unproven).map(|r| r.request_count).sum::<u64>(), 2);
+        assert_eq!(rows.iter().filter(|r| !r.copy_unproven).map(|r| r.request_count).sum::<u64>(), 1);
+        assert!(rows.iter().all(|r| !r.selector_context.contains_key("__ottto_copy_unproven")));
+        assert_ne!(crate::snapshots::snapshot_semantic_component_hashes(SnapshotSource::ClaudeCode, on_body),
+            crate::snapshots::snapshot_semantic_component_hashes(SnapshotSource::ClaudeCode, off_body));
+        assert_eq!(copy_diag(&["copy_prefix_unproven_rows", "copy_prefix_unproven", "copy_prefix_unproven_cost_micros"]), [2, 2, 250]);
+    });
+    }
+}

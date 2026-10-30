@@ -489,6 +489,7 @@ pub(crate) fn release_emitted_fold(item: &mut SnapshotItem) {
     }
     let FileFold {
         entity,
+        copy_unproven_wire: _,
         money_birth: _,
         physical,
         role: _,
@@ -626,7 +627,21 @@ impl Default for ClaudeEntityBody {
         }
     }
 }
+pub(super) const COPY_UNPROVEN_KEY: &str = "__ottto_copy_unproven";
+fn mark_copy_key(key: &mut ClaudeLiveKey) {
+    key.2.insert(COPY_UNPROVEN_KEY.into(), "true".into());
+}
 impl ClaudeEntityBody {
+    fn mark_copy_unproven(&mut self) {
+        self.grains = std::mem::take(&mut self.grains)
+            .into_iter()
+            .map(|((mut key, origin, account), grain)| {
+                mark_copy_key(&mut key);
+                ((key, origin, account), grain)
+            })
+            .collect();
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn add(
         &mut self,
@@ -1030,6 +1045,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for PrefixTally {
 #[derive(Debug, Clone)]
 pub(crate) struct FileFold {
     pub(crate) entity: ClaudeEntityBody,
+    copy_unproven_wire: bool,
     /// Copy rule with the EFFECTIVE cutoff (inherited across proven moves).
     money_birth: ClaudeFileBirth,
     /// The opened file's own physical birth; the only birth ever recorded.
@@ -1073,7 +1089,7 @@ pub(crate) struct FileFold {
     /// The copied prefix's page outcome (local diagnostics only).
     prefix: PrefixTally,
 }
-money_heap_fields!(FileFold; inline: [money_birth, role, copied, disclosed, e2_nanos, responses, root_fallbacks, side, side_requests, prefix]; heap: [entity, physical, location, first_own, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, proof, prefix_inherited, ambiguous, telemetry, accounts]);
+money_heap_fields!(FileFold; inline: [copy_unproven_wire, money_birth, role, copied, disclosed, e2_nanos, responses, root_fallbacks, side, side_requests, prefix]; heap: [entity, physical, location, first_own, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, proof, prefix_inherited, ambiguous, telemetry, accounts]);
 
 /// What the finish hands a gate-on fold, sized for
 /// [`FileFold::finish_heap_bound`] (X_out's E term).
@@ -1272,6 +1288,7 @@ impl FileFold {
         };
         let mut fold = Self {
             entity: Default::default(),
+            copy_unproven_wire: context.is_some_and(|c| c.index.copy_unproven_enabled),
             money_birth: money_birth.with_minimum(cutoff),
             physical,
             role,
@@ -1580,10 +1597,16 @@ impl FileFold {
             self.keep_copies(false, markers);
             return;
         }
-        if let Some(copy) = self.copy.take() {
+        if let Some(mut copy) = self.copy.take() {
+            if self.copy_unproven_wire {
+                copy.mark_copy_unproven();
+            }
             self.entity.absorb_grains(&copy);
         }
-        if let Some(idless) = self.idless_copy.take() {
+        if let Some(mut idless) = self.idless_copy.take() {
+            if self.copy_unproven_wire {
+                idless.mark_copy_unproven();
+            }
             self.prefix.unproven_idless = idless.totals().1;
             self.entity.absorb_grains(&idless);
         }
@@ -1676,6 +1699,17 @@ impl FileFold {
         &self,
         occurrence: &ClaudeTranscriptUsageOccurrence,
     ) -> Option<ClaudeLiveKey> {
+        let mut key = self.occurrence_key_unmarked(occurrence)?;
+        if self.copy_unproven_wire && self.unproven_copy(occurrence) {
+            mark_copy_key(&mut key);
+        }
+        Some(key)
+    }
+
+    fn occurrence_key_unmarked(
+        &self,
+        occurrence: &ClaudeTranscriptUsageOccurrence,
+    ) -> Option<ClaudeLiveKey> {
         if !enabled() {
             return hour_key(
                 occurrence
@@ -1709,7 +1743,12 @@ impl FileFold {
         let tokens = ClaudeMoneyTokens::from_usage(&occurrence.usage);
         let requests = occurrence.usage.request_count;
         let (Some(key), Some(removed), Some(removed_requests)) = (
-            self.occurrence_key(occurrence),
+            self.occurrence_key_unmarked(occurrence).map(|mut key| {
+                if self.copy_unproven_wire {
+                    mark_copy_key(&mut key);
+                }
+                key
+            }),
             self.entity.removed.checked_sub(&tokens),
             self.entity.removed_requests.checked_sub(requests),
         ) else {
@@ -1733,9 +1772,12 @@ impl FileFold {
 
     /// Held id-less copies count: no census can prove them.
     fn restore_idless(&mut self) {
-        let Some(idless) = self.idless_copy.take() else {
+        let Some(mut idless) = self.idless_copy.take() else {
             return;
         };
+        if self.copy_unproven_wire {
+            idless.mark_copy_unproven();
+        }
         let (tokens, requests) = idless.totals();
         let responses = idless.contributions();
         match (
@@ -2813,6 +2855,7 @@ fn attach_one(
         hour,
         account: account.as_ref().map_or(0, |key| Arc::as_ptr(key) as usize),
         origin: None,
+        copy_unproven: fold.copy_unproven_wire && fold.unproven_copy(occurrence),
     };
     let Some(estimated) = memo.estimated.get(shared, || {
         let key = fold.occurrence_key(occurrence)?;
@@ -2843,7 +2886,10 @@ fn attach_one(
         ..shared
     };
     let Some(reported) = memo.reported.get(inputs, || {
-        let key = reported_key(row, Some(occurrence), &fold.base_selector)?;
+        let mut key = reported_key(row, Some(occurrence), &fold.base_selector)?;
+        if inputs.copy_unproven {
+            mark_copy_key(&mut key);
+        }
         Some((key, Some(origin), account.clone()))
     }) else {
         return false;
@@ -2893,6 +2939,7 @@ struct SlotInputs<'a> {
     hour: i128,
     account: usize,
     origin: Option<ClaudeRequestUsageOrigin>,
+    copy_unproven: bool,
 }
 struct PlacedSlot {
     holder: usize,
@@ -2903,6 +2950,7 @@ struct PlacedSlot {
     hour: i128,
     account: usize,
     origin: Option<ClaudeRequestUsageOrigin>,
+    copy_unproven: bool,
     slot: Option<Slot>,
 }
 impl PlacedSlot {
@@ -2912,6 +2960,7 @@ impl PlacedSlot {
             && self.selector == inputs.selector
             && self.account == inputs.account
             && self.origin == inputs.origin
+            && self.copy_unproven == inputs.copy_unproven
             && self.model == inputs.model
             && self.speed == inputs.speed
             && self.effort.as_deref() == inputs.effort
@@ -2949,6 +2998,7 @@ impl SlotMemo {
                     hour: inputs.hour,
                     account: inputs.account,
                     origin: inputs.origin,
+                    copy_unproven: inputs.copy_unproven,
                     slot: place(),
                 };
                 if self.placed.len() < MEMO_SLOTS {
@@ -3013,7 +3063,10 @@ pub(crate) fn place_request_identity(
     let reported = telemetry
         .filter(|_| occurrence.telemetry_attached)
         .and_then(|row| {
-            let key = reported_key(row, Some(occurrence), &fold.base_selector)?;
+            let mut key = reported_key(row, Some(occurrence), &fold.base_selector)?;
+            if fold.copy_unproven_wire && fold.unproven_copy(occurrence) {
+                mark_copy_key(&mut key);
+            }
             let origin = if row.cost_usd_micros.is_some() {
                 ClaudeRequestUsageOrigin::TelemetryMatched
             } else {
@@ -3764,6 +3817,14 @@ pub(crate) fn finish_page(
         // apply refuses before mutating, so a withheld item is unchanged:
         // its fold gets its own entity back (moved out above).
         let emitted = super::emit::apply(item, &entity);
+        if emitted {
+            if let Some(marked) = item.copy_unproven_counts {
+                let mut counts = Counts::default();
+                counts.0[19] = marked.rows;
+                record_counts(counts);
+                diag("copy_prefix_unproven_rows", marked.rows);
+            }
+        }
         if !emitted {
             withheld.insert(item.source_session_id.clone());
         }
@@ -3862,7 +3923,7 @@ fn absent_twins(sessions: &[(&str, &[LocationKey])], index: &ScanIndex) -> BTree
 // Existing native_collection_page carrier, nonzero only. These are shared
 // process fold deltas since its previous Claude page line.
 use std::sync::atomic::{AtomicU64, Ordering};
-const COUNT_NAMES: [&str; 19] = [
+const COUNT_NAMES: [&str; 20] = [
     "fold_us",
     "responses",
     "copy_skipped",
@@ -3886,8 +3947,9 @@ const COUNT_NAMES: [&str; 19] = [
     "copy_prefix_held_requests",
     "copy_prefix_held_files",
     "copy_prefix_hold_expired",
+    "copy_prefix_unproven_rows",
 ];
-static COUNTS: [AtomicU64; 19] = [const { AtomicU64::new(0) }; 19];
+static COUNTS: [AtomicU64; 20] = [const { AtomicU64::new(0) }; 20];
 /// A page pass's share of `fold_us` (see `FileFold::spend`), on drop.
 struct PageSpent(
     Instant,
@@ -3919,18 +3981,18 @@ pub(crate) fn take_counts() -> Counts {
     Counts(COUNTS.each_ref().map(|c| c.swap(0, Ordering::Relaxed)))
 }
 #[derive(Debug, Default)]
-pub(crate) struct Counts([u64; 19]);
+pub(crate) struct Counts([u64; 20]);
 impl Counts {
     /// The first seven (work and decision) counters.
     fn work(values: [u64; 7]) -> Self {
-        let mut all = [0; 19];
+        let mut all = [0; 20];
         all[..7].copy_from_slice(&values);
         Self(all)
     }
     /// A decided fold's copied-prefix outcome.
     fn prefix(tally: &PrefixTally) -> Self {
         let unproven = tally.unproven_requests + tally.unproven_idless;
-        let mut all = [0; 19];
+        let mut all = [0; 20];
         all[7..12].copy_from_slice(&[
             unproven,
             u64::from(unproven > 0),
@@ -3945,7 +4007,7 @@ impl Counts {
         Self(all)
     }
     fn removal_store(added: u64, overflow: u64) -> Self {
-        let mut all = [0; 19];
+        let mut all = [0; 20];
         all[12] = added;
         all[13] = overflow;
         all[14] = overflow;

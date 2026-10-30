@@ -32,15 +32,33 @@ available proof; without proof, the prefix emits flagged and increments
 `copy_removal_metadata_lost`. Recovery never requests an additional holder read.
 A parent link alone does not prove an older-writer resumed prefix.
 
-Flags remain diagnostic, with no new wire fields. Reported flagged dollars
-cover only requests matched to priced local telemetry;
+The daemon sends `copy_unproven: true` only on unproven-prefix usage rows and
+`copy_unproven_counts: {rows, requests}` on the body, counting bucket rows once.
+The exact provisional activity hint `copy_unproven_contract: "copy_unproven:v1"`
+is required; absent, null or unknown capability stays OFF. With the gate off,
+fields are omitted and existing row grouping, wire bytes and semantic hashes
+are preserved. Backend admission and capability advertisement must precede
+activation; the provisional token/field name still needs backend confirmation.
+
+When enabled, marked and ordinary requests keep distinct money grains even if
+hour, model and account coincide. The mark changes no identity classification,
+tokens or costs. It participates in the semantic hash. A capability change
+uses existing upload-context adoption to prevent stale marked retry pages from
+crossing a downgrade; the OFF context is byte-identical to the released one.
+No request ids, digests, paths, file keys or source-session links are added.
+
+`copy_prefix_unproven_rows` counts emitted marked bucket rows. Existing local
+request/file diagnostics continue while wire emission is OFF. Reported flagged
+dollars cover only requests matched to priced local telemetry;
 `copy_prefix_unproven_priced_requests` states that partial coverage. Server-side
-pricing is responsible for the remaining dollars. No historical money-rule
-re-owe, revision bump, production re-read, or release is included.
+pricing covers the remainder. Unknown usage stays counted as today and is
+separately disclosed; server-side exclusion requires a later evidence-based
+rule. No production re-read, money-rule revision bump or release is included.
 
 Synthetic pipeline fixtures cover older-writer families, retirement, missing and
 damaged metadata, Lossy positive and negative evidence, capacity refusal, and
-three-pass prefix expiry with own-turn ACK and restart. Tests run in Linux CI,
+three-pass prefix expiry with own-turn ACK and restart; capability-off byte/hash
+identity and capability-on mixed-grain flags/counts (Full and sampled/cache). Tests run in Linux CI,
 never locally. Before release, measure local files, holder groups, copied
 requests, longest resume chain and charged bytes; occupancy above 50% needs
 review before release.
