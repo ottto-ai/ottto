@@ -2229,10 +2229,10 @@ fn terminal_off_context_mismatch_cannot_wake_parked_key_until_stat_change() {
         .claude_request_census_mut_for_test()
         .insert_for_test(
             &key,
-            ClaudeRequestCensusRecord::synthetic_for_test(
+            claude_request_census::ClaudeRequestCensusRecord::synthetic_for_test(
                 &"ab".repeat(32),
                 0,
-                ClaudeRequestCensusShape::IdentityIncomplete,
+                claude_request_census::ClaudeRequestCensusShape::IdentityIncomplete,
                 vec![1],
             )
             .with_unverified_for_test(true),
