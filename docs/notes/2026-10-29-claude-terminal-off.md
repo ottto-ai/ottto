@@ -1,5 +1,12 @@
 # Claude terminal authority containment
 
+R26 release policy: this note describes the **ON** containment path. The runtime
+switch now defaults **OFF**; main's behavior remains the release default. See
+[local switch, owner procedure and ON blockers](2026-10-30-claude-terminal-off-switch.md)
+and the [per-hunk OFF audit](2026-10-30-claude-terminal-off-static-audit.md).
+Historical constant-ON/test-knob statements below predate that policy change.
+
+
 This draft alternative withholds Claude terminal authority for every cohort.
 Current-page evidence, upload, exact ACK handling and selected-index saves
 continue. It has no terminal admission, staged raw effects, frozen reader or

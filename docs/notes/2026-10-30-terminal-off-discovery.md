@@ -1,6 +1,7 @@
 # Terminal-off discovery and debt service
 
-Claude terminal authority remains off. Ordinary page upload, exact ACK and
+When the [default-OFF local switch](2026-10-30-claude-terminal-off-switch.md)
+is ON, Claude terminal authority remains off. Ordinary page upload, exact ACK and
 selected-save rules are unchanged. Scheduling state below exists only in RAM.
 
 Owed work enqueues individual keys, bounded by the page allowance and deduplicated
@@ -21,12 +22,15 @@ root probe starts even with queued work, preserving older directory work. It
 skips queued paths and paths observed in the current RAM round whose length,
 mtime, device/inode and birth still match. Unknown identity is never a reason to
 suppress. Watcher hints bypass this suppression and still obey the existing
-same-stat park. Rename-over, shrink and stat changes reach ordinary validation.
+same-stat park at the selector. Validated presence is recorded before enqueue
+suppression, including stat-confirmed hints. Rename-over, shrink and stat changes
+reach ordinary validation.
 The observed census-key set resets at each ordinary round start.
 
 Context and revision work has its independent targeted route, including during a
 suppressing walk. A served unchanged blocking hold or oversized path keeps its
-existing six-hour floor; changed stat or revision can wake it earlier. Failed
+six-hour RAM floor from its most recent serve; changed stat or revision can wake
+it earlier. A frozen census window never leaves the floor permanently open. Failed
 opens retain their original debt and use their own throttle before retrying.
 Vanished paths enter the existing NotFound flow; no absence/retirement shortcut.
 
