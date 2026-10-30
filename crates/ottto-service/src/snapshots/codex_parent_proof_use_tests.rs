@@ -1198,7 +1198,7 @@ fn one_step(job: &mut CodexProofReaders) -> (CodexProofRun, isize, bool) {
     (run, grew, headers_seen(job) != seen)
 }
 
-/// A max-length ordinary message through P's ledger reader and a deciding
+/// A max-length turn context through P's ledger reader and a deciding
 /// child keeps retained growth within `ORDINARY_LINE_RETAINED`.
 #[test]
 fn an_ordinary_long_proof_line_retains_a_fixed_amount() {
@@ -1207,11 +1207,7 @@ fn an_ordinary_long_proof_line_retains_a_fixed_amount() {
     }
     let root = temp_root("job-line-k");
     let long = MAX_JSONL_LINE_BYTES - 4096;
-    let shared = [json!({
-        "timestamp": "2026-08-02T08:00:02Z",
-        "type": "response_item",
-        "payload": {"type": "message", "role": "user", "content": "x".repeat(long)},
-    })];
+    let shared = [turn("2026-08-02T08:00:01Z", &"t".repeat(long))];
     let mut parent_rows = vec![parent_values()[0].clone()];
     parent_rows.extend(shared.iter().cloned());
     parent_rows.push(turn("2026-08-02T08:30:01Z", "parent-later"));
