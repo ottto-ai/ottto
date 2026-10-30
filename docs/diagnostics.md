@@ -1155,30 +1155,30 @@ admission and its other counter projections arrive in subsequent slices.
 ## Pi reported-cost parsing
 
 Pi cost fields use checked decimal arithmetic and an inclusive $100,000 ceiling
-per field per source record. Negative or malformed fields remain Unknown.
-Arithmetic overflow or a value above the ceiling also remains Unknown, preserving
-valid sibling fields. Strings retain their original decimal lexeme; JSON floating
-numbers use serde_json's shortest round-trip f64 representation because their
-original lexeme is unavailable. Integers remain exact.
+per field per source record. Negative values, including numeric or string `-0`,
+and malformed fields remain Unknown. Arithmetic overflow or a value above the
+ceiling also remains Unknown, preserving valid sibling fields. Strings retain
+their original decimal lexeme; JSON floating numbers use serde_json's shortest
+round-trip f64 representation because their original lexeme is unavailable.
+Integers remain exact.
 
 More than twelve fractional decimal places after applying the exponent rounds
 half-to-even to picos. `pi_cost_precision_rounded` counts each accepted field with
-that precision, including trailing zeros and values rounded to zero.
-`pi_cost_refused{overflow}` counts each field refused for arithmetic overflow or
-the ceiling, including a sub-pico excess above it. Other invalid fields do not
-increment these counters.
+that precision, including trailing zeros and values rounded to zero. It measures
+lexical source precision, not an anomaly: Pi computes costs with floating point,
+so their decimal representations often carry more than twelve fractional digits.
+`pi_cost_refused_overflow` counts each field refused for arithmetic overflow or
+the ceiling, including a sub-pico excess above it. A string lexeme whose digits
+overflow checked arithmetic also counts, even when its mathematical value is in
+range; that field safely remains Unknown. Other invalid fields do not increment
+these counters.
 
-Stage `pi_cost_observations`, source `pi`, uses the existing `local_resources`
-carrier with cumulative saturating process totals in
-`counts.pi_cost_refused.overflow` and `counts.pi_cost_precision_rounded`. The
-lifecycle registry projects the same observations as `pi_cost_refused_overflow`
-and `pi_cost_precision_rounded` in `process_retained_cache_lifecycle_totals`.
-These projections overlap; do not add them together. Counts observe source fields
-once per applied usage record, before response deduplication or timestamp drops;
-shape probes do not count, and rereads count again. They are observations rather
-than retention failures. The replay harness classifies both as `Observation`;
-the money-equivalence script records their diagnostic totals separately from
-its unchanged exact upload-body comparison.
+Both counters are cumulative saturating process totals in the lifecycle registry,
+reported through `process_retained_cache_lifecycle_totals`. There is no labelled
+log line or per-line diagnostic emission. Counts are per observed usage line,
+before response deduplication, timestamp drops and token-field validation;
+rereads count again. Shape probes do not count. These are observations rather
+than retention failures. The replay harness classifies both as `Observation`.
 
 
 ## Compressed Codex reader refusals

@@ -18,33 +18,6 @@ def output(args):
     return subprocess.check_output(args, text=True).strip()
 
 
-# Diagnostic observations are evidence only; never upload-body exclusions or
-# retention failures. Registry names match the replay harness Observation list.
-PI_COST_OBSERVATIONS = {
-    "pi_cost_refused_overflow": ("pi_cost_refused", "overflow"),
-    "pi_cost_precision_rounded": ("pi_cost_precision_rounded",),
-}
-
-
-def pi_cost_observations(log):
-    totals = dict.fromkeys(PI_COST_OBSERVATIONS, 0)
-    for line in log.splitlines():
-        _, marker, payload = line.partition("ottto-service: local_resources ")
-        if not marker:
-            continue
-        record = json.loads(payload)
-        if record.get("stage") != "pi_cost_observations":
-            continue
-        for key, path in PI_COST_OBSERVATIONS.items():
-            count = record["counts"]
-            for part in path:
-                count = count[part]
-            if type(count) is not int or count < 0:
-                raise RuntimeError(f"invalid Pi observation: {key}")
-            totals[key] = max(totals[key], count)
-    return totals
-
-
 # Disk-only lifecycle fixtures (#806): a VERIFIED line each, no receipt file.
 DISK_FIXTURES = ("restart_between_pages", "upgrade_without_semantic_revision",
                  "downgrade_then_reupgrade")
@@ -79,8 +52,7 @@ def main():
     head_sha = output(["git", "rev-parse", "HEAD"])
     manifest = {"base": base_sha, "head": head_sha, "base_ref": ref,
                 "arms": ["retained_ram_tail_or_unchanged", "cold_full", "disk_restore"],
-                "disk_restore": "EXECUTED: " + ", ".join(DISK_FIXTURES),
-                "pi_cost_observations": {}}
+                "disk_restore": "EXECUTED: " + ", ".join(DISK_FIXTURES)}
     (receipts / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     base = root / "base"
     command(["git", "worktree", "add", "--detach", str(base), base_sha])
@@ -113,7 +85,6 @@ def main():
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             print(result.stdout, flush=True)
             (receipts / f"{arm}.log").write_text(result.stdout)
-            manifest["pi_cost_observations"][arm] = pi_cost_observations(result.stdout)
             result.check_returncode()
             verified = re.findall(r"\bMONEY_EQUIVALENCE (\w+) VERIFIED ", result.stdout, re.M)
             expected = {
