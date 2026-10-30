@@ -1,6 +1,6 @@
 # R26 changed macOS/layout-gated fixture inventory
 
-Source `48d3a02ae` vs r25 `5718302a7`. **911** new/changed fixture names below.
+Source `e76765beb` vs r25 `5718302a7`. **911** new/changed fixture names below.
 Direct rows contain a layout/macOS check in the test body; shared-file/helper
 rows are a conservative superset because helpers or native branches can gate
 them. No claim that the entire superset is Mac-only. This prevents omitting a
