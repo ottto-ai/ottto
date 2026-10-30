@@ -22708,7 +22708,10 @@ for line in sys.stdin:
             LocalControlCommand::AuthCompletePending {
                 claim_code: "claim_test".to_string(),
             },
-            LocalControlCommand::Status,
+            LocalControlCommand::Status {
+                refresh_agent_status: false,
+                retry_relay_authorization: false,
+            },
             LocalControlCommand::AuthSwitchAccount {
                 claim_code: "claim_test".into(),
             },
@@ -22728,7 +22731,9 @@ for line in sys.stdin:
                 &daemon(),
                 LocalControlRequest {
                     request_id: "req_cli_browser_claim".to_string(),
-                    protocol_version: PROTOCOL_VERSION,
+                    protocol_version: ottto_protocol::expected_local_control_protocol_version(
+                        &command,
+                    ),
                     token: Some("bad-token".to_string()),
                     client_kind: Some(LocalClientKind::Cli),
                     client_install_owner: None,
