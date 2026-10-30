@@ -947,6 +947,11 @@ pub(crate) fn claude_reemission_stop_latched(reminder: bool, counts: &impl Seria
     };
     traversal_point(stage, "claude_code", counts);
 }
+/// State-v2 backend observations use the existing local-only #799 sink.
+/// Callers supply counts, lengths and bounded states, never storage keys.
+pub(crate) fn claude_state_v2(counts: &impl Serialize) {
+    traversal_point("claude_state_v2", "claude_code", counts);
+}
 /// Local alarm (5a1b): durable-store holds, T14 rebuilds, mode repairs and a
 /// disabled store, as [since last, total] counts. No path, id or wire event.
 pub(crate) fn durable_tail_alarm(source: &str, counts: &impl Serialize) {

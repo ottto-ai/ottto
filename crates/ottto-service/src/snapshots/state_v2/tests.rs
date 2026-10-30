@@ -94,8 +94,8 @@ fn typed_keys_and_fixed_columns_round_trip_every_table() {
                 size: 91,
                 mtime_s: 7,
                 mtime_ns: Some(8),
-                ctime_ns: Some(9),
-                birth_ns: Some(10),
+                ctime_ns: 9,
+                birth_ns: 10,
                 witness_rev: 11,
                 flags: 12,
                 source_fp: "0d".repeat(32),
@@ -565,8 +565,8 @@ fn f8_damaged_header_refuses_both_lookup_and_scan_before_owned_copy() {
         size: 1,
         mtime_s: 2,
         mtime_ns: None,
-        ctime_ns: None,
-        birth_ns: None,
+        ctime_ns: 0,
+        birth_ns: 0,
         witness_rev: 0,
         flags: 0,
         source_fp: "03".repeat(32),
@@ -650,8 +650,8 @@ fn format_one_unsigned_clocks_and_hash_spelling_are_lossless() {
                 size: u64::MAX,
                 mtime_s: u64::MAX,
                 mtime_ns: Some(u64::MAX),
-                ctime_ns: None,
-                birth_ns: Some(0),
+                ctime_ns: 0,
+                birth_ns: 0,
                 witness_rev: u64::MAX,
                 flags: 0,
                 source_fp: "a".repeat(64),
@@ -861,4 +861,347 @@ fn f8_vacuum_churn_removes_deleted_keys_and_pl_values() {
     assert_eq!(stats["free_space_admitted"], true);
     assert!(stats["vacuum_latency_ms"].is_u64());
     assert!(stats["vacuum_wal_peak_bytes"].is_u64());
+}
+
+#[test]
+fn request_set_candidates_allow_collisions_and_compare_complete_evidence() {
+    use interning::{intern_request_set, RequestEvidence};
+    let tmp = Scratch::new();
+    let mut db = tmp.store();
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    let base = RequestEvidence::Account {
+        prefixes: "same-prefix",
+        fingerprint: "a",
+        identity_revision: None,
+        hash_count: Some(1),
+    };
+    let a = intern_request_set(&mut tx, &base).unwrap();
+    assert_eq!(intern_request_set(&mut tx, &base).unwrap(), a);
+    let b = intern_request_set(
+        &mut tx,
+        &RequestEvidence::Account {
+            prefixes: "same-prefix",
+            fingerprint: "b",
+            identity_revision: None,
+            hash_count: Some(1),
+        },
+    )
+    .unwrap();
+    let c = intern_request_set(
+        &mut tx,
+        &RequestEvidence::Account {
+            prefixes: "same-prefix",
+            fingerprint: "a",
+            identity_revision: Some(""),
+            hash_count: Some(1),
+        },
+    )
+    .unwrap();
+    let d = intern_request_set(
+        &mut tx,
+        &RequestEvidence::Census {
+            hashes: &Bytes(b"same-prefix".to_vec()),
+            hash_count: Some(1),
+        },
+    )
+    .unwrap();
+    let e = intern_request_set(
+        &mut tx,
+        &RequestEvidence::Account {
+            prefixes: "same-prefix",
+            fingerprint: "a",
+            identity_revision: None,
+            hash_count: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        [a, b, c, d, e]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        5
+    );
+    let header = tx.get(&RowKey::RequestSet(a)).unwrap().unwrap();
+    let Fixed::RequestSet { commitment, .. } = &header.fixed else {
+        panic!("set columns");
+    };
+    // Construct a distinct earlier candidate with the SAME lookup digest.
+    // Full bytes, rather than lookup uniqueness, must distinguish it on reuse.
+    tx.put(RowInput {
+        key: &RowKey::RequestSet(90),
+        fixed: &Fixed::RequestSet {
+            commitment: commitment.clone(),
+            hash_count: Some(1),
+            refs: 1,
+        },
+        value: &Bytes(b"collision".to_vec()),
+    })
+    .unwrap();
+    tx.put(RowInput {
+        key: &RowKey::Meta("next_request_set_id".into()),
+        fixed: &Fixed::None,
+        value: &packed::Json(&91_u64),
+    })
+    .unwrap();
+    let candidates = tx
+        .request_set_candidates(commitment.as_slice().try_into().unwrap(), 0, 32)
+        .unwrap();
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(intern_request_set(&mut tx, &base).unwrap(), a);
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    db.validate_parts().unwrap();
+}
+
+#[test]
+fn colliding_candidate_before_exact_match_is_not_aliased_or_overwritten() {
+    use interning::{intern_request_set, RequestEvidence};
+    let tmp = Scratch::new();
+    let mut db = tmp.store();
+    let base = RequestEvidence::Account {
+        prefixes: "prefixes",
+        fingerprint: "full-set",
+        identity_revision: Some("exact-revision"),
+        hash_count: Some(8),
+    };
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    let a = intern_request_set(&mut tx, &base).unwrap();
+    let exact = tx.get(&RowKey::RequestSet(a)).unwrap().unwrap();
+    let stored = value(&mut tx, &exact);
+    let fixed = exact.fixed.clone();
+    // Both candidates remain. The first differs only in its LAST payload byte.
+    tx.put(RowInput {
+        key: &RowKey::RequestSet(2),
+        fixed: &fixed,
+        value: &Bytes(stored.clone()),
+    })
+    .unwrap();
+    let mut collision = stored.clone();
+    *collision.last_mut().unwrap() ^= 1;
+    tx.put(RowInput {
+        key: &RowKey::RequestSet(a),
+        fixed: &fixed,
+        value: &Bytes(collision.clone()),
+    })
+    .unwrap();
+    tx.put(RowInput {
+        key: &RowKey::Meta("next_request_set_id".into()),
+        fixed: &Fixed::None,
+        value: &packed::Json(&3_u64),
+    })
+    .unwrap();
+    assert_eq!(intern_request_set(&mut tx, &base).unwrap(), 2);
+    let wrong = tx.get(&RowKey::RequestSet(a)).unwrap().unwrap();
+    assert_eq!(value(&mut tx, &wrong), collision);
+    let right = tx.get(&RowKey::RequestSet(2)).unwrap().unwrap();
+    assert_eq!(value(&mut tx, &right), stored);
+    assert!(matches!(right.fixed, Fixed::RequestSet { refs: 2, .. }));
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+}
+
+#[test]
+fn f8_interned_parts_refs_and_high_water_are_atomic_and_nonreused() {
+    use interning::{intern_string, release_string, resolve_string, Vocabulary};
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    let text = "é".repeat(PART_BYTES + 17);
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    let id = intern_string(&mut tx, Vocabulary::Model, &text).unwrap();
+    assert_eq!(
+        intern_string(&mut tx, Vocabulary::Model, &text).unwrap(),
+        id
+    );
+    assert_eq!(
+        resolve_string(&mut tx, Vocabulary::Model, id).unwrap(),
+        text
+    );
+    let key = RowKey::Interned {
+        kind: 1,
+        ordinal: id,
+    };
+    let h = tx.get(&key).unwrap().unwrap();
+    assert_eq!(h.parts, 3);
+    assert!(matches!(h.fixed, Fixed::Interned { refs: 2 }));
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    {
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        release_string(&mut tx, Vocabulary::Model, id).unwrap();
+        release_string(&mut tx, Vocabulary::Model, id).unwrap();
+        assert!(resolve_string(&mut tx, Vocabulary::Model, id).is_err());
+        let next = intern_string(&mut tx, Vocabulary::Model, "new").unwrap();
+        assert!(next > id);
+        // Drop rolls back refs, parts, purge AND high water together.
+    }
+    db.validate_parts().unwrap();
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    assert_eq!(
+        resolve_string(&mut tx, Vocabulary::Model, id).unwrap(),
+        text
+    );
+    release_string(&mut tx, Vocabulary::Model, id).unwrap();
+    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
+    // Updating a live reference count alone removes no PL and creates no purge.
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), None);
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    release_string(&mut tx, Vocabulary::Model, id).unwrap();
+    let next = intern_string(&mut tx, Vocabulary::Model, "new").unwrap();
+    assert!(next > id);
+    assert_eq!(tx.commit(2, 3), DurableCommitOutcome::Committed(3));
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(3));
+    db.validate_parts().unwrap();
+    drop(db);
+    let mut db = sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).unwrap();
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    assert!(resolve_string(&mut tx, Vocabulary::Model, id).is_err());
+    assert_eq!(
+        resolve_string(&mut tx, Vocabulary::Model, next).unwrap(),
+        "new"
+    );
+    let after_restart = intern_string(&mut tx, Vocabulary::Model, "later").unwrap();
+    assert!(after_restart > next);
+    assert_eq!(tx.commit(3, 4), DurableCommitOutcome::Committed(4));
+}
+
+#[test]
+fn f8_set_last_reference_reclaims_parts_without_reusing_ids() {
+    use interning::{intern_request_set, release_request_set, RequestEvidence};
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    let hashes = Repeat(PART_BYTES as u64 + 31);
+    let evidence = RequestEvidence::Census {
+        hashes: &hashes,
+        hash_count: None,
+    };
+    let id = intern_request_set(&mut tx, &evidence).unwrap();
+    assert_eq!(intern_request_set(&mut tx, &evidence).unwrap(), id);
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    release_request_set(&mut tx, id).unwrap();
+    assert!(tx.get(&RowKey::RequestSet(id)).unwrap().is_some());
+    release_request_set(&mut tx, id).unwrap();
+    assert!(tx.get(&RowKey::RequestSet(id)).unwrap().is_none());
+    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
+    db.validate_parts().unwrap();
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    let next = intern_request_set(&mut tx, &evidence).unwrap();
+    assert!(next > id);
+    assert_eq!(tx.commit(2, 3), DurableCommitOutcome::Committed(3));
+    // These keys/values are N/H only; no PL purge is manufactured.
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), None);
+}
+
+#[test]
+fn f8_full_stream_comparison_validates_parts_and_all_bytes() {
+    let tmp = Scratch::new();
+    let mut db = tmp.store();
+    let bytes = vec![b'a'; PART_BYTES * 2 + 17];
+    let mut changed = bytes.clone();
+    *changed.last_mut().unwrap() = b'b';
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    let h = put(&mut tx, &RowKey::Traversal("stream".into()), &bytes);
+    assert!(tx.value_matches(&h, &Bytes(bytes)).unwrap());
+    assert!(!tx.value_matches(&h, &Bytes(changed)).unwrap());
+    assert!(!tx.value_matches(&h, &Repeat(17)).unwrap());
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    sqlite::damage_part_for_test(&mut db);
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    assert!(tx.value_matches(&h, &Repeat(h.len)).is_err());
+}
+
+#[test]
+fn format_one_physical_columns_match_the_fourteen_table_contract() {
+    let tmp = Scratch::new();
+    let db = tmp.store();
+    let (tables, unique) = sqlite::schema_for_test(&db);
+    assert_eq!(FORMAT, 1);
+    assert_eq!(tables.len(), 14);
+    assert_eq!(
+        tables
+            .iter()
+            .map(|(_, columns)| columns.len())
+            .sum::<usize>(),
+        108
+    );
+    assert!(!unique, "lookup collisions must coexist");
+    let census = &tables.iter().find(|(name, _)| name == "census").unwrap().1;
+    assert_eq!(census.len(), 13);
+    assert!(!census
+        .iter()
+        .any(|(name, _)| ["len", "parts", "inline"].contains(&name.as_str())));
+    let account = &tables
+        .iter()
+        .find(|(name, _)| name == "account_pending")
+        .unwrap()
+        .1;
+    assert!(account.contains(&("evidence_count".into(), "BLOB".into())));
+    assert!(account.contains(&("window_end".into(), "TEXT".into())));
+}
+
+#[test]
+fn f6_busy_purge_retains_obligation_paces_retry_and_allows_in_deadline_writes() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    let key = RowKey::Traversal("private".into());
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    put(&mut tx, &key, b"old private bytes");
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    let reader = sqlite::reader_for_test(&db);
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    put(&mut tx, &key, b"new bytes");
+    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
+    db.maintenance(true).unwrap();
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
+    let attempted = serde_json::to_value(db.maintenance_stats()).unwrap()["vacuum_attempts"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(attempted, 1);
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    put(&mut tx, &key, b"still live");
+    assert_eq!(tx.commit(2, 3), DurableCommitOutcome::Committed(3));
+    drop(reader);
+    db.maintenance(true).unwrap();
+    assert_eq!(
+        serde_json::to_value(db.maintenance_stats()).unwrap()["vacuum_attempts"],
+        attempted
+    );
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
+    // Make the original deadline overdue, while the attempt remains in its
+    // cooldown. Neither restart nor ordinary writes may claim erasure.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    db.control("erasure_since", &(now - 86401)).unwrap();
+    assert!(db.maintenance(false).is_err());
+    assert!(db.begin(TxnMode::Write).is_err());
+    let stats = serde_json::to_value(db.maintenance_stats()).unwrap();
+    assert_eq!(stats["erasure_overdue"], true);
+    assert_eq!(stats["vacuum_attempts"], attempted);
+    drop(db);
+    assert!(sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).is_err());
+}
+
+#[test]
+fn f6_restart_between_vacuum_and_metadata_clear_keeps_pending_debt() {
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    let key = RowKey::Meta("private".into());
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    put(&mut tx, &key, b"old");
+    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    tx.delete(&key).unwrap();
+    assert_eq!(tx.commit(1, 2), DurableCommitOutcome::Committed(2));
+    assert_eq!(
+        db.checkpoint(CheckpointMode::Purge).state,
+        CheckpointState::Complete
+    );
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
+    drop(db);
+    let mut db = sqlite::Sqlite::open(&tmp.path(), &tmp.identity()).unwrap();
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(2));
+    db.maintenance(true).unwrap();
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(0));
 }

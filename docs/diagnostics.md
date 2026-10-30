@@ -60,6 +60,29 @@ appear in this section. Approved upload uses the existing disclosure and consent
 
 ## Local Resource Measurements
 
+The unrouted state-v2 backend uses stage `claude_state_v2` in this same local
+sink. Normal application load/save does not yet invoke it. Backend observations
+include `wal_peak_bytes`, `wal_alarm` at 64 MiB, unavailable WAL measurements,
+`db_bytes`, and optional `cache_used_bytes`. Null means unavailable, never zero.
+VACUUM observations include `vacuum_latency_ms`, the maximum sampled
+`vacuum_wal_peak_bytes`, free-space available/required bytes and admission,
+`erasure_pending_age_s`, `erasure_overdue`, and attempt/failure/deferred counts.
+A pending age is null when no obligation exists or its clock is unavailable;
+`erasure_overdue` distinguishes a conservative overdue clock refusal.
+
+Checkpoint count arrays are ordered PASSIVE, purge, idle reclaim; purge means
+VACUUM plus TRUNCATE. Commit outcome arrays are ordered committed, not published,
+published after error, ambiguous. `commit_latency_us` reports p50/p95 over at
+most the latest 128 measured COMMIT calls and the number of recent samples. It
+excludes encoding, checkpoint and VACUUM time; pre-COMMIT refusals have no latency
+sample. These counters and sampled peaks reset with the backend handle; the
+pending generation, first erasure time and last attempt time persist in the DB.
+No paths, keys, raw values, bindings, database IDs or hash commitments are logged.
+
+These observations do not yet provide application pass CPU/RSS, hydrate or
+same-corpus importer comparisons. The backend is still under construction;
+these measurements cannot establish conversion or rollout acceptance.
+
 The existing service error log contains content-free JSON lines prefixed
 `ottto-service: local_resources`. The macOS app/dev LaunchAgent writes
 `~/Library/Logs/Ottto/ottto-service.err.log`; Homebrew writes

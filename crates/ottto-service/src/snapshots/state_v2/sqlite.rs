@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod maintenance;
+mod references;
 use maintenance::{MaintenanceStats, PurgePolicy};
 
 const BUSY: Duration = Duration::from_millis(100);
@@ -112,7 +113,7 @@ fn schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(&format!(
         "CREATE TABLE meta(name TEXT NOT NULL,{VAL},PRIMARY KEY(name)) WITHOUT ROWID;"
     ))?;
-    conn.execute_batch(&format!("CREATE TABLE files(key TEXT NOT NULL,size BLOB NOT NULL CHECK(length(size)=8),mtime_s BLOB NOT NULL CHECK(length(mtime_s)=8),mtime_ns BLOB CHECK(mtime_ns IS NULL OR length(mtime_ns)=8),ctime_ns BLOB CHECK(ctime_ns IS NULL OR length(ctime_ns)=8),birth_ns BLOB CHECK(birth_ns IS NULL OR length(birth_ns)=8),witness_rev BLOB NOT NULL CHECK(length(witness_rev)=8),flags INTEGER NOT NULL,source_fp BLOB NOT NULL,last_snapshot_fp BLOB,body_witness BLOB,scan_identity TEXT,{VAL},PRIMARY KEY(key)) WITHOUT ROWID;"))?;
+    conn.execute_batch(&format!("CREATE TABLE files(key TEXT NOT NULL,size BLOB NOT NULL CHECK(length(size)=8),mtime_s BLOB NOT NULL CHECK(length(mtime_s)=8),mtime_ns BLOB CHECK(mtime_ns IS NULL OR length(mtime_ns)=8),ctime_ns BLOB NOT NULL CHECK(length(ctime_ns)=8),birth_ns BLOB NOT NULL CHECK(length(birth_ns)=8),witness_rev BLOB NOT NULL CHECK(length(witness_rev)=8),flags INTEGER NOT NULL,source_fp BLOB NOT NULL,last_snapshot_fp BLOB,body_witness BLOB,scan_identity TEXT,{VAL},PRIMARY KEY(key)) WITHOUT ROWID;"))?;
     conn.execute_batch(&format!(
         "CREATE TABLE family_requests(root TEXT NOT NULL,{VAL},PRIMARY KEY(root)) WITHOUT ROWID;"
     ))?;
@@ -163,8 +164,8 @@ fn fixed_values(table: Table, fixed: &Fixed) -> Result<Vec<SqlValue>> {
             unsigned(*size),
             unsigned(*mtime_s),
             optional_unsigned(*mtime_ns),
-            optional_unsigned(*ctime_ns),
-            optional_unsigned(*birth_ns),
+            unsigned(*ctime_ns),
+            unsigned(*birth_ns),
             unsigned(*witness_rev),
             sql(flags)?,
             SqlValue::Blob(packed::hash_string(source_fp)?),
@@ -287,8 +288,8 @@ fn read_fixed(table: Table, row: &rusqlite::Row<'_>, start: usize) -> rusqlite::
             size: read_unsigned(row, start)?,
             mtime_s: read_unsigned(row, start + 1)?,
             mtime_ns: read_optional_unsigned(row, start + 2)?,
-            ctime_ns: read_optional_unsigned(row, start + 3)?,
-            birth_ns: read_optional_unsigned(row, start + 4)?,
+            ctime_ns: read_unsigned(row, start + 3)?,
+            birth_ns: read_unsigned(row, start + 4)?,
             witness_rev: read_unsigned(row, start + 5)?,
             flags: row.get(start + 6)?,
             source_fp: read_hash(row, start + 7)?,
@@ -816,6 +817,12 @@ impl Sqlite {
                     break;
                 }
                 for h in &page {
+                    if let Fixed::RequestSet { refs, .. } | Fixed::Interned { refs } = &h.fixed {
+                        ensure!(
+                            *refs > 0 && *refs <= i64::MAX as u64,
+                            "state_v2_reference_count"
+                        );
+                    }
                     read_value(conn, h, &mut io::sink())?;
                     total_parts = total_parts
                         .checked_add(h.parts as u64)
@@ -851,6 +858,7 @@ impl Store for Sqlite {
     }
     fn checkpoint(&mut self, mode: CheckpointMode) -> CheckpointResult {
         if mode == CheckpointMode::Purge && self.vacuum().is_err() {
+            self.stats.checkpoint(mode, CheckpointState::Failed);
             return CheckpointResult {
                 state: CheckpointState::Failed,
                 log_frames: None,
@@ -1110,6 +1118,11 @@ fn pl(key: &RowKey) -> bool {
                 | "erasure_pending"
                 | "erasure_since"
                 | "erasure_attempt"
+                | "next_request_set_id"
+                | "next_version_ordinal"
+                | "next_model_ordinal"
+                | "next_speed_ordinal"
+                | "next_effort_ordinal"
                 | "baseline_bytes"
                 | "baseline_digest"
                 | "repair_commitment"
@@ -1223,6 +1236,23 @@ impl Transaction for Txn<'_> {
         self.failed |= result.is_err();
         result
     }
+    fn value_matches(&mut self, header: &Header, value: &dyn Value) -> Result<bool> {
+        references::matches(self.store.conn()?, header, value)
+    }
+    fn request_set_candidates(
+        &mut self,
+        commitment: &[u8; 32],
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<Header>> {
+        references::candidates(self.store.conn()?, commitment, after, limit)
+    }
+    fn interned_candidates(&mut self, kind: u16, after: u64, limit: usize) -> Result<Vec<Header>> {
+        references::interned_candidates(self.store.conn()?, kind, after, limit)
+    }
+    fn adjust_refs(&mut self, key: &RowKey, delta: i64) -> Result<u64> {
+        references::adjust(self, key, delta)
+    }
     fn scan_prefix(
         &mut self,
         prefix: RowPrefix,
@@ -1270,13 +1300,21 @@ impl Transaction for Txn<'_> {
             Ok(())
         })();
         if result.is_err() {
+            self.store
+                .stats
+                .commit(&DurableCommitOutcome::NotPublished, None);
             return DurableCommitOutcome::NotPublished;
         }
+        let started = Instant::now();
         let result = self
             .store
             .conn()
             .and_then(|c| Ok(c.execute_batch("COMMIT")?));
+        let latency = started.elapsed();
         if result.is_ok() {
+            self.store
+                .stats
+                .commit(&DurableCommitOutcome::Committed(next), Some(latency));
             self.finished = true;
             // Required checkpoint failure records debt; the completed data
             // commit stands. No caller may infer an ACK from a failed commit.
@@ -1301,7 +1339,7 @@ impl Transaction for Txn<'_> {
             store.conn = Some(conn);
             Ok(generation)
         })();
-        match generation {
+        let outcome = match generation {
             Ok(g) if g == expected => DurableCommitOutcome::NotPublished,
             Ok(g) if g == next => {
                 store.reload = true;
@@ -1311,11 +1349,15 @@ impl Transaction for Txn<'_> {
                 store.reload = true;
                 DurableCommitOutcome::Ambiguous
             }
-        }
+        };
+        store.stats.commit(&outcome, Some(latency));
+        outcome
     }
 }
 
 fn validate_schema(conn: &Connection) -> Result<()> {
+    let unique: i64 = conn.query_row("SELECT \"unique\" FROM pragma_index_list('request_sets') WHERE name='request_sets_commitment'", [], |r| r.get(0))?;
+    ensure!(unique == 0, "scan_index_representation_refused");
     for table in Table::ALL {
         let expected = table
             .keys()
@@ -1403,4 +1445,42 @@ pub(super) fn oversize_header_for_test(db: &mut Sqlite) {
         .unwrap()
         .execute("UPDATE files SET source_fp=zeroblob(1048576)", [])
         .unwrap();
+}
+
+#[cfg(test)]
+pub(super) struct ReaderForTest {
+    _conn: Connection,
+}
+#[cfg(test)]
+pub(super) fn reader_for_test(db: &Sqlite) -> ReaderForTest {
+    let conn = Connection::open_with_flags(&db.path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    conn.busy_timeout(BUSY).unwrap();
+    conn.execute_batch("BEGIN").unwrap();
+    let _: Vec<u8> = conn
+        .query_row("SELECT inline FROM meta WHERE name='phase'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    ReaderForTest { _conn: conn }
+}
+
+#[cfg(test)]
+type SchemaFacts = Vec<(String, Vec<(String, String)>)>;
+#[cfg(test)]
+pub(super) fn schema_for_test(db: &Sqlite) -> (SchemaFacts, bool) {
+    let conn = db.conn().unwrap();
+    let mut facts = Vec::new();
+    for table in Table::ALL.iter().map(|t| t.name()).chain(["blob_parts"]) {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        let columns = stmt
+            .query_map([], |r| Ok((r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<(String, String)>>>()
+            .unwrap();
+        facts.push((table.to_owned(), columns));
+    }
+    let unique: bool = conn.query_row("SELECT \"unique\" FROM pragma_index_list('request_sets') WHERE name='request_sets_commitment'", [], |r| r.get(0)).unwrap();
+    (facts, unique)
 }

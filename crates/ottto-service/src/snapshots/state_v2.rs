@@ -7,6 +7,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 
+mod interning;
 mod packed;
 mod shape;
 mod sqlite;
@@ -72,8 +73,8 @@ pub(super) enum Fixed {
         size: u64,
         mtime_s: u64,
         mtime_ns: Option<u64>,
-        ctime_ns: Option<u64>,
-        birth_ns: Option<u64>,
+        ctime_ns: u64,
+        birth_ns: u64,
         witness_rev: u64,
         flags: u64,
         source_fp: String,
@@ -218,6 +219,17 @@ pub(super) trait Transaction {
     fn read_value(&mut self, header: &Header, out: &mut dyn Write) -> Result<()>;
     fn put(&mut self, row: RowInput<'_>) -> Result<Header>;
     fn delete(&mut self, key: &RowKey) -> Result<bool>;
+    /// Compare complete admitted bytes, never just a digest. Corruption errs.
+    fn value_matches(&mut self, header: &Header, value: &dyn Value) -> Result<bool>;
+    fn request_set_candidates(
+        &mut self,
+        commitment: &[u8; 32],
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<Header>>;
+    fn interned_candidates(&mut self, kind: u16, after: u64, limit: usize) -> Result<Vec<Header>>;
+    /// Changes only refs and its integrity digest; zero reclaims owner/parts.
+    fn adjust_refs(&mut self, key: &RowKey, delta: i64) -> Result<u64>;
     /// Header-only, key-ordered, one bounded page. `after` is exclusive.
     fn scan_prefix(
         &mut self,

@@ -1,5 +1,59 @@
 # ScanIndex staged persistence: reader release N
 
+## State-v2 backend under construction
+
+The private state-v2 backend is not yet routed from application load/save. The
+reader and legacy-write behavior below remains the active behavior. The backend
+alone does not provide conversion, publication, recovery or a runtime switch.
+
+Its format-1 schema has 14 tables and 108 columns. Census records contain fixed
+columns and a 16-byte integrity digest, with no duplicate variable payload.
+Unsigned clocks/extents use exact eight-byte big-endian blobs; account evidence
+counts use sixteen bytes. Window strings keep their spelling, including malformed
+values. Hash strings have a tagged literal or canonical lowercase binary encoding;
+optional absence remains distinct from empty text. Unchunked keys and strings
+have a checked 4 KiB fallback cap. Variable values use at most 256 parts of
+256 KiB each, or inline storage up to 512 bytes.
+
+Request-set lookup commitments are nonunique. Reuse requires streamed equality
+of the complete evidence tuple, including encoding, payload, full fingerprint,
+optional identity revision and count presence. Reference updates preserve the
+value bytes; last-reference removal deletes the owner and all parts in the same
+transaction. String vocabularies use monotonically allocated, nonreused ordinals;
+resolving a string reads directly into the final owned string without loading a
+whole dictionary. Semantic caller mapping and reference-closure checks across
+owners remain prerequisites for routing this backend.
+
+### Deferred erasure maintenance
+
+Removing potentially private keys or values marks the first pending generation
+and its start time in that same transaction. Later removals preserve the oldest
+deadline. `secure_delete` and TRUNCATE alone cannot establish erasure: stale text
+may remain in gaps in live pages. Completion requires in-place VACUUM, successful
+TRUNCATE with a measured zero-length WAL, and a durable metadata-only clear.
+
+The backend defaults to a configurable 24-hour deadline and prefers an idle
+pass. Normal writes remain possible before the deadline, subject to ordinary
+WAL checkpoint debt. Each VACUUM attempt is paced across restart to at most once
+per deadline window. Failed or incomplete maintenance retains the obligation;
+overdue obligations alarm and refuse further writes until resolved. A completed
+data commit remains completed if later maintenance fails.
+
+Admission requires available space of at least twice the larger of the main
+file length and the logical database size, including pages still in WAL.
+Unknown space refuses the attempt. VACUUM has a configurable VM work budget
+(250 ms by default) plus the existing bounded busy wait. This is interruptible
+work, not a hard latency guarantee. A large database can require a larger budget
+to finish. Its WAL may grow approximately with database size; the 64 MiB WAL
+alarm is not a cap. System SQLite temporary-file behavior and maintenance cost
+still require platform qualification before routing or enabling conversion.
+
+The erasure claim covers bytes readable through the current DB/WAL/SHM after
+verified completion. It excludes retained read-only v1 baselines, temporary-file
+remnants, APFS snapshots and physical SSD erasure. Baseline lifetime requires a
+separate retention policy. No application deletion or money-debt retirement is
+authorized merely by this storage maintenance.
+
 This is the reader component. It reads legacy logical-schema-2 JSON and storage
 format 1, and always writes legacy JSON with the existing semantic serializer.
 After a sharded load, the next synchronous save atomically replaces the manifest

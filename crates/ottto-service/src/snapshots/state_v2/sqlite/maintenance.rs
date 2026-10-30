@@ -35,8 +35,45 @@ pub(in super::super) struct MaintenanceStats {
     vacuum_deferred: u64,
     checkpoint_complete: [u64; 3],
     checkpoint_incomplete: [u64; 3],
+    commit_outcomes: [u64; 4],
+    commit_latency_us: CommitLatency,
+    cache_used_bytes: Option<u64>,
+    db_bytes: Option<u64>,
+}
+#[derive(Clone, Default, Debug, Serialize)]
+struct CommitLatency {
+    p50: Option<u64>,
+    p95: Option<u64>,
+    recent_samples: usize,
+    #[serde(skip)]
+    samples: Vec<u64>,
+    #[serde(skip)]
+    cursor: usize,
 }
 impl MaintenanceStats {
+    pub(super) fn commit(&mut self, outcome: &DurableCommitOutcome, latency: Option<Duration>) {
+        let slot = match outcome {
+            DurableCommitOutcome::Committed(_) => 0,
+            DurableCommitOutcome::NotPublished => 1,
+            DurableCommitOutcome::Published(_) => 2,
+            DurableCommitOutcome::Ambiguous => 3,
+        };
+        self.commit_outcomes[slot] = self.commit_outcomes[slot].saturating_add(1);
+        if let Some(us) = latency.and_then(|d| u64::try_from(d.as_micros()).ok()) {
+            let h = &mut self.commit_latency_us;
+            if h.samples.len() < 128 {
+                h.samples.push(us);
+            } else {
+                h.samples[h.cursor] = us;
+            }
+            h.cursor = (h.cursor + 1) % 128;
+            let mut sorted = h.samples.clone();
+            sorted.sort_unstable();
+            h.recent_samples = sorted.len();
+            h.p50 = Some(sorted[(sorted.len() * 50).div_ceil(100) - 1]);
+            h.p95 = Some(sorted[(sorted.len() * 95).div_ceil(100) - 1]);
+        }
+    }
     pub(super) fn observe_wal(&mut self, bytes: Option<u64>) {
         if let Some(bytes) = bytes {
             self.wal_peak_bytes = self.wal_peak_bytes.max(bytes);
@@ -122,9 +159,17 @@ impl Sqlite {
 
     pub(super) fn vacuum(&mut self) -> Result<()> {
         ensure!(!self.import, "state_v2_import_purge_refused");
-        let required = fs::metadata(&self.path)
-            .ok()
-            .and_then(|m| m.len().checked_mul(2));
+        // Main-file length alone undercounts live pages still in the WAL.
+        let logical = (|| -> Result<u64> {
+            let conn = self.conn()?;
+            let pages: u64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+            let size: u64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+            pages.checked_mul(size).context("state_v2_vacuum_space")
+        })()
+        .ok();
+        let required = logical
+            .zip(fs::metadata(&self.path).ok().map(|m| m.len()))
+            .and_then(|(logical, file)| logical.max(file).checked_mul(2));
         let available = free_space(&self.path);
         self.stats.free_space_required_bytes = required;
         self.stats.free_space_available_bytes = available;
@@ -152,6 +197,29 @@ impl Sqlite {
     }
 
     pub(in super::super) fn maintenance(&mut self, idle: bool) -> Result<()> {
+        let result = self.maintenance_inner(idle);
+        self.stats.db_bytes = fs::metadata(&self.path).ok().map(|m| m.len());
+        self.stats.cache_used_bytes = self.conn().ok().and_then(|conn| {
+            let (mut current, mut high) = (0, 0);
+            let rc = unsafe {
+                rusqlite::ffi::sqlite3_db_status(
+                    conn.handle(),
+                    rusqlite::ffi::SQLITE_DBSTATUS_CACHE_USED,
+                    &mut current,
+                    &mut high,
+                    0,
+                )
+            };
+            if rc == rusqlite::ffi::SQLITE_OK {
+                u64::try_from(current).ok()
+            } else {
+                None
+            }
+        });
+        crate::local_resource_diagnostics::claude_state_v2(&self.stats);
+        result
+    }
+    fn maintenance_inner(&mut self, idle: bool) -> Result<()> {
         if self.import {
             return Ok(());
         }
