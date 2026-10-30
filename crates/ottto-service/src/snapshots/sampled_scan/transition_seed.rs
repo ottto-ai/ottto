@@ -1,10 +1,11 @@
 //! Genuine v1 records from main's pinned 53d05a43 writer, before R2 (#865).
 //! Read the production post-save artifact unchanged: never rewrite its version,
 //! binding, allowlist, body or trailer. The seed compares it byte for byte with
-//! a hash-pinned `archived_writers` copy of that writer, so current source can
-//! move on while a future writer that drifts refuses instead of being relabeled.
-//! That copy passes stored content digests through, so drift in those digests
-//! refuses in the two `*_archived_v1_writer` tests of `durable_tests.rs` instead.
+//! what a hash-pinned `archived_writers` copy of that writer emits for the
+//! retained live reduction (never for the stored body), so current source can
+//! move on while a future writer that drifts, even by reordering two same-type
+//! fields, refuses instead of being relabeled. Header fields other than the
+//! body come from the stored record after the binding checks below.
 //!
 //! The `PINNED_SOURCES` tests below stay as the separate check on CURRENT code.
 //! Serializer regions are extracted by the single companion Python standard-
@@ -28,7 +29,7 @@
 //! There is no environment opt-out. Tests inject an interpreter/root per call;
 //! they never change PATH or other process-global environment variables.
 use super::*;
-use archived_writers::{ArchivedRecord, ArchivedWriter, W_53d05a43};
+use archived_writers::{ArchivedRecord, ArchivedWriter, StateNode, W_53d05a43};
 use sha2::{Digest, Sha256};
 
 #[path = "archived_writers/mod.rs"]
@@ -56,9 +57,13 @@ pub(crate) fn seed_archived<W: ArchivedWriter>(
     index: &ScanIndex,
 ) -> Vec<u8> {
     archived_writers::assert_provenance::<W>();
-    let checkpoint = cache
-        .retained_checkpoint(key)
-        .expect("populated native reduction");
+    let (checkpoint, state) = {
+        let retained = cache.retained().unwrap();
+        let retained = retained.peek(key).expect("populated native reduction");
+        (retained.checkpoint.clone(), format!("{:?}", retained.state))
+    };
+    let state = StateNode::parse(&state)
+        .unwrap_or_else(|error| panic!("live reduction rendering did not parse: {error}"));
     let ds = durable_source(source).unwrap();
     let mut stores = cache.durable().unwrap();
     let slot = stores.slot(ds).as_mut().unwrap();
@@ -99,30 +104,34 @@ pub(crate) fn seed_archived<W: ArchivedWriter>(
     );
     let binding = &record.record.binding;
     let certificate = &record.record.certificate;
-    let archived = W::encode(&ArchivedRecord {
-        source_tag,
-        key: binding.key,
-        context: binding.context,
-        scope: binding.scope,
-        entry: binding.entry,
-        allowlist: record.record.allowlist,
-        generation: record.index_generation,
-        device: certificate.device,
-        inode: certificate.inode,
-        length: certificate.length,
-        modified: certificate.modified,
-        birth_nanos: certificate.birth_nanos,
-        sealed_offset: certificate.sealed_offset,
-        sample_len: certificate.sample_len,
-        head_sha256: certificate.head_sha256,
-        boundary_sha256: certificate.boundary_sha256,
-        verified_unix_seconds: certificate.verified_unix_seconds,
-        audit_debt: record
-            .envelope_audit_debt
-            .or(certificate.audit_debt_unix_seconds),
-        body: record.record.body.clone(),
-    })
-    .unwrap_or_else(|error| panic!("writer {} refused this body: {error}", W::PIN));
+    let archived = W::encode_live(
+        &ArchivedRecord {
+            source_tag,
+            key: binding.key,
+            context: binding.context,
+            scope: binding.scope,
+            entry: binding.entry,
+            allowlist: record.record.allowlist,
+            generation: record.index_generation,
+            device: certificate.device,
+            inode: certificate.inode,
+            length: certificate.length,
+            modified: certificate.modified,
+            birth_nanos: certificate.birth_nanos,
+            sealed_offset: certificate.sealed_offset,
+            sample_len: certificate.sample_len,
+            head_sha256: certificate.head_sha256,
+            boundary_sha256: certificate.boundary_sha256,
+            verified_unix_seconds: certificate.verified_unix_seconds,
+            audit_debt: record
+                .envelope_audit_debt
+                .or(certificate.audit_debt_unix_seconds),
+            body: Vec::new(),
+        },
+        &state,
+        crate::snapshots::jsonl_line_cap() as u64,
+    )
+    .unwrap_or_else(|error| panic!("writer {} refused this live state: {error}", W::PIN));
     assert_eq!(
         bytes,
         archived,

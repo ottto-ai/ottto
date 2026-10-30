@@ -7,7 +7,15 @@
 //! another. `transition_serializer_regions.py --archive <sha>` documents the
 //! verification. The live-source check in `transition_seed.rs` is separate and
 //! keeps following current code.
-use std::collections::{BTreeMap, BTreeSet};
+//!
+//! The seed feeds an archived writer live state, not the bytes it checks: the
+//! retained reduction's `{:?}` rendering becomes a `StateNode`, each archived
+//! type takes its fields from it by name (`FromState`), and the copied `encode`
+//! serializes the result. A writer that moves a value to another wire position
+//! therefore disagrees with the archive even when the old layout still parses
+//! its bytes. `live_state.rs` and two test-only impls next to their private
+//! types render the few production types without a derived `Debug`.
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsStr;
 use std::path::Path;
 
@@ -18,6 +26,9 @@ use sha2::{Digest, Sha256};
 pub(crate) mod w_53d05a43;
 
 pub(crate) use w_53d05a43::W_53d05a43;
+
+#[path = "live_state.rs"]
+mod live_state;
 
 const KNOWN_PINS: [&str; 1] = [W_53d05a43::PIN];
 
@@ -90,8 +101,10 @@ pub(crate) trait ArchivedWriter {
     fn regions() -> &'static [Region];
     /// The allowlist digest this writer stamps for a source.
     fn allowlist(source_tag: u8) -> Result<[u8; 32], String>;
-    /// Re-emit stored body bytes, or say why this writer never could have. Stored
-    /// content digests pass through, so drift in them needs the two checks below.
+    /// The body this writer emits for a live reduction rendered as `state`.
+    fn encode_state(source_tag: u8, state: &StateNode, line_cap: u64) -> Result<Vec<u8>, String>;
+    /// Re-emit stored body bytes, or say why this writer never could have. A
+    /// structural check only: stored digests and old-layout values pass through.
     fn encode_body(source_tag: u8, body: &[u8]) -> Result<Vec<u8>, String>;
     /// Header, opaque body and trailer.
     fn frame(record: &ArchivedRecord) -> Result<Vec<u8>, String>;
@@ -102,10 +115,539 @@ pub(crate) trait ArchivedWriter {
     fn session_start_golden(source_tag: u8) -> Option<&'static str>;
     fn goldens() -> Vec<Golden>;
 
-    fn encode(record: &ArchivedRecord) -> Result<Vec<u8>, String> {
+    /// The whole record for live state; `record.body` is replaced.
+    fn encode_live(
+        record: &ArchivedRecord,
+        state: &StateNode,
+        line_cap: u64,
+    ) -> Result<Vec<u8>, String> {
         let mut framed = record.clone();
-        framed.body = Self::encode_body(record.source_tag, &record.body)?;
+        framed.body = Self::encode_state(record.source_tag, state, line_cap)?;
         Self::frame(&framed)
+    }
+}
+
+/// A `{:?}` rendering read back as data. Maps keep their rendered entries;
+/// `FromState` rebuilds typed values from these by field name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum StateNode {
+    Text(String),
+    Number(String),
+    /// A unit struct or variant, `None`, `true` or `false`.
+    Name(String),
+    Named(String, Vec<(String, StateNode)>),
+    /// A tuple struct or variant, `Some(..)`, or a tuple when unnamed.
+    Tuple(Option<String>, Vec<StateNode>),
+    List(Vec<StateNode>),
+    Map(Vec<(StateNode, StateNode)>),
+    Set(Vec<StateNode>),
+}
+
+impl StateNode {
+    pub(crate) fn parse(text: &str) -> Result<Self, String> {
+        let mut parser = StateParser { text, at: 0 };
+        let node = parser.node()?;
+        parser.skip_space();
+        if parser.at != text.len() {
+            return Err(format!("trailing state text at byte {}", parser.at));
+        }
+        Ok(node)
+    }
+
+    /// Exchange two fields' values in every `owner` struct: the value a writer
+    /// with those two `put` calls reversed would emit. Returns how many moved.
+    pub(crate) fn swap_fields(&mut self, owner: &str, a: &str, b: &str) -> usize {
+        let mut swapped = 0;
+        match self {
+            Self::Named(name, fields) => {
+                let at = |field: &str| fields.iter().position(|(n, _)| n == field);
+                if name == owner {
+                    if let (Some(x), Some(y)) = (at(a), at(b)) {
+                        let first = fields[x].1.clone();
+                        fields[x].1 = std::mem::replace(&mut fields[y].1, first);
+                        swapped += 1;
+                    }
+                }
+                for (_, value) in fields.iter_mut() {
+                    swapped += value.swap_fields(owner, a, b);
+                }
+            }
+            Self::Tuple(_, items) | Self::List(items) | Self::Set(items) => {
+                for item in items {
+                    swapped += item.swap_fields(owner, a, b);
+                }
+            }
+            Self::Map(entries) => {
+                for (key, value) in entries {
+                    swapped += key.swap_fields(owner, a, b) + value.swap_fields(owner, a, b);
+                }
+            }
+            Self::Text(_) | Self::Number(_) | Self::Name(_) => {}
+        }
+        swapped
+    }
+
+    /// A content-free label for errors: rendered state can hold user text.
+    fn kind(&self) -> String {
+        match self {
+            Self::Text(_) => "text".to_string(),
+            Self::Number(_) => "number".to_string(),
+            Self::Name(name) => name.clone(),
+            Self::Named(name, _) => format!("{name} {{ .. }}"),
+            Self::Tuple(Some(name), _) => format!("{name}(..)"),
+            Self::Tuple(None, _) => "tuple".to_string(),
+            Self::List(_) => "list".to_string(),
+            Self::Map(_) => "map".to_string(),
+            Self::Set(_) => "set".to_string(),
+        }
+    }
+}
+
+struct StateParser<'a> {
+    text: &'a str,
+    at: usize,
+}
+
+impl StateParser<'_> {
+    fn peek(&self) -> Option<char> {
+        self.text[self.at..].chars().next()
+    }
+
+    fn skip_space(&mut self) {
+        while let Some(c) = self.peek().filter(|c| c.is_whitespace()) {
+            self.at += c.len_utf8();
+        }
+    }
+
+    fn eat(&mut self, want: char) -> bool {
+        self.skip_space();
+        let found = self.peek() == Some(want);
+        if found {
+            self.at += want.len_utf8();
+        }
+        found
+    }
+
+    fn expect(&mut self, want: char) -> Result<(), String> {
+        if self.eat(want) {
+            Ok(())
+        } else {
+            Err(format!("expected {want:?} at byte {}", self.at))
+        }
+    }
+
+    fn word(&mut self) -> String {
+        let start = self.at;
+        while let Some(c) = self
+            .peek()
+            .filter(|c| c.is_alphanumeric() || matches!(c, '_' | '#' | '.' | '-'))
+        {
+            self.at += c.len_utf8();
+        }
+        let word = &self.text[start..self.at];
+        word.strip_prefix("r#").unwrap_or(word).to_string()
+    }
+
+    fn node(&mut self) -> Result<StateNode, String> {
+        self.skip_space();
+        let Some(first) = self.peek() else {
+            return Err("state text ended early".to_string());
+        };
+        if first == '"' {
+            self.at += 1;
+            return self.text().map(StateNode::Text);
+        }
+        if let Some(close) = [('[', ']'), ('(', ')'), ('{', '}')]
+            .iter()
+            .find(|(open, _)| *open == first)
+            .map(|(_, close)| *close)
+        {
+            self.at += 1;
+            return match close {
+                ']' => self.items(']').map(StateNode::List),
+                ')' => self.items(')').map(|items| StateNode::Tuple(None, items)),
+                _ => self.braced(),
+            };
+        }
+        if first == '-' || first.is_ascii_digit() {
+            return Ok(StateNode::Number(self.word()));
+        }
+        if !(first.is_alphabetic() || first == '_') {
+            return Err(format!("unexpected state text at byte {}", self.at));
+        }
+        let name = self.word();
+        if self.eat('(') {
+            return Ok(StateNode::Tuple(Some(name), self.items(')')?));
+        }
+        if self.eat('{') {
+            return Ok(StateNode::Named(name, self.fields()?));
+        }
+        Ok(StateNode::Name(name))
+    }
+
+    fn items(&mut self, close: char) -> Result<Vec<StateNode>, String> {
+        let mut items = Vec::new();
+        while !self.eat(close) {
+            items.push(self.node()?);
+            if !self.eat(',') {
+                self.expect(close)?;
+                break;
+            }
+        }
+        Ok(items)
+    }
+
+    fn fields(&mut self) -> Result<Vec<(String, StateNode)>, String> {
+        let mut fields = Vec::new();
+        while !self.eat('}') {
+            self.skip_space();
+            let name = self.word();
+            self.expect(':')?;
+            fields.push((name, self.node()?));
+            if !self.eat(',') {
+                self.expect('}')?;
+                break;
+            }
+        }
+        Ok(fields)
+    }
+
+    fn braced(&mut self) -> Result<StateNode, String> {
+        if self.eat('}') {
+            return Ok(StateNode::Map(Vec::new()));
+        }
+        let first = self.node()?;
+        if !self.eat(':') {
+            let mut items = vec![first];
+            if self.eat(',') {
+                items.extend(self.items('}')?);
+            } else {
+                self.expect('}')?;
+            }
+            return Ok(StateNode::Set(items));
+        }
+        let mut entries = vec![(first, self.node()?)];
+        while self.eat(',') {
+            if self.eat('}') {
+                return Ok(StateNode::Map(entries));
+            }
+            let key = self.node()?;
+            self.expect(':')?;
+            entries.push((key, self.node()?));
+        }
+        self.expect('}')?;
+        Ok(StateNode::Map(entries))
+    }
+
+    /// The body of a `{:?}` string after its opening quote.
+    fn text(&mut self) -> Result<String, String> {
+        let mut out = String::new();
+        loop {
+            let Some(c) = self.peek() else {
+                return Err("unterminated state string".to_string());
+            };
+            self.at += c.len_utf8();
+            match c {
+                '"' => return Ok(out),
+                '\\' => {
+                    let Some(escape) = self.peek() else {
+                        return Err("unterminated state escape".to_string());
+                    };
+                    self.at += escape.len_utf8();
+                    out.push(match escape {
+                        'n' => '\n',
+                        'r' => '\r',
+                        't' => '\t',
+                        '0' => '\0',
+                        '\\' | '"' | '\'' => escape,
+                        'u' => {
+                            self.expect('{')?;
+                            let digits = self.word();
+                            self.expect('}')?;
+                            u32::from_str_radix(&digits, 16)
+                                .ok()
+                                .and_then(char::from_u32)
+                                .ok_or_else(|| "bad unicode escape in state string".to_string())?
+                        }
+                        _ => return Err("unsupported escape in state string".to_string()),
+                    });
+                }
+                _ => out.push(c),
+            }
+        }
+    }
+}
+
+/// A typed value rebuilt from rendered live state.
+pub(crate) trait FromState: Sized {
+    fn from_state(node: &StateNode) -> Result<Self, String>;
+}
+
+/// A struct's rendered fields, consumed by name.
+pub(crate) struct StateFields<'a> {
+    owner: &'a str,
+    fields: Vec<(&'a str, &'a StateNode)>,
+}
+
+impl<'a> StateFields<'a> {
+    pub(crate) fn named(node: &'a StateNode, owner: &'a str) -> Result<Self, String> {
+        let fields = match node {
+            StateNode::Named(name, fields) if name == owner => fields
+                .iter()
+                .map(|(name, value)| (name.as_str(), value))
+                .collect(),
+            StateNode::Name(name) if name == owner => Vec::new(),
+            other => return Err(format!("expected {owner}, found {}", other.kind())),
+        };
+        Ok(Self { owner, fields })
+    }
+
+    pub(crate) fn take<T: FromState>(&mut self, name: &str) -> Result<T, String> {
+        let at = self
+            .fields
+            .iter()
+            .position(|(field, _)| *field == name)
+            .ok_or_else(|| format!("{}.{name} is missing from live state", self.owner))?;
+        let (_, node) = self.fields.remove(at);
+        T::from_state(node).map_err(|error| format!("{}.{name}: {error}", self.owner))
+    }
+
+    /// `E` and `I` fields never reach the wire, so a rendering may omit them.
+    pub(crate) fn ignore<T: Default>(&mut self, name: &str) -> T {
+        self.fields.retain(|(field, _)| *field != name);
+        T::default()
+    }
+
+    pub(crate) fn finish(self) -> Result<(), String> {
+        match self.fields.first() {
+            None => Ok(()),
+            Some((name, _)) => Err(format!("{}.{name} has no archived field", self.owner)),
+        }
+    }
+
+    pub(crate) fn variant(node: &StateNode) -> Result<&str, String> {
+        match node {
+            StateNode::Name(name) | StateNode::Named(name, _) | StateNode::Tuple(Some(name), _) => {
+                Ok(name)
+            }
+            other => Err(format!("expected an enum variant, found {}", other.kind())),
+        }
+    }
+
+    pub(crate) fn unit(node: &StateNode, variant: &str) -> Result<(), String> {
+        match node {
+            StateNode::Name(name) if name == variant => Ok(()),
+            other => Err(format!("expected {variant}, found {}", other.kind())),
+        }
+    }
+}
+
+/// A tuple struct's or variant's rendered items, consumed in order.
+pub(crate) struct StateItems<'a> {
+    owner: &'a str,
+    items: std::slice::Iter<'a, StateNode>,
+}
+
+impl<'a> StateItems<'a> {
+    pub(crate) fn tuple(node: &'a StateNode, owner: &'a str) -> Result<Self, String> {
+        match node {
+            StateNode::Tuple(Some(name), items) if name == owner => Ok(Self {
+                owner,
+                items: items.iter(),
+            }),
+            other => Err(format!("expected {owner}(..), found {}", other.kind())),
+        }
+    }
+
+    pub(crate) fn take<T: FromState>(&mut self) -> Result<T, String> {
+        let node = self
+            .items
+            .next()
+            .ok_or_else(|| format!("{} has too few items", self.owner))?;
+        T::from_state(node).map_err(|error| format!("{}.{error}", self.owner))
+    }
+
+    pub(crate) fn finish(mut self) -> Result<(), String> {
+        match self.items.next() {
+            None => Ok(()),
+            Some(_) => Err(format!("{} has too many items", self.owner)),
+        }
+    }
+}
+
+macro_rules! numbers_from_state {
+    ($($t:ty),* $(,)?) => {$(
+        impl FromState for $t {
+            fn from_state(node: &StateNode) -> Result<Self, String> {
+                match node {
+                    StateNode::Number(text) => text
+                        .parse()
+                        .map_err(|_| format!("{text} is not a {}", stringify!($t))),
+                    other => Err(format!("expected a number, found {}", other.kind())),
+                }
+            }
+        }
+    )*};
+}
+numbers_from_state!(
+    u8,
+    u16,
+    u32,
+    u64,
+    usize,
+    i32,
+    i64,
+    i128,
+    u128,
+    std::num::NonZeroU64
+);
+
+impl FromState for bool {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        match node {
+            StateNode::Name(name) if name == "true" => Ok(true),
+            StateNode::Name(name) if name == "false" => Ok(false),
+            other => Err(format!("expected a bool, found {}", other.kind())),
+        }
+    }
+}
+
+impl FromState for String {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        match node {
+            StateNode::Text(text) => Ok(text.clone()),
+            other => Err(format!("expected text, found {}", other.kind())),
+        }
+    }
+}
+
+impl FromState for std::path::PathBuf {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        String::from_state(node).map(Self::from)
+    }
+}
+
+/// Static labels: the copied `put` looks the text up in its own table.
+impl FromState for &'static str {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        Ok(Box::leak(String::from_state(node)?.into_boxed_str()))
+    }
+}
+
+impl FromState for () {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        match node {
+            StateNode::Tuple(None, items) if items.is_empty() => Ok(()),
+            other => Err(format!("expected (), found {}", other.kind())),
+        }
+    }
+}
+
+impl<T: FromState> FromState for Option<T> {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        match node {
+            StateNode::Name(name) if name == "None" => Ok(None),
+            StateNode::Tuple(Some(name), items) if name == "Some" && items.len() == 1 => {
+                T::from_state(&items[0]).map(Some)
+            }
+            other => Err(format!("expected an Option, found {}", other.kind())),
+        }
+    }
+}
+
+impl<T: FromState> FromState for Box<T> {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        T::from_state(node).map(Box::new)
+    }
+}
+
+fn state_list(node: &StateNode) -> Result<&[StateNode], String> {
+    match node {
+        StateNode::List(items) => Ok(items),
+        other => Err(format!("expected a list, found {}", other.kind())),
+    }
+}
+
+impl<T: FromState> FromState for Vec<T> {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        state_list(node)?.iter().map(T::from_state).collect()
+    }
+}
+
+impl<T: FromState> FromState for VecDeque<T> {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        state_list(node)?.iter().map(T::from_state).collect()
+    }
+}
+
+impl<T: FromState, const N: usize> FromState for [T; N] {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let items = Vec::<T>::from_state(node)?;
+        let len = items.len();
+        items
+            .try_into()
+            .map_err(|_| format!("expected {N} items, found {len}"))
+    }
+}
+
+impl<K: FromState + Ord, V: FromState> FromState for BTreeMap<K, V> {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let entries = match node {
+            StateNode::Map(entries) => entries,
+            other => return Err(format!("expected a map, found {}", other.kind())),
+        };
+        let mut out = Self::new();
+        for (key, value) in entries {
+            if out
+                .insert(K::from_state(key)?, V::from_state(value)?)
+                .is_some()
+            {
+                return Err("duplicate rendered map key".to_string());
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl<T: FromState + Ord> FromState for BTreeSet<T> {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let items: &[StateNode] = match node {
+            StateNode::Set(items) => items,
+            StateNode::Map(entries) if entries.is_empty() => &[],
+            other => return Err(format!("expected a set, found {}", other.kind())),
+        };
+        let mut out = Self::new();
+        for item in items {
+            if !out.insert(T::from_state(item)?) {
+                return Err("duplicate rendered set item".to_string());
+            }
+        }
+        Ok(out)
+    }
+}
+
+fn state_tuple(node: &StateNode, len: usize) -> Result<&[StateNode], String> {
+    match node {
+        StateNode::Tuple(None, items) if items.len() == len => Ok(items),
+        other => Err(format!("expected a {len}-tuple, found {}", other.kind())),
+    }
+}
+
+impl<A: FromState, B: FromState> FromState for (A, B) {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let items = state_tuple(node, 2)?;
+        Ok((A::from_state(&items[0])?, B::from_state(&items[1])?))
+    }
+}
+
+impl<A: FromState, B: FromState, C: FromState> FromState for (A, B, C) {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let items = state_tuple(node, 3)?;
+        Ok((
+            A::from_state(&items[0])?,
+            B::from_state(&items[1])?,
+            C::from_state(&items[2])?,
+        ))
     }
 }
 
@@ -426,9 +968,8 @@ fn archived_writer_encode_frames_its_own_body() {
         })
         .unwrap();
     let mut with_body = record.clone();
-    with_body.body = body.clone();
-    let framed = W_53d05a43::encode(&with_body).unwrap();
-    assert_eq!(W_53d05a43::frame(&with_body).unwrap(), framed);
+    with_body.body = W_53d05a43::encode_body(record.source_tag, body).unwrap();
+    let framed = W_53d05a43::frame(&with_body).unwrap();
     assert_eq!(&framed[..8], &expected[..8]);
     assert_eq!(
         u16::from_le_bytes(framed[8..10].try_into().unwrap()),
@@ -439,9 +980,57 @@ fn archived_writer_encode_frames_its_own_body() {
         &framed[digest_at..],
         Sha256::digest(&framed[..digest_at]).as_slice()
     );
-    let mut opaque = record.clone();
-    opaque.body = b"opaque-v1-body".to_vec();
-    assert!(W_53d05a43::encode(&opaque).is_err());
+    assert!(W_53d05a43::encode_body(record.source_tag, b"opaque-v1-body").is_err());
+}
+
+#[test]
+fn state_node_reads_debug_renderings() {
+    #[derive(Debug)]
+    struct Unit;
+    #[derive(Debug)]
+    struct Pair(i64, Option<u8>);
+    #[derive(Debug)]
+    struct Live {
+        r#type: String,
+        unit: Unit,
+        pair: Pair,
+        map: BTreeMap<String, Vec<u8>>,
+        set: BTreeSet<u64>,
+        empty: BTreeSet<u64>,
+        tuple: (bool, ()),
+    }
+    let live = Live {
+        r#type: "q\"\\\n\t\0\u{1}é".to_string(),
+        unit: Unit,
+        pair: Pair(-3, Some(7)),
+        map: BTreeMap::from([("k".to_string(), vec![1, 2])]),
+        set: BTreeSet::from([4, 5]),
+        empty: BTreeSet::new(),
+        tuple: (true, ()),
+    };
+    for rendered in [format!("{live:?}"), format!("{live:#?}")] {
+        let node = StateNode::parse(&rendered).unwrap();
+        let mut fields = StateFields::named(&node, "Live").unwrap();
+        assert_eq!(fields.take::<String>("type").unwrap(), live.r#type);
+        StateFields::unit(fields.fields[0].1, "Unit").unwrap();
+        fields.ignore::<()>("unit");
+        let mut pair = StateItems::tuple(fields.fields[0].1, "Pair").unwrap();
+        assert_eq!(pair.take::<i64>().unwrap(), live.pair.0);
+        assert_eq!(pair.take::<Option<u8>>().unwrap(), live.pair.1);
+        pair.finish().unwrap();
+        fields.ignore::<()>("pair");
+        assert_eq!(
+            fields.take::<BTreeMap<String, Vec<u8>>>("map").unwrap(),
+            live.map
+        );
+        assert_eq!(fields.take::<BTreeSet<u64>>("set").unwrap(), live.set);
+        assert_eq!(fields.take::<BTreeSet<u64>>("empty").unwrap(), live.empty);
+        assert_eq!(fields.take::<(bool, ())>("tuple").unwrap(), live.tuple);
+        fields.finish().unwrap();
+    }
+    let Unit = live.unit;
+    assert!(StateNode::parse("Live { a: 1 } trailing").is_err());
+    assert!(StateNode::parse("\"unterminated").is_err());
 }
 
 struct SyntheticRepo(std::path::PathBuf);

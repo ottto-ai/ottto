@@ -682,7 +682,7 @@ def verify_archive(sources, wanted, text_only, source_root):
     archives = {}
     for path, text in sources.items():
         name = path[len(ARCHIVE_DIR):]
-        if path.startswith(ARCHIVE_DIR) and path.endswith(".rs") and name != "mod.rs":
+        if path.startswith(ARCHIVE_DIR) and name.startswith("w_") and name.endswith(".rs"):
             sha = ARCHIVE_SHA.search(text)
             root = ARCHIVE_ROOT.search(text)
             if sha is None or root is None:
@@ -744,7 +744,7 @@ def archive_sources(root):
         raise ValueError("archive verification requires an existing source tree: " + str(root))
     return {
         ARCHIVE_DIR + path.name: path.read_text(encoding="utf-8")
-        for path in sorted(directory.glob("*.rs"))
+        for path in sorted(directory.glob("w_*.rs"))
     }
 
 

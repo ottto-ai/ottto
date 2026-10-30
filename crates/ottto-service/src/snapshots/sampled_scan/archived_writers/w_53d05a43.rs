@@ -22,7 +22,8 @@
 )]
 
 use super::{
-    decode_hex, ArchivedContent, ArchivedRecord, ArchivedWriter, ContentDigests, Golden, Region,
+    decode_hex, ArchivedContent, ArchivedRecord, ArchivedWriter, ContentDigests, FromState,
+    Golden, Region, StateFields, StateItems, StateNode,
 };
 use sha2::{Digest, Sha256};
 
@@ -46,6 +47,10 @@ impl ArchivedWriter for W_53d05a43 {
         hasher.update(b"ottto-durable-tail-shape:v1");
         hasher.update(text.as_bytes());
         Ok(hasher.finalize().into())
+    }
+
+    fn encode_state(source_tag: u8, state: &StateNode, line_cap: u64) -> Result<Vec<u8>, String> {
+        snapshots::archived_encode_state(snapshots::archived_source(source_tag)?, state, line_cap)
     }
 
     fn encode_body(source_tag: u8, body: &[u8]) -> Result<Vec<u8>, String> {
@@ -335,6 +340,30 @@ pub(crate) mod owned_heap {
     #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
     pub(crate) struct OwnedMap<K, V> { values: BTreeMap<K, V>, elements: Option<usize> }
     pub(crate) struct ValueGuard<'a, T> { value: &'a mut T, sum: &'a mut Option<usize>, base: Option<usize> }
+    use crate::snapshots::sampled_scan::durable_tail::transition_seed::archived_writers::w_53d05a43::{FromState, StateFields, StateNode};
+    // Live containers render `{ values, elements }`; the count is recomputed.
+    impl<T: FromState + HeapLayoutBound> FromState for OwnedVec<T> {
+        fn from_state(node: &StateNode) -> Result<Self, String> {
+            let mut fields = StateFields::named(node, "OwnedVec")?;
+            let values: Vec<T> = fields.take("values")?;
+            fields.ignore::<Option<usize>>("elements");
+            fields.finish()?;
+            Ok(Self::from(values))
+        }
+    }
+    impl<K: FromState + Ord + HeapLayoutBound, V: FromState + HeapLayoutBound> FromState for OwnedMap<K, V> {
+        fn from_state(node: &StateNode) -> Result<Self, String> {
+            let mut fields = StateFields::named(node, "OwnedMap")?;
+            let values: BTreeMap<K, V> = fields.take("values")?;
+            fields.ignore::<Option<usize>>("elements");
+            fields.finish()?;
+            let mut out = Self::new();
+            for (key, value) in values {
+                out.insert(key, value);
+            }
+            Ok(out)
+        }
+    }
 // archive-region: owned_heap.rs
 fn heap<T: HeapLayoutBound>(value: &T) -> Option<usize> {
     let bytes = heap_layout_bound::bound(value, crate::snapshots::sampled_scan::durable_tail::transition_seed::archived_writers::w_53d05a43::transcript_cache::ENTRY_BYTES)?;
@@ -1856,6 +1885,20 @@ pub(crate) fn current_line() -> Option<(u64, u64)> {
     LINE.with(std::cell::Cell::get)
 }
 // archive-region-end
+    impl crate::snapshots::sampled_scan::durable_tail::transition_seed::archived_writers::w_53d05a43::FromState for DurableMarks {
+        fn from_state(node: &crate::snapshots::sampled_scan::durable_tail::transition_seed::archived_writers::w_53d05a43::StateNode) -> Result<Self, String> {
+            let mut fields = crate::snapshots::sampled_scan::durable_tail::transition_seed::archived_writers::w_53d05a43::StateFields::named(node, "DurableMarks")?;
+            let value = Self {
+                first_prompt: fields.take("first_prompt")?,
+                workspace: fields.take("workspace")?,
+                agent_label: fields.take("agent_label")?,
+                title_line: fields.take("title_line")?,
+                unknown: fields.take("unknown")?,
+            };
+            fields.finish()?;
+            Ok(value)
+        }
+    }
     impl Shape {
         pub(crate) fn archived_text(&self) -> &str {
             &self.text
@@ -2005,10 +2048,22 @@ pub(crate) mod codex_prelude_footprint {
     use crate::snapshots::sampled_scan::durable_tail::transition_seed::archived_writers::w_53d05a43::durable_tail_codec::*;
     use std::collections::{BTreeMap, BTreeSet};
     use crate::snapshots::sampled_scan::durable_tail::transition_seed::archived_writers::w_53d05a43::snapshots::*;
+    use crate::snapshots::sampled_scan::durable_tail::transition_seed::archived_writers::w_53d05a43::{FromState, StateFields, StateItems, StateNode};
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct LoadedAgentsMd {
     pub(crate) directory: Option<String>,
     pub(crate) text: String,
+}
+impl FromState for LoadedAgentsMd {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "LoadedAgentsMd")?;
+        let value = Self {
+            directory: fields.take("directory")?,
+            text: fields.take("text")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub(crate) struct CodexPrelude {
@@ -2030,6 +2085,32 @@ pub(crate) struct CodexPrelude {
     pub(crate) agents_md_capped: bool,
     pub(crate) skills_body: Option<String>,
 }
+impl FromState for CodexPrelude {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "CodexPrelude")?;
+        let value = Self {
+            cwd: fields.take("cwd")?,
+            started_at: fields.take("started_at")?,
+            is_fork: fields.take("is_fork")?,
+            complete: fields.take("complete")?,
+            model: fields.take("model")?,
+            context_window: fields.take("context_window")?,
+            first_input_tokens: fields.take("first_input_tokens")?,
+            base_instructions_chars: fields.take("base_instructions_chars")?,
+            other_harness_chars: fields.take("other_harness_chars")?,
+            hook_chars: fields.take("hook_chars")?,
+            block_chars: fields.take("block_chars")?,
+            blocks_incomplete: fields.take("blocks_incomplete")?,
+            input_closed: fields.take("input_closed")?,
+            world_state_seen: fields.take("world_state_seen")?,
+            agents_md: fields.take("agents_md")?,
+            agents_md_capped: fields.take("agents_md_capped")?,
+            skills_body: fields.ignore("skills_body"),
+        };
+        fields.finish()?;
+        Ok(value)
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct CodexPreludeParser {
     pub(crate) prelude: CodexPrelude,
@@ -2037,6 +2118,20 @@ pub(crate) struct CodexPreludeParser {
     pub(crate) rows_after_first_request: usize,
     pub(crate) agents_md_cap: usize,
     pub(crate) keep_skills_body: bool,
+}
+impl FromState for CodexPreludeParser {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "CodexPreludeParser")?;
+        let value = Self {
+            prelude: fields.take("prelude")?,
+            session_id: fields.take("session_id")?,
+            rows_after_first_request: fields.take("rows_after_first_request")?,
+            agents_md_cap: fields.take("agents_md_cap")?,
+            keep_skills_body: fields.take("keep_skills_body")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
 }
 
 // archive-region: codex_prelude_footprint.rs
@@ -2094,6 +2189,7 @@ pub(crate) mod snapshots {
     use std::num::NonZeroU64;
     use crate::snapshots::sampled_scan::durable_tail::transition_seed::archived_writers::w_53d05a43::codex_prelude_footprint::*;
     use crate::snapshots::sampled_scan::durable_tail::transition_seed::archived_writers::w_53d05a43::owned_heap::{OwnedVec, OwnedMap};
+    use crate::snapshots::sampled_scan::durable_tail::transition_seed::archived_writers::w_53d05a43::{FromState, StateFields, StateItems, StateNode};
     pub(crate) type PrefixDigest = [u8; 32];
     pub(crate) type T6 = [u64; 6];
     pub(crate) mod session_start { pub(crate) use super::*; }
@@ -2105,6 +2201,15 @@ pub(crate) mod snapshots {
     absent_on_wire!(Value, SessionArtifact, ProofRefusal, PiUsageDedupState, CodexTurnTraceMap, CodexParentPrefix, CodexParentOwnershipLedger, ClaudeTranscriptUsageOccurrence, ClaudeDesktopSpawnLineage, CacheObservations, CodexParentPrefixProof);
     #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
     pub(crate) struct SelectorCapture { pub(crate) context: BTreeMap<String, String>, pub(crate) sources: BTreeMap<String, String> }
+    // By name: the copied `put` (not this association) decides the wire order.
+    impl FromState for SelectorCapture {
+        fn from_state(node: &StateNode) -> Result<Self, String> {
+            let mut fields = StateFields::named(node, "SelectorCapture")?;
+            let value = Self { context: fields.take("context")?, sources: fields.take("sources")? };
+            fields.finish()?;
+            Ok(value)
+        }
+    }
     use crate::snapshots::sampled_scan::durable_tail::transition_seed::archived_writers::w_53d05a43::heap_layout_bound::HeapLayoutBound;
     macro_rules! heap_elements { ($($t:ty),* $(,)?) => { $(impl HeapLayoutBound for $t {})* } }
     heap_elements!(SelectorCapture, PendingRow, OwnedRequest, ContextCurveCandidatePoint, ContextCurveCandidateBoundary, CompactClaudeResponseRecord, ClaudeResponseObservation, ClaudeCompactionObservation);
@@ -2114,12 +2219,46 @@ pub(crate) enum ClaudeCompactionKind {
     LegacySummary,
     CurrentBoundary,
 }
+impl FromState for ClaudeCompactionKind {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        Ok(match StateFields::variant(node)? {
+            "LegacySummary" => {
+                StateFields::unit(node, "LegacySummary")?;
+                Self::LegacySummary
+            }
+            "CurrentBoundary" => {
+                StateFields::unit(node, "CurrentBoundary")?;
+                Self::CurrentBoundary
+            }
+            other => return Err(format!("ClaudeCompactionKind has no variant {other}")),
+        })
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Default, Copy)]
 pub(crate) enum SnapshotSource {
     #[default]
     Codex,
     ClaudeCode,
     Pi,
+}
+impl FromState for SnapshotSource {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        Ok(match StateFields::variant(node)? {
+            "Codex" => {
+                StateFields::unit(node, "Codex")?;
+                Self::Codex
+            }
+            "ClaudeCode" => {
+                StateFields::unit(node, "ClaudeCode")?;
+                Self::ClaudeCode
+            }
+            "Pi" => {
+                StateFields::unit(node, "Pi")?;
+                Self::Pi
+            }
+            other => return Err(format!("SnapshotSource has no variant {other}")),
+        })
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub(crate) enum CodexOwnershipBoundary {
@@ -2131,6 +2270,45 @@ pub(crate) enum CodexOwnershipBoundary {
     Ordinal { start: u64 },
     NativeCreatedThread,
     AmbiguousFork,
+}
+impl FromState for CodexOwnershipBoundary {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        Ok(match StateFields::variant(node)? {
+            "Undetermined" => {
+                StateFields::unit(node, "Undetermined")?;
+                Self::Undetermined
+            }
+            "AllLocal" => {
+                StateFields::unit(node, "AllLocal")?;
+                Self::AllLocal
+            }
+            "AwaitingLegacyTrigger" => {
+                StateFields::unit(node, "AwaitingLegacyTrigger")?;
+                Self::AwaitingLegacyTrigger
+            }
+            "AwaitingParentPrefix" => {
+                StateFields::unit(node, "AwaitingParentPrefix")?;
+                Self::AwaitingParentPrefix
+            }
+            "Ordinal" => {
+                let mut fields = StateFields::named(node, "Ordinal")?;
+                let value = Self::Ordinal {
+                    start: fields.take("start")?,
+                };
+                fields.finish()?;
+                value
+            }
+            "NativeCreatedThread" => {
+                StateFields::unit(node, "NativeCreatedThread")?;
+                Self::NativeCreatedThread
+            }
+            "AmbiguousFork" => {
+                StateFields::unit(node, "AmbiguousFork")?;
+                Self::AmbiguousFork
+            }
+            other => return Err(format!("CodexOwnershipBoundary has no variant {other}")),
+        })
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Default, Copy)]
 pub(crate) enum CodexParentUnresolvable {
@@ -2148,12 +2326,80 @@ pub(crate) enum CodexParentUnresolvable {
     DeferredRef,
     DeferredRestart,
 }
+impl FromState for CodexParentUnresolvable {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        Ok(match StateFields::variant(node)? {
+            "Absent" => {
+                StateFields::unit(node, "Absent")?;
+                Self::Absent
+            }
+            "Duplicated" => {
+                StateFields::unit(node, "Duplicated")?;
+                Self::Duplicated
+            }
+            "NotRegular" => {
+                StateFields::unit(node, "NotRegular")?;
+                Self::NotRegular
+            }
+            "Oversize" => {
+                StateFields::unit(node, "Oversize")?;
+                Self::Oversize
+            }
+            "NoLedger" => {
+                StateFields::unit(node, "NoLedger")?;
+                Self::NoLedger
+            }
+            "LedgerCapped" => {
+                StateFields::unit(node, "LedgerCapped")?;
+                Self::LedgerCapped
+            }
+            "ParentHeld" => {
+                StateFields::unit(node, "ParentHeld")?;
+                Self::ParentHeld
+            }
+            "ParentLossy" => {
+                StateFields::unit(node, "ParentLossy")?;
+                Self::ParentLossy
+            }
+            "OutOfWindow" => {
+                StateFields::unit(node, "OutOfWindow")?;
+                Self::OutOfWindow
+            }
+            "ForkCycle" => {
+                StateFields::unit(node, "ForkCycle")?;
+                Self::ForkCycle
+            }
+            "DeferredRef" => {
+                StateFields::unit(node, "DeferredRef")?;
+                Self::DeferredRef
+            }
+            "DeferredRestart" => {
+                StateFields::unit(node, "DeferredRestart")?;
+                Self::DeferredRestart
+            }
+            other => return Err(format!("CodexParentUnresolvable has no variant {other}")),
+        })
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct BucketRowAccumulator {
     pub(crate) selector_context: BTreeMap<String, String>,
     pub(crate) selector_sources: BTreeMap<String, String>,
     pub(crate) usage: UsageTotals,
     pub(crate) reasoning_effort: Option<String>,
+}
+impl FromState for BucketRowAccumulator {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "BucketRowAccumulator")?;
+        let value = Self {
+            selector_context: fields.take("selector_context")?,
+            selector_sources: fields.take("selector_sources")?,
+            usage: fields.take("usage")?,
+            reasoning_effort: fields.take("reasoning_effort")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ClaudeCompactionObservation {
@@ -2170,6 +2416,27 @@ pub(crate) struct ClaudeCompactionObservation {
     pub(crate) id_less_before: bool,
     pub(crate) id_less_after: bool,
 }
+impl FromState for ClaudeCompactionObservation {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "ClaudeCompactionObservation")?;
+        let value = Self {
+            kind: fields.take("kind")?,
+            timestamp: fields.take("timestamp")?,
+            pre_tokens: fields.take("pre_tokens")?,
+            post_tokens: fields.take("post_tokens")?,
+            cumulative_dropped_tokens: fields.take("cumulative_dropped_tokens")?,
+            duration_ms: fields.take("duration_ms")?,
+            response_count_before: fields.take("response_count_before")?,
+            pair_key: fields.take("pair_key")?,
+            has_parent_link: fields.take("has_parent_link")?,
+            trigger: fields.take("trigger")?,
+            id_less_before: fields.take("id_less_before")?,
+            id_less_after: fields.take("id_less_after")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ClaudeResponseObservation {
     pub(crate) sequence: u64,
@@ -2177,6 +2444,20 @@ pub(crate) struct ClaudeResponseObservation {
     pub(crate) records: crate::snapshots::sampled_scan::durable_tail::transition_seed::archived_writers::w_53d05a43::owned_heap::OwnedVec<CompactClaudeResponseRecord>,
     pub(crate) record_limit_exceeded: bool,
     pub(crate) desktop_request: bool,
+}
+impl FromState for ClaudeResponseObservation {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "ClaudeResponseObservation")?;
+        let value = Self {
+            sequence: fields.take("sequence")?,
+            preceding_user_timestamp: fields.take("preceding_user_timestamp")?,
+            records: fields.take("records")?,
+            record_limit_exceeded: fields.take("record_limit_exceeded")?,
+            desktop_request: fields.take("desktop_request")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct CodexPathSidecarCandidate {
@@ -2190,6 +2471,24 @@ pub(crate) struct CodexPathSidecarCandidate {
     pub(crate) child_created_at_nanos: Option<i128>,
     pub(crate) projected_next_ordinal: Option<u64>,
 }
+impl FromState for CodexPathSidecarCandidate {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "CodexPathSidecarCandidate")?;
+        let value = Self {
+            identity: fields.take("identity")?,
+            recorded_evidence: fields.take("recorded_evidence")?,
+            created_thread: fields.take("created_thread")?,
+            identity_conflict: fields.take("identity_conflict")?,
+            detail_incomplete: fields.take("detail_incomplete")?,
+            rollout_file_matches: fields.take("rollout_file_matches")?,
+            parent: fields.take("parent")?,
+            child_created_at_nanos: fields.take("child_created_at_nanos")?,
+            projected_next_ordinal: fields.take("projected_next_ordinal")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct RowKey {
     pub(crate) model: String,
@@ -2202,13 +2501,51 @@ pub(crate) struct RowKey {
     pub(crate) model_provider: Option<String>,
     pub(crate) subscription_product: Option<String>,
 }
+impl FromState for RowKey {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "RowKey")?;
+        let value = Self {
+            model: fields.take("model")?,
+            selector_hash: fields.take("selector_hash")?,
+            reasoning_effort: fields.take("reasoning_effort")?,
+            auth_mode: fields.take("auth_mode")?,
+            billing_channel: fields.take("billing_channel")?,
+            billing_provider: fields.take("billing_provider")?,
+            gateway_provider: fields.take("gateway_provider")?,
+            model_provider: fields.take("model_provider")?,
+            subscription_product: fields.take("subscription_product")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ActivityCallId {
     pub(crate) id: String,
 }
+impl FromState for ActivityCallId {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "ActivityCallId")?;
+        let value = Self {
+            id: fields.take("id")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ActivityCallTool {
     pub(crate) name: String,
+}
+impl FromState for ActivityCallTool {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "ActivityCallTool")?;
+        let value = Self {
+            name: fields.take("name")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct SessionAccountEvidence {
@@ -2219,6 +2556,22 @@ pub(crate) struct SessionAccountEvidence {
     pub(crate) evidence_source: &'static str,
     pub(crate) identity_disposition: Option<&'static str>,
     pub(crate) source_created_at: Option<String>,
+}
+impl FromState for SessionAccountEvidence {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "SessionAccountEvidence")?;
+        let value = Self {
+            provider: fields.take("provider")?,
+            account_identifier_hash: fields.take("account_identifier_hash")?,
+            provider_workspace_hash: fields.take("provider_workspace_hash")?,
+            identity_hash_scheme: fields.take("identity_hash_scheme")?,
+            evidence_source: fields.take("evidence_source")?,
+            identity_disposition: fields.take("identity_disposition")?,
+            source_created_at: fields.take("source_created_at")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
 }
 #[derive(Clone, Debug)]
 pub(crate) struct SnapshotAccumulator {
@@ -2372,6 +2725,164 @@ pub(crate) struct SnapshotAccumulator {
     pub(crate) session_start: Box<session_start::SessionStartState>,
     pub(crate) durable_marks: crate::snapshots::sampled_scan::durable_tail::transition_seed::archived_writers::w_53d05a43::durable_tail_codec::DurableMarks,
 }
+impl FromState for SnapshotAccumulator {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "SnapshotAccumulator")?;
+        let value = Self {
+            source: fields.take("source")?,
+            cache_configuration_witness: fields.take("cache_configuration_witness")?,
+            cache_task_complete_at: fields.take("cache_task_complete_at")?,
+            cache_pending_idle: fields.take("cache_pending_idle")?,
+            cache_active_turns: fields.take("cache_active_turns")?,
+            context_curve_enabled: fields.take("context_curve_enabled")?,
+            source_session_id: fields.take("source_session_id")?,
+            account_identifier_hash: fields.take("account_identifier_hash")?,
+            title: fields.take("title")?,
+            title_source: fields.take("title_source")?,
+            first_prompt_title: fields.take("first_prompt_title")?,
+            first_prompt_material: fields.take("first_prompt_material")?,
+            provider_skills: fields.ignore("provider_skills"),
+            started_at: fields.take("started_at")?,
+            ended_at: fields.take("ended_at")?,
+            last_activity_at: fields.take("last_activity_at")?,
+            workspace_hash: fields.take("workspace_hash")?,
+            workspace_path: fields.take("workspace_path")?,
+            latest_model: fields.take("latest_model")?,
+            latest_reasoning_effort: fields.take("latest_reasoning_effort")?,
+            latest_turn_id: fields.take("latest_turn_id")?,
+            codex_turn_traces: fields.ignore("codex_turn_traces"),
+            codex_observed_priority_turns: fields.take("codex_observed_priority_turns")?,
+            codex_priority_witnesses_uncapped: fields.take("codex_priority_witnesses_uncapped")?,
+            codex_tier_replay: fields.ignore("codex_tier_replay"),
+            codex_counting: fields.take("codex_counting")?,
+            current_selector: fields.take("current_selector")?,
+            session_cumulative_usage: fields.take("session_cumulative_usage")?,
+            codex_session_meta_seen: fields.take("codex_session_meta_seen")?,
+            codex_record_seen: fields.take("codex_record_seen")?,
+            codex_creator_header_id: fields.take("codex_creator_header_id")?,
+            codex_creator_evidence: fields.take("codex_creator_evidence")?,
+            codex_creator_evidence_conflicted: fields.take("codex_creator_evidence_conflicted")?,
+            claude_desktop_identity: fields.ignore("claude_desktop_identity"),
+            claude_desktop_spawn_lineage: fields.ignore("claude_desktop_spawn_lineage"),
+            claude_owned_session_id_observed: fields.take("claude_owned_session_id_observed")?,
+            claude_owned_session_id_conflicted: fields.take("claude_owned_session_id_conflicted")?,
+            codex_ownership_boundary: fields.take("codex_ownership_boundary")?,
+            codex_legacy_trigger_seen: fields.take("codex_legacy_trigger_seen")?,
+            codex_legacy_bootstrap_valid: fields.take("codex_legacy_bootstrap_valid")?,
+            codex_parent_ownership_ledgers: fields.ignore("codex_parent_ownership_ledgers"),
+            codex_sidecar_created_thread: fields.take("codex_sidecar_created_thread")?,
+            codex_path_sidecar_candidates: fields.take("codex_path_sidecar_candidates")?,
+            codex_resolved_path_identity: fields.take("codex_resolved_path_identity")?,
+            codex_sidecar_identity_ambiguous: fields.take("codex_sidecar_identity_ambiguous")?,
+            codex_sidecar_parent: fields.take("codex_sidecar_parent")?,
+            codex_sidecar_child_created_at_nanos: fields.take("codex_sidecar_child_created_at_nanos")?,
+            codex_bind_seed_len: fields.take("codex_bind_seed_len")?,
+            codex_sidecar_projected_next_ordinal: fields.ignore("codex_sidecar_projected_next_ordinal"),
+            codex_parent_session_ref: fields.take("codex_parent_session_ref")?,
+            codex_parent_signatures: fields.ignore("codex_parent_signatures"),
+            codex_parent_prefix_digest: fields.take("codex_parent_prefix_digest")?,
+            codex_parent_prefix_decided: fields.take("codex_parent_prefix_decided")?,
+            codex_parent_prefix_proof: fields.ignore("codex_parent_prefix_proof"),
+            codex_parent_proof_used: fields.ignore("codex_parent_proof_used"),
+            codex_parent_proof_mismatch: fields.take("codex_parent_proof_mismatch")?,
+            codex_parent_proof_refusal: fields.ignore("codex_parent_proof_refusal"),
+            codex_proof_decision_only: fields.take("codex_proof_decision_only")?,
+            codex_boundary_buffer_count: fields.take("codex_boundary_buffer_count")?,
+            codex_proof_ledger_row: fields.take("codex_proof_ledger_row")?,
+            codex_parent_ledger_identity_used: fields.take("codex_parent_ledger_identity_used")?,
+            codex_parent_unresolvable: fields.take("codex_parent_unresolvable")?,
+            codex_parent_ledger_consulted: fields.take("codex_parent_ledger_consulted")?,
+            codex_parent_signature_index: fields.take("codex_parent_signature_index")?,
+            codex_native_created_thread_valid: fields.take("codex_native_created_thread_valid")?,
+            codex_created_thread_native_only: fields.take("codex_created_thread_native_only")?,
+            codex_native_created_thread_header_nanos: fields.take("codex_native_created_thread_header_nanos")?,
+            codex_native_created_thread_last_nanos: fields.take("codex_native_created_thread_last_nanos")?,
+            codex_native_created_thread_task_turn_id: fields.take("codex_native_created_thread_task_turn_id")?,
+            codex_native_created_thread_first_turn_bound: fields.take("codex_native_created_thread_first_turn_bound")?,
+            codex_physical_signatures: fields.take("codex_physical_signatures")?,
+            codex_physical_signatures_complete: fields.take("codex_physical_signatures_complete")?,
+            codex_ordinal_expected: fields.take("codex_ordinal_expected")?,
+            codex_ordinal_sequence_valid: fields.take("codex_ordinal_sequence_valid")?,
+            codex_owned_record_seen: fields.take("codex_owned_record_seen")?,
+            codex_is_fork: fields.take("codex_is_fork")?,
+            codex_inherited_usage_records_skipped: fields.take("codex_inherited_usage_records_skipped")?,
+            codex_duplicate_usage_records_skipped: fields.take("codex_duplicate_usage_records_skipped")?,
+            codex_cumulative_reset_count: fields.take("codex_cumulative_reset_count")?,
+            codex_context_curve_candidates: fields.take("codex_context_curve_candidates")?,
+            codex_context_curve_boundaries: fields.take("codex_context_curve_boundaries")?,
+            codex_context_curve_exact_supported: fields.take("codex_context_curve_exact_supported")?,
+            codex_last_usage_event_identity: fields.take("codex_last_usage_event_identity")?,
+            codex_legacy_bootstrap_buffer: fields.ignore("codex_legacy_bootstrap_buffer"),
+            accepted_usage_totals: fields.take("accepted_usage_totals")?,
+            usage_buckets: fields.take("usage_buckets")?,
+            origin: fields.take("origin")?,
+            codex_root_session_ref: fields.take("codex_root_session_ref")?,
+            codex_spawn_depth: fields.take("codex_spawn_depth")?,
+            codex_agent_label: fields.take("codex_agent_label")?,
+            activity_tool_counts: fields.take("activity_tool_counts")?,
+            activity_call_tools: fields.take("activity_call_tools")?,
+            activity_mcp_tool_counts: fields.take("activity_mcp_tool_counts")?,
+            activity_mcp_tool_usage_counts: fields.take("activity_mcp_tool_usage_counts")?,
+            activity_mcp_call_ids: fields.take("activity_mcp_call_ids")?,
+            activity_capability_buckets: fields.take("activity_capability_buckets")?,
+            seen_claude_capability_tool_uses: fields.take("seen_claude_capability_tool_uses")?,
+            activity_skills: fields.ignore("activity_skills"),
+            skill_detector_incomplete: fields.take("skill_detector_incomplete")?,
+            activity_changed_file_hashes: fields.take("activity_changed_file_hashes")?,
+            activity_patch_operations: fields.take("activity_patch_operations")?,
+            activity_lines_added: fields.take("activity_lines_added")?,
+            activity_lines_deleted: fields.take("activity_lines_deleted")?,
+            activity_web_searches: fields.take("activity_web_searches")?,
+            activity_mcp_calls: fields.take("activity_mcp_calls")?,
+            activity_subagent_spawns: fields.take("activity_subagent_spawns")?,
+            artifacts: fields.ignore("artifacts"),
+            artifacts_enabled: fields.take("artifacts_enabled")?,
+            latency_duration_ms_sum: fields.take("latency_duration_ms_sum")?,
+            latency_duration_ms_count: fields.take("latency_duration_ms_count")?,
+            latency_ttft_ms_sum: fields.take("latency_ttft_ms_sum")?,
+            latency_ttft_ms_count: fields.take("latency_ttft_ms_count")?,
+            latency_duration_ms_max: fields.take("latency_duration_ms_max")?,
+            latency_ttft_ms_max: fields.take("latency_ttft_ms_max")?,
+            claude_responses: fields.take("claude_responses")?,
+            claude_response_sequence: fields.take("claude_response_sequence")?,
+            claude_response_record_count: fields.take("claude_response_record_count")?,
+            claude_usage_request_ids: fields.ignore("claude_usage_request_ids"),
+            claude_usage_occurrences: fields.ignore("claude_usage_occurrences"),
+            claude_request_identity_capture: fields.take("claude_request_identity_capture")?,
+            claude_org_markers: fields.take("claude_org_markers")?,
+            cache_observations: fields.ignore("cache_observations"),
+            cache_requests: fields.take("cache_requests")?,
+            cache_requests_complete: fields.take("cache_requests_complete")?,
+            claude_context_curve_identity_complete: fields.take("claude_context_curve_identity_complete")?,
+            claude_context_curve_request_index_complete: fields.take("claude_context_curve_request_index_complete")?,
+            claude_context_curve_owned_start_proven: fields.take("claude_context_curve_owned_start_proven")?,
+            claude_file_birth: fields.take("claude_file_birth")?,
+            claude_fork_parent: fields.ignore("claude_fork_parent"),
+            claude_money: fields.ignore("claude_money"),
+            tool_usage_counts: fields.take("tool_usage_counts")?,
+            tool_usage_truncated: fields.take("tool_usage_truncated")?,
+            seen_pi_usage_keys: fields.ignore("seen_pi_usage_keys"),
+            dropped_usage_record_count: fields.take("dropped_usage_record_count")?,
+            claude_last_user_ts: fields.take("claude_last_user_ts")?,
+            peak_context_fill_tokens: fields.take("peak_context_fill_tokens")?,
+            first_turn_context_tokens: fields.take("first_turn_context_tokens")?,
+            last_turn_context_tokens: fields.take("last_turn_context_tokens")?,
+            first_turn_context_window_tokens: fields.take("first_turn_context_window_tokens")?,
+            peak_context_fill_window_tokens: fields.take("peak_context_fill_window_tokens")?,
+            last_turn_context_window_tokens: fields.take("last_turn_context_window_tokens")?,
+            compaction_count: fields.take("compaction_count")?,
+            compaction_timestamps: fields.take("compaction_timestamps")?,
+            codex_compaction_sizes: fields.take("codex_compaction_sizes")?,
+            local_context_points: fields.take("local_context_points")?,
+            claude_compaction_observations: fields.take("claude_compaction_observations")?,
+            claude_compaction_link_tip: fields.take("claude_compaction_link_tip")?,
+            session_start: fields.take("session_start")?,
+            durable_marks: fields.take("durable_marks")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct SnapshotOrigin {
     pub(crate) thread_source: Option<String>,
@@ -2385,11 +2896,42 @@ pub(crate) struct SnapshotOrigin {
     pub(crate) used_workflow_orchestration: Option<bool>,
     pub(crate) parent_session_ref: Option<String>,
 }
+impl FromState for SnapshotOrigin {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "SnapshotOrigin")?;
+        let value = Self {
+            thread_source: fields.take("thread_source")?,
+            source: fields.take("source")?,
+            source_subagent: fields.take("source_subagent")?,
+            originator: fields.take("originator")?,
+            agent_role: fields.take("agent_role")?,
+            entrypoint: fields.take("entrypoint")?,
+            is_sidechain: fields.take("is_sidechain")?,
+            session_kind: fields.take("session_kind")?,
+            used_workflow_orchestration: fields.take("used_workflow_orchestration")?,
+            parent_session_ref: fields.take("parent_session_ref")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct UsageBucketState {
     pub(crate) rows: BTreeMap<RowKey, BucketRowAccumulator>,
     pub(crate) first_activity_at: Option<String>,
     pub(crate) last_activity_at: Option<String>,
+}
+impl FromState for UsageBucketState {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "UsageBucketState")?;
+        let value = Self {
+            rows: fields.take("rows")?,
+            first_activity_at: fields.take("first_activity_at")?,
+            last_activity_at: fields.take("last_activity_at")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct UsageCosts {
@@ -2400,6 +2942,22 @@ pub(crate) struct UsageCosts {
     pub(crate) output: Option<u128>,
     pub(crate) cache_read: Option<u128>,
     pub(crate) cache_creation: Option<u128>,
+}
+impl FromState for UsageCosts {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "UsageCosts")?;
+        let value = Self {
+            observed: fields.take("observed")?,
+            reported: fields.take("reported")?,
+            total: fields.take("total")?,
+            input: fields.take("input")?,
+            output: fields.take("output")?,
+            cache_read: fields.take("cache_read")?,
+            cache_creation: fields.take("cache_creation")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct UsageTotals {
@@ -2413,6 +2971,24 @@ pub(crate) struct UsageTotals {
     pub(crate) request_count: u64,
     pub(crate) costs: UsageCosts,
 }
+impl FromState for UsageTotals {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "UsageTotals")?;
+        let value = Self {
+            input_tokens: fields.take("input_tokens")?,
+            output_tokens: fields.take("output_tokens")?,
+            cache_read_tokens: fields.take("cache_read_tokens")?,
+            cache_creation_5m_tokens: fields.take("cache_creation_5m_tokens")?,
+            cache_creation_1h_tokens: fields.take("cache_creation_1h_tokens")?,
+            reasoning_output_tokens: fields.take("reasoning_output_tokens")?,
+            unattributed_total_tokens: fields.take("unattributed_total_tokens")?,
+            request_count: fields.take("request_count")?,
+            costs: fields.take("costs")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct JsonlReadReport {
     pub(crate) physical_line_count: usize,
@@ -2420,6 +2996,20 @@ pub(crate) struct JsonlReadReport {
     pub(crate) malformed_json_line_count: usize,
     pub(crate) invalid_utf8_line_count: usize,
     pub(crate) over_line_cap_count: usize,
+}
+impl FromState for JsonlReadReport {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "JsonlReadReport")?;
+        let value = Self {
+            physical_line_count: fields.take("physical_line_count")?,
+            parsed_json_line_count: fields.take("parsed_json_line_count")?,
+            malformed_json_line_count: fields.take("malformed_json_line_count")?,
+            invalid_utf8_line_count: fields.take("invalid_utf8_line_count")?,
+            over_line_cap_count: fields.take("over_line_cap_count")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -2430,6 +3020,21 @@ pub(crate) struct OwnedRequest {
     pub(crate) configuration_changed: bool,
     pub(crate) configuration_witness: Option<String>,
     pub(crate) idle_seconds: Option<u64>,
+}
+impl FromState for OwnedRequest {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "OwnedRequest")?;
+        let value = Self {
+            slot: fields.take("slot")?,
+            ordering: fields.take("ordering")?,
+            compaction_before: fields.take("compaction_before")?,
+            configuration_changed: fields.take("configuration_changed")?,
+            configuration_witness: fields.take("configuration_witness")?,
+            idle_seconds: fields.take("idle_seconds")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct RequestSlot {
@@ -2443,13 +3048,50 @@ pub(crate) struct RequestSlot {
     pub(crate) uncached_tokens: Option<u64>,
     pub(crate) output_tokens: Option<u64>,
 }
+impl FromState for RequestSlot {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "RequestSlot")?;
+        let value = Self {
+            request_ref: fields.take("request_ref")?,
+            occurred_at: fields.take("occurred_at")?,
+            model: fields.take("model")?,
+            effort: fields.take("effort")?,
+            prompt_tokens: fields.take("prompt_tokens")?,
+            cache_read_tokens: fields.take("cache_read_tokens")?,
+            cache_creation_tokens: fields.take("cache_creation_tokens")?,
+            uncached_tokens: fields.take("uncached_tokens")?,
+            output_tokens: fields.take("output_tokens")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ClaudeWriterRun(pub(crate) u8);
+impl FromState for ClaudeWriterRun {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut items = StateItems::tuple(node, "ClaudeWriterRun")?;
+        let value = Self(items.take()?);
+        items.finish()?;
+        Ok(value)
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ClaudeOwnWriters {
     pub(crate) latest: i64,
     pub(crate) others: [i64; KNOWN_COPY_WRITERS.len()],
+}
+impl FromState for ClaudeOwnWriters {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "ClaudeOwnWriters")?;
+        let value = Self {
+            latest: fields.take("latest")?,
+            others: fields.take("others")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub(crate) struct ClaudeOpenedBirth {
@@ -2458,6 +3100,19 @@ pub(crate) struct ClaudeOpenedBirth {
     pub(crate) inode: u64,
     pub(crate) size: u64,
 }
+impl FromState for ClaudeOpenedBirth {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "ClaudeOpenedBirth")?;
+        let value = Self {
+            birth: fields.take("birth")?,
+            device: fields.take("device")?,
+            inode: fields.take("inode")?,
+            size: fields.take("size")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub(crate) enum ClaudeBirthScope {
     #[default]
@@ -2465,6 +3120,31 @@ pub(crate) enum ClaudeBirthScope {
     Subagent,
     RootUnknownBirth,
     Root(i128),
+}
+impl FromState for ClaudeBirthScope {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        Ok(match StateFields::variant(node)? {
+            "NotObserved" => {
+                StateFields::unit(node, "NotObserved")?;
+                Self::NotObserved
+            }
+            "Subagent" => {
+                StateFields::unit(node, "Subagent")?;
+                Self::Subagent
+            }
+            "RootUnknownBirth" => {
+                StateFields::unit(node, "RootUnknownBirth")?;
+                Self::RootUnknownBirth
+            }
+            "Root" => {
+                let mut items = StateItems::tuple(node, "Root")?;
+                let value = Self::Root(items.take()?);
+                items.finish()?;
+                value
+            }
+            other => return Err(format!("ClaudeBirthScope has no variant {other}")),
+        })
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ClaudeFileBirth {
@@ -2483,6 +3163,29 @@ pub(crate) struct ClaudeFileBirth {
     pub(crate) all_response_writers: ClaudeWriterRun,
     pub(crate) opened: ClaudeOpenedBirth,
 }
+impl FromState for ClaudeFileBirth {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "ClaudeFileBirth")?;
+        let value = Self {
+            scope: fields.take("scope")?,
+            path_key_hash: fields.ignore("path_key_hash"),
+            tagged_in_opening: fields.take("tagged_in_opening")?,
+            tagged_responses: fields.take("tagged_responses")?,
+            own_responses: fields.take("own_responses")?,
+            untimed_records: fields.take("untimed_records")?,
+            first_own_sequence: fields.take("first_own_sequence")?,
+            own_first_context: fields.take("own_first_context")?,
+            own_peak_context: fields.take("own_peak_context")?,
+            own_last_context: fields.take("own_last_context")?,
+            tagged_before_first_own: fields.take("tagged_before_first_own")?,
+            writer: fields.take("writer")?,
+            all_response_writers: fields.take("all_response_writers")?,
+            opened: fields.ignore("opened"),
+        };
+        fields.finish()?;
+        Ok(value)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct OrgMarkers {
@@ -2495,11 +3198,40 @@ pub(crate) struct OrgMarkers {
     pub(crate) context_flip_position: Option<u64>,
     pub(crate) home: Option<crate::snapshots::sampled_scan::durable_tail::transition_seed::archived_writers::w_53d05a43::claude_status_coverage::HomeKey>,
 }
+impl FromState for OrgMarkers {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "OrgMarkers")?;
+        let value = Self {
+            entries: fields.take("entries")?,
+            starting_marker: fields.take("starting_marker")?,
+            overflowed: fields.take("overflowed")?,
+            context_digest: fields.take("context_digest")?,
+            context_changed: fields.take("context_changed")?,
+            context_position: fields.take("context_position")?,
+            context_flip_position: fields.take("context_flip_position")?,
+            home: fields.ignore("home"),
+        };
+        fields.finish()?;
+        Ok(value)
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct OrgMarker {
     pub(crate) position: u64,
     pub(crate) org: Option<String>,
     pub(crate) terminal_trusted: bool,
+}
+impl FromState for OrgMarker {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "OrgMarker")?;
+        let value = Self {
+            position: fields.take("position")?,
+            org: fields.take("org")?,
+            terminal_trusted: fields.take("terminal_trusted")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -2507,16 +3239,71 @@ pub(crate) enum CompactClaudeSelector {
     Interned(u32),
     Inline(Box<SelectorCapture>),
 }
+impl FromState for CompactClaudeSelector {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        Ok(match StateFields::variant(node)? {
+            "Interned" => {
+                let mut items = StateItems::tuple(node, "Interned")?;
+                let value = Self::Interned(items.take()?);
+                items.finish()?;
+                value
+            }
+            "Inline" => {
+                let mut items = StateItems::tuple(node, "Inline")?;
+                let value = Self::Inline(items.take()?);
+                items.finish()?;
+                value
+            }
+            other => return Err(format!("CompactClaudeSelector has no variant {other}")),
+        })
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub(crate) enum ClaudeRecordText {
     #[default]
     SameAsFirstRecord,
     Own(Option<String>),
 }
+impl FromState for ClaudeRecordText {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        Ok(match StateFields::variant(node)? {
+            "SameAsFirstRecord" => {
+                StateFields::unit(node, "SameAsFirstRecord")?;
+                Self::SameAsFirstRecord
+            }
+            "Own" => {
+                let mut items = StateItems::tuple(node, "Own")?;
+                let value = Self::Own(items.take()?);
+                items.finish()?;
+                value
+            }
+            other => return Err(format!("ClaudeRecordText has no variant {other}")),
+        })
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ClaudeSlot {
     Derived(ClaudeSlotTokens),
     Explicit(Box<RequestSlot>),
+}
+impl FromState for ClaudeSlot {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        Ok(match StateFields::variant(node)? {
+            "Derived" => {
+                let mut items = StateItems::tuple(node, "Derived")?;
+                let value = Self::Derived(items.take()?);
+                items.finish()?;
+                value
+            }
+            "Explicit" => {
+                let mut items = StateItems::tuple(node, "Explicit")?;
+                let value = Self::Explicit(items.take()?);
+                items.finish()?;
+                value
+            }
+            other => return Err(format!("ClaudeSlot has no variant {other}")),
+        })
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ClaudeResponseBook {
@@ -2524,9 +3311,31 @@ pub(crate) struct ClaudeResponseBook {
     pub(crate) responses: OwnedVec<ClaudeResponseObservation>,
     pub(crate) selectors: ClaudeSelectorTable,
 }
+impl FromState for ClaudeResponseBook {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "ClaudeResponseBook")?;
+        let value = Self {
+            index: fields.take("index")?,
+            responses: fields.take("responses")?,
+            selectors: fields.take("selectors")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ClaudeSelectorTable {
     pub(crate) selectors: OwnedVec<SelectorCapture>,
+}
+impl FromState for ClaudeSelectorTable {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "ClaudeSelectorTable")?;
+        let value = Self {
+            selectors: fields.take("selectors")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct CompactClaudeUsage {
@@ -2540,6 +3349,24 @@ pub(crate) struct CompactClaudeUsage {
     pub(crate) request_count: u64,
     pub(crate) costs: Option<Box<UsageCosts>>,
 }
+impl FromState for CompactClaudeUsage {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "CompactClaudeUsage")?;
+        let value = Self {
+            input_tokens: fields.take("input_tokens")?,
+            output_tokens: fields.take("output_tokens")?,
+            cache_read_tokens: fields.take("cache_read_tokens")?,
+            cache_creation_5m_tokens: fields.take("cache_creation_5m_tokens")?,
+            cache_creation_1h_tokens: fields.take("cache_creation_1h_tokens")?,
+            reasoning_output_tokens: fields.take("reasoning_output_tokens")?,
+            unattributed_total_tokens: fields.take("unattributed_total_tokens")?,
+            request_count: fields.take("request_count")?,
+            costs: fields.take("costs")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ClaudeSlotTokens {
     pub(crate) prompt_tokens: Option<u64>,
@@ -2548,10 +3375,35 @@ pub(crate) struct ClaudeSlotTokens {
     pub(crate) uncached_tokens: Option<u64>,
     pub(crate) output_tokens: Option<u64>,
 }
+impl FromState for ClaudeSlotTokens {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "ClaudeSlotTokens")?;
+        let value = Self {
+            prompt_tokens: fields.take("prompt_tokens")?,
+            cache_read_tokens: fields.take("cache_read_tokens")?,
+            cache_creation_tokens: fields.take("cache_creation_tokens")?,
+            uncached_tokens: fields.take("uncached_tokens")?,
+            output_tokens: fields.take("output_tokens")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ClaudeToolUse {
     pub(crate) id: String,
     pub(crate) name: String,
+}
+impl FromState for ClaudeToolUse {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "ClaudeToolUse")?;
+        let value = Self {
+            id: fields.take("id")?,
+            name: fields.take("name")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct CompactClaudeResponseRecord {
@@ -2566,12 +3418,46 @@ pub(crate) struct CompactClaudeResponseRecord {
     pub(crate) selector: CompactClaudeSelector,
     pub(crate) tool_uses: Vec<ClaudeToolUse>,
 }
+impl FromState for CompactClaudeResponseRecord {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "CompactClaudeResponseRecord")?;
+        let value = Self {
+            usage: fields.take("usage")?,
+            slot: fields.take("slot")?,
+            physical_sequence: fields.take("physical_sequence")?,
+            model: fields.take("model")?,
+            reasoning_effort: fields.take("reasoning_effort")?,
+            request_id: fields.take("request_id")?,
+            timestamp: fields.take("timestamp")?,
+            computed_effective_input_context: fields.take("computed_effective_input_context")?,
+            selector: fields.take("selector")?,
+            tool_uses: fields.take("tool_uses")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Default, Copy)]
 pub(crate) enum CountingVersion {
     #[default]
     Legacy,
     V2,
+}
+impl FromState for CountingVersion {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        Ok(match StateFields::variant(node)? {
+            "Legacy" => {
+                StateFields::unit(node, "Legacy")?;
+                Self::Legacy
+            }
+            "V2" => {
+                StateFields::unit(node, "V2")?;
+                Self::V2
+            }
+            other => return Err(format!("CountingVersion has no variant {other}")),
+        })
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Default, Copy)]
 pub(crate) enum AckEvidence {
@@ -2580,15 +3466,55 @@ pub(crate) enum AckEvidence {
     V2Marked,
     LegacyAcked,
 }
+impl FromState for AckEvidence {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        Ok(match StateFields::variant(node)? {
+            "None" => {
+                StateFields::unit(node, "None")?;
+                Self::None
+            }
+            "V2Marked" => {
+                StateFields::unit(node, "V2Marked")?;
+                Self::V2Marked
+            }
+            "LegacyAcked" => {
+                StateFields::unit(node, "LegacyAcked")?;
+                Self::LegacyAcked
+            }
+            other => return Err(format!("AckEvidence has no variant {other}")),
+        })
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ClosedTurnFilter(pub(crate) Box<[u64; CLOSED_TURN_FILTER_WORDS]>);
+impl FromState for ClosedTurnFilter {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut items = StateItems::tuple(node, "ClosedTurnFilter")?;
+        let value = Self(items.take()?);
+        items.finish()?;
+        Ok(value)
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct CodexCounting {
     pub(crate) evidence: AckEvidence,
     pub(crate) cutover_unix_ms: Option<i64>,
     pub(crate) version: Option<CountingVersion>,
     pub(crate) reducer: Option<Box<OccurrenceReducer>>,
+}
+impl FromState for CodexCounting {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "CodexCounting")?;
+        let value = Self {
+            evidence: fields.take("evidence")?,
+            cutover_unix_ms: fields.take("cutover_unix_ms")?,
+            version: fields.take("version")?,
+            reducer: fields.take("reducer")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct OccurrenceReducer {
@@ -2602,6 +3528,24 @@ pub(crate) struct OccurrenceReducer {
     pub(crate) closed_filter: Option<ClosedTurnFilter>,
     pub(crate) counters: OccurrenceCounters,
 }
+impl FromState for OccurrenceReducer {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "OccurrenceReducer")?;
+        let value = Self {
+            epoch: fields.take("epoch")?,
+            last_native: fields.take("last_native")?,
+            prev_ui: fields.take("prev_ui")?,
+            native_since_prev_ui: fields.take("native_since_prev_ui")?,
+            line_ui: fields.take("line_ui")?,
+            turn: fields.take("turn")?,
+            closed_turns: fields.take("closed_turns")?,
+            closed_filter: fields.take("closed_filter")?,
+            counters: fields.take("counters")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct Epoch {
     pub(crate) base: T6,
@@ -2609,11 +3553,36 @@ pub(crate) struct Epoch {
     pub(crate) first_id: String,
     pub(crate) contiguous: bool,
 }
+impl FromState for Epoch {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "Epoch")?;
+        let value = Self {
+            base: fields.take("base")?,
+            hwm: fields.take("hwm")?,
+            first_id: fields.take("first_id")?,
+            contiguous: fields.take("contiguous")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct LastNative {
     pub(crate) id: String,
     pub(crate) usage: T6,
     pub(crate) after: T6,
+}
+impl FromState for LastNative {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "LastNative")?;
+        let value = Self {
+            id: fields.take("id")?,
+            usage: fields.take("usage")?,
+            after: fields.take("after")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct UiTuple {
@@ -2621,6 +3590,19 @@ pub(crate) struct UiTuple {
     pub(crate) total: UsageTotals,
     pub(crate) last_t6: T6,
     pub(crate) total_t6: T6,
+}
+impl FromState for UiTuple {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "UiTuple")?;
+        let value = Self {
+            last: fields.take("last")?,
+            total: fields.take("total")?,
+            last_t6: fields.take("last_t6")?,
+            total_t6: fields.take("total_t6")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct BoundTurn {
@@ -2630,6 +3612,20 @@ pub(crate) struct BoundTurn {
     pub(crate) staged_events: u64,
     pub(crate) pending: OwnedMap<(String, RowKey), PendingRow>,
 }
+impl FromState for BoundTurn {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "BoundTurn")?;
+        let value = Self {
+            id: fields.take("id")?,
+            native: fields.take("native")?,
+            ui_published: fields.take("ui_published")?,
+            staged_events: fields.take("staged_events")?,
+            pending: fields.take("pending")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct PendingRow {
     pub(crate) selector_context: BTreeMap<String, String>,
@@ -2638,6 +3634,21 @@ pub(crate) struct PendingRow {
     pub(crate) events: u64,
     pub(crate) first_activity_at: String,
     pub(crate) last_activity_at: String,
+}
+impl FromState for PendingRow {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "PendingRow")?;
+        let value = Self {
+            selector_context: fields.take("selector_context")?,
+            selector_sources: fields.take("selector_sources")?,
+            usage: fields.take("usage")?,
+            events: fields.take("events")?,
+            first_activity_at: fields.take("first_activity_at")?,
+            last_activity_at: fields.take("last_activity_at")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct OccurrenceCounters {
@@ -2670,6 +3681,43 @@ pub(crate) struct OccurrenceCounters {
     pub(crate) closed_filter_hit_unconfirmed_native_usage: T6,
     pub(crate) pending_overflow_flushes: u64,
 }
+impl FromState for OccurrenceCounters {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "OccurrenceCounters")?;
+        let value = Self {
+            native_counted: fields.take("native_counted")?,
+            native_not_authority: fields.take("native_not_authority")?,
+            native_restated: fields.take("native_restated")?,
+            native_inside_holed_coverage: fields.take("native_inside_holed_coverage")?,
+            native_inside_holed_coverage_usage: fields.take("native_inside_holed_coverage_usage")?,
+            native_chain_gap: fields.take("native_chain_gap")?,
+            native_chain_overlap: fields.take("native_chain_overlap")?,
+            native_chain_overlap_covered: fields.take("native_chain_overlap_covered")?,
+            native_epoch_reset: fields.take("native_epoch_reset")?,
+            native_conflict: fields.take("native_conflict")?,
+            native_outside_open_turn: fields.take("native_outside_open_turn")?,
+            native_outside_open_turn_usage: fields.take("native_outside_open_turn_usage")?,
+            native_after_turn_closed: fields.take("native_after_turn_closed")?,
+            native_after_turn_closed_usage: fields.take("native_after_turn_closed_usage")?,
+            native_after_ui_flush: fields.take("native_after_ui_flush")?,
+            native_after_ui_flush_usage: fields.take("native_after_ui_flush_usage")?,
+            ui_equal_total_repeat: fields.take("ui_equal_total_repeat")?,
+            ui_equal_total_repeat_usage: fields.take("ui_equal_total_repeat_usage")?,
+            ui_in_native_turn_not_counted: fields.take("ui_in_native_turn_not_counted")?,
+            ui_in_native_turn_not_counted_usage: fields.take("ui_in_native_turn_not_counted_usage")?,
+            ui_in_unbound_span: fields.take("ui_in_unbound_span")?,
+            v2_cumulative_base_uncounted: fields.take("v2_cumulative_base_uncounted")?,
+            v2_cumulative_base_uncounted_usage: fields.take("v2_cumulative_base_uncounted_usage")?,
+            turn_closure_mismatch: fields.take("turn_closure_mismatch")?,
+            turn_reopened: fields.take("turn_reopened")?,
+            closed_filter_hit_unconfirmed: fields.take("closed_filter_hit_unconfirmed")?,
+            closed_filter_hit_unconfirmed_native_usage: fields.take("closed_filter_hit_unconfirmed_native_usage")?,
+            pending_overflow_flushes: fields.take("pending_overflow_flushes")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Default, Copy)]
 pub(crate) enum ClaudeCompactionTrigger {
@@ -2678,21 +3726,73 @@ pub(crate) enum ClaudeCompactionTrigger {
     Manual,
     Idle,
 }
+impl FromState for ClaudeCompactionTrigger {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        Ok(match StateFields::variant(node)? {
+            "Auto" => {
+                StateFields::unit(node, "Auto")?;
+                Self::Auto
+            }
+            "Manual" => {
+                StateFields::unit(node, "Manual")?;
+                Self::Manual
+            }
+            "Idle" => {
+                StateFields::unit(node, "Idle")?;
+                Self::Idle
+            }
+            other => return Err(format!("ClaudeCompactionTrigger has no variant {other}")),
+        })
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct CodexCompactionSize {
     pub(crate) before: Option<NonZeroU64>,
     pub(crate) after: Option<NonZeroU64>,
+}
+impl FromState for CodexCompactionSize {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "CodexCompactionSize")?;
+        let value = Self {
+            before: fields.take("before")?,
+            after: fields.take("after")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct CodexCompactionSizes {
     pub(crate) entries: Vec<(String, CodexCompactionSize)>,
     pub(crate) pending_after: bool,
 }
+impl FromState for CodexCompactionSizes {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "CodexCompactionSizes")?;
+        let value = Self {
+            entries: fields.take("entries")?,
+            pending_after: fields.take("pending_after")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ContextCurveCandidateBoundary {
     pub(crate) observed_at: Option<String>,
     pub(crate) point_count_before: u64,
+}
+impl FromState for ContextCurveCandidateBoundary {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "ContextCurveCandidateBoundary")?;
+        let value = Self {
+            observed_at: fields.take("observed_at")?,
+            point_count_before: fields.take("point_count_before")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ContextCurveCandidatePoint {
@@ -2701,15 +3801,49 @@ pub(crate) struct ContextCurveCandidatePoint {
     pub(crate) model: Option<String>,
     pub(crate) context_window_tokens: Option<u64>,
 }
+impl FromState for ContextCurveCandidatePoint {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "ContextCurveCandidatePoint")?;
+        let value = Self {
+            observed_at: fields.take("observed_at")?,
+            effective_input_tokens: fields.take("effective_input_tokens")?,
+            model: fields.take("model")?,
+            context_window_tokens: fields.take("context_window_tokens")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct LocalContextPoint {
     pub(crate) at_unix_seconds: u32,
     pub(crate) prompt_tokens: u32,
 }
+impl FromState for LocalContextPoint {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "LocalContextPoint")?;
+        let value = Self {
+            at_unix_seconds: fields.take("at_unix_seconds")?,
+            prompt_tokens: fields.take("prompt_tokens")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct LocalContextPoints {
     pub(crate) points: Vec<LocalContextPoint>,
+}
+impl FromState for LocalContextPoints {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "LocalContextPoints")?;
+        let value = Self {
+            points: fields.take("points")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2719,6 +3853,20 @@ pub(crate) struct CachedJsonlReduction {
     pub(crate) recognized_usage_drop_count: usize,
     pub(crate) positive_recognized_usage_count: usize,
     pub(crate) positive_usage_evidence: bool,
+}
+impl FromState for CachedJsonlReduction {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "CachedJsonlReduction")?;
+        let value = Self {
+            accumulator: fields.take("accumulator")?,
+            report: fields.take("report")?,
+            recognized_usage_drop_count: fields.take("recognized_usage_drop_count")?,
+            positive_recognized_usage_count: fields.take("positive_recognized_usage_count")?,
+            positive_usage_evidence: fields.take("positive_usage_evidence")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -2731,11 +3879,39 @@ pub(crate) struct OpeningRequest {
     pub(crate) parts_reconcile: bool,
     pub(crate) output_tokens: u64,
 }
+impl FromState for OpeningRequest {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "OpeningRequest")?;
+        let value = Self {
+            context_tokens: fields.take("context_tokens")?,
+            uncached_input_tokens: fields.take("uncached_input_tokens")?,
+            cache_read_tokens: fields.take("cache_read_tokens")?,
+            cache_write_5m_tokens: fields.take("cache_write_5m_tokens")?,
+            cache_write_1h_tokens: fields.take("cache_write_1h_tokens")?,
+            parts_reconcile: fields.take("parts_reconcile")?,
+            output_tokens: fields.take("output_tokens")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ClaudeBlob {
     pub(crate) parts: [u64; PARTS],
     pub(crate) unmeasurable: bool,
     pub(crate) config_digest: Option<ConfigDigest>,
+}
+impl FromState for ClaudeBlob {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "ClaudeBlob")?;
+        let value = Self {
+            parts: fields.take("parts")?,
+            unmeasurable: fields.take("unmeasurable")?,
+            config_digest: fields.take("config_digest")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ConfigDigest {
@@ -2743,11 +3919,41 @@ pub(crate) struct ConfigDigest {
     pub(crate) b: u64,
     pub(crate) len: u64,
 }
+impl FromState for ConfigDigest {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "ConfigDigest")?;
+        let value = Self {
+            a: fields.take("a")?,
+            b: fields.take("b")?,
+            len: fields.take("len")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ClaudeRequestKey(pub(crate) [u8; 32]);
+impl FromState for ClaudeRequestKey {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut items = StateItems::tuple(node, "ClaudeRequestKey")?;
+        let value = Self(items.take()?);
+        items.finish()?;
+        Ok(value)
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct OpeningCallId {
     pub(crate) id: String,
+}
+impl FromState for OpeningCallId {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "OpeningCallId")?;
+        let value = Self {
+            id: fields.take("id")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct OpeningCall {
@@ -2757,6 +3963,21 @@ pub(crate) struct OpeningCall {
     pub(crate) files: Vec<String>,
     pub(crate) answered: bool,
     pub(crate) truncated: bool,
+}
+impl FromState for OpeningCall {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "OpeningCall")?;
+        let value = Self {
+            response: fields.take("response")?,
+            tool: fields.take("tool")?,
+            candidates: fields.take("candidates")?,
+            files: fields.ignore("files"),
+            answered: fields.take("answered")?,
+            truncated: fields.take("truncated")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct OpeningFileState {
@@ -2768,6 +3989,23 @@ pub(crate) struct OpeningFileState {
     pub(crate) chars: [u64; 2],
     pub(crate) client_loaded: [bool; 2],
     pub(crate) truncated: [bool; 2],
+}
+impl FromState for OpeningFileState {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "OpeningFileState")?;
+        let value = Self {
+            ordinal: fields.take("ordinal")?,
+            tool: fields.take("tool")?,
+            repo_path: fields.take("repo_path")?,
+            instruction_segments: fields.take("instruction_segments")?,
+            reads: fields.take("reads")?,
+            chars: fields.take("chars")?,
+            client_loaded: fields.take("client_loaded")?,
+            truncated: fields.take("truncated")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct SessionStartState {
@@ -2799,6 +4037,43 @@ pub(crate) struct SessionStartState {
     pub(crate) shell_moved: bool,
     pub(crate) collapsed_requests: bool,
     pub(crate) content_end: Option<u64>,
+}
+impl FromState for SessionStartState {
+    fn from_state(node: &StateNode) -> Result<Self, String> {
+        let mut fields = StateFields::named(node, "SessionStartState")?;
+        let value = Self {
+            client_version: fields.take("client_version")?,
+            user_turns: fields.take("user_turns")?,
+            inherited_prefix: fields.take("inherited_prefix")?,
+            frozen: fields.take("frozen")?,
+            requests: fields.take("requests")?,
+            codex_requests: fields.take("codex_requests")?,
+            response_tool_calls: fields.take("response_tool_calls")?,
+            truncated_outputs: fields.take("truncated_outputs")?,
+            parts: fields.take("parts")?,
+            parts_closed: fields.take("parts_closed")?,
+            parts_unmeasurable: fields.take("parts_unmeasurable")?,
+            codex_tools_logged: fields.take("codex_tools_logged")?,
+            config_digest: fields.take("config_digest")?,
+            claude_shape: fields.take("claude_shape")?,
+            claude_blobs: fields.take("claude_blobs")?,
+            memory_units: fields.take("memory_units")?,
+            instruction_load_cut: fields.take("instruction_load_cut")?,
+            instructions: fields.take("instructions")?,
+            instructions_capped: fields.take("instructions_capped")?,
+            codex_prelude: fields.take("codex_prelude")?,
+            calls: fields.take("calls")?,
+            last_codex_call: fields.take("last_codex_call")?,
+            files: fields.take("files")?,
+            files_untracked: fields.take("files_untracked")?,
+            held_bytes: fields.take("held_bytes")?,
+            shell_moved: fields.take("shell_moved")?,
+            collapsed_requests: fields.take("collapsed_requests")?,
+            content_end: fields.take("content_end")?,
+        };
+        fields.finish()?;
+        Ok(value)
+    }
 }
 
 // archive-region: snapshots.rs
@@ -3957,10 +5232,25 @@ fn durable_content_hash(
         })
     }
 
-    /// Re-emit a body through this writer's own field walk. `encode` is not the
-    /// entry point because the content digests need live fields that a record
-    /// never carries, so the stored `Rederive` is written back as it was and
-    /// `archived_content_digests` checks those digests separately.
+    /// The copied `encode` over a reduction rebuilt field by field, by name,
+    /// from a live `{:?}` rendering. Nothing here reads the bytes under test,
+    /// and the content digests run through the copied functions on live values.
+    /// Limit and line cap only gate refusal; a record exists, so neither refused.
+    pub(super) fn archived_encode_state(
+        source: SnapshotSource,
+        state: &StateNode,
+        line_cap: u64,
+    ) -> Result<Vec<u8>, String> {
+        let reduction = CachedJsonlReduction::from_state(state)?;
+        if reduction.accumulator.source != source {
+            return Err("state belongs to another source".to_string());
+        }
+        encode(&reduction, usize::MAX, line_cap).map_err(|refuse| format!("refused: {refuse:?}"))
+    }
+
+    /// Re-emit a body through this writer's own take/put. A structural check
+    /// only: it passes stored digests through and cannot see a field swap that
+    /// the old layout still parses. The seed uses `archived_encode_state`.
     /// Bytes this writer could not have produced refuse here.
     pub(super) fn archived_rewrite(source: SnapshotSource, body: &[u8]) -> Result<Vec<u8>, String> {
         let mut d = Dec::new(body);
