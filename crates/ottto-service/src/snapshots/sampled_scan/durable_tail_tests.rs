@@ -1786,7 +1786,8 @@ fn receipt_pending_guard_keeps_accepted_witness_and_census_without_unreadable() 
     assert_eq!(index.claude_request_census.get(&key), Some(&census_record));
     let (counts, disk) = cache.durable_counters(source).unwrap();
     // The composed floor owner adds slot7; receipt custody keeps slot6.
-    assert_eq!(counts.durable_held.len(), 8);
+    assert_eq!(counts.durable_held.len(), 9);
+    assert_eq!(counts.durable_held[store::Refusal::Repin as usize], 0);
     assert_eq!(store::Refusal::ReceiptPending as usize, 6);
     assert_eq!(counts.durable_held[5], 0, "retired coordinate stays zero");
     assert_eq!(counts.durable_held[6], 1);
