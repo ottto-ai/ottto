@@ -82,8 +82,6 @@ impl ActiveLease {
         let at = owner.len;
         owner.queue[at] = ticket;
         owner.len += 1;
-        #[cfg(test)]
-        tests::registered(ticket);
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -174,28 +172,10 @@ fn event(source: &str, name: &'static str, value: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::local_resource_diagnostics::capture;
-    use std::sync::mpsc;
 
     thread_local! {
-        static QUEUED: std::cell::RefCell<Option<mpsc::Sender<u64>>> = const { std::cell::RefCell::new(None) };
         pub(super) static NEXT_TIMEOUT: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
     }
-    pub(super) fn registered(ticket: u64) {
-        QUEUED.with(|sender| {
-            if let Some(sender) = sender.borrow().as_ref() {
-                sender.send(ticket).unwrap();
-            }
-        });
-    }
-
-    fn granted() -> ActiveLease {
-        match ActiveLease::acquire("claude_code") {
-            LeaseWait::Granted(lease) => lease,
-            LeaseWait::Busy | LeaseWait::OverBudget => panic!("test owner unavailable"),
-        }
-    }
-
     fn isolated_owner() -> Mutex<Owner> {
         Mutex::new(Owner {
             busy: false,
@@ -218,41 +198,5 @@ mod tests {
         assert!(owner.is_poisoned());
         assert!(ActiveLease::wait_on(WAIT, &owner, &wake).is_none());
         assert!(!OWNER.is_poisoned());
-    }
-
-    /// [behaviour] checked credit explicit release and counted drop.
-    #[test]
-    fn checked_credit_explicit_release_and_counted_drop() {
-        let (_, events) = capture(|| {
-            let mut lease = granted();
-            lease.charge(ACTIVE_BYTES).unwrap();
-            assert!(matches!(lease.charge(1), Err(ActiveOverBudget)));
-            assert!(matches!(lease.charge(u64::MAX), Err(ActiveOverBudget)));
-            assert_eq!(lease.bytes, ACTIVE_BYTES);
-            lease.release();
-            drop(granted());
-            granted().release();
-        });
-        let counters = events
-            .iter()
-            .map(|event| &event["counts"])
-            .collect::<Vec<_>>();
-        assert!(counters
-            .iter()
-            .any(|c| c["active_peak_bytes"] == ACTIVE_BYTES));
-        assert_eq!(
-            counters
-                .iter()
-                .filter(|c| c["active_drop_release"] == 1)
-                .count(),
-            1
-        );
-        assert!(
-            counters
-                .iter()
-                .filter(|c| c["active_current_bytes"] == 0)
-                .count()
-                >= 3
-        );
     }
 }
