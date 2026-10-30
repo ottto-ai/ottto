@@ -249,6 +249,7 @@ fn only(reason: Incomplete, count: u64) -> BTreeMap<Incomplete, u64> {
     BTreeMap::from([(reason, count)])
 }
 
+/// [behaviour] current families complete and singletons are counted.
 #[test]
 fn current_families_complete_and_singletons_are_counted() {
     let mut index = index();
@@ -264,6 +265,7 @@ fn current_families_complete_and_singletons_are_counted() {
     assert_eq!(family(&family_keys[0]), family(&family_keys[2]));
 }
 
+/// [behaviour] each reason in isolation partitions the incomplete count.
 #[test]
 fn each_reason_in_isolation_partitions_the_incomplete_count() {
     let mut base = index();
@@ -447,6 +449,7 @@ fn each_reason_in_isolation_partitions_the_incomplete_count() {
     }
 }
 
+/// [behaviour] unknown enumeration keeps every family incomplete.
 #[test]
 fn unknown_enumeration_keeps_every_family_incomplete() {
     let mut base = index();
@@ -521,6 +524,7 @@ fn unknown_enumeration_keeps_every_family_incomplete() {
     }
 }
 
+/// [behaviour] coverage needs an attestation of the current revision.
 #[test]
 fn coverage_needs_an_attestation_of_the_current_revision() {
     let mut base = index();
@@ -621,6 +625,7 @@ fn unchanged_member() -> (ScanIndex, CandidateFile) {
     (index, candidate)
 }
 
+/// [behaviour] only the ordinary equality skip attests.
 #[test]
 fn only_the_ordinary_equality_skip_attests() {
     let (index, candidate) = unchanged_member();
@@ -653,6 +658,7 @@ fn only_the_ordinary_equality_skip_attests() {
     assert!(!attests(&debt, &candidate));
 }
 
+/// [behaviour] loss vetoes stay up for the generation.
 #[test]
 fn loss_vetoes_stay_up_for_the_generation() {
     let mut index = index();
@@ -736,6 +742,7 @@ fn loss_vetoes_stay_up_for_the_generation() {
     assert_eq!(reattested.families.complete, 2);
 }
 
+/// [behaviour] the skipped view is queue plus replay.
 #[test]
 fn the_skipped_view_is_queue_plus_replay() {
     let mut index = index();
@@ -775,6 +782,7 @@ fn the_skipped_view_is_queue_plus_replay() {
     assert_eq!(again.oldest_age_s, 60);
 }
 
+/// [behaviour] changed new and deleted members never count as covered.
 #[test]
 fn changed_new_and_deleted_members_never_count_as_covered() {
     let mut base = index();
@@ -842,6 +850,7 @@ fn changed_new_and_deleted_members_never_count_as_covered() {
     assert!(base.claude_account_family_pending.contains_key(&root));
 }
 
+/// [behaviour] old window carry alone stays incomplete.
 #[test]
 fn old_window_carry_alone_stays_incomplete() {
     let mut index = index();
@@ -858,6 +867,7 @@ fn old_window_carry_alone_stays_incomplete() {
     assert_eq!(counts.complete, 0);
 }
 
+/// [behaviour] quantum admits 64 complete families and defers the rest.
 #[test]
 fn quantum_admits_64_complete_families_and_defers_the_rest() {
     let mut index = index();
@@ -874,6 +884,7 @@ fn quantum_admits_64_complete_families_and_defers_the_rest() {
 /// M4 shape: 1,000 three-member families, all 3,000 members queued, 100
 /// served per page in FIFO order, so many families span a served (uncapped)
 /// and a still-queued (capped) member at a page boundary.
+/// [behaviour] m4 shape drains 3000 queued members at 100 per page.
 #[test]
 fn m4_shape_drains_3000_queued_members_at_100_per_page() {
     const FAMILIES: usize = 1_000;
@@ -974,6 +985,7 @@ fn m4_shape_drains_3000_queued_members_at_100_per_page() {
     assert_eq!(completed.len(), FAMILIES);
 }
 
+/// [behaviour] a restart between pages rederives identical counts with zero reads.
 #[test]
 fn a_restart_between_pages_rederives_identical_counts_with_zero_reads() {
     let mut index = index();
@@ -1071,6 +1083,7 @@ fn a_restart_between_pages_rederives_identical_counts_with_zero_reads() {
     assert!(no_census_bits(&reloaded));
 }
 
+/// [behaviour] first pending at is bounded and counts pace evictions.
 #[test]
 fn first_pending_at_is_bounded_and_counts_pace_evictions() {
     let path = |n: usize| ScanTraversalPath {
@@ -1114,6 +1127,7 @@ fn first_pending_at_is_bounded_and_counts_pace_evictions() {
 
 const OVER_DAY: u64 = 24 * 60 * 60;
 
+/// [behaviour] rotation visits other families and wraps.
 #[test]
 fn rotation_visits_other_families_and_wraps() {
     let mut index = index();
@@ -1133,6 +1147,7 @@ fn rotation_visits_other_families_and_wraps() {
     assert_eq!(seen.len(), 99);
 }
 
+/// [behaviour] a real claude page emits shadow counts and keeps the census bits.
 #[test]
 fn a_real_claude_page_emits_shadow_counts_and_keeps_the_census_bits() {
     let root = crate::test_scratch::private_dir("e7-8a-family-shadow");
@@ -1203,6 +1218,7 @@ fn a_real_claude_page_emits_shadow_counts_and_keeps_the_census_bits() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// [behaviour] a page that removes a key and adds a path elsewhere recounts the root.
 #[test]
 fn a_page_that_removes_a_key_and_adds_a_path_elsewhere_recounts_the_root() {
     let mut index = index();
@@ -1252,6 +1268,7 @@ fn a_page_that_removes_a_key_and_adds_a_path_elsewhere_recounts_the_root() {
         .contains_key(&Incomplete::PathNotUnique));
 }
 
+/// [behaviour] a confirmed empty path counts for uniqueness but is no member.
 #[test]
 fn a_confirmed_empty_path_counts_for_uniqueness_but_is_no_member() {
     let mut index = index();
@@ -1272,6 +1289,7 @@ fn a_confirmed_empty_path_counts_for_uniqueness_but_is_no_member() {
     );
 }
 
+/// [behaviour] only an attestation after leaving the queue resolves a stamp.
 #[test]
 fn only_an_attestation_after_leaving_the_queue_resolves_a_stamp() {
     let mut index = index();
@@ -1304,6 +1322,7 @@ fn only_an_attestation_after_leaving_the_queue_resolves_a_stamp() {
     assert_eq!(page(&queued, &[], NOW + 240).oldest_age_s, 120);
 }
 
+/// [behaviour] the shadow row carries attestation cost and the page cap fails closed.
 #[test]
 fn the_shadow_row_carries_attestation_cost_and_the_page_cap_fails_closed() {
     let (index, candidate) = unchanged_member();
@@ -1341,6 +1360,7 @@ fn the_shadow_row_carries_attestation_cost_and_the_page_cap_fails_closed() {
     assert_eq!(next["attest_capped"], 0);
 }
 
+/// [behaviour] runtime state at every cap stays within the stated worst case.
 #[test]
 fn runtime_state_at_every_cap_stays_within_the_stated_worst_case() {
     assert!(size_of::<Runtime>() < 512);
@@ -1418,6 +1438,7 @@ fn runtime_state_at_every_cap_stays_within_the_stated_worst_case() {
     assert!(heap >= 256 * 1024 * 3, "{heap}");
 }
 
+/// [behaviour] held history vetoes its family and not a sibling and a literal denial is no hold.
 #[test]
 fn held_history_vetoes_its_family_and_not_a_sibling_and_a_literal_denial_is_no_hold() {
     let mut index = index();
@@ -1479,6 +1500,7 @@ fn evaluate_within(index: &ScanIndex, families: &[FamilyRef], budget: usize) -> 
     counts
 }
 
+/// [behaviour] the budget charges both inventories and the key that ends each range.
 #[test]
 fn the_budget_charges_both_inventories_and_the_key_that_ends_each_range() {
     let mut index = index();
@@ -1497,6 +1519,7 @@ fn the_budget_charges_both_inventories_and_the_key_that_ends_each_range() {
     }
 }
 
+/// [behaviour] confirmed empty families spend the budget and count as nothing.
 #[test]
 fn confirmed_empty_families_spend_the_budget_and_count_as_nothing() {
     let mut index = index();
@@ -1521,6 +1544,7 @@ fn confirmed_empty_families_spend_the_budget_and_count_as_nothing() {
     assert_eq!(short.unevaluated, 2);
 }
 
+/// [behaviour] unrelated keys under a family prefix are charged and a short budget is not complete.
 #[test]
 fn unrelated_keys_under_a_family_prefix_are_charged_and_a_short_budget_is_not_complete() {
     let mut index = index();
@@ -1541,6 +1565,7 @@ fn unrelated_keys_under_a_family_prefix_are_charged_and_a_short_budget_is_not_co
     assert_eq!((short.unevaluated, short.member_keys), (1, 50));
 }
 
+/// [behaviour] an oversized family is membership unknown within the budget.
 #[test]
 fn an_oversized_family_is_membership_unknown_within_the_budget() {
     let mut index = index();
@@ -1553,6 +1578,7 @@ fn an_oversized_family_is_membership_unknown_within_the_budget() {
 /// A corpus far larger than a page, with one touched family: each page does
 /// bounded key work, nothing certifies uniqueness until the pass ends, and a
 /// finished pass costs an unchanged corpus nothing.
+/// [behaviour] a large corpus is counted across small pages.
 #[test]
 fn a_large_corpus_is_counted_across_small_pages() {
     const KEYS: usize = 3 * ROOT_PASS_KEYS_PER_PAGE + 100;
@@ -1678,6 +1704,7 @@ fn root_evidence() -> BTreeMap<String, Vec<crate::claude_local_otel::ClaudeLocal
 /// inventory sizes and the generation hold and no page reports a change. The
 /// union keeps the key: the cross-directory duplicate is counted either way,
 /// and the family never completes.
+/// [regress] R1 masked-migration bug: observed-to-indexed moves cannot hide a cross-directory duplicate.
 #[test]
 fn a_masked_observed_to_indexed_migration_mid_pass_keeps_the_duplicate() {
     const FILLER: usize = 2 * ROOT_PASS_KEYS_PER_PAGE;
@@ -1753,6 +1780,7 @@ fn a_masked_observed_to_indexed_migration_mid_pass_keeps_the_duplicate() {
 /// One full-budget call and one that must stop short agree: the merged pass
 /// charges both inventories, never exceeds a page, and resumes after its last
 /// key, so a key in both inventories is counted once.
+/// [behaviour] the merged pass counts a shared key once across a budget stop.
 #[test]
 fn the_merged_pass_counts_a_shared_key_once_across_a_budget_stop() {
     let mut index = index();
@@ -1830,6 +1858,7 @@ fn root_revision(index: &ScanIndex) -> Option<String> {
         .clone()
 }
 
+/// [behaviour] a real parse and finalization complete a family on a later production page.
 #[test]
 fn a_real_parse_and_finalization_complete_a_family_on_a_later_production_page() {
     let dir = production_corpus("e7-8a-production-complete");
@@ -1844,6 +1873,7 @@ fn a_real_parse_and_finalization_complete_a_family_on_a_later_production_page() 
     let _ = fs::remove_dir_all(dir);
 }
 
+/// [behaviour] a proof that never finalized stays evidence on production pages.
 #[test]
 fn a_proof_that_never_finalized_stays_evidence_on_production_pages() {
     let dir = production_corpus("e7-8a-production-missing");
@@ -1856,6 +1886,7 @@ fn a_proof_that_never_finalized_stays_evidence_on_production_pages() {
     let _ = fs::remove_dir_all(dir);
 }
 
+/// [behaviour] same window growth is incomplete until the new revision finalizes.
 #[test]
 fn same_window_growth_is_incomplete_until_the_new_revision_finalizes() {
     let dir = production_corpus("e7-8a-production-growth");

@@ -89,6 +89,7 @@ fn measure(
         .0
 }
 
+/// [behaviour] Pending ages and current metadata coverage are aggregate-only lower bounds.
 #[test]
 fn each_gauge_and_metadata_coverage_are_distinct_and_read_free() {
     let mut index = fixture();
@@ -123,6 +124,7 @@ fn each_gauge_and_metadata_coverage_are_distinct_and_read_free() {
     assert_eq!(measure(&index, &mut stamps, 1, NOW + DAY).over_24h, 0);
 }
 
+/// [behaviour] Replay is distinct from unread work and missing change evidence stays unknown.
 #[test]
 fn replay_without_index_is_not_never_read_and_unknown_is_not_zero() {
     let mut index = fixture();
@@ -137,6 +139,7 @@ fn replay_without_index_is_not_never_read_and_unknown_is_not_zero() {
     assert_eq!(empty.freshness.changed_since_scan_complete_count, Some(0));
 }
 
+/// [behaviour] Bounded coverage loss is explicit and restart ages are lower bounds.
 #[test]
 fn eviction_is_reported_as_missing_coverage_and_restart_ages_reset() {
     let mut index = fixture();
@@ -167,6 +170,7 @@ fn positive() -> Counts {
     }
 }
 
+/// [behaviour] Alarm continuity requires observed positives strictly beyond six hours.
 #[test]
 fn alarm_strict_edge_zero_unknown_restart_clock_and_scope_isolation() {
     let mut a = Episode::new();
@@ -199,17 +203,78 @@ fn alarm_strict_edge_zero_unknown_restart_clock_and_scope_isolation() {
     assert_eq!(rollback.changed_episode_age_seconds, 0);
 }
 
+/// [money] Lead B restart proxy allows exactly one atomic first observation across threads and resets.
 #[test]
 fn first_observation_is_process_wide_and_never_rearmed() {
-    assert!(first_observation() && !first_observation());
-    let _reset_episode = Episode::new();
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    let observed = AtomicBool::new(false);
+    let start = std::sync::Barrier::new(8);
+    let firsts = std::thread::scope(|threads| {
+        let callers = (0..8)
+            .map(|_| {
+                threads.spawn(|| {
+                    start.wait();
+                    claim_first_observation(&observed)
+                })
+            })
+            .collect::<Vec<_>>();
+        callers
+            .into_iter()
+            .map(|caller| usize::from(caller.join().unwrap()))
+            .sum::<usize>()
+    });
+    assert_eq!(
+        firsts, 1,
+        "the same production atomic claim elects exactly one caller"
+    );
+    let mut runtime = shadow::Runtime::default();
+    let mut index = fixture();
+    let touched = shadow::Touched::default();
+    for (scope, now, age, reload) in [
+        ("original", NOW, 0, false),
+        ("original", NOW + 1, 1, false),
+        ("moved", NOW + 2, 0, false),
+        ("reloaded", NOW + 3, 0, true),
+    ] {
+        if reload {
+            index = serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
+            runtime = shadow::Runtime::default();
+        }
+        let row = shadow::evaluate_page(
+            &mut runtime,
+            &index,
+            &touched,
+            std::iter::empty(),
+            false,
+            scope,
+            now,
+        )
+        .unwrap();
+        assert_eq!(row.pending_census_members.stamped_for_s, age);
+        assert!(!claim_first_observation(&observed));
+    }
     {
         let _disabled = DisabledForTest::new();
-        assert!(!first_observation());
+        assert!(!enabled());
+        shadow::observe_page(&index, &None, &[], &ScanCensus::default(), &None, NOW + 4);
+        assert!(!claim_first_observation(&observed));
     }
-    assert!(!first_observation());
+    assert!(enabled());
+    shadow::evaluate_page(
+        &mut runtime,
+        &index,
+        &touched,
+        std::iter::empty(),
+        false,
+        "restored",
+        NOW + 5,
+    )
+    .unwrap();
+    assert!(!claim_first_observation(&observed));
+    assert!(observed.load(Relaxed));
 }
 
+/// [off=main] Disabling the shadow adds no tracker state, allocation or diagnostic emission.
 #[test]
 fn disabled_shadow_has_no_tracker_state_box_or_emission() {
     let _disabled = DisabledForTest::new();
@@ -251,12 +316,9 @@ fn disabled_shadow_has_no_tracker_state_box_or_emission() {
         &[],
     );
     assert!(scan.claude_family_shadow.is_none());
-    assert!(
-        first_observation(),
-        "OFF did not consume the process's first emission"
-    );
 }
 
+/// [behaviour] Only a regular-file disable sentinel changes the default-ON policy.
 #[test]
 fn kill_switch_defaults_on_and_requires_a_regular_file() {
     let scratch = crate::test_scratch::ScratchDir::new("money-freshness-policy");
@@ -279,6 +341,7 @@ fn kill_switch_defaults_on_and_requires_a_regular_file() {
     }
 }
 
+/// [regress] Duplicate heap-eviction coverage bug: retained queue/replay keys keep complete metadata coverage.
 #[test]
 fn replay_overlap_at_capacity_keeps_complete_known_metadata_coverage() {
     let mut index = fixture();

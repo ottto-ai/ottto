@@ -83,17 +83,12 @@ impl Episode {
 /// Claimed only at a completed emission. No tracker/scope/policy owns or
 /// resets this process-wide bit; Relaxed swap gives exactly one true caller.
 pub(super) fn first_observation() -> bool {
-    #[cfg(not(test))]
-    {
-        static OBSERVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        !OBSERVED.swap(true, std::sync::atomic::Ordering::Relaxed)
-    }
-    #[cfg(test)]
-    FIRST_OBSERVED.with(|seen| !seen.replace(true))
+    static OBSERVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    claim_first_observation(&OBSERVED)
 }
-#[cfg(test)]
-thread_local! {
-    static FIRST_OBSERVED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+fn claim_first_observation(observed: &std::sync::atomic::AtomicBool) -> bool {
+    !observed.swap(true, std::sync::atomic::Ordering::Relaxed)
 }
 
 #[cfg(test)]
