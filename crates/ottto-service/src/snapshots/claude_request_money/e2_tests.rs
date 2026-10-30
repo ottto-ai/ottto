@@ -4419,3 +4419,562 @@ fn e2_identity_incomplete_clock_survives_discarded_twin_in_both_orders() {
         }
     });
 }
+
+// Strict partial copies (B15 design, R3 review): a pre-birth response of a
+// partial MAIN copy with no writer certificate stays removed only while an
+// earlier main file of ANOTHER session holds its request id NOW.
+
+const HOLDER: &str = "b0000000-0000-4000-8000-00000000000b";
+const OTHER: &str = "c0000000-0000-4000-8000-00000000000c";
+
+/// How a holder fixture's census record stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HolderCensus {
+    Current,
+    Retired,
+    OverBudget,
+    Unverified,
+    /// Read at another mtime: the file changed since its census read.
+    Stale,
+}
+
+/// `HOLDER`'s settled main file in `dir`, its census listing `ids`, born
+/// 600 s before t0 (earlier than every copy here) with its object identity
+/// recorded at that birth.
+fn holder_in(dir: &Path, ids: &[&str], census: HolderCensus, index: &mut ScanIndex) -> PathBuf {
+    use crate::snapshots::claude_request_census::{
+        ClaudeRequestCensusRecord, ClaudeRequestCensusShape,
+    };
+    let path = dir.join(format!("{HOLDER}.jsonl"));
+    fs::write(&path, b"holder fixture\n").unwrap();
+    let key = local_index_key(&path);
+    let fingerprint = format!("{:x}", Sha256::digest(key.as_bytes()));
+    let metadata = fs::metadata(&path).unwrap();
+    index.files.insert(
+        key.clone(),
+        serde_json::from_value(
+            json!({"size_bytes":metadata.len(),"modified_unix_seconds":1,
+            "source_file_fingerprint":fingerprint}),
+        )
+        .unwrap(),
+    );
+    let mut hashes = ids
+        .iter()
+        .map(|id| claude_request_hash(id))
+        .collect::<Vec<_>>();
+    hashes.sort_unstable();
+    hashes.dedup();
+    let shape = if census == HolderCensus::OverBudget {
+        ClaudeRequestCensusShape::OverBudget
+    } else {
+        ClaudeRequestCensusShape::Exact
+    };
+    let mut record = ClaudeRequestCensusRecord::synthetic_for_test(&fingerprint, 1, shape, hashes)
+        .with_unverified_for_test(census == HolderCensus::Unverified)
+        .with_modified_for_test((census == HolderCensus::Stale).then_some(1));
+    if census == HolderCensus::Retired {
+        record.retire();
+    }
+    index.claude_request_census.insert_for_test(&key, record);
+    let birth = t0() - 600_000_000_000;
+    let mut opened = ClaudeOpenedBirth::from_metadata(&metadata);
+    opened.birth = u64::try_from(birth).unwrap();
+    index
+        .claude_money_birth_store
+        .record_opened(HOLDER, &key, birth, opened);
+    path
+}
+fn append_bytes(path: &Path, bytes: &[u8]) {
+    use std::io::Write as _;
+    fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .unwrap()
+        .write_all(bytes)
+        .unwrap();
+}
+/// A response written by `version` ("" writes none).
+fn written_by(value: Value, version: &str) -> Value {
+    if version.is_empty() {
+        without_version(value)
+    } else {
+        versioned(value, version)
+    }
+}
+/// (counted requests, removed requests, counted input, removed input,
+/// disclosed) of one published copy body.
+fn published(item: SnapshotItem, index: &ScanIndex) -> (u64, u64, u64, u64, u64) {
+    let disclosed = fold(&item).disclosed;
+    let got = publish(vec![item], None, TelemetryRead::Loaded, index);
+    let removed_input = got[0].removed_usage.as_ref().map_or(0, |u| u.input_tokens);
+    (
+        got[0].request_count,
+        got[0].removed_request_count.unwrap_or(0),
+        got[0].input_tokens,
+        removed_input,
+        disclosed,
+    )
+}
+
+#[test]
+fn e2_strict_partial_copy_by_any_writer_skips_what_a_cross_session_holder_holds() {
+    with_enabled(|| {
+        // Unknown (2.1.311), missing and mixed own writers: no certificate.
+        for (first, second) in [
+            ("2.1.311", "2.1.311"),
+            ("", ""),
+            ("2.1.309", "2.1.311"),
+            ("2.1.311", "2.1.309"),
+        ] {
+            let copy = root_file("strict-writers");
+            let mut index = ScanIndex::default();
+            holder_in(
+                copy.parent().unwrap(),
+                &["c1", "c2"],
+                HolderCensus::Current,
+                &mut index,
+            );
+            let lines = [
+                line("c1", &at(-100), 10),
+                line("c2", &at(-90), 20),
+                written_by(line("o1", &at(1), 100), first),
+                written_by(line("o2", &at(2), 200), second),
+            ];
+            let item = parse(&copy, Some(t0()), &index, &lines);
+            assert!(!fold(&item).entity.held, "{first} {second}");
+            assert_eq!(
+                published(item, &index),
+                (2, 2, 300, 30, 0),
+                "{first} {second}: both copies removed by their holder, own counted"
+            );
+            cleanup(&[&copy]);
+        }
+    })
+}
+
+#[test]
+fn e2_strict_partial_copy_counts_a_unique_backdated_request() {
+    with_enabled(|| {
+        let copy = root_file("strict-unique");
+        let mut index = ScanIndex::default();
+        holder_in(
+            copy.parent().unwrap(),
+            &["c1"],
+            HolderCensus::Current,
+            &mut index,
+        );
+        let lines = [
+            line("c1", &at(-100), 10),
+            // Backdated new usage no earlier file holds: never removed.
+            line("u1", &at(-80), 40),
+            versioned(line("o1", &at(1), 100), "2.1.311"),
+        ];
+        let item = parse(&copy, Some(t0()), &index, &lines);
+        // Conservation: 3 requests and 150 input tokens, counted or removed.
+        assert_eq!(published(item, &index), (2, 1, 140, 10, 1));
+        cleanup(&[&copy]);
+    })
+}
+
+#[test]
+fn e2_strict_partial_copy_counts_when_its_settled_holder_file_is_gone() {
+    with_enabled(|| {
+        for all_copied in [false, true] {
+            let copy = root_file("strict-deleted");
+            let mut index = ScanIndex::default();
+            let holder = holder_in(
+                copy.parent().unwrap(),
+                &["c1", "c2"],
+                HolderCensus::Current,
+                &mut index,
+            );
+            fs::remove_file(holder).unwrap();
+            let mut lines = vec![line("c1", &at(-100), 10), line("c2", &at(-90), 20)];
+            if !all_copied {
+                lines.push(versioned(line("o1", &at(1), 100), "2.1.311"));
+            }
+            let item = parse(&copy, Some(t0()), &index, &lines);
+            let got = published(item, &index);
+            if all_copied {
+                // The all-pre-birth route is unchanged: a settled entry
+                // whose file is gone still proves its scan (R3 L3).
+                assert_eq!(got, (0, 2, 0, 30, 0));
+            } else {
+                assert_eq!(got, (3, 0, 130, 0, 2), "no live holder: counted, disclosed");
+            }
+            cleanup(&[&copy]);
+        }
+    })
+}
+
+#[test]
+fn e2_strict_partial_copy_counts_on_a_stale_holder_unless_it_only_grew() {
+    with_enabled(|| {
+        // (grown-holder rule on, how the holder changed, copies removed)
+        for (grown_rule, change, removed) in [
+            (false, "append", 0),
+            (true, "append", 2),
+            (true, "truncate", 0),
+            (true, "replace", 0),
+        ] {
+            let copy = root_file("strict-stale");
+            let mut index = ScanIndex::default();
+            let holder = holder_in(
+                copy.parent().unwrap(),
+                &["c1", "c2"],
+                HolderCensus::Stale,
+                &mut index,
+            );
+            match change {
+                "append" => append_bytes(&holder, b"more holder lines\n"),
+                "truncate" => fs::write(&holder, b"h\n").unwrap(),
+                _ => {
+                    // A new object, longer than the indexed one, renamed over it.
+                    let fresh = holder.with_extension("new");
+                    fs::write(&fresh, b"a longer replacement holder\n").unwrap();
+                    fs::rename(fresh, &holder).unwrap();
+                }
+            }
+            assert!(holder.is_file(), "{change}: the holder file is live");
+            let lines = [
+                line("c1", &at(-100), 10),
+                line("c2", &at(-90), 20),
+                versioned(line("o1", &at(1), 100), "2.1.311"),
+            ];
+            let item =
+                with_grown_holder_current(grown_rule, || parse(&copy, Some(t0()), &index, &lines));
+            let case = format!("rule={grown_rule} {change}");
+            assert!(
+                !fold(&item).entity.held,
+                "{case}: a stale holder never holds"
+            );
+            assert_eq!(fold(&item).entity.removed_requests, removed, "{case}");
+            assert_eq!(fold(&item).entity.totals().1, 3 - removed, "{case}");
+            assert_eq!(fold(&item).disclosed, 2 - removed, "{case}");
+            cleanup(&[&copy]);
+        }
+    })
+}
+
+#[test]
+fn e2_strict_partial_copy_counts_on_a_holder_resized_within_its_read_second() {
+    with_enabled(|| {
+        // Same mtime second as the census read (no `modified` to differ),
+        // not queued: only the indexed extent shows the change.
+        for (grown_rule, change, removed) in [
+            (false, "append", 0),
+            (true, "append", 1),
+            (false, "truncate", 0),
+            (true, "truncate", 0),
+        ] {
+            let copy = root_file("strict-resized");
+            let mut index = ScanIndex::default();
+            let holder = holder_in(
+                copy.parent().unwrap(),
+                &["c1"],
+                HolderCensus::Current,
+                &mut index,
+            );
+            if change == "append" {
+                append_bytes(&holder, b"more holder lines\n");
+            } else {
+                fs::write(&holder, b"h\n").unwrap();
+            }
+            let lines = [
+                line("c1", &at(-100), 10),
+                versioned(line("o1", &at(1), 100), "2.1.311"),
+            ];
+            let item =
+                with_grown_holder_current(grown_rule, || parse(&copy, Some(t0()), &index, &lines));
+            let case = format!("rule={grown_rule} {change}");
+            assert!(!fold(&item).entity.held, "{case}");
+            assert_eq!(fold(&item).entity.removed_requests, removed, "{case}");
+            assert_eq!(fold(&item).entity.totals().1, 2 - removed, "{case}");
+            cleanup(&[&copy]);
+        }
+    })
+}
+
+#[test]
+fn e2_strict_partial_copy_keeps_the_bounded_queued_and_unscanned_holds() {
+    with_enabled(|| {
+        // A queued holder whose size changed within its read's mtime second.
+        let copy = root_file("strict-queued");
+        let dir = copy.parent().unwrap().to_path_buf();
+        let mut index = queued_traversal(&[], &[dir.join(format!("{HOLDER}.jsonl"))]);
+        let holder = holder_in(&dir, &["c1"], HolderCensus::Current, &mut index);
+        append_bytes(&holder, b"more\n");
+        let lines = [
+            line("c1", &at(-100), 10),
+            versioned(line("o1", &at(1), 100), "2.1.311"),
+        ];
+        let item = parse(&copy, Some(t0()), &index, &lines);
+        assert!(fold(&item).entity.held, "waits for the holder's re-read");
+        assert_eq!(fold(&item).entity.removed_requests, 1, "nothing decided");
+        cleanup(&[&copy]);
+
+        // Another session's main file this traversal has not read yet.
+        for (unique, held) in [(false, false), (true, true)] {
+            let copy = root_file("strict-unscanned");
+            let dir = copy.parent().unwrap().to_path_buf();
+            let mut index = queued_traversal(&[], &[dir.join(format!("{OTHER}.jsonl"))]);
+            holder_in(&dir, &["c1"], HolderCensus::Current, &mut index);
+            let mut lines = vec![line("c1", &at(-100), 10)];
+            if unique {
+                lines.push(line("u1", &at(-80), 40));
+            }
+            lines.push(versioned(line("o1", &at(1), 100), "2.1.311"));
+            let item = parse(&copy, Some(t0()), &index, &lines);
+            assert_eq!(
+                fold(&item).entity.held,
+                held,
+                "only an uncovered copy waits for the unread file"
+            );
+            cleanup(&[&copy]);
+        }
+    })
+}
+
+#[test]
+fn e2_strict_partial_copy_counts_against_a_non_proving_holder_record() {
+    with_enabled(|| {
+        for census in [
+            HolderCensus::Retired,
+            HolderCensus::OverBudget,
+            // TODO(SOURCE ask g): an unverified scan proves nothing here.
+            HolderCensus::Unverified,
+        ] {
+            let copy = root_file("strict-nonproving");
+            let mut index = ScanIndex::default();
+            holder_in(copy.parent().unwrap(), &["c1"], census, &mut index);
+            let lines = [
+                line("c1", &at(-100), 10),
+                versioned(line("o1", &at(1), 100), "2.1.311"),
+            ];
+            let item = parse(&copy, Some(t0()), &index, &lines);
+            assert_eq!(published(item, &index), (2, 0, 110, 0, 1), "{census:?}");
+            cleanup(&[&copy]);
+        }
+    })
+}
+
+#[test]
+fn e2_strict_partial_copy_ignores_a_named_parent_without_per_request_coverage() {
+    with_enabled(|| {
+        for all_copied in [true, false] {
+            let copy = root_file("strict-parent");
+            let mut index = ScanIndex::default();
+            // Indexed, earlier, named by the fork line, census retired.
+            holder_in(
+                copy.parent().unwrap(),
+                &["c1"],
+                HolderCensus::Retired,
+                &mut index,
+            );
+            let mut lines = vec![
+                json!({"type":"fork-context-ref", "sessionId":ROOT, "agentId":"fork-agent",
+                    "contextLength":1, "parentSessionId":HOLDER, "parentLastUuid":"parent-last",
+                    "timestamp":at(0)}),
+                line("c1", &at(-100), 10),
+            ];
+            if !all_copied {
+                lines.push(versioned(line("o1", &at(1), 100), "2.1.311"));
+            }
+            let item = parse(&copy, Some(t0()), &index, &lines);
+            let got = published(item, &index);
+            if all_copied {
+                assert_eq!(got, (0, 1, 0, 10, 0), "all-pre-birth keeps PR C (a)");
+            } else {
+                assert_eq!(
+                    got,
+                    (2, 0, 110, 0, 1),
+                    "strict mode: parent-only proves nothing"
+                );
+            }
+            cleanup(&[&copy]);
+        }
+    })
+}
+
+#[test]
+fn e2_strict_partial_copy_untimed_idless_and_slack_responses_count() {
+    with_enabled(|| {
+        let copy = root_file("strict-untimed");
+        let mut index = ScanIndex::default();
+        holder_in(
+            copy.parent().unwrap(),
+            &["c1", "t1", "s1", "s3"],
+            HolderCensus::Current,
+            &mut index,
+        );
+        let mut untimed = line("t1", &at(-70), 2);
+        untimed.as_object_mut().unwrap().remove("timestamp");
+        let mut idless = line("i1", &at(-60), 4);
+        idless.as_object_mut().unwrap().remove("requestId");
+        let lines = [
+            line("c1", &at(-100), 1),
+            untimed,
+            idless,
+            // Within the 2 s slack: own, counted.
+            line("s1", &at(-1), 8),
+            // Just outside it: a copy, removed by its holder.
+            line("s3", &at(-3), 16),
+            versioned(line("o1", &at(1), 32), "2.1.311"),
+        ];
+        let item = parse(&copy, Some(t0()), &index, &lines);
+        // c1 and s3 removed; t1, i1, s1 and o1 counted; untimed and id-less
+        // disclosed. 63 input tokens in all.
+        assert_eq!(published(item, &index), (4, 2, 46, 17, 2));
+        cleanup(&[&copy]);
+    })
+}
+
+#[test]
+fn e2_strict_partial_copy_deadline_counts_without_holding() {
+    with_enabled(|| {
+        for all_copied in [false, true] {
+            let copy = root_file("strict-deadline");
+            let mut index = ScanIndex::default();
+            holder_in(
+                copy.parent().unwrap(),
+                &["c1", "c2"],
+                HolderCensus::Current,
+                &mut index,
+            );
+            let mut lines = vec![line("c1", &at(-100), 10), line("c2", &at(-90), 20)];
+            if !all_copied {
+                lines.push(versioned(line("o1", &at(1), 100), "2.1.311"));
+            }
+            take_diag();
+            let item = crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
+                parse(&copy, Some(t0()), &index, &lines)
+            });
+            let diag = take_diag();
+            let f = fold(&item);
+            if all_copied {
+                assert!(f.entity.held, "the all-pre-birth route still holds");
+                assert_eq!(diag.get("held_copy_deadline"), Some(&1));
+            } else {
+                assert!(!f.entity.held, "no new hold for a partial copy");
+                assert_eq!((f.entity.removed_requests, f.entity.totals().1), (0, 3));
+                assert_eq!(diag.get("copy_strict_deadline"), Some(&2), "{diag:?}");
+            }
+            cleanup(&[&copy]);
+        }
+    })
+}
+
+#[test]
+fn e2_copy_restore_is_idempotent() {
+    with_enabled(|| {
+        let copy = root_file("strict-restore-twice");
+        let mut index = ScanIndex::default();
+        holder_in(
+            copy.parent().unwrap(),
+            &["c1"],
+            HolderCensus::Current,
+            &mut index,
+        );
+        let lines = [
+            line("c1", &at(-100), 10),
+            versioned(line("o1", &at(1), 100), "2.1.311"),
+        ];
+        let mut item = parse(&copy, Some(t0()), &index, &lines);
+        assert_eq!(fold(&item).entity.removed_requests, 1);
+        let c1 = || vec!["c1".to_owned(), "c1".to_owned()];
+        restore_uncovered(&mut item, &c1(), "copy_uncovered");
+        restore_uncovered(&mut item, &c1(), "copy_uncovered");
+        let f = fold(&item);
+        assert!(f.entity.certificate_ok);
+        assert_eq!((f.entity.removed_requests, f.entity.totals().1), (0, 2));
+        assert_eq!(f.entity.totals().0.input, 110, "c1 added back once");
+        assert_eq!(f.disclosed, 1);
+        cleanup(&[&copy]);
+    })
+}
+
+#[test]
+fn e2_strict_skipped_copy_never_returns_as_a_side_call() {
+    with_enabled(|| {
+        let copy = root_file("strict-side");
+        let mut index = ScanIndex::default();
+        holder_in(
+            copy.parent().unwrap(),
+            &["c1"],
+            HolderCensus::Current,
+            &mut index,
+        );
+        let lines = [
+            line("c1", &at(-100), 10),
+            versioned(line("o1", &at(1), 100), "2.1.311"),
+        ];
+        let mut items = vec![parse(&copy, Some(t0()), &index, &lines)];
+        let read = sidecar(&[row("c1", 1, 10), row("o1", 2, 100)]);
+        attach_page(&mut items, &read);
+        side_calls_page(
+            &mut items,
+            &api_report(&read),
+            &ClaudeTraceOwnershipLoadReport::default(),
+            &index,
+        );
+        assert_eq!(fold(&items[0]).side_requests, 0, "c1 keeps its membership");
+        let got = publish(items, None, TelemetryRead::Loaded, &index);
+        assert_eq!(
+            (got[0].request_count, got[0].removed_request_count),
+            (1, Some(1))
+        );
+        cleanup(&[&copy]);
+    })
+}
+
+/// R3 L4: no two files remove each other's requests while every file's
+/// copy order is at most its order as a holder, for each role, including a
+/// birth-store update made earlier on the same page.
+#[test]
+fn e2_copy_order_never_exceeds_holder_order_in_any_role() {
+    with_enabled(|| {
+        let a = root_file("order-a");
+        let b = root_file("order-b");
+        let c = root_file("order-c");
+        let invariant = |item: &SnapshotItem, path: &Path, index: &ScanIndex, role: &str| {
+            let f = fold(item);
+            let copy = f.copy_order().expect("a located root");
+            let holder = holder_order(
+                &index.claude_money_birth_store,
+                ROOT,
+                &local_index_key(path),
+            )
+            .expect("a stored birth");
+            assert!(copy <= holder, "{role}: {copy:?} > {holder:?}");
+            f.role
+        };
+        let history = [line("h1", &at(1), 1), line("h2", &at(2), 2)];
+        let mut index = ScanIndex::default();
+        let owner = parse_and_remember(&a, t0(), &mut index, &history);
+        assert_eq!(invariant(&owner, &a, &index, "owner"), Role::Owner);
+        let mut index = restart(&index);
+        fs::remove_file(&a).unwrap();
+        index.files.remove(&local_index_key(&a));
+        let moved = [
+            history[0].clone(),
+            history[1].clone(),
+            line("h3", &at(70), 4),
+        ];
+        let b_moved = parse_and_remember(&b, t0() + 60_000_000_000, &mut index, &moved);
+        assert!(matches!(
+            invariant(&b_moved, &b, &index, "moved"),
+            Role::Moved(_)
+        ));
+        let mut index = restart(&index);
+        stage_twins(
+            &mut index,
+            &[(&b, t0() + 60_000_000_000), (&c, t0() + 120_000_000_000)],
+        );
+        let b_item = parse(&b, Some(t0() + 60_000_000_000), &index, &moved);
+        let c_item = parse_and_remember(&c, t0() + 120_000_000_000, &mut index, &moved);
+        // Both checked after c's birth was recorded on this page.
+        invariant(&b_item, &b, &index, "owner after a same-page update");
+        assert_eq!(invariant(&c_item, &c, &index, "staged twin"), Role::Twin);
+        cleanup(&[&a, &b, &c]);
+    })
+}

@@ -2782,3 +2782,301 @@ fn e2_pipeline_held_new_file_lifetime_losses_preserve_main_body() {
         withheld_new_file_retries_from_retained_read(false, false, loss);
     }
 }
+
+// Strict partial copies (B15 design, R3 review). Copied lines keep their
+// original's writer; the copy's own turns come from Claude Code 2.1.311,
+// outside the writer allowlist, so only per-request holder proof applies.
+const UNLISTED_WRITER: &str = "2.1.311";
+const COPY_BIRTH: &str = "2026-08-02T07:03:00Z";
+
+/// One copy body's money: counts, tokens and the removal it declares.
+fn copy_money(item: &SnapshotItem) -> (u64, u64, u64, u64, u64, u64, Option<u64>, String) {
+    (
+        item.request_count,
+        item.input_tokens,
+        item.output_tokens,
+        item.cache_read_tokens,
+        item.cache_creation_5m_tokens,
+        item.cache_creation_1h_tokens,
+        item.removed_request_count,
+        serde_json::to_string(&item.removed_usage).unwrap(),
+    )
+}
+fn original_lines() -> String {
+    line(ROOT, "r1", AT, 10) + &line(ROOT, "r2", "2026-08-02T07:01:00Z", 20)
+}
+/// The copied prefix and the copy's first own turn.
+fn partial_copy_lines() -> String {
+    line(COPY, "r1", AT, 10)
+        + &line(COPY, "r2", "2026-08-02T07:01:00Z", 20)
+        + &line_by(COPY, "o1", "2026-08-02T07:04:00Z", 30, UNLISTED_WRITER)
+}
+fn second_own_turn() -> String {
+    line_by(COPY, "o2", "2026-08-02T07:05:00Z", 40, UNLISTED_WRITER)
+}
+
+/// Restore+Tail: the original settles first, then the copy, then the copy
+/// grows by one own turn; the index is saved and loaded between pages.
+/// `delete_holder` deletes the original before the last page. Returns the
+/// copy's body on the last page.
+fn strict_copy_incremental(delete_holder: bool) -> SnapshotItem {
+    let mut c = Corpus::new(&format!("e2-pipeline-strict-incremental-{delete_holder}"));
+    let original = c.root(ROOT, &original_lines());
+    let mut progress = e2_progress();
+    let old = ScanIndex::default();
+    let first = ready(&c, &E2ScanFixture::default(), old.clone(), 100, false);
+    assert_eq!(total(&first), 2);
+    let prior = settle(&c, &old, first, &mut progress);
+    let copy = c.write_at(&format!("{COPY}.jsonl"), &partial_copy_lines(), COPY_BIRTH);
+    let page = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
+    literal(&page);
+    let found = body(&page, COPY).expect("the copy publishes");
+    assert_eq!(
+        (found.request_count, found.removed_request_count),
+        (1, Some(2)),
+        "the live other-session holder proves both copied requests"
+    );
+    let prior = settle(&c, &prior, page, &mut progress);
+    if delete_holder {
+        std::fs::remove_file(&original).unwrap();
+        c.births.remove(&original);
+    }
+    append(&copy, &second_own_turn());
+    let page = ready(&c, &E2ScanFixture::default(), prior, 100, false);
+    literal(&page);
+    body(&page, COPY).expect("the grown copy publishes").clone()
+}
+
+/// Cold Full: one page on a fresh index over the final files.
+fn strict_copy_cold(with_holder: bool) -> SnapshotItem {
+    let mut c = Corpus::new(&format!("e2-pipeline-strict-cold-{with_holder}"));
+    if with_holder {
+        c.root(ROOT, &original_lines());
+    }
+    c.write_at(
+        &format!("{COPY}.jsonl"),
+        &(partial_copy_lines() + &second_own_turn()),
+        COPY_BIRTH,
+    );
+    let page = ready(
+        &c,
+        &E2ScanFixture::default(),
+        ScanIndex::default(),
+        100,
+        false,
+    );
+    literal(&page);
+    if with_holder {
+        assert_eq!(body(&page, ROOT).map(|s| s.request_count), Some(2));
+    }
+    body(&page, COPY).expect("the copy publishes").clone()
+}
+
+/// Money gate (intentional change): a partial copy proved per request by a
+/// live other-session holder. Incremental equals cold Full, and both remove
+/// exactly the two copied requests (base main counts them a second time).
+#[test]
+fn e2_pipeline_strict_partial_copy_incremental_equals_cold_full() {
+    with_e2(|| {
+        let incremental = copy_money(&strict_copy_incremental(false));
+        let cold = copy_money(&strict_copy_cold(true));
+        assert_eq!(incremental, cold, "Restore+Tail == cold Full");
+        let removed = serde_json::to_string(&Some(crate::snapshots::ClaudeRemovedUsage {
+            input_tokens: 30,
+            output_tokens: 30,
+            cache_read_tokens: 6,
+            cache_creation_5m_tokens: 10,
+            cache_creation_1h_tokens: 4,
+            unattributed_total_tokens: 0,
+            reasoning_output_tokens: 0,
+        }))
+        .unwrap();
+        assert_eq!(
+            cold,
+            (2, 70, 70, 6, 10, 4, Some(2), removed),
+            "own o1 + o2 counted; r1 + r2 removed (main before this change: 4 counted, 0 removed)"
+        );
+    })
+}
+
+/// Money gate: the holder is deleted between pages. Strict mode needs a live
+/// holder (R3 L3), so the incremental arm counts the copies again, exactly
+/// as the cold arm without the holder does.
+#[test]
+fn e2_pipeline_strict_partial_copy_counts_after_its_holder_is_deleted() {
+    with_e2(|| {
+        let incremental = copy_money(&strict_copy_incremental(true));
+        let cold = copy_money(&strict_copy_cold(false));
+        assert_eq!(incremental, cold, "Restore+Tail == cold Full");
+        assert_eq!(
+            (cold.0, cold.1, cold.6),
+            (4, 100, Some(0)),
+            "every request counts"
+        );
+    })
+}
+
+/// A progressive holder: the copy kept a truncated value of r1, the holder
+/// the final, larger one. The copy's r1 is removed at its own value and the
+/// holder counts its larger value: nothing is undercounted.
+#[test]
+fn e2_pipeline_strict_partial_copy_of_a_progressive_holder_keeps_the_holder_value() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-pipeline-strict-progressive");
+        c.root(ROOT, &line(ROOT, "r1", AT, 50));
+        c.write_at(
+            &format!("{COPY}.jsonl"),
+            &(line(COPY, "r1", AT, 10)
+                + &line_by(COPY, "o1", "2026-08-02T07:04:00Z", 30, UNLISTED_WRITER)),
+            COPY_BIRTH,
+        );
+        let page = ready(
+            &c,
+            &E2ScanFixture::default(),
+            ScanIndex::default(),
+            100,
+            false,
+        );
+        literal(&page);
+        let original = body(&page, ROOT).expect("the holder publishes");
+        assert_eq!((original.request_count, original.input_tokens), (1, 50));
+        let copy = body(&page, COPY).expect("the copy publishes");
+        assert_eq!(
+            (
+                copy.request_count,
+                copy.input_tokens,
+                copy.removed_request_count
+            ),
+            (1, 30, Some(1))
+        );
+        assert_eq!(
+            copy.removed_usage.as_ref().map(|u| u.input_tokens),
+            Some(10)
+        );
+    })
+}
+
+/// R3 H1(a) receipt for Lead B, not a gate: `page.copies` wall time on each
+/// page of one live partial copy appended `APPENDS` times, against a census
+/// of about two million hashes (cap 2,097,152). `certified` own turns take
+/// the timestamp route (no walk), the baseline; unlisted ones walk the
+/// census on every page. Test profile: this crate builds at opt-level 0.
+#[test]
+fn e2_pipeline_strict_copy_census_walk_receipt() {
+    use crate::snapshots::claude_request_census::{
+        ClaudeRequestCensusInsert, ClaudeRequestCensusRecord, ClaudeRequestCensusShape,
+    };
+    const PAD_RECORDS: u64 = 1_000;
+    const PAD_HASHES: u64 = 2_000;
+    const APPENDS: usize = 6;
+    let pad = |c: &Corpus, index: &mut ScanIndex| {
+        if index.claude_request_census_for_test().totals_for_test().0
+            >= (PAD_RECORDS * PAD_HASHES) as usize
+        {
+            return;
+        }
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        for record in 0..PAD_RECORDS {
+            let mut hashes = (0..PAD_HASHES)
+                .map(|_| {
+                    state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                    let mut z = state;
+                    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                    z ^ (z >> 31)
+                })
+                .collect::<Vec<_>>();
+            hashes.sort_unstable();
+            hashes.dedup();
+            let key = c.base.join(format!(
+                "pad/{record:08x}-0000-4000-8000-000000000000.jsonl"
+            ));
+            let inserted = index.claude_request_census_mut_for_test().insert_for_test(
+                &key.to_string_lossy(),
+                ClaudeRequestCensusRecord::synthetic_for_test(
+                    &format!("{record:064x}"),
+                    1,
+                    ClaudeRequestCensusShape::Exact,
+                    hashes,
+                ),
+            );
+            assert_eq!(inserted, ClaudeRequestCensusInsert::Stored);
+        }
+    };
+    let mut receipt = serde_json::Map::new();
+    for (arm, writer) in [("certified", "2.1.309"), ("strict", UNLISTED_WRITER)] {
+        with_e2(|| {
+            let mut c = Corpus::new(&format!("e2-pipeline-strict-walk-{arm}"));
+            c.root(ROOT, &original_lines());
+            let old = ScanIndex::default();
+            let first = ready(&c, &E2ScanFixture::default(), old.clone(), 100, false);
+            let mut prior = settle(&c, &old, first, &mut e2_progress());
+            let copy = c.write_at(
+                &format!("{COPY}.jsonl"),
+                &(line(COPY, "r1", AT, 10)
+                    + &line(COPY, "r2", "2026-08-02T07:01:00Z", 20)
+                    + &line_by(COPY, "o0", "2026-08-02T07:04:00Z", 30, writer)),
+                COPY_BIRTH,
+            );
+            let mut per_page = Vec::new();
+            let mut census = 0;
+            for turn in 0..=APPENDS {
+                if turn > 0 {
+                    append(
+                        &copy,
+                        &line_by(
+                            COPY,
+                            &format!("o{turn}"),
+                            &format!("2026-08-02T07:{:02}:00Z", 4 + turn),
+                            30,
+                            writer,
+                        ),
+                    );
+                }
+                // The scan's terminal prunes unindexed records: pad after it,
+                // before the page's copy decisions.
+                let mut page = c.raw(&E2ScanFixture::default(), prior, 100, false, &[]);
+                pad(&c, &mut page.index);
+                census = page
+                    .index
+                    .claude_request_census_for_test()
+                    .totals_for_test()
+                    .0;
+                e2::take_stages();
+                page.enrich(&c);
+                let spent = e2::take_stages()
+                    .get("page.copies")
+                    .copied()
+                    .unwrap_or_default();
+                let found = body(&page, COPY).expect("the copy is read on every page");
+                assert_eq!(
+                    found.removed_request_count,
+                    Some(2),
+                    "{arm} page {turn}: both copies stay removed"
+                );
+                per_page.push(spent.as_micros() as u64);
+                page.finish();
+                prior = page.index;
+            }
+            let mut sorted = per_page.clone();
+            sorted.sort_unstable();
+            receipt.insert(
+                arm.to_owned(),
+                json!({
+                    "census_hashes": census,
+                    "pages": per_page.len(),
+                    "page_copies_us": per_page,
+                    "median_us": sorted[sorted.len() / 2],
+                    "max_us": sorted.last(),
+                }),
+            );
+            assert!(census >= 2_000_000, "{arm}: census of {census} hashes");
+        });
+    }
+    receipt.insert("os".into(), json!(std::env::consts::OS));
+    receipt.insert("profile".into(), json!("test (crate opt-level 0)"));
+    eprintln!(
+        "\nMONEY_E2_STRICT_COPY_WALK {}",
+        serde_json::Value::Object(receipt)
+    );
+}
