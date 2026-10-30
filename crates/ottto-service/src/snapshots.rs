@@ -532,10 +532,21 @@ const CODEX_CONTEXT_BUCKET_REVISIT: &str = "codex_context_bucket_revisit:v1";
 const CODEX_CONTEXT_BUCKET_REVISIT_FROM_UNIX_NANOS: u64 =
     PROVIDER_PRICE_LINE_EFFECTIVE_FROM_UNIX_SECONDS * 1_000_000_000;
 
-/// Scan identity folded into one candidate's file fingerprint: the source's
-/// identity plus the bounded Codex price-bucket revisit for recent rollouts.
+// Revisit indexed Pi files once so previously accepted floating-point costs
+// are corrected even when transcript bytes and metadata have not changed.
+// Keep the frozen parser/scan versions and semantic-envelope contract intact;
+// this token is solely an acquisition obligation, settled with the new file key.
+const PI_COST_DECIMAL_REVISIT: &str = "pi_cost_decimal_revisit:v1";
+
+/// Scan identity folded into one candidate's file fingerprint, including the
+/// one-time Pi cost correction and bounded Codex price-bucket revisit.
 fn candidate_scan_identity(source: SnapshotSource, modified_unix_nanos: u64) -> String {
-    if source == SnapshotSource::Codex
+    if source == SnapshotSource::Pi {
+        format!(
+            "{};{PI_COST_DECIMAL_REVISIT}",
+            source.scan_identity_version()
+        )
+    } else if source == SnapshotSource::Codex
         && modified_unix_nanos >= CODEX_CONTEXT_BUCKET_REVISIT_FROM_UNIX_NANOS
     {
         format!(
@@ -80130,6 +80141,60 @@ mod tests {
         aggregate.add(&invalid);
         assert!(!aggregate.reported);
         assert_eq!(aggregate.snapshot_cost(), None);
+    }
+
+    #[test]
+    fn pi_cost_decimal_correction_revisits_settled_files_once() {
+        let mut candidate = test_candidate(PathBuf::from("/synthetic/cost.jsonl"));
+        let fingerprint = |identity: &str| {
+            scan_file_fingerprint_with_opened_identity(
+                &candidate.path,
+                0,
+                0,
+                identity,
+                "",
+                "synthetic-opened",
+            )
+        };
+        let previous = fingerprint("pi_jsonl:v13");
+        let current = fingerprint(&candidate_scan_identity(SnapshotSource::Pi, 0));
+        assert_ne!(previous, current);
+        candidate.source_file_fingerprint = previous;
+        let mut index = ScanIndex::default();
+        index.record(
+            candidate.clone(),
+            Some("settled".into()),
+            ScanParseOutcome::Snapshot,
+        );
+        index
+            .snapshot_activity_at
+            .insert("settled".into(), Some("2026-07-22T08:00:00Z".into()));
+        assert_eq!(
+            index.candidate_decision(&candidate),
+            CandidateDecision::Skip
+        );
+        candidate.source_file_fingerprint = current;
+        assert_eq!(
+            index.candidate_decision(&candidate),
+            CandidateDecision::Parse
+        );
+        index.record(
+            candidate.clone(),
+            Some("settled".into()),
+            ScanParseOutcome::Snapshot,
+        );
+        assert_eq!(
+            index.candidate_decision(&candidate),
+            CandidateDecision::Skip
+        );
+        assert_eq!(
+            candidate_scan_identity(SnapshotSource::ClaudeCode, 0),
+            CLAUDE_CODE_SCAN_IDENTITY_VERSION,
+        );
+        assert_eq!(
+            candidate_scan_identity(SnapshotSource::Codex, 0),
+            CODEX_SCAN_IDENTITY_VERSION,
+        );
     }
 
     #[test]

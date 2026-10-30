@@ -1155,7 +1155,9 @@ admission and its other counter projections arrive in subsequent slices.
 ## Pi reported-cost parsing
 
 Pi cost fields use checked decimal arithmetic and an inclusive $100,000 ceiling
-per field per source record. Negative or malformed fields remain Unknown.
+per field per source record. A fixed `pi_cost_decimal_revisit:v1` acquisition token
+selects previously indexed Pi files once for correction; saving the new file
+fingerprint settles the obligation. Negative or malformed fields remain Unknown.
 Arithmetic overflow or a value above the ceiling also remains Unknown, preserving
 valid sibling fields. Strings retain their original decimal lexeme; JSON floating
 numbers use serde_json's shortest round-trip f64 representation because their
