@@ -2809,7 +2809,8 @@ pub(crate) fn scan_index_repair_required(
     source: &str,
     cause: crate::snapshots::scan_index_health::RepairCause,
 ) {
-    static TOTALS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    static TOTALS: [AtomicU64; crate::snapshots::scan_index_health::RepairCause::COUNT] =
+        [const { AtomicU64::new(0) }; crate::snapshots::scan_index_health::RepairCause::COUNT];
     let count = TOTALS[cause as usize]
         .fetch_update(Relaxed, Relaxed, |v| Some(v.saturating_add(1)))
         .unwrap_or_else(|v| v)

@@ -172,7 +172,6 @@ impl Sqlite {
     pub(super) fn vacuum(&mut self) -> Result<()> {
         migrations::check_current(self.conn()?)?;
         let started = Instant::now();
-        self.stats.erasure_vacuum.runs = self.stats.erasure_vacuum.runs.saturating_add(1);
         let bytes = fs::metadata(&self.path).ok().map(|m| m.len()).unwrap_or(0);
         let result = self.vacuum_inner();
         self.stats.erasure_vacuum.seconds += started.elapsed().as_secs_f64();
@@ -197,7 +196,7 @@ impl Sqlite {
         }
         result
     }
-    fn erasure_failed(&mut self, reason: &'static str) {
+    pub(super) fn erasure_failed(&mut self, reason: &'static str) {
         let count = self.stats.erasure_vacuum_failed.entry(reason).or_default();
         *count = count.saturating_add(1);
     }
@@ -224,6 +223,7 @@ impl Sqlite {
         // saves; neither the 64 MiB alarm nor the work budget is a WAL cap.
         let started = Instant::now();
         self.stats.vacuum_attempts = self.stats.vacuum_attempts.saturating_add(1);
+        self.stats.erasure_vacuum.runs = self.stats.erasure_vacuum.runs.saturating_add(1);
         let result = limited(self.conn()?, self.purge_policy.work, || {
             Ok(self.conn()?.execute_batch("VACUUM")?)
         });
@@ -315,8 +315,7 @@ impl Sqlite {
                 erased = true;
                 self.stats.erasure_overdue = false;
                 self.stats.erasure_pending_age_s = None;
-            } else {
-                self.erasure_failed("vacuum_or_truncate");
+                self.stats.oldest_pending_age_s = None;
             }
         } else if pending && (idle || overdue) {
             self.stats.vacuum_deferred = self.stats.vacuum_deferred.saturating_add(1);
@@ -325,13 +324,8 @@ impl Sqlite {
         let bytes = self.wal_bytes();
         self.stats.observe_wal(bytes);
         let required = self.debt || bytes.map_or(true, |bytes| bytes >= WAL_PASSIVE_BYTES);
-        if required || idle {
-            let mode = if required {
-                CheckpointMode::Passive
-            } else {
-                CheckpointMode::IdleReclaim
-            };
-            let result = self.checkpoint(mode);
+        if required {
+            let result = self.checkpoint(CheckpointMode::Passive);
             self.debt = required && result.state != CheckpointState::Complete;
         }
         if idle {

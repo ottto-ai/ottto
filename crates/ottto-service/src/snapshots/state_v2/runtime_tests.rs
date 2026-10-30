@@ -222,3 +222,44 @@ fn pending_mapper_pause_does_not_touch_v1_and_off_cancels_inventory_slot() {
     import_with(&f.path, &mut index, &EmptyMapper).unwrap();
     assert_eq!(fs::read(&f.path).unwrap(), bytes);
 }
+
+#[test]
+fn state_v2_hold_reporting_accepts_every_repair_cause() {
+    use crate::snapshots::scan_index_health::RepairCause;
+    for cause in [
+        RepairCause::PriorState,
+        RepairCause::StorageGeneration,
+        RepairCause::StateV2,
+    ] {
+        crate::local_resource_diagnostics::scan_index_repair_required("claude_code", cause);
+    }
+}
+#[test]
+fn absent_parent_containment_guard_never_promotes_a_database() {
+    let f = Fixture::new();
+    f.imported();
+    let mut file = fence::create_private(&f.path).unwrap();
+    serde_json::to_writer(&mut file, &fence::Fence::new(&f.identity())).unwrap();
+    drop(file);
+    assert!(guard_containment_locked(&f.path).is_err());
+    assert!(fence::sibling(&f.path, ".v2.sqlite.import").exists());
+    assert!(!fence::sibling(&f.path, ".v2.sqlite").exists());
+}
+
+#[test]
+fn damaged_and_oversized_fence_claims_hold_before_v1_containment() {
+    for bytes in [
+        b"{\"schema_version\":4,".to_vec(),
+        format!(
+            "{{\"schema_version\":4,\"padding\":\"{}\"}}",
+            "x".repeat(5000)
+        )
+        .into_bytes(),
+    ] {
+        let f = Fixture::new();
+        fs::write(&f.path, &bytes).unwrap();
+        assert!(load_with(&f.path, false, &EmptyMapper).is_err());
+        assert!(guard_containment_locked(&f.path).is_err());
+        assert_eq!(fs::read(&f.path).unwrap(), bytes);
+    }
+}

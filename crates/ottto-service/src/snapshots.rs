@@ -94070,3 +94070,8 @@ pub(crate) fn erase_claude_state_v2_artifacts(support: &Path) -> Result<()> {
 pub(crate) fn maintain_state_v2_idle(path: &Path, index: &ScanIndex) -> Result<()> {
     state_v2::idle(path, index)
 }
+
+#[cfg(target_os = "macos")]
+pub(crate) fn invalidate_claude_state_v2_sessions(support: &Path) -> Result<()> {
+    state_v2::invalidate_tree(support)
+}

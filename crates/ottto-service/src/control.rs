@@ -1650,7 +1650,8 @@ fn handle_command(
                 ));
             }
             let home = local_lifecycle_home()?;
-            crate::snapshots::erase_claude_state_v2_artifacts(
+            #[cfg(target_os = "macos")]
+            crate::snapshots::invalidate_claude_state_v2_sessions(
                 &home.join("Library/Application Support/Ottto"),
             )
             .map_err(|_| LocalApiError::StatePoisoned)?;

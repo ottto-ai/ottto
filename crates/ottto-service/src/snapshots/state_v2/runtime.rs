@@ -74,25 +74,37 @@ struct RouteState {
     pace: Pace,
     latched: bool,
     inventory_ready: bool,
+    sample_v1: bool,
     runtimes: Vec<std::sync::Weak<Runtime>>,
 }
-fn states() -> &'static Mutex<BTreeMap<PathBuf, RouteState>> {
-    static STATES: OnceLock<Mutex<BTreeMap<PathBuf, RouteState>>> = OnceLock::new();
+type RouteHandle = Arc<Mutex<RouteState>>;
+fn states() -> &'static Mutex<BTreeMap<PathBuf, RouteHandle>> {
+    static STATES: OnceLock<Mutex<BTreeMap<PathBuf, RouteHandle>>> = OnceLock::new();
     STATES.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 fn with_state<T>(path: &Path, f: impl FnOnce(&mut RouteState) -> Result<T>) -> Result<T> {
-    let mut states = states().lock().map_err(|_| Hold::DbUnavailable)?;
-    // Never evict a publication latch. Exhaustion holds instead of losing it.
-    ensure!(
-        states.contains_key(path) || states.len() < 64,
-        Hold::DbUnavailable
-    );
-    f(states.entry(path.to_owned()).or_insert_with(|| RouteState {
-        pace: Pace::default(),
-        latched: false,
-        inventory_ready: false,
-        runtimes: Vec::new(),
-    }))
+    let state = {
+        let mut states = states().lock().map_err(|_| Hold::DbUnavailable)?;
+        // Latches are never evicted. Release the registry before blocking work.
+        ensure!(
+            states.contains_key(path) || states.len() < 64,
+            Hold::DbUnavailable
+        );
+        states
+            .entry(path.to_owned())
+            .or_insert_with(|| {
+                Arc::new(Mutex::new(RouteState {
+                    pace: Pace::default(),
+                    latched: false,
+                    inventory_ready: false,
+                    sample_v1: false,
+                    runtimes: Vec::new(),
+                }))
+            })
+            .clone()
+    };
+    let mut state = state.lock().map_err(|_| Hold::DbUnavailable)?;
+    f(&mut state)
 }
 
 pub(super) fn enabled(support: Option<&Path>) -> bool {
@@ -113,9 +125,11 @@ fn route_needed(path: &Path, switched: bool) -> Result<bool> {
         || fence::evidence(path)?)
 }
 pub(super) fn observed(path: &Path) -> bool {
-    states()
+    let state = states()
         .lock()
-        .is_ok_and(|states| states.contains_key(path))
+        .ok()
+        .and_then(|states| states.get(path).cloned());
+    state.is_some_and(|state| state.lock().is_ok_and(|state| state.sample_v1))
 }
 fn binding(path: &Path) -> Option<super::super::scan_index_persistence::Binding> {
     super::super::scan_index_integration::scan_index_storage_binding(path)
@@ -162,6 +176,7 @@ fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Optio
     }
     held(with_state(path, |state| {
         state.inventory_ready = false;
+        state.sample_v1 = switched;
         let pair = fence::reconcile(path, &binding, state.latched)?;
         if let Some((identity, db_path)) = pair {
             state.latched = true;
@@ -427,15 +442,14 @@ fn apply_outcome(
 }
 
 pub(in super::super) fn guard_containment_locked(path: &Path) -> Result<()> {
-    let Some(binding) = binding(path) else {
-        return Ok(());
-    };
-    if !route_needed(path, false)? {
+    if binding(path).is_none() || !route_needed(path, false)? {
         return Ok(());
     }
+    // A containment guard never promotes a DB. This also covers a parent/root
+    // appearing during the absent-parent path where no checkpoint lock exists.
     held(with_state(path, |state| {
         ensure!(
-            fence::reconcile(path, &binding, state.latched)?.is_none(),
+            !state.latched && !fence::evidence(path)?,
             Hold::DbUnavailable
         );
         Ok(())
@@ -481,12 +495,11 @@ fn register(state: &mut RouteState, index: &ScanIndex) -> Result<()> {
     Ok(())
 }
 
-/// Explicit erasure only. Close the shared session before unlinking all
-/// artifacts, and invalidate clones before releasing CheckpointLock.
-pub(in super::super) fn erase_locked(path: &Path, index: Option<&ScanIndex>) -> Result<()> {
+fn invalidate_locked(path: &Path) -> Result<()> {
     with_state(path, |state| {
         state.latched = true;
         state.inventory_ready = false;
+        state.sample_v1 = false;
         for runtime in state.runtimes.drain(..).filter_map(|r| r.upgrade()) {
             runtime
                 .session
@@ -495,7 +508,34 @@ pub(in super::super) fn erase_locked(path: &Path, index: Option<&ScanIndex>) -> 
                 .take();
         }
         Ok(())
-    })?;
+    })
+}
+/// Uninstall retains its existing OS/ownership/cleanup ordering. Close native
+/// handles first; its established cleanup owner performs all file deletion.
+pub(in super::super) fn invalidate_tree(support: &Path) -> Result<()> {
+    let root = support.join("snapshots");
+    let paths: Vec<_> = states()
+        .lock()
+        .map_err(|_| Hold::DbUnavailable)?
+        .keys()
+        .filter(|p| p.starts_with(&root))
+        .cloned()
+        .collect();
+    for path in paths {
+        if path.parent().is_some_and(Path::is_dir) {
+            let _lock = super::super::CheckpointLock::acquire(&path)?;
+            invalidate_locked(&path)?;
+        } else {
+            invalidate_locked(&path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Explicit erasure only. Close the shared session before unlinking all
+/// artifacts, and invalidate clones before releasing CheckpointLock.
+pub(in super::super) fn erase_locked(path: &Path, index: Option<&ScanIndex>) -> Result<()> {
+    invalidate_locked(path)?;
     if let Some(runtime) = index.and_then(|i| i.persistence_v2.as_ref()) {
         runtime
             .session

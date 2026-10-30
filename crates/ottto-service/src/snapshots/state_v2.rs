@@ -12,6 +12,8 @@ mod fence;
 mod import;
 mod runtime;
 pub(super) mod telemetry;
+#[cfg(target_os = "macos")]
+pub(super) use runtime::invalidate_tree;
 pub(super) use runtime::Hold;
 pub(super) use runtime::{
     after_v1_locked, erase_tree, guard_containment_locked, idle, load_locked, save_locked,

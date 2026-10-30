@@ -503,6 +503,7 @@ pub(super) struct Txn<'a> {
     finished: bool,
     removed_keys: BTreeSet<RowKey>,
     original_paths: BTreeMap<RowKey, BTreeSet<String>>,
+    path_bytes: usize,
     failed: bool,
 }
 impl Drop for Txn<'_> {
@@ -772,6 +773,7 @@ impl Sqlite {
                 finished: false,
                 removed_keys: BTreeSet::new(),
                 original_paths: BTreeMap::new(),
+                path_bytes: 0,
                 failed: false,
             };
             tx.put(RowInput {
@@ -835,6 +837,7 @@ impl Store for Sqlite {
     type Txn<'a> = Txn<'a>;
     fn begin(&mut self, mode: TxnMode) -> Result<Txn<'_>> {
         if mode == TxnMode::Write {
+            self.stats.erasure_pending_marks = 0;
             self.maintenance(false)?;
         }
         if mode == TxnMode::Write {
@@ -848,6 +851,7 @@ impl Store for Sqlite {
             finished: false,
             removed_keys: BTreeSet::new(),
             original_paths: BTreeMap::new(),
+            path_bytes: 0,
             failed: false,
         })
     }
@@ -899,6 +903,13 @@ impl Store for Sqlite {
             }
             Err(_) => (CheckpointState::Failed, None, None),
         };
+        if mode == CheckpointMode::Purge && state != CheckpointState::Complete {
+            self.erasure_failed(if state == CheckpointState::Busy {
+                "busy"
+            } else {
+                "truncate"
+            });
+        }
         self.stats.checkpoint(mode, state);
         CheckpointResult {
             state,
@@ -1086,17 +1097,7 @@ impl Txn<'_> {
         if !pl(&old.key) || self.original_paths.contains_key(&old.key) {
             return Ok(());
         }
-        let mut bytes: usize = self
-            .original_paths
-            .iter()
-            .map(|(key, paths)| {
-                owner_key(key).map(|key| {
-                    key.len() * 2 + 512 + paths.iter().map(|p| p.len() + 64).sum::<usize>()
-                })
-            })
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .sum();
+        let mut bytes = self.path_bytes;
         bytes = bytes
             .checked_add(owner_key(&old.key)?.len() * 2 + 512)
             .context("state_v2_path_diff_admission")?;
@@ -1119,6 +1120,7 @@ impl Txn<'_> {
             },
         )?;
         if !paths.is_empty() {
+            self.path_bytes = bytes;
             self.original_paths.insert(old.key.clone(), paths);
         }
         Ok(())
@@ -1278,7 +1280,9 @@ impl Transaction for Txn<'_> {
                     *row.key != RowKey::Meta("identity".into()),
                     "state_v2_identity_immutable"
                 );
-                if !references::matches(self.store.conn()?, &old, row.value)? {
+                if table == Table::Census {
+                    read_value(self.store.conn()?, &old, &mut io::sink())?;
+                } else if !references::matches(self.store.conn()?, &old, row.value)? {
                     self.remember_paths(&old)?;
                 }
                 self.store.conn()?.execute(

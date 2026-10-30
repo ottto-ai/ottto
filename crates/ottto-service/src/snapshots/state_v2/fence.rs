@@ -60,13 +60,17 @@ fn read(path: &Path) -> Result<Option<Fence>> {
         .open(path)?;
     // A bounded sniff never feeds a large v1 index to serde. Invalid small v1
     // JSON remains v1 containment's decision unless final DB evidence exists.
-    if file.metadata()?.len() > 4096 {
-        return Ok(None);
-    }
+    let oversized = file.metadata()?.len() > 4096;
     let mut bytes = Vec::new();
     file.take(4097).read_to_end(&mut bytes)?;
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+    if oversized {
+        ensure!(!declares_v2(&bytes), Hold::Future);
         return Ok(None);
+    }
+    let value = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(value) => value,
+        Err(_) if declares_v2(&bytes) => return Err(Hold::Future.into()),
+        Err(_) => return Ok(None),
     };
     if value
         .get("schema_version")
@@ -91,6 +95,38 @@ fn read(path: &Path) -> Result<Option<Fence>> {
         Hold::Future
     );
     Ok(Some(fence))
+}
+
+// A damaged/oversized fence must not become v1 containment just because the
+// complete strict parse fails. Published fences put schema_version first.
+fn declares_v2(bytes: &[u8]) -> bool {
+    struct Hint;
+    impl<'de> serde::de::Visitor<'de> for Hint {
+        type Value = bool;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("index header")
+        }
+        fn visit_map<M: serde::de::MapAccess<'de>>(
+            self,
+            mut map: M,
+        ) -> std::result::Result<bool, M::Error> {
+            while let Some(key) = map.next_key::<String>()? {
+                if key == "storage_format" {
+                    return Ok(true);
+                }
+                if key == "schema_version" {
+                    if map.next_value::<u64>()? >= 4 {
+                        return Ok(true);
+                    }
+                } else {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+            Ok(false)
+        }
+    }
+    serde::de::Deserializer::deserialize_map(&mut serde_json::Deserializer::from_slice(bytes), Hint)
+        .unwrap_or(false)
 }
 
 /// None permits v1 only when there is no evidence of publication. `latched`

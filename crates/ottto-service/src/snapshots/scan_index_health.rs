@@ -17,6 +17,7 @@ pub(crate) enum RepairCause {
     StateV2,
 }
 impl RepairCause {
+    pub(crate) const COUNT: usize = 3;
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::PriorState => "prior_state",

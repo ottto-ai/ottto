@@ -1418,3 +1418,42 @@ fn c1_fixed_size_rewrite_and_delete_reinsert_do_not_mark_purge() {
     assert_eq!(tx.commit(3, 4), DurableCommitOutcome::Committed(4));
     assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(4));
 }
+
+#[test]
+fn census_fixed_column_update_preserves_digest_without_value_comparison() {
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    let key = RowKey::Census("/synthetic/census".into());
+    let mut fixed = Fixed::Census {
+        fp: vec![1; 32],
+        derivation: 0,
+        window: 0,
+        shape: 0,
+        flags: 0,
+        set_id: None,
+        retired: None,
+        old_path_requests: None,
+        old_path_tokens: None,
+        modified: None,
+        birth: None,
+    };
+    for generation in 0..2 {
+        if let Fixed::Census { window, .. } = &mut fixed {
+            *window = generation;
+        }
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        let header = tx
+            .put(RowInput {
+                key: &key,
+                fixed: &fixed,
+                value: &Bytes(vec![]),
+            })
+            .unwrap();
+        tx.read_value(&header, &mut std::io::sink()).unwrap();
+        assert_eq!(
+            tx.commit(generation, generation + 1),
+            DurableCommitOutcome::Committed(generation + 1)
+        );
+    }
+    assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), None);
+}
