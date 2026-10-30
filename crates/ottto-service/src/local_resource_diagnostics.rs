@@ -235,30 +235,50 @@ pub(crate) enum UnselectedReason {
     Age,
     Size,
 }
-/// Claude, Codex, Pi x (age, size), drained by that source's page line.
+/// Why an owned frame continued serially instead of parking for a sibling.
+pub(crate) enum SerialFallbackCause {
+    UnsupportedLayout,
+    BoundNone,
+    BudgetExhausted,
+}
+/// Claude, Codex, Pi x (age, size, serial fallback causes), drained by that
+/// source's page line. Diagnostics only; never carried in a scan/frame graph.
 #[cfg(not(test))]
-static LINE_UNSELECTED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+static SOURCE_COUNTS: [AtomicU64; 15] = [const { AtomicU64::new(0) }; 15];
 #[cfg(test)]
 thread_local! {
-    static LINE_UNSELECTED: [AtomicU64; 6] = const { [const { AtomicU64::new(0) }; 6] };
+    static SOURCE_COUNTS: [AtomicU64; 15] = const { [const { AtomicU64::new(0) }; 15] };
 }
-fn line_unselected(source: &str, reason: usize, f: impl FnOnce(&AtomicU64) -> u64) -> u64 {
+fn source_count(source: &str, reason: usize, f: impl FnOnce(&AtomicU64) -> u64) -> u64 {
     let sources = ["claude_code", "codex", "pi"];
     let Some(slot) = sources.iter().position(|s| *s == source) else {
         return 0;
     };
     #[cfg(test)]
     {
-        LINE_UNSELECTED.with(|slots| f(&slots[2 * slot + reason]))
+        SOURCE_COUNTS.with(|slots| f(&slots[5 * slot + reason]))
     }
     #[cfg(not(test))]
     {
-        f(&LINE_UNSELECTED[2 * slot + reason])
+        f(&SOURCE_COUNTS[5 * slot + reason])
     }
 }
 /// One skip decision, recorded after the gate decided; never a gate input.
 pub(crate) fn line_delivery_unselected(source: &str, reason: UnselectedReason) {
-    line_unselected(source, reason as usize, |slot| slot.fetch_add(1, Relaxed));
+    source_count(source, reason as usize, |slot| slot.fetch_add(1, Relaxed));
+}
+/// One failed parking decision; no logging, resource probes or scan ownership.
+pub(crate) fn source_rotation_serial_fallback(source: &str, cause: SerialFallbackCause) {
+    let cause = match cause {
+        SerialFallbackCause::BoundNone if !crate::heap_layout_bound::layout_supported() => {
+            SerialFallbackCause::UnsupportedLayout
+        }
+        cause => cause,
+    };
+    source_count(source, 2 + cause as usize, |slot| {
+        slot.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)))
+            .unwrap_or_else(|n| n)
+    });
 }
 
 // Same public seam as E3/#876. Its merged withheld carrier can keep this
@@ -560,6 +580,8 @@ impl Probe {
             line_delivery: Option<BTreeMap<&'static str, LineDeliveryCounts>>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             line_delivery_unselected: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            source_rotation_serial_fallback: BTreeMap<&'static str, u64>,
         }
         let claude = source == "claude_code";
         let counts = Counts {
@@ -571,9 +593,23 @@ impl Probe {
                 .map(|(observer, counts)| BTreeMap::from([(observer, counts)])),
             line_delivery_unselected: [("age", 0), ("size", 1)]
                 .into_iter()
-                .map(|(key, reason)| (key, line_unselected(source, reason, |n| n.swap(0, Relaxed))))
+                .map(|(key, reason)| (key, source_count(source, reason, |n| n.swap(0, Relaxed))))
                 .filter(|(_, count)| *count > 0)
                 .collect(),
+            source_rotation_serial_fallback: [
+                ("unsupported_layout", SerialFallbackCause::UnsupportedLayout),
+                ("bound_none", SerialFallbackCause::BoundNone),
+                ("budget_exhausted", SerialFallbackCause::BudgetExhausted),
+            ]
+            .into_iter()
+            .map(|(key, cause)| {
+                (
+                    key,
+                    source_count(source, 2 + cause as usize, |n| n.swap(0, Relaxed)),
+                )
+            })
+            .filter(|(_, count)| *count > 0)
+            .collect(),
             reread: if claude {
                 self.page_events.with_current().without_terminal_rearm()
             } else {

@@ -167,6 +167,12 @@ pub(crate) trait Owner {
     fn outcome(&mut self, source: Self::Source, result: Result<()>);
     fn monotonic(&self) -> Duration;
     fn parked(&mut self, _bytes: usize) {}
+    fn serial_fallback(
+        &mut self,
+        _source: Self::Source,
+        _cause: crate::local_resource_diagnostics::SerialFallbackCause,
+    ) {
+    }
     /// Optional process-retained graphs outside every moving/parked frame.
     /// A graph moved into a frame is charged by `bound`, never here as well.
     /// Concrete owners must use the existing requested-layout admission;
@@ -291,6 +297,8 @@ pub(crate) fn run<O: Owner>(owner: &mut O, sources: &[O::Source], parked_budget:
                 break;
             }
             if !remaining.is_empty() || !parked.is_empty() {
+                use crate::local_resource_diagnostics::SerialFallbackCause;
+                let mut cause = SerialFallbackCause::BudgetExhausted;
                 if let Some((available, retained)) =
                     retained_remainder(owner, budget.and_then(|b| b.checked_sub(parked_bytes)))
                 {
@@ -307,8 +315,13 @@ pub(crate) fn run<O: Owner>(owner: &mut O, sources: &[O::Source], parked_budget:
                             );
                             break;
                         }
+                    } else {
+                        cause = SerialFallbackCause::BoundNone;
                     }
+                } else if budget.and_then(|b| b.checked_sub(parked_bytes)).is_some() {
+                    cause = SerialFallbackCause::BoundNone;
                 }
+                owner.serial_fallback(source, cause);
             }
             // Unsupported layout, opaque state or budget exhaustion: continue
             // this SAME owned frame serially. Never restart files for a turn.
@@ -409,11 +422,9 @@ mod retained_budget_tests {
                 Step::Pending(frame)
             }
         }
-        fn bound(&self, frame: &Frame, limit: usize) -> Option<usize> {
-            let bytes = self
-                .frame_charge
-                .checked_add(frame.carry.as_ref().map_or(0, |graph| graph.charge))?;
-            (bytes <= limit).then_some(bytes)
+        fn bound(&self, frame: &Frame, _limit: usize) -> Option<usize> {
+            self.frame_charge
+                .checked_add(frame.carry.as_ref().map_or(0, |graph| graph.charge))
         }
         fn finish(&mut self, frame: Frame, remaining: Option<usize>) -> Result<()> {
             self.allowances.push(("finish", frame.source, remaining));
@@ -445,6 +456,16 @@ mod retained_budget_tests {
             assert!(bytes <= PARKED_BUDGET);
             self.parks.push(bytes);
         }
+        fn serial_fallback(
+            &mut self,
+            source: usize,
+            cause: crate::local_resource_diagnostics::SerialFallbackCause,
+        ) {
+            crate::local_resource_diagnostics::source_rotation_serial_fallback(
+                ["claude_code", "codex"][source],
+                cause,
+            );
+        }
         fn retained_bound(&self, limit: usize) -> Option<usize> {
             if self.persistent_unknown || (self.unknown && self.carry.is_some()) {
                 return None;
@@ -455,6 +476,59 @@ mod retained_budget_tests {
         fn discard_retained(&mut self) {
             self.discards += 1;
             self.carry = None;
+        }
+    }
+
+    #[test]
+    /// [behaviour] Serial parking refusals reach the existing per-source page counter once each.
+    fn serial_fallback_counts_unknown_and_excess_bounds() {
+        use crate::local_resource_diagnostics::{capture, CollectionCounts, Probe};
+        let emit_page = |source| {
+            Probe::start().collection(
+                source,
+                CollectionCounts {
+                    scanned_files: 0,
+                    semantic_noops: 0,
+                    sampled_acquisition: None,
+                    full_causes: Default::default(),
+                },
+            );
+        };
+        // Other rotation fixtures can leave this thread's page counts pending.
+        capture(|| {
+            emit_page("claude_code");
+            emit_page("codex");
+        });
+        for (charge, expected) in [
+            (usize::MAX, serde_json::json!({"bound_none": 2})),
+            (PARKED_BUDGET, serde_json::json!({"budget_exhausted": 2})),
+            (0, serde_json::Value::Null),
+        ] {
+            let mut owner = ProofOwner {
+                steps: vec![2 * TURN_STEPS + 1, TURN_STEPS + 1],
+                frame_charge: charge,
+                take_at: Some(0),
+                carry: Some(Box::new(Carry {
+                    charge: 1,
+                    root_revoked: true,
+                })),
+                ..Default::default()
+            };
+            let (_, rows) = capture(|| {
+                run(&mut owner, &[0, 1], PARKED_BUDGET);
+                for source in ["codex", "claude_code", "claude_code"] {
+                    emit_page(source);
+                }
+            });
+            assert!(owner.outcomes.iter().all(|(_, ok)| *ok));
+            assert_eq!(owner.outcomes.len(), 2);
+            assert_eq!(rows.len(), 3, "fallback adds no emitter");
+            assert!(rows[0]["counts"]["source_rotation_serial_fallback"].is_null());
+            assert_eq!(
+                rows[1]["counts"]["source_rotation_serial_fallback"],
+                expected
+            );
+            assert!(rows[2]["counts"]["source_rotation_serial_fallback"].is_null());
         }
     }
 

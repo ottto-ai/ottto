@@ -496,6 +496,13 @@ after the existing decision, are drained by that source's next completed page,
 and count repeated decisions, not distinct files or bytes. They are recorded
 whether or not an observer is registered.
 
+`counts.source_rotation_serial_fallback` counts failed parking decisions while
+sibling sources wait, drained by that source's next completed page. Closed
+causes are `unsupported_layout`, `bound_none` (opaque/unaccountable ownership)
+and `budget_exhausted` (no queue allowance or a returned bound over available).
+Each decision continues the same owned frame serially and counts once; ordinary
+serial turns with no waiting sibling do not count.
+
 ## Context Footprint Discovery
 
 Context footprint opens no transcript. Its workspaces come from the cwds of
