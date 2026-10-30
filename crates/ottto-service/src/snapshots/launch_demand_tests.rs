@@ -80,7 +80,6 @@ fn transcript(session: &str, request: &str, sidechain: bool) -> String {
 /// Workflow agent of unbatched parents, and a UUID-stem subagent.
 struct Transcripts {
     root: PathBuf,
-    top: PathBuf,
     /// (path, re-keyed session id, direct parent)
     subagents: Vec<(PathBuf, String, &'static str)>,
 }
@@ -108,11 +107,7 @@ fn transcripts(home: &Home) -> Transcripts {
         fs::write(&path, transcript(parent, stem, true)).unwrap();
         subagents.push((path, format!("{parent}_{stem}"), parent));
     }
-    Transcripts {
-        root,
-        top,
-        subagents,
-    }
+    Transcripts { root, subagents }
 }
 
 fn has_launcher_fact(item: &SnapshotItem) -> bool {
