@@ -31361,6 +31361,13 @@ impl OwnedSourceScan {
                         held_audit_open_failed.1,
                         sampled_audit::held_audit_open_backoff_evicted()
                     );
+                    #[cfg(test)]
+                    CLAUDE_PARSE_REASON_LINES.with(|lines| {
+                        lines.borrow_mut().push(census_count_fields(
+                            &CANDIDATE_PARSE_REASON_NAMES,
+                            &census.parse_reasons,
+                        ));
+                    });
                     if history_upgrade.family_closure_root_absent_excluded > 0 {
                         crate::local_resource_diagnostics::claude_reemission_family_closure_root_absent_excluded(
                             history_upgrade.family_closure_root_absent_excluded,
@@ -44824,8 +44831,15 @@ fn census_count_fields(names: &[&str], counts: &[usize]) -> String {
 
 #[cfg(test)]
 thread_local! {
+    static CLAUDE_PARSE_REASON_LINES: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     static CODEX_PARSE_REASON_LINES: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_claude_parse_reason_lines_for_test() -> Vec<String> {
+    CLAUDE_PARSE_REASON_LINES.with(|lines| std::mem::take(&mut *lines.borrow_mut()))
 }
 
 #[cfg(test)]
@@ -50812,6 +50826,13 @@ impl ScanIndex {
         let retry_due = record.disposition
             == ClaudeUsageAuthorityQuarantineDisposition::RetryPending
             && record.retry_after_unix_seconds <= now;
+        #[cfg(test)]
+        if !witness_matches || !revision_matches || retry_due {
+            eprintln!(
+                "Claude forced-family predicate: revision={} witness={} retry={}",
+                !revision_matches, !witness_matches, retry_due
+            );
+        }
         (!witness_matches || !revision_matches || retry_due).then_some(root_session_id)
     }
 

@@ -26,6 +26,10 @@
 
 use super::*;
 
+thread_local! {
+    static APC_R2_TRACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 const APC_DESTINATION: &str = "authority-proof-correction-destination";
 const APC_MACHINE_ID: &str = "machine-authority-proof-correction";
 const APC_PAGE_FILES: usize = 2;
@@ -141,6 +145,7 @@ enum ApcUpload {
 
 struct ApcPage {
     upload: ApcUpload,
+    forced_family: usize,
     scan: crate::snapshots::SourceScanResult,
     /// Sessions the page parsed, before any hold removed a body.
     parsed: BTreeSet<String>,
@@ -512,7 +517,14 @@ impl ApcFixture {
 
     fn page_born(&self, collected_at: &str, upload: ApcUpload) -> ApcPage {
         if crate::snapshots::ClaudeTerminalOffForTest::active() {
-            return self.terminal_off_on_page_born(collected_at, upload);
+            // The synthetic page clock must also drive production cadence;
+            // otherwise hour-to-hour walks happen within one wall-clock tick.
+            let now = time::OffsetDateTime::parse(
+                collected_at, &time::format_description::well_known::Rfc3339,
+            ).unwrap().unix_timestamp();
+            return crate::snapshots::with_terminal_off_audit_now_for_test(now as u64, || {
+                self.terminal_off_on_page_born(collected_at, upload)
+            });
         }
         let before_bytes = std::fs::read(&self.index_path).unwrap_or_default();
         let before = ScanIndex::load(&self.index_path).expect("load scan index");
@@ -678,6 +690,7 @@ impl ApcFixture {
             // Nothing after the scan reaches the network or the disk.
             return ApcPage {
                 upload,
+                forced_family: 0,
                 scan,
                 parsed,
                 before_bytes,
@@ -829,6 +842,7 @@ impl ApcFixture {
             }
             return ApcPage {
                 upload,
+                forced_family: 0,
                 scan,
                 parsed,
                 before_bytes,
@@ -889,6 +903,7 @@ impl ApcFixture {
         .expect("save index and publish manifest");
         ApcPage {
             upload,
+            forced_family: 0,
             scan,
             parsed,
             before_bytes,
@@ -910,7 +925,10 @@ impl ApcFixture {
         let before_bytes = std::fs::read(&self.index_path).unwrap_or_default();
         let before = ScanIndex::load(&self.index_path).expect("load scan index");
         let mut index = before.clone();
-        index.activate_upload_context("upload-context-apc".to_string());
+        index.activate_upload_context(snapshot_upload_context_fingerprint(
+            SnapshotUploadPolicy::default(),
+            Some(APC_DESTINATION),
+        ));
         index.activate_effective_upload_body_witness_revision(
             effective_upload_body_witness_revision(SnapshotSource::ClaudeCode),
         );
@@ -923,11 +941,15 @@ impl ApcFixture {
         .expect("reload exact synthetic upload progress");
         activate_source_upload_context(
             SnapshotSource::ClaudeCode,
-            "upload-context-apc".to_string(),
+            snapshot_upload_context_fingerprint(
+                SnapshotUploadPolicy::default(),
+                Some(APC_DESTINATION),
+            ),
             &mut index,
             &mut progress,
         );
         let committed_index = index.clone();
+        crate::snapshots::take_claude_parse_reason_lines_for_test();
         let (mut scan, mut native_completion) = if self.retain_native_terminal.get() {
             let mut state = crate::snapshots::OwnedSourceScan::new(
                 SnapshotSource::ClaudeCode,
@@ -980,6 +1002,12 @@ impl ApcFixture {
             .expect("scan bounded Claude page");
             (scan, None)
         };
+        let forced_family = crate::snapshots::take_claude_parse_reason_lines_for_test()
+            .iter()
+            .flat_map(|line| line.split_whitespace())
+            .filter_map(|field| field.strip_prefix("forced_family="))
+            .map(|count| count.parse::<usize>().expect("parse forced-family counter"))
+            .sum();
         self.census_before_fold.set(scan.census_complete);
         let parsed = scan
             .snapshots
@@ -1077,6 +1105,7 @@ impl ApcFixture {
             // Nothing after the scan reaches the network or the disk.
             return ApcPage {
                 upload,
+                forced_family,
                 scan,
                 parsed,
                 before_bytes,
@@ -1207,6 +1236,64 @@ impl ApcFixture {
             &progress.accepted_fingerprints,
             &progress.accepted_body_witnesses,
         );
+        let proof_body_drains = index.claude_proof_body_drains(&committed_index);
+        // Trace the legacy selection BEFORE the ON reconciliation, using the
+        // real valid-context ledger. This distinguishes R2 from ledger resets.
+        if !proof_body_drains.is_empty() {
+            let current_bodies = scan
+                .snapshots
+                .iter()
+                .map(|item| {
+                    (
+                        item.snapshot_fingerprint.clone(),
+                        snapshot_upload_body_witness(item),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            let accepted = progress
+                .accepted_fingerprints
+                .iter()
+                .filter(|fp| {
+                    !holds.held_fingerprints.contains(*fp)
+                        && current_bodies.contains_key(*fp)
+                        && current_bodies.get(*fp) == progress.accepted_body_witnesses.get(*fp)
+                })
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let quarantined = progress
+                .quarantined_fingerprints
+                .iter()
+                .filter(|(fp, record)| {
+                    !holds.held_fingerprints.contains(*fp)
+                        && current_bodies.contains_key(*fp)
+                        && current_bodies.get(*fp) == record.upload_body_witness.as_ref()
+                })
+                .map(|(fp, record)| (fp.clone(), record.clone()))
+                .collect();
+            let selected = index.committable_subset_with_local_holds(
+                &committed_index,
+                &accepted,
+                &quarantined,
+                &holds.held_fingerprints,
+            );
+            for candidate in &candidates {
+                let member = candidate.member_for_test();
+                let key = Self::family_keys(&index).get(member).cloned().unwrap();
+                if let Some(record) = index.claude_authority_record_for_test(APC_ROOT) {
+                    if record
+                        .correction
+                        .as_ref()
+                        .is_some_and(|(_, owed)| !owed.contains(member))
+                    {
+                        eprintln!("R2 drain trace: member={member} before={} candidate={} record={} legacy_selected={} accepted={}",
+                            committed_index.files[&key].source_file_fingerprint,
+                            candidate.revision_for_test(), record.member_source_file_fingerprints[member],
+                            selected.files[&key].source_file_fingerprint,
+                            index.file_snapshot_fingerprints[&key].is_subset(&accepted));
+                    }
+                }
+            }
+        }
         index.log_claude_proof_correction_debt();
         if shed {
             progress
@@ -1229,6 +1316,7 @@ impl ApcFixture {
             }
             return ApcPage {
                 upload,
+                forced_family,
                 scan,
                 parsed,
                 before_bytes,
@@ -1268,6 +1356,7 @@ impl ApcFixture {
             &cutoff_candidates,
             settlement.fully_settled,
         );
+        index.restore_unselected_claude_proof_body_drains(&committed_index, proof_body_drains);
         let census_complete = scan.census_complete;
         settle_context_curve_replay_state(
             &mut index,
@@ -1293,6 +1382,7 @@ impl ApcFixture {
         .expect("save index and publish manifest");
         ApcPage {
             upload,
+            forced_family,
             scan,
             parsed,
             before_bytes,
@@ -3528,6 +3618,278 @@ fn terminal_off_on_controlled_three_owed_members_settle_on_their_own_pages_while
     };
     let (finally, _, _) = fixture.drain_until_clear(&regrant, natural.hour + 2);
     assert_eq!(finally, BTreeSet::from([held_member]));
+}
+
+/// A sidecar stat change preserves every provider row and the root body, but
+/// moves the root revision. A shed must retain its correction until a carrying
+/// page; the next page counts the one family-unit re-read under normal pacing.
+#[test]
+#[serial(source_manifests)]
+#[serial(client_report)]
+fn terminal_off_on_sidecar_only_revision_change_on_a_shed_page_keeps_the_owed_root_owed() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    let _source_manifests = SourceManifestTestGuard::new();
+    let fixture = ApcFixture::new("claude-authority-proof-correction-r2-sidecar", false);
+    let (_, grant) = fixture.reach_grant();
+    assert!(grant.owed.contains(APC_ROOT));
+    let root_bytes = std::fs::read(fixture.member_path(None)).unwrap();
+    let sidecar = fixture.sidecar_path("claude-code-effort");
+    let rows = std::fs::read(&sidecar).unwrap();
+    let modified = std::fs::metadata(&sidecar).unwrap().modified().unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&sidecar)
+        .unwrap()
+        .set_modified(modified + Duration::from_secs(10))
+        .unwrap();
+    assert_eq!(std::fs::read(&sidecar).unwrap(), rows);
+    assert_eq!(
+        std::fs::read(fixture.member_path(None)).unwrap(),
+        root_bytes
+    );
+    let pages = fixture.generation(grant.hour + 1, |number| {
+        if number == 0 {
+            ApcUpload::Crash
+        } else {
+            ApcUpload::Shed
+        }
+    });
+    let mut saw_reverted_root = false;
+    let mut offered_owed = BTreeSet::new();
+    for (number, page) in pages.iter().enumerate() {
+        let label = format!("sidecar shed page {number}");
+        let transition = ApcFixture::check(page, &label);
+        assert!(transition.granted.is_none() && !transition.failed);
+        assert!(transition.acked.is_empty());
+        assert!(
+            !transition.noop.contains(APC_ROOT),
+            "a reverted root stays owed"
+        );
+        let record = page.record().expect("shed keeps the correction");
+        let (proof, owed) = record.correction.as_ref().unwrap();
+        assert_eq!(proof, &grant.proof);
+        assert!(owed.contains(APC_ROOT));
+        assert_eq!(
+            record.failed_reconstruction_count,
+            grant.record.failed_reconstruction_count
+        );
+        assert_eq!(
+            record.retry_after_unix_seconds,
+            grant.record.retry_after_unix_seconds
+        );
+        for (member, (fingerprint, _)) in &page.offered_bodies {
+            if grant.owed.contains(member) && page.offered.contains(fingerprint) {
+                assert!(owed.contains(member));
+                assert!(!page
+                    .index
+                    .accepted_snapshot_fingerprint_recorded(fingerprint));
+                offered_owed.insert(member.clone());
+            }
+        }
+        if page.shed {
+            if let Some(candidate) = page
+                .candidates
+                .iter()
+                .find(|candidate| candidate.member_for_test() == APC_ROOT)
+            {
+                let key = &ApcFixture::family_keys(&page.index)[APC_ROOT];
+                assert_ne!(
+                    candidate.revision_for_test(),
+                    page.index.files[key].source_file_fingerprint
+                );
+                assert_eq!(
+                    page.index.files[key].source_file_fingerprint,
+                    page.before.files[key].source_file_fingerprint
+                );
+                assert_eq!(
+                    record.member_source_file_fingerprints[APC_ROOT],
+                    page.record_before()
+                        .unwrap()
+                        .member_source_file_fingerprints[APC_ROOT]
+                );
+                saw_reverted_root = true;
+            }
+        }
+    }
+    assert!(
+        saw_reverted_root,
+        "non-vacuous: the valid-ledger shed reverts a no-op root revision"
+    );
+    assert!(!offered_owed.is_empty());
+    let pages = fixture.generation(grant.hour + 2, |_| ApcUpload::Accept);
+    let root_page = pages
+        .iter()
+        .position(|page| page.parsed.contains(APC_ROOT))
+        .unwrap();
+    assert_eq!(root_page, 0, "the next page revisits the owed root");
+    assert_eq!(pages[root_page].forced_family, apc_family_sessions().len());
+    assert_eq!(
+        pages.iter().map(|page| page.forced_family).sum::<usize>(),
+        apc_family_sessions().len(),
+        "one counted family-unit re-read in the next generation"
+    );
+    let mut drained = BTreeSet::new();
+    for (number, page) in pages.iter().enumerate() {
+        let transition = ApcFixture::check(page, &format!("sidecar recovery page {number}"));
+        assert!(transition.granted.is_none() && !transition.failed);
+        drained.extend(transition.acked);
+        drained.extend(transition.noop);
+    }
+    assert!(
+        drained.contains(APC_ROOT),
+        "a carrying page re-drains the root at the saved revision"
+    );
+    if pages.last().unwrap().record().is_some() {
+        let (rest, _, _) = fixture.drain_until_clear(&grant, grant.hour + 3);
+        drained.extend(rest);
+    }
+    assert!(offered_owed.is_subset(&drained));
+    assert!(ScanIndex::load(&fixture.index_path)
+        .unwrap()
+        .claude_authority_record_for_test(APC_ROOT)
+        .is_none());
+    assert_eq!(
+        fixture.quarantined_index_count(),
+        0,
+        "neither index nor upload ledger was quarantined"
+    );
+}
+
+// R2: unchanged accepted body at a new file revision. Exercise both a
+// surviving correction and its last-member clear through the real locked save.
+#[test]
+fn terminal_off_partial_checkpoint_reverts_a_no_op_drain_whose_revision_was_not_selected() {
+    let _terminal_off = crate::snapshots::ClaudeTerminalOffForTest::enabled();
+    assert!(crate::snapshots::claude_terminal_off());
+    for owed in [1, 2] {
+        for accept_on_page in [false, true] {
+            let scratch = crate::test_scratch::ScratchDir::new("apc-r2-body-checkpoint");
+            let index_path = scratch.join("claude-scan-index.json");
+            let progress_path = scratch.join("claude-upload-progress.json");
+            let transcript_root = scratch.join("transcripts");
+            std::fs::create_dir_all(&transcript_root).unwrap();
+            std::fs::write(
+                transcript_root.join(format!("{}.jsonl", apc_m2_root(0))),
+                apc_transcript_line(&apc_m2_root(0), None, "req_r2", 1),
+            )
+            .unwrap();
+            let mut unrelated = ScanIndex::default();
+            let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
+                SnapshotSource::ClaudeCode,
+                &[transcript_root],
+                &mut unrelated,
+                APC_WINDOW_END,
+                183,
+                APC_PAGE_FILES,
+                false,
+            )
+            .unwrap();
+            let mut item = scan.snapshots.remove(0);
+            let (root, member, key) = (apc_m2_root(0), apc_m2_agent(0), apc_m2_agent_key(0));
+            item.source_session_id = member.clone();
+            item.snapshot_fingerprint = apc_m2_digest(3, 1);
+            let body = snapshot_upload_body_witness(&item);
+            let mut value = serde_json::to_value(apc_m2_index(1, owed, false, true)).unwrap();
+            value["files"][&key]["last_upload_body_witness"] =
+                serde_json::json!(crate::snapshots::snapshot_file_upload_body_set_for_test(
+                    std::slice::from_ref(&body)
+                ));
+            value["claude_usage_family_pending"][&root] = serde_json::json!({
+                "census_window_end": APC_WINDOW_END, "member_request_id_hashes": {}, "invalid": false,
+            });
+            let mut committed: ScanIndex = serde_json::from_value(value).unwrap();
+            committed.save(&index_path).unwrap();
+            let before = committed.claude_authority_record_for_test(&root).unwrap();
+            assert!(before.family_pending_retained && before.bound_to_retained_witness);
+            let mut current = committed.clone();
+            let revision = apc_m2_digest(7, 1);
+            current.files.get_mut(&key).unwrap().source_file_fingerprint = revision.clone();
+            let candidate = crate::snapshots::ClaudeProofCorrectionCandidate::for_test(
+                &current,
+                &key,
+                body.clone(),
+            );
+            current.settle_claude_proof_corrections(
+                &committed,
+                &[candidate],
+                &BTreeSet::new(),
+                &BTreeMap::new(),
+            );
+            let drained = current.claude_authority_record_for_test(&root);
+            if owed == 1 {
+                assert!(drained.is_none(), "last-member no-op clears in memory");
+                assert!(!current.claude_usage_family_pending_retained_for_test(&root));
+            } else {
+                let drained = drained.unwrap();
+                assert!(!drained.correction.unwrap().1.contains(&member));
+                assert_eq!(drained.member_source_file_fingerprints[&member], revision);
+            }
+            let mut progress = test_upload_progress();
+            let snapshots = if accept_on_page {
+                progress
+                    .accepted_fingerprints
+                    .insert(item.snapshot_fingerprint.clone());
+                progress
+                    .accepted_body_witnesses
+                    .insert(item.snapshot_fingerprint.clone(), body);
+                vec![item]
+            } else {
+                Vec::new()
+            };
+            progress.save(&progress_path).unwrap();
+            checkpoint_partial_snapshot_index(
+                &current,
+                &committed,
+                &progress,
+                &snapshots,
+                None,
+                &BTreeSet::new(),
+                &index_path,
+                &progress_path,
+                || Ok(()),
+            )
+            .unwrap();
+            let restarted = ScanIndex::load(&index_path).unwrap();
+            assert_eq!(
+                serde_json::to_value(&restarted).unwrap()["accepted_snapshot_fingerprints"],
+                serde_json::to_value(&committed).unwrap()["accepted_snapshot_fingerprints"]
+            );
+            assert_eq!(
+                restarted.file_snapshot_fingerprints,
+                committed.file_snapshot_fingerprints
+            );
+            if accept_on_page {
+                assert_eq!(restarted.files[&key].source_file_fingerprint, revision);
+                let record = restarted.claude_authority_record_for_test(&root);
+                if owed == 1 {
+                    assert!(record.is_none());
+                } else {
+                    let record = record.unwrap();
+                    assert!(!record.correction.unwrap().1.contains(&member));
+                    assert_eq!(record.member_source_file_fingerprints[&member], revision);
+                }
+            } else {
+                assert_eq!(
+                    restarted.files[&key].source_file_fingerprint,
+                    committed.files[&key].source_file_fingerprint
+                );
+                assert_eq!(restarted.claude_authority_record_for_test(&root), Some(before),
+                    "same proof, owed set, pre-page revision, counter, deadline and pending binding survive restart");
+                assert!(progress.accepted_fingerprints.is_empty(), "no ACK credit");
+                assert!(progress.accepted_body_witnesses.is_empty());
+            }
+            assert_eq!(
+                std::fs::read_dir(&scratch)
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.file_name().to_string_lossy().contains(".corrupt."))
+                    .count(),
+                0
+            );
+        }
+    }
 }
 
 // Synthetic M2 family shape (one or more roots, two members each) built
