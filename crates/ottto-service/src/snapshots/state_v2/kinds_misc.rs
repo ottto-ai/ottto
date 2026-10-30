@@ -985,10 +985,6 @@ macro_rules! fields {
         $apply!(upload_ack_retirement_handoff, "accepted.ack_handoff");
         $apply!(held_audit_progress, "scan_state.held_audit_progress");
         $apply!(claude_money_birth_store, "v1_field.birth_store");
-        $apply!(
-            claude_desktop_store_inventory,
-            "v1_field.claude_desktop_store_inventory"
-        );
     };
 }
 
@@ -1055,7 +1051,6 @@ pub(super) const KINDS: &[&str] = &[
     "accepted.ack_handoff",
     "scan_state.held_audit_progress",
     "v1_field.birth_store",
-    "v1_field.claude_desktop_store_inventory",
     "v1_field.repair_provenance",
     "raw_hold.files",
     "raw_hold.claude_account_family_witnesses",

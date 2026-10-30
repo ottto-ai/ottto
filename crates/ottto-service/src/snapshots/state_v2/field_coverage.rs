@@ -124,13 +124,12 @@ coverage! {
     claude_no_list_policy => ("MISC", "runtime"),
     claude_history_emission => ("MISC", "runtime"),
     claude_money_birth_store => ("MISC", "v1_field.birth_store"),
-    claude_desktop_store_inventory => ("MISC", "v1_field.claude_desktop_store_inventory"),
     growth_retention => ("FILES", "file.growth_retention"),
 }
 #[test]
 fn every_scan_index_field_and_kind_has_one_owner() {
     exhaustive(ScanIndex::default());
-    assert_eq!(FIELDS.len(), 115);
+    assert_eq!(FIELDS.len(), 114);
     let names: BTreeSet<_> = FIELDS.iter().map(|(field, _, _)| *field).collect();
     assert_eq!(names.len(), FIELDS.len());
     let groups = [

@@ -619,18 +619,6 @@ impl Observation {
     }
 }
 
-// Final upload candidates compared with their retained accepted bodies on this worker.
-// Drained by the existing finish record; no identifiers reach the log.
-thread_local! {
-    static ACCOUNT_HASH_CHANGED: std::cell::RefCell<std::collections::BTreeSet<String>> =
-        const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
-}
-pub(crate) fn account_hash_changed(session_key: &str) {
-    ACCOUNT_HASH_CHANGED.with(|sessions| {
-        sessions.borrow_mut().insert(session_key.to_string());
-    });
-}
-
 /// Local prepare window, including index load/baseline work before page probes.
 /// Return values and errors pass through; unwinding closes sampling silently.
 pub(crate) fn source_prepare<T>(source: &str, inner: impl FnOnce() -> T) -> T {
@@ -654,11 +642,6 @@ pub(crate) fn source_finish<T>(
     source: &str,
     inner: impl FnOnce() -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    #[derive(Serialize)]
-    struct Counts {
-        account_hash_changed: u64,
-    }
-    ACCOUNT_HASH_CHANGED.with(|sessions| sessions.borrow_mut().clear());
     let probe = Probe::start();
     let footprint = footprint::Stage::begin();
     let result = inner();
@@ -668,13 +651,7 @@ pub(crate) fn source_finish<T>(
         stage: "source_finish",
         source: Source::from_slug(source),
         observation: probe.stage_observation(footprint.as_ref()),
-        counts: Counts {
-            account_hash_changed: ACCOUNT_HASH_CHANGED.with(|sessions| {
-                let count = sessions.borrow().len() as u64;
-                sessions.borrow_mut().clear();
-                count
-            }),
-        },
+        counts: EmptyCounts {},
     });
     result
 }
@@ -717,6 +694,9 @@ pub(crate) fn codex_census_fence(
         },
     });
 }
+
+#[derive(Serialize)]
+struct EmptyCounts {}
 
 /// Fixed-schema traversal decisions only; no CPU/RSS sample or wire event.
 pub(crate) fn traversal_transition(source: &str, counts: &impl Serialize) {
@@ -1871,10 +1851,7 @@ mod tests {
         assert_eq!(record["schema_version"], SCHEMA_VERSION);
         assert_eq!(record["stage"], "source_finish");
         assert_eq!(record["source"], source);
-        assert_eq!(
-            record["counts"],
-            serde_json::json!({"account_hash_changed": 0})
-        );
+        assert_eq!(record["counts"], serde_json::json!({}));
         assert!(record.get("result").is_none());
         println!("RESOURCE_V2_FINISH_FIXTURE {record}");
     }
