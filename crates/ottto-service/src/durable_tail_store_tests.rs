@@ -3,8 +3,6 @@
 //! the single-writer seam and the content-free certificate. The record body
 //! is a placeholder; no accumulator field is encoded here.
 use super::*;
-#[path = "durable_tail_store/repin_tests.rs"]
-mod repin_tests;
 use crate::snapshots::ScanIndex;
 use crate::transcript_acquisition::{DurableAdmission, FullReason, ReadPlan, Scope};
 use std::collections::BTreeMap;

@@ -628,6 +628,15 @@ impl DurableTailStore {
                     io::Error::other("protected predecessor")
                 })?;
                 self.counters.guard_header_bytes += size as u64;
+                if retired_pin(self.source, old.format, &old.record.allowlist) {
+                    // THE classifier verifies the opaque predecessor and funds the
+                    // ordinary exact-stamp overwrite permission; never decode it.
+                    self.classify(&key, "overwrite", Some(writer))
+                        .map_err(|reason| {
+                            protected = Some(reason);
+                            io::Error::other("unverified retired predecessor")
+                        })?;
+                }
                 if stamp_at(&attempt.path)? != Some(prior) || !self.authorized(&key, old.format) {
                     protected = Some(Refusal::Unbindable);
                     return Err(io::Error::other("unproved predecessor"));

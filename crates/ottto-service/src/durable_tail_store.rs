@@ -47,8 +47,6 @@ use std::sync::{
 };
 
 pub(crate) mod active;
-mod repin;
-pub(crate) use repin::retired_pin;
 mod stream;
 pub(crate) use active::{ActiveLease, ActiveOverBudget, LeaseWait, ACTIVE_BYTES};
 pub(crate) use stream::{
@@ -233,6 +231,16 @@ pub(crate) fn scope_digest_v3(
             counting,
         ],
     )
+}
+
+fn retired_pin(source: DurableSource, format: u16, pin: &Digest32) -> bool {
+    let retired = match source {
+        DurableSource::ClaudeCode => {
+            "8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c"
+        }
+        DurableSource::Codex => "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1",
+    };
+    format == FORMAT_V1 && parse_hex_digest(retired).as_ref() == Some(pin)
 }
 
 fn header_len(format: u16, source: DurableSource, allowlist: &Digest32) -> Result<usize, Refusal> {
@@ -844,11 +852,21 @@ impl DurableTailStore {
             .map(|h| (h.format, h.record.allowlist))
     }
 
-    /// Metadata-only: Claude observes the native read of a key with no record.
-    pub(crate) fn absent(&self, key: &Digest32) -> bool {
-        self.disabled.is_none()
-            && inspect_path(&self.record_path(key))
-                .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+    /// Missing reduction, including an exact retired representation.
+    pub(crate) fn absent(&mut self, key: &Digest32) -> bool {
+        self.missing_cause(key).is_some()
+    }
+
+    /// Cause only: retired envelopes are missing reductions, not restore authority.
+    pub(crate) fn missing_cause(&mut self, key: &Digest32) -> Option<&'static str> {
+        if self.disabled.is_some() || self.receipt_pending(key) {
+            return None;
+        }
+        if inspect_path(&self.record_path(key)).is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+        {
+            return Some("upgrade_state_missing");
+        }
+        matches!(self.classify(key, "presence", None), Err(Refusal::Repin)).then_some("repin")
     }
 
     pub(crate) fn counters(&self) -> StoreCounters {
@@ -982,15 +1000,12 @@ impl DurableTailStore {
             rest.map_err(|e| self.read_failure(e, Refusal::Corrupt))?;
             n = header.len();
             let mut binding = decode_header(&header, key, self.source)?;
-            if retired_pin(self.source, binding.format, &binding.record.allowlist)
-                && (!matches!(work, "repin" | "overwrite")
-                    || work == "overwrite"
-                        && !self.durable.get(key).is_some_and(|(_, stamp, allowed)| {
-                            *allowed
-                                && stamp_at(&self.record_path(key)).ok().flatten() == Some(*stamp)
-                        }))
-            {
-                return Err(Refusal::Repin);
+            let retired = retired_pin(self.source, binding.format, &binding.record.allowlist);
+            if retired && work != "overwrite" {
+                return Err(Refusal::Repin); // Missing to readers, opaque to current decoders.
+            }
+            if work == "presence" {
+                return Ok(None); // Presence is never verification or mutation authority.
             }
             // After any repair: its ctime moved.
             let Some(metadata) = self.inspect_file(&file) else {
@@ -1031,7 +1046,7 @@ impl DurableTailStore {
             let allowed = self.durable.get(key).is_some_and(|(old, saved, allowed)| {
                 *allowed && *saved == stamp && *old == Some(content)
             });
-            self.memoize(*key, (Some(content), stamp, allowed));
+            self.memoize(*key, (Some(content), stamp, allowed || retired));
             if restoring {
                 binding.verified = Some(bytes);
             }
@@ -1042,7 +1057,9 @@ impl DurableTailStore {
         }
         if let Err(reason) = result {
             self.durable.remove(key);
-            self.counters.format_hold[reason as usize] += 1;
+            if reason != Refusal::Repin {
+                self.counters.format_hold[reason as usize] += 1;
+            }
         }
         result
     }
@@ -1087,8 +1104,9 @@ impl DurableTailStore {
             return Err(Refusal::ReceiptPending);
         }
         let result = self.classify(key, "guard", None);
-        self.pass[0] += u64::from(!matches!(result, Ok(None)));
+        self.pass[0] += u64::from(!matches!(result, Ok(None) | Err(Refusal::Repin)));
         match result {
+            Err(Refusal::Repin) => Ok(None),
             Err(Refusal::Corrupt) if !self.rebuilt.contains_key(key) => {
                 if self.pass[1] >= T14_BREAKER.max(self.pass[0] / 50) {
                     self.disable("t14_breaker");
@@ -1168,6 +1186,10 @@ impl DurableTailStore {
         match self.read_known(key, None, false) {
             Ok(Some(verified)) => ReadOutcome::Found(verified.record),
             Ok(None) => ReadOutcome::Missing,
+            Err(Refusal::Repin) => {
+                self.counters.missing += 1;
+                ReadOutcome::Missing
+            }
             Err(reason) => ReadOutcome::Refused(reason),
         }
     }
@@ -2886,21 +2908,6 @@ impl OwnedTemp {
         };
         if actual != prior {
             return Err(io::Error::other("predecessor changed"));
-        }
-        // A re-pin successor must be durable under its stage name before
-        // rename-over can retire the exact old inode. Ordinary writes retain
-        // their existing ordering. The final receipt still needs canonical
-        // directory sync and survivor verification.
-        if prior.is_some() && repin::retired_at(path)? {
-            self.sync()?;
-            let dir = path
-                .parent()
-                .ok_or_else(|| io::Error::other("record parent"))?;
-            sync_dir(dir)?;
-            sync_dir(
-                dir.parent()
-                    .ok_or_else(|| io::Error::other("store parent"))?,
-            )?;
         }
         fs::rename(&self.path, path)?;
         // Disarm immediately after rename, including failure of the following fstat.

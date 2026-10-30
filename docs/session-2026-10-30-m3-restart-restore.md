@@ -35,8 +35,9 @@ and reset semantics. Counters never contain transcript content or file paths.
 
 Known limits: native layout proofs require macOS; Linux does not execute those
 fixtures. RAM-only six-hour pacing resets at process restart. Exact retired-pin
-recovery still uses its previous 64-file/64-MiB cap in this intermediate cut:
-replacing it with missing-record recovery is pending resolution of the required
-successor-plus-upload-ACK retirement ordering. That existing path does not prove
-upload ACK before rename-over. This branch is therefore not ready to ship.
-The per-key state consolidation and switch decision remain separate follow-ups.
+records now follow missing-record recovery: a quiet file reads zero bytes,
+and growth takes a counted repin Full through the shared six-hour pace and
+history-upgrade page (2,000 files / 1 GiB, 512 MiB per file). Replacements use
+the normal write-ahead/receipt path; only an exact upload ACK settles the body.
+No post-ACK GC gate or second-generation store is introduced. The per-key state
+consolidation and switch decision remain separate follow-ups.

@@ -3273,10 +3273,6 @@ pub(crate) fn durable_after_save(
     }
     cache.durable_alarm(source);
     cache.durable_rederive_proxies(source);
-    if let Some(writer) = crate::locked_state_dir::held_for(support_dir) {
-        cache.repin_retire(writer, source);
-    }
-    cache.repin_report(source);
 }
 
 /// Audit retirement additionally commits its marker CAS only after #865's
@@ -28524,7 +28520,28 @@ impl OwnedSourceScan {
                 #[cfg(unix)]
                 if boot.awaits_read() {
                     if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
-                        if !cache.repin_group_start(source, &boot.group.members) {
+                        let allowed = boot
+                            .group
+                            .members
+                            .iter()
+                            .filter(|member| {
+                                index
+                                    .files
+                                    .get(&local_index_key(&member.path))
+                                    .is_some_and(|entry| member.size_bytes > entry.size_bytes)
+                            })
+                            .all(|member| {
+                                File::open(&member.path).is_ok_and(|file| {
+                                    cache.upgrade_full_allowed(
+                                        source,
+                                        &local_index_key(&member.path),
+                                        &file,
+                                        index,
+                                        &mut history_upgrade,
+                                    )
+                                })
+                            });
+                        if !allowed {
                             sampled_scan::codex_cursor::requeue_members(
                                 index,
                                 &codex_selected_flags,
@@ -28545,22 +28562,6 @@ impl OwnedSourceScan {
                 );
                 // Header and probe bytes are singleton-budget reads (§d.2).
                 let boot_input = boot.take_charge();
-                #[cfg(unix)]
-                if boot_input > 0
-                    && boot.group.members.iter().any(|m| {
-                        durable_guard
-                            .as_ref()
-                            .and_then(std::sync::Weak::upgrade)
-                            .is_some_and(|cache| {
-                                cache.repin_started(source, &local_index_key(&m.path))
-                            })
-                    })
-                {
-                    crate::local_resource_diagnostics::durable_tail_alarm(
-                        source.api_slug(),
-                        &serde_json::json!({"repin_full_bytes":boot_input}),
-                    );
-                }
                 codex_page.charge(false, boot_input);
                 let members = boot.group.members.len();
                 match outcome {
@@ -29131,18 +29132,6 @@ impl OwnedSourceScan {
                         // the group; short-circuiting loses refused-member evidence.
                         for member in &group.members {
                             let key = local_index_key(&member.path);
-                            if let Ok(file) = std::fs::File::open(&member.path) {
-                                use sampled_scan::durable_tail::RepinPlan;
-                                match cache.repin_plan(source, &key, &file, index) {
-                                    RepinPlan::Quiet | RepinPlan::Carry => {
-                                        refused = true;
-                                        index.mark_bounded_sweep_unsettled();
-                                        residue_index_keys.insert(key.clone());
-                                        continue;
-                                    }
-                                    _ => {}
-                                }
-                            }
                             match cache.durable_funded_guard(source, &key, |cache| {
                                 cache.durable_full_hold_active(source, &key, false)
                             }) {
@@ -29237,22 +29226,6 @@ impl OwnedSourceScan {
                     }
                     pending!();
                 }
-                #[cfg(unix)]
-                if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
-                    let key = local_index_key(&active.candidate.path);
-                    if cache.repin_pending(source, &key)
-                        && !cache.repin_started(source, &key)
-                        && !cache.repin_start(source, &key, active.parser.reader.reader.get_ref())
-                    {
-                        residue_index_keys.insert(key);
-                        index.mark_bounded_sweep_unsettled();
-                        drop(codex_cursor_lease.take());
-                        pending!();
-                    }
-                    if let Some(limit) = cache.repin_limit(source, &key) {
-                        active.parser.reader.set_extent_limit(limit);
-                    }
-                }
                 let before_body_read = active.parser.reader.consumed_bytes();
                 if let Some(delivery) = line_delivery.as_mut() {
                     delivery.begin_armed(&active, &roots);
@@ -29287,11 +29260,6 @@ impl OwnedSourceScan {
                             artifacts: artifacts_enabled,
                             context_curve: context_curve_enabled,
                             live_scope: &live_scope,
-                            #[cfg(unix)]
-                            repin_cache: durable_guard
-                                .as_ref()
-                                .and_then(std::sync::Weak::upgrade)
-                                .as_deref(),
                         },
                     ) {
                         codex_file_join::GroupStep::Read(result) => result,
@@ -29305,23 +29273,6 @@ impl OwnedSourceScan {
                 } else {
                     active.parser.step()
                 };
-                #[cfg(unix)]
-                if let Some(cache) = durable_guard
-                    .as_ref()
-                    .and_then(std::sync::Weak::upgrade)
-                    .filter(|_| active.group.is_none())
-                {
-                    cache.repin_input(
-                        source,
-                        &local_index_key(&active.candidate.path),
-                        active
-                            .parser
-                            .reader
-                            .consumed_bytes()
-                            .saturating_sub(before_body_read),
-                        matches!(&stepped, Ok(true)),
-                    );
-                }
                 context_read_budget.record(
                     index,
                     &active.candidate,
@@ -29532,18 +29483,6 @@ impl OwnedSourceScan {
                         hook(&active);
                     }
                 });
-                #[cfg(unix)]
-                if active.cursor.is_none() && active.group.is_none() {
-                    if let Some(limit) = durable_guard
-                        .as_ref()
-                        .and_then(std::sync::Weak::upgrade)
-                        .and_then(|cache| {
-                            cache.repin_limit(source, &local_index_key(&active.candidate.path))
-                        })
-                    {
-                        active.parser.apply_repin_eof(limit);
-                    }
-                }
                 // H2c/E1: retain native trailing-line behavior at a genuine
                 // unchanged EOF. A grown read keeps this fragment withheld.
                 if source == SnapshotSource::ClaudeCode
@@ -31032,19 +30971,6 @@ impl OwnedSourceScan {
                     );
                 }
                 let parse_complete = parsed_file.complete();
-                #[cfg(unix)]
-                if !parse_complete
-                    && durable_guard
-                        .as_ref()
-                        .and_then(std::sync::Weak::upgrade)
-                        .is_some_and(|cache| {
-                            cache.repin_pending(source, &local_index_key(&candidate.path))
-                        })
-                {
-                    residue_index_keys.insert(local_index_key(&candidate.path));
-                    index.mark_bounded_sweep_unsettled();
-                    pending!();
-                }
                 // Claude response conflicts may be discovered only by native
                 // finalization. A prefix cannot publish that late loss: it
                 // would have neither a committed audit marker nor necessarily
@@ -33100,16 +33026,8 @@ impl OwnedSourceScan {
                 claude_effort_support_dir_ref,
             );
             let rescue_key = local_index_key(&candidate.path);
-            let verification_rescue = sampled_audit::progress_debt(index, &rescue_key, audit_now)
-                .is_some()
-                || sampling.as_ref().is_some_and(|context| {
-                    context.cache.repin_growth(
-                        source,
-                        &rescue_key,
-                        &index.files,
-                        candidate.size_bytes,
-                    )
-                });
+            let verification_rescue =
+                sampled_audit::progress_debt(index, &rescue_key, audit_now).is_some();
             let Some((mut candidate, opened_file)) = open_and_identify_scan_candidate_with_rescue(
                 source,
                 candidate,
@@ -33125,33 +33043,6 @@ impl OwnedSourceScan {
                 }
                 pending!();
             };
-            // The retired-pin exception runs before skip/memo/sample paths.
-            // Carry never advances the committed extent or loses discovery.
-            #[cfg(unix)]
-            let repin_ready =
-                if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
-                    use sampled_scan::durable_tail::RepinPlan;
-                    match cache.repin_plan(source, &rescue_key, &opened_file, index) {
-                        RepinPlan::Ordinary => false,
-                        RepinPlan::Ready => true,
-                        RepinPlan::Quiet => {
-                            pending!();
-                        }
-                        RepinPlan::Carry => {
-                            residue_index_keys.insert(rescue_key.clone());
-                            index.mark_bounded_sweep_unsettled();
-                            pending!();
-                        }
-                    }
-                } else {
-                    false
-                };
-            #[cfg(not(unix))]
-            let repin_ready = false;
-            #[cfg(unix)]
-            if repin_ready && source == SnapshotSource::ClaudeCode && restore_floor.is_none() {
-                restore_floor = sampled_scan::durable_tail::AcceptedFloor::of(index, &rescue_key);
-            }
             // A2: a current, source-verified census independently proves that
             // THIS committed object shrank. Read its new body even without a
             // reusable optional record; unknown/downgrade floors remain holds.
@@ -33507,9 +33398,6 @@ impl OwnedSourceScan {
                         }
                     }
                 }
-            }
-            if repin_ready {
-                decision = CandidateDecision::Parse;
             }
             if source == SnapshotSource::Codex {
                 census.note_codex_selection(decision, parse_reason, codex_selected_by);
@@ -33926,11 +33814,7 @@ impl OwnedSourceScan {
                 });
             }
             #[cfg(unix)]
-            let durable_accepted = if repin_ready {
-                restore_floor
-            } else {
-                accepted_floor
-            };
+            let durable_accepted = accepted_floor;
             let previous_snapshot_fingerprint = index.last_snapshot_fingerprint(&candidate);
             let previous_upload_body_witness = index.last_upload_body_witness(&candidate);
             let projection_adoption_required = index
@@ -34113,7 +33997,7 @@ impl OwnedSourceScan {
                 #[cfg(not(unix))]
                 let taken = context.cache.take(&key);
                 #[cfg(unix)]
-                let taken = if native_edit_proven || repin_ready {
+                let taken = if native_edit_proven {
                     // A real edit invalidates the old graph; no Tail spend or
                     // guardless reuse. Drop it before releasing transfer credit.
                     drop(taken);
@@ -35169,16 +35053,15 @@ impl OwnedSourceScan {
                 })
             {
                 if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
-                    if source == SnapshotSource::ClaudeCode
-                        && restart_restore::enabled()
-                        && !paced_full_granted
-                        && !repin_ready
+                    if !paced_full_granted
                         && !active_bound_degraded
                         && migration_floor.is_none()
                         && !cache.upgrade_full_allowed(
+                            source,
                             &local_index_key(&active.candidate.path),
                             active.parser.reader.reader.get_ref(),
                             index,
+                            &mut history_upgrade,
                         )
                     {
                         cache.durable_stale_hold(source, index, &active.candidate);
@@ -35218,15 +35101,12 @@ impl OwnedSourceScan {
             // There is one shared admission for this actual Full. Earlier
             // grants and later structural/stale-selection owners take priority.
             #[cfg(unix)]
-            let resource_full_pending = if paced_full_granted
-                || repin_ready
-                || active_bound_degraded
-                || stale_selection_pending
-            {
-                None
-            } else {
-                resource_full_pending
-            };
+            let resource_full_pending =
+                if paced_full_granted || active_bound_degraded || stale_selection_pending {
+                    None
+                } else {
+                    resource_full_pending
+                };
             if let (Some(phase), Some(context)) = (resource_full_pending, sampling.as_ref()) {
                 let key = local_index_key(&active.candidate.path);
                 if !context.cache.start_resource_full(
@@ -35267,7 +35147,6 @@ impl OwnedSourceScan {
             if let Some(context) = sampling.as_mut() {
                 #[cfg(unix)]
                 if restart_restore::enabled() && source == SnapshotSource::ClaudeCode
-                    && !repin_ready
                     // No plan is the existing unsampled native Full path.
                     && planned_mode.map_or(true, |(mode, _)| {
                         matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
@@ -36339,23 +36218,6 @@ impl OwnedJsonlParser {
             );
         }
         Ok(matches!(step?, JsonlReaderStep::Complete(_)))
-    }
-
-    /// Preserve ordinary trailing-line parsing only at the exact frozen EOF.
-    /// A later append keeps the fragment withheld for the next acquisition.
-    #[cfg(unix)]
-    fn apply_repin_eof(&mut self, limit: u64) {
-        if self.reader.sealed_fragment()
-            && self.reader.consumed_bytes() == limit
-            && self
-                .reader
-                .reader
-                .get_ref()
-                .metadata()
-                .is_ok_and(|m| m.len() == limit)
-        {
-            self.apply_sealed_fragment();
-        }
     }
 
     /// Apply one record another parser's reader produced (a group's legacy
@@ -45664,10 +45526,10 @@ impl<'a> From<&'a BTreeMap<String, ScanIndexEntry>> for DiscoveryRecovery<'a> {
 impl DiscoveryRecovery<'_> {
     fn requires(&self, source: SnapshotSource, path: &Path, length: u64) -> bool {
         #[cfg(unix)]
-        if self.cache.is_some_and(|cache| {
-            cache.owes_discovery(source, &local_index_key(path))
-                || cache.repin_growth(source, &local_index_key(path), self.files, length)
-        }) {
+        if self
+            .cache
+            .is_some_and(|cache| cache.owes_discovery(source, &local_index_key(path)))
+        {
             return true;
         }
         sampled_audit::path_requires_recovery(source, self.files, path, length)

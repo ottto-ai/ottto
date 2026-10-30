@@ -30,9 +30,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(super) mod acquired;
 mod m1;
-mod repin;
 pub(crate) use acquired::{AcquiredChain, AcquisitionProtocol, ImmutableCounting};
-pub(in crate::snapshots) use repin::RepinPlan;
 mod owed;
 pub(in crate::snapshots) use owed::OwedCompletionAdmission;
 pub(crate) use owed::{OwedAdmission, OwedQuery, ReceiptOwed};
@@ -685,7 +683,6 @@ pub(crate) struct Stores {
     key_debt: BTreeMap<store::Digest32, Box<owed::KeyDebt>>,
     /// P2 restored head bytes reserved this pass, per durable source.
     rederive_spent: [u64; crate::snapshots::durable_sources::SOURCES.len()],
-    repin_pass: [repin::Pass; crate::snapshots::durable_sources::SOURCES.len()],
     retail_full_at: BTreeMap<store::Digest32, FullPace>,
     #[cfg(test)]
     retail_full_now: Option<std::time::SystemTime>,
@@ -758,7 +755,6 @@ impl Default for Stores {
             restore_pending: BTreeMap::new(),
             key_debt: BTreeMap::new(),
             rederive_spent: Default::default(),
-            repin_pass: Default::default(),
             retail_full_at: BTreeMap::new(),
             #[cfg(test)]
             retail_full_now: None,
@@ -2274,14 +2270,6 @@ impl SharedCache {
         let (Some(source), Some(mut stores)) = (durable_source(source), self.durable()) else {
             return;
         };
-        let seen = stores.repin_pass[source.slot()].seen;
-        stores.repin_pass[source.slot()] = Default::default();
-        stores.repin_pass[source.slot()].seen = seen;
-        for debt in stores.key_debt.values_mut() {
-            if let Some(state) = debt.repin.as_mut() {
-                state.begin_pass(source);
-            }
-        }
         let dir = store::store_dir_for_index(index_path);
         if restart_restore::enabled() {
             // P2 head budget is per pass; authorityless custody nodes are freed.
@@ -2408,11 +2396,7 @@ impl SharedCache {
             );
             return None;
         }
-        if held == Some(store::Refusal::Repin) && stores.repin_pending(source, key) {
-            None
-        } else {
-            held
-        }
+        held
     }
 
     /// `audit_carrier` (recovered miss) or `audit_carrier_staged_unverified`.
@@ -2463,7 +2447,6 @@ impl SharedCache {
                 *recovered_audit_due = due.map(|due| due.min(super::now_seconds()));
                 None
             }
-            Err(store::Refusal::Repin) if stores.repin_pending(source, key) => None,
             Err(reason) => Some(reason),
         }
     }
@@ -2655,52 +2638,89 @@ impl SharedCache {
     ) -> Option<store::Refusal> {
         let source = durable_source(source)?;
         let mut stores = self.durable()?;
-        let held = stores
+        stores
             .slot(source)
             .as_mut()?
             .store
-            .full_hold(&store::key_digest(source, key), start);
-        if held == Some(store::Refusal::Repin) && stores.repin_pending(source, key) {
-            None
-        } else {
-            held
-        }
+            .full_hold(&store::key_digest(source, key), start)
     }
 
-    /// Absent upgrade records are counted Misses, never unreadable holds.
-    /// Repeated growth Fulls share the exact same map as stale/no-match/retail.
+    /// Missing reductions share one per-key pace. Retired-pin rebuilds also
+    /// reserve the existing history page before the first native input.
     pub(in crate::snapshots) fn upgrade_full_allowed(
         &self,
+        source: SnapshotSource,
         key: &str,
         file: &File,
         index: &ScanIndex,
+        page: &mut HistoryPage,
     ) -> bool {
         let Some(entry) = index.files.get(key).filter(|e| {
             !e.source_file_fingerprint.is_empty() || e.last_upload_body_witness.is_some()
         }) else {
             return true;
         };
-        let absent = self.durable().is_some_and(|mut stores| {
-            stores
-                .slot(DurableSource::ClaudeCode)
-                .as_ref()
-                .is_some_and(|slot| {
-                    slot.store
-                        .absent(&store::key_digest(DurableSource::ClaudeCode, key))
-                })
-        });
-        // Non-growth edits retain their ordinary A2 path. This is only the
-        // repeating, known-absence growth cause, not a new first-read gate.
-        if !absent || !file.metadata().is_ok_and(|m| m.len() > entry.size_bytes) {
+        let Some(ds) = durable_source(source) else {
+            return true;
+        };
+        match self.durable_classifier_enabled(source) {
+            Ok(false) => return true, // Disabled/absent stores preserve native Full behavior.
+            Err(_) => return false,
+            Ok(true) => {}
+        }
+        let cause = match self.durable_funded_probe(source, |cache| {
+            cache.durable().and_then(|mut stores| {
+                stores
+                    .slot(ds)
+                    .as_mut()?
+                    .store
+                    .missing_cause(&store::key_digest(ds, key))
+            })
+        }) {
+            Ok(cause) => cause,
+            Err(_) => return false,
+        };
+        let Some(cause) = cause else {
+            return true;
+        };
+        if cause != "repin" && (source != SnapshotSource::ClaudeCode || !restart_restore::enabled())
+        {
             return true;
         }
-        self.paced_cause_full(
-            key,
-            file,
-            entry.size_bytes,
-            std::time::SystemTime::now(),
-            Some(4),
-        )
+        let Ok(metadata) = file.metadata() else {
+            return false;
+        };
+        if metadata.len() <= entry.size_bytes {
+            return cause != "repin"; // Quiet retired records consume no source input.
+        }
+        if cause == "repin" {
+            if metadata.len() > max_jsonl_file_bytes(SnapshotSource::ClaudeCode)
+                || !page.reserve(key, metadata.len())
+            {
+                return false;
+            }
+            if !self
+                .durable()
+                .is_some_and(|mut stores| stores.fund_debt(full_pace_key(source, key)).is_some())
+            {
+                return false;
+            }
+            if !self.paced_with_cause(
+                source,
+                key,
+                SystemTime::now(),
+                (false, false, true),
+                Some(4),
+            ) {
+                return false;
+            }
+            if let Some(mut stores) = self.durable() {
+                stores.counters.upgrade_missing_full += 1;
+                Counters::bump(&mut stores.counters.resource_full, "repin");
+            }
+            return true;
+        }
+        self.paced_cause_full(key, file, entry.size_bytes, SystemTime::now(), Some(4))
     }
 
     pub(in crate::snapshots) fn migration_start(
@@ -2835,9 +2855,9 @@ impl SharedCache {
         file: &File,
         index: &ScanIndex,
     ) -> Result<Option<UpgradeRead>, RetailHold> {
-        if self.durable().is_some_and(|s| {
+        if self.durable().is_some_and(|mut s| {
             s.slots[DurableSource::ClaudeCode.slot()]
-                .as_ref()
+                .as_mut()
                 .is_some_and(|c| {
                     c.store
                         .absent(&store::key_digest(DurableSource::ClaudeCode, key))
@@ -2873,7 +2893,7 @@ impl SharedCache {
         };
         let mut stores = self.durable().ok_or(RetailHold::AccountingLost)?;
         if !stores.slots[DurableSource::ClaudeCode.slot()]
-            .as_ref()
+            .as_mut()
             .is_some_and(|s| s.store.absent(&key))
         {
             if !stores
@@ -3089,9 +3109,6 @@ impl SharedCache {
         index: &ScanIndex,
         interpretation: &Interpretation<'_>,
     ) -> RestoreOutcome {
-        if self.repin_pending(snapshot_source, key) {
-            return RestoreOutcome::Miss(MissClass::Record(store::Refusal::Repin));
-        }
         if !restart_restore::enabled() {
             return self.m1_restore(
                 snapshot_source,
@@ -3866,13 +3883,12 @@ impl SharedCache {
                 // SOURCE cond. 5: a record surviving behind a cleared selection
                 // (the D3 strict rebind's carrier, no new persisted field) is a
                 // refused stale record. A disabled store cannot prove absence.
-                let Some(slot) = stores
-                    .slot(source)
-                    .as_mut()
-                    .filter(|slot| !slot.store.absent(&store_key))
-                else {
+                let Some(slot) = stores.slot(source).as_mut() else {
                     return Err(MissClass::SelectionCleared.into());
                 };
+                if slot.store.absent(&store_key) {
+                    return Err(MissClass::SelectionCleared.into());
+                }
                 slot.store.note_stale_refusal();
                 drop(stores);
                 return Err(self.stale_selection_full(snapshot_source, key, held));
@@ -5122,10 +5138,7 @@ impl SharedCache {
                     .map(|slot| !slot.skill_labels_enabled && !slot.skill_label_purge_complete)
             })
             .unwrap_or(false);
-        if !restart_restore::enabled()
-            && !purge_needed
-            && !self.repin_source_pending(snapshot_source)
-        {
+        if !restart_restore::enabled() && !purge_needed {
             return None;
         }
         let store::LeaseWait::Granted(lease) = self.acquire_active(
@@ -5161,7 +5174,7 @@ impl SharedCache {
                 }
             }
         }
-        if !restart_restore::enabled() && !self.repin_source_pending(snapshot_source) {
+        if !restart_restore::enabled() {
             lease.release();
             return None;
         }
@@ -5186,7 +5199,7 @@ impl SharedCache {
     ) -> Option<store::BatchReceipt> {
         let source = durable_source(snapshot_source)?;
         let allowlist = source.properties().allowlist();
-        let (mut touched, mut selected, namespace, identity_capture, retiring) = {
+        let (touched, mut selected, namespace, identity_capture, retiring) = {
             let mut stores = self.durable()?;
             stores.note_indexed(source, index);
             let slot = stores.slot(source).as_ref()?;
@@ -5205,9 +5218,6 @@ impl SharedCache {
                     .collect::<BTreeMap<_, _>>(),
             )
         };
-        if !restart_restore::enabled() {
-            touched.retain(|key| self.repin_completed(snapshot_source, key));
-        }
         let namespace = &namespace;
         let mut pending = Vec::new();
         let mut offered = BTreeMap::new();
@@ -5357,19 +5367,6 @@ impl SharedCache {
         for class in not_persisted {
             Counters::bump(&mut counters.not_persisted, class);
         }
-        if source == DurableSource::Codex {
-            for key in offered.values() {
-                let digest = store::key_digest(source, key);
-                if stores.repin_pending(source, key) {
-                    let inner = &mut *stores;
-                    let proof = inner.retail_spent.get(&digest)?.original.as_ref()?;
-                    inner.slots[source.slot()]
-                        .as_mut()?
-                        .store
-                        .authorize_repin(proof);
-                }
-            }
-        }
         if source == DurableSource::ClaudeCode {
             for key in offered.values() {
                 let digest = store::key_digest(source, key);
@@ -5383,15 +5380,6 @@ impl SharedCache {
                 }
                 let stores = &mut *stores;
                 let replacement = pending.iter().find(|r| r.binding.key == digest)?;
-                if stores.repin_pending(source, key) {
-                    let inner = &mut *stores;
-                    let proof = inner.retail_spent.get(&digest)?.original.as_ref()?;
-                    inner.slots[source.slot()]
-                        .as_mut()?
-                        .store
-                        .authorize_repin(proof);
-                    continue;
-                }
                 authorize_strict(
                     stores.slots[source.slot()].as_mut()?,
                     snapshot_source,
@@ -5480,13 +5468,6 @@ impl SharedCache {
         {
             let stores = &mut *stores;
             for digest in offered.keys() {
-                if stores
-                    .key_debt
-                    .get(digest)
-                    .is_some_and(|d| d.repin.is_some())
-                {
-                    continue;
-                }
                 if let Some(c) = stores.retail_spent.get_mut(digest) {
                     if c.original.as_ref().is_some_and(|p| {
                         stores.slots[source.slot()]
@@ -5538,7 +5519,6 @@ impl SharedCache {
             }
         }
         drop(stores);
-        self.repin_retire(writer, snapshot_source);
         Some(receipt)
     }
 

@@ -28,7 +28,6 @@ pub(super) enum OwedMark {
 /// node stays within its 1024-byte charge (`KEY_RESERVE_BYTES`).
 #[derive(Default)]
 pub(super) struct KeyDebt {
-    pub(super) repin: Option<super::repin::State>,
     owed: OwedMark,
     pub(super) rederive_hold: Option<DurableSource>,
     pub(super) head_extent: Option<u32>,
@@ -49,20 +48,10 @@ pub(super) struct FullSpend {
     pub(super) near_extra: bool,
 }
 impl KeyDebt {
-    pub(super) fn settle_repin(&mut self) {
-        self.repin = None;
-        // Exact successor settlement ends this recovery's never-evicted
-        // spend custody. The shared paid pace stamp remains unchanged.
-        let spend = self.full_spend.take();
-        if !self.reclaimable(std::time::SystemTime::now()) {
-            self.full_spend = spend;
-        }
-    }
     /// Only idle observations or expired pacing may be reclaimed. Receipt,
     /// discovery, retirement and directory-sync custody are never victims.
     fn reclaimable(&self, now: std::time::SystemTime) -> bool {
-        self.repin.is_none()
-            && self.owed == OwedMark::None
+        self.owed == OwedMark::None
             && self.hold.is_none()
             && self.rederive_hold.is_none()
             && self.retire_source.is_none()
@@ -72,8 +61,7 @@ impl KeyDebt {
                 .is_some_and(|spend| super::full_pace_delayed(spend.at, now))
     }
     pub(super) fn is_empty(&self) -> bool {
-        self.repin.is_none()
-            && self.owed == OwedMark::None
+        self.owed == OwedMark::None
             && self.hold.is_none()
             && self.rederive_hold.is_none()
             && self.retire_source.is_none()
@@ -627,9 +615,6 @@ impl SharedCache {
     /// Age-independent: debt, a pending receipt, a D3 hold or the source-wide
     /// conservative bit keeps the key discoverable.
     pub(in crate::snapshots) fn owes_discovery(&self, source: SnapshotSource, key: &str) -> bool {
-        if self.repin_pending(source, key) {
-            return true;
-        }
         if !crate::snapshots::restart_restore::enabled() {
             return false;
         }

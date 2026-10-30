@@ -468,27 +468,11 @@ impl SharedCache {
     ) -> Result<(), HeldCause> {
         let ds = durable_source(source).ok_or(HeldCause::Incompatible)?;
         let digest = binding.key;
-        if self.repin_pending(source, key) {
-            let mut guard = self.durable().ok_or(HeldCause::Fence)?;
-            let stores = &mut *guard;
-            let proof = stores
-                .retail_spent
-                .get(&digest)
-                .and_then(|c| c.original.as_ref())
-                .ok_or(HeldCause::Fence)?;
-            return stores.slots[ds.slot()]
-                .as_mut()
-                .ok_or(HeldCause::Fence)?
-                .store
-                .authorize_repin(proof)
-                .then_some(())
-                .ok_or(HeldCause::Fence);
-        }
         if self.durable().is_some_and(|mut stores| {
             stores
                 .slot(ds)
-                .as_ref()
-                .is_some_and(|slot| slot.store.absent(&digest))
+                .as_mut()
+                .is_some_and(|slot| slot.store.missing_cause(&digest).is_some())
         }) {
             return Ok(());
         }
@@ -992,12 +976,15 @@ impl SharedCache {
             };
         };
         let stores = &mut *guard;
+        let absent = stores.slots[source.slot()]
+            .as_mut()
+            .is_some_and(|slot| slot.store.absent(&digest));
         let prior = match stores.slots[source.slot()].as_mut() {
             None => PriorRecord::Unobserved(Degraded::Disabled),
             Some(slot) if slot.store.disabled().is_some() => {
                 PriorRecord::Unobserved(Degraded::Disabled)
             }
-            Some(slot) if slot.store.absent(&digest) => PriorRecord::Absent,
+            Some(_) if absent => PriorRecord::Absent,
             // Header-only classification of the survivor, never its body.
             Some(slot) => match slot.store.guard_with_carrier(&digest, true, &[0; 32]).err() {
                 Some(refusal) => PriorRecord::Protected(refusal),

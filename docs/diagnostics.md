@@ -1479,39 +1479,16 @@ overwrite; backend authority rules independently govern successor acceptance.
 
 ### Retired-pin recovery
 
-Only the exact retired v1 Claude and Codex pins are classified as `repin`.
-They are never decoded as current reductions. Unknown pins and newer formats
-retain their preservation behavior. Pi has no registered retired pin yet.
+An exact retired v1 pin is a missing reduction, never decoded as current.
+Quiet files consume zero transcript bytes. A grown file takes the existing
+missing-record Full path, counted under `resource_full.repin`, and shares the
+six-hour per-key pace. Admission uses the existing history-upgrade page:
+2,000 files / 1 GiB total, at most 512 MiB for one file, with no first-file
+escape. Other history reservations consume the same page, not a second budget.
+No repin custody map, carry/age counters or private per-pass cap remains.
 
-On real growth, recovery selects one ordinary native Full through the shared
-six-hour pacing allowance. Each source pass admits at most 64 files and 64 MiB
-before input, including an aggregate Claude Full-byte cap for this cause. There
-is no first-file escape. A native group prepays its replay, probes and header
-rechecks as one unit. Quiet files read no transcript bytes. Deferred growth keeps
-its committed extent, remains discoverable outside the activity window, and is
-reported as carried rather than silently lost.
-
-`repin_full_files` counts starts; `repin_full_bytes` counts consumed input,
-including partial and failed attempts; `repin_completed` counts completed input.
-`repin_pending`, `repin_carried_files` and `repin_oldest_carried_age_seconds`
-report outstanding work. `repin_carry_over_24h` alarms for waits longer than a day.
-No path or file identity appears in these labels.
-
-The exact retired cohort is an explicit exception to default-OFF M1 behavior:
-recovery and current-pin successor writes apply with restart restore OFF and ON.
-OFF writes only selected recovery candidates. A successor stage is synced before
-rename-over of the old record, and exact predecessor custody settles through
-`retire_exact` only after canonical successor verification and directory sync.
-Unknown or newer survivors remain untouched. Existing complete-body settlement,
-exact accepted-evidence equality, exact ACK, and accepted-floor protections apply.
-The one-time estimated cohort is at most 326 files / approximately 195 MB
-(256 Claude, 70 Codex), about 11 minutes at 1 GiB per hour; actual cadence depends
-on pass caps and pacing. A single file larger than the per-pass byte cap stays
-carried with the age alarm; the cap never permits an oversized first read.
-
-### Durable store occupancy
-
-`disk_bytes` on the existing per-source `durable_tail_alarm` snapshot is the
-store-bytes gauge, refreshed by the store inventory after writes or GC.
-`store_bytes_alarm` is true above 512 MiB. This threshold is observational: it
-does not refuse acquisitions, evict active records or persist capacity debt.
+The normal write-ahead path conditionally replaces the old inode. Pending local
+receipts and upload ACKs keep their existing distinct obligations: local receipt
+reconciliation cannot grant a stored upload ACK. Refused, not-stored and partial
+uploads do not settle the body; retries use ordinary discovery/pacing. Unknown
+pins and newer formats remain protected. There is no post-upload-ACK GC gate.

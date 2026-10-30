@@ -9,8 +9,6 @@ const INDEX_KEYS: usize = 20_000;
 
 #[path = "m3_integrated_rederive_tests.rs"]
 mod integrated_rederive;
-#[path = "m3_repin_tests.rs"]
-mod repin_tests;
 
 thread_local! {
     static BEFORE_WARM_TRANSFER: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
@@ -8265,7 +8263,7 @@ fn b1g_absent_growth_twice_overflow_cancel_restart_exact_body_and_idle() {
             .durable()
             .unwrap()
             .slot(DurableSource::ClaudeCode)
-            .as_ref()
+            .as_mut()
             .unwrap()
             .store
             .absent(&store::key_digest(DurableSource::ClaudeCode, &key)));
@@ -8515,7 +8513,7 @@ fn b1_future_accepted_floor_blocks_fresh_cancelled_and_restarted_inputs_before_r
             .durable()
             .unwrap()
             .slot(DurableSource::ClaudeCode)
-            .as_ref()
+            .as_mut()
             .unwrap()
             .store
             .absent(&store::key_digest(DurableSource::ClaudeCode, &key)));
@@ -12769,4 +12767,184 @@ fn retirement_each_edge_holds_without_witness_then_exits_by_revalidated_exact_re
         assert_eq!(stores.key_debt[&binding.key].retire_source, None);
         assert!(!stores.key_debt[&binding.key].retire_sync);
     }
+}
+
+/// [behaviour] Retired records are missing reductions: quiet input is zero,
+/// and rebuild admission shares the normal history page and six-hour pace.
+#[test]
+fn retired_missing_uses_shared_history_page_and_growth_pace() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let _on = RestartRestoreForTest::enabled();
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let root = crate::test_scratch::ScratchDir::new("retired-missing-page");
+        let path = root.join("source.jsonl");
+        fs::write(&path, b"{}\n").unwrap();
+        let key = local_index_key(&path);
+        let ds = durable_source(source).unwrap();
+        let index_path = root.join("index.json");
+        let namespace = Scope("retired-missing".into());
+        let cache = SharedCache::default();
+        cache.durable_begin_pass(source, &index_path, &namespace, false);
+        let mut binding = store::tests::binding("account", "old", ("accepted", None));
+        binding.source = ds;
+        binding.key = store::key_digest(ds, &key);
+        binding.context = store::context_digest(&namespace.0, None);
+        let mut record = store::tests::pending(binding, certificate(&path, &namespace), 1);
+        record.allowlist = store::parse_hex_digest(match source {
+            SnapshotSource::ClaudeCode => {
+                "8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c"
+            }
+            _ => "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1",
+        })
+        .unwrap();
+        let dir = store::store_dir_for_index(&index_path);
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let record_path = dir.join(format!(
+            "{}.rec",
+            record
+                .binding
+                .key
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        ));
+        fs::write(&record_path, store::tests::pinned_v1_bytes(&record, 1)).unwrap();
+        fs::set_permissions(&record_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut index = ScanIndex::default();
+        index.files.insert(
+            key.clone(),
+            serde_json::from_value(serde_json::json!({
+                "size_bytes":3,"modified_unix_seconds":1,"source_file_fingerprint":"accepted"
+            }))
+            .unwrap(),
+        );
+        let file = File::open(&path).unwrap();
+        let ((allowed, input), samples) =
+            crate::transcript_acquisition::capture_sample_reads(|| {
+                observe_consumed(|| {
+                    cache.upgrade_full_allowed(
+                        source,
+                        &key,
+                        &file,
+                        &index,
+                        &mut HistoryPage::default(),
+                    )
+                })
+            });
+        assert!(!allowed);
+        assert_eq!(input, 0);
+        assert!(samples.is_empty());
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{}\n")
+            .unwrap();
+        // Other ordinary history work consumes the same page; there is no
+        // repin budget or oversized-first-file escape alongside it.
+        let mut page = HistoryPage::default();
+        assert!(page.reserve("ordinary-history", 1024 * 1024 * 1024));
+        assert!(!cache.upgrade_full_allowed(source, &key, &file, &index, &mut page));
+        let mut full_files = HistoryPage::default();
+        for n in 0..2_000 {
+            assert!(full_files.reserve(&format!("history-{n}"), 1));
+        }
+        assert!(!cache.upgrade_full_allowed(source, &key, &file, &index, &mut full_files));
+        let writable = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        writable.set_len(512 * 1024 * 1024 + 1).unwrap();
+        assert!(!cache.upgrade_full_allowed(
+            source,
+            &key,
+            &file,
+            &index,
+            &mut HistoryPage::default()
+        ));
+        writable.set_len(6).unwrap();
+        let mut page = HistoryPage::default();
+        assert!(cache.upgrade_full_allowed(source, &key, &file, &index, &mut page));
+        assert!(!cache.upgrade_full_allowed(
+            source,
+            &key,
+            &file,
+            &index,
+            &mut HistoryPage::default()
+        ));
+        assert!(cache
+            .durable()
+            .unwrap()
+            .counters
+            .resource_full
+            .get("repin")
+            .is_some_and(|n| *n == 1));
+        assert!(
+            record_path.exists(),
+            "admission cannot delete the predecessor"
+        );
+    }
+}
+
+/// [money] A retired Claude prefix rebuild publishes the cold Full body once;
+/// the normal successor then restores and Tails instead of repeating repin.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
+fn retired_missing_native_rebuild_then_successor_tails_without_double_count() {
+    use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    let _on = RestartRestoreForTest::enabled();
+    let _money = claude_request_money::e2::GateForTest::set(true);
+    let f = O3Fixture::from_rows(&a1a_row("accepted", 100), false);
+    let mut old = fs::read(&f.record_path).unwrap();
+    old[10..42].copy_from_slice(
+        &store::parse_hex_digest(
+            "8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c",
+        )
+        .unwrap(),
+    );
+    let end = old.len() - 32;
+    let digest = Sha256::digest(&old[..end]);
+    old[end..].copy_from_slice(&digest);
+    fs::write(&f.record_path, &old).unwrap();
+    let owner = f.owner();
+    let mut prior = f.prior.clone();
+    let ((_, quiet, modes), bytes) = observe_consumed(|| f.scan(&owner, &mut prior));
+    assert!(quiet.snapshots.is_empty());
+    assert_eq!(modes.0 + modes.1, 0);
+    assert_eq!(bytes, 0);
+    f.append("growth", 200);
+    let before = prior.clone();
+    let (mut index, mut scan, modes) = f.scan(&owner, &mut prior);
+    assert_eq!(modes.0, 1);
+    let actual = a1a_wire(&f.root, &mut index, &mut scan);
+    let mut cold_prior = before;
+    let (mut cold_index, mut cold, _) = f.scan(&E2ScanFixture::default(), &mut cold_prior);
+    assert_eq!(actual, a1a_wire(&f.root, &mut cold_index, &mut cold));
+    index.record_accepted_snapshot_fingerprints(
+        &scan
+            .snapshots
+            .iter()
+            .map(|s| s.snapshot_fingerprint.clone())
+            .collect(),
+    );
+    index.save(&f.index_path).unwrap();
+    owner
+        .cache
+        .durable_write_after_save(
+            test_locks::hold(&f.root),
+            SnapshotSource::ClaudeCode,
+            &index,
+        )
+        .unwrap();
+    assert_ne!(fs::read(&f.record_path).unwrap(), old);
+    f.append("next", 300);
+    let (_, tail, modes) = f.scan(&f.owner(), &mut index);
+    assert_eq!(modes.0, 0);
+    assert_eq!(modes.1, 1);
+    assert_eq!(tail.snapshots[0].input_tokens, 600);
 }
