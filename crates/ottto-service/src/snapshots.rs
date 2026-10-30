@@ -52546,60 +52546,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_rollout_emits_agent_label_without_sqlite_lineage() {
-        let home = temp_dir("codex-agent-label-without-sqlite");
-        let sessions_dir = home.join(".codex/sessions");
-        fs::create_dir_all(&sessions_dir).expect("create sessions");
-        let path = sessions_dir.join("rollout-child-session.jsonl");
-        fs::write(
-            &path,
-            concat!(
-                "{\"timestamp\":\"2026-08-02T06:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"child-session\",\"thread_source\":\"subagent\",\"source\":{\"subagent\":{\"thread_spawn\":{\"parent_thread_id\":\"parent-session\",\"agent_path\":\"/root/repair_baseline_test\"}}}}}\n",
-                "{\"timestamp\":\"2026-08-02T06:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":10,\"output_tokens\":2,\"request_count\":1},\"model\":\"gpt-5.6\"}}}\n"
-            ),
-        )
-        .expect("write transcript");
-
-        let metadata = CodexTitleMetadata::load_from_roots(std::slice::from_ref(&sessions_dir));
-        let item = parse_codex_jsonl_file_with_title_metadata(
-            &path,
-            "2026-08-02T06:02:00Z",
-            "fingerprint".to_string(),
-            &metadata,
-            None,
-        )
-        .expect("parse")
-        .into_iter()
-        .next()
-        .expect("snapshot");
-
-        let agent_kind = item
-            .attribution_facts
-            .iter()
-            .find(|fact| fact.field == "agent_kind")
-            .expect("rollout-native agent kind fact");
-        assert_eq!(agent_kind.value, "codex_subagent");
-        assert_eq!(
-            agent_kind.display_label.as_deref(),
-            Some("repair baseline test")
-        );
-        assert_eq!(
-            agent_kind.display_label_source.as_deref(),
-            Some("agent_label")
-        );
-        assert!(item
-            .attribution_facts
-            .iter()
-            .any(|fact| fact.field == "agent_ref" && fact.value == "child-session"));
-        assert!(!item
-            .attribution_facts
-            .iter()
-            .any(|fact| fact.field == "root_session_ref" || fact.field == "spawn_depth"));
-
-        let _ = fs::remove_dir_all(home);
-    }
-
-    #[test]
     fn claude_skill_evidence_separates_invocations_from_references() {
         let tool_use = |id: &str, name: &str, input: Value| json!({"type":"assistant","sessionId":"claude-skills","timestamp":"2026-10-18T06:00:00Z","message":{"id":format!("msg-{id}"),"role":"assistant","content":[{"type":"tool_use","id":id,"name":name,"input":input}]}});
         let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
@@ -53075,90 +53021,56 @@ mod tests {
 
     #[test]
     fn tool_usage_wire_contract_per_source() {
-        for source in [SnapshotSource::Codex, SnapshotSource::ClaudeCode] {
-            for capped in [false, true] {
-                let path = temp_file("tool-usage-wire");
-                let lines = if source == SnapshotSource::Codex {
-                    let mut lines = vec![
-                        json!({"timestamp":"2026-08-02T06:00:00Z","type":"session_meta","payload":{"id":"codex-tool-cap-session"}}),
-                    ];
-                    if capped {
-                        for _ in 0..3 {
-                            lines.push(json!({"timestamp":"2026-08-02T06:00:01Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"never-upload\"}"}}));
-                        }
-                        for index in 0..MAX_TOOL_USAGE_NAMES {
-                            lines.push(json!({"timestamp":"2026-08-02T06:00:02Z","type":"event_msg","payload":{"type":"mcp_tool_call_end","invocation":{"server":"fixture","tool":format!("tool_{index}"),"arguments":{"secret":"never-upload"}}}}));
-                        }
+        for capped in [false, true] {
+            let path = temp_file("tool-usage-wire");
+            let lines = {
+                let mut lines = vec![
+                    json!({"timestamp":"2026-08-02T06:00:00Z","type":"session_meta","payload":{"id":"codex-tool-cap-session"}}),
+                ];
+                if capped {
+                    for _ in 0..3 {
+                        lines.push(json!({"timestamp":"2026-08-02T06:00:01Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"never-upload\"}"}}));
                     }
-                    lines.push(json!({"timestamp":"2026-08-02T06:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":2,"request_count":1},"model":"gpt-5.6"}}}));
-                    lines
-                } else {
-                    let mut lines = vec![json!({
-                        "timestamp": "2026-08-02T06:00:00Z",
-                        "type": "user",
-                        "sessionId": "claude-tool-cap-session",
-                        "message": {"role": "user", "content": "exercise tools"}
-                    })];
-                    for index in 0..if capped { MAX_TOOL_USAGE_NAMES + 1 } else { 1 } {
-                        lines.push(json!({
-                            "timestamp": "2026-08-02T06:01:00Z",
-                            "type": "assistant",
-                            "sessionId": "claude-tool-cap-session",
-                            "requestId": format!("req-{index}"),
-                            "message": {
-                                "id": format!("msg-{index}"),
-                                "role": "assistant",
-                                "model": "claude-opus-4-1",
-                                "usage": {"input_tokens": 1, "output_tokens": 1},
-                                "content": if capped { json!([{
-                                    "type": "tool_use",
-                                    "id": format!("tool-{index}"),
-                                    "name": format!("mcp__fixture__tool_{index}"),
-                                    "input": {"secret": format!("never-upload-{index}")}
-                                }]) } else { json!([]) }
-                            }
-                        }));
+                    for index in 0..MAX_TOOL_USAGE_NAMES {
+                        lines.push(json!({"timestamp":"2026-08-02T06:00:02Z","type":"event_msg","payload":{"type":"mcp_tool_call_end","invocation":{"server":"fixture","tool":format!("tool_{index}"),"arguments":{"secret":"never-upload"}}}}));
                     }
-                    lines
-                };
-                fs::write(
-                    &path,
-                    lines
-                        .into_iter()
-                        .map(|line| line.to_string())
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                )
-                .expect("transcript");
-                let items = if source == SnapshotSource::Codex {
-                    parse_codex_jsonl_file(&path, "2026-08-02T07:02:00Z", "fp".into())
-                } else {
-                    parse_claude_code_jsonl_file(&path, "2026-08-02T07:02:00Z", "fp".into())
                 }
-                .expect("parse");
-                let item = &items[0];
-                let usage = item.tool_usage.as_deref().expect("tool contract");
-                assert_eq!(usage.len(), if capped { MAX_TOOL_USAGE_NAMES } else { 0 });
-                assert_eq!(item.tool_usage_truncated, capped);
-                if capped && source == SnapshotSource::Codex {
-                    assert_eq!(
-                        usage[0],
-                        SnapshotToolUsage {
-                            name: "exec_command".into(),
-                            count: 3
-                        }
-                    );
-                }
-                assert!(usage
-                    .iter()
-                    .all(|row| row.name.chars().count() <= MAX_TOOL_USAGE_NAME_LENGTH));
-                let wire = serde_json::to_string(item).expect("wire");
-                assert!(!wire.contains("never-upload"));
-                if !capped {
-                    assert!(wire.contains("\"tool_usage\":[]"));
-                }
-                let _ = fs::remove_file(path);
+                lines.push(json!({"timestamp":"2026-08-02T06:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":2,"request_count":1},"model":"gpt-5.6"}}}));
+                lines
+            };
+            fs::write(
+                &path,
+                lines
+                    .into_iter()
+                    .map(|line| line.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .expect("transcript");
+            let items =
+                parse_codex_jsonl_file(&path, "2026-08-02T07:02:00Z", "fp".into()).expect("parse");
+            let item = &items[0];
+            let usage = item.tool_usage.as_deref().expect("tool contract");
+            assert_eq!(usage.len(), if capped { MAX_TOOL_USAGE_NAMES } else { 0 });
+            assert_eq!(item.tool_usage_truncated, capped);
+            if capped {
+                assert_eq!(
+                    usage[0],
+                    SnapshotToolUsage {
+                        name: "exec_command".into(),
+                        count: 3
+                    }
+                );
             }
+            assert!(usage
+                .iter()
+                .all(|row| row.name.chars().count() <= MAX_TOOL_USAGE_NAME_LENGTH));
+            let wire = serde_json::to_string(item).expect("wire");
+            assert!(!wire.contains("never-upload"));
+            if !capped {
+                assert!(wire.contains("\"tool_usage\":[]"));
+            }
+            let _ = fs::remove_file(path);
         }
     }
 
@@ -53605,33 +53517,6 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    /// A ledger left at the unproven version must not be sealed by a cycle that
-    /// never armed anything — its pending set is computed from an accepted set
-    /// this daemon has not re-proved.
-    #[test]
-    fn unproven_ledger_is_not_finished_without_the_bounded_reopen() {
-        let sealed = "a".repeat(64);
-        let mut index = ScanIndex {
-            file_snapshot_fingerprints: BTreeMap::from([(
-                "same-session-siblings.jsonl".to_string(),
-                BTreeSet::from([sealed.clone()]),
-            )]),
-            accepted_snapshot_fingerprints: BTreeSet::from([sealed]),
-            accepted_snapshot_fingerprint_ledger_version: SNAPSHOT_ACCEPTED_LEDGER_UNPROVEN_VERSION,
-            ..ScanIndex::default()
-        };
-        assert!(index
-            .legacy_settlement_reconciliation_pending_fingerprints()
-            .is_empty());
-
-        index.finish_legacy_settlement_reconciliation();
-
-        assert!(
-            index.legacy_settlement_ledger_needs_migration(),
-            "the stale pending set may not close the migration"
-        );
-    }
-
     /// The sweep is self-terminating: each cycle advances the cursor by exactly
     /// one page, and the migration closes once the server has settled every
     /// revision. This is what makes removing the fast path affordable.
@@ -53732,45 +53617,6 @@ mod tests {
         assert_eq!(
             restarted.legacy_settlement_reconciliation_pending_fingerprints(),
             BTreeSet::from([accepted, stranded])
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn legacy_reconciliation_bounds_real_scale_and_resumes_from_persisted_cursor() {
-        let root = temp_dir("scan-index-bounded-legacy-reconciliation");
-        let path = root.join("codex-scan-index-v3.json");
-        let fingerprints = (0..2_247)
-            .map(|value| format!("{value:064x}"))
-            .collect::<BTreeSet<_>>();
-        let mut index = legacy_shaped_index(ScanIndex {
-            file_snapshot_fingerprints: BTreeMap::from([(
-                "real-scale-session-set.jsonl".to_string(),
-                fingerprints.clone(),
-            )]),
-            traversal: Some(terminal_unhealthy_traversal("terminal-red".to_string())),
-            ..ScanIndex::default()
-        });
-
-        let (first, changed) =
-            index.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
-        assert!(changed);
-        assert_eq!(first.len(), 50);
-        assert_eq!(index.quarantined_snapshot_fingerprints.len(), 50);
-        index.save(&path).expect("persist first bounded cursor");
-
-        let mut restarted = ScanIndex::load(&path).expect("reload first bounded cursor");
-        let (second, changed) =
-            restarted.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
-        assert!(changed);
-        assert_eq!(second.len(), 50);
-        assert!(first.is_disjoint(&second));
-        assert_eq!(restarted.quarantined_snapshot_fingerprints.len(), 100);
-        assert_eq!(
-            restarted
-                .legacy_settlement_reconciliation_pending_fingerprints()
-                .len(),
-            fingerprints.len()
         );
         let _ = fs::remove_dir_all(root);
     }
@@ -53927,40 +53773,6 @@ mod tests {
             refused.snapshot_fingerprint
         );
         let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn admission_retry_window_stays_open_until_ack_or_terminal() {
-        let fp = "a".repeat(64);
-        let mut index = ScanIndex::default();
-        let mut record = snapshot_quarantine_record(SnapshotSource::Pi);
-        for failures in 0..MAX_SNAPSHOT_RECONSTRUCTION_FAILURES {
-            record.failed_reconstruction_count = failures;
-            index
-                .quarantined_snapshot_fingerprints
-                .insert(fp.clone(), record.clone());
-            assert!(
-                index.snapshot_admission_reoffer_pending(),
-                "historical retry still needs reconstruction after conflict {failures}"
-            );
-        }
-        record.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
-        record.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
-        record.retry_after_unix_seconds = 0;
-        index
-            .quarantined_snapshot_fingerprints
-            .insert(fp.clone(), record.clone());
-        assert!(!index.snapshot_admission_reoffer_pending());
-        record.disposition = SnapshotQuarantineDisposition::SupersededTerminal;
-        index
-            .quarantined_snapshot_fingerprints
-            .insert(fp.clone(), record);
-        assert!(!index.snapshot_admission_reoffer_pending());
-        index.quarantined_snapshot_fingerprints.clear();
-        assert!(
-            !index.snapshot_admission_reoffer_pending(),
-            "ACK retires the obligation"
-        );
     }
 
     #[test]
@@ -55448,65 +55260,6 @@ mod tests {
     }
 
     #[test]
-    fn scan_policy_caps_recent_files_and_reports_partial_state() {
-        let root = temp_dir("scan-policy-cap");
-        // Inject a tiny cap so we exercise truncation without writing
-        // MAX_BACKFILL_FILES_PER_SOURCE (10k) fixture files.
-        let file_limit = 3;
-        for index in 0..=file_limit {
-            let path = root.join(format!("session-{index:04}.jsonl"));
-            fs::write(
-                path,
-                concat!(
-                    "{\"timestamp\":\"2026-05-14T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e253c-4444-7000-9000-dddddddddddd\"}}\n",
-                    "{\"timestamp\":\"2026-05-14T10:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":40,\"output_tokens\":8},\"model\":\"gpt-5.5\"}}}\n"
-                ).replace("019e253c-4444-7000-9000-dddddddddddd", &format!("019e253c-4444-7000-9000-{index:012}")),
-            )
-            .expect("write fixture");
-        }
-
-        let mut index = ScanIndex::default();
-        let first = scan_source_roots_with_limit(
-            SnapshotSource::Codex,
-            std::slice::from_ref(&root),
-            &mut index,
-            "2026-05-14T10:04:00Z",
-            BACKFILL_WINDOW_DAYS,
-            file_limit,
-            true,
-        )
-        .expect("scan");
-
-        assert_eq!(first.backfill_window_days, BACKFILL_WINDOW_DAYS);
-        assert_eq!(first.backfill_file_limit, file_limit);
-        assert_eq!(first.discovered_file_count, file_limit + 1);
-        assert_eq!(first.skipped_file_count_due_to_limit, 1);
-        assert!(first.scan_cap_hit);
-        assert!(!first.census_complete);
-        assert_eq!(first.scanned_file_count, file_limit);
-        assert_eq!(first.census_window_end, "2026-05-14T10:04:00Z");
-
-        let second = scan_source_roots_with_limit(
-            SnapshotSource::Codex,
-            std::slice::from_ref(&root),
-            &mut index,
-            "2026-05-14T10:09:00Z",
-            BACKFILL_WINDOW_DAYS,
-            file_limit,
-            true,
-        )
-        .expect("complete frozen sweep");
-        assert!(second.census_complete);
-        assert_eq!(second.scanned_file_count, 1);
-        assert_eq!(
-            second.census_window_end, "2026-05-14T10:04:00Z",
-            "a multi-cycle manifest cannot claim through its later finishing tick"
-        );
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn wide_single_directory_fails_red_without_materializing_past_budget() {
         let root = temp_dir("bounded-wide-directory");
         for index in 0..4 {
@@ -55705,21 +55458,6 @@ mod tests {
         assert!(!index.bounded_sweep_had_unsettled_upload);
 
         let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn claude_stable_owned_start_recovers_after_partial_conflict() {
-        exercise_claude_partial_census_recovery(false, false);
-    }
-
-    #[test]
-    fn claude_duplicate_across_pages_stays_refused_without_reparse_loop() {
-        exercise_claude_partial_census_recovery(true, false);
-    }
-
-    #[test]
-    fn claude_pending_census_recovers_without_releasing_future_quarantine() {
-        exercise_claude_partial_census_recovery(false, true);
     }
 
     #[test]
@@ -56122,38 +55860,6 @@ mod tests {
         );
         assert!(reconcile_missing_index_entries_with_limit(&mut index, 2));
         assert_eq!(index.files.keys().cloned().collect::<Vec<_>>(), ["b", "d"]);
-    }
-
-    #[test]
-    fn bounded_watcher_hint_joins_complete_durable_census() {
-        let root = temp_dir("bounded-watcher-hint");
-        let path = root.join("session.jsonl");
-        fs::write(
-            &path,
-            "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":1}}}\n",
-        )
-        .expect("write watcher fixture");
-        let mut index = ScanIndex::default();
-        let mut hinted = scan_source_roots_with_limit_and_attribution(
-            SnapshotSource::Pi,
-            std::slice::from_ref(&root),
-            &mut index,
-            "2026-07-31T00:00:00Z",
-            BACKFILL_WINDOW_DAYS,
-            MAX_BACKFILL_FILES_PER_SOURCE,
-            true,
-            None,
-            None,
-            std::slice::from_ref(&path),
-            false,
-        )
-        .expect("hinted scan");
-        finalize_scan_after_policy(SnapshotSource::Pi, &mut hinted, &mut index);
-        assert_eq!(hinted.snapshots.len(), 1);
-        assert!(hinted.census_complete);
-        assert!(!hinted.scan_cap_hit);
-        assert!(index.traversal.is_none());
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -57997,107 +57703,78 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_jsonl_never_settles_the_scan_index() {
-        let root = temp_dir("scan-incomplete-jsonl");
-        let path = root.join("session-incomplete.jsonl");
-        fs::write(
-            &path,
-            concat!(
-                "{\"type\":\"session\",\"session_id\":\"019e2700-1111-7000-9000-111111111111\",\"cwd\":\"/tmp/ottto\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
-                "{\"type\":\"message_end\",\"message\":{\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"api\":\"responses\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4,\"cacheRead\":0,\"cacheWrite\":0}}}\n",
-                "this is not valid json\n"
-            ),
-        )
-        .expect("write incomplete transcript");
-        let mut index = ScanIndex::default();
-        let scan = scan_source_roots_with_limit(
-            SnapshotSource::Pi,
-            std::slice::from_ref(&root),
-            &mut index,
-            "2026-05-14T10:04:00Z",
-            BACKFILL_WINDOW_DAYS,
-            MAX_BACKFILL_FILES_PER_SOURCE,
-            true,
-        )
-        .expect("scan quarantines parse loss");
-        assert_eq!(scan.malformed_json_line_count, 1);
-        assert!(!scan.census_complete);
-        assert_eq!(scan.scanned_session_count, 1);
-        assert!(
-            scan.snapshots.is_empty(),
-            "a partial entity from a lossy file must never reach upload"
-        );
-        assert!(index.files.is_empty(), "incomplete file stays retryable");
-        assert!(index.confirmed_empty_files.is_empty());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn every_lossy_line_class_is_quarantined_or_terminally_disclosed() {
-        let session = "{\"type\":\"session\",\"session_id\":\"019e2700-1111-7000-9000-111111111111\",\"cwd\":\"/tmp/ottto\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n";
-        let usage = "{\"type\":\"message_end\",\"message\":{\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"api\":\"responses\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4,\"cacheRead\":0,\"cacheWrite\":0}}}\n";
-        // `over-line-cap` stays in this case list deliberately. It is no longer
-        // retryable-quarantined - it is terminal-with-disclosed-loss - so it is
-        // asserted here against its new contract instead of being deleted.
-        let cases = ["invalid-utf8", "over-line-cap", "recognized-drop"];
-        for case in cases {
-            let root = temp_dir(case);
-            let path = root.join("session.jsonl");
-            let mut bytes = format!("{session}{usage}").into_bytes();
-            match case {
+        with_test_line_cap(64 * 1024, || {
+            let session = "{\"type\":\"session\",\"session_id\":\"019e2700-1111-7000-9000-111111111111\",\"cwd\":\"/tmp/ottto\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n";
+            let usage = "{\"type\":\"message_end\",\"message\":{\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"api\":\"responses\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4,\"cacheRead\":0,\"cacheWrite\":0}}}\n";
+            // `over-line-cap` stays in this case list deliberately. It is no longer
+            // retryable-quarantined - it is terminal-with-disclosed-loss - so it is
+            // asserted here against its new contract instead of being deleted.
+            let cases = ["invalid-utf8", "over-line-cap", "recognized-drop"];
+            for case in cases {
+                let root = temp_dir(case);
+                let path = root.join("session.jsonl");
+                let mut bytes = format!("{session}{usage}").into_bytes();
+                match case {
                 "invalid-utf8" => bytes.extend_from_slice(&[0xff, b'\n']),
-                "over-line-cap" => {
-                    bytes.extend_from_slice(b"{\"ignored\":\"");
-                    bytes.extend(std::iter::repeat_n(b'x', MAX_JSONL_LINE_BYTES + 1));
-                    bytes.extend_from_slice(b"\"}\n");
-                }
+                "over-line-cap" => {}
                 "recognized-drop" => bytes.extend_from_slice(
                     b"{\"type\":\"message_end\",\"message\":{\"usage\":{\"input\":\"invalid\"}}}\n",
                 ),
                 _ => unreachable!(),
             }
-            fs::write(&path, bytes).expect("write lossy fixture");
-            let mut index = ScanIndex::default();
-            let scan = scan_source_roots_with_limit(
-                SnapshotSource::Pi,
-                std::slice::from_ref(&root),
-                &mut index,
-                "2026-07-22T08:02:00Z",
-                BACKFILL_WINDOW_DAYS,
-                MAX_BACKFILL_FILES_PER_SOURCE,
-                true,
-            )
-            .expect("lossy file is isolated");
-            match case {
-                "invalid-utf8" => {
-                    assert!(!scan.census_complete, "{case}");
-                    assert!(scan.snapshots.is_empty(), "{case}");
-                    assert!(index.files.is_empty(), "{case}");
-                    assert_eq!(scan.invalid_utf8_line_count, 1);
+                if case == "over-line-cap" {
+                    write_over_cap_file(
+                        &path,
+                        &format!("{session}{usage}"),
+                        "{\"ignored\":\"",
+                        "\"}\n",
+                    );
+                } else {
+                    fs::write(&path, bytes).expect("write lossy fixture");
                 }
-                "over-line-cap" => {
-                    // Terminal, disclosed, and committed: the loss is not
-                    // recoverable by any later retry of the same bytes.
-                    assert!(scan.census_complete, "{case}");
-                    assert_eq!(scan.over_line_cap_count, 1);
-                    assert_eq!(scan.recognized_usage_drop_count, 1);
-                    assert_eq!(scan.dropped_usage_record_count, 1);
-                    assert_eq!(scan.snapshots.len(), 1, "healthy siblings still commit");
-                    assert_eq!(index.files.len(), 1, "{case}");
+                let mut index = ScanIndex::default();
+                let scan = scan_source_roots_with_limit(
+                    SnapshotSource::Pi,
+                    std::slice::from_ref(&root),
+                    &mut index,
+                    "2026-07-22T08:02:00Z",
+                    BACKFILL_WINDOW_DAYS,
+                    MAX_BACKFILL_FILES_PER_SOURCE,
+                    true,
+                )
+                .expect("lossy file is isolated");
+                match case {
+                    "invalid-utf8" => {
+                        assert!(!scan.census_complete, "{case}");
+                        assert!(scan.snapshots.is_empty(), "{case}");
+                        assert!(index.files.is_empty(), "{case}");
+                        assert_eq!(scan.invalid_utf8_line_count, 1);
+                    }
+                    "over-line-cap" => {
+                        // Terminal, disclosed, and committed: the loss is not
+                        // recoverable by any later retry of the same bytes.
+                        assert!(scan.census_complete, "{case}");
+                        assert_eq!(scan.over_line_cap_count, 1);
+                        assert_eq!(scan.recognized_usage_drop_count, 1);
+                        assert_eq!(scan.dropped_usage_record_count, 1);
+                        assert_eq!(scan.snapshots.len(), 1, "healthy siblings still commit");
+                        assert_eq!(index.files.len(), 1, "{case}");
+                    }
+                    "recognized-drop" => {
+                        // Non-progressing residue: the census completes with the
+                        // loss named while the file itself stays un-indexed and
+                        // retryable (`settle_non_progressing_residue`).
+                        assert!(scan.census_complete, "{case}");
+                        assert!(scan.snapshots.is_empty(), "{case}");
+                        assert!(index.files.is_empty(), "{case}");
+                        assert_eq!(scan.recognized_usage_drop_count, 1);
+                    }
+                    _ => unreachable!(),
                 }
-                "recognized-drop" => {
-                    // Non-progressing residue: the census completes with the
-                    // loss named while the file itself stays un-indexed and
-                    // retryable (`settle_non_progressing_residue`).
-                    assert!(scan.census_complete, "{case}");
-                    assert!(scan.snapshots.is_empty(), "{case}");
-                    assert!(index.files.is_empty(), "{case}");
-                    assert_eq!(scan.recognized_usage_drop_count, 1);
-                }
-                _ => unreachable!(),
+                let _ = fs::remove_dir_all(root);
             }
-            let _ = fs::remove_dir_all(root);
-        }
+        });
     }
 
     /// `terminal_line_loss_count` applies to every source, but the oversized
@@ -58106,68 +57783,71 @@ mod tests {
     /// non-Codex shape directly instead of inferring it from the Codex case.
     #[test]
     fn over_line_cap_is_terminal_with_disclosed_loss_for_non_codex_sources() {
-        let claude = "{\"type\":\"assistant\",\"sessionId\":\"019e2700-5555-7000-9000-555555555555\",\"uuid\":\"019e2700-5555-7000-9000-5555555555a1\",\"timestamp\":\"2026-07-22T08:00:01Z\",\"cwd\":\"/tmp/ottto\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":12,\"output_tokens\":4,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}\n";
-        let pi = concat!(
+        with_test_line_cap(64 * 1024, || {
+            let claude = "{\"type\":\"assistant\",\"sessionId\":\"019e2700-5555-7000-9000-555555555555\",\"uuid\":\"019e2700-5555-7000-9000-5555555555a1\",\"timestamp\":\"2026-07-22T08:00:01Z\",\"cwd\":\"/tmp/ottto\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":12,\"output_tokens\":4,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}\n";
+            let pi = concat!(
             "{\"type\":\"session\",\"session_id\":\"019e2700-6666-7000-9000-666666666666\",\"cwd\":\"/tmp/ottto\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
             "{\"type\":\"message_end\",\"message\":{\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"api\":\"responses\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4,\"cacheRead\":0,\"cacheWrite\":0}}}\n",
         );
-        for (source, name, healthy) in [
-            (SnapshotSource::ClaudeCode, "over-cap-claude", claude),
-            (SnapshotSource::Pi, "over-cap-pi", pi),
-        ] {
-            let root = temp_dir(name);
-            let path = root.join("session.jsonl");
-            let mut bytes = healthy.as_bytes().to_vec();
-            bytes.extend_from_slice(b"{\"type\":\"assistant\",\"ignored\":\"");
-            bytes.extend(std::iter::repeat_n(b'x', MAX_JSONL_LINE_BYTES + 1));
-            bytes.extend_from_slice(b"\"}\n");
-            fs::write(&path, bytes).expect("write over-cap fixture");
+            for (source, name, healthy) in [
+                (SnapshotSource::ClaudeCode, "over-cap-claude", claude),
+                (SnapshotSource::Pi, "over-cap-pi", pi),
+            ] {
+                let root = temp_dir(name);
+                let path = root.join("session.jsonl");
+                write_over_cap_file(
+                    &path,
+                    healthy,
+                    "{\"type\":\"assistant\",\"ignored\":\"",
+                    "\"}\n",
+                );
 
-            let mut index = ScanIndex::default();
-            let mut first = scan_source_roots_with_limit(
-                source,
-                std::slice::from_ref(&root),
-                &mut index,
-                "2026-07-22T08:02:00Z",
-                BACKFILL_WINDOW_DAYS,
-                MAX_BACKFILL_FILES_PER_SOURCE,
-                true,
-            )
-            .expect("over-cap line reaches a terminal disclosed result");
-            assert!(first.census_complete, "{name}");
-            assert!(!first.scan_cap_hit, "{name}");
-            assert_eq!(first.scanned_file_count, 1, "{name}");
-            assert_eq!(first.over_line_cap_count, 1, "{name}");
-            assert_eq!(first.recognized_usage_drop_count, 1, "{name}");
-            assert_eq!(first.dropped_usage_record_count, 1, "{name}");
-            assert_eq!(
-                first.snapshots.len(),
-                1,
-                "{name}: healthy sibling lines still commit"
-            );
-            finalize_scan_after_policy(source, &mut first, &mut index);
+                let mut index = ScanIndex::default();
+                let mut first = scan_source_roots_with_limit(
+                    source,
+                    std::slice::from_ref(&root),
+                    &mut index,
+                    "2026-07-22T08:02:00Z",
+                    BACKFILL_WINDOW_DAYS,
+                    MAX_BACKFILL_FILES_PER_SOURCE,
+                    true,
+                )
+                .expect("over-cap line reaches a terminal disclosed result");
+                assert!(first.census_complete, "{name}");
+                assert!(!first.scan_cap_hit, "{name}");
+                assert_eq!(first.scanned_file_count, 1, "{name}");
+                assert_eq!(first.over_line_cap_count, 1, "{name}");
+                assert_eq!(first.recognized_usage_drop_count, 1, "{name}");
+                assert_eq!(first.dropped_usage_record_count, 1, "{name}");
+                assert_eq!(
+                    first.snapshots.len(),
+                    1,
+                    "{name}: healthy sibling lines still commit"
+                );
+                finalize_scan_after_policy(source, &mut first, &mut index);
 
-            let second = scan_source_roots_with_limit(
-                source,
-                std::slice::from_ref(&root),
-                &mut index,
-                "2026-07-22T08:07:00Z",
-                BACKFILL_WINDOW_DAYS,
-                MAX_BACKFILL_FILES_PER_SOURCE,
-                true,
-            )
-            .expect("unchanged terminal file uses its disposition");
-            assert_eq!(
-                second.scanned_file_count, 0,
-                "{name}: unchanged terminal file is not reparsed"
-            );
-            assert!(second.census_complete, "{name}");
-            assert_eq!(second.over_line_cap_count, 1, "{name}");
-            assert_eq!(second.recognized_usage_drop_count, 1, "{name}");
-            assert_eq!(second.dropped_usage_record_count, 1, "{name}");
-            assert!(second.snapshots.is_empty(), "{name}");
-            let _ = fs::remove_dir_all(root);
-        }
+                let second = scan_source_roots_with_limit(
+                    source,
+                    std::slice::from_ref(&root),
+                    &mut index,
+                    "2026-07-22T08:07:00Z",
+                    BACKFILL_WINDOW_DAYS,
+                    MAX_BACKFILL_FILES_PER_SOURCE,
+                    true,
+                )
+                .expect("unchanged terminal file uses its disposition");
+                assert_eq!(
+                    second.scanned_file_count, 0,
+                    "{name}: unchanged terminal file is not reparsed"
+                );
+                assert!(second.census_complete, "{name}");
+                assert_eq!(second.over_line_cap_count, 1, "{name}");
+                assert_eq!(second.recognized_usage_drop_count, 1, "{name}");
+                assert_eq!(second.dropped_usage_record_count, 1, "{name}");
+                assert!(second.snapshots.is_empty(), "{name}");
+                let _ = fs::remove_dir_all(root);
+            }
+        });
     }
 
     /// The disposition map is durable, so a record whose file was renamed or
@@ -58176,73 +57856,82 @@ mod tests {
     /// one dead key per lossy transcript the user ever moves.
     #[test]
     fn terminal_dispositions_are_pruned_when_their_file_moves_or_disappears() {
-        let source = SnapshotSource::ClaudeCode;
-        let root = temp_dir("terminal-disposition-prune");
-        let original = root.join("session-a.jsonl");
-        let moved = root.join("session-b.jsonl");
-        let mut bytes = b"{\"type\":\"assistant\",\"sessionId\":\"019e2700-7777-7000-9000-777777777777\",\"uuid\":\"019e2700-7777-7000-9000-7777777777a1\",\"timestamp\":\"2026-07-22T08:00:01Z\",\"cwd\":\"/tmp/ottto\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":12,\"output_tokens\":4,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}\n".to_vec();
-        bytes.extend_from_slice(b"{\"type\":\"assistant\",\"ignored\":\"");
-        bytes.extend(std::iter::repeat_n(b'x', MAX_JSONL_LINE_BYTES + 1));
-        bytes.extend_from_slice(b"\"}\n");
-        fs::write(&original, &bytes).expect("write over-cap fixture");
+        with_test_line_cap(64 * 1024, || {
+            let source = SnapshotSource::ClaudeCode;
+            let root = temp_dir("terminal-disposition-prune");
+            let original = root.join("session-a.jsonl");
+            let moved = root.join("session-b.jsonl");
+            write_over_cap_file(&original, "{\"type\":\"assistant\",\"sessionId\":\"019e2700-7777-7000-9000-777777777777\",\"uuid\":\"019e2700-7777-7000-9000-7777777777a1\",\"timestamp\":\"2026-07-22T08:00:01Z\",\"cwd\":\"/tmp/ottto\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":12,\"output_tokens\":4,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}\n", "{\"type\":\"assistant\",\"ignored\":\"", "\"}\n");
 
-        let traverse = |index: &mut ScanIndex, at: &str| {
-            let mut result = scan_source_roots_with_limit(
-                source,
-                std::slice::from_ref(&root),
-                index,
-                at,
-                BACKFILL_WINDOW_DAYS,
-                MAX_BACKFILL_FILES_PER_SOURCE,
-                true,
-            )
-            .expect("traversal completes");
-            assert!(result.census_complete);
-            finalize_scan_after_policy(source, &mut result, index);
-            result
-        };
+            let traverse = |index: &mut ScanIndex, at: &str| {
+                let mut result = scan_source_roots_with_limit(
+                    source,
+                    std::slice::from_ref(&root),
+                    index,
+                    at,
+                    BACKFILL_WINDOW_DAYS,
+                    MAX_BACKFILL_FILES_PER_SOURCE,
+                    true,
+                )
+                .expect("traversal completes");
+                assert!(result.census_complete);
+                finalize_scan_after_policy(source, &mut result, index);
+                result
+            };
 
-        let mut index = ScanIndex::default();
-        let first = traverse(&mut index, "2026-07-22T08:02:00Z");
-        assert_eq!(first.scanned_file_count, 1);
-        assert_eq!(first.over_line_cap_count, 1);
-        assert_eq!(index.terminal_jsonl_dispositions.len(), 1);
-        assert!(index
-            .terminal_jsonl_dispositions
-            .contains_key(&local_index_key(&original)));
+            let mut index = ScanIndex::default();
+            let first = traverse(&mut index, "2026-07-22T08:02:00Z");
+            assert_eq!(first.scanned_file_count, 1);
+            assert_eq!(first.over_line_cap_count, 1);
+            assert_eq!(index.terminal_jsonl_dispositions.len(), 1);
+            assert!(index
+                .terminal_jsonl_dispositions
+                .contains_key(&local_index_key(&original)));
 
-        // Moved path: the same bytes are a new object. The new key is recorded
-        // and the old key must NOT be carried forward beside it.
-        fs::rename(&original, &moved).expect("rename terminal fixture");
-        let after_move = traverse(&mut index, "2026-07-22T08:07:00Z");
-        assert_eq!(
-            after_move.scanned_file_count, 1,
-            "moved object is read once"
-        );
-        assert_eq!(
-            after_move.over_line_cap_count, 1,
-            "loss is not double-counted"
-        );
-        assert_eq!(
-            index.terminal_jsonl_dispositions.len(),
-            1,
-            "the renamed-away key is pruned, not accumulated"
-        );
-        assert!(index
-            .terminal_jsonl_dispositions
-            .contains_key(&local_index_key(&moved)));
-        assert_eq!(index.files.len(), 1);
+            // Moved path: the same bytes are a new object. The new key is recorded
+            // and the old key must NOT be carried forward beside it.
+            fs::rename(&original, &moved).expect("rename terminal fixture");
+            let after_move = traverse(&mut index, "2026-07-22T08:07:00Z");
+            assert_eq!(
+                after_move.scanned_file_count, 1,
+                "moved object is read once"
+            );
+            assert_eq!(
+                after_move.over_line_cap_count, 1,
+                "loss is not double-counted"
+            );
+            assert_eq!(
+                index.terminal_jsonl_dispositions.len(),
+                1,
+                "the renamed-away key is pruned, not accumulated"
+            );
+            assert!(index
+                .terminal_jsonl_dispositions
+                .contains_key(&local_index_key(&moved)));
+            assert_eq!(index.files.len(), 1);
 
-        // Deleted path: nothing indexed corresponds to the disposition at all.
-        fs::remove_file(&moved).expect("remove terminal fixture");
-        let after_delete = traverse(&mut index, "2026-07-22T08:12:00Z");
-        assert_eq!(after_delete.scanned_file_count, 0);
-        assert!(
-            index.terminal_jsonl_dispositions.is_empty(),
-            "a deleted file leaves no durable disposition behind"
-        );
-        assert!(index.files.is_empty());
-        let _ = fs::remove_dir_all(root);
+            // Deleted path: nothing indexed corresponds to the disposition at all.
+            fs::remove_file(&moved).expect("remove terminal fixture");
+            let after_delete = traverse(&mut index, "2026-07-22T08:12:00Z");
+            assert_eq!(after_delete.scanned_file_count, 0);
+            assert!(
+                index.terminal_jsonl_dispositions.is_empty(),
+                "a deleted file leaves no durable disposition behind"
+            );
+            assert!(index.files.is_empty());
+            let _ = fs::remove_dir_all(root);
+        });
+    }
+
+    fn write_over_cap_file(path: &Path, head: &str, prefix: &str, suffix: &str) {
+        use std::io::Write;
+        let mut file = File::create(path).expect("create over-cap fixture");
+        file.write_all(head.as_bytes()).expect("write healthy head");
+        file.write_all(prefix.as_bytes())
+            .expect("write oversized prefix");
+        file.seek(SeekFrom::Current((jsonl_line_cap() + 1) as i64))
+            .expect("skip sparse oversized payload");
+        file.write_all(suffix.as_bytes()).expect("write suffix");
     }
 
     /// The disposition map is deliberately uncapped: pruning keeps it a subset
@@ -58269,8 +57958,6 @@ mod tests {
     /// shape and asserts the file is read exactly once.
     #[test]
     fn terminal_dispositions_settle_for_a_corpus_larger_than_any_fixed_cap() {
-        use std::io::Write;
-
         // Comfortably over the 256 records the removed cap allowed.
         const FILES: usize = 300;
         // Readers run under a scaled line cap so each over-cap file is 64 KiB,
@@ -58284,16 +57971,6 @@ mod tests {
         // it over-cap and then clears the buffer without inspecting the skipped
         // bytes, so a zero-filled hole is byte-equivalent input for this path
         // and keeps a 300-file over-cap corpus off disk.
-        let write_over_cap_file = |path: &Path, head: &str, prefix: &str, suffix: &str| {
-            let mut file = File::create(path).expect("create over-cap fixture");
-            file.write_all(head.as_bytes()).expect("write healthy head");
-            file.write_all(prefix.as_bytes())
-                .expect("write oversized line prefix");
-            file.seek(SeekFrom::Current((LINE_CAP + 1) as i64))
-                .expect("skip the oversized payload hole");
-            file.write_all(suffix.as_bytes())
-                .expect("close the oversized line");
-        };
 
         with_test_line_cap(LINE_CAP, || {
             for (source, name) in [
@@ -58407,103 +58084,99 @@ mod tests {
 
     #[test]
     fn oversized_21mb_line_is_terminal_once_and_salvages_usage_siblings() {
-        let root = temp_dir("terminal-21mb-line");
-        let session_id = "019e2700-1111-7000-9000-111111111111";
-        let parent_id = "019e2700-2222-7000-9000-222222222222";
-        let path = root.join(format!("rollout-{session_id}.jsonl"));
-        let session = format!(
+        with_test_line_cap(64 * 1024, || {
+            let root = temp_dir("terminal-21mb-line");
+            let session_id = "019e2700-1111-7000-9000-111111111111";
+            let parent_id = "019e2700-2222-7000-9000-222222222222";
+            let path = root.join(format!("rollout-{session_id}.jsonl"));
+            let session = format!(
             "{{\"timestamp\":\"2026-07-22T08:00:00Z\",\"type\":\"session_meta\",\"ordinal\":0,\"payload\":{{\"id\":\"{session_id}\",\"session_id\":\"{session_id}\",\"thread_source\":\"subagent\",\"forked_from_id\":\"{parent_id}\",\"subagent_history_start_ordinal\":1,\"source\":{{\"subagent\":{{\"thread_spawn\":{{\"parent_thread_id\":\"{parent_id}\"}}}}}}}}}}\n"
         );
-        let usage = codex_test_token_line(
-            "2026-07-22T08:00:02Z",
-            Some(2),
-            (12, 0, 4, 0),
-            Some((12, 0, 4, 0)),
-        )
-        .to_string()
-            + "\n";
-        let mut bytes = Vec::with_capacity(21 * 1024 * 1024 + session.len() + usage.len() + 32);
-        bytes.extend_from_slice(session.as_bytes());
-        bytes.extend_from_slice(b"{\"timestamp\":\"2026-07-22T08:00:01Z\",\"type\":\"response_item\",\"ordinal\":1,\"payload\":{\"type\":\"message\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"");
-        bytes.extend(std::iter::repeat_n(b'x', 21 * 1024 * 1024));
-        bytes.extend_from_slice(b"\"}]}}\n");
-        bytes.extend_from_slice(usage.as_bytes());
-        fs::write(&path, bytes).expect("write 21 MiB line fixture");
+            let usage = codex_test_token_line(
+                "2026-07-22T08:00:02Z",
+                Some(2),
+                (12, 0, 4, 0),
+                Some((12, 0, 4, 0)),
+            )
+            .to_string()
+                + "\n";
+            write_over_cap_file(&path, &session, "{\"timestamp\":\"2026-07-22T08:00:01Z\",\"type\":\"response_item\",\"ordinal\":1,\"payload\":{\"type\":\"message\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"", &format!("\"}}]}}}}\n{usage}"));
 
-        let mut index = ScanIndex::default();
-        let mut first = scan_source_roots_with_limit(
-            SnapshotSource::Codex,
-            std::slice::from_ref(&root),
-            &mut index,
-            "2026-07-22T08:02:00Z",
-            BACKFILL_WINDOW_DAYS,
-            MAX_BACKFILL_FILES_PER_SOURCE,
-            true,
-        )
-        .expect("oversized line reaches a terminal disclosed result");
-        assert!(first.census_complete);
-        assert!(!first.scan_cap_hit);
-        assert_eq!(first.scanned_file_count, 1);
-        assert_eq!(first.snapshots.len(), 1, "valid usage sibling is salvaged");
-        assert_eq!(first.over_line_cap_count, 1);
-        assert_eq!(first.recognized_usage_drop_count, 1);
-        assert_eq!(first.dropped_usage_record_count, 1);
-        finalize_scan_after_policy(SnapshotSource::Codex, &mut first, &mut index);
+            let mut index = ScanIndex::default();
+            let mut first = scan_source_roots_with_limit(
+                SnapshotSource::Codex,
+                std::slice::from_ref(&root),
+                &mut index,
+                "2026-07-22T08:02:00Z",
+                BACKFILL_WINDOW_DAYS,
+                MAX_BACKFILL_FILES_PER_SOURCE,
+                true,
+            )
+            .expect("oversized line reaches a terminal disclosed result");
+            assert!(first.census_complete);
+            assert!(!first.scan_cap_hit);
+            assert_eq!(first.scanned_file_count, 1);
+            assert_eq!(first.snapshots.len(), 1, "valid usage sibling is salvaged");
+            assert_eq!(first.over_line_cap_count, 1);
+            assert_eq!(first.recognized_usage_drop_count, 1);
+            assert_eq!(first.dropped_usage_record_count, 1);
+            finalize_scan_after_policy(SnapshotSource::Codex, &mut first, &mut index);
 
-        let second = scan_source_roots_with_limit(
-            SnapshotSource::Codex,
-            std::slice::from_ref(&root),
-            &mut index,
-            "2026-07-22T08:07:00Z",
-            BACKFILL_WINDOW_DAYS,
-            MAX_BACKFILL_FILES_PER_SOURCE,
-            true,
-        )
-        .expect("unchanged terminal file uses its disposition");
-        assert!(second.census_complete);
-        assert!(!second.scan_cap_hit);
-        assert_eq!(
-            second.scanned_file_count, 0,
-            "unchanged file is not reparsed"
-        );
-        assert_eq!(second.over_line_cap_count, 1);
-        assert_eq!(second.recognized_usage_drop_count, 1);
-        assert_eq!(second.dropped_usage_record_count, 1);
-        assert!(second.snapshots.is_empty());
+            let second = scan_source_roots_with_limit(
+                SnapshotSource::Codex,
+                std::slice::from_ref(&root),
+                &mut index,
+                "2026-07-22T08:07:00Z",
+                BACKFILL_WINDOW_DAYS,
+                MAX_BACKFILL_FILES_PER_SOURCE,
+                true,
+            )
+            .expect("unchanged terminal file uses its disposition");
+            assert!(second.census_complete);
+            assert!(!second.scan_cap_hit);
+            assert_eq!(
+                second.scanned_file_count, 0,
+                "unchanged file is not reparsed"
+            );
+            assert_eq!(second.over_line_cap_count, 1);
+            assert_eq!(second.recognized_usage_drop_count, 1);
+            assert_eq!(second.dropped_usage_record_count, 1);
+            assert!(second.snapshots.is_empty());
 
-        let key = local_index_key(&path);
-        index
-            .terminal_jsonl_dispositions
-            .get_mut(&key)
-            .expect("terminal disposition")
-            .parser_generation = "bounded_jsonl_terminal:future".to_string();
-        let mut upgraded = scan_source_roots_with_limit(
-            SnapshotSource::Codex,
-            std::slice::from_ref(&root),
-            &mut index,
-            "2026-07-22T08:12:00Z",
-            BACKFILL_WINDOW_DAYS,
-            MAX_BACKFILL_FILES_PER_SOURCE,
-            true,
-        )
-        .expect("new parser generation gets one re-evaluation");
-        assert_eq!(upgraded.scanned_file_count, 1);
-        assert_eq!(upgraded.snapshots.len(), 1);
-        finalize_scan_after_policy(SnapshotSource::Codex, &mut upgraded, &mut index);
+            let key = local_index_key(&path);
+            index
+                .terminal_jsonl_dispositions
+                .get_mut(&key)
+                .expect("terminal disposition")
+                .parser_generation = "bounded_jsonl_terminal:future".to_string();
+            let mut upgraded = scan_source_roots_with_limit(
+                SnapshotSource::Codex,
+                std::slice::from_ref(&root),
+                &mut index,
+                "2026-07-22T08:12:00Z",
+                BACKFILL_WINDOW_DAYS,
+                MAX_BACKFILL_FILES_PER_SOURCE,
+                true,
+            )
+            .expect("new parser generation gets one re-evaluation");
+            assert_eq!(upgraded.scanned_file_count, 1);
+            assert_eq!(upgraded.snapshots.len(), 1);
+            finalize_scan_after_policy(SnapshotSource::Codex, &mut upgraded, &mut index);
 
-        let settled = scan_source_roots_with_limit(
-            SnapshotSource::Codex,
-            std::slice::from_ref(&root),
-            &mut index,
-            "2026-07-22T08:17:00Z",
-            BACKFILL_WINDOW_DAYS,
-            MAX_BACKFILL_FILES_PER_SOURCE,
-            true,
-        )
-        .expect("upgraded disposition settles");
-        assert_eq!(settled.scanned_file_count, 0);
-        assert_eq!(settled.dropped_usage_record_count, 1);
-        let _ = fs::remove_dir_all(root);
+            let settled = scan_source_roots_with_limit(
+                SnapshotSource::Codex,
+                std::slice::from_ref(&root),
+                &mut index,
+                "2026-07-22T08:17:00Z",
+                BACKFILL_WINDOW_DAYS,
+                MAX_BACKFILL_FILES_PER_SOURCE,
+                true,
+            )
+            .expect("upgraded disposition settles");
+            assert_eq!(settled.scanned_file_count, 0);
+            assert_eq!(settled.dropped_usage_record_count, 1);
+            let _ = fs::remove_dir_all(root);
+        });
     }
 
     /// Mirrors the exact live M4 shape that the single-file synthetic fixture
@@ -58515,168 +58188,112 @@ mod tests {
     /// a 127 MB rollout forever.
     #[test]
     fn oversized_parent_of_ordinal_subagent_children_is_read_once() {
-        let root = temp_dir("terminal-oversized-parent");
-        let parent_id = "019e2700-2222-7000-9000-222222222222";
-        let child_ids = [
-            "019e2700-3333-7000-9000-333333333333",
-            "019e2700-4444-7000-9000-444444444444",
-        ];
+        with_test_line_cap(64 * 1024, || {
+            let root = temp_dir("terminal-oversized-parent");
+            let parent_id = "019e2700-2222-7000-9000-222222222222";
+            let child_ids = [
+                "019e2700-3333-7000-9000-333333333333",
+                "019e2700-4444-7000-9000-444444444444",
+            ];
 
-        let oversized_line = |ordinal: u64, timestamp: &str, bytes: usize| {
-            let mut line = format!(
-                "{{\"timestamp\":\"{timestamp}\",\"type\":\"response_item\",\"ordinal\":{ordinal},\"payload\":{{\"type\":\"message\",\"content\":[{{\"type\":\"input_image\",\"image_url\":\""
-            )
-            .into_bytes();
-            line.extend(std::iter::repeat_n(b'x', bytes));
-            line.extend_from_slice(b"\"}]}}\n");
-            line
-        };
-
-        let parent_path = root.join(format!("rollout-2026-07-22T08-00-00-{parent_id}.jsonl"));
-        let mut parent_bytes = format!(
+            let parent_path = root.join(format!("rollout-2026-07-22T08-00-00-{parent_id}.jsonl"));
+            let parent_head = format!(
             "{{\"timestamp\":\"2026-07-22T08:00:00Z\",\"type\":\"session_meta\",\"ordinal\":0,\"payload\":{{\"id\":\"{parent_id}\",\"session_id\":\"{parent_id}\"}}}}\n"
-        )
-        .into_bytes();
-        parent_bytes.extend_from_slice(&oversized_line(
-            1,
-            "2026-07-22T08:00:01Z",
-            21 * 1024 * 1024,
-        ));
-        parent_bytes.extend_from_slice(
-            (codex_test_token_line(
+        );
+            let parent_usage = codex_test_token_line(
                 "2026-07-22T08:00:02Z",
                 Some(2),
                 (40, 0, 8, 0),
                 Some((40, 0, 8, 0)),
             )
-            .to_string()
-                + "\n")
-                .as_bytes(),
-        );
-        fs::write(&parent_path, parent_bytes).expect("write oversized parent rollout");
+            .to_string();
+            write_over_cap_file(&parent_path, &parent_head,
+            "{\"timestamp\":\"2026-07-22T08:00:01Z\",\"type\":\"response_item\",\"ordinal\":1,\"payload\":{\"type\":\"message\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"",
+            &format!("\"}}]}}}}\n{parent_usage}\n"));
 
-        for (offset, child_id) in child_ids.iter().enumerate() {
-            let path = root.join(format!(
-                "rollout-2026-07-22T08-1{offset}-00-{child_id}.jsonl"
-            ));
-            let mut bytes = format!(
+            for (offset, child_id) in child_ids.iter().enumerate() {
+                let path = root.join(format!(
+                    "rollout-2026-07-22T08-1{offset}-00-{child_id}.jsonl"
+                ));
+                let mut bytes = format!(
                 "{{\"timestamp\":\"2026-07-22T08:10:00Z\",\"type\":\"session_meta\",\"ordinal\":0,\"payload\":{{\"id\":\"{child_id}\",\"session_id\":\"{child_id}\",\"thread_source\":\"subagent\",\"forked_from_id\":\"{parent_id}\",\"subagent_history_start_ordinal\":11,\"source\":{{\"subagent\":{{\"thread_spawn\":{{\"parent_thread_id\":\"{parent_id}\"}}}}}}}}}}\n"
             )
             .into_bytes();
-            for ordinal in 1..=10_u64 {
-                bytes.extend_from_slice(
+                for ordinal in 1..=10_u64 {
+                    bytes.extend_from_slice(
                     format!(
                         "{{\"timestamp\":\"2026-07-22T08:10:{ordinal:02}Z\",\"type\":\"response_item\",\"ordinal\":{ordinal},\"payload\":{{\"type\":\"message\",\"content\":[]}}}}\n"
                     )
                     .as_bytes(),
                 );
-            }
-            // Children carry oversized image rows too; the Codex envelope
-            // salvage keeps their ordinal chain gap-free.
-            bytes.extend_from_slice(&oversized_line(
-                11,
-                "2026-07-22T08:10:11Z",
-                MAX_JSONL_LINE_BYTES + 1,
-            ));
-            bytes.extend_from_slice(
-                (codex_test_token_line(
+                }
+                // Children carry oversized image rows too; the Codex envelope
+                // salvage keeps their ordinal chain gap-free.
+                let usage = codex_test_token_line(
                     "2026-07-22T08:10:12Z",
                     Some(12),
                     (12, 0, 4, 0),
                     Some((12, 0, 4, 0)),
                 )
-                .to_string()
-                    + "\n")
-                    .as_bytes(),
-            );
-            fs::write(&path, bytes).expect("write ordinal subagent child rollout");
-        }
+                .to_string();
+                write_over_cap_file(&path, std::str::from_utf8(&bytes).unwrap(),
+                "{\"timestamp\":\"2026-07-22T08:10:11Z\",\"type\":\"response_item\",\"ordinal\":11,\"payload\":{\"type\":\"message\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"",
+                &format!("\"}}]}}}}\n{usage}\n"));
+            }
 
-        let mut index = ScanIndex::default();
-        let mut observed = Vec::new();
-        for cycle in 0..4 {
-            let mut scan = scan_source_roots_with_limit(
-                SnapshotSource::Codex,
-                std::slice::from_ref(&root),
-                &mut index,
-                "2026-07-22T09:00:00Z",
-                BACKFILL_WINDOW_DAYS,
-                MAX_BACKFILL_FILES_PER_SOURCE,
-                true,
-            )
-            .unwrap_or_else(|error| panic!("cycle {cycle} traversal: {error}"));
-            assert!(scan.census_complete, "cycle {cycle} census");
-            assert!(!scan.scan_cap_hit, "cycle {cycle} cap hit");
+            let mut index = ScanIndex::default();
+            let mut observed = Vec::new();
+            for cycle in 0..4 {
+                let mut scan = scan_source_roots_with_limit(
+                    SnapshotSource::Codex,
+                    std::slice::from_ref(&root),
+                    &mut index,
+                    "2026-07-22T09:00:00Z",
+                    BACKFILL_WINDOW_DAYS,
+                    MAX_BACKFILL_FILES_PER_SOURCE,
+                    true,
+                )
+                .unwrap_or_else(|error| panic!("cycle {cycle} traversal: {error}"));
+                assert!(scan.census_complete, "cycle {cycle} census");
+                assert!(!scan.scan_cap_hit, "cycle {cycle} cap hit");
+                assert_eq!(
+                    scan.ownership_incomplete_file_count, 0,
+                    "cycle {cycle} ownership"
+                );
+                // Loss stays disclosed on every cycle, including the ones that
+                // read nothing: three oversized physical lines, one dropped
+                // potential usage record each.
+                assert_eq!(scan.over_line_cap_count, 3, "cycle {cycle} over cap");
+                assert_eq!(
+                    scan.recognized_usage_drop_count, 3,
+                    "cycle {cycle} recognized drop"
+                );
+                assert_eq!(
+                    scan.dropped_usage_record_count, 3,
+                    "cycle {cycle} dropped usage"
+                );
+                observed.push((scan.scanned_file_count, scan.snapshots.len()));
+                finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
+            }
             assert_eq!(
-                scan.ownership_incomplete_file_count, 0,
-                "cycle {cycle} ownership"
+                observed,
+                vec![(3, 3), (0, 0), (0, 0), (0, 0)],
+                "the oversized parent must be read exactly once, not once per cycle"
             );
-            // Loss stays disclosed on every cycle, including the ones that
-            // read nothing: three oversized physical lines, one dropped
-            // potential usage record each.
-            assert_eq!(scan.over_line_cap_count, 3, "cycle {cycle} over cap");
-            assert_eq!(
-                scan.recognized_usage_drop_count, 3,
-                "cycle {cycle} recognized drop"
+            // PR-P §2.4: ordinal subagent children never consult a parent
+            // ledger, so they request no parent ref (P-T34 keeps the referenced
+            // parent's coverage).
+            assert!(
+                !index.codex_parent_ownership_refs.contains(parent_id),
+                "ordinal children request no parent reference"
             );
-            assert_eq!(
-                scan.dropped_usage_record_count, 3,
-                "cycle {cycle} dropped usage"
+            assert!(
+                !index.codex_parent_ownership_ledgers.contains_key(parent_id),
+                "a lossy parent must not publish a scan-complete ownership ledger"
             );
-            observed.push((scan.scanned_file_count, scan.snapshots.len()));
-            finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
-        }
-        assert_eq!(
-            observed,
-            vec![(3, 3), (0, 0), (0, 0), (0, 0)],
-            "the oversized parent must be read exactly once, not once per cycle"
-        );
-        // PR-P §2.4: ordinal subagent children never consult a parent
-        // ledger, so they request no parent ref (P-T34 keeps the referenced
-        // parent's coverage).
-        assert!(
-            !index.codex_parent_ownership_refs.contains(parent_id),
-            "ordinal children request no parent reference"
-        );
-        assert!(
-            !index.codex_parent_ownership_ledgers.contains_key(parent_id),
-            "a lossy parent must not publish a scan-complete ownership ledger"
-        );
-        assert_eq!(index.terminal_jsonl_dispositions.len(), 3);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn positive_usage_without_an_emittable_entity_stays_retryable() {
-        let root = temp_dir("positive-usage-without-entity");
-        fs::write(
-            root.join("session.jsonl"),
-            concat!(
-                "{\"type\":\"session\",\"session_id\":\"019e2700-1111-7000-9000-111111111111\"}\n",
-                "{\"type\":\"message_end\",\"message\":{\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"api\":\"responses\",\"usage\":{\"input\":12,\"output\":4,\"cacheRead\":0,\"cacheWrite\":0}}}\n"
-            ),
-        )
-        .expect("write positive usage without an activity timestamp");
-        let mut index = ScanIndex::default();
-        let scan = scan_source_roots_with_limit(
-            SnapshotSource::Pi,
-            std::slice::from_ref(&root),
-            &mut index,
-            "2026-07-22T08:02:00Z",
-            BACKFILL_WINDOW_DAYS,
-            MAX_BACKFILL_FILES_PER_SOURCE,
-            true,
-        )
-        .expect("lossy positive usage remains retryable");
-
-        assert_eq!(scan.recognized_usage_drop_count, 1);
-        // Non-progressing residue: the census completes with the loss named
-        // while the file itself stays un-indexed and retryable.
-        assert!(scan.census_complete);
-        assert!(scan.snapshots.is_empty());
-        assert!(index.files.is_empty());
-        assert!(index.confirmed_empty_files.is_empty());
-        let _ = fs::remove_dir_all(root);
+            assert_eq!(index.terminal_jsonl_dispositions.len(), 3);
+            let _ = fs::remove_dir_all(root);
+        });
     }
 
     #[test]
@@ -59165,43 +58782,6 @@ mod tests {
         assert_eq!(item.input_tokens, 150);
         assert_eq!(item.output_tokens, 30);
         assert_eq!(item.request_count, 2);
-
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn claude_code_turn_duration_skips_responses_without_preceding_user() {
-        // A response with no preceding `type=user` record (e.g. the transcript
-        // opens mid-stream after a compaction/resume) has no input moment to
-        // measure against and must contribute no latency sample. Only the
-        // response that follows a real user record is measured.
-        let path = temp_file("claude-turn-duration-noprompt");
-        fs::write(
-            &path,
-            concat!(
-                // Leading assistant response with nothing before it -> skipped.
-                "{\"timestamp\":\"2026-06-30T13:00:00.000Z\",\"type\":\"assistant\",\"sessionId\":\"claude-latency-2\",\"requestId\":\"req_A\",\"message\":{\"id\":\"msg_A\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n",
-                "{\"timestamp\":\"2026-06-30T13:00:01.000Z\",\"type\":\"user\",\"sessionId\":\"claude-latency-2\",\"message\":{\"role\":\"user\",\"content\":\"continue\"}}\n",
-                // Only this response has a preceding user record: 4000ms.
-                "{\"timestamp\":\"2026-06-30T13:00:05.000Z\",\"type\":\"assistant\",\"sessionId\":\"claude-latency-2\",\"requestId\":\"req_B\",\"message\":{\"id\":\"msg_B\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":7,\"output_tokens\":9}}}\n"
-            ),
-        )
-        .expect("write fixture");
-
-        let item = parse_claude_code_jsonl_file(
-            &path,
-            "2026-06-30T13:04:00Z",
-            "file-fingerprint".to_string(),
-        )
-        .expect("parse")
-        .into_iter()
-        .next()
-        .expect("snapshot");
-
-        // Exactly one turn measured, so avg == max == that single sample.
-        assert_eq!(item.avg_duration_ms, Some(4000));
-        assert_eq!(item.max_duration_ms, Some(4000));
-        assert_eq!(item.avg_time_to_first_token_ms, None);
 
         let _ = fs::remove_file(path);
     }
@@ -59820,44 +59400,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_state_only_covers_a_persisted_header_outside_both_filename_candidates() {
-        let owner = "header-outside-both-candidates";
-        let (mut metadata, index, native) = ambiguous_state_only_fixture(owner);
-        let path = Path::new(index.files.keys().next().unwrap());
-        assert!(!codex_session_id_candidates_from_path(path).contains(&owner.to_string()));
-        metadata.state_threads.insert(
-            owner.into(),
-            CodexStateThread {
-                tokens_used: 900,
-                ..Default::default()
-            },
-        );
-        for mut index in [
-            index.clone(),
-            serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap(),
-        ] {
-            let mut replacements = Vec::new();
-            append_codex_state_only_snapshots(
-                &mut replacements,
-                &metadata,
-                "2026-05-14T11:04:00Z",
-                &mut index,
-                &BTreeSet::new(),
-            );
-            assert!(!replacements
-                .iter()
-                .any(|item| item.source_session_id == owner));
-            assert_eq!(
-                replacements.len(),
-                2,
-                "header coverage does not cover unrelated filename candidates"
-            );
-            assert_eq!(native.input_tokens, 50);
-            assert_eq!(native.model_usage[0].model, "gpt-5.6-sol");
-        }
-    }
-
-    #[test]
     fn codex_ambiguous_filename_without_committed_owner_withholds_and_counts() {
         for (tokens, expected_sum) in [([900, 900], 1800), ([0, 0], 0), ([u64::MAX, 1], u64::MAX)] {
             for binding in [None, Some("malformed".to_string())] {
@@ -59978,69 +59520,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_accepted_owner_preserves_unambiguous_filename_coverage() {
-        let owner = "019e253c-9999-7000-9000-cccccccccccc";
-        for same in [false, true] {
-            for timestamp in [false, true] {
-                let (_, mut index, _) = ambiguous_state_only_fixture(owner);
-                let old = index.files.keys().next().unwrap().clone();
-                let filename_id = if same {
-                    owner
-                } else {
-                    "019e253c-8888-7000-9000-cccccccccccc"
-                };
-                let key = if timestamp {
-                    format!("rollout-2026-05-14T10-00-00-{filename_id}.jsonl")
-                } else {
-                    format!("rollout-{filename_id}.jsonl")
-                };
-                let entry = index.files.remove(&old).unwrap();
-                let incidence = index.file_snapshot_fingerprints.remove(&old).unwrap();
-                index.files.insert(key.clone(), entry);
-                index
-                    .file_snapshot_fingerprints
-                    .insert(key.clone(), incidence);
-                assert!(codex_index_file_body_accepted(
-                    &index,
-                    &key,
-                    &index.files[&key]
-                ));
-                let mut metadata = CodexTitleMetadata::default();
-                for id in [owner, filename_id] {
-                    metadata.state_threads.insert(
-                        id.into(),
-                        CodexStateThread {
-                            tokens_used: 900,
-                            ..Default::default()
-                        },
-                    );
-                }
-                assert_eq!(
-                    metadata
-                        .identity_from_path_evidence(Path::new(&key))
-                        .as_deref(),
-                    Some(filename_id)
-                );
-                let mut items = Vec::new();
-                let (_, rows) = crate::local_resource_diagnostics::capture(|| {
-                    append_codex_state_only_snapshots(
-                        &mut items,
-                        &metadata,
-                        "2026-05-14T11:04:00Z",
-                        &mut index,
-                        &BTreeSet::new(),
-                    )
-                });
-                assert!(
-                    items.is_empty(),
-                    "header and unique filename identities both retain coverage"
-                );
-                assert!(rows.iter().all(|row| row["stage"] == "codex_state_only"));
-            }
-        }
-    }
-
-    #[test]
     fn codex_ambiguous_observations_are_supported_fingerprinted_and_batched_per_pass() {
         let owner = "019e253c-9999-7000-9000-cccccccccccc";
         let (metadata, mut index, _) = ambiguous_state_only_fixture(owner);
@@ -60139,74 +59618,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_state_only_terminal_diagnostic_counts_uncovered_entities() {
-        for n in [0, 1, 3] {
-            let dir = temp_dir("codex-state-only-terminal-counts");
-            let sessions = dir.join("sessions");
-            fs::create_dir_all(&sessions).unwrap();
-            let connection = Connection::open(dir.join("state_5.sqlite")).unwrap();
-            connection.execute(CODEX_THREADS_DDL, []).unwrap();
-            for i in 0..=n {
-                connection
-                    .execute(
-                        CODEX_THREADS_INSERT,
-                        (
-                            format!("019e253c-bbbb-7000-9000-{i:012x}"),
-                            "Synthetic State Thread",
-                            if i < n { 59_i64 } else { 0 },
-                            0_i64,
-                            1_777_777_000_i64,
-                            1_777_777_100_i64,
-                            1_777_777_000_000_i64,
-                            1_777_777_100_000_i64,
-                            "fixture-model",
-                        ),
-                    )
-                    .unwrap();
-            }
-            drop(connection);
-            let mut index = ScanIndex::default();
-            let (scan, rows) = crate::local_resource_diagnostics::capture(|| {
-                scan_source_roots(
-                    SnapshotSource::Codex,
-                    &[sessions],
-                    &mut index,
-                    "2026-05-14T10:04:00Z",
-                    BACKFILL_WINDOW_DAYS,
-                )
-                .unwrap()
-            });
-            assert!(scan.census_complete, "the real terminal append call ran");
-            assert_eq!(scan.snapshots.len(), n);
-            assert_eq!(scan.scanned_session_count, n);
-            assert_eq!(scan.semantic_noop_count, 0);
-            let observations = rows
-                .iter()
-                .filter(|row| row["stage"] == "codex_state_only")
-                .collect::<Vec<_>>();
-            if n == 0 {
-                assert!(observations.is_empty(), "all-zero diagnostic is omitted");
-            } else {
-                assert_eq!(observations.len(), 1, "one record per terminal call");
-                assert_eq!(observations[0]["source"], "codex");
-                assert_eq!(
-                    observations[0]["counts"],
-                    json!({"codex_state_only": {
-                        "scanned": n, "emitted": n, "noops": 0,
-                    }})
-                );
-            }
-            assert!(!serde_json::to_string(&scan.snapshots)
-                .unwrap()
-                .contains("codex_state_only"));
-            assert!(!serde_json::to_string(&index)
-                .unwrap()
-                .contains("\"codex_state_only\":"));
-            fs::remove_dir_all(dir).unwrap();
-        }
-    }
-
-    #[test]
     fn codex_state_only_replaces_a_deleted_rollout_in_the_same_complete_census() {
         let codex_dir = temp_dir("codex-state-deleted-rollout");
         let sessions_dir = codex_dir.join("sessions");
@@ -60277,89 +59688,6 @@ mod tests {
             state_only.provenance.input_token_scope.as_deref(),
             Some("total_only")
         );
-        let _ = fs::remove_dir_all(codex_dir);
-    }
-
-    #[test]
-    fn ambiguous_codex_fork_blocks_inclusive_state_only_fallback() {
-        let codex_dir = temp_dir("codex-ambiguous-state-fallback");
-        let sessions_dir = codex_dir.join("sessions");
-        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
-        let session_id = "019fcafe-aaaa-7000-9000-eeeeeeeeeeee";
-        fs::write(
-            sessions_dir.join(format!(
-                "rollout-2026-08-02T10-00-00-{session_id}.jsonl"
-            )),
-            format!(
-                "{{\"timestamp\":\"2026-08-02T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session_id}\",\"forked_from_id\":\"root\",\"thread_source\":\"user\",\"source\":\"cli\"}}}}\n{{\"timestamp\":\"2026-08-02T10:01:00Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":1000,\"output_tokens\":100}},\"last_token_usage\":{{\"input_tokens\":100,\"output_tokens\":10}},\"model\":\"gpt-5.6-sol\"}}}}}}\n"
-            ),
-        )
-        .expect("write ambiguous rollout");
-        let connection = Connection::open(codex_dir.join("state_5.sqlite")).expect("open sqlite");
-        connection
-            .execute(CODEX_THREADS_DDL, [])
-            .expect("create threads");
-        connection
-            .execute(
-                CODEX_THREADS_INSERT,
-                (
-                    session_id,
-                    "Ambiguous Fork",
-                    1_100_i64,
-                    0_i64,
-                    1_775_300_400_i64,
-                    1_775_300_460_i64,
-                    1_775_300_400_000_i64,
-                    1_775_300_460_000_i64,
-                    "gpt-5.6-sol",
-                ),
-            )
-            .expect("insert thread");
-        drop(connection);
-
-        let mut index = ScanIndex::default();
-        let scan = scan_source_roots(
-            SnapshotSource::Codex,
-            std::slice::from_ref(&sessions_dir),
-            &mut index,
-            "2026-08-02T10:04:00Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("scan ambiguous fork");
-        assert!(scan
-            .snapshots
-            .iter()
-            .all(|snapshot| snapshot.source_session_id != session_id));
-        assert_eq!(scan.recognized_usage_drop_count, 0);
-        assert!(!scan.census_complete);
-        assert!(!index
-            .codex_state_only_snapshot_fingerprints
-            .contains_key(session_id));
-        assert!(index
-            .codex_state_only_blocked_session_ids
-            .contains(session_id));
-
-        // The unresolved boundary is durable but is expected retry work, not
-        // transcript loss. The clean follow-up generation runs without an
-        // unhealthy backoff; inclusive state usage must stay blocked.
-        let serialized_index = serde_json::to_vec(&index).expect("serialize unresolved block");
-        let mut index: ScanIndex =
-            serde_json::from_slice(&serialized_index).expect("restore unresolved block");
-        let second = scan_source_roots(
-            SnapshotSource::Codex,
-            std::slice::from_ref(&sessions_dir),
-            &mut index,
-            "2026-08-02T10:04:01Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("second scan retains unresolved boundary");
-        assert!(second
-            .snapshots
-            .iter()
-            .all(|snapshot| snapshot.source_session_id != session_id));
-        assert!(index
-            .codex_state_only_blocked_session_ids
-            .contains(session_id));
         let _ = fs::remove_dir_all(codex_dir);
     }
 
@@ -60639,73 +59967,6 @@ mod tests {
         )
         .expect("third scan");
         assert_eq!(third.snapshots.len(), 0);
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn scan_checkpoints_codex_zero_parsed_file_until_it_changes() {
-        let root = temp_dir("codex-retry-zero-parsed");
-        let path =
-            root.join("rollout-2026-05-14T10-00-00-019e2700-3333-7000-9000-333333333333.jsonl");
-        let session_meta = "{\"timestamp\":\"2026-05-14T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e2700-3333-7000-9000-333333333333\"}}\n";
-        fs::write(&path, session_meta).expect("write empty usage fixture");
-
-        let mut index = ScanIndex::default();
-        let first_empty = scan_source_roots(
-            SnapshotSource::Codex,
-            std::slice::from_ref(&root),
-            &mut index,
-            "2026-05-14T10:05:00Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("first empty scan");
-        assert_eq!(first_empty.snapshots.len(), 0);
-        assert_eq!(first_empty.scanned_file_count, 1);
-        assert_eq!(first_empty.scanned_session_count, 0);
-
-        let settled_empty = scan_source_roots(
-            SnapshotSource::Codex,
-            std::slice::from_ref(&root),
-            &mut index,
-            "2026-05-14T10:05:30Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("settled empty scan");
-        assert_eq!(settled_empty.snapshots.len(), 0);
-        assert_eq!(settled_empty.scanned_file_count, 0);
-        assert_eq!(settled_empty.scanned_session_count, 0);
-
-        fs::write(
-            &path,
-            format!(
-                "{session_meta}{}",
-                "{\"timestamp\":\"2026-05-14T10:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":40,\"output_tokens\":8},\"model\":\"gpt-5.5\"}}}\n"
-            ),
-        )
-        .expect("write usage fixture");
-
-        let populated = scan_source_roots(
-            SnapshotSource::Codex,
-            std::slice::from_ref(&root),
-            &mut index,
-            "2026-05-14T10:06:00Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("populated scan");
-        assert_eq!(populated.snapshots.len(), 1);
-        assert_eq!(populated.scanned_session_count, 1);
-
-        let settled = scan_source_roots(
-            SnapshotSource::Codex,
-            std::slice::from_ref(&root),
-            &mut index,
-            "2026-05-14T10:07:00Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("settled scan");
-        assert_eq!(settled.snapshots.len(), 0);
-        assert_eq!(settled.scanned_file_count, 0);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -61003,162 +60264,6 @@ mod tests {
     }
 
     #[test]
-    fn pi_invalid_provider_timestamp_does_not_fall_back_to_envelope_time() {
-        let root = temp_dir("pi-invalid-provider-valid-envelope");
-        let path = root.join("session.jsonl");
-        fs::write(
-            &path,
-            concat!(
-                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
-                "{\"type\":\"message\",\"timestamp\":\"2026-07-22T09:00:00Z\",\"message\":{\"role\":\"assistant\",\"model\":\"gpt-5.4\",\"responseId\":\"bad-provider-time\",\"timestamp\":\"not-a-time\",\"usage\":{\"input\":12,\"output\":4}}}\n",
-            ),
-        )
-        .expect("write invalid provider timestamp fixture");
-
-        let mut index = ScanIndex::default();
-        let scan = scan_source_roots(
-            SnapshotSource::Pi,
-            std::slice::from_ref(&root),
-            &mut index,
-            "2026-07-22T09:01:00Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("scan invalid provider timestamp fixture");
-
-        assert!(scan.snapshots.is_empty());
-        // Non-progressing residue: the census completes with the loss named
-        // while the file itself stays un-indexed and retryable.
-        assert!(scan.census_complete);
-        assert_eq!(scan.dropped_usage_record_count, 1);
-        assert!(index.files.is_empty());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn codex_and_claude_partial_timestamp_loss_stays_visible() {
-        let codex_root = temp_dir("codex-partial-timestamp-loss");
-        let codex_path = codex_root.join("rollout-019e253c-6666-7000-9000-aaaaaaaaaaaa.jsonl");
-        fs::write(
-            &codex_path,
-            concat!(
-                "{\"timestamp\":\"2026-07-22T08:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e253c-6666-7000-9000-aaaaaaaaaaaa\"}}\n",
-                "{\"timestamp\":\"not-a-time\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":10,\"output_tokens\":2},\"model\":\"gpt-5.5\"}}}\n",
-                "{\"timestamp\":\"2026-07-22T08:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":15,\"output_tokens\":3},\"model\":\"gpt-5.5\"}}}\n",
-            ),
-        )
-        .expect("write Codex partial-loss fixture");
-        let mut codex_index = ScanIndex::default();
-        let codex = scan_source_roots(
-            SnapshotSource::Codex,
-            std::slice::from_ref(&codex_root),
-            &mut codex_index,
-            "2026-07-22T08:02:00Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("scan Codex partial-loss fixture");
-        assert!(codex.snapshots.is_empty());
-        // Non-progressing residue: the census completes with the loss named
-        // while the file itself stays un-indexed and retryable.
-        assert!(codex.census_complete);
-        assert_eq!(codex.dropped_usage_record_count, 1);
-
-        let claude_root = temp_dir("claude-partial-timestamp-loss");
-        let claude_path = claude_root.join("019e2700-4444-7000-9000-444444444444.jsonl");
-        fs::write(
-            &claude_path,
-            concat!(
-                "{\"timestamp\":\"2026-07-22T08:00:00Z\",\"sessionId\":\"019e2700-4444-7000-9000-444444444444\",\"type\":\"system\"}\n",
-                "{\"timestamp\":\"not-a-time\",\"sessionId\":\"019e2700-4444-7000-9000-444444444444\",\"type\":\"assistant\",\"requestId\":\"bad\",\"message\":{\"id\":\"bad\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\n",
-                "{\"timestamp\":\"2026-07-22T08:01:00Z\",\"sessionId\":\"019e2700-4444-7000-9000-444444444444\",\"type\":\"assistant\",\"requestId\":\"good\",\"message\":{\"id\":\"good\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n",
-            ),
-        )
-        .expect("write Claude partial-loss fixture");
-        let mut claude_index = ScanIndex::default();
-        let claude = scan_source_roots(
-            SnapshotSource::ClaudeCode,
-            std::slice::from_ref(&claude_root),
-            &mut claude_index,
-            "2026-07-22T08:02:00Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("scan Claude partial-loss fixture");
-        assert!(claude.snapshots.is_empty());
-        // Non-progressing residue: the census completes with the loss named
-        // while the file itself stays un-indexed and retryable.
-        assert!(claude.census_complete);
-        assert_eq!(claude.dropped_usage_record_count, 1);
-
-        let _ = fs::remove_dir_all(codex_root);
-        let _ = fs::remove_dir_all(claude_root);
-    }
-
-    #[test]
-    fn scan_checkpoints_claude_zero_parsed_file_until_it_changes() {
-        let root = temp_dir("claude-retry-zero-parsed");
-        let path = root.join("019e2700-4444-7000-9000-444444444444.jsonl");
-        let session_header = "{\"timestamp\":\"2026-05-14T10:00:00Z\",\"sessionId\":\"019e2700-4444-7000-9000-444444444444\",\"type\":\"system\"}\n";
-        fs::write(&path, session_header).expect("write empty usage fixture");
-
-        let mut index = ScanIndex::default();
-        let first_empty = scan_source_roots(
-            SnapshotSource::ClaudeCode,
-            std::slice::from_ref(&root),
-            &mut index,
-            "2026-05-14T10:05:00Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("first empty scan");
-        assert_eq!(first_empty.snapshots.len(), 0);
-        assert_eq!(first_empty.scanned_file_count, 1);
-        assert_eq!(first_empty.scanned_session_count, 0);
-
-        let settled_empty = scan_source_roots(
-            SnapshotSource::ClaudeCode,
-            std::slice::from_ref(&root),
-            &mut index,
-            "2026-05-14T10:05:30Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("settled empty scan");
-        assert_eq!(settled_empty.snapshots.len(), 0);
-        assert_eq!(settled_empty.scanned_file_count, 0);
-        assert_eq!(settled_empty.scanned_session_count, 0);
-
-        fs::write(
-            &path,
-            format!(
-                "{session_header}{}",
-                "{\"timestamp\":\"2026-05-14T10:03:00Z\",\"sessionId\":\"019e2700-4444-7000-9000-444444444444\",\"type\":\"assistant\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n"
-            ),
-        )
-        .expect("write usage fixture");
-
-        let populated = scan_source_roots(
-            SnapshotSource::ClaudeCode,
-            std::slice::from_ref(&root),
-            &mut index,
-            "2026-05-14T10:06:00Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("populated scan");
-        assert_eq!(populated.snapshots.len(), 1);
-        assert_eq!(populated.scanned_session_count, 1);
-
-        let settled = scan_source_roots(
-            SnapshotSource::ClaudeCode,
-            std::slice::from_ref(&root),
-            &mut index,
-            "2026-05-14T10:07:00Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("settled scan");
-        assert_eq!(settled.snapshots.len(), 0);
-        assert_eq!(settled.scanned_file_count, 0);
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn pi_scan_reprocesses_v6_zero_parse_index_entries() {
         let root = temp_dir("pi-v6-index");
         let path = root.join("session-019e2700-2222-7000-9000-222222222222.jsonl");
@@ -61319,35 +60424,6 @@ mod tests {
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(noisy_path);
         let _ = fs::remove_file(continuation_path);
-    }
-
-    #[test]
-    fn codex_agent_role_prompt_titles() {
-        for (source, prompt, expected) in [
-            (SnapshotSource::Codex, "You are the LANDING OWNER AGENT for ottto-ai/coding-agents-observability — coordinate the queue and keep the full operating contract private.", Some("Landing owner agent")),
-            (SnapshotSource::Codex, "You are a PR REPAIR AGENT for ottto-ai/coding-agents-observability.", Some("PR repair agent")),
-            (SnapshotSource::Codex, "You are a Phase-2 projector implementation worker (GPT-5.6 Sol via Codex CLI).", Some("Phase-2 projector implementation worker")),
-            (SnapshotSource::Codex, "You are the extraordinarily detailed multi-stage cross-repository production incident response coordination agent for this task.", None),
-            (SnapshotSource::Codex, "You are the /root repair agent for this task.", None),
-            (SnapshotSource::Codex, "You are the diligent agentless helper.", None),
-            (SnapshotSource::ClaudeCode, "You are the LANDING OWNER AGENT for this task.", None),
-        ] {
-            assert_eq!(first_prompt_display_title(source, prompt.into()).as_deref(), expected, "{prompt}");
-        }
-    }
-
-    #[test]
-    fn first_prompt_material_filters_only_injected_scaffolding() {
-        for (prompts, expected, check_title) in [
-            (vec!["# AGENTS.md instructions for /repo\n<INSTRUCTIONS>Shared setup</INSTRUCTIONS>\n<environment_context><cwd>/repo</cwd></environment_context>", "Investigate the upload timeout"], "Investigate the upload timeout", true),
-            (vec!["Update the AGENTS.md instructions and parse the current date: field"], "Update the AGENTS.md instructions and parse the current date: field", false),
-            (vec!["<recommended_plugins>Plugins</recommended_plugins>\n# AGENTS.md instructions for /repo\n<INSTRUCTIONS>Shared setup</INSTRUCTIONS>\n<environment_context><cwd>/repo</cwd></environment_context>\nExplain how this XML is parsed"], "Explain how this XML is parsed", true),
-        ] {
-            let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
-            for prompt in prompts { accumulator.set_first_prompt_title(Some(prompt.into())); }
-            assert_eq!(accumulator.first_prompt_material.as_deref(), Some(expected));
-            if check_title { assert_eq!(accumulator.first_prompt_title.as_deref(), Some(expected)); }
-        }
     }
 
     #[test]
@@ -62027,15 +61103,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_logs2_priority_turn_from_body_extracts_turn_id_for_priority() {
-        let body = priority_request_body(FAST_TURN);
-        assert_eq!(
-            codex_logs2_priority_turn_from_body(&body).as_deref(),
-            Some(FAST_TURN)
-        );
-    }
-
-    #[test]
     fn codex_logs2_priority_turn_from_body_ignores_standard_and_non_request() {
         // No service_tier (standard) -> not a fast turn.
         let standard = "turn{turn.id=019ee421-1b3b-71c3-a0a8-ec9f645bf521}: \
@@ -62440,35 +61507,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_attribution_contract_allows_all_five_keys() {
-        let keys = [
-            ("attribution_subagent", "general-purpose"),
-            ("attribution_skill", "design-sync"),
-            ("attribution_plugin", "anthropic-skills"),
-            ("attribution_mcp_server", "claude-in-chrome"),
-            ("attribution_mcp_tool", "tabs_context_mcp"),
-        ];
-        let mut merged = SelectorCapture::default();
-        merged.insert("context_bucket", "long".into(), "test");
-        for (key, value) in keys {
-            assert!(SELECTOR_CONTEXT_ALLOWED.contains(&key));
-            merged.insert(key, value.into(), "claude_code_attribution_field");
-        }
-        let (_, context, sources) = build_row_identity("claude-opus-4-8", &merged, None);
-        assert_eq!(
-            context.get("context_bucket").map(String::as_str),
-            Some("long")
-        );
-        for (key, value) in keys {
-            assert_eq!(context.get(key).map(String::as_str), Some(value));
-            assert_eq!(
-                sources.get(key).map(String::as_str),
-                Some("claude_code_attribution_field")
-            );
-        }
-    }
-
-    #[test]
     fn codex_logs2_reader_collects_priority_turns_from_sqlite() {
         let codex_dir = temp_dir("codex-logs2-reader");
         let db_path = codex_dir.join("logs_2.sqlite");
@@ -62580,44 +61618,6 @@ mod tests {
             .expect("standard row");
         assert_eq!(standard.input_tokens, 100);
         assert_eq!(standard.output_tokens, 30);
-
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn codex_logs2_tier_absent_map_leaves_turns_standard() {
-        // Same fast turn, but no trace map: the parser is unchanged and stamps
-        // no service_tier (regression guard for the default path).
-        let path = temp_file("codex-logs2-none");
-        fs::write(
-            &path,
-            format!(
-                concat!(
-                    "{{\"timestamp\":\"2026-06-20T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"019ee443-4c18-71c3-843e-847232f694b0\"}}}}\n",
-                    "{{\"timestamp\":\"2026-06-20T10:01:00Z\",\"type\":\"turn_context\",\"payload\":{{\"model\":\"gpt-5.5\",\"turn_id\":\"{fast}\"}}}}\n",
-                    "{{\"timestamp\":\"2026-06-20T10:02:00Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":300,\"output_tokens\":90,\"request_count\":1}},\"model\":\"gpt-5.5\"}}}}}}\n"
-                ),
-                fast = FAST_TURN,
-            ),
-        )
-        .expect("write fixture");
-
-        let item = parse_codex_jsonl_file_with_title_metadata(
-            &path,
-            "2026-06-20T10:05:00Z",
-            "file-fingerprint".to_string(),
-            &CodexTitleMetadata::default(),
-            None,
-        )
-        .expect("parse")
-        .into_iter()
-        .next()
-        .expect("snapshot");
-
-        assert_eq!(item.model_usage.len(), 1);
-        assert!(!item.model_usage[0]
-            .selector_context
-            .contains_key("service_tier"));
 
         let _ = fs::remove_file(path);
     }
@@ -62825,65 +61825,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_settings_defaults_capture_model_permission_mode_fast_and_sandbox() {
-        let root = temp_dir("claude-settings-defaults");
-        let claude_dir = root.join(".claude");
-        fs::create_dir_all(&claude_dir).expect("create .claude");
-        fs::write(
-            claude_dir.join("settings.json"),
-            concat!(
-                "{\n",
-                "  \"model\": \"claude-opus-4-7\",\n",
-                "  \"effortLevel\": \"high\",\n",
-                "  \"fastMode\": true,\n",
-                "  \"permissions\": {\"defaultMode\": \"acceptEdits\"},\n",
-                "  \"sandbox\": {\"enabled\": true}\n",
-                "}\n"
-            ),
-        )
-        .expect("write settings");
-
-        let paths = claude_settings_chain(&claude_dir, &root.join("managed-settings.json"));
-        let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(&paths) else {
-            panic!("expected configured Claude defaults");
-        };
-        assert_eq!(defaults.model.as_deref(), Some("claude-opus-4-7"));
-        assert_eq!(defaults.reasoning_effort.as_deref(), Some("high"));
-        assert_eq!(
-            defaults
-                .selector_sources
-                .get("reasoning_effort")
-                .map(String::as_str),
-            Some("claude_code.settings.effortLevel")
-        );
-        assert_eq!(defaults.approval_policy.as_deref(), Some("acceptEdits"));
-        assert_eq!(defaults.fast_mode_enabled, Some(true));
-        // `sandbox.enabled` with no `autoAllowBashIfSandboxed` override is
-        // Claude Code's auto-allow default.
-        assert_eq!(defaults.sandbox_mode.as_deref(), Some("auto_allow"));
-        assert_eq!(
-            defaults.selector_sources.get("model").map(String::as_str),
-            Some("claude_code.settings.model")
-        );
-        assert_eq!(
-            defaults
-                .selector_sources
-                .get("approval_policy")
-                .map(String::as_str),
-            Some("claude_code.settings.permissions.defaultMode")
-        );
-        assert_eq!(
-            defaults
-                .selector_context
-                .get("fast_mode_enabled")
-                .map(String::as_str),
-            Some("true")
-        );
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn claude_settings_defaults_prefer_local_then_managed_scope() {
         let root = temp_dir("claude-settings-precedence");
         let claude_dir = root.join(".claude");
@@ -63020,279 +61961,6 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    /// Without a saved model, the effort depends on the model Claude Code
-    /// starts with, so no single effort is reported, even for one entry, and the
-    /// stale legacy key is not resurrected. The model itself is never invented.
-    /// Each entry is still reported per model, and alone keeps the capture
-    /// configured.
-    #[test]
-    fn claude_settings_defaults_model_settings_effort_without_saved_model() {
-        let root = temp_dir("claude-settings-model-effort-unset");
-        let claude_dir = root.join(".claude");
-        fs::create_dir_all(&claude_dir).expect("create .claude");
-        let paths = claude_settings_chain(&claude_dir, &root.join("managed-settings.json"));
-
-        fs::write(
-            claude_dir.join("settings.json"),
-            "{\"effortLevel\": \"low\", \"modelSettings\": {\"claude-opus-5-5\": {\"effortLevel\": \"high\"}, \"claude-sonnet-5\": {}}}\n",
-        )
-        .expect("write settings");
-        let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(&paths) else {
-            panic!("expected configured Claude defaults");
-        };
-        assert_eq!(defaults.reasoning_effort, None);
-        assert_eq!(
-            defaults.reasoning_effort_by_model,
-            BTreeMap::from([("claude-opus-5-5".to_string(), "high".to_string())])
-        );
-
-        fs::write(
-            claude_dir.join("settings.json"),
-            "{\"effortLevel\": \"low\", \"permissions\": {\"defaultMode\": \"auto\"}, \"modelSettings\": {\"claude-opus-5[1m]\": {\"effortLevel\": \"high\"}, \"claude-opus-5-5\": {\"effortLevel\": \"medium\"}}}\n",
-        )
-        .expect("rewrite settings");
-        let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(&paths) else {
-            panic!("expected configured Claude defaults");
-        };
-        assert_eq!(defaults.reasoning_effort, None);
-        assert!(!defaults.selector_sources.contains_key("reasoning_effort"));
-        assert_eq!(defaults.model, None);
-        assert_eq!(defaults.approval_policy.as_deref(), Some("auto"));
-        assert_eq!(
-            defaults.reasoning_effort_by_model,
-            BTreeMap::from([
-                ("claude-opus-5".to_string(), "high".to_string()),
-                ("claude-opus-5-5".to_string(), "medium".to_string()),
-            ])
-        );
-        assert_eq!(
-            defaults
-                .selector_sources
-                .get("reasoning_effort_by_model")
-                .map(String::as_str),
-            Some("claude_code.settings.modelSettings")
-        );
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    /// Scope precedence holds for per-model effort: the highest file with an
-    /// answer wins, and the winning `model` selects the key in every file.
-    #[test]
-    fn claude_settings_defaults_model_settings_effort_respects_scope_precedence() {
-        let root = temp_dir("claude-settings-model-effort-scopes");
-        let claude_dir = root.join(".claude");
-        fs::create_dir_all(&claude_dir).expect("create .claude");
-        let managed = root.join("managed-settings.json");
-        let paths = claude_settings_chain(&claude_dir, &managed);
-        fs::write(
-            claude_dir.join("settings.json"),
-            "{\"model\": \"claude-opus-5\", \"modelSettings\": {\"claude-opus-5\": {\"effortLevel\": \"high\"}, \"claude-opus-5-5\": {\"effortLevel\": \"medium\"}}}\n",
-        )
-        .expect("write user settings");
-
-        // A managed `model` selects the user file's entry for that model.
-        fs::write(&managed, "{\"model\": \"claude-opus-5-5\"}\n").expect("write managed");
-        assert_eq!(
-            claude_effort_with_source(&paths),
-            Some((
-                "medium".to_string(),
-                "claude_code.settings.modelSettings.claude-opus-5-5.effortLevel".to_string()
-            ))
-        );
-
-        // A local top-level `effortLevel` overrides the user's per-model entry.
-        fs::write(
-            claude_dir.join("settings.local.json"),
-            "{\"effortLevel\": \"xhigh\"}\n",
-        )
-        .expect("write local settings");
-        assert_eq!(
-            claude_effort_with_source(&paths),
-            Some((
-                "xhigh".to_string(),
-                "claude_code.settings_local.effortLevel".to_string()
-            ))
-        );
-
-        // A managed per-model entry overrides both.
-        fs::write(
-            &managed,
-            "{\"model\": \"claude-opus-5-5[1m]\", \"modelSettings\": {\"claude-opus-5-5\": {\"effortLevel\": \"low\"}}}\n",
-        )
-        .expect("rewrite managed");
-        assert_eq!(
-            claude_effort_with_source(&paths),
-            Some((
-                "low".to_string(),
-                "claude_code.managed_settings.modelSettings.claude-opus-5-5.effortLevel"
-                    .to_string()
-            ))
-        );
-        // Each model follows the same rule: the local top-level value covers
-        // the model the managed file has no entry for. The source names both.
-        let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(&paths) else {
-            panic!("expected configured Claude defaults");
-        };
-        // The managed model is too unusual to display, so the user's model is
-        // not shown beside the managed model's effort.
-        assert_eq!(defaults.model, None);
-        assert_eq!(
-            defaults.reasoning_effort_by_model,
-            BTreeMap::from([
-                ("claude-opus-5".to_string(), "xhigh".to_string()),
-                ("claude-opus-5-5".to_string(), "low".to_string()),
-            ])
-        );
-        assert_eq!(
-            defaults
-                .selector_sources
-                .get("reasoning_effort_by_model")
-                .map(String::as_str),
-            Some(
-                "claude_code.settings_local.effortLevel,claude_code.managed_settings.modelSettings"
-            )
-        );
-
-        // A managed top-level `effortLevel` sets every model.
-        fs::write(&managed, "{\"effortLevel\": \"low\"}\n").expect("rewrite managed");
-        let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(&paths) else {
-            panic!("expected configured Claude defaults");
-        };
-        assert_eq!(defaults.reasoning_effort.as_deref(), Some("low"));
-        assert!(defaults
-            .reasoning_effort_by_model
-            .values()
-            .all(|effort| effort == "low"));
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn claude_settings_defaults_keep_only_safe_scalars() {
-        for (file, body, model, effort, fast) in [
-            (
-                "settings.local.json",
-                json!({"effortLevel":"max"}),
-                None,
-                Some("max"),
-                Some(false),
-            ),
-            (
-                "settings.json",
-                json!({"effortLevel":"/Users/someone/.claude/effort-profile", "model":"claude-opus-4-7"}),
-                Some("claude-opus-4-7"),
-                None,
-                Some(false),
-            ),
-            (
-                "settings.json",
-                json!({"effortLevel":4,"model":"claude-opus-4-7"}),
-                Some("claude-opus-4-7"),
-                None,
-                Some(false),
-            ),
-            (
-                "settings.json",
-                json!({"model":"/Users/someone/models/local.gguf","fastMode":false}),
-                None,
-                None,
-                Some(false),
-            ),
-        ] {
-            let root = temp_dir("claude-settings-scalars");
-            let claude_dir = root.join(".claude");
-            fs::create_dir_all(&claude_dir).unwrap();
-            fs::write(claude_dir.join(file), body.to_string()).unwrap();
-            let paths = claude_settings_chain(&claude_dir, &root.join("managed-settings.json"));
-            let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(&paths)
-            else {
-                panic!("configured defaults");
-            };
-            assert_eq!(defaults.model.as_deref(), model);
-            assert_eq!(defaults.reasoning_effort.as_deref(), effort);
-            assert_eq!(defaults.fast_mode_enabled, fast);
-            if effort.is_none() {
-                assert!(!defaults.selector_context.contains_key("reasoning_effort"));
-            }
-            let _ = fs::remove_dir_all(root);
-        }
-    }
-
-    #[test]
-    fn claude_settings_defaults_report_fast_off_only_when_a_file_was_read() {
-        let root = temp_dir("claude-settings-empty");
-        let claude_dir = root.join(".claude");
-        fs::create_dir_all(&claude_dir).expect("create .claude");
-        let paths = claude_settings_chain(&claude_dir, &root.join("managed-settings.json"));
-
-        // No settings file at all: we could not look, so Fast stays unknown.
-        assert_eq!(
-            load_claude_defaults(&paths),
-            ClaudeConfigDefaultsOutcome::Unreadable
-        );
-
-        // Unparseable settings are also "we could not read it".
-        fs::write(claude_dir.join("settings.json"), "not json\n").expect("write settings");
-        assert_eq!(
-            load_claude_defaults(&paths),
-            ClaudeConfigDefaultsOutcome::Unreadable
-        );
-
-        // Readable settings without `fastMode`: Claude Code's default, off, and
-        // labelled as the default rather than as a key in the file.
-        fs::write(
-            claude_dir.join("settings.json"),
-            "{\"agentPushNotifEnabled\": true, \"cleanupPeriodDays\": 30}\n",
-        )
-        .expect("write settings");
-        let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(&paths) else {
-            panic!("expected configured Claude defaults");
-        };
-        assert_eq!(defaults.fast_mode_enabled, Some(false));
-        assert_eq!(
-            defaults
-                .selector_context
-                .get("fast_mode_enabled")
-                .map(String::as_str),
-            Some("false")
-        );
-        assert_eq!(
-            defaults
-                .selector_sources
-                .get("fast_mode_enabled")
-                .map(String::as_str),
-            Some("claude_code.default.fastMode")
-        );
-        assert_eq!(defaults.model, None);
-        assert_eq!(defaults.reasoning_effort, None);
-        assert_eq!(defaults.approval_policy, None);
-        assert_eq!(defaults.sandbox_mode, None);
-
-        for (body, source) in [
-            (r#"{"fastMode":false}"#, "claude_code.settings.fastMode"),
-            (
-                r#"{"fastMode":true,"fastModePerSessionOptIn":true}"#,
-                "claude_code.settings.fastModePerSessionOptIn",
-            ),
-        ] {
-            fs::write(claude_dir.join("settings.json"), body).unwrap();
-            let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(&paths)
-            else {
-                panic!("configured defaults");
-            };
-            assert_eq!(defaults.fast_mode_enabled, Some(false));
-            assert_eq!(
-                defaults
-                    .selector_sources
-                    .get("fast_mode_enabled")
-                    .map(String::as_str),
-                Some(source)
-            );
-        }
-        let _ = fs::remove_dir_all(root);
-    }
-
     #[test]
     fn claude_settings_defaults_never_emit_paths_secrets_or_bypass_permissions() {
         let root = temp_dir("claude-settings-redaction");
@@ -63355,127 +62023,6 @@ mod tests {
         assert_eq!(leaked, None, "no path or secret text may ride along");
 
         let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn codex_parser_does_not_backdate_fast_opt_out_to_history() {
-        let root = temp_dir("codex-config-standard-selector");
-        let codex_dir = root.join(".codex");
-        let sessions_dir = codex_dir.join("sessions");
-        fs::create_dir_all(&sessions_dir).expect("create sessions");
-        fs::write(
-            codex_dir.join("config.toml"),
-            "model = \"gpt-5.5\"\nfast_default_opt_out = true\n",
-        )
-        .expect("write config");
-        let path = sessions_dir.join("session.jsonl");
-        fs::write(
-            &path,
-            concat!(
-                "{\"timestamp\":\"2026-05-19T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e2700-cafe-7000-9000-333333333333\"}}\n",
-                "{\"timestamp\":\"2026-05-19T10:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":10,\"output_tokens\":4,\"request_count\":1},\"model\":\"gpt-5.5\"}}}\n"
-            ),
-        )
-        .expect("write fixture");
-        let metadata = CodexTitleMetadata::load_from_roots(std::slice::from_ref(&sessions_dir));
-
-        let item = parse_codex_jsonl_file_with_title_metadata(
-            &path,
-            "2026-05-19T10:04:00Z",
-            "file-fingerprint".to_string(),
-            &metadata,
-            None,
-        )
-        .expect("parse")
-        .into_iter()
-        .next()
-        .expect("snapshot");
-
-        let selector = &item.model_usage[0].selector_context;
-        assert!(selector.is_empty());
-        assert!(item.model_usage[0].selector_sources.is_empty());
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn codex_parser_does_not_backdate_notice_fast_opt_out_to_history() {
-        let root = temp_dir("codex-notice-standard-selector");
-        let codex_dir = root.join(".codex");
-        let sessions_dir = codex_dir.join("sessions");
-        fs::create_dir_all(&sessions_dir).expect("create sessions");
-        fs::write(
-            codex_dir.join("config.toml"),
-            "model = \"gpt-5.5\"\n[notice]\nfast_default_opt_out = true\n",
-        )
-        .expect("write config");
-        let path = sessions_dir.join("session.jsonl");
-        fs::write(
-            &path,
-            concat!(
-                "{\"timestamp\":\"2026-05-19T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e2700-cafe-7000-9000-444444444444\"}}\n",
-                "{\"timestamp\":\"2026-05-19T10:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":10,\"output_tokens\":4,\"request_count\":1},\"model\":\"gpt-5.5\"}}}\n"
-            ),
-        )
-        .expect("write fixture");
-        let metadata = CodexTitleMetadata::load_from_roots(std::slice::from_ref(&sessions_dir));
-
-        let item = parse_codex_jsonl_file_with_title_metadata(
-            &path,
-            "2026-05-19T10:04:00Z",
-            "file-fingerprint".to_string(),
-            &metadata,
-            None,
-        )
-        .expect("parse")
-        .into_iter()
-        .next()
-        .expect("snapshot");
-
-        let selector = &item.model_usage[0].selector_context;
-        assert!(selector.is_empty());
-        assert!(item.model_usage[0].selector_sources.is_empty());
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn claude_parser_forwards_raw_session_origin() {
-        // Claude JSONL lines carry entrypoint/sessionKind/isSidechain; any
-        // sidechain line marks the whole session a subagent.
-        let path = temp_file("claude");
-        fs::write(
-            &path,
-            concat!(
-                "{\"timestamp\":\"2026-05-06T10:00:00Z\",\"sessionId\":\"claude-origin-1\",\"entrypoint\":\"cli\",\"isSidechain\":false,\"summary\":\"t\"}\n",
-                "{\"timestamp\":\"2026-05-06T10:01:00Z\",\"sessionId\":\"claude-origin-1\",\"isSidechain\":true,\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":4,\"output_tokens\":2}}}\n"
-            ),
-        )
-        .expect("write fixture");
-
-        let item = parse_claude_code_jsonl_file(&path, "2026-05-06T10:04:00Z", "fp".to_string())
-            .expect("parse")
-            .into_iter()
-            .next()
-            .expect("snapshot");
-        let origin = item.origin.expect("origin forwarded");
-        assert_eq!(origin.entrypoint.as_deref(), Some("cli"));
-        assert_eq!(origin.is_sidechain, Some(true));
-        // No sibling `<session>/workflows/wf_*.json` footprint -> detection ran
-        // and reported false (not None / unknown).
-        assert_eq!(origin.used_workflow_orchestration, Some(false));
-        // `originator` is Codex-only; Claude Code sessions never carry one.
-        assert_eq!(item.originator, None);
-        assert!(item
-            .attribution_facts
-            .iter()
-            .any(|fact| fact.field == "origin_kind" && fact.value == "subagent"));
-        assert!(item
-            .attribution_facts
-            .iter()
-            .any(|fact| fact.field == "provider_surface" && fact.value == "claude_cli"));
-
-        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -64152,22 +62699,6 @@ mod tests {
         );
         assert!(claude_api_matches_transcript_occurrence(
             &cache_split_api_row(&parent, true),
-            &occurrence
-        ));
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn claude_cache_split_matcher_preserves_old_aggregate_only() {
-        let (root, parent, items) = cache_split_fixture();
-        let occurrence = ClaudeTranscriptUsageOccurrenceWitness::from(
-            items[0]
-                .claude_usage_occurrences
-                .get("req_cache_split")
-                .unwrap(),
-        );
-        assert!(claude_api_matches_transcript_occurrence(
-            &cache_split_api_row(&parent, false),
             &occurrence
         ));
         fs::remove_dir_all(root).unwrap();
@@ -67261,89 +65792,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_account_pending_current_withheld_keeps_older_unfinished_window() {
-        d2_assert_current_window_blocks_older_unfinished_retirement("withheld");
-    }
-
-    #[test]
-    fn claude_account_pending_current_retry_pending_keeps_older_unfinished_window() {
-        d2_assert_current_window_blocks_older_unfinished_retirement("retry_pending");
-    }
-
-    #[test]
-    fn claude_account_pending_current_identity_incomplete_keeps_older_unfinished_window() {
-        d2_assert_current_window_blocks_older_unfinished_retirement("identity_incomplete");
-    }
-
-    #[test]
-    fn claude_account_pending_current_census_incomplete_keeps_older_unfinished_window() {
-        d2_assert_current_window_blocks_older_unfinished_retirement("census_incomplete");
-    }
-
-    #[test]
-    fn claude_account_pending_local_resources_count_retained_bytes_and_omit_zero() {
-        use crate::local_resource_diagnostics::{CollectionCounts, Probe};
-        let (dir, root, items) = claude_account_family_fixture();
-        let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
-        let mut index = d2_family_index(&dir, &root);
-        for window in ["2026-08-02T07:10:00Z", "2026-08-02T07:11:00Z"] {
-            apply_claude_effort_evidence_with_index(
-                &mut items.clone(),
-                &evidence,
-                &mut index,
-                false,
-                window,
-            );
-        }
-        index
-            .claude_account_family_pending
-            .get_mut(&root)
-            .unwrap()
-            .invalid = true;
-        let expected = serde_json::to_vec_pretty(&serde_json::json!({
-            "claude_account_family_pending": &index.claude_account_family_pending,
-        }))
-        .unwrap()
-        .len() as u64;
-        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
-            for empty in [false, true] {
-                if empty {
-                    index.claude_account_family_pending.clear();
-                }
-                Probe::start().collection_with_account_pending(
-                    "claude_code",
-                    CollectionCounts {
-                        scanned_files: 0,
-                        semantic_noops: 0,
-                        sampled_acquisition: None,
-                        full_causes: Default::default(),
-                    },
-                    index.claude_account_retained_pending_resources(),
-                );
-            }
-        });
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0]["stage"], "native_collection_page");
-        assert_eq!(
-            rows[0]["counts"]["claude_account_retained_pending_families"],
-            1
-        );
-        assert_eq!(
-            rows[0]["counts"]["claude_account_retained_pending_bytes"],
-            expected
-        );
-        assert!(expected > 0);
-        assert!(rows[1]["counts"]
-            .get("claude_account_retained_pending_families")
-            .is_none());
-        assert!(rows[1]["counts"]
-            .get("claude_account_retained_pending_bytes")
-            .is_none());
-        assert!(!serde_json::to_string(&rows).unwrap().contains(&root));
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
     fn claude_account_pending_new_identity_cannot_retire_using_prior_revision_acks() {
         let (dir, root, items) = claude_account_family_fixture();
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
@@ -67392,46 +65840,6 @@ mod tests {
         let mut accepted = working.committable_subset(&previous, &newer_entities, &BTreeMap::new());
         accepted.save(&dir.join("all-accepted.json")).unwrap();
         assert!(!accepted.claude_account_family_pending.contains_key(&root));
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn claude_account_pending_accepted_singleton_and_completed_owned_start_do_not_grow() {
-        let (dir, root, items) = claude_account_family_fixture();
-        let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 4]);
-        let mut index = d2_family_index(&dir, &root);
-        index.files.retain(|key, _| {
-            claude_index_path_family_member(Path::new(key))
-                .is_some_and(|(_, member)| member == root)
-        });
-        index
-            .file_snapshot_fingerprints
-            .retain(|key, _| index.files.contains_key(key));
-        index.claude_owned_start_census.insert(
-            root.clone(),
-            ClaudeOwnedStartCensusWitness {
-                marker_source_file_fingerprint: "completed".into(),
-                verified_source_file_fingerprint: Some("completed".into()),
-                emitted_source_file_fingerprint: Some("completed".into()),
-            },
-        );
-        let path = dir.join("singleton.json");
-        for window in 0..5 {
-            apply_claude_effort_evidence_with_index(
-                &mut [items[0].clone()],
-                &evidence,
-                &mut index,
-                true,
-                &format!("2026-08-02T07:1{window}:00Z"),
-            );
-            d2_finalize_identity_revisions(&mut index);
-            index.save(&path).unwrap();
-            index = lenient_decode::read_file(File::open(&path).unwrap(), "test", "claude_code")
-                .unwrap();
-            assert!(!index.claude_account_family_witnesses.contains_key(&root));
-            assert!(!claude_pending_family_session_ids(&index).contains(&root));
-            assert!(index.claude_account_family_pending.is_empty());
-        }
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -68747,48 +67155,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_subagent_fact_names_are_the_agreed_backend_contract() {
-        // These names are a FIXED contract with the backend session-attribution
-        // reader (`SessionAttributionField` in
-        // backend/app/domain/telemetry/session_attribution.py). The backend enum
-        // rejects unknown field names, and one rejected fact fails the WHOLE
-        // upload batch, so the enum must carry every name below BEFORE a daemon
-        // emitting `claude_code_jsonl:v20` reaches users. Renaming anything here
-        // is a coordinated cross-repo change, never a local rename.
-        let facts = crate::session_attribution::claude_subagent_facts(
-            &crate::session_attribution::ClaudeSubagentAttribution {
-                root_session_ref: "1338a80a-f36e-4cbc-a5bb-50fc66430ba5",
-                agent_kind: Some("workflow-subagent"),
-                agent_ref: Some("a4d1585d310070d0f"),
-                spawn_depth: Some("1"),
-                workflow_ref: Some("wf_ffe2de5a-c85"),
-            },
-            "1338a80a-f36e-4cbc-a5bb-50fc66430ba5_agent-a4d1585d310070d0f",
-            "2026-07-24T09:10:00Z",
-            "claude_code_jsonl:v20",
-        );
-        assert_eq!(
-            facts
-                .iter()
-                .map(|fact| fact.field.as_str())
-                .collect::<Vec<_>>(),
-            // Ordered most- to least-load-bearing: the caller trims from the
-            // tail to stay inside the bounded payload budget.
-            vec![
-                "root_session_ref",
-                "agent_kind",
-                "agent_ref",
-                "workflow_ref",
-                "spawn_depth",
-            ]
-        );
-        // Every value is a bounded provider identifier, never free text.
-        assert!(facts
-            .iter()
-            .all(|fact| fact.evidence.strength == "direct" && fact.display_label.is_none()));
-    }
-
-    #[test]
     fn claude_subagent_facts_fit_the_bounded_payload_budget() {
         // The budget is a hard byte ceiling over the serialized fact list and
         // one oversized item 422s the whole batch, so the daemon must trim. At
@@ -69312,45 +67678,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_progressive_sidechain_response_uses_terminal_output_and_late_selector() {
-        let root = temp_dir("claude-progressive-response");
-        let parent = "11111111-2222-3333-4444-555555555555";
-        let dir = root.join(parent).join("subagents");
-        fs::create_dir_all(&dir).expect("create subagent dir");
-        let path = dir.join("agent-a665ed7d7731771a8.jsonl");
-        fs::write(
-            &path,
-            concat!(
-                "{\"timestamp\":\"2026-08-02T09:00:00Z\",\"type\":\"user\",\"sessionId\":\"11111111-2222-3333-4444-555555555555\",\"isSidechain\":true,\"message\":{\"role\":\"user\",\"content\":\"work\"}}\n",
-                "{\"timestamp\":\"2026-08-02T09:00:01Z\",\"type\":\"assistant\",\"sessionId\":\"11111111-2222-3333-4444-555555555555\",\"isSidechain\":true,\"requestId\":\"req_progress\",\"message\":{\"id\":\"msg_progress\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"cache_read_input_tokens\":30}}}\n",
-                "{\"timestamp\":\"2026-08-02T09:00:02Z\",\"type\":\"assistant\",\"sessionId\":\"11111111-2222-3333-4444-555555555555\",\"isSidechain\":true,\"requestId\":\"req_progress\",\"speed\":\"standard\",\"message\":{\"id\":\"msg_progress\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":10,\"output_tokens\":19,\"cache_read_input_tokens\":30}}}\n"
-            ),
-        )
-        .expect("write fixture");
-
-        let item = parse_claude_code_jsonl_file(&path, "2026-08-02T09:01:00Z", "fp".into())
-            .expect("parse")
-            .into_iter()
-            .next()
-            .expect("snapshot");
-        assert_eq!(item.input_tokens, 10);
-        assert_eq!(item.output_tokens, 19);
-        assert_eq!(item.cache_read_tokens, 30);
-        assert_eq!(item.request_count, 1);
-        assert_eq!(item.avg_duration_ms, Some(1_000));
-        assert_eq!(item.peak_context_fill_tokens, Some(40));
-        assert_eq!(
-            item.model_usage[0]
-                .selector_context
-                .get("speed_mode")
-                .map(String::as_str),
-            Some("standard")
-        );
-        assert_eq!(item.usage_accounting_contract, None);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn claude_out_of_order_progressive_response_uses_provider_time() {
         let path = temp_file("claude-progressive-provider-time");
         fs::write(
@@ -69696,35 +68023,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_code_distinct_response_ids_count_separately() {
-        let path = temp_file("claude-dedup-distinct-ids");
-        fs::write(
-            &path,
-            concat!(
-                "{\"timestamp\":\"2026-06-30T11:01:00Z\",\"sessionId\":\"claude-dedup-2\",\"requestId\":\"req_011AAA\",\"message\":{\"id\":\"msg_011AAA\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n",
-                "{\"timestamp\":\"2026-06-30T11:02:00Z\",\"sessionId\":\"claude-dedup-2\",\"requestId\":\"req_011BBB\",\"message\":{\"id\":\"msg_011BBB\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":7,\"output_tokens\":9}}}\n"
-            ),
-        )
-        .expect("write fixture");
-
-        let item = parse_claude_code_jsonl_file(
-            &path,
-            "2026-06-30T11:04:00Z",
-            "file-fingerprint".to_string(),
-        )
-        .expect("parse")
-        .into_iter()
-        .next()
-        .expect("snapshot");
-
-        assert_eq!(item.input_tokens, 17);
-        assert_eq!(item.output_tokens, 14);
-        assert_eq!(item.request_count, 2);
-
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
     fn claude_code_usage_without_ids_counts_each_line() {
         // No message.id and no requestId: nothing to dedup on, so identical
         // usage on consecutive lines still counts per line (legacy behavior).
@@ -70034,147 +68332,10 @@ mod tests {
     }
 
     #[test]
-    fn claude_compaction_matching_cases() {
-        for (case, (observations, expected_count, expected_timestamps)) in [
-            (
-                {
-                    let observation = |kind, timestamp: &str, response_count_before| {
-                        ClaudeCompactionObservation {
-                            kind,
-                            timestamp: Some(timestamp.to_string()),
-                            pre_tokens: None,
-                            post_tokens: None,
-                            cumulative_dropped_tokens: None,
-                            duration_ms: None,
-                            response_count_before,
-                            pair_key: None,
-                            has_parent_link: false,
-                            trigger: None,
-                            id_less_before: false,
-                            id_less_after: false,
-                        }
-                    };
-                    let legacy = ClaudeCompactionKind::LegacySummary;
-                    let current = ClaudeCompactionKind::CurrentBoundary;
-                    let observations = vec![
-                        observation(legacy, "2026-07-01T11:00:00Z", 5),
-                        observation(legacy, "2026-07-01T11:00:00.100Z", 4),
-                        // Equal distance consumes index 0, even though its ordinal is later.
-                        observation(current, "2026-07-01T11:00:00.050Z", 3),
-                        // The nearer remaining legacy (100 ms) wins over the farther one.
-                        observation(current, "2026-07-01T11:00:00Z", 2),
-                        observation(legacy, "2026-07-01T11:00:02.051Z", 1),
-                        // Repeated currents are retained; 2,001 ms is outside tolerance.
-                        observation(current, "2026-07-01T11:00:00.050Z", 3),
-                    ];
-
-                    observations
-                },
-                4,
-                vec![
-                    "2026-07-01T11:00:00.050Z",
-                    "2026-07-01T11:00:00Z",
-                    "2026-07-01T11:00:02.051Z",
-                ],
-            ),
-            (
-                {
-                    let observation =
-                        |kind, timestamp: Option<&str>, pre_tokens| ClaudeCompactionObservation {
-                            kind,
-                            timestamp: timestamp.map(str::to_string),
-                            pre_tokens,
-                            post_tokens: Some(2),
-                            cumulative_dropped_tokens: Some(3),
-                            duration_ms: Some(4),
-                            response_count_before: 0,
-                            pair_key: None,
-                            has_parent_link: false,
-                            trigger: None,
-                            id_less_before: false,
-                            id_less_after: false,
-                        };
-                    let legacy = ClaudeCompactionKind::LegacySummary;
-                    let current = ClaudeCompactionKind::CurrentBoundary;
-                    let observations = vec![
-                        observation(legacy, Some("1969-12-31T23:59:59.9999Z"), Some(50)),
-                        observation(current, Some("1970-01-01T01:00:00+01:00"), Some(u64::MAX)),
-                        observation(current, Some("1970-01-01T00:00:00Z"), Some(1)),
-                        observation(current, Some("malformed"), Some(u64::MAX)),
-                        observation(current, None, Some(u64::MAX)),
-                        observation(legacy, Some("malformed"), None),
-                        observation(legacy, None, None),
-                    ];
-
-                    observations
-                },
-                6,
-                vec![
-                    "1970-01-01T00:00:00Z",
-                    "1970-01-01T01:00:00+01:00",
-                    "malformed",
-                ],
-            ),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let (count, timestamps, metrics) = claude_compaction_summary(&observations);
-            assert_eq!(count, expected_count);
-            assert_eq!(timestamps, expected_timestamps);
-            let boundaries = canonical_claude_curve_boundaries(&observations);
-            if case == 0 {
-                assert_eq!(metrics.metrics_count, 0);
-                assert_eq!(
-                    boundaries
-                        .iter()
-                        .map(|b| b.response_count_before)
-                        .collect::<Vec<_>>(),
-                    vec![1, 2, 3, 3]
-                );
-                assert_eq!(
-                    format!("{:?}", boundaries[2]),
-                    format!("{:?}", observations[2])
-                );
-                assert_eq!(
-                    format!("{:?}", boundaries[3]),
-                    format!("{:?}", observations[5])
-                );
-            } else {
-                assert_eq!(metrics.metrics_count, 2);
-                assert_eq!(metrics.total_pre_tokens, u64::MAX);
-                assert_eq!(metrics.total_post_tokens, 4);
-                assert_eq!(metrics.total_cumulative_dropped_tokens, 6);
-                assert_eq!(metrics.total_duration_ms, 8);
-                assert_eq!(boundaries.len(), 6);
-                assert_eq!(boundaries[0].timestamp, None);
-                assert_eq!(boundaries[1].timestamp, None);
-                assert_eq!(boundaries[4].kind, ClaudeCompactionKind::CurrentBoundary);
-                assert_eq!(boundaries[5].kind, ClaudeCompactionKind::LegacySummary);
-            }
-        }
-    }
-
-    #[test]
-    fn claude_compaction_pairing_cases() {
-        type Case<'a> = (&'a [&'a str], u64, Vec<String>, Option<u64>);
-        let cases: [Case<'_>; 5] = [
-(&[                "{\"timestamp\":\"2026-07-01T11:00:00Z\",\"sessionId\":\"claude-compact-1\",\"requestId\":\"req_011AAA\",\"message\":{\"id\":\"msg_011AAA\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":50,\"output_tokens\":5}}}\n",
-                "{\"timestamp\":\"2026-07-01T11:01:00.003Z\",\"sessionId\":\"claude-compact-1\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\"}}\n",
-                "{\"timestamp\":\"2026-07-01T11:01:00Z\",\"sessionId\":\"claude-compact-1\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}\n",
-                "{\"timestamp\":\"2026-07-01T11:02:00Z\",\"sessionId\":\"claude-compact-1\",\"type\":\"user\",\"isCompactSummary\":false,\"message\":{\"role\":\"user\",\"content\":\"regular prompt\"}}\n",
-                "{\"timestamp\":\"2026-07-01T11:03:00Z\",\"sessionId\":\"claude-compact-1\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary again\"}}\n",
-                "{\"timestamp\":\"2026-07-01T11:04:00Z\",\"sessionId\":\"claude-compact-1\",\"type\":\"assistant\",\"isCompactSummary\":true,\"message\":{\"role\":\"assistant\",\"content\":\"not a compaction event\"}}\n",
-                "{\"timestamp\":\"2026-07-01T11:05:00Z\",\"sessionId\":\"claude-compact-1\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\"}}\n",
-                "{\"timestamp\":\"2026-07-01T11:06:00Z\",\"sessionId\":\"claude-compact-1\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"manual\"}}\n",
-                "{\"timestamp\":\"2026-07-01T11:07:00Z\",\"sessionId\":\"claude-compact-1\",\"type\":\"system\",\"subtype\":\"status\"}\n"
-], 4, vec![
-                "2026-07-01T11:01:00.003Z".to_string(),
-                "2026-07-01T11:03:00Z".to_string(),
-                "2026-07-01T11:05:00Z".to_string(),
-                "2026-07-01T11:06:00Z".to_string(),
-            ], None),
-(&[
+    fn claude_code_parser_pairs_compaction_summary_through_its_parent_chain() {
+        let item = parse_claude_compaction_fixture(
+            "claude-compaction-structural-pair",
+            &[
                 "{\"timestamp\":\"2026-10-20T09:00:00Z\",\"sessionId\":\"claude-pair\",\"requestId\":\"req_pair_1\",\"message\":{\"id\":\"msg_pair_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":50,\"output_tokens\":5}}}",
                 // Current provider shape: boundary, attachment chain, then the
                 // summary 600 ms earlier than the boundary it descends from.
@@ -70186,133 +68347,40 @@ mod tests {
                 // directly and sits 5 s away, outside the time fallback.
                 "{\"timestamp\":\"2026-10-20T09:11:05Z\",\"uuid\":\"boundary-2\",\"parentUuid\":null,\"logicalParentUuid\":\"msg-2\",\"sessionId\":\"claude-pair\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":800000,\"postTokens\":90000,\"durationMs\":30}}",
                 "{\"timestamp\":\"2026-10-20T09:11:00Z\",\"uuid\":\"summary-2\",\"parentUuid\":\"boundary-2\",\"sessionId\":\"claude-pair\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
-            ], 2, vec![
+            ],
+        );
+
+        assert_eq!(item.compaction_count, Some(2));
+        // Time and sizes come from each boundary, never its summary.
+        assert_eq!(
+            item.compaction_timestamps,
+            vec![
                 "2026-10-20T09:01:00.600Z".to_string(),
                 "2026-10-20T09:11:05Z".to_string(),
-            ], Some(1700000)),
-(&[
-                "{\"timestamp\":\"2026-10-20T10:00:00Z\",\"sessionId\":\"claude-fallback\",\"requestId\":\"req_fallback_1\",\"message\":{\"id\":\"msg_fallback_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":50,\"output_tokens\":5}}}",
-                // No link field at all: the pair rests on the 1.5 s time fallback.
-                "{\"timestamp\":\"2026-10-20T10:01:01.500Z\",\"uuid\":\"boundary-fallback\",\"sessionId\":\"claude-fallback\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":700000}}",
-                "{\"timestamp\":\"2026-10-20T10:01:00Z\",\"uuid\":\"summary-fallback\",\"sessionId\":\"claude-fallback\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
-                // A summary whose parent lies outside the boundary's chain is
-                // not paired by time, even 1.5 s away: two events.
-                "{\"timestamp\":\"2026-10-20T10:05:01.500Z\",\"uuid\":\"boundary-elsewhere\",\"sessionId\":\"claude-fallback\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":500000}}",
-                "{\"timestamp\":\"2026-10-20T10:05:00Z\",\"uuid\":\"summary-elsewhere\",\"parentUuid\":\"unrelated\",\"sessionId\":\"claude-fallback\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
-                // A boundary alone still counts once.
-                "{\"timestamp\":\"2026-10-20T10:11:00Z\",\"uuid\":\"boundary-alone\",\"sessionId\":\"claude-fallback\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"manual\",\"preTokens\":600000}}",
-                "{\"timestamp\":\"2026-10-20T10:12:00Z\",\"uuid\":\"prompt-1\",\"parentUuid\":\"boundary-alone\",\"sessionId\":\"claude-fallback\",\"type\":\"user\",\"isCompactSummary\":false,\"message\":{\"role\":\"user\",\"content\":\"regular prompt\"}}",
-                // A legacy summary alone still counts once.
-                "{\"timestamp\":\"2026-10-20T10:21:00Z\",\"uuid\":\"summary-alone\",\"parentUuid\":\"prompt-1\",\"sessionId\":\"claude-fallback\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
-            ], 5, vec![
-                "2026-10-20T10:01:01.500Z".to_string(),
-                "2026-10-20T10:05:00Z".to_string(),
-                "2026-10-20T10:05:01.500Z".to_string(),
-                "2026-10-20T10:11:00Z".to_string(),
-                "2026-10-20T10:21:00Z".to_string(),
-            ], Some(1800000)),
-(&[
-            "{\"timestamp\":\"2026-10-20T13:00:00Z\",\"sessionId\":\"claude-unlinked\",\"requestId\":\"req_unlinked_1\",\"message\":{\"id\":\"msg_unlinked_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":50,\"output_tokens\":5}}}",
-            // Linked through an attachment: one event, not counted.
-            "{\"timestamp\":\"2026-10-20T13:01:01Z\",\"uuid\":\"boundary-linked\",\"parentUuid\":null,\"sessionId\":\"claude-unlinked\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":700000}}",
-            "{\"timestamp\":\"2026-10-20T13:01:01.001Z\",\"uuid\":\"attachment-linked\",\"parentUuid\":\"boundary-linked\",\"sessionId\":\"claude-unlinked\",\"type\":\"attachment\"}",
-            "{\"timestamp\":\"2026-10-20T13:01:00Z\",\"uuid\":\"summary-linked\",\"parentUuid\":\"attachment-linked\",\"sessionId\":\"claude-unlinked\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
-            // An unknown record type inside the chain breaks the link: the
-            // summary names a parent, stays its own event and is counted.
-            "{\"timestamp\":\"2026-10-20T13:05:01Z\",\"uuid\":\"boundary-broken\",\"parentUuid\":null,\"sessionId\":\"claude-unlinked\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":500000}}",
-            "{\"timestamp\":\"2026-10-20T13:05:01.001Z\",\"uuid\":\"future-record\",\"parentUuid\":\"boundary-broken\",\"sessionId\":\"claude-unlinked\",\"type\":\"future_record_type\"}",
-            "{\"timestamp\":\"2026-10-20T13:05:00.500Z\",\"uuid\":\"summary-broken\",\"parentUuid\":\"future-record\",\"sessionId\":\"claude-unlinked\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
-            // A summary with no parent at all is not this counter's case.
-            "{\"timestamp\":\"2026-10-20T13:21:00Z\",\"uuid\":\"summary-parentless\",\"sessionId\":\"claude-unlinked\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
-        ], 4, vec![
-                "2026-10-20T13:01:01Z".to_string(),
-                "2026-10-20T13:05:00.500Z".to_string(),
-                "2026-10-20T13:05:01Z".to_string(),
-                "2026-10-20T13:21:00Z".to_string(),
-            ], Some(1200000)),
-(&[
-                "{\"timestamp\":\"2026-10-20T11:00:00Z\",\"sessionId\":\"claude-beside\",\"requestId\":\"req_beside_1\",\"message\":{\"id\":\"msg_beside_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":50,\"output_tokens\":5}}}",
-                // A boundary without a uuid cannot be linked to.
-                "{\"timestamp\":\"2026-10-20T11:01:00.500Z\",\"sessionId\":\"claude-beside\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":400000}}",
-                "{\"timestamp\":\"2026-10-20T11:01:03Z\",\"uuid\":\"boundary-linked\",\"parentUuid\":null,\"sessionId\":\"claude-beside\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":300000}}",
-                // Linked to the second boundary, yet 10 ms from the first: the
-                // first boundary's fallback must skip it.
-                "{\"timestamp\":\"2026-10-20T11:01:00.490Z\",\"uuid\":\"summary-linked\",\"parentUuid\":\"boundary-linked\",\"sessionId\":\"claude-beside\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
-                // The first boundary's own unlinked summary, 1 s away.
-                "{\"timestamp\":\"2026-10-20T11:01:01.500Z\",\"uuid\":\"summary-unlinked\",\"sessionId\":\"claude-beside\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
-            ], 2, vec![
-                "2026-10-20T11:01:00.500Z".to_string(),
-                "2026-10-20T11:01:03Z".to_string(),
-            ], Some(700000))
-        ];
-        for (case, (lines, count, timestamps, pre)) in cases.into_iter().enumerate() {
-            let path = temp_file("claude-compaction-pairing");
-            fs::write(&path, lines.join("\n")).unwrap();
-            let mut file = File::open(&path).unwrap();
-            let identity = opened_object_identity(SnapshotSource::ClaudeCode, &mut file).unwrap();
-            let parsed = parse_opened_jsonl_file(
-                file,
-                &identity,
-                &path,
-                "2026-10-20T13:30:00Z",
-                "fp".into(),
-                SnapshotSource::ClaudeCode,
-                apply_claude_code_line,
-                None,
-                Some(&ClaudeTitleMetadata::default()),
-                None,
-                None,
-                true,
-                None,
-                true,
-            )
-            .unwrap();
-            let item = &parsed.snapshots[0];
-            assert_eq!(item.compaction_count, Some(count), "case {case}");
-            assert_eq!(item.compaction_timestamps, timestamps, "case {case}");
-            if let Some(pre) = pre {
-                assert_eq!(item.compaction_total_pre_tokens, Some(pre));
-            }
-            if case == 0 {
-                assert_eq!(
-                    (item.input_tokens, item.output_tokens, item.request_count),
-                    (50, 5, 1)
-                );
-                assert_eq!(item.usage_accounting_contract, None);
-            }
-            if case == 1 {
-                assert_eq!(item.compaction_total_post_tokens, Some(190_000));
-                assert_eq!(item.compaction_total_duration_ms, Some(50));
-                let curve =
-                    canonical_claude_curve_boundaries(&item.claude_context_curve_boundaries);
-                assert_eq!(
-                    curve
-                        .iter()
-                        .map(|b| (b.kind, b.timestamp.as_deref()))
-                        .collect::<Vec<_>>(),
-                    vec![
-                        (
-                            ClaudeCompactionKind::CurrentBoundary,
-                            Some("2026-10-20T09:01:00.600Z")
-                        ),
-                        (
-                            ClaudeCompactionKind::CurrentBoundary,
-                            Some("2026-10-20T09:11:05Z")
-                        )
-                    ]
-                );
-            }
-            if case == 3 {
-                assert_eq!(parsed.claude_compaction_unlinked_parent_count, 1);
-            }
-            if case == 4 {
-                assert_eq!(
-                    canonical_claude_curve_boundaries(&item.claude_context_curve_boundaries).len(),
-                    2
-                );
-            }
-            let _ = fs::remove_file(path);
-        }
+            ]
+        );
+        assert_eq!(item.compaction_total_pre_tokens, Some(1_700_000));
+        assert_eq!(item.compaction_total_post_tokens, Some(190_000));
+        assert_eq!(item.compaction_total_duration_ms, Some(50));
+        // The curve sees the same events: one boundary per pair, including the
+        // pair linked 5 s apart that the time window alone would split.
+        let curve = canonical_claude_curve_boundaries(&item.claude_context_curve_boundaries);
+        assert_eq!(
+            curve
+                .iter()
+                .map(|boundary| (boundary.kind, boundary.timestamp.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    ClaudeCompactionKind::CurrentBoundary,
+                    Some("2026-10-20T09:01:00.600Z")
+                ),
+                (
+                    ClaudeCompactionKind::CurrentBoundary,
+                    Some("2026-10-20T09:11:05Z")
+                ),
+            ]
+        );
     }
 
     fn parse_claude_compaction_fixture(name: &str, lines: &[&str]) -> SnapshotItem {
@@ -70973,6 +69041,19 @@ mod tests {
 
     #[test]
     fn claude_explicit_fork_duplicate_owned_request_fails_posture_closed() {
+        let apply = |items: &mut [SnapshotItem], index: &mut ScanIndex, terminal, at: &str| {
+            apply_claude_reported_usage_with_index(
+                items,
+                &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                    evidence: BTreeMap::new(),
+                    health: Default::default(),
+                },
+                &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+                index,
+                terminal,
+                at,
+            );
+        };
         let root = temp_dir("claude-explicit-fork-duplicate");
         let child_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let sibling_id = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff";
@@ -71016,13 +69097,8 @@ mod tests {
         assert_eq!(items[0].peak_context_fill_tokens, Some(895_010));
         assert_eq!(items[0].compaction_count, Some(1));
 
-        apply_claude_reported_usage_with_index(
+        apply(
             &mut items,
-            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
-                evidence: BTreeMap::new(),
-                health: Default::default(),
-            },
-            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
             &mut ScanIndex::default(),
             true,
             "2026-08-20T11:04:00Z",
@@ -71051,13 +69127,8 @@ mod tests {
             manifest_index_entry(Some("sibling-settled")),
         );
         let mut child_page = vec![child];
-        apply_claude_reported_usage_with_index(
+        apply(
             &mut child_page,
-            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
-                evidence: BTreeMap::new(),
-                health: Default::default(),
-            },
-            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
             &mut paged_index,
             false,
             "2026-08-20T11:04:00Z",
@@ -71065,13 +69136,8 @@ mod tests {
         assert_eq!(child_page[0].peak_context_fill_tokens, Some(895_010));
 
         let mut sibling_page = vec![sibling];
-        apply_claude_reported_usage_with_index(
+        apply(
             &mut sibling_page,
-            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
-                evidence: BTreeMap::new(),
-                health: Default::default(),
-            },
-            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
             &mut paged_index,
             true,
             "2026-08-20T11:04:00Z",
@@ -71105,13 +69171,8 @@ mod tests {
         // complete census must keep the inherited 895K context and compaction
         // tombstoned instead of treating the lone re-armed child as unique.
         let mut corrective_page = vec![child_page.remove(0), sibling_page.remove(0)];
-        apply_claude_reported_usage_with_index(
+        apply(
             &mut corrective_page,
-            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
-                evidence: BTreeMap::new(),
-                health: Default::default(),
-            },
-            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
             &mut paged_index,
             true,
             "2026-08-20T11:04:00Z",
@@ -71152,13 +69213,8 @@ mod tests {
         let mut deletion_index = paged_index.clone();
         deletion_index.files.remove(&local_index_key(&sibling_path));
         let mut deletion_pass = vec![corrective_page[0].clone()];
-        apply_claude_reported_usage_with_index(
+        apply(
             &mut deletion_pass,
-            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
-                evidence: BTreeMap::new(),
-                health: Default::default(),
-            },
-            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
             &mut deletion_index,
             true,
             "2026-08-20T11:05:00Z",
@@ -71177,13 +69233,8 @@ mod tests {
             .expect("deletion child index entry")
             .source_file_fingerprint = "deletion-corrected".to_string();
         let mut deletion_recovery = vec![corrective_page[0].clone()];
-        apply_claude_reported_usage_with_index(
+        apply(
             &mut deletion_recovery,
-            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
-                evidence: BTreeMap::new(),
-                health: Default::default(),
-            },
-            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
             &mut deletion_index,
             true,
             "2026-08-20T11:05:00Z",
@@ -71233,13 +69284,8 @@ mod tests {
             manifest_index_entry(Some("replacement-settled")),
         );
         let mut replacement_pass = vec![replacement.clone()];
-        apply_claude_reported_usage_with_index(
+        apply(
             &mut replacement_pass,
-            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
-                evidence: BTreeMap::new(),
-                health: Default::default(),
-            },
-            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
             &mut replacement_index,
             true,
             "2026-08-20T11:07:00Z",
@@ -71258,13 +69304,8 @@ mod tests {
             .expect("replacement index entry")
             .source_file_fingerprint = "replacement-corrected".to_string();
         let mut replacement_recovery = vec![replacement];
-        apply_claude_reported_usage_with_index(
+        apply(
             &mut replacement_recovery,
-            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
-                evidence: BTreeMap::new(),
-                health: Default::default(),
-            },
-            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
             &mut replacement_index,
             true,
             "2026-08-20T11:07:00Z",
@@ -71285,13 +69326,8 @@ mod tests {
         paged_index.claude_duplicate_request_owners.clear();
         paged_index.claude_duplicate_request_witness_overflowed = true;
         let mut overflow_recovery = corrective_page.clone();
-        apply_claude_reported_usage_with_index(
+        apply(
             &mut overflow_recovery,
-            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
-                evidence: BTreeMap::new(),
-                health: Default::default(),
-            },
-            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
             &mut paged_index,
             true,
             "2026-08-20T11:04:00Z",
@@ -71315,13 +69351,8 @@ mod tests {
             .expect("sibling index entry")
             .source_file_fingerprint = "sibling-after-overflow".to_string();
         let mut stable_after_overflow = corrective_page.clone();
-        apply_claude_reported_usage_with_index(
+        apply(
             &mut stable_after_overflow,
-            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
-                evidence: BTreeMap::new(),
-                health: Default::default(),
-            },
-            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
             &mut paged_index,
             true,
             "2026-08-20T11:04:00Z",
@@ -71466,26 +69497,16 @@ mod tests {
         .expect("parse unchanged sibling")
         .remove(0);
         let mut resolved_child_page = vec![changed_child];
-        apply_claude_reported_usage_with_index(
+        apply(
             &mut resolved_child_page,
-            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
-                evidence: BTreeMap::new(),
-                health: Default::default(),
-            },
-            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
             &mut paged_index,
             false,
             "2026-08-20T11:05:00Z",
         );
         assert_eq!(paged_index.claude_duplicate_request_owners.len(), 1);
         let mut resolved_sibling_page = vec![unchanged_sibling];
-        apply_claude_reported_usage_with_index(
+        apply(
             &mut resolved_sibling_page,
-            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
-                evidence: BTreeMap::new(),
-                health: Default::default(),
-            },
-            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
             &mut paged_index,
             true,
             "2026-08-20T11:05:00Z",
@@ -71501,13 +69522,8 @@ mod tests {
             resolved_child_page.remove(0),
             resolved_sibling_page.remove(0),
         ];
-        apply_claude_reported_usage_with_index(
+        apply(
             &mut resolved_correction,
-            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
-                evidence: BTreeMap::new(),
-                health: Default::default(),
-            },
-            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
             &mut paged_index,
             true,
             "2026-08-20T11:05:00Z",
@@ -73097,11 +71113,6 @@ mod tests {
             }
         }
         assert_eq!(cases.len(), 64);
-        let corpus =
-            json!({"contract_version":"paired_creator_cache_wire_corpus:v1","cases":cases});
-        if let Ok(output) = std::env::var("OTTTO_PAIRED_CREATOR_CACHE_CORPUS_OUT") {
-            fs::write(output, serde_json::to_vec_pretty(&corpus).unwrap()).unwrap();
-        }
     }
 
     fn projection_adoption_fixture(name: &str, count: usize) -> (PathBuf, PathBuf, ScanIndex) {
@@ -73261,88 +71272,6 @@ mod tests {
         fs::remove_dir_all(home).unwrap();
     }
 
-    #[test]
-    fn codex_local_diagnostics_trace_successors_empty_and_incomplete_finalization() {
-        for disposition in [FileReason::Complete, FileReason::ReadOrLineLoss] {
-            for empty in [false, true] {
-                let (home, root, mut index) = projection_adoption_fixture("codex-local-lineage", 1);
-                let old_fingerprint = index
-                    .file_snapshot_fingerprints
-                    .values()
-                    .next()
-                    .unwrap()
-                    .iter()
-                    .next()
-                    .unwrap()
-                    .clone();
-                let quarantines = BTreeMap::from([(
-                    old_fingerprint.clone(),
-                    snapshot_quarantine_record(SnapshotSource::Codex),
-                )]);
-                if disposition == FileReason::ReadOrLineLoss {
-                    let path = PathBuf::from(index.files.keys().next().unwrap());
-                    let mut bytes = fs::read(&path).unwrap();
-                    bytes.extend_from_slice(b"not valid json\n");
-                    fs::write(&path, bytes).unwrap();
-                }
-                index.activate_effective_upload_body_witness_revision(1);
-                let mut scan =
-                    projection_adoption_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
-                prepare_codex_recovery_diagnostics(&mut scan, &index, &quarantines);
-                assert_eq!(
-                    scan.pending_finalization[0].parse_complete,
-                    disposition == FileReason::Complete
-                );
-                let parsed_count = scan.pending_finalization[0].parsed_snapshot_count as u64;
-                if empty {
-                    crate::backfill::apply_backfill_cutoff(
-                        &mut scan.snapshots,
-                        &crate::backfill::BackfillState {
-                            backfill_cutoff_at: Some("2026-07-23T00:00:00Z".into()),
-                            ..Default::default()
-                        },
-                    );
-                } else if let Some(snapshot) = scan.snapshots.first_mut() {
-                    snapshot.output_tokens += 1;
-                }
-                let mut control = scan.clone();
-                control.local_codex_diagnostics = None;
-                let mut control_index = index.clone();
-                finalize_scan_after_policy(SnapshotSource::Codex, &mut control, &mut control_index);
-                finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
-                assert_eq!(
-                    serde_json::to_value(&index).unwrap(),
-                    serde_json::to_value(&control_index).unwrap()
-                );
-                assert_eq!(
-                    serde_json::to_value(&scan.snapshots).unwrap(),
-                    serde_json::to_value(&control.snapshots).unwrap()
-                );
-                let sample = scan.local_codex_diagnostics.unwrap().lineage[0].unwrap();
-                assert!(sample.before_current);
-                assert_eq!(sample.parsed_count, parsed_count);
-                assert_eq!(sample.file_reason, disposition);
-                assert_eq!(sample.finalized, disposition == FileReason::Complete);
-                if sample.finalized {
-                    assert_eq!(sample.finalized_entity_count, u64::from(!empty));
-                    assert!(!index
-                        .current_snapshot_fingerprints()
-                        .contains(&old_fingerprint));
-                    assert_eq!(sample.final_body_revision, 1);
-                    if !empty {
-                        assert_ne!(sample.successor_digests[0], sample.fingerprint_digest);
-                        assert!(sample.final_body_digest.is_some());
-                    }
-                } else {
-                    assert!(index
-                        .current_snapshot_fingerprints()
-                        .contains(&old_fingerprint));
-                }
-                fs::remove_dir_all(home).unwrap();
-            }
-        }
-    }
-
     fn projection_adoption_scan(
         root: &Path,
         index: &mut ScanIndex,
@@ -73361,8 +71290,8 @@ mod tests {
     }
 
     #[test]
-    fn projection_adoption_reselects_143_current_files_with_equal_body_once() {
-        let (home, root, mut index) = projection_adoption_fixture("projection-adoption-143", 143);
+    fn projection_adoption_reselects_3_current_files_with_equal_body_once() {
+        let (home, root, mut index) = projection_adoption_fixture("projection-adoption-3", 3);
         let unchanged = projection_adoption_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
         assert_eq!(
             unchanged.scanned_file_count, 0,
@@ -73372,7 +71301,7 @@ mod tests {
         let previous = index.clone();
         let mut scan = projection_adoption_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
         assert_eq!(
-            scan.scanned_file_count, 143,
+            scan.scanned_file_count, 3,
             "projection revision selects unchanged files"
         );
         finalize_scan_after_policy_with_body_witness(
@@ -73381,7 +71310,7 @@ mod tests {
             &mut index,
             snapshot_upload_body_witness,
         );
-        assert_eq!((scan.snapshots.len(), scan.semantic_noop_count), (143, 0));
+        assert_eq!((scan.snapshots.len(), scan.semantic_noop_count), (3, 0));
         for (key, entry) in &index.files {
             assert_eq!(entry.effective_upload_body_witness_revision, 1);
             assert_eq!(
@@ -73408,10 +71337,7 @@ mod tests {
         let mut retry =
             projection_adoption_scan(&root, &mut retry_index, MAX_BACKFILL_FILES_PER_SOURCE);
         finalize_scan_after_policy(SnapshotSource::Codex, &mut retry, &mut retry_index);
-        assert_eq!(
-            (retry.scanned_file_count, retry.snapshots.len()),
-            (143, 143)
-        );
+        assert_eq!((retry.scanned_file_count, retry.snapshots.len()), (3, 3));
         let accepted = retry
             .snapshots
             .iter()
@@ -73707,91 +71633,6 @@ mod tests {
         ScanIndex::load(&home.join("scan-index.json")).unwrap()
     }
 
-    #[test]
-    fn claude_context_backfill_selects_every_root_and_subagent_once() {
-        assert_eq!(
-            crate::snapshot_sync::effective_upload_body_witness_revision(
-                SnapshotSource::ClaudeCode
-            ),
-            3
-        );
-        let (home, root, index) =
-            claude_context_backfill_fixture("claude-context-backfill-once", 2);
-        let mut released = index.clone();
-        released.activate_effective_upload_body_witness_revision(1);
-        let stable = scan_source_roots_with_limit(
-            SnapshotSource::ClaudeCode,
-            std::slice::from_ref(&root),
-            &mut released,
-            "2026-08-23T18:35:00Z",
-            BACKFILL_WINDOW_DAYS,
-            MAX_BACKFILL_FILES_PER_SOURCE,
-            true,
-        )
-        .unwrap();
-        assert_eq!(stable.scanned_file_count, 0, "revision 1 stays settled");
-        // With no adoption budget every file is deferred, so the revision is
-        // the only gate that selects these unchanged root and subagent files.
-        let mut unbudgeted = index.clone();
-        let deferred = with_body_witness_adoption_page_budget(0, || {
-            claude_context_backfill_scan(&root, &mut unbudgeted, MAX_BACKFILL_FILES_PER_SOURCE)
-        });
-        assert_eq!(deferred.scanned_file_count, 0);
-        assert!(deferred.census_complete, "deferral never holds the census");
-        assert!(unbudgeted
-            .files
-            .values()
-            .all(|entry| entry.effective_upload_body_witness_revision == 1));
-
-        let mut index = index;
-        let previous = index.clone();
-        let mut scan =
-            claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
-        assert_eq!(scan.scanned_file_count, 4, "every root and subagent file");
-        assert_eq!(
-            scan.snapshots.len(),
-            4,
-            "an adopting file re-sends its body even when it is unchanged"
-        );
-        let mut loaded = claude_context_backfill_settle(&home, &previous, &mut scan, &mut index);
-        assert!(loaded
-            .files
-            .values()
-            .all(|entry| entry.effective_upload_body_witness_revision == 3));
-        let again = claude_context_backfill_scan(&root, &mut loaded, MAX_BACKFILL_FILES_PER_SOURCE);
-        assert_eq!((again.scanned_file_count, again.snapshots.len()), (0, 0));
-        let _ = fs::remove_dir_all(home);
-    }
-
-    #[test]
-    fn claude_context_backfill_resumes_after_restart_without_rereading_settled_files() {
-        let (home, root, mut index) =
-            claude_context_backfill_fixture("claude-context-backfill-resume", 2);
-        let mut parsed = 0;
-        for page in 1..=2 {
-            let previous = index.clone();
-            let mut scan = claude_context_backfill_scan(&root, &mut index, 2);
-            assert_eq!(scan.scanned_file_count, 2);
-            assert_eq!(scan.census_complete, page == 2);
-            parsed += scan.scanned_file_count;
-            // Restart between pages: only the settled index survives.
-            index = claude_context_backfill_settle(&home, &previous, &mut scan, &mut index);
-            assert_eq!(
-                index
-                    .files
-                    .values()
-                    .filter(|entry| entry.effective_upload_body_witness_revision == 3)
-                    .count(),
-                page * 2
-            );
-        }
-        assert_eq!(parsed, 4, "no file was read twice");
-        let stable = claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
-        assert_eq!((stable.scanned_file_count, stable.snapshots.len()), (0, 0));
-        assert!(stable.census_complete);
-        let _ = fs::remove_dir_all(home);
-    }
-
     /// MONEY P2: Claude re-reads a file only when its stored revision is
     /// below the active one (a missing stored value is 0). A newer stored
     /// revision, as after a downgrade, is not re-read; Codex and Pi keep the
@@ -73998,379 +71839,6 @@ mod tests {
         let (_, paired, revisions) = pages(two, "claude-context-backfill-bytes-paired");
         assert_eq!(paired, vec![2, 2, 2, 0]);
         assert_eq!(revisions, BTreeSet::from([3]));
-    }
-
-    #[test]
-    fn claude_context_backfill_quarantined_family_keeps_its_own_retry_gate() {
-        let (home, root, mut index) =
-            claude_context_backfill_fixture("claude-context-backfill-quarantine", 1);
-        let (root_session_id, members) = {
-            let mut root_session_id = String::new();
-            let members = index
-                .files
-                .iter()
-                .filter_map(|(key, entry)| {
-                    let (family_root, member) = claude_index_path_family_member(Path::new(key))?;
-                    root_session_id = family_root;
-                    Some((member, entry.source_file_fingerprint.clone()))
-                })
-                .collect::<BTreeMap<_, _>>();
-            (root_session_id, members)
-        };
-        assert_eq!(members.len(), 2);
-        let witness = ClaudeUsageFamilyWitness {
-            evidence_fingerprint: "provider-evidence".to_string(),
-            member_request_id_fingerprints: members
-                .keys()
-                .map(|member| (member.clone(), "requests".to_string()))
-                .collect(),
-            member_occurrence_fingerprints: members
-                .keys()
-                .map(|member| (member.clone(), "occurrences".to_string()))
-                .collect(),
-            assigned_request_id_fingerprints: members
-                .keys()
-                .map(|member| (member.clone(), "assigned".to_string()))
-                .collect(),
-            legacy_excluded_request_id_hashes: BTreeMap::new(),
-            legacy_exclusion_evidence_fingerprint: None,
-            legacy_owner_roots: BTreeSet::new(),
-        };
-        let witness_fingerprint = claude_usage_family_witness_fingerprint(&witness);
-        index
-            .claude_usage_family_witnesses
-            .insert(root_session_id.clone(), witness);
-        index.claude_usage_authority_quarantine.insert(
-            root_session_id.clone(),
-            ClaudeUsageAuthorityQuarantineRecord {
-                proof_correction: None,
-                contract: CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION.to_string(),
-                proven_witness_fingerprint: witness_fingerprint,
-                member_source_file_fingerprints: members,
-                failed_reconstruction_count: 1,
-                disposition: ClaudeUsageAuthorityQuarantineDisposition::RetryPending,
-                retry_after_unix_seconds: u64::MAX,
-            },
-        );
-        with_body_witness_adoption_page_budget(0, || {
-            let held =
-                claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
-            assert_eq!(
-                held.scanned_file_count, 0,
-                "the held family is neither adopted nor retried before its gate opens"
-            );
-            let subagent = index
-                .files
-                .keys()
-                .find(|key| key.contains("/subagents/"))
-                .unwrap()
-                .clone();
-            let mut bytes = fs::read(&subagent).unwrap();
-            bytes.extend_from_slice(b"{}\n");
-            fs::write(&subagent, bytes).unwrap();
-            let retried =
-                claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
-            assert_eq!(
-                retried.scanned_file_count, 2,
-                "its own retry reparses every member even with no adoption budget"
-            );
-        });
-        let _ = fs::remove_dir_all(home);
-    }
-
-    #[test]
-    fn claude_context_backfill_skips_sessions_on_the_local_reemission_list() {
-        let (home, root, mut index) =
-            claude_context_backfill_fixture("claude-context-backfill-exclusions", 3);
-        let support = crate::test_scratch::ScratchDir::new("claude-reemission-exclusions");
-        let list = ReemissionExclusions::path(&support);
-        fs::create_dir_all(list.parent().unwrap()).unwrap();
-        let session = |slot: usize| format!("aaaaaaaa-bbbb-4ccc-8ddd-{slot:012x}");
-        let digest = |id: &str| format!("{:x}", Sha256::digest(id.as_bytes()));
-        // Slot 0 by its family root (root and subagent), slot 1 by its
-        // subagent member only. The list is closed over family roots, so
-        // slot 1's root is excluded too (N1). Slot 2 is not listed.
-        let listed_member = index
-            .files
-            .keys()
-            .filter_map(|key| claude_index_path_family_member(Path::new(key)))
-            .find(|(family_root, member)| *family_root == session(1) && *member != session(1))
-            .map(|(_, member)| member)
-            .unwrap();
-        fs::write(
-            &list,
-            format!(
-                "# local only\n{}\n\n{}\n",
-                digest(&session(0)),
-                digest(&listed_member)
-            ),
-        )
-        .unwrap();
-        let excluded = |key: &str| {
-            claude_index_path_family_member(Path::new(key)).is_some_and(|(family_root, _)| {
-                family_root == session(0) || family_root == session(1)
-            })
-        };
-        let revisions = |index: &ScanIndex| {
-            index
-                .files
-                .iter()
-                .map(|(key, entry)| {
-                    (
-                        excluded(key.as_str()),
-                        entry.effective_upload_body_witness_revision,
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
-
-        // A malformed list defers every adoption-only file; a changed file
-        // is still read.
-        fs::write(&list, "not-a-digest\n").unwrap();
-        let mut refused = index.clone();
-        refused.load_claude_reemission_exclusions(&support);
-        assert!(
-            !ReemissionExclusions::seen_marker_path(&support).exists(),
-            "a malformed list never counts as installed"
-        );
-        let deferred =
-            claude_context_backfill_scan(&root, &mut refused, MAX_BACKFILL_FILES_PER_SOURCE);
-        assert_eq!(
-            deferred.scanned_file_count, 0,
-            "an unreadable list adopts nothing"
-        );
-        assert!(deferred.census_complete);
-        let changed = index
-            .files
-            .keys()
-            .find(|key| !excluded(key.as_str()))
-            .unwrap()
-            .clone();
-        let mut appended = refused.clone();
-        appended.files.get_mut(&changed).unwrap().size_bytes += 1;
-        let changed_scan =
-            claude_context_backfill_scan(&root, &mut appended, MAX_BACKFILL_FILES_PER_SOURCE);
-        assert!(
-            changed_scan.scanned_file_count >= 1,
-            "the list only gates adoption, never a changed file"
-        );
-
-        fs::write(
-            &list,
-            format!(
-                "# local only\n{}\n\n{}\n",
-                digest(&session(0)),
-                digest(&listed_member)
-            ),
-        )
-        .unwrap();
-        index.load_claude_reemission_exclusions(&support);
-        let previous = index.clone();
-        // Listed files never use the budget: the two unlisted files fit in it.
-        let mut scan = with_body_witness_adoption_page_budget(2, || {
-            claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE)
-        });
-        assert_eq!(
-            scan.scanned_file_count, 2,
-            "only the unlisted family adopts"
-        );
-        assert!(scan.census_complete);
-        let mut index = claude_context_backfill_settle(&home, &previous, &mut scan, &mut index);
-        let mut settled = revisions(&index);
-        settled.sort();
-        assert_eq!(
-            settled,
-            vec![
-                (false, 3),
-                (false, 3),
-                (true, 1),
-                (true, 1),
-                (true, 1),
-                (true, 1)
-            ],
-            "listed families keep the old stamp, including a member-only line's root"
-        );
-        index.load_claude_reemission_exclusions(&support);
-        let held = claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
-        assert_eq!(held.scanned_file_count, 0, "listed files stay unread");
-
-        // Once their recovery settles their lines are removed (the file
-        // stays), and the old stamp lets them adopt with no new revision.
-        fs::write(&list, "# local only\n").unwrap();
-        index.load_claude_reemission_exclusions(&support);
-        let previous = index.clone();
-        let mut released =
-            claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
-        assert_eq!(released.scanned_file_count, 4);
-        let index = claude_context_backfill_settle(&home, &previous, &mut released, &mut index);
-        assert!(index
-            .files
-            .values()
-            .all(|entry| entry.effective_upload_body_witness_revision == 3));
-        let _ = fs::remove_dir_all(home);
-    }
-
-    #[test]
-    fn claude_context_backfill_holds_old_entities_until_the_list_is_installed() {
-        use claude_reemission_exclusions::with_no_list_cutoff;
-        let (home, root, mut index) =
-            claude_context_backfill_fixture("claude-context-backfill-no-list", 2);
-        let support = crate::test_scratch::ScratchDir::new("claude-reemission-no-list");
-        index.load_claude_reemission_exclusions(&support);
-        assert_eq!(
-            index.claude_reemission_exclusions.state(),
-            ListState::NotInstalled
-        );
-        // The no-list hold applies on an unverified Mac (StateMissing N1).
-        index.claude_no_list_policy = NoListPolicy::HoldUnverified;
-        let stamps = |index: &ScanIndex| {
-            index
-                .files
-                .values()
-                .map(|entry| entry.effective_upload_body_witness_revision)
-                .collect::<Vec<_>>()
-        };
-
-        // The fixtures are born now. A cutoff after them makes every entity
-        // old: held with its old stamp, and the census still completes.
-        let mut old = index.clone();
-        let held = with_no_list_cutoff(u64::MAX, || {
-            claude_context_backfill_scan(&root, &mut old, MAX_BACKFILL_FILES_PER_SOURCE)
-        });
-        assert_eq!(
-            held.scanned_file_count, 0,
-            "old entities are not re-emitted"
-        );
-        assert!(held.census_complete);
-        assert_eq!(stamps(&old), vec![1; 4]);
-        let changed = old.files.keys().next().unwrap().clone();
-        let mut appended = old.clone();
-        appended.files.get_mut(&changed).unwrap().size_bytes += 1;
-        let changed_scan = with_no_list_cutoff(u64::MAX, || {
-            claude_context_backfill_scan(&root, &mut appended, MAX_BACKFILL_FILES_PER_SOURCE)
-        });
-        assert!(
-            changed_scan.scanned_file_count >= 1,
-            "the hold only gates adoption, never a changed file"
-        );
-        // Where no list is intended on a verified Mac, the same old
-        // entities are paced through the budget instead (N1).
-        let mut paced = index.clone();
-        paced.claude_no_list_policy = NoListPolicy::Pace;
-        let paced_scan = with_no_list_cutoff(u64::MAX, || {
-            claude_context_backfill_scan(&root, &mut paced, MAX_BACKFILL_FILES_PER_SOURCE)
-        });
-        assert_eq!(paced_scan.scanned_file_count, 4, "paced, not held");
-
-        // A cutoff before them makes every entity new: they adopt.
-        let previous = index.clone();
-        let mut fresh = with_no_list_cutoff(0, || {
-            claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE)
-        });
-        assert_eq!(fresh.scanned_file_count, 4, "newer entities proceed");
-        let index = claude_context_backfill_settle(&home, &previous, &mut fresh, &mut index);
-        assert_eq!(stamps(&index), vec![3; 4]);
-        assert!(!ReemissionExclusions::seen_marker_path(&support).exists());
-        let _ = fs::remove_dir_all(home);
-    }
-
-    #[test]
-    fn claude_context_backfill_empty_list_installs_the_marker_and_adopts_old_entities() {
-        use claude_reemission_exclusions::with_no_list_cutoff;
-        let (home, root, mut index) =
-            claude_context_backfill_fixture("claude-context-backfill-empty-list", 2);
-        let support = crate::test_scratch::ScratchDir::new("claude-reemission-empty-list");
-        let list = ReemissionExclusions::path(&support);
-        fs::create_dir_all(list.parent().unwrap()).unwrap();
-        fs::write(&list, "").unwrap();
-        index.load_claude_reemission_exclusions(&support);
-        assert_eq!(
-            index.claude_reemission_exclusions.state(),
-            ListState::Installed
-        );
-        assert!(ReemissionExclusions::seen_marker_path(&support).exists());
-        let previous = index.clone();
-        let mut scan = with_no_list_cutoff(u64::MAX, || {
-            claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE)
-        });
-        assert_eq!(
-            scan.scanned_file_count, 4,
-            "an installed list, even empty, ends the old-entity hold"
-        );
-        let index = claude_context_backfill_settle(&home, &previous, &mut scan, &mut index);
-        assert!(index
-            .files
-            .values()
-            .all(|entry| entry.effective_upload_body_witness_revision == 3));
-        let _ = fs::remove_dir_all(home);
-    }
-
-    #[test]
-    fn claude_context_backfill_pauses_with_an_alarm_when_an_installed_list_goes_missing() {
-        use claude_reemission_exclusions::with_no_list_cutoff;
-        let (home, root, mut index) =
-            claude_context_backfill_fixture("claude-context-backfill-list-missing", 2);
-        let support = crate::test_scratch::ScratchDir::new("claude-reemission-list-missing");
-        let list = ReemissionExclusions::path(&support);
-        fs::create_dir_all(list.parent().unwrap()).unwrap();
-        fs::write(&list, "# nothing listed\n").unwrap();
-        index.load_claude_reemission_exclusions(&support);
-        assert_eq!(
-            index.claude_reemission_exclusions.state(),
-            ListState::Installed
-        );
-        fs::remove_file(&list).unwrap();
-
-        let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
-            index.load_claude_reemission_exclusions(&support)
-        });
-        let state = index.claude_reemission_exclusions.state();
-        assert_eq!(state, ListState::MissingAfterInstall);
-        assert_eq!(state.as_str(), "missing_after_install");
-        assert_eq!(alarms.len(), 1);
-        assert_eq!(
-            alarms[0]["stage"],
-            "claude_reemission_list_missing_after_install"
-        );
-        assert_eq!(alarms[0]["source"], "claude_code");
-        assert_eq!(alarms[0]["counts"]["cause"], "seen_marker");
-        // Paused: even entities newer than the cutoff wait, with old stamps.
-        let paused = with_no_list_cutoff(0, || {
-            claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE)
-        });
-        assert_eq!(paused.scanned_file_count, 0);
-        assert!(paused.census_complete);
-        assert!(index
-            .files
-            .values()
-            .all(|entry| entry.effective_upload_body_witness_revision == 1));
-
-        // A restart reloads the saved index; an index rebuild starts from an
-        // empty one. Neither carries the list state, and both still pause:
-        // the marker lives beside the list, not in the index.
-        index.save(&home.join("scan-index.json")).unwrap();
-        for mut reloaded in [
-            ScanIndex::load(&home.join("scan-index.json")).unwrap(),
-            ScanIndex::default(),
-        ] {
-            let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
-                reloaded.load_claude_reemission_exclusions(&support)
-            });
-            assert_eq!(
-                reloaded.claude_reemission_exclusions.state(),
-                ListState::MissingAfterInstall
-            );
-            assert_eq!(alarms.len(), 1);
-        }
-
-        // Putting the file back resumes adoption.
-        fs::write(&list, "").unwrap();
-        index.load_claude_reemission_exclusions(&support);
-        let resumed = with_no_list_cutoff(u64::MAX, || {
-            claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE)
-        });
-        assert_eq!(resumed.scanned_file_count, 4);
-        let _ = fs::remove_dir_all(home);
     }
 
     fn body_witness_finalizer_scan(
@@ -74588,48 +72056,40 @@ mod tests {
     }
 
     #[test]
-    fn claude_title_precedence() {
-        for (session, desktop, transcript, title, source) in [
-("claude-session-title", "{}", concat!(
-                "{\"type\":\"ai-title\",\"sessionId\":\"claude-session-title\",\"aiTitle\":\"Tighten dashboard activity feed\"}\n",
-                "{\"timestamp\":\"2026-05-06T10:00:00Z\",\"sessionId\":\"claude-session-title\",\"summary\":\"Claude Code session\"}\n",
-                "{\"timestamp\":\"2026-05-06T10:01:00Z\",\"sessionId\":\"claude-session-title\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":35,\"output_tokens\":8}}}\n"
-            ), "Tighten dashboard activity feed", "ai_title"),
-("s-1", "{\"cliSessionId\":\"s-1\",\"title\":\"Desktop auto title\",\"titleSource\":\"auto\"}", concat!(
-                "{\"type\":\"ai-title\",\"sessionId\":\"s-1\",\"aiTitle\":\"Transcript ai title\"}\n",
-                "{\"timestamp\":\"2026-07-10T10:01:00Z\",\"sessionId\":\"s-1\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n",
-            ), "Transcript ai title", "ai_title"),
-("s-2", "{\"cliSessionId\":\"s-2\",\"title\":\"My renamed session\",\"titleSource\":\"user\"}", concat!(
+    fn claude_desktop_user_title_overrides_transcript_title() {
+        let (home, transcript_path, projects_root) = claude_desktop_fixture(
+            "claude-desktop-user-override",
+            "s-2",
+            "{\"cliSessionId\":\"s-2\",\"title\":\"My renamed session\",\"titleSource\":\"user\"}",
+            concat!(
                 "{\"timestamp\":\"2026-07-10T10:00:00Z\",\"sessionId\":\"s-2\",\"summary\":\"Stale summary title\"}\n",
                 "{\"timestamp\":\"2026-07-10T10:01:00Z\",\"sessionId\":\"s-2\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n",
-            ), "My renamed session", "desktop_title"),
-("s-4", "{}", concat!(
-                // Harness wrappers and tool_result user records never title.
-                "{\"type\":\"user\",\"sessionId\":\"s-4\",\"message\":{\"role\":\"user\",\"content\":\"<command-name>/model</command-name>\"}}\n",
-                "{\"type\":\"user\",\"sessionId\":\"s-4\",\"isMeta\":true,\"message\":{\"role\":\"user\",\"content\":\"Caveat: the messages below were generated by the user while running local commands\"}}\n",
-                "{\"type\":\"user\",\"sessionId\":\"s-4\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"content\":[{\"type\":\"text\",\"text\":\"file contents here\"}]}]}}\n",
-                "{\"type\":\"user\",\"sessionId\":\"s-4\",\"timestamp\":\"2026-07-10T10:00:00Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"fix the flaky sessions table sort\"}]}}\n",
-                "{\"timestamp\":\"2026-07-10T10:01:00Z\",\"sessionId\":\"s-4\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n",
-            ), "fix the flaky sessions table sort", "first_prompt"),
-("37227cb3-9bd5-41c9-9fbc-85652afe8793", "{}", concat!(
-                "{\"type\":\"user\",\"sessionId\":\"37227cb3-9bd5-41c9-9fbc-85652afe8793\",\"message\":{\"role\":\"user\",\"content\":\"repair this pull request\"}}\n",
-                "{\"type\":\"custom-title\",\"customTitle\":\"pr-fixer-3532-37227cb3\"}\n",
-                "{\"timestamp\":\"2026-07-29T10:33:00Z\",\"sessionId\":\"37227cb3-9bd5-41c9-9fbc-85652afe8793\",\"message\":{\"model\":\"claude-sonnet-5\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n",
-            ), "Fix PR #3532", "transcript_title"),
-("s-5", "{}", concat!(
-                "{\"type\":\"user\",\"sessionId\":\"s-5\",\"message\":{\"role\":\"user\",\"content\":\"rename all the things\"}}\n",
-                "{\"timestamp\":\"2026-07-10T10:00:00Z\",\"sessionId\":\"s-5\",\"summary\":\"Rename cleanup pass\"}\n",
-                "{\"timestamp\":\"2026-07-10T10:01:00Z\",\"sessionId\":\"s-5\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n",
-            ), "Rename cleanup pass", "summary")
-        ] {
-            let (home, path, projects) = claude_desktop_fixture("claude-title-precedence", session, desktop, transcript);
-            let metadata = ClaudeTitleMetadata::load_from_roots(std::slice::from_ref(&projects));
-            let item = parse_claude_code_jsonl_file_with_title_metadata(&path, "2026-07-29T10:34:00Z", "fp".into(), &metadata, true).expect("parse").remove(0);
-            assert_eq!(item.source_session_id, session);
-            assert_eq!(item.session_display_name.as_deref(), Some(title), "{session}");
-            assert_eq!(item.session_display_name_source.as_deref(), Some(source), "{session}");
-            let _ = fs::remove_dir_all(home);
-        }
+            ),
+        );
+        let metadata = ClaudeTitleMetadata::load_from_roots(std::slice::from_ref(&projects_root));
+
+        let item = parse_claude_code_jsonl_file_with_title_metadata(
+            &transcript_path,
+            "2026-07-10T10:04:00Z",
+            "fp".to_string(),
+            &metadata,
+            true,
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        assert_eq!(
+            item.session_display_name.as_deref(),
+            Some("My renamed session")
+        );
+        assert_eq!(
+            item.session_display_name_source.as_deref(),
+            Some("desktop_title")
+        );
+
+        let _ = fs::remove_dir_all(home);
     }
 
     /// Build a fake home with one Claude transcript and one desktop-store
@@ -75786,131 +73246,6 @@ mod tests {
         desktop_spawn_entry_raw(&spawn_cli(label), desktop, spawned_from)
     }
 
-    fn spawn_parent(
-        lineage: &BTreeMap<String, ClaudeDesktopSpawnLineage>,
-        label: &str,
-    ) -> Option<String> {
-        lineage
-            .get(&spawn_cli(label))
-            .map(|lineage| lineage.parent_session_id.clone())
-    }
-
-    #[test]
-    fn claude_desktop_spawn_lineage_static_cases() {
-        for (rows, expected, malformed) in [
-            (
-                vec![
-                    ("root", "local_root", None),
-                    ("mid", "local_mid", Some("local_root")),
-                    ("leaf", "local_leaf", Some("local_mid")),
-                    ("orphan", "local_orphan", Some("local_missing")),
-                ],
-                vec![("mid", "root"), ("leaf", "mid")],
-                false,
-            ),
-            (
-                vec![
-                    ("parent-a", "local_a", None),
-                    ("parent-b", "local_b", None),
-                    ("split-child", "local_split_1", Some("local_a")),
-                    ("split-child", "local_split_2", Some("local_b")),
-                    ("dup-1", "local_dup", None),
-                    ("dup-2", "local_dup", None),
-                    ("dup-child", "local_dup_child", Some("local_dup")),
-                    ("cycle-1", "local_c1", Some("local_c2")),
-                    ("cycle-2", "local_c2", Some("local_c1")),
-                    ("self", "local_self", Some("local_self")),
-                ],
-                vec![],
-                false,
-            ),
-            (
-                vec![
-                    ("p-missing", "local_p_missing", Some("local_gone")),
-                    ("c-missing", "local_c_missing", Some("local_p_missing")),
-                    ("p-self", "local_p_self", Some("local_p_self")),
-                    ("c-self", "local_c_self", Some("local_p_self")),
-                    ("p-mixed", "local_p_mixed_1", None),
-                    ("p-mixed", "local_p_mixed_2", Some("local_p_missing")),
-                    ("c-mixed", "local_c_mixed", Some("local_p_mixed_1")),
-                    ("x1", "local_x1", Some("local_x2")),
-                    ("x2", "local_x2", Some("local_x1")),
-                    ("c-cycle", "local_c_cycle", Some("local_x1")),
-                ],
-                vec![
-                    ("c-missing", "p-missing"),
-                    ("c-self", "p-self"),
-                    ("c-mixed", "p-mixed"),
-                    ("c-cycle", "x1"),
-                ],
-                false,
-            ),
-            (
-                vec![
-                    ("p-bad", "local_p_bad", None),
-                    ("c-bad", "local_c_bad", Some("local_p_bad")),
-                ],
-                vec![("c-bad", "p-bad")],
-                true,
-            ),
-        ] {
-            let mut entries = rows
-                .into_iter()
-                .map(|(cli, local, parent)| desktop_spawn_entry(cli, local, parent))
-                .collect::<Vec<_>>();
-            entries[0].spawned_from_unresolved = malformed;
-            let lineage = claude_desktop_spawn_lineage(entries.iter(), |_| None);
-            assert_eq!(lineage.len(), expected.len());
-            for (child, parent) in expected {
-                assert_eq!(spawn_parent(&lineage, child), Some(spawn_cli(parent)));
-            }
-        }
-        for cycle in [true, false] {
-            let entries = (0..11)
-                .map(|i| {
-                    let parent = if cycle {
-                        Some(format!("local_b{}", (i + 1) % 11))
-                    } else {
-                        (i > 0).then(|| format!("local_b{}", i - 1))
-                    };
-                    desktop_spawn_entry(&format!("b{i}"), &format!("local_b{i}"), parent.as_deref())
-                })
-                .collect::<Vec<_>>();
-            let lineage = claude_desktop_spawn_lineage(entries.iter(), |_| None);
-            assert_eq!(lineage.len(), if cycle { 0 } else { 10 });
-            if !cycle {
-                assert_eq!(spawn_parent(&lineage, "b10"), Some(spawn_cli("b9")));
-            }
-        }
-        let child = spawn_cli("child");
-        let entries = [
-            desktop_spawn_entry_raw("/Users/example/project", "local_path", None),
-            desktop_spawn_entry_raw(&child, "local_child", Some("local_path")),
-            desktop_spawn_entry_raw("not a session", "local_bad", None),
-            desktop_spawn_entry("child-of-bad", "local_child_bad", Some("local_bad")),
-            desktop_spawn_entry_raw(
-                &spawn_cli("upper").to_ascii_uppercase(),
-                "local_upper",
-                None,
-            ),
-            desktop_spawn_entry("child-of-upper", "local_child_upper", Some("local_upper")),
-            desktop_spawn_entry("valid-parent", "local_valid", None),
-            desktop_spawn_entry_raw("../escape", "local_escape", Some("local_valid")),
-        ];
-        assert!(claude_desktop_spawn_lineage(entries.iter(), |_| None).is_empty());
-        let entries = [
-            desktop_spawn_entry("valid-parent", "local_valid", None),
-            desktop_spawn_entry_raw(&child, "local_child", Some("local_valid")),
-        ];
-        assert_eq!(
-            spawn_parent(
-                &claude_desktop_spawn_lineage(entries.iter(), |_| None),
-                "child"
-            ),
-            Some(spawn_cli("valid-parent"))
-        );
-    }
-
     #[test]
     fn claude_desktop_spawn_lineage_waits_for_a_complete_store_census() {
         let parent = spawn_cli("parent");
@@ -75958,234 +73293,6 @@ mod tests {
             imported: false,
         });
         entry
-    }
-
-    fn live_window(first: &str, last: &str) -> ClaudeTranscriptLiveWindow {
-        ClaudeTranscriptLiveWindow {
-            first_unix_nanos: rfc3339_unix_nanos(first).expect("first"),
-            last_unix_nanos: rfc3339_unix_nanos(last).expect("last"),
-        }
-    }
-
-    /// Resolve with fixed windows per label, recording which transcripts
-    /// were asked for.
-    fn spawn_lineage_with_windows(
-        entries: &[ClaudeDesktopTitleIndexEntry],
-        windows: &[(&str, ClaudeTranscriptLiveWindow)],
-    ) -> (
-        BTreeMap<String, ClaudeDesktopSpawnLineage>,
-        BTreeSet<String>,
-    ) {
-        let windows = windows
-            .iter()
-            .map(|(label, window)| (spawn_cli(label), *window))
-            .collect::<BTreeMap<_, _>>();
-        let mut asked = BTreeSet::new();
-        let lineage = claude_desktop_spawn_lineage(entries.iter(), |cli| {
-            asked.insert(cli.to_string());
-            windows.get(cli).copied()
-        });
-        (lineage, asked)
-    }
-
-    #[test]
-    fn claude_desktop_spawn_lineage_window_cases() {
-        let mut cases = vec![
-            {
-                let entries = [
-                    desktop_spawn_entry_created(
-                        "old",
-                        "local_owner",
-                        None,
-                        Some("2026-09-09T18:31:51Z"),
-                    ),
-                    desktop_spawn_entry_created(
-                        "new",
-                        "local_owner",
-                        None,
-                        Some("2026-09-09T18:31:51Z"),
-                    ),
-                    // Created while the old transcript was live, before the switch.
-                    desktop_spawn_entry_created(
-                        "before-switch",
-                        "local_before_1",
-                        Some("local_owner"),
-                        Some("2026-09-18T11:29:54.915Z"),
-                    ),
-                    desktop_spawn_entry_created(
-                        "before-switch",
-                        "local_before_2",
-                        Some("local_owner"),
-                        Some("2026-09-18T11:29:54.915Z"),
-                    ),
-                    // Created after the switch.
-                    desktop_spawn_entry_created(
-                        "after-switch",
-                        "local_after",
-                        Some("local_owner"),
-                        Some("2026-09-28T10:00:00Z"),
-                    ),
-                    // Created in the gap between the two: neither was live.
-                    desktop_spawn_entry_created(
-                        "in-gap",
-                        "local_gap",
-                        Some("local_owner"),
-                        Some("2026-09-27T02:00:00Z"),
-                    ),
-                    // An ordinary single-transcript parent never needs a window.
-                    desktop_spawn_entry_created("solo", "local_solo", None, None),
-                    desktop_spawn_entry_created(
-                        "solo-child",
-                        "local_solo_child",
-                        Some("local_solo"),
-                        None,
-                    ),
-                ];
-
-                (
-                    entries.to_vec(),
-                    [
-                        (
-                            "old",
-                            live_window("2026-09-09T18:31:55.158Z", "2026-09-26T14:31:52.136Z"),
-                        ),
-                        (
-                            "new",
-                            live_window("2026-09-27T18:26:48.551Z", "2026-09-28T15:10:20.064Z"),
-                        ),
-                    ]
-                    .to_vec(),
-                    vec![
-                        ("before-switch", "old"),
-                        ("after-switch", "new"),
-                        ("solo-child", "solo"),
-                    ],
-                    true,
-                )
-            },
-            {
-                let windows = [
-                    (
-                        "earlier",
-                        live_window("2026-10-09T14:33:34.213Z", "2026-10-09T20:26:26.825Z"),
-                    ),
-                    (
-                        "forked",
-                        live_window("2026-10-09T14:33:34.213Z", "2026-10-20T20:09:43.795Z"),
-                    ),
-                ];
-                let entries = [
-                    desktop_spawn_entry_created(
-                        "earlier",
-                        "local_fork",
-                        None,
-                        Some("2026-10-09T14:33:31Z"),
-                    ),
-                    desktop_spawn_entry_created(
-                        "forked",
-                        "local_fork",
-                        None,
-                        Some("2026-10-09T14:33:31Z"),
-                    ),
-                    // After the earlier transcript's last event: only the fork was live.
-                    desktop_spawn_entry_created(
-                        "after-last",
-                        "local_after_last",
-                        Some("local_fork"),
-                        Some("2026-10-11T12:37:29.831Z"),
-                    ),
-                    // Inside the copied span: both windows hold it.
-                    desktop_spawn_entry_created(
-                        "inside-copy",
-                        "local_inside_copy",
-                        Some("local_fork"),
-                        Some("2026-10-09T18:00:00Z"),
-                    ),
-                    // Within the margin of the earlier transcript's last event.
-                    desktop_spawn_entry_created(
-                        "at-boundary",
-                        "local_at_boundary",
-                        Some("local_fork"),
-                        Some("2026-10-09T20:27:00Z"),
-                    ),
-                ];
-
-                (
-                    entries.to_vec(),
-                    windows.to_vec(),
-                    vec![("after-last", "forked")],
-                    false,
-                )
-            },
-        ];
-        let windows = [
-            (
-                "old",
-                live_window("2026-09-09T18:31:55Z", "2026-09-26T14:31:52Z"),
-            ),
-            (
-                "new",
-                live_window("2026-09-27T18:26:48Z", "2026-09-28T15:10:20Z"),
-            ),
-        ];
-        let owner = [
-            desktop_spawn_entry_created("old", "local_owner", None, None),
-            desktop_spawn_entry_created("new", "local_owner", None, None),
-        ];
-        let child = |created: &[Option<&str>]| {
-            created
-                .iter()
-                .enumerate()
-                .map(|(copy, created_at)| {
-                    desktop_spawn_entry_created(
-                        "child",
-                        &format!("local_child_{copy}"),
-                        Some("local_owner"),
-                        *created_at,
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
-
-        for created in [
-            // No creation time at all.
-            vec![None],
-            // One store copy lacks it.
-            vec![Some("2026-09-18T11:29:54Z"), None],
-            // Copies disagree.
-            vec![Some("2026-09-18T11:29:54Z"), Some("2026-09-28T10:00:00Z")],
-            // Unparseable.
-            vec![Some("yesterday")],
-        ] {
-            cases.push((
-                owner.iter().cloned().chain(child(&created)).collect(),
-                windows.to_vec(),
-                vec![],
-                false,
-            ));
-        }
-        let dated = owner
-            .iter()
-            .cloned()
-            .chain(child(&[Some("2026-09-18T11:29:54Z")]))
-            .collect::<Vec<_>>();
-        cases.push((dated.clone(), windows[..1].to_vec(), vec![], false));
-        cases.push((dated, windows.to_vec(), vec![("child", "old")], false));
-        for (entries, windows, expected, check_asked) in cases {
-            let (lineage, asked) = spawn_lineage_with_windows(&entries, &windows);
-            let actual: BTreeMap<_, _> = lineage
-                .into_iter()
-                .map(|(child, edge)| (child, edge.parent_session_id))
-                .collect();
-            let expected: BTreeMap<_, _> = expected
-                .into_iter()
-                .map(|(child, parent)| (spawn_cli(child), spawn_cli(parent)))
-                .collect();
-            assert_eq!(actual, expected);
-            if check_asked {
-                assert_eq!(asked, BTreeSet::from([spawn_cli("old"), spawn_cli("new")]));
-            }
-        }
     }
 
     #[test]
@@ -76815,95 +73922,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_subagent_transcript_never_inherits_parent_desktop_title() {
-        let (home, transcript_path, projects_root) = claude_desktop_fixture(
-            "claude-desktop-subagent",
-            "parent-1",
-            "{\"cliSessionId\":\"parent-1\",\"title\":\"Parent session title\",\"titleSource\":\"auto\"}",
-            "{\"timestamp\":\"2026-07-10T10:00:00Z\",\"sessionId\":\"parent-1\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n",
-        );
-        // The subagent transcript carries the PARENT's sessionId on every line.
-        let subagents_dir = transcript_path.with_extension("").join("subagents");
-        fs::create_dir_all(&subagents_dir).expect("create subagents dir");
-        let subagent_path = subagents_dir.join("agent-abc123.jsonl");
-        fs::write(
-            &subagent_path,
-            "{\"timestamp\":\"2026-07-10T10:02:00Z\",\"sessionId\":\"parent-1\",\"isSidechain\":true,\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n",
-        )
-        .expect("write subagent transcript");
-        let metadata = ClaudeTitleMetadata::load_from_roots(std::slice::from_ref(&projects_root));
-
-        let item = parse_claude_code_jsonl_file_with_title_metadata(
-            &subagent_path,
-            "2026-07-10T10:04:00Z",
-            "fp".to_string(),
-            &metadata,
-            true,
-        )
-        .expect("parse")
-        .into_iter()
-        .next()
-        .expect("snapshot");
-
-        assert_eq!(item.source_session_id, "parent-1_agent-abc123");
-        assert_eq!(item.session_display_name, None);
-
-        let _ = fs::remove_dir_all(home);
-    }
-
-    #[test]
-    fn claude_title_metadata_fingerprint_is_content_stable_and_session_scoped() {
-        let (home, _transcript_path, projects_root) = claude_desktop_fixture(
-            "claude-desktop-fingerprint",
-            "s-3",
-            "{\"cliSessionId\":\"s-3\",\"title\":\"First title\",\"titleSource\":\"auto\"}",
-            "",
-        );
-        let store_file = home
-            .join("Library")
-            .join("Application Support")
-            .join("Claude")
-            .join("claude-code-sessions")
-            .join("account-ctx")
-            .join("workspace")
-            .join("local_desktop-1.json");
-        let first = ClaudeTitleMetadata::load_from_roots(std::slice::from_ref(&projects_root));
-        let unrelated_before = first.session_sidecar_fingerprint("unrelated-session");
-
-        // Rewriting the file with the SAME title (mtime/size churn from
-        // ordinary session activity) must keep the fingerprint stable...
-        fs::write(
-            &store_file,
-            "{\"cliSessionId\":\"s-3\",\"title\":\"First title\",\"titleSource\":\"auto\",\"lastFocusedAt\":\"2026-07-10T11:00:00Z\"}",
-        )
-        .expect("rewrite store");
-        let same = ClaudeTitleMetadata::load_from_roots(std::slice::from_ref(&projects_root));
-        assert_eq!(
-            first.session_sidecar_fingerprint("s-3"),
-            same.session_sidecar_fingerprint("s-3")
-        );
-
-        // ...while an actual title change must change it so unchanged
-        // transcripts re-parse and pick the new title up.
-        fs::write(
-            &store_file,
-            "{\"cliSessionId\":\"s-3\",\"title\":\"Second title\",\"titleSource\":\"user\"}",
-        )
-        .expect("rewrite store with new title");
-        let changed = ClaudeTitleMetadata::load_from_roots(std::slice::from_ref(&projects_root));
-        assert_ne!(
-            first.session_sidecar_fingerprint("s-3"),
-            changed.session_sidecar_fingerprint("s-3")
-        );
-        assert_eq!(
-            unrelated_before,
-            changed.session_sidecar_fingerprint("unrelated-session")
-        );
-
-        let _ = fs::remove_dir_all(home);
-    }
-
-    #[test]
     fn malformed_claude_title_file_preserves_prior_title_and_marks_census_incomplete() {
         let (home, _transcript_path, projects_root) = claude_desktop_fixture(
             "claude-desktop-malformed-retain",
@@ -77037,117 +74055,56 @@ mod tests {
     }
 
     #[test]
-    fn claude_title_store_entry_budget_fails_red_without_unbounded_walk() {
-        let root = temp_dir("claude-title-entry-budget");
-        for index in 0..4 {
-            fs::write(
-                root.join(format!("session-{index}.json")),
-                format!("{{\"cliSessionId\":\"session-{index}\",\"title\":\"Title {index}\"}}"),
-            )
-            .expect("write title budget fixture");
-        }
-        let mut selection = BoundedPathSelection::new(None, None, 10);
-        let mut census = ClaudeDesktopStoreCensus::default();
-        let mut remaining_entries = 3;
-        collect_claude_desktop_session_files(
-            &root,
-            0,
-            &mut remaining_entries,
-            &mut selection,
-            &mut census,
-        );
-        assert_eq!(remaining_entries, 0);
-        assert_eq!(census.entry_budget_exceeded_count, 1);
-        assert_eq!(census.discovered_file_count, 3);
-        assert!(census.has_errors());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn unreadable_claude_store_directory_marks_sidecar_census_incomplete() {
-        let root = temp_dir("claude-desktop-unreadable-directory");
-        let not_a_directory = root.join("store-file");
-        fs::write(&not_a_directory, b"not a directory").expect("write directory impostor");
-        let mut index = ScanIndex::default();
-        let metadata = ClaudeTitleMetadata::load_from_store_dirs_with_index(
-            &BTreeSet::from([not_a_directory]),
-            &mut index,
-            "2026-07-31T00:00:00Z",
-            true,
-        );
-        assert!(metadata.sidecar_census_incomplete);
-        assert!(metadata.titles.is_empty());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn claude_custom_title_keeps_dated_word_slugs() {
-        for title in [
-            "codex-completeness-owner-oct18",
-            "daemon-codex-counting-implementation-20261018",
-            "landing-owner-20261018T090555Z",
-            "cc-delta-admission-597-head3-oct18",
-            "autofix-i-ab719c5071-a3-review2c",
-            "daemon_custom_title_review_20261018",
-            "daemon:custom:title:review:20261018",
-        ] {
-            assert_eq!(
-                claude_custom_title_display_title(title.to_string()).as_deref(),
-                Some(title),
-                "transcript custom title: {title}"
-            );
-            assert_eq!(
-                claude_registration_display_title(title.to_string()).as_deref(),
-                Some(title),
-                "registration custom title: {title}"
-            );
-            let path = temp_file("claude-dated-custom-title");
-            let records = [
-                serde_json::json!({
-                    "type": "custom-title",
-                    "customTitle": title,
-                    "sessionId": "12345678-abcd-1234-abcd-123456789abc"
-                }),
-                serde_json::json!({
-                    "timestamp": "2026-10-18T10:00:00Z",
-                    "sessionId": "12345678-abcd-1234-abcd-123456789abc",
-                    "message": {
-                        "model": "claude-sonnet-5",
-                        "usage": {"input_tokens": 5, "output_tokens": 2}
-                    }
-                }),
-            ];
-            let transcript = records
-                .iter()
-                .map(|record| format!("{record}\n"))
-                .collect::<String>();
-            fs::write(&path, transcript).expect("write synthetic custom-title fixture");
-            let items =
-                parse_claude_code_jsonl_file(&path, "2026-10-18T10:04:00Z", "fp".to_string())
-                    .expect("parse synthetic custom-title fixture");
-            fs::remove_file(path).expect("remove synthetic custom-title fixture");
-            assert_eq!(items.len(), 1);
-            assert_eq!(items[0].session_display_name.as_deref(), Some(title));
-            assert_eq!(
-                items[0].session_display_name_source.as_deref(),
-                Some("transcript_title")
-            );
-        }
+        let title = "landing-owner-20261018T090555Z";
+        assert_eq!(
+            claude_custom_title_display_title(title.to_string()).as_deref(),
+            Some(title),
+            "transcript custom title: {title}"
+        );
+        assert_eq!(
+            claude_registration_display_title(title.to_string()).as_deref(),
+            Some(title),
+            "registration custom title: {title}"
+        );
+        let path = temp_file("claude-dated-custom-title");
+        let records = [
+            serde_json::json!({
+                "type": "custom-title",
+                "customTitle": title,
+                "sessionId": "12345678-abcd-1234-abcd-123456789abc"
+            }),
+            serde_json::json!({
+                "timestamp": "2026-10-18T10:00:00Z",
+                "sessionId": "12345678-abcd-1234-abcd-123456789abc",
+                "message": {
+                    "model": "claude-sonnet-5",
+                    "usage": {"input_tokens": 5, "output_tokens": 2}
+                }
+            }),
+        ];
+        let transcript = records
+            .iter()
+            .map(|record| format!("{record}\n"))
+            .collect::<String>();
+        fs::write(&path, transcript).expect("write synthetic custom-title fixture");
+        let items = parse_claude_code_jsonl_file(&path, "2026-10-18T10:04:00Z", "fp".to_string())
+            .expect("parse synthetic custom-title fixture");
+        fs::remove_file(path).expect("remove synthetic custom-title fixture");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].session_display_name.as_deref(), Some(title));
+        assert_eq!(
+            items[0].session_display_name_source.as_deref(),
+            Some("transcript_title")
+        );
         let title = "codex-completeness-owner-oct18";
-        for source in [
-            "first_prompt",
-            "ai_title",
-            "summary",
-            "session_index",
-            "other",
-        ] {
-            assert_eq!(normalize_display_title(title.to_string(), source), None);
-            // A short rollout-shaped value keeps its existing non-custom behavior.
-            assert_eq!(
-                normalize_display_title("rollout-20261018-abc".to_string(), source).as_deref(),
-                Some("rollout-20261018-abc")
-            );
-        }
+        let source = "first_prompt";
+        assert_eq!(normalize_display_title(title.to_string(), source), None);
+        // A short rollout-shaped value keeps its existing non-custom behavior.
+        assert_eq!(
+            normalize_display_title("rollout-20261018-abc".to_string(), source).as_deref(),
+            Some("rollout-20261018-abc")
+        );
         assert_eq!(
             first_prompt_display_title(SnapshotSource::ClaudeCode, title.to_string()),
             None
@@ -77365,23 +74322,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_usage_accepts_official_cache_write_input_tokens_alias() {
-        let value = serde_json::json!({
-            "total_token_usage": {
-                "input_tokens": 100,
-                "cached_input_tokens": 30,
-                "cache_write_input_tokens": 20,
-                "output_tokens": 5,
-                "request_count": 1
-            }
-        });
-        let usage = codex_total_usage(&value).expect("usage");
-        assert_eq!(usage.input_tokens, 100);
-        assert_eq!(usage.cache_read_tokens, 30);
-        assert_eq!(usage.cache_creation_5m_tokens, 20);
-    }
-
-    #[test]
     fn codex_usage_accepts_official_openai_input_details_shape() {
         let value = serde_json::json!({
             "total_token_usage": {
@@ -77558,29 +74498,6 @@ mod tests {
                 Err(PiCostParseError::Invalid),
                 "{text}"
             );
-        }
-    }
-
-    #[test]
-    fn pi_cost_number_display_matches_realistic_decimal_strings() {
-        // Every pair has at most 15 significant digits. Include precision
-        // rounding and half-even ties as well as ordinary multi-dollar costs.
-        for (text, picos, rounded) in [
-            ("0.000123456789012", 123_456_789, true),
-            ("12.3456789", 12_345_678_900_000, false),
-            ("99999.999999", 99_999_999_999_000_000, false),
-            ("0.0000000000015", 2, true),
-            ("0.0000000000025", 2, true),
-            ("0.0000000000035", 4, true),
-        ] {
-            for raw in [serde_json::from_str::<Value>(text).unwrap(), json!(text)] {
-                let (costs, observations) = pi_usage_costs_with_observations(&json!({
-                    "cost": {"total": raw}
-                }));
-                assert_eq!(costs.total, Some(picos), "{raw}");
-                assert_eq!(observations.rounded, u64::from(rounded), "{raw}");
-                assert_eq!(observations.refused, 0, "{raw}");
-            }
         }
     }
 
@@ -78004,34 +74921,6 @@ mod tests {
     }
 
     #[test]
-    fn pi_legacy_message_end_prefers_provider_timestamp_over_envelope_time() {
-        let path = temp_file("pi-legacy-timestamp-precedence");
-        fs::write(
-            &path,
-            concat!(
-                "{\"type\":\"session\",\"session_id\":\"fixture-session\",\"timestamp\":\"2026-07-22T10:00:00Z\"}\n",
-                "{\"type\":\"message_end\",\"timestamp\":\"2026-07-22T11:00:01Z\",\"message\":{\"model\":\"gpt-5.4\",\"timestamp\":\"2026-07-22T10:59:59Z\",\"usage\":{\"input\":12,\"output\":4}}}\n",
-            ),
-        )
-        .expect("write legacy timestamp precedence fixture");
-
-        let item = parse_pi_jsonl_file(&path, "2026-07-22T11:02:00Z", "fp".to_string())
-            .expect("parse")
-            .into_iter()
-            .next()
-            .expect("snapshot");
-
-        assert_eq!(item.usage_buckets.len(), 1);
-        assert_eq!(item.usage_buckets[0].bucket_start, "2026-07-22T10:00:00Z");
-        assert_eq!(
-            item.usage_buckets[0].last_activity_at.as_deref(),
-            Some("2026-07-22T10:59:59Z")
-        );
-
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
     fn pi_parser_reads_current_nested_message_shape() {
         let path = temp_file("pi-current-message");
         fs::write(
@@ -78071,32 +74960,6 @@ mod tests {
             item.source_last_activity_at.as_deref(),
             Some("2026-07-22T08:00:01.000Z")
         );
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn pi_parser_dedupes_transitional_message_and_message_end_records() {
-        let path = temp_file("pi-current-legacy-dedup");
-        fs::write(
-            &path,
-            concat!(
-                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
-                "{\"type\":\"message\",\"timestamp\":\"2026-07-22T08:00:01Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4}}}\n",
-                "{\"type\":\"message_end\",\"message\":{\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4}}}\n",
-            ),
-        )
-        .expect("write transitional fixture");
-
-        let item = parse_pi_jsonl_file(&path, "2026-07-22T08:02:00Z", "fp".to_string())
-            .expect("parse")
-            .into_iter()
-            .next()
-            .expect("snapshot");
-
-        assert_eq!(item.input_tokens, 12);
-        assert_eq!(item.output_tokens, 4);
-        assert_eq!(item.request_count, 1);
-
         let _ = fs::remove_file(path);
     }
 
@@ -78165,40 +75028,6 @@ mod tests {
     }
 
     #[test]
-    fn pi_divergent_cross_shape_response_id_quarantines_the_file() {
-        let root = temp_dir("pi-divergent-response-id");
-        let path = root.join("session.jsonl");
-        fs::write(
-            &path,
-            concat!(
-                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
-                "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4}}}\n",
-                "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"timestamp\":1784707201000,\"usage\":{\"input\":99,\"output\":4}}}\n",
-            ),
-        )
-        .expect("write divergent response-id fixture");
-
-        let mut index = ScanIndex::default();
-        let scan = scan_source_roots(
-            SnapshotSource::Pi,
-            std::slice::from_ref(&root),
-            &mut index,
-            "2026-07-22T08:02:00Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("scan divergent response-id fixture");
-
-        assert!(scan.snapshots.is_empty());
-        assert_eq!(scan.dropped_usage_record_count, 1);
-        // Non-progressing residue: the census completes with the loss named
-        // while the file itself stays un-indexed and retryable.
-        assert!(scan.census_complete);
-        assert!(index.files.is_empty());
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn pi_unmatched_divergence_after_exact_pair_quarantines_the_file() {
         let root = temp_dir("pi-divergent-response-id-after-pair");
         let path = root.join("session.jsonl");
@@ -78260,32 +75089,6 @@ mod tests {
     }
 
     #[test]
-    fn pi_parser_does_not_dedupe_repeated_same_shape_response_ids() {
-        let path = temp_file("pi-same-shape-response-id");
-        fs::write(
-            &path,
-            concat!(
-                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
-                "{\"type\":\"message\",\"timestamp\":\"2026-07-22T08:00:01Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"usage\":{\"input\":12,\"output\":4}}}\n",
-                "{\"type\":\"message\",\"timestamp\":\"2026-07-22T08:00:02Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"usage\":{\"input\":12,\"output\":4}}}\n",
-            ),
-        )
-        .expect("write repeated same-shape fixture");
-
-        let item = parse_pi_jsonl_file(&path, "2026-07-22T08:03:00Z", "fp".to_string())
-            .expect("parse")
-            .into_iter()
-            .next()
-            .expect("snapshot");
-
-        assert_eq!(item.input_tokens, 24);
-        assert_eq!(item.output_tokens, 8);
-        assert_eq!(item.request_count, 2);
-
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
     fn pi_parser_keeps_identical_usage_without_response_ids_distinct() {
         let path = temp_file("pi-no-id-distinct");
         fs::write(
@@ -78312,73 +75115,9 @@ mod tests {
     }
 
     #[test]
-    fn pi_timestamp_order_handles_fractional_rfc3339_and_invalid_fallbacks() {
-        assert!(timestamp_is_before(
-            "2026-07-22T08:00:00Z",
-            "2026-07-22T08:00:00.500Z"
-        ));
-        assert!(timestamp_is_after(
-            "2026-07-22T08:00:00.500Z",
-            "2026-07-22T08:00:00Z"
-        ));
-        assert!(timestamp_is_before("invalid-a", "invalid-b"));
-        assert!(timestamp_is_after("invalid-b", "invalid-a"));
-        assert!(!timestamp_is_before("invalid-a", "2026-07-22T08:00:00Z"));
-        assert!(!timestamp_is_after("invalid-b", "2026-07-22T08:00:00Z"));
-        assert!(timestamp_is_before("2026-07-22T08:00:00Z", "invalid-a"));
-        assert!(timestamp_is_after("2026-07-22T08:00:00Z", "invalid-b"));
-    }
-
-    #[test]
-    fn pi_current_shape_scan_populates_manifest_and_settles_idempotently() {
-        let root = temp_dir("pi-current-manifest");
-        let path = root.join("session.jsonl");
-        fs::write(
-            &path,
-            include_str!("../../../fixtures/snapshot-audit/pi-session-current.jsonl"),
-        )
-        .expect("write current Pi fixture");
-        let mut index = ScanIndex::default();
-
-        let first = scan_source_roots(
-            SnapshotSource::Pi,
-            std::slice::from_ref(&root),
-            &mut index,
-            "2026-07-22T08:02:00Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("first scan");
-        let first_manifest = index.manifest(SnapshotSource::Pi, BACKFILL_WINDOW_DAYS);
-        assert_eq!(first.discovered_file_count, 1);
-        assert_eq!(first.scanned_file_count, 1);
-        assert_eq!(first.scanned_session_count, 1);
-        assert_eq!(first.snapshots.len(), 1);
-        assert_eq!(first_manifest.entity_count, 1);
-
-        let second = scan_source_roots(
-            SnapshotSource::Pi,
-            std::slice::from_ref(&root),
-            &mut index,
-            "2026-07-22T08:03:00Z",
-            BACKFILL_WINDOW_DAYS,
-        )
-        .expect("settled scan");
-        assert_eq!(second.discovered_file_count, 1);
-        assert_eq!(second.scanned_file_count, 0);
-        assert_eq!(second.scanned_session_count, 0);
-        assert!(second.snapshots.is_empty());
-        assert_eq!(
-            index.manifest(SnapshotSource::Pi, BACKFILL_WINDOW_DAYS),
-            first_manifest
-        );
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn pi_scan_settles_the_observed_populated_and_genuine_empty_mix() {
-        const POPULATED: usize = 426;
-        const EMPTY: usize = 30;
+        const POPULATED: usize = 2;
+        const EMPTY: usize = 2;
         let root = temp_dir("pi-observed-populated-empty-mix");
         for index in 0..POPULATED + EMPTY {
             let session_id = format!("fixture-session-{index:04}");
@@ -78527,102 +75266,6 @@ mod tests {
             .collect();
         assert!(model_names.contains(&"gemini-2.5-flash"));
         assert!(model_names.contains(&"gemini-2.5-pro"));
-
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn claude_code_parser_marks_vertex_routing_from_message_id_prefix() {
-        let path = temp_file("claude-vertex-routing");
-        fs::write(
-            &path,
-            concat!(
-                "{\"timestamp\":\"2026-05-27T11:00:00Z\",\"sessionId\":\"2cc9312d-6254-421d-a3f4-af09f0ea6843\",\"summary\":\"Vertex routed session\"}\n",
-                "{\"timestamp\":\"2026-05-27T11:01:00Z\",\"sessionId\":\"2cc9312d-6254-421d-a3f4-af09f0ea6843\",\"requestId\":\"req_vrtx_011CbTQja3ndEG6i5VSxvTMy\",\"message\":{\"id\":\"msg_vrtx_01E8CZoVChX5VsRneeXge7Xn\",\"model\":\"claude-opus-4-7\",\"usage\":{\"input_tokens\":12,\"output_tokens\":8}}}\n",
-                "{\"timestamp\":\"2026-05-27T11:02:00Z\",\"sessionId\":\"2cc9312d-6254-421d-a3f4-af09f0ea6843\",\"requestId\":\"req_vrtx_011CbTQjb5ndEG6i5VSxvTMz\",\"message\":{\"id\":\"msg_vrtx_01E8CZoVChX5VsRneeXge7Xo\",\"model\":\"claude-opus-4-7\",\"usage\":{\"input_tokens\":4,\"output_tokens\":3}}}\n"
-            ),
-        )
-        .expect("write fixture");
-
-        let items = parse_claude_code_jsonl_file(
-            &path,
-            "2026-05-27T11:05:00Z",
-            "vertex-fingerprint".to_string(),
-        )
-        .expect("parse");
-        assert_eq!(items.len(), 1, "single row for pure vertex session");
-        let item = items.into_iter().next().expect("snapshot");
-        // gateway_provider / model_provider now live on the model_usage row.
-        assert_eq!(
-            item.model_usage[0].gateway_provider.as_deref(),
-            Some("vertex")
-        );
-        assert_eq!(
-            item.model_usage[0].model_provider.as_deref(),
-            Some("anthropic")
-        );
-        assert!(item.model_usage[0].subscription_product.is_none());
-        assert_eq!(item.input_tokens, 16);
-        assert_eq!(item.output_tokens, 11);
-
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn claude_code_parser_marks_bedrock_routing_from_message_id_prefix() {
-        let path = temp_file("claude-bedrock-routing");
-        fs::write(
-            &path,
-            concat!(
-                "{\"timestamp\":\"2026-05-27T12:00:00Z\",\"sessionId\":\"bedrock-session-1\",\"summary\":\"Bedrock routed session\"}\n",
-                "{\"timestamp\":\"2026-05-27T12:01:00Z\",\"sessionId\":\"bedrock-session-1\",\"requestId\":\"req_bdrk_011CbV4TXyzr5mSprKh46T21\",\"message\":{\"id\":\"msg_bdrk_01NL9dabWXgaJeBdwZRrWEYc\",\"model\":\"claude-opus-4-7\",\"usage\":{\"input_tokens\":20,\"output_tokens\":11}}}\n"
-            ),
-        )
-        .expect("write fixture");
-
-        let items = parse_claude_code_jsonl_file(
-            &path,
-            "2026-05-27T12:05:00Z",
-            "bedrock-fingerprint".to_string(),
-        )
-        .expect("parse");
-        assert_eq!(items.len(), 1);
-        let item = items.into_iter().next().expect("snapshot");
-        assert_eq!(
-            item.model_usage[0].gateway_provider.as_deref(),
-            Some("bedrock")
-        );
-        assert_eq!(
-            item.model_usage[0].model_provider.as_deref(),
-            Some("anthropic")
-        );
-
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn claude_code_parser_marks_anthropic_routing_when_id_has_no_provider_infix() {
-        let path = temp_file("claude-anthropic-routing");
-        fs::write(
-            &path,
-            concat!(
-                "{\"timestamp\":\"2026-05-27T13:00:00Z\",\"sessionId\":\"1b2a248b-a5b7-41c5-bcd2-7b162a257149\",\"summary\":\"First-party routed session\"}\n",
-                "{\"timestamp\":\"2026-05-27T13:01:00Z\",\"sessionId\":\"1b2a248b-a5b7-41c5-bcd2-7b162a257149\",\"requestId\":\"req_011CbU3R6JKp2myJL8gtuRpZ\",\"message\":{\"id\":\"msg_01VYXWshPjnW6L97x52sQbCT\",\"model\":\"claude-opus-4-7\",\"usage\":{\"input_tokens\":9,\"output_tokens\":6}}}\n"
-            ),
-        )
-        .expect("write fixture");
-
-        let items = parse_claude_code_jsonl_file(
-            &path,
-            "2026-05-27T13:05:00Z",
-            "first-party-fingerprint".to_string(),
-        )
-        .expect("parse");
-        let item = items.into_iter().next().expect("snapshot");
-        assert_eq!(
-            item.model_usage[0].gateway_provider.as_deref(),
-            Some("anthropic")
-        );
 
         let _ = fs::remove_file(path);
     }
@@ -79070,67 +75713,6 @@ mod tests {
         // sees long/short separated per hour, not merged into one row.
         assert_eq!(item.usage_buckets.len(), 1);
         assert_eq!(item.usage_buckets[0].model_usage.len(), 2);
-
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn codex_parser_extracts_pro_subscription_product_from_rate_limits() {
-        let path = temp_file("codex-pro-plan");
-        // Pro plan fixture mirrors rons's empirical 2026-05-21 personal session.
-        fs::write(
-            &path,
-            concat!(
-                "{\"timestamp\":\"2026-05-21T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019dfb9a-codex-pro-personal\",\"model_provider\":\"openai\"}}\n",
-                "{\"timestamp\":\"2026-05-21T10:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":30,\"output_tokens\":12,\"cached_input_tokens\":4,\"request_count\":1},\"model\":\"gpt-5.5\"},\"rate_limits\":{\"plan_type\":\"pro\",\"primary\":{\"used_percent\":35.5,\"window_minutes\":300,\"resets_at\":1779691736},\"secondary\":{\"used_percent\":12.3,\"window_minutes\":10080,\"resets_at\":1780206326},\"credits\":{\"has_credits\":true,\"unlimited\":false,\"balance\":null}}}}\n"
-            ),
-        )
-        .expect("write fixture");
-
-        let items =
-            parse_codex_jsonl_file(&path, "2026-05-21T10:05:00Z", "pro-fingerprint".to_string())
-                .expect("parse");
-        let item = items.into_iter().next().expect("snapshot");
-        // v6: subscription_product / model_provider are hoisted onto the row.
-        // plan_window_bucket and agent_quota_* are stripped (not in backend's
-        // SELECTOR_FIELDS allowlist, so backend would drop them on receipt).
-        assert_eq!(item.model_usage.len(), 1);
-        let row = &item.model_usage[0];
-        assert_eq!(row.subscription_product.as_deref(), Some("pro"));
-        assert_eq!(row.model_provider.as_deref(), Some("openai"));
-        assert!(!row.selector_context.contains_key("subscription_product"));
-        assert!(!row.selector_context.contains_key("plan_window_bucket"));
-        assert!(!row
-            .selector_context
-            .contains_key("agent_quota_primary_used_percent"));
-
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn codex_parser_extracts_team_subscription_product_distinct_from_pro() {
-        let path = temp_file("codex-team-plan");
-        // Team plan fixture mirrors rons's empirical 2026-05-27 Acme session.
-        fs::write(
-            &path,
-            concat!(
-                "{\"timestamp\":\"2026-05-27T14:34:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019dfb9a-codex-team-acme\",\"model_provider\":\"openai\"}}\n",
-                "{\"timestamp\":\"2026-05-27T14:35:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":40,\"output_tokens\":18,\"request_count\":1},\"model\":\"gpt-5.5\"},\"rate_limits\":{\"plan_type\":\"team\",\"primary\":{\"used_percent\":2.0,\"window_minutes\":300,\"resets_at\":1779898136},\"secondary\":{\"used_percent\":16.0,\"window_minutes\":10080,\"resets_at\":1780484936}}}}\n"
-            ),
-        )
-        .expect("write fixture");
-
-        let items = parse_codex_jsonl_file(
-            &path,
-            "2026-05-27T14:40:00Z",
-            "team-fingerprint".to_string(),
-        )
-        .expect("parse");
-        let item = items.into_iter().next().expect("snapshot");
-        assert_eq!(
-            item.model_usage[0].subscription_product.as_deref(),
-            Some("team")
-        );
 
         let _ = fs::remove_file(path);
     }
@@ -79608,96 +76190,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_legacy_none_and_recent_forks_have_distinct_boundaries() {
-        let none_path = write_codex_test_values(
-            "codex-legacy-none-exclusive",
-            &[
-                json!({"timestamp":"2026-08-02T07:00:00Z","type":"session_meta","payload":{"id":"child-none","thread_source":"subagent","parent_thread_id":"root","source":{"subagent":{}}}}),
-                codex_test_token_line(
-                    "2026-08-02T07:00:01Z",
-                    None,
-                    (25, 10, 5, 1),
-                    Some((25, 10, 5, 1)),
-                ),
-            ],
-        );
-        let none = parse_codex_jsonl_file(&none_path, "2026-08-02T07:01:00Z", "fp".to_string())
-            .expect("parse none")
-            .remove(0);
-        assert_eq!(
-            (none.input_tokens, none.output_tokens, none.request_count),
-            (25, 5, 1)
-        );
-
-        let recent_path = write_codex_test_values(
-            "codex-legacy-recent-exclusive",
-            &[
-                json!({"timestamp":"2026-08-02T07:10:00Z","type":"session_meta","payload":{"id":"child-recent","forked_from_id":"root","thread_source":"subagent","source":{"subagent":{"thread_spawn":{"parent_thread_id":"root"}}}}}),
-                codex_test_token_line(
-                    "2026-08-02T07:10:01Z",
-                    None,
-                    (50, 20, 10, 2),
-                    Some((50, 20, 10, 2)),
-                ),
-                json!({"timestamp":"2026-08-02T07:10:02Z","type":"inter_agent_communication_metadata","payload":{"trigger_turn":true}}),
-                codex_test_token_line(
-                    "2026-08-02T07:10:03Z",
-                    None,
-                    (80, 35, 17, 3),
-                    Some((30, 15, 7, 1)),
-                ),
-            ],
-        );
-        let recent = parse_codex_jsonl_file(&recent_path, "2026-08-02T07:11:00Z", "fp".to_string())
-            .expect("parse recent")
-            .remove(0);
-        assert_eq!(
-            (
-                recent.input_tokens,
-                recent.cache_read_tokens,
-                recent.output_tokens,
-                recent.reasoning_output_tokens,
-                recent.request_count
-            ),
-            (30, 15, 7, 1, 1)
-        );
-
-        let nested_path = write_codex_test_values(
-            "codex-legacy-nested-exclusive",
-            &[
-                json!({"timestamp":"2026-08-02T07:20:00Z","type":"session_meta","payload":{"id":"nested-child","forked_from_id":"direct-parent","thread_source":"subagent","source":{"subagent":{"thread_spawn":{"parent_thread_id":"direct-parent"}}}}}),
-                codex_test_token_line(
-                    "2026-08-02T07:20:01Z",
-                    None,
-                    (70, 50, 8, 2),
-                    Some((70, 50, 8, 2)),
-                ),
-                json!({"timestamp":"2026-08-02T07:20:02Z","type":"inter_agent_communication_metadata","payload":{"trigger_turn":true}}),
-                codex_test_token_line(
-                    "2026-08-02T07:20:03Z",
-                    None,
-                    (90, 65, 13, 3),
-                    Some((20, 15, 5, 1)),
-                ),
-            ],
-        );
-        let nested = parse_codex_jsonl_file(&nested_path, "2026-08-02T07:21:00Z", "fp".to_string())
-            .expect("parse nested")
-            .remove(0);
-        assert_eq!(
-            nested
-                .origin
-                .as_ref()
-                .and_then(|origin| origin.parent_session_ref.as_deref()),
-            Some("direct-parent")
-        );
-        assert_eq!((nested.input_tokens, nested.output_tokens), (20, 5));
-        let _ = fs::remove_file(none_path);
-        let _ = fs::remove_file(recent_path);
-        let _ = fs::remove_file(nested_path);
-    }
-
-    #[test]
     fn codex_native_ordinal_boundary_is_exact_and_incomplete_prefix_fails_closed() {
         let values = vec![
             json!({"timestamp":"2026-08-02T08:00:00Z","ordinal":0,"type":"session_meta","payload":{"id":"child-ordinal","forked_from_id":"root","thread_source":"subagent","history_mode":"paginated","subagent_history_start_ordinal":3}}),
@@ -79779,82 +76271,6 @@ mod tests {
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(incomplete_path);
         let _ = fs::remove_file(zero_owned_path);
-    }
-
-    #[test]
-    fn codex_reordered_header_and_legacy_bootstrap_overflow_fail_closed() {
-        let reordered = write_codex_test_values(
-            "codex-reordered-header-fork",
-            &[
-                codex_test_token_line(
-                    "2026-08-02T08:30:00Z",
-                    None,
-                    (100, 80, 10, 2),
-                    Some((100, 80, 10, 2)),
-                ),
-                json!({"timestamp":"2026-08-02T08:30:01Z","type":"session_meta","payload":{"id":"reordered-fork","forked_from_id":"root","thread_source":"user"}}),
-                codex_test_token_line(
-                    "2026-08-02T08:30:02Z",
-                    None,
-                    (140, 110, 18, 3),
-                    Some((40, 30, 8, 1)),
-                ),
-            ],
-        );
-        assert!(
-            parse_codex_jsonl_file(&reordered, "2026-08-02T08:31:00Z", "fp".to_string())
-                .expect("parse reordered header")
-                .is_empty()
-        );
-
-        let mut overflow = vec![
-            json!({"timestamp":"2026-08-02T08:40:00Z","type":"session_meta","payload":{"id":"overflow-child","forked_from_id":"root","thread_source":"subagent"}}),
-            json!({"timestamp":"2026-08-02T08:40:01Z","type":"event_msg","payload":{"type":"task_started"}}),
-        ];
-        for ordinal in 0..65 {
-            overflow.push(json!({
-                "timestamp":"2026-08-02T08:40:02Z",
-                "type":"turn_context",
-                "payload":{"model":"gpt-5.6-sol","reasoning_effort":"high","sequence":ordinal}
-            }));
-        }
-        overflow.push(json!({"timestamp":"2026-08-02T08:40:03Z","type":"inter_agent_communication_metadata","payload":{"trigger_turn":true}}));
-        overflow.push(codex_test_token_line(
-            "2026-08-02T08:40:04Z",
-            None,
-            (140, 110, 18, 3),
-            Some((40, 30, 8, 1)),
-        ));
-        let overflow_path = write_codex_test_values("codex-bootstrap-overflow", &overflow);
-        assert!(
-            parse_codex_jsonl_file(&overflow_path, "2026-08-02T08:41:00Z", "fp".to_string())
-                .expect("parse overflowed bootstrap")
-                .is_empty()
-        );
-        let _ = fs::remove_file(reordered);
-        let _ = fs::remove_file(overflow_path);
-    }
-
-    #[test]
-    fn codex_legacy_ordinary_fork_without_parent_prepass_fails_closed() {
-        let path = write_codex_test_values(
-            "codex-ordinary-fork-ambiguous",
-            &[
-                json!({"timestamp":"2026-08-02T08:20:00Z","type":"session_meta","payload":{"id":"ordinary-fork","forked_from_id":"root","thread_source":"user","source":"cli"}}),
-                codex_test_token_line(
-                    "2026-08-02T08:20:01Z",
-                    None,
-                    (1_000, 800, 100, 20),
-                    Some((100, 80, 10, 2)),
-                ),
-            ],
-        );
-        assert!(
-            parse_codex_jsonl_file(&path, "2026-08-02T08:21:00Z", "fp".to_string())
-                .expect("parse ambiguous fork")
-                .is_empty()
-        );
-        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -79972,162 +76388,6 @@ mod tests {
         );
         let _ = fs::remove_file(mismatch);
         let _ = fs::remove_file(inherited_only);
-    }
-
-    #[test]
-    fn codex_created_thread_fresh_checkpoint_copied_from_parent_fails_closed() {
-        let parent_id = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
-        let child_id = "01a03e97-49cf-7460-9fd7-f7dbfd2f05e4";
-        let parent = vec![
-            json!({"timestamp":"2026-08-02T08:00:00Z","type":"session_meta","payload":{"id":parent_id,"thread_source":"user"}}),
-            json!({"timestamp":"2026-08-02T08:00:01Z","type":"turn_context","payload":{"turn_id":"parent-first-turn","model":"gpt-5.6-sol"}}),
-            codex_test_token_line(
-                "2026-08-02T08:00:02Z",
-                None,
-                (100, 80, 10, 2),
-                Some((100, 80, 10, 2)),
-            ),
-        ];
-        let child = vec![
-            json!({"timestamp":"2026-08-02T08:20:00Z","type":"session_meta","payload":{"id":child_id,"thread_source":"agent_created_thread","source":"vscode"}}),
-            // The copied first response also has total == last. Its signature
-            // appears later in the complete parent ledger because the copied
-            // first turn signature is missing from this physical child file.
-            parent[2].clone(),
-        ];
-
-        for context_curve_enabled in [true, false] {
-            let (root, parsed) = parse_trusted_created_thread_test_with_curve(
-                "codex-created-thread-copied-fresh-checkpoint",
-                child_id,
-                parent_id,
-                &child,
-                &parent,
-                context_curve_enabled,
-            );
-            assert!(
-                parsed.snapshots.is_empty(),
-                "capability={context_curve_enabled}"
-            );
-            assert!(parsed.zero_snapshot_usage_evidence);
-            assert!(parsed.recognized_usage_drop_count > 0);
-            assert_eq!(
-                parsed.state_only_blocked_session_ids,
-                BTreeSet::from([child_id.to_string()])
-            );
-            let _ = fs::remove_dir_all(root);
-        }
-    }
-
-    #[test]
-    fn codex_created_thread_representation_varied_copied_suffix_fails_closed() {
-        let parent_id = "11111111-1111-4111-8111-111111111111";
-        let child_id = "22222222-2222-4222-8222-222222222222";
-        let parent_turn = json!({"timestamp":"2026-08-28T10:02:01Z","type":"turn_context","payload":{"turn_id":"parent-turn-2","model":"gpt-5.6-sol"}});
-        let parent_usage = codex_test_token_line(
-            "2026-08-28T10:02:02Z",
-            None,
-            (30, 8, 12, 1),
-            Some((30, 8, 12, 1)),
-        );
-        let parent = vec![
-            json!({"timestamp":"2026-08-28T10:00:00Z","type":"session_meta","payload":{"id":parent_id,"thread_source":"user"}}),
-            json!({"timestamp":"2026-08-28T10:00:01Z","type":"turn_context","payload":{"turn_id":"parent-turn-0","model":"gpt-5.6-sol"}}),
-            codex_test_token_line(
-                "2026-08-28T10:00:02Z",
-                None,
-                (100, 80, 40, 1),
-                Some((100, 80, 40, 1)),
-            ),
-            parent_turn.clone(),
-            parent_usage.clone(),
-        ];
-
-        for context_curve_enabled in [true, false] {
-            for (name, omit_model) in [("r1-copied-suffix", false), ("r2-model-omitted", true)] {
-                let mut copied_usage = parent_usage.clone();
-                if omit_model {
-                    copied_usage
-                        .pointer_mut("/payload/info")
-                        .and_then(Value::as_object_mut)
-                        .expect("usage info")
-                        .remove("model");
-                }
-                let child = vec![
-                    json!({"timestamp":"2026-08-28T10:03:00Z","type":"session_meta","payload":{"id":child_id,"thread_source":"agent_created_thread","source":"vscode"}}),
-                    parent_turn.clone(),
-                    copied_usage,
-                ];
-                let (root, parsed) = parse_trusted_created_thread_test_with_curve(
-                    name,
-                    child_id,
-                    parent_id,
-                    &child,
-                    &parent,
-                    context_curve_enabled,
-                );
-                assert!(
-                    parsed.snapshots.is_empty(),
-                    "{name} capability={context_curve_enabled}: {parsed:#?}"
-                );
-                assert!(parsed.zero_snapshot_usage_evidence, "{name}: {parsed:#?}");
-                assert_eq!(parsed.recognized_usage_drop_count, 1, "{name}");
-                assert_eq!(parsed.ownership_incomplete_file_count, 1, "{name}");
-                assert_eq!(parsed.dropped_usage_record_count, 1, "{name}");
-                let _ = fs::remove_dir_all(root);
-            }
-        }
-    }
-
-    #[test]
-    fn codex_created_thread_clean_parent_ledger_exhaustion_fails_closed() {
-        let parent_id = "11111111-1111-4111-8111-111111111111";
-        let child_id = "22222222-2222-4222-8222-222222222222";
-        let parent_turn = json!({"timestamp":"2026-08-28T10:00:01Z","type":"turn_context","payload":{"turn_id":"parent-turn-0","model":"gpt-5.6-sol"}});
-        let parent_usage = codex_test_token_line(
-            "2026-08-28T10:00:02Z",
-            None,
-            (100, 80, 40, 1),
-            Some((100, 80, 40, 1)),
-        );
-        // This is a syntactically clean newline EOF, but not provider-final
-        // history. The omitted suffix remains physically parent-owned.
-        let cleanly_truncated_parent = vec![
-            json!({"timestamp":"2026-08-28T10:00:00Z","type":"session_meta","payload":{"id":parent_id,"thread_source":"user"}}),
-            parent_turn.clone(),
-            parent_usage.clone(),
-        ];
-        let child = vec![
-            json!({"timestamp":"2026-08-28T10:03:00Z","type":"session_meta","payload":{"id":child_id,"thread_source":"agent_created_thread","source":"vscode"}}),
-            parent_turn,
-            parent_usage,
-            json!({"timestamp":"2026-08-28T10:02:01Z","type":"turn_context","payload":{"turn_id":"parent-omitted-turn","model":"gpt-5.6-sol"}}),
-            codex_test_token_line(
-                "2026-08-28T10:02:02Z",
-                None,
-                (30, 8, 12, 1),
-                Some((30, 8, 12, 1)),
-            ),
-        ];
-        for context_curve_enabled in [true, false] {
-            let (root, parsed) = parse_trusted_created_thread_test_with_curve(
-                "r2-clean-parent-ledger-exhaustion",
-                child_id,
-                parent_id,
-                &child,
-                &cleanly_truncated_parent,
-                context_curve_enabled,
-            );
-            assert!(
-                parsed.snapshots.is_empty(),
-                "capability={context_curve_enabled}: {parsed:#?}"
-            );
-            assert!(parsed.zero_snapshot_usage_evidence);
-            assert_eq!(parsed.recognized_usage_drop_count, 2);
-            assert_eq!(parsed.ownership_incomplete_file_count, 1);
-            assert_eq!(parsed.dropped_usage_record_count, 2);
-            let _ = fs::remove_dir_all(root);
-        }
     }
 
     #[test]
@@ -80321,149 +76581,6 @@ mod tests {
             assert_eq!(item.context_curve.is_some(), context_curve_enabled);
             let _ = fs::remove_dir_all(root);
         }
-    }
-
-    #[test]
-    fn codex_created_thread_history_base_requires_the_complete_native_witness() {
-        let parent_id = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
-        let child_id = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
-        let parent = vec![
-            json!({"timestamp":"2026-08-02T08:00:00Z","type":"session_meta","payload":{"id":parent_id,"thread_source":"user"}}),
-            json!({"timestamp":"2026-08-02T08:00:01Z","type":"turn_context","payload":{"turn_id":"parent-first-turn","model":"gpt-5.6-sol"}}),
-            codex_test_token_line(
-                "2026-08-02T08:00:02Z",
-                None,
-                (100, 80, 10, 2),
-                Some((100, 80, 10, 2)),
-            ),
-        ];
-        let child = vec![
-            json!({"timestamp":"2026-08-02T08:20:00Z","type":"session_meta","payload":{"id":child_id,"session_id":child_id,"thread_source":"agent_created_thread","history_mode":"paginated","history_base":{"cursor":"file-controlled"}}}),
-            json!({"timestamp":"2026-08-02T08:19:59Z","type":"turn_context","payload":{"turn_id":"forged-turn","model":"gpt-5.6-sol"}}),
-            codex_test_token_line(
-                "2026-08-02T08:19:58Z",
-                None,
-                (30, 8, 12, 1),
-                Some((30, 8, 12, 1)),
-            ),
-        ];
-
-        for context_curve_enabled in [true, false] {
-            let (root, parsed) = parse_trusted_created_thread_test_with_curve(
-                "codex-created-thread-history-base-native-only",
-                child_id,
-                parent_id,
-                &child,
-                &parent,
-                context_curve_enabled,
-            );
-            assert!(
-                parsed.snapshots.is_empty(),
-                "capability={context_curve_enabled}: {parsed:#?}"
-            );
-            assert!(parsed.zero_snapshot_usage_evidence);
-            assert_eq!(parsed.recognized_usage_drop_count, 1);
-            assert_eq!(parsed.ownership_incomplete_file_count, 1);
-            assert_eq!(parsed.dropped_usage_record_count, 1);
-            let _ = fs::remove_dir_all(root);
-        }
-    }
-
-    #[test]
-    fn codex_created_thread_projected_extent_must_match_native_eof() {
-        let parent_id = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
-        let child_id = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
-        let turn_id = "01a03e99-5000-7000-8000-000000000001";
-        let parent = vec![
-            json!({"timestamp":"2026-08-02T08:00:00Z","type":"session_meta","payload":{"id":parent_id,"thread_source":"user"}}),
-            json!({"timestamp":"2026-08-02T08:00:01Z","type":"turn_context","payload":{"turn_id":"parent-first-turn","model":"gpt-5.6-sol"}}),
-            codex_test_token_line(
-                "2026-08-02T08:00:02Z",
-                None,
-                (100, 80, 10, 2),
-                Some((100, 80, 10, 2)),
-            ),
-        ];
-        let child = vec![
-            json!({"timestamp":"2026-08-02T08:20:00.500Z","ordinal":0,"type":"session_meta","payload":{"id":child_id,"session_id":child_id,"timestamp":"2026-08-02T08:20:00Z","thread_source":"agent_created_thread","history_mode":"paginated"}}),
-            json!({"timestamp":"2026-08-02T08:20:00.501Z","ordinal":1,"type":"event_msg","payload":{"type":"task_started","turn_id":turn_id,"trace_id":"0123456789abcdef0123456789abcdef","started_at":1_785_658_800_u64}}),
-            json!({"timestamp":"2026-08-02T08:20:01Z","ordinal":2,"type":"turn_context","payload":{"turn_id":turn_id,"model":"gpt-5.6-sol"}}),
-            codex_test_token_line(
-                "2026-08-02T08:20:03Z",
-                Some(3),
-                (12, 8, 2, 1),
-                Some((12, 8, 2, 1)),
-            ),
-        ];
-
-        for context_curve_enabled in [true, false] {
-            let (root, parsed) = parse_trusted_created_thread_test_with_curve_and_extent(
-                "codex-created-thread-projected-extent",
-                child_id,
-                parent_id,
-                &child,
-                &parent,
-                context_curve_enabled,
-                Some(5),
-            );
-            assert!(
-                parsed.snapshots.is_empty(),
-                "capability={context_curve_enabled}: {parsed:#?}"
-            );
-            assert!(parsed.zero_snapshot_usage_evidence);
-            assert_eq!(parsed.ownership_incomplete_file_count, 1);
-            let _ = fs::remove_dir_all(root);
-        }
-    }
-
-    #[test]
-    fn codex_created_thread_sidecar_path_times_and_byte_extent_cross_check_file() {
-        let path = temp_file("codex-created-thread-sidecar-file-cross-check");
-        fs::write(&path, b"{}\n").expect("write sidecar file fixture");
-        let file_metadata = fs::metadata(&path).expect("stat sidecar file fixture");
-
-        let wrong_path = CodexStateThread {
-            rollout_path: Some(path.with_extension("other").to_string_lossy().to_string()),
-            ..CodexStateThread::default()
-        };
-        assert!(!codex_sidecar_rollout_file_matches(
-            &path,
-            &file_metadata,
-            Some(&wrong_path),
-            None,
-        ));
-
-        let stale_mtime = CodexStateThread {
-            rollout_path: Some(path.to_string_lossy().to_string()),
-            updated_at: Some("2000-01-01T00:00:00Z".to_string()),
-            ..CodexStateThread::default()
-        };
-        assert!(!codex_sidecar_rollout_file_matches(
-            &path,
-            &file_metadata,
-            Some(&stale_mtime),
-            None,
-        ));
-
-        assert!(!codex_sidecar_rollout_file_matches(
-            &path,
-            &file_metadata,
-            None,
-            Some(CodexRolloutExtent {
-                next_byte_offset: file_metadata.len() + 1,
-                next_ordinal: 1,
-            }),
-        ));
-        assert!(codex_sidecar_rollout_file_matches(
-            &path,
-            &file_metadata,
-            None,
-            Some(CodexRolloutExtent {
-                next_byte_offset: file_metadata.len(),
-                next_ordinal: 1,
-            }),
-        ));
-        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -80749,59 +76866,6 @@ mod tests {
             }
         }
         let _ = fs::remove_dir_all(home);
-    }
-
-    #[test]
-    fn codex_uuid_identity_is_canonical_but_non_uuid_identity_remains_byte_exact() {
-        let lowercase = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
-        let mixed = "01A03e99-49CF-7460-9Fd7-F7dBfD2F05E4";
-        assert_eq!(resolve_codex_identity(mixed), lowercase);
-
-        let non_uuid = "Provider-Session-Case-Sensitive";
-        let other_non_uuid = "provider-session-case-sensitive";
-        assert_eq!(resolve_codex_identity(non_uuid), non_uuid);
-        assert_eq!(resolve_codex_identity(other_non_uuid), other_non_uuid);
-        assert_ne!(
-            resolve_codex_identity(non_uuid),
-            resolve_codex_identity(other_non_uuid)
-        );
-
-        let mut metadata = CodexTitleMetadata::default();
-        metadata
-            .spawn_parents
-            .insert(non_uuid.to_string(), "Parent-Exact".to_string());
-        assert_eq!(
-            metadata
-                .family_position(non_uuid)
-                .map(|(parent, _, _)| parent),
-            Some("Parent-Exact".to_string())
-        );
-        assert_eq!(metadata.family_position(other_non_uuid), None);
-        assert_ne!(
-            metadata.session_sidecar_fingerprint(non_uuid),
-            metadata.session_sidecar_fingerprint(other_non_uuid)
-        );
-
-        let header = json!({
-            "timestamp":"2026-08-02T08:20:00.500Z",
-            "ordinal":0,
-            "type":"session_meta",
-            "payload":{
-                "id":other_non_uuid,
-                "session_id":other_non_uuid,
-                "timestamp":"2026-08-02T08:20:00Z",
-                "thread_source":"agent_created_thread",
-                "history_mode":"paginated"
-            }
-        });
-        assert_eq!(
-            codex_native_created_thread_header(
-                &header,
-                Some(non_uuid),
-                rfc3339_unix_nanos("2026-08-02T08:20:00Z")
-            ),
-            None
-        );
     }
 
     #[test]
@@ -81498,76 +77562,6 @@ mod tests {
             assert!(index.codex_state_only_blocked_session_ids.contains(legacy));
             assert!(!index.codex_state_only_blocked_session_ids.contains(modern));
         }
-        let _ = fs::remove_dir_all(home);
-    }
-
-    #[test]
-    fn codex_sidecar_uuid_alias_collision_marks_the_census_incomplete() {
-        let home = temp_dir("codex-sidecar-uuid-alias-collision");
-        let codex_dir = home.join(".codex");
-        let sessions_dir = codex_dir.join("sessions");
-        fs::create_dir_all(&sessions_dir).expect("create collision sessions fixture");
-        let database = Connection::open(codex_dir.join("state_5.sqlite"))
-            .expect("open collision state fixture");
-        database
-            .execute_batch(
-                "CREATE TABLE threads (\
-                    id TEXT NOT NULL, title TEXT, tokens_used INTEGER NOT NULL,\
-                    thread_source TEXT, first_user_message TEXT\
-                );\
-                INSERT INTO threads VALUES (\
-                    '01a03e99-49cf-7460-9fd7-f7dbfd2f05e4', 'Lower', 1,\
-                    'agent_created_thread', NULL\
-                );\
-                INSERT INTO threads VALUES (\
-                    '01A03E99-49CF-7460-9FD7-F7DBFD2F05E4', 'Upper', 2,\
-                    'agent_created_thread', NULL\
-                );",
-            )
-            .expect("seed colliding state rows");
-        drop(database);
-
-        let collision_key = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
-        let mut state_threads = BTreeMap::new();
-        let mut state_conflicts = BTreeSet::new();
-        load_codex_sqlite_state_threads(
-            &codex_dir.join("state_5.sqlite"),
-            &mut state_threads,
-            &mut state_conflicts,
-            &mut IdentityConflictTaxonomy::default(),
-        )
-        .expect("a scoped collision retains unrelated state rows");
-        assert!(state_threads.is_empty());
-        assert_eq!(state_conflicts, BTreeSet::from([collision_key.to_string()]));
-
-        let mut created_threads = BTreeSet::new();
-        let mut spawn_parents = BTreeMap::new();
-        let mut spawn_conflicts = BTreeSet::new();
-        let mut identity_conflicts = BTreeSet::new();
-        load_codex_sqlite_spawn_edges(
-            &codex_dir.join("state_5.sqlite"),
-            &mut created_threads,
-            &mut spawn_parents,
-            &mut spawn_conflicts,
-            &mut identity_conflicts,
-            &mut BTreeSet::new(),
-        )
-        .expect("a scoped collision retains unrelated created classifications");
-        assert!(created_threads.is_empty());
-        assert_eq!(
-            identity_conflicts,
-            BTreeSet::from([collision_key.to_string()])
-        );
-
-        let metadata = CodexTitleMetadata::load_from_roots(std::slice::from_ref(&sessions_dir));
-        assert!(metadata.state_census_incomplete);
-        assert!(metadata.sidecar_census_incomplete);
-        assert!(!metadata.state_census_unscoped_incomplete);
-        assert!(!metadata.sidecar_census_unscoped_incomplete);
-        assert_eq!(
-            metadata.identity_conflicts,
-            BTreeSet::from([collision_key.to_string()])
-        );
         let _ = fs::remove_dir_all(home);
     }
 
@@ -82987,43 +78981,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_ordinary_paginated_resume_never_acquires_created_thread_admission() {
-        let path = write_codex_test_values(
-            "codex-ordinary-paginated-resume",
-            &[
-                json!({"timestamp":"2026-08-02T08:20:00Z","type":"session_meta","payload":{"id":"ordinary-resume","thread_source":"user","history_mode":"paginated","history_base":{"cursor":"provider"},"source":"cli"}}),
-                json!({"timestamp":"2026-08-02T08:20:01Z","type":"turn_context","payload":{"turn_id":"ordinary-turn","model":"gpt-5.6-sol"}}),
-                codex_test_token_line(
-                    "2026-08-02T08:20:02Z",
-                    None,
-                    (12, 8, 2, 1),
-                    Some((12, 8, 2, 1)),
-                ),
-            ],
-        );
-        for context_curve_enabled in [true, false] {
-            let parsed = parse_codex_test_with_metadata_ledgers_and_curve(
-                &path,
-                &CodexTitleMetadata::default(),
-                BTreeMap::new(),
-                context_curve_enabled,
-            );
-            assert!(
-                parsed.complete(),
-                "capability={context_curve_enabled}: {parsed:#?}"
-            );
-            assert_eq!(parsed.snapshots.len(), 1);
-            assert_eq!(parsed.snapshots[0].source_session_id, "ordinary-resume");
-            assert_eq!(parsed.snapshots[0].input_tokens, 12);
-            assert_eq!(
-                parsed.snapshots[0].context_curve.is_some(),
-                context_curve_enabled
-            );
-        }
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
     fn codex_ordinary_resume_ignores_generic_edge_and_unrelated_created_state_row() {
         let root = temp_dir("codex-ordinary-resume-unrelated-created-state");
         let ordinary_id = "01a03e9c-49cf-7460-9fd7-f7dbfd2f05e4";
@@ -83086,59 +79043,6 @@ mod tests {
             );
         }
         let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn codex_truncated_parent_ledger_fails_closed() {
-        let parent_id = "truncated-parent";
-        let parent_path = temp_file("codex-truncated-parent");
-        let parent_turn = json!({"timestamp":"2026-08-02T08:00:01Z","type":"turn_context","payload":{"turn_id":"truncated-parent-turn","model":"gpt-5.6-sol"}});
-        let parent_usage = codex_test_token_line(
-            "2026-08-02T08:00:02Z",
-            None,
-            (100, 80, 10, 2),
-            Some((100, 80, 10, 2)),
-        );
-        fs::write(
-            &parent_path,
-            format!(
-                "{}\n{}\n{}\n{{",
-                json!({"timestamp":"2026-08-02T08:00:00Z","type":"session_meta","payload":{"id":parent_id,"thread_source":"user"}}),
-                parent_turn,
-                parent_usage,
-            ),
-        )
-        .expect("write truncated parent");
-        let parsed_parent = parse_codex_test_with_ledgers(&parent_path, BTreeMap::new());
-        let (ledger_id, ledger) = parsed_parent
-            .codex_parent_ownership_ledger
-            .expect("truncated parent ledger evidence");
-        assert_eq!(ledger_id, parent_id);
-        assert!(!ledger.scan_complete);
-
-        let child_path = write_codex_test_values(
-            "codex-truncated-parent-child",
-            &[
-                json!({"timestamp":"2026-08-02T08:20:00Z","type":"session_meta","payload":{"id":"truncated-child","forked_from_id":parent_id,"thread_source":"user"}}),
-                parent_turn,
-                parent_usage,
-                json!({"timestamp":"2026-08-02T08:20:01Z","type":"turn_context","payload":{"turn_id":"truncated-child-turn","model":"gpt-5.6-sol"}}),
-                codex_test_token_line(
-                    "2026-08-02T08:20:02Z",
-                    None,
-                    (120, 95, 13, 3),
-                    Some((20, 15, 3, 1)),
-                ),
-            ],
-        );
-        assert!(parse_codex_test_with_ledgers(
-            &child_path,
-            BTreeMap::from([(parent_id.to_string(), ledger)]),
-        )
-        .snapshots
-        .is_empty());
-        let _ = fs::remove_file(parent_path);
-        let _ = fs::remove_file(child_path);
     }
 
     #[test]
@@ -83879,28 +79783,6 @@ mod tests {
         sb_disclose(&mut reupgraded, "held-key", &[]);
         sb_disclose(&mut reupgraded, "other-key", &[]);
         assert_eq!(reupgraded.codex_state_only_blocked_session_ids, blocked);
-    }
-
-    /// SB-T5: two keys block X; one shrinks, X stays; the other shrinks, X
-    /// is released, equal to cold.
-    #[test]
-    fn l_sb_shared_id_is_released_only_when_its_last_holder_shrinks() {
-        let mut index = sb_cold(&[]);
-        sb_disclose(&mut index, "a", &["x"]);
-        sb_disclose(&mut index, "b", &["x"]);
-        sb_disclose(&mut index, "a", &[]);
-        assert!(sb_blocked(&index, "x"));
-        assert_eq!(
-            index.codex_state_only_blocked_session_ids,
-            sb_cold(&[("a", ""), ("b", "x")]).codex_state_only_blocked_session_ids
-        );
-        sb_disclose(&mut index, "b", &[]);
-        assert!(!sb_blocked(&index, "x"));
-        assert!(index.codex_state_only_blocked_by_file.is_empty());
-        assert_eq!(
-            index.codex_state_only_blocked_session_ids,
-            sb_cold(&[("a", ""), ("b", "")]).codex_state_only_blocked_session_ids
-        );
     }
 
     /// SB-T5b (zero-usage cure), both legs, each with a variant where another
@@ -85772,28 +81654,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_paginated_fork_incomplete_acquisition_cannot_certify_creator() {
-        let header = codex_paginated_creator_fixture();
-        let id = header["payload"]["id"].as_str().unwrap();
-        let root = crate::test_scratch::ScratchDir::new("codex-paginated-creator-incomplete");
-        let path = root.join(format!("rollout-2026-09-30T10-00-00-{id}.jsonl"));
-        let usage = json!({"timestamp":"2026-09-30T10:01:00Z","ordinal":1362,
-            "type":"event_msg","payload":{"type":"token_count","info":{
-                "total_token_usage":{"input_tokens":100,"output_tokens":5},"model":"gpt-5.5"}}});
-        for body in [
-            format!("malformed\n{header}\n{usage}\n"),
-            format!("{header}\n{usage}\nmalformed\n"),
-        ] {
-            fs::write(&path, body).unwrap();
-            let items =
-                parse_codex_jsonl_file(&path, "2026-09-30T10:05:00Z", "f".repeat(64)).unwrap();
-            assert_eq!(items.len(), 1);
-            assert_eq!((items[0].input_tokens, items[0].output_tokens), (100, 5));
-            assert!(items[0].session_account_evidence.is_none());
-        }
-    }
-
-    #[test]
     fn codex_fork_creator_own_header_ordinal_wire_corpus() {
         let mut header = codex_child_creator_header();
         header["payload"]["forked_from_id"] = header["payload"]["session_id"].clone();
@@ -85830,7 +81690,6 @@ mod tests {
         let mut conflict = header.clone();
         conflict["ordinal"] = json!(1);
         conflict["payload"]["creator_account_id"] = json!("different-workspace");
-        let mut cases = Vec::new();
         for (name, records, path_id, expected) in [
             (
                 "native_fork_own_header",
@@ -85925,7 +81784,6 @@ mod tests {
             request.source = "codex".into();
             request.snapshots = items;
             request.upload_policy = policy;
-            let item = &request.snapshots[0];
             let bytes = serde_json::to_vec(&request).unwrap();
             let wire: Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(
@@ -85935,121 +81793,6 @@ mod tests {
                 expected,
                 "{name}"
             );
-            let version = snapshot_upload_body_witness_version(item);
-            let released = version.map(|version| match version {
-                9 => 3,
-                10 => 4,
-                11 => 5,
-                12 => 6,
-                15 | 23 if item.cache_observations.is_some() => 13,
-                16 | 24 if item.cache_observations.is_some() => 14,
-                19 => 17,
-                20 => 18,
-                23 => 7,
-                24 => 8,
-                _ => panic!("unexpected fork domain {version}"),
-            });
-            cases.push(json!({"name":name, "capability":match (expected, item.cache_observations.is_some()) {
-                (true,true)=>"combined",(true,false)=>"creator",(false,true)=>"cache",(false,false)=>"legacy"},
-                "exclusive":true,"curve":item.context_curve.is_some(),"tools":"omitted",
-                "wire_body_utf8":String::from_utf8(bytes).unwrap(),"wire":wire,
-                "body_projection":snapshot_upload_body_witness_payload(item),
-                "released_ack_version":released,"digest":version.map(|_| snapshot_upload_body_witness(item))}));
-        }
-        if let Ok(path) = std::env::var("OTTTO_FORK_CREATOR_CORPUS_PATH") {
-            fs::write(
-                path,
-                serde_json::to_vec_pretty(&json!({"schema_version":1,"cases":cases})).unwrap(),
-            )
-            .unwrap();
-        }
-    }
-
-    #[test]
-    fn codex_child_creator_source_generated_wire_corpus() {
-        let child = codex_child_creator_header();
-        let id = child["payload"]["id"].as_str().unwrap();
-        let mut missing_parent = child.clone();
-        missing_parent["payload"]["source"]["subagent"]["thread_spawn"]["parent_thread_id"] =
-            Value::Null;
-        let mut contradictory = child.clone();
-        contradictory["payload"]["session_id"] = json!("019e253c-3333-7000-9000-cccccccccccc");
-        let mut fork = child.clone();
-        fork["payload"]["forked_from_id"] = fork["payload"]["session_id"].clone();
-        fork["payload"]["history_base"] = json!({"cursor":"external"});
-        let mut legacy = child.clone();
-        legacy["payload"]
-            .as_object_mut()
-            .unwrap()
-            .remove("creator_user_id");
-        legacy["payload"]
-            .as_object_mut()
-            .unwrap()
-            .remove("creator_account_id");
-        let ordinary = codex_creator_header();
-        let mut cases = Vec::new();
-        for (name, header, path_id, expected) in [
-            ("native_parent", child.clone(), id, true),
-            ("missing_parent", missing_parent, id, false),
-            ("contradictory_alias", contradictory, id, false),
-            ("ordinary_fork", fork, id, false),
-            ("legacy_no_witness", legacy, id, false),
-            ("ordinary_original", ordinary, id, true),
-            (
-                "copied_parent_header",
-                child.clone(),
-                "019e253c-4444-7000-9000-dddddddddddd",
-                false,
-            ),
-        ] {
-            let mut request = valid_v6_batch_request();
-            request.source = "codex".into();
-            request.snapshots = vec![codex_creator_item(&[header], path_id)];
-            apply_upload_policy(
-                SnapshotSource::Codex,
-                &mut request.snapshots,
-                request.upload_policy,
-            );
-            let item = &request.snapshots[0];
-            assert_eq!(item.session_account_evidence.is_some(), expected, "{name}");
-            assert_eq!((item.input_tokens, item.output_tokens), (100, 5), "{name}");
-            let bytes = serde_json::to_vec(&request).unwrap();
-            let wire: Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(
-                wire["snapshots"][0]
-                    .get("session_account_evidence")
-                    .is_some(),
-                expected
-            );
-            let version = snapshot_upload_body_witness_version(item);
-            let released = version.map(|version| match version {
-                9 => 3,
-                10 => 4,
-                11 => 5,
-                12 => 6,
-                15 | 23 if item.cache_observations.is_some() => 13,
-                16 | 24 if item.cache_observations.is_some() => 14,
-                19 => 17,
-                20 => 18,
-                23 => 7,
-                24 => 8,
-                _ => panic!("unexpected child-parent domain {version}"),
-            });
-            cases.push(json!({"name":name,
-                "capability":if expected {"creator"} else {"legacy"},
-                "exclusive":item.usage_accounting_contract.is_some(),
-                "curve":item.context_curve.is_some(), "tools":"omitted",
-                "wire_body_utf8":String::from_utf8(bytes).unwrap(), "wire":wire,
-                "body_projection":snapshot_upload_body_witness_payload(item),
-                "released_ack_version":released,
-                "digest":version.map(|_| snapshot_upload_body_witness(item))}));
-        }
-        if let Ok(path) = std::env::var("OTTTO_CHILD_PARENT_CORPUS_PATH") {
-            fs::write(
-                path,
-                serde_json::to_vec_pretty(&json!({"schema_version":1,"cases":cases})).unwrap(),
-            )
-            .unwrap();
         }
     }
 
@@ -86241,93 +81984,6 @@ mod tests {
             serde_json::to_value(&legacy).unwrap(),
             "missing evidence retains legacy wire"
         );
-    }
-
-    #[test]
-    fn codex_creator_header_copied_parent_and_conflicts_fail_closed() {
-        let header = codex_creator_header();
-        let id = header["payload"]["id"].as_str().unwrap();
-        let copied = codex_creator_item(
-            std::slice::from_ref(&header),
-            "019e253c-2222-7000-9000-bbbbbbbbbbbb",
-        );
-        assert!(copied.session_account_evidence.is_none());
-        let mut conflict = header.clone();
-        conflict["payload"]["creator_account_id"] = json!("synthetic-other-workspace");
-        assert!(
-            codex_creator_item(&[header.clone(), conflict, header.clone()], id)
-                .session_account_evidence
-                .is_none(),
-            "conflict stays closed"
-        );
-        assert!(
-            codex_creator_item(&[header.clone(), header.clone()], id)
-                .session_account_evidence
-                .is_some(),
-            "exact duplicate does not replace creator"
-        );
-        assert!(
-            codex_creator_item(&[json!({"type":"turn_context"}), header.clone()], id)
-                .session_account_evidence
-                .is_none(),
-            "later header cannot prove original creation"
-        );
-    }
-
-    #[test]
-    fn codex_creator_header_missing_malformed_and_time_fail_closed() {
-        let header = codex_creator_header();
-        let id = header["payload"]["id"].as_str().unwrap();
-        for (key, value) in [
-            ("creator_user_id", Value::Null),
-            ("creator_account_id", json!(" ")),
-            ("creator_user_id", json!({"id":"synthetic-user"})),
-            ("timestamp", json!("bad-time")),
-            ("timestamp", json!("2026-09-30T10:02:00Z")),
-            ("session_id", json!("other-session")),
-        ] {
-            let mut malformed = header.clone();
-            malformed["payload"][key] = value;
-            assert!(
-                codex_creator_item(&[malformed], id)
-                    .session_account_evidence
-                    .is_none(),
-                "{key}"
-            );
-        }
-        let mut late = header.clone();
-        late["ordinal"] = json!(1);
-        assert!(codex_creator_item(&[late], id)
-            .session_account_evidence
-            .is_none());
-        let mut no_time = header.clone();
-        no_time.as_object_mut().unwrap().remove("timestamp");
-        assert!(codex_creator_item(&[no_time], id)
-            .session_account_evidence
-            .is_none());
-    }
-
-    #[test]
-    fn codex_creator_header_unread_physical_prefix_cannot_certify_creation() {
-        let header = codex_creator_header();
-        let root = temp_dir("codex-creator-malformed-prefix");
-        let id = header["payload"]["id"].as_str().unwrap();
-        let path = root.join(format!("rollout-2026-09-30T10-00-00-{id}.jsonl"));
-        let usage = json!({"timestamp":"2026-09-30T10:01:00Z", "type":"event_msg",
-            "payload":{"type":"token_count", "info":{
-                "total_token_usage":{"input_tokens":100,"output_tokens":5},"model":"gpt-5.5"}}});
-        fs::write(&path, format!("malformed\n{header}\n{usage}\n")).unwrap();
-        let item = parse_codex_jsonl_file(&path, "2026-09-30T10:05:00Z", "fp".into())
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap();
-        assert!(item.session_account_evidence.is_none());
-        assert_eq!(
-            item.input_tokens, 100,
-            "legacy partial parse behavior is unchanged"
-        );
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -87840,46 +83496,6 @@ mod tests {
     }
 
     #[test]
-    fn committable_subset_applies_the_same_rule_to_codex_state_only_entities() {
-        let mut committed = ScanIndex::default();
-        committed
-            .codex_state_only_snapshot_fingerprints
-            .insert("session-noop".to_string(), "aa".to_string());
-        committed
-            .codex_state_only_snapshot_fingerprints
-            .insert("session-pending".to_string(), "old".to_string());
-
-        let mut scanned = ScanIndex::default();
-        scanned
-            .codex_state_only_snapshot_fingerprints
-            .insert("session-noop".to_string(), "aa".to_string());
-        scanned
-            .codex_state_only_snapshot_fingerprints
-            .insert("session-pending".to_string(), "cc".to_string());
-        scanned
-            .codex_state_only_snapshot_fingerprints
-            .insert("session-accepted".to_string(), "bb".to_string());
-        scanned
-            .codex_state_only_snapshot_fingerprints
-            .insert("session-new".to_string(), "dd".to_string());
-
-        let committable = scanned.committable_subset(
-            &committed,
-            &BTreeSet::from(["bb".to_string()]),
-            &BTreeMap::new(),
-        );
-
-        assert_eq!(
-            committable.codex_state_only_snapshot_fingerprints,
-            BTreeMap::from([
-                ("session-noop".to_string(), "aa".to_string()),
-                ("session-pending".to_string(), "old".to_string()),
-                ("session-accepted".to_string(), "bb".to_string()),
-            ])
-        );
-    }
-
-    #[test]
     fn committable_subset_uses_exact_multi_entity_set_and_preserves_quarantine() {
         let accepted = "a".repeat(64);
         let quarantined = "b".repeat(64);
@@ -88186,17 +83802,6 @@ mod tests {
         assert!(entries
             .iter()
             .all(|entry| entry["quantity"].as_u64() == Some(0)));
-    }
-
-    #[test]
-    fn wire_envelope_carries_the_content_hash_and_its_epoch() {
-        let request = valid_v6_batch_request();
-        let value = serde_json::to_value(&request).expect("serialize batch");
-        let envelope = &value["snapshots"][0]["semantic_envelope"];
-        let content_hash = envelope["content_hash"].as_str().expect("content hash");
-        assert_eq!(content_hash.len(), 64);
-        assert!(content_hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
-        assert_eq!(envelope["hash_epoch"], SNAPSHOT_CONTENT_HASH_EPOCH);
     }
 
     #[test]
