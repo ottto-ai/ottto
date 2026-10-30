@@ -24,6 +24,14 @@ touch "$support/claude_terminal_off_enabled"
 rm "$support/claude_terminal_off_enabled"
 ```
 
+The supported upgrade input is shipped main. The constant-ON development
+versions of this still-draft PR were not rollout versions; their untagged
+checkpoints are not migration input. Those development hashes cannot be
+distinguished from main's without invalidating main's resume too. OFF therefore
+keeps main's fingerprint: a shipped checkpoint resumes without a new re-arm.
+Every rollout-reachable ON checkpoint gets the tag described below before the
+first authorized ON use.
+
 The existing traversal-context digest includes an ON-only domain tag. A saved
 ON traversal therefore cannot resume in OFF, including after restart: main
 starts a fresh traversal before reconciliation. No new persisted field is
@@ -43,6 +51,19 @@ Each real held serve renews its own RAM six-hour floor. Presence is recorded
 before enqueue suppression, including stat-confirmed hints. Read the
 [discovery design](2026-10-30-terminal-off-discovery.md) and
 [OFF-path hunk audit](2026-10-30-claude-terminal-off-static-audit.md).
+
+## Shared safety exception in OFF
+
+Trace sidecar reads retain a per-file take() bound and opened/path generation
+validation in both modes. This fixes an inherited main race: the real capture
+writer can append its cap-crossing final row after the reader's initial stat.
+The old reader could certify that oversized/growing file as complete. The shared
+fix withholds evidence instead; it adds no proof, ACK or receipt. Stable trace
+rows, dedupe and health counters are compared with the exact main reader body in
+a test-only reference. A real cap-crossing producer fixture asserts consumed
+bytes equal the initial opened length plus one, with no complete evidence.
+Per-pass strict-cohort pacing remains ON-only. This is the explicit shared
+correctness exception in the hunk audit, not an OFF terminal-policy change.
 
 ## Readiness and known ON residuals
 

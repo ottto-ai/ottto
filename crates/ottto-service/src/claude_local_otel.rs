@@ -1261,10 +1261,9 @@ pub fn load_claude_trace_ownership_evidence(
     support_dir: &Path,
     session_ids: impl IntoIterator<Item = String>,
 ) -> ClaudeTraceOwnershipLoadReport {
-    if !crate::snapshots::claude_terminal_off() {
-        return load_claude_trace_ownership_evidence_main(support_dir, session_ids);
-    }
-
+    // Shared correctness fix: even OFF cannot certify a trace that grew or
+    // changed after stat. Per-pass cohort pacing remains ON-only; the ordinary
+    // main per-file cap still bounds this reader when no budget is installed.
     let mut report = ClaudeTraceOwnershipLoadReport::default();
     for session_id in BTreeSet::from_iter(session_ids) {
         let path = trace_evidence_path(support_dir, &session_id);
@@ -4109,7 +4108,8 @@ fn decode_api_sidecar_main(
     Ok((rows, ApiReadWitness { health, generation }))
 }
 
-fn load_claude_trace_ownership_evidence_main(
+#[cfg(test)]
+fn load_claude_trace_ownership_evidence_main_reference(
     support_dir: &Path,
     session_ids: impl IntoIterator<Item = String>,
 ) -> ClaudeTraceOwnershipLoadReport {

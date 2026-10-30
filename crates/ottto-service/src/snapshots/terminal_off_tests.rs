@@ -1595,6 +1595,15 @@ fn terminal_off_saturated_drain_ceiling_picks_up_unhinted_create_and_rename_over
         ended,
         "c1b_traversal_ended within bounded pages, no queue refill"
     );
+    assert!(
+        new_seen.is_some() && replaced_seen.is_some(),
+        "discovered paths are eventually read"
+    );
+    assert_eq!(
+        consumed.get(&newcomer),
+        Some(&1),
+        "newcomer's body is read exactly once"
+    );
     assert!(coalesced > 0);
     assert!(forced > 0);
     let ceiling = terminal_off_discovery::TERMINAL_OFF_FRESHNESS_WALK_CEILING_SECONDS;
