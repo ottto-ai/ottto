@@ -3428,13 +3428,20 @@ impl SharedCache {
         let already_spent = self.durable().is_some_and(|stores| {
             #[cfg(test)]
             let now = stores.retail_full_now.unwrap_or(now);
+            let digest = full_pace_key(source, key);
             stores
-                .retail_full_at
-                .get(&full_pace_key(source, key))
-                .is_some_and(|stamp| {
-                    now.duration_since(stamp.at)
-                        .is_ok_and(|age| age < std::time::Duration::from_secs(PACE_SECS))
+                .key_debt
+                .get(&digest)
+                .and_then(|debt| debt.full_spend)
+                .map(|spend| spend.at)
+                .or_else(|| {
+                    stores
+                        .retail_full_at
+                        .get(&digest)
+                        .filter(|stamp| stamp.flags & FULL_SPENT != 0)
+                        .map(|stamp| stamp.at)
                 })
+                .is_some_and(|at| full_pace_delayed(at, now))
         });
         if !already_spent {
             let _ = self.paced_admission(source, key, now, false, false, true);

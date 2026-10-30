@@ -16039,3 +16039,81 @@ fn capacity_missing_claude_growth_spends_one_pace_and_reaches_native_full() {
     let stores = owner.cache.durable().unwrap();
     assert_eq!(stores.counters.resource_full.get("capacity"), Some(&1));
 }
+
+#[test]
+fn capacity_debt_preserves_rederive_near_cap_single_extra_allowance() {
+    let _on = RestartRestoreForTest::enabled();
+    let root = crate::test_scratch::ScratchDir::new("capacity-rederive-near-cap");
+    let path = root.join("source.jsonl");
+    fs::write(&path, b"{}\n").unwrap();
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let source = SnapshotSource::Codex;
+    file.set_len(max_jsonl_file_bytes(source)).unwrap();
+    let key = local_index_key(&path);
+    let cache = SharedCache::default();
+    cache
+        .rederive_gate(source, full_pace_key(source, &key), 3, true, false)
+        .unwrap();
+    let phase = capacity_full_phase(true, false, false, false, Some("rederive_refused")).unwrap();
+    assert!(cache.start_resource_full(source, &key, &file, 3, phase));
+    assert!(cache.start_resource_full(source, &key, &file, 3, phase));
+    assert!(!cache.start_resource_full(source, &key, &file, 3, phase));
+    let stores = cache.durable().unwrap();
+    assert_eq!(
+        stores.counters.resource_full.get("rederive_refused"),
+        Some(&2)
+    );
+    assert_eq!(stores.counters.resource_full.get("capacity"), None);
+}
+
+#[test]
+fn completed_capacity_full_ignores_head_only_stamps_and_honors_spend_custody() {
+    let _on = RestartRestoreForTest::enabled();
+    let root = crate::test_scratch::ScratchDir::new("capacity-rederive-stamps");
+    let path = root.join("source.jsonl");
+    fs::write(&path, b"{}\n{}\n").unwrap();
+    let file = File::open(&path).unwrap();
+    let source = SnapshotSource::Codex;
+    let now = SystemTime::now();
+    for flags in [HEAD_USED, DEFERRED] {
+        let cache = SharedCache::default();
+        let digest = full_pace_key(source, "key");
+        {
+            let mut stores = cache.durable().unwrap();
+            stores.retail_full_now = Some(now);
+            stores.retail_full_at.insert(
+                digest,
+                FullPace {
+                    at: now,
+                    structural: false,
+                    flags,
+                    head_extent: 3,
+                },
+            );
+        }
+        cache.completed_capacity_full(source, "key");
+        assert_ne!(
+            cache.durable().unwrap().retail_full_at[&digest].flags & FULL_SPENT,
+            0
+        );
+        assert!(!cache.start_resource_full(source, "key", &file, 3, "capacity"));
+    }
+    let cache = SharedCache::default();
+    let digest = full_pace_key(source, "custody-only");
+    {
+        let mut stores = cache.durable().unwrap();
+        stores.retail_full_now = Some(now);
+        stores.fund_debt(digest).unwrap().full_spend = Some(owed::FullSpend {
+            at: now,
+            near_extra: true,
+        });
+    }
+    cache.completed_capacity_full(source, "custody-only");
+    let stores = cache.durable().unwrap();
+    assert!(stores.retail_full_at.is_empty());
+    assert!(stores.key_debt[&digest].full_spend.unwrap().near_extra);
+}

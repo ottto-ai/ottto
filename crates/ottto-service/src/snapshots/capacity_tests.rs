@@ -256,6 +256,17 @@ fn capacity_full_defers_to_each_existing_admission_owner() {
         capacity_full_phase(false, false, false, false, Some("cache_transit")),
         Some("cache_transit")
     );
+    for resource in [
+        "cache_transit",
+        "decode",
+        "rederive_refused",
+        "rederive_budget",
+    ] {
+        assert_eq!(
+            capacity_full_phase(true, false, false, false, Some(resource)),
+            Some(resource)
+        );
+    }
 }
 
 #[test]

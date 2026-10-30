@@ -96751,10 +96751,10 @@ fn capacity_full_phase(
 ) -> Option<&'static str> {
     if paid || active_bound || stale_selection {
         None
-    } else if capacity_growth {
-        Some("capacity")
     } else {
-        resource
+        // Resource recovery owns its admission even when a prior quota
+        // refusal also leaves capacity debt for this file.
+        resource.or(capacity_growth.then_some("capacity"))
     }
 }
 
