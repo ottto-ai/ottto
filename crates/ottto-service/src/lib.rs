@@ -6354,7 +6354,7 @@ mod tests {
                     let finding = finding.unwrap();
                     assert_eq!(finding.severity, LocalHealthSeverity::Warning);
                     assert_eq!(finding.owner, "source");
-                    assert_eq!(finding.source, LocalHealthAuthority::Runtime);
+                    assert_eq!(finding.source, "runtime");
                     assert_eq!(finding.clear_condition, "Some Claude Code sessions still send telemetry to an older Ottto port; restart those Claude Code sessions.");
                     assert!(!finding.clear_condition.chars().any(|c| c.is_ascii_digit()));
                 }
