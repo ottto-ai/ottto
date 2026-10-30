@@ -795,6 +795,10 @@ fn e2_unhealthy_root_billing_case(mode: &str, split_logins: bool, billing: &str)
             fs::remove_file(&path).unwrap();
             fs::create_dir_all(&path).unwrap();
         }
+        "incomplete" => {
+            // The API sidecar stays: a missing pair member is failed evidence.
+            fs::remove_file(&path).unwrap();
+        }
         "oversized" => {
             // Sparse: the strict reader refuses at open from metadata alone.
             fs::OpenOptions::new()
@@ -1062,6 +1066,11 @@ fn e2_pipeline_bound_a_split_logins_unreadable_trace_is_unknown_not_a() {
 #[test]
 fn e2_pipeline_bound_a_split_logins_oversized_trace_is_unknown_not_a() {
     e2_unhealthy_root_case("oversized", true);
+}
+
+#[test]
+fn e2_pipeline_bound_a_split_logins_missing_trace_member_is_unknown_not_a() {
+    e2_unhealthy_root_case("incomplete", true);
 }
 
 #[test]
