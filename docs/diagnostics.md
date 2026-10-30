@@ -1520,12 +1520,11 @@ Upstream authority-key allocation loss remains fail-closed: inherited partitions
 are not reclassified as request proof by budget recovery or a uniform starting-account
 retry. Only an intact current grouping can enter the cap allocator.
 
-The default-OFF Claude state-v2 route also emits `growth_claim_refused` with fixed
-lineage/publication labels and `recovery_backup_verified` / `recovery_backup_restored`
-counts, plus `recovery_backup_superseded` after a verified replacement switches
-the current pointer. `recovery_backup_unpublished_reclaimed` counts cleanup of
-failed attempts. These counters describe rolling artifact protection, without
-claiming runtime/native restore qualification or enabling conversion.
+The default-OFF Claude state-v2 route reports current bounded states through the
+existing local resource diagnostics sink, including `growth_claim_refused` labels.
+It keeps CPU/RSS, WAL, import peak versus the same-process v1 load, erasure inventory
+and baseline-age/escalation gauges. It does not maintain a second cumulative event
+or label counter registry. Hydration and saves create no rolling backup copies.
 Selected saves retain `unit_selected`, `unit_deferred`, charge rows/bytes/pages,
 `unit_oversize_alarm`, retained-account-window counts and `save_page_reduced`.
 Inert staging reports `unit_custody_staged` and

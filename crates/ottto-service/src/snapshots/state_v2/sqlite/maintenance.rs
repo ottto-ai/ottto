@@ -491,27 +491,6 @@ impl Sqlite {
             // Crash during work is a failed attempt, with persisted pacing.
             self.control("erasure_failures", &failures.saturating_add(1))?;
             self.last_purge_attempt = Some(Instant::now());
-            // Rolling copies inherit the same erasure deadline. Source erasure
-            // removes them immediately through runtime; scheduled PL purge also
-            // removes interrupted generations before it clears the obligation.
-            if let Some(name) = self
-                .path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .and_then(|s| s.strip_suffix(".v2.sqlite"))
-            {
-                super::super::recovery_backup::erase(&self.path.with_file_name(name))?;
-            }
-            // Backups carry the same PL erasure obligation as the database.
-            let backup = sidecar(&self.path, ".migration-backup");
-            match fs::remove_file(&backup) {
-                Ok(()) => super::super::super::sync_checkpoint_parent(&backup)?,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(_) => {
-                    self.erasure_failed("backup_io");
-                    return Ok(());
-                }
-            }
             let result = self.checkpoint(CheckpointMode::Purge);
             if result.state == CheckpointState::Complete {
                 // Success and epoch clear are atomic. A crash never grants a

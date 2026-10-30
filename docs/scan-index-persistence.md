@@ -479,31 +479,21 @@ progress remains durable so a missing ledger cannot silently reopen old work.
 
 Before publication, the import owner must seal the proved original progress bytes
 with `ProgressRecovery::seal_import`; this operation does not infer ownership from a
-filename. Backup/recovery owners must use `RecoverySet::capture` in the consistent
-DB snapshot and protect the companion plus every exact `resume.checkpoint` reference.
-The descriptor binds DB identity/generation, the complete receipt digest, ordered
-reference keys/positions, exact encoded tuples and value digests. Before fence
-publication, the import owner persists a private `.v2-recovery` bundle containing
-the closed import DB, independently retained fence bytes, companion, baselines
-and copied exact restart files. Every restart copy is checked against its trailer.
-The descriptor is published last and read back before fence replacement starts.
-Explicit restore verifies every member and replays newer external receipts first;
-newer or conflicting custody refuses restoration without overwriting progress.
-Authenticated saves retain a rolling bundle with the exact DB/WAL pair,
-independent fence, companion, baselines and exact restart files. The source and
-progress owners exclude changes through capture and publication; copying the WAL
-avoids imposing a TRUNCATE on each save. A private atomic current pointer switches
-only after the replacement descriptor and every member pass read-back. Superseded
-bundles are reclaimed afterward; a failed replacement keeps the prior seal.
-Failed unpublished copies are reclaimed before retrying, while the current verified
-bundle stays protected. Interrupted restoration completes a matching base with its
-verified WAL before checking the restored generation; newer receipts still refuse
-stale recovery before any pair completion.
-Source erasure, forget and uninstall remove every generation immediately, including
-interrupted replacements. Scheduled private-text purge also removes backup custody
-before clearing its erasure obligation. Destructive migrations require a verified
-bundle matching the exact current DB/WAL pair; a DB-only copy is insufficient.
-Companions share the source's erasure and immediate-removal obligations.
+filename. The import owner independently reads back the receipt and verifies its
+DB identity/generation against the closed-over source snapshot while holding the
+progress lock through database fsync and fence publication. Original inventory
+commitments and the copied `v1-readonly` baseline are verified before publication.
+There is one retained pre-import baseline, including its referenced immutable
+shards; saves and hydration create no additional backup copies. The baseline
+retains its explicit erasure exception and 14-day hard-age escalation. Source
+erasure, forget and uninstall delete it and its shards immediately alongside the
+DB/WAL/SHM, import remnants, exact ACK companion and restart records.
+
+Schema revision one uses the forward-only `user_version` runner and checks
+`minimum_writer_capability` before writes. Nonempty revision-zero layouts are
+refused rather than adopted. There are no destructive migration steps or automatic
+backup restoration; newer schema/writer capabilities hold the source. Exact ACK
+receipt reconciliation remains required before collection or settlement.
 
 Explicit source erasure also removes the exact ACK companion. Maintenance reports
 its count/bytes through `ack_receipt_inventory`; inventory alone grants no recovery

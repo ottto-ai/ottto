@@ -43,6 +43,36 @@ pub(super) fn sibling(path: &Path, suffix: &str) -> PathBuf {
     name.push(suffix);
     name.into()
 }
+/// One inventory drives orphan cleanup, explicit erasure and erasure gauges.
+/// Publication must be excluded before deleting any unpublished artifact.
+pub(super) const ARTIFACTS: &[(&str, bool, Option<&str>)] = &[
+    ("", false, None),
+    (".shards", false, None),
+    (".v2.sqlite", false, None),
+    (".v2.sqlite-wal", false, None),
+    (".v2.sqlite-shm", false, None),
+    // Cleanup-only names: no writer or recovery/adoption path remains.
+    (".v2.sqlite.migration-backup", false, None),
+    (".v2-recovery", true, None),
+    (".v2.sqlite.import", true, Some("import_remnant_inventory")),
+    (".v2.sqlite.import-wal", true, None),
+    (".v2.sqlite.import-shm", true, None),
+    (".v1-readonly", true, Some("baseline_inventory")),
+    (".v1-readonly.shards", true, None),
+    (".v2-fence.tmp", true, None),
+    (".v2-ack-receipt", false, Some("ack_receipt_inventory")),
+];
+
+pub(super) fn remove_artifact(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => fs::remove_dir_all(path)?,
+        Ok(_) => fs::remove_file(path)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+    }
+    Ok(true)
+}
+
 pub(super) fn exists(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
@@ -243,28 +273,10 @@ pub(super) fn cleanup_unpublished(path: &Path, latched: bool) -> Result<u64> {
         !latched && !exists(&sibling(path, ".v2.sqlite"))? && read(path)?.is_none(),
         Hold::DbUnavailable
     );
-    super::recovery_backup::erase(path)?;
     let mut removed = 0;
-    for suffix in [
-        ".v2.sqlite.import",
-        ".v2.sqlite.import-wal",
-        ".v2.sqlite.import-shm",
-        ".v2-fence.tmp",
-        ".v1-readonly",
-        ".v1-readonly.shards",
-    ] {
-        let artifact = sibling(path, suffix);
-        match fs::symlink_metadata(&artifact) {
-            Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {
-                fs::remove_dir_all(&artifact)?;
-                removed += 1;
-            }
-            Ok(_) => {
-                fs::remove_file(&artifact)?;
-                removed += 1;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
+    for (suffix, unpublished, _) in ARTIFACTS {
+        if *unpublished && remove_artifact(&sibling(path, suffix))? {
+            removed += 1;
         }
     }
     if removed != 0 {

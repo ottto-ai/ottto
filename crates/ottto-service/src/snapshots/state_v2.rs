@@ -28,7 +28,6 @@ mod kinds_census;
 mod kinds_files;
 mod kinds_misc;
 mod packed;
-mod recovery_backup;
 mod shape;
 mod sqlite;
 mod units;

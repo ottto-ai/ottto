@@ -86,77 +86,6 @@ fn missing_or_damaged_receipt_never_falls_back_to_unbound_progress() {
 }
 
 #[test]
-fn recovery_set_pins_db_identity_generation_progress_and_every_exact_resume_reference() {
-    let scratch = crate::test_scratch::ScratchDir::new("v2-ack-recovery-set");
-    let index = scratch.join("index");
-    let path = scratch.join("progress");
-    let db_path = scratch.join("db.v2.sqlite.import");
-    let binding = ProgressRecovery::synthetic(&index, &"a".repeat(64), 0);
-    let old = progress(4, "old");
-    write(&path, &old);
-    binding.adopt(Some(&old)).unwrap();
-    let mut db = sqlite::Sqlite::create_import(&db_path).unwrap();
-    db.control("identity", &binding.scope.identity).unwrap();
-    db.control("generation", &0_u64).unwrap();
-    db.finish_import().unwrap();
-    let open = || {
-        let mut db = sqlite::Sqlite::open(&db_path, &binding.scope.identity).unwrap();
-        db.path_extractor(|_, _, _| Ok(()));
-        db
-    };
-    let mut db = open();
-    struct Bytes(&'static [u8]);
-    impl Value for Bytes {
-        fn write(&self, out: &mut dyn Write) -> Result<()> {
-            out.write_all(self.0)?;
-            Ok(())
-        }
-    }
-    let key = RowKey::record("resume.checkpoint", b"synthetic-file".to_vec(), 0).unwrap();
-    let mut tx = db.begin(TxnMode::Write).unwrap();
-    tx.put(RowInput {
-        key: &key,
-        fixed: &Fixed::None,
-        value_version: 1,
-        value: &Bytes(b"exact-immutable-generation-name-trailer-tuple"),
-    })
-    .unwrap();
-    assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
-    let manifest = {
-        let mut tx = db.begin(TxnMode::Read).unwrap();
-        RecoverySet::capture(&mut tx, &binding, &path).unwrap()
-    };
-    drop(db);
-    let mut db = open();
-    let mut tx = db.begin(TxnMode::Read).unwrap();
-    manifest.verify(&mut tx, &binding, &path).unwrap();
-    for case in ["db", "generation", "resume"] {
-        let mut fork: RecoverySet =
-            serde_json::from_slice(&serde_json::to_vec(&manifest).unwrap()).unwrap();
-        match case {
-            "db" => fork.scope.identity.db_id.push('x'),
-            "generation" => fork.scope.generation += 1,
-            "resume" => fork.resume[0].digest[0] ^= 1,
-            _ => unreachable!(),
-        }
-        assert!(fork.verify(&mut tx, &binding, &path).is_err(), "{case}");
-    }
-    drop(tx);
-    // A missing exact restart member cannot borrow a nearby name/generation.
-    let mut tx = db.begin(TxnMode::Write).unwrap();
-    tx.delete(&key).unwrap();
-    assert!(manifest.verify(&mut tx, &binding, &path).is_err());
-    drop(tx); // rollback
-              // A newer external receipt is replayed first; the old backup descriptor
-              // then holds until an explicit consistent recovery set has been proved.
-    let next = progress(5, "newer-accepted-body");
-    binding.before_progress_save(Some(&old), &next).unwrap();
-    binding.recover(&path).unwrap();
-    let mut tx = db.begin(TxnMode::Read).unwrap();
-    assert!(manifest.verify(&mut tx, &binding, &path).is_err());
-}
-
-#[test]
 fn import_sealing_is_idempotent_but_never_rebinds_a_different_db_or_progress() {
     let scratch = crate::test_scratch::ScratchDir::new("v2-ack-import-seal");
     let index = scratch.join("index");
@@ -243,9 +172,7 @@ fn obsolete_unpublished_seal_preserves_custody_then_retries_after_v1_advances() 
     let mut db = sqlite::Sqlite::create_import(&scratch.join("retry.v2.sqlite.import")).unwrap();
     db.control("identity", &identity).unwrap();
     db.control("generation", &2_u64).unwrap();
-    resumed
-        .seal_and_capture(&index, &identity, &mut db)
-        .unwrap();
+    resumed.seal(&index, &identity, &mut db).unwrap();
     assert!(failed_imports(&index).unwrap().is_empty());
     assert_eq!(std::fs::read(&path).unwrap(), progress(2));
     let sealed = std::fs::read(&companion).unwrap();

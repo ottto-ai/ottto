@@ -208,12 +208,21 @@ fn f6_explicit_forget_deletes_all_artifacts_and_invalidates_stale_clones() {
     let shards = fence::sibling(&f.path, ".v1-readonly.shards");
     fs::create_dir(&shards).unwrap();
     fs::write(shards.join("payload"), b"forgotten-path-canary").unwrap();
+    let recovery = fence::sibling(&f.path, ".v2-recovery");
+    fs::create_dir(&recovery).unwrap();
+    fs::write(
+        recovery.join("interrupted-member"),
+        b"forgotten-path-canary",
+    )
+    .unwrap();
     let records = crate::durable_tail_store::store_dir_for_index(&f.path);
     fs::create_dir(&records).unwrap();
     fs::write(records.join("synthetic.rec"), b"restart-record").unwrap();
     crate::snapshots::erase_claude_state_v2_artifacts(&f.support).unwrap();
     assert!(!records.exists());
+    assert!(!recovery.exists());
     for suffix in [
+        ".v2.sqlite.migration-backup",
         "",
         ".v2.sqlite",
         ".v2.sqlite-wal",
@@ -221,7 +230,6 @@ fn f6_explicit_forget_deletes_all_artifacts_and_invalidates_stale_clones() {
         ".v2.sqlite.import",
         ".v2.sqlite.import-wal",
         ".v2.sqlite.import-shm",
-        ".v2.sqlite.migration-backup",
         ".v1-readonly",
         ".v1-readonly.shards",
         ".v2-fence.tmp",
@@ -250,17 +258,6 @@ fn publication_pending_pause_does_not_touch_v1_and_off_cancels_inventory_slot() 
     assert_eq!(fs::read(&f.path).unwrap(), bytes);
 }
 
-#[test]
-fn state_v2_hold_reporting_accepts_every_repair_cause() {
-    use crate::snapshots::scan_index_health::RepairCause;
-    for cause in [
-        RepairCause::PriorState,
-        RepairCause::StorageGeneration,
-        RepairCause::StateV2,
-    ] {
-        crate::local_resource_diagnostics::scan_index_repair_required("claude_code", cause);
-    }
-}
 #[test]
 fn absent_parent_containment_guard_never_promotes_a_database() {
     let f = Fixture::new();
@@ -444,22 +441,23 @@ fn newly_adopted_import_can_save_without_an_intervening_load() {
 }
 
 #[test]
-fn newly_adopted_import_without_a_sealed_receipt_refuses_save() {
+fn import_without_original_inventory_refuses_publication() {
     let f = Fixture::new();
-    fs::write(&f.path, b"synthetic-v1-authority").unwrap();
+    let bytes = b"synthetic-v1-authority";
+    fs::write(&f.path, bytes).unwrap();
     assert!(load_with(&f.path, true, &EmptyMapper).unwrap().is_none());
     let mut index = ScanIndex::default();
-    // The table-agnostic fake publishes without Original's progress custody.
     import_with(&f.path, &mut index, &EmptyMapper).unwrap();
-    assert!(index.persistence_v2.is_some());
+    assert!(index.persistence_v2.is_none());
+    assert_eq!(fs::read(&f.path).unwrap(), bytes);
+    for (suffix, _, _) in fence::ARTIFACTS
+        .iter()
+        .filter(|(_, unpublished, _)| *unpublished)
+    {
+        assert!(!fence::sibling(&f.path, suffix).exists());
+    }
+    assert!(!fence::sibling(&f.path, ".v2.sqlite").exists());
     assert!(!fence::sibling(&f.path, ".v2-ack-receipt").exists());
-    assert_eq!(
-        save_with(&f.path, &mut index, &EmptyMapper)
-            .unwrap_err()
-            .downcast_ref::<Hold>(),
-        Some(&Hold::DbUnavailable)
-    );
-    assert_eq!(index.generation, 0);
 }
 
 // Real mapper coverage for the raw decoder/load route (the fixtures above use

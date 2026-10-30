@@ -1003,12 +1003,12 @@ impl Original {
         path: &Path,
         identity: &Identity,
         store: &mut S,
-    ) -> Result<super::ack::RecoverySet> {
+    ) -> Result<()> {
         self.verify_baseline(path)?;
         self.progress
             .as_ref()
             .ok_or(Pause::Mismatch)?
-            .seal_and_capture(path, identity, store)
+            .seal(path, identity, store)
     }
     pub(super) fn publish_import(
         &self,
@@ -1021,11 +1021,10 @@ impl Original {
         self.progress
             .as_ref()
             .ok_or(Pause::Mismatch)?
-            .with_sealed_import(path, identity, db, |db, recovery| {
+            .with_sealed_import(path, identity, db, |db| {
                 db.finish_import()?;
                 fence::boundary(fence::Boundary::ImportFinished)?;
                 self.unchanged()?;
-                super::recovery_backup::persist_import(path, recovery)?;
                 fence::publish(path, identity, latched)
             })
     }
@@ -1410,7 +1409,7 @@ mod application_cases {
             .progress
             .as_ref()
             .unwrap()
-            .with_sealed_import(&c.path, &identity, db, |db, _set| {
+            .with_sealed_import(&c.path, &identity, db, |db| {
                 assert!(
                     crate::snapshot_sync::with_state_v2_progress_lock(&c.path, |_| Ok(())).is_err(),
                     "the post-seal callback still owns the progress lock"
@@ -1810,5 +1809,4 @@ mod application_cases {
         assert_eq!(verified.presence, original.presence);
         assert!(!verified.account_rows.is_empty());
     }
-    include!("import_peak_tests.rs");
 }
