@@ -4,6 +4,13 @@ use super::*;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Release synthetic custody and its registry slot when a fixture is finished.
+pub(in crate::snapshots) fn erase_published(path: &Path) {
+    let _owner = super::super::super::CheckpointLock::acquire(path).unwrap();
+    erase_locked(path, None).unwrap();
+    states().lock().unwrap().remove(path);
+}
+
 fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Option<ScanIndex>> {
     load_with_custody(path, switched, mapper, published(path)?)
 }

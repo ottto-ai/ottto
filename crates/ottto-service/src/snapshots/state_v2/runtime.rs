@@ -1084,12 +1084,8 @@ pub(in super::super) fn erase_locked(path: &Path, index: Option<&ScanIndex>) -> 
     }
     super::super::sync_checkpoint_parent(path)?;
     telemetry::event("source_erasure_confirmed", &1);
-    // Successful explicit erasure ends this custody lineage. Old clones still
-    // carry closed sessions and cannot save; a fresh setup may create new state.
-    states()
-        .lock()
-        .map_err(|_| Hold::DbUnavailable)?
-        .remove(path);
+    // Retain the invalidated route's custody latch: erased artifacts must not
+    // let this process resume v1 or re-create v2 without an explicit new lineage.
     Ok(())
 }
 
@@ -1146,6 +1142,8 @@ fn close_tree(support: &Path, erase: bool) -> Result<()> {
 #[cfg(test)]
 #[path = "runtime_tests.rs"]
 mod tests;
+#[cfg(test)]
+pub(in super::super) use tests::erase_published;
 
 // OPS maintenance boundary; routing/import/ACK remain owned by their adapters.
 #[path = "runtime_ops.rs"]

@@ -127,11 +127,7 @@ pub(crate) fn publish(index: &ScanIndex, path: &Path, progress: &[u8]) -> ScanIn
     ScanIndex::load(path).unwrap()
 }
 
-/// Release synthetic native custody before deleting a fixture directory.
-pub(in super::super) fn erase_published(path: &Path) {
-    let _owner = super::super::CheckpointLock::acquire(path).unwrap();
-    runtime::erase_locked(path, None).unwrap();
-}
+pub(in super::super) use runtime::erase_published;
 
 /// Synthetic R1 certificate using the real storage and durable-tail digests.
 pub(super) fn checkpoint(
