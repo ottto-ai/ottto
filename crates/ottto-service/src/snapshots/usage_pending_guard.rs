@@ -228,8 +228,15 @@ pub(super) struct Runtime {
     // (Lead B round 8). Derived from the census; rebuilt per complete pass.
     // Keyed by window and whether a complete pass built it.
     census_prefix: Option<(String, bool, Arc<usage_census_prefix::CensusPrefixIndex>)>,
+    // Source-wide refused or paced reads of ANY Claude file, held or not,
+    // until that exact key's complete parse is published (fork-lineage
+    // retirement gate). Past the bound it saturates for the process.
+    refused: BTreeSet<String>,
+    refused_saturated: bool,
 }
-crate::heap_layout_bound::fields!(Runtime; slots, slot_occurrences, paced, withheld, audited, custody, unread, census_prefix);
+crate::heap_layout_bound::fields!(Runtime; slots, slot_occurrences, paced, withheld, audited, custody, unread, census_prefix, refused, refused_saturated);
+/// Source-wide refused keys kept for the fork-lineage gate.
+pub(super) const FORK_LINEAGE_REFUSED_KEYS: usize = 4096;
 
 /// One held family's refused keys. Past the bound the family is saturated:
 /// it stays unread (vetoing conservatively) until the hold itself ends.
@@ -714,8 +721,12 @@ impl Holds {
             }
         }
         // Closure may pass through a current family; that family itself
-        // keeps its ordinary current-window reads.
-        held.retain(|(root, _)| !is_current(root));
+        // keeps its ordinary current-window reads. It may also pass through a
+        // family under authority quarantine, which keeps the quarantine rules
+        // (re-arm, retry, prune and rebind); only a decode hold holds it.
+        held.retain(|(root, reason)| {
+            !is_current(root) && (*reason == Unknown::Decode || !quarantine_governs(index, root))
+        });
         Some(Self {
             roots: held,
             catchup,
@@ -831,6 +842,17 @@ impl ScanIndex {
             self.usage_guard_holds.invalidate();
         }
     }
+    /// Drop the cached index ahead of a rebuild. A global hold it forced is
+    /// lifted at the next projection unless the rebuild is Unknown too.
+    pub(super) fn usage_guard_drop_census_prefix(&mut self) {
+        if self.usage_guard_census_prefix_unknown() {
+            self.usage_guard_holds.invalidate();
+        }
+        let runtime = &mut self.usage_guard_holds.runtime;
+        if runtime.census_prefix.take().is_some() {
+            stash(runtime);
+        }
+    }
     fn usage_guard_census_prefix_unknown(&self) -> bool {
         self.usage_guard_holds
             .runtime
@@ -918,6 +940,17 @@ impl ScanIndex {
         let Some(member) = claude_index_path_member_ref(path) else {
             return;
         };
+        // Source-wide first: the fork-lineage gate covers every family.
+        let runtime = &mut self.usage_guard_holds.runtime;
+        let key = local_index_key(path);
+        if !runtime.refused_saturated && !runtime.refused.contains(&key) {
+            if runtime.refused.len() >= FORK_LINEAGE_REFUSED_KEYS {
+                runtime.refused = BTreeSet::new();
+                runtime.refused_saturated = true;
+            } else {
+                runtime.refused.insert(key);
+            }
+        }
         if !self.usage_guard_holds.holds(member.root) {
             return;
         }
@@ -956,6 +989,7 @@ impl ScanIndex {
             return;
         };
         let key = local_index_key(path);
+        self.usage_guard_holds.runtime.refused.remove(&key);
         if let Some(unread) = self.usage_guard_holds.runtime.unread.get_mut(member.root) {
             if unread.keys.contains(&key) {
                 unread.read.insert(key);
@@ -1017,6 +1051,8 @@ fn unread_scope_of(index: &ScanIndex, holds: &Holds, window: &str) -> BTreeSet<S
 /// still unread, an indexed sibling missing from its evidence, held growth
 /// not yet merged, or a global (Unknown) hold. While it does, a family's
 /// fork lineage cannot be ruled out, so no family's pending may retire.
+/// Source-wide: unlike the scoped posture veto (`unread_scope`), no hold,
+/// current window or authority quarantine exempts a family (review r8/9).
 pub(super) fn fork_lineage_incomplete(index: &ScanIndex) -> bool {
     let current = index.current_census_window();
     // An unbuilt or dirty projection may miss a newly held family.
@@ -1027,10 +1063,40 @@ pub(super) fn fork_lineage_incomplete(index: &ScanIndex) -> bool {
         rebuilt = projection(index, current.as_deref());
         &rebuilt
     };
+    let runtime = &index.usage_guard_holds.runtime;
     holds.global()
         || index.usage_guard_census_prefix_unknown()
-        || !index.usage_guard_holds.runtime.slots.is_empty()
-        || !unread_scope_of(index, holds, current.as_deref().unwrap_or_default()).is_empty()
+        || !runtime.slots.is_empty()
+        || runtime.refused_saturated
+        || runtime
+            .refused
+            .iter()
+            .any(|key| index.files.contains_key(key))
+        || source_wide_missing_sibling(index, current.as_deref().unwrap_or_default())
+}
+
+/// Any family with pending (current-window, Match, held or quarantined)
+/// whose indexed, non-empty file is absent from its retained membership and
+/// from this window's held growth. Unlike the scoped posture veto, no hold
+/// or window exempts a family here.
+fn source_wide_missing_sibling(index: &ScanIndex, window: &str) -> bool {
+    let slots = &index.usage_guard_holds.runtime.slots;
+    index.files.keys().any(|key| {
+        let Some(member) = claude_index_path_member_ref(Path::new(key)) else {
+            return false;
+        };
+        if index.confirmed_empty_files.contains(key) {
+            return false;
+        }
+        let Some(pending) = index.claude_usage_family_pending.get(member.root) else {
+            return false;
+        };
+        let (root, id) = member.into_owned();
+        !(pending.membership().contains_key(&id)
+            || slots
+                .get(&id)
+                .is_some_and(|slot| slot.root == root && slot.window == window))
+    })
 }
 
 /// Page families an incomplete held family vetoes: (a) those sharing its
@@ -1286,4 +1352,93 @@ pub(super) fn withheld_checkpoint(retained: bool) {
         SnapshotSource::ClaudeCode.api_slug(),
         &json!({"withheld_full_checkpoint_retained":u64::from(retained),"withheld_full_checkpoint_refused":u64::from(!retained)}),
     );
+}
+
+/// Alarm thresholds of the held-no-witness gauge (Lead B approved gauge;
+/// thresholds are local tuning, counts only).
+pub(super) const HELD_NO_WITNESS_ALARM_AGE_SECONDS: u64 = 7 * 24 * 60 * 60;
+pub(super) const HELD_NO_WITNESS_ALARM_FAMILIES: u64 = 1_000;
+const HELD_NO_WITNESS_ALARM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3_600);
+
+#[cfg(not(test))]
+static HELD_NO_WITNESS_LAST_ALARM: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+thread_local! {
+    static HELD_NO_WITNESS_LAST_ALARM: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Whether a held-no-witness alarm is due at `now`; takes the slot when it is.
+fn take_held_no_witness_alarm_slot(now: std::time::Instant) -> bool {
+    let due = |last: Option<std::time::Instant>| {
+        last.map_or(true, |at| {
+            now.saturating_duration_since(at) >= HELD_NO_WITNESS_ALARM_INTERVAL
+        })
+    };
+    #[cfg(not(test))]
+    {
+        let mut last = HELD_NO_WITNESS_LAST_ALARM
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let due = due(*last);
+        if due {
+            *last = Some(now);
+        }
+        due
+    }
+    #[cfg(test)]
+    HELD_NO_WITNESS_LAST_ALARM.with(|last| {
+        let due = due(last.get());
+        if due {
+            last.set(Some(now));
+        }
+        due
+    })
+}
+
+/// Gauge `usage_held_no_witness`: families held for a missing witness, their
+/// retained pending bytes, and the age of the oldest one's window at `now`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub(super) struct HeldNoWitness {
+    pub(super) families: u64,
+    pub(super) bytes: u64,
+    pub(super) oldest_age_seconds: u64,
+}
+
+impl ScanIndex {
+    /// Emit the gauge (each traversal start) and, at most hourly, a local
+    /// alarm once the oldest such family or their number passes its
+    /// threshold. Counts only; no path or id.
+    pub(super) fn usage_guard_gauge_held_no_witness(&self, now: &str) -> HeldNoWitness {
+        let now_seconds = rfc3339_unix_seconds(now).unwrap_or_default();
+        let mut gauge = HeldNoWitness::default();
+        for (root, pending) in &self.claude_usage_family_pending {
+            if self.usage_guard_holds.reason(root) != Some(Unknown::MissingWitness) {
+                continue;
+            }
+            gauge.families += 1;
+            gauge.bytes = gauge
+                .bytes
+                .saturating_add(usage_pending_retention::pending_bytes(pending).unwrap_or(0));
+            if let Some(window) = rfc3339_unix_seconds(&pending.census_window_end) {
+                gauge.oldest_age_seconds = gauge
+                    .oldest_age_seconds
+                    .max(now_seconds.saturating_sub(window));
+            }
+        }
+        crate::local_resource_diagnostics::traversal_point(
+            "usage_held_no_witness",
+            SnapshotSource::ClaudeCode.api_slug(),
+            &gauge,
+        );
+        if (gauge.oldest_age_seconds >= HELD_NO_WITNESS_ALARM_AGE_SECONDS
+            || gauge.families >= HELD_NO_WITNESS_ALARM_FAMILIES)
+            && gauge.families != 0
+            && take_held_no_witness_alarm_slot(std::time::Instant::now())
+        {
+            crate::local_resource_diagnostics::claude_usage_held_no_witness_alarm(&gauge);
+        }
+        gauge
+    }
 }

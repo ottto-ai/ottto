@@ -348,7 +348,7 @@ pub(super) struct Counts {
     pub(super) retired: Weight,
 }
 
-fn pending_bytes(pending: &ClaudeUsageFamilyPending) -> Option<u64> {
+pub(super) fn pending_bytes(pending: &ClaudeUsageFamilyPending) -> Option<u64> {
     struct Counter(u64);
     impl Write for Counter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {

@@ -710,6 +710,12 @@ pub(crate) fn claude_history_upgrade_owed_without_list(counts: &impl Serialize) 
         counts,
     );
 }
+/// Local alarm, at most hourly: Claude families held for a missing usage
+/// witness passed the age or count threshold of the `usage_held_no_witness`
+/// gauge (B3 phase 1). Counts only; no path, id or wire event.
+pub(crate) fn claude_usage_held_no_witness_alarm(counts: &impl Serialize) {
+    traversal_point("usage_held_no_witness_alarm", "claude_code", counts);
+}
 /// Local alarm, once per park: a held Claude key's progress audit failed its
 /// secure open 8 times in a row and is parked, its audit debt still owed.
 /// Counts only; no path, id or wire event.

@@ -1034,6 +1034,324 @@ fn fork_lineage_unknown_refuses_retirement_while_any_family_incomplete() {
     }
 }
 
+/// A due, bounded quarantine record over CARRY_ROOT bound to its witness.
+fn quarantine_carry_root(index: &mut ScanIndex) {
+    let witness = &index.claude_usage_family_witnesses[CARRY_ROOT];
+    let record = ClaudeUsageAuthorityQuarantineRecord {
+        contract: CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION.to_string(),
+        proven_witness_fingerprint: claude_usage_family_witness_fingerprint(witness),
+        member_source_file_fingerprints: carry_family_members()
+            .into_iter()
+            .zip(["f".repeat(64), "f".repeat(64)])
+            .collect(),
+        failed_reconstruction_count: 1,
+        disposition: ClaudeUsageAuthorityQuarantineDisposition::RetryPending,
+        retry_after_unix_seconds: 0,
+        proof_correction: None,
+    };
+    index
+        .claude_usage_authority_quarantine
+        .insert(CARRY_ROOT.into(), record);
+}
+
+/// CARRY_ROOT's state after a retry start, minus the wall-clock deadline.
+fn quarantined_root_state(index: &ScanIndex) -> serde_json::Value {
+    let mut record = serde_json::to_value(index.claude_usage_authority_quarantine.get(CARRY_ROOT))
+        .unwrap();
+    if let Some(record) = record.as_object_mut() {
+        record.remove("retry_after_unix_seconds");
+    }
+    json!({
+        "files": carry_family_keys()
+            .iter()
+            .map(|key| serde_json::to_value(index.files.get(key)).unwrap())
+            .collect::<Vec<_>>(),
+        "pending": serde_json::to_value(index.claude_usage_family_pending.get(CARRY_ROOT)).unwrap(),
+        "quarantine": record,
+    })
+}
+
+#[test]
+fn quarantined_root_never_becomes_held_through_dependency_closure() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    // Review r89 HIGH: a family under authority quarantine keeps its
+    // quarantine rules (re-arm, retry, prune/rebind) even when a held,
+    // witnessless family reaches it by a shared request or a legacy owner
+    // edge. Traversal still passes through it; only a decode hold holds it.
+    for edge in ["shared_request", "legacy_owner"] {
+        let mut index = carry_index();
+        retry_under_way(&mut index);
+        quarantine_carry_root(&mut index);
+        let unwitnessed = index
+            .claude_usage_family_pending
+            .get_mut(CARRY_UNWITNESSED)
+            .unwrap();
+        unwitnessed.invalid = false;
+        if edge == "shared_request" {
+            let member = carry_member(CARRY_UNWITNESSED, None);
+            let shared = index.claude_usage_family_pending[CARRY_ROOT]
+                .membership()
+                .values()
+                .next()
+                .unwrap()
+                .iter()
+                .next()
+                .unwrap()
+                .clone();
+            let unwitnessed = index
+                .claude_usage_family_pending
+                .get_mut(CARRY_UNWITNESSED)
+                .unwrap();
+            unwitnessed
+                .member_request_id_hashes
+                .get_mut(&member)
+                .unwrap()
+                .insert(shared.clone());
+            unwitnessed
+                .member_occurrences
+                .get_mut(&member)
+                .unwrap()
+                .insert(shared, carry_occurrence(1, 10));
+        } else {
+            index
+                .claude_usage_family_witnesses
+                .get_mut(CARRY_ROOT)
+                .unwrap()
+                .legacy_owner_roots
+                .insert(CARRY_UNWITNESSED.into());
+        }
+        let old = {
+            let mut old = index.clone();
+            usage_pending_guard::replay_old(|| carry_start(&mut old, CARRY_RETRY, BACKFILL_WINDOW_DAYS));
+            quarantined_root_state(&old)
+        };
+        index.refresh_usage_guard_holds_at(Some(CARRY_RETRY));
+        assert_eq!(
+            index.usage_guard_reason(CARRY_UNWITNESSED),
+            Some(Unknown::MissingWitness),
+            "{edge}"
+        );
+        assert_eq!(index.usage_guard_reason(CARRY_ROOT), None, "{edge}");
+        assert!(!index.usage_guard_holds.holds(CARRY_ROOT), "{edge}");
+        carry_start(&mut index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+        assert_eq!(
+            quarantined_root_state(&index),
+            old,
+            "{edge}: the quarantined family's retry start is the pre-B3 one"
+        );
+    }
+}
+
+#[test]
+fn census_prefix_over_budget_record_is_unknown_under_the_byte_budget() {
+    // Review r89 MEDIUM: a pending-free record whose hashes the census
+    // dropped proves no absence. Far under the byte budget, the index is
+    // still Unknown, never Clear.
+    let mut index = ScanIndex::default();
+    let _ = index.claude_request_census_mut_for_test().insert(
+        carry_key(CARRY_OTHER, None),
+        claude_request_census::ClaudeRequestCensusRecord::synthetic_for_test(
+            &"a".repeat(64),
+            1,
+            claude_request_census::ClaudeRequestCensusShape::Exact,
+            vec![claude_request_census::claude_request_hash("req_other")],
+        ),
+    );
+    let clear = usage_census_prefix::CensusPrefixIndex::build(&index);
+    assert!(!clear.unknown());
+    assert_eq!(
+        clear.verdict(CARRY_ROOT, [claude_request_census::claude_request_hash("req_owned")]),
+        usage_census_prefix::CensusPrefixVerdict::Clear
+    );
+    assert!(clear.bytes() < usage_census_prefix::CENSUS_PREFIX_MAX_BYTES);
+    let _ = index.claude_request_census_mut_for_test().insert(
+        carry_key(CARRY_UNWITNESSED, None),
+        claude_request_census::ClaudeRequestCensusRecord::synthetic_for_test(
+            &"b".repeat(64),
+            1,
+            claude_request_census::ClaudeRequestCensusShape::OverBudget,
+            vec![],
+        ),
+    );
+    let (built, rows) = crate::local_resource_diagnostics::capture(|| {
+        usage_census_prefix::CensusPrefixIndex::build(&index)
+    });
+    assert!(built.unknown());
+    assert_eq!(
+        built.verdict(CARRY_ROOT, [claude_request_census::claude_request_hash("req_owned")]),
+        usage_census_prefix::CensusPrefixVerdict::Unknown
+    );
+    assert!(rows.iter().any(|row| {
+        row["counts"]["census_prefix_over_budget_records"] == 1
+            && row["counts"]["census_prefix_overflow"] == 0
+    }));
+    // A family with usage pending keeps its own record out of the index.
+    index.claude_usage_family_pending.insert(
+        CARRY_UNWITNESSED.into(),
+        ClaudeUsageFamilyPending {
+            derived_request_members: BTreeSet::new(),
+            census_window_end: CARRY_FAILED.into(),
+            member_request_id_hashes: BTreeMap::new(),
+            member_occurrences: BTreeMap::new(),
+            invalid: false,
+            idless_revision: None,
+        },
+    );
+    assert!(!usage_census_prefix::CensusPrefixIndex::build(&index).unknown());
+}
+
+#[test]
+fn fork_lineage_unknown_is_source_wide_beside_an_unrelated_qualified_family() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    // Review r89 MEDIUM: the retirement gate is source-wide. An incomplete
+    // current-window, Match or quarantined family, or a refused read of a
+    // family that is not held, refuses an unrelated qualified family too.
+    let mut base = carry_index();
+    retry_under_way(&mut base);
+    base.claude_usage_family_pending.remove(CARRY_UNWITNESSED);
+    carry_family(&mut base, CARRY_OTHER, &[None], true);
+    base.refresh_usage_guard_holds_at(Some(CARRY_RETRY));
+    assert_eq!(
+        usage_pending_guard::verdict(&base, CARRY_ROOT),
+        Verdict::Match
+    );
+    assert!(!base.usage_guard_holds.holds(CARRY_ROOT));
+    assert!(!usage_pending_guard::fork_lineage_incomplete(&base));
+    let counts = retirement_attempt(&mut base.clone());
+    assert!(counts["retire_refused"]["fork_lineage_unknown"].is_null());
+    let sibling = |index: &mut ScanIndex| {
+        index.files.insert(
+            carry_key(CARRY_ROOT, Some("agent-b5e1b2c3d4e5f6072")),
+            manifest_index_entry(Some("unread-sibling")),
+        );
+    };
+    let mut current = base.clone();
+    current
+        .claude_usage_family_pending
+        .get_mut(CARRY_ROOT)
+        .unwrap()
+        .census_window_end = CARRY_RETRY.into();
+    sibling(&mut current);
+    let mut matched = base.clone();
+    sibling(&mut matched);
+    let mut quarantined = base.clone();
+    quarantine_carry_root(&mut quarantined);
+    sibling(&mut quarantined);
+    let mut refused = base.clone();
+    refused.usage_guard_full_blocked(Path::new(&carry_key(CARRY_ROOT, None)));
+    for (label, mut incomplete) in [
+        ("current", current),
+        ("match", matched),
+        ("quarantined", quarantined),
+        ("refused_unheld", refused),
+    ] {
+        incomplete.refresh_usage_guard_holds_at(Some(CARRY_RETRY));
+        assert!(
+            !incomplete.usage_guard_holds.holds(CARRY_ROOT),
+            "{label}: no scoped hold is needed"
+        );
+        assert!(
+            usage_pending_guard::fork_lineage_incomplete(&incomplete),
+            "{label}"
+        );
+        let counts = retirement_attempt(&mut incomplete);
+        assert_eq!(
+            counts["retire_refused"]["fork_lineage_unknown"]["families"],
+            2,
+            "{label}: the unrelated qualified family is held back too"
+        );
+        assert_eq!(counts["retired"]["families"], 0, "{label}");
+        assert!(
+            incomplete.claude_usage_family_pending.contains_key(CARRY_OTHER),
+            "{label}: the unrelated qualified family is refused"
+        );
+    }
+}
+
+#[test]
+fn owned_start_correction_waits_for_a_held_family() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    // Review r89 note (approved: "Unknown hold instead of carry/re-arm"):
+    // an outstanding owned-start correction does not clear a held family's
+    // fingerprints; it stays owed until the hold ends.
+    let (mut index, root, _) = held_family_index();
+    index.claude_owned_start_census.insert(
+        root.clone(),
+        ClaudeOwnedStartCensusWitness {
+            marker_source_file_fingerprint: "m".repeat(64),
+            verified_source_file_fingerprint: Some("v".repeat(64)),
+            emitted_source_file_fingerprint: None,
+        },
+    );
+    let parent = index
+        .files
+        .keys()
+        .find(|key| {
+            claude_index_path_member_ref(Path::new(key))
+                .is_some_and(|member| member.root == root && member.subagent_stem.is_none())
+        })
+        .cloned()
+        .unwrap();
+    let before = index.files[&parent].source_file_fingerprint.clone();
+    assert!(!before.is_empty());
+    let api = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
+    let trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
+    let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+        apply_claude_reported_usage_with_index(&mut Vec::new(), &api, &trace, &mut index, false, CARRY_RETRY)
+    });
+    assert!(index.usage_guard_holds.holds(&root));
+    assert_eq!(index.files[&parent].source_file_fingerprint, before);
+    assert!(rows
+        .iter()
+        .any(|row| row["counts"]["owned_start_correction_held_files"] == 1));
+    assert!(index.claude_owned_start_census[&root]
+        .emitted_source_file_fingerprint
+        .is_none());
+}
+
+#[test]
+fn held_no_witness_gauge_counts_and_alarms_hourly() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    // Lead B round 10: gauge usage_held_no_witness{families, bytes,
+    // oldest_age} with the local hourly alarm pattern.
+    let (index, root, _) = held_family_index();
+    let window = rfc3339_unix_seconds(CARRY_FAILED).unwrap();
+    let young = "2026-08-02T08:10:00Z";
+    let (gauge, rows) =
+        crate::local_resource_diagnostics::capture(|| index.usage_guard_gauge_held_no_witness(young));
+    assert_eq!(gauge.families, 1);
+    assert_eq!(
+        gauge.bytes,
+        usage_pending_retention::pending_bytes(&index.claude_usage_family_pending[&root]).unwrap()
+    );
+    assert!(gauge.bytes > 0);
+    assert_eq!(gauge.oldest_age_seconds, 3_600);
+    assert!(rows.iter().any(|row| row["stage"] == "usage_held_no_witness"
+        && row["counts"]["families"] == 1));
+    assert!(!rows.iter().any(|row| row["stage"] == "usage_held_no_witness_alarm"));
+    let old = "2026-08-09T07:10:00Z";
+    let (gauge, rows) =
+        crate::local_resource_diagnostics::capture(|| index.usage_guard_gauge_held_no_witness(old));
+    assert_eq!(
+        gauge.oldest_age_seconds,
+        rfc3339_unix_seconds(old).unwrap() - window
+    );
+    assert!(gauge.oldest_age_seconds >= usage_pending_guard::HELD_NO_WITNESS_ALARM_AGE_SECONDS);
+    assert!(rows.iter().any(|row| row["stage"] == "usage_held_no_witness_alarm"));
+    // At most hourly.
+    let (_, rows) =
+        crate::local_resource_diagnostics::capture(|| index.usage_guard_gauge_held_no_witness(old));
+    assert!(!rows.iter().any(|row| row["stage"] == "usage_held_no_witness_alarm"));
+}
+
 /// Counts-only inventory comparison entry. Supply one frozen ScanIndex, or a
 /// directory of ordered *.json checkpoint copies. This never opens transcripts,
 /// saves state, uploads, or repairs the input. A single selected generation has
@@ -1079,6 +1397,7 @@ fn phase1_replay_frozen_scan_index_guard_comparison() {
     let mut fork_lineage_unknown_families = 0_u64;
     let mut census_prefix_entries_max = 0_u64;
     let mut census_prefix_unknown = 0_u64;
+    let mut census_prefix_bytes_max = 0_u64;
     for path in paths {
         let file = File::open(path).expect("frozen checkpoint unavailable");
         let mut index =
@@ -1086,12 +1405,16 @@ fn phase1_replay_frozen_scan_index_guard_comparison() {
                 .unwrap_or_else(|_| {
                     panic!("frozen checkpoint decode refused; no repair attempted")
                 });
-        // Model the next traversal start: every retained pending is stale.
+        // Model the next traversal start as production runs it: the
+        // census-prefix refresh (runtime only) before the hold projection,
+        // so a prefix Unknown reaches the projection and the fork gate.
+        // Every retained pending is stale.
+        let prefixes = index.refresh_claude_census_prefix("9999-12-31T23:59:59Z", false);
         index.refresh_usage_guard_holds_at(None);
         checkpoints += 1;
         global_unknown += u64::from(index.usage_guard_holds.global());
-        let prefixes = usage_census_prefix::CensusPrefixIndex::build(&index);
         census_prefix_entries_max = census_prefix_entries_max.max(prefixes.len() as u64);
+        census_prefix_bytes_max = census_prefix_bytes_max.max(prefixes.bytes() as u64);
         census_prefix_unknown += u64::from(prefixes.unknown());
         if usage_pending_guard::fork_lineage_incomplete(&index) {
             fork_lineage_unknown_checkpoints += 1;
@@ -1165,7 +1488,8 @@ fn phase1_replay_frozen_scan_index_guard_comparison() {
         "retire_refused_fork_lineage_unknown_families":fork_lineage_unknown_families,
         "fork_lineage_runtime_marks_unavailable":1,
         "census_prefix_entries_max":census_prefix_entries_max,
-        "census_prefix_cap":usage_census_prefix::CENSUS_PREFIX_MAX_ENTRIES,
+        "census_prefix_bytes_max":census_prefix_bytes_max,
+        "census_prefix_byte_budget":usage_census_prefix::CENSUS_PREFIX_MAX_BYTES,
         "census_prefix_unknown_checkpoints":census_prefix_unknown})
     );
     assert_eq!(known_diffs, 0, "known guard differences; counts only");

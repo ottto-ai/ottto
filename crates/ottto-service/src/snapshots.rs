@@ -9779,16 +9779,32 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         })
         .collect::<BTreeSet<_>>();
     if !owned_start_reparse_ids.is_empty() {
+        // B3 phase 1 (approved: "Unknown hold instead of carry/re-arm"): an
+        // outstanding correction never re-arms a held family's file. It
+        // stays owed and is served once the hold ends.
+        let holds = &index.usage_guard_holds;
+        let mut held_corrections = 0_u64;
         for (index_key, entry) in &mut index.files {
             if claude_index_path_family_member(Path::new(index_key)).is_some_and(
                 |(_, source_session_id)| owned_start_reparse_ids.contains(&source_session_id),
             ) {
+                if holds.holds_path(Path::new(index_key)) {
+                    held_corrections += 1;
+                    continue;
+                }
                 crate::local_resource_diagnostics::claude_reread::clear(
                     crate::local_resource_diagnostics::claude_reread::ClearSite::OwnedStart,
                     !entry.source_file_fingerprint.is_empty(),
                 );
                 entry.source_file_fingerprint.clear();
             }
+        }
+        if held_corrections != 0 {
+            crate::local_resource_diagnostics::traversal_point(
+                "claude_usage_held_owned_start_correction",
+                SnapshotSource::ClaudeCode.api_slug(),
+                &json!({"owned_start_correction_held_files":held_corrections}),
+            );
         }
     }
 
@@ -42294,6 +42310,9 @@ fn ensure_bounded_traversal(
             index.refresh_claude_census_prefix(collected_at, false);
         }
         index.refresh_usage_guard_holds_at(Some(collected_at));
+        if source == SnapshotSource::ClaudeCode {
+            index.usage_guard_gauge_held_no_witness(collected_at);
+        }
         let mut stale_carry_rejection_counts = StaleCarryRejectionCounts::default();
         let carry = if streaming_carry {
             // Existing scheduling debt survives even if the whole set now fits.
@@ -56213,6 +56232,118 @@ mod tests {
     #[test]
     fn claude_future_quarantine_preserves_cross_page_duplicate_refusal() {
         exercise_claude_partial_census_recovery(true, true);
+    }
+
+    /// Lead B money condition (round 10): a witnessless family is B3-held
+    /// from its second traversal on, yet each pass in which its file grew
+    /// still emits a usage body equal to a cold Full parse of that file.
+    /// This drives the plain scan path; the sampled acquisition path (RAM
+    /// checkpoint, planned Tail, withheld Full) has no Claude harness yet,
+    /// see the ignored fixture below.
+    #[test]
+    fn held_no_witness_family_growing_file_uploads_usage_under_file_birth_posture() {
+        let root = temp_dir("held-no-witness-growing");
+        let path = root.join("held-growing.jsonl");
+        let line = |n: u32| {
+            format!(
+                "{{\"timestamp\":\"2026-08-20T10:{n:02}:00Z\",\"sessionId\":\"held-growing\",\"type\":\"assistant\",\"requestId\":\"req_{n}\",\"message\":{{\"id\":\"msg_{n}\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":{},\"output_tokens\":2}}}}}}\n",
+                100 + n
+            )
+        };
+        fs::write(&path, line(0)).expect("seed transcript");
+        let api = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
+        let trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
+        // The money-bearing body: tokens, request count, the per-model usage
+        // the server prices, and any collector cost.
+        let totals = |items: &[SnapshotItem]| {
+            items
+                .iter()
+                .filter(|item| item.source_session_id == "held-growing")
+                .map(|item| {
+                    (
+                        item.request_count,
+                        item.input_tokens,
+                        item.output_tokens,
+                        item.cache_read_tokens,
+                        serde_json::to_value(&item.model_usage).expect("model usage"),
+                        item.cost.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut index = ScanIndex::default();
+        let mut held_passes = 0;
+        for generation in 0..4_u32 {
+            if generation > 0 {
+                let mut file = fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .expect("grow transcript");
+                std::io::Write::write_all(&mut file, line(generation).as_bytes()).expect("append");
+            }
+            let started = format!("2026-08-20T11:{:02}:00Z", generation * 2);
+            if index
+                .claude_usage_family_pending
+                .get("held-growing")
+                .is_some_and(|pending| pending.census_window_end != started)
+                && matches!(
+                    usage_pending_guard::verdict(&index, "held-growing"),
+                    usage_pending_guard::Verdict::Unknown(
+                        usage_pending_guard::Unknown::MissingWitness
+                    )
+                )
+            {
+                held_passes += 1;
+            }
+            let mut scan = scan_source_roots_with_limit(
+                SnapshotSource::ClaudeCode,
+                std::slice::from_ref(&root),
+                &mut index,
+                &started,
+                BACKFILL_WINDOW_DAYS,
+                16,
+                true,
+            )
+            .expect("bounded page");
+            apply_claude_reported_usage_with_index(
+                &mut scan.snapshots,
+                &api,
+                &trace,
+                &mut index,
+                scan.census_complete,
+                &scan.census_window_end,
+            );
+            let cold = parse_claude_code_jsonl_file(&path, &started, "source".to_string())
+                .expect("cold Full parse");
+            assert_eq!(
+                totals(&scan.snapshots),
+                totals(&cold),
+                "pass {generation}: the grown file's body equals a cold Full"
+            );
+            let body = totals(&scan.snapshots);
+            assert!(
+                body.len() == 1
+                    && body[0].1 > 0
+                    && body[0].4.as_array().is_some_and(|m| !m.is_empty()),
+                "pass {generation}: the grown file uploads tokens and priced model usage"
+            );
+            finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
+        }
+        assert!(held_passes >= 1, "the witnessless family was B3-held");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Lead B money condition (round 10), second fixture. A held file with no
+    /// retained checkpoint takes a paced withheld Full that publishes
+    /// nothing; the next pass continues as a planned Tail from the
+    /// checkpoint that read rebuilt, and must upload the growth with bodies
+    /// equal to a cold Full. Those reads exist only on the sampled
+    /// acquisition path (RAM checkpoint cache), for which the tree has no
+    /// Claude test harness; this records the obligation until one exists.
+    #[test]
+    #[ignore = "needs a sampled Claude scan harness (RAM checkpoint cache, planned Tail); none exists yet"]
+    fn held_file_without_checkpoint_withheld_full_then_tail_uploads_growth() {
+        unimplemented!("sampled Claude scan harness required");
     }
 
     /// The stable session's family holds stale (older-window) proof that B3
