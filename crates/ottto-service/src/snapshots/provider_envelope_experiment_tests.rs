@@ -670,61 +670,7 @@ fn qualified_prior(
     )
 }
 
-#[test]
-fn envelope_experiment_frozen_old_proof_does_not_mask_new_native_request() {
-    // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
-    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
-    let (dir, parent, raw) = claude_account_family_fixture();
-    let (api0, trace0) = reports(&parent, false);
-    let mut index = fixture_index(&dir, &parent, &raw);
-    let mut seed = raw.clone();
-    apply_claude_reported_usage_with_index(&mut seed, &api0, &trace0, &mut index, true, WINDOW);
-    let retained = index.claude_usage_family_witnesses[&parent].clone();
-    assert!(qualified_prior(&retained, &raw[0], &api0, &trace0, true).is_some());
-
-    let path = dir.join(format!("{parent}.jsonl"));
-    let mut contents = fs::read_to_string(&path).unwrap();
-    contents.push_str(&format!("{{\"timestamp\":\"2026-08-02T07:00:06Z\",\"type\":\"assistant\",\"sessionId\":\"{parent}\",\"requestId\":\"req_extra\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":10}}}}}}\n"));
-    fs::write(&path, contents).unwrap();
-    let grown = parse_claude_code_jsonl_file(&path, WINDOW, hex64('a'))
-        .unwrap()
-        .remove(0);
-    let (api1, trace1) = reports(&parent, true);
-    let mut current = vec![grown.clone(), raw[1].clone()];
-    let outcome = apply_claude_reported_usage_with_index(
-        &mut current,
-        &api1,
-        &trace1,
-        &mut index,
-        true,
-        WINDOW,
-    );
-    assert!(!outcome.duplicate_census.census_invalid);
-    assert!(current
-        .iter()
-        .all(|i| i.usage_accounting_contract.as_deref()
-            == Some("session_exclusive_reported_usage:v1")));
-    let new_proof = &index.claude_usage_family_witnesses[&parent];
-    assert_ne!(new_proof, &retained);
-    assert!(qualified_prior(&retained, &grown, &api1, &trace1, true).is_none());
-    let unsafe_prior = qualified_prior(new_proof, &grown, &api1, &trace1, true).unwrap();
-    let actual = raw_hashes(&grown);
-    assert!(
-        actual.difference(&unsafe_prior).next().is_none(),
-        "fresh proof would hide the new request"
-    );
-    let extra = format!("{:x}", Sha256::digest(b"req_extra"));
-    assert!(
-        actual.contains(&extra),
-        "old-proof miss falls back to ALL, preserving the native comparison trigger"
-    );
-    assert!(
-        qualified_prior(new_proof, &grown, &api1, &trace1, false).is_none(),
-        "demotion cannot certify prior"
-    );
-    writeln!(std::io::stderr().lock(), "envelope_experiment_old_p: frozen_rejected=true fresh_would_mask=true required_native_hit=1").unwrap();
-    fs::remove_dir_all(dir).unwrap();
-}
+// Nonshipping frozen-proof experiment retired.
 
 #[derive(Default)]
 struct ProcessPermit {
@@ -1179,26 +1125,7 @@ impl SelectionFixture {
     }
 }
 
-#[test]
-fn envelope_experiment_target_priority_precedes_actual_audit_selection() {
-    let fixture = SelectionFixture::new();
-    let base = fixture.prepare(fixture.previous.clone(), 1);
-    assert_eq!(base.identified_candidates[0].path, fixture.paths[1]);
-    let scope = envelope_selection_experiment::Scope::controlled();
-    scope.register("family", BTreeSet::from([fixture.paths[0].clone()]));
-    let candidate = fixture.prepare(fixture.previous.clone(), 1);
-    assert_eq!(candidate.identified_candidates.len(), 1);
-    assert_eq!(candidate.identified_candidates[0].path, fixture.paths[0]);
-    let (index, scan) = SelectionFixture::run(candidate);
-    assert_eq!(scan.scanned_file_count, 1);
-    assert_eq!(scan.snapshots.len(), 1);
-    assert!(
-        index.files[&local_index_key(&fixture.paths[1])]
-            .audit_requires_full(sampled_scan::now_seconds()),
-        "priority does not clear unrelated audit debt"
-    );
-    writeln!(std::io::stderr().lock(), "envelope_experiment_audit: base_selects_audit=true candidate_selects_target=true page_limit=1 audit_debt_preserved=true").unwrap();
-}
+// Nonshipping target-priority experiment retired.
 
 #[test]
 fn envelope_experiment_oversized_family_exits_immediately_without_cap_increase() {
