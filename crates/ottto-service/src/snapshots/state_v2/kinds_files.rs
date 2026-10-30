@@ -100,9 +100,38 @@ impl Write for Bounded {
         Ok(())
     }
 }
+/// The packed codec's generic 64 MiB input allowance is wider than this
+/// kind's mutable-value limit. Count expanded JSON before compression as well
+/// as bounding the encoded output, so admission and hydration agree.
+struct JsonLimit<W> {
+    inner: W,
+    written: usize,
+}
+impl<W: Write> Write for JsonLimit<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self
+            .written
+            .checked_add(bytes.len())
+            .map_or(true, |n| n > MUTABLE_VALUE_BYTES as usize)
+        {
+            return Err(std::io::Error::other("state_v2_files_value_admission"));
+        }
+        let n = self.inner.write(bytes)?;
+        self.written += n;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
 fn encoded(value: &impl Serialize) -> Result<Vec<u8>> {
     let mut out = Bounded(Vec::new());
-    packed::Json(value).write(&mut out)?;
+    let mut json = JsonLimit {
+        inner: packed::Encoder::new(&mut out),
+        written: 0,
+    };
+    serde_json::to_writer(&mut json, value)?;
+    json.inner.finish()?;
     Ok(out.0)
 }
 fn decoded<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
@@ -1084,6 +1113,20 @@ mod tests {
         fn commit(self, _: u64, _: u64) -> DurableCommitOutcome {
             panic!("fixture commits the owning transaction")
         }
+    }
+    #[test]
+    fn compression_cannot_admit_more_json_than_hydration_can_read() {
+        let hashes = vec!["a".repeat(64); 16_000];
+        let raw = serde_json::to_vec(&hashes).unwrap();
+        assert!(raw.len() > MUTABLE_VALUE_BYTES as usize);
+        let mut packed = Vec::new();
+        packed::Json(&hashes).write(&mut packed).unwrap();
+        assert!(packed.len() < MUTABLE_VALUE_BYTES as usize);
+        assert!(decoded::<Vec<String>>(&packed).is_err());
+        assert!(encoded(&hashes).is_err());
+        let admitted = &hashes[..15_000];
+        let bytes = encoded(&admitted).unwrap();
+        assert_eq!(typed::<Vec<String>>(&bytes).unwrap(), admitted);
     }
     #[test]
     fn v1_subset_round_trip_keeps_raw_codex_presence_side_only_rows_and_growth_claims() {
