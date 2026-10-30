@@ -42,6 +42,7 @@
 
 use super::claude_reemission_exclusions::{ListState, ReemissionExclusions};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 /// Most history files one page may upgrade, for every revision (MONEY P2).
 pub(super) const HISTORY_UPGRADE_FILES_PER_PAGE: usize = 2_000;

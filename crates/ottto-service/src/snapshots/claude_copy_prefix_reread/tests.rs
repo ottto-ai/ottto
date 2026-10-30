@@ -544,7 +544,7 @@ fn one_listed_twin_estimates_and_reads_the_complete_native_family() {
         expected
             .iter()
             .map(|p| fs::metadata(p).unwrap().len())
-            .sum()
+            .sum::<u64>()
     );
     assert_eq!(
         counts.added_by_twins_bytes,
@@ -616,7 +616,7 @@ fn added_twin_family_member_blocks_apply_at_the_existing_native_file_cap() {
     let counts = run(&home.join("scope.json"), &support, false).unwrap();
     assert_eq!(counts.listed_files, 1);
     assert!(counts.blocked_files >= 1);
-    assert!(counts.blocked_bytes >= max_jsonl_file_bytes(SnapshotSource::ClaudeCode) + 1);
+    assert!(counts.blocked_bytes > max_jsonl_file_bytes(SnapshotSource::ClaudeCode));
     assert_eq!(counts.runnable_files + counts.blocked_files, counts.files);
     assert!(run(&home.join("scope.json"), &support, true).is_err());
     assert!(!support.exists());

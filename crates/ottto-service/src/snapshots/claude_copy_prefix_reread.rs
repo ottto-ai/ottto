@@ -119,12 +119,12 @@ fn runnable(member: &Member, now: u64, days: u64) -> bool {
 // Native path twins reserve together, including when their combined bytes
 // exceed a page even though every physical member fits by itself.
 fn read_groups(request: &Request) -> Vec<Vec<&Member>> {
-    let mut groups = BTreeMap::new();
+    let mut groups: BTreeMap<_, Vec<&Member>> = BTreeMap::new();
     for member in &request.members {
         let identity = claude_index_path_member_ref(&member.path).expect("validated member");
         groups
             .entry((identity.root, identity.subagent_stem))
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(member);
     }
     let mut groups = groups.into_values().collect::<Vec<_>>();
