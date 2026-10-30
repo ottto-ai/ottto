@@ -56,6 +56,10 @@ fn now() -> u64 {
         .as_secs()
 }
 pub(super) fn accepted(destination: &str, entity: &str, body: &str) {
+    if !crate::snapshots::claude_terminal_off() {
+        return;
+    }
+
     if let Ok(mut ages) = memo().lock() {
         ages.accept(key(destination, entity, body), now());
     }

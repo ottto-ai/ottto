@@ -178,6 +178,10 @@ impl ScanIndex {
     // cooldowns are active. The early ACK view alone cannot decide whether
     // retained conflict debt is parked or selected for retry this cycle.
     pub(crate) fn count_mixed_file_context_holds(&mut self) {
+        if !claude_terminal_off() {
+            return;
+        }
+
         // Count even when the quiet path opens no candidate.
         self.mixed_context_view.held_files = self
             .mixed_context_view

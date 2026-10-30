@@ -7298,6 +7298,7 @@ pub struct ClaudeDuplicateCensusCounts {
     pub coverage_complete: bool,
     pub coverage_missing_member_count: usize,
     pub full_rearm: bool,
+    #[serde(skip_serializing_if = "is_zero_u64")]
     pub rearm_full_suppressed: u64,
     pub rearm_attempt: u8,
     pub full_rearm_deferred_until: Option<u64>,
@@ -9524,7 +9525,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         trace_report,
         veto_api_rows,
     );
-    if !reports_healthy || !negative_dependencies_complete {
+    if claude_terminal_off() && (!reports_healthy || !negative_dependencies_complete) {
         file_birth_tripwire.refuse_incomplete_dependencies();
     }
 
@@ -27303,7 +27304,11 @@ impl OwnedSourceScan {
                 index,
                 &mut pending_paths,
                 retry_service_end,
-                collected_at,
+                if claude_terminal_off() {
+                    collected_at
+                } else {
+                    &census_window_end
+                },
             );
         }
         index.resume_census_window_end = Some(census_window_end.clone());
@@ -28178,7 +28183,8 @@ impl OwnedSourceScan {
                                             && !index.context_only_read(candidate, audit_now)
                                             && index
                                                 .candidate_decision_with_reason_at(
-                                                    candidate, audit_now,
+                                                    candidate,
+                                                    terminal_off_decision_now(audit_now),
                                                 )
                                                 .0
                                                 != CandidateDecision::Skip
@@ -28308,7 +28314,10 @@ impl OwnedSourceScan {
                                 let disposable = |candidate: &CandidateFile| {
                                     index.context_only_read(candidate, audit_now)
                                         || index
-                                            .candidate_decision_with_reason_at(candidate, audit_now)
+                                            .candidate_decision_with_reason_at(
+                                                candidate,
+                                                terminal_off_decision_now(audit_now),
+                                            )
                                             .0
                                             == CandidateDecision::Skip
                                 };
@@ -28781,7 +28790,10 @@ impl OwnedSourceScan {
                             || !identified_candidates.iter().any(|candidate| {
                                 !index.context_only_read(candidate, audit_now)
                                     && index
-                                        .candidate_decision_with_reason_at(candidate, audit_now)
+                                        .candidate_decision_with_reason_at(
+                                            candidate,
+                                            terminal_off_decision_now(audit_now),
+                                        )
                                         .0
                                         == CandidateDecision::Parse
                             }))
@@ -28913,7 +28925,10 @@ impl OwnedSourceScan {
                 && identified_candidates.iter().any(|candidate| {
                     !index.context_only_read(candidate, audit_now)
                         && index
-                            .candidate_decision_with_reason_at(candidate, audit_now)
+                            .candidate_decision_with_reason_at(
+                                candidate,
+                                terminal_off_decision_now(audit_now),
+                            )
                             .0
                             == CandidateDecision::Parse
                 });
@@ -29369,7 +29384,11 @@ impl OwnedSourceScan {
                         }
                     }
                     let acquisition = active.sampling.as_mut().expect("sampled acquisition");
-                    let debt = sampled_audit::debt_for_key(index, &acquisition.key, audit_now);
+                    let debt = sampled_audit::debt_for_key(
+                        index,
+                        &acquisition.key,
+                        terminal_off_decision_now(audit_now),
+                    );
                     let Ok(mode) = parser.prepare_acquisition(
                         None,
                         &acquisition.scope,
@@ -31716,7 +31735,8 @@ impl OwnedSourceScan {
                         &history_upgrade,
                         index.claude_reemission_exclusions.state(),
                     );
-                    let held_audit_open_failed = sampled_audit::held_audit_open_failed(audit_now);
+                    let held_audit_open_failed =
+                        sampled_audit::held_audit_open_failed(terminal_off_decision_now(audit_now));
                     // Count-only attribution of why Claude files were selected
                     // on this page. No path, session, or identifier is named.
                     eprintln!(
@@ -31921,7 +31941,7 @@ impl OwnedSourceScan {
                             .origin
                             .as_ref()
                             .and_then(|origin| origin.admission.as_ref())
-                            .map_or(true, |state| state.complete));
+                            .map_or(true, |state| !claude_terminal_off() || state.complete));
                 let clean_frozen_generation = !traversal_snapshot.watcher_hint_seen;
                 let reconciliation_complete = if terminal_effects_allowed
                     && traversal_discovery_done
@@ -32387,6 +32407,7 @@ impl OwnedSourceScan {
                     rearm_cause::retain(index);
                 }
                 let sampled_acquisition = sampling.as_ref().map(|context| {
+                    let audit_now = terminal_off_decision_now(audit_now);
                     let pending = index
                         .files
                         .values()
@@ -32480,6 +32501,15 @@ impl OwnedSourceScan {
                     terminal_native_traversal,
                 });
             };
+            if source == SnapshotSource::ClaudeCode
+                && claude_terminal_off()
+                && terminal_off_discovery::retry_blocked(index, &local_index_key(&candidate.path))
+            {
+                census
+                    .observed_index_keys
+                    .insert(local_index_key(&candidate.path));
+                pending!();
+            }
             // Reject budget debt before opening/constructing any body parser.
             // Requeue the original census membership; absence/completion stays owed.
             if index.context_only_read(&candidate, audit_now)
@@ -42233,6 +42263,11 @@ fn scan_traversal_context_fingerprint(
 ) -> String {
     let mut digest = Sha256::new();
     update_length_prefixed(&mut digest, b"ottto:snapshot-bounded-traversal:v1");
+    if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
+        // Existing context fingerprint, no new persisted field: ON checkpoints
+        // cannot resume under OFF (including after a daemon restart).
+        update_length_prefixed(&mut digest, b"claude_terminal_off_enabled:v1");
+    }
     update_length_prefixed(&mut digest, source.api_slug().as_bytes());
     // A persisted queue contains paths already consumed under the scanner that
     // created it. Resuming that queue after an upgrade without binding these
@@ -43209,6 +43244,15 @@ fn enqueue_watcher_hints(
         {
             continue;
         }
+        if source == SnapshotSource::ClaudeCode
+            && claude_terminal_off()
+            && fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
+        {
+            // A stat-confirmed hint is presence, never terminal/absence proof.
+            // Record it before family coverage is planned, even if the read
+            // later remains parked or the candidate queue already owns it.
+            traversal.observed_index_keys.insert(local_index_key(path));
+        }
         if source == SnapshotSource::ClaudeCode {
             if claude_terminal_off() {
                 if !terminal_off_discovery::hint_allowed(traversal, path) {
@@ -43222,8 +43266,12 @@ fn enqueue_watcher_hints(
             }
         }
         if let Some(&position) = pending.get(path) {
-            if let Some(candidate) = traversal.pending_candidates.get_mut(position) {
-                candidate.watcher_hint = true;
+            if source == SnapshotSource::Codex
+                || (source == SnapshotSource::ClaudeCode && claude_terminal_off())
+            {
+                if let Some(candidate) = traversal.pending_candidates.get_mut(position) {
+                    candidate.watcher_hint = true;
+                }
             }
             continue;
         }
@@ -43582,12 +43630,14 @@ fn advance_bounded_directory_traversal_with_budget(
     // silently age boundary files out while still publishing the earlier
     // `census_window_end` as its agreement scope.
     let census_unix_seconds = rfc3339_unix_seconds(&traversal.census_window_end);
-    let mut pending = traversal
-        .pending_candidates
-        .iter()
-        .enumerate()
-        .map(|(i, p)| (p.path.clone(), i))
-        .collect::<BTreeMap<_, _>>();
+    let mut pending = traversal.pending_candidates.iter().enumerate().fold(
+        BTreeMap::new(),
+        |mut pending, (i, p)| {
+            // Match main's .find(): first duplicate owns the role update.
+            pending.entry(p.path.clone()).or_insert(i);
+            pending
+        },
+    );
     let mut remaining = max_entries;
     while remaining > 0 {
         let Some(directory) = traversal.pending_directories.pop_front() else {
@@ -43726,6 +43776,11 @@ fn advance_bounded_directory_traversal_with_budget(
             {
                 line_delivery_unselected(source.api_slug(), UnselectedReason::Age);
                 continue;
+            }
+            if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
+                // Record physically validated presence BEFORE any enqueue-only
+                // suppression, including ceiling skips of targeted-served keys.
+                traversal.observed_index_keys.insert(local_index_key(&path));
             }
             let walk_path = if source == SnapshotSource::ClaudeCode && claude_terminal_off() {
                 terminal_off_discovery::walk_path(
@@ -44455,6 +44510,7 @@ fn open_and_identify_scan_candidate_with_rescue_at(
     // preflight and synthetic progress all obey the same failed-open park.
     // Stat change/overflow/restart still fail toward trying the real open.
     if source == SnapshotSource::ClaudeCode
+        && claude_terminal_off()
         && sampled_audit::candidate_open_blocked(&local_index_key(&candidate.path), audit_now)
     {
         // Omission is not absence. Preserve observation and explicit unread
@@ -44466,7 +44522,7 @@ fn open_and_identify_scan_candidate_with_rescue_at(
         return None;
     }
     let opened = open_candidate_file_stat_retained(source, &mut candidate, cache);
-    if source == SnapshotSource::ClaudeCode && opened.is_err() {
+    if source == SnapshotSource::ClaudeCode && claude_terminal_off() && opened.is_err() {
         sampled_audit::candidate_open_failed(&local_index_key(&candidate.path), audit_now);
     }
     let (mut opened_file, live) = match opened {
@@ -50837,9 +50893,14 @@ impl ScanIndex {
                 return (CandidateDecision::Skip, None);
             }
         }
-        if sampled_audit::debt_for_key(self, &key, now)
-            .is_some_and(|debt| now >= debt.due_unix_seconds)
-        {
+        let audit_due = if claude_terminal_off() {
+            sampled_audit::debt_for_key(self, &key, now)
+                .is_some_and(|debt| now >= debt.due_unix_seconds)
+        } else {
+            entry.audit_requires_full(now)
+                || sampled_audit::progress_debt(self, &key, now).is_some()
+        };
+        if audit_due {
             return (CandidateDecision::Parse, Some(CandidateParseReason::Audit));
         }
         // A locally held Claude family above keeps its existing bounded retry
@@ -52402,6 +52463,7 @@ mod tests {
     mod terminal_off_tests {
         include!("snapshots/terminal_off_tests.rs");
     }
+
     mod full_rearm_progress_tests {
         include!("snapshots/full_rearm_progress_tests.rs");
     }

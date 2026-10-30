@@ -190,7 +190,7 @@ impl ScanIndex {
             .get(&key)
             .is_some_and(|entities| !entities.is_empty())
             && self
-                .candidate_decision_with_reason_at(candidate, audit_now)
+                .candidate_decision_with_reason_at(candidate, terminal_off_decision_now(audit_now))
                 .1
                 == Some(CandidateParseReason::UploadContext)
     }

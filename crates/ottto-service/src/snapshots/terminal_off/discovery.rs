@@ -39,6 +39,7 @@ struct Observation {
     targeted: Option<[u8; 32]>,
     served: Option<(Option<Stat>, [u8; 32])>,
     served_root: Option<[u8; 32]>,
+    served_at: Option<u64>,
 }
 #[derive(Clone, Default)]
 struct Walk {
@@ -48,7 +49,6 @@ struct Walk {
     round: u64,
     suppressing: bool,
     target_cursor: Option<String>,
-    floor_due: bool,
     held_roots: BTreeSet<String>,
     oversized: BTreeSet<String>,
     observations: BTreeMap<[u8; 32], Observation>,
@@ -115,9 +115,6 @@ fn observation<'a>(walk: &'a mut Walk, key: &str) -> &'a mut Observation {
     })
 }
 fn blocked(walk: &Walk, key: &str, stat: Option<Stat>, token: Option<[u8; 32]>) -> bool {
-    if walk.floor_due {
-        return false;
-    }
     let held = claude_index_path_member_ref(Path::new(key)).is_some_and(|m| {
         walk.held_roots
             .contains(&claude_full_rearm_root_digest(m.root))
@@ -127,7 +124,11 @@ fn blocked(walk: &Walk, key: &str, stat: Option<Stat>, token: Option<[u8; 32]>) 
             .oversized
             .contains(&oversized_discovery::path_hash(Path::new(key))))
         && walk.observations.get(&digest(key)).is_some_and(|o| {
-            stat.is_some_and(|s| s.identity.is_some() && s.modified.is_some() && s.birth > 0)
+            // A frozen census window cannot renew a retry floor. Every real
+            // serve starts this key's next six-hour floor in process memory.
+            o.served_at
+                .is_some_and(|at| walk.now < at.saturating_add(6 * 3600))
+                && stat.is_some_and(|s| s.identity.is_some() && s.modified.is_some() && s.birth > 0)
                 && o.served.is_some_and(|(old, revision)| {
                     old == stat && token.map_or(true, |t| t == revision)
                 })
@@ -234,6 +235,10 @@ impl Drop for Preview {
 
 /// A watcher is an immediate key hint, never evidence of a completed walk.
 pub(super) fn hint_allowed(traversal: &ScanTraversalCheckpoint, path: &Path) -> bool {
+    if !claude_terminal_off() {
+        return true;
+    }
+
     let Some(scope) = terminal_off_traversal_scope(traversal) else {
         return true;
     };
@@ -252,7 +257,11 @@ pub(super) fn hint_allowed(traversal: &ScanTraversalCheckpoint, path: &Path) -> 
 
 /// `false`: coalesce a requested walk; `true`: start it. Targeted work is
 /// independent. Unknown/restarted RAM state permits one walk without proof.
-pub(super) fn prepare(index: &mut ScanIndex, now: u64, at: &str, requested: bool) -> bool {
+pub(super) fn prepare(index: &mut ScanIndex, now: u64, _at: &str, requested: bool) -> bool {
+    if !claude_terminal_off() {
+        return false;
+    }
+
     let scope = terminal_off_rediscovery_scope(index).expect("traversal");
     let traversal = index.traversal.as_ref().unwrap();
     let empty = traversal.pending_directories.is_empty() && traversal.pending_candidates.is_empty();
@@ -262,10 +271,6 @@ pub(super) fn prepare(index: &mut ScanIndex, now: u64, at: &str, requested: bool
         .clone()
         .unwrap_or_default();
     let oversized = traversal.oversized_discovery.keys().cloned().collect();
-    // Preserve the existing floor's frozen census clock, not a new wall read.
-    let floor_due = rfc3339_unix_seconds(at)
-        .zip(rfc3339_unix_seconds(&traversal.census_window_end))
-        .is_some_and(|(now, start)| now >= start.saturating_add(6 * 3600));
     let (start, new_round, coalesced, ceiling, interval, oldest, metadata_bytes) =
         with_walks(|memo| {
             if !memo.contains_key(&scope) && memo.len() >= TERMINAL_OFF_REDISCOVERY_SCOPES {
@@ -280,7 +285,7 @@ pub(super) fn prepare(index: &mut ScanIndex, now: u64, at: &str, requested: bool
             walk.now = now;
             walk.held_roots = held_roots;
             walk.oversized = oversized;
-            walk.floor_due = floor_due;
+
             let ceiling = !empty
                 && walk.last_walk.is_some_and(|last| {
                     now.saturating_sub(last) >= TERMINAL_OFF_FRESHNESS_WALK_CEILING_SECONDS
@@ -376,6 +381,10 @@ pub(super) fn walk_path(
     pending: bool,
     watcher: bool,
 ) -> WalkPath {
+    if !claude_terminal_off() {
+        return WalkPath::Enqueue;
+    }
+
     let Some(scope) = terminal_off_traversal_scope(traversal) else {
         return WalkPath::Enqueue;
     };
@@ -406,6 +415,7 @@ pub(super) fn walk_path(
         o.round = round;
         if metadata.len() > MAX_CLAUDE_JSONL_FILE_BYTES {
             o.served = Some((stat, [0; 32]));
+            o.served_at = Some(now);
         }
         if enqueue_suppressed {
             WalkPath::ObserveOnly
@@ -416,6 +426,10 @@ pub(super) fn walk_path(
 }
 
 pub(super) fn served(index: &ScanIndex, candidate: &CandidateFile, now: u64) {
+    if !claude_terminal_off() {
+        return;
+    }
+
     let Some(scope) = terminal_off_rediscovery_scope(index) else {
         return;
     };
@@ -440,6 +454,7 @@ pub(super) fn served(index: &ScanIndex, candidate: &CandidateFile, now: u64) {
             o.stat = stat;
             o.round = round;
             o.served = Some((stat, token));
+            o.served_at = Some(now);
             o.served_root = Some(digest(&local_index_key(&candidate.scan_root)));
             o.targeted = Some(service_token(token, debt, stat, cause));
         }
@@ -447,6 +462,10 @@ pub(super) fn served(index: &ScanIndex, candidate: &CandidateFile, now: u64) {
 }
 
 pub(super) fn targeted(index: &mut ScanIndex, now: u64, limit: usize) {
+    if !claude_terminal_off() {
+        return;
+    }
+
     let Some(scope) = terminal_off_rediscovery_scope(index) else {
         return;
     };
@@ -585,5 +604,23 @@ pub(super) fn targeted(index: &mut ScanIndex, now: u64, limit: usize) {
 }
 
 crate::heap_layout_bound::fields!(Stat; length, modified, identity, birth);
-crate::heap_layout_bound::fields!(Observation; stat, round, first_seen, targeted, served, served_root);
-crate::heap_layout_bound::fields!(Walk; now, last_walk, coalesced_since, round, suppressing, target_cursor, floor_due, held_roots, oversized, observations);
+crate::heap_layout_bound::fields!(Observation; stat, round, first_seen, targeted, served, served_root, served_at);
+crate::heap_layout_bound::fields!(Walk; now, last_walk, coalesced_since, round, suppressing, target_cursor, held_roots, oversized, observations);
+
+pub(super) fn retry_blocked(index: &ScanIndex, key: &str) -> bool {
+    if !claude_terminal_off() {
+        return false;
+    }
+    let Some(scope) = terminal_off_rediscovery_scope(index) else {
+        return false;
+    };
+    let stat = fs::symlink_metadata(key)
+        .ok()
+        .and_then(|m| Stat::capture(&m));
+    let token = revision(index, key);
+    with_walks(|m| {
+        m.get(&scope).is_some_and(|w| {
+            blocked(w, key, stat, Some(token)) || sampled_audit::candidate_open_blocked(key, w.now)
+        })
+    })
+}

@@ -236,7 +236,9 @@ impl ScanIndex {
             .get_mut(key)
             .expect("validated entry")
             .scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
-        with_open_backoff(|backoff| backoff.keys.remove(key));
+        if claude_terminal_off() {
+            with_open_backoff(|backoff| backoff.keys.remove(key));
+        }
         true
     }
 }
@@ -368,6 +370,10 @@ pub(super) fn progress_debt(index: &ScanIndex, key: &str, now: u64) -> Option<Au
 }
 
 pub(super) fn debt_for_key(index: &ScanIndex, key: &str, now: u64) -> Option<AuditDebt> {
+    if !claude_terminal_off() {
+        return debt_for_key_main(index, key, now);
+    }
+
     index
         .files
         .get(key)
@@ -505,7 +511,7 @@ impl OpenBackoff {
     }
     fn blocked(&self, key: &str, now: u64) -> bool {
         self.keys.get(key).is_some_and(|failure| {
-            failure.failures > 0
+            (!claude_terminal_off() || failure.failures > 0)
                 && (failure.failures >= OPEN_PARK_FAILURES
                     || (self.page < failure.retry_page
                         && now < failure.last_failed.saturating_add(OPEN_BACKOFF_CAP_SECONDS)))
@@ -630,6 +636,10 @@ mod open_backoff_tests;
 /// numeric due in the bounded map until a marker/native acquisition carries
 /// it or a completed source verification retires it.
 pub(super) fn progress_opened(index: &mut ScanIndex, key: &str) {
+    if !claude_terminal_off() {
+        return progress_opened_main(index, key);
+    }
+
     if let Some(slot) = index
         .held_audit_progress
         .as_mut()
@@ -678,6 +688,10 @@ pub(super) fn candidate_open_failed(key: &str, now: u64) {
 /// other member is eligible, but keep the owed due: a failed open never
 /// re-arms a later deadline.
 pub(super) fn progress_open_failed(index: &mut ScanIndex, key: &str, now: u64) {
+    if !claude_terminal_off() {
+        return progress_open_failed_main(index, key, now);
+    }
+
     let Some(due) = index
         .held_audit_progress
         .as_ref()
@@ -722,10 +736,11 @@ fn schedule_held_audit_progress(index: &mut ScanIndex, now: u64) -> Option<Strin
         // until source verification discharges them (or the entry is gone).
         backoff.keys.retain(|key, _| {
             awaits_hold_deadline_restoration(index, key)
-                || index
-                    .files
-                    .get(key)
-                    .is_some_and(ScanIndexEntry::has_unverified_source)
+                || claude_terminal_off()
+                    && index
+                        .files
+                        .get(key)
+                        .is_some_and(ScanIndexEntry::has_unverified_source)
         });
     });
     let previous = index.held_audit_progress.clone();
@@ -1814,4 +1829,56 @@ mod absence_non_unix_tests {
             &[std::path::PathBuf::from("missing")]
         ));
     }
+}
+
+pub(super) fn debt_for_key_main(index: &ScanIndex, key: &str, now: u64) -> Option<AuditDebt> {
+    index
+        .files
+        .get(key)
+        .and_then(|entry| entry.audit_obligation(now))
+        .or_else(|| progress_debt(index, key, now))
+}
+
+pub(super) fn progress_opened_main(index: &mut ScanIndex, key: &str) {
+    if let Some(slot) = index
+        .held_audit_progress
+        .as_mut()
+        .filter(|slot| slot.key == key)
+    {
+        slot.attempted = true;
+        with_open_backoff(|backoff| backoff.keys.remove(key));
+    }
+}
+
+pub(super) fn progress_open_failed_main(index: &mut ScanIndex, key: &str, now: u64) {
+    let Some(due) = index
+        .held_audit_progress
+        .as_ref()
+        .filter(|slot| slot.key == key && !slot.attempted)
+        .map(|slot| slot.due)
+    else {
+        return;
+    };
+    let (recorded, keys) =
+        with_open_backoff(|backoff| (backoff.record_failure(key, due, now), backoff.keys.len()));
+    if let Some(parked) = recorded.parked {
+        // Counts only; no path or id. Once per park.
+        crate::local_resource_diagnostics::claude_held_audit_open_parked(&HeldAuditOpenParked {
+            held_audit_open_failures: parked.failures,
+            held_audit_open_owed_age_seconds: now.saturating_sub(parked.owed_due),
+            held_audit_open_failed_keys: keys,
+        });
+    }
+    let previous = index.held_audit_progress.take();
+    // Rule 7: an overflow-evicted key may retry, so it takes the next turn,
+    // and its owed due moves into the slot: the debt is never dropped.
+    let (evicted, evicted_due) = recorded.evicted.unzip();
+    index.held_audit_progress = evicted
+        .filter(|evicted| progress_eligible(index, evicted))
+        .or_else(|| next_progress_key(index, Some(key), now))
+        .map(|next| {
+            let mut slot = progress_slot(next, due, previous.as_ref());
+            slot.due = evicted_due.map_or(slot.due, |owed| slot.due.min(owed));
+            slot
+        });
 }

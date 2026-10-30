@@ -9366,9 +9366,11 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         identity_unhealthy_roots.extend(strict_plan.deferred.iter().cloned());
     }
     let usage_roots = strict_plan.roots;
-    let strict_budget = crate::claude_local_otel::strict_budget::StrictReadBudget::new(
-        strict_cohort::BYTES_PER_PASS,
-    );
+    let strict_budget = crate::snapshots::claude_terminal_off().then(|| {
+        crate::claude_local_otel::strict_budget::StrictReadBudget::new(
+            strict_cohort::BYTES_PER_PASS,
+        )
+    });
 
     // Effort has already updated pending-family state. Release all non-paired
     // rows before moving the selected roots into the usage aggregate.
@@ -9462,9 +9464,11 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             trace_report.evidence.insert(root_session_id, rows);
         }
     }
-    let strict_bytes = strict_budget.consumed();
+    let strict_bytes = strict_budget.as_ref().map_or(0, |b| b.consumed());
     drop(strict_budget);
-    eprintln!("strict_cohort_deferred roots={deferred_roots} bytes={} consumed_bytes={strict_bytes} allowance_bytes={} custody=UNPROVEN", deferred_bytes, strict_cohort::BYTES_PER_PASS);
+    if crate::snapshots::claude_terminal_off() {
+        eprintln!("strict_cohort_deferred roots={deferred_roots} bytes={} consumed_bytes={strict_bytes} allowance_bytes={} custody=UNPROVEN", deferred_bytes, strict_cohort::BYTES_PER_PASS);
+    }
     // Keep global negative-dependency debt separate from per-root health:
     // page-local healthy accounting must not become an unrelated read error.
     scan_result.strict_cohort_deferred_root_count = deferred_roots;
@@ -23213,6 +23217,7 @@ mod tests {
     include!("retry_live_native_tests.rs");
     include!("snapshot_sync/continuation_prepare_tests.rs");
     include!("snapshot_sync/census_convergence_pipeline_tests.rs");
+
     include!("snapshot_sync/claude_request_census_pipeline_tests.rs");
     mod history_upgrade_pipeline_tests {
         include!("snapshot_sync/history_upgrade_pipeline_tests.rs");

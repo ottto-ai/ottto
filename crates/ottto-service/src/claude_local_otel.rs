@@ -1070,6 +1070,10 @@ fn decode_api_sidecar(
     support_dir: &Path,
     session_id: &str,
 ) -> Result<(Vec<ClaudeLocalOtelEvidence>, ApiReadWitness)> {
+    if !crate::snapshots::claude_terminal_off() {
+        return decode_api_sidecar_main(support_dir, session_id);
+    }
+
     let path = evidence_path(support_dir, session_id);
     let mut health = ClaudeLocalOtelLoadHealth::default();
     let empty = |health| {
@@ -1257,6 +1261,10 @@ pub fn load_claude_trace_ownership_evidence(
     support_dir: &Path,
     session_ids: impl IntoIterator<Item = String>,
 ) -> ClaudeTraceOwnershipLoadReport {
+    if !crate::snapshots::claude_terminal_off() {
+        return load_claude_trace_ownership_evidence_main(support_dir, session_ids);
+    }
+
     let mut report = ClaudeTraceOwnershipLoadReport::default();
     for session_id in BTreeSet::from_iter(session_ids) {
         let path = trace_evidence_path(support_dir, &session_id);
@@ -3999,4 +4007,158 @@ impl crate::heap_layout_bound::HeapLayoutBound for ClaudeIdentityAttributeOrigin
             }
         }
     }
+}
+
+fn decode_api_sidecar_main(
+    support_dir: &Path,
+    session_id: &str,
+) -> Result<(Vec<ClaudeLocalOtelEvidence>, ApiReadWitness)> {
+    let path = evidence_path(support_dir, session_id);
+    let mut health = ClaudeLocalOtelLoadHealth::default();
+    let empty = |health| {
+        (
+            Vec::new(),
+            ApiReadWitness {
+                health,
+                generation: None,
+            },
+        )
+    };
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                health.missing_files += 1;
+            } else {
+                health.unreadable_lines += 1;
+            }
+            return Ok(empty(health));
+        }
+    };
+    // Refuse before opening: a directory/erroring stream must never loop.
+    if !metadata.is_file() {
+        anyhow::bail!("Claude effort evidence is not a regular file");
+    }
+    if metadata.len() >= MAX_EVIDENCE_FILE_BYTES {
+        health.oversized_files += 1;
+        return Ok(empty(health));
+    }
+    let before_path = api_file_generation(&metadata);
+    #[cfg(test)]
+    API_BEFORE_OPEN.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook(&path);
+        }
+    });
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A stat/open race to a FIFO must refuse without blocking at open.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(&path).context("open Claude effort evidence")?;
+    #[cfg(test)]
+    API_READ_RECEIPT.with(|r| {
+        let (opens, bytes, force) = r.get();
+        r.set((opens + 1, bytes, force));
+    });
+    let opened = file
+        .metadata()
+        .context("stat opened Claude effort evidence")?;
+    if !opened.is_file() {
+        anyhow::bail!("opened Claude effort evidence is not a regular file");
+    }
+    if opened.len() >= MAX_EVIDENCE_FILE_BYTES {
+        health.oversized_files += 1;
+        return Ok(empty(health));
+    }
+    let before_opened = api_file_generation(&opened);
+    // A concurrent writer must not defeat the existing per-file read bound.
+    let mut reader = BufReader::new((&file).take(MAX_EVIDENCE_FILE_BYTES));
+    let (rows, bytes) = decode_api_rows(&mut reader, session_id, &mut health);
+    #[cfg(test)]
+    API_AFTER_READ.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook(&path);
+        }
+    });
+    if bytes >= MAX_EVIDENCE_FILE_BYTES {
+        health.oversized_files += 1;
+        return Ok(empty(health));
+    }
+    let after_opened = file
+        .metadata()
+        .ok()
+        .and_then(|metadata| api_file_generation(&metadata));
+    let after_path = fs::metadata(&path)
+        .ok()
+        .and_then(|metadata| api_file_generation(&metadata));
+    let generation = if before_opened.is_some()
+        && before_path == before_opened
+        && before_opened == after_opened
+        && before_opened == after_path
+        && bytes == opened.len()
+        && health.is_complete()
+    {
+        before_opened
+    } else {
+        None
+    };
+    Ok((rows, ApiReadWitness { health, generation }))
+}
+
+fn load_claude_trace_ownership_evidence_main(
+    support_dir: &Path,
+    session_ids: impl IntoIterator<Item = String>,
+) -> ClaudeTraceOwnershipLoadReport {
+    let mut report = ClaudeTraceOwnershipLoadReport::default();
+    for session_id in BTreeSet::from_iter(session_ids) {
+        let path = trace_evidence_path(support_dir, &session_id);
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                report.missing_files += 1;
+                continue;
+            }
+            Err(_) => {
+                report.unreadable_lines += 1;
+                continue;
+            }
+        };
+        if !metadata.is_file() {
+            report.unreadable_lines += 1;
+            continue;
+        }
+        if metadata.len() >= MAX_EVIDENCE_FILE_BYTES {
+            report.oversized_files += 1;
+            continue;
+        }
+        let Ok(file) = File::open(&path) else {
+            report.unreadable_lines += 1;
+            continue;
+        };
+        #[cfg(test)]
+        TRACE_READ_RECEIPT.with(|count| count.set(count.get() + 1));
+        let mut decoder = TraceSidecarDecoder::new(&session_id, Vec::new());
+        decoder.report = report;
+        for line in BufReader::new(file).lines() {
+            let line = match line {
+                Ok(line) => line,
+                Err(_) => {
+                    decoder.report.unreadable_lines += 1;
+                    continue;
+                }
+            };
+            decoder.push_line(line.as_bytes());
+        }
+        decoder.finish_eof(None);
+        let (rows, decoded_report) = decoder.into_output();
+        report = decoded_report;
+        if !rows.is_empty() {
+            report.evidence.insert(session_id, rows);
+        }
+    }
+    report
 }

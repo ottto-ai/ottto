@@ -198,6 +198,10 @@ fn claude_terminal_stale_roots(index: &ScanIndex, window: &str) -> BTreeSet<Stri
 }
 
 fn claude_terminal_unproven(index: &ScanIndex, window: &str) {
+    if !claude_terminal_off() {
+        return;
+    }
+
     let stale = index
         .claude_usage_family_pending
         .values()
@@ -223,10 +227,14 @@ thread_local! {
     static START_IDENTITY_SAMPLE_FOR_TEST: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
 }
 fn reset_start_identity_samples() {
+    if !claude_terminal_off() {
+        return;
+    }
+
     START_IDENTITY_SAMPLES.with(|counts| *counts.borrow_mut() = StartIdentitySamples::default());
 }
 fn note_start_identity_sample(source: SnapshotSource, file: &File, samples: &OpenedContentSamples) {
-    if source != SnapshotSource::ClaudeCode {
+    if source != SnapshotSource::ClaudeCode || !claude_terminal_off() {
         return;
     }
     let bytes = (samples.head.len() + samples.tail.as_ref().map_or(0, Vec::len)) as u64;
@@ -248,6 +256,10 @@ fn note_start_identity_sample(source: SnapshotSource, file: &File, samples: &Ope
 }
 
 fn terminal_off_offer(index: &ScanIndex, window: &str) {
+    if !claude_terminal_off() {
+        return;
+    }
+
     use std::sync::atomic::Ordering::Relaxed;
     let offers = CLAUDE_TERMINAL_OFF_OFFERS.fetch_add(1, Relaxed) + 1;
     static SINCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -266,6 +278,10 @@ fn terminal_off_offer(index: &ScanIndex, window: &str) {
 }
 
 fn claude_terminal_rewind(traversal: &mut ScanTraversalCheckpoint) {
+    if !claude_terminal_off() {
+        return;
+    }
+
     // Existing queue is durable demand; re-list metadata without throwing it
     // away, changing the frozen window or minting a new native owner.
     for root in &traversal.scan_roots {
@@ -485,6 +501,10 @@ fn refresh_terminal_off_discovery(
     at: &str,
     file_limit: usize,
 ) {
+    if !claude_terminal_off() {
+        return;
+    }
+
     // The selecting page owns this clock, including all cooperative yields.
     // Revalidate configured targets EVERY pass, before selecting retained
     // paths, even when the readdir cadence is not due. A retargeted symlink
@@ -557,11 +577,19 @@ fn carry_admission_debt(index: &ScanIndex, at: &str) -> (usize, u64) {
 }
 
 fn carry_admission_stall(index: &ScanIndex, at: &str) {
+    if !claude_terminal_off() {
+        return;
+    }
+
     let (families, oldest_age) = carry_admission_debt(index, at);
     eprintln!("ALARM carry_admission_stalled families={families} oldest_age={oldest_age}: denied members remain UNPROVEN; family-scoping B deferred");
 }
 
 fn resume_claude_retry_admission(index: &mut ScanIndex, at: &str) {
+    if !claude_terminal_off() {
+        return;
+    }
+
     let Some(mut previous) = index
         .claude_stale_family_carry
         .origin
@@ -743,8 +771,13 @@ impl ScanIndex {
         if !claude_terminal_off() {
             return;
         }
+        let runnable = keys
+            .iter()
+            .filter(|key| !terminal_off_discovery::retry_blocked(self, key))
+            .cloned()
+            .collect::<Vec<_>>();
         if let Some(traversal) = self.traversal.as_mut() {
-            for key in keys {
+            for key in &runnable {
                 // Already observed held custody is a reread, not new discovery.
                 // G1 lets real-loss/floor retries restart despite rereads.
                 if let Some(admitted) = self
@@ -1057,6 +1090,7 @@ mod retention_alarm_tests {
     use super::*;
     #[test]
     fn terminal_off_retention_thresholds_alarm_once_per_window_without_disposing_debt() {
+        let _on = ClaudeTerminalOffForTest::enabled();
         for (class, threshold) in [
             (1, TERMINAL_RETRY_PENDING_ALARM_COUNT),
             (2, TERMINAL_HELD_HISTORY_ALARM_BYTES),
@@ -1097,4 +1131,19 @@ fn terminal_off_replay_before_fifo(
 ) {
     let count = limit.saturating_sub(selected.len()).min(replay.len());
     selected.extend(replay.drain(..count));
+}
+
+#[cfg(test)]
+pub(crate) fn with_terminal_off_audit_now_for_test<T>(now: u64, f: impl FnOnce() -> T) -> T {
+    sampled_scan::with_test_now(now, f)
+}
+
+// Only #899's added decision sites use this adapter: OFF preserves main's
+// fresh-clock call; ON uses the selecting page's one captured #870 clock.
+fn terminal_off_decision_now(captured: u64) -> u64 {
+    if claude_terminal_off() {
+        captured
+    } else {
+        sampled_scan::now_seconds()
+    }
 }

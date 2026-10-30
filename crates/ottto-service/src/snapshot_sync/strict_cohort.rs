@@ -19,6 +19,14 @@ pub(super) fn plan(
     page: &BTreeSet<String>,
     scope: &str,
 ) -> Plan {
+    if !crate::snapshots::claude_terminal_off() {
+        return Plan {
+            roots,
+            deferred: BTreeSet::new(),
+            deferred_bytes: 0,
+        };
+    }
+
     let key = format!(
         "{:x}",
         Sha256::digest(format!("{}:{scope}", support.display()).as_bytes())
