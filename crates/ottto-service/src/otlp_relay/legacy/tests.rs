@@ -879,6 +879,23 @@ fn unknown_ticks_preserve_state_and_revocation_requires_two_consecutive_ticks() 
     assert_eq!(supervisor.counters.closed.load(Ordering::Relaxed), 1);
 }
 
+/// A nonblocking owner may see WouldBlock while the loopback handshake that
+/// `connect` started is still completing; allow it a bounded moment.
+fn accept_within(owner: &TcpListener) -> io::Result<(TcpStream, SocketAddr)> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match owner.accept() {
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    && std::time::Instant::now() < deadline =>
+            {
+                thread::sleep(std::time::Duration::from_millis(10));
+            }
+            other => return other,
+        }
+    }
+}
+
 #[test]
 fn wildcard_ipv4_owner_is_not_stolen_or_shared() {
     let (_dir, mut supervisor) = scratch();
@@ -891,9 +908,8 @@ fn wildcard_ipv4_owner_is_not_stolen_or_shared() {
     assert!(supervisor.open.is_empty());
     assert_eq!(supervisor.counters.bind_skipped.load(Ordering::Relaxed), 1);
     let _client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
-    let _accepted = owner
-        .accept()
-        .expect("the wildcard owner still receives its loopback traffic");
+    let _accepted =
+        accept_within(&owner).expect("the wildcard owner still receives its loopback traffic");
 }
 
 #[test]
@@ -923,9 +939,7 @@ fn dual_stack_ipv6_owner_vetoes_ipv4_legacy_bind() {
     assert!(supervisor.open.is_empty());
     assert_eq!(supervisor.counters.bind_skipped.load(Ordering::Relaxed), 1);
     let _client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
-    let _accepted = owner
-        .accept()
-        .expect("V6ONLY=0 owner still receives IPv4 traffic");
+    let _accepted = accept_within(&owner).expect("V6ONLY=0 owner still receives IPv4 traffic");
 }
 
 #[test]
@@ -944,7 +958,8 @@ fn native_legacy_listener_enables_reuseaddr_after_wildcard_probes() {
         )
     };
     assert_eq!(result, 0);
-    assert_eq!(reuse, 1);
+    // Linux reports 1; macOS reports the option's flag bit (SO_REUSEADDR).
+    assert_ne!(reuse, 0);
     assert_eq!(
         listener.local_addr().unwrap().ip(),
         IpAddr::V4(Ipv4Addr::LOCALHOST)
