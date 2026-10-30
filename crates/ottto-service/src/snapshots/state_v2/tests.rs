@@ -1232,7 +1232,7 @@ fn f8_damaged_header_refuses_both_lookup_and_scan_before_owned_copy() {
         tx.put(RowInput {
             value_version: 1,
             key: &key,
-            fixed: &Fixed::None,
+            fixed: &Fixed::File { extent: 0, logical_progress: 0 },
             value: &Bytes(vec![]),
         })
         .unwrap();

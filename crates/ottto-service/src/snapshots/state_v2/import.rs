@@ -1661,7 +1661,15 @@ mod application_cases {
             serde_json::json!("mistyped-original");
         let bytes = serde_json::to_vec(&value).unwrap();
         fs::write(&c.path, &bytes).unwrap();
-        let original = Original::read(&c.path).unwrap();
+        // Import deliberately refuses mistyped original classes before a fence.
+        // Already-authenticated raw holds still roundtrip through the mapper.
+        assert_eq!(Original::read(&c.path).unwrap_err(), Pause::UnknownClass);
+        assert_eq!(fs::read(&c.path).unwrap(), bytes);
+        assert!(!fence::sibling(&c.path, ".v2.sqlite").exists());
+        let original = Original {
+            presence: original_presence(bytes.as_slice()).unwrap(),
+            ..Default::default()
+        };
         // The production v1 loader owns all original-span repair/freeze ordering.
         let mut normalized = ScanIndex::load(&c.path).unwrap();
         assert!(normalized.decode_holds_family("family"));

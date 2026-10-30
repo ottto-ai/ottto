@@ -62,7 +62,7 @@ pub(in super::super::super) fn before_collection(index: &ScanIndex) -> Result<()
 /// Hold failed R1 keys before opening/parsing candidates. The route outlives a
 /// discarded session, so reloading cannot lose the short staging backoff.
 pub(in super::super::super) fn resume_selection_held(index: &ScanIndex, key: &str) -> bool {
-    let Some(runtime) = &index.persistence_v2 else {
+    let Some(runtime) = &index.v2().persistence_v2 else {
         return false;
     };
     let result = (|| {

@@ -142,12 +142,13 @@ fn write_holds(index: &ScanIndex, txn: &mut dyn Transaction, cx: &mut KindCx) ->
             },
         );
     }
-    write_field(
-        &metadata,
-        "decode_holds",
-        "v1_field.repair_provenance",
+    // Internal repair custody is not a field in the original v1 document.
+    mapper::field_write(
         txn,
         cx,
+        "v1_field.repair_provenance",
+        &metadata,
+        mapper::Members::Field,
     )
 }
 fn read_holds(index: &mut ScanIndex, txn: &mut dyn Transaction, cx: &mut KindCx) -> Result<()> {

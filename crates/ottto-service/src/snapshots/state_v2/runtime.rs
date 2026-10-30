@@ -308,7 +308,6 @@ fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Optio
                         normalize_hydrated(&mut index)?;
                         session.stamp = session.db.stamp()?;
                         ensure!(index.generation == session.stamp.0, Hold::DbUnavailable);
-                        normalize_hydrated(&mut index)?;
                         session.cx = cx;
                         index.v2_mut().persistence_v2 = Some(runtime.clone());
                         state.cached = Some(index.clone());
@@ -329,7 +328,6 @@ fn load_with<M: Mapper>(path: &Path, switched: bool, mapper: &M) -> Result<Optio
             let stamp = db.stamp()?;
             super::ack::ProgressRecovery::recover_route(&identity, stamp.0, path)?;
             let (mut index, cx) = mapper.hydrate_context(&mut db)?;
-            normalize_hydrated(&mut index)?;
             let stamp = db.stamp()?;
             ensure!(index.generation == stamp.0, Hold::DbUnavailable);
             normalize_hydrated(&mut index)?;
