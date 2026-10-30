@@ -1408,8 +1408,12 @@ existing `durable_tail_alarm` carrier with `process_id`. The first counts keys
 whose first eligible non-quiet (b) restore attempt in this process failed, including
 a fence drop; later failures of the same key do not increment it, and a first
 success followed by failure does not count. Its diagnostic marker shares the
-bounded, never-evicted key custody. If that custody is full, `key_debt_unfunded`
-reports the observation gap; the proxy is then a lower bound. The quiet proxy
+bounded key custody. Under capacity pressure, idle diagnostic observations and
+expired pacing can be reclaimed; live receipt, discovery and retirement custody
+remain protected. If any first-result marker is forgotten or cannot be funded,
+`rederive_first_attempt_tracking_closed` latches true and no more first results
+are enrolled for this process. The first-failure total is then a lower bound;
+returning keys cannot be counted twice, and diagnostics cannot pin write capacity. The quiet proxy
 counts metadata-only restores returning Pending with zero transcript input.
 It does not decode obligations and cannot establish `pending_no_obligation`.
 Neither proxy measures a per-key restart streak. Compare process totals using

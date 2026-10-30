@@ -15664,3 +15664,89 @@ fn rederive_unfunded_key_custody_keeps_existing_counted_paced_full_fallback() {
     );
     assert!(stores.owed_overflow[ds.slot()]);
 }
+
+#[test]
+fn first_attempt_observations_yield_capacity_without_double_counting_forgotten_keys() {
+    let cache = SharedCache::default();
+    let source = SnapshotSource::Codex;
+    for n in 0..store::MAX_RECORDS {
+        cache.record_first_rederive_result(
+            source,
+            full_pace_key(source, &format!("observed-{n}")),
+            n == 0,
+        );
+    }
+    let before: BTreeSet<_> = cache.durable().unwrap().key_debt.keys().copied().collect();
+    assert_eq!(before.len(), store::MAX_RECORDS);
+    let next = full_pace_key(source, "native-write-after-diagnostic-saturation");
+    {
+        let mut stores = cache.durable().unwrap();
+        assert!(
+            stores.fund_debt(next).is_some(),
+            "idle diagnostics cannot deny native capacity"
+        );
+        assert!(stores.counters.rederive_first_attempt_tracking_closed);
+    }
+    let after: BTreeSet<_> = cache.durable().unwrap().key_debt.keys().copied().collect();
+    let forgotten = *before.difference(&after).next().unwrap();
+    let first = cache
+        .durable()
+        .unwrap()
+        .counters
+        .rederive_failed_first_attempt;
+    cache.record_first_rederive_result(source, forgotten, true);
+    assert_eq!(
+        cache
+            .durable()
+            .unwrap()
+            .counters
+            .rederive_failed_first_attempt,
+        first
+    );
+    // Keep admitting/settling real work well beyond process cache capacity.
+    for n in 0..3 * store::MAX_RECORDS {
+        let key = full_pace_key(source, &format!("later-native-{n}"));
+        let mut stores = cache.durable().unwrap();
+        stores.set_owed(key, owed::OwedMark::Owed(DurableSource::Codex));
+        assert_eq!(
+            stores.owed_mark(&key),
+            owed::OwedMark::Owed(DurableSource::Codex)
+        );
+        stores.clear_owed(key);
+        assert!(!stores.owed_overflow[DurableSource::Codex.slot()]);
+    }
+    let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+        let _on = crate::snapshots::RestartRestoreForTest::enabled();
+        cache.durable_rederive_proxies(source);
+    });
+    assert_eq!(
+        rows[0]["counts"]["rederive_first_attempt_tracking_closed"],
+        true
+    );
+}
+
+#[test]
+fn key_debt_pressure_preserves_live_custody_and_only_reclaims_expired_full_spends() {
+    let mut stores = Stores::default();
+    let now = SystemTime::now();
+    stores.retail_full_now = Some(now);
+    for n in 0..store::MAX_RECORDS {
+        let digest = full_pace_key(SnapshotSource::Codex, &format!("spent-{n}"));
+        stores.fund_debt(digest).unwrap().full_spend = Some(owed::FullSpend {
+            at: now,
+            near_extra: true,
+        });
+    }
+    let extra = full_pace_key(SnapshotSource::Codex, "extra");
+    assert!(
+        stores.fund_debt(extra).is_none(),
+        "unexpired Full allowance is custody"
+    );
+    // Even after pacing expires, an active discovery/receipt/retirement hold
+    // cannot be reclaimed. Only the remaining idle expired spend is a victim.
+    let retained = *stores.key_debt.keys().next().unwrap();
+    stores.key_debt.get_mut(&retained).unwrap().rederive_hold = Some(DurableSource::Codex);
+    stores.retail_full_now = Some(now + std::time::Duration::from_secs(PACE_SECS));
+    assert!(stores.fund_debt(extra).is_some());
+    assert!(stores.key_debt.contains_key(&retained));
+}

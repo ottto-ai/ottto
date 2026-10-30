@@ -47,6 +47,18 @@ pub(super) struct FullSpend {
     pub(super) near_extra: bool,
 }
 impl KeyDebt {
+    /// Only idle observations or expired pacing may be reclaimed. Receipt,
+    /// discovery, retirement and directory-sync custody are never victims.
+    fn reclaimable(&self, now: std::time::SystemTime) -> bool {
+        self.owed == OwedMark::None
+            && self.hold.is_none()
+            && self.rederive_hold.is_none()
+            && self.retire_source.is_none()
+            && !self.retire_sync
+            && !self
+                .full_spend
+                .is_some_and(|spend| super::full_pace_delayed(spend.at, now))
+    }
     pub(super) fn is_empty(&self) -> bool {
         self.owed == OwedMark::None
             && self.hold.is_none()
@@ -144,8 +156,24 @@ pub(in crate::snapshots) enum OwedCompletionAdmission {
 }
 
 impl Stores {
-    /// Funds `digest`'s debt node; never evicts another key's debt or hold.
+    /// Funds `digest`'s debt node; never evicts another key's live custody.
+    /// Idle diagnostic observations and expired pacing cannot deny capacity.
     pub(super) fn fund_debt(&mut self, digest: store::Digest32) -> Option<&mut KeyDebt> {
+        if !self.key_debt.contains_key(&digest) && self.key_debt.len() >= KEY_DEBT_KEYS {
+            let now = std::time::SystemTime::now();
+            #[cfg(test)]
+            let now = self.retail_full_now.unwrap_or(now);
+            if let Some(idle) = self
+                .key_debt
+                .iter()
+                .find_map(|(key, debt)| debt.reclaimable(now).then_some(*key))
+            {
+                let forgotten = self.key_debt.remove(&idle).expect("idle observation");
+                if forgotten.first_rederive_failed.is_some() {
+                    self.close_first_rederive_tracking();
+                }
+            }
+        }
         if key_debt_node_bytes().map_or(true, |n| n > 1024)
             || (!self.key_debt.contains_key(&digest) && self.key_debt.len() >= KEY_DEBT_KEYS)
         {
@@ -153,6 +181,17 @@ impl Stores {
             return None;
         }
         Some(self.key_debt.entry(digest).or_default().as_mut())
+    }
+    /// After forgetting any first-result marker, stop enrolling observations:
+    /// a later visit cannot be mistaken for a key's first process attempt.
+    pub(super) fn close_first_rederive_tracking(&mut self) {
+        if !self.counters.rederive_first_attempt_tracking_closed {
+            self.counters.rederive_first_attempt_tracking_closed = true;
+            super::Counters::bump(
+                &mut self.counters.ineligible,
+                "rederive_first_attempt_tracking_closed",
+            );
+        }
     }
     pub(super) fn clear_rederive_hold(&mut self, digest: &store::Digest32) {
         if let Some(debt) = self.key_debt.get_mut(digest) {

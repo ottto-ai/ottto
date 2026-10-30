@@ -269,6 +269,13 @@ const PACE_SECS: u64 = 6 * 3600;
 const PACE_SANITY_SECS: u64 = 7 * 86_400;
 const _: () = assert!(PACE_SECS < 86_400);
 
+fn full_pace_delayed(at: SystemTime, now: SystemTime) -> bool {
+    // Backwards and implausibly large forwards jumps both EXPIRE.
+    now.duration_since(at).is_ok_and(|age| {
+        age.as_secs() <= PACE_SANITY_SECS && age < std::time::Duration::from_secs(PACE_SECS)
+    })
+}
+
 /// Content-free outcome counts, by class. Field paths are static names; no
 /// id, path or value is ever counted.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -276,6 +283,7 @@ pub(crate) struct Counters {
     pub(crate) restore_attempts: u64,
     /// Per-process totals, emitted together once at the source pass boundary.
     rederive_failed_first_attempt: [u64; 3],
+    rederive_first_attempt_tracking_closed: bool,
     restore_pending_quiet: [u64; 3],
     pub(crate) restored: u64,
     pub(crate) original_v1_mapped: u64,
@@ -1957,14 +1965,7 @@ impl SharedCache {
         }) {
             stores.counters.pace_anomaly += 1;
         }
-        let delayed = !near_cap
-            && full_at.is_some_and(|at| {
-                // Backwards and implausibly large forwards jumps both EXPIRE.
-                now.duration_since(at).is_ok_and(|age| {
-                    age.as_secs() <= PACE_SANITY_SECS
-                        && age < std::time::Duration::from_secs(PACE_SECS)
-                })
-            });
+        let delayed = !near_cap && full_at.is_some_and(|at| full_pace_delayed(at, now));
         if !delayed && !start {
             return true;
         }
@@ -4557,9 +4558,18 @@ impl SharedCache {
         let Some(mut stores) = self.durable() else {
             return;
         };
-        let Some(debt) = stores.fund_debt(digest) else {
+        if stores.counters.rederive_first_attempt_tracking_closed {
             return;
-        };
+        }
+        if stores.fund_debt(digest).is_none() {
+            stores.close_first_rederive_tracking();
+            return;
+        }
+        // Funding may have reclaimed an idle diagnostic marker.
+        if stores.counters.rederive_first_attempt_tracking_closed {
+            return;
+        }
+        let debt = stores.key_debt.get_mut(&digest).expect("funded");
         if debt.first_rederive_failed.is_none() {
             debt.first_rederive_failed = Some(failed);
             stores.counters.rederive_failed_first_attempt[diagnostic_source_slot(source)] +=
@@ -4578,12 +4588,14 @@ impl SharedCache {
         let slot = diagnostic_source_slot(source);
         let failed = stores.counters.rederive_failed_first_attempt[slot];
         let quiet = stores.counters.restore_pending_quiet[slot];
+        let stores_tracking_closed = stores.counters.rederive_first_attempt_tracking_closed;
         drop(stores);
         crate::local_resource_diagnostics::durable_tail_alarm(
             source.api_slug(),
             &serde_json::json!({
                 "rederive_failed_first_attempt": failed,
                 "restore_pending_quiet": quiet,
+                "rederive_first_attempt_tracking_closed": stores_tracking_closed,
             }),
         );
     }
