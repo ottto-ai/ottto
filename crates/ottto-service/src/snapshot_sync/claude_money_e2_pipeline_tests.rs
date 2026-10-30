@@ -167,7 +167,10 @@ impl Corpus {
         }
     }
     fn reload(&self, index: &mut ScanIndex) -> ScanIndex {
-        let path = self.base.join("scan-index.json");
+        self.reload_in(index, "scan-index.json")
+    }
+    fn reload_in(&self, index: &mut ScanIndex, name: &str) -> ScanIndex {
+        let path = self.base.join(name);
         index.save(&path).unwrap();
         ScanIndex::load(&path).unwrap()
     }
@@ -1845,8 +1848,17 @@ const LATE: &str = "3338a80a-f36e-4cbc-a5bb-50fc66430ba5";
 fn settle(
     c: &Corpus,
     committed: &ScanIndex,
+    page: Page,
+    progress: &mut SnapshotUploadProgress,
+) -> ScanIndex {
+    settle_in(c, committed, page, progress, "scan-index.json")
+}
+fn settle_in(
+    c: &Corpus,
+    committed: &ScanIndex,
     mut page: Page,
     progress: &mut SnapshotUploadProgress,
+    index_name: &str,
 ) -> ScanIndex {
     page.finish();
     upload(&page.scan.snapshots, progress, ack).0.unwrap();
@@ -1858,7 +1870,7 @@ fn settle(
     );
     let mut settled = settle_completed_upload(page.index, committed, progress, &holds);
     settle_index_after_upload(&mut settled.index, committed, progress);
-    c.reload(&mut settled.index)
+    c.reload_in(&mut settled.index, index_name)
 }
 fn body<'a>(page: &'a Page, session: &str) -> Option<&'a SnapshotItem> {
     page.scan
@@ -3199,7 +3211,10 @@ fn e2_pipeline_resumed_switch_off_matches_pre_change_builder_demo_family() {
                 assert!(actual.index.claude_copy_removals.is_empty());
                 assert_eq!(copy_diag(&PREFIX_KEYS), [0; 5]);
                 current = settle(&c, &current, actual, &mut progress);
-                reference = settle(&c, &reference, expected, &mut reference_progress);
+                // Independent generations need independent index files; the
+                // source paths and uploaded bodies remain identical.
+                reference = settle_in(&c, &reference, expected, &mut reference_progress,
+                    "pre-change-scan-index.json");
             }
         }
     });
