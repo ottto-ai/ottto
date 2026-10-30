@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 #[serde(rename_all = "snake_case")]
 pub(super) enum Pause {
     PublicationPending,
+    R1StagingNotInstalled,
     UnknownClass,
     Malformed,
     Partial,
@@ -18,7 +19,11 @@ pub(super) enum Pause {
 }
 impl std::fmt::Display for Pause {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("state_v2_import_paused")
+        f.write_str(if *self == Self::R1StagingNotInstalled {
+            "R1 staging not installed"
+        } else {
+            "state_v2_import_paused"
+        })
     }
 }
 impl std::error::Error for Pause {}
@@ -205,7 +210,9 @@ impl Mapper for ClaudeMapper {
         Original::read(path).map(Some)
     }
     fn preflight(&self, _: &ScanIndex) -> std::result::Result<(), Pause> {
-        Err(Pause::PublicationPending)
+        // M1 protects every active file publication, including first admission.
+        // Omitting resume rows cannot promise v1-equivalent restart recovery.
+        Err(Pause::R1StagingNotInstalled)
     }
     fn populate<S: Store>(&self, _: &mut S, _: &ScanIndex) -> Result<()> {
         bail!(Pause::PublicationPending)
@@ -1420,10 +1427,10 @@ mod application_cases {
         assert_eq!(loaded.generation, 10);
         assert!(loaded.persistence_v2.is_some());
         // Only this component fixture publishes. Production conversion keeps
-        // its explicit PublicationPending prerequisite until save parity lands.
+        // its explicit R1 staging prerequisite remains until the owner installs hooks.
         assert_eq!(
             ClaudeMapper.preflight(&loaded),
-            Err(Pause::PublicationPending)
+            Err(Pause::R1StagingNotInstalled)
         );
     }
 
