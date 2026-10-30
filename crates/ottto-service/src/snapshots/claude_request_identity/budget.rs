@@ -8,6 +8,26 @@ pub(crate) struct OverflowCounts {
     pub(crate) same_as_parent: u64,
     pub(crate) differs: u64,
 }
+/// `accepted_state_unknown` split by cause; each unknown attempt counts once.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct UnknownCauses {
+    pub(crate) no_key: u64,
+    pub(crate) epoch_changed: u64,
+    pub(crate) untracked_session: u64,
+    pub(crate) incomplete: u64,
+}
+impl UnknownCauses {
+    pub(super) fn one(cause: accepted::UnknownCause) -> Self {
+        let mut causes = Self::default();
+        *match cause {
+            accepted::UnknownCause::NoKey => &mut causes.no_key,
+            accepted::UnknownCause::EpochChanged => &mut causes.epoch_changed,
+            accepted::UnknownCause::UntrackedSession => &mut causes.untracked_session,
+            accepted::UnknownCause::Incomplete => &mut causes.incomplete,
+        } = 1;
+        causes
+    }
+}
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct Counts {
     pub(crate) retained_buckets: u64,
@@ -16,6 +36,11 @@ pub(crate) struct Counts {
     pub(crate) accepted_share_changed: u64,
     pub(crate) accepted_state_evicted: u64,
     pub(crate) accepted_overflow: OverflowCounts,
+    /// Final model rows sent untagged: a share lacked a cost its priced row carries.
+    pub(crate) unpriced_part_untagged: u64,
+    /// Frozen tagged rows absent from their still-present accepted bucket.
+    pub(crate) accepted_row_vanished: u64,
+    pub(crate) accepted_state_unknown_cause: UnknownCauses,
 }
 impl Counts {
     pub(super) fn is_empty(&self) -> bool {
@@ -23,10 +48,10 @@ impl Counts {
     }
 }
 #[cfg(not(test))]
-static COUNTERS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+static COUNTERS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 #[cfg(test)]
-thread_local! { static COUNTERS: [AtomicU64; 7] = const { [const { AtomicU64::new(0) }; 7] }; }
-fn counters<T>(f: impl FnOnce(&[AtomicU64; 7]) -> T) -> T {
+thread_local! { static COUNTERS: [AtomicU64; 13] = const { [const { AtomicU64::new(0) }; 13] }; }
+fn counters<T>(f: impl FnOnce(&[AtomicU64; 13]) -> T) -> T {
     #[cfg(test)]
     {
         COUNTERS.with(f)
@@ -46,13 +71,19 @@ pub(super) fn record(counts: &Counts) {
             counts.accepted_state_evicted,
             counts.accepted_overflow.same_as_parent,
             counts.accepted_overflow.differs,
+            counts.unpriced_part_untagged,
+            counts.accepted_row_vanished,
+            counts.accepted_state_unknown_cause.no_key,
+            counts.accepted_state_unknown_cause.epoch_changed,
+            counts.accepted_state_unknown_cause.untracked_session,
+            counts.accepted_state_unknown_cause.incomplete,
         ]) {
             let _ = counter.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(value)));
         }
     });
 }
 pub(super) fn take_counts() -> Counts {
-    let [retained_buckets, refused_new_buckets, accepted_state_unknown, accepted_share_changed, accepted_state_evicted, same_as_parent, differs] =
+    let [retained_buckets, refused_new_buckets, accepted_state_unknown, accepted_share_changed, accepted_state_evicted, same_as_parent, differs, unpriced_part_untagged, accepted_row_vanished, no_key, epoch_changed, untracked_session, incomplete] =
         counters(|counters| counters.each_ref().map(|counter| counter.swap(0, Relaxed)));
     Counts {
         retained_buckets,
@@ -63,6 +94,14 @@ pub(super) fn take_counts() -> Counts {
         accepted_overflow: OverflowCounts {
             same_as_parent,
             differs,
+        },
+        unpriced_part_untagged,
+        accepted_row_vanished,
+        accepted_state_unknown_cause: UnknownCauses {
+            no_key,
+            epoch_changed,
+            untracked_session,
+            incomplete,
         },
     }
 }

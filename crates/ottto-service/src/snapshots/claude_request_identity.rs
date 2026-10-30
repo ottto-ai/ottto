@@ -425,6 +425,10 @@ pub(crate) struct Grouping {
     /// Additional cache-reconciliation wire bytes, projected once before tags.
     extra_wire_bytes: usize,
     accepted_share_changed: BTreeSet<String>,
+    /// Frozen tagged rows absent from their present accepted bucket.
+    accepted_rows_vanished: u64,
+    /// Why the caller found no accepted state, when it found none.
+    accepted_miss: accepted::UnknownCause,
     failed: Option<Ineligible>,
     /// Requests a `RequestSink` admitted: those the item's transcript holds,
     /// and telemetry-only (auxiliary) ones the reported rebuild added.
@@ -551,6 +555,8 @@ impl Grouping {
             upstream_proof_lost: false,
             extra_wire_bytes: 0,
             accepted_share_changed: BTreeSet::new(),
+            accepted_rows_vanished: 0,
+            accepted_miss: accepted::UnknownCause::NoKey,
             failed: None,
             transcript_requests: 0,
             telemetry_only_requests: 0,
@@ -797,6 +803,7 @@ pub(crate) fn apply_with_reserved_bytes_for_test(
         );
     }
     let known = accepted.get(&item.source_session_id);
+    grouping.accepted_miss = accepted.miss_cause();
     apply_grouped_with_accepted(item, grouping, known)
 }
 
@@ -1008,11 +1015,27 @@ fn apply_grouped_with_accepted(
     if attempted_bytes > MAX_ITEM_BYTES {
         over_cap.insert(OverCap::Bytes);
     }
-    if over_cap.is_empty() {
-        budget::record(&cap_counts(item, &grouping, accepted, None));
-        item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
-        item.claude_account_display = display(grouping.unowned_request);
-        return Ok(Tagged::Sent { refusals });
+    let unpriced = over_cap
+        .is_empty()
+        .then(|| untag_unpriced_parts(item, &grouping, accepted))
+        .flatten();
+    if let Some(unpriced) = unpriced {
+        // Stripping only removes tags; the wire bound is still re-checked.
+        if grouping.item_bytes(item) <= MAX_ITEM_BYTES {
+            let mut counts = cap_counts(item, &grouping, accepted, None);
+            unpriced.count(&mut counts);
+            budget::record(&counts);
+            untag_groups(&mut grouping, &unpriced.keys);
+            item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
+            item.claude_account_display = Some(Box::new(account_display(
+                &grouping,
+                grouping.unowned_request,
+            )));
+            return Ok(Tagged::Sent {
+                refusals: item.request_identity_refusals,
+            });
+        }
+        over_cap.insert(OverCap::Bytes);
     }
     crate::local_resource_diagnostics::claude_identity_over_cap(&over_cap, attempted_bytes);
     let attempted_counts = cap_counts(item, &grouping, accepted, None);
@@ -1032,10 +1055,22 @@ fn apply_grouped_with_accepted(
         .count() as u64;
     let selected = (!grouping.upstream_proof_lost)
         .then(|| budget::select(item, &grouping, prior_refusals, accepted))
-        .flatten();
-    if let Some((kept, measurement)) = selected {
-        budget::record(&cap_counts(item, &grouping, accepted, Some(&measurement)));
+        .flatten()
+        .and_then(|(kept, mut measurement)| {
+            let unpriced = untag_unpriced_parts(item, &grouping, accepted)?;
+            if !unpriced.keys.is_empty() {
+                // Kept buckets left without any tag are no longer retained.
+                measurement.accepted_retained =
+                    cap_counts(item, &grouping, accepted, None).retained_buckets;
+            }
+            (grouping.item_bytes(item) <= MAX_ITEM_BYTES).then_some((kept, measurement, unpriced))
+        });
+    if let Some((kept, measurement, unpriced)) = selected {
+        let mut counts = cap_counts(item, &grouping, accepted, Some(&measurement));
+        unpriced.count(&mut counts);
+        budget::record(&counts);
         let mut visible = grouping;
+        untag_groups(&mut visible, &unpriced.keys);
         for (bucket, keep) in item.usage_buckets.iter().zip(&kept) {
             if !keep {
                 for group in visible
@@ -1100,6 +1135,9 @@ fn protect_accepted_shares(grouping: &mut Grouping, accepted: Option<&accepted::
         if accepted.binary_search(&start).is_err() {
             continue;
         }
+        // Counts only: a frozen row whose usage moved to a new key bypasses
+        // the gate (no money or tagging change).
+        grouping.accepted_rows_vanished += accepted.vanished_rows(start, rows.keys());
         for (row, group) in rows {
             let prior = accepted.row_shares(start, row);
             let current = group
@@ -1143,6 +1181,12 @@ fn cap_counts(
     accepted: Option<&accepted::AcceptedSession>,
     measurement: Option<&CapMeasurement>,
 ) -> budget::Counts {
+    let unknown = match accepted {
+        None => Some(grouping.accepted_miss),
+        Some(known) => known
+            .incomplete
+            .then_some(accepted::UnknownCause::Incomplete),
+    };
     let retained = item
         .usage_buckets
         .iter()
@@ -1164,10 +1208,13 @@ fn cap_counts(
         retained_buckets: measurement.map_or(retained, |m| m.accepted_retained),
         refused_new_buckets: measurement.map_or(0, |m| m.refused_recent_buckets),
         accepted_state_evicted: 0,
-        accepted_state_unknown: u64::from(accepted.map_or(true, |known| known.incomplete)),
+        accepted_state_unknown: u64::from(unknown.is_some()),
         accepted_share_changed: grouping.accepted_share_changed.len() as u64,
         accepted_overflow: measurement
             .map_or_else(Default::default, |m| m.accepted_overflow.clone()),
+        unpriced_part_untagged: 0,
+        accepted_row_vanished: grouping.accepted_rows_vanished,
+        accepted_state_unknown_cause: unknown.map(budget::UnknownCauses::one).unwrap_or_default(),
     }
 }
 
@@ -1646,6 +1693,224 @@ fn strip(item: &mut SnapshotItem) {
         row.account_identifier_hash = None;
         row.evidence_ref = None;
         row.identity_parts = None;
+    }
+}
+
+fn row_tagged(row: &SnapshotModelUsage) -> bool {
+    row.evidence_ref.is_some()
+        || row
+            .identity_parts
+            .iter()
+            .flatten()
+            .any(|part| part.evidence_ref.is_some())
+}
+
+/// Receiver `_validate_identity_parts` money presence
+/// (backend/app/schemas/agent_session_snapshots.py:634-641): per cost field, a
+/// row carrying it needs it on every part and a row without it allows none.
+fn parts_presence_holds(row: &SnapshotModelUsage) -> bool {
+    let row_present = row_costs(row).map(Option::is_some);
+    row.identity_parts.iter().flatten().all(|part| {
+        [
+            &part.cost_usd,
+            &part.input_cost_usd,
+            &part.output_cost_usd,
+            &part.cache_read_cost_usd,
+            &part.cache_creation_cost_usd,
+        ]
+        .map(Option::is_some)
+            == row_present
+    })
+}
+
+/// Model rows the final body stripped because a share had no value for a cost
+/// field its priced row carries.
+#[derive(Default)]
+struct UnpricedStrip {
+    keys: BTreeSet<RowKey>,
+    /// Stripped rows with a frozen tagged share set in an accepted bucket.
+    accepted_rows: u64,
+}
+
+impl UnpricedStrip {
+    fn count(&self, counts: &mut budget::Counts) {
+        counts.unpriced_part_untagged = self.keys.len() as u64;
+        // Losing accepted tags can move dollars to the starting binding.
+        counts.accepted_overflow.differs = counts
+            .accepted_overflow
+            .differs
+            .saturating_add(self.accepted_rows);
+    }
+}
+
+/// Fail closed on the final derived rows: a share whose contributing buckets
+/// all lack a cost its priced parent carries has no exact value, and neither a
+/// zero nor a guessed identity may stand in. The whole model row (top and
+/// every bucket row) goes out untagged with its unchanged money, one refusal
+/// per newly untagged bucket row; orphaned evidence is pruned and remapped.
+/// `None` when the stripped body no longer reconciles (never expected).
+fn untag_unpriced_parts(
+    item: &mut SnapshotItem,
+    grouping: &Grouping,
+    accepted: Option<&accepted::AcceptedSession>,
+) -> Option<UnpricedStrip> {
+    let keys = item
+        .model_usage
+        .iter()
+        .chain(
+            item.usage_buckets
+                .iter()
+                .flat_map(|bucket| &bucket.model_usage),
+        )
+        .filter(|row| !parts_presence_holds(row))
+        .map(row_key_from_model_usage)
+        .collect::<BTreeSet<_>>();
+    let mut stripped = UnpricedStrip::default();
+    if keys.is_empty() {
+        return Some(stripped);
+    }
+    let mut refusals = 0_u64;
+    let mut accepted_keys = BTreeSet::new();
+    for bucket in &mut item.usage_buckets {
+        let start = accepted::bucket_key(&bucket.bucket_start)
+            .filter(|key| accepted.is_some_and(|known| known.binary_search(key).is_ok()));
+        for row in &mut bucket.model_usage {
+            let key = row_key_from_model_usage(row);
+            if !keys.contains(&key) || !row_tagged(row) {
+                continue;
+            }
+            let group = grouping.get(&bucket.bucket_start, &key)?;
+            refusals += u64::from(!group.refused);
+            if let (Some(start), Some(known)) = (start, accepted) {
+                if known.row_shares(start, &key).iter().any(Option::is_some) {
+                    accepted_keys.insert(key);
+                }
+            }
+            row.account_identifier_hash = None;
+            row.evidence_ref = None;
+            row.identity_parts = None;
+        }
+    }
+    for row in &mut item.model_usage {
+        if keys.contains(&row_key_from_model_usage(row)) {
+            row.account_identifier_hash = None;
+            row.evidence_ref = None;
+            row.identity_parts = None;
+        }
+    }
+    item.request_identity_refusals = item.request_identity_refusals.saturating_add(refusals);
+    prune_evidence(item);
+    if !wire_reconciles(item) {
+        return None;
+    }
+    stripped.accepted_rows = accepted_keys.len() as u64;
+    stripped.keys = keys;
+    Some(stripped)
+}
+
+/// Drop evidence no row references and remap references, preserving order.
+fn prune_evidence(item: &mut SnapshotItem) {
+    let mut used = vec![false; item.request_evidence.len()];
+    let rows = || {
+        item.model_usage.iter().chain(
+            item.usage_buckets
+                .iter()
+                .flat_map(|bucket| &bucket.model_usage),
+        )
+    };
+    for row in rows() {
+        let references = row.evidence_ref.into_iter().chain(
+            row.identity_parts
+                .iter()
+                .flatten()
+                .filter_map(|part| part.evidence_ref),
+        );
+        for reference in references {
+            if let Some(slot) = used.get_mut(usize::from(reference)) {
+                *slot = true;
+            }
+        }
+    }
+    if used.iter().all(|used| *used) {
+        return;
+    }
+    let mut next = 0_u16;
+    let positions = used
+        .iter()
+        .map(|used| {
+            let index = next;
+            next += u16::from(*used);
+            used.then_some(index)
+        })
+        .collect::<Vec<_>>();
+    item.request_evidence = std::mem::take(&mut item.request_evidence)
+        .into_iter()
+        .zip(&used)
+        .filter_map(|(entry, used)| used.then_some(entry))
+        .collect();
+    let remap = |reference: &mut Option<u16>| {
+        *reference = reference.and_then(|old| positions.get(usize::from(old)).copied().flatten());
+    };
+    for row in item.model_usage.iter_mut().chain(
+        item.usage_buckets
+            .iter_mut()
+            .flat_map(|bucket| bucket.model_usage.iter_mut()),
+    ) {
+        remap(&mut row.evidence_ref);
+        for part in row.identity_parts.iter_mut().flatten() {
+            remap(&mut part.evidence_ref);
+        }
+    }
+}
+
+/// Re-run the bucket and top-row reconciliation on the emitted wire alone:
+/// money presence on every part, bucket rows reproduced by their shares, and
+/// top rows equal to the receiver-arithmetic sum of their bucket rows.
+fn wire_reconciles(item: &SnapshotItem) -> bool {
+    let rows = || {
+        item.model_usage.iter().chain(
+            item.usage_buckets
+                .iter()
+                .flat_map(|bucket| &bucket.model_usage),
+        )
+    };
+    if !rows().all(parts_presence_holds) {
+        return false;
+    }
+    let Some(grouping) = wire_grouping(item).filter(|grouping| grouping.failed.is_none()) else {
+        return false;
+    };
+    let mut top: BTreeMap<RowKey, Amounts> = BTreeMap::new();
+    for bucket in &item.usage_buckets {
+        for row in &bucket.model_usage {
+            let key = row_key_from_model_usage(row);
+            let Some(group) = grouping.get(&bucket.bucket_start, &key) else {
+                return false;
+            };
+            if reproduces(row, &group.total).is_err()
+                || top
+                    .entry(key)
+                    .or_default()
+                    .merge_wire(&group.total)
+                    .is_none()
+            {
+                return false;
+            }
+        }
+    }
+    top.len() == item.model_usage.len()
+        && item.model_usage.iter().all(|row| {
+            top.get(&row_key_from_model_usage(row))
+                .is_some_and(|amounts| reproduces(row, amounts).is_ok())
+        })
+}
+
+/// Display follows the emitted rows: stripped model rows name no account.
+fn untag_groups(grouping: &mut Grouping, keys: &BTreeSet<RowKey>) {
+    for (key, group) in grouping.groups.values_mut().flat_map(BTreeMap::iter_mut) {
+        if keys.contains(key) {
+            group.by_key = BTreeMap::from([(None, group.total.clone())]);
+        }
     }
 }
 
@@ -4258,6 +4523,10 @@ fn tag_item(
     let accepted = evidence
         .accepted_buckets
         .and_then(|state| state.get(&item.source_session_id));
+    // No ledger is the same as no usable key: share protection is off.
+    let miss = evidence
+        .accepted_buckets
+        .map_or(accepted::UnknownCause::NoKey, AcceptedBuckets::miss_cause);
     if super::claude_request_money::e2::enabled()
         && super::claude_history_upgrade::is_request_owned_literal(item)
     {
@@ -4288,6 +4557,7 @@ fn tag_item(
         grouping.extra_wire_bytes = evidence
             .wire_size_reservation
             .map_or(0, |reserve| reserve(item));
+        grouping.accepted_miss = miss;
         let tagged = apply_grouped_with_accepted(item, grouping, accepted);
         if tagged.is_err() {
             (
@@ -4353,6 +4623,7 @@ fn tag_item(
         .map_or(0, |reserve| reserve(item));
     let desktop_recent = std::mem::take(&mut grouping.desktop_recent);
     let owned = !grouping.unowned_request;
+    grouping.accepted_miss = miss;
     let tagged = apply_grouped_with_accepted(item, grouping, accepted);
     if tagged.is_ok() && owned {
         crate::desktop_recent::publish(desktop_recent);

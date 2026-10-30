@@ -1137,11 +1137,34 @@ overwrite; backend authority rules independently govern successor acceptance.
 
 `native_collection_page.counts.identity_cap` contains sparse page observations
 for `retained_buckets`, `refused_new_buckets`, `accepted_state_unknown`, and
-`accepted_overflow.{same_as_parent,differs}`, and `accepted_share_changed`. Labels are append-only.
+`accepted_overflow.{same_as_parent,differs}`, `accepted_share_changed`,
+`unpriced_part_untagged`, `accepted_row_vanished` and
+`accepted_state_unknown_cause.{no_key,epoch_changed,untracked_session,incomplete}`.
+Labels are append-only.
 `accepted_share_changed` counts bucket observations where a previously accepted
 row gains a different authority or loses a tagged share/presence. Unchanged
 shares stay tagged; changed/missing shares become untagged with one refusal
 per affected row. Such a bucket is not counted as retained.
+`accepted_state_unknown_cause` splits each `accepted_state_unknown` attempt
+into exactly one cause: `no_key` (no usable attribution key, so share
+protection is off while shares are still tagged), `epoch_changed` (this pass
+discarded hints of a different key epoch), `untracked_session` (no hints for
+the session: never stored-body ACKed, evicted or invalid) or `incomplete`
+(whole buckets evicted at the share limit). `accepted_row_vanished` counts
+frozen tagged rows absent from their still-present accepted bucket, such as
+usage moved to a new row key by late effort or billing resolution; it is
+counts-only and changes no tag or money.
+
+The final derived rows mirror the receiver's identity-part money presence
+rule: a row carrying a cost field needs it on every part. A share whose
+contributing buckets all lack a cost its priced row carries has no exact
+value, and no zero or guessed identity stands in. That whole model row (top
+row and every bucket row) goes out untagged with unchanged money and one
+refusal per newly untagged bucket row; orphaned evidence is pruned and the
+wire is reconciled again. `unpriced_part_untagged` counts such model rows; a
+stripped row with frozen accepted shares also counts in
+`accepted_overflow.differs`.
+
 The default classifier always uses `differs`: a local starting login, creator
 hint or display cannot prove the backend's parent binding. Zero
 `same_as_parent` is explicit when this object is present. Counts describe tagging

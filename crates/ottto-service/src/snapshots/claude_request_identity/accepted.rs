@@ -18,8 +18,27 @@ impl std::fmt::Debug for FingerprintKey {
         f.write_str("FingerprintKey([redacted])")
     }
 }
+/// The third member is runtime only: this pass's bind discarded hints of a
+/// different key epoch.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct AcceptedBuckets(BTreeMap<String, AcceptedSession>, Option<FingerprintKey>);
+pub(crate) struct AcceptedBuckets(
+    BTreeMap<String, AcceptedSession>,
+    Option<FingerprintKey>,
+    bool,
+);
+/// Why a tagging attempt had no complete accepted state (local diagnostics).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum UnknownCause {
+    /// No usable attribution key (or no ledger): share protection is off.
+    #[default]
+    NoKey,
+    /// Hints were discarded because the key epoch changed this pass.
+    EpochChanged,
+    /// No hints for this session: never stored-body ACKed, evicted or invalid.
+    UntrackedSession,
+    /// Hints exist but whole buckets were evicted at the share limit.
+    Incomplete,
+}
 #[cfg(test)]
 fn fixture_key() -> FingerprintKey {
     FingerprintKey(Zeroizing::new([0x42; 32]))
@@ -184,6 +203,26 @@ impl AcceptedSession {
     pub(super) fn authority_hash(&self, authority: &AuthorityKey) -> [u8; 32] {
         authority_hash(self.key.as_ref().expect("bound accepted epoch"), authority)
     }
+    /// Frozen tagged rows of a present bucket that no current row key matches,
+    /// e.g. usage moved to a new key by late effort or billing resolution.
+    pub(super) fn vanished_rows<'r>(
+        &self,
+        bucket: i64,
+        current: impl Iterator<Item = &'r RowKey>,
+    ) -> u64 {
+        let key = self.key.as_ref().expect("bound accepted epoch");
+        let current = current
+            .map(|row| row_hash(key, row))
+            .collect::<BTreeSet<_>>();
+        let first = self.shares.partition_point(|share| share.bucket < bucket);
+        self.shares[first..]
+            .iter()
+            .take_while(|share| share.bucket == bucket)
+            .map(|share| share.row)
+            .filter(|row| !current.contains(row))
+            .collect::<BTreeSet<_>>()
+            .len() as u64
+    }
     pub(super) fn row_shares(&self, bucket: i64, row: &RowKey) -> BTreeSet<Option<[u8; 32]>> {
         let row = row_hash(self.key.as_ref().expect("bound accepted epoch"), row);
         let first = self
@@ -235,7 +274,7 @@ impl<'de> Deserialize<'de> for AcceptedBuckets {
                     state.shares = state.shares.into_boxed_slice().into_vec();
                     states.insert(session, state);
                 }
-                Ok(AcceptedBuckets(states, None))
+                Ok(AcceptedBuckets(states, None, false))
             }
             fn visit_seq<S: SeqAccess<'de>>(self, mut seq: S) -> Result<Self::Value, S::Error> {
                 while seq.next_element::<IgnoredAny>()?.is_some() {}
@@ -266,7 +305,7 @@ impl<'de> Deserialize<'de> for AcceptedBuckets {
 impl AcceptedBuckets {
     #[cfg(test)]
     pub(crate) fn for_test() -> Self {
-        Self(BTreeMap::new(), Some(fixture_key()))
+        Self(BTreeMap::new(), Some(fixture_key()), false)
     }
     #[cfg(test)]
     pub(crate) fn maximum_for_test() -> Self {
@@ -302,6 +341,7 @@ impl AcceptedBuckets {
                 })
                 .collect(),
             Some(key),
+            false,
         )
     }
     #[cfg(test)]
@@ -324,9 +364,11 @@ impl AcceptedBuckets {
     }
     fn bind_key(&mut self, key: Option<FingerprintKey>) {
         let epoch = key.as_ref().map(key_epoch);
-        if epoch.is_none() || self.0.values().any(|state| Some(state.key_epoch) != epoch) {
+        let rotated = self.0.values().any(|state| Some(state.key_epoch) != epoch);
+        if epoch.is_none() || rotated {
             self.0.clear();
         }
+        self.2 = epoch.is_some() && rotated;
         for state in self.0.values_mut() {
             state.key = key.clone();
         }
@@ -340,6 +382,14 @@ impl AcceptedBuckets {
         self.0
             .get(&session_key(key, session))
             .filter(|state| state.key_epoch == key_epoch(key))
+    }
+    /// Why `get(session)` found no state; meaningful only when it returned `None`.
+    pub(crate) fn miss_cause(&self) -> UnknownCause {
+        match (&self.1, self.2) {
+            (None, _) => UnknownCause::NoKey,
+            (Some(_), true) => UnknownCause::EpochChanged,
+            (Some(_), false) => UnknownCause::UntrackedSession,
+        }
     }
     /// Record only the body actually stored. A stripped ACK preserves prior
     /// fingerprints while the bucket is present; fingerprints never restore tags.
@@ -580,6 +630,7 @@ mod heap_tests {
                 })
                 .collect(),
             None,
+            false,
         );
         let mut counter = Counter::new(3 * 1024 * 1024);
         counter.add(std::mem::size_of_val(&state)).unwrap();

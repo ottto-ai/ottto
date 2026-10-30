@@ -1710,6 +1710,18 @@ fn sticky_emitted_wire_goldens_match_receiver_contract_cases() {
         .any(|part| part.evidence_ref.is_none()));
     sticky_assert_reconciled(&changed);
     cases.insert("accepted_share_changed", sticky_wire(changed));
+    // The original single-changed-bucket shape the receiver rejected: the
+    // untagged share's only bucket lacks costs its priced top row carries.
+    let (mut unpriced, proof) = sticky_unpriced_share_shape(false);
+    let accepted = sticky_unpriced_share_ledger(&unpriced);
+    assert_eq!(
+        sticky_apply(&mut unpriced, &proof, &accepted).unwrap(),
+        Tagged::Sent { refusals: 4 }
+    );
+    assert!(unpriced.request_evidence.is_empty());
+    assert!(!sticky_any_tagged(&unpriced));
+    sticky_assert_reconciled(&unpriced);
+    cases.insert("unpriced_part_untagged", sticky_wire(unpriced));
     let actual = serde_json::to_value(cases).unwrap();
     let fixture = include_str!("fixtures/claude_identity_cap_emitted.json");
     let expected: Value = serde_json::from_str(fixture).unwrap();
@@ -1718,6 +1730,7 @@ fn sticky_emitted_wire_goldens_match_receiver_contract_cases() {
         "window",
         "accepted_overflow",
         "restore_from_held_proof",
+        "accepted_share_changed",
     ] {
         assert_eq!(
             actual[case], expected[case],
@@ -1838,4 +1851,310 @@ fn sticky_missing_presence_resolves_to_the_same_accepted_tagged_set_without_repe
         sticky_assert_reconciled(&current);
         accepted.record(&serde_json::to_value(current).unwrap());
     }
+}
+
+fn sticky_any_tagged(item: &SnapshotItem) -> bool {
+    item.model_usage
+        .iter()
+        .chain(item.usage_buckets.iter().flat_map(|b| &b.model_usage))
+        .any(sticky_tagged)
+}
+
+fn sticky_money(item: &SnapshotItem) -> Value {
+    let today = stripped(item);
+    serde_json::to_value((&today.model_usage, &today.usage_buckets, &today.cost)).unwrap()
+}
+
+/// Four priced hours; hour 0 lacks total and cache-creation cost. With
+/// `second_model`, a fully priced second model row shares every bucket and
+/// authority key. Proof index 1 is hour 0's second share of the first model.
+fn sticky_unpriced_share_base(second_model: bool) -> (SnapshotItem, Vec<Contribution>) {
+    let (mut item, mut proof) = sticky_session(4);
+    sticky_price_fixture(&mut item, &mut proof);
+    if second_model {
+        let mut row = item.model_usage[0].clone();
+        row.model = "claude-second-model".into();
+        let key = row_key_from_model_usage(&row);
+        let mut second = proof.clone();
+        for c in &mut second {
+            c.row_key = key.clone();
+            c.usage.costs = UsageCosts {
+                observed: true,
+                reported: true,
+                total: Some(1_000_000),
+                input: Some(2_000_000),
+                output: Some(3_000_000),
+                cache_read: Some(4_000_000),
+                cache_creation: Some(5_000_000),
+            };
+        }
+        for bucket in &mut item.usage_buckets {
+            let mut bucket_row = bucket.model_usage[0].clone();
+            bucket_row.model = row.model.clone();
+            for (field, slot) in [
+                &mut bucket_row.cost_usd,
+                &mut bucket_row.input_cost_usd,
+                &mut bucket_row.output_cost_usd,
+                &mut bucket_row.cache_read_cost_usd,
+                &mut bucket_row.cache_creation_cost_usd,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                *slot = Some(usd_picos_string(3 * (field as u128 + 1) * 1_000_000));
+            }
+            bucket.model_usage.push(bucket_row);
+        }
+        item.model_usage.push(row);
+        proof.extend(second);
+    }
+    (item, proof)
+}
+
+/// The accepted ledger after the base body's stored-body ACK.
+fn sticky_unpriced_share_ledger(item: &SnapshotItem) -> identity::AcceptedBuckets {
+    let (_, proof) = sticky_unpriced_share_base(item.model_usage.len() > 1);
+    let mut accepted = identity::AcceptedBuckets::for_test();
+    let mut first = item.clone();
+    sticky_apply(&mut first, &proof, &accepted).unwrap();
+    assert!(sticky_any_tagged(&first));
+    accepted.record(&serde_json::to_value(first).unwrap());
+    accepted
+}
+
+/// The accepted base with hour 0's second share retagged to a new login.
+fn sticky_unpriced_share_shape(second_model: bool) -> (SnapshotItem, Vec<Contribution>) {
+    let (item, mut proof) = sticky_unpriced_share_base(second_model);
+    proof[1].identity = login_key(D64);
+    (item, proof)
+}
+
+#[test]
+fn sticky_unpriced_share_strips_only_its_model_row_and_counts_accepted_differs() {
+    let (original, proof) = sticky_unpriced_share_shape(true);
+    let accepted = sticky_unpriced_share_ledger(&original);
+    let (_, base_proof) = sticky_unpriced_share_base(true);
+    let mut unchanged = original.clone();
+    sticky_apply(&mut unchanged, &base_proof, &accepted).unwrap();
+    assert!(sticky_tagged(&unchanged.model_usage[0]));
+    let mut next = original.clone();
+    identity::take_identity_counts();
+    let result = sticky_apply(&mut next, &proof, &accepted).unwrap();
+    // Hour 0 was already refused for its share change; hours 1-3 lose tags.
+    assert_eq!(result, Tagged::Sent { refusals: 4 });
+    assert_eq!(next.request_identity_refusals, 4);
+    let counts =
+        serde_json::to_value(identity::take_identity_counts()).unwrap()["identity_cap"].clone();
+    assert_eq!(counts["unpriced_part_untagged"], 1);
+    assert_eq!(counts["accepted_overflow"]["differs"], 1);
+    assert_eq!(counts["accepted_overflow"]["same_as_parent"], 0);
+    assert_eq!(counts["accepted_share_changed"], 1);
+    assert_eq!(counts["retained_buckets"], 3);
+    assert_eq!(counts["accepted_state_unknown"], 0);
+    // The violating model row is untagged at both grains.
+    assert!(!sticky_tagged(&next.model_usage[0]));
+    assert!(next
+        .usage_buckets
+        .iter()
+        .all(|b| !sticky_tagged(&b.model_usage[0])));
+    // The other model row and its evidence keep their exact bytes.
+    assert_eq!(
+        serde_json::to_value(&next.model_usage[1]).unwrap(),
+        serde_json::to_value(&unchanged.model_usage[1]).unwrap()
+    );
+    for (bucket, before) in next.usage_buckets.iter().zip(&unchanged.usage_buckets) {
+        assert!(sticky_tagged(&bucket.model_usage[1]));
+        assert_eq!(
+            serde_json::to_value(&bucket.model_usage[1]).unwrap(),
+            serde_json::to_value(&before.model_usage[1]).unwrap()
+        );
+    }
+    assert_eq!(
+        serde_json::to_value(&next.request_evidence).unwrap(),
+        serde_json::to_value(&unchanged.request_evidence).unwrap()
+    );
+    // Money is byte-equal to the untagged baseline.
+    assert_eq!(sticky_money(&next), sticky_money(&unchanged));
+    sticky_assert_reconciled(&next);
+    let mut repeat = original.clone();
+    sticky_apply(&mut repeat, &proof, &accepted).unwrap();
+    assert_eq!(
+        serde_json::to_value(&repeat).unwrap(),
+        serde_json::to_value(&next).unwrap()
+    );
+}
+
+#[test]
+fn sticky_unpriced_missing_share_without_accepted_state_strips_without_differs() {
+    let (mut item, mut proof) = sticky_unpriced_share_base(false);
+    proof[1].identity = RequestIdentity::Missing;
+    let mut baseline = item.clone();
+    sticky_receiver_totals(&mut baseline);
+    identity::take_identity_counts();
+    let result = sticky_apply(&mut item, &proof, &identity::AcceptedBuckets::for_test()).unwrap();
+    assert_eq!(result, Tagged::Sent { refusals: 4 });
+    assert!(item.request_evidence.is_empty());
+    assert!(!sticky_any_tagged(&item));
+    assert_eq!(sticky_money(&item), sticky_money(&baseline));
+    let counts =
+        serde_json::to_value(identity::take_identity_counts()).unwrap()["identity_cap"].clone();
+    assert_eq!(counts["unpriced_part_untagged"], 1);
+    assert_eq!(counts["accepted_overflow"]["differs"], 0);
+    assert_eq!(counts["accepted_state_unknown"], 1);
+    assert_eq!(
+        counts["accepted_state_unknown_cause"]["untracked_session"],
+        1
+    );
+    sticky_assert_reconciled(&item);
+}
+
+#[test]
+fn sticky_unpriced_share_after_budget_selection_is_stripped_from_the_final_rows() {
+    // Only the newest hour is priced. Every key is priced once all buckets
+    // stay; a partial selection leaves an unpriced untagged remainder.
+    let (mut item, mut proof) = sticky_session(24);
+    for (hour, bucket) in item.usage_buckets.iter_mut().enumerate() {
+        let reported = hour == 23;
+        bucket.model_usage[0].cost_usd = reported.then(|| "0.000003".into());
+        for c in &mut proof[hour * 3..hour * 3 + 3] {
+            c.usage.costs = UsageCosts {
+                observed: true,
+                reported,
+                total: reported.then_some(1_000_000),
+                ..Default::default()
+            };
+        }
+    }
+    let ledger = identity::AcceptedBuckets::for_test();
+    let mut full = item.clone();
+    sticky_apply(&mut full, &proof, &ledger).unwrap();
+    assert!(full
+        .usage_buckets
+        .iter()
+        .all(|b| sticky_tagged(&b.model_usage[0])));
+    let tagged_bytes = identity::item_bytes(&full);
+    let clean_bytes = identity::item_bytes(&stripped(&full));
+    let reserve = identity::MAX_ITEM_BYTES - clean_bytes - (tagged_bytes - clean_bytes) / 2;
+    sticky_receiver_totals(&mut item);
+    identity::take_identity_counts();
+    let result =
+        identity::apply_with_reserved_bytes_for_test(&mut item, &proof, &ledger, reserve).unwrap();
+    assert_eq!(result, Tagged::Sent { refusals: 24 });
+    assert!(item.request_evidence.is_empty());
+    assert!(!sticky_any_tagged(&item));
+    assert_eq!(sticky_money(&item), sticky_money(&full));
+    let counts =
+        serde_json::to_value(identity::take_identity_counts()).unwrap()["identity_cap"].clone();
+    assert_eq!(counts["unpriced_part_untagged"], 1);
+    // Budget selection ran: it refused never-accepted buckets that did not fit.
+    assert!(counts["refused_new_buckets"].as_u64().unwrap() > 0);
+    sticky_assert_reconciled(&item);
+}
+
+#[test]
+fn sticky_unknown_accepted_state_is_split_by_cause() {
+    let (original, proof) = sticky_session(1);
+    let unknown = |accepted: &identity::AcceptedBuckets| {
+        let mut next = original.clone();
+        identity::take_identity_counts();
+        sticky_apply(&mut next, &proof, accepted).unwrap();
+        sticky_assert_reconciled(&next);
+        let counts =
+            serde_json::to_value(identity::take_identity_counts()).unwrap()["identity_cap"].clone();
+        let causes = counts["accepted_state_unknown_cause"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(_, count)| count.as_u64() != Some(0))
+            .map(|(cause, count)| (cause.clone(), count.as_u64().unwrap()))
+            .collect::<Vec<_>>();
+        (counts["accepted_state_unknown"].as_u64().unwrap(), causes)
+    };
+    let one = |cause: &str| (1, vec![(cause.to_owned(), 1)]);
+    let mut accepted = identity::AcceptedBuckets::for_test();
+    assert_eq!(unknown(&accepted), one("untracked_session"));
+    let mut first = original.clone();
+    sticky_apply(&mut first, &proof, &accepted).unwrap();
+    accepted.record(&serde_json::to_value(&first).unwrap());
+    assert_eq!(unknown(&accepted), (0, vec![]));
+    let bytes = serde_json::to_vec(&accepted).unwrap();
+    let mut hints: Value = serde_json::from_slice(&bytes).unwrap();
+    for state in hints.as_object_mut().unwrap().values_mut() {
+        state["incomplete"] = json!(true);
+    }
+    let incomplete =
+        identity::AcceptedBuckets::restore_for_test(&serde_json::to_vec(&hints).unwrap());
+    assert_eq!(unknown(&incomplete), one("incomplete"));
+    let mut no_key: identity::AcceptedBuckets = serde_json::from_slice(&bytes).unwrap();
+    no_key.bind_test_key(None);
+    assert_eq!(unknown(&no_key), one("no_key"));
+    let mut rotated: identity::AcceptedBuckets = serde_json::from_slice(&bytes).unwrap();
+    rotated.bind_test_key(Some([0x43; 32]));
+    assert_eq!(unknown(&rotated), one("epoch_changed"));
+    // The next pass under the same rotated key has no hints for the session.
+    rotated.bind_test_key(Some([0x43; 32]));
+    assert_eq!(unknown(&rotated), one("untracked_session"));
+}
+
+#[test]
+fn sticky_frozen_row_moved_to_a_new_row_key_counts_vanished_without_changing_the_body() {
+    let (original, proof) = sticky_session(1);
+    let mut first = original.clone();
+    let mut accepted = identity::AcceptedBuckets::for_test();
+    sticky_apply(&mut first, &proof, &accepted).unwrap();
+    accepted.record(&serde_json::to_value(first).unwrap());
+    let mut control = original.clone();
+    identity::take_identity_counts();
+    sticky_apply(&mut control, &proof, &accepted).unwrap();
+    let counts =
+        serde_json::to_value(identity::take_identity_counts()).unwrap()["identity_cap"].clone();
+    assert_eq!(counts["accepted_row_vanished"], 0);
+    // Late effort resolution moves the accepted usage to a new row key.
+    let mut moved = original.clone();
+    for row in moved.model_usage.iter_mut().chain(
+        moved
+            .usage_buckets
+            .iter_mut()
+            .flat_map(|b| b.model_usage.iter_mut()),
+    ) {
+        row.reasoning_effort = Some("high".into());
+    }
+    let key = row_key_from_model_usage(&moved.model_usage[0]);
+    let mut moved_proof = proof.clone();
+    for c in &mut moved_proof {
+        c.row_key = key.clone();
+    }
+    let mut unhinted = moved.clone();
+    sticky_apply(
+        &mut unhinted,
+        &moved_proof,
+        &identity::AcceptedBuckets::for_test(),
+    )
+    .unwrap();
+    identity::take_identity_counts();
+    sticky_apply(&mut moved, &moved_proof, &accepted).unwrap();
+    let counts =
+        serde_json::to_value(identity::take_identity_counts()).unwrap()["identity_cap"].clone();
+    assert_eq!(counts["accepted_row_vanished"], 1);
+    assert_eq!(counts["accepted_share_changed"], 0);
+    // Counts only: identity and money equal the body built without hints.
+    assert_eq!(moved.request_identity_refusals, 0);
+    assert!(sticky_tagged(&moved.usage_buckets[0].model_usage[0]));
+    for (left, right) in [
+        (
+            serde_json::to_value(&moved.model_usage).unwrap(),
+            serde_json::to_value(&unhinted.model_usage).unwrap(),
+        ),
+        (
+            serde_json::to_value(&moved.usage_buckets).unwrap(),
+            serde_json::to_value(&unhinted.usage_buckets).unwrap(),
+        ),
+        (
+            serde_json::to_value(&moved.request_evidence).unwrap(),
+            serde_json::to_value(&unhinted.request_evidence).unwrap(),
+        ),
+    ] {
+        assert_eq!(left, right);
+    }
+    sticky_assert_reconciled(&moved);
 }
