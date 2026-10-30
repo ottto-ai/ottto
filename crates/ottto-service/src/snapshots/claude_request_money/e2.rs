@@ -2559,7 +2559,8 @@ fn decide_holders(
             hashes.dedup();
             // Addendum 1: a stored removal stays removed after its holder's
             // id list retires, while that holder is still indexed. A holder
-            // whose census still answers decides through the walk instead.
+            // whose census disproves it invalidates that saved decision.
+            // Positive proof also remains valid if the walk hits its deadline.
             let mut stored = BTreeSet::new();
             if enabled() {
                 for (holder, held) in index.claude_copy_removals.get(order.1) {
@@ -2569,7 +2570,7 @@ fn decide_holders(
                     };
                     stored.extend(held.iter().filter(|&&hash| {
                         hashes.binary_search(&hash).is_ok()
-                            && stored_holder_answer(index, key, hash).is_none()
+                            && stored_holder_answer(index, key, hash) != Some(false)
                     }));
                 }
             }
@@ -2664,6 +2665,7 @@ fn decide_holders(
             .iter()
             .filter(|hash| !wanted.covered.contains_key(hash))
             .count() as u64;
+        note_reused(&mut items[wanted.at], reused);
         // Only the unresolved prefix waits. Persisted retry debt reselects
         // the file after its own-turn ACK, even when it is unchanged; its
         // third decision emits any remaining unproven requests flagged.
@@ -2702,7 +2704,6 @@ fn decide_holders(
             }
             diag("copy_parent_ref", uncovered.len() as u64);
             restore_uncovered(&mut items[wanted.at], &[]);
-            note_reused(&mut items[wanted.at], reused);
             continue;
         }
         // A resumed file waits only for a possible earlier holder; an
@@ -2736,7 +2737,6 @@ fn decide_holders(
             .cloned()
             .collect::<Vec<_>>();
         restore_uncovered(&mut items[wanted.at], &ids);
-        note_reused(&mut items[wanted.at], reused);
     }
     updates
 }

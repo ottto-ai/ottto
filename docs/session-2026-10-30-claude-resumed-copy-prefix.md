@@ -10,6 +10,8 @@ the earlier holder. While that holder remains indexed, retirement or loss of its
 census hashes does not restore a recorded removal. A positive id hit in a Lossy
 holder remains proof. Absence in a Lossy holder is unknown and never invalidates
 a recorded removal; only an answering loss-free record can disprove it.
+Recorded removals also survive census-walk deadlines while the holder still
+contains the request; retry expiry applies only to unresolved copies.
 Account-marker decisions follow the exact removed or held requests. Such
 markers cannot lend identity to retained usage. Emitted prefix markers and
 later own markers keep their scope; both identified and id-less inherited

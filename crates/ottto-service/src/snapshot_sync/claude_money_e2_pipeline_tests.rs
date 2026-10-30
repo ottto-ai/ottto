@@ -3336,3 +3336,28 @@ fn e2_pipeline_proven_prefix_markers_never_lend_identity_to_retained_requests() 
         });
     }
 }
+
+#[test]
+fn e2_pipeline_recorded_removals_survive_repeated_walk_deadlines_with_live_proof() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-pipeline-stored-copy-deadline");
+        let scanner = E2ScanFixture::default();
+        let mut progress = e2_progress();
+        let mut prior = demo_family(&mut c, &mut progress);
+        for pass in 1..=3 {
+            append(&c.root.join(file(THIRD)), &line_by(THIRD, &format!("own-{pass}"),
+                &format!("2026-08-02T07:06:2{pass}Z"), 10, RESUME_WRITER));
+            let mut page = c.raw(&scanner, prior.clone(), 100, false, &[]);
+            e2::take_diag();
+            crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
+                page.enrich(&c);
+            });
+            let third = body(&page, THIRD).unwrap();
+            assert_eq!((third.request_count, third.removed_request_count),
+                (1 + pass, Some(3)), "a timeout never restores a validated stored removal");
+            assert_eq!(copy_diag(&["copy_removal_reused", "copy_prefix_held_requests",
+                "copy_prefix_hold_expired", "copy_prefix_unproven"]), [3, 0, 0, 0]);
+            prior = settle(&c, &prior, page, &mut progress);
+        }
+    });
+}
