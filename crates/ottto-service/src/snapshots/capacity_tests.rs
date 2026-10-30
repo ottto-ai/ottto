@@ -50,7 +50,7 @@ fn capacity_debt_survives_save_restart_and_keeps_idle_growth_discoverable() {
         recovery,
     )
     .expect("capacity debt must survive the age filter");
-    assert!(open_and_identify_scan_candidate(
+    assert!(open_and_identify_capacity_candidate(
         SnapshotSource::Codex,
         candidate,
         &mut census,

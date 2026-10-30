@@ -15188,3 +15188,25 @@ fn first_capacity_refusal_enrols_completed_full_before_more_growth() {
     cache.completed_capacity_full(source, "key");
     assert!(!cache.start_resource_full(source, "key", &file, 3, "capacity"));
 }
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
+fn capacity_missing_claude_growth_spends_one_pace_and_reaches_native_full() {
+    let _on = crate::snapshots::RestartRestoreForTest::enabled();
+    let _gate = claude_request_money::e2::GateForTest::set(true);
+    let f = O3Fixture::new();
+    std::fs::remove_file(&f.record_path).unwrap();
+    f.append("growth", 200);
+    let owner = f.owner();
+    let mut prior = f.prior.clone();
+    prior
+        .tail_capacity_debt
+        .insert(f.key.clone(), prior.files[&f.key].size_bytes);
+    let ((index, scan, modes), bytes) = observe_consumed(|| f.scan(&owner, &mut prior));
+    assert_eq!(modes, (1, 0, 0));
+    assert_eq!(bytes, std::fs::metadata(&f.path).unwrap().len());
+    assert!(!scan.snapshots.is_empty());
+    assert_eq!(index.files[&f.key].size_bytes, bytes);
+    let stores = owner.cache.durable().unwrap();
+    assert_eq!(stores.counters.resource_full.get("capacity"), Some(&1));
+}

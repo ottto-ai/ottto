@@ -27433,7 +27433,7 @@ impl OwnedSourceScan {
             files
                 .into_iter()
                 .filter_map(|candidate| {
-                    open_and_identify_scan_candidate(
+                    open_and_identify_capacity_candidate(
                         source,
                         candidate,
                         &mut census,
@@ -27533,7 +27533,7 @@ impl OwnedSourceScan {
                 .filter(|candidate| {
                     let mut twin = (*candidate).clone();
                     prepare_candidate_context(&mut twin);
-                    match open_and_identify_scan_candidate(
+                    match open_and_identify_capacity_candidate(
                         source,
                         twin,
                         &mut ScanCensus::default(),
@@ -27628,7 +27628,7 @@ impl OwnedSourceScan {
                     continue;
                 };
                 prepare_candidate_context(&mut candidate);
-                if let Some(opened) = open_and_identify_scan_candidate(
+                if let Some(opened) = open_and_identify_capacity_candidate(
                     source,
                     candidate,
                     &mut census,
@@ -34989,6 +34989,28 @@ impl OwnedSourceScan {
                 }
             }
             #[cfg(unix)]
+            let capacity_growth = restart_restore::enabled()
+                && active.side_origin.is_none()
+                && index
+                    .tail_capacity_debt
+                    .contains_key(&local_index_key(&active.candidate.path))
+                && active.sampling.as_ref().map_or(true, |a| {
+                    matches!(a.mode, crate::transcript_acquisition::ReadMode::Full(_))
+                })
+                && active
+                    .parser
+                    .reader
+                    .reader
+                    .get_ref()
+                    .metadata()
+                    .is_ok_and(|m| {
+                        m.len()
+                            > index
+                                .files
+                                .get(&local_index_key(&active.candidate.path))
+                                .map_or(0, |entry| entry.size_bytes)
+                    });
+            #[cfg(unix)]
             if active.side_origin.is_none()
                 && active.sampling.as_ref().map_or(true, |a| {
                     matches!(a.mode, crate::transcript_acquisition::ReadMode::Full(_))
@@ -34998,6 +35020,7 @@ impl OwnedSourceScan {
                     if source == SnapshotSource::ClaudeCode
                         && restart_restore::enabled()
                         && !paced_full_granted
+                        && !capacity_growth
                         && !active_bound_degraded
                         && migration_floor.is_none()
                         && !cache.upgrade_full_allowed(
@@ -35041,29 +35064,14 @@ impl OwnedSourceScan {
                 }
             }
             #[cfg(unix)]
-            if restart_restore::enabled()
-                && active.side_origin.is_none()
-                && index
-                    .tail_capacity_debt
-                    .contains_key(&local_index_key(&active.candidate.path))
-                && active.sampling.as_ref().map_or(true, |a| {
-                    matches!(a.mode, crate::transcript_acquisition::ReadMode::Full(_))
-                })
-            {
-                let key = local_index_key(&active.candidate.path);
-                if active
-                    .parser
-                    .reader
-                    .reader
-                    .get_ref()
-                    .metadata()
-                    .is_ok_and(|m| {
-                        m.len() > index.files.get(&key).map_or(0, |entry| entry.size_bytes)
-                    })
-                {
-                    resource_full_pending = Some("capacity");
-                }
+            if capacity_growth {
+                resource_full_pending = Some("capacity");
             }
+            // Retail/stale and active-bound paths already own this read's pace.
+            // Capacity and other resource labels cannot spend it a second time.
+            #[cfg(unix)]
+            let resource_full_pending =
+                resource_full_pending.filter(|_| !paced_full_granted && !active_bound_degraded);
             if let (Some(phase), Some(context)) = (resource_full_pending, sampling.as_ref()) {
                 let key = local_index_key(&active.candidate.path);
                 if !context.cache.start_resource_full(
@@ -45935,8 +45943,10 @@ fn reconcile_missing_index_entries_with_side(
             crate::local_resource_diagnostics::audit_retired_absent(source.api_slug());
             continue; // SOURCE: debt retirement alone does not prune incidence.
         }
+        let capacity_held =
+            restart_restore::enabled() && index.tail_capacity_debt.contains_key(key);
         if !observed
-            && !(restart_restore::enabled() && index.tail_capacity_debt.contains_key(key))
+            && !capacity_held
             && !durable.is_some_and(|(source, cache)| owed_discovery(Some(cache), source, key))
             && !index.decode_holds_file(key)
             && !index
@@ -46299,7 +46309,28 @@ fn open_candidate_file_stat_retained(
     Ok((file, stat))
 }
 
+#[cfg(test)]
 fn open_and_identify_scan_candidate(
+    source: SnapshotSource,
+    candidate: CandidateFile,
+    census: &mut ScanCensus,
+    census_unix_seconds: Option<u64>,
+    backfill_window_days: u64,
+    files: &BTreeMap<String, ScanIndexEntry>,
+) -> Option<(CandidateFile, File)> {
+    open_and_identify_scan_candidate_with_rescue(
+        source,
+        candidate,
+        census,
+        census_unix_seconds,
+        backfill_window_days,
+        files,
+        false,
+        None,
+    )
+}
+
+fn open_and_identify_capacity_candidate(
     source: SnapshotSource,
     candidate: CandidateFile,
     census: &mut ScanCensus,
@@ -96247,7 +96278,6 @@ mod census_unreadable_tests {
             &mut census,
             None,
             30,
-            &BTreeMap::new(),
             &BTreeMap::new()
         )
         .is_none());
