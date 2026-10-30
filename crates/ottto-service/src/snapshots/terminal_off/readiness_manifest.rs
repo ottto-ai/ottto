@@ -21,8 +21,6 @@ const READINESS_MANIFEST: &[(&str, &str, &str)] = &[
     ("snapshot_sync/census_convergence_pipeline_tests.rs", "terminal_off_on_account_deferred_hold_lets_a_bounded_claude_traversal_converge", "C6"),
     ("snapshot_sync/census_convergence_pipeline_tests.rs", "terminal_off_on_full_tombstone_set_keeps_the_excess_family_and_holds_both_returns", "completion-fold"),
     ("snapshot_sync/census_convergence_pipeline_tests.rs", "terminal_off_on_real_rejected_page_records_account_hold_across_reload_and_reparses_next_generation", "R8"),
-    ("snapshot_sync/census_convergence_pipeline_tests.rs", "terminal_off_on_real_rejected_page_restores_terminal_hold_and_discloses_refusal_beside_accepted_sibling", "R8"),
-    ("snapshot_sync/census_convergence_pipeline_tests.rs", "terminal_off_on_retry_pending_debt_elsewhere_settles_unrelated_pages_like_no_debt", "R9"),
     ("snapshot_sync/census_convergence_pipeline_tests.rs", "terminal_off_on_returning_member_that_never_reproves_is_held_until_its_bounded_terminal", "completion-fold"),
     ("snapshot_sync/census_convergence_pipeline_tests.rs", "terminal_off_on_terminal_family_member_controls_keep_blocking_pruning_and_rebinding", "C6"),
     ("snapshot_sync/census_convergence_pipeline_tests.rs", "terminal_off_on_terminal_family_never_committed_members_let_the_claude_census_complete", "C6"),
@@ -130,7 +128,7 @@ fn terminal_off_on_readiness_ignores_equal_the_checked_in_manifest() {
     assert_eq!(expected, sorted, "keep the manifest sorted");
     assert_eq!(ignored_for_readiness(), expected);
     // The count is the ON gate: it must reach 0 before ON anywhere.
-    assert_eq!(READINESS_MANIFEST.len(), 76);
+    assert_eq!(READINESS_MANIFEST.len(), 74);
 }
 
 #[test]
